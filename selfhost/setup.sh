@@ -15,6 +15,8 @@ if [[ ! -d "$WT" ]]; then
     git -C "$WT" apply "$B/selfhost/bootstrap.patch"
     cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
 fi
-rsync -a --delete --exclude target --exclude rust-toolchain.toml --exclude examples --exclude .git \
+# -c, no -t: changed files get a fresh mtime, so cargo rebuilds the backend even
+# when the edit is older than the last build artifact.
+rsync -rlpc --delete --exclude target --exclude rust-toolchain.toml --exclude examples --exclude .git \
     "$B/" "$WT/compiler/rustc_codegen_pliron/"
 echo "now: cd $WT && ./x build --stage 1 library && ./x build --stage 2 compiler"
