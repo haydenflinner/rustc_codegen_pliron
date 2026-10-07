@@ -608,7 +608,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(FPTruncOp) || is!(FPExtOp) {
             let x = self.get1(opnds[0]);
             let t = self.ty_leaves(self.res_ty(op))[0].1;
-            let r = if is!(FPTruncOp) { self.b.ins().fdemote(t, x) } else { self.b.ins().fpromote(t, x) };
+            let from = self.b.func.dfg.value_type(x);
+            let r = if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
+                // Cranelift x64 can't convert f16/f128; use compiler-builtins.
+                let l = |t: ClType| match t {
+                    clt::F16 => "hf",
+                    clt::F32 => "sf",
+                    clt::F64 => "df",
+                    _ => "tf",
+                };
+                let f = format!("__{}{}{}2", if is!(FPTruncOp) { "trunc" } else { "extend" }, l(from), l(t));
+                self.libcall(&f, &[from], &[t], &[x])[0]
+            } else if is!(FPTruncOp) {
+                self.b.ins().fdemote(t, x)
+            } else {
+                self.b.ins().fpromote(t, x)
+            };
             self.set1(op, r);
         } else if is!(FPToUIOp) || is!(FPToSIOp) {
             let x = self.get1(opnds[0]);
