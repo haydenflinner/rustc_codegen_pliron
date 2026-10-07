@@ -6,4 +6,4 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-bevy = { version = "0.17", default-features = false, features = ["bevy_window", "bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_text", "default_font", "x11", "std", "multi_threaded"] }
+bevy = { version = "0.17", default-features = false, features = ["bevy_window", "bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_sprite_render", "bevy_log", "bevy_text", "default_font", "x11", "std", "multi_threaded"] }
