@@ -22,7 +22,7 @@ use rustc_data_structures::fx::FxHashMap;
 use crate::context::State;
 use crate::lower::has_body;
 
-const DEFAULT_LIMIT: usize = 40;
+const DEFAULT_LIMIT: usize = 320;
 
 pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
