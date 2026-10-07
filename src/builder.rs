@@ -877,15 +877,15 @@ impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_inline_asm(
         &mut self,
-        _template: &[rustc_ast::InlineAsmTemplatePiece],
-        _operands: &[InlineAsmOperandRef<'tcx, Self>],
-        _options: rustc_ast::InlineAsmOptions,
+        template: &[rustc_ast::InlineAsmTemplatePiece],
+        operands: &[InlineAsmOperandRef<'tcx, Self>],
+        options: rustc_ast::InlineAsmOptions,
         line_spans: &[Span],
-        _instance: Instance<'_>,
-        _dest: Option<Ptr<BasicBlock>>,
+        instance: Instance<'_>,
+        dest: Option<Ptr<BasicBlock>>,
         _catch_funclet: Option<(Ptr<BasicBlock>, Option<&()>)>,
     ) {
-        self.tcx.dcx().span_fatal(line_spans[0], "inline asm is not supported by the pliron backend yet")
+        self.inline_asm(template, operands, options, line_spans, instance, dest)
     }
 }
 

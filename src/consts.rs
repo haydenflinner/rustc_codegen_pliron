@@ -64,7 +64,7 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     /// Ok(symbol address) or Err(absolute address) for allocations without a symbol.
-    fn alloc_to_backend(&self, ga: GlobalAlloc<'tcx>) -> Result<Value, u64> {
+    pub(crate) fn alloc_to_backend(&self, ga: GlobalAlloc<'tcx>) -> Result<Value, u64> {
         match ga {
             GlobalAlloc::Function { instance, .. } => Ok(self.get_fn_addr(instance, None)),
             GlobalAlloc::Static(def_id) => Ok(self.get_static_addr(def_id)),

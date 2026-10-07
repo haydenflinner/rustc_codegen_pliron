@@ -99,6 +99,8 @@ pub struct State<'tcx> {
     pub const_allocs: FxHashMap<ConstAllocation<'tcx>, Value>,
     pub strs: FxHashMap<String, Value>,
     pub counter: usize,
+    pub cgu: String,
+    pub asm: String,
 }
 
 pub struct CodegenCx<'tcx> {
@@ -482,13 +484,13 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
 impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn codegen_global_asm(
         &mut self,
-        _template: &[rustc_ast::InlineAsmTemplatePiece],
-        _operands: &[GlobalAsmOperandRef<'tcx>],
-        _options: rustc_ast::InlineAsmOptions,
+        template: &[rustc_ast::InlineAsmTemplatePiece],
+        operands: &[GlobalAsmOperandRef<'tcx>],
+        options: rustc_ast::InlineAsmOptions,
         line_spans: &[Span],
         _extra: &[String],
     ) {
-        self.tcx.dcx().span_fatal(line_spans[0], "global_asm! is not supported by the pliron backend yet")
+        self.push_global_asm(template, operands, options, line_spans)
     }
 
     fn mangled_name(&self, instance: Instance<'tcx>) -> String {

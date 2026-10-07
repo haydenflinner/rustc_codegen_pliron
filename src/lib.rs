@@ -23,6 +23,7 @@ extern crate rustc_target;
 mod builder;
 mod consts;
 mod context;
+mod asm;
 mod intrinsic;
 mod simd;
 mod lower;
@@ -68,6 +69,7 @@ pub struct PlironCodegenBackend;
 pub struct PlironModule {
     pub obj: Vec<u8>,
     pub ir: String,
+    pub asm: String,
 }
 
 pub struct PlironBuffer(Vec<u8>);
@@ -105,7 +107,8 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     let isa = build_isa(cx.tcx.sess);
     let obj = lower::lower_to_object(&cx.pctx.borrow(), &cx.st.borrow(), isa, name);
-    PlironModule { obj, ir }
+    let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
+    PlironModule { obj, ir, asm }
 }
 
 impl CodegenBackend for PlironCodegenBackend {
@@ -217,6 +220,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
 fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
     let cgu = tcx.codegen_unit(cgu_name);
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
+    cx.st.borrow_mut().cgu = cgu_name.to_string();
     let mono_items = cgu.items_in_deterministic_order(tcx);
     for &(mono_item, data) in &mono_items {
         mono_item.predefine::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data.linkage, data.visibility);
@@ -319,7 +323,12 @@ impl WriteBackendMethods for PlironCodegenBackend {
         let emit_obj = config.emit_obj != EmitObj::None;
         if emit_obj {
             let path = outs.temp_path_for_cgu(OutputType::Object, &module.name);
-            std::fs::write(&path, &module.module_llvm.obj).expect("write object");
+            let m = &module.module_llvm;
+            if m.asm.is_empty() {
+                std::fs::write(&path, &m.obj).expect("write object");
+            } else {
+                write_obj_with_asm(&path, &m.obj, &m.asm);
+            }
         }
         if config.emit_ir {
             let path = outs.temp_path_for_cgu(OutputType::LlvmAssembly, &module.name);
@@ -330,6 +339,27 @@ impl WriteBackendMethods for PlironCodegenBackend {
 
     fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
         PlironBuffer(module.obj)
+    }
+}
+
+/// Assembles `asm!`/`global_asm!` text with the system assembler and merges
+/// it into the Cranelift object with a relocatable link.
+fn write_obj_with_asm(path: &std::path::Path, obj: &[u8], asm: &str) {
+    let main = path.with_extension("cl.o");
+    let src = path.with_extension("s");
+    let asm_obj = path.with_extension("asm.o");
+    std::fs::write(&main, obj).expect("write object");
+    std::fs::write(&src, format!("{asm}\n.section .note.GNU-stack,\"\",@progbits\n")).expect("write asm");
+    let run = |cmd: &mut std::process::Command| {
+        let out = cmd.output().unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"));
+        if !out.status.success() {
+            panic!("{cmd:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+    };
+    run(std::process::Command::new("as").arg("-o").arg(&asm_obj).arg(&src));
+    run(std::process::Command::new("ld").arg("-r").arg("-o").arg(path).arg(&main).arg(&asm_obj));
+    for f in [&main, &src, &asm_obj] {
+        let _ = std::fs::remove_file(f);
     }
 }
 
