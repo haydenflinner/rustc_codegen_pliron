@@ -22,5 +22,6 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | omit frame pointers (`PLIRON_OMIT_FP`) | – | – | – | – | no effect: regex-syntax object is byte-identical; Cranelift x64 always sets up rbp frames |
 | + internal ABI: tail CC for non-escaping, non-invoked local fns (`PLIRON_TAILCC`) + sret→register return (`PLIRON_SRET2REG`) | 2.15s | 3.94s | 8.92B (−0.3%) | 19.40B (−0.5%) | kept (first version, tail CC on invoked callees too, was +1%: try_call into tail CC clobbers all registers) |
 | + egg instcombine (`PLIRON_INSTCOMBINE`) | 2.13s | 3.82s | 8.88B (−0.4%) | 19.30B (−0.5%) | kept |
+| + dead-argument elimination for internal fns (`PLIRON_DEADARG=1`) | 2.17s (noise) | 3.99s (noise) | 8.88B (��0) | 19.30B (±0) | opt-in only: only 107 of 2655 internal-fn params in regex-syntax are dead; `.text` −0.03% |
 | + memcpyopt sret call-slot forwarding (`PLIRON_MEMCPYOPT=1`) | 2.59s | 5.23s (noise) | 11.87B (−0.1%) | 25.63B (±0) | dropped (opt-in only) |
 | instcombine, egg e-graph (`PLIRON_INSTCOMBINE`) | pending | | | | |

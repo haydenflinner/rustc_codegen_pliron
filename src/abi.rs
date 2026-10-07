@@ -90,7 +90,7 @@ fn call_sites(
 
 /// Dead-argument elimination for internal functions: parameters the body
 /// never reads are dropped from the signature and from every call.
-/// `PLIRON_DEADARG=0` disables it.
+/// Opt-in (`PLIRON_DEADARG=1`): stage2 instruction count unchanged.
 pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
