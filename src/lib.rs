@@ -98,7 +98,17 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
         },
     )
     .unwrap();
-    fb.set("preserve_frame_pointers", "true").unwrap();
+    // Frame pointers follow the target default and `-Cforce-frame-pointers`, as in
+    // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
+    // `PLIRON_OMIT_FP=0` keeps them unconditionally.
+    let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
+    let keep_fp =
+        fp != rustc_target::spec::FramePointer::MayOmit || !pass_enabled("PLIRON_OMIT_FP");
+    fb.set(
+        "preserve_frame_pointers",
+        if keep_fp { "true" } else { "false" },
+    )
+    .unwrap();
     fb.set("tls_model", "elf_gd").unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
