@@ -14,7 +14,7 @@ use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::Ty;
-use rustc_target::callconv::{ArgAttributes, ArgExtension, CastTarget, FnAbi, PassMode};
+use rustc_target::callconv::{ArgAttributes, ArgExtension, CastTarget, FnAbi, IndirectMode, PassMode};
 
 use crate::context::{ArgExt, CodegenCx, Exts, layout_ty_key};
 use crate::types::{FP128Type, TyK};
@@ -32,7 +32,7 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
     let mut e = Exts::default();
     match &fn_abi.ret.mode {
         PassMode::Direct(a) => e.ret = ext(a),
-        PassMode::Indirect { .. } => e.params.push(ArgExt::None),
+        PassMode::Indirect { .. } => e.params.push(ArgExt::SRet),
         _ => {}
     }
     for arg in fn_abi.args.iter() {
@@ -52,6 +52,9 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
                     e.params.push(ArgExt::None);
                 }
                 e.params.push(ArgExt::None);
+            }
+            PassMode::Indirect { meta_attrs: None, mode: IndirectMode::OnStack, .. } => {
+                e.params.push(ArgExt::ByVal(arg.layout.size.bytes() as u32))
             }
             PassMode::Indirect { meta_attrs: None, .. } => e.params.push(ArgExt::None),
         }

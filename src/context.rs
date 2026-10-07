@@ -54,6 +54,10 @@ pub enum ArgExt {
     None,
     Zext,
     Sext,
+    /// Hidden struct-return pointer (`sret`).
+    SRet,
+    /// Aggregate passed by value on the stack (`byval`), with its size in bytes.
+    ByVal(u32),
 }
 
 #[derive(Clone, Debug, Default)]

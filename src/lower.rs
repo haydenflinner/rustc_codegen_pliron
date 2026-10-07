@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    self, AbiParam, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    self, AbiParam, ArgumentPurpose, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData, Signature, StackSlotData,
     StackSlotKind, TrapCode, Type as ClType, types as clt,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
@@ -43,16 +43,12 @@ enum Sym {
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
     let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else { panic!("not a function type") };
     let mut sig = Signature::new(cc);
-    let apply = |p: AbiParam, e: ArgExt, t: ClType| {
-        if t.is_int() && t.bits() < 32 {
-            match e {
-                ArgExt::Zext => p.uext(),
-                ArgExt::Sext => p.sext(),
-                ArgExt::None => p,
-            }
-        } else {
-            p
-        }
+    let apply = |p: AbiParam, e: ArgExt, t: ClType| match e {
+        ArgExt::SRet => AbiParam::special(t, ArgumentPurpose::StructReturn),
+        ArgExt::ByVal(n) => AbiParam::special(t, ArgumentPurpose::StructArgument(n)),
+        ArgExt::Zext if t.is_int() && t.bits() < 32 => p.uext(),
+        ArgExt::Sext if t.is_int() && t.bits() < 32 => p.sext(),
+        _ => p,
     };
     for (i, a) in args.iter().enumerate() {
         let lv = leaves(ctx, *a);
