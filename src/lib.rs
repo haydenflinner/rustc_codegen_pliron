@@ -138,6 +138,11 @@ impl CodegenBackend for PlironCodegenBackend {
         "pliron"
     }
 
+    fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
+        // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
+        rustc_session::CodegenBackendInit { thin_lto_supported: false, ..Default::default() }
+    }
+
     fn target_cpu(&self, _sess: &Session) -> String {
         "generic".to_string()
     }

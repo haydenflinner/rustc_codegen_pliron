@@ -1,0 +1,14 @@
+change-id = "ignore"
+[build]
+docs = false
+extended = false
+optimized-compiler-builtins = false
+[llvm]
+download-ci-llvm = false
+[rust]
+codegen-backends = ["pliron"]
+deny-warnings = false
+debug-assertions = false
+channel = "nightly"
+lld = false
+incremental = false

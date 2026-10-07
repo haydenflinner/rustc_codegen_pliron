@@ -1,0 +1,67 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 63d96ff2a..660a294c4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -54,6 +54,7 @@ exclude = [
+   "build",
+   "compiler/rustc_codegen_cranelift",
+   "compiler/rustc_codegen_gcc",
++  "compiler/rustc_codegen_pliron",
+   "src/bootstrap",
+   "tests/rustdoc-gui",
+   # HACK(eddyb) This hardcodes the fact that our CI uses `/checkout/obj`.
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 3aded5812..0bc7faee1 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1817,6 +1817,38 @@ fn metadata(&self) -> Option<StepMetadata> {
+     }
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++pub struct PlironCodegenBackend {
++    pub compilers: RustcPrivateCompilers,
++}
++
++impl Step for PlironCodegenBackend {
++    type Output = BuildStamp;
++
++    fn run(self, builder: &Builder<'_>) -> Self::Output {
++        let target = self.compilers.target();
++        let build_compiler = self.compilers.build_compiler();
++        let kind = CodegenBackendKind::Custom("pliron".to_string());
++        let stamp = build_stamp::codegen_backend_stamp(builder, build_compiler, target, &kind);
++        if builder.config.keep_stage.contains(&build_compiler.stage) {
++            return stamp;
++        }
++        let mut cargo = builder::Cargo::new(
++            builder,
++            build_compiler,
++            Mode::Codegen,
++            SourceType::InTree,
++            target,
++            Kind::Build,
++        );
++        cargo.arg("--manifest-path").arg(builder.src.join("compiler/rustc_codegen_pliron/Cargo.toml"));
++        let _guard =
++            builder.msg(Kind::Build, "codegen backend pliron", Mode::Codegen, build_compiler, target);
++        let files = run_cargo(builder, cargo, vec![], &stamp, vec![], ArtifactKeepMode::OnlyDylib);
++        write_codegen_backend_stamp(stamp, files, builder.config.dry_run())
++    }
++}
++
+ /// Write filtered `files` into the passed build stamp and returns it.
+ fn write_codegen_backend_stamp(
+     mut stamp: BuildStamp,
+@@ -2491,6 +2523,11 @@ fn run(self, builder: &Builder<'_>) -> Compiler {
+                         // library sysroots, so that they are available for cg_gcc.
+                         dylib_set.install_to(builder, target_compiler);
+                     }
++                    CodegenBackendKind::Custom(name) if name == "pliron" => {
++                        let stamp =
++                            builder.ensure(PlironCodegenBackend { compilers: prepare_compilers() });
++                        copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
++                    }
+                     CodegenBackendKind::Llvm | CodegenBackendKind::Custom(_) => continue,
+                 }
+             }
