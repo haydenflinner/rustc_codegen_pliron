@@ -17,10 +17,10 @@ use pliron::value::Value;
 use pliron_llvm::ops::{FuncOp, GlobalOp, UndefOp};
 use pliron_llvm::types::FuncType;
 use rustc_abi::{HasDataLayout, TargetDataLayout, VariantIdx};
+use rustc_attr_ir::Linkage as RLinkage;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_attr_ir::Linkage as RLinkage;
 use rustc_middle::mir::interpret::ConstAllocation;
 use rustc_middle::mono::Visibility;
 use rustc_middle::ty::layout::{
@@ -45,7 +45,10 @@ pub enum ConstVal {
     /// Struct / array / vector of other constants.
     Agg(Vec<Value>),
     /// Address of a symbol plus a byte offset.
-    Sym { sym: String, off: i64 },
+    Sym {
+        sym: String,
+        off: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +103,8 @@ pub struct State<'tcx> {
     pub ident_to_sym: FxHashMap<String, String>,
     pub sym_to_ident: FxHashMap<String, Identifier>,
     pub allocas: FxHashMap<Value, (u64, u64)>,
+    /// Allocas lowered as Cranelift variables (see sroa.rs), with their value type.
+    pub promoted: FxHashMap<Value, TypeHandle>,
     pub calls: FxHashMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: FxHashMap<Ptr<Operation>, String>,
     pub rmw: FxHashMap<Ptr<Operation>, AtomicRmwBinOp>,
@@ -125,7 +130,11 @@ pub struct CodegenCx<'tcx> {
 }
 
 pub fn mask(bits: u128, w: u32) -> u128 {
-    if w >= 128 { bits } else { bits & ((1u128 << w) - 1) }
+    if w >= 128 {
+        bits
+    } else {
+        bits & ((1u128 << w) - 1)
+    }
 }
 
 pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
@@ -145,8 +154,10 @@ pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
 impl<'tcx> CodegenCx<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, name: &str) -> Self {
         let mut ctx = Context::new();
-        let mname: String =
-            name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let mname: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
         let module = ModuleOp::new(&mut ctx, Identifier::try_new(format!("m_{mname}")).unwrap())
             .get_operation();
         CodegenCx {
@@ -193,7 +204,13 @@ impl<'tcx> CodegenCx<'tcx> {
         }
         st.counter += 1;
         let mut s = format!("s{}_", st.counter);
-        s.extend(sym.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }));
+        s.extend(sym.chars().map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        }));
         let id = Identifier::try_new(s.clone()).unwrap();
         st.sym_to_ident.insert(sym.to_string(), id.clone());
         st.ident_to_sym.insert(s, sym.to_string());
@@ -228,10 +245,17 @@ impl<'tcx> CodegenCx<'tcx> {
             self.append_to_module(&mut ctx, op);
             op
         };
-        self.st
-            .borrow_mut()
-            .funcs
-            .insert(sym.to_string(), FuncInfo { op, ty: fn_ty, linkage, exts, no_inline: false, always_inline: false });
+        self.st.borrow_mut().funcs.insert(
+            sym.to_string(),
+            FuncInfo {
+                op,
+                ty: fn_ty,
+                linkage,
+                exts,
+                no_inline: false,
+                always_inline: false,
+            },
+        );
         op
     }
 
@@ -253,12 +277,22 @@ impl<'tcx> CodegenCx<'tcx> {
 
     pub fn sym_addr(&self, sym: &str) -> Value {
         let p = self.type_ptr();
-        self.new_value(p, ConstVal::Sym { sym: sym.to_string(), off: 0 })
+        self.new_value(
+            p,
+            ConstVal::Sym {
+                sym: sym.to_string(),
+                off: 0,
+            },
+        )
     }
 
     pub fn fn_sym(&self, f: Ptr<Operation>) -> String {
         let st = self.st.borrow();
-        st.funcs.iter().find(|(_, i)| i.op == f).map(|(n, _)| n.clone()).unwrap()
+        st.funcs
+            .iter()
+            .find(|(_, i)| i.op == f)
+            .map(|(n, _)| n.clone())
+            .unwrap()
     }
 
     pub fn private_global(&self, init: Value, align: u64, mutable: bool) -> Value {
@@ -286,7 +320,10 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub fn fn_sig(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> (TypeHandle, Exts) {
-        (self.fn_decl_backend_type(fn_abi), crate::type_of::exts_of(fn_abi))
+        (
+            self.fn_decl_backend_type(fn_abi),
+            crate::type_of::exts_of(fn_abi),
+        )
     }
 
     pub fn get_static_addr(&self, def_id: rustc_hir::def_id::DefId) -> Value {
@@ -305,10 +342,23 @@ impl<'tcx> CodegenCx<'tcx> {
             if !self.st.borrow().globals.contains_key(&r) {
                 if !self.st.borrow().globals.contains_key(sym) {
                     let ty = self.type_i8();
-                    let linkage = if weak { Linkage::Preemptible } else { Linkage::Import };
+                    let linkage = if weak {
+                        Linkage::Preemptible
+                    } else {
+                        Linkage::Import
+                    };
                     self.declare_global(
                         sym,
-                        GlobalInfo { ty, init: None, align: 1, mutable: false, tls: false, linkage, used: false, section: None },
+                        GlobalInfo {
+                            ty,
+                            init: None,
+                            align: 1,
+                            mutable: false,
+                            tls: false,
+                            linkage,
+                            used: false,
+                            section: None,
+                        },
                     );
                 }
                 let init = self.sym_addr(sym);
@@ -316,7 +366,16 @@ impl<'tcx> CodegenCx<'tcx> {
                 let align = self.tcx.data_layout.pointer_align().abi.bytes();
                 self.declare_global(
                     &r,
-                    GlobalInfo { ty, init: Some(init), align, mutable: false, tls: false, linkage: Linkage::Local, used: false, section: None },
+                    GlobalInfo {
+                        ty,
+                        init: Some(init),
+                        align,
+                        mutable: false,
+                        tls: false,
+                        linkage: Linkage::Local,
+                        used: false,
+                        section: None,
+                    },
                 );
             }
             return self.sym_addr(&r);
@@ -385,25 +444,22 @@ impl<'tcx> HasTypingEnv<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'tcx> {
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        self.tcx.dcx().span_fatal(span, format!("failed to get layout for `{ty}`: {err:?}"))
+        self.tcx
+            .dcx()
+            .span_fatal(span, format!("failed to get layout for `{ty}`: {err:?}"))
     }
 }
 
 impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
-    fn handle_fn_abi_err(
-        &self,
-        err: FnAbiError<'tcx>,
-        span: Span,
-        _req: FnAbiRequest<'tcx>,
-    ) -> ! {
-        self.tcx.dcx().span_fatal(span, format!("failed to get fn ABI: {err:?}"))
+    fn handle_fn_abi_err(&self, err: FnAbiError<'tcx>, span: Span, _req: FnAbiRequest<'tcx>) -> ! {
+        self.tcx
+            .dcx()
+            .span_fatal(span, format!("failed to get fn ABI: {err:?}"))
     }
 }
 
 impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
-    fn vtables(
-        &self,
-    ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>> {
+    fn vtables(&self) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>> {
         &self.vtables
     }
 
@@ -513,7 +569,9 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn codegen_static(&mut self, def_id: rustc_hir::def_id::DefId) {
-        let Ok(alloc) = self.tcx.eval_static_initializer(def_id) else { return };
+        let Ok(alloc) = self.tcx.eval_static_initializer(def_id) else {
+            return;
+        };
         let init = self.const_alloc_to_value(alloc.inner());
         let ty = self.ty_of(init);
         let instance = Instance::mono(self.tcx, def_id);

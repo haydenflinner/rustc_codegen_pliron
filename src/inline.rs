@@ -32,12 +32,17 @@ fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
 
 fn direct_callee<'a>(ctx: &Context, st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
-    let CallOpCallable::Direct(id) = c.callee(ctx) else { return None };
+    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+        return None;
+    };
     st.ident_to_sym.get(&id.to_string())
 }
 
 pub fn run(ctx: &mut Context, st: &mut State<'_>) {
-    let limit = std::env::var("PLIRON_INLINE").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_LIMIT);
+    let limit = std::env::var("PLIRON_INLINE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
         return;
     }
@@ -50,9 +55,14 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         for b in blocks(ctx, f.op) {
             for op in ops(ctx, b) {
                 n += 1;
-                let eh_or_va =
-                    st.intrinsics.get(&op).is_some_and(|s| s.starts_with("pliron.eh") || s.starts_with("llvm.va_"));
-                if eh_or_va || st.invokes.contains_key(&op) || direct_callee(ctx, st, op) == Some(sym) {
+                let eh_or_va = st
+                    .intrinsics
+                    .get(&op)
+                    .is_some_and(|s| s.starts_with("pliron.eh") || s.starts_with("llvm.va_"));
+                if eh_or_va
+                    || st.invokes.contains_key(&op)
+                    || direct_callee(ctx, st, op) == Some(sym)
+                {
                     ok = false;
                 }
             }
@@ -64,7 +74,12 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
     if eligible.is_empty() {
         return;
     }
-    let callers: Vec<Ptr<Operation>> = st.funcs.values().map(|f| f.op).filter(|&f| has_body(ctx, f)).collect();
+    let callers: Vec<Ptr<Operation>> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| has_body(ctx, f))
+        .collect();
     let mut rw = IRRewriter::<DummyListener>::default();
     for caller in callers {
         let mut sites = Vec::new();
@@ -73,8 +88,12 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 if st.invokes.contains_key(&op) {
                     continue;
                 }
-                let Some(sym) = direct_callee(ctx, st, op) else { continue };
-                let Some(&callee) = eligible.get(sym) else { continue };
+                let Some(sym) = direct_callee(ctx, st, op) else {
+                    continue;
+                };
+                let Some(&callee) = eligible.get(sym) else {
+                    continue;
+                };
                 if callee != caller && st.calls[&op].fn_ty == st.funcs[sym].ty {
                     sites.push((op, callee));
                 }

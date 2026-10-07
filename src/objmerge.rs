@@ -5,8 +5,8 @@
 use object::read::elf::ElfFile64;
 use object::write::{self, Relocation, SectionId, SymbolId, SymbolSection};
 use object::{
-    Object as _, ObjectSection as _, ObjectSymbol as _, RelocationFlags, RelocationTarget, SectionIndex,
-    SectionKind, SymbolIndex, SymbolKind,
+    Object as _, ObjectSection as _, ObjectSymbol as _, RelocationFlags, RelocationTarget,
+    SectionIndex, SectionKind, SymbolIndex, SymbolKind,
 };
 use rsasm::assembler::{Assembler, Options};
 use rsasm::lexer::Dialect;
@@ -29,7 +29,11 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     for s in f.sections() {
         let name = s.name_bytes().unwrap();
         let kind = if name == b".eh_frame" {
-            if x86 { SectionKind::Elf(object::elf::SHT_X86_64_UNWIND) } else { SectionKind::ReadOnlyData }
+            if x86 {
+                SectionKind::Elf(object::elf::SHT_X86_64_UNWIND)
+            } else {
+                SectionKind::ReadOnlyData
+            }
         } else {
             s.kind()
         };
@@ -50,7 +54,10 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
         }
         let id = out.add_section(Vec::new(), name.to_vec(), kind);
         let sec = out.section_mut(id);
-        if matches!(kind, SectionKind::UninitializedData | SectionKind::UninitializedTls) {
+        if matches!(
+            kind,
+            SectionKind::UninitializedData | SectionKind::UninitializedTls
+        ) {
             sec.append_bss(s.size(), s.align());
         } else {
             sec.set_data(s.data().unwrap().to_vec(), s.align());
@@ -86,7 +93,9 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
             _ => SymbolSection::Undefined,
         };
         let flags = match sym.flags() {
-            object::SymbolFlags::Elf { st_info, st_other } => object::SymbolFlags::Elf { st_info, st_other },
+            object::SymbolFlags::Elf { st_info, st_other } => {
+                object::SymbolFlags::Elf { st_info, st_other }
+            }
             _ => object::SymbolFlags::None,
         };
         let new = write::Symbol {
@@ -102,7 +111,9 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
         if !sym.is_local() {
             if let Some(id) = out.symbol_id(name) {
                 let s = out.symbol_mut(id);
-                if matches!(s.section, SymbolSection::Undefined) && !matches!(section, SymbolSection::Undefined) {
+                if matches!(s.section, SymbolSection::Undefined)
+                    && !matches!(section, SymbolSection::Undefined)
+                {
                     *s = new;
                 }
                 syms.insert(sym.index(), id);
@@ -113,16 +124,28 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     }
 
     for s in f.sections() {
-        let Some(&to) = secs.get(&s.index()) else { continue };
+        let Some(&to) = secs.get(&s.index()) else {
+            continue;
+        };
         for (offset, r) in s.relocations() {
             let symbol = match r.target() {
                 RelocationTarget::Symbol(i) => syms[&i],
                 RelocationTarget::Section(i) => out.section_symbol(secs[&i]),
                 t => panic!("unsupported relocation target {t:?} in asm object"),
             };
-            let RelocationFlags::Elf { r_type } = r.flags() else { unreachable!() };
-            out.add_relocation(to, Relocation { offset, symbol, addend: r.addend(), flags: RelocationFlags::Elf { r_type } })
-                .unwrap();
+            let RelocationFlags::Elf { r_type } = r.flags() else {
+                unreachable!()
+            };
+            out.add_relocation(
+                to,
+                Relocation {
+                    offset,
+                    symbol,
+                    addend: r.addend(),
+                    flags: RelocationFlags::Elf { r_type },
+                },
+            )
+            .unwrap();
         }
     }
 }

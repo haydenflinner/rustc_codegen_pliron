@@ -1,7 +1,7 @@
 //! Constants: recorded as `ConstVal` side-table entries on placeholder values.
 
-use pliron::value::Value;
 use pliron::r#type::TypeHandle;
+use pliron::value::Value;
 use rustc_abi::{self as abi, HasDataLayout, Primitive, Size, WrappingRange};
 use rustc_codegen_ssa::traits::*;
 use rustc_const_eval::interpret::{GlobalAlloc, Pointer, Scalar as InterpScalar, read_target_uint};
@@ -46,7 +46,10 @@ impl<'tcx> CodegenCx<'tcx> {
                 as u64;
             let address_space = self.tcx.global_alloc(prov.alloc_id()).address_space(self);
             vals.push(self.scalar_to_backend(
-                InterpScalar::from_pointer(Pointer::new(prov, Size::from_bytes(ptr_offset)), &self.tcx),
+                InterpScalar::from_pointer(
+                    Pointer::new(prov, Size::from_bytes(ptr_offset)),
+                    &self.tcx,
+                ),
                 abi::Scalar::Initialized {
                     value: Primitive::Pointer(address_space),
                     valid_range: WrappingRange::full(dl.pointer_size()),
@@ -70,7 +73,9 @@ impl<'tcx> CodegenCx<'tcx> {
             GlobalAlloc::Static(def_id) => Ok(self.get_static_addr(def_id)),
             // Like cg_llvm: empty allocations (e.g. `&()`) get a dangling,
             // aligned address instead of a real global.
-            GlobalAlloc::Memory(alloc) if alloc.inner().len() == 0 => Err(alloc.inner().align.bytes()),
+            GlobalAlloc::Memory(alloc) if alloc.inner().len() == 0 => {
+                Err(alloc.inner().align.bytes())
+            }
             GlobalAlloc::Memory(alloc) => Ok(self.static_addr_of(alloc, None)),
             GlobalAlloc::VTable(ty, dyn_ty) => {
                 let alloc = self
@@ -143,17 +148,21 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         self.new_value(t, ConstVal::Bits(mask(u, w)))
     }
     fn const_real(&self, t: TypeHandle, val: f64) -> Value {
-        use rustc_apfloat::{Float, FloatConvert};
         use rustc_apfloat::ieee::{Double, Half, Quad};
+        use rustc_apfloat::{Float, FloatConvert};
         let bits = match self.kind(t) {
             TyK::F32 => (val as f32).to_bits() as u128,
             TyK::F64 => val.to_bits() as u128,
             TyK::F16 => {
-                let h: Half = Double::from_bits(val.to_bits() as u128).convert(&mut false).value;
+                let h: Half = Double::from_bits(val.to_bits() as u128)
+                    .convert(&mut false)
+                    .value;
                 h.to_bits()
             }
             TyK::F128 => {
-                let q: Quad = Double::from_bits(val.to_bits() as u128).convert(&mut false).value;
+                let q: Quad = Double::from_bits(val.to_bits() as u128)
+                    .convert(&mut false)
+                    .value;
                 q.to_bits()
             }
             k => panic!("const_real of {k:?}"),
@@ -206,7 +215,11 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         llty: TypeHandle,
         _schema: Option<&rustc_session::PointerAuthSchema>,
     ) -> Value {
-        let bitsize = if layout.is_bool() { 1 } else { layout.size(self).bits() as u32 };
+        let bitsize = if layout.is_bool() {
+            1
+        } else {
+            layout.size(self).bits() as u32
+        };
         match cv {
             InterpScalar::Int(int) => {
                 let data = int.to_bits(layout.size(self));
@@ -219,7 +232,10 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                     Ok(base) => match self.cval(base) {
                         Some(ConstVal::Sym { sym, off }) => self.new_value(
                             llty,
-                            ConstVal::Sym { sym, off: off + offset.bytes() as i64 },
+                            ConstVal::Sym {
+                                sym,
+                                off: off + offset.bytes() as i64,
+                            },
                         ),
                         other => panic!("symbol base expected, got {other:?}"),
                     },
@@ -234,13 +250,18 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     fn const_ptr_byte_offset(&self, val: Value, offset: Size) -> Value {
         let ty = self.ty_of(val);
         match self.cval(val) {
-            Some(ConstVal::Sym { sym, off }) => {
-                self.new_value(ty, ConstVal::Sym { sym, off: off + offset.bytes() as i64 })
+            Some(ConstVal::Sym { sym, off }) => self.new_value(
+                ty,
+                ConstVal::Sym {
+                    sym,
+                    off: off + offset.bytes() as i64,
+                },
+            ),
+            Some(ConstVal::Bits(b)) => {
+                self.new_value(ty, ConstVal::Bits(b + offset.bytes() as u128))
             }
-            Some(ConstVal::Bits(b)) => self.new_value(ty, ConstVal::Bits(b + offset.bytes() as u128)),
             Some(ConstVal::Zero) => self.new_value(ty, ConstVal::Bits(offset.bytes() as u128)),
             other => panic!("const_ptr_byte_offset of {other:?}"),
         }
     }
 }
-

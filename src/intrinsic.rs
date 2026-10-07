@@ -75,7 +75,9 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         if n.starts_with("simd_") {
             return match self.simd_intrinsic(n, args, result_layout.ty, ret) {
                 Some(v) => imm(v),
-                None => self.tcx.dcx().fatal(format!("SIMD intrinsic `{n}` is not supported by the pliron backend yet")),
+                None => self.tcx.dcx().fatal(format!(
+                    "SIMD intrinsic `{n}` is not supported by the pliron backend yet"
+                )),
             };
         }
         if let Some(i) = float(n) {
@@ -101,10 +103,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::bswap | sym::bitreverse => {
                 let x = a(0);
                 let ty = self.val_ty(x);
-                let i = if name == sym::bswap { "llvm.bswap" } else { "llvm.bitreverse" };
+                let i = if name == sym::bswap {
+                    "llvm.bswap"
+                } else {
+                    "llvm.bitreverse"
+                };
                 self.intrinsic(i, ty, &[x])
             }
-            sym::rotate_left | sym::rotate_right | sym::unchecked_funnel_shl | sym::unchecked_funnel_shr => {
+            sym::rotate_left
+            | sym::rotate_right
+            | sym::unchecked_funnel_shl
+            | sym::unchecked_funnel_shr => {
                 let (x, y, s) = match name {
                     sym::rotate_left | sym::rotate_right => (a(0), a(0), a(1)),
                     _ => (a(0), a(1), a(2)),
@@ -123,7 +132,11 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let t = args[0].layout.ty;
                 let signed = t.is_signed();
                 let ty = self.val_ty(x);
-                let op = if name == sym::saturating_add { OverflowOp::Add } else { OverflowOp::Sub };
+                let op = if name == sym::saturating_add {
+                    OverflowOp::Add
+                } else {
+                    OverflowOp::Sub
+                };
                 let (r, of) = self.checked_binop(op, t, x, y);
                 let w = self.int_width(ty);
                 let sat = if signed {
@@ -226,7 +239,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             | sym::prefetch_write_instruction => {
                 return IntrinsicResult::Operand(OperandValue::ZeroSized);
             }
-            _ => return IntrinsicResult::Fallback(ty::Instance::new_raw(instance.def_id(), instance.args)),
+            _ => {
+                return IntrinsicResult::Fallback(ty::Instance::new_raw(
+                    instance.def_id(),
+                    instance.args,
+                ));
+            }
         };
         imm(r)
     }
@@ -239,10 +257,18 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         let name = self.tcx.symbol_name(instance).name.to_string();
         // fn_abi_of_instance rejects LLVM intrinsics; use the signature directly.
-        let sig = self.tcx.fn_sig(instance.def_id()).instantiate(self.tcx, instance.args).skip_norm_wip();
+        let sig = self
+            .tcx
+            .fn_sig(instance.def_id())
+            .instantiate(self.tcx, instance.args)
+            .skip_norm_wip();
         let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
         let out = self.layout_of(sig.output());
-        let ret = if out.is_zst() { self.type_void() } else { self.immediate_backend_type(out) };
+        let ret = if out.is_zst() {
+            self.type_void()
+        } else {
+            self.immediate_backend_type(out)
+        };
         let vs: Vec<Value> = args.iter().map(|a| a.immediate()).collect();
         if let Some(v) = self.llvm_x86_intrinsic(&name, args, sig.output(), ret) {
             return v;
@@ -263,10 +289,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn expect(&mut self, cond: Value, _expected: bool) -> Value {
         cond
     }
-    fn type_checked_load(&mut self, _llvtable: Value, _vtable_byte_offset: u64, _typeid: &[u8]) -> Value {
+    fn type_checked_load(
+        &mut self,
+        _llvtable: Value,
+        _vtable_byte_offset: u64,
+        _typeid: &[u8],
+    ) -> Value {
         panic!("type_checked_load is not supported by the pliron backend")
     }
     fn va_start(&mut self, _val: Value) {
-        self.tcx.dcx().fatal("C-variadic functions are not supported by the pliron backend yet")
+        self.tcx
+            .dcx()
+            .fatal("C-variadic functions are not supported by the pliron backend yet")
     }
 }

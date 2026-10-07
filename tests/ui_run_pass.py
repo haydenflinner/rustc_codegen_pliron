@@ -2,6 +2,7 @@
 """Run rustc's directive-free `//@ run-pass` UI tests through the backend.
 
 Usage: tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]
+UI_FLAGS adds rustc flags to the backend runs (e.g. UI_FLAGS=-O).
 Writes target/ui/results.json and prints a failure summary. Tests with
 directives (aux-build, compile-flags, revisions, ignore/only/needs, ...) are
 skipped; edition defaults to 2015 like compiletest.
@@ -16,6 +17,7 @@ SKIP = re.compile(r"^//@\s*(aux-|compile-flags|revisions|ignore-|only-|needs-|ed
 # Tests run with cwd = their own dir, so pin the toolchain explicitly.
 os.environ["RUSTUP_TOOLCHAIN"] = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
 BE = f"-Zcodegen-backend={ROOT}/target/debug/librustc_codegen_pliron.so"
+EXTRA = os.environ.get("UI_FLAGS", "").split()  # e.g. UI_FLAGS=-O
 WILD = ["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options", f"-Clink-arg=-B{ROOT}/target/wild-ld"]
 
 def tests():
@@ -31,7 +33,7 @@ def tests():
 def run(path, backend=True):
     rel = os.path.relpath(path, os.path.join(RUST, "tests/ui"))
     exe = os.path.join(OUT, "bin", rel.replace("/", "__")[:-3] + ("" if backend else ".llvm"))
-    cmd = ["rustc", path, "-o", exe, "-Awarnings", "-Ccodegen-units=1"] + ([BE] + WILD if backend else [])
+    cmd = ["rustc", path, "-o", exe, "-Awarnings", "-Ccodegen-units=1"] + ([BE] + WILD + EXTRA if backend else [])
     try:
         c = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=os.path.dirname(path))
     except subprocess.TimeoutExpired:

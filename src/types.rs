@@ -59,7 +59,10 @@ pub fn classify(ctx: &Context, ty: TypeHandle) -> TyK {
         return TyK::Array(a.elem_type(), a.size());
     }
     if let Some(s) = t.downcast_ref::<StructType>() {
-        return TyK::Struct(s.fields().collect(), matches!(s.layout(), StructLayout::Packed));
+        return TyK::Struct(
+            s.fields().collect(),
+            matches!(s.layout(), StructLayout::Packed),
+        );
     }
     if let Some(v) = t.downcast_ref::<VectorType>() {
         return TyK::Vector(v.elem_type(), v.num_elements());

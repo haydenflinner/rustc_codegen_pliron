@@ -8,8 +8,8 @@ use std::sync::Arc;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    self, AbiParam, ArgumentPurpose, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData, Signature, StackSlotData,
-    StackSlotKind, TrapCode, Type as ClType, types as clt,
+    self, AbiParam, ArgumentPurpose, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData,
+    Signature, StackSlotData, StackSlotKind, TrapCode, Type as ClType, types as clt,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -41,7 +41,9 @@ enum Sym {
 }
 
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
-    let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else { panic!("not a function type") };
+    let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else {
+        panic!("not a function type")
+    };
     let mut sig = Signature::new(cc);
     let apply = |p: AbiParam, e: ArgExt, t: ClType| match e {
         ArgExt::SRet => AbiParam::special(t, ArgumentPurpose::StructReturn),
@@ -63,16 +65,26 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
     let single = lv.len() == 1;
     for (_, t) in lv {
         let p = AbiParam::new(t);
-        sig.returns.push(if single { apply(p, exts.ret, t) } else { p });
+        sig.returns
+            .push(if single { apply(p, exts.ret, t) } else { p });
     }
     sig
 }
 
 pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
-    Operation::get_op::<FuncOp>(f, ctx).unwrap().get_entry_block(ctx).is_some()
+    Operation::get_op::<FuncOp>(f, ctx)
+        .unwrap()
+        .get_entry_block(ctx)
+        .is_some()
 }
 
-pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, name: &str) -> Vec<u8> {
+pub fn lower_to_object(
+    unwind: bool,
+    ctx: &Context,
+    st: &State<'_>,
+    isa: Arc<dyn TargetIsa>,
+    name: &str,
+) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     b.per_function_section(true);
     b.per_data_object_section(true);
@@ -85,15 +97,23 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
         if l == Linkage::Import && has_body(ctx, f.op) {
             l = Linkage::Export;
         }
-        let id = m.declare_function(n, l, &sig).unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        let id = m
+            .declare_function(n, l, &sig)
+            .unwrap_or_else(|e| panic!("declare {n}: {e}"));
         ids.insert(n.clone(), Sym::F(id, f.ty));
     }
     for (n, g) in &st.globals {
         if ids.contains_key(n) {
             continue;
         }
-        let l = if g.linkage == Linkage::Import && g.init.is_some() { Linkage::Export } else { g.linkage };
-        let id = m.declare_data(n, l, g.mutable, g.tls).unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        let l = if g.linkage == Linkage::Import && g.init.is_some() {
+            Linkage::Export
+        } else {
+            g.linkage
+        };
+        let id = m
+            .declare_data(n, l, g.mutable, g.tls)
+            .unwrap_or_else(|e| panic!("declare {n}: {e}"));
         ids.insert(n.clone(), Sym::D(id, g.tls));
     }
 
@@ -105,7 +125,9 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
         if !has_body(ctx, f.op) {
             continue;
         }
-        let Sym::F(id, _) = ids[n] else { unreachable!() };
+        let Sym::F(id, _) = ids[n] else {
+            unreachable!()
+        };
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc);
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
@@ -123,6 +145,7 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
                 terminated: false,
                 cc,
                 exn: None,
+                vars: FxHashMap::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -136,7 +159,9 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
 
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
-        let Some(Sym::D(id, _)) = ids.get(n).copied() else { continue };
+        let Some(Sym::D(id, _)) = ids.get(n).copied() else {
+            continue;
+        };
         let (size, _) = size_align(ctx, init.get_type(ctx));
         let mut bytes = vec![0u8; size as usize];
         let mut relocs = Vec::new();
@@ -163,7 +188,8 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
                 None => panic!("unknown symbol {sym} in initializer of {n}"),
             }
         }
-        m.define_data(id, &desc).unwrap_or_else(|e| panic!("define data {n}: {e}"));
+        m.define_data(id, &desc)
+            .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
     let mut product = m.finish();
     eh.emit(&mut product);
@@ -183,7 +209,11 @@ fn write_const(
     relocs: &mut Vec<(u64, String, i64)>,
 ) {
     let ty = v.get_type(ctx);
-    match st.consts.get(&v).unwrap_or_else(|| panic!("non-constant value in initializer")) {
+    match st
+        .consts
+        .get(&v)
+        .unwrap_or_else(|| panic!("non-constant value in initializer"))
+    {
         ConstVal::Bits(b) => {
             let (s, _) = size_align(ctx, ty);
             let le = b.to_le_bytes();
@@ -220,6 +250,8 @@ struct FnLower<'a, 'b, 'tcx> {
     terminated: bool,
     cc: CallConv,
     exn: Option<cranelift_frontend::Variable>,
+    /// Promoted allocas (sroa.rs): one variable per scalar leaf.
+    vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -237,13 +269,26 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let args: Vec<Value> = pb.deref(ctx).arguments().collect();
             for a in args {
                 let cb = self.blocks[pb];
-                let vs: Vals = leaves(ctx, a.get_type(ctx)).into_iter().map(|(_, t)| self.b.append_block_param(cb, t)).collect();
+                let vs: Vals = leaves(ctx, a.get_type(ctx))
+                    .into_iter()
+                    .map(|(_, t)| self.b.append_block_param(cb, t))
+                    .collect();
                 self.vals.insert(a, vs);
             }
         }
         let pt = self.m.target_config().pointer_type();
         let exn = self.b.declare_var(pt);
         self.exn = Some(exn);
+        for op in crate::sroa::allocas(ctx, f) {
+            let a = op.deref(ctx).get_result(0);
+            if let Some(&ty) = self.st.promoted.get(&a) {
+                let vs = leaves(ctx, ty)
+                    .into_iter()
+                    .map(|(_, t)| (self.b.declare_var(t), t))
+                    .collect();
+                self.vars.insert(a, vs);
+            }
+        }
         let params = self.b.block_params(entry).to_vec();
         let mut i = 0;
         let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
@@ -311,7 +356,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let why = match v.defining_op() {
                 Some(op) => {
                     let blk = op.deref(self.ctx).get_parent_block();
-                    format!("defined by `{}` in block {:?} (known block: {})", Operation::get_opid(op, self.ctx), blk, blk.is_some_and(|b| self.blocks.contains_key(&b)))
+                    format!(
+                        "defined by `{}` in block {:?} (known block: {})",
+                        Operation::get_opid(op, self.ctx),
+                        blk,
+                        blk.is_some_and(|b| self.blocks.contains_key(&b))
+                    )
                 }
                 None => "a block argument".to_string(),
             };
@@ -323,7 +373,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn block_args(&mut self, vs: &[Value]) -> Vec<ir::BlockArg> {
-        vs.iter().flat_map(|v| self.get(*v)).map(ir::BlockArg::Value).collect()
+        vs.iter()
+            .flat_map(|v| self.get(*v))
+            .map(ir::BlockArg::Value)
+            .collect()
     }
 
     fn get1(&mut self, v: Value) -> ir::Value {
@@ -334,14 +387,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
 
     fn const_int(&self, v: Value) -> Option<i128> {
         let ConstVal::Bits(b) = self.st.consts.get(&v)? else {
-            return if matches!(self.st.consts.get(&v)?, ConstVal::Zero) { Some(0) } else { None };
+            return if matches!(self.st.consts.get(&v)?, ConstVal::Zero) {
+                Some(0)
+            } else {
+                None
+            };
         };
         let w = match classify(self.ctx, v.get_type(self.ctx)) {
             TyK::Int(w) => w,
             _ => 64,
         };
         let b = *b;
-        Some(if w < 128 && (b >> (w - 1)) & 1 == 1 { (b | (!0u128 << w)) as i128 } else { b as i128 })
+        Some(if w < 128 && (b >> (w - 1)) & 1 == 1 {
+            (b | (!0u128 << w)) as i128
+        } else {
+            b as i128
+        })
     }
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
@@ -369,14 +430,23 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 assert_eq!(lv.len(), 1);
                 smallvec![self.iconst_any(lv[0].1, bits)]
             }
-            ConstVal::Zero | ConstVal::Undef => {
-                self.ty_leaves(ty).into_iter().map(|(_, t)| self.iconst_any(t, 0)).collect()
-            }
-            ConstVal::Bytes(bs) => bs.iter().map(|b| self.b.ins().iconst(clt::I8, *b as i64)).collect(),
+            ConstVal::Zero | ConstVal::Undef => self
+                .ty_leaves(ty)
+                .into_iter()
+                .map(|(_, t)| self.iconst_any(t, 0))
+                .collect(),
+            ConstVal::Bytes(bs) => bs
+                .iter()
+                .map(|b| self.b.ins().iconst(clt::I8, *b as i64))
+                .collect(),
             ConstVal::Agg(elems) => elems.iter().flat_map(|e| self.get(*e)).collect(),
             ConstVal::Sym { sym, off } => {
                 let base = self.sym_addr(&sym);
-                smallvec![if off != 0 { self.b.ins().iadd_imm_s(base, off) } else { base }]
+                smallvec![if off != 0 {
+                    self.b.ins().iadd_imm_s(base, off)
+                } else {
+                    base
+                }]
             }
         }
     }
@@ -391,23 +461,44 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn sym_addr(&mut self, sym: &str) -> ir::Value {
-        match self.ids.get(sym).copied().unwrap_or_else(|| panic!("unknown symbol {sym}")) {
+        match self
+            .ids
+            .get(sym)
+            .copied()
+            .unwrap_or_else(|| panic!("unknown symbol {sym}"))
+        {
             Sym::F(id, _) => {
                 let fr = self.fref(id);
                 self.b.ins().func_addr(clt::I64, fr)
             }
             Sym::D(id, tls) => {
-                let gv = *self.gvs.entry(id).or_insert_with(|| self.m.declare_data_in_func(id, self.b.func));
-                if tls { self.b.ins().tls_value(clt::I64, gv) } else { self.b.ins().symbol_value(clt::I64, gv) }
+                let gv = *self
+                    .gvs
+                    .entry(id)
+                    .or_insert_with(|| self.m.declare_data_in_func(id, self.b.func));
+                if tls {
+                    self.b.ins().tls_value(clt::I64, gv)
+                } else {
+                    self.b.ins().symbol_value(clt::I64, gv)
+                }
             }
         }
     }
 
-    fn libcall(&mut self, name: &str, params: &[ClType], rets: &[ClType], args: &[ir::Value]) -> Vec<ir::Value> {
+    fn libcall(
+        &mut self,
+        name: &str,
+        params: &[ClType],
+        rets: &[ClType],
+        args: &[ir::Value],
+    ) -> Vec<ir::Value> {
         let mut sig = Signature::new(self.cc);
         sig.params.extend(params.iter().map(|t| AbiParam::new(*t)));
         sig.returns.extend(rets.iter().map(|t| AbiParam::new(*t)));
-        let id = self.m.declare_function(name, Linkage::Import, &sig).unwrap();
+        let id = self
+            .m
+            .declare_function(name, Linkage::Import, &sig)
+            .unwrap();
         let fr = self.fref(id);
         let c = self.b.ins().call(fr, args);
         self.b.inst_results(c).to_vec()
@@ -464,7 +555,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             ($m:ident) => {{
                 let a = self.get(opnds[0]);
                 let b = self.get(opnds[1]);
-                let r: Vals = a.iter().zip(b.iter()).map(|(x, y)| self.b.ins().$m(*x, *y)).collect();
+                let r: Vals = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| self.b.ins().$m(*x, *y))
+                    .collect();
                 self.set(op, r);
             }};
         }
@@ -475,7 +570,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let mut r = Vals::new();
                 for (x, y) in a.iter().zip(b.iter()) {
                     if self.b.func.dfg.value_type(*x) == clt::I128 {
-                        r.push(self.libcall($lib, &[clt::I128, clt::I128], &[clt::I128], &[*x, *y])[0]);
+                        r.push(
+                            self.libcall($lib, &[clt::I128, clt::I128], &[clt::I128], &[*x, *y])[0],
+                        );
                     } else {
                         r.push(self.b.ins().$m(*x, *y));
                     }
@@ -524,7 +621,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             };
             let a = self.get(opnds[0]);
             let b = self.get(opnds[1]);
-            let r: Vals = a.iter().zip(b.iter()).map(|(x, y)| self.b.ins().icmp(cc, *x, *y)).collect();
+            let r: Vals = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| self.b.ins().icmp(cc, *x, *y))
+                .collect();
             self.set(op, r);
         } else if is!(FCmpOp) {
             use FCmpPredicateAttr as P;
@@ -629,7 +730,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     clt::F64 => "df",
                     _ => "tf",
                 };
-                let f = format!("__{}{}{}2", if is!(FPTruncOp) { "trunc" } else { "extend" }, l(from), l(t));
+                let f = format!(
+                    "__{}{}{}2",
+                    if is!(FPTruncOp) { "trunc" } else { "extend" },
+                    l(from),
+                    l(t)
+                );
                 self.libcall(&f, &[from], &[t], &[x])[0]
             } else if is!(FPTruncOp) {
                 self.b.ins().fdemote(t, x)
@@ -656,8 +762,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 };
                 self.libcall(name, &[clt::I128], &[t], &[x])[0]
             } else {
-                let x = if ft.bits() < 32 { self.resize(x, clt::I32, signed) } else { x };
-                if signed { self.b.ins().fcvt_from_sint(t, x) } else { self.b.ins().fcvt_from_uint(t, x) }
+                let x = if ft.bits() < 32 {
+                    self.resize(x, clt::I32, signed)
+                } else {
+                    x
+                };
+                if signed {
+                    self.b.ins().fcvt_from_sint(t, x)
+                } else {
+                    self.b.ins().fcvt_from_uint(t, x)
+                }
             };
             self.set1(op, r);
         } else if is!(BitcastOp) || is!(AddrSpaceCastOp) || is!(FreezeOp) {
@@ -673,11 +787,47 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let slot = self.slot(sz.max(16), 16);
                 let sl = self.ty_leaves(opnds[0].get_type(ctx));
                 for (x, (o, _)) in xs.iter().zip(sl) {
-                    self.b.ins().store(MemFlagsData::trusted(), *x, slot, o as i32);
+                    self.b
+                        .ins()
+                        .store(MemFlagsData::trusted(), *x, slot, o as i32);
                 }
-                dts.iter().map(|(o, t)| self.b.ins().load(*t, MemFlagsData::trusted(), slot, *o as i32)).collect()
+                dts.iter()
+                    .map(|(o, t)| {
+                        self.b
+                            .ins()
+                            .load(*t, MemFlagsData::trusted(), slot, *o as i32)
+                    })
+                    .collect()
             };
             self.set(op, r);
+        } else if is!(AllocaOp) && self.vars.contains_key(&op.deref(ctx).get_result(0)) {
+        } else if is!(LoadOp) && self.vars.contains_key(&opnds[0]) {
+            let lv = self.ty_leaves(self.res_ty(op));
+            let vars = self.vars[&opnds[0]].clone();
+            let r = vars
+                .into_iter()
+                .zip(lv)
+                .map(|((var, vt), (_, t))| {
+                    let x = self.b.use_var(var);
+                    if vt == t {
+                        x
+                    } else {
+                        self.b.ins().bitcast(t, MemFlagsData::new(), x)
+                    }
+                })
+                .collect();
+            self.set(op, r);
+        } else if is!(StoreOp) && self.vars.contains_key(&opnds[1]) {
+            let vs = self.get(opnds[0]);
+            let vars = self.vars[&opnds[1]].clone();
+            for (x, (var, vt)) in vs.into_iter().zip(vars) {
+                let x = if self.b.func.dfg.value_type(x) == vt {
+                    x
+                } else {
+                    self.b.ins().bitcast(vt, MemFlagsData::new(), x)
+                };
+                self.b.def_var(var, x);
+            }
         } else if is!(AllocaOp) {
             let res = op.deref(ctx).get_result(0);
             let (size, align) = self.st.allocas[&res];
@@ -759,12 +909,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .collect();
             self.set(op, r);
         } else if is!(ExtractValueOp) {
-            let idx = Operation::get_op::<ExtractValueOp>(op, ctx).unwrap().indices(ctx);
+            let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
+                .unwrap()
+                .indices(ctx);
             let (s, n, _) = leaf_range(ctx, opnds[0].get_type(ctx), &idx);
             let a = self.get(opnds[0]);
             self.set(op, a[s..s + n].into());
         } else if is!(InsertValueOp) {
-            let idx = Operation::get_op::<InsertValueOp>(op, ctx).unwrap().indices(ctx);
+            let idx = Operation::get_op::<InsertValueOp>(op, ctx)
+                .unwrap()
+                .indices(ctx);
             let (s, n, _) = leaf_range(ctx, opnds[0].get_type(ctx), &idx);
             let mut a = self.get(opnds[0]);
             let v = self.get(opnds[1]);
@@ -794,13 +948,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     self.b.ins().store(MemFlagsData::trusted(), e, addr, 0);
                     let t = self.b.func.dfg.value_type(a[0]);
                     for (i, x) in a.iter_mut().enumerate() {
-                        *x = self.b.ins().load(t, MemFlagsData::trusted(), p, (i as u64 * es) as i32);
+                        *x = self.b.ins().load(
+                            t,
+                            MemFlagsData::trusted(),
+                            p,
+                            (i as u64 * es) as i32,
+                        );
                     }
                 }
             }
             self.set(op, a);
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
-            let r = self.ty_leaves(self.res_ty(op)).into_iter().map(|(_, t)| self.iconst_any(t, 0)).collect();
+            let r = self
+                .ty_leaves(self.res_ty(op))
+                .into_iter()
+                .map(|(_, t)| self.iconst_any(t, 0))
+                .collect();
             self.set(op, r);
         } else {
             panic!("pliron->cranelift: unsupported op {id}");
@@ -821,7 +984,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let p = self.slot(sz, al);
         let es = sz / a.len() as u64;
         for (i, x) in a.iter().enumerate() {
-            self.b.ins().store(MemFlagsData::trusted(), *x, p, (i as u64 * es) as i32);
+            self.b
+                .ins()
+                .store(MemFlagsData::trusted(), *x, p, (i as u64 * es) as i32);
         }
         (p, es)
     }
@@ -846,7 +1011,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             return self.libcall(name, &[ft], &[clt::I128], &[x])[0];
         }
         let it = if t.bits() < 32 { clt::I32 } else { t };
-        let r = if signed { self.b.ins().fcvt_to_sint_sat(it, x) } else { self.b.ins().fcvt_to_uint_sat(it, x) };
+        let r = if signed {
+            self.b.ins().fcvt_to_sint_sat(it, x)
+        } else {
+            self.b.ins().fcvt_to_uint_sat(it, x)
+        };
         if it == t {
             return r;
         }
@@ -858,8 +1027,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         };
         let lo = self.b.ins().iconst(clt::I32, lo);
         let hi = self.b.ins().iconst(clt::I32, hi);
-        let r = if signed { self.b.ins().smax(r, lo) } else { self.b.ins().umax(r, lo) };
-        let r = if signed { self.b.ins().smin(r, hi) } else { self.b.ins().umin(r, hi) };
+        let r = if signed {
+            self.b.ins().smax(r, lo)
+        } else {
+            self.b.ins().umax(r, lo)
+        };
+        let r = if signed {
+            self.b.ins().smin(r, hi)
+        } else {
+            self.b.ins().umin(r, hi)
+        };
         self.b.ins().ireduce(t, r)
     }
 
@@ -896,7 +1073,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             match (c, idx) {
                 (Some(c), _) => {
                     if c != 0 {
-                        addr = self.b.ins().iadd_imm_s(addr, (c as i64).wrapping_mul(scale as i64));
+                        addr = self
+                            .b
+                            .ins()
+                            .iadd_imm_s(addr, (c as i64).wrapping_mul(scale as i64));
                     }
                 }
                 (None, GepIndex::Value(v)) => addr = self.dyn_index(addr, *v, scale),
@@ -915,23 +1095,43 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         catch: Ptr<BasicBlock>,
         is_catch: bool,
     ) -> Vals {
-        use cranelift_codegen::ir::{BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag};
+        use cranelift_codegen::ir::{
+            BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
+        };
         let sr = match target {
             Ok(fr) => self.b.func.dfg.ext_funcs[fr].signature,
             Err((_, sr)) => sr,
         };
-        let rets: Vec<ClType> = self.b.func.dfg.signatures[sr].returns.iter().map(|r| r.value_type).collect();
+        let rets: Vec<ClType> = self.b.func.dfg.signatures[sr]
+            .returns
+            .iter()
+            .map(|r| r.value_type)
+            .collect();
         let normal = self.b.create_block();
-        let nargs: Vec<BlockArg> = (0..rets.len()).map(|i| BlockArg::TryCallRet(i as u32)).collect();
+        let nargs: Vec<BlockArg> = (0..rets.len())
+            .map(|i| BlockArg::TryCallRet(i as u32))
+            .collect();
         let ncall = self.b.func.dfg.block_call(normal, &nargs);
         let pre = self.b.create_block();
         let pcall = self.b.func.dfg.block_call(pre, &[BlockArg::TryCallExn(0)]);
-        let tag = if is_catch { crate::eh::EXCEPTION_HANDLER_CATCH } else { crate::eh::EXCEPTION_HANDLER_CLEANUP };
-        let et = self.b.func.dfg.exception_tables.push(ExceptionTableData::new(
-            sr,
-            ncall,
-            [ExceptionTableItem::Tag(ExceptionTag::with_number(tag).unwrap(), pcall)],
-        ));
+        let tag = if is_catch {
+            crate::eh::EXCEPTION_HANDLER_CATCH
+        } else {
+            crate::eh::EXCEPTION_HANDLER_CLEANUP
+        };
+        let et = self
+            .b
+            .func
+            .dfg
+            .exception_tables
+            .push(ExceptionTableData::new(
+                sr,
+                ncall,
+                [ExceptionTableItem::Tag(
+                    ExceptionTag::with_number(tag).unwrap(),
+                    pcall,
+                )],
+            ));
         match target {
             Ok(fr) => self.b.ins().try_call(fr, args, et),
             Err((addr, _)) => self.b.ins().try_call_indirect(addr, args, et),
@@ -945,7 +1145,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.b.ins().jump(lp, &[]);
         self.b.switch_to_block(normal);
         self.cconst.clear();
-        rets.into_iter().map(|t| self.b.append_block_param(normal, t)).collect()
+        rets.into_iter()
+            .map(|t| self.b.append_block_param(normal, t))
+            .collect()
     }
 
     fn lower_call(&mut self, op: Ptr<Operation>) {
@@ -995,7 +1197,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let r = match name {
             "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
             "llvm.memcpy" | "llvm.memmove" => {
-                if let Some(n) = self.const_int(opnds[2]).filter(|n| (0..=SMALL_MEM).contains(n)) {
+                if let Some(n) = self
+                    .const_int(opnds[2])
+                    .filter(|n| (0..=SMALL_MEM).contains(n))
+                {
                     // Load everything before storing, so this is also a valid memmove.
                     let vals: Vec<_> = mem_chunks(n as u64)
                         .into_iter()
@@ -1015,11 +1220,14 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 return;
             }
             "llvm.memset" => {
-                let n = self.const_int(opnds[2]).filter(|n| (0..=SMALL_MEM).contains(n));
+                let n = self
+                    .const_int(opnds[2])
+                    .filter(|n| (0..=SMALL_MEM).contains(n));
                 if let (Some(n), Some(c)) = (n, self.const_int(opnds[1])) {
                     let byte = c as u8 as u64;
                     for (o, t) in mem_chunks(n as u64) {
-                        let pat = byte.wrapping_mul(0x0101_0101_0101_0101) & (u64::MAX >> (64 - t.bits()));
+                        let pat = byte.wrapping_mul(0x0101_0101_0101_0101)
+                            & (u64::MAX >> (64 - t.bits()));
                         let v = self.b.ins().iconst(t, pat as i64);
                         self.b.ins().store(MemFlagsData::new(), v, a[0], o);
                     }
@@ -1038,7 +1246,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             "llvm.ctlz" => self.b.ins().clz(a[0]),
             "llvm.cttz" => self.b.ins().ctz(a[0]),
             "llvm.bswap" => {
-                if self.b.func.dfg.value_type(a[0]) == clt::I8 { a[0] } else { self.b.ins().bswap(a[0]) }
+                if self.b.func.dfg.value_type(a[0]) == clt::I8 {
+                    a[0]
+                } else {
+                    self.b.ins().bswap(a[0])
+                }
             }
             "llvm.bitreverse" => self.b.ins().bitrev(a[0]),
             "llvm.fshl" | "llvm.fshr" => {
@@ -1046,7 +1258,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let w = t.bits() as i64;
                 let s = self.b.ins().band_imm_u(a[2], w - 1);
                 if a[0] == a[1] {
-                    if name == "llvm.fshl" { self.b.ins().rotl(a[0], s) } else { self.b.ins().rotr(a[0], s) }
+                    if name == "llvm.fshl" {
+                        self.b.ins().rotl(a[0], s)
+                    } else {
+                        self.b.ins().rotr(a[0], s)
+                    }
                 } else {
                     let wv = self.b.ins().iconst(t, w);
                     let inv = self.b.ins().isub(wv, s);
@@ -1066,9 +1282,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let (r, of) = match (n, t == clt::I128) {
                     ("llvm.smul.with.overflow" | "llvm.umul.with.overflow", true) => {
                         let slot = self.slot(4, 4);
-                        let f = if n.starts_with("llvm.s") { "__rust_i128_mulo" } else { "__rust_u128_mulo" };
+                        let f = if n.starts_with("llvm.s") {
+                            "__rust_i128_mulo"
+                        } else {
+                            "__rust_u128_mulo"
+                        };
                         let r = self.libcall(f, &[t, t, clt::I64], &[t], &[a[0], a[1], slot])[0];
-                        let o = self.b.ins().load(clt::I32, MemFlagsData::trusted(), slot, 0);
+                        let o = self
+                            .b
+                            .ins()
+                            .load(clt::I32, MemFlagsData::trusted(), slot, 0);
                         (r, self.b.ins().icmp_imm_s(IntCC::NotEqual, o, 0))
                     }
                     ("llvm.sadd.with.overflow", _) => self.b.ins().sadd_overflow(a[0], a[1]),
@@ -1099,8 +1322,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             "llvm.fmuladd" => self.b.ins().fma(a[0], a[1], a[2]),
             n if matches!(
                 n,
-                "llvm.round" | "llvm.sin" | "llvm.cos" | "llvm.exp" | "llvm.exp2" | "llvm.log"
-                    | "llvm.log2" | "llvm.log10" | "llvm.pow"
+                "llvm.round"
+                    | "llvm.sin"
+                    | "llvm.cos"
+                    | "llvm.exp"
+                    | "llvm.exp2"
+                    | "llvm.log"
+                    | "llvm.log2"
+                    | "llvm.log10"
+                    | "llvm.pow"
             ) =>
             {
                 // No Cranelift instruction: call libm, like cg_llvm does on x86.
@@ -1120,12 +1350,14 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 }
 
-
 /// Reverse postorder from the entry block, then any unreachable blocks, so
 /// every SSA definition is lowered before its uses.
 fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
-        b.deref(ctx).iter(ctx).flat_map(|op| op.deref(ctx).successors().collect::<Vec<_>>()).collect()
+        b.deref(ctx)
+            .iter(ctx)
+            .flat_map(|op| op.deref(ctx).successors().collect::<Vec<_>>())
+            .collect()
     };
     let mut seen = std::collections::HashSet::new();
     let mut post = Vec::new();

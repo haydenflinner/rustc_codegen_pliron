@@ -27,9 +27,18 @@ use crate::builder::Builder;
 use crate::context::{CodegenCx, ConstVal};
 
 enum AOp {
-    In { reg: InlineAsmRegOrRegClass },
-    Out { reg: InlineAsmRegOrRegClass, late: bool, has_place: bool },
-    InOut { reg: InlineAsmRegOrRegClass, has_out: bool },
+    In {
+        reg: InlineAsmRegOrRegClass,
+    },
+    Out {
+        reg: InlineAsmRegOrRegClass,
+        late: bool,
+        has_place: bool,
+    },
+    InOut {
+        reg: InlineAsmRegOrRegClass,
+        has_out: bool,
+    },
     Text(String),
 }
 
@@ -44,16 +53,25 @@ impl<'tcx> CodegenCx<'tcx> {
                 let alloc = self.tcx.global_alloc(prov.alloc_id());
                 let v = self.alloc_to_backend(alloc).ok();
                 let Some(ConstVal::Sym { sym, off: o }) = v.and_then(|v| self.cval(v)) else {
-                    self.tcx.dcx().span_fatal(span, "unsupported asm symbol operand")
+                    self.tcx
+                        .dcx()
+                        .span_fatal(span, "unsupported asm symbol operand")
                 };
                 let off = o + off.bytes() as i64;
-                if off != 0 { format!("{sym}{off:+}") } else { sym }
+                if off != 0 {
+                    format!("{sym}{off:+}")
+                } else {
+                    sym
+                }
             }
         }
     }
 
     fn asm_tls_sym(&self, def_id: DefId) -> String {
-        self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name.to_string()
+        self.tcx
+            .symbol_name(Instance::mono(self.tcx, def_id))
+            .name
+            .to_string()
     }
 
     pub fn push_global_asm(
@@ -63,7 +81,10 @@ impl<'tcx> CodegenCx<'tcx> {
         options: InlineAsmOptions,
         line_spans: &[Span],
     ) {
-        let is_x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86 | InlineAsmArch::X86_64));
+        let is_x86 = matches!(
+            self.tcx.sess.asm_arch,
+            Some(InlineAsmArch::X86 | InlineAsmArch::X86_64)
+        );
         let intel = is_x86 && !options.contains(InlineAsmOptions::ATT_SYNTAX);
         let mut s = String::new();
         if intel {
@@ -72,16 +93,16 @@ impl<'tcx> CodegenCx<'tcx> {
         for piece in template {
             match piece {
                 InlineAsmTemplatePiece::String(t) => s.push_str(t),
-                InlineAsmTemplatePiece::Placeholder { operand_idx, span, .. } => {
-                    match operands[*operand_idx] {
-                        GlobalAsmOperandRef::Const { value, ty } => {
-                            s.push_str(&self.asm_const(value, ty, *span))
-                        }
-                        GlobalAsmOperandRef::SymThreadLocalStatic { def_id } => {
-                            s.push_str(&self.asm_tls_sym(def_id))
-                        }
+                InlineAsmTemplatePiece::Placeholder {
+                    operand_idx, span, ..
+                } => match operands[*operand_idx] {
+                    GlobalAsmOperandRef::Const { value, ty } => {
+                        s.push_str(&self.asm_const(value, ty, *span))
                     }
-                }
+                    GlobalAsmOperandRef::SymThreadLocalStatic { def_id } => {
+                        s.push_str(&self.asm_tls_sym(def_id))
+                    }
+                },
             }
         }
         s.push('\n');
@@ -98,15 +119,21 @@ impl<'tcx> CodegenCx<'tcx> {
     /// A few are implemented in assembly; the rest become weak stubs that
     /// trap if they're ever executed, so crates still build.
     pub fn llvm_intrinsic_stub(&self, name: &str) -> String {
-        let sym: String =
-            format!("__pliron_{}", name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>());
+        let sym: String = format!(
+            "__pliron_{}",
+            name.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        );
         let mut st = self.st.borrow_mut();
         if !st.llvm_stubs.insert(sym.clone()) {
             return sym;
         }
         let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
         let body = match name {
-            "llvm.x86.xgetbv" if x86 => "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
+            "llvm.x86.xgetbv" if x86 => {
+                "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n"
+            }
             "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
             "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n",
             _ if x86 => "    ud2\n",
@@ -150,16 +177,28 @@ impl Gen<'_, '_> {
         let mut regs = vec![None; self.ops.len()];
         for (i, op) in self.ops.iter().enumerate() {
             match *op {
-                AOp::In { reg: InlineAsmRegOrRegClass::Reg(reg) } => {
+                AOp::In {
+                    reg: InlineAsmRegOrRegClass::Reg(reg),
+                } => {
                     regs[i] = Some(reg);
                     allocated.entry(reg).or_default().0 = true;
                 }
-                AOp::Out { reg: InlineAsmRegOrRegClass::Reg(reg), late: true, .. } => {
+                AOp::Out {
+                    reg: InlineAsmRegOrRegClass::Reg(reg),
+                    late: true,
+                    ..
+                } => {
                     regs[i] = Some(reg);
                     allocated.entry(reg).or_default().1 = true;
                 }
-                AOp::Out { reg: InlineAsmRegOrRegClass::Reg(reg), .. }
-                | AOp::InOut { reg: InlineAsmRegOrRegClass::Reg(reg), .. } => {
+                AOp::Out {
+                    reg: InlineAsmRegOrRegClass::Reg(reg),
+                    ..
+                }
+                | AOp::InOut {
+                    reg: InlineAsmRegOrRegClass::Reg(reg),
+                    ..
+                } => {
                     regs[i] = Some(reg);
                     allocated.insert(reg, (true, true));
                 }
@@ -184,8 +223,15 @@ impl Gen<'_, '_> {
                 .expect("cannot allocate asm registers")
         };
         for (i, op) in self.ops.iter().enumerate() {
-            if let AOp::Out { reg: InlineAsmRegOrRegClass::RegClass(c), late: false, .. }
-            | AOp::InOut { reg: InlineAsmRegOrRegClass::RegClass(c), .. } = *op
+            if let AOp::Out {
+                reg: InlineAsmRegOrRegClass::RegClass(c),
+                late: false,
+                ..
+            }
+            | AOp::InOut {
+                reg: InlineAsmRegOrRegClass::RegClass(c),
+                ..
+            } = *op
             {
                 let r = pick(&allocated, c, |_| true);
                 regs[i] = Some(r);
@@ -194,12 +240,18 @@ impl Gen<'_, '_> {
         }
         for (i, op) in self.ops.iter().enumerate() {
             match *op {
-                AOp::In { reg: InlineAsmRegOrRegClass::RegClass(c) } => {
+                AOp::In {
+                    reg: InlineAsmRegOrRegClass::RegClass(c),
+                } => {
                     let r = pick(&allocated, c, |u| u.0);
                     regs[i] = Some(r);
                     allocated.entry(r).or_default().0 = true;
                 }
-                AOp::Out { reg: InlineAsmRegOrRegClass::RegClass(c), late: true, .. } => {
+                AOp::Out {
+                    reg: InlineAsmRegOrRegClass::RegClass(c),
+                    late: true,
+                    ..
+                } => {
                     let r = pick(&allocated, c, |u| u.1);
                     regs[i] = Some(r);
                     allocated.entry(r).or_default().1 = true;
@@ -235,7 +287,12 @@ impl Gen<'_, '_> {
         )
         .unwrap()
         .clobbered_regs();
-        for (i, reg) in self.regs.iter().enumerate().filter_map(|(i, r)| r.map(|r| (i, r))) {
+        for (i, reg) in self
+            .regs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.map(|r| (i, r)))
+        {
             let mut need_save = true;
             for r in abi_clobber {
                 r.overlapping_regs(|r| {
@@ -260,14 +317,24 @@ impl Gen<'_, '_> {
         }
         let before_in = size;
         for (i, op) in self.ops.iter().enumerate() {
-            if let AOp::In { reg } | AOp::InOut { reg, has_out: false } = *op {
+            if let AOp::In { reg }
+            | AOp::InOut {
+                reg,
+                has_out: false,
+            } = *op
+            {
                 sin[i] = Some(new_slot(&mut size, reg.reg_class()));
             }
         }
         let after_in = size;
         size = before_in;
         for (i, op) in self.ops.iter().enumerate() {
-            if let AOp::Out { reg, has_place: true, .. } = *op {
+            if let AOp::Out {
+                reg,
+                has_place: true,
+                ..
+            } = *op
+            {
                 sout[i] = Some(new_slot(&mut size, reg.reg_class()));
             }
         }
@@ -287,7 +354,11 @@ impl Gen<'_, '_> {
             InlineAsmArch::X86_64 => {
                 if Self::is_vreg(reg) {
                     let name = reg.name();
-                    let mov = if name.starts_with("xmm") { "movups" } else { "vmovups" };
+                    let mov = if name.starts_with("xmm") {
+                        "movups"
+                    } else {
+                        "vmovups"
+                    };
                     writeln!(s, "    {mov} [rbx+0x{:x}], {name}", off.bytes()).unwrap();
                 } else {
                     write!(s, "    mov [rbx+0x{:x}], ", off.bytes()).unwrap();
@@ -298,7 +369,9 @@ impl Gen<'_, '_> {
             InlineAsmArch::AArch64 => {
                 s.push_str("    str ");
                 match reg {
-                    InlineAsmReg::AArch64(r) if r.vreg_index().is_some() => reg.emit(s, self.arch, Some('q')),
+                    InlineAsmReg::AArch64(r) if r.vreg_index().is_some() => {
+                        reg.emit(s, self.arch, Some('q'))
+                    }
                     _ => reg.emit(s, self.arch, None),
                 }
                 .unwrap();
@@ -313,7 +386,11 @@ impl Gen<'_, '_> {
             InlineAsmArch::X86_64 => {
                 if Self::is_vreg(reg) {
                     let name = reg.name();
-                    let mov = if name.starts_with("xmm") { "movups" } else { "vmovups" };
+                    let mov = if name.starts_with("xmm") {
+                        "movups"
+                    } else {
+                        "vmovups"
+                    };
                     write!(s, "    {mov} {name}").unwrap();
                 } else {
                     s.push_str("    mov ");
@@ -324,7 +401,9 @@ impl Gen<'_, '_> {
             InlineAsmArch::AArch64 => {
                 s.push_str("    ldr ");
                 match reg {
-                    InlineAsmReg::AArch64(r) if r.vreg_index().is_some() => reg.emit(s, self.arch, Some('q')),
+                    InlineAsmReg::AArch64(r) if r.vreg_index().is_some() => {
+                        reg.emit(s, self.arch, Some('q'))
+                    }
                     _ => reg.emit(s, self.arch, None),
                 }
                 .unwrap();
@@ -347,7 +426,11 @@ impl Gen<'_, '_> {
             s.push_str("    stp fp, lr, [sp, #-32]!\n    mov fp, sp\n    str x19, [sp, #24]\n    mov x19, x0\n");
         }
         let pairs = |slots: &[Option<Size>]| -> Vec<(InlineAsmReg, Size)> {
-            self.regs.iter().zip(slots.iter().copied()).filter_map(|(r, s)| r.zip(s)).collect()
+            self.regs
+                .iter()
+                .zip(slots.iter().copied())
+                .filter_map(|(r, s)| r.zip(s))
+                .collect()
         };
         if !noreturn {
             for (r, o) in pairs(&self.slots_clobber) {
@@ -363,26 +446,28 @@ impl Gen<'_, '_> {
         for piece in self.template {
             match piece {
                 InlineAsmTemplatePiece::String(t) => s.push_str(t),
-                InlineAsmTemplatePiece::Placeholder { operand_idx, modifier, .. } => {
-                    match &self.ops[*operand_idx] {
-                        AOp::Text(t) => s.push_str(t),
-                        _ => {
-                            if att {
-                                s.push('%');
+                InlineAsmTemplatePiece::Placeholder {
+                    operand_idx,
+                    modifier,
+                    ..
+                } => match &self.ops[*operand_idx] {
+                    AOp::Text(t) => s.push_str(t),
+                    _ => {
+                        if att {
+                            s.push('%');
+                        }
+                        let reg = self.regs[*operand_idx].unwrap();
+                        if x86 && Self::is_vreg(reg) {
+                            let name = reg.name();
+                            match modifier {
+                                Some(p) => write!(s, "{p}mm{}", &name[3..]).unwrap(),
+                                None => s.push_str(&name),
                             }
-                            let reg = self.regs[*operand_idx].unwrap();
-                            if x86 && Self::is_vreg(reg) {
-                                let name = reg.name();
-                                match modifier {
-                                    Some(p) => write!(s, "{p}mm{}", &name[3..]).unwrap(),
-                                    None => s.push_str(&name),
-                                }
-                            } else {
-                                reg.emit(&mut s, self.arch, *modifier).unwrap();
-                            }
+                        } else {
+                            reg.emit(&mut s, self.arch, *modifier).unwrap();
                         }
                     }
-                }
+                },
             }
         }
         s.push('\n');
@@ -427,23 +512,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let span = line_spans.first().copied().unwrap_or(rustc_span::DUMMY_SP);
         let arch = match self.tcx.sess.asm_arch {
             Some(a @ (InlineAsmArch::X86_64 | InlineAsmArch::AArch64)) => a,
-            a => self.tcx.dcx().span_fatal(span, format!("inline asm on {a:?} is not supported by the pliron backend")),
+            a => self.tcx.dcx().span_fatal(
+                span,
+                format!("inline asm on {a:?} is not supported by the pliron backend"),
+            ),
         };
         let ops: Vec<AOp> = operands
             .iter()
             .map(|o| match o {
                 InlineAsmOperandRef::In { reg, .. } => AOp::In { reg: *reg },
-                InlineAsmOperandRef::Out { reg, late, place } => {
-                    AOp::Out { reg: *reg, late: *late, has_place: place.is_some() }
+                InlineAsmOperandRef::Out { reg, late, place } => AOp::Out {
+                    reg: *reg,
+                    late: *late,
+                    has_place: place.is_some(),
+                },
+                InlineAsmOperandRef::InOut { reg, out_place, .. } => AOp::InOut {
+                    reg: *reg,
+                    has_out: out_place.is_some(),
+                },
+                InlineAsmOperandRef::Const { value, ty } => {
+                    AOp::Text(self.cx.asm_const(*value, *ty, span))
                 }
-                InlineAsmOperandRef::InOut { reg, out_place, .. } => {
-                    AOp::InOut { reg: *reg, has_out: out_place.is_some() }
+                InlineAsmOperandRef::SymThreadLocalStatic { def_id } => {
+                    AOp::Text(self.cx.asm_tls_sym(*def_id))
                 }
-                InlineAsmOperandRef::Const { value, ty } => AOp::Text(self.cx.asm_const(*value, *ty, span)),
-                InlineAsmOperandRef::SymThreadLocalStatic { def_id } => AOp::Text(self.cx.asm_tls_sym(*def_id)),
-                InlineAsmOperandRef::Label { .. } => {
-                    self.tcx.dcx().span_fatal(span, "asm goto is not supported by the pliron backend")
-                }
+                InlineAsmOperandRef::Label { .. } => self
+                    .tcx
+                    .dcx()
+                    .span_fatal(span, "asm goto is not supported by the pliron backend"),
             })
             .collect();
         let mut g = Gen {
@@ -464,10 +560,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let name = {
             let mut st = self.st.borrow_mut();
             st.counter += 1;
-            let cgu: String = st.cgu.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let cgu: String = st
+                .cgu
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
             format!(
                 "__pliron_asm_{:x}_{cgu}_{}",
-                self.tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE).as_u64(),
+                self.tcx
+                    .stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+                    .as_u64(),
                 st.counter
             )
         };
@@ -496,13 +598,23 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         for (i, o) in operands.iter().enumerate() {
             let place = match o {
                 InlineAsmOperandRef::Out { place: Some(p), .. } => p,
-                InlineAsmOperandRef::InOut { out_place: Some(p), .. } => p,
+                InlineAsmOperandRef::InOut {
+                    out_place: Some(p), ..
+                } => p,
                 _ => continue,
             };
             let off = self.const_usize(g.slots_out[i].unwrap().bytes());
             let src = self.inbounds_ptradd(slot, off);
             let n = self.const_usize(place.layout.size.bytes());
-            self.memcpy(place.val.llval, place.val.align, src, Align::ONE, n, MemFlags::empty(), None);
+            self.memcpy(
+                place.val.llval,
+                place.val.align,
+                src,
+                Align::ONE,
+                n,
+                MemFlags::empty(),
+                None,
+            );
         }
         if let Some(d) = dest {
             self.br(d);
