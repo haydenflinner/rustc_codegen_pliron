@@ -1,0 +1,30 @@
+[package]
+name = "pliron-derive"
+description = "Derive macros for pliron"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+combine.workspace = true
+indexmap.workspace = true
+rustc-hash.workspace = true
+convert_case = "0.11"
+
+syn = { version = "3", features = ["derive", "full", "parsing"] }
+
+[dev-dependencies]
+prettyplease.workspace = true
+expect-test.workspace = true
+pliron = { path = "../" }

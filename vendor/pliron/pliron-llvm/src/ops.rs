@@ -1,0 +1,4969 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! [Op]s defined in the LLVM dialect
+
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::{cell::Ref, num::NonZero, ops::Range};
+
+use pliron::{
+    arg_err_noloc,
+    attribute::{AttrObj, Attribute, AttributeDict, attr_cast, attr_impls, attr_should_outline},
+    basic_block::BasicBlock,
+    builtin::{
+        attr_interfaces::{FloatAttr, TypedAttrInterface},
+        attributes::{BoolAttr, IdentifierAttr, IntegerAttr, StringAttr, TypeAttr},
+        op_interfaces::{
+            self, ATTR_KEY_SYM_NAME, AtMostNRegionsInterface, AtMostOneRegionInterface,
+            BranchOpInterface, CallOpCallable, CallOpInterface, IsTerminatorInterface,
+            IsolatedFromAboveInterface, NOpdsInterface, NResultsInterface, NSuccsInterface,
+            OneOpdInterface, OneResultInterface, OneSuccInterface, OperandSegmentInterface,
+            OperandsMNOfType, OptionalOpdInterface, SameOperandsAndResultType, SameOperandsType,
+            SameResultsType, SingleBlockRegionInterface, SymbolOpInterface, SymbolUserOpInterface,
+        },
+        type_interfaces::{FloatTypeInterface, FunctionTypeInterface},
+        types::{IntegerType, Signedness},
+    },
+    common_traits::{Named, Verify},
+    context::{Context, Ptr},
+    graph::walkers::{self, IRNode, WALKCONFIG_PREORDER_FORWARD},
+    ident,
+    identifier::Identifier,
+    input_err,
+    irfmt::{
+        self,
+        outlined::{OUTLINED_ATTR_MARKER, outlined_marker_or},
+        parsers::{
+            attr_parser, block_opd_parser, delimited_list_parser, process_parsed_ssa_defs, spaced,
+            ssa_opd_parser, type_parser,
+        },
+        printers::{iter_with_sep, list_with_sep, op::typed_symb_op_header},
+    },
+    linked_list::ContainsLinkedList,
+    location::{Located, Location},
+    op::{Op, OpObj, op_cast},
+    operation::Operation,
+    parsable::{IntoParseResult, Parsable, ParseResult, StateStream},
+    printable::{self, Printable, indented_nl},
+    region::Region,
+    result::{Error, ErrorKind, Result},
+    symbol_table::SymbolTableCollection,
+    r#type::{TypeHandle, TypedHandle, type_cast},
+    utils::{apint::APInt, const_bound_n::I, vec_exns::VecExtns},
+    value::Value,
+    verify_err, verify_error,
+};
+
+use crate::{
+    attributes::{
+        AddressSpaceAttr, AggregateAttr, AlignmentAttr, AtomicOrderingAttr, AtomicRmwKindAttr,
+        BytesAttr, CaseValuesAttr, FCmpPredicateAttr, FastmathFlagsAttr,
+        InsertExtractValueIndicesAttr, LinkageAttr, ShuffleVectorMaskAttr, SplatAttr,
+        SymbolAddrAttr, SyncScopeAttr,
+    },
+    llvm_attrs::LlvmAttributesAttr,
+    op_interfaces::{
+        AlignableOpInterface, BinArithOp, CastOpInterface, CastOpWithNNegInterface, FastMathFlags,
+        FloatBinArithOp, FloatBinArithOpWithFastMathFlags, IntBinArithOp,
+        IntBinArithOpWithOverflowFlag, IsDeclaration, LlvmSymbolName, NNegFlag, PointerTypeResult,
+        ScalarOrVectorOpd, ScalarOrVectorOpdImpls, ScalarOrVectorRes, ScalarOrVectorResImpls,
+        SyncScopeInterface, VolatilityOpInterface,
+    },
+    ops::{
+        func_op_attr_names::ATTR_KEY_LLVM_FUNC_TYPE,
+        global_op_attr_names::{ATTR_KEY_LLVM_GLOBAL_INITIALIZER, ATTR_KEY_LLVM_GLOBAL_TYPE},
+    },
+    types::{ArrayType, FuncType, StructLayout, StructType, VectorType},
+};
+
+#[cfg(feature = "llvm-sys")]
+use crate::llvm_sys::core::{llvm_get_undef_mask_elem, llvm_lookup_intrinsic_id};
+
+use pliron::combine::{
+    self, between, optional,
+    parser::{Parser, char::spaces},
+    token,
+};
+
+use pliron::derive::{op_interface_impl, pliron_op};
+use thiserror::Error;
+
+use super::{
+    attributes::{
+        GepIndexAttr, GepIndicesAttr, GepNoWrapFlags, GepNoWrapFlagsAttr, ICmpPredicateAttr,
+    },
+    types::PointerType,
+};
+
+/// Equivalent to LLVM's return opcode.
+///
+/// Operands:
+///
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | any type |
+#[pliron_op(
+    name = "llvm.return",
+    format = "operands(CharSpace(`,`))",
+    interfaces = [IsTerminatorInterface, NResultsInterface<0>, OptionalOpdInterface],
+)]
+pub struct ReturnOp;
+impl ReturnOp {
+    /// Create a new [ReturnOp]
+    pub fn new(ctx: &mut Context, value: Option<Value>) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            value.into_iter().collect(),
+            vec![],
+            0,
+        );
+        ReturnOp { op }
+    }
+
+    /// Get the returned value, if it exists.
+    pub fn retval(&self, ctx: &Context) -> Option<Value> {
+        self.get_operand_opt(ctx)
+    }
+}
+
+#[derive(Error, Debug)]
+enum ReturnOpVerifyErr {
+    #[error("ReturnOp must have no operands in a void function")]
+    VoidWithOperand,
+    #[error("ReturnOp must have exactly one operand in a non-void function")]
+    NonVoidArity,
+    #[error("ReturnOp operand type does not match the function's result type")]
+    ResultTypeMismatch,
+}
+
+impl Verify for ReturnOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+        // Signature coupling is only enforced when the return is inside a FuncOp.
+        let Some(parent_op) = self.get_operation().deref(ctx).get_parent_op(ctx) else {
+            return Ok(());
+        };
+        let Some(func_op) = Operation::get_op::<FuncOp>(parent_op, ctx) else {
+            return Ok(());
+        };
+        let func_ty = func_op.get_type(ctx);
+        let res_ty = func_ty.deref(ctx).result_type();
+        let num_operands = self.get_operation().deref(ctx).get_num_operands();
+        if res_ty.deref(ctx).is::<crate::types::VoidType>() {
+            if num_operands != 0 {
+                verify_err!(self.loc(ctx), ReturnOpVerifyErr::VoidWithOperand)?
+            }
+        } else if num_operands != 1 {
+            verify_err!(self.loc(ctx), ReturnOpVerifyErr::NonVoidArity)?
+        } else {
+            let ret_ty = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+            if ret_ty != res_ty {
+                verify_err!(self.loc(ctx), ReturnOpVerifyErr::ResultTypeMismatch)?
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's unreachable opcode.
+/// No operands or results.
+#[pliron_op(
+    name = "llvm.unreachable",
+    format = "",
+    interfaces = [IsTerminatorInterface, NOpdsInterface<0>, NResultsInterface<0>],
+    verifier = "succ"
+)]
+pub struct UnreachableOp;
+
+impl UnreachableOp {
+    /// Create a new [UnreachableOp]
+    pub fn new(ctx: &mut Context) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        UnreachableOp { op }
+    }
+}
+
+macro_rules! new_int_bin_op_with_format {
+    (   $(#[$outer:meta])*
+        $op_name:ident, $op_id:literal, $format:literal
+    ) => {
+        $(#[$outer])*
+        /// ### Operands:
+        ///
+        /// | operand | description |
+        /// |-----|-------|
+        /// | `lhs` | Signless integer |
+        /// | `rhs` | Signless integer |
+        ///
+        /// ### Result(s):
+        ///
+        /// | result | description |
+        /// |-----|-------|
+        /// | `res` | Signless integer |
+        #[pliron_op(
+            name = $op_id,
+            format = $format,
+            interfaces = [
+                OneResultInterface, SameOperandsType, SameResultsType,
+                SameOperandsAndResultType, BinArithOp, IntBinArithOp,
+                ScalarOrVectorOpd<IntegerType, 0>, NOpdsInterface<2>
+            ],
+            verifier = "succ"
+        )]
+        pub struct $op_name;
+    }
+}
+
+macro_rules! new_int_bin_op {
+    (   $(#[$outer:meta])*
+        $op_name:ident, $op_id:literal
+    ) => {
+        new_int_bin_op_with_format!(
+            $(#[$outer])*
+            $op_name,
+            $op_id,
+            "$0 `, ` $1 ` : ` type($0)"
+        );
+    }
+}
+
+macro_rules! new_int_bin_op_with_overflow {
+    (   $(#[$outer:meta])*
+        $op_name:ident, $op_id:literal
+    ) => {
+        new_int_bin_op_with_format!(
+            $(#[$outer])*
+            /// ### Attributes:
+            ///
+            /// | key | value | via Interface |
+            /// |-----|-------| --------------
+            /// | [ATTR_KEY_INTEGER_OVERFLOW_FLAGS](super::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS) | [IntegerOverflowFlagsAttr](super::attributes::IntegerOverflowFlagsAttr) | [IntBinArithOpWithOverflowFlag] |
+            $op_name,
+            $op_id,
+            "$0 `, ` $1 ` <` attr($llvm_integer_overflow_flags, `super::attributes::IntegerOverflowFlagsAttr`) `>` `: ` type($0)"
+        );
+        #[pliron::derive::op_interface_impl]
+        impl IntBinArithOpWithOverflowFlag for $op_name {}
+    }
+}
+
+new_int_bin_op_with_overflow!(
+    /// Equivalent to LLVM's Add opcode.
+    AddOp,
+    "llvm.add"
+);
+
+new_int_bin_op_with_overflow!(
+    /// Equivalent to LLVM's Sub opcode.
+    SubOp,
+    "llvm.sub"
+);
+
+new_int_bin_op_with_overflow!(
+    /// Equivalent to LLVM's Mul opcode.
+    MulOp,
+    "llvm.mul"
+);
+
+new_int_bin_op_with_overflow!(
+    /// Equivalent to LLVM's Shl opcode.
+    ShlOp,
+    "llvm.shl"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's UDiv opcode.
+    UDivOp,
+    "llvm.udiv"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's SDiv opcode.
+    SDivOp,
+    "llvm.sdiv"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's URem opcode.
+    URemOp,
+    "llvm.urem"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's SRem opcode.
+    SRemOp,
+    "llvm.srem"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's And opcode.
+    AndOp,
+    "llvm.and"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's Or opcode.
+    OrOp,
+    "llvm.or"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's Xor opcode.
+    XorOp,
+    "llvm.xor"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's LShr opcode.
+    LShrOp,
+    "llvm.lshr"
+);
+
+new_int_bin_op!(
+    /// Equivalent to LLVM's AShr opcode.
+    AShrOp,
+    "llvm.ashr"
+);
+
+#[derive(Error, Debug)]
+pub enum ICmpOpVerifyErr {
+    #[error("Result must be (possibly vector of) 1-bit integer (bool)")]
+    ResultNotBool,
+    #[error("Operand must be (possibly vector of) integer or pointer types")]
+    IncorrectOperandsType,
+    #[error("Missing or incorrect predicate attribute")]
+    PredAttrErr,
+    #[error("Vector operand and result types must have the same number of elements")]
+    MismatchedVectorNumElements,
+}
+
+/// Equivalent to LLVM's ICmp opcode.
+/// ### Operand(s):
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | Signless integer or pointer |
+/// | `rhs` | Signless integer or pointer |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | 1-bit signless integer |
+#[pliron_op(
+    name = "llvm.icmp",
+    format = "$0 ` <` attr($llvm_icmp_predicate, $ICmpPredicateAttr) `> ` $1 ` : ` type($0)",
+    interfaces = [
+        SameOperandsType,
+        OneResultInterface,
+        NOpdsInterface<2>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ],
+    attributes = (llvm_icmp_predicate: ICmpPredicateAttr)
+)]
+pub struct ICmpOp;
+
+impl ICmpOp {
+    /// Create a new [ICmpOp]
+    pub fn new(ctx: &mut Context, pred: ICmpPredicateAttr, lhs: Value, rhs: Value) -> Self {
+        use pliron::r#type::Typed;
+
+        // Determine the result type.
+        let bool_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+        let opd_type = lhs.get_type(ctx);
+        let vec_details = opd_type
+            .deref(ctx)
+            .downcast_ref::<VectorType>()
+            .map(|vec_ty| (vec_ty.num_elements(), vec_ty.kind()));
+        let res_ty = if let Some((num_elements, kind)) = vec_details {
+            VectorType::get(ctx, bool_ty.into(), num_elements, kind).into()
+        } else {
+            bool_ty.into()
+        };
+
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        let op = ICmpOp { op };
+        op.set_attr_llvm_icmp_predicate(ctx, pred);
+        op
+    }
+
+    /// Get the predicate
+    pub fn predicate(&self, ctx: &Context) -> ICmpPredicateAttr {
+        self.get_attr_llvm_icmp_predicate(ctx)
+            .expect("ICmpOp missing or incorrect predicate attribute type")
+            .clone()
+    }
+}
+
+impl Verify for ICmpOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+
+        if self.get_attr_llvm_icmp_predicate(ctx).is_none() {
+            verify_err!(loc.clone(), ICmpOpVerifyErr::PredAttrErr)?
+        }
+
+        let res_ty = self.scalar_or_vector_elem_ty(ctx);
+        if res_ty.deref(ctx).width() != 1 {
+            return verify_err!(loc, ICmpOpVerifyErr::ResultNotBool);
+        }
+        let res_shape = self.vector_shape(ctx);
+
+        let mut opd_ty = self.operand_type_i(ctx, I::<0>.into());
+        let opd_shape = opd_ty
+            .deref(ctx)
+            .downcast_ref::<VectorType>()
+            .inspect(|vec_ty| opd_ty = vec_ty.elem_type())
+            .map(|vec_ty| (vec_ty.num_elements(), vec_ty.kind()));
+
+        if opd_shape != res_shape {
+            return verify_err!(loc, ICmpOpVerifyErr::MismatchedVectorNumElements);
+        }
+        let opd_ty = opd_ty.deref(ctx);
+        if !(opd_ty.is::<IntegerType>() || opd_ty.is::<PointerType>()) {
+            return verify_err!(loc, ICmpOpVerifyErr::IncorrectOperandsType);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum AllocaOpVerifyErr {
+    #[error("Operand must be a signless integer")]
+    OperandType,
+    #[error("Missing or incorrect type of attribute for element type")]
+    ElemTypeAttr,
+}
+
+/// Equivalent to LLVM's Alloca opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `array_size` | Signless integer |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | [PointerType] |
+#[pliron_op(
+    name = "llvm.alloca",
+    format = "`[` attr($llvm_alloca_element_type, $TypeAttr) ` x ` $0 `]` ` ` \
+    opt_attr($llvm_alignment, $AlignmentAttr, label($align), delimiters(`[`, `]`)) \
+    ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        AlignableOpInterface,
+    ],
+    operands = (array_size: IntegerType),
+    results = (_: PointerType),
+    attributes = (llvm_alloca_element_type: TypeAttr)
+)]
+pub struct AllocaOp;
+impl Verify for AllocaOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Ensure correctness of element type.
+        if self.get_attr_llvm_alloca_element_type(ctx).is_none() {
+            verify_err!(loc, AllocaOpVerifyErr::ElemTypeAttr)?
+        }
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl PointerTypeResult for AllocaOp {
+    fn result_pointee_type(&self, ctx: &Context) -> TypeHandle {
+        self.get_attr_llvm_alloca_element_type(ctx)
+            .expect("AllocaOp missing or incorrect type for elem_type attribute")
+            .get_type(ctx)
+    }
+}
+
+impl AllocaOp {
+    /// Create a new [AllocaOp]
+    pub fn new(ctx: &mut Context, elem_type: TypeHandle, size: Value, address_space: u32) -> Self {
+        let ptr_ty = PointerType::get(ctx, address_space).into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![ptr_ty],
+            vec![size],
+            vec![],
+            0,
+        );
+        let op = AllocaOp { op };
+        op.set_attr_llvm_alloca_element_type(ctx, TypeAttr::new(elem_type));
+        op
+    }
+}
+
+/// Equivalent to LLVM's Bitcast opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | non-aggregate LLVM type |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | non-aggregate LLVM type |
+#[pliron_op(
+    name = "llvm.bitcast",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        CastOpInterface
+    ],
+    verifier = "succ"
+)]
+pub struct BitcastOp;
+
+#[derive(Error, Debug)]
+pub enum IntToPtrOpErr {
+    #[error("Operand must be a signless integer")]
+    OperandTypeErr,
+    #[error("Result must be a pointer type")]
+    ResultTypeErr,
+}
+
+/// Equivalent to LLVM's IntToPtr opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Signless integer |
+////
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | [PointerType] |
+///
+#[pliron_op(
+    name = "llvm.inttoptr",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        CastOpInterface,
+     ],
+      operands = (arg: IntegerType),
+    results = (_: PointerType),
+     verifier = "succ"
+)]
+pub struct IntToPtrOp;
+
+#[derive(Error, Debug)]
+pub enum PtrToIntOpErr {
+    #[error("Operand must be a pointer type")]
+    OperandTypeErr,
+    #[error("Result must be a signless integer type")]
+    ResultTypeErr,
+}
+
+/// Equivalent to LLVM's PtrToInt opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | [PointerType] |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Signless integer |
+#[pliron_op(
+    name = "llvm.ptrtoint",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        CastOpInterface,
+    ],
+    operands = (arg: PointerType),
+    results = (_: IntegerType),
+    verifier = "succ"
+)]
+pub struct PtrToIntOp;
+
+/// Equivalent to LLVM's AddrSpaceCast opcode: casts a pointer to a pointer in a
+/// different address space.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | [PointerType] |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | [PointerType] |
+#[pliron_op(
+    name = "llvm.addrspacecast",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        CastOpInterface,
+    ],
+    operands = (arg: PointerType),
+    results = (_: PointerType),
+    verifier = "succ"
+)]
+pub struct AddrSpaceCastOp;
+
+/// Equivalent to LLVM's Unconditional Branch.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `dest_opds` | Any number of operands with any LLVM type |
+///
+/// ### Successors:
+///
+/// | Successor | description |
+/// |-----|-------|
+/// | `dest` | Any successor |
+#[pliron_op(
+    name = "llvm.br",
+    format = "succ($0) `(` operands(CharSpace(`,`)) `)`",
+    interfaces = [
+        IsTerminatorInterface,
+        NResultsInterface<0>,
+        OneSuccInterface
+    ],
+    verifier = "succ"
+)]
+pub struct BrOp;
+
+#[op_interface_impl]
+impl BranchOpInterface for BrOp {
+    fn verify_successor_operand_layout(&self, ctx: &Context) -> Result<()> {
+        <Self as OneSuccInterface>::verify(self, ctx)
+    }
+
+    fn successor_operand_range(&self, ctx: &Context, succ_idx: usize) -> Range<usize> {
+        assert!(succ_idx == 0, "BrOp has exactly one successor");
+        0..self.get_operation().deref(ctx).get_num_operands()
+    }
+
+    fn add_successor_operand(&self, ctx: &mut Context, succ_idx: usize, operand: Value) -> usize {
+        assert!(succ_idx == 0, "BrOp has exactly one successor");
+        Operation::push_operand(self.get_operation(), ctx, operand)
+    }
+
+    fn remove_successor_operand(
+        &self,
+        ctx: &mut Context,
+        succ_idx: usize,
+        arg_idx: usize,
+    ) -> Value {
+        assert!(succ_idx == 0, "BrOp has exactly one successor");
+        Operation::remove_operand(self.get_operation(), ctx, arg_idx)
+    }
+}
+
+impl BrOp {
+    /// Create anew [BrOp].
+    pub fn new(ctx: &mut Context, dest: Ptr<BasicBlock>, dest_opds: Vec<Value>) -> Self {
+        BrOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                dest_opds,
+                vec![dest],
+                0,
+            ),
+        }
+    }
+}
+
+/// Equivalent to LLVM's Conditional Branch.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `condition` | 1-bit signless integer |
+/// | `true_dest_opds` | Any number of operands with any LLVM type |
+/// | `false_dest_opds` | Any number of operands with any LLVM type |
+///
+/// ### Successors:
+///
+/// | Successor | description |
+/// |-----|-------|
+/// | `true_dest` | Any successor |
+/// | `false_dest` | Any successor |
+#[pliron_op(
+    name = "llvm.cond_br",
+    interfaces = [IsTerminatorInterface, NResultsInterface<0>, NSuccsInterface<2>],
+    operands = (condition),
+)]
+pub struct CondBrOp;
+impl CondBrOp {
+    /// Create a new [CondBrOp].
+    pub fn new(
+        ctx: &mut Context,
+        condition: Value,
+        true_dest: Ptr<BasicBlock>,
+        true_dest_opds: Vec<Value>,
+        false_dest: Ptr<BasicBlock>,
+        false_dest_opds: Vec<Value>,
+    ) -> Self {
+        let (operands, segment_sizes) =
+            Self::compute_segment_sizes(vec![vec![condition], true_dest_opds, false_dest_opds]);
+
+        let op = CondBrOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                operands,
+                vec![true_dest, false_dest],
+                0,
+            ),
+        };
+
+        // Set the operand segment sizes attribute.
+        op.set_operand_segment_sizes(ctx, segment_sizes);
+        op
+    }
+
+    /// Get the operands forwarded to the true destination.
+    pub fn get_true_dest_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.successor_operands(ctx, 0)
+    }
+
+    /// Get the operands forwarded to the false destination.
+    pub fn get_false_dest_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.successor_operands(ctx, 1)
+    }
+}
+
+#[derive(Error, Debug)]
+enum CondBrOpVerifyErr {
+    #[error("Condition operand must be a 1-bit signless integer (i1) or vector of i1")]
+    IncorrectConditionType,
+    #[error("Expected exactly one condition operand, but found {0}")]
+    ConditionOperandCount(u32),
+}
+
+impl Verify for CondBrOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+        let num_conditions = self.segment_size(ctx, 0);
+        if num_conditions != 1 {
+            verify_err!(
+                self.loc(ctx),
+                CondBrOpVerifyErr::ConditionOperandCount(num_conditions)
+            )?
+        }
+
+        // Ensure that the condition is a 1-bit signless integer
+        let condition_ty = self.get_operand_condition(ctx).get_type(ctx);
+        let condition_ty = condition_ty.deref(ctx);
+        let condition_int_ty = condition_ty.downcast_ref::<IntegerType>().ok_or_else(|| {
+            verify_error!(self.loc(ctx), CondBrOpVerifyErr::IncorrectConditionType)
+        })?;
+        if condition_int_ty.width() != 1 || condition_int_ty.signedness() != Signedness::Signless {
+            verify_err!(self.loc(ctx), CondBrOpVerifyErr::IncorrectConditionType)?
+        }
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl OperandSegmentInterface for CondBrOp {
+    fn expected_num_segments(&self, _ctx: &Context) -> Option<usize> {
+        // The condition, the true destination operands and the false destination operands.
+        Some(3)
+    }
+}
+
+impl Printable for CondBrOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let op = self.get_operation().deref(ctx);
+        let condition = op.get_operand(0);
+        let true_dest_opds = self.successor_operands(ctx, 0);
+        let false_dest_opds = self.successor_operands(ctx, 1);
+        let res = write!(
+            f,
+            "{} if {} ^{}({}) else ^{}({})",
+            Self::get_opid_static(),
+            condition.print(ctx, state),
+            op.get_successor(0).deref(ctx).unique_name(ctx),
+            iter_with_sep(
+                true_dest_opds.iter(),
+                pliron::printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state),
+            op.get_successor(1).deref(ctx).unique_name(ctx),
+            iter_with_sep(
+                false_dest_opds.iter(),
+                pliron::printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state),
+        );
+        res
+    }
+}
+
+impl Parsable for CondBrOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        results: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        if !results.is_empty() {
+            input_err!(
+                state_stream.loc(),
+                op_interfaces::NResultsVerifyErr(0, results.len())
+            )?
+        }
+
+        // Parse the condition operand.
+        let r#if = irfmt::parsers::spaced::<StateStream, _>(combine::parser::char::string("if"));
+
+        let condition = ssa_opd_parser();
+
+        let true_operands = delimited_list_parser('(', ')', ',', ssa_opd_parser());
+
+        let r_else =
+            irfmt::parsers::spaced::<StateStream, _>(combine::parser::char::string("else"));
+
+        let false_operands = delimited_list_parser('(', ')', ',', ssa_opd_parser());
+
+        let final_parser = r#if
+            .with(spaced(condition))
+            .and(spaced(block_opd_parser()))
+            .and(true_operands)
+            .and(spaced(r_else).with(spaced(block_opd_parser()).and(false_operands)));
+
+        final_parser
+            .then(
+                move |(((condition, true_dest), true_dest_opds), (false_dest, false_dest_opds))| {
+                    let results = results.clone();
+                    combine::parser(move |parsable_state: &mut StateStream<'a>| {
+                        let ctx = &mut parsable_state.state.ctx;
+                        let op = CondBrOp::new(
+                            ctx,
+                            condition,
+                            true_dest,
+                            true_dest_opds.clone(),
+                            false_dest,
+                            false_dest_opds.clone(),
+                        );
+
+                        process_parsed_ssa_defs(parsable_state, &results, op.get_operation())?;
+                        Ok(OpObj::new(op)).into_parse_result()
+                    })
+                },
+            )
+            .parse_stream(state_stream)
+            .into()
+    }
+}
+
+#[op_interface_impl]
+impl BranchOpInterface for CondBrOp {
+    fn verify_successor_operand_layout(&self, ctx: &Context) -> Result<()> {
+        <Self as OperandSegmentInterface>::verify(self, ctx)?;
+        <Self as NSuccsInterface<2>>::verify(self, ctx)
+    }
+
+    fn successor_operand_range(&self, ctx: &Context, succ_idx: usize) -> Range<usize> {
+        assert!(
+            succ_idx == 0 || succ_idx == 1,
+            "CondBrOp has exactly two successors"
+        );
+
+        // Skip the first segment, which is the condition.
+        self.segment_range(ctx, succ_idx + 1)
+    }
+
+    fn add_successor_operand(&self, ctx: &mut Context, succ_idx: usize, operand: Value) -> usize {
+        // The successor operands start at segment 1, since segment 0 is the condition operand.
+        self.push_to_segment(ctx, succ_idx + 1, operand)
+    }
+
+    fn remove_successor_operand(
+        &self,
+        ctx: &mut Context,
+        succ_idx: usize,
+        arg_idx: usize,
+    ) -> Value {
+        // The successor operands start at segment 1, since segment 0 is the condition operand.
+        self.remove_from_segment(ctx, succ_idx + 1, arg_idx)
+    }
+}
+
+/// Equivalent to LLVM's Switch opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `condition` | integer (width matches the case values) |
+/// | `default_dest_opds` | variadic of any type |
+/// | `case_dest_opds` | variadic of any type |
+///
+/// ### Successors:
+/// | Successor | description |
+/// |-----|-------|
+/// | `default_dest` | any successor |
+/// | `case_dests` | any successor(s) |
+#[pliron_op(
+    name = "llvm.switch",
+    interfaces = [IsTerminatorInterface, NResultsInterface<0>],
+    operands = (condition),
+    attributes = (llvm_switch_case_values: CaseValuesAttr)
+)]
+pub struct SwitchOp;
+
+/// One case of a switch statement.
+#[derive(Clone)]
+pub struct SwitchCase {
+    /// The value being matched against.
+    pub value: IntegerAttr,
+    /// The destination block to jump to if this case is taken.
+    pub dest: Ptr<BasicBlock>,
+    /// The operands to pass to the destination block.
+    pub dest_opds: Vec<Value>,
+}
+
+impl Printable for SwitchCase {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(
+            f,
+            "{{ {}: ^{}({}) }}",
+            self.value.print(ctx, state),
+            self.dest.deref(ctx).unique_name(ctx),
+            list_with_sep(
+                &self.dest_opds,
+                pliron::printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state)
+        )
+    }
+}
+
+impl Parsable for SwitchCase {
+    type Arg = ();
+    type Parsed = Self;
+
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        let mut parser = between(
+            token('{'),
+            token('}'),
+            (
+                spaced(IntegerAttr::parser(())),
+                spaced(token(':')),
+                spaced(block_opd_parser()),
+                delimited_list_parser('(', ')', ',', ssa_opd_parser()),
+                spaces(),
+            ),
+        );
+
+        let ((value, _colon, dest, dest_opds, _spaces), _) =
+            parser.parse_stream(state_stream).into_result()?;
+
+        Ok(SwitchCase {
+            value,
+            dest,
+            dest_opds,
+        })
+        .into_parse_result()
+    }
+}
+
+impl Printable for SwitchOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let op = self.get_operation().deref(ctx);
+        let condition = op.get_operand(0);
+
+        let default_successor = op
+            .successors()
+            .next()
+            .expect("SwitchOp must have at least one successor");
+        let num_total_successors = op.get_num_successors();
+
+        write!(
+            f,
+            "{} {}, ^{}({})",
+            Self::get_opid_static(),
+            condition.print(ctx, state),
+            default_successor.unique_name(ctx).print(ctx, state),
+            iter_with_sep(
+                self.successor_operands(ctx, 0).iter(),
+                pliron::printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state),
+        )?;
+
+        if num_total_successors < 2 {
+            writeln!(f, "[]")?;
+            return Ok(());
+        }
+
+        let cases = self.cases(ctx);
+
+        write!(f, "{}[", indented_nl(state))?;
+        {
+            let _indent = state.indent();
+            write!(f, "{}", indented_nl(state))?;
+            list_with_sep(&cases, pliron::printable::ListSeparator::CharNewline(','))
+                .fmt(ctx, state, f)?;
+        }
+        write!(f, "{}]", indented_nl(state))?;
+
+        Ok(())
+    }
+}
+
+impl Parsable for SwitchOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        arg: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        if !arg.is_empty() {
+            input_err!(
+                state_stream.loc(),
+                op_interfaces::NResultsVerifyErr(0, arg.len())
+            )?
+        }
+
+        // Parse the condition operand.
+        let condition = ssa_opd_parser().skip(spaced(token(',')));
+        let default_successor = block_opd_parser();
+        let default_operands = delimited_list_parser('(', ')', ',', ssa_opd_parser());
+        let cases = delimited_list_parser('[', ']', ',', SwitchCase::parser(()));
+
+        let final_parser = spaced(condition)
+            .and(default_successor)
+            .skip(spaces())
+            .and(default_operands)
+            .skip(spaces())
+            .and(cases);
+
+        final_parser
+            .then(
+                move |(((condition, default_dest), default_dest_opds), cases)| {
+                    let results = arg.clone();
+                    combine::parser(move |parsable_state: &mut StateStream<'a>| {
+                        let ctx = &mut parsable_state.state.ctx;
+                        let op = SwitchOp::new(
+                            ctx,
+                            condition,
+                            default_dest,
+                            default_dest_opds.clone(),
+                            cases.clone(),
+                        );
+
+                        process_parsed_ssa_defs(parsable_state, &results, op.get_operation())?;
+                        Ok(OpObj::new(op)).into_parse_result()
+                    })
+                },
+            )
+            .parse_stream(state_stream)
+            .into()
+    }
+}
+
+impl SwitchOp {
+    /// Create a new [SwitchOp].
+    pub fn new(
+        ctx: &mut Context,
+        condition: Value,
+        default_dest: Ptr<BasicBlock>,
+        default_dest_opds: Vec<Value>,
+        cases: Vec<SwitchCase>,
+    ) -> Self {
+        let case_values: Vec<IntegerAttr> = cases.iter().map(|case| case.value.clone()).collect();
+
+        let case_operands = cases
+            .iter()
+            .map(|case| case.dest_opds.clone())
+            .collect::<Vec<_>>();
+
+        let mut operand_segments = vec![vec![condition], default_dest_opds];
+        operand_segments.extend(case_operands);
+        let (operands, segment_sizes) = Self::compute_segment_sizes(operand_segments);
+
+        let case_dests = cases.iter().map(|case| case.dest);
+        let successors = vec![default_dest].into_iter().chain(case_dests).collect();
+        let op = SwitchOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                operands,
+                successors,
+                0,
+            ),
+        };
+
+        // Set the operand segment sizes attribute.
+        op.set_operand_segment_sizes(ctx, segment_sizes);
+        // Set the case values
+        op.set_attr_llvm_switch_case_values(ctx, CaseValuesAttr(case_values));
+        op
+    }
+
+    /// Get the cases of this switch operation.
+    /// (The default case cannot be / isn't included here).
+    pub fn cases(&self, ctx: &Context) -> Vec<SwitchCase> {
+        let case_values = &*self
+            .get_attr_llvm_switch_case_values(ctx)
+            .expect("SwitchOp missing or incorrect case values attribute");
+
+        let op = self.get_operation().deref(ctx);
+        // Skip the first one, which is the default successor.
+        let successors = op.successors().skip(1);
+
+        successors
+            .zip(case_values.0.iter())
+            .enumerate()
+            .map(|(i, (dest, value))| {
+                // i+1 here because the first successor is the default destination.
+                let dest_opds = self.successor_operands(ctx, i + 1);
+                SwitchCase {
+                    value: value.clone(),
+                    dest,
+                    dest_opds,
+                }
+            })
+            .collect()
+    }
+
+    /// Get the default destination of this switch operation.
+    pub fn default_dest(&self, ctx: &Context) -> Ptr<BasicBlock> {
+        self.get_operation().deref(ctx).get_successor(0)
+    }
+
+    /// Get the operands to pass to the default destination.
+    pub fn default_dest_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.successor_operands(ctx, 0)
+    }
+
+    /// Get the operands forwarded to the destination of case `case_idx`.
+    /// Panics if `case_idx` is invalid.
+    pub fn get_case_dest_operands(&self, ctx: &Context, case_idx: usize) -> Vec<Value> {
+        // Successor 0 is the default destination.
+        self.successor_operands(ctx, case_idx + 1)
+    }
+}
+
+#[op_interface_impl]
+impl BranchOpInterface for SwitchOp {
+    fn verify_successor_operand_layout(&self, ctx: &Context) -> Result<()> {
+        <Self as OperandSegmentInterface>::verify(self, ctx)
+    }
+
+    fn successor_operand_range(&self, ctx: &Context, succ_idx: usize) -> Range<usize> {
+        // Skip the first segment, which is the condition.
+        self.segment_range(ctx, succ_idx + 1)
+    }
+
+    fn add_successor_operand(&self, ctx: &mut Context, succ_idx: usize, operand: Value) -> usize {
+        // The successor operands start at segment 1, since segment 0 is the condition operand.
+        self.push_to_segment(ctx, succ_idx + 1, operand)
+    }
+
+    fn remove_successor_operand(
+        &self,
+        ctx: &mut Context,
+        succ_idx: usize,
+        arg_idx: usize,
+    ) -> Value {
+        // The successor operands start at segment 1, since segment 0 is the condition operand.
+        self.remove_from_segment(ctx, succ_idx + 1, arg_idx)
+    }
+}
+
+#[op_interface_impl]
+impl OperandSegmentInterface for SwitchOp {
+    fn expected_num_segments(&self, ctx: &Context) -> Option<usize> {
+        // One segment for the condition, and one segment for each successor.
+        Some(self.get_operation().deref(ctx).get_num_successors() + 1)
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SwitchOpVerifyErr {
+    #[error("SwitchOp has no or incorrect case values attribute")]
+    CaseValuesAttrErr,
+    #[error("SwitchOp has no or incorrect default destination")]
+    DefaultDestErr,
+    #[error("SwitchOp has no condition operand or is not an integer")]
+    ConditionErr,
+    #[error("Expected exactly one condition operand, but found {0}")]
+    ConditionOperandCount(u32),
+}
+
+impl Verify for SwitchOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+
+        let Some(case_values) = self.get_attr_llvm_switch_case_values(ctx) else {
+            verify_err!(loc.clone(), SwitchOpVerifyErr::CaseValuesAttrErr)?
+        };
+
+        let num_conditions = self.segment_size(ctx, 0);
+        if num_conditions != 1 {
+            verify_err!(
+                loc.clone(),
+                SwitchOpVerifyErr::ConditionOperandCount(num_conditions)
+            )?
+        }
+
+        let op = &*self.get_operation().deref(ctx);
+
+        if op.get_num_successors() < 1 {
+            verify_err!(loc.clone(), SwitchOpVerifyErr::DefaultDestErr)?;
+        }
+
+        let condition_ty = pliron::r#type::Typed::get_type(&op.get_operand(0), ctx);
+        let condition_ty = TypedHandle::<IntegerType>::from_handle(condition_ty, ctx)?;
+
+        if let Some(case_value) = case_values.0.first() {
+            // Ensure that the case value type matches the condition type.
+            if case_value.get_type() != condition_ty {
+                verify_err!(loc, SwitchOpVerifyErr::ConditionErr)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One destination of an [IndirectBrOp].
+#[derive(Clone)]
+pub struct IndirectBrDest {
+    /// The destination block to jump to.
+    pub dest: Ptr<BasicBlock>,
+    /// The operands to pass to the destination block.
+    pub dest_opds: Vec<Value>,
+}
+
+impl Printable for IndirectBrDest {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(
+            f,
+            "^{}({})",
+            self.dest.deref(ctx).unique_name(ctx),
+            list_with_sep(
+                &self.dest_opds,
+                pliron::printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state)
+        )
+    }
+}
+
+impl Parsable for IndirectBrDest {
+    type Arg = ();
+    type Parsed = Self;
+
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        let mut parser = (
+            block_opd_parser(),
+            delimited_list_parser('(', ')', ',', ssa_opd_parser()),
+        );
+
+        let ((dest, dest_opds), _) = parser.parse_stream(state_stream).into_result()?;
+
+        Ok(IndirectBrDest { dest, dest_opds }).into_parse_result()
+    }
+}
+
+/// Equivalent to LLVM's IndirectBr opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `address` | [PointerType] |
+/// | `dest_opds` | variadic of any type, one segment per destination |
+///
+/// ### Successors:
+/// | Successor | description |
+/// |-----|-------|
+/// | `dests` | one or more successor(s) |
+#[pliron_op(
+    name = "llvm.indirectbr",
+    interfaces = [IsTerminatorInterface, NResultsInterface<0>],
+    operands = (address: PointerType),
+)]
+pub struct IndirectBrOp;
+
+impl Printable for IndirectBrOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let op = self.get_operation().deref(ctx);
+        let address = op.get_operand(0);
+        let dests = self.destinations(ctx);
+
+        write!(
+            f,
+            "{} {} [",
+            Self::get_opid_static(),
+            address.print(ctx, state)
+        )?;
+        {
+            let _indent = state.indent();
+            write!(f, "{}", indented_nl(state))?;
+            list_with_sep(&dests, pliron::printable::ListSeparator::CharNewline(','))
+                .fmt(ctx, state, f)?;
+        }
+        write!(f, "{}]", indented_nl(state))?;
+
+        Ok(())
+    }
+}
+
+impl Parsable for IndirectBrOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        arg: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        if !arg.is_empty() {
+            input_err!(
+                state_stream.loc(),
+                op_interfaces::NResultsVerifyErr(0, arg.len())
+            )?
+        }
+
+        let dests = delimited_list_parser('[', ']', ',', IndirectBrDest::parser(()));
+
+        let final_parser = spaced(ssa_opd_parser()).and(dests);
+
+        final_parser
+            .then(move |(address, dests)| {
+                let results = arg.clone();
+                combine::parser(move |parsable_state: &mut StateStream<'a>| {
+                    let ctx = &mut parsable_state.state.ctx;
+                    let op = IndirectBrOp::new(
+                        ctx,
+                        address,
+                        dests
+                            .iter()
+                            .map(|d| (d.dest, d.dest_opds.clone()))
+                            .collect(),
+                    );
+
+                    process_parsed_ssa_defs(parsable_state, &results, op.get_operation())?;
+                    Ok(OpObj::new(op)).into_parse_result()
+                })
+            })
+            .parse_stream(state_stream)
+            .into()
+    }
+}
+
+impl IndirectBrOp {
+    /// Create a new [IndirectBrOp].
+    pub fn new(
+        ctx: &mut Context,
+        address: Value,
+        dests: Vec<(Ptr<BasicBlock>, Vec<Value>)>,
+    ) -> Self {
+        let mut operand_segments = vec![vec![address]];
+        operand_segments.extend(dests.iter().map(|(_, dest_opds)| dest_opds.clone()));
+        let (operands, segment_sizes) = Self::compute_segment_sizes(operand_segments);
+
+        let successors = dests.iter().map(|(dest, _)| *dest).collect();
+        let op = IndirectBrOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                operands,
+                successors,
+                0,
+            ),
+        };
+
+        // Set the operand segment sizes attribute.
+        op.set_operand_segment_sizes(ctx, segment_sizes);
+        op
+    }
+
+    /// Get the destinations of this indirectbr operation, along with the operands
+    /// passed to each.
+    pub fn destinations(&self, ctx: &Context) -> Vec<IndirectBrDest> {
+        let op = self.get_operation().deref(ctx);
+        op.successors()
+            .enumerate()
+            .map(|(i, dest)| IndirectBrDest {
+                dest,
+                dest_opds: self.successor_operands(ctx, i),
+            })
+            .collect()
+    }
+
+    /// Get the operands forwarded to destination `dest_idx`.
+    /// Panics if `dest_idx` is invalid.
+    pub fn get_dest_operands(&self, ctx: &Context, dest_idx: usize) -> Vec<Value> {
+        self.successor_operands(ctx, dest_idx)
+    }
+}
+
+#[op_interface_impl]
+impl BranchOpInterface for IndirectBrOp {
+    fn verify_successor_operand_layout(&self, ctx: &Context) -> Result<()> {
+        <Self as OperandSegmentInterface>::verify(self, ctx)
+    }
+
+    fn successor_operand_range(&self, ctx: &Context, succ_idx: usize) -> Range<usize> {
+        // Skip the first segment, which is the address.
+        self.segment_range(ctx, succ_idx + 1)
+    }
+
+    fn add_successor_operand(&self, ctx: &mut Context, succ_idx: usize, operand: Value) -> usize {
+        // The successor operands start at segment 1, since segment 0 is the address operand.
+        self.push_to_segment(ctx, succ_idx + 1, operand)
+    }
+
+    fn remove_successor_operand(
+        &self,
+        ctx: &mut Context,
+        succ_idx: usize,
+        arg_idx: usize,
+    ) -> Value {
+        // The successor operands start at segment 1, since segment 0 is the address operand.
+        self.remove_from_segment(ctx, succ_idx + 1, arg_idx)
+    }
+}
+
+#[op_interface_impl]
+impl OperandSegmentInterface for IndirectBrOp {
+    fn expected_num_segments(&self, ctx: &Context) -> Option<usize> {
+        // One segment for the address, and one segment for each successor.
+        Some(self.get_operation().deref(ctx).get_num_successors() + 1)
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum IndirectBrOpVerifyErr {
+    #[error("IndirectBrOp must have at least one destination")]
+    NoDestinations,
+    #[error("Expected exactly one address operand, but found {0}")]
+    AddressOperandCount(u32),
+}
+
+impl Verify for IndirectBrOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+
+        let num_addresses = self.segment_size(ctx, 0);
+        if num_addresses != 1 {
+            verify_err!(
+                loc.clone(),
+                IndirectBrOpVerifyErr::AddressOperandCount(num_addresses)
+            )?
+        }
+
+        let op = &*self.get_operation().deref(ctx);
+
+        if op.get_num_successors() < 1 {
+            verify_err!(loc, IndirectBrOpVerifyErr::NoDestinations)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A way to express whether a GEP index is a constant or an SSA value
+#[derive(Clone)]
+pub enum GepIndex {
+    Constant(u32),
+    Value(Value),
+}
+
+impl Printable for GepIndex {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        match self {
+            GepIndex::Constant(c) => write!(f, "{c}"),
+            GepIndex::Value(v) => write!(f, "{}", v.print(ctx, state)),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum GetElementPtrOpErr {
+    #[error("GetElementPtrOp has no or incorrect indices attribute")]
+    IndicesAttrErr,
+    #[error("The indices on this GEP are invalid for its source element type")]
+    IndicesErr,
+}
+
+/// Equivalent to LLVM's GetElementPtr.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `base` | LLVM pointer type |
+/// | `dynamicIndices` | Any number of signless integers |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM pointer type |
+#[pliron_op(
+    name = "llvm.gep",
+    format = "`<` attr($llvm_gep_src_elem_type, $TypeAttr) `>` ` (` operands(CharSpace(`,`)) `)` opt_attr($llvm_gep_no_wrap_flags, $GepNoWrapFlagsAttr) attr($llvm_gep_indices, $GepIndicesAttr) ` : ` type($0)",
+    interfaces = [OneResultInterface, OperandsMNOfType<1, {-1}, IntegerType>],
+    operands = (src_ptr: PointerType, dynamic_indices),
+    results = (_: PointerType),
+    attributes = (
+        llvm_gep_src_elem_type: TypeAttr,
+        llvm_gep_indices: GepIndicesAttr,
+        llvm_gep_no_wrap_flags: GepNoWrapFlagsAttr
+    )
+)]
+pub struct GetElementPtrOp;
+
+#[op_interface_impl]
+impl PointerTypeResult for GetElementPtrOp {
+    fn result_pointee_type(&self, ctx: &Context) -> TypeHandle {
+        Self::indexed_type(ctx, self.src_elem_type(ctx), &self.indices(ctx))
+            .expect("Invalid indices for GEP")
+    }
+}
+
+impl Verify for GetElementPtrOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Ensure that we have the indices as an attribute.
+        if self.get_attr_llvm_gep_indices(ctx).is_none() {
+            verify_err!(loc, GetElementPtrOpErr::IndicesAttrErr)?
+        }
+
+        if let Err(e @ Error { .. }) =
+            Self::indexed_type(ctx, self.src_elem_type(ctx), &self.indices(ctx))
+        {
+            return Err(Error {
+                kind: ErrorKind::VerificationFailed,
+                // We reset the error origin to be from here
+                backtrace: pliron::std_deps::backtrace::Backtrace::capture(),
+                ..e
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl GetElementPtrOp {
+    /// Create a new [GetElementPtrOp]
+    pub fn new(
+        ctx: &mut Context,
+        base: Value,
+        indices: Vec<GepIndex>,
+        src_elem_type: TypeHandle,
+    ) -> Self {
+        Self::new_with_no_wrap_flags(ctx, base, indices, src_elem_type, GepNoWrapFlags::empty())
+    }
+
+    /// Create a new [GetElementPtrOp] with LLVM no-wrap flags.
+    pub fn new_with_no_wrap_flags(
+        ctx: &mut Context,
+        base: Value,
+        indices: Vec<GepIndex>,
+        src_elem_type: TypeHandle,
+        no_wrap_flags: GepNoWrapFlags,
+    ) -> Self {
+        use pliron::r#type::Typed;
+
+        // A GEP result inherits the address space of its base pointer.
+        let addr_space = {
+            let base_ty = base.get_type(ctx);
+            base_ty
+                .deref(ctx)
+                .downcast_ref::<PointerType>()
+                .map_or(0, PointerType::address_space)
+        };
+        let result_type = PointerType::get(ctx, addr_space).into();
+        let mut attr: Vec<GepIndexAttr> = Vec::new();
+        let mut opds: Vec<Value> = vec![base];
+        for idx in indices {
+            match idx {
+                GepIndex::Constant(c) => {
+                    attr.push(GepIndexAttr::Constant(c));
+                }
+                GepIndex::Value(v) => {
+                    attr.push(GepIndexAttr::OperandIdx(opds.push_back(v)));
+                }
+            }
+        }
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            opds,
+            vec![],
+            0,
+        );
+        let src_elem_type = TypeAttr::new(src_elem_type);
+        let op = GetElementPtrOp { op };
+
+        op.set_attr_llvm_gep_indices(ctx, GepIndicesAttr(attr));
+        op.set_attr_llvm_gep_src_elem_type(ctx, src_elem_type);
+        if !no_wrap_flags.is_empty() {
+            op.set_attr_llvm_gep_no_wrap_flags(ctx, no_wrap_flags.into());
+        }
+        op
+    }
+
+    /// Get the GEP no-wrap flags.
+    pub fn no_wrap_flags(&self, ctx: &Context) -> GepNoWrapFlags {
+        self.get_attr_llvm_gep_no_wrap_flags(ctx)
+            .map_or(GepNoWrapFlags::empty(), |attr| attr.0.normalized())
+    }
+
+    /// Get the source pointer's element type.
+    pub fn src_elem_type(&self, ctx: &Context) -> TypeHandle {
+        self.get_attr_llvm_gep_src_elem_type(ctx)
+            .expect("GetElementPtrOp missing or has incorrect src_elem_type attribute type")
+            .get_type(ctx)
+    }
+
+    /// Get the indices of this GEP.
+    pub fn indices(&self, ctx: &Context) -> Vec<GepIndex> {
+        let op = &*self.op.deref(ctx);
+        self.get_attr_llvm_gep_indices(ctx)
+            .unwrap()
+            .0
+            .iter()
+            .map(|index| match index {
+                GepIndexAttr::Constant(c) => GepIndex::Constant(*c),
+                GepIndexAttr::OperandIdx(i) => GepIndex::Value(op.get_operand(*i)),
+            })
+            .collect()
+    }
+
+    /// Returns the result element type of a GEP with the given source element type and indexes.
+    /// See [getIndexedType](https://llvm.org/doxygen/classllvm_1_1GetElementPtrInst.html#a99d4bfe49182f8d80abb1960f2c12d46)
+    pub fn indexed_type(
+        ctx: &Context,
+        src_elem_type: TypeHandle,
+        indices: &[GepIndex],
+    ) -> Result<TypeHandle> {
+        fn indexed_type_inner(
+            ctx: &Context,
+            src_elem_type: TypeHandle,
+            mut idx_itr: impl Iterator<Item = GepIndex>,
+        ) -> Result<TypeHandle> {
+            let Some(idx) = idx_itr.next() else {
+                return Ok(src_elem_type);
+            };
+            let src_elem_type = &*src_elem_type.deref(ctx);
+            if let Some(st) = src_elem_type.downcast_ref::<StructType>() {
+                let GepIndex::Constant(i) = idx else {
+                    return arg_err_noloc!(GetElementPtrOpErr::IndicesErr);
+                };
+                if st.is_opaque() || i as usize >= st.num_fields() {
+                    return arg_err_noloc!(GetElementPtrOpErr::IndicesErr);
+                }
+                indexed_type_inner(ctx, st.field_type(i as usize), idx_itr)
+            } else if let Some(at) = src_elem_type.downcast_ref::<ArrayType>() {
+                indexed_type_inner(ctx, at.elem_type(), idx_itr)
+            } else {
+                arg_err_noloc!(GetElementPtrOpErr::IndicesErr)
+            }
+        }
+        // The first index is for the base (source) pointer. Skip that.
+        indexed_type_inner(ctx, src_elem_type, indices.iter().skip(1).cloned())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum LoadOpVerifyErr {
+    #[error("Load operand must be a pointer")]
+    OperandTypeErr,
+}
+
+/// Equivalent to LLVM's Load opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `addr` | [PointerType] |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | sized LLVM type |
+#[pliron_op(
+    name = "llvm.load",
+    format = "$0 ` ` opt_attr($llvm_volatile, $BoolAttr, label($volatile), delimiters(`[`, `]`)) opt_attr($llvm_alignment, $AlignmentAttr, label($align), delimiters(`[`, `]`)) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        AlignableOpInterface,
+        VolatilityOpInterface,
+    ],
+    operands = (address: PointerType),
+    verifier = "succ"
+)]
+pub struct LoadOp;
+impl LoadOp {
+    /// Create a new [LoadOp]
+    pub fn new(ctx: &mut Context, ptr: Value, res_ty: TypeHandle) -> Self {
+        LoadOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![res_ty],
+                vec![ptr],
+                vec![],
+                0,
+            ),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum StoreOpVerifyErr {
+    #[error("Store operand must have two operands")]
+    NumOpdsErr,
+    #[error("Store operand must have a pointer as its second argument")]
+    AddrOpdTypeErr,
+}
+
+/// Equivalent to LLVM's Store opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `addr` | [PointerType] |
+/// | `value` | Sized type |
+#[pliron_op(
+    name = "llvm.store",
+    format = "`*` $1 ` <- ` $0 ` ` opt_attr($llvm_volatile, $BoolAttr, label($volatile), delimiters(`[`, `]`)) opt_attr($llvm_alignment, $AlignmentAttr, label($align), delimiters(`[`, `]`))",
+    interfaces = [
+        NResultsInterface<0>,
+        AlignableOpInterface,
+        VolatilityOpInterface,
+        NOpdsInterface<2>
+    ],
+    operands = (value, address: PointerType),
+    verifier = "succ"
+)]
+pub struct StoreOp;
+impl StoreOp {
+    /// Create a new [StoreOp]
+    pub fn new(ctx: &mut Context, value: Value, ptr: Value) -> Self {
+        StoreOp {
+            op: Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                vec![value, ptr],
+                vec![],
+                0,
+            ),
+        }
+    }
+}
+
+/// Equivalent to LLVM's `atomicrmw`: atomically applies `kind` to the value at
+/// a pointer and returns the old value.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `ptr` | [PointerType] |
+/// | `val` | value to combine with the one in memory |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | the old value (same type as `val`) |
+#[pliron_op(
+    name = "llvm.atomicrmw",
+    format = "attr($llvm_rmw_kind, $AtomicRmwKindAttr) ` ` $0 `, ` $1 ` ` attr($llvm_syncscope, $SyncScopeAttr, label($syncscope)) ` ` attr($llvm_rmw_ordering, $AtomicOrderingAttr) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        NOpdsInterface<2>,
+        SyncScopeInterface,
+    ],
+    operands = (ptr: PointerType, val),
+    attributes = (
+        llvm_rmw_kind: AtomicRmwKindAttr,
+        llvm_rmw_ordering: AtomicOrderingAttr
+    ),
+    verifier = "succ"
+)]
+pub struct AtomicRmwOp;
+
+impl AtomicRmwOp {
+    /// Create a new [AtomicRmwOp].
+    pub fn new(
+        ctx: &mut Context,
+        ptr: Value,
+        val: Value,
+        kind: AtomicRmwKindAttr,
+        ordering: AtomicOrderingAttr,
+        syncscope: SyncScopeAttr,
+    ) -> Self {
+        use pliron::r#type::Typed;
+        let res_ty = val.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![ptr, val],
+            vec![],
+            0,
+        );
+        let op = AtomicRmwOp { op };
+        op.set_attr_llvm_rmw_kind(ctx, kind);
+        op.set_attr_llvm_rmw_ordering(ctx, ordering);
+        op.set_syncscope(ctx, syncscope);
+        op
+    }
+}
+
+/// Equivalent to LLVM's `cmpxchg`: atomically compares the value at a pointer
+/// with `cmp` and, if equal, stores `new`. Returns a `{ value, i1 }` pair of the
+/// loaded value and whether the swap succeeded.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `ptr` | [PointerType] |
+/// | `cmp` | expected value |
+/// | `new` | value to store on success |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | `{ value, i1 }` (loaded value, success flag) |
+#[pliron_op(
+    name = "llvm.cmpxchg",
+    format = "$0 `, ` $1 `, ` $2 ` ` attr($llvm_syncscope, $SyncScopeAttr, label($syncscope)) ` ` attr($llvm_cas_success_ordering, $AtomicOrderingAttr) ` ` attr($llvm_cas_failure_ordering, $AtomicOrderingAttr) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        NOpdsInterface<3>,
+        SyncScopeInterface,
+    ],
+    operands = (ptr: PointerType, cmp, new_val),
+    attributes = (
+        llvm_cas_success_ordering: AtomicOrderingAttr,
+        llvm_cas_failure_ordering: AtomicOrderingAttr
+    )
+)]
+pub struct AtomicCmpxchgOp;
+
+#[derive(Error, Debug)]
+enum AtomicCmpxchgOpVerifyErr {
+    #[error("Missing or incorrect type of attribute for cmpxchg ordering")]
+    OrderingAttrErr,
+    #[error("cmpxchg failure ordering cannot be release or acq_rel")]
+    InvalidFailureOrdering,
+}
+
+impl Verify for AtomicCmpxchgOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // AtomicCmpXchgInst::isValid{Success,Failure}Ordering. Neither ordering
+        // may be non-atomic or unordered, which AtomicOrderingAttr cannot express.
+        if self.get_attr_llvm_cas_success_ordering(ctx).is_none() {
+            return verify_err!(loc, AtomicCmpxchgOpVerifyErr::OrderingAttrErr);
+        }
+        let Some(failure) = self.get_attr_llvm_cas_failure_ordering(ctx) else {
+            return verify_err!(loc, AtomicCmpxchgOpVerifyErr::OrderingAttrErr);
+        };
+        if matches!(
+            *failure,
+            AtomicOrderingAttr::Release | AtomicOrderingAttr::AcqRel
+        ) {
+            return verify_err!(loc, AtomicCmpxchgOpVerifyErr::InvalidFailureOrdering);
+        }
+        Ok(())
+    }
+}
+
+impl AtomicCmpxchgOp {
+    /// Create a new [AtomicCmpxchgOp].
+    pub fn new(
+        ctx: &mut Context,
+        ptr: Value,
+        cmp: Value,
+        new_val: Value,
+        success_ordering: AtomicOrderingAttr,
+        failure_ordering: AtomicOrderingAttr,
+        syncscope: SyncScopeAttr,
+    ) -> Self {
+        use pliron::r#type::Typed;
+        let val_ty = cmp.get_type(ctx);
+        let bool_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+        let res_ty =
+            StructType::get_unnamed(ctx, (vec![val_ty, bool_ty.into()], StructLayout::Unpacked))
+                .into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![ptr, cmp, new_val],
+            vec![],
+            0,
+        );
+        let op = AtomicCmpxchgOp { op };
+        op.set_attr_llvm_cas_success_ordering(ctx, success_ordering);
+        op.set_attr_llvm_cas_failure_ordering(ctx, failure_ordering);
+        op.set_syncscope(ctx, syncscope);
+        op
+    }
+}
+
+/// Equivalent to LLVM's `fence`: orders memory accesses. Has no operands or
+/// results.
+#[pliron_op(
+    name = "llvm.fence",
+    format = "attr($llvm_syncscope, $SyncScopeAttr, label($syncscope)) ` ` attr($llvm_fence_ordering, $AtomicOrderingAttr)",
+    interfaces = [NResultsInterface<0>, NOpdsInterface<0>, SyncScopeInterface],
+    attributes = (llvm_fence_ordering: AtomicOrderingAttr)
+)]
+pub struct FenceOp;
+
+#[derive(Error, Debug)]
+enum FenceOpVerifyErr {
+    #[error("Missing or incorrect type of attribute for fence ordering")]
+    OrderingAttrErr,
+    #[error("fence ordering cannot be monotonic")]
+    InvalidOrdering,
+}
+
+impl Verify for FenceOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Verifier::visitFenceInst.
+        let Some(ordering) = self.get_attr_llvm_fence_ordering(ctx) else {
+            return verify_err!(loc, FenceOpVerifyErr::OrderingAttrErr);
+        };
+        if matches!(*ordering, AtomicOrderingAttr::Monotonic) {
+            return verify_err!(loc, FenceOpVerifyErr::InvalidOrdering);
+        }
+        Ok(())
+    }
+}
+
+impl FenceOp {
+    /// Create a new [FenceOp].
+    pub fn new(ctx: &mut Context, ordering: AtomicOrderingAttr, syncscope: SyncScopeAttr) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = FenceOp { op };
+        op.set_attr_llvm_fence_ordering(ctx, ordering);
+        op.set_syncscope(ctx, syncscope);
+        op
+    }
+}
+
+/// Equivalent to LLVM's atomic `load`.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `ptr` | [PointerType] |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | the loaded value |
+#[pliron_op(
+    name = "llvm.atomic_load",
+    format = "$0 ` ` opt_attr($llvm_alignment, $AlignmentAttr, label($align), delimiters(`[`, `]`)) ` ` attr($llvm_syncscope, $SyncScopeAttr, label($syncscope)) ` ` attr($llvm_ld_ordering, $AtomicOrderingAttr) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        AlignableOpInterface,
+        SyncScopeInterface,
+    ],
+    operands = (ptr: PointerType),
+    attributes = (llvm_ld_ordering: AtomicOrderingAttr)
+)]
+pub struct AtomicLoadOp;
+
+#[derive(Error, Debug)]
+enum AtomicLoadOpVerifyErr {
+    #[error("Missing or incorrect type of attribute for atomic load ordering")]
+    OrderingAttrErr,
+    #[error("atomic load ordering cannot be release or acq_rel")]
+    InvalidOrdering,
+}
+
+impl Verify for AtomicLoadOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Verifier::visitLoadInst.
+        let Some(ordering) = self.get_attr_llvm_ld_ordering(ctx) else {
+            return verify_err!(loc, AtomicLoadOpVerifyErr::OrderingAttrErr);
+        };
+        if matches!(
+            *ordering,
+            AtomicOrderingAttr::Release | AtomicOrderingAttr::AcqRel
+        ) {
+            return verify_err!(loc, AtomicLoadOpVerifyErr::InvalidOrdering);
+        }
+        Ok(())
+    }
+}
+
+impl AtomicLoadOp {
+    /// Create a new [AtomicLoadOp].
+    pub fn new(
+        ctx: &mut Context,
+        ptr: Value,
+        res_ty: TypeHandle,
+        ordering: AtomicOrderingAttr,
+        syncscope: SyncScopeAttr,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![ptr],
+            vec![],
+            0,
+        );
+        let op = AtomicLoadOp { op };
+        op.set_attr_llvm_ld_ordering(ctx, ordering);
+        op.set_syncscope(ctx, syncscope);
+        op
+    }
+}
+
+/// Equivalent to LLVM's atomic `store`.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `val` | value to store |
+/// | `ptr` | [PointerType] |
+#[pliron_op(
+    name = "llvm.atomic_store",
+    format = "`*` $1 ` <- ` $0 ` ` opt_attr($llvm_alignment, $AlignmentAttr, label($align), delimiters(`[`, `]`)) ` ` attr($llvm_syncscope, $SyncScopeAttr, label($syncscope)) ` ` attr($llvm_st_ordering, $AtomicOrderingAttr)",
+    interfaces = [
+        NResultsInterface<0>,
+        AlignableOpInterface,
+        NOpdsInterface<2>,
+        SyncScopeInterface
+    ],
+    operands = (value, ptr: PointerType),
+    attributes = (llvm_st_ordering: AtomicOrderingAttr)
+)]
+pub struct AtomicStoreOp;
+
+#[derive(Error, Debug)]
+enum AtomicStoreOpVerifyErr {
+    #[error("Missing or incorrect type of attribute for atomic store ordering")]
+    OrderingAttrErr,
+    #[error("atomic store ordering cannot be acquire or acq_rel")]
+    InvalidOrdering,
+}
+
+impl Verify for AtomicStoreOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Verifier::visitStoreInst.
+        let Some(ordering) = self.get_attr_llvm_st_ordering(ctx) else {
+            return verify_err!(loc, AtomicStoreOpVerifyErr::OrderingAttrErr);
+        };
+        if matches!(
+            *ordering,
+            AtomicOrderingAttr::Acquire | AtomicOrderingAttr::AcqRel
+        ) {
+            return verify_err!(loc, AtomicStoreOpVerifyErr::InvalidOrdering);
+        }
+        Ok(())
+    }
+}
+
+impl AtomicStoreOp {
+    /// Create a new [AtomicStoreOp].
+    pub fn new(
+        ctx: &mut Context,
+        value: Value,
+        ptr: Value,
+        ordering: AtomicOrderingAttr,
+        syncscope: SyncScopeAttr,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![value, ptr],
+            vec![],
+            0,
+        );
+        let op = AtomicStoreOp { op };
+        op.set_attr_llvm_st_ordering(ctx, ordering);
+        op.set_syncscope(ctx, syncscope);
+        op
+    }
+}
+
+/// Equivalent to LLVM's inline assembly call.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `inputs` | input operands to the inline asm |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | the asm result (a void type when there is none) |
+#[pliron_op(
+    name = "llvm.inline_asm",
+    format = "attr($llvm_inline_asm_template, $StringAttr) `, ` attr($llvm_inline_asm_constraints, $StringAttr) ` side_effects = ` attr($llvm_inline_asm_side_effects, $BoolAttr) ` ` opt_attr($llvm_inline_asm_attrs, $LlvmAttributesAttr, label($attrs)) ` (` operands(CharSpace(`,`)) `) : ` type($0)",
+    interfaces = [OneResultInterface],
+    attributes = (
+        llvm_inline_asm_template: StringAttr,
+        llvm_inline_asm_constraints: StringAttr,
+        llvm_inline_asm_side_effects: BoolAttr,
+        llvm_inline_asm_attrs: LlvmAttributesAttr
+    )
+)]
+pub struct InlineAsmOp;
+
+#[derive(Error, Debug)]
+enum InlineAsmOpVerifyErr {
+    #[error("Missing or incorrect inline asm template attribute")]
+    Template,
+    #[error("Missing or incorrect inline asm constraints attribute")]
+    Constraints,
+    #[error("Missing or incorrect inline asm side-effects attribute")]
+    SideEffects,
+}
+
+impl Verify for InlineAsmOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        if self.get_attr_llvm_inline_asm_template(ctx).is_none() {
+            return verify_err!(loc, InlineAsmOpVerifyErr::Template);
+        }
+        if self.get_attr_llvm_inline_asm_constraints(ctx).is_none() {
+            return verify_err!(loc, InlineAsmOpVerifyErr::Constraints);
+        }
+        if self.get_attr_llvm_inline_asm_side_effects(ctx).is_none() {
+            return verify_err!(loc, InlineAsmOpVerifyErr::SideEffects);
+        }
+        Ok(())
+    }
+}
+
+impl InlineAsmOp {
+    /// Create a new [InlineAsmOp].
+    ///
+    /// Use a void result type for asm with no result value.
+    pub fn new(
+        ctx: &mut Context,
+        result_ty: TypeHandle,
+        inputs: Vec<Value>,
+        asm_template: &str,
+        constraints: &str,
+        side_effects: bool,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            inputs,
+            vec![],
+            0,
+        );
+        let op = InlineAsmOp { op };
+        op.set_attr_llvm_inline_asm_template(ctx, StringAttr::new(asm_template.to_string()));
+        op.set_attr_llvm_inline_asm_constraints(ctx, StringAttr::new(constraints.to_string()));
+        op.set_attr_llvm_inline_asm_side_effects(ctx, BoolAttr::new(side_effects));
+        op
+    }
+}
+
+/// Equivalent to LLVM's Store opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `callee_operands` | Optional function pointer followed by any number of parameters |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM type |
+#[pliron_op(
+    name = "llvm.call",
+    interfaces = [OneResultInterface],
+    attributes = (
+        llvm_call_callee: IdentifierAttr,
+        llvm_call_fastmath_flags: FastmathFlagsAttr,
+        llvm_call_attrs: LlvmAttributesAttr
+    )
+)]
+pub struct CallOp;
+
+impl CallOp {
+    /// Get a new [CallOp].
+    pub fn new(
+        ctx: &mut Context,
+        callee: CallOpCallable,
+        callee_ty: TypedHandle<FuncType>,
+        mut args: Vec<Value>,
+    ) -> Self {
+        let res_ty = callee_ty.deref(ctx).result_type();
+        let op = match callee {
+            CallOpCallable::Direct(cval) => {
+                let op = Operation::new(
+                    ctx,
+                    Self::get_concrete_op_info(),
+                    vec![res_ty],
+                    args,
+                    vec![],
+                    0,
+                );
+                let op = CallOp { op };
+                op.set_attr_llvm_call_callee(ctx, IdentifierAttr::new(cval));
+                op
+            }
+            CallOpCallable::Indirect(csym) => {
+                args.insert(0, csym);
+                let op = Operation::new(
+                    ctx,
+                    Self::get_concrete_op_info(),
+                    vec![res_ty],
+                    args,
+                    vec![],
+                    0,
+                );
+                CallOp { op }
+            }
+        };
+        op.set_callee_type(ctx, callee_ty.into());
+        op
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SymbolUserOpVerifyErr {
+    #[error("Symbol {0} not found")]
+    SymbolNotFound(String),
+    #[error("Function {0} should have been llvm.func type")]
+    NotLlvmFunc(String),
+    #[error("AddressOf Op can only refer to a function or a global variable")]
+    AddressOfInvalidReference,
+    #[error("Function call has incorrect type: {0}")]
+    FuncTypeErr(String),
+}
+
+#[op_interface_impl]
+impl SymbolUserOpInterface for CallOp {
+    fn verify_symbol_uses(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Result<()> {
+        match self.callee(ctx) {
+            CallOpCallable::Direct(callee_sym) => {
+                let Some(callee) = symbol_tables.lookup_symbol_in_nearest_table(
+                    ctx,
+                    self.get_operation(),
+                    &callee_sym,
+                ) else {
+                    return verify_err!(
+                        self.loc(ctx),
+                        SymbolUserOpVerifyErr::SymbolNotFound(callee_sym.to_string())
+                    );
+                };
+                let Some(func_op) = (&*callee as &dyn Op).downcast_ref::<FuncOp>() else {
+                    return verify_err!(
+                        self.loc(ctx),
+                        SymbolUserOpVerifyErr::NotLlvmFunc(callee_sym.to_string())
+                    );
+                };
+                let func_op_ty = func_op.get_type(ctx);
+
+                if func_op_ty.to_handle() != self.callee_type(ctx) {
+                    return verify_err!(
+                        self.loc(ctx),
+                        SymbolUserOpVerifyErr::FuncTypeErr(format!(
+                            "expected {}, got {}",
+                            func_op_ty.disp(ctx),
+                            self.callee_type(ctx).disp(ctx)
+                        ))
+                    );
+                }
+            }
+            CallOpCallable::Indirect(pointer) => {
+                use pliron::r#type::Typed;
+                if !pointer.get_type(ctx).deref(ctx).is::<PointerType>() {
+                    return verify_err!(
+                        self.loc(ctx),
+                        SymbolUserOpVerifyErr::FuncTypeErr("Callee must be a pointer".to_string())
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn used_symbols(&self, ctx: &Context) -> Vec<Identifier> {
+        match self.callee(ctx) {
+            CallOpCallable::Direct(identifier) => vec![identifier],
+            CallOpCallable::Indirect(_) => vec![],
+        }
+    }
+}
+
+#[op_interface_impl]
+impl CallOpInterface for CallOp {
+    fn callee(&self, ctx: &Context) -> CallOpCallable {
+        let op = self.op.deref(ctx);
+        if let Some(callee_sym) = self.get_attr_llvm_call_callee(ctx) {
+            CallOpCallable::Direct(callee_sym.clone().into())
+        } else {
+            assert!(
+                op.get_num_operands() > 0,
+                "Indirect call must have function pointer operand"
+            );
+            CallOpCallable::Indirect(op.get_operand(0))
+        }
+    }
+
+    fn arg_range(&self, ctx: &Context) -> Range<usize> {
+        // If this is an indirect call, the first operand is the callee value.
+        let skip = if matches!(self.callee(ctx), CallOpCallable::Direct(_)) {
+            0
+        } else {
+            1
+        };
+        skip..self.get_operation().deref(ctx).get_num_operands()
+    }
+}
+
+impl Printable for CallOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let callee = self.callee(ctx);
+        write!(
+            f,
+            "{} = {} ",
+            self.get_result(ctx).print(ctx, state),
+            self.get_opid()
+        )?;
+        match callee {
+            CallOpCallable::Direct(callee_sym) => {
+                write!(f, "@{callee_sym}")?;
+            }
+            CallOpCallable::Indirect(callee_val) => {
+                write!(f, "{}", callee_val.print(ctx, state))?;
+            }
+        }
+
+        if let Some(fmf) = self.get_attr_llvm_call_fastmath_flags(ctx)
+            && *fmf != FastmathFlagsAttr::default()
+        {
+            write!(f, " {}", fmf.print(ctx, state))?;
+        }
+
+        let args = self.args(ctx);
+        let ty = self.callee_type(ctx);
+        write!(
+            f,
+            " ({}) : {}",
+            list_with_sep(&args, pliron::printable::ListSeparator::CharSpace(','))
+                .print(ctx, state),
+            ty.print(ctx, state)
+        )?;
+        Ok(())
+    }
+}
+
+impl Parsable for CallOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        results: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        let direct_callee = combine::token('@')
+            .with(Identifier::parser(()))
+            .map(CallOpCallable::Direct);
+        let indirect_callee = ssa_opd_parser().map(CallOpCallable::Indirect);
+        let callee_parser = direct_callee.or(indirect_callee);
+        let fastmath_flags_parser = optional(FastmathFlagsAttr::parser(()));
+        let args_parser = delimited_list_parser('(', ')', ',', ssa_opd_parser());
+        let ty_parser = spaced(combine::token(':')).with(TypedHandle::<FuncType>::parser(()));
+
+        let mut final_parser = spaced(callee_parser)
+            .and(spaced(fastmath_flags_parser))
+            .and(spaced(args_parser))
+            .and(ty_parser)
+            .then(move |(((callee, fastmath_flags), args), ty)| {
+                let results = results.clone();
+                combine::parser(move |parsable_state: &mut StateStream<'a>| {
+                    let ctx = &mut parsable_state.state.ctx;
+                    let op = CallOp::new(ctx, callee.clone(), ty, args.clone());
+                    if let Some(fmf) = &fastmath_flags {
+                        op.set_attr_llvm_call_fastmath_flags(ctx, *fmf);
+                    }
+                    process_parsed_ssa_defs(parsable_state, &results, op.get_operation())?;
+                    Ok(OpObj::new(op)).into_parse_result()
+                })
+            });
+
+        final_parser.parse_stream(state_stream).into_result()
+    }
+}
+
+impl Verify for CallOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        // Check that the argument and result types match the callee type.
+        let callee_ty = &*self.callee_type(ctx).deref(ctx);
+        let Some(callee_ty) = callee_ty.downcast_ref::<FuncType>() else {
+            return verify_err!(
+                self.loc(ctx),
+                SymbolUserOpVerifyErr::FuncTypeErr("Callee is not a function".to_string())
+            );
+        };
+        // Check the function type against the arguments.
+        let args = self.args(ctx);
+        let expected_args = callee_ty.arg_types();
+        if !callee_ty.is_var_arg() && args.len() != expected_args.len() {
+            return verify_err!(
+                self.loc(ctx),
+                SymbolUserOpVerifyErr::FuncTypeErr("argument count mismatch.".to_string())
+            );
+        }
+        use pliron::r#type::Typed;
+        for (arg_idx, (arg, expected_arg)) in args.iter().zip(expected_args.iter()).enumerate() {
+            if arg.get_type(ctx) != *expected_arg {
+                return verify_err!(
+                    self.loc(ctx),
+                    SymbolUserOpVerifyErr::FuncTypeErr(format!(
+                        "argument {} type mismatch: expected {}, got {}",
+                        arg_idx,
+                        expected_arg.disp(ctx),
+                        arg.get_type(ctx).disp(ctx)
+                    ))
+                );
+            }
+        }
+
+        if callee_ty.result_type() != self.result_type(ctx) {
+            return verify_err!(
+                self.loc(ctx),
+                SymbolUserOpVerifyErr::FuncTypeErr(format!(
+                    "result type mismatch: expected {}, got {}",
+                    callee_ty.result_type().disp(ctx),
+                    self.result_type(ctx).disp(ctx)
+                ))
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Constant value operation for the LLVM dialect.
+/// Similar to MLIR's [llvm.mlir.constant](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirconstant-llvmconstantop).
+///
+/// The constant value is held as one of the following attributes:
+/// [IntegerAttr], [dyn FloatAttr](FloatAttr), [AggregateAttr](crate::attributes::AggregateAttr)
+/// [SplatAttr](crate::attributes::SplatAttr), [BytesAttr](crate::attributes::BytesAttr),
+/// [SymbolAddrAttr](crate::attributes::SymbolAddrAttr).
+///
+/// ### Results:
+///
+/// | result | description |
+/// |-----|-------|
+/// | `result` | the type of the value attribute |
+#[pliron_op(
+    name = "llvm.constant",
+    format = "`<` $llvm_constant_value `>` ` : ` type($0)",
+    interfaces = [NOpdsInterface<0>, OneResultInterface],
+    attributes = (llvm_constant_value),
+)]
+pub struct ConstantOp;
+
+impl ConstantOp {
+    /// Get the constant value that this Op defines.
+    /// The [Ref] is a borrow of the containing [Operation] object.
+    ///
+    /// Use [pliron::dyn_clone::clone_box] to clone the value if required.
+    pub fn get_value<'a>(&self, ctx: &'a Context) -> Ref<'a, dyn TypedAttrInterface> {
+        Ref::map(
+            self.get_attr_llvm_constant_value(ctx)
+                .expect("ConstantOp must have a value attribute"),
+            |attr| {
+                attr_cast::<dyn TypedAttrInterface>(&**attr)
+                    .expect("ConstantOp's value attribute must impl TypedAttrInterface")
+            },
+        )
+    }
+
+    /// Create a new [ConstantOp] holding `value`.
+    pub fn new(ctx: &mut Context, value: Box<dyn TypedAttrInterface>) -> Self {
+        let result_type = value.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![],
+            vec![],
+            0,
+        );
+        let op = ConstantOp { op };
+        op.set_attr_llvm_constant_value(ctx, value);
+        op
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ConstantOpVerifyErr {
+    #[error("ConstantOp does not have a value attribute")]
+    MissingValue,
+    #[error("{0} not allowed on a ConstantOp")]
+    InvalidValue(String),
+    #[error("The value attribute is of type {0}, but the constant is of type {1}")]
+    ResultTypeMismatch(String, String),
+}
+
+impl Verify for ConstantOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        let result_type = self.result_type(ctx);
+
+        let Some(value) = self.get_attr_llvm_constant_value(ctx) else {
+            return verify_err!(loc, ConstantOpVerifyErr::MissingValue);
+        };
+        let value: &dyn Attribute = &**value;
+
+        if !(value.is::<IntegerAttr>()
+            || attr_impls::<dyn FloatAttr>(value)
+            || value.is::<AggregateAttr>()
+            || value.is::<SplatAttr>()
+            || value.is::<BytesAttr>()
+            || value.is::<SymbolAddrAttr>())
+        {
+            verify_err!(
+                loc.clone(),
+                ConstantOpVerifyErr::InvalidValue(value.get_attr_id().to_string())
+            )?;
+        }
+
+        let value = attr_cast::<dyn TypedAttrInterface>(value)
+            .expect("All attributes we allow above implement TypedAttrInterface");
+
+        if value.get_type(ctx) != result_type {
+            verify_err!(
+                loc,
+                ConstantOpVerifyErr::ResultTypeMismatch(
+                    value.get_type(ctx).disp(ctx).to_string(),
+                    result_type.disp(ctx).to_string()
+                )
+            )?
+        }
+        Ok(())
+    }
+}
+
+/// Undefined value of a type.
+/// See MLIR's [llvm.mlir.undef](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirundef-llvmundefop).
+///
+/// ### Results:
+/// | result | description |
+/// |-----|-------|
+/// | `result` | any type |
+#[pliron_op(
+    name = "llvm.undef",
+    format = "`: ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<0>],
+    verifier = "succ"
+)]
+pub struct UndefOp;
+
+impl UndefOp {
+    /// Create a new [UndefOp].
+    pub fn new(ctx: &mut Context, result_ty: TypeHandle) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        UndefOp { op }
+    }
+}
+
+/// Poison value of a type.
+/// See MLIR's [llvm.mlir.poison](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirpoison-llvmpoisonop).
+///
+/// ### Results:
+/// | result | description |
+/// |-----|-------|
+/// | `result` | any type |
+#[pliron_op(
+    name = "llvm.poison",
+    format = "`: ` type($0)",
+    interfaces = [OneResultInterface],
+    verifier = "succ"
+)]
+pub struct PoisonOp;
+
+impl PoisonOp {
+    /// Create a new [PoisonOp].
+    pub fn new(ctx: &mut Context, result_ty: TypeHandle) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        PoisonOp { op }
+    }
+}
+
+/// Freeze value of a type.
+/// See MLIR's [llvm.mlir.freeze](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmfreeze-llvmfreezeop).
+///
+/// ### Results:
+/// | result | description |
+/// |-----|-------|
+/// | `result` | any type |
+///
+/// ### Operands:
+/// | operand | description |
+/// |-----|-------|
+/// | `value` | any type |
+#[pliron_op(
+    name = "llvm.freeze",
+    format = "$0 ` : ` type($0)",
+    interfaces = [OneOpdInterface, OneResultInterface],
+    verifier = "succ"
+)]
+pub struct FreezeOp;
+
+impl FreezeOp {
+    /// Create a new [FreezeOp].
+    pub fn new(ctx: &mut Context, value: Value) -> Self {
+        use pliron::r#type::Typed;
+        let result_ty = value.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            vec![value],
+            vec![],
+            0,
+        );
+        FreezeOp { op }
+    }
+}
+
+/// Same as MLIR's LLVM dialect [ZeroOp](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirzero-llvmzeroop)
+/// It creates a zero-initialized value of the specified LLVM IR dialect type.
+/// Results:
+///
+/// | result | description |
+/// |-----|-------|
+/// | `result` | any type |
+#[pliron_op(
+    name = "llvm.zero",
+    format = "`: ` type($0)",
+    interfaces = [NOpdsInterface<0>, OneResultInterface],
+    verifier = "succ"
+)]
+pub struct ZeroOp;
+
+impl ZeroOp {
+    /// Create a new [ZeroOp].
+    pub fn new(ctx: &mut Context, result_ty: TypeHandle) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        ZeroOp { op }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum GlobalOpVerifyErr {
+    #[error("GlobalOp must have a type")]
+    MissingType,
+    #[error("GlobalOp cannot have both an initializer value and initializer region")]
+    InvalidInitializer,
+    #[error("The initializer is of type {0}, but the global is of type {1}")]
+    InitializerTypeMismatch(String, String),
+    #[error("GlobalOp initializer region does not terminate with a return with value")]
+    InitializerRegionBadReturn,
+}
+
+/// Same as MLIR's LLVM dialect [GlobalOp](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirglobal-llvmglobalop)
+/// It creates a global variable of the specified LLVM IR dialect type.
+/// An initializer can be specified either as an attribute or in the
+/// operation's initializer region, ending with a return.
+#[pliron_op(
+    name = "llvm.global",
+    interfaces = [
+        IsolatedFromAboveInterface,
+        NOpdsInterface<0>,
+        NResultsInterface<0>,
+        SymbolOpInterface,
+        SingleBlockRegionInterface,
+        LlvmSymbolName,
+        AlignableOpInterface
+    ],
+    attributes = (
+        llvm_global_type: TypeAttr,
+        llvm_global_initializer,
+        llvm_global_linkage: LinkageAttr,
+        llvm_global_addrspace: AddressSpaceAttr,
+        llvm_global_constant: BoolAttr
+    )
+)]
+pub struct GlobalOp;
+
+impl GlobalOp {
+    /// Create a new [GlobalOp]. An initializer region can be added later if needed.
+    pub fn new(ctx: &mut Context, name: Identifier, ty: TypeHandle) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = GlobalOp { op };
+        op.set_symbol_name(ctx, name);
+        op.set_attr_llvm_global_type(ctx, TypeAttr::new(ty));
+        op
+    }
+
+    /// Get the address space of this global (0 if unset).
+    pub fn address_space(&self, ctx: &Context) -> u32 {
+        self.get_attr_llvm_global_addrspace(ctx)
+            .map_or(0, |attr| attr.0)
+    }
+
+    /// Set the address space of this global.
+    pub fn set_address_space(&self, ctx: &mut Context, addr_space: u32) {
+        self.set_attr_llvm_global_addrspace(ctx, AddressSpaceAttr(addr_space));
+    }
+
+    /// Whether this global is constant.
+    pub fn is_constant(&self, ctx: &Context) -> bool {
+        self.get_attr_llvm_global_constant(ctx)
+            .is_some_and(|attr| attr.clone().into())
+    }
+
+    /// Set whether this global is constant.
+    pub fn set_constant(&self, ctx: &mut Context, is_constant: bool) {
+        self.set_attr_llvm_global_constant(ctx, is_constant.into());
+    }
+}
+
+impl pliron::r#type::Typed for GlobalOp {
+    fn get_type(&self, ctx: &Context) -> TypeHandle {
+        pliron::r#type::Typed::get_type(
+            &*self
+                .get_attr_llvm_global_type(ctx)
+                .expect("GlobalOp missing or has incorrect type attribute"),
+            ctx,
+        )
+    }
+}
+
+impl GlobalOp {
+    /// Get the initializer value of this global variable.
+    pub fn get_initializer_value(&self, ctx: &Context) -> Option<AttrObj> {
+        self.get_attr_llvm_global_initializer(ctx)
+            .map(|v| v.clone())
+    }
+
+    /// Get the initializer region's block of this global variable.
+    /// This is a block that ends with a return operation.
+    /// The return operation must have the same type as the global variable.
+    pub fn get_initializer_block(&self, ctx: &Context) -> Option<Ptr<BasicBlock>> {
+        (self.op.deref(ctx).num_regions() > 0).then(|| self.get_body(ctx, 0))
+    }
+
+    /// Get the initializer region of this global variable.
+    pub fn get_initializer_region(&self, ctx: &Context) -> Option<Ptr<Region>> {
+        (self.op.deref(ctx).num_regions() > 0)
+            .then(|| self.get_operation().deref(ctx).get_region(0))
+    }
+
+    /// Set a simple initializer value for this global variable.
+    pub fn set_initializer_value(&self, ctx: &Context, value: AttrObj) {
+        assert!(
+            self.get_initializer_region(ctx).is_none(),
+            "Attempt to add an initializer value when there already is an initializer region"
+        );
+        self.set_attr_llvm_global_initializer(ctx, value);
+    }
+
+    /// Add an initializer region (with an entry block) for this global variable.
+    /// There shouldn't already be one.
+    pub fn add_initializer_region(&self, ctx: &mut Context) -> Ptr<Region> {
+        assert!(
+            self.get_initializer_value(ctx).is_none(),
+            "Attempt to create an initializer region when there already is an initializer value"
+        );
+        let region = Operation::add_region(self.get_operation(), ctx);
+        let entry = BasicBlock::new(ctx, Some(ident!("entry")), vec![]);
+        entry.insert_at_front(region, ctx);
+
+        region
+    }
+}
+
+impl IsDeclaration for GlobalOp {
+    fn is_declaration(&self, ctx: &Context) -> bool {
+        self.get_initializer_value(ctx).is_none() && self.get_initializer_region(ctx).is_none()
+    }
+}
+
+impl Verify for GlobalOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+
+        let loc = self.loc(ctx);
+
+        // The name must be set. That is checked by the SymbolOpInterface.
+        // So we check that other attributes are set. Start with type.
+        if self.get_attr_llvm_global_type(ctx).is_none() {
+            return verify_err!(loc, GlobalOpVerifyErr::MissingType);
+        }
+
+        // Check that there is at most one initializer
+        if self.get_initializer_value(ctx).is_some() && self.get_initializer_region(ctx).is_some() {
+            return verify_err!(loc, GlobalOpVerifyErr::InvalidInitializer);
+        }
+
+        // The initializer, in whichever form it is specified, must be of the global's type.
+        let init_ty = if let Some(init) = self.get_initializer_value(ctx) {
+            attr_cast::<dyn TypedAttrInterface>(&*init).map(|typed| typed.get_type(ctx))
+        } else if let Some(init_block) = self.get_initializer_block(ctx) {
+            // An initializer region must end with a return of the global's value.
+            let Some(retval) = init_block
+                .deref(ctx)
+                .get_terminator(ctx)
+                .and_then(|term| Operation::get_op::<ReturnOp>(term, ctx))
+                .and_then(|ret| ret.retval(ctx))
+            else {
+                return verify_err!(loc, GlobalOpVerifyErr::InitializerRegionBadReturn);
+            };
+            Some(retval.get_type(ctx))
+        } else {
+            None
+        };
+        let global_ty = self.get_type(ctx);
+        if let Some(init_ty) = init_ty
+            && init_ty != global_ty
+        {
+            return verify_err!(
+                loc,
+                GlobalOpVerifyErr::InitializerTypeMismatch(
+                    init_ty.disp(ctx).to_string(),
+                    global_ty.disp(ctx).to_string()
+                )
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl Printable for GlobalOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(
+            f,
+            "{} @{} : {}",
+            self.get_opid(),
+            self.get_symbol_name(ctx),
+            <Self as pliron::r#type::Typed>::get_type(self, ctx).print(ctx, state)
+        )?;
+
+        // Print attributes except for type, initializer and symbol name.
+        let mut attributes_to_print_separately =
+            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+        attributes_to_print_separately.0.retain(|key, _| {
+            key != &ATTR_KEY_LLVM_GLOBAL_TYPE
+                && key != &ATTR_KEY_SYM_NAME
+                && key != &ATTR_KEY_LLVM_GLOBAL_INITIALIZER
+        });
+        {
+            let _indent = state.indent();
+            write!(
+                f,
+                "{}{}",
+                indented_nl(state),
+                attributes_to_print_separately.print(ctx, state)
+            )?;
+        }
+
+        if let Some(init_value) = self.get_initializer_value(ctx) {
+            if attr_should_outline(&*init_value, ctx) {
+                write!(f, " = {OUTLINED_ATTR_MARKER}")?;
+            } else {
+                write!(f, " = {}", init_value.print(ctx, state))?;
+            }
+        }
+
+        if let Some(init_region) = self.get_initializer_region(ctx) {
+            write!(f, " = {}", init_region.print(ctx, state))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Parsable for GlobalOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        results: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        let loc = state_stream.loc();
+        if !results.is_empty() {
+            input_err!(loc, "GlobalOp must cannot have results")?;
+        }
+        let name_parser = combine::token('@').with(Identifier::parser(()));
+        let type_parser = type_parser();
+        let attr_dict_parser = AttributeDict::parser(());
+
+        let mut parser = name_parser
+            .skip(spaced(combine::token(':')))
+            .and(type_parser)
+            .and(spaced(attr_dict_parser));
+
+        let (((name, ty), attr_dict), _) = parser.parse_stream(state_stream).into_result()?;
+        let op = GlobalOp::new(state_stream.state.ctx, name, ty);
+        op.get_operation()
+            .deref_mut(state_stream.state.ctx)
+            .attributes
+            .0
+            .extend(attr_dict.0);
+
+        enum Initializer {
+            Value(Option<AttrObj>),
+            Region(Ptr<Region>),
+        }
+        // Parse optional initializer value or region.
+        let initializer_parser = combine::token('=').skip(spaces()).with(
+            outlined_marker_or(attr_parser())
+                .map(Initializer::Value)
+                .or(Region::parser(op.get_operation()).map(Initializer::Region)),
+        );
+
+        let initializer = spaces()
+            .with(combine::optional(initializer_parser))
+            .parse_stream(state_stream)
+            .into_result()?;
+
+        if let Some(initializer) = initializer.0 {
+            match initializer {
+                Initializer::Value(Some(v)) => op.set_initializer_value(state_stream.state.ctx, v),
+                Initializer::Value(None) => {
+                    // The value is outlined; it is restored from the outline entry.
+                }
+                Initializer::Region(_r) => {
+                    // Nothing to do since the region is already added to the operation during parsing.
+                }
+            }
+        }
+
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+/// Same as MLIR's LLVM dialect [AddressOfOp](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmliraddressof-llvmaddressofop).
+/// Creates an SSA value containing a pointer to a global value (function, variable etc).
+///
+/// ### Results:
+///
+/// | result | description |
+/// |-----|-------|
+/// | `result` | LLVM pointer type |
+///
+#[pliron_op(
+    name = "llvm.addressof",
+    format = "`@` attr($llvm_global_name, $IdentifierAttr) ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<0>],
+    results = (_: PointerType),
+    attributes = (llvm_global_name: IdentifierAttr),
+)]
+pub struct AddressOfOp;
+
+#[derive(Error, Debug)]
+enum AddressOfOpVerifyErr {
+    #[error("AddressOfOp is missing its `llvm_global_name` attribute")]
+    MissingGlobalName,
+}
+
+impl Verify for AddressOfOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        if self.get_attr_llvm_global_name(ctx).is_none() {
+            verify_err!(self.loc(ctx), AddressOfOpVerifyErr::MissingGlobalName)?
+        }
+        Ok(())
+    }
+}
+
+impl AddressOfOp {
+    /// Create a new [AddressOfOp].
+    pub fn new(ctx: &mut Context, global_name: Identifier, address_space: u32) -> Self {
+        let result_type = PointerType::get(ctx, address_space).into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![],
+            vec![],
+            0,
+        );
+        let op = AddressOfOp { op };
+        op.set_attr_llvm_global_name(ctx, IdentifierAttr::new(global_name));
+        op
+    }
+
+    /// Get the global name that this refers to.
+    pub fn get_global_name(&self, ctx: &Context) -> Identifier {
+        self.get_attr_llvm_global_name(ctx)
+            .expect("AddressOfOp missing or has incorrect llvm_global_name attribute type")
+            .clone()
+            .into()
+    }
+
+    /// If this operation referes to a global, get it.
+    pub fn get_global(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Option<GlobalOp> {
+        let global_name = self.get_global_name(ctx);
+        symbol_tables
+            .lookup_symbol_in_nearest_table(ctx, self.get_operation(), &global_name)
+            .and_then(|sym_op| {
+                (sym_op as Box<dyn Op>)
+                    .downcast::<GlobalOp>()
+                    .map(|op| *op)
+                    .ok()
+            })
+    }
+
+    /// If this operation refers to a function, get it.
+    pub fn get_function(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Option<FuncOp> {
+        let global_name = self.get_global_name(ctx);
+        symbol_tables
+            .lookup_symbol_in_nearest_table(ctx, self.get_operation(), &global_name)
+            .and_then(|sym_op| {
+                (sym_op as Box<dyn Op>)
+                    .downcast::<FuncOp>()
+                    .map(|op| *op)
+                    .ok()
+            })
+    }
+}
+
+#[op_interface_impl]
+impl SymbolUserOpInterface for AddressOfOp {
+    fn used_symbols(&self, ctx: &Context) -> Vec<Identifier> {
+        vec![self.get_global_name(ctx)]
+    }
+
+    fn verify_symbol_uses(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Result<()> {
+        let loc = self.loc(ctx);
+        let global_name = self.get_global_name(ctx);
+        let Some(symbol) =
+            symbol_tables.lookup_symbol_in_nearest_table(ctx, self.get_operation(), &global_name)
+        else {
+            return verify_err!(
+                loc,
+                SymbolUserOpVerifyErr::SymbolNotFound(global_name.to_string())
+            );
+        };
+
+        // Symbol can only be a FuncOp or a GlobalOp
+        let is_global = (&*symbol as &dyn Op).is::<GlobalOp>();
+        let is_func = (&*symbol as &dyn Op).is::<FuncOp>();
+        if !is_global && !is_func {
+            return verify_err!(loc, SymbolUserOpVerifyErr::AddressOfInvalidReference);
+        }
+
+        Ok(())
+    }
+}
+
+/// Similar to MLIR's LLVM dialect `llvm.blocktag`.
+/// Marks a basic block with a tag so `llvm.blockaddress` can refer to it.
+/// A given function should have at most one llvm.blocktag operation with a given tag.
+#[pliron_op(
+    name = "llvm.blocktag",
+    format = "`<id = ` attr($llvm_block_tag_id, $IntegerAttr) `>`",
+    interfaces = [NResultsInterface<0>, NOpdsInterface<0>],
+    attributes = (llvm_block_tag_id: IntegerAttr),
+)]
+pub struct BlockTagOp;
+
+#[derive(Error, Debug)]
+enum BlockAddressTagVerifyErr {
+    #[error("Block address tag attribute missing")]
+    MissingTagAttribute,
+    #[error("Block address function name attribute missing")]
+    MissingFunctionNameAttribute,
+    #[error("Block address tag = {0} not found in function {1}")]
+    BlockAddressTagNotFound(u64, String),
+}
+
+impl Verify for BlockTagOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        if self.get_attr_llvm_block_tag_id(ctx).is_none() {
+            return verify_err!(self.loc(ctx), BlockAddressTagVerifyErr::MissingTagAttribute);
+        }
+        Ok(())
+    }
+}
+
+impl BlockTagOp {
+    pub fn new(ctx: &mut Context, tag: u64) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = Self { op };
+        let tag_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+        op.set_attr_llvm_block_tag_id(
+            ctx,
+            IntegerAttr::new(tag_ty, APInt::from_u64(tag, NonZero::new(64).unwrap())),
+        );
+        op
+    }
+
+    pub fn get_tag_id(&self, ctx: &Context) -> u64 {
+        self.get_attr_llvm_block_tag_id(ctx)
+            .expect("BlockTagOp missing or has incorrect tag attribute type")
+            .value()
+            .to_u64()
+    }
+}
+
+/// Similar to MLIR's LLVM dialect `llvm.blockaddress`.
+/// Creates an SSA value containing the address of a tagged block in a function.
+#[pliron_op(
+    name = "llvm.blockaddress",
+    format = "`<function = @` attr($llvm_block_address_function, $IdentifierAttr) `, tag = ` attr($llvm_block_address_tag, $IntegerAttr) `> : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<0>],
+    results = (_: PointerType),
+    attributes = (llvm_block_address_function: IdentifierAttr, llvm_block_address_tag: IntegerAttr),
+)]
+pub struct BlockAddressOp;
+
+impl Verify for BlockAddressOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        if self.get_attr_llvm_block_address_function(ctx).is_none() {
+            return verify_err!(
+                self.loc(ctx),
+                BlockAddressTagVerifyErr::MissingFunctionNameAttribute
+            );
+        }
+        if self.get_attr_llvm_block_address_tag(ctx).is_none() {
+            return verify_err!(self.loc(ctx), BlockAddressTagVerifyErr::MissingTagAttribute);
+        }
+        Ok(())
+    }
+}
+
+impl BlockAddressOp {
+    /// Create a new [BlockAddressOp] referring to a specific block (function_name, tag).
+    pub fn new(ctx: &mut Context, function_name: Identifier, tag: u64, address_space: u32) -> Self {
+        let result_type = PointerType::get(ctx, address_space).into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![],
+            vec![],
+            0,
+        );
+        let op = Self { op };
+        let tag_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+        op.set_attr_llvm_block_address_function(ctx, IdentifierAttr::new(function_name));
+        op.set_attr_llvm_block_address_tag(
+            ctx,
+            IntegerAttr::new(tag_ty, APInt::from_u64(tag, NonZero::new(64).unwrap())),
+        );
+        op
+    }
+
+    /// Get the function name of the block that this address refers to.
+    pub fn get_function_name(&self, ctx: &Context) -> Identifier {
+        self.get_attr_llvm_block_address_function(ctx)
+            .expect("BlockAddressOp missing or has incorrect function_name attribute type")
+            .clone()
+            .into()
+    }
+
+    /// Get the tag of the block that this address refers to.
+    pub fn get_tag_id(&self, ctx: &Context) -> u64 {
+        self.get_attr_llvm_block_address_tag(ctx)
+            .expect("BlockAddressOp missing or has incorrect tag attribute type")
+            .value()
+            .to_u64()
+    }
+
+    /// Get the [BlockTagOp] that this refers to.
+    /// For a well-formed program, this should always return `Some(BlockTagOp)`.
+    pub fn get_block_tag_op(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Option<BlockTagOp> {
+        let function_name = self.get_function_name(ctx);
+        let tag_id = self.get_tag_id(ctx);
+        let symbol = symbol_tables.lookup_symbol_in_nearest_table(
+            ctx,
+            self.get_operation(),
+            &function_name,
+        )?;
+
+        let func_op = symbol.as_any().downcast_ref::<FuncOp>()?;
+
+        // Search the function's blocks for a `BlockTagOp` with the same tag.
+        walkers::interruptible::immutable::walk_op(
+            ctx,
+            &mut tag_id.clone(),
+            &WALKCONFIG_PREORDER_FORWARD,
+            func_op.get_operation(),
+            |ctx, tag_id, irnode| {
+                let IRNode::Operation(op) = irnode else {
+                    return walkers::interruptible::walk_advance();
+                };
+                if let Some(block_tag_op) = Operation::get_op::<BlockTagOp>(op, ctx)
+                    && block_tag_op.get_tag_id(ctx) == *tag_id
+                {
+                    return walkers::interruptible::walk_break(block_tag_op);
+                }
+                walkers::interruptible::walk_advance()
+            },
+        )
+        .break_value()
+    }
+}
+
+#[op_interface_impl]
+impl SymbolUserOpInterface for BlockAddressOp {
+    fn used_symbols(&self, ctx: &Context) -> Vec<Identifier> {
+        vec![self.get_function_name(ctx)]
+    }
+
+    fn verify_symbol_uses(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Result<()> {
+        let loc = self.loc(ctx);
+        let function_name = self.get_function_name(ctx);
+        let tag = self.get_tag_id(ctx);
+        if self.get_block_tag_op(ctx, symbol_tables).is_none() {
+            return verify_err!(
+                loc,
+                BlockAddressTagVerifyErr::BlockAddressTagNotFound(tag, function_name.to_string())
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug)]
+enum IntCastVerifyErr {
+    #[error("Result type must be larger than operand type")]
+    SmallerThanOperand,
+    #[error("Result type must be smaller than operand type")]
+    LargerThanOperand,
+    #[error("Result type must be equal to operand type")]
+    NotEqualToOperand,
+    #[error("Operand and result must both be scalars or vectors with matching shape")]
+    MismatchedVectorShape,
+}
+
+/// Ensure that the integer cast operation is valid.
+/// This checks that the result type is an integer and that the operand type is also an integer.
+/// It also checks that the result type is larger or smaller than the operand type (`cmp` operand).
+fn integer_cast_verify(op: &dyn Op, ctx: &Context, cmp: ICmpPredicateAttr) -> Result<()> {
+    let loc = op.loc(ctx);
+
+    let opd_iface = op_cast::<dyn ScalarOrVectorOpd<IntegerType, 0>>(op)
+        .expect("Op must impl ScalarOrVectorOpd<IntegerType, 0>");
+    let res_iface = op_cast::<dyn ScalarOrVectorRes<IntegerType, 0>>(op)
+        .expect("Op must impl ScalarOrVectorRes<IntegerType, 0>");
+
+    if opd_iface.vector_shape(ctx) != res_iface.vector_shape(ctx) {
+        return verify_err!(loc, IntCastVerifyErr::MismatchedVectorShape);
+    }
+
+    let opd_ty = opd_iface.scalar_or_vector_elem_ty(ctx);
+    let opd_ty = opd_ty.deref(ctx);
+    let res_ty = res_iface.scalar_or_vector_elem_ty(ctx);
+    let res_ty = res_ty.deref(ctx);
+
+    match cmp {
+        ICmpPredicateAttr::SLT | ICmpPredicateAttr::ULT => {
+            if res_ty.width() >= opd_ty.width() {
+                return verify_err!(loc, IntCastVerifyErr::LargerThanOperand);
+            }
+        }
+        ICmpPredicateAttr::SGT | ICmpPredicateAttr::UGT => {
+            if res_ty.width() <= opd_ty.width() {
+                return verify_err!(loc, IntCastVerifyErr::SmallerThanOperand);
+            }
+        }
+        ICmpPredicateAttr::SLE | ICmpPredicateAttr::ULE => {
+            if res_ty.width() > opd_ty.width() {
+                return verify_err!(loc, IntCastVerifyErr::LargerThanOperand);
+            }
+        }
+        ICmpPredicateAttr::SGE | ICmpPredicateAttr::UGE => {
+            if res_ty.width() < opd_ty.width() {
+                return verify_err!(loc, IntCastVerifyErr::SmallerThanOperand);
+            }
+        }
+        ICmpPredicateAttr::EQ | ICmpPredicateAttr::NE => {
+            if res_ty.width() != opd_ty.width() {
+                return verify_err!(loc, IntCastVerifyErr::NotEqualToOperand);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Equivalent to LLVM's sext opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Signless integer |
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Signless integer |
+#[pliron_op(
+    name = "llvm.sext",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        ScalarOrVectorOpd<IntegerType, 0>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ]
+)]
+pub struct SExtOp;
+impl Verify for SExtOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        integer_cast_verify(self, ctx, ICmpPredicateAttr::SGT)
+    }
+}
+
+/// Equivalent to LLVM's zext opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Signless integer |
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Signless integer |
+#[pliron_op(
+    name = "llvm.zext",
+    format = "`<nneg=` attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> ` $0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        NNegFlag,
+        CastOpWithNNegInterface,
+        ScalarOrVectorOpd<IntegerType, 0>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ]
+)]
+pub struct ZExtOp;
+
+impl Verify for ZExtOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        integer_cast_verify(self, ctx, ICmpPredicateAttr::UGT)
+    }
+}
+
+/// Equivalent to LLVM's FPExt opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Floating-point number |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Floating-point number |
+#[pliron_op(
+    name = "llvm.fpext",
+    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        FastMathFlags,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+        ScalarOrVectorResImpls<dyn FloatTypeInterface, 0>,
+    ]
+)]
+pub struct FPExtOp;
+
+impl Verify for FPExtOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let opd_ty = ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::scalar_or_vector_elem_ty(
+            self, ctx,
+        );
+        let opd_float_ty = opd_ty.deref(ctx);
+
+        let res_ty = ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::scalar_or_vector_elem_ty(
+            self, ctx,
+        );
+        let res_float_ty = res_ty.deref(ctx);
+
+        let opd_shape =
+            ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        let res_shape =
+            ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+
+        let opd_size = opd_float_ty.get_semantics().bits;
+        let res_size = res_float_ty.get_semantics().bits;
+        if res_size <= opd_size {
+            return verify_err!(
+                self.loc(ctx),
+                FloatCastVerifyErr::ResultTypeSmallerThanOperand
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum FloatCastVerifyErr {
+    #[error("Incorrect operand type")]
+    OperandTypeErr,
+    #[error("Incorrect result type")]
+    ResultTypeErr,
+    #[error("Operand and result must both be scalars or vectors with matching shape")]
+    MismatchedVectorShape,
+    #[error("Result type must be bigger than the operand type")]
+    ResultTypeSmallerThanOperand,
+    #[error("Operand type must be bigger than the result type")]
+    OperandTypeSmallerThanResult,
+}
+
+/// Equivalent to LLVM's trunc opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Signless integer |
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Signless integer |
+#[pliron_op(
+    name = "llvm.trunc",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        ScalarOrVectorOpd<IntegerType, 0>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ]
+)]
+pub struct TruncOp;
+
+impl Verify for TruncOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        integer_cast_verify(self, ctx, ICmpPredicateAttr::ULT)
+    }
+}
+
+/// Equivalent to LLVM's FPTrunc opcode.
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | float or vector of float |
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | float or vector of float |
+#[pliron_op(
+    name = "llvm.fptrunc",
+    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        FastMathFlags,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+        ScalarOrVectorResImpls<dyn FloatTypeInterface, 0>,
+    ]
+)]
+pub struct FPTruncOp;
+
+impl Verify for FPTruncOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let opd_ty = ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::scalar_or_vector_elem_ty(
+            self, ctx,
+        );
+        let opd_float_ty = opd_ty.deref(ctx);
+
+        let res_ty = ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::scalar_or_vector_elem_ty(
+            self, ctx,
+        );
+        let res_float_ty = res_ty.deref(ctx);
+
+        let opd_shape =
+            ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        let res_shape =
+            ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+
+        let opd_size = opd_float_ty.get_semantics().bits;
+        let res_size = res_float_ty.get_semantics().bits;
+        if opd_size <= res_size {
+            return verify_err!(
+                self.loc(ctx),
+                FloatCastVerifyErr::OperandTypeSmallerThanResult
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's FPToSI opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Floating-point number |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Signed integer |
+#[pliron_op(
+    name = "llvm.fptosi",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ]
+)]
+pub struct FPToSIOp;
+
+impl Verify for FPToSIOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let res_int_ty = ScalarOrVectorRes::<IntegerType, 0>::scalar_or_vector_elem_ty(self, ctx);
+        if !res_int_ty.deref(ctx).is_signless() {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::ResultTypeErr);
+        }
+        let opd_shape =
+            ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        let res_shape = ScalarOrVectorRes::<IntegerType, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's FPToUI opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Floating-point number |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Unsigned integer |
+#[pliron_op(
+    name = "llvm.fptoui",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+        ScalarOrVectorRes<IntegerType, 0>,
+    ]
+)]
+pub struct FPToUIOp;
+
+impl Verify for FPToUIOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let res_int_ty = ScalarOrVectorRes::<IntegerType, 0>::scalar_or_vector_elem_ty(self, ctx);
+        if !res_int_ty.deref(ctx).is_signless() {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::ResultTypeErr);
+        }
+        let opd_shape =
+            ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        let res_shape = ScalarOrVectorRes::<IntegerType, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's SIToFP opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Signed integer |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Floating-point number |
+#[pliron_op(
+    name = "llvm.sitofp",
+    format = "$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        ScalarOrVectorOpd<IntegerType, 0>,
+        ScalarOrVectorResImpls<dyn FloatTypeInterface, 0>,
+    ]
+)]
+pub struct SIToFPOp;
+
+impl Verify for SIToFPOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let opd_int_ty = ScalarOrVectorOpd::<IntegerType, 0>::scalar_or_vector_elem_ty(self, ctx);
+        if !opd_int_ty.deref(ctx).is_signless() {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::OperandTypeErr);
+        }
+        let opd_shape = ScalarOrVectorOpd::<IntegerType, 0>::vector_shape(self, ctx);
+        let res_shape =
+            ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's UIToFP opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | Unsigned integer |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | Floating-point number |
+#[pliron_op(
+    name = "llvm.uitofp",
+    format = "`<nneg=` attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> `$0 ` to ` type($0)",
+    interfaces = [
+        CastOpInterface,
+        OneResultInterface,
+        OneOpdInterface,
+        CastOpWithNNegInterface,
+        NNegFlag,
+        ScalarOrVectorOpd<IntegerType, 0>,
+        ScalarOrVectorResImpls<dyn FloatTypeInterface, 0>,
+    ]
+)]
+pub struct UIToFPOp;
+
+impl Verify for UIToFPOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let opd_int_ty = ScalarOrVectorOpd::<IntegerType, 0>::scalar_or_vector_elem_ty(self, ctx);
+        if !opd_int_ty.deref(ctx).is_signless() {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::OperandTypeErr);
+        }
+        let opd_shape = ScalarOrVectorOpd::<IntegerType, 0>::vector_shape(self, ctx);
+        let res_shape =
+            ScalarOrVectorResImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        if opd_shape != res_shape {
+            return verify_err!(self.loc(ctx), FloatCastVerifyErr::MismatchedVectorShape);
+        }
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's InsertValue opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `aggregate` | LLVM aggregate type |
+/// | `value` | LLVM type |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM aggregate type |
+#[pliron_op(
+    name = "llvm.insert_value",
+    format = "$0 attr($llvm_insert_value_indices, $InsertExtractValueIndicesAttr) `, ` $1 ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<2>],
+    attributes = (llvm_insert_value_indices: InsertExtractValueIndicesAttr)
+)]
+pub struct InsertValueOp;
+
+impl InsertValueOp {
+    /// Create a new [InsertValueOp].
+    /// `aggregate` is the aggregate type and `value` is the value to insert.
+    /// `indices` is the list of indices to insert the value at.
+    /// The `indices` must be valid for the given `aggregate` type.
+    pub fn new(ctx: &mut Context, aggregate: Value, value: Value, indices: Vec<u32>) -> Self {
+        use pliron::r#type::Typed;
+
+        let result_type = aggregate.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![aggregate, value],
+            vec![],
+            0,
+        );
+        let op = InsertValueOp { op };
+        op.set_attr_llvm_insert_value_indices(ctx, InsertExtractValueIndicesAttr(indices));
+        op
+    }
+
+    /// Get the indices for inserting value into aggregate.
+    pub fn indices(&self, ctx: &Context) -> Vec<u32> {
+        self.get_attr_llvm_insert_value_indices(ctx)
+            .unwrap()
+            .clone()
+            .0
+    }
+}
+
+impl Verify for InsertValueOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Ensure that we have the indices as an attribute.
+        if self.get_attr_llvm_insert_value_indices(ctx).is_none() {
+            verify_err!(loc.clone(), InsertExtractValueErr::IndicesAttrErr)?
+        }
+
+        use pliron::r#type::Typed;
+
+        // Check that the value we are inserting is of the correct type.
+        let aggr_type = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+        let indices = self.indices(ctx);
+        match ExtractValueOp::indexed_type(ctx, aggr_type, &indices) {
+            Err(e @ Error { .. }) => {
+                // We reset the error type and error origin to be from here
+                return Err(Error {
+                    kind: ErrorKind::VerificationFailed,
+                    backtrace: pliron::std_deps::backtrace::Backtrace::capture(),
+                    ..e
+                });
+            }
+            Ok(indexed_type) => {
+                if indexed_type != self.get_operation().deref(ctx).get_operand(1).get_type(ctx) {
+                    return verify_err!(loc, InsertExtractValueErr::ValueTypeErr);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's ExtractValue opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `aggregate` | LLVM aggregate type |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM type |
+#[pliron_op(
+    name = "llvm.extract_value",
+    format = "$0 attr($llvm_extract_value_indices, $InsertExtractValueIndicesAttr) ` : ` type($0)",
+    interfaces = [OneResultInterface, OneOpdInterface],
+    attributes = (llvm_extract_value_indices: InsertExtractValueIndicesAttr)
+)]
+pub struct ExtractValueOp;
+
+impl Verify for ExtractValueOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        // Ensure that we have the indices as an attribute.
+        if self.get_attr_llvm_extract_value_indices(ctx).is_none() {
+            verify_err!(loc.clone(), InsertExtractValueErr::IndicesAttrErr)?
+        }
+
+        use pliron::r#type::Typed;
+        // Check that the result type matches the indexed type
+        let aggr_type = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+        let indices = self.indices(ctx);
+        match Self::indexed_type(ctx, aggr_type, &indices) {
+            Err(e @ Error { .. }) => {
+                // We reset the error type and error origin to be from here
+                return Err(Error {
+                    kind: ErrorKind::VerificationFailed,
+                    backtrace: pliron::std_deps::backtrace::Backtrace::capture(),
+                    ..e
+                });
+            }
+            Ok(indexed_type) => {
+                if indexed_type != self.get_operation().deref(ctx).get_type(0) {
+                    return verify_err!(loc, InsertExtractValueErr::ValueTypeErr);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ExtractValueOp {
+    /// Create a new [ExtractValueOp].
+    /// `aggregate` is the aggregate type and `indices` is the list of indices to extract the value from.
+    /// The `indices` must be valid for the given `aggregate` type.
+    /// The result type of the operation is the type of the value at the given indices.
+    pub fn new(ctx: &mut Context, aggregate: Value, indices: Vec<u32>) -> Result<Self> {
+        use pliron::r#type::Typed;
+        let result_type = Self::indexed_type(ctx, aggregate.get_type(ctx), &indices)?;
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![aggregate],
+            vec![],
+            0,
+        );
+        let op = ExtractValueOp { op };
+        op.set_attr_llvm_extract_value_indices(ctx, InsertExtractValueIndicesAttr(indices));
+        Ok(op)
+    }
+
+    /// Get the indices for extracting value from aggregate.
+    pub fn indices(&self, ctx: &Context) -> Vec<u32> {
+        self.get_attr_llvm_extract_value_indices(ctx)
+            .unwrap()
+            .clone()
+            .0
+    }
+
+    /// Returns the type of the value at the given indices in the given aggregate type.
+    pub fn indexed_type(
+        ctx: &Context,
+        aggr_type: TypeHandle,
+        indices: &[u32],
+    ) -> Result<TypeHandle> {
+        fn indexed_type_inner(
+            ctx: &Context,
+            aggr_type: TypeHandle,
+            mut idx_itr: impl Iterator<Item = u32>,
+        ) -> Result<TypeHandle> {
+            let Some(idx) = idx_itr.next() else {
+                return Ok(aggr_type);
+            };
+            let aggr_type = &*aggr_type.deref(ctx);
+            if let Some(st) = aggr_type.downcast_ref::<StructType>() {
+                if st.is_opaque() || idx as usize >= st.num_fields() {
+                    return arg_err_noloc!(InsertExtractValueErr::InvalidIndicesErr);
+                }
+                indexed_type_inner(ctx, st.field_type(idx as usize), idx_itr)
+            } else if let Some(at) = aggr_type.downcast_ref::<ArrayType>() {
+                if idx as u64 >= at.size() {
+                    return arg_err_noloc!(InsertExtractValueErr::InvalidIndicesErr);
+                }
+                indexed_type_inner(ctx, at.elem_type(), idx_itr)
+            } else {
+                arg_err_noloc!(InsertExtractValueErr::InvalidIndicesErr)
+            }
+        }
+        indexed_type_inner(ctx, aggr_type, indices.iter().cloned())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum InsertExtractValueErr {
+    #[error("Insert/Extract value instruction has no or incorrect indices attribute")]
+    IndicesAttrErr,
+    #[error("Invalid indices on insert/extract value instruction")]
+    InvalidIndicesErr,
+    #[error("Value being inserted / extracted does not match the type of the indexed aggregate")]
+    ValueTypeErr,
+}
+
+/// Equivalent to LLVM's InsertElement opcode.
+///
+//// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `vector` | LLVM vector type |
+/// | `element` | LLVM type |
+/// | `index` | u32 |
+///
+/// /// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM vector type |
+#[pliron_op(
+    name = "llvm.insertelement",
+    format = "$0 `, ` $1 `, ` $2 ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<3>],
+    operands = (vector, element, index)
+)]
+pub struct InsertElementOp;
+impl Verify for InsertElementOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+
+        let loc = self.loc(ctx);
+        let op = &*self.op.deref(ctx);
+        let vector_ty = op.get_operand(0).get_type(ctx);
+        let element_ty = op.get_operand(1).get_type(ctx);
+        let index_ty = op.get_operand(2).get_type(ctx);
+
+        let vector_ty = vector_ty.deref(ctx);
+        let vector_ty = vector_ty.downcast_ref::<VectorType>();
+        if vector_ty.is_none_or(|ty| ty.elem_type() != element_ty) {
+            return verify_err!(loc, InsertExtractElementOpVerifyErr::ElementTypeErr);
+        }
+
+        if !index_ty.deref(ctx).is::<IntegerType>() {
+            return verify_err!(loc, InsertExtractElementOpVerifyErr::IndexTypeErr);
+        }
+
+        Ok(())
+    }
+}
+
+impl InsertElementOp {
+    /// Create a new [InsertElementOp].
+    pub fn new(ctx: &mut Context, vector: Value, element: Value, index: Value) -> Self {
+        use pliron::r#type::Typed;
+
+        let result_type = vector.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![vector, element, index],
+            vec![],
+            0,
+        );
+        InsertElementOp { op }
+    }
+
+    /// Get the vector type of the InsertElementOp.
+    pub fn vector_type(&self, ctx: &Context) -> TypedHandle<VectorType> {
+        let ty = self.get_operation().deref(ctx).get_type(0);
+        TypedHandle::<VectorType>::from_handle(ty, ctx)
+            .expect("InsertElementOp result type is not a VectorType")
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum InsertExtractElementOpVerifyErr {
+    #[error("Element type must match vector element type")]
+    ElementTypeErr,
+    #[error("Index type must be signless integer")]
+    IndexTypeErr,
+}
+
+/// ExtractElementOp
+/// Equivalent to LLVM's ExtractElement opcode.
+/// /// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `vector` | LLVM vector type |
+/// | `index` | u32 |
+/// /// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM type |
+#[pliron_op(
+    name = "llvm.extractelement",
+    format = "$0 `, ` $1 ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<2>],
+    operands = (vector, index)
+)]
+pub struct ExtractElementOp;
+
+impl Verify for ExtractElementOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+        let loc = self.loc(ctx);
+        let op = &*self.op.deref(ctx);
+        let vector_ty = op.get_operand(0).get_type(ctx);
+        let index_ty = op.get_operand(1).get_type(ctx);
+        let vector_ty = vector_ty.deref(ctx);
+        let vector_ty = vector_ty.downcast_ref::<VectorType>();
+        if vector_ty.is_none_or(|ty| ty.elem_type() != op.get_type(0)) {
+            return verify_err!(loc, InsertExtractElementOpVerifyErr::ElementTypeErr);
+        }
+        if !index_ty.deref(ctx).is::<IntegerType>() {
+            return verify_err!(loc, InsertExtractElementOpVerifyErr::IndexTypeErr);
+        }
+        Ok(())
+    }
+}
+
+impl ExtractElementOp {
+    /// Create a new [ExtractElementOp].
+    pub fn new(ctx: &mut Context, vector: Value, index: Value) -> Self {
+        use pliron::r#type::Typed;
+
+        let result_type = vector
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<VectorType>()
+            .expect("ExtractElementOp vector operand must be a vector type")
+            .elem_type();
+
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![vector, index],
+            vec![],
+            0,
+        );
+        ExtractElementOp { op }
+    }
+
+    /// Get the vector type of the ExtractElementOp.
+    pub fn vector_type(&self, ctx: &Context) -> TypedHandle<VectorType> {
+        use pliron::r#type::Typed;
+        let ty = self.get_operand_vector(ctx).get_type(ctx);
+        TypedHandle::<VectorType>::from_handle(ty, ctx)
+            .expect("ExtractElementOp vector operand type is not a VectorType")
+    }
+}
+
+/// ShuffleVectorOp
+/// Equivalent to LLVM's ShuffleVector opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `vector1` | LLVM vector type |
+/// | `vector2` | LLVM vector type |
+/// | `mask` | LLVM vector type |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | LLVM vector type |
+#[pliron_op(
+    name = "llvm.shuffle_vector",
+    format = "$0 `, ` $1 `, ` attr($llvm_shuffle_vector_mask, $ShuffleVectorMaskAttr) ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<2>],
+    attributes = (llvm_shuffle_vector_mask: ShuffleVectorMaskAttr)
+)]
+pub struct ShuffleVectorOp;
+impl Verify for ShuffleVectorOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+
+        let loc = self.loc(ctx);
+        let op = &*self.op.deref(ctx);
+        let vector1_ty = op.get_operand(0).get_type(ctx);
+        let vector2_ty = op.get_operand(1).get_type(ctx);
+
+        let vector1_ty = vector1_ty.deref(ctx);
+        let vector1_ty = vector1_ty.downcast_ref::<VectorType>();
+        let vector2_ty = vector2_ty.deref(ctx);
+        let vector2_ty = vector2_ty.downcast_ref::<VectorType>();
+
+        let (Some(v1_ty), Some(v2_ty)) = (vector1_ty, vector2_ty) else {
+            return verify_err!(loc, ShuffleVectorOpVerifyErr::OperandsTypeErr);
+        };
+
+        if v1_ty != v2_ty {
+            return verify_err!(loc, ShuffleVectorOpVerifyErr::OperandsTypeErr);
+        }
+
+        let res_ty = op.get_type(0).deref(ctx);
+        let res_ty = res_ty.downcast_ref::<VectorType>();
+        let Some(res_ty) = res_ty else {
+            return verify_err!(loc, ShuffleVectorOpVerifyErr::ResultTypeErr);
+        };
+
+        if res_ty.elem_type() != v1_ty.elem_type()
+            || res_ty.num_elements() as usize
+                != self.get_attr_llvm_shuffle_vector_mask(ctx).unwrap().0.len()
+        {
+            return verify_err!(loc, ShuffleVectorOpVerifyErr::ResultTypeErr);
+        }
+
+        Ok(())
+    }
+}
+
+/// The undef mask element used in ShuffleVectorOp masks.
+#[cfg(feature = "llvm-sys")]
+pub static SHUFFLE_VECTOR_UNDEF_MASK_ELEM: std::sync::LazyLock<i32> =
+    std::sync::LazyLock::new(llvm_get_undef_mask_elem);
+#[cfg(not(feature = "llvm-sys"))]
+pub static SHUFFLE_VECTOR_UNDEF_MASK_ELEM: i32 = -1;
+
+impl ShuffleVectorOp {
+    /// Create a new [ShuffleVectorOp].
+    pub fn new(ctx: &mut Context, vector1: Value, vector2: Value, mask: Vec<i32>) -> Self {
+        use pliron::r#type::Typed;
+
+        let (elem_ty, kind) = {
+            let vector1_ty = vector1.get_type(ctx).deref(ctx);
+            let opd_vec_ty = vector1_ty
+                .downcast_ref::<VectorType>()
+                .expect("ShuffleVectorOp vector1 operand must be a vector type");
+            (opd_vec_ty.elem_type(), opd_vec_ty.kind())
+        };
+
+        let result_type = VectorType::get(
+            ctx,
+            elem_ty,
+            mask.len()
+                .try_into()
+                .expect("ShuffleVectorOp mask length too large"),
+            kind,
+        );
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type.into()],
+            vec![vector1, vector2],
+            vec![],
+            0,
+        );
+
+        let mask_attr = ShuffleVectorMaskAttr(mask);
+        let op = ShuffleVectorOp { op };
+        op.set_attr_llvm_shuffle_vector_mask(ctx, mask_attr);
+        op
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ShuffleVectorOpVerifyErr {
+    #[error("Both operands must be equivalent vector types")]
+    OperandsTypeErr,
+    #[error("Result type must be a vector type with correct element type and size")]
+    ResultTypeErr,
+}
+
+/// Equivalent to LLVM's Select opcode.
+///
+/// ### Operands
+/// | operand | description |
+/// |-----|-------|
+/// | `condition` | i1 |
+/// | `true_dest` | any type |
+/// | `false_dest` | any type |
+///
+/// ### Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | any type |
+#[pliron_op(
+    name = "llvm.select",
+    format = "opt_attr($llvm_select_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` ? ` $1 ` : ` $2 ` : ` type($0)",
+    interfaces = [OneResultInterface, NOpdsInterface<3>],
+    attributes = (llvm_select_fast_math_flags: FastmathFlagsAttr),
+)]
+pub struct SelectOp;
+
+impl SelectOp {
+    /// Create a new [SelectOp].
+    pub fn new(ctx: &mut Context, cond: Value, true_val: Value, false_val: Value) -> Self {
+        use pliron::r#type::Typed;
+
+        let result_type = true_val.get_type(ctx);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type],
+            vec![cond, true_val, false_val],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    /// Create a new [SelectOp] with fast-math flags set.
+    pub fn new_with_fast_math_flags(
+        ctx: &mut Context,
+        cond: Value,
+        true_val: Value,
+        false_val: Value,
+        fast_math_flags: FastmathFlagsAttr,
+    ) -> Self {
+        let op = Self::new(ctx, cond, true_val, false_val);
+        op.set_attr_llvm_select_fast_math_flags(ctx, fast_math_flags);
+        op
+    }
+}
+
+impl Verify for SelectOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use pliron::r#type::Typed;
+
+        let loc = self.loc(ctx);
+        let op = &*self.op.deref(ctx);
+        let ty = op.get_type(0);
+        let cond_ty = op.get_operand(0).get_type(ctx);
+        let true_ty = op.get_operand(1).get_type(ctx);
+        let false_ty = op.get_operand(2).get_type(ctx);
+        if ty != true_ty || ty != false_ty {
+            return verify_err!(loc, SelectOpVerifyErr::ResultTypeErr);
+        }
+
+        let mut cond_ty = cond_ty.deref(ctx);
+        if let Some(vec_ty) = cond_ty.downcast_ref::<VectorType>() {
+            if let Some(opd_vec_ty) = ty.deref(ctx).downcast_ref::<VectorType>()
+                && vec_ty.num_elements() == opd_vec_ty.num_elements()
+            {
+                // We're good, both the condition and operand are vectors of the same length
+            } else {
+                return verify_err!(loc, SelectOpVerifyErr::ConditionTypeErr);
+            }
+            cond_ty = vec_ty.elem_type().deref(ctx);
+        }
+
+        let cond_ty = cond_ty.downcast_ref::<IntegerType>();
+        if cond_ty.is_none_or(|ty| ty.width() != 1) {
+            return verify_err!(loc, SelectOpVerifyErr::ConditionTypeErr);
+        }
+
+        // LLVM permits fast-math flags on select only when the result type is
+        // a floating-point scalar or vector.
+        if let Some(fmf) = self.get_attr_llvm_select_fast_math_flags(ctx)
+            && *fmf != FastmathFlagsAttr::default()
+        {
+            let mut res_ty = ty;
+            if let Some(vec_ty) = res_ty.deref(ctx).downcast_ref::<VectorType>() {
+                res_ty = vec_ty.elem_type();
+            }
+            if type_cast::<dyn FloatTypeInterface>(&*res_ty.deref(ctx)).is_none() {
+                return verify_err!(loc, SelectOpVerifyErr::FastMathFlagsOnNonFloatErr);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SelectOpVerifyErr {
+    #[error("Result must be the same as the true and false destination types")]
+    ResultTypeErr,
+    #[error("Condition must be an i1 or a vector of i1 equal in length to the operand vectors")]
+    ConditionTypeErr,
+    #[error("Fast-math flags are only allowed on selects of floating-point type")]
+    FastMathFlagsOnNonFloatErr,
+}
+
+/// Floating-point negation
+/// Equivalent to LLVM's `fneg` instruction.
+///
+/// Operands:
+/// | operand | description |
+/// |-----|-------|
+/// | `arg` | float or vector of float |
+///
+/// Result(s):
+/// | result | description |
+/// |-----|-------|
+/// | `res` | float or vector of float |
+#[pliron_op(
+    name = "llvm.fneg",
+    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        OneOpdInterface,
+        SameResultsType,
+        SameOperandsType,
+        SameOperandsAndResultType,
+        FastMathFlags,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+    ],
+    verifier = "succ"
+)]
+pub struct FNegOp;
+
+impl FNegOp {
+    /// Create a new [FNegOp].
+    pub fn new_with_fast_math_flags(
+        ctx: &mut Context,
+        arg: Value,
+        fast_math_flags: FastmathFlagsAttr,
+    ) -> Self {
+        use pliron::r#type::Typed;
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![arg.get_type(ctx)],
+            vec![arg],
+            vec![],
+            0,
+        );
+        let op = FNegOp { op };
+        op.set_fast_math_flags(ctx, fast_math_flags);
+        op
+    }
+}
+
+macro_rules! new_float_bin_op {
+    (   $(#[$outer:meta])*
+        $op_name:ident, $op_id:literal
+    ) => {
+        $(#[$outer])*
+        /// ### Operands:
+        ///
+        /// | operand | description |
+        /// |-----|-------|
+        /// | `lhs` | float |
+        /// | `rhs` | float |
+        ///
+        /// ### Result(s):
+        ///
+        /// | result | description |
+        /// |-----|-------|
+        /// | `res` | float |
+        #[pliron_op(
+            name = $op_id,
+            format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 `, ` $1 ` : ` type($0)",
+            interfaces = [
+                OneResultInterface, SameOperandsType, SameResultsType,
+                SameOperandsAndResultType, BinArithOp, FloatBinArithOp,
+                ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+                FloatBinArithOpWithFastMathFlags, FastMathFlags, NOpdsInterface<2>
+            ],
+            verifier = "succ"
+        )]
+        pub struct $op_name;
+    }
+}
+
+new_float_bin_op! {
+    /// Equivalent to LLVM's `fadd` instruction.
+    FAddOp,
+    "llvm.fadd"
+}
+
+new_float_bin_op! {
+    /// Equivalent to LLVM's `fsub` instruction.
+    FSubOp,
+    "llvm.fsub"
+}
+
+new_float_bin_op! {
+    /// Equivalent to LLVM's `fmul` instruction.
+    FMulOp,
+    "llvm.fmul"
+}
+
+new_float_bin_op! {
+    /// Equivalent to LLVM's `fdiv` instruction.
+    FDivOp,
+    "llvm.fdiv"
+}
+
+new_float_bin_op! {
+    /// Equivalent to LLVM's `frem` instruction.
+    FRemOp,
+    "llvm.frem"
+}
+
+/// Equivalent to LLVM'same `fcmp` instruction.
+///
+/// ### Operand(s):
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | float or vector of float |
+/// | `rhs` | float or vector of float |
+///
+/// ### Result(s):
+///
+/// | result | description |
+/// |-----|-------|
+/// | `res` | i1 or vector of i1 |
+#[pliron_op(
+    name = "llvm.fcmp",
+    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` <` attr($llvm_fcmp_predicate, $FCmpPredicateAttr) `> ` $1 ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        SameOperandsType,
+        FastMathFlags,
+        NOpdsInterface<2>,
+        ScalarOrVectorRes<IntegerType, 0>,
+        ScalarOrVectorOpdImpls<dyn FloatTypeInterface, 0>,
+    ],
+    attributes = (llvm_fcmp_predicate: FCmpPredicateAttr)
+)]
+pub struct FCmpOp;
+
+impl FCmpOp {
+    /// Create a new [FCmpOp]
+    pub fn new(ctx: &mut Context, pred: FCmpPredicateAttr, lhs: Value, rhs: Value) -> Self {
+        use pliron::r#type::Typed;
+        let mut result_ty: TypeHandle = IntegerType::get(ctx, 1, Signedness::Signless).into();
+        if let Some(vector) = lhs.get_type(ctx).deref(ctx).downcast_ref::<VectorType>() {
+            let num_elements = vector.num_elements();
+            let kind = vector.kind();
+            result_ty = VectorType::get(ctx, result_ty, num_elements, kind).into();
+        }
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        let op = FCmpOp { op };
+        op.set_attr_llvm_fcmp_predicate(ctx, pred);
+        op
+    }
+
+    /// Get the predicate
+    pub fn predicate(&self, ctx: &Context) -> FCmpPredicateAttr {
+        self.get_attr_llvm_fcmp_predicate(ctx)
+            .expect("FCmpOp missing or incorrect predicate attribute type")
+            .clone()
+    }
+}
+
+impl Verify for FCmpOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+
+        if self.get_attr_llvm_fcmp_predicate(ctx).is_none() {
+            verify_err!(loc.clone(), FCmpOpVerifyErr::PredAttrErr)?
+        }
+
+        let res_ty = ScalarOrVectorRes::<IntegerType, 0>::scalar_or_vector_elem_ty(self, ctx);
+        if res_ty.deref(ctx).width() != 1 {
+            return verify_err!(loc, FCmpOpVerifyErr::ResultNotBool);
+        }
+
+        let res_shape = ScalarOrVectorRes::<IntegerType, 0>::vector_shape(self, ctx);
+        let opd_shape =
+            ScalarOrVectorOpdImpls::<dyn FloatTypeInterface, 0>::vector_shape(self, ctx);
+        if res_shape != opd_shape {
+            return verify_err!(loc, FCmpOpVerifyErr::MismatchedVectorNumElements);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum FCmpOpVerifyErr {
+    #[error("Result must be (possibly vector of) 1-bit integer (bool)")]
+    ResultNotBool,
+    #[error("Missing or incorrect predicate attribute")]
+    PredAttrErr,
+    #[error("Vector operand and result types must have the same number of elements")]
+    MismatchedVectorNumElements,
+}
+
+/// All LLVM intrinsic calls are represented by this [Op].
+/// Same as MLIR's [llvm.call_intrinsic](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmcall_intrinsic-llvmcallintrinsicop).
+#[pliron_op(
+    name = "llvm.call_intrinsic",
+    interfaces = [OneResultInterface],
+    attributes = (
+        llvm_intrinsic_name: StringAttr,
+        llvm_intrinsic_type: TypeAttr,
+        llvm_intrinsic_fastmath_flags: FastmathFlagsAttr,
+        llvm_intrinsic_attrs: LlvmAttributesAttr
+    )
+)]
+pub struct CallIntrinsicOp;
+
+impl CallIntrinsicOp {
+    /// Create a new [CallIntrinsicOp].
+    pub fn new(
+        ctx: &mut Context,
+        intrinsic_name: StringAttr,
+        intrinsic_type: TypedHandle<FuncType>,
+        operands: Vec<Value>,
+    ) -> Self {
+        let res_ty = intrinsic_type.deref(ctx).result_type();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            operands,
+            vec![],
+            0,
+        );
+        let op = CallIntrinsicOp { op };
+        op.set_attr_llvm_intrinsic_name(ctx, intrinsic_name);
+        op.set_attr_llvm_intrinsic_type(ctx, TypeAttr::new(intrinsic_type.into()));
+        op
+    }
+}
+
+impl Printable for CallIntrinsicOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        // [result = ] llvm.call_intrinsic @name <FastMathFlags> (operands) : type
+        if let Some(res) = self.op.deref(ctx).results().next() {
+            write!(f, "{} = ", res.print(ctx, state))?;
+        }
+
+        write!(
+            f,
+            "{} @{} ",
+            Self::get_opid_static(),
+            self.get_attr_llvm_intrinsic_name(ctx)
+                .expect("CallIntrinsicOp missing or incorrect intrinsic name attribute")
+                .print(ctx, state),
+        )?;
+
+        if let Some(fmf) = self.get_attr_llvm_intrinsic_fastmath_flags(ctx)
+            && *fmf != FastmathFlagsAttr::default()
+        {
+            write!(f, " {} ", fmf.print(ctx, state))?;
+        }
+
+        write!(
+            f,
+            "({}) : {}",
+            iter_with_sep(
+                self.op.deref(ctx).operands(),
+                printable::ListSeparator::CharSpace(',')
+            )
+            .print(ctx, state),
+            self.get_attr_llvm_intrinsic_type(ctx)
+                .expect("CallIntrinsicOp missing or incorrect intrinsic type attribute")
+                .print(ctx, state),
+        )
+    }
+}
+
+impl Parsable for CallIntrinsicOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        results: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        let pos = state_stream.loc();
+
+        let mut parser = (
+            spaced(token('@').with(StringAttr::parser(()))),
+            optional(spaced(FastmathFlagsAttr::parser(()))),
+            delimited_list_parser('(', ')', ',', ssa_opd_parser()).skip(spaced(token(':'))),
+            spaced(type_parser()),
+        );
+
+        // Parse and build the call intrinsic op.
+        let (iname, fmf, operands, ftype) = parser.parse_stream(state_stream).into_result()?.0;
+
+        let ctx = &mut state_stream.state.ctx;
+        let intr_ty = TypedHandle::<FuncType>::from_handle(ftype, ctx).map_err(|mut err| {
+            err.set_loc(pos);
+            err
+        })?;
+        let op = CallIntrinsicOp::new(ctx, iname, intr_ty, operands);
+        if let Some(fmf) = fmf {
+            op.set_attr_llvm_intrinsic_fastmath_flags(ctx, fmf);
+        }
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum CallIntrinsicVerifyErr {
+    #[error("Missing or incorrect intrinsic name attribute")]
+    MissingIntrinsicNameAttr,
+    #[error("Missing or incorrect intrinsic type attribute")]
+    MissingIntrinsicTypeAttr,
+    #[error("Number or types of operands does not match intrinsic type")]
+    OperandsMismatch,
+    #[error("Number or types of results does not match intrinsic type")]
+    ResultsMismatch,
+    #[error("Intrinsic name does not correspond to a known LLVM intrinsic")]
+    UnknownIntrinsicName,
+}
+
+impl Verify for CallIntrinsicOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        // Check that the intrinsic name and type attributes are present.
+        let Some(name) = self.get_attr_llvm_intrinsic_name(ctx) else {
+            return verify_err!(
+                self.loc(ctx),
+                CallIntrinsicVerifyErr::MissingIntrinsicNameAttr
+            );
+        };
+
+        let Some(ty) = self
+            .get_attr_llvm_intrinsic_type(ctx)
+            .and_then(|ty| TypedHandle::<FuncType>::from_handle(ty.get_type(ctx), ctx).ok())
+        else {
+            return verify_err!(
+                self.loc(ctx),
+                CallIntrinsicVerifyErr::MissingIntrinsicTypeAttr
+            );
+        };
+
+        let arg_types = ty.deref(ctx).arg_types();
+        let res_type = ty.deref(ctx).result_type();
+
+        // Check that the operand and result types match the intrinsic type.
+        let op = &*self.op.deref(ctx);
+        let intrinsic_arg_types = ty.deref(ctx).arg_types();
+        if op.operands().count() != intrinsic_arg_types.len() {
+            return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::OperandsMismatch);
+        }
+
+        for (i, operand) in op.operands().enumerate() {
+            let opd_ty = pliron::r#type::Typed::get_type(&operand, ctx);
+            if opd_ty != arg_types[i] {
+                return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::OperandsMismatch);
+            }
+        }
+
+        let mut result_types = op.result_types();
+        if let Some(result_type) = result_types.next()
+            && result_type == res_type
+            && result_types.next().is_none()
+        {
+        } else {
+            return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::ResultsMismatch);
+        }
+
+        let name: String = name.clone().into();
+        #[cfg(feature = "llvm-sys")]
+        if llvm_lookup_intrinsic_id(&name).is_none() {
+            return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::UnknownIntrinsicName);
+        }
+        #[cfg(not(feature = "llvm-sys"))]
+        // We can't verify the intrinsic name without llvm-sys, so just check that it's not empty.
+        if name.is_empty() {
+            return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::UnknownIntrinsicName);
+        }
+
+        Ok(())
+    }
+}
+
+/// Equivalent to LLVM's `va_arg` operation.
+#[pliron_op(
+    name = "llvm.va_arg",
+    format = "$0 ` : ` type($0)",
+    interfaces = [OneResultInterface, OneOpdInterface]
+)]
+pub struct VAArgOp;
+
+#[derive(Error, Debug)]
+pub enum VAArgOpVerifyErr {
+    #[error("Operand must be a pointer type")]
+    OperandNotPointer,
+}
+
+impl Verify for VAArgOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+
+        // Check that the argument is a pointer.
+        let opd_ty = self.operand_type(ctx).deref(ctx);
+        if !opd_ty.is::<PointerType>() {
+            return verify_err!(loc, VAArgOpVerifyErr::OperandNotPointer);
+        }
+
+        Ok(())
+    }
+}
+
+impl VAArgOp {
+    /// Create a new [VAArgOp].
+    pub fn new(ctx: &mut Context, list: Value, ty: TypeHandle) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![ty],
+            vec![list],
+            vec![],
+            0,
+        );
+        VAArgOp { op }
+    }
+}
+
+/// Equivalent to LLVM's `func` operation.
+/// See [llvm.func](https://mlir.llvm.org/docs/Dialects/LLVM/#llvmfunc-llvmllvmfuncop).
+#[pliron_op(
+    name = "llvm.func",
+    interfaces = [
+        SymbolOpInterface,
+        IsolatedFromAboveInterface,
+        AtMostNRegionsInterface<1>,
+        AtMostOneRegionInterface,
+        NResultsInterface<0>,
+        NOpdsInterface<0>,
+        LlvmSymbolName
+    ],
+    attributes = (
+        llvm_func_type: TypeAttr,
+        llvm_function_linkage: LinkageAttr,
+        llvm_func_attrs: LlvmAttributesAttr
+    )
+)]
+pub struct FuncOp;
+
+impl FuncOp {
+    /// Create a new empty [FuncOp].
+    pub fn new(ctx: &mut Context, name: Identifier, ty: TypedHandle<FuncType>) -> Self {
+        let ty_attr = TypeAttr::new(ty.into());
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let opop = FuncOp { op };
+        opop.set_symbol_name(ctx, name);
+        opop.set_attr_llvm_func_type(ctx, ty_attr);
+
+        opop
+    }
+
+    /// Get the function signature (type).
+    pub fn get_type(&self, ctx: &Context) -> TypedHandle<FuncType> {
+        let ty = attr_cast::<dyn TypedAttrInterface>(&*self.get_attr_llvm_func_type(ctx).unwrap())
+            .unwrap()
+            .get_type(ctx);
+        TypedHandle::from_handle(ty, ctx).unwrap()
+    }
+
+    /// Get the entry block (if it exists) of this function.
+    pub fn get_entry_block(&self, ctx: &Context) -> Option<Ptr<BasicBlock>> {
+        self.op
+            .deref(ctx)
+            .regions()
+            .next()
+            .and_then(|region| region.deref(ctx).get_head())
+    }
+
+    /// Get the entry block of this function, creating it if it does not exist.
+    pub fn get_or_create_entry_block(&self, ctx: &mut Context) -> Ptr<BasicBlock> {
+        if let Some(entry_block) = self.get_entry_block(ctx) {
+            return entry_block;
+        }
+
+        // Create an empty entry block.
+        assert!(
+            self.op.deref(ctx).regions().next().is_none(),
+            "FuncOp already has a region, but no block inside it"
+        );
+        let region = Operation::add_region(self.op, ctx);
+        let arg_types = self.get_type(ctx).deref(ctx).arg_types().clone();
+        let body = BasicBlock::new(ctx, Some(ident!("entry")), arg_types);
+        body.insert_at_front(region, ctx);
+        body
+    }
+}
+
+impl pliron::r#type::Typed for FuncOp {
+    fn get_type(&self, ctx: &Context) -> TypeHandle {
+        self.get_type(ctx).into()
+    }
+}
+
+impl Printable for FuncOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        state: &printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        typed_symb_op_header(self).fmt(ctx, state, f)?;
+
+        // Print attributes except for function type and symbol name.
+        let mut attributes_to_print_separately =
+            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+        attributes_to_print_separately
+            .0
+            .retain(|key, _| key != &ATTR_KEY_LLVM_FUNC_TYPE && key != &ATTR_KEY_SYM_NAME);
+        {
+            let _indent = state.indent();
+            write!(
+                f,
+                "{}{}",
+                indented_nl(state),
+                attributes_to_print_separately.print(ctx, state)
+            )?;
+        }
+
+        if let Some(r) = self.get_region(ctx) {
+            write!(f, " ")?;
+            r.fmt(ctx, state, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Parsable for FuncOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        results: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed> {
+        if !results.is_empty() {
+            input_err!(
+                state_stream.loc(),
+                op_interfaces::NResultsVerifyErr(0, results.len())
+            )?
+        }
+
+        let op = Operation::new(
+            state_stream.state.ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+
+        let mut parser = (
+            spaced(token('@').with(Identifier::parser(()))).skip(spaced(token(':'))),
+            spaced(type_parser()),
+            spaced(AttributeDict::parser(())),
+            spaced(optional(Region::parser(op))),
+        );
+
+        // Parse and build the function, providing name and type details.
+        parser
+            .parse_stream(state_stream)
+            .map(|(fname, fty, attrs, _region)| -> OpObj {
+                let ctx = &mut state_stream.state.ctx;
+                op.deref_mut(ctx).attributes = attrs;
+                let ty_attr = TypeAttr::new(fty);
+                let opop = FuncOp { op };
+                opop.set_symbol_name(ctx, fname);
+                opop.set_attr_llvm_func_type(ctx, ty_attr);
+                OpObj::new(opop)
+            })
+            .into()
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("llvm.func op does not have llvm.func type")]
+pub struct FuncOpTypeErr;
+
+impl Verify for FuncOp {
+    fn verify(&self, _ctx: &Context) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl IsDeclaration for FuncOp {
+    fn is_declaration(&self, ctx: &Context) -> bool {
+        self.get_region(ctx).is_none()
+    }
+}

@@ -1,0 +1,798 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Control-flow-graph traversals
+
+use super::ControlFlowGraph;
+use crate::utils::table::{HMap, HSet, IMap};
+
+/// Region traversal utilities
+pub mod region {
+    use alloc::{vec, vec::Vec};
+
+    use crate::graph::HasLabel;
+
+    use super::*;
+
+    fn post_order_walk_component<G, GraphContext>(
+        ctx: &GraphContext,
+        graph: &G,
+        node: G::Node,
+        seen_nodes: &mut HSet<G::Node>,
+        po: &mut Vec<G::Node>,
+    ) where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        if seen_nodes.contains(&node) {
+            // node already visited.
+            return;
+        }
+
+        let mut stack = Vec::<(G::Node, usize)>::new();
+
+        // Start from `node`.
+        seen_nodes.insert(node.clone());
+        // The second element of the pair is the index of the next successor to visit for this node.
+        stack.push((node, 0));
+        while let Some((node, succ_idx)) = stack.pop() {
+            if succ_idx < graph.num_successors(ctx, &node) {
+                // Push the current node back to stack with next successor index.
+                stack.push((node.clone(), succ_idx + 1));
+
+                let succ = graph.get_successor(ctx, &node, succ_idx);
+                if seen_nodes.contains(&succ) {
+                    // successor already visited.
+                    continue;
+                }
+
+                // Visit this successor next.
+                seen_nodes.insert(succ.clone());
+                stack.push((succ, 0));
+            } else {
+                // All successors of this node have been visited. We can visit this node now.
+                po.push(node);
+            }
+        }
+    }
+
+    /// Compute post-order of the nodes in a graph.
+    /// *Note*: Assumes that for each disconnected component the entry node appears
+    /// before all other nodes in the component in the input.
+    pub fn post_order<G, GraphContext>(ctx: &GraphContext, graph: &G) -> Vec<G::Node>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        post_order_by_component(ctx, graph)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<G::Node>>()
+    }
+
+    /// Compute the post-order of the nodes in a graph,
+    /// providing result for each connected component separately.
+    /// *Note*: Assumes that for each disconnected component the entry node appears
+    /// before all other nodes in the component in the input.
+    pub fn post_order_by_component<G, GraphContext>(
+        ctx: &GraphContext,
+        graph: &G,
+    ) -> Vec<Vec<G::Node>>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        let seen_nodes = &mut HSet::<G::Node>::default();
+        let mut po_by_component = Vec::<Vec<G::Node>>::new();
+
+        // Walk every node (not just entry) since we may have unreachable nodes.
+        for node in graph.nodes(ctx) {
+            let mut po = Vec::<G::Node>::new();
+            post_order_walk_component(ctx, graph, node, seen_nodes, &mut po);
+            if !po.is_empty() {
+                po_by_component.push(po);
+            }
+        }
+        po_by_component
+    }
+
+    /// Compute reverse-post-order of the nodes in a graph.
+    /// *Note*: Assumes that for each disconnected component the entry node appears
+    /// before all other nodes in the component in the input.
+    pub fn topological_order<G, GraphContext>(ctx: &GraphContext, graph: &G) -> Vec<G::Node>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        topological_order_by_component(ctx, graph)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<G::Node>>()
+    }
+
+    /// Compute the reverse-post-order of the nodes in a graph,
+    /// providing result for each connected component separately.
+    /// *Note*:
+    ///   1. Component wise order remains the same as the input.
+    ///   2. Each component must have its entry node as the first node.
+    pub fn topological_order_by_component<G, GraphContext>(
+        ctx: &GraphContext,
+        graph: &G,
+    ) -> Vec<Vec<G::Node>>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        let seen_nodes = &mut HSet::<G::Node>::default();
+        let mut rpo_by_component = Vec::<Vec<G::Node>>::new();
+
+        // Walk every node (not just entry) since we may have unreachable nodes.
+        for node in graph.nodes(ctx) {
+            let mut po = Vec::<G::Node>::new();
+            post_order_walk_component(ctx, graph, node, seen_nodes, &mut po);
+            if !po.is_empty() {
+                rpo_by_component.push(po.into_iter().rev().collect());
+            }
+        }
+        rpo_by_component
+    }
+
+    /// The pre-order, post-order and rpo numbers of a node in a DFS traversal.
+    struct DFSNumber {
+        pre_order_number: usize,
+        post_order_number: usize,
+        reverse_post_order_number: usize,
+    }
+
+    /// Edge kind in a DFS traversal.
+    /// Conventionally DFS traversal classifies edges into tree, back, forward and cross edges.
+    /// Since we don't explicitly maintain the DFS tree, we can't distinguish between
+    /// tree and forward edges. So we classify them both as forward edges.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum DFSEdgeKind {
+        Forward,
+        Back,
+        Cross,
+    }
+
+    /// Performs a DFS traversal of the graph reachable from the entry node.
+    /// Answers queries related to the traversal.
+    pub struct DFSTraversal<G, GraphContext>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        tree: IMap<G::Node, DFSNumber>,
+    }
+
+    fn dfs_walk<G, GraphContext>(
+        ctx: &GraphContext,
+        graph: &G,
+        node: G::Node,
+        pre_order_counter: &mut usize,
+        post_order_counter: &mut usize,
+        result: &mut IMap<G::Node, DFSNumber>,
+    ) where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        let mut stack = Vec::<(G::Node, usize)>::new();
+
+        // Assign pre-order number to the entry node and start DFS from it.
+        let pre_order_number = *pre_order_counter;
+        *pre_order_counter += 1;
+        let newly_inserted = result.insert(
+            node.clone(),
+            DFSNumber {
+                pre_order_number,
+                post_order_number: 0,         // to be filled later
+                reverse_post_order_number: 0, // to be filled later
+            },
+        );
+        assert!(
+            newly_inserted.is_none(),
+            "Node {} visited multiple times during DFS traversal",
+            node.label(ctx)
+        );
+        stack.push((node, 0));
+
+        while let Some((node, succ_idx)) = stack.pop() {
+            if succ_idx < graph.num_successors(ctx, &node) {
+                // Re-visit this node after attempting this successor.
+                stack.push((node.clone(), succ_idx + 1));
+
+                let succ = graph.get_successor(ctx, &node, succ_idx);
+                if result.contains_key(&succ) {
+                    // successor already visited.
+                    continue;
+                }
+
+                // First time we discover this successor: assign pre-order and descend.
+                let pre_order_number = *pre_order_counter;
+                *pre_order_counter += 1;
+                let newly_inserted = result.insert(
+                    succ.clone(),
+                    DFSNumber {
+                        pre_order_number,
+                        post_order_number: 0,         // to be filled later
+                        reverse_post_order_number: 0, // to be filled later
+                    },
+                );
+                assert!(
+                    newly_inserted.is_none(),
+                    "Node {} visited multiple times during DFS traversal",
+                    succ.label(ctx)
+                );
+                stack.push((succ, 0));
+            } else {
+                // All successors are processed, so we can assign post-order now.
+                let post_order_number = *post_order_counter;
+                *post_order_counter += 1;
+                result
+                    .get_mut(&node)
+                    .expect("Node missing during DFS traversal")
+                    .post_order_number = post_order_number;
+            }
+        }
+    }
+
+    impl<G, GraphContext> DFSTraversal<G, GraphContext>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        /// Perform DFS traversal of the graph and compute pre-order,
+        /// post-order and reverse-post-order numbers for each node.
+        pub fn new(ctx: &GraphContext, graph: &G) -> Self {
+            let mut result = IMap::<G::Node, DFSNumber>::default();
+            let mut pre_order_counter = 0;
+            let mut post_order_counter = 0;
+
+            if let Some(entry) = graph.entry_node(ctx) {
+                dfs_walk(
+                    ctx,
+                    graph,
+                    entry,
+                    &mut pre_order_counter,
+                    &mut post_order_counter,
+                    &mut result,
+                );
+            }
+
+            let num_nodes = result.len();
+            for dfs_number in result.values_mut() {
+                dfs_number.reverse_post_order_number = num_nodes - 1 - dfs_number.post_order_number;
+            }
+            Self { tree: result }
+        }
+
+        /// Returns the pre-order number of a node.
+        pub fn pre_order_number(&self, node: &G::Node) -> usize {
+            self.tree
+                .get(node)
+                .expect("pre-order number requested for unreachable node in graph")
+                .pre_order_number
+        }
+
+        /// Returns the post-order number of a node.
+        pub fn post_order_number(&self, node: &G::Node) -> usize {
+            self.tree
+                .get(node)
+                .expect("post-order number requested for unreachable node in graph")
+                .post_order_number
+        }
+
+        /// Returns the reverse-post-order number of a node.
+        pub fn reverse_post_order_number(&self, node: &G::Node) -> usize {
+            self.tree
+                .get(node)
+                .expect("reverse-post-order number requested for unreachable node in graph")
+                .reverse_post_order_number
+        }
+
+        /// Returns the kind of edge (tree, back, forward or cross) between two nodes.
+        pub fn edge_kind(&self, from: &G::Node, to: &G::Node) -> DFSEdgeKind {
+            let from_pre = self.pre_order_number(from);
+            let from_post = self.post_order_number(from);
+            let to_pre = self.pre_order_number(to);
+            let to_post = self.post_order_number(to);
+
+            // If the pre-order numbers are the same, the post-order
+            // numbers must also be the same, and vice versa.
+            assert!((from_pre == to_pre) == (from_post == to_post));
+            if from_pre == to_pre {
+                // Self-loop edge; classify as back edge.
+                return DFSEdgeKind::Back;
+            }
+
+            if from_pre < to_pre {
+                assert!(
+                    from_post > to_post,
+                    "Can't pop a node before finishing its subtree in DFS traversal"
+                );
+                // Descendant edge in DFS forest: tree or forward.
+                DFSEdgeKind::Forward
+            } else {
+                if from_post < to_post {
+                    // Edge to an ancestor in DFS tree.
+                    DFSEdgeKind::Back
+                } else {
+                    DFSEdgeKind::Cross
+                }
+            }
+        }
+
+        /// Get all nodes reachable from entry in post-order.
+        pub fn post_order(&self) -> impl Iterator<Item = G::Node> {
+            let mut nodes = vec![None; self.tree.len()];
+            for (node, dfs_number) in &self.tree {
+                nodes[dfs_number.post_order_number] = Some(node.clone());
+            }
+            nodes
+                .into_iter()
+                .map(|n| n.expect("Node missing in post-order"))
+        }
+
+        /// Get all nodes reachable from entry in reverse post-order.
+        pub fn reverse_post_order(&self) -> impl Iterator<Item = G::Node> {
+            let mut nodes = vec![None; self.tree.len()];
+            for (node, dfs_number) in &self.tree {
+                nodes[dfs_number.reverse_post_order_number] = Some(node.clone());
+            }
+            nodes
+                .into_iter()
+                .map(|n| n.expect("Node missing in reverse post-order"))
+        }
+
+        /// Get all nodes reachable from entry in pre-order.
+        pub fn pre_order(&self) -> impl Iterator<Item = G::Node> {
+            let mut nodes = vec![None; self.tree.len()];
+            for (node, dfs_number) in &self.tree {
+                nodes[dfs_number.pre_order_number] = Some(node.clone());
+            }
+            nodes
+                .into_iter()
+                .map(|n| n.expect("Node missing in pre-order"))
+        }
+    }
+
+    /// A strongly connected component of a graph.
+    #[derive(Clone, Debug)]
+    pub struct Scc<Node> {
+        /// The nodes in this component.
+        pub nodes: Vec<Node>,
+        /// Is there a cycle within this component?
+        /// (i.e., more than one node, or a single node with a self-edge).
+        pub is_cyclic: bool,
+    }
+
+    /// Compute the strongly connected components of a graph, returned in
+    /// topological order of the condensation (the SCC-DAG): if there is an edge
+    /// from a node in component `A` to a node in a different component `B`,
+    /// then `A` appears before `B` in the result.
+    ///
+    /// Uses Tarjan's algorithm (implemented iteratively), which emits SCCs in
+    /// reverse topological order; the result is reversed before returning.
+    /// Nodes unreachable from the entry node are also covered, as separate
+    /// DFS roots visited after the entry node.
+    pub fn sccs_in_topological_order<G, GraphContext>(
+        ctx: &GraphContext,
+        graph: &G,
+    ) -> Vec<Scc<G::Node>>
+    where
+        G: ControlFlowGraph<GraphContext>,
+    {
+        // DFS visit index of each visited node.
+        let mut index_of = HMap::<G::Node, usize>::default();
+        // The lowest visit index reachable from each node's DFS subtree.
+        let mut lowlink = HMap::<G::Node, usize>::default();
+        let mut next_index = 0usize;
+        // Tarjan's component stack.
+        let mut scc_stack = Vec::<G::Node>::new();
+        let mut on_scc_stack = HSet::<G::Node>::default();
+        let mut sccs = Vec::<Scc<G::Node>>::new();
+
+        // Start DFS at the entry node first (if any), then cover any remaining
+        // (unreachable) nodes.
+        let roots: Vec<G::Node> = graph
+            .entry_node(ctx)
+            .into_iter()
+            .chain(graph.nodes(ctx))
+            .collect();
+
+        for root in roots {
+            if index_of.contains_key(&root) {
+                continue;
+            }
+
+            // Iterative version of Tarjan's `strongconnect`.
+            // The second element of the pair is the index of the next successor
+            // to visit for that node.
+            let mut call_stack = Vec::<(G::Node, usize)>::new();
+
+            index_of.insert(root.clone(), next_index);
+            lowlink.insert(root.clone(), next_index);
+            next_index += 1;
+            scc_stack.push(root.clone());
+            on_scc_stack.insert(root.clone());
+            call_stack.push((root, 0));
+
+            while let Some((node, succ_idx)) = call_stack.pop() {
+                if succ_idx < graph.num_successors(ctx, &node) {
+                    // Re-visit this node after attempting this successor.
+                    call_stack.push((node.clone(), succ_idx + 1));
+
+                    let succ = graph.get_successor(ctx, &node, succ_idx);
+                    if let Some(&succ_index) = index_of.get(&succ) {
+                        if on_scc_stack.contains(&succ) {
+                            // `succ` is in the current SCC-in-progress.
+                            let node_low = lowlink[&node].min(succ_index);
+                            lowlink.insert(node, node_low);
+                        }
+                        // Otherwise `succ`'s SCC is already complete; nothing to do.
+                    } else {
+                        // First visit of `succ`: descend.
+                        index_of.insert(succ.clone(), next_index);
+                        lowlink.insert(succ.clone(), next_index);
+                        next_index += 1;
+                        scc_stack.push(succ.clone());
+                        on_scc_stack.insert(succ.clone());
+                        call_stack.push((succ, 0));
+                    }
+                } else {
+                    // All successors of `node` have been visited.
+                    let node_low = lowlink[&node];
+                    if node_low == index_of[&node] {
+                        // `node` is the root of an SCC: pop the component.
+                        let mut nodes = Vec::new();
+                        loop {
+                            let member = scc_stack.pop().expect("SCC stack must contain the root");
+                            on_scc_stack.remove(&member);
+                            let is_root = member == node;
+                            nodes.push(member);
+                            if is_root {
+                                break;
+                            }
+                        }
+                        let is_cyclic =
+                            nodes.len() > 1 || graph.successors(ctx, &nodes[0]).contains(&nodes[0]);
+                        sccs.push(Scc { nodes, is_cyclic });
+                    }
+                    // Propagate this node's lowlink to its DFS parent
+                    // (which is now on top of the call stack).
+                    if let Some((parent, _)) = call_stack.last() {
+                        let parent_low = lowlink[parent].min(node_low);
+                        lowlink.insert(parent.clone(), parent_low);
+                    }
+                }
+            }
+        }
+
+        // Tarjan emits SCCs in reverse topological order.
+        sccs.reverse();
+        sccs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::region::{
+        DFSEdgeKind, DFSTraversal, Scc, post_order, sccs_in_topological_order, topological_order,
+    };
+    use crate::graph::{ControlFlowGraph, HasLabel};
+    use alloc::{
+        boxed::Box,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+
+    #[derive(Clone, Debug)]
+    struct Node {
+        data: u32,
+        succs: Vec<usize>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ArenaGraph;
+
+    impl HasLabel<Vec<Node>> for usize {
+        fn label(&self, _ctx: &Vec<Node>) -> String {
+            self.to_string()
+        }
+    }
+
+    impl ControlFlowGraph<Vec<Node>> for ArenaGraph {
+        type Node = usize;
+
+        fn entry_node(&self, ctx: &Vec<Node>) -> Option<Self::Node> {
+            (!ctx.is_empty()).then_some(0)
+        }
+
+        fn nodes<'a>(&'a self, ctx: &'a Vec<Node>) -> Box<dyn Iterator<Item = Self::Node> + 'a> {
+            Box::new(0..ctx.len())
+        }
+
+        fn num_successors(&self, ctx: &Vec<Node>, node: &Self::Node) -> usize {
+            ctx[*node].succs.len()
+        }
+
+        fn get_successor(&self, ctx: &Vec<Node>, node: &Self::Node, i: usize) -> Self::Node {
+            ctx[*node].succs[i]
+        }
+
+        fn num_predecessors(&self, ctx: &Vec<Node>, node: &Self::Node) -> usize {
+            ctx.iter().filter(|n| n.succs.contains(node)).count()
+        }
+
+        fn get_predecessor(&self, ctx: &Vec<Node>, node: &Self::Node, i: usize) -> Self::Node {
+            ctx.iter()
+                .enumerate()
+                .filter_map(|(idx, n)| n.succs.contains(node).then_some(idx))
+                .nth(i)
+                .expect("Node doesn't have that many predecessors")
+        }
+    }
+
+    fn n(data: u32, succs: &[usize]) -> Node {
+        Node {
+            data,
+            succs: succs.to_vec(),
+        }
+    }
+
+    fn data_order(ctx: &[Node], order: &[usize]) -> Vec<u32> {
+        order.iter().map(|&idx| ctx[idx].data).collect()
+    }
+
+    fn assert_is_permutation_of_all_nodes(ctx: &[Node], order: &[usize]) {
+        assert_eq!(order.len(), ctx.len());
+        let mut seen = vec![false; ctx.len()];
+        for &idx in order {
+            assert!(idx < ctx.len(), "index {idx} out of bounds");
+            assert!(!seen[idx], "duplicate node index {idx}");
+            seen[idx] = true;
+        }
+        assert!(seen.into_iter().all(|v| v));
+    }
+
+    fn assert_post_order_edge_property_for_dag(ctx: &[Node], po: &[usize]) {
+        let mut pos = vec![usize::MAX; ctx.len()];
+        for (i, &idx) in po.iter().enumerate() {
+            pos[idx] = i;
+        }
+        for (u, node) in ctx.iter().enumerate() {
+            for &v in &node.succs {
+                assert!(
+                    pos[v] < pos[u],
+                    "expected successor {v} to appear before predecessor {u} in post-order"
+                );
+            }
+        }
+    }
+
+    fn assert_topological_edge_property_for_dag(ctx: &[Node], rpo: &[usize]) {
+        let mut pos = vec![usize::MAX; ctx.len()];
+        for (i, &idx) in rpo.iter().enumerate() {
+            pos[idx] = i;
+        }
+        for (u, node) in ctx.iter().enumerate() {
+            for &v in &node.succs {
+                assert!(
+                    pos[u] < pos[v],
+                    "expected predecessor {u} to appear before successor {v} in reverse post-order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_order_linear_chain() {
+        let ctx = vec![n(10, &[1]), n(20, &[2]), n(30, &[])];
+
+        let po = post_order(&ctx, &ArenaGraph);
+        let rpo = topological_order(&ctx, &ArenaGraph);
+
+        assert_eq!(data_order(&ctx, &po), vec![30, 20, 10]);
+        assert_eq!(data_order(&ctx, &rpo), vec![10, 20, 30]);
+        assert_is_permutation_of_all_nodes(&ctx, &po);
+        assert_post_order_edge_property_for_dag(&ctx, &po);
+        assert_topological_edge_property_for_dag(&ctx, &rpo);
+    }
+
+    #[test]
+    fn post_order_diamond_dag() {
+        let ctx = vec![n(0, &[1, 2]), n(1, &[3]), n(2, &[3]), n(3, &[])];
+
+        let po = post_order(&ctx, &ArenaGraph);
+        let rpo = topological_order(&ctx, &ArenaGraph);
+
+        assert_eq!(data_order(&ctx, &po), vec![3, 1, 2, 0]);
+        assert_eq!(data_order(&ctx, &rpo), vec![0, 2, 1, 3]);
+        assert_is_permutation_of_all_nodes(&ctx, &po);
+        assert_post_order_edge_property_for_dag(&ctx, &po);
+        assert_topological_edge_property_for_dag(&ctx, &rpo);
+    }
+
+    #[test]
+    fn post_order_handles_cycle_and_isolated_node() {
+        let ctx = vec![n(0, &[1]), n(1, &[2]), n(2, &[0]), n(99, &[])];
+
+        let po = post_order(&ctx, &ArenaGraph);
+        let rpo = topological_order(&ctx, &ArenaGraph);
+
+        assert_eq!(data_order(&ctx, &po), vec![2, 1, 0, 99]);
+        assert_eq!(data_order(&ctx, &rpo), vec![0, 1, 2, 99]);
+        assert_is_permutation_of_all_nodes(&ctx, &po);
+    }
+
+    #[test]
+    fn post_order_covers_disconnected_components() {
+        let ctx = vec![n(0, &[1]), n(1, &[]), n(2, &[3]), n(3, &[]), n(4, &[])];
+
+        let po = post_order(&ctx, &ArenaGraph);
+        let rpo = topological_order(&ctx, &ArenaGraph);
+
+        assert_eq!(data_order(&ctx, &po), vec![1, 0, 3, 2, 4]);
+        assert_eq!(data_order(&ctx, &rpo), vec![0, 1, 2, 3, 4]);
+        assert_is_permutation_of_all_nodes(&ctx, &po);
+        assert_post_order_edge_property_for_dag(&ctx, &po);
+        assert_topological_edge_property_for_dag(&ctx, &rpo);
+    }
+
+    #[test]
+    fn dfs_edge_kind_classification() {
+        let ctx = vec![n(0, &[1, 2]), n(1, &[3]), n(2, &[3]), n(3, &[0, 3])];
+        let dfs = DFSTraversal::<ArenaGraph, Vec<Node>>::new(&ctx, &ArenaGraph);
+
+        assert_eq!(dfs.edge_kind(&0, &1), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&1, &3), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&0, &2), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&3, &0), DFSEdgeKind::Back);
+        assert_eq!(dfs.edge_kind(&3, &3), DFSEdgeKind::Back);
+        assert_eq!(dfs.edge_kind(&2, &3), DFSEdgeKind::Cross);
+    }
+
+    #[test]
+    fn dfs_edge_kind_classification_bob_morgan_fig31() {
+        // This graph is from Figure 3.1 in Bob Morgan's "Building an Optimizing Compiler".
+        let ctx = vec![
+            n(0, &[1, 5]),
+            n(1, &[2, 4]),
+            n(2, &[3, 6]),
+            n(3, &[4, 2]),
+            n(4, &[5, 1]),
+            n(5, &[]),
+            n(6, &[3]),
+        ];
+        let dfs = DFSTraversal::<ArenaGraph, Vec<Node>>::new(&ctx, &ArenaGraph);
+
+        // Table 3.1 in Bob Morgan's "Building an Optimizing Compiler" classifies edges in this graph as follows:
+        // Tree edges: 0->1, 1->2, 2->3, 2->6, 3->4, 4->5
+        // Forward edges: 0->5, 1->4
+        assert_eq!(dfs.edge_kind(&0, &1), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&1, &2), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&2, &3), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&2, &6), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&3, &4), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&4, &5), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&0, &5), DFSEdgeKind::Forward);
+        assert_eq!(dfs.edge_kind(&1, &4), DFSEdgeKind::Forward);
+
+        // Back edges: 3->2, 4->1
+        assert_eq!(dfs.edge_kind(&3, &2), DFSEdgeKind::Back);
+        assert_eq!(dfs.edge_kind(&4, &1), DFSEdgeKind::Back);
+
+        // Cross edges: 6->3
+        assert_eq!(dfs.edge_kind(&6, &3), DFSEdgeKind::Cross);
+
+        // Test pre-order, post-order and reverse-post-order numbers for a few nodes.
+        assert_eq!(dfs.pre_order_number(&0), 0);
+        assert_eq!(dfs.pre_order_number(&1), 1);
+        assert_eq!(dfs.pre_order_number(&2), 2);
+        assert_eq!(dfs.pre_order_number(&3), 3);
+        assert_eq!(dfs.pre_order_number(&4), 4);
+        assert_eq!(dfs.pre_order_number(&5), 5);
+        assert_eq!(dfs.pre_order_number(&6), 6);
+
+        assert_eq!(dfs.post_order_number(&5), 0);
+        assert_eq!(dfs.post_order_number(&4), 1);
+        assert_eq!(dfs.post_order_number(&3), 2);
+        assert_eq!(dfs.post_order_number(&6), 3);
+        assert_eq!(dfs.post_order_number(&2), 4);
+        assert_eq!(dfs.post_order_number(&1), 5);
+        assert_eq!(dfs.post_order_number(&0), 6);
+
+        assert_eq!(dfs.reverse_post_order_number(&0), 0);
+        assert_eq!(dfs.reverse_post_order_number(&1), 1);
+        assert_eq!(dfs.reverse_post_order_number(&2), 2);
+        assert_eq!(dfs.reverse_post_order_number(&6), 3);
+        assert_eq!(dfs.reverse_post_order_number(&3), 4);
+        assert_eq!(dfs.reverse_post_order_number(&4), 5);
+        assert_eq!(dfs.reverse_post_order_number(&5), 6);
+    }
+
+    /// Assert that `sccs` partition all of `ctx`'s nodes, and that the
+    /// topological property holds: every edge goes within an SCC or from an
+    /// earlier SCC to a later one.
+    fn assert_valid_scc_topo_order(ctx: &[Node], sccs: &[Scc<usize>]) {
+        let mut scc_of = vec![usize::MAX; ctx.len()];
+        let mut count = 0;
+        for (scc_idx, scc) in sccs.iter().enumerate() {
+            for &node in &scc.nodes {
+                assert_eq!(scc_of[node], usize::MAX, "node {node} in multiple SCCs");
+                scc_of[node] = scc_idx;
+                count += 1;
+            }
+        }
+        assert_eq!(count, ctx.len(), "SCCs must cover all nodes");
+        for (u, node) in ctx.iter().enumerate() {
+            for &v in &node.succs {
+                assert!(
+                    scc_of[u] <= scc_of[v],
+                    "edge {u}->{v} goes from a later SCC to an earlier one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scc_linear_chain() {
+        let ctx = vec![n(10, &[1]), n(20, &[2]), n(30, &[])];
+        let sccs = sccs_in_topological_order(&ctx, &ArenaGraph);
+        assert_valid_scc_topo_order(&ctx, &sccs);
+        assert_eq!(sccs.len(), 3);
+        assert!(sccs.iter().all(|scc| !scc.is_cyclic));
+        assert_eq!(
+            sccs.iter().map(|scc| scc.nodes[0]).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn scc_simple_loop() {
+        // 0 -> 1 <-> 2, 1 -> 3
+        let ctx = vec![n(0, &[1]), n(1, &[2, 3]), n(2, &[1]), n(3, &[])];
+        let sccs = sccs_in_topological_order(&ctx, &ArenaGraph);
+        assert_valid_scc_topo_order(&ctx, &sccs);
+        assert_eq!(sccs.len(), 3);
+        assert!(!sccs[0].is_cyclic && sccs[0].nodes == vec![0]);
+        assert!(sccs[1].is_cyclic);
+        let mut loop_nodes = sccs[1].nodes.clone();
+        loop_nodes.sort();
+        assert_eq!(loop_nodes, vec![1, 2]);
+        assert!(!sccs[2].is_cyclic && sccs[2].nodes == vec![3]);
+    }
+
+    #[test]
+    fn scc_self_loop() {
+        let ctx = vec![n(0, &[1]), n(1, &[1, 2]), n(2, &[])];
+        let sccs = sccs_in_topological_order(&ctx, &ArenaGraph);
+        assert_valid_scc_topo_order(&ctx, &sccs);
+        assert_eq!(sccs.len(), 3);
+        assert!(!sccs[0].is_cyclic);
+        assert!(sccs[1].is_cyclic, "self-loop must be classified cyclic");
+        assert!(!sccs[2].is_cyclic);
+    }
+
+    #[test]
+    fn scc_nested_loops_merge() {
+        // Loop nest: 0 -> 1 -> 2 -> 3 -> 1 (outer), 3 -> 2 (inner), 3 -> 4.
+        let ctx = vec![
+            n(0, &[1]),
+            n(1, &[2]),
+            n(2, &[3]),
+            n(3, &[1, 2, 4]),
+            n(4, &[]),
+        ];
+        let sccs = sccs_in_topological_order(&ctx, &ArenaGraph);
+        assert_valid_scc_topo_order(&ctx, &sccs);
+        assert_eq!(sccs.len(), 3);
+        assert!(sccs[1].is_cyclic);
+        let mut loop_nodes = sccs[1].nodes.clone();
+        loop_nodes.sort();
+        assert_eq!(loop_nodes, vec![1, 2, 3], "nested loops form one SCC");
+    }
+
+    #[test]
+    fn scc_unreachable_nodes_covered() {
+        // 0 -> 1; 2 <-> 3 unreachable from entry.
+        let ctx = vec![n(0, &[1]), n(1, &[]), n(2, &[3]), n(3, &[2])];
+        let sccs = sccs_in_topological_order(&ctx, &ArenaGraph);
+        assert_valid_scc_topo_order(&ctx, &sccs);
+        assert_eq!(sccs.len(), 3);
+        assert_eq!(sccs.iter().filter(|scc| scc.is_cyclic).count(), 1);
+    }
+}

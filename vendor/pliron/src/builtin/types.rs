@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Builtin dialect types
+
+use crate::{
+    builtin::type_interfaces::{FloatTypeInterface, FunctionTypeInterface},
+    combine::{
+        Parser, choice,
+        parser::char::{spaces, string},
+    },
+    context::Context,
+    irfmt::parsers::int_parser,
+    parsable::{Parsable, ParseResult, StateStream},
+    printable::{self, Printable},
+    r#type::{Type, TypeHandle, TypeSig, TypedHandle},
+    utils::apfloat::{self, GetSemantics, Semantics},
+};
+use alloc::vec::Vec;
+use pliron::derive::{pliron_type, type_interface_impl};
+
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum Signedness {
+    Signed,
+    Unsigned,
+    Signless,
+}
+
+#[pliron_type(name = "builtin.integer", generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct IntegerType {
+    width: u32,
+    signedness: Signedness,
+}
+
+impl IntegerType {
+    /// Get width.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Get signedness.
+    pub fn signedness(&self) -> Signedness {
+        self.signedness
+    }
+
+    /// Is Signed?
+    pub fn is_signed(&self) -> bool {
+        matches!(self.signedness, Signedness::Signed)
+    }
+
+    /// Is Unsigned?
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self.signedness, Signedness::Unsigned)
+    }
+
+    /// Is Signless?
+    pub fn is_signless(&self) -> bool {
+        matches!(self.signedness, Signedness::Signless)
+    }
+
+    /// Does a value of this type print as a signed decimal?
+    /// A signless integer of more than one bit prints as signed.
+    /// A signless integer of one bit prints as unsigned.
+    pub fn prints_as_signed(&self) -> bool {
+        match self.signedness {
+            Signedness::Signed => true,
+            Signedness::Unsigned => false,
+            Signedness::Signless => self.width > 1,
+        }
+    }
+}
+
+impl Parsable for IntegerType {
+    type Arg = ();
+    type Parsed = TypedHandle<Self>;
+    fn parse<'a>(
+        state_stream: &mut StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> ParseResult<'a, Self::Parsed>
+    where
+        Self: Sized,
+    {
+        // Choose b/w si/ui/i ...
+        let choicer = choice((
+            string("si").map(|_| Signedness::Signed),
+            string("ui").map(|_| Signedness::Unsigned),
+            string("i").map(|_| Signedness::Signless),
+        ));
+
+        // followed by an integer.
+        let mut parser = spaces().with(choicer.and(int_parser()));
+        parser
+            .parse_stream(state_stream)
+            .map(|(signedness, width)| IntegerType::get(state_stream.state.ctx, width, signedness))
+            .into()
+    }
+}
+
+impl Printable for IntegerType {
+    fn fmt(
+        &self,
+        _ctx: &Context,
+        _state: &printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        match &self.signedness {
+            Signedness::Signed => write!(f, "si{}", self.width)?,
+            Signedness::Unsigned => write!(f, "ui{}", self.width)?,
+            Signedness::Signless => write!(f, "i{}", self.width)?,
+        };
+        Ok(())
+    }
+}
+
+/// Map from a list of inputs to a list of results
+///
+/// See MLIR's [FunctionType](https://mlir.llvm.org/docs/Dialects/Builtin/#functiontype).
+///
+#[pliron_type(name = "builtin.function", format = "`<` $0 `>`", verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct FunctionType(TypeSig);
+
+impl FunctionType {
+    /// Get a Function type.
+    pub fn get(
+        ctx: &Context,
+        arguments: Vec<TypeHandle>,
+        results: Vec<TypeHandle>,
+    ) -> TypedHandle<Self> {
+        FunctionType::instantiate(FunctionType(TypeSig { arguments, results }), ctx)
+    }
+}
+
+#[type_interface_impl]
+impl FunctionTypeInterface for FunctionType {
+    /// Get a reference to the function input / argument types.
+    fn arg_types(&self) -> Vec<TypeHandle> {
+        self.0.arguments.clone()
+    }
+
+    /// Get a reference to the function result / output types.
+    fn res_types(&self) -> Vec<TypeHandle> {
+        self.0.results.clone()
+    }
+}
+
+#[pliron_type(name = "builtin.unit", format, generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct UnitType;
+
+#[pliron_type(name = "builtin.fp32", format, generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct FP32Type;
+#[type_interface_impl]
+impl FloatTypeInterface for FP32Type {
+    fn get_semantics(&self) -> Semantics {
+        apfloat::Single::get_semantics()
+    }
+}
+
+#[pliron_type(name = "builtin.fp64", format, generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct FP64Type;
+#[type_interface_impl]
+impl FloatTypeInterface for FP64Type {
+    fn get_semantics(&self) -> Semantics {
+        apfloat::Double::get_semantics()
+    }
+}
+
+#[pliron_type(name = "builtin.fp16", format, generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct FP16Type;
+#[type_interface_impl]
+impl FloatTypeInterface for FP16Type {
+    fn get_semantics(&self) -> Semantics {
+        apfloat::Half::get_semantics()
+    }
+}
+
+#[pliron_type(name = "builtin.bf16", format, generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct BF16Type;
+#[type_interface_impl]
+impl FloatTypeInterface for BF16Type {
+    fn get_semantics(&self) -> Semantics {
+        apfloat::BFloat::get_semantics()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{format, string::ToString, vec};
+    use expect_test::expect;
+
+    use super::*;
+
+    use crate::{
+        builtin::types::{IntegerType, Signedness},
+        combine::{Parser, eof},
+        context::Context,
+        irfmt::parsers::type_parser,
+        parsable::parse_from_str,
+        printable::Printable,
+        result::ExpectOk,
+        r#type::{Type, TypeHandle},
+    };
+
+    #[test]
+    fn test_integer_types() {
+        let ctx = Context::new();
+
+        let int32_1_ptr = IntegerType::get(&ctx, 32, Signedness::Signed);
+        let int32_2_ptr = IntegerType::get(&ctx, 32, Signedness::Signed);
+        let int64_ptr = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let uint32_ptr = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+
+        assert!(int32_1_ptr.deref(&ctx).hash_type() == int32_2_ptr.deref(&ctx).hash_type());
+        assert!(int32_1_ptr.deref(&ctx).hash_type() != int64_ptr.deref(&ctx).hash_type());
+        assert!(int32_1_ptr.deref(&ctx).hash_type() != uint32_ptr.deref(&ctx).hash_type());
+        assert!(int32_1_ptr == int32_2_ptr);
+        assert!(int32_1_ptr != int64_ptr);
+        assert!(int32_1_ptr != uint32_ptr);
+
+        assert!(int32_1_ptr.deref(&ctx).get_self_handle(&ctx) == int32_1_ptr.into());
+        assert!(int32_2_ptr.deref(&ctx).get_self_handle(&ctx) == int32_1_ptr.into());
+        assert!(int32_2_ptr.deref(&ctx).get_self_handle(&ctx) == int32_2_ptr.into());
+        assert!(int64_ptr.deref(&ctx).get_self_handle(&ctx) == int64_ptr.into());
+        assert!(uint32_ptr.deref(&ctx).get_self_handle(&ctx) == uint32_ptr.into());
+        assert!(uint32_ptr.deref(&ctx).get_self_handle(&ctx) != int32_1_ptr.into());
+        assert!(uint32_ptr.deref(&ctx).get_self_handle(&ctx) != int64_ptr.into());
+    }
+
+    #[test]
+    fn test_function_types() {
+        let ctx = Context::new();
+        let int32_1_ptr = IntegerType::get(&ctx, 32, Signedness::Signed);
+        let int64_ptr = IntegerType::get(&ctx, 64, Signedness::Signed);
+
+        let ft_ref =
+            FunctionType::get(&ctx, vec![int32_1_ptr.into()], vec![int64_ptr.into()]).deref(&ctx);
+        assert!(
+            ft_ref.arg_types()[0] == int32_1_ptr.into()
+                && ft_ref.res_types()[0] == int64_ptr.into()
+        );
+    }
+
+    #[test]
+    fn test_integer_parsing() {
+        let mut ctx = Context::new();
+
+        let res = parse_from_str(IntegerType::parser(()).and(eof()), &mut ctx, "si64")
+            .expect_ok(&ctx)
+            .0;
+        assert!(res == IntegerType::get(&ctx, 64, Signedness::Signed))
+    }
+
+    #[test]
+    fn test_integer_parsing_errs() {
+        let mut ctx = Context::new();
+
+        let err_msg = format!(
+            "{}",
+            parse_from_str(IntegerType::parser(()), &mut ctx, "asi64").unwrap_err()
+        );
+
+        let expected_err_msg = expect![[r#"
+            Compilation error: invalid input program.
+            Parse error at line: 1, column: 1
+            Unexpected `a`
+            Expected whitespaces, si, ui or i
+        "#]];
+        expected_err_msg.assert_eq(&err_msg);
+    }
+
+    #[test]
+    fn test_fntype_parsing() {
+        let mut ctx = Context::new();
+
+        let si32 = IntegerType::get(&ctx, 32, Signedness::Signed);
+
+        let res = parse_from_str(
+            FunctionType::parser(()).and(eof()),
+            &mut ctx,
+            "<() -> (builtin.integer si32)>",
+        )
+        .expect_ok(&ctx)
+        .0;
+        assert!(res == FunctionType::get(&ctx, vec![], vec![si32.into()]))
+    }
+
+    #[test]
+    fn test_float_types_roundtrip() {
+        let mut ctx = Context::new();
+
+        let cases: [(&str, TypeHandle); 4] = [
+            ("builtin.fp16", FP16Type::get(&ctx).into()),
+            ("builtin.bf16", BF16Type::get(&ctx).into()),
+            ("builtin.fp32", FP32Type::get(&ctx).into()),
+            ("builtin.fp64", FP64Type::get(&ctx).into()),
+        ];
+
+        for (input, expected_ty) in cases {
+            let res = parse_from_str(type_parser().and(eof()), &mut ctx, input)
+                .expect_ok(&ctx)
+                .0;
+            // The parsed type must be the uniqued float type.
+            assert!(res == expected_ty);
+            // The printed type must be the same as the input.
+            assert_eq!(res.disp(&ctx).to_string().trim(), input);
+        }
+    }
+}

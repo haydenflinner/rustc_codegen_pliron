@@ -1,0 +1,641 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+use core::cell::Cell;
+
+use pliron::{
+    basic_block::BasicBlock,
+    builtin::{
+        op_interfaces::{
+            IsTerminatorInterface, NOpdsInterface, NResultsInterface, OneOpdInterface,
+            OneResultInterface, SingleBlockRegionInterface,
+        },
+        ops::{FuncOp, ModuleOp},
+        types::{FunctionType, IntegerType, Signedness},
+    },
+    context::{Context, Ptr},
+    ident, init_env_logger_for_tests,
+    irbuild::{
+        dialect_conversion::{
+            DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
+        },
+        inserter::Inserter,
+        rewriter::Rewriter,
+    },
+    linked_list::ContainsLinkedList,
+    op::Op,
+    operation::Operation,
+    result::Result,
+    r#type::{TypeHandle, Typed},
+    value::{DefiningEntity, Value},
+};
+
+use pliron::derive::pliron_op;
+
+#[pliron_op(
+    name = "test.producer",
+    format,
+    interfaces = [NOpdsInterface<0>, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct ProducerOp;
+
+impl ProducerOp {
+    fn new(ctx: &mut Context, width: u32) -> Self {
+        let ty = IntegerType::get(ctx, width, Signedness::Signed).into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![ty],
+            vec![],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+#[pliron_op(
+    name = "test.consumer",
+    format,
+    interfaces = [OneOpdInterface, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct ConsumerOp;
+
+impl ConsumerOp {
+    fn new(ctx: &mut Context, value: pliron::value::Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![value],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+#[pliron_op(
+    name = "test.cycle",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct CycleOp;
+
+impl CycleOp {
+    fn new_unconnected(ctx: &mut Context, width: u32) -> Self {
+        let ty = IntegerType::get(ctx, width, Signedness::Signed).into();
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![ty],
+            vec![],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    fn new(ctx: &mut Context, width: u32, operand: pliron::value::Value) -> Self {
+        let op = Self::new_unconnected(ctx, width);
+        Operation::push_operand(op.get_operation(), ctx, operand);
+        op
+    }
+}
+
+#[pliron_op(
+    name = "test.forward_to_succ",
+    format,
+    interfaces = [
+        IsTerminatorInterface,
+        OneOpdInterface,
+        NResultsInterface<0>
+    ],
+    verifier = "succ",
+)]
+pub struct ForwardToSuccOp;
+
+impl ForwardToSuccOp {
+    fn new(ctx: &mut Context, value: pliron::value::Value, succ: Ptr<BasicBlock>) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![value],
+            vec![succ],
+            0,
+        );
+        Self { op }
+    }
+}
+
+#[derive(Default)]
+struct WidthConversion {
+    saw_consumer: bool,
+}
+
+impl DialectConversion for WidthConversion {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        if let Some(producer) = Operation::get_op::<ProducerOp>(op, ctx) {
+            let ty = producer.get_result(ctx).get_type(ctx);
+            let width = ty
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            return width > 16;
+        }
+        Operation::get_op::<ConsumerOp>(op, ctx).is_some()
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        if let Some(producer) = Operation::get_op::<ProducerOp>(op, ctx) {
+            let current_ty = producer.get_result(ctx).get_type(ctx);
+            let current_width = current_ty
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            let converted = ProducerOp::new(ctx, current_width / 2).get_operation();
+            rewriter.insert_operation(ctx, converted);
+            rewriter.replace_operation(ctx, op, converted);
+            return Ok(());
+        }
+
+        if let Some(consumer) = Operation::get_op::<ConsumerOp>(op, ctx) {
+            let operand = consumer.get_operand(ctx);
+            let final_width = operand
+                .get_type(ctx)
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            assert_eq!(final_width, 16);
+
+            let operand_type_history = operands_info.lookup_operand_history(operand);
+            assert_eq!(operand_type_history.len(), 2);
+            let previous_widths = operand_type_history
+                .iter()
+                .map(|ty| {
+                    ty.deref(ctx)
+                        .downcast_ref::<IntegerType>()
+                        .expect("expected integer type")
+                        .width()
+                })
+                .collect::<Vec<u32>>();
+            assert_eq!(previous_widths, vec![64, 32]);
+
+            self.saw_consumer = true;
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+fn dialect_conversion_defs_before_uses() -> Result<()> {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::new();
+
+    let module = ModuleOp::new(ctx, ident!("dialect_conversion_test"));
+    let func_type = FunctionType::get(ctx, vec![], vec![]);
+    let func = FuncOp::new(ctx, ident!("defs_before_uses"), func_type);
+    func.get_operation()
+        .insert_at_back(module.get_body(ctx, 0), ctx);
+    let body = func.get_entry_block(ctx);
+
+    let producer = ProducerOp::new(ctx, 64);
+    producer.get_operation().insert_at_back(body, ctx);
+    let consumer = ConsumerOp::new(ctx, producer.get_result(ctx));
+    consumer.get_operation().insert_at_back(body, ctx);
+
+    let mut conversion = WidthConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert!(conversion.saw_consumer);
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct WidthConversionViaValueReplacement {
+    saw_consumer: bool,
+}
+
+impl DialectConversion for WidthConversionViaValueReplacement {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        if let Some(producer) = Operation::get_op::<ProducerOp>(op, ctx) {
+            let ty = producer.get_result(ctx).get_type(ctx);
+            let width = ty
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            return width > 16;
+        }
+        Operation::get_op::<ConsumerOp>(op, ctx).is_some()
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        if let Some(producer) = Operation::get_op::<ProducerOp>(op, ctx) {
+            let current_ty = producer.get_result(ctx).get_type(ctx);
+            let current_width = current_ty
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            let converted = ProducerOp::new(ctx, current_width / 2);
+            rewriter.insert_operation(ctx, converted.get_operation());
+            rewriter.replace_value_uses_with(
+                ctx,
+                producer.get_result(ctx),
+                converted.get_result(ctx),
+            );
+            rewriter.erase_operation(ctx, op);
+            return Ok(());
+        }
+
+        if let Some(consumer) = Operation::get_op::<ConsumerOp>(op, ctx) {
+            let operand = consumer.get_operand(ctx);
+            let final_width = operand
+                .get_type(ctx)
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .expect("expected integer type")
+                .width();
+            assert_eq!(final_width, 16);
+
+            let operand_type_history = operands_info.lookup_operand_history(operand);
+            assert_eq!(operand_type_history.len(), 2);
+            let previous_widths = operand_type_history
+                .iter()
+                .map(|ty| {
+                    ty.deref(ctx)
+                        .downcast_ref::<IntegerType>()
+                        .expect("expected integer type")
+                        .width()
+                })
+                .collect::<Vec<u32>>();
+            assert_eq!(previous_widths, vec![64, 32]);
+
+            self.saw_consumer = true;
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+fn dialect_conversion_value_replacement_preserves_type_history() -> Result<()> {
+    let ctx = &mut Context::new();
+
+    let module = ModuleOp::new(ctx, ident!("dialect_conversion_value_replacement_test"));
+    let func_type = FunctionType::get(ctx, vec![], vec![]);
+    let func = FuncOp::new(ctx, ident!("value_replacement"), func_type);
+    func.get_operation()
+        .insert_at_back(module.get_body(ctx, 0), ctx);
+    let body = func.get_entry_block(ctx);
+
+    let producer = ProducerOp::new(ctx, 64);
+    producer.get_operation().insert_at_back(body, ctx);
+    let consumer = ConsumerOp::new(ctx, producer.get_result(ctx));
+    consumer.get_operation().insert_at_back(body, ctx);
+
+    let mut conversion = WidthConversionViaValueReplacement::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert!(conversion.saw_consumer);
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct CycleWidthConversion {
+    eligibility_checks: Cell<usize>,
+    rewrites: usize,
+}
+
+impl DialectConversion for CycleWidthConversion {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        let Some(cycle_op) = Operation::get_op::<CycleOp>(op, ctx) else {
+            return false;
+        };
+
+        let eligibility_checks = self.eligibility_checks.get() + 1;
+        self.eligibility_checks.set(eligibility_checks);
+        assert!(
+            eligibility_checks < 256,
+            "Dialect conversion appears to be stuck on a graph-region cycle"
+        );
+
+        cycle_op
+            .get_result(ctx)
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width()
+            > 16
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let cycle_op = Operation::get_op::<CycleOp>(op, ctx).expect("expected cycle op");
+        let current_width = value_width(ctx, cycle_op.get_result(ctx));
+        let converted = CycleOp::new(ctx, current_width / 2, cycle_op.get_operand(ctx));
+        rewriter.insert_operation(ctx, converted.get_operation());
+        rewriter.replace_operation(ctx, op, converted.get_operation());
+        self.rewrites += 1;
+        Ok(())
+    }
+}
+
+fn value_width(ctx: &Context, value: Value) -> u32 {
+    value
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .expect("expected integer type")
+        .width()
+}
+
+#[test]
+fn dialect_conversion_handles_mutually_referential_graph_ops() -> Result<()> {
+    let ctx = &mut Context::new();
+    let module = ModuleOp::new(ctx, ident!("dialect_conversion_graph_cycle_test"));
+    let body = module.get_body(ctx, 0);
+
+    let a = CycleOp::new_unconnected(ctx, 64);
+    let b = CycleOp::new_unconnected(ctx, 64);
+    Operation::push_operand(a.get_operation(), ctx, b.get_result(ctx));
+    Operation::push_operand(b.get_operation(), ctx, a.get_result(ctx));
+    a.get_operation().insert_at_back(body, ctx);
+    b.get_operation().insert_at_back(body, ctx);
+
+    let mut conversion = CycleWidthConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert_eq!(conversion.rewrites, 4);
+
+    let cycle_ops: Vec<_> = body
+        .deref(ctx)
+        .iter(ctx)
+        .filter(|op| Operation::get_op::<CycleOp>(*op, ctx).is_some())
+        .collect();
+    assert_eq!(cycle_ops.len(), 2);
+    for op in &cycle_ops {
+        let cycle_op = Operation::get_op::<CycleOp>(*op, ctx).unwrap();
+        assert_eq!(value_width(ctx, cycle_op.get_result(ctx)), 16);
+        assert_eq!(value_width(ctx, cycle_op.get_operand(ctx)), 16);
+        let def_op = cycle_op
+            .get_operand(ctx)
+            .defining_op()
+            .expect("cycle operand must be defined by an operation");
+        assert!(cycle_ops.contains(&def_op));
+        assert_ne!(*op, def_op);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn dialect_conversion_handles_self_referential_graph_op() -> Result<()> {
+    let ctx = &mut Context::new();
+    let module = ModuleOp::new(ctx, ident!("dialect_conversion_graph_self_cycle_test"));
+    let body = module.get_body(ctx, 0);
+
+    let cycle = CycleOp::new_unconnected(ctx, 64);
+    Operation::push_operand(cycle.get_operation(), ctx, cycle.get_result(ctx));
+    cycle.get_operation().insert_at_back(body, ctx);
+
+    let mut conversion = CycleWidthConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert_eq!(conversion.rewrites, 2);
+
+    let final_op = body
+        .deref(ctx)
+        .iter(ctx)
+        .find(|op| Operation::get_op::<CycleOp>(*op, ctx).is_some())
+        .expect("converted cycle op missing");
+    let final_cycle = Operation::get_op::<CycleOp>(final_op, ctx).unwrap();
+    assert_eq!(value_width(ctx, final_cycle.get_result(ctx)), 16);
+    assert_eq!(value_width(ctx, final_cycle.get_operand(ctx)), 16);
+    assert_eq!(
+        final_cycle.get_operand(ctx).defining_entity(),
+        DefiningEntity::Op(final_op)
+    );
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct ConsumerOnlyConversion {
+    saw_consumer: bool,
+}
+
+impl DialectConversion for ConsumerOnlyConversion {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        Operation::get_op::<ConsumerOp>(op, ctx).is_some()
+    }
+
+    fn can_convert_type(&self, ctx: &Context, ty: TypeHandle) -> bool {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|int_ty| int_ty.width() > 16)
+    }
+
+    fn convert_type(&mut self, ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle> {
+        let width = ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width();
+        Ok(IntegerType::get(ctx, width / 2, Signedness::Signed).into())
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        _rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let consumer = Operation::get_op::<ConsumerOp>(op, ctx).expect("expected consumer op");
+        let operand = consumer.get_operand(ctx);
+
+        let final_width = operand
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width();
+        assert_eq!(final_width, 16);
+
+        let previous_width = operands_info
+            .lookup_most_recent_of_type::<IntegerType>(ctx, operand)
+            .expect("Previous integer type missing");
+        assert_eq!(previous_width.width(), 32);
+
+        self.saw_consumer = true;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ForwardOnlyConversion {
+    saw_forward: bool,
+}
+
+impl DialectConversion for ForwardOnlyConversion {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        Operation::get_op::<ForwardToSuccOp>(op, ctx).is_some()
+    }
+
+    fn can_convert_type(&self, ctx: &Context, ty: TypeHandle) -> bool {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|int_ty| int_ty.width() > 16)
+    }
+
+    fn convert_type(&mut self, ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle> {
+        let width = ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width();
+        Ok(IntegerType::get(ctx, width / 2, Signedness::Signed).into())
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        _rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let succ = op.deref(ctx).get_successor(0);
+        let succ_arg = succ.deref(ctx).get_argument(0);
+        let succ_arg_width = succ_arg
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width();
+        assert_eq!(succ_arg_width, 16);
+
+        self.saw_forward = true;
+        Ok(())
+    }
+}
+
+#[test]
+fn dialect_conversion_block_arg_type_conversion() -> Result<()> {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::new();
+
+    let module = ModuleOp::new(ctx, ident!("block_arg_type_conversion"));
+    let body = module.get_body(ctx, 0);
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed).into();
+    let arg_idx = BasicBlock::push_argument(body, ctx, i64_ty);
+    let block_arg = body.deref(ctx).get_argument(arg_idx);
+
+    let consumer = ConsumerOp::new(ctx, block_arg);
+    consumer.get_operation().insert_at_back(body, ctx);
+
+    let mut conversion = ConsumerOnlyConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert!(conversion.saw_consumer);
+
+    Ok(())
+}
+
+#[test]
+fn dialect_conversion_dead_block_arg_type_conversion() -> Result<()> {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::new();
+
+    let module = ModuleOp::new(ctx, ident!("dead_block_arg_type_conversion"));
+    let body = module.get_body(ctx, 0);
+    let region = body
+        .deref(ctx)
+        .get_parent_region()
+        .expect("module body block must be in a region");
+
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed).into();
+
+    // Neither the entry block nor the successor of any operation, and its
+    // argument is never used: nothing would ever visit this block under the
+    // old "convert on use / convert on successor" scheme.
+    let dead_block = BasicBlock::new(ctx, Some(ident!("dead")), vec![i64_ty]);
+    dead_block.insert_at_back(region, ctx);
+
+    let mut conversion = ConsumerOnlyConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+
+    let dead_arg = dead_block.deref(ctx).get_argument(0);
+    let dead_arg_width = dead_arg
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .expect("expected integer type")
+        .width();
+    assert_eq!(dead_arg_width, 16);
+
+    Ok(())
+}
+
+#[test]
+fn dialect_conversion_successor_block_arg_type_conversion_without_uses() -> Result<()> {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::new();
+
+    let module = ModuleOp::new(ctx, ident!("block_arg_successor_type_conversion"));
+    let pred_block = module.get_body(ctx, 0);
+    let region = pred_block
+        .deref(ctx)
+        .get_parent_region()
+        .expect("module body block must be in a region");
+
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed).into();
+
+    let producer = ProducerOp::new(ctx, 64);
+    producer.get_operation().insert_at_back(pred_block, ctx);
+
+    let succ_block = BasicBlock::new(ctx, Some(ident!("succ")), vec![i64_ty]);
+    succ_block.insert_at_back(region, ctx);
+
+    let forward = ForwardToSuccOp::new(ctx, producer.get_result(ctx), succ_block);
+    forward.get_operation().insert_at_back(pred_block, ctx);
+
+    let mut conversion = ForwardOnlyConversion::default();
+    apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
+    assert!(conversion.saw_forward);
+
+    let succ_arg = succ_block.deref(ctx).get_argument(0);
+    let succ_arg_width = succ_arg
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .expect("expected integer type")
+        .width();
+    assert_eq!(succ_arg_width, 16);
+
+    Ok(())
+}

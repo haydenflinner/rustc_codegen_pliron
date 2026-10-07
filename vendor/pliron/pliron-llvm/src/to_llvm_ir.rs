@@ -1,0 +1,2925 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Translate from pliron's LLVM dialect to LLVM-IR
+
+use llvm_sys::{
+    LLVMAtomicOrdering, LLVMAtomicRMWBinOp, LLVMInlineAsmDialect, LLVMIntPredicate, LLVMLinkage,
+    LLVMRealPredicate,
+};
+use pliron::{
+    attribute::{Attribute, attr_cast},
+    basic_block::BasicBlock,
+    builtin::{
+        attr_interfaces::FloatAttr,
+        attributes::{
+            FPBFloatAttr, FPDoubleAttr, FPHalfAttr, FPSingleAttr, IntegerAttr, StringAttr,
+        },
+        op_interfaces::{
+            AtMostOneRegionInterface, BranchOpInterface, CallOpCallable, CallOpInterface,
+            OneOpdInterface, OneResultInterface, SingleBlockRegionInterface, SymbolOpInterface,
+        },
+        ops::ModuleOp,
+        type_interfaces::FunctionTypeInterface,
+        types::{BF16Type, FP16Type, FP32Type, FP64Type, IntegerType},
+    },
+    common_traits::Named,
+    context::{Context, Ptr},
+    derive::{attr_interface, attr_interface_impl},
+    graph::traversals::region::topological_order,
+    identifier::Identifier,
+    input_err, input_err_noloc, input_error, input_error_noloc,
+    linked_list::ContainsLinkedList,
+    location::{Located, Location},
+    op::{Op, op_cast},
+    operation::Operation,
+    printable::Printable,
+    result::Result,
+    r#type::{Type, TypeHandle, Typed, type_cast},
+    utils::{
+        apfloat::float_to_f64,
+        apint::APInt,
+        table::{HMap, IMap, htable},
+    },
+    value::{DefiningEntity, Value},
+};
+
+use pliron::derive::{op_interface, op_interface_impl, type_interface, type_interface_impl};
+use thiserror::Error;
+
+use crate::{
+    attributes::{
+        AggregateAttr, AtomicOrderingAttr, AtomicRmwKindAttr, BytesAttr, FCmpPredicateAttr,
+        ICmpPredicateAttr, LinkageAttr, PoisonAttr, SplatAttr, SymbolAddrAttr, UndefAttr, ZeroAttr,
+    },
+    llvm_attrs_conversions::to_llvm_ir::add_function_attributes,
+    llvm_sys::core::{
+        LLVMBasicBlock, LLVMBuilder, LLVMContext, LLVMModule, LLVMType, LLVMValue,
+        instruction_iter, llvm_add_attribute_at_index, llvm_add_call_site_attribute, llvm_add_case,
+        llvm_add_destination, llvm_add_function, llvm_add_global_in_address_space,
+        llvm_add_incoming, llvm_append_basic_block_in_context, llvm_array_type2,
+        llvm_bfloat_type_in_context, llvm_block_address, llvm_build_add, llvm_build_addrspacecast,
+        llvm_build_and, llvm_build_array_alloca, llvm_build_ashr, llvm_build_atomic_cmpxchg,
+        llvm_build_atomic_rmw, llvm_build_bitcast, llvm_build_br, llvm_build_call2,
+        llvm_build_cond_br, llvm_build_extract_element, llvm_build_extract_value, llvm_build_fadd,
+        llvm_build_fcmp, llvm_build_fdiv, llvm_build_fence, llvm_build_fmul, llvm_build_fneg,
+        llvm_build_fpext, llvm_build_fptosi, llvm_build_fptoui, llvm_build_fptrunc,
+        llvm_build_freeze, llvm_build_frem, llvm_build_fsub, llvm_build_gep_with_no_wrap_flags,
+        llvm_build_icmp, llvm_build_indirect_br, llvm_build_insert_element,
+        llvm_build_insert_value, llvm_build_int_to_ptr, llvm_build_load2, llvm_build_lshr,
+        llvm_build_mul, llvm_build_or, llvm_build_phi, llvm_build_ptr_to_int, llvm_build_ret,
+        llvm_build_ret_void, llvm_build_sdiv, llvm_build_select, llvm_build_sext, llvm_build_shl,
+        llvm_build_shuffle_vector, llvm_build_sitofp, llvm_build_srem, llvm_build_store,
+        llvm_build_sub, llvm_build_switch, llvm_build_trunc, llvm_build_udiv, llvm_build_uitofp,
+        llvm_build_unreachable, llvm_build_urem, llvm_build_va_arg, llvm_build_xor,
+        llvm_build_zext, llvm_can_value_use_fast_math_flags, llvm_clear_insertion_position,
+        llvm_const_array, llvm_const_int, llvm_const_null, llvm_const_real,
+        llvm_const_string_in_context, llvm_const_struct, llvm_const_vector, llvm_delete_global,
+        llvm_double_type_in_context, llvm_float_type_in_context, llvm_function_type,
+        llvm_get_inline_asm, llvm_get_named_function, llvm_get_param,
+        llvm_get_pointer_address_space, llvm_get_poison, llvm_get_sync_scope_id, llvm_get_undef,
+        llvm_half_type_in_context, llvm_int_type_in_context, llvm_is_a, llvm_lookup_intrinsic_id,
+        llvm_pointer_type_in_context, llvm_position_builder_at_end, llvm_replace_all_uses_with,
+        llvm_scalable_vector_type, llvm_set_alignment, llvm_set_atomic_sync_scope_id,
+        llvm_set_fast_math_flags, llvm_set_global_constant, llvm_set_initializer, llvm_set_linkage,
+        llvm_set_nneg, llvm_set_ordering, llvm_set_volatile, llvm_struct_create_named,
+        llvm_struct_set_body, llvm_struct_type_in_context, llvm_type_of, llvm_vector_type,
+        llvm_void_type_in_context,
+    },
+    metadata_conversions::to_llvm_ir::{
+        MdConversionContext, convert_md_attachments, convert_module_metadata,
+    },
+    op_interfaces::{
+        AlignableOpInterface, FastMathFlags, IsDeclaration, LlvmSymbolName, NNegFlag,
+        PointerTypeResult, SyncScopeInterface, VolatilityOpInterface,
+    },
+    ops::{
+        AShrOp, AddOp, AddrSpaceCastOp, AddressOfOp, AllocaOp, AndOp, AtomicCmpxchgOp,
+        AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, BitcastOp, BlockAddressOp, BlockTagOp, BrOp,
+        CallIntrinsicOp, CallOp, CondBrOp, ConstantOp, ExtractElementOp, ExtractValueOp, FAddOp,
+        FCmpOp, FDivOp, FMulOp, FNegOp, FPExtOp, FPToSIOp, FPToUIOp, FPTruncOp, FRemOp, FSubOp,
+        FenceOp, FreezeOp, FuncOp, GetElementPtrOp, GlobalOp, ICmpOp, IndirectBrOp, InlineAsmOp,
+        InsertElementOp, InsertValueOp, IntToPtrOp, LShrOp, LoadOp, MulOp, OrOp, PoisonOp,
+        PtrToIntOp, ReturnOp, SDivOp, SExtOp, SIToFPOp, SRemOp, SelectOp, ShlOp, ShuffleVectorOp,
+        StoreOp, SubOp, SwitchOp, TruncOp, UDivOp, UIToFPOp, URemOp, UndefOp, UnreachableOp,
+        VAArgOp, XorOp, ZExtOp, ZeroOp,
+    },
+    types::{ArrayType, FuncType, PointerType, StructType, VectorType, VoidType},
+};
+
+/// Mapping from pliron types to [LLVMType]s.
+#[derive(Default)]
+pub struct TypeConversionContext {
+    // A map from pliron StructTypes to LLVM StructTypes.
+    structs_map: HMap<Identifier, LLVMType>,
+    // Type cache to avoid redundant conversions.
+    type_cache: HMap<TypeHandle, LLVMType>,
+}
+
+/// Mapping from pliron entities to LLVM entities.
+pub struct ConversionContext<'a> {
+    // The current LLVMModule being converted to.
+    pub(crate) cur_llvm_module: &'a LLVMModule,
+    // A map from pliron Values to LLVM Values.
+    value_map: HMap<Value, LLVMValue>,
+    // A map from pliron basic blocks to LLVM.
+    block_map: HMap<Ptr<BasicBlock>, LLVMBasicBlock>,
+    // A map from pliron functions to LLVM functions.
+    pub(crate) function_map: HMap<Identifier, LLVMValue>,
+    // A map from pliron globals to LLVM globals.
+    pub(crate) globals_map: HMap<Identifier, LLVMValue>,
+    // A map from `(function symbol, block tag)` to the corresponding LLVM block.
+    block_tags: HMap<(Identifier, u64), LLVMBasicBlock>,
+    // A map from every placeholder we insert to
+    // its corresponding `(function symbol, block tag)`
+    pending_block_address_ops: IMap<LLVMValue, (Identifier, u64)>,
+    // Mapping from pliron types to LLVM types.
+    pub(crate) types: TypeConversionContext,
+    // The active LLVM builder.
+    builder: LLVMBuilder,
+    // Scratch builder in a scratch function for attempting to evaluate constants.
+    scratch_builder: LLVMBuilder,
+    // State for converting the module's metadata.
+    pub(crate) md: MdConversionContext,
+}
+
+impl<'a> ConversionContext<'a> {
+    pub fn new(llvm_ctx: &'a LLVMContext, cur_llvm_module: &'a LLVMModule) -> Self {
+        Self {
+            cur_llvm_module,
+            value_map: HMap::default(),
+            block_map: HMap::default(),
+            function_map: HMap::default(),
+            globals_map: HMap::default(),
+            block_tags: HMap::default(),
+            pending_block_address_ops: IMap::default(),
+            types: TypeConversionContext::default(),
+            builder: LLVMBuilder::new(llvm_ctx),
+            scratch_builder: LLVMBuilder::new(llvm_ctx),
+            md: MdConversionContext::default(),
+        }
+    }
+
+    pub fn clear_per_function_data(&mut self) {
+        self.value_map.clear();
+        self.block_map.clear();
+        llvm_clear_insertion_position(&self.builder);
+    }
+}
+
+/// Conversion errors.
+#[derive(Error, Debug)]
+pub enum ToLLVMErr {
+    #[error("Type {0} does not have a conversion to LLVM type implemented")]
+    MissingTypeConversion(String),
+    #[error("Operation {0} does not have a conversion to LLVM instruction implemented")]
+    MissingOpConversion(String),
+    #[error("Definition for value {0} not seen yet")]
+    UndefinedValue(String),
+    #[error("Block definition {0} not seen yet")]
+    UndefinedBlock(String),
+    #[error("Number of block args in the source dialect equal the number of PHIs in target IR")]
+    NumBlockArgsNumPhisMismatch,
+    #[error(
+        "Insert/Extract value instructions must specify exactly one index, an LLVM-C API limitation"
+    )]
+    InsertExtractValueIndices,
+    #[error("GlobalOp Initializer region does not terminate with a return with value")]
+    GlobalOpInitializerRegionBadReturn,
+    #[error("Cannot evaluate value to a constant")]
+    CannotEvaluateToConst,
+    #[error("BlockAddressOp refers to missing block tag {1} in function {0}")]
+    MissingBlockTag(String, u64),
+    #[error("The attribute {0} is not an LLVM constant")]
+    AttrNotConst(String),
+    #[error("SymbolAddrAttr for {0} is invalid: {1}")]
+    InvalidSymbolAddr(String, String),
+}
+
+pub fn convert_ipredicate(pred: ICmpPredicateAttr) -> LLVMIntPredicate {
+    match pred {
+        ICmpPredicateAttr::EQ => LLVMIntPredicate::LLVMIntEQ,
+        ICmpPredicateAttr::NE => LLVMIntPredicate::LLVMIntNE,
+        ICmpPredicateAttr::UGT => LLVMIntPredicate::LLVMIntUGT,
+        ICmpPredicateAttr::UGE => LLVMIntPredicate::LLVMIntUGE,
+        ICmpPredicateAttr::ULT => LLVMIntPredicate::LLVMIntULT,
+        ICmpPredicateAttr::ULE => LLVMIntPredicate::LLVMIntULE,
+        ICmpPredicateAttr::SGT => LLVMIntPredicate::LLVMIntSGT,
+        ICmpPredicateAttr::SGE => LLVMIntPredicate::LLVMIntSGE,
+        ICmpPredicateAttr::SLT => LLVMIntPredicate::LLVMIntSLT,
+        ICmpPredicateAttr::SLE => LLVMIntPredicate::LLVMIntSLE,
+    }
+}
+
+pub fn convert_fpredicate(pred: FCmpPredicateAttr) -> LLVMRealPredicate {
+    match pred {
+        FCmpPredicateAttr::False => LLVMRealPredicate::LLVMRealPredicateFalse,
+        FCmpPredicateAttr::OEQ => LLVMRealPredicate::LLVMRealOEQ,
+        FCmpPredicateAttr::OGT => LLVMRealPredicate::LLVMRealOGT,
+        FCmpPredicateAttr::OGE => LLVMRealPredicate::LLVMRealOGE,
+        FCmpPredicateAttr::OLT => LLVMRealPredicate::LLVMRealOLT,
+        FCmpPredicateAttr::OLE => LLVMRealPredicate::LLVMRealOLE,
+        FCmpPredicateAttr::ONE => LLVMRealPredicate::LLVMRealONE,
+        FCmpPredicateAttr::ORD => LLVMRealPredicate::LLVMRealORD,
+        FCmpPredicateAttr::UNO => LLVMRealPredicate::LLVMRealUNO,
+        FCmpPredicateAttr::UEQ => LLVMRealPredicate::LLVMRealUEQ,
+        FCmpPredicateAttr::UGT => LLVMRealPredicate::LLVMRealUGT,
+        FCmpPredicateAttr::UGE => LLVMRealPredicate::LLVMRealUGE,
+        FCmpPredicateAttr::ULT => LLVMRealPredicate::LLVMRealULT,
+        FCmpPredicateAttr::ULE => LLVMRealPredicate::LLVMRealULE,
+        FCmpPredicateAttr::UNE => LLVMRealPredicate::LLVMRealUNE,
+        FCmpPredicateAttr::True => LLVMRealPredicate::LLVMRealPredicateTrue,
+    }
+}
+
+pub fn convert_linkage(linkage: LinkageAttr) -> LLVMLinkage {
+    match linkage {
+        LinkageAttr::ExternalLinkage => LLVMLinkage::LLVMExternalLinkage,
+        LinkageAttr::AvailableExternallyLinkage => LLVMLinkage::LLVMAvailableExternallyLinkage,
+        LinkageAttr::LinkOnceAnyLinkage => LLVMLinkage::LLVMLinkOnceAnyLinkage,
+        LinkageAttr::LinkOnceODRLinkage => LLVMLinkage::LLVMLinkOnceODRLinkage,
+        LinkageAttr::WeakAnyLinkage => LLVMLinkage::LLVMWeakAnyLinkage,
+        LinkageAttr::WeakODRLinkage => LLVMLinkage::LLVMWeakODRLinkage,
+        LinkageAttr::AppendingLinkage => LLVMLinkage::LLVMAppendingLinkage,
+        LinkageAttr::InternalLinkage => LLVMLinkage::LLVMInternalLinkage,
+        LinkageAttr::PrivateLinkage => LLVMLinkage::LLVMPrivateLinkage,
+        LinkageAttr::DLLImportLinkage => LLVMLinkage::LLVMDLLImportLinkage,
+        LinkageAttr::DLLExportLinkage => LLVMLinkage::LLVMDLLExportLinkage,
+        LinkageAttr::ExternalWeakLinkage => LLVMLinkage::LLVMExternalWeakLinkage,
+        LinkageAttr::GhostLinkage => LLVMLinkage::LLVMGhostLinkage,
+        LinkageAttr::CommonLinkage => LLVMLinkage::LLVMCommonLinkage,
+        LinkageAttr::LinkOnceODRAutoHideLinkage => LLVMLinkage::LLVMLinkOnceODRAutoHideLinkage,
+        LinkageAttr::LinkerPrivateLinkage => LLVMLinkage::LLVMLinkerPrivateLinkage,
+        LinkageAttr::LinkerPrivateWeakLinkage => LLVMLinkage::LLVMLinkerPrivateWeakLinkage,
+    }
+}
+
+#[::pliron::linkme::distributed_slice]
+#[linkme(crate = pliron::linkme)]
+pub static TEST: [u64];
+
+/// Convert a float attribute to fp64 (since LLVM's C-API pretty much restricts us to that).
+#[attr_interface]
+trait FloatAttrToFP64: FloatAttr {
+    fn to_fp64(&self) -> f64;
+    fn verify(_attr: &dyn Attribute, _ctx: &Context) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+}
+
+#[attr_interface_impl]
+impl FloatAttrToFP64 for FPHalfAttr {
+    fn to_fp64(&self) -> f64 {
+        float_to_f64(self.0, &mut false)
+    }
+}
+
+#[attr_interface_impl]
+impl FloatAttrToFP64 for FPBFloatAttr {
+    fn to_fp64(&self) -> f64 {
+        float_to_f64(self.0, &mut false)
+    }
+}
+
+#[attr_interface_impl]
+impl FloatAttrToFP64 for FPSingleAttr {
+    fn to_fp64(&self) -> f64 {
+        Into::<f32>::into(self.clone()) as f64
+    }
+}
+
+#[attr_interface_impl]
+impl FloatAttrToFP64 for FPDoubleAttr {
+    fn to_fp64(&self) -> f64 {
+        Into::<f64>::into(self.clone())
+    }
+}
+
+/// A type that implements this is convertible to an [LLVMType].
+#[type_interface]
+trait ToLLVMType {
+    /// Convert from pliron [Type] to [LLVMType].
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType>;
+
+    fn verify(_type: &dyn Type, _ctx: &Context) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+}
+
+/// An [Op] that implements this is convertible to an [LLVMValue].
+#[op_interface]
+trait ToLLVMValue {
+    /// Convert from pliron [Op] to [LLVMValue].
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue>;
+
+    fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for IntegerType {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_int_type_in_context(llvm_ctx, self.width()))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for ArrayType {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        let elem_ty = convert_type(ctx, llvm_ctx, tcctx, self.elem_type())?;
+        Ok(llvm_array_type2(elem_ty, self.size()))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for FuncType {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        let args_tys: Vec<_> = self
+            .arg_types()
+            .iter()
+            .map(|ty| convert_type(ctx, llvm_ctx, tcctx, *ty))
+            .collect::<Result<_>>()?;
+        let ret_ty = convert_type(ctx, llvm_ctx, tcctx, self.result_type())?;
+        Ok(llvm_function_type(ret_ty, &args_tys, self.is_var_arg()))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for VoidType {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_void_type_in_context(llvm_ctx))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for PointerType {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_pointer_type_in_context(llvm_ctx, self.address_space()))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for StructType {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        if self.is_opaque() {
+            let name = self.name().expect("Opaqaue struct must have a name");
+            Ok(llvm_struct_create_named(llvm_ctx, name.as_ref()))
+        } else {
+            let field_types = self
+                .fields()
+                .map(|fty| convert_type(ctx, llvm_ctx, tcctx, fty))
+                .collect::<Result<Vec<_>>>()?;
+            let is_packed: bool = self.layout().into();
+            if let Some(name) = self.name() {
+                match tcctx.structs_map.entry(name) {
+                    htable::Entry::Occupied(entry) => Ok(*entry.get()),
+                    htable::Entry::Vacant(entry) => {
+                        let str_ty = llvm_struct_create_named(llvm_ctx, entry.key().as_ref());
+                        llvm_struct_set_body(str_ty, &field_types, is_packed);
+                        entry.insert(str_ty);
+                        Ok(str_ty)
+                    }
+                }
+            } else {
+                Ok(llvm_struct_type_in_context(
+                    llvm_ctx,
+                    &field_types,
+                    is_packed,
+                ))
+            }
+        }
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for VectorType {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        let elem_ty = convert_type(ctx, llvm_ctx, tcctx, self.elem_type())?;
+        let num_elems = self.num_elements();
+        if self.is_scalable() {
+            Ok(llvm_scalable_vector_type(elem_ty, num_elems))
+        } else {
+            Ok(llvm_vector_type(elem_ty, num_elems))
+        }
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for FP32Type {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_float_type_in_context(llvm_ctx))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for FP64Type {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_double_type_in_context(llvm_ctx))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for FP16Type {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_half_type_in_context(llvm_ctx))
+    }
+}
+
+#[type_interface_impl]
+impl ToLLVMType for BF16Type {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _tcctx: &mut TypeConversionContext,
+    ) -> Result<LLVMType> {
+        Ok(llvm_bfloat_type_in_context(llvm_ctx))
+    }
+}
+
+/// Convert a pliron [Type] to [LLVMType].
+pub fn convert_type(
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    tcctx: &mut TypeConversionContext,
+    ty: TypeHandle,
+) -> Result<LLVMType> {
+    if let Some(cached) = tcctx.type_cache.get(&ty) {
+        return Ok(*cached);
+    }
+    if let Some(converter) = type_cast::<dyn ToLLVMType>(&*ty.deref(ctx)) {
+        let llvm_ty = converter.convert(ctx, llvm_ctx, tcctx)?;
+        tcctx.type_cache.insert(ty, llvm_ty);
+        return Ok(llvm_ty);
+    }
+
+    input_err_noloc!(ToLLVMErr::MissingTypeConversion(
+        ty.deref(ctx).get_type_id().to_string()
+    ))
+}
+
+fn convert_value_operand(
+    cctx: &mut ConversionContext,
+    ctx: &Context,
+    value: &Value,
+) -> Result<LLVMValue> {
+    match cctx.value_map.get(value) {
+        Some(v) => Ok(*v),
+        None => {
+            input_err_noloc!(ToLLVMErr::UndefinedValue(value.unique_name(ctx).into()))
+        }
+    }
+}
+
+fn convert_block_operand(
+    cctx: &mut ConversionContext,
+    ctx: &Context,
+    block: Ptr<BasicBlock>,
+) -> Result<LLVMBasicBlock> {
+    match cctx.block_map.get(&block) {
+        Some(v) => Ok(*v),
+        None => {
+            input_err_noloc!(ToLLVMErr::UndefinedBlock(block.unique_name(ctx).into()))
+        }
+    }
+}
+
+macro_rules! to_llvm_value_int_bin_op {
+    (
+        $op_name:ident, $builder_function:ident
+    ) => {
+        #[pliron::derive::op_interface_impl]
+        impl ToLLVMValue for $op_name {
+            fn convert(
+                &self,
+                ctx: &Context,
+                _llvm_ctx: &LLVMContext,
+                cctx: &mut ConversionContext,
+            ) -> Result<LLVMValue> {
+                let op = self.get_operation().deref(ctx);
+                let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+                let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+                let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+                Ok($builder_function(
+                    &cctx.builder,
+                    lhs,
+                    rhs,
+                    self.get_result(ctx).unique_name(ctx).as_ref(),
+                ))
+            }
+        }
+    };
+}
+
+to_llvm_value_int_bin_op!(AddOp, llvm_build_add);
+to_llvm_value_int_bin_op!(SubOp, llvm_build_sub);
+to_llvm_value_int_bin_op!(MulOp, llvm_build_mul);
+to_llvm_value_int_bin_op!(SDivOp, llvm_build_sdiv);
+to_llvm_value_int_bin_op!(UDivOp, llvm_build_udiv);
+to_llvm_value_int_bin_op!(URemOp, llvm_build_urem);
+to_llvm_value_int_bin_op!(SRemOp, llvm_build_srem);
+to_llvm_value_int_bin_op!(AndOp, llvm_build_and);
+to_llvm_value_int_bin_op!(OrOp, llvm_build_or);
+to_llvm_value_int_bin_op!(XorOp, llvm_build_xor);
+to_llvm_value_int_bin_op!(ShlOp, llvm_build_shl);
+to_llvm_value_int_bin_op!(LShrOp, llvm_build_lshr);
+to_llvm_value_int_bin_op!(AShrOp, llvm_build_ashr);
+
+#[op_interface_impl]
+impl ToLLVMValue for AllocaOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(
+            ctx,
+            llvm_ctx,
+            &mut cctx.types,
+            self.result_pointee_type(ctx),
+        )?;
+        let size = convert_value_operand(cctx, ctx, &self.get_operand(ctx))?;
+        let name = self.get_result(ctx).unique_name(ctx);
+        let alloca_op = llvm_build_array_alloca(&cctx.builder, ty, size, name.as_ref());
+        if let Some(alignment) = self.alignment(ctx) {
+            llvm_set_alignment(alloca_op, alignment);
+        }
+
+        // LLVM's C API has no address space aware alloca builder: `LLVMBuildArrayAlloca`
+        // always allocates in the address space the data layout nominates for allocas.
+        // When the op's result asks for a different one, cast into it.
+        let res_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        if llvm_type_of(alloca_op) == res_ty {
+            return Ok(alloca_op);
+        }
+        Ok(llvm_build_addrspacecast(
+            &cctx.builder,
+            alloca_op,
+            res_ty,
+            &format!("{name}.ascast"),
+        ))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for BitcastOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let arg = convert_value_operand(cctx, ctx, &self.get_operand(ctx))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let bitcast_op = llvm_build_bitcast(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(bitcast_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AddrSpaceCastOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let arg = convert_value_operand(cctx, ctx, &self.get_operand(ctx))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let addrspacecast_op = llvm_build_addrspacecast(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(addrspacecast_op)
+    }
+}
+
+fn link_succ_operands_with_phis(
+    ctx: &Context,
+    cctx: &mut ConversionContext,
+    source_block: Ptr<BasicBlock>,
+    target_block: LLVMBasicBlock,
+    opds: Vec<Value>,
+) -> Result<()> {
+    let mut phis = vec![];
+    for inst in instruction_iter(target_block) {
+        if !llvm_is_a::phi_node(inst) {
+            break;
+        };
+        phis.push(inst);
+    }
+
+    if phis.len() != opds.len() {
+        return input_err!(
+            source_block.deref(ctx).loc(),
+            ToLLVMErr::NumBlockArgsNumPhisMismatch
+        );
+    }
+
+    let source_block = convert_block_operand(cctx, ctx, source_block)?;
+
+    for (idx, arg) in opds.iter().enumerate() {
+        let arg = convert_value_operand(cctx, ctx, arg)?;
+        llvm_add_incoming(phis[idx], &[arg], &[source_block]);
+    }
+    Ok(())
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for BrOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let succ = op.get_successor(0);
+        let succ_llvm = convert_block_operand(cctx, ctx, succ)?;
+        let branch_op = llvm_build_br(&cctx.builder, succ_llvm);
+
+        // Link the arguments we pass to the block with the PHIs there.
+        link_succ_operands_with_phis(
+            ctx,
+            cctx,
+            op.get_parent_block().expect("Unlinked operation"),
+            succ_llvm,
+            self.successor_operands(ctx, 0),
+        )?;
+
+        Ok(branch_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for CondBrOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (true_succ, false_succ) = (op.get_successor(0), op.get_successor(1));
+        let true_succ_llvm = convert_block_operand(cctx, ctx, true_succ)?;
+        let false_succ_llvm = convert_block_operand(cctx, ctx, false_succ)?;
+        let cond = convert_value_operand(cctx, ctx, &self.get_operand_condition(ctx))?;
+
+        let branch_op = llvm_build_cond_br(&cctx.builder, cond, true_succ_llvm, false_succ_llvm);
+
+        // Link the arguments we pass to the block with the PHIs there.
+        link_succ_operands_with_phis(
+            ctx,
+            cctx,
+            op.get_parent_block().expect("Unlinked operation"),
+            true_succ_llvm,
+            self.successor_operands(ctx, 0),
+        )?;
+        link_succ_operands_with_phis(
+            ctx,
+            cctx,
+            op.get_parent_block().expect("Unlinked operation"),
+            false_succ_llvm,
+            self.successor_operands(ctx, 1),
+        )?;
+
+        Ok(branch_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for SwitchOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let cond = convert_value_operand(cctx, ctx, &self.get_operand_condition(ctx))?;
+        let default_succ = convert_block_operand(cctx, ctx, self.default_dest(ctx))?;
+        let switch_op = llvm_build_switch(
+            &cctx.builder,
+            cond,
+            default_succ,
+            self.cases(ctx).len() as u32,
+        );
+
+        // Link the arguments we pass to the block with the PHIs there.
+        link_succ_operands_with_phis(
+            ctx,
+            cctx,
+            op.get_parent_block().expect("Unlinked operation"),
+            default_succ,
+            self.default_dest_operands(ctx),
+        )?;
+        for case in self.cases(ctx) {
+            let succ_llvm = convert_block_operand(cctx, ctx, case.dest)?;
+            link_succ_operands_with_phis(
+                ctx,
+                cctx,
+                op.get_parent_block().expect("Unlinked operation"),
+                succ_llvm,
+                case.dest_opds,
+            )?;
+
+            let int_ty = case.value.get_type();
+            let int_ty_llvm = convert_type(ctx, llvm_ctx, &mut cctx.types, int_ty.into())?;
+            let ap_int_val: APInt = case.value.clone().into();
+            let case_const_val = llvm_const_int(int_ty_llvm, ap_int_val.to_u64(), false);
+
+            llvm_add_case(switch_op, case_const_val, succ_llvm);
+        }
+
+        Ok(switch_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for IndirectBrOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let addr = convert_value_operand(cctx, ctx, &self.get_operand_address(ctx))?;
+        let dests = self.destinations(ctx);
+        let indirect_br_op = llvm_build_indirect_br(&cctx.builder, addr, dests.len() as u32);
+
+        for dest in dests {
+            let succ_llvm = convert_block_operand(cctx, ctx, dest.dest)?;
+            llvm_add_destination(indirect_br_op, succ_llvm);
+            link_succ_operands_with_phis(
+                ctx,
+                cctx,
+                op.get_parent_block().expect("Unlinked operation"),
+                succ_llvm,
+                dest.dest_opds,
+            )?;
+        }
+
+        Ok(indirect_br_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for LoadOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let pointee_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let ptr = convert_value_operand(cctx, ctx, &self.get_operand(ctx))?;
+        let load_op = llvm_build_load2(
+            &cctx.builder,
+            pointee_ty,
+            ptr,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if let Some(alignment) = self.alignment(ctx) {
+            llvm_set_alignment(load_op, alignment);
+        }
+        llvm_set_volatile(load_op, self.is_volatile(ctx));
+        Ok(load_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for StoreOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let value = convert_value_operand(cctx, ctx, &self.get_operand_value(ctx))?;
+        let ptr = convert_value_operand(cctx, ctx, &self.get_operand_address(ctx))?;
+        let store_op = llvm_build_store(&cctx.builder, value, ptr);
+        if let Some(alignment) = self.alignment(ctx) {
+            llvm_set_alignment(store_op, alignment);
+        }
+        llvm_set_volatile(store_op, self.is_volatile(ctx));
+        Ok(store_op)
+    }
+}
+
+/// Map a pliron [AtomicOrderingAttr] to its LLVM-C counterpart.
+fn convert_atomic_ordering(o: &AtomicOrderingAttr) -> LLVMAtomicOrdering {
+    match o {
+        AtomicOrderingAttr::Monotonic => LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+        AtomicOrderingAttr::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
+        AtomicOrderingAttr::Release => LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
+        AtomicOrderingAttr::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
+        AtomicOrderingAttr::SeqCst => LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+    }
+}
+
+/// Map a pliron [AtomicRmwKindAttr] to its LLVM-C counterpart.
+fn convert_rmw_kind(k: &AtomicRmwKindAttr) -> LLVMAtomicRMWBinOp {
+    match k {
+        AtomicRmwKindAttr::Xchg => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpXchg,
+        AtomicRmwKindAttr::Add => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd,
+        AtomicRmwKindAttr::Sub => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpSub,
+        AtomicRmwKindAttr::And => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAnd,
+        AtomicRmwKindAttr::Nand => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpNand,
+        AtomicRmwKindAttr::Or => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpOr,
+        AtomicRmwKindAttr::Xor => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpXor,
+        AtomicRmwKindAttr::Max => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpMax,
+        AtomicRmwKindAttr::Min => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpMin,
+        AtomicRmwKindAttr::UMax => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpUMax,
+        AtomicRmwKindAttr::UMin => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpUMin,
+        AtomicRmwKindAttr::FAdd => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpFAdd,
+        AtomicRmwKindAttr::FSub => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpFSub,
+        AtomicRmwKindAttr::FMax => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpFMax,
+        AtomicRmwKindAttr::FMin => LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpFMin,
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AtomicRmwOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let (ptr_opd, val_opd) = {
+            let op = self.get_operation().deref(ctx);
+            (op.get_operand(0), op.get_operand(1))
+        };
+        let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
+        let val = convert_value_operand(cctx, ctx, &val_opd)?;
+        let kind = convert_rmw_kind(
+            &self
+                .get_attr_llvm_rmw_kind(ctx)
+                .expect("atomicrmw missing rmw kind"),
+        );
+        let ordering = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_rmw_ordering(ctx)
+                .expect("atomicrmw missing ordering"),
+        );
+        let scope = self.syncscope(ctx).to_name();
+        let ssid = llvm_get_sync_scope_id(llvm_ctx, &scope);
+        Ok(llvm_build_atomic_rmw(
+            &cctx.builder,
+            kind,
+            ptr,
+            val,
+            ordering,
+            ssid,
+        ))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AtomicCmpxchgOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let (ptr_opd, cmp_opd, new_opd) = {
+            let op = self.get_operation().deref(ctx);
+            (op.get_operand(0), op.get_operand(1), op.get_operand(2))
+        };
+        let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
+        let cmp = convert_value_operand(cctx, ctx, &cmp_opd)?;
+        let new = convert_value_operand(cctx, ctx, &new_opd)?;
+        let success = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_cas_success_ordering(ctx)
+                .expect("cmpxchg missing success ordering"),
+        );
+        let failure = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_cas_failure_ordering(ctx)
+                .expect("cmpxchg missing failure ordering"),
+        );
+        let scope = self.syncscope(ctx).to_name();
+        let ssid = llvm_get_sync_scope_id(llvm_ctx, &scope);
+        Ok(llvm_build_atomic_cmpxchg(
+            &cctx.builder,
+            ptr,
+            cmp,
+            new,
+            success,
+            failure,
+            ssid,
+        ))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FenceOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ordering = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_fence_ordering(ctx)
+                .expect("fence missing ordering"),
+        );
+        let scope = self.syncscope(ctx).to_name();
+        let ssid = llvm_get_sync_scope_id(llvm_ctx, &scope);
+        Ok(llvm_build_fence(&cctx.builder, ordering, ssid, ""))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AtomicLoadOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let (ptr_opd, result_val) = {
+            let op = self.get_operation().deref(ctx);
+            (op.get_operand(0), op.get_result(0))
+        };
+        let pointee_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, result_val.get_type(ctx))?;
+        let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
+        let load = llvm_build_load2(
+            &cctx.builder,
+            pointee_ty,
+            ptr,
+            result_val.unique_name(ctx).as_ref(),
+        );
+        let ordering = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_ld_ordering(ctx)
+                .expect("atomic load missing ordering"),
+        );
+        llvm_set_ordering(load, ordering);
+        let scope = self.syncscope(ctx).to_name();
+        llvm_set_atomic_sync_scope_id(load, llvm_get_sync_scope_id(llvm_ctx, &scope));
+        if let Some(alignment) = self.alignment(ctx) {
+            llvm_set_alignment(load, alignment);
+        }
+        Ok(load)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AtomicStoreOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let (val_opd, ptr_opd) = {
+            let op = self.get_operation().deref(ctx);
+            (op.get_operand(0), op.get_operand(1))
+        };
+        let value = convert_value_operand(cctx, ctx, &val_opd)?;
+        let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
+        let store = llvm_build_store(&cctx.builder, value, ptr);
+        let ordering = convert_atomic_ordering(
+            &self
+                .get_attr_llvm_st_ordering(ctx)
+                .expect("atomic store missing ordering"),
+        );
+        llvm_set_ordering(store, ordering);
+        let scope = self.syncscope(ctx).to_name();
+        llvm_set_atomic_sync_scope_id(store, llvm_get_sync_scope_id(llvm_ctx, &scope));
+        if let Some(alignment) = self.alignment(ctx) {
+            llvm_set_alignment(store, alignment);
+        }
+        Ok(store)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for InlineAsmOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let (arg_opds, result_val) = {
+            let op = self.get_operation().deref(ctx);
+            let n = op.get_num_operands();
+            let args: Vec<Value> = (0..n).map(|i| op.get_operand(i)).collect();
+            (args, op.get_result(0))
+        };
+        let args: Vec<LLVMValue> = arg_opds
+            .iter()
+            .map(|v| convert_value_operand(cctx, ctx, v))
+            .collect::<Result<_>>()?;
+        let result_ty = result_val.get_type(ctx);
+        let result_llvm_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, result_ty)?;
+        let arg_types: Vec<LLVMType> = args.iter().map(|a| llvm_type_of(*a)).collect();
+        let fn_ty = llvm_function_type(result_llvm_ty, &arg_types, false);
+        let asm = String::from(
+            (*self
+                .get_attr_llvm_inline_asm_template(ctx)
+                .expect("inline asm missing template"))
+            .clone(),
+        );
+        let constraints = String::from(
+            (*self
+                .get_attr_llvm_inline_asm_constraints(ctx)
+                .expect("inline asm missing constraints"))
+            .clone(),
+        );
+        let side_effects = bool::from(
+            self.get_attr_llvm_inline_asm_side_effects(ctx)
+                .expect("inline asm missing side-effects flag")
+                .clone(),
+        );
+        let asm_val = llvm_get_inline_asm(
+            fn_ty,
+            &asm,
+            &constraints,
+            side_effects,
+            false,
+            LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            false,
+        );
+        let name = if result_ty.deref(ctx).is::<VoidType>() {
+            String::new()
+        } else {
+            result_val.unique_name(ctx).to_string()
+        };
+        let call_val = llvm_build_call2(&cctx.builder, fn_ty, asm_val, &args, &name);
+        if let Some(attrs) = self.get_attr_llvm_inline_asm_attrs(ctx) {
+            add_function_attributes(
+                ctx,
+                llvm_ctx,
+                &mut cctx.types,
+                call_val,
+                &attrs,
+                llvm_add_call_site_attribute,
+            )?;
+        }
+        Ok(call_val)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ICmpOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let predicate = convert_ipredicate(self.predicate(ctx));
+        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let icmp_op = llvm_build_icmp(
+            &cctx.builder,
+            predicate,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(icmp_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ReturnOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ret_op = if let Some(retval) = self.retval(ctx) {
+            let retval = convert_value_operand(cctx, ctx, &retval)?;
+            llvm_build_ret(&cctx.builder, retval)
+        } else {
+            llvm_build_ret_void(&cctx.builder)
+        };
+        Ok(ret_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for UnreachableOp {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        Ok(llvm_build_unreachable(&cctx.builder))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ConstantOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ZeroOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for IntToPtrOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let inttoptr_op = llvm_build_int_to_ptr(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(inttoptr_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for PtrToIntOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let ptrtoint_op = llvm_build_ptr_to_int(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(ptrtoint_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for UndefOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for PoisonOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for AddressOfOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for BlockAddressOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        <Self as OpToLLVMConstValue>::convert(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for BlockTagOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let cur_block = self
+            .get_operation()
+            .deref(ctx)
+            .get_parent_block()
+            .expect("BlockTagOp must be in a basic block");
+        let cur_func = cur_block
+            .deref(ctx)
+            .get_parent_op(ctx)
+            .expect("BlockTagOp must be in a basic block of a function");
+        let cur_func =
+            Operation::get_op::<FuncOp>(cur_func, ctx).expect("Block's parent op must be FuncOp");
+        let cur_func_name = cur_func.get_symbol_name(ctx);
+        let tag = self.get_tag_id(ctx);
+
+        let cur_llvm_block = cctx
+            .block_map
+            .get(&cur_block)
+            .expect("Current block must be in block_map");
+
+        // Later on, for all llvm.blockaddress that refers to this tag, we use this info.
+        cctx.block_tags
+            .insert((cur_func_name, tag), *cur_llvm_block);
+
+        // Actual LLVM doesn't need a BlockTagOp.
+        // Address is taken directly via the llvm.blockaddress instruction.
+        Ok(llvm_const_null(llvm_pointer_type_in_context(llvm_ctx, 0)))
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FreezeOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let freeze_op = llvm_build_freeze(
+            &cctx.builder,
+            arg,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(freeze_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for CallOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let args: Vec<_> = self
+            .args(ctx)
+            .into_iter()
+            .map(|v| convert_value_operand(cctx, ctx, &v))
+            .collect::<Result<_>>()?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.callee_type(ctx))?;
+        let res = self.get_result(ctx);
+        let unique_name;
+        let name = if res.get_type(ctx).deref(ctx).is::<VoidType>() {
+            ""
+        } else {
+            unique_name = res.unique_name(ctx);
+            unique_name.as_ref()
+        };
+        let callee = match self.callee(ctx) {
+            CallOpCallable::Direct(callee_sym) => {
+                *cctx.function_map.get(&callee_sym).ok_or_else(|| {
+                    input_error_noloc!(ToLLVMErr::UndefinedValue(callee_sym.to_string()))
+                })?
+            }
+            CallOpCallable::Indirect(callee) => convert_value_operand(cctx, ctx, &callee)?,
+        };
+        let call_val = llvm_build_call2(&cctx.builder, ty, callee, &args, name);
+        if let Some(fmf) = self.get_attr_llvm_call_fastmath_flags(ctx)
+            && llvm_can_value_use_fast_math_flags(call_val)
+        {
+            llvm_set_fast_math_flags(call_val, (*fmf).into());
+        }
+        if let Some(attrs) = self.get_attr_llvm_call_attrs(ctx) {
+            add_function_attributes(
+                ctx,
+                llvm_ctx,
+                &mut cctx.types,
+                call_val,
+                &attrs,
+                llvm_add_call_site_attribute,
+            )?;
+        }
+        Ok(call_val)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for CallIntrinsicOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let args: Vec<_> = (0..op.get_num_operands())
+            .map(|i| convert_value_operand(cctx, ctx, &op.get_operand(i)))
+            .collect::<Result<_>>()?;
+        let fn_ty = convert_type(
+            ctx,
+            llvm_ctx,
+            &mut cctx.types,
+            self.get_attr_llvm_intrinsic_type(ctx)
+                .unwrap()
+                .get_type(ctx),
+        )?;
+
+        let intrinsic_name = <StringAttr as Into<String>>::into(
+            self.get_attr_llvm_intrinsic_name(ctx)
+                .expect("Intrinsic call does not name the intrinsic to be called")
+                .clone(),
+        );
+
+        let _intrinsic_id = llvm_lookup_intrinsic_id(&intrinsic_name).ok_or_else(|| {
+            input_error_noloc!(ToLLVMErr::UndefinedValue(intrinsic_name.to_string()))
+        })?;
+
+        // We just use llvm_add_function instead of llvm_get_intrinsic_declaration here
+        // because the latter requires that (and I quote from Intrinsics.h::getOrInsertDeclaration):
+        //   "For a declaration of an overloaded intrinsic, Tys must provide exactly one
+        //    type for each overloaded type in the intrinsic."
+        // I don't know how to determine that from just the name and argument types.
+        let intrinsic_fn = llvm_get_named_function(cctx.cur_llvm_module, &intrinsic_name)
+            .unwrap_or_else(|| llvm_add_function(cctx.cur_llvm_module, &intrinsic_name, fn_ty));
+
+        let res = self.get_result(ctx);
+        let unique_name;
+        let name = if res.get_type(ctx).deref(ctx).is::<VoidType>() {
+            ""
+        } else {
+            unique_name = res.unique_name(ctx);
+            unique_name.as_ref()
+        };
+
+        let intrinsic_op = llvm_build_call2(&cctx.builder, fn_ty, intrinsic_fn, &args, name);
+
+        if let Some(fmf) = self.get_attr_llvm_intrinsic_fastmath_flags(ctx)
+            && llvm_can_value_use_fast_math_flags(intrinsic_op)
+        {
+            llvm_set_fast_math_flags(intrinsic_op, (*fmf).into());
+        }
+        if let Some(attrs) = self.get_attr_llvm_intrinsic_attrs(ctx) {
+            add_function_attributes(
+                ctx,
+                llvm_ctx,
+                &mut cctx.types,
+                intrinsic_op,
+                &attrs,
+                llvm_add_call_site_attribute,
+            )?;
+        }
+
+        Ok(intrinsic_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for SExtOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let sext_op = llvm_build_sext(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(sext_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ZExtOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let zext_op = llvm_build_zext(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_is_a::instruction(zext_op) {
+            let nneg = self.nneg(ctx);
+            llvm_set_nneg(zext_op, nneg);
+        }
+        Ok(zext_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for TruncOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let trunc_op = llvm_build_trunc(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(trunc_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for GetElementPtrOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let indices = self
+            .indices(ctx)
+            .iter()
+            .map(|v| match v {
+                crate::ops::GepIndex::Constant(c) => Ok(llvm_const_int(
+                    llvm_int_type_in_context(llvm_ctx, 32),
+                    Into::<u64>::into(*c),
+                    false,
+                )),
+                crate::ops::GepIndex::Value(value) => convert_value_operand(cctx, ctx, value),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let base = convert_value_operand(cctx, ctx, &self.get_operand_src_ptr(ctx))?;
+
+        let src_elem_type = convert_type(ctx, llvm_ctx, &mut cctx.types, self.src_elem_type(ctx))?;
+        let gep_op = llvm_build_gep_with_no_wrap_flags(
+            &cctx.builder,
+            src_elem_type,
+            base,
+            &indices,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+            self.no_wrap_flags(ctx),
+        );
+        Ok(gep_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for InsertValueOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let base = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let value = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let indices = self.indices(ctx);
+        if indices.len() != 1 {
+            return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
+        }
+        let insert_op = llvm_build_insert_value(
+            &cctx.builder,
+            base,
+            value,
+            indices[0],
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(insert_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ExtractValueOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let base = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let indices = self.indices(ctx);
+        if indices.len() != 1 {
+            return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
+        }
+        let extract_op = llvm_build_extract_value(
+            &cctx.builder,
+            base,
+            indices[0],
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(extract_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for InsertElementOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let base = convert_value_operand(cctx, ctx, &self.get_operand_vector(ctx))?;
+        let value = convert_value_operand(cctx, ctx, &self.get_operand_element(ctx))?;
+        let index = convert_value_operand(cctx, ctx, &self.get_operand_index(ctx))?;
+        let insert_op = llvm_build_insert_element(
+            &cctx.builder,
+            base,
+            value,
+            index,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(insert_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ExtractElementOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let base = convert_value_operand(cctx, ctx, &self.get_operand_vector(ctx))?;
+        let index = convert_value_operand(cctx, ctx, &self.get_operand_index(ctx))?;
+        let extract_op = llvm_build_extract_element(
+            &cctx.builder,
+            base,
+            index,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(extract_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for ShuffleVectorOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let mask = &self
+            .get_attr_llvm_shuffle_vector_mask(ctx)
+            .expect("ShuffleVectorOp missing mask attribute")
+            .0;
+        let op = self.get_operation().deref(ctx);
+        let vec1 = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let vec2 = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let int_ty = llvm_int_type_in_context(llvm_ctx, 32);
+
+        let mask = mask
+            .iter()
+            .map(|&i| llvm_const_int(int_ty, i as u64, true))
+            .collect::<Vec<LLVMValue>>();
+        let mask = llvm_const_vector(&mask);
+
+        let shuffle_op = llvm_build_shuffle_vector(
+            &cctx.builder,
+            vec1,
+            vec2,
+            mask,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(shuffle_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for SelectOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let cond = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let true_val = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let false_val = convert_value_operand(cctx, ctx, &op.get_operand(2))?;
+        let select_op = llvm_build_select(
+            &cctx.builder,
+            cond,
+            true_val,
+            false_val,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if let Some(fmf) = self.get_attr_llvm_select_fast_math_flags(ctx)
+            && llvm_can_value_use_fast_math_flags(select_op)
+        {
+            llvm_set_fast_math_flags(select_op, (*fmf).into());
+        }
+        Ok(select_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FAddOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+        let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+        let inst = llvm_build_fadd(
+            &cctx.builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FSubOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+        let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+        let inst = llvm_build_fsub(
+            &cctx.builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FMulOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+        let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+        let inst = llvm_build_fmul(
+            &cctx.builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FDivOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+        let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+        let inst = llvm_build_fdiv(
+            &cctx.builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FRemOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let lhs = convert_value_operand(cctx, ctx, &lhs)?;
+        let rhs = convert_value_operand(cctx, ctx, &rhs)?;
+        let inst = llvm_build_frem(
+            &cctx.builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FCmpOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let predicate = convert_fpredicate(self.predicate(ctx));
+        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let fcmp_op = llvm_build_fcmp(
+            &cctx.builder,
+            predicate,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(fcmp_op) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(fcmp_op, fastmath.into());
+        }
+        Ok(fcmp_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FNegOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let inst = llvm_build_fneg(
+            &cctx.builder,
+            arg,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(inst) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(inst, fastmath.into());
+        }
+        Ok(inst)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FPExtOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let fpext_op = llvm_build_fpext(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(fpext_op) {
+            let fastmath = self.fast_math_flags(ctx);
+            llvm_set_fast_math_flags(fpext_op, fastmath.into());
+        }
+        Ok(fpext_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FPTruncOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let fptrunc_op = llvm_build_fptrunc(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_can_value_use_fast_math_flags(fptrunc_op) {
+            llvm_set_fast_math_flags(fptrunc_op, self.fast_math_flags(ctx).into());
+        }
+        Ok(fptrunc_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FPToSIOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let fptosi_op = llvm_build_fptosi(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(fptosi_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for SIToFPOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let sitofp_op = llvm_build_sitofp(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(sitofp_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for FPToUIOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let fptoui_op = llvm_build_fptoui(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(fptoui_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for UIToFPOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let uitofp_op = llvm_build_uitofp(
+            &cctx.builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        // The built value may not even be an instruction, but a folded constant.
+        if llvm_is_a::instruction(uitofp_op) {
+            let nneg = self.nneg(ctx);
+            llvm_set_nneg(uitofp_op, nneg);
+        }
+        Ok(uitofp_op)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMValue for VAArgOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let opd = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        log::warn!("Generating va_arg instruction: It is poorly supported by LLVM");
+        let vaarg_op = llvm_build_va_arg(
+            &cctx.builder,
+            opd,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        Ok(vaarg_op)
+    }
+}
+
+/// Convert a pliron [BasicBlock] to [LLVMBasicBlock].
+fn convert_block(
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    cctx: &mut ConversionContext,
+    block: Ptr<BasicBlock>,
+) -> Result<()> {
+    let block_llvm = cctx.block_map[&block];
+    llvm_position_builder_at_end(&cctx.builder, block_llvm);
+
+    for opr in block.deref(ctx).iter(ctx) {
+        let op = Operation::get_op_dyn(opr, ctx);
+        let op = op.as_ref();
+        let Some(op_conv) = op_cast::<dyn ToLLVMValue>(op) else {
+            let loc = op.loc(ctx);
+            return input_err!(
+                loc,
+                ToLLVMErr::MissingOpConversion(op.get_opid().to_string())
+            );
+        };
+        let op_llvm = op_conv.convert(ctx, llvm_ctx, cctx)?;
+        convert_md_attachments(ctx, llvm_ctx, cctx, opr, op_llvm)?;
+        {
+            let opr_ref = opr.deref(ctx);
+            // LLVM instructions have at most one result.
+            if opr_ref.get_num_results() == 1 {
+                cctx.value_map.insert(opr_ref.get_result(0), op_llvm);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a pliron [FuncOp] to [LLVMValue]
+fn convert_function(
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    cctx: &mut ConversionContext,
+    func_op: FuncOp,
+) -> Result<LLVMValue> {
+    cctx.clear_per_function_data();
+    let func_llvm = cctx.function_map[&func_op.get_symbol_name(ctx)];
+
+    if let Some(linkage) = func_op.get_attr_llvm_function_linkage(ctx) {
+        let llvm_linkage: LLVMLinkage = convert_linkage(linkage.clone());
+        llvm_set_linkage(func_llvm, llvm_linkage);
+    }
+
+    let f_region = func_op.get_region(ctx).expect("Function missing region");
+
+    // Map all blocks, staring with entry.
+    let mut block_iter = f_region.deref(ctx).iter(ctx);
+    {
+        let entry = block_iter.next().expect("Missing entry block");
+        // Map entry block arguments to LLVM function arguments.
+        for (arg_idx, arg) in entry.deref(ctx).arguments().enumerate() {
+            cctx.value_map
+                .insert(arg, llvm_get_param(func_llvm, arg_idx.try_into().unwrap()));
+        }
+        let llvm_entry_block = llvm_append_basic_block_in_context(
+            llvm_ctx,
+            func_llvm,
+            entry.deref(ctx).unique_name(ctx).as_ref(),
+        );
+        cctx.block_map.insert(entry, llvm_entry_block);
+    }
+    for block in block_iter {
+        let llvm_block = llvm_append_basic_block_in_context(
+            llvm_ctx,
+            func_llvm,
+            block.deref(ctx).unique_name(ctx).as_ref(),
+        );
+        llvm_position_builder_at_end(&cctx.builder, llvm_block);
+        for arg in block.deref(ctx).arguments() {
+            let arg_type = convert_type(ctx, llvm_ctx, &mut cctx.types, arg.get_type(ctx))?;
+            let phi = llvm_build_phi(&cctx.builder, arg_type, arg.unique_name(ctx).as_ref());
+            cctx.value_map.insert(arg, phi);
+        }
+        cctx.block_map.insert(block, llvm_block);
+    }
+
+    // Convert within every block.
+    for block in topological_order(ctx, &f_region) {
+        convert_block(ctx, llvm_ctx, cctx, block)?;
+    }
+
+    Ok(func_llvm)
+}
+
+/// Attributes that can be converted to a constant [LLVMValue]
+#[attr_interface]
+pub(crate) trait AttrToLLVMConst {
+    /// Convert from pliron [Attribute] to a constant [LLVMValue].
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue>;
+
+    fn verify(_op: &dyn Attribute, _ctx: &Context) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for BytesAttr {
+    fn convert(
+        &self,
+        _ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        _cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        Ok(llvm_const_string_in_context(llvm_ctx, self.as_ref()))
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for IntegerAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let int_ty_llvm = convert_type(ctx, llvm_ctx, &mut cctx.types, self.get_type().into())?;
+        let ap_int_val: APInt = self.clone().into();
+        Ok(llvm_const_int(int_ty_llvm, ap_int_val.to_u64(), false))
+    }
+}
+
+/// Shared by the [AttrToLLVMConst] impls of the float attributes.
+fn float_attr_to_llvm_const(
+    value: &dyn FloatAttrToFP64,
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    cctx: &mut ConversionContext,
+) -> Result<LLVMValue> {
+    let float_ty_llvm = convert_type(ctx, llvm_ctx, &mut cctx.types, value.get_type(ctx))?;
+    Ok(llvm_const_real(float_ty_llvm, value.to_fp64()))
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for FPHalfAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        float_attr_to_llvm_const(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for FPBFloatAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        float_attr_to_llvm_const(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for FPSingleAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        float_attr_to_llvm_const(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for FPDoubleAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        float_attr_to_llvm_const(self, ctx, llvm_ctx, cctx)
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for ZeroAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.0)?;
+        Ok(llvm_const_null(ty))
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for UndefAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.0)?;
+        Ok(llvm_get_undef(ty))
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for PoisonAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.0)?;
+        Ok(llvm_get_poison(ty))
+    }
+}
+
+/// Convert the constant attribute `attr` to an LLVM constant.
+fn const_attr_to_llvm_constant(
+    attr: &dyn Attribute,
+    loc: Option<Location>,
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    cctx: &mut ConversionContext,
+) -> Result<LLVMValue> {
+    let not_const = || {
+        input_err_noloc!(ToLLVMErr::AttrNotConst(format!(
+            "{} {}",
+            attr.get_attr_id(),
+            attr.disp(ctx)
+        )))
+    };
+    let converted = match attr_cast::<dyn AttrToLLVMConst>(attr) {
+        Some(conv) => conv.convert(ctx, llvm_ctx, cctx),
+        None => not_const(),
+    };
+    // Check that the value we have is indeed an LLVM constant.
+    let converted = converted.and_then(|val| {
+        if llvm_is_a::constant(val) {
+            Ok(val)
+        } else {
+            not_const()
+        }
+    });
+    converted.map_err(|mut err| {
+        if let Some(loc) = loc {
+            err.set_loc(loc);
+        }
+        err
+    })
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for AggregateAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = self.ty();
+        let elements = self
+            .elements()
+            .iter()
+            .map(|element| const_attr_to_llvm_constant(&**element, None, ctx, llvm_ctx, cctx))
+            .collect::<Result<Vec<_>>>()?;
+
+        let ty_obj = ty.deref(ctx);
+        if let Some(array_ty) = ty_obj.downcast_ref::<ArrayType>() {
+            let elem_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, array_ty.elem_type())?;
+            Ok(llvm_const_array(elem_ty, &elements))
+        } else if ty_obj.is::<StructType>() {
+            let struct_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, ty)?;
+            Ok(llvm_const_struct(struct_ty, &elements))
+        } else if ty_obj.is::<VectorType>() {
+            Ok(llvm_const_vector(&elements))
+        } else {
+            // The verifier has established that an aggregate is of one of these types.
+            panic!(
+                "An aggregate constant of type {}, which is not an array, a struct or a vector",
+                ty.disp(ctx)
+            )
+        }
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for SplatAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = self.ty();
+        let (num_elements, is_scalable) = {
+            let vector_ty = ty.deref(ctx);
+            (vector_ty.num_elements(), vector_ty.is_scalable())
+        };
+        let element = const_attr_to_llvm_constant(self.element(), None, ctx, llvm_ctx, cctx)?;
+        if !is_scalable {
+            // LLVM folds a vector of equal elements back into a splat constant.
+            return Ok(llvm_const_vector(&vec![element; num_elements as usize]));
+        }
+
+        // A scalable vector's element count isn't known statically,
+        // so there is no constant to list its elements out. We do what LLVM does:
+        // `shufflevector(insertelement(poison, element, 0), poison, zeroinitializer)`,
+        let vector_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, ty.into())?;
+        let poison = llvm_get_poison(vector_ty);
+        let index = llvm_const_int(llvm_int_type_in_context(llvm_ctx, 64), 0, false);
+        let inserted = llvm_build_insert_element(&cctx.scratch_builder, poison, element, index, "");
+        // An all-zeros mask of the vector's shape broadcasts element 0.
+        let mask_ty =
+            llvm_scalable_vector_type(llvm_int_type_in_context(llvm_ctx, 32), num_elements);
+        let splat = llvm_build_shuffle_vector(
+            &cctx.scratch_builder,
+            inserted,
+            poison,
+            llvm_const_null(mask_ty),
+            "",
+        );
+        Ok(splat)
+    }
+}
+
+#[attr_interface_impl]
+impl AttrToLLVMConst for SymbolAddrAttr {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let sym = self.symbol();
+        let sym_val = cctx
+            .globals_map
+            .get(sym)
+            .or_else(|| cctx.function_map.get(sym))
+            .cloned()
+            .ok_or_else(|| {
+                input_error_noloc!(ToLLVMErr::InvalidSymbolAddr(
+                    sym.to_string(),
+                    "not a global or a function of the module".to_string()
+                ))
+            })?;
+
+        let declared_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.ty().into())?;
+        let actual_ty = llvm_type_of(sym_val);
+        // The verifier cannot check this, so we do it now.
+        if declared_ty != actual_ty {
+            return input_err_noloc!(ToLLVMErr::InvalidSymbolAddr(
+                sym.to_string(),
+                format!("declared type is {declared_ty}, but the symbol is of type {actual_ty}")
+            ));
+        }
+
+        Ok(sym_val)
+    }
+}
+
+/// Pliron [Op]s that can be converted to a constant [LLVMValue]
+#[op_interface]
+trait OpToLLVMConstValue {
+    /// Convert from pliron [Op] to a constant [LLVMValue].
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue>;
+
+    fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for ConstantOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let value = self
+            .get_attr_llvm_constant_value(ctx)
+            .expect("ConstantOp must have a value attribute");
+        const_attr_to_llvm_constant(&**value, Some(self.loc(ctx)), ctx, llvm_ctx, cctx)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for UndefOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        Ok(llvm_get_undef(ty))
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for PoisonOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        Ok(llvm_get_poison(ty))
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for ZeroOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let zero_val = llvm_const_null(ty);
+        Ok(zero_val)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for AddressOfOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        _llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let sym = self.get_global_name(ctx);
+        cctx.globals_map
+            .get(&sym)
+            .or_else(|| cctx.function_map.get(&sym))
+            .cloned()
+            .ok_or_else(|| input_error_noloc!(ToLLVMErr::CannotEvaluateToConst))
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for BlockAddressOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let tag = self.get_tag_id(ctx);
+        let func = self.get_function_name(ctx);
+
+        // The target block may not be converted yet (possibly not even its
+        // function), so emit a placeholder now and patch it in `convert_module`
+        // once the whole module is converted. The placeholder must be a real
+        // constant, not an instruction, so it can be used in other constant
+        // expressions (e.g. a global's initializer). A `GlobalVariable` fits:
+        // unlike other LLVM constants, which are unique'd, it has per-instance
+        // identity and so can be RAUW'd. Same trick used by MLIR's LLVM-IR
+        // translation and LLVM's own bitcode reader for forward-referenced
+        // block addresses.
+        let result_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+        let addr_space = llvm_get_pointer_address_space(result_ty);
+        let placeholder = llvm_add_global_in_address_space(
+            cctx.cur_llvm_module,
+            llvm_int_type_in_context(llvm_ctx, 8),
+            "blockaddress_placeholder",
+            addr_space,
+        );
+
+        cctx.pending_block_address_ops
+            .insert(placeholder, (func, tag));
+        Ok(placeholder)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for InsertValueOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+        let indices = self.indices(ctx);
+        if indices.len() != 1 {
+            return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
+        }
+
+        // LLVM's builder tries to fold this, so we rely on that.
+        let insert_op = llvm_build_insert_value(
+            &cctx.scratch_builder,
+            base,
+            value,
+            indices[0],
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if !llvm_is_a::constant(insert_op) {
+            return input_err!(op.loc(), ToLLVMErr::CannotEvaluateToConst);
+        }
+        Ok(insert_op)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for InsertElementOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+        let index = self.get_operand_index(ctx);
+        let index = convert_to_llvm_const(ctx, cctx, llvm_ctx, index)?;
+
+        // LLVM's builder tries to fold this, so we rely on that.
+        let insert_op = llvm_build_insert_element(
+            &cctx.scratch_builder,
+            base,
+            value,
+            index,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if !llvm_is_a::constant(insert_op) {
+            return input_err!(op.loc(), ToLLVMErr::CannotEvaluateToConst);
+        }
+        Ok(insert_op)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for TruncOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+
+        // LLVM's builder tries to fold this, so we rely on that.
+        let trunc_op = llvm_build_trunc(
+            &cctx.scratch_builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if !llvm_is_a::constant(trunc_op) {
+            return input_err!(op.loc(), ToLLVMErr::CannotEvaluateToConst);
+        }
+        Ok(trunc_op)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for SubOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let lhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let rhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+
+        // LLVM's builder tries to fold this, so we rely on that.
+        let sub_op = llvm_build_sub(
+            &cctx.scratch_builder,
+            lhs,
+            rhs,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if !llvm_is_a::constant(sub_op) {
+            return input_err!(op.loc(), ToLLVMErr::CannotEvaluateToConst);
+        }
+        Ok(sub_op)
+    }
+}
+
+#[op_interface_impl]
+impl OpToLLVMConstValue for PtrToIntOp {
+    fn convert(
+        &self,
+        ctx: &Context,
+        llvm_ctx: &LLVMContext,
+        cctx: &mut ConversionContext,
+    ) -> Result<LLVMValue> {
+        let op = self.get_operation().deref(ctx);
+        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
+
+        // LLVM's builder tries to fold this, so we rely on that.
+        let ptoi_op = llvm_build_ptr_to_int(
+            &cctx.scratch_builder,
+            arg,
+            ty,
+            self.get_result(ctx).unique_name(ctx).as_ref(),
+        );
+        if !llvm_is_a::constant(ptoi_op) {
+            return input_err!(op.loc(), ToLLVMErr::CannotEvaluateToConst);
+        }
+        Ok(ptoi_op)
+    }
+}
+
+fn convert_to_llvm_const(
+    ctx: &Context,
+    cctx: &mut ConversionContext,
+    llvm_ctx: &LLVMContext,
+    value: Value,
+) -> Result<LLVMValue> {
+    match value.defining_entity() {
+        DefiningEntity::Op(op) => {
+            let op = Operation::get_op_dyn(op, ctx);
+            if let Some(const_trans) = op_cast::<dyn OpToLLVMConstValue>(op.as_ref()) {
+                const_trans.convert(ctx, llvm_ctx, cctx)
+            } else {
+                input_err!(value.loc(ctx), ToLLVMErr::CannotEvaluateToConst)
+            }
+        }
+        DefiningEntity::Block(_) => {
+            input_err!(value.loc(ctx), ToLLVMErr::CannotEvaluateToConst)
+        }
+    }
+}
+
+fn convert_global_initializer(
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    cctx: &mut ConversionContext,
+    global_op: GlobalOp,
+) -> Result<Option<LLVMValue>> {
+    if let Some(initializer) = global_op.get_initializer_value(ctx) {
+        let initializer_val = const_attr_to_llvm_constant(
+            &*initializer,
+            Some(global_op.loc(ctx)),
+            ctx,
+            llvm_ctx,
+            cctx,
+        )?;
+        return Ok(Some(initializer_val));
+    }
+
+    if let Some(init_block) = global_op.get_initializer_block(ctx) {
+        let ret =
+            Operation::get_op::<ReturnOp>(init_block.deref(ctx).get_terminator(ctx).unwrap(), ctx);
+        let ret = ret.ok_or_else(|| {
+            input_error!(
+                global_op.loc(ctx),
+                ToLLVMErr::GlobalOpInitializerRegionBadReturn
+            )
+        })?;
+        let Some(ret_val) = ret.retval(ctx) else {
+            return input_err!(
+                global_op.loc(ctx),
+                ToLLVMErr::GlobalOpInitializerRegionBadReturn
+            );
+        };
+        let initializer_val = convert_to_llvm_const(ctx, cctx, llvm_ctx, ret_val)?;
+        return Ok(Some(initializer_val));
+    }
+
+    Ok(None)
+}
+
+/// Convert pliron [ModuleOp] to [LLVMModule].
+pub fn convert_module(
+    ctx: &Context,
+    llvm_ctx: &LLVMContext,
+    module: ModuleOp,
+) -> Result<LLVMModule> {
+    let mod_name = module.get_symbol_name(ctx);
+    let llvm_module = LLVMModule::new(mod_name.as_ref(), llvm_ctx);
+    // Set data-layout up-front, it affects how instructions are built.
+    if let Some(data_layout) = crate::attributes::get_data_layout(ctx, module) {
+        llvm_module.set_data_layout(&data_layout);
+    }
+    if let Some(target_triple) = crate::attributes::get_target_triple(ctx, module) {
+        llvm_module.set_target_triple(&target_triple);
+    }
+    let cctx = &mut ConversionContext::new(llvm_ctx, &llvm_module);
+
+    // Setup the scratch builder for evaluating constants.
+    // `scratch_module` is freed at the end of this function, when it exits the scope.
+    let scratch_module = LLVMModule::new("__pliron_scratch_module", llvm_ctx);
+    let scratch_function = llvm_add_function(
+        &scratch_module,
+        "scratch",
+        llvm_function_type(llvm_void_type_in_context(llvm_ctx), &[], false),
+    );
+    let scratch_function_entry =
+        llvm_append_basic_block_in_context(llvm_ctx, scratch_function, "entry");
+    llvm_position_builder_at_end(&cctx.scratch_builder, scratch_function_entry);
+
+    // Create new functions and map them.
+    for op in module.get_body(ctx, 0).deref(ctx).iter(ctx) {
+        if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
+            let func_ty = func_op.get_type(ctx).deref(ctx);
+            let func_ty_to_llvm = type_cast::<dyn ToLLVMType>(&*func_ty).ok_or_else(|| {
+                input_error_noloc!(ToLLVMErr::MissingTypeConversion(
+                    func_ty.disp(ctx).to_string()
+                ))
+            })?;
+            let fn_ty_llvm = func_ty_to_llvm.convert(ctx, llvm_ctx, &mut cctx.types)?;
+            let name = func_op.get_symbol_name(ctx);
+            let llvm_name = func_op.llvm_symbol_name(ctx).unwrap_or(name.clone().into());
+            let func_llvm = llvm_add_function(&llvm_module, &llvm_name, fn_ty_llvm);
+            if let Some(attrs) = func_op.get_attr_llvm_func_attrs(ctx) {
+                add_function_attributes(
+                    ctx,
+                    llvm_ctx,
+                    &mut cctx.types,
+                    func_llvm,
+                    &attrs,
+                    llvm_add_attribute_at_index,
+                )?;
+            }
+            cctx.function_map.insert(name, func_llvm);
+        }
+        if let Some(global_op) = Operation::get_op::<GlobalOp>(op, ctx) {
+            let global_ty = global_op.get_type(ctx);
+            let global_ty_llvm = convert_type(ctx, llvm_ctx, &mut cctx.types, global_ty)?;
+            let global_name = global_op.get_symbol_name(ctx);
+            let llvm_global_name = global_op
+                .llvm_symbol_name(ctx)
+                .unwrap_or(global_name.clone().into());
+            let global_addr_space = global_op.address_space(ctx);
+            let global_llvm = llvm_add_global_in_address_space(
+                &llvm_module,
+                global_ty_llvm,
+                &llvm_global_name,
+                global_addr_space,
+            );
+            cctx.globals_map.insert(global_name, global_llvm);
+        }
+    }
+
+    // The module's metadata may refer to the globals and functions declared above, and
+    // the instructions converted below attach metadata, so this goes in between.
+    convert_module_metadata(ctx, llvm_ctx, cctx, module)?;
+
+    for op in module.get_body(ctx, 0).deref(ctx).iter(ctx) {
+        if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
+            let func_llvm = cctx.function_map[&func_op.get_symbol_name(ctx)];
+            convert_md_attachments(ctx, llvm_ctx, cctx, op, func_llvm)?;
+        }
+        if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx)
+            && !func_op.is_declaration(ctx)
+        {
+            convert_function(ctx, llvm_ctx, cctx, func_op)?;
+        }
+        if let Some(global_op) = Operation::get_op::<GlobalOp>(op, ctx) {
+            let global_name = global_op.get_symbol_name(ctx);
+            let global_llvm = cctx.globals_map[&global_name];
+            if !global_op.is_declaration(ctx)
+                && let Some(initializer) =
+                    convert_global_initializer(ctx, llvm_ctx, cctx, global_op)?
+            {
+                llvm_set_initializer(global_llvm, initializer);
+            }
+            llvm_set_global_constant(global_llvm, global_op.is_constant(ctx));
+            if let Some(linkage) = global_op.get_attr_llvm_global_linkage(ctx) {
+                let llvm_linkage: LLVMLinkage = convert_linkage(linkage.clone());
+                llvm_set_linkage(global_llvm, llvm_linkage);
+            }
+            if let Some(alignment) = global_op.alignment(ctx) {
+                llvm_set_alignment(global_llvm, alignment);
+            }
+            convert_md_attachments(ctx, llvm_ctx, cctx, op, global_llvm)?;
+        }
+    }
+
+    // Replace all pending block address operations with the actual block addresses.
+    for (placeholder, (func_name, tag)) in cctx.pending_block_address_ops.iter() {
+        let function_llvm = cctx
+            .function_map
+            .get(func_name)
+            .ok_or_else(|| input_error_noloc!(ToLLVMErr::CannotEvaluateToConst))?;
+        let block_llvm = cctx
+            .block_tags
+            .get(&(func_name.clone(), *tag))
+            .ok_or_else(|| {
+                input_error_noloc!(ToLLVMErr::MissingBlockTag(func_name.to_string(), *tag))
+            })?;
+        let block_addr = llvm_block_address(*function_llvm, *block_llvm);
+        llvm_replace_all_uses_with(*placeholder, block_addr);
+        llvm_delete_global(*placeholder);
+    }
+
+    Ok(llvm_module)
+}

@@ -1,0 +1,63 @@
+; fpops.ll - Test various floating point operations (no math intrinsics, more casts)
+
+define i32 @main() {
+entry:
+  ; Declare some float constants
+  %a = fadd float 1.5, 2.5           ; a = 1.5 + 2.5 = 4.0
+  %b = fsub float %a, 1.0            ; b = 4.0 - 1.0 = 3.0
+  %c = fmul float %b, 2.0            ; c = 3.0 * 2.0 = 6.0
+  %d = fdiv float %c, 3.0            ; d = 6.0 / 3.0 = 2.0
+  %e = frem float %d, 1.5            ; e = 2.0 % 1.5 = 0.5
+
+  ; Instead of math intrinsics, just use more arithmetic
+  %f = fmul float %c, %d             ; f = 6.0 * 2.0 = 12.0
+  %g = fdiv float %f, %a             ; g = 12.0 / 4.0 = 3.0
+
+  ; Cast results to double and back to float
+  %a_d = fpext float %a to double
+  %b_d = fpext float %b to double
+  %c_d = fpext float %c to double
+  %d_d = fpext float %d to double
+  %e_d = fpext float %e to double
+  %f_d = fpext float %f to double
+  %g_d = fpext float %g to double
+
+  %a_f = fptrunc double %a_d to float
+  %b_f = fptrunc double %b_d to float
+  %c_f = fptrunc double %c_d to float
+  %d_f = fptrunc double %d_d to float
+  %e_f = fptrunc double %e_d to float
+  %f_f = fptrunc double %f_d to float
+  %g_f = fptrunc double %g_d to float
+
+  ; Combine all results into a single float value
+  %sum1 = fadd float %a_f, %b_f
+  %sum2 = fadd float %c_f, %d_f
+  %sum3 = fadd float %e_f, %f_f
+  %sum4 = fadd float %sum1, %sum2
+  %sum5 = fadd float %sum3, %g_f
+  %neg_sum4 = fneg float %sum4
+  %final_sum = fsub float %sum5, %neg_sum4
+
+  ; Same in half precision
+  %h = fptrunc float %c to half      ; h = 6.0
+  %h2 = fmul half %h, 0.5            ; h2 = 3.0
+  %h3 = fsub half %h2, 0.5           ; h3 = 2.5
+  %h_f = fpext half %h3 to float     ; h_f = 2.5
+
+  ; Same in bfloat precision
+  %bf = fptrunc float %c to bfloat   ; bf = 6.0
+  %bf2 = fmul bfloat %bf, 0.5        ; bf2 = 3.0
+  %bf3 = fadd bfloat %bf2, 0.5       ; bf3 = 3.5
+  %bf_f = fpext bfloat %bf3 to float ; bf_f = 3.5
+
+  ; Cast final result to int and return
+  %result2 = fptosi float %final_sum to i32
+  %result1 = fptoui float %sum5 to i32
+  %result0 = fptosi float %h_f to i32
+  %result3 = fptosi float %bf_f to i32
+  %result4 = add i32 %result2, %result1
+  %result5 = add i32 %result4, %result0
+  %result = add i32 %result5, %result3
+  ret i32 %result
+}

@@ -1,0 +1,537 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Utilities for parsing.
+
+use core::{num::ParseIntError, str::FromStr};
+
+use crate::{
+    arg_err,
+    attribute::AttrObj,
+    basic_block::BasicBlock,
+    builtin::given_names::set_operation_result_name,
+    combine::{
+        Parser, Stream, any, between, many, many1, none_of, optional,
+        parser::char::{digit, hex_digit, spaces},
+        sep_by, token,
+    },
+    context::Ptr,
+    identifier::Identifier,
+    location::{Located, Location},
+    operation::Operation,
+    parsable::{IntoParseResult, Parsable, ParseResult, StateStream, parser_combinator},
+    printable::ListSeparator,
+    result::Result,
+    r#type::TypeHandle,
+    value::Value,
+};
+
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+/// Parse from `parser`, ignoring whitespace(s) before and after.
+/// > **Warning**: Do not use this inside inside [combine::optional] or
+/// >   inside repeating combiners, such as [combine::many].
+/// >   After successfully parsing one instance, if spaces are consumed to parse
+/// >   the next one, but the next one doesn't exist, it is treated as a failure
+/// >   that consumed some input. This messes things up. So spaces must be consumed
+/// >   after a successfull parse, and not prior to an upcoming one.
+/// >   A possibly right way to, for example, parse a comma separated list of [Identifier]s:
+///
+///```
+///     # use pliron::combine::{parser::char::spaces, Parser};
+///     # use pliron::parsable::Parsable;
+///     let ids = spaces().with
+///               (combine::sep_by::<Vec<_>, _, _, _>
+///                 (pliron::identifier::Identifier::parser(()).skip(spaces()),
+///                 combine::token(',').skip(spaces())));
+///```
+/// >    Similarly, if you want to use this inside [combine::optional], you should
+/// >    use [combine::attempt] to ensure that no input is consumed if the parser fails.
+pub fn spaced<Input: Stream<Token = char>, Output>(
+    parser: impl Parser<Input, Output = Output>,
+) -> impl Parser<Input, Output = Output> {
+    combine::between(spaces(), spaces(), parser)
+}
+
+/// A parser that returns the current [Location] and does nothing else
+pub fn location<'a>() -> Box<dyn Parser<StateStream<'a>, Output = Location, PartialState = ()> + 'a>
+{
+    combine::parser(|parsable_state: &mut StateStream<'a>| {
+        combine::ParseResult::PeekOk(parsable_state.loc()).into()
+    })
+    .boxed()
+}
+
+/// A parser to parse [TypeId](crate::type::TypeId) followed by the type's contents.
+pub fn type_parse<'a>(state_stream: &mut StateStream<'a>) -> ParseResult<'a, TypeHandle> {
+    TypeHandle::parse(state_stream, ())
+}
+
+/// A parser combinator to parse [TypeId](crate::type::TypeId) followed by the type's contents.
+pub fn type_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = TypeHandle, PartialState = ()> + 'a> {
+    TypeHandle::parser(())
+}
+
+/// A parser to parse a decimal number: an optional `+` or `-` followed by digit(s).
+pub fn number_as_string_parse<'a>(
+    state_stream: &mut StateStream<'a>,
+    _arg: (),
+) -> ParseResult<'a, String> {
+    optional(token('+').or(token('-')))
+        .and(many1::<String, _, _>(digit()))
+        .map(|(sign, digits): (Option<char>, String)| match sign {
+            Some(sign) => {
+                let mut signed = String::with_capacity(digits.len() + 1);
+                signed.push(sign);
+                signed.push_str(&digits);
+                signed
+            }
+            None => digits,
+        })
+        .parse_stream(state_stream)
+        .into()
+}
+
+/// A parser combinator to parse a decimal number: an optional `+` or `-` followed by digit(s).
+pub fn number_as_string_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = String, PartialState = ()> + 'a> {
+    parser_combinator(number_as_string_parse, ())
+}
+
+/// A parser to parse any Rust integer type.
+pub fn int_parse<'a, IntT>(state_stream: &mut StateStream<'a>, _arg: ()) -> ParseResult<'a, IntT>
+where
+    IntT: FromStr,
+    IntT::Err: core::error::Error + Send + Sync + 'static,
+{
+    number_as_string_parser()
+        .and_then(|digits| digits.parse::<IntT>())
+        .parse_stream(state_stream)
+        .into()
+}
+
+/// Get a parser combinator that can parse any Rust integer type.
+pub fn int_parser<'a, IntT>()
+-> Box<dyn Parser<StateStream<'a>, Output = IntT, PartialState = ()> + 'a>
+where
+    IntT: FromStr + 'a,
+    IntT::Err: core::error::Error + Send + Sync + 'static,
+{
+    parser_combinator(int_parse, ())
+}
+
+/// A trait for parsing an integer from a string with a given radix.
+pub trait FromStrRadix: Sized {
+    fn from_str_radix(src: &str, radix: u32) -> core::result::Result<Self, ParseIntError>;
+}
+
+macro_rules! impl_from_str_radix_for_int {
+    ($($ty:ty),*) => {
+        $(
+            impl FromStrRadix for $ty {
+                fn from_str_radix(src: &str, radix: u32) -> core::result::Result<Self, ParseIntError> {
+                    <$ty>::from_str_radix(src, radix)
+                }
+            }
+        )*
+    };
+}
+impl_from_str_radix_for_int!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
+
+/// Parser to parse a hexadecimal integer, which is a sequence of hexadecimal digits prefixed with `0x`.
+pub fn hex_int_parse<'a, IntT>(
+    state_stream: &mut StateStream<'a>,
+    _arg: (),
+) -> ParseResult<'a, IntT>
+where
+    IntT: FromStrRadix,
+{
+    combine::parser::char::string("0x")
+        .with(many1::<String, _, _>(combine::parser::char::hex_digit()))
+        .and_then(|digits| IntT::from_str_radix(&digits, 16))
+        .parse_stream(state_stream)
+        .into()
+}
+
+/// Get a parser combinator to parse a hexadecimal integer,
+/// which is a sequence of hexadecimal digits prefixed with `0x`.
+pub fn hex_int_parser<'a, IntT>()
+-> Box<dyn Parser<StateStream<'a>, Output = IntT, PartialState = ()> + 'a>
+where
+    IntT: FromStrRadix + 'a,
+{
+    parser_combinator(hex_int_parse, ())
+}
+
+/// Parse a quoted string: a double-quoted string that may contain escaped characters.
+/// This is a mirror to [quoted](crate::irfmt::printers::quoted).
+pub fn quoted_string_parse<'a>(
+    state_stream: &mut StateStream<'a>,
+    _arg: (),
+) -> ParseResult<'a, String> {
+    // An escaped charater is one that is preceded by a backslash.
+    let escaped_char = combine::parser(move |parsable_state: &mut StateStream<'a>| {
+        // This combine::parser() is so that we can get a location before the parsing begins.
+        let loc = parsable_state.loc();
+        let mut escaped_char = token('\\').with(any()).then(move |c: char| {
+            let loc = loc.clone();
+            if c == 'u' {
+                // A `\u{...}` escape carries the hexadecimal value of a unicode scalar.
+                between(token('{'), token('}'), many1::<String, _, _>(hex_digit()))
+                    .then(move |digits: String| {
+                        let loc = loc.clone();
+                        // This combine::parser() is to return an error of the right type.
+                        combine::parser(move |_parsable_state: &mut StateStream<'a>| {
+                            let result = match u32::from_str_radix(&digits, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                            {
+                                Some(c) => Ok(c),
+                                None => arg_err!(
+                                    loc.clone(),
+                                    "Invalid unicode escape \\u{{{}}}",
+                                    digits
+                                ),
+                            };
+                            result.into_parse_result()
+                        })
+                    })
+                    .left()
+            } else {
+                // This combine::parser() is to return an error of the right type.
+                combine::parser(move |_parsable_state: &mut StateStream<'a>| {
+                    // Filter out the escaped characters that we handle.
+                    let result = match c {
+                        '\\' => Ok('\\'),
+                        '\"' => Ok('\"'),
+                        '\'' => Ok('\''),
+                        '0' => Ok('\0'),
+                        'n' => Ok('\n'),
+                        'r' => Ok('\r'),
+                        't' => Ok('\t'),
+                        _ => arg_err!(loc.clone(), "Unexpected escaped character \\{}", c),
+                    };
+                    result.into_parse_result()
+                })
+                .right()
+            }
+        });
+        escaped_char.parse_stream(parsable_state).into()
+    });
+
+    // We want to scan a double quote deliminted string with possibly escaped characters in between.
+    let quoted_string = between(
+        token('"'),
+        token('"'),
+        many(escaped_char.or(none_of("\"".chars()))),
+    );
+
+    quoted_string
+        .map(|chars: Vec<char>| {
+            // Convert the characters to a string.
+            chars.into_iter().collect::<String>()
+        })
+        .parse_stream(state_stream)
+        .into()
+}
+
+/// A parser combinator to parse a quoted string:
+/// a double-quoted string that may contain escaped characters.
+/// This is a mirror to [quoted](crate::irfmt::printers::quoted).
+pub fn quoted_string_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = String, PartialState = ()> + 'a> {
+    parser_combinator(quoted_string_parse, ())
+}
+
+/// A parser to parse [AttrId](crate::attribute::AttrId) followed by the attribute's contents.
+pub fn attr_parse<'a>(state_stream: &mut StateStream<'a>) -> ParseResult<'a, AttrObj> {
+    AttrObj::parse(state_stream, ())
+}
+
+/// A parser combinator to parse [AttrId](crate::attribute::AttrId) followed by the attribute's contents.
+pub fn attr_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = AttrObj, PartialState = ()> + 'a> {
+    AttrObj::parser(())
+}
+
+/// Parse a delimitted list of objects.
+pub fn delimited_list_parser<Input: Stream<Token = char>, Output>(
+    open: char,
+    close: char,
+    sep: char,
+    parser: impl Parser<Input, Output = Output>,
+) -> impl Parser<Input, Output = Vec<Output>> {
+    between(
+        token(open).skip(spaces()),
+        spaces().with(token(close)),
+        list_parser(sep, parser),
+    )
+}
+
+/// Parse a list of objects.
+pub fn list_parser<Input: Stream<Token = char>, Output>(
+    sep: char,
+    parser: impl Parser<Input, Output = Output>,
+) -> impl Parser<Input, Output = Vec<Output>> {
+    sep_by::<Vec<_>, _, _, _>(parser.skip(spaces()), token(sep).skip(spaces()))
+}
+
+/// Parse a list of objects, separated by `sep`.
+/// This parses lists printed by [list_with_sep](super::printers::list_with_sep).
+pub fn list_with_sep_parser<Input: Stream<Token = char>, Output>(
+    sep: ListSeparator,
+    parser: impl Parser<Input, Output = Output>,
+) -> impl Parser<Input, Output = Vec<Output>> {
+    match sep {
+        ListSeparator::None | ListSeparator::Newline => {
+            many::<Vec<_>, _, _>(parser.skip(spaces())).left()
+        }
+        ListSeparator::Char(c) | ListSeparator::CharSpace(c) | ListSeparator::CharNewline(c) => {
+            list_parser(c, parser).right()
+        }
+    }
+}
+
+/// Parse zero-or-more occurrences (ignoring spaces) of `parser`.
+pub fn zero_or_more_parser<Input: Stream<Token = char>, Output>(
+    parser: impl Parser<Input, Output = Output>,
+) -> impl Parser<Input, Output = Vec<Output>> {
+    many::<Vec<_>, _, _>(spaces().with(parser.skip(spaces())))
+}
+
+/// Parse an identifier into an SSA [Value]. Typically called to parse
+/// the SSA operands of an [Operation]. If the SSA value hasn't been defined yet,
+/// a [forward reference](crate::builtin::ops::ForwardRefOp) is returned.
+pub fn ssa_opd_parse<'a>(state_stream: &mut StateStream<'a>, _arg: ()) -> ParseResult<'a, Value> {
+    Identifier::parser(())
+        .parse_stream(state_stream)
+        .map(|opd| {
+            state_stream
+                .state
+                .name_tracker
+                .ssa_use(state_stream.state.ctx, &opd)
+        })
+        .into()
+}
+
+/// A parser to parse an identifier into an SSA [Value]. Typically called to parse
+/// the SSA operands of an [Operation]. If the SSA value hasn't been defined yet,
+/// a [forward reference](crate::builtin::ops::ForwardRefOp) is returned.
+pub fn ssa_opd_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = Value, PartialState = ()> + 'a> {
+    parser_combinator(ssa_opd_parse, ())
+}
+
+/// Parse a block label into a [`Ptr<BasicBlock>`]. Typically called to parse
+/// the block (successor) operands of an [Operation]. If the block doesn't exist, it's created.
+pub fn block_opd_parse<'a>(
+    state_stream: &mut StateStream<'a>,
+    _arg: (),
+) -> ParseResult<'a, Ptr<BasicBlock>> {
+    token('^')
+        .with(Identifier::parser(()))
+        .parse_stream(state_stream)
+        .map(|opd| {
+            state_stream
+                .state
+                .name_tracker
+                .block_use(state_stream.state.ctx, &opd)
+        })
+        .into()
+}
+
+/// A parser to parse a block label into a [`Ptr<BasicBlock>`]. Typically called to parse
+/// the block (successor) operands of an [Operation]. If the block doesn't exist, it's created.
+pub fn block_opd_parser<'a>()
+-> Box<dyn Parser<StateStream<'a>, Output = Ptr<BasicBlock>, PartialState = ()> + 'a> {
+    parser_combinator(block_opd_parse, ())
+}
+
+/// After an [Operation] is fully parsed, for each result,
+/// set its name and register it as an SSA definition.
+pub fn process_parsed_ssa_defs(
+    state_stream: &mut StateStream,
+    results: &[(Identifier, Location)],
+    op: Ptr<Operation>,
+) -> Result<()> {
+    let ctx = &mut state_stream.state.ctx;
+    assert!(
+        results.len() == op.deref(ctx).get_num_results(),
+        "Error processing parsed SSA definitions. Result count mismatch"
+    );
+
+    let name_tracker = &mut state_stream.state.name_tracker;
+    for (idx, name_loc) in results.iter().enumerate() {
+        let res = op.deref(ctx).get_result(idx);
+        name_tracker.ssa_def(ctx, name_loc, res)?;
+        set_operation_result_name(ctx, op, idx, Some(name_loc.0.clone()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use alloc::{format, string::ToString};
+
+    use expect_test::expect;
+
+    use crate::{
+        context::Context, parsable::parse_from_str, printable::Printable, result::ExpectOk,
+    };
+
+    #[test]
+    fn test_number_as_string() {
+        let mut ctx = Context::new();
+
+        // Sign is optional
+        for input in ["0", "42", "+42", "-42"] {
+            let parsed = parse_from_str(number_as_string_parser(), &mut ctx, input).expect_ok(&ctx);
+            assert_eq!(parsed, input);
+        }
+
+        // All digits must be parsed
+        let wide = "-1606938044258990275541962092341162602522202993782792835301376";
+        let parsed = parse_from_str(number_as_string_parser(), &mut ctx, wide).expect_ok(&ctx);
+        assert_eq!(parsed, wide);
+
+        // A number needs at least one digit, and a sign belongs at the front.
+        for input in ["", "-", "+", "x1"] {
+            assert!(
+                parse_from_str(number_as_string_parser(), &mut ctx, input).is_err(),
+                "{input} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_type() {
+        let mut ctx = Context::new();
+
+        let err_msg = format!(
+            "{}",
+            parse_from_str(type_parser(), &mut ctx, "builtin.some").unwrap_err()
+        );
+
+        let expected_err_msg = expect![[r#"
+            Compilation error: invalid input program.
+            Parse error at line: 1, column: 1
+            Unregistered type builtin.some
+        "#]];
+        expected_err_msg.assert_eq(&err_msg);
+
+        let err_msg = format!(
+            "{}",
+            parse_from_str(type_parser(), &mut ctx, "builtin.integer a").unwrap_err()
+        );
+
+        let expected_err_msg = expect![[r#"
+            Compilation error: invalid input program.
+            Parse error at line: 1, column: 17
+            Unexpected `a`
+            Expected whitespaces, si, ui or i
+        "#]];
+        expected_err_msg.assert_eq(&err_msg);
+
+        let parsed =
+            parse_from_str(type_parser(), &mut ctx, "builtin.integer si32").expect_ok(&ctx);
+        assert_eq!(parsed.disp(&ctx).to_string(), "builtin.integer si32");
+    }
+
+    #[test]
+    fn test_int_parser() {
+        let mut ctx = Context::new();
+
+        // No sign.
+        let parsed: i32 = parse_from_str(int_parser(), &mut ctx, "42").expect_ok(&ctx);
+        assert_eq!(parsed, 42);
+
+        // An explicit `+` sign.
+        let parsed: i32 = parse_from_str(int_parser(), &mut ctx, "+42").expect_ok(&ctx);
+        assert_eq!(parsed, 42);
+
+        // A `-` sign.
+        let parsed: i32 = parse_from_str(int_parser(), &mut ctx, "-42").expect_ok(&ctx);
+        assert_eq!(parsed, -42);
+
+        // The bounds of i8. The smallest value has no positive counterpart.
+        let parsed: i8 = parse_from_str(int_parser(), &mut ctx, "-128").expect_ok(&ctx);
+        assert_eq!(parsed, i8::MIN);
+        let parsed: i8 = parse_from_str(int_parser(), &mut ctx, "127").expect_ok(&ctx);
+        assert_eq!(parsed, i8::MAX);
+
+        // A value that is too small for i8 must fail.
+        assert!(parse_from_str(int_parser::<i8>(), &mut ctx, "-129").is_err());
+
+        // A negative value for an unsigned type must fail.
+        assert!(parse_from_str(int_parser::<u32>(), &mut ctx, "-1").is_err());
+
+        // A sign without digits must fail.
+        assert!(parse_from_str(int_parser::<i32>(), &mut ctx, "-").is_err());
+        assert!(parse_from_str(int_parser::<i32>(), &mut ctx, "+").is_err());
+
+        // A space between the sign and the digits is not allowed.
+        assert!(parse_from_str(int_parser::<i32>(), &mut ctx, "- 1").is_err());
+
+        // Round-trip a negative value through the printer.
+        let printed = (-42i32).disp(&ctx).to_string();
+        let parsed: i32 = parse_from_str(int_parser(), &mut ctx, &printed).expect_ok(&ctx);
+        assert_eq!(parsed, -42);
+    }
+
+    #[test]
+    fn test_hex_int_parser() {
+        use crate::{context::Context, parsable::parse_from_str, result::ExpectOk};
+
+        let mut ctx = Context::new();
+
+        // Valid hex integer
+        let parsed: u64 = parse_from_str(hex_int_parser(), &mut ctx, "0xff").expect_ok(&ctx);
+        assert_eq!(parsed, 0xff);
+
+        // Valid hex integer with uppercase digits
+        let parsed: u64 = parse_from_str(hex_int_parser(), &mut ctx, "0xDEAD").expect_ok(&ctx);
+        assert_eq!(parsed, 0xDEAD);
+
+        // u32 type
+        let parsed: u32 = parse_from_str(hex_int_parser(), &mut ctx, "0xCAFE").expect_ok(&ctx);
+        assert_eq!(parsed, 0xCAFEu32);
+
+        // u8 type
+        let parsed: u8 = parse_from_str(hex_int_parser(), &mut ctx, "0x7f").expect_ok(&ctx);
+        assert_eq!(parsed, 0x7fu8);
+
+        // i64 type
+        let parsed: i64 = parse_from_str(hex_int_parser(), &mut ctx, "0x1234").expect_ok(&ctx);
+        assert_eq!(parsed, 0x1234i64);
+
+        // usize type
+        let parsed: usize = parse_from_str(hex_int_parser(), &mut ctx, "0xABCDEF").expect_ok(&ctx);
+        assert_eq!(parsed, 0xABCDEFusize);
+
+        // Value too large for u8 (0x100 = 256) should fail
+        {
+            let res = parse_from_str(hex_int_parser::<u8>(), &mut ctx, "0x100");
+            assert!(res.is_err());
+        }
+
+        // Value too large for u16 (0x10000 = 65536) should fail
+        {
+            let res = parse_from_str(hex_int_parser::<u16>(), &mut ctx, "0x10000");
+            assert!(res.is_err());
+        }
+
+        // Missing 0x prefix should fail
+        {
+            let res = parse_from_str(hex_int_parser::<u64>(), &mut ctx, "ff");
+            assert!(res.is_err());
+        }
+
+        // No digits after 0x should fail
+        {
+            let res = parse_from_str(hex_int_parser::<u64>(), &mut ctx, "0x");
+            assert!(res.is_err());
+        }
+    }
+}

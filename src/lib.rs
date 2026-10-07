@@ -1,0 +1,319 @@
+//! rustc codegen backend: rustc_codegen_ssa -> pliron LLVM dialect -> Cranelift -> object.
+//! No LLVM is linked; pliron-llvm is built without its `llvm-sys` features.
+
+#![feature(rustc_private)]
+#![allow(clippy::too_many_arguments)]
+
+extern crate rustc_abi;
+extern crate rustc_apfloat;
+extern crate rustc_attr_ir;
+extern crate rustc_ast;
+extern crate rustc_codegen_ssa;
+extern crate rustc_const_eval;
+extern crate rustc_data_structures;
+extern crate rustc_driver;
+extern crate rustc_errors;
+extern crate rustc_hir;
+extern crate rustc_middle;
+extern crate rustc_session;
+extern crate rustc_span;
+extern crate rustc_symbol_mangling;
+extern crate rustc_target;
+
+mod builder;
+mod consts;
+mod context;
+mod intrinsic;
+mod lower;
+mod type_of;
+mod types;
+
+use std::any::Any;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_module::Linkage;
+use rustc_ast::expand::allocator::{
+    AllocatorMethod, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name,
+};
+use rustc_codegen_ssa::back::lto::ThinModule;
+use rustc_codegen_ssa::back::write::{
+    CodegenContext, EmitObj, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn,
+    ThinLtoInput,
+};
+use rustc_codegen_ssa::base::{codegen_crate, maybe_create_entry_wrapper};
+use rustc_codegen_ssa::mono_item::MonoItemExt;
+use rustc_codegen_ssa::traits::*;
+use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen};
+use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_errors::DiagCtxtHandle;
+use rustc_middle::dep_graph::{WorkProduct, WorkProductMap};
+use rustc_middle::ty::TyCtxt;
+use rustc_session::config::{OptLevel, OutputFilenames, OutputType};
+use rustc_session::{IncrCompSession, Session};
+use rustc_span::Symbol;
+use rustc_symbol_mangling::mangle_internal_symbol;
+
+pub use builder::Builder;
+pub use context::CodegenCx;
+use context::Exts;
+
+#[derive(Clone)]
+pub struct PlironCodegenBackend;
+
+pub struct PlironModule {
+    pub obj: Vec<u8>,
+    pub ir: String,
+}
+
+pub struct PlironBuffer(Vec<u8>);
+
+impl ModuleBufferMethods for PlironBuffer {
+    fn data(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
+    let mut fb = settings::builder();
+    fb.set("is_pic", "true").unwrap();
+    fb.set("enable_verifier", if cfg!(debug_assertions) { "true" } else { "false" }).unwrap();
+    fb.set("preserve_frame_pointers", "true").unwrap();
+    fb.set("tls_model", "elf_gd").unwrap();
+    fb.set("enable_llvm_abi_extensions", "true").unwrap();
+    fb.enable("enable_multi_ret_implicit_sret").unwrap();
+    fb.set("opt_level", if sess.opts.optimize == OptLevel::No { "none" } else { "speed_and_size" })
+        .unwrap();
+    let triple = target_lexicon::Triple::from_str(&sess.target.llvm_target)
+        .unwrap_or_else(|e| sess.dcx().fatal(format!("unsupported target: {e}")));
+    let flags = settings::Flags::new(fb);
+    let isa = cranelift_codegen::isa::lookup(triple)
+        .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
+    isa.finish(flags).unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
+}
+
+fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
+    let emit_ir = cx.tcx.sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+        || std::env::var_os("PLIRON_DUMP").is_some();
+    let ir = if emit_ir { cx.print_ir() } else { String::new() };
+    if std::env::var_os("PLIRON_DUMP").is_some() {
+        eprintln!("==== {name} ====\n{ir}");
+    }
+    let isa = build_isa(cx.tcx.sess);
+    let obj = lower::lower_to_object(&cx.pctx.borrow(), &cx.st.borrow(), isa, name);
+    PlironModule { obj, ir }
+}
+
+impl CodegenBackend for PlironCodegenBackend {
+    fn name(&self) -> &'static str {
+        "pliron"
+    }
+
+    fn target_cpu(&self, _sess: &Session) -> String {
+        "generic".to_string()
+    }
+
+    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        Box::new(codegen_crate(self.clone(), tcx))
+    }
+
+    fn join_codegen(
+        &self,
+        ongoing_codegen: Box<dyn Any>,
+        sess: &Session,
+        incr_comp_session: Option<&IncrCompSession>,
+        _outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
+        ongoing_codegen
+            .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<PlironCodegenBackend>>()
+            .expect("expected PlironCodegenBackend's OngoingCodegen")
+            .join(sess, incr_comp_session, crate_info)
+    }
+}
+
+impl ExtraBackendMethods for PlironCodegenBackend {
+    type Module = PlironModule;
+
+    fn codegen_allocator<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        module_name: &str,
+        methods: &[AllocatorMethod],
+    ) -> PlironModule {
+        let cx = CodegenCx::new(tcx, module_name);
+        let usize = cx.type_isize();
+        let ptr = cx.type_ptr();
+        for method in methods {
+            let mut types = Vec::new();
+            for input in method.inputs.iter() {
+                match input.ty {
+                    AllocatorTy::Layout => {
+                        types.push(usize);
+                        types.push(usize);
+                    }
+                    AllocatorTy::Ptr => types.push(ptr),
+                    AllocatorTy::Usize => types.push(usize),
+                    AllocatorTy::Never | AllocatorTy::ResultPtr | AllocatorTy::Unit => {
+                        panic!("invalid allocator arg")
+                    }
+                }
+            }
+            let output = match method.output {
+                AllocatorTy::ResultPtr => Some(ptr),
+                AllocatorTy::Never | AllocatorTy::Unit => None,
+                _ => panic!("invalid allocator output"),
+            };
+            let from = mangle_internal_symbol(tcx, &global_fn_name(method.name));
+            let to = mangle_internal_symbol(tcx, &default_fn_name(method.name));
+            wrapper(&cx, &from, Some(&to), &types, output);
+        }
+        wrapper(&cx, &mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE), None, &[], None);
+        finish_module(&cx, module_name)
+    }
+
+    fn compile_codegen_unit(
+        &self,
+        tcx: TyCtxt<'_>,
+        cgu_name: Symbol,
+        _bitcode_needed: bool,
+    ) -> (ModuleCodegen<PlironModule>, u64) {
+        let start = std::time::Instant::now();
+        let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
+        let (module, _) = tcx.dep_graph.with_task(
+            dep_node,
+            tcx,
+            || module_codegen(tcx, cgu_name),
+            Some(rustc_middle::dep_graph::hash_result),
+        );
+        (module, start.elapsed().as_nanos() as u64)
+    }
+}
+
+fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
+    let cgu = tcx.codegen_unit(cgu_name);
+    let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
+    let mono_items = cgu.items_in_deterministic_order(tcx);
+    for &(mono_item, data) in &mono_items {
+        mono_item.predefine::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data.linkage, data.visibility);
+    }
+    for &(mono_item, data) in &mono_items {
+        mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
+    }
+    maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
+    let m = finish_module(&cx, cgu_name.as_str());
+    ModuleCodegen::new_regular(cgu_name.to_string(), m)
+}
+
+fn wrapper(
+    cx: &CodegenCx<'_>,
+    from: &str,
+    to: Option<&str>,
+    types: &[pliron::r#type::TypeHandle],
+    output: Option<pliron::r#type::TypeHandle>,
+) {
+    let ret = output.unwrap_or_else(|| cx.type_void());
+    let fty = cx.type_func(types, ret);
+    let f = cx.declare_fn_sym(from, fty, Linkage::Export, Exts::default());
+    let bb = Builder::append_block(cx, f, "entry");
+    let mut bx = Builder::build(cx, bb);
+    if let Some(to) = to {
+        cx.declare_fn_sym(to, fty, Linkage::Import, Exts::default());
+        let args: Vec<_> = (0..types.len()).map(|i| bx.get_param(i)).collect();
+        let callee = cx.sym_addr(to);
+        let r = bx.call_raw(fty, callee, &args, Exts::default());
+        if output.is_some() { bx.ret(r) } else { bx.ret_void() }
+    } else {
+        bx.ret_void();
+    }
+}
+
+impl WriteBackendMethods for PlironCodegenBackend {
+    type Module = PlironModule;
+    type TargetMachine = ();
+    type ModuleBuffer = PlironBuffer;
+    type ThinData = ();
+
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    fn target_machine_factory(&self, _sess: &Session, _opt_level: OptLevel) -> TargetMachineFactoryFn<Self> {
+        Arc::new(|_, _| ())
+    }
+
+    fn optimize_and_codegen_fat_lto(
+        _sess: &Session,
+        _cgcx: &CodegenContext,
+        _shared_emitter: &SharedEmitter,
+        _tm_factory: TargetMachineFactoryFn<Self>,
+        _exported_symbols_for_lto: &[String],
+        _each_linked_rlib_for_lto: &[PathBuf],
+        _modules: Vec<FatLtoInput<Self>>,
+    ) -> CompiledModule {
+        unimplemented!("LTO is not supported by the pliron backend")
+    }
+
+    fn run_thin_lto(
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _dcx: DiagCtxtHandle<'_>,
+        _exported_symbols_for_lto: &[String],
+        _each_linked_rlib_for_lto: &[PathBuf],
+        _modules: Vec<ThinLtoInput<Self>>,
+    ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
+        unimplemented!("LTO is not supported by the pliron backend")
+    }
+
+    fn optimize(
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _shared_emitter: &SharedEmitter,
+        _module: &mut ModuleCodegen<PlironModule>,
+        _config: &ModuleConfig,
+    ) {
+    }
+
+    fn optimize_and_codegen_thin(
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _shared_emitter: &SharedEmitter,
+        _tm_factory: TargetMachineFactoryFn<Self>,
+        _thin: ThinModule<Self>,
+    ) -> CompiledModule {
+        unimplemented!("LTO is not supported by the pliron backend")
+    }
+
+    fn codegen(
+        cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _shared_emitter: &SharedEmitter,
+        module: ModuleCodegen<PlironModule>,
+        config: &ModuleConfig,
+    ) -> CompiledModule {
+        let outs = &cgcx.output_filenames;
+        let emit_obj = config.emit_obj != EmitObj::None;
+        if emit_obj {
+            let path = outs.temp_path_for_cgu(OutputType::Object, &module.name);
+            std::fs::write(&path, &module.module_llvm.obj).expect("write object");
+        }
+        if config.emit_ir {
+            let path = outs.temp_path_for_cgu(OutputType::LlvmAssembly, &module.name);
+            std::fs::write(&path, &module.module_llvm.ir).expect("write ir");
+        }
+        module.into_compiled_module(emit_obj, false, false, false, config.emit_ir, outs)
+    }
+
+    fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
+        PlironBuffer(module.obj)
+    }
+}
+
+/// Entry point loaded by `-Zcodegen-backend=path/to/librustc_codegen_pliron.so`.
+#[unsafe(no_mangle)]
+pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
+    Box::new(PlironCodegenBackend)
+}

@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Tests for dialect conversion from builtin to LLVM ops.
+
+#![cfg(feature = "llvm-sys")]
+
+use expect_test::expect;
+
+use pliron::{
+    builtin::ops::ModuleOp,
+    context::Context,
+    init_env_logger_for_tests,
+    irfmt::parsers::spaced,
+    operation::{Operation, verify_operation},
+    parsable::parse_from_str,
+    pass::{AnalysisManager, OpPass, Pass, Passes},
+    result::{ExpectOk, Result},
+};
+use pliron_llvm::llvm_sys::core::LLVMContext;
+
+mod common;
+
+fn run_conversion_pipeline(input: &str) -> Result<String> {
+    init_env_logger_for_tests!();
+
+    let ctx = &mut Context::new();
+    let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+
+    verify_operation(op, ctx)?;
+
+    // Run O1 passes (which also includes the builtin to LLVM conversion pass) on the module
+    let mut passes = OpPass::<ModuleOp, Passes>::default();
+    pliron_llvm::append_o1_passes(&mut passes);
+    passes.run(op, ctx, &mut AnalysisManager::default())?;
+
+    verify_operation(op, ctx)?;
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_mod = common::to_llvm_ir_verify(ctx, &llvm_ctx, module_op)?;
+    Ok(llvm_mod.to_string())
+}
+
+#[test]
+fn mixed_constant_ops_fold_then_lower_to_llvm() -> Result<()> {
+    let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @foo: llvm.func <builtin.integer i64() variadic = false> [] {
+          ^entry_block_1_0():
+            a = builtin.constant <builtin.integer <3: i64>> : builtin.integer i64;
+            b = llvm.constant <builtin.integer <4: i64>> : builtin.integer i64;
+            sum = llvm.add a, b <{nsw=false,nuw=false}> : builtin.integer i64;
+            llvm.return sum
+          }
+        }
+    "#;
+
+    let after = run_conversion_pipeline(input)?;
+
+    expect![[r#"
+        ; ModuleID = 'm'
+        source_filename = "m"
+
+        define i64 @foo() {
+        entry_block_1_0_block2v1:
+          ret i64 7
+        }
+    "#]]
+    .assert_eq(&after);
+
+    Ok(())
+}
+
+#[test]
+fn builtin_func_converts_to_llvm_func() -> Result<()> {
+    let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          builtin.func @foo: builtin.function <() -> (builtin.integer i64)> {
+          ^entry_block_1_0():
+            c0 = builtin.constant <builtin.integer <42: i64>> : builtin.integer i64;
+            llvm.return c0
+          }
+        }
+    "#;
+
+    let after = run_conversion_pipeline(input)?;
+
+    expect![[r#"
+        ; ModuleID = 'm'
+        source_filename = "m"
+
+        define i64 @foo() {
+        entry_block_1_0_block2v1:
+          ret i64 42
+        }
+    "#]]
+    .assert_eq(&after);
+
+    Ok(())
+}
+
+#[test]
+fn builtin_unit_func_converts_to_llvm_void_func() -> Result<()> {
+    let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          builtin.func @foo: builtin.function <() -> (builtin.unit)> {
+          ^entry_block_1_0():
+            llvm.return
+          }
+        }
+    "#;
+
+    let after = run_conversion_pipeline(input)?;
+
+    expect![[r#"
+        ; ModuleID = 'm'
+        source_filename = "m"
+
+        define void @foo() {
+        entry_block_1_0_block2v1:
+          ret void
+        }
+    "#]]
+    .assert_eq(&after);
+
+    Ok(())
+}

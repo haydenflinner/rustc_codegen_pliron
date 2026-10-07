@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) The pliron contributors
+
+//! Utilities for attaching / retrieving given names
+//! for [Operation] results and [BasicBlock] arguments.
+//!
+//! The names themselves are stored as [GivenNamesAttr] on the attribute
+//! dict of an [Operation]/[BasicBlock] with key [ATTR_KEY_GIVEN_NAMES].
+
+use crate::{
+    attribute::AttributeDict,
+    basic_block::BasicBlock,
+    builtin::attributes::{ATTR_KEY_GIVEN_NAMES, GivenNamesAttr},
+    context::{Context, Ptr},
+    graph::{
+        walkers,
+        walkers::{IRNode, WALKCONFIG_PREORDER_FORWARD},
+    },
+    identifier::Identifier,
+    operation::Operation,
+    utils::table::smalltable,
+};
+
+fn set_name_in_attr_map(attributes: &mut AttributeDict, idx: usize, name: Option<Identifier>) {
+    match attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone()) {
+        smalltable::Entry::Occupied(mut occupied) => {
+            let given_names = occupied
+                .get_mut()
+                .downcast_mut::<GivenNamesAttr>()
+                .expect("Existing attribute entry for given names incorrect");
+            let name_is_none = name.is_none();
+            given_names.set_name(idx, name);
+            // If the given names attribute has all None entries, remove it from the map.
+            if name_is_none && given_names.are_all_names_unset() {
+                occupied.remove();
+            }
+        }
+        smalltable::Entry::Vacant(vacant) => {
+            // Only insert a new given names attribute if there's actually a name to set.
+            if name.is_some() {
+                let mut given_names = GivenNamesAttr::default();
+                given_names.set_name(idx, name);
+                vacant.insert(given_names.into());
+            }
+        }
+    }
+}
+
+fn insert_name_in_attr_map(attributes: &mut AttributeDict, idx: usize, name: Option<Identifier>) {
+    match attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone()) {
+        smalltable::Entry::Occupied(mut occupied) => {
+            let given_names = occupied
+                .get_mut()
+                .downcast_mut::<GivenNamesAttr>()
+                .expect("Existing attribute entry for given names incorrect");
+            let name_is_none = name.is_none();
+            given_names.insert_name(idx, name);
+            // If the given names attribute has all None entries, remove it from the map.
+            if name_is_none && given_names.are_all_names_unset() {
+                occupied.remove();
+            }
+        }
+        smalltable::Entry::Vacant(vacant) => {
+            // Only insert a new given names attribute if there's actually a name to set.
+            if name.is_some() {
+                let mut given_names = GivenNamesAttr::default();
+                given_names.insert_name(idx, name);
+                vacant.insert(given_names.into());
+            }
+        }
+    }
+}
+
+fn remove_name_from_attr_map(attributes: &mut AttributeDict, idx: usize) {
+    if let smalltable::Entry::Occupied(mut occupied) =
+        attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone())
+    {
+        let given_names = occupied
+            .get_mut()
+            .downcast_mut::<GivenNamesAttr>()
+            .expect("Existing attribute entry for given names incorrect");
+        given_names.remove_name(idx);
+        // If the given names attribute has no more names, remove it from the map.
+        if given_names.are_all_names_unset() {
+            occupied.remove();
+        }
+    }
+}
+
+fn get_name_from_attr_map(attributes: &AttributeDict, idx: usize) -> Option<Identifier> {
+    attributes
+        .get::<GivenNamesAttr>(&ATTR_KEY_GIVEN_NAMES)
+        .and_then(|given_names| given_names.get_name(idx))
+}
+
+/// Set the name for a result in an [Operation].
+/// Panics if the given `res_idx` is out of range.
+pub fn set_operation_result_name(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    res_idx: usize,
+    name: Option<Identifier>,
+) {
+    let op = &mut *op.deref_mut(ctx);
+    let num_results = op.get_num_results();
+    assert!(res_idx < num_results);
+
+    set_name_in_attr_map(&mut op.attributes, res_idx, name);
+}
+
+/// Insert a name for a result in an [Operation] at the given index,
+/// shifting existing names at that index and beyond to the right.
+/// Panics if the given `res_idx` is out of range (i.e., `res_idx > num_results`).
+pub fn insert_operation_result_name(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    res_idx: usize,
+    name: Option<Identifier>,
+) {
+    let op = &mut *op.deref_mut(ctx);
+    let num_results = op.get_num_results();
+    assert!(res_idx <= num_results);
+
+    insert_name_in_attr_map(&mut op.attributes, res_idx, name);
+}
+
+/// Remove the name for a result in an [Operation] at the given index,
+/// shifting existing names at beyond that index to the left.
+/// Panics if the given `res_idx` is out of range.
+pub fn remove_operation_result_name(ctx: &Context, op: Ptr<Operation>, res_idx: usize) {
+    let op = &mut *op.deref_mut(ctx);
+    let num_results = op.get_num_results();
+    assert!(res_idx < num_results);
+
+    remove_name_from_attr_map(&mut op.attributes, res_idx);
+}
+
+/// Get name for a result in an [Operation].
+pub fn get_operation_result_name(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    res_idx: usize,
+) -> Option<Identifier> {
+    let op = &*op.deref(ctx);
+    get_name_from_attr_map(&op.attributes, res_idx)
+}
+
+/// Set the name for an argument in a [BasicBlock].
+/// Panics if the given `arg_idx` is out of range.
+pub fn set_block_arg_name(
+    ctx: &Context,
+    block: Ptr<BasicBlock>,
+    arg_idx: usize,
+    name: Option<Identifier>,
+) {
+    let block = &mut *block.deref_mut(ctx);
+    let num_args = block.get_num_arguments();
+    assert!(arg_idx < num_args);
+
+    set_name_in_attr_map(&mut block.attributes, arg_idx, name);
+}
+
+/// Insert a name for an argument in a [BasicBlock] at the given index,
+/// shifting existing names at that index and beyond to the right.
+/// Panics if the given `arg_idx` is out of range (i.e., `arg_idx > num_args`).
+pub fn insert_block_arg_name(
+    ctx: &Context,
+    block: Ptr<BasicBlock>,
+    arg_idx: usize,
+    name: Option<Identifier>,
+) {
+    let block = &mut *block.deref_mut(ctx);
+    let num_args = block.get_num_arguments();
+    assert!(arg_idx <= num_args);
+
+    insert_name_in_attr_map(&mut block.attributes, arg_idx, name);
+}
+
+/// Remove the name for an argument in a [BasicBlock] at the given index,
+/// shifting existing names at beyond that index to the left.
+/// Panics if the given `arg_idx` is out of range.
+pub fn remove_block_arg_name(ctx: &Context, block: Ptr<BasicBlock>, arg_idx: usize) {
+    let block = &mut *block.deref_mut(ctx);
+    let num_args = block.get_num_arguments();
+    assert!(arg_idx < num_args);
+
+    remove_name_from_attr_map(&mut block.attributes, arg_idx);
+}
+
+/// Get name for an argument in a [BasicBlock].
+pub fn get_block_arg_name(
+    ctx: &Context,
+    block: Ptr<BasicBlock>,
+    arg_idx: usize,
+) -> Option<Identifier> {
+    let block = &*block.deref(ctx);
+    get_name_from_attr_map(&block.attributes, arg_idx)
+}
+
+/// Recursively erase every [given_name](crate::common_traits::Named::given_name)
+/// nested within `op`: Op results, block arguments and block labels.
+pub fn erase_given_names(ctx: &Context, op: Ptr<Operation>) {
+    walkers::uninterruptible::immutable::walk_op(
+        ctx,
+        &mut (),
+        &WALKCONFIG_PREORDER_FORWARD,
+        op,
+        |ctx: &Context, _state: &mut (), node: IRNode| match node {
+            IRNode::Operation(op) => {
+                let num_results = op.deref(ctx).get_num_results();
+                for res_idx in 0..num_results {
+                    set_operation_result_name(ctx, op, res_idx, None);
+                }
+            }
+            IRNode::BasicBlock(block) => {
+                let num_args = block.deref(ctx).get_num_arguments();
+                for arg_idx in 0..num_args {
+                    set_block_arg_name(ctx, block, arg_idx, None);
+                }
+                block.deref_mut(ctx).set_label(None);
+            }
+            IRNode::Region(_) => {}
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        get_block_arg_name, get_operation_result_name, insert_block_arg_name,
+        insert_operation_result_name, remove_block_arg_name, remove_operation_result_name,
+        set_block_arg_name, set_operation_result_name,
+    };
+    use crate::{
+        basic_block::BasicBlock,
+        builtin::{
+            op_interfaces::{NOpdsInterface, OneResultInterface},
+            types::{IntegerType, Signedness},
+        },
+        context::Context,
+        ident,
+        op::Op,
+        operation::{Operation, verify_operation},
+        result::Result,
+    };
+    use alloc::vec;
+    use pliron::derive::pliron_op;
+
+    #[pliron_op(
+        name = "test.zero",
+        format,
+        interfaces = [OneResultInterface, NOpdsInterface<0>],
+        verifier = "succ",
+    )]
+    struct ZeroOp;
+    impl ZeroOp {
+        pub fn new(ctx: &mut Context) -> Self {
+            let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed);
+            ZeroOp {
+                op: Operation::new(
+                    ctx,
+                    Self::get_concrete_op_info(),
+                    vec![i64_ty.into()],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_op_result_name() -> Result<()> {
+        let mut ctx = Context::new();
+        let cop = ZeroOp::new(&mut ctx);
+        let op = cop.get_operation();
+        set_operation_result_name(&ctx, op, 0, Some(ident!("foo")));
+        assert_eq!(
+            get_operation_result_name(&ctx, op, 0).unwrap(),
+            ident!("foo")
+        );
+        verify_operation(op, &ctx)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_arg_name() -> Result<()> {
+        let mut ctx = Context::new();
+        let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let block = BasicBlock::new(&mut ctx, Some(ident!("entry")), vec![i64_ty.into()]);
+        set_block_arg_name(&ctx, block, 0, Some(ident!("foo")));
+        assert!(get_block_arg_name(&ctx, block, 0).unwrap() == ident!("foo"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_op_result_name_insert_remove_shift() {
+        let mut ctx = Context::new();
+        let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let op = Operation::new(
+            &mut ctx,
+            ZeroOp::get_concrete_op_info(),
+            vec![i64_ty.into(), i64_ty.into(), i64_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+
+        set_operation_result_name(&ctx, op, 0, Some(ident!("r0")));
+        set_operation_result_name(&ctx, op, 1, Some(ident!("r1")));
+        assert_eq!(get_operation_result_name(&ctx, op, 0), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r1")));
+        assert_eq!(get_operation_result_name(&ctx, op, 2), None);
+
+        // Insert/remove at end should not affect earlier indices.
+        insert_operation_result_name(&ctx, op, 2, Some(ident!("tail")));
+        assert_eq!(get_operation_result_name(&ctx, op, 0), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r1")));
+        assert_eq!(get_operation_result_name(&ctx, op, 2), Some(ident!("tail")));
+        remove_operation_result_name(&ctx, op, 2);
+        assert_eq!(get_operation_result_name(&ctx, op, 0), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r1")));
+        assert_eq!(get_operation_result_name(&ctx, op, 2), None);
+
+        // Insert a placeholder at front, shifting r0 name to index 1.
+        insert_operation_result_name(&ctx, op, 0, None);
+        assert_eq!(get_operation_result_name(&ctx, op, 0), None);
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 2), Some(ident!("r1")));
+
+        // Insert a named result at the front.
+        insert_operation_result_name(&ctx, op, 0, Some(ident!("ins")));
+        assert_eq!(get_operation_result_name(&ctx, op, 0), Some(ident!("ins")));
+        assert_eq!(get_operation_result_name(&ctx, op, 1), None);
+        assert_eq!(get_operation_result_name(&ctx, op, 2), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 3), Some(ident!("r1")));
+
+        // Remove front name; prior index 1 becomes 0 and index 2 becomes 1.
+        remove_operation_result_name(&ctx, op, 0);
+        assert_eq!(get_operation_result_name(&ctx, op, 0), None);
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 2), Some(ident!("r1")));
+
+        // Remove the placeholder, moving r0 back to index 0.
+        remove_operation_result_name(&ctx, op, 0);
+        assert_eq!(get_operation_result_name(&ctx, op, 0), Some(ident!("r0")));
+        assert_eq!(get_operation_result_name(&ctx, op, 1), Some(ident!("r1")));
+    }
+
+    #[test]
+    fn test_block_arg_name_insert_remove_shift() {
+        let mut ctx = Context::new();
+        let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let block = BasicBlock::new(
+            &mut ctx,
+            Some(ident!("entry")),
+            vec![i64_ty.into(), i64_ty.into(), i64_ty.into()],
+        );
+
+        set_block_arg_name(&ctx, block, 0, Some(ident!("a0")));
+        set_block_arg_name(&ctx, block, 1, Some(ident!("a1")));
+        assert_eq!(get_block_arg_name(&ctx, block, 0), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a1")));
+        assert_eq!(get_block_arg_name(&ctx, block, 2), None);
+
+        // Insert/remove at end should not affect earlier indices.
+        insert_block_arg_name(&ctx, block, 2, Some(ident!("tail")));
+        assert_eq!(get_block_arg_name(&ctx, block, 0), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a1")));
+        assert_eq!(get_block_arg_name(&ctx, block, 2), Some(ident!("tail")));
+        remove_block_arg_name(&ctx, block, 2);
+        assert_eq!(get_block_arg_name(&ctx, block, 0), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a1")));
+        assert_eq!(get_block_arg_name(&ctx, block, 2), None);
+
+        // Insert a placeholder at front, shifting a0 to index 1.
+        insert_block_arg_name(&ctx, block, 0, None);
+        assert_eq!(get_block_arg_name(&ctx, block, 0), None);
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 2), Some(ident!("a1")));
+
+        // Insert a named arg at the front.
+        insert_block_arg_name(&ctx, block, 0, Some(ident!("ins")));
+        assert_eq!(get_block_arg_name(&ctx, block, 0), Some(ident!("ins")));
+        assert_eq!(get_block_arg_name(&ctx, block, 1), None);
+        assert_eq!(get_block_arg_name(&ctx, block, 2), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 3), Some(ident!("a1")));
+
+        // Remove front name; prior index 1 becomes 0 and index 2 becomes 1.
+        remove_block_arg_name(&ctx, block, 0);
+        assert_eq!(get_block_arg_name(&ctx, block, 0), None);
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 2), Some(ident!("a1")));
+
+        // Remove placeholder, moving a0 back to index 0.
+        remove_block_arg_name(&ctx, block, 0);
+        assert_eq!(get_block_arg_name(&ctx, block, 0), Some(ident!("a0")));
+        assert_eq!(get_block_arg_name(&ctx, block, 1), Some(ident!("a1")));
+    }
+}
