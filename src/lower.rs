@@ -979,6 +979,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let r = match name {
             "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
             "llvm.memcpy" | "llvm.memmove" => {
+                if let Some(n) = self.const_int(opnds[2]).filter(|n| (0..=SMALL_MEM).contains(n)) {
+                    // Load everything before storing, so this is also a valid memmove.
+                    let vals: Vec<_> = mem_chunks(n as u64)
+                        .into_iter()
+                        .map(|(o, t)| (o, self.b.ins().load(t, MemFlagsData::new(), a[1], o)))
+                        .collect();
+                    for (o, v) in vals {
+                        self.b.ins().store(MemFlagsData::new(), v, a[0], o);
+                    }
+                    return;
+                }
                 let cfg = self.m.target_config();
                 if name == "llvm.memcpy" {
                     self.b.call_memcpy(cfg, a[0], a[1], a[2]);
@@ -988,6 +999,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 return;
             }
             "llvm.memset" => {
+                let n = self.const_int(opnds[2]).filter(|n| (0..=SMALL_MEM).contains(n));
+                if let (Some(n), Some(c)) = (n, self.const_int(opnds[1])) {
+                    let byte = c as u8 as u64;
+                    for (o, t) in mem_chunks(n as u64) {
+                        let pat = byte.wrapping_mul(0x0101_0101_0101_0101) & (u64::MAX >> (64 - t.bits()));
+                        let v = self.b.ins().iconst(t, pat as i64);
+                        self.b.ins().store(MemFlagsData::new(), v, a[0], o);
+                    }
+                    return;
+                }
                 let cfg = self.m.target_config();
                 self.b.call_memset(cfg, a[0], a[1], a[2]);
                 return;
@@ -1109,4 +1130,20 @@ fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     post.reverse();
     post.extend(blocks.iter().copied().filter(|b| !seen.contains(b)));
     post
+}
+
+/// Constant-size mem{cpy,move,set} up to this many bytes are expanded inline
+/// (unaligned scalar loads/stores) instead of calling libc.
+const SMALL_MEM: i128 = 64;
+
+fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
+    let mut v = Vec::new();
+    let mut o = 0;
+    for (sz, t) in [(8, clt::I64), (4, clt::I32), (2, clt::I16), (1, clt::I8)] {
+        while n - o >= sz {
+            v.push((o as i32, t));
+            o += sz;
+        }
+    }
+    v
 }
