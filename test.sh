@@ -24,3 +24,4 @@ if [[ "${1:-}" == --sysroot ]]; then
     cargo build -Zbuild-std=std,panic_unwind --target "$T" --bins &&
     ../../target/sysroot/$T/debug/sysroot-test && ../../target/sysroot/$T/debug/unwind-test)
 fi
+if command -v node >/dev/null; then tests/wasm/run.sh; fi

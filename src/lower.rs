@@ -186,7 +186,7 @@ pub fn lower_to_object(unwind: bool, hot: bool, ctx: &Context, st: &State<'_>, i
     product.emit().unwrap()
 }
 
-fn write_const(
+pub(crate) fn write_const(
     ctx: &Context,
     st: &State<'_>,
     v: Value,
@@ -1135,7 +1135,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
 
 /// Reverse postorder from the entry block, then any unreachable blocks, so
 /// every SSA definition is lowered before its uses.
-fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
         b.deref(ctx).iter(ctx).flat_map(|op| op.deref(ctx).successors().collect::<Vec<_>>()).collect()
     };

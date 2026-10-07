@@ -34,6 +34,19 @@ rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranel
 - Mid-level passes: a small same-CGU inliner (`src/inline.rs`, at -O; `PLIRON_INLINE=0` disables it).
 - Not done yet: debuginfo, LTO, and targets other than x86_64.
 
+## wasm32 (in progress)
+
+`--target wasm32-unknown-unknown` lowers the pliron LLVM dialect to
+[waffle](https://github.com/bytecodealliance/waffle) IR, which does the
+reducify/stackify/localify into structured wasm (`src/wasm.rs`). Each
+codegen unit becomes a wasm "object" that imports memory, the stack pointer,
+the function table and GOT-style globals, plus a `pliron.link` custom section
+with data and relocations. `tools/pliron-wasm-ld` links those objects and
+rlibs into one module (wasm-ld is LLVM, so it is not used).
+
+`tests/wasm/run.sh` builds core, compiler_builtins and a test crate this way
+and runs it in node. Not done yet: std, unwinding, rustc itself as wasm.
+
 ## Usage
 ```
 cargo build

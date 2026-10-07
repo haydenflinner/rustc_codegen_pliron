@@ -70,6 +70,13 @@ pub fn classify(ctx: &Context, ty: TypeHandle) -> TyK {
     TyK::Other
 }
 
+/// Set for 32-bit-pointer targets (wasm32) before any layout query.
+pub static PTR32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn ptr32() -> bool {
+    PTR32.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn align_to(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
@@ -85,7 +92,7 @@ pub fn size_align(ctx: &Context, ty: TypeHandle) -> (u64, u64) {
         TyK::F32 => (4, 4),
         TyK::F64 => (8, 8),
         TyK::F128 => (16, 16),
-        TyK::Ptr => (8, 8),
+        TyK::Ptr => if ptr32() { (4, 4) } else { (8, 8) },
         TyK::Void | TyK::Func(..) | TyK::Other => (0, 1),
         TyK::Array(e, n) => {
             let (s, a) = size_align(ctx, e);
@@ -143,7 +150,7 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
         TyK::F32 => out.push((base, clt::F32)),
         TyK::F64 => out.push((base, clt::F64)),
         TyK::F128 => out.push((base, clt::F128)),
-        TyK::Ptr => out.push((base, clt::I64)),
+        TyK::Ptr => out.push((base, if ptr32() { clt::I32 } else { clt::I64 })),
         TyK::Void | TyK::Func(..) | TyK::Other => {}
         TyK::Array(e, n) => {
             let (s, _) = size_align(ctx, e);
