@@ -156,7 +156,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         inline::run(ctx, st);
-        if pass_enabled("PLIRON_NOUNWIND") {
+        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }
         if pass_enabled("PLIRON_SRET2REG") {
