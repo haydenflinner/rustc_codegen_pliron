@@ -16,6 +16,8 @@ out=target/tests; mkdir -p $out
 rustc $BE --edition 2024 -Cpanic=abort -Clink-arg=-lc tests/nostd/main.rs -o $out/nostd && $out/nostd
 for t in std asm unwind; do rustc $BE --edition 2024 tests/$t/main.rs -o $out/$t && $out/$t; done
 if [[ "${1:-}" == --sysroot ]]; then
-  (cd tests/sysroot && RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot \
-    cargo run -Zbuild-std=std,panic_abort --target "$(rustc -vV | sed -n 's/host: //p')")
+  (cd tests/sysroot && export RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot &&
+    T="$(rustc -vV | sed -n 's/host: //p')" &&
+    cargo build -Zbuild-std=std,panic_unwind --target "$T" --bins &&
+    ../../target/sysroot/$T/debug/sysroot-test && ../../target/sysroot/$T/debug/unwind-test)
 fi

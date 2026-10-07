@@ -7,7 +7,8 @@ edition = "2024"
 name = "sysroot-test"
 path = "../std/main.rs"
 
-[profile.dev]
-panic = "abort"
+[[bin]]
+name = "unwind-test"
+path = "../unwind/main.rs"
 
 [workspace]
