@@ -3,7 +3,7 @@
 An out-of-tree rustc codegen backend with no LLVM:
 
 ```
-rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranelift-object → system linker
+rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranelift-object (+ rsasm for asm) → wild
 ```
 
 [pliron](https://github.com/vaivaswatha/pliron) is vendored in `vendor/` with its LLVM (llvm-sys) features disabled.
@@ -11,17 +11,33 @@ rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranel
 
 ## Status (x86_64 Linux)
 - `no_std` and `std` programs compile and run.
-- `-Zbuild-std`: core, alloc and std build with this backend, and the resulting binary runs.
+- `-Zbuild-std=std,panic_unwind`: core, alloc and std build with this backend, and the resulting binaries run.
+- Unwinding: `invoke` lowers to Cranelift `try_call`, and `.eh_frame` and LSDA are emitted (adapted from rustc_codegen_cranelift).
+  `catch_unwind` and `Drop` during panics work.
 - `asm!`/`global_asm!`: each asm block becomes an out-of-line wrapper (allocator adapted from rustc_codegen_cranelift).
-  The system `as` assembles the wrappers and `ld -r` merges them into the CGU object.
-- `llvm.*` `link_name` intrinsics: a few have asm implementations. The rest are weak stubs that trap only if they are called.
-- Not done yet: optimizations, debuginfo, LTO, unwinding (use `panic=abort`), and targets other than x86_64.
+  The wrappers are assembled in-process by [rsasm](https://crates.io/crates/rsasm) and spliced into the object (`src/objmerge.rs`).
+  No GNU `as` or `ld -r` is involved.
+- Linking: `test.sh` links with [wild](https://github.com/davidlattimore/wild) when it is on `PATH`. The `cc` driver still runs it.
+- `llvm.*` `link_name` intrinsics: the ones reached via runtime feature detection are emulated lane-wise.
+  These include pshufb, cmpps/cmppd and vcvtps2ph, plus xgetbv, rdtsc and pause in asm.
+  The rest are weak stubs that trap only if called.
+- rustc UI tests: `tests/ui_run_pass.py` runs the 2594 directive-free run-pass tests.
+  All 2537 that pass with stock rustc on the test box also pass here.
+- `examples/bevy-game`: a small bevy 0.17 2D game (sprites, text, input).
+  Its target crates are compiled by this backend and linked with wild, and it runs on Vulkan (tested on Mesa lavapipe).
+  `--frames N --autoplay` gives an unattended smoke run.
+- Not done yet: optimizations, debuginfo, LTO, and targets other than x86_64.
+  Host proc-macros and build scripts are still compiled by stock rustc.
 
 ## Usage
 ```
 cargo build
 rustc -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.so main.rs
-./test.sh            # nostd/std/asm tests against the prebuilt sysroot
+./test.sh            # nostd/std/asm/unwind tests against the prebuilt sysroot
 ./test.sh --sysroot  # also rebuild core/alloc/std with this backend
 ```
 Uses the nightly pinned in `rust-toolchain.toml`. It needs `rustc-dev` because the backend links against rustc_private crates.
+```
+tests/ui_run_pass.py           # rustc UI run-pass slice (needs a rust checkout, default ~/work/rust)
+examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game
+```
