@@ -157,7 +157,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
         }
-        if pass_enabled("PLIRON_MEMCPYOPT") {
+        if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
             memcpyopt::run(ctx, st);
         }
         if pass_enabled("PLIRON_SROA") {
