@@ -71,6 +71,48 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
     sig
 }
 
+/// Local, non-variadic functions whose address never escapes and that are
+/// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
+/// 8 int + 8 float return registers instead of SysV's 2+2).
+fn internal_fns(ctx: &Context, st: &State<'_>) -> rustc_data_structures::fx::FxHashSet<String> {
+    use rustc_data_structures::fx::FxHashSet;
+    if !crate::pass_enabled("PLIRON_TAILCC") {
+        return FxHashSet::default();
+    }
+    let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
+    for c in st.consts.values() {
+        if let ConstVal::Agg(vs) = c {
+            escaped.extend(vs.iter().copied());
+        }
+    }
+    // A `try_call` into a tail-CC callee clobbers every register, so callees
+    // reached by an invoke keep the platform ABI.
+    let mut taken: FxHashSet<&str> = st
+        .invokes
+        .keys()
+        .filter_map(|&op| crate::inline::direct_callee(ctx, st, op))
+        .map(|s| s.as_str())
+        .collect();
+    for (v, c) in &st.consts {
+        if let ConstVal::Sym { sym, .. } = c {
+            if v.is_used(ctx) || escaped.contains(v) {
+                taken.insert(sym.as_str());
+            }
+        }
+    }
+    st.funcs
+        .iter()
+        .filter(|(n, f)| {
+            f.linkage == Linkage::Local
+                && !taken.contains(n.as_str())
+                && !st.asm.contains(n.as_str())
+                && !matches!(classify(ctx, f.ty), TyK::Func(_, _, true))
+                && has_body(ctx, f.op)
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
 pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx)
         .unwrap()
@@ -90,9 +132,17 @@ pub fn lower_to_object(
     b.per_data_object_section(true);
     let mut m = ObjectModule::new(b);
     let cc = isa.default_call_conv();
+    let internal = internal_fns(ctx, st);
+    let cc_of = |n: &str| {
+        if internal.contains(n) {
+            CallConv::Tail
+        } else {
+            cc
+        }
+    };
     let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
     for (n, f) in &st.funcs {
-        let sig = make_sig(ctx, f.ty, &f.exts, cc);
+        let sig = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let mut l = f.linkage;
         if l == Linkage::Import && has_body(ctx, f.op) {
             l = Linkage::Export;
@@ -128,7 +178,7 @@ pub fn lower_to_object(
         let Sym::F(id, _) = ids[n] else {
             unreachable!()
         };
-        clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc);
+        clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -144,6 +194,7 @@ pub fn lower_to_object(
                 gvs: FxHashMap::default(),
                 terminated: false,
                 cc,
+                internal: &internal,
                 exn: None,
                 vars: FxHashMap::default(),
             };
@@ -249,6 +300,8 @@ struct FnLower<'a, 'b, 'tcx> {
     gvs: FxHashMap<DataId, GlobalValue>,
     terminated: bool,
     cc: CallConv,
+    /// Local functions using our internal ABI (`CallConv::Tail`).
+    internal: &'a rustc_data_structures::fx::FxHashSet<String>,
     exn: Option<cranelift_frontend::Variable>,
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
@@ -1277,7 +1330,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
         let info = &self.st.calls[&op];
         let fn_ty = info.fn_ty;
-        let sig = make_sig(ctx, fn_ty, &info.exts, self.cc);
+        let cc = match call.callee(ctx) {
+            CallOpCallable::Direct(id)
+                if self
+                    .internal
+                    .contains(&self.st.ident_to_sym[&id.to_string()]) =>
+            {
+                CallConv::Tail
+            }
+            _ => self.cc,
+        };
+        let sig = make_sig(ctx, fn_ty, &info.exts, cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         for a in args {
