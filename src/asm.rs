@@ -116,7 +116,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let back = if x86 { ".att_syntax\n" } else { "" };
         write!(
             st.asm,
-            ".section .text.{sym},\"axG\",@progbits,{sym},comdat\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
+            ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
         )
         .unwrap();
         sym

@@ -25,6 +25,7 @@ mod consts;
 mod context;
 mod asm;
 mod eh;
+mod objmerge;
 mod intrinsic;
 mod simd;
 mod lower;
@@ -325,11 +326,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
         if emit_obj {
             let path = outs.temp_path_for_cgu(OutputType::Object, &module.name);
             let m = &module.module_llvm;
-            if m.asm.is_empty() {
-                std::fs::write(&path, &m.obj).expect("write object");
-            } else {
-                write_obj_with_asm(&path, &m.obj, &m.asm);
-            }
+            std::fs::write(&path, &m.obj).expect("write object");
         }
         if config.emit_ir {
             let path = outs.temp_path_for_cgu(OutputType::LlvmAssembly, &module.name);
@@ -340,54 +337,6 @@ impl WriteBackendMethods for PlironCodegenBackend {
 
     fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
         PlironBuffer(module.obj)
-    }
-}
-
-/// LLVM's assembler accepts `//` line comments on every target; GNU `as` on
-/// x86 doesn't, so drop them (outside string literals).
-fn strip_line_comments(asm: &str) -> String {
-    let mut out = String::with_capacity(asm.len());
-    for line in asm.lines() {
-        let b = line.as_bytes();
-        let (mut in_str, mut cut) = (false, b.len());
-        let mut i = 0;
-        while i < b.len() {
-            match b[i] {
-                b'\\' if in_str => i += 1,
-                b'"' => in_str = !in_str,
-                b'/' if !in_str && b.get(i + 1) == Some(&b'/') => {
-                    cut = i;
-                    break;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        out.push_str(&line[..cut]);
-        out.push('\n');
-    }
-    out
-}
-
-/// Assembles `asm!`/`global_asm!` text with the system assembler and merges
-/// it into the Cranelift object with a relocatable link.
-fn write_obj_with_asm(path: &std::path::Path, obj: &[u8], asm: &str) {
-    let main = path.with_extension("cl.o");
-    let src = path.with_extension("s");
-    let asm_obj = path.with_extension("asm.o");
-    std::fs::write(&main, obj).expect("write object");
-    let asm = strip_line_comments(asm);
-    std::fs::write(&src, format!("{asm}\n.section .note.GNU-stack,\"\",@progbits\n")).expect("write asm");
-    let run = |cmd: &mut std::process::Command| {
-        let out = cmd.output().unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"));
-        if !out.status.success() {
-            panic!("{cmd:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
-        }
-    };
-    run(std::process::Command::new("as").arg("-o").arg(&asm_obj).arg(&src));
-    run(std::process::Command::new("ld").arg("-r").arg("-o").arg(path).arg(&main).arg(&asm_obj));
-    for f in [&main, &src, &asm_obj] {
-        let _ = std::fs::remove_file(f);
     }
 }
 

@@ -171,6 +171,10 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
     }
     let mut product = m.finish();
     eh.emit(&mut product);
+    if !st.asm.is_empty() {
+        let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+        crate::objmerge::assemble_into(&mut product.object, &st.asm, x86);
+    }
     product.emit().unwrap()
 }
 
