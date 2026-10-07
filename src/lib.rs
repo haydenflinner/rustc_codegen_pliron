@@ -28,6 +28,7 @@ mod eh;
 mod objmerge;
 mod intrinsic;
 mod simd;
+mod hot;
 mod inline;
 mod lower;
 mod type_of;
@@ -112,7 +113,8 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         inline::run(&mut cx.pctx.borrow_mut(), &mut cx.st.borrow_mut());
     }
     let isa = build_isa(cx.tcx.sess);
-    let obj = lower::lower_to_object(cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind, &cx.pctx.borrow(), &cx.st.borrow(), isa, name);
+    let hot = std::env::var("PLIRON_HOT").is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
+    let obj = lower::lower_to_object(cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind, hot, &cx.pctx.borrow(), &cx.st.borrow(), isa, name);
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }
 }

@@ -72,18 +72,28 @@ pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx).unwrap().get_entry_block(ctx).is_some()
 }
 
-pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, name: &str) -> Vec<u8> {
+pub fn lower_to_object(unwind: bool, hot: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, name: &str) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     b.per_function_section(true);
     b.per_data_object_section(true);
     let mut m = ObjectModule::new(b);
     let cc = isa.default_call_conv();
     let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
+    let mut hot_bodies: FxHashMap<String, FuncId> = FxHashMap::default();
+    let mut hot_asm = String::new();
     for (n, f) in &st.funcs {
         let sig = make_sig(ctx, f.ty, &f.exts, cc);
         let mut l = f.linkage;
         if l == Linkage::Import && has_body(ctx, f.op) {
             l = Linkage::Export;
+        }
+        if hot && has_body(ctx, f.op) && crate::hot::patchable(n) {
+            let body = m.declare_function(&crate::hot::body_name(n), Linkage::Hidden, &sig).unwrap();
+            let thunk = m.declare_function(n, Linkage::Import, &sig).unwrap();
+            hot_bodies.insert(n.clone(), body);
+            hot_asm.push_str(&crate::hot::thunk_asm(n, l));
+            ids.insert(n.clone(), Sym::F(thunk, f.ty));
+            continue;
         }
         let id = m.declare_function(n, l, &sig).unwrap_or_else(|e| panic!("declare {n}: {e}"));
         ids.insert(n.clone(), Sym::F(id, f.ty));
@@ -106,6 +116,7 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
             continue;
         }
         let Sym::F(id, _) = ids[n] else { unreachable!() };
+        let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc);
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
@@ -167,9 +178,10 @@ pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn
     }
     let mut product = m.finish();
     eh.emit(&mut product);
-    if !st.asm.is_empty() {
+    if !st.asm.is_empty() || !hot_asm.is_empty() {
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        crate::objmerge::assemble_into(&mut product.object, &st.asm, x86);
+        let asm = format!("{}\n{hot_asm}", st.asm);
+        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
     product.emit().unwrap()
 }
