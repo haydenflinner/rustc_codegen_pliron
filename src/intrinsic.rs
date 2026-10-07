@@ -244,6 +244,9 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let out = self.layout_of(sig.output());
         let ret = if out.is_zst() { self.type_void() } else { self.immediate_backend_type(out) };
         let vs: Vec<Value> = args.iter().map(|a| a.immediate()).collect();
+        if let Some(v) = self.llvm_x86_intrinsic(&name, args, sig.output(), ret) {
+            return v;
+        }
         let stub = self.cx.llvm_intrinsic_stub(&name);
         self.call_sym(&stub, ret, &vs)
     }

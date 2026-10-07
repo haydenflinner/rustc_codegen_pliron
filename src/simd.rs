@@ -341,4 +341,84 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             _ => None,
         }
     }
+
+    /// Lane-wise emulation of the `llvm.x86.*` SIMD intrinsics that
+    /// runtime-dispatching crates (aho-corasick, half, ...) actually reach.
+    pub fn llvm_x86_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[OperandRef<'tcx, Value>],
+        ret_rty: Ty<'tcx>,
+        ret: TypeHandle,
+    ) -> Option<Value> {
+        use rustc_codegen_ssa::common::RealPredicate::*;
+        let a = |i: usize| args[i].immediate();
+        match name {
+            "llvm.x86.ssse3.pshuf.b.128" | "llvm.x86.avx2.pshuf.b" => {
+                // r[i] = b[i] & 0x80 ? 0 : a[16 * (i / 16) + (b[i] & 15)]
+                let (n, _) = self.elem_of(ret_rty);
+                let one = rustc_abi::Align::ONE;
+                let slot = self.alloca(rustc_abi::Size::from_bytes(n), one);
+                self.store(a(0), slot, one);
+                let (i8t, isz) = (self.type_i8(), self.type_isize());
+                let zero = self.const_u8(0);
+                let bs = self.lanes(a(1), n);
+                let mut out = Vec::new();
+                for (i, b) in bs.into_iter().enumerate() {
+                    let m = self.const_u8(0x0f);
+                    let idx = self.and(b, m);
+                    let idx = self.zext(idx, isz);
+                    let base = self.const_usize(i as u64 / 16 * 16);
+                    let off = self.add(idx, base);
+                    let p = self.inbounds_ptradd(slot, off);
+                    let v = self.load(i8t, p, one);
+                    let hb = self.const_u8(0x80);
+                    let h = self.and(b, hb);
+                    let c = self.nonzero(h);
+                    out.push(self.select(c, zero, v));
+                }
+                Some(self.build_vec(ret, out))
+            }
+            "llvm.x86.sse.cmp.ps" | "llvm.x86.sse2.cmp.pd" => {
+                // Predicates 16..31 only differ in signaling, so the low 4 bits suffice.
+                let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
+                let pred = [
+                    RealOEQ, RealOLT, RealOLE, RealUNO, RealUNE, RealUGE, RealUGT, RealORD, RealUEQ, RealULT,
+                    RealULE, RealPredicateFalse, RealONE, RealOGE, RealOGT, RealPredicateTrue,
+                ][imm as usize];
+                let (n, _) = self.elem_of(ret_rty);
+                let et = self.element_type(ret);
+                let it = self.type_ix(if name.ends_with(".ps") { 32 } else { 64 });
+                let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
+                let mut out = Vec::new();
+                for (x, y) in xs.into_iter().zip(ys) {
+                    let m = match pred {
+                        RealPredicateFalse => self.const_int(it, 0),
+                        RealPredicateTrue => self.const_int(it, -1),
+                        p => {
+                            let c = self.fcmp(p, x, y);
+                            self.sext(c, it)
+                        }
+                    };
+                    out.push(self.bitcast(m, et));
+                }
+                Some(self.build_vec(ret, out))
+            }
+            "llvm.x86.vcvtps2ph.128" => {
+                // <4 x f32> -> low 4 lanes of <8 x i16>; callers use round-to-nearest.
+                let (f16, i16t) = (self.type_f16(), self.type_i16());
+                let xs = self.lanes(a(0), 4);
+                let mut out = Vec::new();
+                for x in xs {
+                    let h = self.fptrunc(x, f16);
+                    out.push(self.bitcast(h, i16t));
+                }
+                for _ in 0..4 {
+                    out.push(self.const_i16(0));
+                }
+                Some(self.build_vec(ret, out))
+            }
+            _ => None,
+        }
+    }
 }
