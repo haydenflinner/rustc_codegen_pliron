@@ -94,6 +94,36 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 }
 
+impl<'tcx> CodegenCx<'tcx> {
+    /// `link_name = "llvm.*"` intrinsics used by `core::arch`/`std_detect`.
+    /// A few are implemented in assembly; the rest become weak stubs that
+    /// trap if they're ever executed, so crates still build.
+    pub fn llvm_intrinsic_stub(&self, name: &str) -> String {
+        let sym: String =
+            format!("__pliron_{}", name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>());
+        let mut st = self.st.borrow_mut();
+        if !st.llvm_stubs.insert(sym.clone()) {
+            return sym;
+        }
+        let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
+        let body = match name {
+            "llvm.x86.xgetbv" if x86 => "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
+            "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
+            "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n",
+            _ if x86 => "    ud2\n",
+            _ => "    brk #0x1\n",
+        };
+        let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
+        let back = if x86 { ".att_syntax\n" } else { "" };
+        write!(
+            st.asm,
+            ".section .text.{sym},\"axG\",@progbits,{sym},comdat\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
+        )
+        .unwrap();
+        sym
+    }
+}
+
 struct Gen<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     arch: InlineAsmArch,

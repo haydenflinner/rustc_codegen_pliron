@@ -342,6 +342,32 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 }
 
+/// LLVM's assembler accepts `//` line comments on every target; GNU `as` on
+/// x86 doesn't, so drop them (outside string literals).
+fn strip_line_comments(asm: &str) -> String {
+    let mut out = String::with_capacity(asm.len());
+    for line in asm.lines() {
+        let b = line.as_bytes();
+        let (mut in_str, mut cut) = (false, b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if in_str => i += 1,
+                b'"' => in_str = !in_str,
+                b'/' if !in_str && b.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
 /// Assembles `asm!`/`global_asm!` text with the system assembler and merges
 /// it into the Cranelift object with a relocatable link.
 fn write_obj_with_asm(path: &std::path::Path, obj: &[u8], asm: &str) {
@@ -349,6 +375,7 @@ fn write_obj_with_asm(path: &std::path::Path, obj: &[u8], asm: &str) {
     let src = path.with_extension("s");
     let asm_obj = path.with_extension("asm.o");
     std::fs::write(&main, obj).expect("write object");
+    let asm = strip_line_comments(asm);
     std::fs::write(&src, format!("{asm}\n.section .note.GNU-stack,\"\",@progbits\n")).expect("write asm");
     let run = |cmd: &mut std::process::Command| {
         let out = cmd.output().unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"));

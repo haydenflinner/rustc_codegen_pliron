@@ -771,6 +771,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn fcvt_sat(&mut self, signed: bool, t: ClType, x: ir::Value) -> ir::Value {
+        if t == clt::I128 {
+            // Cranelift x64 can't convert floats to i128; compiler-builtins' helpers saturate.
+            let ft = self.b.func.dfg.value_type(x);
+            let name = match (signed, ft == clt::F32) {
+                (true, true) => "__fixsfti",
+                (true, false) => "__fixdfti",
+                (false, true) => "__fixunssfti",
+                (false, false) => "__fixunsdfti",
+            };
+            return self.libcall(name, &[ft], &[clt::I128], &[x])[0];
+        }
         let it = if t.bits() < 32 { clt::I32 } else { t };
         let r = if signed { self.b.ins().fcvt_to_sint_sat(it, x) } else { self.b.ins().fcvt_to_uint_sat(it, x) };
         if it == t {

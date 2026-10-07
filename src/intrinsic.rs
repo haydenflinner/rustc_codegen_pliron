@@ -209,8 +209,15 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         args: &[OperandRef<'tcx, Value>],
         _is_cleanup: bool,
     ) -> Value {
-        let sym = self.tcx.symbol_name(instance).name.to_string();
-        panic!("LLVM intrinsic `{sym}` is not supported by the pliron backend ({} args)", args.len())
+        let name = self.tcx.symbol_name(instance).name.to_string();
+        // fn_abi_of_instance rejects LLVM intrinsics; use the signature directly.
+        let sig = self.tcx.fn_sig(instance.def_id()).instantiate(self.tcx, instance.args).skip_norm_wip();
+        let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
+        let out = self.layout_of(sig.output());
+        let ret = if out.is_zst() { self.type_void() } else { self.immediate_backend_type(out) };
+        let vs: Vec<Value> = args.iter().map(|a| a.immediate()).collect();
+        let stub = self.cx.llvm_intrinsic_stub(&name);
+        self.call_sym(&stub, ret, &vs)
     }
 
     fn abort_immediate(&mut self) {

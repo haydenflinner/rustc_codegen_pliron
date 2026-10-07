@@ -101,6 +101,7 @@ pub struct State<'tcx> {
     pub counter: usize,
     pub cgu: String,
     pub asm: String,
+    pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
 }
 
 pub struct CodegenCx<'tcx> {
