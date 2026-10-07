@@ -12,3 +12,4 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 |---|---|---|---|---|---|
 | baseline (ade7be2) | 3.25s | 6.06s | 14.84B | 32.11B | |
 | SROA + promotion to Cranelift vars (`PLIRON_SROA`) | 3.02s (−7%) | 5.44s (−10%) | 13.23B (−11%) | 28.41B (−12%) | kept |
+| memcpyopt call-slot forwarding (`PLIRON_MEMCPYOPT`) | pending | | | | |

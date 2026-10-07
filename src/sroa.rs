@@ -549,6 +549,54 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             }
             eprintln!("  cond_br {n}: {k} const cond, {kk} cond of all-const operands");
         }
+        if std::env::var_os("PLIRON_STATS_MEMCPY").is_some() {
+            let mut h: std::collections::BTreeMap<String, usize> = Default::default();
+            let kind = |v: Value| -> String {
+                let Some(d) = v.defining_op() else {
+                    return "arg".into();
+                };
+                if Operation::is_op::<AllocaOp>(d, ctx) {
+                    let uses: Vec<String> = v
+                        .uses(ctx)
+                        .iter()
+                        .map(|u| {
+                            let o = u.user_op();
+                            st.intrinsics
+                                .get(&o)
+                                .cloned()
+                                .unwrap_or_else(|| Operation::get_opid(o, ctx).to_string())
+                                + &format!("#{}", u.find_index(ctx))
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    format!("alloca[{}]", uses.join(","))
+                } else {
+                    Operation::get_opid(d, ctx).to_string()
+                }
+            };
+            for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
+                for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+                    for op in b.deref(ctx).iter(ctx) {
+                        if intrinsic(st, op) == Some("llvm.memcpy") {
+                            let o: Vec<Value> = op.deref(ctx).operands().collect();
+                            let c = if const_int(ctx, st, o[2]).is_some() {
+                                "const"
+                            } else {
+                                "dyn"
+                            };
+                            *h.entry(format!("{c} {} <- {}", kind(o[0]), kind(o[1])))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+            let mut v: Vec<_> = h.into_iter().collect();
+            v.sort_by_key(|x| std::cmp::Reverse(x.1));
+            for (n, c) in v.iter().take(25) {
+                eprintln!("  memcpy {c:5} {n}");
+            }
+        }
         if std::env::var_os("PLIRON_STATS_WHY").is_some() {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
