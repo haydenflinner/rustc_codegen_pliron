@@ -71,6 +71,8 @@ pub struct FuncInfo {
     pub ty: TypeHandle,
     pub linkage: Linkage,
     pub exts: Exts,
+    pub no_inline: bool,
+    pub always_inline: bool,
 }
 
 pub struct GlobalInfo {
@@ -84,6 +86,7 @@ pub struct GlobalInfo {
     pub section: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct CallInfo {
     pub fn_ty: TypeHandle,
     pub exts: Exts,
@@ -228,7 +231,7 @@ impl<'tcx> CodegenCx<'tcx> {
         self.st
             .borrow_mut()
             .funcs
-            .insert(sym.to_string(), FuncInfo { op, ty: fn_ty, linkage, exts });
+            .insert(sym.to_string(), FuncInfo { op, ty: fn_ty, linkage, exts, no_inline: false, always_inline: false });
         op
     }
 
@@ -486,6 +489,12 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
         self.declare_fn_sym(symbol_name, ty, map_linkage(linkage, visibility), exts);
+        use rustc_attr_ir::InlineAttr;
+        let inline = self.tcx.codegen_instance_attrs(instance.def).inline.clone();
+        if let Some(f) = self.st.borrow_mut().funcs.get_mut(symbol_name) {
+            f.no_inline = matches!(inline, InlineAttr::Never);
+            f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
+        }
     }
 }
 

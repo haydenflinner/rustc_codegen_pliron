@@ -68,7 +68,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
     sig
 }
 
-fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
+pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx).unwrap().get_entry_block(ctx).is_some()
 }
 
@@ -233,6 +233,14 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
         let entry = self.blocks[&pblocks[0]];
         self.b.append_block_params_for_function_params(entry);
+        for pb in &pblocks[1..] {
+            let args: Vec<Value> = pb.deref(ctx).arguments().collect();
+            for a in args {
+                let cb = self.blocks[pb];
+                let vs: Vals = leaves(ctx, a.get_type(ctx)).into_iter().map(|(_, t)| self.b.append_block_param(cb, t)).collect();
+                self.vals.insert(a, vs);
+            }
+        }
         let pt = self.m.target_config().pointer_type();
         let exn = self.b.declare_var(pt);
         self.exn = Some(exn);
@@ -312,6 +320,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let r = self.mat(v.get_type(self.ctx), cv);
         self.cconst.insert(v, r.clone());
         r
+    }
+
+    fn block_args(&mut self, vs: &[Value]) -> Vec<ir::BlockArg> {
+        vs.iter().flat_map(|v| self.get(*v)).map(ir::BlockArg::Value).collect()
     }
 
     fn get1(&mut self, v: Value) -> ir::Value {
@@ -484,12 +496,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.terminated = true;
         } else if is!(BrOp) {
             let d = self.blocks[&succs[0]];
-            self.b.ins().jump(d, &[]);
+            let a = self.block_args(&opnds);
+            self.b.ins().jump(d, &a);
             self.terminated = true;
         } else if is!(CondBrOp) {
             let c = self.get1(opnds[0]);
             let (t, e) = (self.blocks[&succs[0]], self.blocks[&succs[1]]);
-            self.b.ins().brif(c, t, &[], e, &[]);
+            let cb = Operation::get_op::<CondBrOp>(op, ctx).unwrap();
+            let ta = self.block_args(&cb.get_true_dest_operands(ctx));
+            let ea = self.block_args(&cb.get_false_dest_operands(ctx));
+            self.b.ins().brif(c, t, &ta, e, &ea);
             self.terminated = true;
         } else if is!(ICmpOp) {
             use ICmpPredicateAttr as P;

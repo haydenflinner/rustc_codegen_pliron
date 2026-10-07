@@ -28,6 +28,7 @@ mod eh;
 mod objmerge;
 mod intrinsic;
 mod simd;
+mod inline;
 mod lower;
 mod type_of;
 mod types;
@@ -106,6 +107,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let ir = if emit_ir { cx.print_ir() } else { String::new() };
     if std::env::var_os("PLIRON_DUMP").is_some() {
         eprintln!("==== {name} ====\n{ir}");
+    }
+    if cx.tcx.sess.opts.optimize != OptLevel::No {
+        inline::run(&mut cx.pctx.borrow_mut(), &mut cx.st.borrow_mut());
     }
     let isa = build_isa(cx.tcx.sess);
     let obj = lower::lower_to_object(cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind, &cx.pctx.borrow(), &cx.st.borrow(), isa, name);
