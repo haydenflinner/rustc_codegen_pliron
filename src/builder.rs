@@ -115,6 +115,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         p
     }
 
+    fn mark_volatile(&mut self, volatile: bool) {
+        if volatile {
+            use pliron::linked_list::ContainsLinkedList;
+            let tail = self.block.deref(&self.cx.pctx.borrow()).get_tail().unwrap();
+            self.st.borrow_mut().volatile.insert(tail);
+        }
+    }
+
     pub(crate) fn mk<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Value {
         let p = f(&mut self.cx.pctx.borrow_mut()).get_operation();
         self.push(p).expect("op has no result")
@@ -485,7 +493,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| LoadOp::new(c, ptr, ty))
     }
     fn volatile_load(&mut self, ty: TypeHandle, ptr: Value, _align: Align) -> Value {
-        self.mk(|c| LoadOp::new(c, ptr, ty))
+        let v = self.mk(|c| LoadOp::new(c, ptr, ty));
+        self.mark_volatile(true);
+        v
     }
     fn atomic_load(
         &mut self,
@@ -574,14 +584,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| StoreOp::new(c, val, ptr));
         val
     }
-    fn store_with_flags(
-        &mut self,
-        val: Value,
-        ptr: Value,
-        align: Align,
-        _flags: MemFlags,
-    ) -> Value {
-        self.store(val, ptr, align)
+    fn store_with_flags(&mut self, val: Value, ptr: Value, align: Align, flags: MemFlags) -> Value {
+        self.store(val, ptr, align);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
+        val
     }
     fn atomic_store(
         &mut self,
@@ -712,11 +718,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         src: Value,
         _src_align: Align,
         size: Value,
-        _flags: MemFlags,
+        flags: MemFlags,
         _tt: Option<rustc_ast::expand::typetree::FncTree>,
     ) {
         let v = self.type_void();
         self.intrinsic("llvm.memcpy", v, &[dst, src, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
     fn memmove(
         &mut self,
@@ -725,10 +732,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         src: Value,
         _src_align: Align,
         size: Value,
-        _flags: MemFlags,
+        flags: MemFlags,
     ) {
         let v = self.type_void();
         self.intrinsic("llvm.memmove", v, &[dst, src, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
     fn memset(
         &mut self,
@@ -736,10 +744,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         fill_byte: Value,
         size: Value,
         _align: Align,
-        _flags: MemFlags,
+        flags: MemFlags,
     ) {
         let v = self.type_void();
         self.intrinsic("llvm.memset", v, &[ptr, fill_byte, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
 
     fn vscale(&mut self, _ty: TypeHandle) -> Value {

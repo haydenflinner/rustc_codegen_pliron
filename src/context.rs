@@ -117,6 +117,8 @@ pub struct State<'tcx> {
     pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
     pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
+    /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
+    pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
 }
 
 pub struct CodegenCx<'tcx> {

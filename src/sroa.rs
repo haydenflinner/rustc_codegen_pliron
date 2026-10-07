@@ -117,6 +117,9 @@ fn accesses(
         for u in p.uses(ctx) {
             let op = u.user_op();
             let idx = u.find_index(ctx);
+            if st.volatile.contains(&op) {
+                return None;
+            }
             let in_range = |off: i64, n: u64| {
                 off >= 0 && (off as u64).checked_add(n).is_some_and(|e| e <= size)
             };
