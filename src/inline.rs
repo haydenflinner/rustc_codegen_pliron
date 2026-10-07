@@ -24,11 +24,11 @@ use crate::lower::has_body;
 
 const DEFAULT_LIMIT: usize = 40;
 
-fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
 }
 
-fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
+pub(crate) fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 

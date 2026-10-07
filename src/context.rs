@@ -78,6 +78,8 @@ pub struct FuncInfo {
     pub always_inline: bool,
     /// `#[cold]`: blocks calling it are laid out out of line.
     pub cold: bool,
+    /// Declared or inferred unable to unwind (see nounwind.rs).
+    pub nounwind: bool,
 }
 
 pub struct GlobalInfo {
@@ -263,6 +265,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 no_inline: false,
                 always_inline: false,
                 cold: false,
+                nounwind: false,
             },
         );
         op
@@ -328,7 +331,7 @@ impl<'tcx> CodegenCx<'tcx> {
         self.sym_addr(&sym)
     }
 
-    fn mark_cold(&self, sym: &str, instance: Instance<'tcx>) {
+    fn mark_attrs(&self, sym: &str, instance: Instance<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) {
         use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags as F;
         let cold = self
             .tcx
@@ -337,6 +340,7 @@ impl<'tcx> CodegenCx<'tcx> {
             .contains(F::COLD);
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
+            f.nounwind |= !fn_abi.can_unwind;
         }
     }
 
@@ -492,7 +496,7 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
         let op = self.declare_fn_sym(sym, ty, Linkage::Import, exts);
-        self.mark_cold(sym, instance);
+        self.mark_attrs(sym, instance, fn_abi);
         op
     }
 
@@ -574,7 +578,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             f.no_inline = matches!(inline, InlineAttr::Never);
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
         }
-        self.mark_cold(symbol_name, instance);
+        self.mark_attrs(symbol_name, instance, fn_abi);
     }
 }
 

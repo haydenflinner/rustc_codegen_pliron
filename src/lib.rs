@@ -30,6 +30,7 @@ mod instcombine;
 mod intrinsic;
 mod lower;
 mod memcpyopt;
+mod nounwind;
 mod objmerge;
 mod simd;
 mod sroa;
@@ -154,6 +155,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         inline::run(ctx, st);
+        if pass_enabled("PLIRON_NOUNWIND") {
+            nounwind::run(ctx, st);
+        }
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
         }
