@@ -26,6 +26,7 @@ mod consts;
 mod context;
 mod eh;
 mod inline;
+mod instcombine;
 mod intrinsic;
 mod lower;
 mod memcpyopt;
@@ -143,6 +144,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         inline::run(ctx, st);
+        if pass_enabled("PLIRON_INSTCOMBINE") {
+            instcombine::run(ctx, st);
+        }
         if pass_enabled("PLIRON_MEMCPYOPT") {
             memcpyopt::run(ctx, st);
         }
