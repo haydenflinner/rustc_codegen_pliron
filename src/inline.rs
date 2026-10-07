@@ -32,7 +32,11 @@ fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
-fn direct_callee<'a>(ctx: &Context, st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a String> {
+pub(crate) fn direct_callee<'a>(
+    ctx: &Context,
+    st: &'a State<'_>,
+    op: Ptr<Operation>,
+) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
     let CallOpCallable::Direct(id) = c.callee(ctx) else {
         return None;
@@ -183,6 +187,9 @@ fn inline_call(
             }
             if let Some(r) = st.rmw.get(&op).copied() {
                 st.rmw.insert(new, r);
+            }
+            if let Some(e) = st.expect.get(&op).copied() {
+                st.expect.insert(new, e);
             }
             if st.volatile.contains(&op) {
                 st.volatile.insert(new);

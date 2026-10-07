@@ -249,6 +249,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| CondBrOp::new(c, cond, then_llbb, vec![], else_llbb, vec![]));
     }
 
+    fn cond_br_with_expect(
+        &mut self,
+        cond: Value,
+        then_llbb: Ptr<BasicBlock>,
+        else_llbb: Ptr<BasicBlock>,
+        expect: Option<bool>,
+    ) {
+        let op = self.mk_op(|c| CondBrOp::new(c, cond, then_llbb, vec![], else_llbb, vec![]));
+        if let Some(e) = expect {
+            self.st.borrow_mut().expect.insert(op, e);
+        }
+    }
+
     fn switch(
         &mut self,
         v: Value,

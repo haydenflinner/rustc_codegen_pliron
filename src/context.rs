@@ -76,6 +76,8 @@ pub struct FuncInfo {
     pub exts: Exts,
     pub no_inline: bool,
     pub always_inline: bool,
+    /// `#[cold]`: blocks calling it are laid out out of line.
+    pub cold: bool,
 }
 
 pub struct GlobalInfo {
@@ -121,6 +123,8 @@ pub struct State<'tcx> {
     pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
+    /// cond_br op → expected condition value (`likely`/`unlikely`).
+    pub expect: FxHashMap<Ptr<Operation>, bool>,
 }
 
 pub struct CodegenCx<'tcx> {
@@ -258,6 +262,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 exts,
                 no_inline: false,
                 always_inline: false,
+                cold: false,
             },
         );
         op
@@ -321,6 +326,18 @@ impl<'tcx> CodegenCx<'tcx> {
             },
         );
         self.sym_addr(&sym)
+    }
+
+    fn mark_cold(&self, sym: &str, instance: Instance<'tcx>) {
+        use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags as F;
+        let cold = self
+            .tcx
+            .codegen_instance_attrs(instance.def)
+            .flags
+            .contains(F::COLD);
+        if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
+            f.cold |= cold;
+        }
     }
 
     pub fn fn_sig(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> (TypeHandle, Exts) {
@@ -474,7 +491,9 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         }
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
-        self.declare_fn_sym(sym, ty, Linkage::Import, exts)
+        let op = self.declare_fn_sym(sym, ty, Linkage::Import, exts);
+        self.mark_cold(sym, instance);
+        op
     }
 
     fn get_fn_addr(
@@ -555,6 +574,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             f.no_inline = matches!(inline, InlineAttr::Never);
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
         }
+        self.mark_cold(symbol_name, instance);
     }
 }
 

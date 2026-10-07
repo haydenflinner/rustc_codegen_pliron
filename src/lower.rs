@@ -275,6 +275,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
         let entry = self.blocks[&pblocks[0]];
         self.b.append_block_params_for_function_params(entry);
+        if crate::pass_enabled("PLIRON_COLD") {
+            for pb in cold_blocks(ctx, self.st, &pblocks) {
+                self.b.set_cold_block(self.blocks[&pb]);
+            }
+        }
         for pb in &pblocks[1..] {
             let args: Vec<Value> = pb.deref(ctx).arguments().collect();
             for a in args {
@@ -1522,6 +1527,50 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
 
 /// Reverse postorder from the entry block, then any unreachable blocks, so
 /// every SSA definition is lowered before its uses.
+/// Blocks that end in `unreachable`, call a `#[cold]` function, are the
+/// unlikely side of an expect branch, or only lead to such blocks.
+fn cold_blocks(
+    ctx: &Context,
+    st: &State<'_>,
+    pblocks: &[Ptr<BasicBlock>],
+) -> rustc_data_structures::fx::FxHashSet<Ptr<BasicBlock>> {
+    let mut cold = rustc_data_structures::fx::FxHashSet::default();
+    let term = |b: Ptr<BasicBlock>| b.deref(ctx).iter(ctx).last().unwrap();
+    for &b in pblocks {
+        let hit = b.deref(ctx).iter(ctx).any(|op| {
+            Operation::is_op::<UnreachableOp>(op, ctx)
+                || crate::inline::direct_callee(ctx, st, op)
+                    .is_some_and(|s| st.funcs.get(s).is_some_and(|f| f.cold))
+        });
+        if hit {
+            cold.insert(b);
+        }
+        let t = term(b);
+        if let Some(&e) = st.expect.get(&t) {
+            cold.insert(t.deref(ctx).get_successor(if e { 1 } else { 0 }));
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &b in &pblocks[1..] {
+            if cold.contains(&b) {
+                continue;
+            }
+            let t = term(b);
+            let succ: Vec<_> = t.deref(ctx).successors().collect();
+            if !succ.is_empty() && succ.iter().all(|s| cold.contains(s)) {
+                cold.insert(b);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    cold.remove(&pblocks[0]);
+    cold
+}
+
 fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
         b.deref(ctx)
