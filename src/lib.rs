@@ -24,6 +24,7 @@ mod builder;
 mod consts;
 mod context;
 mod intrinsic;
+mod simd;
 mod lower;
 mod type_of;
 mod types;
@@ -47,7 +48,7 @@ use rustc_codegen_ssa::back::write::{
 use rustc_codegen_ssa::base::{codegen_crate, maybe_create_entry_wrapper};
 use rustc_codegen_ssa::mono_item::MonoItemExt;
 use rustc_codegen_ssa::traits::*;
-use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen};
+use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductMap};
@@ -108,6 +109,26 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
 }
 
 impl CodegenBackend for PlironCodegenBackend {
+    fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
+        use rustc_target::spec::{Arch, Os};
+        let feats: Vec<Symbol> = match sess.target.arch {
+            Arch::X86_64 if sess.target.os != Os::None => ["fxsr", "sse", "sse2", "x87"]
+                .iter()
+                .map(|f| Symbol::intern(f))
+                .collect(),
+            Arch::AArch64 if sess.target.os != Os::None => vec![Symbol::intern("neon")],
+            _ => vec![],
+        };
+        TargetConfig {
+            internal_target_features: rustc_data_structures::unord::UnordSet::from_iter(feats),
+            has_reliable_f16: false,
+            has_reliable_f16_math: false,
+            has_reliable_f16b: false,
+            has_reliable_f128: false,
+            has_reliable_f128_math: false,
+        }
+    }
+
     fn name(&self) -> &'static str {
         "pliron"
     }

@@ -115,7 +115,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         p
     }
 
-    fn mk<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Value {
+    pub(crate) fn mk<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Value {
         let p = f(&mut self.cx.pctx.borrow_mut()).get_operation();
         self.push(p).expect("op has no result")
     }
@@ -360,7 +360,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn alloca(&mut self, size: Size, align: Align) -> Value {
         let arr = self.type_array(self.type_i8(), size.bytes());
         let one = self.const_i32(1);
-        let v = self.mk(|c| AllocaOp::new(c, arr, one, 0));
+        // Like LLVM, hoist allocas to the entry block so they dominate every use.
+        let op = AllocaOp::new(&mut self.cx.pctx.borrow_mut(), arr, one, 0).get_operation();
+        let v = {
+            use pliron::linked_list::ContainsLinkedList;
+            let ctx = self.cx.pctx.borrow();
+            let region = self.block.deref(&ctx).get_parent_region().expect("block has no region");
+            let entry = region.deref(&ctx).get_head().expect("function has no entry block");
+            op.insert_at_front(entry, &ctx);
+            op.deref(&ctx).get_result(0)
+        };
         self.st.borrow_mut().allocas.insert(v, (size.bytes(), align.bytes()));
         v
     }

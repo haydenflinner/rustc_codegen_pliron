@@ -235,7 +235,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }
-        for pb in pblocks {
+        for pb in rpo(ctx, &pblocks) {
             self.b.switch_to_block(self.blocks[&pb]);
             self.cconst.clear();
             self.terminated = false;
@@ -267,7 +267,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         if let Some(x) = self.cconst.get(&v) {
             return x.clone();
         }
-        let cv = self.st.consts.get(&v).cloned().unwrap_or_else(|| panic!("unlowered value"));
+        let Some(cv) = self.st.consts.get(&v).cloned() else {
+            let why = match v.defining_op() {
+                Some(op) => {
+                    let blk = op.deref(self.ctx).get_parent_block();
+                    format!("defined by `{}` in block {:?} (known block: {})", Operation::get_opid(op, self.ctx), blk, blk.is_some_and(|b| self.blocks.contains_key(&b)))
+                }
+                None => "a block argument".to_string(),
+            };
+            panic!("value used before its definition was lowered: {why}");
+        };
         let r = self.mat(v.get_type(self.ctx), cv);
         self.cconst.insert(v, r.clone());
         r
@@ -952,3 +961,30 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 }
 
+
+/// Reverse postorder from the entry block, then any unreachable blocks, so
+/// every SSA definition is lowered before its uses.
+fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+    let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
+        b.deref(ctx).iter(ctx).flat_map(|op| op.deref(ctx).successors().collect::<Vec<_>>()).collect()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut post = Vec::new();
+    let mut stack = vec![(blocks[0], succs(blocks[0]), 0usize)];
+    seen.insert(blocks[0]);
+    while let Some((b, ss, i)) = stack.last_mut() {
+        if let Some(&n) = ss.get(*i) {
+            *i += 1;
+            if seen.insert(n) {
+                let ns = succs(n);
+                stack.push((n, ns, 0));
+            }
+        } else {
+            post.push(*b);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    post.extend(blocks.iter().copied().filter(|b| !seen.contains(b)));
+    post
+}

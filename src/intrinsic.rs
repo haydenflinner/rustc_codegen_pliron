@@ -72,6 +72,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             })
         };
         let n = name.as_str();
+        if n.starts_with("simd_") {
+            return match self.simd_intrinsic(n, args, result_layout.ty, ret) {
+                Some(v) => imm(v),
+                None => self.tcx.dcx().fatal(format!("SIMD intrinsic `{n}` is not supported by the pliron backend yet")),
+            };
+        }
         if let Some(i) = float(n) {
             let vs: Vec<_> = (0..args.len()).map(a).collect();
             return imm(self.intrinsic(i, ret, &vs));
