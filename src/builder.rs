@@ -1,14 +1,17 @@
 //! `BuilderMethods` emitting pliron LLVM-dialect operations.
 
+use std::num::NonZero;
 use std::ops::Deref;
 
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::attributes::StringAttr;
+use pliron::builtin::attributes::{IntegerAttr, StringAttr};
 use pliron::builtin::op_interfaces::CallOpCallable;
+use pliron::builtin::types::IntegerType;
 use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, TypedHandle};
+use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron_llvm::attributes::{
     AtomicOrderingAttr, FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr, SyncScopeAttr,
@@ -257,6 +260,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return self.br(else_llbb);
         }
         let ty = self.val_ty(v);
+        if crate::pass_enabled("PLIRON_SWITCH") {
+            let w = self.int_width(ty) as usize;
+            let cases = {
+                let c = self.cx.pctx.borrow();
+                let ity = TypedHandle::<IntegerType>::from_handle(ty, &c).unwrap();
+                cases
+                    .into_iter()
+                    .map(|(val, dest)| {
+                        let val = if w < 128 {
+                            val & ((1u128 << w) - 1)
+                        } else {
+                            val
+                        };
+                        SwitchCase {
+                            value: IntegerAttr::new(
+                                ity,
+                                APInt::from_u128(val, NonZero::new(w).unwrap()),
+                            ),
+                            dest,
+                            dest_opds: vec![],
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            self.mk_op(|c| SwitchOp::new(c, v, else_llbb, vec![], cases));
+            return;
+        }
         let n = cases.len();
         for (i, (val, dest)) in cases.into_iter().enumerate() {
             let c = self.const_uint_big(ty, val);

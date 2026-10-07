@@ -669,6 +669,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let a = self.block_args(&opnds);
             self.b.ins().jump(d, &a);
             self.terminated = true;
+        } else if is!(SwitchOp) {
+            let sw = Operation::get_op::<SwitchOp>(op, ctx).unwrap();
+            let x = self.get1(opnds[0]);
+            let cases = sw.cases(ctx);
+            assert!(
+                sw.default_dest_operands(ctx).is_empty()
+                    && cases.iter().all(|c| c.dest_opds.is_empty()),
+                "switch with block arguments"
+            );
+            let mut s = cranelift_frontend::Switch::new();
+            for c in &cases {
+                s.set_entry(c.value.value().to_u128(), self.blocks[&c.dest]);
+            }
+            let d = self.blocks[&sw.default_dest(ctx)];
+            s.emit(&mut self.b, x, d);
+            self.terminated = true;
         } else if is!(CondBrOp) {
             let c = self.get1(opnds[0]);
             let (t, e) = (self.blocks[&succs[0]], self.blocks[&succs[1]]);
