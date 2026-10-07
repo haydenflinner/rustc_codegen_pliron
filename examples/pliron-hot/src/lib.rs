@@ -21,6 +21,8 @@ pub extern "C" fn pliron_hot_anchor() {}
 struct BaseSym {
     addr: usize,
     writable: bool,
+    /// Only one definition of this name, so a patch static can safely alias it.
+    unique: bool,
 }
 
 pub struct Base {
@@ -42,12 +44,19 @@ impl Base {
                 .section_index()
                 .and_then(|i| f.section_by_index(i).ok())
                 .is_some_and(|sec| matches!(sec.kind(), SectionKind::Data | SectionKind::UninitializedData));
-            raw.insert(name.to_string(), (s.address() as usize, writable));
+            let e = raw.entry(name.to_string()).or_insert((s.address() as usize, writable, s.is_global(), 0));
+            e.3 += 1;
+            if s.is_global() && !e.2 {
+                *e = (s.address() as usize, writable, true, e.3);
+            }
         }
         let anchor = raw.get("pliron_hot_anchor").ok_or("executable has no symbol table")?.0;
         let slide = (pliron_hot_anchor as *const () as usize).wrapping_sub(anchor);
         let end = f.segments().map(|s| (s.address() + s.size()) as usize).max().unwrap_or(0).wrapping_add(slide);
-        let syms = raw.into_iter().map(|(k, (a, w))| (k, BaseSym { addr: a.wrapping_add(slide), writable: w })).collect();
+        let syms = raw
+            .into_iter()
+            .map(|(k, (a, w, _, n))| (k, BaseSym { addr: a.wrapping_add(slide), writable: w, unique: n == 1 }))
+            .collect();
         Ok(Base { syms, end })
     }
 
@@ -59,6 +68,10 @@ impl Base {
         let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
         (!p.is_null()).then_some(p as usize)
     }
+}
+
+fn is_mangled(n: &str) -> bool {
+    n.starts_with("_R") || n.starts_with("_ZN")
 }
 
 fn align(x: usize, a: usize) -> usize {
@@ -132,7 +145,9 @@ pub fn apply(base: &Base, path: &Path) -> Result<usize, String> {
             }
             let name = sym.name().unwrap_or("");
             match base.syms.get(name) {
-                Some(b) if b.writable && sym.kind() == SymbolKind::Data => b.addr,
+                // Rust statics keep their live state; anonymous constants
+                // (`__rcg_alloc.N`, per-CGU counters) always use the patch copy.
+                Some(b) if b.writable && b.unique && sym.kind() == SymbolKind::Data && is_mangled(name) => b.addr,
                 _ => local,
             }
         } else {
