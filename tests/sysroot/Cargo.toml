@@ -1,0 +1,13 @@
+[package]
+name = "sysroot-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sysroot-test"
+path = "../std/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

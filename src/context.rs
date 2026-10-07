@@ -282,6 +282,35 @@ impl<'tcx> CodegenCx<'tcx> {
     pub fn get_static_addr(&self, def_id: rustc_hir::def_id::DefId) -> Value {
         let instance = Instance::mono(self.tcx, def_id);
         let sym = self.tcx.symbol_name(instance).name;
+        if let Some(il) = self.tcx.codegen_fn_attrs(def_id).import_linkage {
+            // Like LLVM/cg_clif: `#[linkage]` on a foreign static means the static
+            // holds the (possibly null) address of `sym`, so emit a local pointer
+            // global initialized with it.
+            use rustc_attr_ir::Linkage as L;
+            let weak = matches!(il, L::ExternalWeak | L::WeakAny);
+            let r = format!(
+                "_rust_extern_with_linkage_{:016x}_{sym}",
+                self.tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+            );
+            if !self.st.borrow().globals.contains_key(&r) {
+                if !self.st.borrow().globals.contains_key(sym) {
+                    let ty = self.type_i8();
+                    let linkage = if weak { Linkage::Preemptible } else { Linkage::Import };
+                    self.declare_global(
+                        sym,
+                        GlobalInfo { ty, init: None, align: 1, mutable: false, tls: false, linkage, used: false, section: None },
+                    );
+                }
+                let init = self.sym_addr(sym);
+                let ty = self.type_ptr();
+                let align = self.tcx.data_layout.pointer_align().abi.bytes();
+                self.declare_global(
+                    &r,
+                    GlobalInfo { ty, init: Some(init), align, mutable: false, tls: false, linkage: Linkage::Local, used: false, section: None },
+                );
+            }
+            return self.sym_addr(&r);
+        }
         if !self.st.borrow().globals.contains_key(sym) {
             let ty = self.type_i8();
             self.declare_global(
