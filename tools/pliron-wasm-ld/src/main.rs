@@ -243,20 +243,36 @@ fn run() -> Result<(), String> {
     let mut out = None;
     let mut exports = Vec::new();
     let mut inputs = Vec::new();
+    let (mut dirs, mut libs) = (Vec::<String>::new(), Vec::<String>::new());
+    let mut entry = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = it.next().cloned(),
             "--export" => exports.extend(it.next().cloned()),
-            "-z" | "-L" | "-l" | "-m" | "-flavor" | "--sysroot" => {
+            "--no-entry" => entry = false,
+            "-L" => dirs.extend(it.next().cloned()),
+            "-l" => libs.extend(it.next().cloned()),
+            "-z" | "-m" | "-flavor" | "--sysroot" => {
                 it.next();
             }
             s if s.starts_with("--export=") => exports.push(s["--export=".len()..].to_string()),
+            s if s.starts_with("-L") => dirs.push(s[2..].to_string()),
+            s if s.starts_with("-l") => libs.push(s[2..].to_string()),
             s if s.starts_with('-') => {}
             s => inputs.push(s.to_string()),
         }
     }
     let out = out.ok_or("missing -o")?;
+    for l in &libs {
+        let f = format!("lib{l}.a");
+        let p = dirs
+            .iter()
+            .map(|d| std::path::Path::new(d).join(&f))
+            .find(|p| p.exists())
+            .ok_or_else(|| format!("cannot find -l{l}"))?;
+        inputs.push(p.to_string_lossy().into_owned());
+    }
 
     // Read inputs: direct objects are always linked; archive members on demand.
     let mut blobs: Vec<(String, Vec<u8>, bool)> = Vec::new();
@@ -297,6 +313,16 @@ fn run() -> Result<(), String> {
     let mut k = 0;
     for &i in &included {
         is_in[i] = true;
+    }
+    // Explicit exports and the command entry point root archive members.
+    let roots = exports.iter().map(|s| &s[..]).chain(entry.then_some("_start"));
+    for r in roots {
+        if let Some(&p) = provider.get(r)
+            && !is_in[p]
+        {
+            is_in[p] = true;
+            included.push(p);
+        }
     }
     while k < included.len() {
         let oi = included[k];
@@ -481,7 +507,8 @@ fn run() -> Result<(), String> {
     } else {
         exports
     };
-    for n in names {
+    let start = (entry && defs.contains_key("_start")).then(|| "_start".to_string());
+    for n in names.into_iter().chain(start) {
         if let Some(f) = defs.get(&n).copied().and_then(func_out) {
             if !ex.iter().any(|e| e.0 == n) {
                 ex.push((n, f));

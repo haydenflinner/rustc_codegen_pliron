@@ -18,7 +18,8 @@ node tests/wasm/run_std.mjs "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/wa
 # std on wasm32-wasip1: wasi-libc is replaced by tools/pliron-wasi-libc (pure Rust).
 (cd tools/pliron-wasi-libc && CARGO_TARGET_DIR=$CARGO_TARGET_DIR/wasi-libc cargo build -q --release \
   --target wasm32-wasip1 -Zbuild-std=core,panic_abort)
-WASI_LIBC=$CARGO_TARGET_DIR/wasi-libc/wasm32-wasip1/release/libpliron_wasi_libc.a
-(cd tests/wasm/wasi && RUSTFLAGS="$RUSTFLAGS -Clink-self-contained=no -Clink-arg=$WASI_LIBC -Clink-arg=--export=_start" \
+WASI_LIBC=$CARGO_TARGET_DIR/wasi-libc/wasm32-wasip1/release
+ln -sf libpliron_wasi_libc.a "$WASI_LIBC/libc.a"
+(cd tests/wasm/wasi && RUSTFLAGS="$RUSTFLAGS -Clink-self-contained=no -Lnative=$WASI_LIBC" \
   cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_abort)
 node --no-warnings tests/wasm/run_wasi.mjs "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasmwasitest.wasm"
