@@ -1413,10 +1413,18 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     .filter(|n| (0..=SMALL_MEM).contains(n));
                 if let (Some(n), Some(c)) = (n, self.const_int(opnds[1])) {
                     let byte = c as u8 as u64;
+                    let mut splat = None;
                     for (o, t) in mem_chunks(n as u64) {
-                        let pat = byte.wrapping_mul(0x0101_0101_0101_0101)
-                            & (u64::MAX >> (64 - t.bits()));
-                        let v = self.b.ins().iconst(t, pat as i64);
+                        let v = if t.is_vector() {
+                            *splat.get_or_insert_with(|| {
+                                let b = self.b.ins().iconst(clt::I8, byte as i64);
+                                self.b.ins().splat(t, b)
+                            })
+                        } else {
+                            let pat = byte.wrapping_mul(0x0101_0101_0101_0101)
+                                & (u64::MAX >> (64 - t.bits()));
+                            self.b.ins().iconst(t, pat as i64)
+                        };
                         self.b.ins().store(MemFlagsData::new(), v, a[0], o);
                     }
                     return;
@@ -1667,12 +1675,27 @@ fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
 
 /// Constant-size mem{cpy,move,set} up to this many bytes are expanded inline
 /// (unaligned scalar loads/stores) instead of calling libc.
-const SMALL_MEM: i128 = 64;
+/// Constant-size memcpy/memmove/memset up to this many bytes are expanded inline.
+const SMALL_MEM: i128 = 128;
 
 fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
     let mut v = Vec::new();
     let mut o = 0;
-    for (sz, t) in [(8, clt::I64), (4, clt::I32), (2, clt::I16), (1, clt::I8)] {
+    let wide = if crate::pass_enabled("PLIRON_SIMD") {
+        16
+    } else {
+        0
+    };
+    for (sz, t) in [
+        (wide, clt::I8X16),
+        (8, clt::I64),
+        (4, clt::I32),
+        (2, clt::I16),
+        (1, clt::I8),
+    ] {
+        if sz == 0 {
+            continue;
+        }
         while n - o >= sz {
             v.push((o as i32, t));
             o += sz;
