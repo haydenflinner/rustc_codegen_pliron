@@ -1,0 +1,4 @@
+#!/bin/bash
+# Linker driver for bootstrap: cc for crt/libc paths, wild as the actual linker.
+D="$(cd "$(dirname "$0")/.." && pwd)/target/wild-ld"
+exec cc -B"$D" "$@"
