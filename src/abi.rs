@@ -12,12 +12,12 @@ use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::{TypeHandle, TypedHandle};
+use pliron::r#type::{TypeHandle, Typed, TypedHandle};
 use pliron_llvm::ops::{
     AllocaOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
 };
 use pliron_llvm::types::{ArrayType, FuncType, StructLayout, StructType};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::context::{ArgExt, ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};
@@ -65,8 +65,11 @@ fn fits_regs(ctx: &Context, leaves: &[(u64, TypeHandle)]) -> bool {
     !leaves.is_empty() && fl <= MAX_REGS && leaves.len() - fl <= MAX_REGS
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
-    let internal = crate::lower::internal_fns(ctx, st);
+fn call_sites(
+    ctx: &Context,
+    st: &State<'_>,
+    internal: &FxHashSet<String>,
+) -> FxHashMap<String, Vec<Ptr<Operation>>> {
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     for f in st.funcs.values() {
         if !crate::lower::has_body(ctx, f.op) {
@@ -81,6 +84,129 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 }
             }
         }
+    }
+    sites
+}
+
+/// Dead-argument elimination for internal functions: parameters the body
+/// never reads are dropped from the signature and from every call.
+/// `PLIRON_DEADARG=0` disables it.
+pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
+    let internal = crate::lower::internal_fns(ctx, st);
+    let sites = call_sites(ctx, st, &internal);
+    let mut cands: Vec<&String> = internal.iter().collect();
+    cands.sort();
+    let mut n = 0;
+    for sym in cands {
+        let f = &st.funcs[sym];
+        let TyK::Func(ret, args, _) = classify(ctx, f.ty) else {
+            continue;
+        };
+        if f.exts.params.len() != args.len() {
+            continue;
+        }
+        let entry = Operation::get_op::<FuncOp>(f.op, ctx)
+            .unwrap()
+            .get_entry_block(ctx)
+            .unwrap();
+        let live: Vec<bool> = entry
+            .deref(ctx)
+            .arguments()
+            .map(|a| a.is_used(ctx))
+            .collect();
+        if live.len() != args.len() || live.iter().all(|&l| l) {
+            continue;
+        }
+        let calls = sites.get(sym).cloned().unwrap_or_default();
+        if calls
+            .iter()
+            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+        {
+            continue;
+        }
+        let keep = |v: &[TypeHandle]| -> Vec<TypeHandle> {
+            v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect()
+        };
+        let nty = FuncType::get(ctx, ret, keep(&args), false);
+        let fop = f.op;
+        for i in (0..live.len()).rev().filter(|&i| !live[i]) {
+            BasicBlock::remove_argument(entry, ctx, i);
+        }
+        Operation::get_op::<FuncOp>(fop, ctx)
+            .unwrap()
+            .set_attr_llvm_func_type(ctx, TypeAttr::new(nty.into()));
+        let f = st.funcs.get_mut(sym).unwrap();
+        f.ty = nty.into();
+        let mut i = 0;
+        f.exts.params.retain(|_| {
+            i += 1;
+            live[i - 1]
+        });
+        let exts = f.exts.clone();
+        let id = st.sym_to_ident[sym].clone();
+        for &c in &calls {
+            let cargs = Operation::get_op::<CallOp>(c, ctx).unwrap().args(ctx);
+            let kept: Vec<_> = cargs
+                .iter()
+                .zip(&live)
+                .filter(|p| *p.1)
+                .map(|p| *p.0)
+                .collect();
+            let nc =
+                CallOp::new(ctx, CallOpCallable::Direct(id.clone()), nty, kept).get_operation();
+            nc.insert_before(ctx, c);
+            if c.deref(ctx).get_num_results() > 0 {
+                let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                old.replace_all_uses_with(ctx, &new);
+            }
+            let mut info = st.calls.remove(&c).unwrap();
+            info.fn_ty = nty.into();
+            info.exts = exts.clone();
+            st.calls.insert(nc, info);
+            if let Some(u) = st.invokes.remove(&c) {
+                st.invokes.insert(nc, u);
+            }
+            if st.last_call == Some(c) {
+                st.last_call = Some(nc);
+            }
+            Operation::erase(c, ctx);
+        }
+        n += live.iter().filter(|&&l| !l).count();
+    }
+    if std::env::var("PLIRON_STATS").is_ok() {
+        eprintln!("deadarg {}: {n} params removed", st.cgu);
+    }
+}
+
+pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+    let internal = crate::lower::internal_fns(ctx, st);
+    let sites = call_sites(ctx, st, &internal);
+    if std::env::var("PLIRON_STATS").is_ok() {
+        let (mut total, mut dead, mut ro) = (0, 0, 0);
+        for s in &internal {
+            let f = &st.funcs[s];
+            let e = Operation::get_op::<FuncOp>(f.op, ctx)
+                .unwrap()
+                .get_entry_block(ctx)
+                .unwrap();
+            for a in e.deref(ctx).arguments() {
+                total += 1;
+                if !a.is_used(ctx) {
+                    dead += 1;
+                } else if matches!(classify(ctx, a.get_type(ctx)), TyK::Ptr)
+                    && a.uses(ctx)
+                        .into_iter()
+                        .all(|u| Operation::is_op::<LoadOp>(u.user_op(), ctx))
+                {
+                    ro += 1;
+                }
+            }
+        }
+        eprintln!(
+            "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
+            st.cgu,
+            internal.len()
+        );
     }
     let mut n = 0;
     let mut cands: Vec<&String> = internal.iter().collect();

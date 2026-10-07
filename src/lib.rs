@@ -162,6 +162,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_SRET2REG") {
             abi::run(ctx, st);
         }
+        if pass_enabled("PLIRON_DEADARG") {
+            abi::dead_args(ctx, st);
+        }
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
         }
