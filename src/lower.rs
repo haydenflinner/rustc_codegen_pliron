@@ -74,7 +74,10 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// Local, non-variadic functions whose address never escapes and that are
 /// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
 /// 8 int + 8 float return registers instead of SysV's 2+2).
-fn internal_fns(ctx: &Context, st: &State<'_>) -> rustc_data_structures::fx::FxHashSet<String> {
+pub(crate) fn internal_fns(
+    ctx: &Context,
+    st: &State<'_>,
+) -> rustc_data_structures::fx::FxHashSet<String> {
     use rustc_data_structures::fx::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();

@@ -287,14 +287,19 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
     (!typed.is_empty() && typed.len() <= MAX_SLICES).then_some(typed)
 }
 
-fn mk_const(ctx: &mut Context, st: &mut State<'_>, ty: TypeHandle, cv: ConstVal) -> Value {
+pub(crate) fn mk_const(
+    ctx: &mut Context,
+    st: &mut State<'_>,
+    ty: TypeHandle,
+    cv: ConstVal,
+) -> Value {
     let op = UndefOp::new(ctx, ty).get_operation();
     let v = op.deref(ctx).get_result(0);
     st.consts.insert(v, cv);
     v
 }
 
-fn ptr_plus(
+pub(crate) fn ptr_plus(
     ctx: &mut Context,
     st: &mut State<'_>,
     p: Value,

@@ -80,6 +80,8 @@ pub struct FuncInfo {
     pub cold: bool,
     /// Declared or inferred unable to unwind (see nounwind.rs).
     pub nounwind: bool,
+    /// Backend type of the value returned through the sret pointer.
+    pub sret_ty: Option<TypeHandle>,
 }
 
 pub struct GlobalInfo {
@@ -266,6 +268,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 always_inline: false,
                 cold: false,
                 nounwind: false,
+                sret_ty: None,
             },
         );
         op
@@ -341,6 +344,12 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
+        }
+        if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
+            let t = self.backend_type(fn_abi.ret.layout);
+            if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
+                f.sret_ty = Some(t);
+            }
         }
     }
 

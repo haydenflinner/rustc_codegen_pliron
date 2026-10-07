@@ -20,6 +20,7 @@ extern crate rustc_span;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 
+mod abi;
 mod asm;
 mod builder;
 mod consts;
@@ -157,6 +158,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         inline::run(ctx, st);
         if pass_enabled("PLIRON_NOUNWIND") {
             nounwind::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_SRET2REG") {
+            abi::run(ctx, st);
         }
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
