@@ -255,6 +255,16 @@ struct FnLower<'a, 'b, 'tcx> {
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
+    /// Flags for a plain load/store. Non-volatile accesses to invalid memory are UB
+    /// (as in LLVM), so at -O they need no trap record and may be removed or reordered.
+    fn plain_mf(&self, op: Ptr<Operation>) -> MemFlagsData {
+        if self.st.notrap && !self.st.volatile.contains(&op) {
+            MemFlagsData::new().with_notrap()
+        } else {
+            MemFlagsData::new()
+        }
+    }
+
     fn lower(&mut self, f: Ptr<Operation>) {
         let ctx = self.ctx;
         let region = f.deref(ctx).get_region(0);
@@ -836,6 +846,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
             let atomic = is!(AtomicLoadOp);
+            let mf = self.plain_mf(op);
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
                 .into_iter()
@@ -843,7 +854,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     if atomic {
                         self.b.ins().atomic_load(t, MemFlagsData::trusted(), p)
                     } else {
-                        self.b.ins().load(t, MemFlagsData::new(), p, o as i32)
+                        self.b.ins().load(t, mf, p, o as i32)
                     }
                 })
                 .collect();
@@ -852,11 +863,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let vs = self.get(opnds[0]);
             let p = self.get1(opnds[1]);
             let lv = self.ty_leaves(opnds[0].get_type(ctx));
+            let mf = self.plain_mf(op);
             for (v, (o, _)) in vs.into_iter().zip(lv) {
                 if is!(AtomicStoreOp) {
                     self.b.ins().atomic_store(MemFlagsData::trusted(), v, p);
                 } else {
-                    self.b.ins().store(MemFlagsData::new(), v, p, o as i32);
+                    self.b.ins().store(mf, v, p, o as i32);
                 }
             }
         } else if is!(AtomicRmwOp) {

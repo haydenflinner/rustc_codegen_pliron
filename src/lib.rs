@@ -119,7 +119,7 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
 }
 
 /// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
-fn pass_enabled(var: &str) -> bool {
+pub(crate) fn pass_enabled(var: &str) -> bool {
     std::env::var(var).map_or(true, |v| v != "0")
 }
 
@@ -145,6 +145,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);
         }
+        st.notrap = pass_enabled("PLIRON_NOTRAP");
     }
     let isa = build_isa(cx.tcx.sess);
     let obj = lower::lower_to_object(

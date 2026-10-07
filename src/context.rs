@@ -119,6 +119,8 @@ pub struct State<'tcx> {
     pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
     /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
     pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
+    pub notrap: bool,
 }
 
 pub struct CodegenCx<'tcx> {
