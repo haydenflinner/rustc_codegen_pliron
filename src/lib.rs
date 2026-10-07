@@ -24,6 +24,7 @@ mod builder;
 mod consts;
 mod context;
 mod asm;
+mod eh;
 mod intrinsic;
 mod simd;
 mod lower;
@@ -106,7 +107,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         eprintln!("==== {name} ====\n{ir}");
     }
     let isa = build_isa(cx.tcx.sess);
-    let obj = lower::lower_to_object(&cx.pctx.borrow(), &cx.st.borrow(), isa, name);
+    let obj = lower::lower_to_object(cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind, &cx.pctx.borrow(), &cx.st.borrow(), isa, name);
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }
 }

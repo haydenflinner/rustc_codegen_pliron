@@ -154,11 +154,39 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 return IntrinsicResult::Operand(OperandValue::ZeroSized);
             }
             sym::catch_unwind => {
+                let (try_fn, data, catch_fn) = (a(0), a(1), a(2));
                 let ptr = self.type_ptr();
                 let void = self.type_void();
+                let i32t = self.type_i32();
                 let fty = self.type_func(&[ptr], void);
-                self.call_raw(fty, a(0), &[a(1)], Default::default());
-                self.const_i32(0)
+                if self.tcx.sess.panic_strategy() != rustc_target::spec::PanicStrategy::Unwind {
+                    self.call_raw(fty, try_fn, &[data], Default::default());
+                    self.const_i32(0)
+                } else {
+                    let a4 = rustc_abi::Align::from_bytes(4).unwrap();
+                    let slot = self.alloca(rustc_abi::Size::from_bytes(4), a4);
+                    let then = self.append_sibling_block("catch_unwind_ok");
+                    let catch = self.append_sibling_block("catch_unwind_caught");
+                    let join = self.append_sibling_block("catch_unwind_join");
+                    self.st.borrow_mut().last_call = None;
+                    self.call_raw(fty, try_fn, &[data], Default::default());
+                    let op = self.st.borrow_mut().last_call.take().unwrap();
+                    self.st.borrow_mut().invokes.insert(op, (catch, true));
+                    self.br(then);
+                    self.switch_to_block(then);
+                    let z = self.const_i32(0);
+                    self.store(z, slot, a4);
+                    self.br(join);
+                    self.switch_to_block(catch);
+                    let exn = self.intrinsic("pliron.eh.exn", ptr, &[]);
+                    let cty = self.type_func(&[ptr, ptr], void);
+                    self.call_raw(cty, catch_fn, &[data, exn], Default::default());
+                    let one = self.const_i32(1);
+                    self.store(one, slot, a4);
+                    self.br(join);
+                    self.switch_to_block(join);
+                    self.load(i32t, slot, a4)
+                }
             }
             sym::ptr_mask => {
                 let isize = self.type_isize();

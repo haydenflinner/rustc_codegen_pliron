@@ -76,7 +76,7 @@ fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx).unwrap().get_entry_block(ctx).is_some()
 }
 
-pub fn lower_to_object(ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, name: &str) -> Vec<u8> {
+pub fn lower_to_object(unwind: bool, ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, name: &str) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     b.per_function_section(true);
     b.per_data_object_section(true);
@@ -101,6 +101,7 @@ pub fn lower_to_object(ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, n
         ids.insert(n.clone(), Sym::D(id, g.tls));
     }
 
+    let mut eh = crate::eh::UnwindContext::new(&mut m, true, unwind);
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
@@ -125,6 +126,7 @@ pub fn lower_to_object(ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, n
                 gvs: FxHashMap::default(),
                 terminated: false,
                 cc,
+                exn: None,
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -132,6 +134,7 @@ pub fn lower_to_object(ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, n
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
         }
+        eh.add_function(&mut m, id, &clctx);
         m.clear_context(&mut clctx);
     }
 
@@ -166,7 +169,9 @@ pub fn lower_to_object(ctx: &Context, st: &State<'_>, isa: Arc<dyn TargetIsa>, n
         }
         m.define_data(id, &desc).unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
-    m.finish().emit().unwrap()
+    let mut product = m.finish();
+    eh.emit(&mut product);
+    product.emit().unwrap()
 }
 
 fn write_const(
@@ -214,6 +219,7 @@ struct FnLower<'a, 'b, 'tcx> {
     gvs: FxHashMap<DataId, GlobalValue>,
     terminated: bool,
     cc: CallConv,
+    exn: Option<cranelift_frontend::Variable>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -227,6 +233,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
         let entry = self.blocks[&pblocks[0]];
         self.b.append_block_params_for_function_params(entry);
+        let pt = self.m.target_config().pointer_type();
+        let exn = self.b.declare_var(pt);
+        self.exn = Some(exn);
         let params = self.b.block_params(entry).to_vec();
         let mut i = 0;
         let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
@@ -237,6 +246,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
         for pb in rpo(ctx, &pblocks) {
             self.b.switch_to_block(self.blocks[&pb]);
+            if pb == pblocks[0] {
+                let z = self.b.ins().iconst(pt, 0);
+                self.b.def_var(exn, z);
+            }
             self.cconst.clear();
             self.terminated = false;
             let ops: Vec<Ptr<Operation>> = pb.deref(ctx).iter(ctx).collect();
@@ -843,6 +856,48 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.set1(op, addr);
     }
 
+    /// An `invoke`: `try_call` whose exception edge stores the exception
+    /// pointer in `self.exn` and jumps to the landing block.
+    fn try_call(
+        &mut self,
+        target: Result<FuncRef, (ir::Value, ir::SigRef)>,
+        args: &[ir::Value],
+        catch: Ptr<BasicBlock>,
+        is_catch: bool,
+    ) -> Vals {
+        use cranelift_codegen::ir::{BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag};
+        let sr = match target {
+            Ok(fr) => self.b.func.dfg.ext_funcs[fr].signature,
+            Err((_, sr)) => sr,
+        };
+        let rets: Vec<ClType> = self.b.func.dfg.signatures[sr].returns.iter().map(|r| r.value_type).collect();
+        let normal = self.b.create_block();
+        let nargs: Vec<BlockArg> = (0..rets.len()).map(|i| BlockArg::TryCallRet(i as u32)).collect();
+        let ncall = self.b.func.dfg.block_call(normal, &nargs);
+        let pre = self.b.create_block();
+        let pcall = self.b.func.dfg.block_call(pre, &[BlockArg::TryCallExn(0)]);
+        let tag = if is_catch { crate::eh::EXCEPTION_HANDLER_CATCH } else { crate::eh::EXCEPTION_HANDLER_CLEANUP };
+        let et = self.b.func.dfg.exception_tables.push(ExceptionTableData::new(
+            sr,
+            ncall,
+            [ExceptionTableItem::Tag(ExceptionTag::with_number(tag).unwrap(), pcall)],
+        ));
+        match target {
+            Ok(fr) => self.b.ins().try_call(fr, args, et),
+            Err((addr, _)) => self.b.ins().try_call_indirect(addr, args, et),
+        };
+        self.b.switch_to_block(pre);
+        self.b.set_cold_block(pre);
+        let pt = self.m.target_config().pointer_type();
+        let p = self.b.append_block_param(pre, pt);
+        self.b.def_var(self.exn.unwrap(), p);
+        let lp = self.blocks[&catch];
+        self.b.ins().jump(lp, &[]);
+        self.b.switch_to_block(normal);
+        self.cconst.clear();
+        rets.into_iter().map(|t| self.b.append_block_param(normal, t)).collect()
+    }
+
     fn lower_call(&mut self, op: Ptr<Operation>) {
         let ctx = self.ctx;
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
@@ -854,28 +909,31 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         for a in args {
             cargs.extend(self.get(a));
         }
-        let inst = match call.callee(ctx) {
+        let target = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
                 let sym = &self.st.ident_to_sym[&ident.to_string()];
                 match self.ids.get(sym).copied() {
-                    Some(Sym::F(fid, declty)) if declty == fn_ty => {
-                        let fr = self.fref(fid);
-                        self.b.ins().call(fr, &cargs)
-                    }
+                    Some(Sym::F(fid, declty)) if declty == fn_ty => Ok(self.fref(fid)),
                     _ => {
                         let addr = self.sym_addr(&sym.clone());
-                        let sr = self.b.import_signature(sig);
-                        self.b.ins().call_indirect(sr, addr, &cargs)
+                        Err((addr, self.b.import_signature(sig)))
                     }
                 }
             }
             CallOpCallable::Indirect(v) => {
                 let addr = self.get1(v);
-                let sr = self.b.import_signature(sig);
-                self.b.ins().call_indirect(sr, addr, &cargs)
+                Err((addr, self.b.import_signature(sig)))
             }
         };
-        let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
+        let rs: Vals = if let Some(&(catch, is_catch)) = self.st.invokes.get(&op) {
+            self.try_call(target, &cargs, catch, is_catch)
+        } else {
+            let inst = match target {
+                Ok(fr) => self.b.ins().call(fr, &cargs),
+                Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
+            };
+            self.b.inst_results(inst).iter().copied().collect()
+        };
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
         }
@@ -885,6 +943,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let name = self.st.intrinsics[&op].as_str();
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
+            "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
             "llvm.memcpy" | "llvm.memmove" => {
                 let cfg = self.m.target_config();
                 if name == "llvm.memcpy" {

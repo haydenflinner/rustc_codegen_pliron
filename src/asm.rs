@@ -11,7 +11,6 @@ use std::fmt::Write;
 
 use pliron::basic_block::BasicBlock;
 use pliron::context::Ptr;
-use pliron::value::Value;
 use rustc_abi::{Align, Size};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::MemFlags;
@@ -136,13 +135,6 @@ struct Gen<'a, 'tcx> {
     slots_in: Vec<Option<Size>>,
     slots_out: Vec<Option<Size>>,
     slot_size: Size,
-}
-
-fn op_reg(op: &AOp) -> Option<InlineAsmRegOrRegClass> {
-    match *op {
-        AOp::In { reg } | AOp::Out { reg, .. } | AOp::InOut { reg, .. } => Some(reg),
-        AOp::Text(_) => None,
-    }
 }
 
 impl Gen<'_, '_> {

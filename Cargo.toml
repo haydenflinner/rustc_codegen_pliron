@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["dylib"]
 
 [dependencies]
+gimli = { version = "0.33", default-features = false, features = ["std", "write"] }
 pliron = { path = "vendor/pliron", default-features = false, features = ["std"] }
 pliron-llvm = { path = "vendor/pliron/pliron-llvm", default-features = false, features = ["std"] }
 cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std", "unwind", "host-arch"] }

@@ -2,13 +2,19 @@
 # Usage: ./test.sh [--sysroot]
 # Builds the backend, then compiles and runs tests/{nostd,std,asm} with it.
 # --sysroot additionally rebuilds core/alloc/std with the backend (-Zbuild-std).
+# Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
 set -euo pipefail
 cd "$(dirname "$0")"
 cargo build
 BE="-Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.so"
+if command -v wild >/dev/null; then
+  # gcc 11 has no --ld-path, so point its -B search dir at an `ld` that is wild.
+  mkdir -p target/wild-ld && ln -sf "$(command -v wild)" target/wild-ld/ld
+  BE="$BE -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$PWD/target/wild-ld"
+fi
 out=target/tests; mkdir -p $out
 rustc $BE --edition 2024 -Cpanic=abort -Clink-arg=-lc tests/nostd/main.rs -o $out/nostd && $out/nostd
-for t in std asm; do rustc $BE --edition 2024 tests/$t/main.rs -o $out/$t && $out/$t; done
+for t in std asm unwind; do rustc $BE --edition 2024 tests/$t/main.rs -o $out/$t && $out/$t; done
 if [[ "${1:-}" == --sysroot ]]; then
   (cd tests/sysroot && RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot \
     cargo run -Zbuild-std=std,panic_abort --target "$(rustc -vV | sed -n 's/host: //p')")

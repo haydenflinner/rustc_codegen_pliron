@@ -627,6 +627,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "gimli",
  "object",
  "pliron",
  "pliron-llvm",

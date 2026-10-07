@@ -154,6 +154,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             CallOp::new(&mut c, callable, fty, args.to_vec()).get_operation()
         };
         self.st.borrow_mut().calls.insert(p, CallInfo { fn_ty, exts });
+        self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
             _ => unreachable!(),
@@ -257,11 +258,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         return_slot: ReturnSlot<Value>,
         args: &[Value],
         then: Ptr<BasicBlock>,
-        _catch: Ptr<BasicBlock>,
+        catch: Ptr<BasicBlock>,
         funclet: Option<&()>,
         instance: Option<Instance<'tcx>>,
     ) -> Value {
+        self.st.borrow_mut().last_call = None;
         let r = self.call(llty, fn_attrs, fn_abi, llfn, return_slot, args, funclet, instance);
+        let last = self.st.borrow_mut().last_call.take();
+        if let Some(op) = last {
+            self.st.borrow_mut().invokes.insert(op, (catch, false));
+        }
         self.br(then);
         r
     }
@@ -614,13 +620,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn set_personality_fn(&mut self, _personality: Ptr<Operation>) {}
     fn cleanup_landing_pad(&mut self, _pers_fn: Ptr<Operation>) -> (Value, Value) {
-        (self.const_undef(self.type_ptr()), self.const_undef(self.type_i32()))
+        let ptr = self.type_ptr();
+        let exn = self.intrinsic("pliron.eh.exn", ptr, &[]);
+        (exn, self.const_i32(0))
     }
     fn filter_landing_pad(&mut self, pers_fn: Ptr<Operation>) {
         self.cleanup_landing_pad(pers_fn);
     }
-    fn resume(&mut self, _exn0: Value, _exn1: Value) {
-        self.abort_immediate();
+    fn resume(&mut self, exn0: Value, _exn1: Value) {
+        let void = self.type_void();
+        self.call_sym("_Unwind_Resume", void, &[exn0]);
         self.unreachable();
     }
     fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) {}

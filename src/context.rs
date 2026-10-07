@@ -101,6 +101,9 @@ pub struct State<'tcx> {
     pub counter: usize,
     pub cgu: String,
     pub asm: String,
+    /// call op → (landing block, is catch_unwind catch-all)
+    pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
+    pub last_call: Option<Ptr<Operation>>,
     pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
 }
 
