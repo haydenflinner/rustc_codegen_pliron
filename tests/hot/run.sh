@@ -15,6 +15,7 @@ LIB=$(find "$D/build/pliron_hot" -name 'libpliron_hot-*.rlib' | head -1)
 LDEPS=(); for d in "$D"/build/*/*/out; do LDEPS+=(-L "dependency=$d"); done
 RC=(rustc $FL --edition 2024 -Clinker="$B/selfhost/cc-wild" --extern pliron_hot="$LIB" --extern pliron_hot="${LIB%.rlib}.rmeta" "${LDEPS[@]}" "$W/demo.rs")
 PLIRON_HOT=demo "${RC[@]}" -o "$W/demo"
+"${RC[@]}" --emit=obj -o "$W/patches/base.ref"
 PLIRON_HOT_DIR="$W/patches" "$W/demo" > "$W/out.txt" 2> "$W/err.txt" & PID=$!
 sleep 0.3
 sed -i 's/^    1$/    1000 + TICKS.load(Ordering::Relaxed)/' "$W/demo.rs"

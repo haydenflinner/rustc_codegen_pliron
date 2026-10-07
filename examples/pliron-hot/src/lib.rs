@@ -6,11 +6,14 @@
 //! near the executable, resolves undefined symbols against the running
 //! executable's own symbol table (then `dlsym`), binds writable statics to the
 //! live copies so state survives, registers its `.eh_frame`, and repoints the
-//! slots of every function it defines.
+//! slots of the functions whose code changed since the previous object
+//! (`base.ref` in the patch dir for the first patch). Unchanged functions keep
+//! running the old code, and the patch calls them through their thunks.
 
 use object::elf::*;
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolKind};
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -101,10 +104,56 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
     Err("no address space near the executable".into())
 }
 
-/// Load one patch object; returns the number of functions repointed.
-pub fn apply(base: &Base, path: &Path) -> Result<usize, String> {
+/// Hash of each defined function's code and relocation targets. Anonymous
+/// targets (`__rcg_alloc.N` counters differ between builds) hash by content.
+pub type Prints = HashMap<String, u64>;
+
+pub fn fingerprints(f: &object::File) -> Prints {
+    fn sec_key(f: &object::File, si: SectionIndex, h: &mut DefaultHasher, deep: bool) {
+        let Ok(s) = f.section_by_index(si) else { return };
+        s.data().unwrap_or(&[]).hash(h);
+        for (o, r) in s.relocations() {
+            o.hash(h);
+            r.addend().hash(h);
+            if let RelocationFlags::Elf { r_type } = r.flags() {
+                r_type.hash(h);
+            }
+            match r.target() {
+                RelocationTarget::Symbol(i) => {
+                    let Ok(t) = f.symbol_by_index(i) else { continue };
+                    let name = t.name().unwrap_or("");
+                    if t.is_undefined() || t.kind() == SymbolKind::Text || is_mangled(name) {
+                        name.hash(h);
+                    } else if let (Some(ti), true) = (t.section_index(), deep) {
+                        t.address().hash(h);
+                        sec_key(f, ti, h, false);
+                    }
+                }
+                RelocationTarget::Section(ti) if deep => sec_key(f, ti, h, false),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for sym in f.symbols() {
+        if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+            continue;
+        }
+        let (Ok(name), Some(si)) = (sym.name(), sym.section_index()) else { continue };
+        let mut h = DefaultHasher::new();
+        sec_key(f, si, &mut h, true);
+        out.insert(name.to_string(), h.finish());
+    }
+    out
+}
+
+/// Load one patch object, repointing the slots of functions that differ from
+/// `prev`. Returns how many were repointed and this object's fingerprints.
+pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, Prints), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
+    let prints = fingerprints(&f);
+    let changed = |n: &str| prev.is_none_or(|p| p.get(n) != prints.get(n));
 
     let mut place: HashMap<SectionIndex, usize> = HashMap::new();
     let (mut off, mut eh, mut nrel) = (0usize, None, 0usize);
@@ -145,6 +194,7 @@ pub fn apply(base: &Base, path: &Path) -> Result<usize, String> {
             }
             let name = sym.name().unwrap_or("");
             match base.syms.get(name) {
+                Some(b) if sym.kind() == SymbolKind::Text && !changed(name) => b.addr,
                 // Rust statics keep their live state; anonymous constants
                 // (`__rcg_alloc.N`, per-CGU counters) always use the patch copy.
                 Some(b) if b.writable && b.unique && sym.kind() == SymbolKind::Data && is_mangled(name) => b.addr,
@@ -234,19 +284,24 @@ pub fn apply(base: &Base, path: &Path) -> Result<usize, String> {
             continue;
         }
         let Ok(name) = sym.name() else { continue };
+        if !changed(name) {
+            continue;
+        }
         if let Some(slot) = base.syms.get(&format!("__hot_slot.{name}")) {
             let new = mem + place[&sym.section_index().unwrap()] + sym.address() as usize;
             unsafe { (*(slot.addr as *const AtomicUsize)).store(new, Ordering::Release) };
             n += 1;
         }
     }
-    Ok(n)
+    Ok((n, prints))
 }
 
 /// If `PLIRON_HOT_DIR` is set, apply every `*.o` that appears in it, in name order.
 pub fn start() {
     let Some(dir) = std::env::var_os("PLIRON_HOT_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
     std::thread::spawn(move || {
+        let mut prev = std::fs::read(dir.join("base.ref")).ok().and_then(|b| object::File::parse(&*b).ok().map(|f| fingerprints(&f)));
         let base = match Base::load() {
             Ok(b) => b,
             Err(e) => return eprintln!("[hot] disabled: {e}"),
@@ -263,8 +318,11 @@ pub fn start() {
             new.sort();
             for p in new {
                 let t = std::time::Instant::now();
-                match apply(&base, &p) {
-                    Ok(n) => eprintln!("[hot] {}: {n} functions patched in {:?}", p.display(), t.elapsed()),
+                match apply(&base, &p, prev.as_ref()) {
+                    Ok((n, prints)) => {
+                        prev = Some(prints);
+                        eprintln!("[hot] {}: {n} functions patched in {:?}", p.display(), t.elapsed())
+                    }
                     Err(e) => eprintln!("[hot] {}: {e}", p.display()),
                 }
                 seen.insert(p);

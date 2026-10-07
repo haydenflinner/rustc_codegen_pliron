@@ -16,7 +16,8 @@ if [[ "${1:-}" == --patch ]]; then
 fi
 PLIRON_HOT=pliron_bevy_game "${CR[@]}" -Ccodegen-units=1 || exit 1
 cp target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game "$H/game"
-rm -f "$H"/patches/*.o
+rm -f "$H"/patches/*
+"${CR[@]}" -Ccodegen-units=1 --emit=obj="$H/patches/base.ref" || exit 1
 PLIRON_HOT_DIR="$H/patches" "$H/game" "$@" & GAME=$!
 trap 'kill $GAME 2>/dev/null' EXIT
 last=$(stat -c %Y src/main.rs); n=0
