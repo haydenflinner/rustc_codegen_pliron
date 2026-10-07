@@ -152,6 +152,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let (n, _) = self.elem_of(ret_rty);
             return Some(self.vector_splat(n as usize, a(0)));
         }
+        if op == "expose_provenance" || op == "with_exposed_provenance" {
+            let (n, _) = self.elem_of(ret_rty);
+            let et = self.element_type(ret);
+            let xs = self.lanes(a(0), n);
+            let out = xs
+                .into_iter()
+                .map(|x| if op == "expose_provenance" { self.ptrtoint(x, et) } else { self.inttoptr(x, et) })
+                .collect();
+            return Some(self.build_vec(ret, out));
+        }
+        if op == "cast_ptr" {
+            // Opaque pointers: pointer-to-pointer lane casts are no-ops.
+            return Some(a(0));
+        }
         let (n, e) = self.elem_of(args[0].layout.ty);
         let base = op.strip_suffix("_dyn").unwrap_or(op);
         match base {
@@ -183,7 +197,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 Some(self.build_vec(ret, out))
             }
             "fabs" | "fsqrt" | "floor" | "ceil" | "trunc" | "round_ties_even" | "ctpop" | "ctlz"
-            | "cttz" | "bswap" | "bitreverse" => {
+            | "cttz" | "bswap" | "bitreverse" | "round" => {
                 let i = match base {
                     "fsqrt" => "llvm.sqrt".to_string(),
                     "round_ties_even" => "llvm.roundeven".to_string(),
@@ -227,6 +241,37 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     let c = self.nonzero(b);
                     out.push(self.select(c, x, y));
                 }
+                Some(self.build_vec(ret, out))
+            }
+            "gather" => {
+                // Masked-off lanes load their fallback value from a stack slot,
+                // so every lane can load unconditionally.
+                let (_, ety) = ret_rty.simd_size_and_type(self.tcx);
+                let el = self.layout_of(ety);
+                let (size, align) = (el.size, el.align.abi);
+                let et = self.element_type(ret);
+                let slot = self.alloca(size * n, align);
+                let (vs, ps, ms) = (self.lanes(a(0), n), self.lanes(a(1), n), self.lanes(a(2), n));
+                let mut out = Vec::new();
+                for (i, ((v, p), m)) in vs.into_iter().zip(ps).zip(ms).enumerate() {
+                    let off = self.const_usize(size.bytes() * i as u64);
+                    let fb = self.inbounds_ptradd(slot, off);
+                    self.store(v, fb, align);
+                    let c = self.nonzero(m);
+                    let p = self.select(c, p, fb);
+                    out.push(self.load(et, p, align));
+                }
+                Some(self.build_vec(ret, out))
+            }
+            "fma" | "relaxed_fma" => {
+                let et = self.element_type(ret);
+                let (xs, ys, zs) = (self.lanes(a(0), n), self.lanes(a(1), n), self.lanes(a(2), n));
+                let out = xs
+                    .into_iter()
+                    .zip(ys)
+                    .zip(zs)
+                    .map(|((x, y), z)| self.intrinsic("llvm.fma", et, &[x, y, z]))
+                    .collect();
                 Some(self.build_vec(ret, out))
             }
             "extract" => Some(self.extract_element(a(0), a(1))),

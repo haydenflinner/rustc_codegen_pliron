@@ -68,6 +68,9 @@ impl<'tcx> CodegenCx<'tcx> {
         match ga {
             GlobalAlloc::Function { instance, .. } => Ok(self.get_fn_addr(instance, None)),
             GlobalAlloc::Static(def_id) => Ok(self.get_static_addr(def_id)),
+            // Like cg_llvm: empty allocations (e.g. `&()`) get a dangling,
+            // aligned address instead of a real global.
+            GlobalAlloc::Memory(alloc) if alloc.inner().len() == 0 => Err(alloc.inner().align.bytes()),
             GlobalAlloc::Memory(alloc) => Ok(self.static_addr_of(alloc, None)),
             GlobalAlloc::VTable(ty, dyn_ty) => {
                 let alloc = self

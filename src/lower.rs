@@ -273,6 +273,25 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.b.seal_all_blocks();
     }
 
+    /// Cranelift x64 has no f16/f128 `fneg`; flip the sign bit instead.
+    fn fneg(&mut self, x: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let mf = MemFlagsData::new();
+        if t == clt::F16 {
+            let i = self.b.ins().bitcast(clt::I16, mf, x);
+            let r = self.b.ins().bxor_imm_u(i, 0x8000);
+            self.b.ins().bitcast(t, mf, r)
+        } else if t == clt::F128 {
+            let i = self.b.ins().bitcast(clt::I128, mf, x);
+            let (lo, hi) = self.b.ins().isplit(i);
+            let hi = self.b.ins().bxor_imm_s(hi, i64::MIN);
+            let r = self.b.ins().iconcat(lo, hi);
+            self.b.ins().bitcast(t, mf, r)
+        } else {
+            self.b.ins().fneg(x)
+        }
+    }
+
     fn ty_leaves(&self, t: TypeHandle) -> Vec<(u64, ClType)> {
         leaves(self.ctx, t)
     }
@@ -565,7 +584,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.set1(op, r);
         } else if is!(FNegOp) {
             let a = self.get(opnds[0]);
-            let r = a.iter().map(|x| self.b.ins().fneg(*x)).collect();
+            let r = a.iter().map(|x| self.fneg(*x)).collect();
             self.set(op, r);
         } else if is!(TruncOp) || is!(ZExtOp) || is!(SExtOp) || is!(PtrToIntOp) || is!(IntToPtrOp) {
             let src_w = self.int_width(opnds[0].get_type(ctx));
@@ -1029,6 +1048,24 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             "llvm.fma" => self.b.ins().fma(a[0], a[1], a[2]),
             "llvm.minimum" => self.b.ins().fmin(a[0], a[1]),
             "llvm.maximum" => self.b.ins().fmax(a[0], a[1]),
+            "llvm.fmuladd" => self.b.ins().fma(a[0], a[1], a[2]),
+            n if matches!(
+                n,
+                "llvm.round" | "llvm.sin" | "llvm.cos" | "llvm.exp" | "llvm.exp2" | "llvm.log"
+                    | "llvm.log2" | "llvm.log10" | "llvm.pow"
+            ) =>
+            {
+                // No Cranelift instruction: call libm, like cg_llvm does on x86.
+                let t = self.b.func.dfg.value_type(a[0]);
+                let base = &n["llvm.".len()..];
+                let f = match t {
+                    clt::F32 => format!("{base}f"),
+                    clt::F64 => base.to_string(),
+                    _ => panic!("pliron->cranelift: unsupported intrinsic {n} on {t}"),
+                };
+                let ps = vec![t; a.len()];
+                self.libcall(&f, &ps, &[t], &a)[0]
+            }
             n => panic!("pliron->cranelift: unsupported intrinsic {n}"),
         };
         self.set1(op, r);
