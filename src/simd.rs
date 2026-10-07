@@ -31,6 +31,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         )
     }
 
+    /// Whether `ty` lowers to one native Cranelift SIMD value.
+    pub(crate) fn native(&self, ty: TypeHandle) -> bool {
+        match self.cx.kind(ty) {
+            crate::types::TyK::Vector(e, n) => {
+                crate::types::native_vec(&self.cx.pctx.borrow(), e, n as u64).is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn lane(&mut self, v: Value, i: u64) -> Value {
         let idx = self.const_i32(i as i32);
         self.extract_element(v, idx)
@@ -196,6 +206,24 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     "maximum_number_nsz" => "fmax",
                     o => o,
                 };
+                if self.native(ret) {
+                    let (x, y) = (a(0), a(1));
+                    let r = match (op, e.float) {
+                        ("add", false) => Some(self.add(x, y)),
+                        ("sub", false) => Some(self.sub(x, y)),
+                        ("and", false) => Some(self.and(x, y)),
+                        ("or", false) => Some(self.or(x, y)),
+                        ("xor", false) => Some(self.xor(x, y)),
+                        ("add", true) => Some(self.fadd(x, y)),
+                        ("sub", true) => Some(self.fsub(x, y)),
+                        ("mul", true) => Some(self.fmul(x, y)),
+                        ("div", true) => Some(self.fdiv(x, y)),
+                        _ => None,
+                    };
+                    if r.is_some() {
+                        return r;
+                    }
+                }
                 let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -241,6 +269,26 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     .map(|x| self.intrinsic(&i, et, &[x]))
                     .collect();
                 Some(self.build_vec(ret, out))
+            }
+            "eq" | "ne" | "lt" | "le" | "gt" | "ge"
+                if self.native(self.val_ty(a(0))) && self.native(ret) =>
+            {
+                let k = if e.float {
+                    "f"
+                } else if e.signed {
+                    "s"
+                } else {
+                    "u"
+                };
+                Some(self.intrinsic(&format!("pliron.vcmp.{base}.{k}"), ret, &[a(0), a(1)]))
+            }
+            "select" if self.native(self.val_ty(a(0))) && self.native(ret) => {
+                Some(self.intrinsic("pliron.vbitselect", ret, &[a(0), a(1), a(2)]))
+            }
+            "bitmask"
+                if self.native(self.val_ty(a(0))) && self.type_kind(ret) == TypeKind::Integer =>
+            {
+                Some(self.intrinsic("pliron.vhigh_bits", ret, &[a(0)]))
             }
             "eq" | "ne" | "lt" | "le" | "gt" | "ge" => {
                 let et = self.element_type(ret);

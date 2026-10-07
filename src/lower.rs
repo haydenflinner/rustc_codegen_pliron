@@ -416,6 +416,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
+        if t.is_vector() {
+            let bytes = bits.to_le_bytes()[..t.bytes() as usize].to_vec();
+            let c = self.b.func.dfg.constants.insert(bytes.into());
+            return self.b.ins().vconst(t, c);
+        }
         if t == clt::I128 {
             let lo = self.b.ins().iconst(clt::I64, bits as u64 as i64);
             let hi = self.b.ins().iconst(clt::I64, (bits >> 64) as u64 as i64);
@@ -433,7 +438,65 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
     }
 
+    fn bitcast_to(&mut self, t: ClType, x: ir::Value) -> ir::Value {
+        let from = self.b.func.dfg.value_type(x);
+        let mf = if t.is_vector() || from.is_vector() {
+            MemFlagsData::new().with_endianness(ir::Endianness::Little)
+        } else {
+            MemFlagsData::new()
+        };
+        self.b.ins().bitcast(t, mf, x)
+    }
+
+    /// The single native SIMD leaf of `ty`, if it has one.
+    fn native_leaf(&self, ty: TypeHandle) -> Option<ClType> {
+        match classify(self.ctx, ty) {
+            TyK::Vector(..) => match self.ty_leaves(ty)[..] {
+                [(_, t)] if t.is_vector() => Some(t),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Build a native vector from per-lane values (a `vconst` when all are constant).
+    fn pack_vec(&mut self, t: ClType, elems: &[Value]) -> ir::Value {
+        let lb = t.lane_bits() as usize / 8;
+        let mut bytes = vec![0u8; t.bytes() as usize];
+        let mut all_const = true;
+        for (i, e) in elems.iter().enumerate() {
+            match self.st.consts.get(e) {
+                Some(ConstVal::Bits(b)) => {
+                    bytes[i * lb..(i + 1) * lb].copy_from_slice(&b.to_le_bytes()[..lb])
+                }
+                Some(ConstVal::Zero | ConstVal::Undef) => {}
+                _ => all_const = false,
+            }
+        }
+        let c = self.b.func.dfg.constants.insert(bytes.into());
+        let mut v = self.b.ins().vconst(t, c);
+        if !all_const {
+            for (i, e) in elems.iter().enumerate() {
+                let x = self.get1(*e);
+                v = self.b.ins().insertlane(v, x, i as u8);
+            }
+        }
+        v
+    }
+
     fn mat(&mut self, ty: TypeHandle, cv: ConstVal) -> Vals {
+        if let Some(t) = self.native_leaf(ty) {
+            match &cv {
+                ConstVal::Agg(elems) => return smallvec![self.pack_vec(t, elems)],
+                ConstVal::Bytes(bs) => {
+                    let mut bytes = bs.clone();
+                    bytes.resize(t.bytes() as usize, 0);
+                    let c = self.b.func.dfg.constants.insert(bytes.into());
+                    return smallvec![self.b.ins().vconst(t, c)];
+                }
+                _ => {}
+            }
+        }
         match cv {
             ConstVal::Bits(bits) => {
                 let lv = self.ty_leaves(ty);
@@ -791,7 +854,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let r: Vals = if dts.iter().map(|d| d.1).eq(sts.iter().copied()) {
                 xs
             } else if xs.len() == 1 && dts.len() == 1 {
-                smallvec![self.b.ins().bitcast(dts[0].1, MemFlagsData::new(), xs[0])]
+                smallvec![self.bitcast_to(dts[0].1, xs[0])]
             } else {
                 let (sz, _) = size_align(ctx, self.res_ty(op));
                 let slot = self.slot(sz.max(16), 16);
@@ -819,11 +882,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .zip(lv)
                 .map(|((var, vt), (_, t))| {
                     let x = self.b.use_var(var);
-                    if vt == t {
-                        x
-                    } else {
-                        self.b.ins().bitcast(t, MemFlagsData::new(), x)
-                    }
+                    if vt == t { x } else { self.bitcast_to(t, x) }
                 })
                 .collect();
             self.set(op, r);
@@ -834,7 +893,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let x = if self.b.func.dfg.value_type(x) == vt {
                     x
                 } else {
-                    self.b.ins().bitcast(vt, MemFlagsData::new(), x)
+                    self.bitcast_to(vt, x)
                 };
                 self.b.def_var(var, x);
             }
@@ -939,19 +998,46 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.set(op, a);
         } else if is!(ExtractElementOp) {
             let a = self.get(opnds[0]);
-            let r = match self.const_int(opnds[1]) {
-                Some(i) => a[i as usize],
-                None => {
-                    let (p, es) = self.spill_vec(opnds[0], &a);
-                    let addr = self.dyn_index(p, opnds[1], es);
-                    let t = self.b.func.dfg.value_type(a[0]);
-                    self.b.ins().load(t, MemFlagsData::trusted(), addr, 0)
+            let vt = self.b.func.dfg.value_type(a[0]);
+            let r = if vt.is_vector() {
+                match self.const_int(opnds[1]) {
+                    Some(i) => self.b.ins().extractlane(a[0], i as u8),
+                    None => {
+                        let (p, es) = self.spill_vec(opnds[0], &a);
+                        let addr = self.dyn_index(p, opnds[1], es);
+                        self.b
+                            .ins()
+                            .load(vt.lane_type(), MemFlagsData::trusted(), addr, 0)
+                    }
+                }
+            } else {
+                match self.const_int(opnds[1]) {
+                    Some(i) => a[i as usize],
+                    None => {
+                        let (p, es) = self.spill_vec(opnds[0], &a);
+                        let addr = self.dyn_index(p, opnds[1], es);
+                        let t = self.b.func.dfg.value_type(a[0]);
+                        self.b.ins().load(t, MemFlagsData::trusted(), addr, 0)
+                    }
                 }
             };
             self.set1(op, r);
         } else if is!(InsertElementOp) {
             let mut a = self.get(opnds[0]);
             let e = self.get1(opnds[1]);
+            let vt = self.b.func.dfg.value_type(a[0]);
+            if vt.is_vector() {
+                a[0] = match self.const_int(opnds[2]) {
+                    Some(i) => self.b.ins().insertlane(a[0], e, i as u8),
+                    None => {
+                        let (p, es) = self.spill_vec(opnds[0], &a);
+                        let addr = self.dyn_index(p, opnds[2], es);
+                        self.b.ins().store(MemFlagsData::trusted(), e, addr, 0);
+                        self.b.ins().load(vt, MemFlagsData::trusted(), p, 0)
+                    }
+                };
+                return self.set(op, a);
+            }
             match self.const_int(opnds[2]) {
                 Some(i) => a[i as usize] = e,
                 None => {
@@ -994,7 +1080,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     fn spill_vec(&mut self, v: Value, a: &Vals) -> (ir::Value, u64) {
         let (sz, al) = size_align(self.ctx, v.get_type(self.ctx));
         let p = self.slot(sz, al);
-        let es = sz / a.len() as u64;
+        let es = match classify(self.ctx, v.get_type(self.ctx)) {
+            TyK::Vector(e, _) => size_align(self.ctx, e).0,
+            _ => sz / a.len() as u64,
+        };
         for (i, x) in a.iter().enumerate() {
             self.b
                 .ins()
@@ -1320,6 +1409,59 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             "llvm.fptoui.sat" | "llvm.fptosi.sat" => {
                 let t = self.ty_leaves(self.res_ty(op))[0].1;
                 self.fcvt_sat(name == "llvm.fptosi.sat", t, a[0])
+            }
+            "pliron.vsplat" => {
+                let t = self.ty_leaves(self.res_ty(op))[0].1;
+                self.b.ins().splat(t, a[0])
+            }
+            "pliron.vhigh_bits" => {
+                let t = self.ty_leaves(self.res_ty(op))[0].1;
+                let m = self.b.ins().vhigh_bits(clt::I32, a[0]);
+                self.resize(m, t, false)
+            }
+            "pliron.vbitselect" => {
+                let t = self.b.func.dfg.value_type(a[1]);
+                let m = if self.b.func.dfg.value_type(a[0]) == t {
+                    a[0]
+                } else {
+                    self.bitcast_to(t, a[0])
+                };
+                self.b.ins().bitselect(m, a[1], a[2])
+            }
+            n if n.starts_with("pliron.vcmp.") => {
+                let (p, k) = n["pliron.vcmp.".len()..].split_once('.').unwrap();
+                if k == "f" {
+                    let cc = match p {
+                        "eq" => FloatCC::Equal,
+                        "ne" => FloatCC::NotEqual,
+                        "lt" => FloatCC::LessThan,
+                        "le" => FloatCC::LessThanOrEqual,
+                        "gt" => FloatCC::GreaterThan,
+                        _ => FloatCC::GreaterThanOrEqual,
+                    };
+                    let m = self.b.ins().fcmp(cc, a[0], a[1]);
+                    let t = self.ty_leaves(self.res_ty(op))[0].1;
+                    if self.b.func.dfg.value_type(m) == t {
+                        m
+                    } else {
+                        self.bitcast_to(t, m)
+                    }
+                } else {
+                    let s = k == "s";
+                    let cc = match p {
+                        "eq" => IntCC::Equal,
+                        "ne" => IntCC::NotEqual,
+                        "lt" if s => IntCC::SignedLessThan,
+                        "le" if s => IntCC::SignedLessThanOrEqual,
+                        "gt" if s => IntCC::SignedGreaterThan,
+                        "ge" if s => IntCC::SignedGreaterThanOrEqual,
+                        "lt" => IntCC::UnsignedLessThan,
+                        "le" => IntCC::UnsignedLessThanOrEqual,
+                        "gt" => IntCC::UnsignedGreaterThan,
+                        _ => IntCC::UnsignedGreaterThanOrEqual,
+                    };
+                    self.b.ins().icmp(cc, a[0], a[1])
+                }
             }
             "llvm.sqrt" => self.b.ins().sqrt(a[0]),
             "llvm.fabs" => self.b.ins().fabs(a[0]),

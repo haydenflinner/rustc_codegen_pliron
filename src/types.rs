@@ -155,6 +155,9 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
             }
         }
         TyK::Vector(e, n) => {
+            if let Some(t) = native_vec(ctx, e, n as u64) {
+                return out.push((base, t));
+            }
             let (s, _) = size_align(ctx, e);
             for i in 0..n as u64 {
                 leaves_into(ctx, e, base + i * s, out);
@@ -167,6 +170,25 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
             }
         }
     }
+}
+
+/// 128-bit int/float vectors are one native Cranelift SIMD leaf; other vectors
+/// are flattened lane-wise. `PLIRON_SIMD=0` flattens everything.
+pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
+        return None;
+    }
+    let lane = match classify(ctx, e) {
+        TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,
+        TyK::F32 => clt::F32,
+        TyK::F64 => clt::F64,
+        _ => return None,
+    };
+    if lane.bits() as u64 * n != 128 {
+        return None;
+    }
+    lane.by(n as u32)
 }
 
 /// Element types of an aggregate (struct fields, or `n` copies of the element).

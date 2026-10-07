@@ -770,6 +770,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn vector_splat(&mut self, num_elts: usize, elt: Value) -> Value {
         let ty = self.type_vector(self.val_ty(elt), num_elts as u64);
+        if self.native(ty) {
+            return self.intrinsic("pliron.vsplat", ty, &[elt]);
+        }
         let mut v = self.const_undef(ty);
         for i in 0..num_elts {
             let idx = self.const_i32(i as i32);
