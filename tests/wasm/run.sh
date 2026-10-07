@@ -12,3 +12,6 @@ rm -rf "$CARGO_TARGET_DIR"
 (cd tests/wasm && cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
 node tests/wasm/run.mjs "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/wasmtest.wasm"
+# std (alloc, HashMap, fmt, dlmalloc + memory.grow) on wasm32-unknown-unknown
+(cd tests/wasm/std && cargo build -q --release --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort)
+node tests/wasm/run_std.mjs "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/wasmstdtest.wasm"

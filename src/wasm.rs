@@ -272,9 +272,19 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
         o.funcs[i].body = Some(body);
     }
 
+    // Only import functions that are actually called; GOT.func globals
+    // name their targets, so they don't need an import.
+    let mut called = vec![false; o.funcs.len()];
+    for f in &o.funcs {
+        for v in f.body.iter().flat_map(|b| b.values.values()) {
+            if let ValueDef::Operator(O::Call { function_index }, ..) = v {
+                called[function_index.index()] = true;
+            }
+        }
+    }
     // wasm numbers imported functions first.
     let order: Vec<usize> = (0..o.funcs.len())
-        .filter(|&i| o.funcs[i].body.is_none())
+        .filter(|&i| o.funcs[i].body.is_none() && called[i])
         .chain((0..o.funcs.len()).filter(|&i| o.funcs[i].body.is_some()))
         .collect();
     let mut remap = vec![0usize; o.funcs.len()];
@@ -1319,7 +1329,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             let w = self.width(opnds[1].get_type(ctx));
             let t = wleaves(ctx, opnds[1].get_type(ctx))[0].1;
             let old = self.load(t, p, 0);
-            let ok = self.ib(w, O::I32Eq, O::I64Eq, old, c);
+            let ok = self.op(if w > 32 { O::I64Eq } else { O::I32Eq }, &[old, c], WT::I32);
             let new = self.sel(ok, n, old);
             self.store(t, new, p, 0);
             self.set(op, smallvec![old, ok]);
@@ -1644,6 +1654,21 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 wargs.extend(vs);
             }
         }
+        // core::arch::wasm32 memory intrinsics are declared as `llvm.*`
+        // link_name functions, which become `__pliron_llvm_*` symbols.
+        if let CallOpCallable::Direct(ident) = call.callee(ctx) {
+            let st = self.st;
+            let sym = &st.ident_to_sym[&ident.to_string()];
+            let mem = self.o.mem;
+            if sym.starts_with("__pliron_llvm_wasm_memory_grow") {
+                let v = self.op(O::MemoryGrow { mem }, &[wargs[1]], WT::I32);
+                return self.set(op, smallvec![v]);
+            }
+            if sym.starts_with("__pliron_llvm_wasm_memory_size") {
+                let v = self.op(O::MemorySize { mem }, &[], WT::I32);
+                return self.set(op, smallvec![v]);
+            }
+        }
         let direct = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
                 let sym = self.st.ident_to_sym[&ident.to_string()].clone();
@@ -1944,7 +1969,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                     let comb = self.ib(w, O::I32Or, O::I64Or, hi, lo);
                     let comb = self.norm(comb, w);
                     let zero = self.ic(w, 0);
-                    let z = self.ib(w, O::I32Eq, O::I64Eq, s, zero);
+                    let z = self.op(
+                        if w > 32 { O::I64Eq } else { O::I32Eq },
+                        &[s, zero],
+                        WT::I32,
+                    );
                     let keep = if left { x } else { y };
                     smallvec![self.sel(z, keep, comb)]
                 }
