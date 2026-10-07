@@ -72,14 +72,16 @@ fn wty(t: ClType) -> WT {
 }
 
 fn wsig(ctx: &Context, fn_ty: TypeHandle) -> SignatureData {
-    let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else {
+    let TyK::Func(ret, args, var_arg) = classify(ctx, fn_ty) else {
         panic!("not a function type")
     };
     SignatureData {
+        // C variadics: the extra arguments go in a buffer passed as one i32.
         params: args
             .iter()
             .flat_map(|a| wleaves(ctx, *a))
             .map(|(_, t)| wty(t))
+            .chain(var_arg.then_some(WT::I32))
             .collect(),
         returns: wleaves(ctx, ret).into_iter().map(|(_, t)| wty(t)).collect(),
     }
@@ -299,9 +301,14 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
         match d.body.as_mut() {
             None => {
                 o.m.funcs.push(FuncDecl::Import(d.sig, d.name.clone()));
+                let (module, name) = st
+                    .wasm_imports
+                    .get(&d.name)
+                    .cloned()
+                    .unwrap_or_else(|| ("env".into(), d.name));
                 o.m.imports.push(Import {
-                    module: "env".into(),
-                    name: d.name,
+                    module,
+                    name,
                     kind: ImportKind::Func(f),
                 });
             }
@@ -1636,7 +1643,16 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         let sigd = wsig(ctx, fn_ty);
         let rets = sigd.returns.clone();
         let mut wargs = Vec::new();
+        let (nfixed, var_arg) = match classify(ctx, fn_ty) {
+            TyK::Func(_, a, v) => (a.len(), v),
+            _ => unreachable!(),
+        };
+        let mut va: Vec<WV> = Vec::new();
         for (i, a) in call.args(ctx).into_iter().enumerate() {
+            if var_arg && i >= nfixed {
+                va.extend(self.get(a));
+                continue;
+            }
             let vs = self.get(a);
             if let Some(ArgExt::ByVal(n)) = exts.params.get(i).copied() {
                 let dst = self.slot(n as u64, 16);
@@ -1653,6 +1669,31 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             } else {
                 wargs.extend(vs);
             }
+        }
+        if var_arg {
+            // Each variadic argument at its natural alignment, as clang does.
+            let mut off = 0u64;
+            let lay: Vec<(ClType, u64)> = va
+                .iter()
+                .map(|&v| {
+                    let (t, n) = match self.ty_of(v) {
+                        WT::I32 => (clt::I32, 4),
+                        WT::I64 => (clt::I64, 8),
+                        WT::F32 => (clt::F32, 4),
+                        WT::F64 => (clt::F64, 8),
+                        t => panic!("variadic argument of type {t:?}"),
+                    };
+                    off = off.next_multiple_of(n);
+                    let at = off;
+                    off += n;
+                    (t, at)
+                })
+                .collect();
+            let buf = self.slot(off.max(1), 16);
+            for (&v, &(t, at)) in va.iter().zip(&lay) {
+                self.store(t, v, buf, at);
+            }
+            wargs.push(buf);
         }
         // core::arch::wasm32 memory intrinsics are declared as `llvm.*`
         // link_name functions, which become `__pliron_llvm_*` symbols.

@@ -965,17 +965,25 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
         let info = &self.st.calls[&op];
         let fn_ty = info.fn_ty;
-        let sig = make_sig(ctx, fn_ty, &info.exts, self.cc);
+        let mut sig = make_sig(ctx, fn_ty, &info.exts, self.cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         for a in args {
             cargs.extend(self.get(a));
         }
+        // C variadic: fn_ty only has the fixed params; on SysV the rest are
+        // passed like ordinary arguments of their own types.
+        let var_arg = matches!(classify(ctx, fn_ty), TyK::Func(_, _, true));
+        if var_arg {
+            for &v in &cargs[sig.params.len()..] {
+                sig.params.push(AbiParam::new(self.b.func.dfg.value_type(v)));
+            }
+        }
         let target = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
                 let sym = &self.st.ident_to_sym[&ident.to_string()];
                 match self.ids.get(sym).copied() {
-                    Some(Sym::F(fid, declty)) if declty == fn_ty => Ok(self.fref(fid)),
+                    Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => Ok(self.fref(fid)),
                     _ => {
                         let addr = self.sym_addr(&sym.clone());
                         Err((addr, self.b.import_signature(sig)))

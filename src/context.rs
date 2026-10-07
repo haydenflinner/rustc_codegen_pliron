@@ -112,6 +112,8 @@ pub struct State<'tcx> {
     pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
     pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
+    /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
+    pub wasm_imports: FxHashMap<String, (String, String)>,
 }
 
 pub struct CodegenCx<'tcx> {
@@ -414,6 +416,17 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         }
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
+        if self.tcx.sess.target.is_like_wasm
+            && let Some(module) =
+                self.tcx.wasm_import_module_map(instance.def_id().krate).get(&instance.def_id())
+        {
+            let name = self
+                .tcx
+                .codegen_fn_attrs(instance.def_id())
+                .symbol_name
+                .unwrap_or_else(|| self.tcx.item_name(instance.def_id()));
+            self.st.borrow_mut().wasm_imports.insert(sym.to_string(), (module.clone(), name.to_string()));
+        }
         self.declare_fn_sym(sym, ty, Linkage::Import, exts)
     }
 

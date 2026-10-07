@@ -177,7 +177,11 @@ impl Obj<'_> {
     }
 
     fn refs(&self) -> impl Iterator<Item = &str> {
-        let fi = self.fimports.iter().map(|i| &i.1[..]);
+        let fi = self
+            .fimports
+            .iter()
+            .filter(|i| i.0 == "env")
+            .map(|i| &i.1[..]);
         let gi = self
             .gimports
             .iter()
@@ -338,11 +342,14 @@ fn run() -> Result<(), String> {
     }
 
     // Functions: host imports first, then every included object's bodies.
-    let mut host: Vec<(String, u32)> = Vec::new();
+    // Only `env` imports are link-time symbols; other modules (e.g.
+    // `wasi_snapshot_preview1`) are always provided by the host.
+    let mut host: Vec<(String, String, u32)> = Vec::new();
     for &oi in &included {
-        for (_, n, t) in &objs[oi].fimports {
-            if resolve(oi, n).is_none() && !host.iter().any(|h| &h.0 == n) {
-                host.push((n.clone(), tmaps[&oi][*t as usize]));
+        for (m, n, t) in &objs[oi].fimports {
+            let linked = m == "env" && resolve(oi, n).is_some();
+            if !linked && !host.iter().any(|h| &h.0 == m && &h.1 == n) {
+                host.push((m.clone(), n.clone(), tmaps[&oi][*t as usize]));
             }
         }
     }
@@ -362,11 +369,11 @@ fn run() -> Result<(), String> {
     for &oi in &included {
         let o = &objs[oi];
         let mut m = Vec::new();
-        for (_, n, _) in &o.fimports {
-            m.push(match resolve(oi, n) {
+        for (md, n, _) in &o.fimports {
+            m.push(match resolve(oi, n).filter(|_| md == "env") {
                 Some(d) => func_out(d)
                     .ok_or_else(|| format!("{}: {n} is data, called as a function", o.name))?,
-                None => host.iter().position(|h| &h.0 == n).unwrap() as u32,
+                None => host.iter().position(|h| &h.0 == md && &h.1 == n).unwrap() as u32,
             });
         }
         let b = base[&oi];
@@ -411,7 +418,7 @@ fn run() -> Result<(), String> {
                 (None, _) if func => {
                     let h = host
                         .iter()
-                        .position(|h| h.0 == sym)
+                        .position(|h| h.1 == sym)
                         .ok_or_else(|| format!("undefined function {sym}"))?;
                     Ok(slot(h as u32, table))
                 }
@@ -493,8 +500,8 @@ fn run() -> Result<(), String> {
     }
     module.section(&ts);
     let mut is = we::ImportSection::new();
-    for (n, t) in &host {
-        is.import("env", n, we::EntityType::Function(*t));
+    for (m, n, t) in &host {
+        is.import(m, n, we::EntityType::Function(*t));
     }
     module.section(&is);
     let mut fs = we::FunctionSection::new();
@@ -572,7 +579,7 @@ fn run() -> Result<(), String> {
     let mut named: Vec<(u32, &str)> = host
         .iter()
         .enumerate()
-        .map(|(i, h)| (i as u32, &h.0[..]))
+        .map(|(i, h)| (i as u32, &h.1[..]))
         .collect();
     for &oi in &included {
         for (n, &f) in &objs[oi].exports {
