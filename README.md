@@ -27,7 +27,7 @@ rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranel
   Its target crates are compiled by this backend and linked with wild, and it runs on Vulkan (tested on Mesa lavapipe).
   `--frames N --autoplay` gives an unattended smoke run.
 - Not done yet: optimizations, debuginfo, LTO, and targets other than x86_64.
-  Host proc-macros and build scripts are still compiled by stock rustc.
+  `build.sh --host` also compiles all proc macros and build scripts with this backend (they load into stock rustc, against the prebuilt host std); `build.sh -Zbuild-std=std,panic_unwind` rebuilds the game's std with it. All modes render.
 
 ## Usage
 ```
