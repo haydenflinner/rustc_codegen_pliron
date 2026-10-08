@@ -303,6 +303,20 @@ pub fn lower_to_object(
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") {
+            let k = crate::unroll::run(&mut clctx.func, &nonnull, &derived);
+            if k > 0 && std::env::var_os("PLIRON_UNROLL_DEBUG").is_some() {
+                eprintln!("unroll {k} {n}");
+            }
+            if dump {
+                eprintln!("==== clif {n} after unroll ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("unroll broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.unreach {
             unreached += crate::unreach::run(&mut clctx.func);
             if std::env::var_os("PLIRON_VERIFY").is_some()

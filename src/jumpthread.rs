@@ -46,7 +46,7 @@ fn bits(func: &Function, v: Value) -> Option<u32> {
 }
 
 /// Constant value of `v`: from `env`, or an `iconst` anywhere in the function.
-fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
+pub(crate) fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     if let Some(&c) = env.get(&v) {
         return Some(c);
@@ -80,7 +80,7 @@ fn icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
 }
 
 /// Evaluate one pure body instruction of a merge block.
-fn eval(
+pub(crate) fn eval(
     func: &Function,
     env: &FxHashMap<Value, u64>,
     nz: &dyn Fn(Value) -> bool,
@@ -308,7 +308,7 @@ pub struct NonNull<'a> {
 }
 
 impl<'a> NonNull<'a> {
-    fn new(
+    pub(crate) fn new(
         func: &Function,
         loads: &'a FxHashSet<Value>,
         derived: &'a FxHashMap<Value, Value>,
@@ -359,7 +359,7 @@ impl<'a> NonNull<'a> {
         nn
     }
 
-    fn is(&self, func: &Function, v: Value) -> bool {
+    pub(crate) fn is(&self, func: &Function, v: Value) -> bool {
         let mut v = func.dfg.resolve_aliases(v);
         for _ in 0..8 {
             if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {

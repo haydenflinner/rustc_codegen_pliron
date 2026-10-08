@@ -37,6 +37,7 @@ mod intrinsic;
 mod jumpthread;
 mod loadfwd;
 mod looprot;
+mod unroll;
 mod lower;
 mod memcpyopt;
 mod nounwind;

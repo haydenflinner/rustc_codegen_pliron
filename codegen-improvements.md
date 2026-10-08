@@ -72,3 +72,13 @@ Net at the current defaults: 5.08B / 11.52B instructions (−66% / −64% vs bas
 (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.64×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
+
+## Microbenchmarks (vs stock LLVM rustc -O)
+
+`perf stat -e instructions:u`, best of 3 (runs agree to <0.001%). md5: RustCrypto `md-5` hashing a buffer in a loop,
+digest checked against the LLVM build.
+
+| Change | md5 (LLVM: 2.667B) | Notes |
+|---|---|---|
+| baseline (b36 defaults) | 4.783B (1.79×) | the `[u32; 16]` input copy in `compress` stays a loop over a stack array, with the `try_into().unwrap()` `Result` round-tripping through two stack slots |
+| + full unroll of constant-trip loops on the final CLIF (`PLIRON_UNROLL`, src/unroll.rs): from the loop's single entry edge, constants (incl. folded pre-loop values like `(p+64-p)/4`) and stack-slot bytes stored during the trip are propagated; when every branch on the path is decided within 32 header visits / 400 cloned insts, the trip becomes one straight-line block | 3.306B (1.24×, −30.9%) | kept. `compress` stores now hit constant offsets, so `loadfwd` keeps the words in registers. regex-syntax -O: 6 loops unrolled, `.text` 557,076 → 557,434 B (+0.06%). Not yet in a stage2 benchmark |
