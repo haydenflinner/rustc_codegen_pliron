@@ -47,7 +47,13 @@ pub(crate) fn direct_callee<'a>(
 
 /// `Some(has_eh)` if `sym` may be inlined; `has_eh` = it has invokes or reads
 /// the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees outright.
-fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> Option<bool> {
+fn eligible(
+    ctx: &Context,
+    st: &State<'_>,
+    sym: &str,
+    limit: usize,
+    once: bool,
+) -> Option<(bool, usize)> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
         return None;
@@ -73,7 +79,7 @@ fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) 
     } else {
         limit
     })
-    .then_some(eh)
+    .then_some((eh, n))
 }
 
 fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
@@ -192,13 +198,17 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
     let eh_invoke = crate::pass_enabled("PLIRON_INLINE_EH_INVOKE");
-    let mut ok: FxHashMap<String, (Ptr<Operation>, bool)> = FxHashMap::default();
+    let cap: usize = std::env::var("PLIRON_INLINE_CALLER_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    let mut ok: FxHashMap<String, (Ptr<Operation>, bool, usize)> = FxHashMap::default();
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
-            if let Some(eh) = eligible(ctx, st, sym, limit, single.contains(sym)) {
-                ok.insert(sym.clone(), (st.funcs[sym].op, eh));
+            if let Some((eh, n)) = eligible(ctx, st, sym, limit, single.contains(sym)) {
+                ok.insert(sym.clone(), (st.funcs[sym].op, eh, n));
             }
         }
         st.funcs
@@ -211,6 +221,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     for sym in order {
         let caller = st.funcs[&sym].op;
         let mut sites = Vec::new();
+        let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
         for b in blocks(ctx, caller) {
             for op in ops(ctx, b) {
                 if !bottom_up && st.invokes.contains_key(&op) {
@@ -219,7 +230,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
-                let Some(&(callee, eh)) = ok.get(cs) else {
+                let Some(&(callee, eh, n)) = ok.get(cs) else {
                     continue;
                 };
                 // A callee with landing pads may go into an invoke whose pad is a
@@ -233,7 +244,10 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
                 {
                     continue;
                 }
-                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty {
+                // Stop growing a caller past the cap: huge generated functions
+                // (cranelift's ISLE lowering) would otherwise blow up memory.
+                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty && size + n <= cap {
+                    size += n;
                     sites.push((op, callee));
                 }
             }
@@ -242,8 +256,8 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
             inline_call(ctx, st, &mut rw, call, callee);
         }
         if bottom_up {
-            if let Some(eh) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
-                ok.insert(sym.clone(), (caller, eh));
+            if let Some((eh, n)) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
+                ok.insert(sym.clone(), (caller, eh, n));
             }
         }
     }
@@ -253,7 +267,11 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
 }
 
 /// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
-fn left_stats(ctx: &Context, st: &State<'_>, ok: &FxHashMap<String, (Ptr<Operation>, bool)>) {
+fn left_stats(
+    ctx: &Context,
+    st: &State<'_>,
+    ok: &FxHashMap<String, (Ptr<Operation>, bool, usize)>,
+) {
     let mut why: FxHashMap<&str, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
         if !has_body(ctx, f.op) {
@@ -273,7 +291,7 @@ fn left_stats(ctx: &Context, st: &State<'_>, ok: &FxHashMap<String, (Ptr<Operati
                     "preemptible"
                 } else if cs == sym {
                     "self"
-                } else if let Some(&(_, eh)) = ok.get(cs) {
+                } else if let Some(&(_, eh, _)) = ok.get(cs) {
                     if eh && st.invokes.contains_key(&op) {
                         "eh callee at invoke (catch pad / EH_INVOKE=0)"
                     } else if st.calls[&op].fn_ty != g.ty {
