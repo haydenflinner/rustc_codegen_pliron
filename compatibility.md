@@ -24,7 +24,10 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | parking_lot (wasm32-wasip1) | as above | 1 pass; the rest spawn threads, which wasm32-wasip1 doesn't have |
 | serde, smallvec (wasm32-wasip1) | as above | not run: `serde_core` fails `deny(unused_imports)` on WASI (`OsStr`/`OsString`); smallvec's dev-dep `iai-callgrind-runner` needs serde for `OsString` |
 | itoa, ryu, semver, byteorder (wasm32-wasip1) | `ct-wasi.sh test --no-fail-fast` | 13 / 50 / 38 / 514 pass, 0 fail |
-| indexmap, bitflags (wasm32-wasip1) | as above | indexmap 170 pass; its quickcheck `tests/quick.rs` traps at the first property expected to panic (`drain_bounds`, `replace_index`), because with panic=abort `catch_unwind` cannot recover; stock LLVM traps on the same test. bitflags 78 pass; its trybuild `compile` test needs to spawn cargo |
+| indexmap, bitflags (wasm32-wasip1) | as above | indexmap 170 pass. bitflags 78 pass; its trybuild `compile` test needs to spawn cargo |
+| indexmap `tests/quick.rs` (wasm32-wasip1, node 22) | `ct-wasi-unwind.sh test --test quick` (panic=unwind) | 39/39 pass; under panic=abort it trapped at the first property expected to panic (stock LLVM same), now works via emulated EH |
+| wasm emulated EH (wasm32-wasip1, node 22) | `tests/wasm/unwind` crate in `tests/wasm/run.sh` | `catch_unwind` Ok/Err, panic payloads (&str/String/formatted), drop-guard order across nested frames, `resume_unwind`, `panic_unwind`/`unwind` `_Unwind_*` from pliron-wasi-libc over the linker's `__pliron_eh` flag+exn words |
+| bevy 0.17 (pliron_bevy_game) | wasm32-unknown-unknown, `RUSTFLAGS=--cfg=web_sys_unstable_apis`, `ct-wasm.sh check + build` | full bevy tree (bevy_ecs, bevy_render, wgpu, winit, naga) checks and links into a 190 MB wasm; wasm-bindgen 0.2.129 processes its custom sections; the breakout game runs in desktop Chrome (canvas renders, autoplay scores) |
 | base64, unicode-segmentation (wasm32-wasip1) | as above | not run: dev-deps `criterion` (Rayon) and `wait-timeout` do not build for WASI |
 | polars-core (wasm32-wasip1) | as above | not run: dependency `tokio` is built with features it rejects on wasm |
 | bytes, smallvec, crossbeam (`--workspace`), rayon, parking_lot, anyhow (native) | `compat/pop/run2.sh` | 1305 / 82 / 1037 / 578 / 116 / 99 pass, 0 fail |

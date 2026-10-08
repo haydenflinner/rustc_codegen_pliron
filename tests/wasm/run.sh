@@ -34,3 +34,11 @@ node --no-warnings tests/wasm/run_wasi.mjs "$CARGO_TARGET_DIR/wasm32-wasip1/rele
   cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_unwind)
 node --no-warnings tests/wasm/run_wasi.mjs \
   "$CARGO_TARGET_DIR/eh/wasm32-wasip1/release/wasmunwindtest.wasm"
+# panic=unwind on wasm32-unknown-unknown: same emulated EH via the literal
+# `llvm.wasm.throw` symbol std's unwind::wasm uses.
+(cd tests/wasm/unwind-unknown && \
+  RUSTFLAGS="$RUSTFLAGS -Cpanic=unwind" \
+  CARGO_TARGET_DIR=$CARGO_TARGET_DIR/eh-unk \
+  cargo build -q --release --target wasm32-unknown-unknown -Zbuild-std=std,panic_unwind)
+node --no-warnings tests/wasm/run_eh_unk.mjs \
+  "$CARGO_TARGET_DIR/eh-unk/wasm32-unknown-unknown/release/wasmunwindunk.wasm"

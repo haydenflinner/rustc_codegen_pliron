@@ -1897,7 +1897,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 return self.set(op, smallvec![v]);
             }
             // wasm EH intrinsics on the emulated-EH flag/exception words.
-            if sym == "__pliron_llvm_wasm_throw" {
+            if sym == "__pliron_llvm_wasm_throw" || sym == "llvm.wasm.throw" {
                 let p = self.eh_addr();
                 self.store(clt::I32, wargs[1], p, 4);
                 let one = self.i32c(1);
@@ -1905,20 +1905,22 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 self.eh_check(None);
                 return;
             }
-            if sym == "__pliron_llvm_wasm_rethrow" {
+            if sym == "__pliron_llvm_wasm_rethrow" || sym == "llvm.wasm.rethrow" {
                 let p = self.eh_addr();
                 let one = self.i32c(1);
                 self.store(clt::I32, one, p, 0);
                 self.eh_check(None);
                 return;
             }
-            if sym == "__pliron_llvm_wasm_get_exception" {
+            if sym == "__pliron_llvm_wasm_get_exception" || sym == "llvm.wasm.get_exception" {
                 let p = self.eh_addr();
                 let v = self.load(clt::I32, p, 4);
                 return self.set(op, smallvec![v]);
             }
             if sym == "__pliron_llvm_wasm_get_ehselector"
                 || sym == "__pliron_llvm_wasm_landingpad_index"
+                || sym == "llvm.wasm.get_ehselector"
+                || sym == "llvm.wasm.landingpad_index"
             {
                 let v = self.i32c(0);
                 return self.set(op, smallvec![v]);
