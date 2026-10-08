@@ -556,6 +556,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     };
 
+    // Like LLVM's FixFunctionBitcasts: a no-arg `main` gets a C `main(argc, argv)`
+    // wrapper, which is the entry point wasm-bindgen and other hosts look for.
+    let main_void = match defs.get("main").copied() {
+        Some(d @ Def::Func(oi, f)) => {
+            let t = &types[tmaps[&oi][objs[oi].ftypes[(f - objs[oi].fimports.len() as u32) as usize] as usize] as usize];
+            (t.params().is_empty() && t.results() == [wp::ValType::I32]).then(|| func_out(d)).flatten()
+        }
+        _ => None,
+    };
+    let argc_ty = main_void.map(|_| {
+        let want = wp::FuncType::new([wp::ValType::I32, wp::ValType::I32], [wp::ValType::I32]);
+        match types.iter().position(|t| *t == want) {
+            Some(i) => i as u32,
+            None => {
+                types.push(want);
+                types.len() as u32 - 1
+            }
+        }
+    });
+    let main_fn = ctors_fn + 1;
+
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
     let names: Vec<String> = if exports.is_empty() {
@@ -582,6 +603,13 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
 
+    if main_void.is_some() {
+        match ex.iter_mut().find(|e| e.0 == "main") {
+            Some(e) => e.1 = main_fn,
+            None => ex.push(("main".into(), main_fn)),
+        }
+    }
+
     // Encode.
     let mut module = we::Module::new();
     let mut ts = we::TypeSection::new();
@@ -604,6 +632,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     fs.function(void_ty);
+    if let Some(t) = argc_ty {
+        fs.function(t);
+    }
     module.section(&fs);
     let mut tab = we::TableSection::new();
     let tsize = table.len() as u64 + 1;
@@ -675,6 +706,12 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     call_ctors.instruction(&we::Instruction::End);
     code.function(&call_ctors);
+    if let Some(orig) = main_void {
+        let mut w = we::Function::new([]);
+        w.instruction(&we::Instruction::Call(orig));
+        w.instruction(&we::Instruction::End);
+        code.function(&w);
+    }
     module.section(&code);
     let mut named: Vec<(u32, &str)> = host
         .iter()
@@ -687,6 +724,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     named.push((ctors_fn, CALL_CTORS));
+    if let Some(orig) = main_void {
+        named.push((orig, "__original_main"));
+        named.push((main_fn, "main"));
+    }
     named.sort();
     named.dedup_by_key(|x| x.0);
     let mut fnames = we::NameMap::new();
