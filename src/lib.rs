@@ -32,6 +32,7 @@ mod hot;
 mod inline;
 mod instcombine;
 mod intrinsic;
+mod clifpeep;
 mod jumpthread;
 mod loadfwd;
 mod lower;
@@ -193,6 +194,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
     st.loadfwd = pass_enabled("PLIRON_LOADFWD");
+    st.peep = pass_enabled("PLIRON_PEEP");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
