@@ -961,7 +961,7 @@ index 6609a19fa..373ea04f0 100644
  
  fn main() -> ExitCode {
 diff --git a/compiler/rustc_codegen_ssa/src/back/write.rs b/compiler/rustc_codegen_ssa/src/back/write.rs
-index 04be7956e..09fddebc9 100644
+index 04be7956e..e90729456 100644
 --- a/compiler/rustc_codegen_ssa/src/back/write.rs
 +++ b/compiler/rustc_codegen_ssa/src/back/write.rs
 @@ -1210,7 +1210,7 @@ fn start_executing_work<B: WriteBackendMethods>(
@@ -982,40 +982,49 @@ index 04be7956e..09fddebc9 100644
          _ => None,
      };
      let jobserver_helper = parallel.map(|_| {
-@@ -1642,7 +1642,9 @@ enum CodegenState {
+@@ -1642,16 +1642,22 @@ enum CodegenState {
                      {
                          helper.request_token();
                      }
 -                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
-+                    if !cfg!(target_family = "wasm") {
-+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+-                    main_thread_state = MainThreadState::Idle;
++                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
++                    // wasm replays these after the fact; a main thread still lending keeps its token.
++                    if main_thread_state == MainThreadState::Codegenning {
++                        main_thread_state = MainThreadState::Idle;
 +                    }
-                     main_thread_state = MainThreadState::Idle;
                  }
  
-@@ -1650,7 +1652,9 @@ enum CodegenState {
+                 Message::CodegenComplete => {
                      if codegen_state != Aborted {
                          codegen_state = Completed;
                      }
 -                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
-+                    if !cfg!(target_family = "wasm") {
-+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+-                    main_thread_state = MainThreadState::Idle;
++                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
++                    // wasm replays these after the fact; a main thread still lending keeps its token.
++                    if main_thread_state == MainThreadState::Codegenning {
++                        main_thread_state = MainThreadState::Idle;
 +                    }
-                     main_thread_state = MainThreadState::Idle;
                  }
  
-@@ -1706,7 +1710,9 @@ enum CodegenState {
+                 // If codegen is aborted that means translation was aborted due
+@@ -1706,9 +1712,12 @@ enum CodegenState {
  
                  Message::AddImportOnlyModule { bitcode_path, work_product } => {
                      assert_eq!(codegen_state, Ongoing);
 -                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
-+                    if !cfg!(target_family = "wasm") {
-+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
-+                    }
++                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
                      lto_import_only_modules.push((bitcode_path, work_product));
-                     main_thread_state = MainThreadState::Idle;
+-                    main_thread_state = MainThreadState::Idle;
++                    // wasm replays these after the fact; a main thread still lending keeps its token.
++                    if main_thread_state == MainThreadState::Codegenning {
++                        main_thread_state = MainThreadState::Idle;
++                    }
                  }
-@@ -1777,6 +1783,9 @@ enum CodegenState {
+             }
+         }
+@@ -1777,6 +1786,9 @@ enum CodegenState {
              }),
          }))
      };
@@ -1025,7 +1034,7 @@ index 04be7956e..09fddebc9 100644
      return std::thread::Builder::new()
          .name("coordinator".to_owned())
          .spawn(f)
-@@ -1885,11 +1894,7 @@ fn spawn_work<'a, B: WriteBackendMethods>(
+@@ -1885,11 +1897,7 @@ fn spawn_work<'a, B: WriteBackendMethods>(
          };
          drop(coordinator_send.send(msg));
      };
@@ -1038,7 +1047,7 @@ index 04be7956e..09fddebc9 100644
  }
  
  fn spawn_thin_lto_work<B: WriteBackendMethods>(
-@@ -1932,11 +1937,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
+@@ -1932,11 +1940,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
          };
          drop(coordinator_send.send(msg));
      };
@@ -1051,7 +1060,7 @@ index 04be7956e..09fddebc9 100644
  }
  
  enum SharedEmitterMessage {
-@@ -2051,9 +2052,38 @@ fn check(&self, sess: &Session, blocking: bool) {
+@@ -2051,9 +2055,38 @@ fn check(&self, sess: &Session, blocking: bool) {
      }
  }
  
@@ -1091,7 +1100,7 @@ index 04be7956e..09fddebc9 100644
      // Only used for the Message type.
      phantom: PhantomData<B>,
  }
-@@ -2093,9 +2123,14 @@ pub fn join(
+@@ -2093,9 +2126,14 @@ pub fn join(
          incr_comp_session: Option<&IncrCompSession>,
          crate_info: &CrateInfo,
      ) -> (CompiledModules, WorkProductMap) {
@@ -1107,7 +1116,7 @@ index 04be7956e..09fddebc9 100644
              Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
              Ok(Err(())) => {
                  sess.dcx().abort_if_errors();
-@@ -2184,6 +2219,9 @@ pub(crate) fn check_for_errors(&self, sess: &Session) {
+@@ -2184,6 +2222,9 @@ pub(crate) fn check_for_errors(&self, sess: &Session) {
      }
  
      pub(crate) fn wait_for_signal_to_codegen_item(&self) {

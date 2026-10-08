@@ -657,6 +657,8 @@ fn to_stat(f: w::Filestat, st: &mut Stat) {
         w::FILETYPE_SOCKET_DGRAM | w::FILETYPE_SOCKET_STREAM => S_IFSOCK,
         _ => 0,
     };
+    // WASI has no permission bits; report rw (rwx for dirs) so std's `readonly()` is false.
+    st.st_mode |= if st.st_mode == S_IFDIR { 0o755 } else { 0o644 };
     let ts = |n: u64| timespec {
         tv_sec: (n / 1_000_000_000) as _,
         tv_nsec: (n % 1_000_000_000) as _,
