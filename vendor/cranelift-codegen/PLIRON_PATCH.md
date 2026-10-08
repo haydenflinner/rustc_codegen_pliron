@@ -9,3 +9,8 @@ once proven out on the stage2 benchmark, then drop this copy.
    (aarch64 already omits the frame this way). Skipped when
    `preserve_frame_pointers` is set, i.e. `PLIRON_OMIT_FP=0` or a target that
    requires frame pointers.
+2. `src/isa/x64/lower.isle` (+ `jump_table_size` made `pure` in
+   `src/prelude_lower.isle`): a `br_table` whose index is `band x, k` with
+   `k < table size` skips the `cmp; cmov` bounds clamp. Our `dense_switch`
+   emits that form (`PLIRON_SWITCH_MASK`) when the switch default is
+   `unreachable`, padding the table to a power of two.

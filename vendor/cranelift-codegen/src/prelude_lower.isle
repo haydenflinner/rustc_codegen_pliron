@@ -219,7 +219,7 @@
 (extern extractor jump_table_targets jump_table_targets)
 
 ;; The size of the jump table.
-(decl jump_table_size (BoxVecMachLabel) u32)
+(decl pure jump_table_size (BoxVecMachLabel) u32)
 (extern constructor jump_table_size jump_table_size)
 
 ;;;; Helper Clif Extractors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
