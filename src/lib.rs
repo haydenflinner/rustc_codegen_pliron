@@ -11,6 +11,7 @@ extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
+#[cfg(not(target_family = "wasm"))]
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
@@ -133,7 +134,7 @@ impl CodegenBackend for PlironCodegenBackend {
                 .iter()
                 .map(|f| Symbol::intern(f))
                 .collect(),
-            Arch::AArch64 if sess.target.os != Os::None => vec![Symbol::intern("neon")],
+            Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
             _ => vec![],
         };
         TargetConfig {

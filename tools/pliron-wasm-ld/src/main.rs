@@ -13,8 +13,23 @@ use wasm_encoder as we;
 use wasm_encoder::reencode::{Error as ReError, Reencode};
 use wasmparser as wp;
 
-const STACK: u32 = 1 << 20;
+static STACK_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1 << 20);
+
+fn stack() -> u32 {
+    STACK_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_z_option(opt: &str) {
+    if let Some(n) = opt
+        .strip_prefix("stack-size=")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        STACK_SIZE.store(n.next_multiple_of(16), std::sync::atomic::Ordering::Relaxed);
+    }
+}
 const GLOBAL: u8 = 1;
+const INIT_ARRAY: u8 = 4;
+const CALL_CTORS: &str = "__wasm_call_ctors";
 
 struct DataObj {
     name: String,
@@ -253,9 +268,11 @@ fn run() -> Result<(), String> {
             "--no-entry" => entry = false,
             "-L" => dirs.extend(it.next().cloned()),
             "-l" => libs.extend(it.next().cloned()),
-            "-z" | "-m" | "-flavor" | "--sysroot" => {
+            "-z" => it.next().into_iter().for_each(|o| set_z_option(o)),
+            "-m" | "-flavor" | "--sysroot" => {
                 it.next();
             }
+            s if s.starts_with("-z") => set_z_option(&s[2..]),
             s if s.starts_with("--export=") => exports.push(s["--export=".len()..].to_string()),
             s if s.starts_with("-L") => dirs.push(s[2..].to_string()),
             s if s.starts_with("-l") => libs.push(s[2..].to_string()),
@@ -315,7 +332,10 @@ fn run() -> Result<(), String> {
         is_in[i] = true;
     }
     // Explicit exports and the command entry point root archive members.
-    let roots = exports.iter().map(|s| &s[..]).chain(entry.then_some("_start"));
+    let roots = exports
+        .iter()
+        .map(|s| &s[..])
+        .chain(entry.then_some("_start"));
     for r in roots {
         if let Some(&p) = provider.get(r)
             && !is_in[p]
@@ -373,7 +393,7 @@ fn run() -> Result<(), String> {
     let mut host: Vec<(String, String, u32)> = Vec::new();
     for &oi in &included {
         for (m, n, t) in &objs[oi].fimports {
-            let linked = m == "env" && resolve(oi, n).is_some();
+            let linked = m == "env" && (resolve(oi, n).is_some() || n == CALL_CTORS);
             if !linked && !host.iter().any(|h| &h.0 == m && &h.1 == n) {
                 host.push((m.clone(), n.clone(), tmaps[&oi][*t as usize]));
             }
@@ -385,6 +405,8 @@ fn run() -> Result<(), String> {
         base.insert(oi, next);
         next += objs[oi].bodies.len() as u32;
     }
+    // `__wasm_call_ctors` is synthesized after every object's bodies.
+    let ctors_fn = next;
     let func_out = |d: Def| -> Option<u32> {
         match d {
             Def::Func(oi, f) => Some(base[&oi] + f - objs[oi].fimports.len() as u32),
@@ -399,6 +421,7 @@ fn run() -> Result<(), String> {
             m.push(match resolve(oi, n).filter(|_| md == "env") {
                 Some(d) => func_out(d)
                     .ok_or_else(|| format!("{}: {n} is data, called as a function", o.name))?,
+                None if md == "env" && n == CALL_CTORS => ctors_fn,
                 None => host.iter().position(|h| &h.0 == md && &h.1 == n).unwrap() as u32,
             });
         }
@@ -409,7 +432,7 @@ fn run() -> Result<(), String> {
 
     // Data layout.
     let mut addr: HashMap<(usize, usize), u32> = HashMap::new();
-    let mut cur = 1024 + STACK;
+    let mut cur = 1024 + stack();
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
             cur = cur.next_multiple_of(d.align.max(1));
@@ -438,6 +461,7 @@ fn run() -> Result<(), String> {
             match (resolve(oi, sym), sym) {
                 (Some(Def::Data(o, d)), _) if !func => Ok(addr[&(o, d)]),
                 (Some(d @ Def::Func(..)), _) if func => Ok(slot(func_out(d).unwrap(), table)),
+                (None, CALL_CTORS) if func => Ok(slot(ctors_fn, table)),
                 (None, "__heap_base") => Ok(heap_base),
                 (None, "__data_end") => Ok(data_end),
                 (None, "__heap_end") => Ok(heap_end),
@@ -490,6 +514,30 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Constructors: every pointer in an `.init_array` entry, in link order.
+    let mut ctors: Vec<u32> = Vec::new();
+    for &oi in &included {
+        for d in objs[oi].data.iter().filter(|d| d.flags & INIT_ARRAY != 0) {
+            for (_, func, sym, _) in &d.relocs {
+                let f = resolve(oi, sym)
+                    .filter(|_| *func)
+                    .and_then(func_out)
+                    .ok_or_else(|| format!("{}: bad constructor {sym}", objs[oi].name))?;
+                ctors.push(f);
+            }
+        }
+    }
+    let void_ty = match types
+        .iter()
+        .position(|t| t.params().is_empty() && t.results().is_empty())
+    {
+        Some(i) => i as u32,
+        None => {
+            types.push(wp::FuncType::new([], []));
+            types.len() as u32 - 1
+        }
+    };
+
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
     let names: Vec<String> = if exports.is_empty() {
@@ -537,6 +585,7 @@ fn run() -> Result<(), String> {
             fs.function(tmaps[&oi][*t as usize]);
         }
     }
+    fs.function(void_ty);
     module.section(&fs);
     let mut tab = we::TableSection::new();
     let tsize = table.len() as u64 + 1;
@@ -564,7 +613,7 @@ fn run() -> Result<(), String> {
             mutable: true,
             shared: false,
         },
-        &we::ConstExpr::i32_const((1024 + STACK) as i32),
+        &we::ConstExpr::i32_const((1024 + stack()) as i32),
     );
     for v in &gvals {
         gs.global(
@@ -602,6 +651,12 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
         }
     }
+    let mut call_ctors = we::Function::new([]);
+    for f in &ctors {
+        call_ctors.instruction(&we::Instruction::Call(*f));
+    }
+    call_ctors.instruction(&we::Instruction::End);
+    code.function(&call_ctors);
     module.section(&code);
     let mut named: Vec<(u32, &str)> = host
         .iter()
@@ -613,14 +668,30 @@ fn run() -> Result<(), String> {
             named.push((base[&oi] + f - objs[oi].fimports.len() as u32, n));
         }
     }
+    named.push((ctors_fn, CALL_CTORS));
     named.sort();
     named.dedup_by_key(|x| x.0);
     let mut fnames = we::NameMap::new();
     for (i, n) in named {
         fnames.append(i, n);
     }
+    // Engines cap the segment count (V8: 100k), so coalesce neighbours,
+    // zero-filling small gaps.
+    let mut merged: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut order: Vec<_> = segs.iter().collect();
+    order.sort_by_key(|s| s.0);
+    for (a, bytes) in order {
+        let (a, bytes) = (*a as u64, bytes.as_slice());
+        match merged.last_mut() {
+            Some((m, buf)) if a >= *m + buf.len() as u64 && a - (*m + buf.len() as u64) <= 64 => {
+                buf.resize((a - *m) as usize, 0);
+                buf.extend_from_slice(bytes);
+            }
+            _ => merged.push((a, bytes.to_vec())),
+        }
+    }
     let mut ds = we::DataSection::new();
-    for (a, bytes) in &segs {
+    for (a, bytes) in &merged {
         ds.active(
             0,
             &we::ConstExpr::i32_const(*a as i32),
@@ -639,7 +710,7 @@ fn run() -> Result<(), String> {
             included.iter().filter(|&&i| blobs[i].2).count(),
             next,
             host.len(),
-            data_end - 1024 - STACK
+            data_end - 1024 - stack()
         );
     }
     Ok(())

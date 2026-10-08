@@ -39,11 +39,13 @@ unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
 // ---- entry ----
 
 unsafe extern "C" {
+    fn __wasm_call_ctors();
     fn __main_void() -> c_int;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
+    unsafe { __wasm_call_ctors() };
     let r = unsafe { __main_void() };
     if r != 0 {
         unsafe { w::proc_exit(r as u32) }
@@ -1045,4 +1047,121 @@ pub unsafe extern "C" fn pthread_attr_destroy(_: *mut c_void) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_attr_setstacksize(_: *mut c_void, _: size_t) -> c_int {
     0
+}
+
+// ---- misc posix used by rustc ----
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __errno_location() -> *mut c_int {
+    &raw mut errno
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn isatty(fd: c_int) -> c_int {
+    match unsafe { w::fd_fdstat_get(fd as u32) } {
+        Ok(st) if st.fs_filetype == w::FILETYPE_CHARACTER_DEVICE => 1,
+        Ok(_) => {
+            unsafe { errno = libc::ENOTTY };
+            0
+        }
+        Err(e) => {
+            fail(e);
+            0
+        }
+    }
+}
+/// Variadic in C: `va` points at the optional argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ioctl(_fd: c_int, _req: c_int, _va: *mut c_void) -> c_int {
+    fail(w::ERRNO_NOTTY)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn readlinkat(
+    dirfd: c_int,
+    p: *const c_char,
+    out: *mut c_char,
+    n: size_t,
+) -> ssize_t {
+    let mut b = Path::new();
+    retn(
+        unsafe { resolve(dirfd, p, &mut b) }
+            .and_then(|(fd, rel)| unsafe { w::path_readlink(fd, rel, out.cast(), n) }),
+    )
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn link(a: *const c_char, b: *const c_char) -> c_int {
+    unsafe { linkat(libc::AT_FDCWD, a, libc::AT_FDCWD, b, 0) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn symlinkat(target: *const c_char, dirfd: c_int, p: *const c_char) -> c_int {
+    let t = unsafe { cstr(target) };
+    at!(dirfd, p, |fd, rel| w::path_symlink(t, fd, rel))
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faccessat(
+    dirfd: c_int,
+    p: *const c_char,
+    _mode: c_int,
+    flags: c_int,
+) -> c_int {
+    let lookup = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        0
+    } else {
+        w::LOOKUPFLAGS_SYMLINK_FOLLOW
+    };
+    at!(dirfd, p, |fd, rel| w::path_filestat_get(fd, lookup, rel))
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn access(p: *const c_char, mode: c_int) -> c_int {
+    unsafe { faccessat(libc::AT_FDCWD, p, mode, 0) }
+}
+/// Returns the error number directly, like POSIX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_fadvise(fd: c_int, off: off_t, len: off_t, advice: c_int) -> c_int {
+    let advice = match advice {
+        libc::POSIX_FADV_SEQUENTIAL => w::ADVICE_SEQUENTIAL,
+        libc::POSIX_FADV_RANDOM => w::ADVICE_RANDOM,
+        libc::POSIX_FADV_WILLNEED => w::ADVICE_WILLNEED,
+        libc::POSIX_FADV_DONTNEED => w::ADVICE_DONTNEED,
+        libc::POSIX_FADV_NOREUSE => w::ADVICE_NOREUSE,
+        _ => w::ADVICE_NORMAL,
+    };
+    match unsafe { w::fd_advise(fd as u32, off as u64, len as u64, advice) } {
+        Ok(()) => 0,
+        Err(e) => e.raw() as c_int,
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_fallocate(fd: c_int, off: off_t, len: off_t) -> c_int {
+    match unsafe { w::fd_allocate(fd as u32, off as u64, len as u64) } {
+        Ok(()) => 0,
+        Err(e) => e.raw() as c_int,
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fdatasync(fd: c_int) -> c_int {
+    ret(unsafe { w::fd_datasync(fd as u32) })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn preadv(fd: c_int, iov: *const iovec, n: c_int, off: off_t) -> ssize_t {
+    retn(unsafe {
+        w::fd_pread(
+            fd as u32,
+            core::slice::from_raw_parts(iov.cast(), n as usize),
+            off as u64,
+        )
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pwritev(fd: c_int, iov: *const iovec, n: c_int, off: off_t) -> ssize_t {
+    retn(unsafe {
+        w::fd_pwrite(
+            fd as u32,
+            core::slice::from_raw_parts(iov.cast(), n as usize),
+            off as u64,
+        )
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn sin(x: f64) -> f64 {
+    libm::sin(x)
 }

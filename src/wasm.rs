@@ -387,6 +387,8 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 }
 
 /// Link flags: bit 0 = global (visible to other objects), bit 1 = weak.
+const INIT_ARRAY: u8 = 4;
+
 fn link_flags(l: Linkage) -> u8 {
     match l {
         Linkage::Local => 0,
@@ -398,7 +400,8 @@ fn link_flags(l: Linkage) -> u8 {
 /// `pliron.link` v1, all integers u32 LE, strings length-prefixed:
 /// `nfuncs { name, u8 flags }` for defined functions, then
 /// `ndata { name, u8 flags, align, bytes, nrelocs { off, u8 is_func, sym, i32 addend } }`
-/// for defined data objects.
+/// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
+/// `.init_array` entry (constructor pointers the linker calls from `__wasm_call_ctors`).
 fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     let fs: Vec<_> = st
@@ -434,7 +437,11 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
         } else {
             g.linkage
         };
-        out.push(link_flags(l));
+        let ctor = g
+            .section
+            .as_deref()
+            .is_some_and(|s| s.starts_with(".init_array"));
+        out.push(link_flags(l) | if ctor { INIT_ARRAY } else { 0 });
         put_u32(&mut out, g.align.max(1) as u32);
         put_u32(&mut out, bytes.len() as u32);
         out.extend_from_slice(&bytes);
