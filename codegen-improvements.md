@@ -51,8 +51,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + single-store alloca forwarding before and after SROA splitting (`PLIRON_SROA_FWD`); in-loop frozen `&T` load hoisting written but opt-in (`PLIRON_FROZEN_HOIST=1`, +7% on `hm.rs`) | 1.24s | 2.44s | 5.73B (−0.3%) | 12.85B (−0.2%) | kept; `hm::get` 0x258 → 0x230 B, `hm.rs` 109.7M → 103.5M |
 | + inline callees up to 4× the limit at sites passing a constant address into their indirect-call target (`PLIRON_INLINE_DEVIRT`; hashbrown's `find_or_find_insert_index_inner` taking `&mut dyn FnMut`) | 1.25s | 2.40s | 5.71B (−0.3%) | 12.78B (−0.5%) | kept; 3-monomorph `HashMap::insert` test 361.9M → 224.2M (LLVM 176.7M) |
 | + loop rotation on CLIF: header exit test copied into the latch (`PLIRON_LOOPROT`) | 1.22s | 2.40s | 5.70B (−0.2%) | 12.87B (+0.7%) | opt-in only (`=1`): link got worse; `derive(Hash)` enum test 931.5M → 906.7M |
+| + vendored Cranelift x64: frameless leaf functions (no `push rbp`/`mov rbp,rsp` without calls, clobbers or stack), and switches with an `unreachable` default as a power-of-two table indexed by a masked value, which skips the `cmp`/`cmov` clamp (`PLIRON_SWITCH_MASK`) | 1.30s | 2.42s | 5.59B (−2.1%) | 12.50B (−2.2%) | kept (both on); `derive(Hash)` enum test 906.7M → 855.5M (frameless) → 808.3M (mask) |
 
-Net at the current defaults: 5.71B / 12.78B instructions (−62% / −60% vs baseline),
-1.25s / 2.40s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
+Net at the current defaults: 5.59B / 12.50B instructions (−62% / −61% vs baseline),
+1.30s / 2.42s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
