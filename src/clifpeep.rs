@@ -3,10 +3,19 @@
 //! `(K & (1 << s)) != 0` on i128 constants (rustc's `u128` bitset idiom, e.g.
 //! `is_id_continue`'s ASCII mask) becomes an i64 select + shift, like LLVM's
 //! lowering, instead of a full i128 shift and mask.
+//!
+//! `uextend (band|bor|bxor a, b)` on narrow ints becomes the op on extended
+//! operands, so `uextend (load.i8)` folds into one `movzx` instead of a byte
+//! op followed by another `movzx` (UTF-8 decoding, `u8` flag tests).
+//!
+//! A `load.i8`/`load.i16` that is also `uextend`ed becomes one zero-extending
+//! `uload` to i64; the narrow value and the extensions become `ireduce`s,
+//! which are free. x64 only folds `uextend (load)` when the load has a single
+//! use, so otherwise it re-extends the already-`movzx`ed register.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Function, InstBuilder, InstructionData, Opcode, Value, types};
+use cranelift_codegen::ir::{Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
@@ -104,12 +113,114 @@ fn narrow(pos: &mut FuncCursor, amt: Value) -> Option<Value> {
     })
 }
 
+fn widen(pos: &mut FuncCursor, inst: Inst, arg: Value) -> bool {
+    let f = &*pos.func;
+    let to = f.dfg.value_type(f.dfg.first_result(inst));
+    if to.is_vector() || !to.is_int() || to.bits() > 64 {
+        return false;
+    }
+    let arg = f.dfg.resolve_aliases(arg);
+    let Some(d) = f.dfg.value_def(arg).inst() else {
+        return false;
+    };
+    let InstructionData::Binary { opcode, args } = f.dfg.insts[d] else {
+        return false;
+    };
+    if !matches!(opcode, Opcode::Band | Opcode::Bor | Opcode::Bxor) {
+        return false;
+    }
+    let a = pos.ins().uextend(to, args[0]);
+    let b = pos.ins().uextend(to, args[1]);
+    let r = pos.func.replace(inst);
+    match opcode {
+        Opcode::Band => r.band(a, b),
+        Opcode::Bor => r.bor(a, b),
+        _ => r.bxor(a, b),
+    };
+    true
+}
+
+fn widen_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("PLIRON_WIDEN").is_ok_and(|v| v == "1"));
+    *ON
+}
+
+fn uloads(func: &mut Function) -> usize {
+    let mut users: rustc_data_structures::fx::FxHashMap<Value, Vec<Inst>> = Default::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } = func.dfg.insts[i]
+            {
+                let a = func.dfg.resolve_aliases(arg);
+                if let Some(d) = func.dfg.value_def(a).inst()
+                    && let InstructionData::Load {
+                        opcode: Opcode::Load,
+                        ..
+                    } = func.dfg.insts[d]
+                    && matches!(func.dfg.value_type(a), types::I8 | types::I16)
+                {
+                    users.entry(a).or_default().push(i);
+                }
+            }
+        }
+    }
+    let n = users.len();
+    let mut pos = FuncCursor::new(func);
+    for (r, exts) in users {
+        let l = pos.func.dfg.value_def(r).inst().unwrap();
+        let InstructionData::Load {
+            flags, arg, offset, ..
+        } = pos.func.dfg.insts[l]
+        else {
+            unreachable!()
+        };
+        let nt = pos.func.dfg.value_type(r);
+        let flags = pos.func.dfg.mem_flags[flags].clone();
+        pos.goto_inst(l);
+        let wide = if nt == types::I8 {
+            pos.ins().uload8(types::I64, flags, arg, offset)
+        } else {
+            pos.ins().uload16(types::I64, flags, arg, offset)
+        };
+        pos.func.replace(l).ireduce(nt, wide);
+        for u in exts {
+            let res = pos.func.dfg.first_result(u);
+            let to = pos.func.dfg.value_type(res);
+            if to == types::I64 {
+                pos.func.dfg.clear_results(u);
+                pos.func.layout.remove_inst(u);
+                pos.func.dfg.change_to_alias(res, wide);
+            } else {
+                pos.func.replace(u).ireduce(to, wide);
+            }
+        }
+    }
+    n
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
+    if std::env::var("PLIRON_ULOAD").is_ok_and(|v| v == "1") {
+        n += uloads(func);
+    }
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
+            if let InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } = pos.func.dfg.insts[inst]
+            {
+                if widen_on() && widen(&mut pos, inst, arg) {
+                    n += 1;
+                }
+                continue;
+            }
             let InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond,
