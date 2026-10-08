@@ -146,6 +146,8 @@ pub struct State<'tcx> {
     pub tailmerge: bool,
     /// Run `unreach` on each lowered Cranelift function (`-O`, `PLIRON_UNREACH`).
     pub unreach: bool,
+    /// Run `taildup` on each lowered Cranelift function (opt-in, `PLIRON_TAILDUP=1`).
+    pub taildup: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
