@@ -42,6 +42,7 @@ fn main() {
         .collect();
     names.sort();
     check("read_dir+rename", names == ["nested"]);
+    check("readdir align", readdir_aligned(&d));
     check(
         "exists",
         fs::metadata(format!("{d}/nested/b.txt")).unwrap().is_file(),
@@ -62,4 +63,31 @@ fn main() {
         (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
     );
     eprintln!("wasi std OK");
+}
+
+// std dereferences the returned `dirent` directly, so it must be suitably aligned.
+fn readdir_aligned(dir: &str) -> bool {
+    use std::ffi::{CString, c_char, c_void};
+    unsafe extern "C" {
+        fn opendir(p: *const c_char) -> *mut c_void;
+        fn readdir(d: *mut c_void) -> *mut u8;
+        fn closedir(d: *mut c_void) -> i32;
+    }
+    let p = CString::new(dir).unwrap();
+    unsafe {
+        let d = opendir(p.as_ptr());
+        if d.is_null() {
+            return false;
+        }
+        let mut ok = true;
+        loop {
+            let e = readdir(d);
+            if e.is_null() {
+                break;
+            }
+            ok &= e as usize % 8 == 0;
+        }
+        closedir(d);
+        ok
+    }
 }

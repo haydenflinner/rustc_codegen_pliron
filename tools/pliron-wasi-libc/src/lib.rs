@@ -853,8 +853,12 @@ pub struct Dir {
     len: usize,
     eof: bool,
     buf: [u8; DBUF],
-    ent: [u8; 16 + 512],
+    ent: Ent,
 }
+
+// std reads the returned `dirent` in place, so it needs `dirent`'s alignment.
+#[repr(C, align(8))]
+struct Ent([u8; 16 + 512]);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fdopendir(fd: c_int) -> *mut Dir {
@@ -910,12 +914,12 @@ pub unsafe extern "C" fn readdir(d: *mut Dir) -> *mut dirent {
                 let name = &d.buf[d.pos + H..d.pos + H + namlen];
                 d.pos += H + namlen;
                 d.cookie = next;
-                let n = namlen.min(d.ent.len() - 10);
-                d.ent[..8].copy_from_slice(&ino.to_le_bytes());
-                d.ent[8] = ty;
-                d.ent[9..9 + n].copy_from_slice(&name[..n]);
-                d.ent[9 + n] = 0;
-                return d.ent.as_mut_ptr().cast();
+                let n = namlen.min(d.ent.0.len() - 10);
+                d.ent.0[..8].copy_from_slice(&ino.to_le_bytes());
+                d.ent.0[8] = ty;
+                d.ent.0[9..9 + n].copy_from_slice(&name[..n]);
+                d.ent.0[9 + n] = 0;
+                return d.ent.0.as_mut_ptr().cast();
             }
         }
         if d.eof && avail < H {
