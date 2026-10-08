@@ -205,7 +205,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.st
             .borrow_mut()
             .calls
-            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None });
+            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false });
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -1090,6 +1090,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             funclet,
             instance,
         );
+        // `become`: mark the call as a tail call; the following Return op is
+        // skipped by the terminator logic once `return_call` is emitted.
+        let lc = self.st.borrow().last_call;
+        if let Some(p) = lc {
+            self.st.borrow_mut().calls.get_mut(&p).unwrap().tail = true;
+        }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
             _ => self.ret(r),

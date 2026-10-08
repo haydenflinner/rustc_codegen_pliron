@@ -112,6 +112,10 @@ pub struct CallInfo {
     /// Explicit calling convention for the call (e.g. `extern "win64"` calls
     /// on non-Windows hosts). None = the default for the callee kind.
     pub cc: Option<CallConv>,
+    /// `become f(...)`: emit a `return_call`/`return_call_indirect` (real TCO)
+    /// instead of call+ret. Only honored when the caller's own convention is
+    /// `CallConv::Tail` (Cranelift requires it).
+    pub tail: bool,
 }
 
 #[derive(Default)]

@@ -104,7 +104,7 @@ impl ModuleBufferMethods for PlironBuffer {
     }
 }
 
-fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
+fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     fb.set("is_pic", "true").unwrap();
     if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
@@ -123,8 +123,10 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
     // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
     // `PLIRON_OMIT_FP=0` keeps them unconditionally.
     let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
-    let keep_fp =
-        fp != rustc_target::spec::FramePointer::MayOmit || !pass_enabled("PLIRON_OMIT_FP");
+    // Cranelift's x64 `return_call` emission requires frame pointers.
+    let keep_fp = fp != rustc_target::spec::FramePointer::MayOmit
+        || !pass_enabled("PLIRON_OMIT_FP")
+        || tail_calls;
     fb.set(
         "preserve_frame_pointers",
         if keep_fp { "true" } else { "false" },
@@ -288,7 +290,11 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             asm: String::new(),
         };
     }
-    let isa = build_isa(cx.tcx.sess);
+    let isa = build_isa(
+        cx.tcx.sess,
+        cx.tcx.features().enabled(rustc_span::sym::explicit_tail_calls)
+            || std::env::var("PLIRON_TAILCALL").is_ok(),
+    );
     let hot = std::env::var("PLIRON_HOT")
         .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
     let obj = lower::lower_to_object(

@@ -47,7 +47,17 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
     let mut sig = Signature::new(cc);
     let apply = |p: AbiParam, e: ArgExt, t: ClType| match e {
         ArgExt::SRet => AbiParam::special(t, ArgumentPurpose::StructReturn),
-        ArgExt::ByVal(n) => AbiParam::special(t, ArgumentPurpose::StructArgument(n)),
+        // Cranelift requires StructArgument size to be a multiple of the
+        // 8-byte stack slot; pad to match SysV stack-arg placement. Above
+        // a sane ceiling (huge `repr(align)` types exceed Cranelift's
+        // implementation limits) drop the marker and pass the leaves.
+        ArgExt::ByVal(n) => {
+            if n <= (1 << 20) {
+                AbiParam::special(t, ArgumentPurpose::StructArgument(n.next_multiple_of(8)))
+            } else {
+                p
+            }
+        }
         ArgExt::Zext if t.is_int() && t.bits() < 32 => p.uext(),
         ArgExt::Sext if t.is_int() && t.bits() < 32 => p.sext(),
         _ => p,
@@ -255,6 +265,7 @@ pub fn lower_to_object(
                 terminated: false,
                 cc,
                 internal: &internal,
+                own_tail: internal.contains(n),
                 exn: None,
                 vars: FxHashMap::default(),
                 nonnull: FxHashSet::default(),
@@ -552,6 +563,9 @@ struct FnLower<'a, 'b, 'tcx> {
     cc: CallConv,
     /// Local functions using our internal ABI (`CallConv::Tail`).
     internal: &'a rustc_data_structures::fx::FxHashSet<String>,
+    /// This function's own convention is `CallConv::Tail` (it is internal), so
+    /// `return_call`/`return_call_indirect` are legal in its body.
+    own_tail: bool,
     exn: Option<cranelift_frontend::Variable>,
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
@@ -2077,6 +2091,23 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 Err((addr, self.b.import_signature(sig)))
             }
         };
+        if info.tail && self.own_tail {
+            // `return_call` produces no results, but the dead Return op after
+            // it still reads the call's result operand — bind dummies.
+            let mut dummies = Vals::new();
+            for p in self.b.func.signature.returns.clone() {
+                dummies.push(self.iconst_any(p.value_type, 0));
+            }
+            if !dummies.is_empty() {
+                self.set(op, dummies);
+            }
+            match target {
+                Ok(fr) => self.b.ins().return_call(fr, &cargs),
+                Err((addr, sr)) => self.b.ins().return_call_indirect(sr, addr, &cargs),
+            };
+            self.terminated = true;
+            return;
+        }
         let rs: Vals = if let Some(&(catch, is_catch)) = self.st.invokes.get(&op) {
             self.try_call(target, &cargs, catch, is_catch)
         } else {
