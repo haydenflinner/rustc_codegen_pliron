@@ -45,9 +45,13 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
         panic!("not a function type")
     };
     let mut sig = Signature::new(cc);
+    // Both ends of a tail-CC call are our code and Cranelift never trusts the
+    // upper bits of narrow values, so the platform ABI's extension is waste.
+    let noext = cc == CallConv::Tail && crate::pass_enabled("PLIRON_TAILCC_NOEXT");
     let apply = |p: AbiParam, e: ArgExt, t: ClType| match e {
         ArgExt::SRet => AbiParam::special(t, ArgumentPurpose::StructReturn),
         ArgExt::ByVal(n) => AbiParam::special(t, ArgumentPurpose::StructArgument(n)),
+        ArgExt::Zext | ArgExt::Sext if noext => p,
         ArgExt::Zext if t.is_int() && t.bits() < 32 => p.uext(),
         ArgExt::Sext if t.is_int() && t.bits() < 32 => p.sext(),
         _ => p,
