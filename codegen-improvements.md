@@ -59,8 +59,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + known bits of non-constant merge inputs decide tag tests after the merge; shifts/`stack_addr` count as pure merge-block ops (`PLIRON_KBITS`) | 1.18s | 2.30s | 5.43B (−0.2%) | 12.26B (−0.3%) | kept; packed `Result<u32, E>` tag tests (`(x<<32)&!0xff` vs `0x201`) now thread |
 | + direct PLT32 `call` to functions in other CGUs instead of GOT load + `call *reg` (`PLIRON_PLTCALL`, vendored Cranelift emit); alias block params fed one value by every predecessor before condition folding (`PLIRON_TRIVPARAM`) | 1.15s | 2.25s | 5.39B (−0.7%) | 12.11B (−1.2%) | kept; regex-syntax `.text` −1.5% / −0.6% |
 | + cross-CGU copies also for small callees of copied callees, 3 levels (`PLIRON_XCGU_DEPTH`) | 1.12s | 2.18s | 5.37B (−0.4%) | 12.06B (−0.4%) | kept; regex-syntax (16 CGUs) 136 → 147 copies |
+| + non-null facts for TLS/symbol/function/stack addresses (`PLIRON_NN_ADDR`) + inliner diagnostics | 1.18s | 2.35s | 5.37B (±0) | 12.06B (±0) | kept; no regex-syntax change (the facts matter in rustc code, not this crate) |
 
-Net at the current defaults: 5.59B / 12.50B instructions (−62% / −61% vs baseline),
-1.30s / 2.42s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
+Net at the current defaults: 5.37B / 12.06B instructions (−64% / −62% vs baseline),
+1.18s / 2.35s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.73×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
