@@ -281,7 +281,16 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let v = self.type_void();
         self.intrinsic("llvm.trap", v, &[]);
     }
-    fn assume(&mut self, _val: Value) {}
+    fn assume(&mut self, val: Value) {
+        // `assume(false)` marks the rest of the block unreachable (e.g. the
+        // `unreachable_unchecked` UB-check path); `unreach` then drops the
+        // branch into it.
+        if crate::pass_enabled("PLIRON_UNREACH") && self.cx.const_to_opt_uint(val) == Some(0) {
+            let rest = self.append_sibling_block("assume_false");
+            self.unreachable();
+            self.switch_to_block(rest);
+        }
+    }
     fn retag_mem(&mut self, _place: Value, _info: &rustc_codegen_ssa::RetagInfo<Value>) {}
     fn retag_reg(&mut self, ptr: Value, _info: &rustc_codegen_ssa::RetagInfo<Value>) -> Value {
         ptr

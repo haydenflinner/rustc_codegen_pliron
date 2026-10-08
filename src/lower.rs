@@ -210,6 +210,7 @@ pub fn lower_to_object(
     let mut clctx = m.make_context();
     let mut threaded = 0usize;
     let mut merged = 0usize;
+    let mut unreached = 0usize;
     let mut forwarded = 0usize;
     let mut peeped = 0usize;
     for (n, f) in &st.funcs {
@@ -252,6 +253,14 @@ pub fn lower_to_object(
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
+        }
+        if st.unreach {
+            unreached += crate::unreach::run(&mut clctx.func);
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
+            }
         }
         if st.jumpthread {
             threaded += crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
@@ -300,7 +309,9 @@ pub fn lower_to_object(
         eprintln!("loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes");
     }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
-        eprintln!("jumpthread {name}: {threaded} edges threaded, {merged} exit blocks merged");
+        eprintln!(
+            "jumpthread {name}: {threaded} edges threaded, {merged} exit blocks merged, {unreached} unreachable edges"
+        );
     }
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
