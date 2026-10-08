@@ -83,6 +83,21 @@ fn opts() -> u32 {
     s
 }
 
+#[inline(never)]
+fn arith(x: u32) -> u32 {
+    let mut a = [0u32; 8];
+    for i in 0..8usize {
+        let k = i as u32;
+        a[i] = x.rotate_left(k * 3)
+            ^ ((k * k) << (k % 3))
+            ^ (((k as i8).wrapping_neg() >> 1) as u32)
+            ^ (100 / (k + 1))
+            ^ (k.wrapping_mul(0x9e37_79b9) >> 29)
+            ^ (((k as u8) << 6) as u32);
+    }
+    a.iter().fold(0, |s, &v| s.rotate_left(7) ^ v)
+}
+
 fn main() {
     let mut inp = [0u8; 64];
     for (i, b) in inp.iter_mut().enumerate() {
@@ -97,4 +112,5 @@ fn main() {
     println!("dynamic {}", dynamic(black_box(11), &[1, 2, 3, 4, 5, 6, 7, 8]));
     println!("panics {}", panics(black_box(2)));
     println!("opts {}", opts());
+    println!("arith {}", arith(black_box(0xdead_beef)));
 }

@@ -87,6 +87,8 @@ pub(crate) fn eval(
     rg: &dyn Fn(Value) -> Option<(u64, u64)>,
     inst: Inst,
 ) -> Option<u64> {
+    static ARITH: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_EVAL_ARITH"));
     let res = func.dfg.first_result(inst);
     let w = bits(func, res)?;
     let r = match func.dfg.insts[inst] {
@@ -147,6 +149,21 @@ pub(crate) fn eval(
                 Opcode::Bxor => a ^ b,
                 Opcode::Iadd => a.wrapping_add(b),
                 Opcode::Isub => a.wrapping_sub(b),
+                Opcode::Imul if *ARITH => a.wrapping_mul(b),
+                Opcode::Udiv if *ARITH && b != 0 => a / b,
+                Opcode::Urem if *ARITH && b != 0 => a % b,
+                Opcode::Ishl if *ARITH => a << (b & u64::from(w - 1)),
+                Opcode::Ushr if *ARITH => a >> (b & u64::from(w - 1)),
+                Opcode::Sshr if *ARITH => (sext(a, w) >> (b & u64::from(w - 1))) as u64,
+                Opcode::Rotl | Opcode::Rotr if *ARITH => {
+                    let s = (b & u64::from(w - 1)) as u32;
+                    let (l, r) = if opcode == Opcode::Rotl {
+                        (s, w - s)
+                    } else {
+                        (w - s, s)
+                    };
+                    if s == 0 { a } else { (a << l) | (a >> r) }
+                }
                 _ => return None,
             }
         }
