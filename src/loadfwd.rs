@@ -106,7 +106,11 @@ fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>, eh: bool)
 /// before unwinding: loads available after the call don't survive into `b`.
 fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bool>) -> bool {
     match func.dfg.insts[inst] {
-        InstructionData::TryCall { func_ref, exception, .. } => {
+        InstructionData::TryCall {
+            func_ref,
+            exception,
+            ..
+        } => {
             nw.get(&func_ref) == Some(&false)
                 && func.dfg.exception_tables[exception]
                     .normal_return()
@@ -517,4 +521,57 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
         func.dfg.change_to_alias(r, v);
     }
     fwd.len()
+}
+
+/// Remove stores into stack slots that nothing reads and whose address never
+/// escapes, typically left behind once every load out of the slot has been
+/// forwarded (`PLIRON_SLOT_DSE`). Returns the number of stores removed.
+pub fn dead_slot_stores(func: &mut Function) -> usize {
+    let mut dead: FxHashSet<StackSlot> = func.sized_stack_slots.keys().collect();
+    if dead.is_empty() {
+        return 0;
+    }
+    let mut stores = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let data = &func.dfg.insts[i];
+            if let InstructionData::StackAddr {
+                opcode, stack_slot, ..
+            } = *data
+                && opcode != Opcode::StackAddr
+            {
+                dead.remove(&stack_slot);
+            }
+            for (k, v) in func.dfg.inst_values(i).enumerate() {
+                let Root::S(s) = root(func, v).0 else {
+                    continue;
+                };
+                if !dead.contains(&s) {
+                    continue;
+                }
+                let ok = match data {
+                    InstructionData::Store { .. } if k == 1 => {
+                        stores.push((i, s));
+                        true
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        ..
+                    } => root(func, func.dfg.first_result(i)).0 == Root::S(s),
+                    _ => false,
+                };
+                if !ok {
+                    dead.remove(&s);
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for (i, s) in stores {
+        if dead.contains(&s) {
+            func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
 }

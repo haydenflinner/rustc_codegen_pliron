@@ -219,6 +219,7 @@ pub fn lower_to_object(
     let mut unreached = 0usize;
     let mut dupd = 0usize;
     let mut forwarded = 0usize;
+    let mut slot_dse = 0usize;
     let mut peeped = 0usize;
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -319,6 +320,9 @@ pub fn lower_to_object(
         }
         if st.loadfwd {
             forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
+            if st.slot_dse {
+                slot_dse += crate::loadfwd::dead_slot_stores(&mut clctx.func);
+            }
             if dump {
                 eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
             }
@@ -394,7 +398,9 @@ pub fn lower_to_object(
     }
 
     if st.loadfwd && std::env::var_os("PLIRON_STATS").is_some() {
-        eprintln!("loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes");
+        eprintln!(
+            "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
+        );
     }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
         eprintln!(

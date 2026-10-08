@@ -258,6 +258,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
         st.loadfwd = pass_enabled("PLIRON_LOADFWD");
+        st.slot_dse = pass_enabled("PLIRON_SLOT_DSE");
         st.peep = pass_enabled("PLIRON_PEEP");
         st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
         st.unreach = pass_enabled("PLIRON_UNREACH");

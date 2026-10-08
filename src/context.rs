@@ -156,6 +156,8 @@ pub struct State<'tcx> {
 
     /// Run `loadfwd` on each lowered Cranelift function (`-O`, `PLIRON_LOADFWD`).
     pub loadfwd: bool,
+    /// Drop stores into unread, non-escaping stack slots (`PLIRON_SLOT_DSE`).
+    pub slot_dse: bool,
 
     /// Run `clifpeep` on each lowered Cranelift function (`-O`, `PLIRON_PEEP`).
     pub peep: bool,
