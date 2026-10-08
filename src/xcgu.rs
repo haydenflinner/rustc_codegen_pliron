@@ -13,7 +13,10 @@ use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_span::Spanned;
 
 fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool {
-    if !matches!(inst.def, InstanceKind::Item(_)) {
+    // Items and shims (drop glue, closure-once, reify/fnptr, ...) all have
+    // MIR bodies LLVM can inline across CGUs; other kinds (virtual,
+    // intrinsic, vtable) have no copyable body here.
+    if !matches!(inst.def, InstanceKind::Item(_) | InstanceKind::Shim(_)) {
         return false;
     }
     let a = tcx.codegen_instance_attrs(inst.def);
