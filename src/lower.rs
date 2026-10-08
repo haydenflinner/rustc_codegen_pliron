@@ -347,7 +347,16 @@ pub fn lower_to_object(
         if st.loadfwd {
             forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
             if st.slot_dse {
-                slot_dse += crate::loadfwd::dead_slot_stores(&mut clctx.func);
+                // A load whose only user was a removed dead store keeps its own
+                // slot alive, so alternate the two until nothing changes.
+                for _ in 0..4 {
+                    slot_dse += crate::loadfwd::dead_slot_stores(&mut clctx.func);
+                    if !crate::pass_enabled("PLIRON_DEAD_LOADS")
+                        || crate::loadfwd::dead_loads(&mut clctx.func) == 0
+                    {
+                        break;
+                    }
+                }
             }
             if dump {
                 eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
