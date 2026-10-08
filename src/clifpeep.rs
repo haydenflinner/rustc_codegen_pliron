@@ -194,6 +194,8 @@ fn uloads(func: &mut Function) -> usize {
                 pos.func.dfg.clear_results(u);
                 pos.func.layout.remove_inst(u);
                 pos.func.dfg.change_to_alias(res, wide);
+            } else if to.bits() > 64 {
+                pos.func.replace(u).uextend(to, wide);
             } else {
                 pos.func.replace(u).ireduce(to, wide);
             }
