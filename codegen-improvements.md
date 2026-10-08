@@ -62,8 +62,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + non-null facts for TLS/symbol/function/stack addresses (`PLIRON_NN_ADDR`) + inliner diagnostics | 1.18s | 2.35s | 5.37B (±0) | 12.06B (±0) | kept; no regex-syntax change (the facts matter in rustc code, not this crate) |
 | + xcgu copies for `InstanceKind::Shim` (drop glue, closure-once, reify/fnptr shims) | 1.17s | 2.27s | 5.37B (±0) | 12.06B (±0) | kept; no regex-syntax change either — shims are rare in this crate — but it's the right thing (LLVM can inline those bodies) |
 | + SROA copies untyped gaps as the widest unaligned chunk instead of offset-aligned 1/2/4/1 pieces (`PLIRON_SROA_GAPWIDE`) | 1.18s | 2.33s | 5.34B (−0.6%) | 12.02B (−0.3%) | kept; query accessors (`TyCtxt::features`, `as_lang_item`) loaded an `Erased<[u8;8]>` as 4 pieces + shift/or/mask reassembly and kept 4 callee-saved regs live; now one 8-byte `mov` like LLVM |
+| + dead block-param elimination (`PLIRON_DEADPARAM`) + range facts without a dominating test and through `uextend`/`clz`/`k-x`/`ushr` (`PLIRON_RANGE2`) | 1.20s | 2.35s | 5.28B (−1.1%) | 11.89B (−1.1%) | kept; measured together. regex-syntax `.text` 559,422 → 547,301 (deadparam, 9,063 params removed) → 546,814 B (range2, 3,204 → 3,732 conditions folded). `expect_hir_owner_nodes` 0x700 → 0x4c8 bytes (LLVM 0x26c): the `uextend u32 > u32::MAX` tests and the VecCache bucket bounds checks are gone |
 
-Net at the current defaults: 5.34B / 12.02B instructions (−64% / −63% vs baseline),
-1.18s / 2.33s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.72×).
+Net at the current defaults: 5.28B / 11.89B instructions (−64% / −63% vs baseline),
+1.20s / 2.35s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.70×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
