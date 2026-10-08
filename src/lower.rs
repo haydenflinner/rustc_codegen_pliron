@@ -1400,6 +1400,46 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
     }
 
+    /// Runtime-size copy: sizes in [k, 2k] (k = 16, or 8 without SIMD) are two
+    /// overlapping k-byte moves, loads first so it is also a valid memmove; other
+    /// sizes call libc. `PLIRON_MEMFAST=0` always calls libc.
+    fn small_copy_or_call(&mut self, memcpy: bool, dst: ir::Value, src: ir::Value, n: ir::Value) {
+        let t = if crate::pass_enabled("PLIRON_SIMD") {
+            clt::I8X16
+        } else {
+            clt::I64
+        };
+        let k = t.bytes() as i64;
+        let (fast, slow, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
+        let m = self.b.ins().iadd_imm_s(n, -k);
+        let c = self
+            .b
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, m, k);
+        self.b.ins().brif(c, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let (se, de) = (self.b.ins().iadd(src, m), self.b.ins().iadd(dst, m));
+        let f = MemFlagsData::new();
+        let v0 = self.b.ins().load(t, f, src, 0);
+        let v1 = self.b.ins().load(t, f, se, 0);
+        self.b.ins().store(f, v0, dst, 0);
+        self.b.ins().store(f, v1, de, 0);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(slow);
+        let cfg = self.m.target_config();
+        if memcpy {
+            self.b.call_memcpy(cfg, dst, src, n);
+        } else {
+            self.b.call_memmove(cfg, dst, src, n);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
     fn lower_intrinsic(&mut self, op: Ptr<Operation>, opnds: &[Value]) {
         let name = self.st.intrinsics[&op].as_str();
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
@@ -1418,6 +1458,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     for (o, v) in vals {
                         self.b.ins().store(MemFlagsData::new(), v, a[0], o);
                     }
+                    return;
+                }
+                if crate::pass_enabled("PLIRON_MEMFAST")
+                    && !self.st.volatile.contains(&op)
+                    && self.b.func.dfg.value_type(a[2]) == clt::I64
+                {
+                    self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2]);
                     return;
                 }
                 let cfg = self.m.target_config();
