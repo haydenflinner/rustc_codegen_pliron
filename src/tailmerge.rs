@@ -88,6 +88,40 @@ fn constant(func: &Function, v: Value) -> Option<String> {
     ))
 }
 
+fn rematerialize_constants(func: &mut Function, block: Block) {
+    let insts: Vec<_> = func.layout.block_insts(block).collect();
+    let mut copies: FxHashMap<Value, Value> = FxHashMap::default();
+    for inst in insts {
+        let args = func.dfg.inst_args(inst).to_vec();
+        for (n, arg) in args.into_iter().enumerate() {
+            let arg = func.dfg.resolve_aliases(arg);
+            let replacement = if let Some(&copy) = copies.get(&arg) {
+                Some(copy)
+            } else {
+                let def = func.dfg.value_def(arg).inst().filter(|&def| {
+                    func.layout.inst_block(def) != Some(block) && constant(func, arg).is_some()
+                });
+                if let Some(def) = def {
+                    let ty = func.dfg.value_type(arg);
+                    let data = func.dfg.insts[def].clone();
+                    let copy = func.dfg.make_inst(data);
+                    func.dfg.make_inst_results(copy, ty);
+                    let value = func.dfg.first_result(copy);
+                    let first = func.layout.first_inst(block).unwrap();
+                    func.layout.insert_inst(copy, first);
+                    copies.insert(arg, value);
+                    Some(value)
+                } else {
+                    None
+                }
+            };
+            if let Some(replacement) = replacement {
+                func.dfg.inst_args_mut(inst)[n] = replacement;
+            }
+        }
+    }
+}
+
 /// Returns the number of blocks merged away.
 pub fn run(func: &mut Function) -> usize {
     let entry = func.layout.entry_block();
@@ -111,6 +145,12 @@ pub fn run(func: &mut Function) -> usize {
     }
     if map.is_empty() {
         return 0;
+    }
+    let targets: FxHashSet<Block> = map.values().copied().collect();
+    for &b in &blocks {
+        if targets.contains(&b) {
+            rematerialize_constants(func, b);
+        }
     }
     let dead: FxHashSet<Block> = map.keys().copied().collect();
     for &b in &blocks {
