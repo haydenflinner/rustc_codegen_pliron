@@ -1,6 +1,7 @@
 //! Rust intrinsics -> pliron ops / `llvm.*` intrinsic calls / libm calls.
 
 use pliron::value::Value;
+use rustc_abi::Align;
 use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
@@ -89,6 +90,10 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             return imm(self.call_sym(f, ret, &vs));
         }
         let r = match name {
+            sym::va_arg => {
+                let v = self.va_arg(a(0), ret);
+                return imm(v);
+            }
             sym::ctpop | sym::ctlz | sym::cttz | sym::ctlz_nonzero | sym::cttz_nonzero => {
                 let x = a(0);
                 let ty = self.val_ty(x);
@@ -306,9 +311,11 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         panic!("type_checked_load is not supported by the pliron backend")
     }
-    fn va_start(&mut self, _val: Value) {
-        self.tcx
-            .dcx()
-            .fatal("C-variadic functions are not supported by the pliron backend yet")
+    fn va_start(&mut self, val: Value) {
+        // The variadic-argument buffer pointer, delivered by the lowering as the
+        // hidden extra parameter of a C-variadic function; the VaList place is
+        // used as a cursor into it.
+        let buf = self.intrinsic("pliron.va.buf", self.type_ptr(), &[]);
+        self.store(buf, val, Align::EIGHT);
     }
 }

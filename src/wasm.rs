@@ -570,6 +570,8 @@ struct FL<'o, 'a, 'tcx> {
     epi: Option<WBlock>,
     /// This function's wasm result types, for the epilogue's dummy values.
     rets: Vec<WT>,
+    /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
+    va_buf: Option<WV>,
 }
 
 impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
@@ -596,6 +598,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             mask_c: WV::invalid(),
             frame: 0,
             frame_align: 16,
+            va_buf: None,
         };
         let sp = fl.o.sp;
         fl.sp0 = fl.op(O::GlobalGet { global_index: sp }, &[], WT::I32);
@@ -954,6 +957,10 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             let n = wleaves(ctx, arg.get_type(ctx)).len();
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
+        }
+        if i < params.len() {
+            // Variadic functions carry one extra hidden param (see wsig).
+            self.va_buf = Some(params[i]);
         }
         for pb in rpo(ctx, self.st, &pblocks) {
             self.cur = self.blocks[&pb];
@@ -2121,6 +2128,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 let z = self.i32c(0);
                 self.store(clt::I32, z, p, 0);
                 self.set(op, smallvec![exn]);
+                return;
+            }
+            "pliron.va.buf" => {
+                let v = self.va_buf.expect("pliron.va.buf in a non-variadic function");
+                self.set(op, smallvec![v]);
                 return;
             }
             // Rethrow: the unwind continues out of this function.

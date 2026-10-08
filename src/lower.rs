@@ -41,7 +41,7 @@ enum Sym {
 }
 
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
-    let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else {
+    let TyK::Func(ret, args, var_arg) = classify(ctx, fn_ty) else {
         panic!("not a function type")
     };
     let mut sig = Signature::new(cc);
@@ -60,6 +60,15 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
             let p = AbiParam::new(t);
             sig.params.push(if single { apply(p, e, t) } else { p });
         }
+    }
+    if var_arg {
+        // C-variadic definitions: callers pass the variadic args packed in a
+        // buffer whose address arrives as one extra pointer parameter.
+        sig.params.push(AbiParam::new(if crate::types::ptr32() {
+            clt::I32
+        } else {
+            clt::I64
+        }));
     }
     let lv = leaves(ctx, ret);
     let single = lv.len() == 1;
@@ -252,6 +261,7 @@ pub fn lower_to_object(
                 bool01: FxHashSet::default(),
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
+                va_buf: None,
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -553,6 +563,8 @@ struct FnLower<'a, 'b, 'tcx> {
     derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
     /// Entry params pointing at frozen memory → dereferenceable bytes.
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
+    /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
+    va_buf: Option<ir::Value>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -617,6 +629,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
+        }
+        if i < params.len() {
+            // Variadic functions carry one extra hidden param (see make_sig).
+            self.va_buf = Some(params[i]);
         }
         let (order, live) = rpo_split(ctx, self.st, &pblocks);
         for (k, pb) in order.into_iter().enumerate() {
@@ -1183,6 +1199,120 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 P::ULE => FloatCC::UnorderedOrLessThanOrEqual,
                 P::UNE => FloatCC::NotEqual,
             };
+            if self.b.func.dfg.value_type(a) == clt::F128 {
+                // x64 Cranelift cannot compare f128: lower via compiler-rt
+                // `__*tf2` comparison helpers, as LLVM does.
+                let lc = |this: &mut Self, s: &str| {
+                    this.libcall(s, &[clt::F128, clt::F128], &[clt::I32], &[a, b])[0]
+                };
+                let z = |this: &mut Self| this.b.ins().iconst(clt::I32, 0);
+                let eq = |this: &mut Self, r: ir::Value| {
+                    let z = this.b.ins().iconst(clt::I32, 0);
+                    this.b.ins().icmp(IntCC::Equal, r, z)
+                };
+                let cmp = match pred {
+                    P::False | P::True => {
+                        let v =
+                            self.b.ins().iconst(clt::I8, matches!(pred, P::True) as i64);
+                        return self.set1(op, v);
+                    }
+                    P::OEQ => {
+                        let r = lc(self, "__eqtf2");
+                        eq(self, r)
+                    }
+                    P::OGT => {
+                        let r = lc(self, "__gttf2");
+                        let z = z(self);
+                        self.b.ins().icmp(IntCC::SignedGreaterThan, r, z)
+                    }
+                    P::OGE => {
+                        let r = lc(self, "__getf2");
+                        let z = z(self);
+                        self.b
+                            .ins()
+                            .icmp(IntCC::SignedGreaterThanOrEqual, r, z)
+                    }
+                    P::OLT => {
+                        let r = lc(self, "__lttf2");
+                        let z = z(self);
+                        self.b.ins().icmp(IntCC::SignedLessThan, r, z)
+                    }
+                    P::OLE => {
+                        let r = lc(self, "__letf2");
+                        let z = z(self);
+                        self.b
+                            .ins()
+                            .icmp(IntCC::SignedLessThanOrEqual, r, z)
+                    }
+                    P::UNE => {
+                        let r = lc(self, "__netf2");
+                        let z = z(self);
+                        self.b.ins().icmp(IntCC::NotEqual, r, z)
+                    }
+                    P::ORD => {
+                        let r = lc(self, "__unordtf2");
+                        let z = z(self);
+                        self.b.ins().icmp(IntCC::Equal, r, z)
+                    }
+                    P::UNO => {
+                        let r = lc(self, "__unordtf2");
+                        let z = z(self);
+                        self.b.ins().icmp(IntCC::NotEqual, r, z)
+                    }
+                    P::ONE => {
+                        let u = {
+                            let r = lc(self, "__unordtf2");
+                            let z = z(self);
+                            self.b.ins().icmp(IntCC::Equal, r, z)
+                        };
+                        let n = {
+                            let r = lc(self, "__netf2");
+                            let z = z(self);
+                            self.b.ins().icmp(IntCC::NotEqual, r, z)
+                        };
+                        self.b.ins().band(u, n)
+                    }
+                    P::UEQ | P::UGT | P::UGE | P::ULT | P::ULE => {
+                        let u = {
+                            let r = lc(self, "__unordtf2");
+                            let z = z(self);
+                            self.b.ins().icmp(IntCC::NotEqual, r, z)
+                        };
+                        let o = match pred {
+                            P::UEQ => {
+                                let r = lc(self, "__eqtf2");
+                                eq(self, r)
+                            }
+                            P::UGT => {
+                                let r = lc(self, "__gttf2");
+                                let z = z(self);
+                                self.b.ins().icmp(IntCC::SignedGreaterThan, r, z)
+                            }
+                            P::UGE => {
+                                let r = lc(self, "__getf2");
+                                let z = z(self);
+                                self.b
+                                    .ins()
+                                    .icmp(IntCC::SignedGreaterThanOrEqual, r, z)
+                            }
+                            P::ULT => {
+                                let r = lc(self, "__lttf2");
+                                let z = z(self);
+                                self.b.ins().icmp(IntCC::SignedLessThan, r, z)
+                            }
+                            _ => {
+                                let r = lc(self, "__letf2");
+                                let z = z(self);
+                                self.b
+                                    .ins()
+                                    .icmp(IntCC::SignedLessThanOrEqual, r, z)
+                            }
+                        };
+                        self.b.ins().bor(u, o)
+                    }
+                };
+                return self.set1(op, cmp);
+            }
             let r = self.b.ins().fcmp(cc, a, b);
             self.set1(op, r);
         } else if is!(AddOp) {
@@ -1885,19 +2015,48 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             _ => self.cc,
         };
+        // The caller recorded an explicit ABI override (e.g. `extern "win64"`
+        // called on a SysV host).
+        let cc = info.cc.unwrap_or(cc);
         let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         for a in args {
             cargs.extend(self.get(a));
         }
-        // C variadic: fn_ty only has the fixed params; on SysV the rest are
-        // passed like ordinary arguments of their own types.
+        // C variadic: fn_ty only has the fixed params. Foreign callees get the
+        // real SysV ABI (extra args passed like ordinary arguments); callees
+        // compiled by this backend get the args packed in a buffer whose
+        // address is the extra param make_sig appends.
         let var_arg = matches!(classify(ctx, fn_ty), TyK::Func(_, _, true));
         if var_arg {
-            for &v in &cargs[sig.params.len()..] {
-                sig.params
-                    .push(AbiParam::new(self.b.func.dfg.value_type(v)));
+            let foreign = info.foreign;
+            if foreign {
+                sig.params.pop();
+                for &v in &cargs[sig.params.len()..] {
+                    sig.params
+                        .push(AbiParam::new(self.b.func.dfg.value_type(v)));
+                }
+            } else {
+                let va: Vec<ir::Value> =
+                    cargs.drain(sig.params.len() - 1..).collect();
+                let mut off = 0u64;
+                let lay: Vec<(u64, ClType)> = va
+                    .iter()
+                    .map(|&v| {
+                        let t = self.b.func.dfg.value_type(v);
+                        let n = t.bytes() as u64;
+                        off = off.next_multiple_of(n);
+                        let at = off;
+                        off += n;
+                        (at, t)
+                    })
+                    .collect();
+                let buf = self.slot(off.max(1), 16);
+                for (&v, &(at, t)) in va.iter().zip(&lay) {
+                    self.b.ins().store(MemFlagsData::new(), v, buf, at as i32);
+                }
+                cargs.push(buf);
             }
         }
         let target = match call.callee(ctx) {
@@ -1987,6 +2146,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
             "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
+            "pliron.va.buf" => {
+                self.va_buf.expect("pliron.va.buf in a non-variadic function")
+            }
             "llvm.memcpy" | "llvm.memmove" => {
                 if let Some(n) = self
                     .const_int(opnds[2])

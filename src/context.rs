@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 
+use cranelift_codegen::isa::CallConv;
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SingleBlockRegionInterface;
@@ -104,6 +105,13 @@ pub struct GlobalInfo {
 pub struct CallInfo {
     pub fn_ty: TypeHandle,
     pub exts: Exts,
+    /// Whether the callee is a foreign (extern) function; only meaningful for
+    /// C-variadic signatures, where foreign callees get real inline C-ABI
+    /// arguments and Rust callees get a packed buffer pointer.
+    pub foreign: bool,
+    /// Explicit calling convention for the call (e.g. `extern "win64"` calls
+    /// on non-Windows hosts). None = the default for the callee kind.
+    pub cc: Option<CallConv>,
 }
 
 #[derive(Default)]

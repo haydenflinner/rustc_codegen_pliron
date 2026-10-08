@@ -205,7 +205,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.st
             .borrow_mut()
             .calls
-            .insert(p, CallInfo { fn_ty, exts });
+            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None });
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -852,10 +852,26 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| SelectOp::new(c, cond, then_val, else_val))
     }
 
-    fn va_arg(&mut self, _list: Value, _ty: TypeHandle) -> Value {
-        self.tcx
-            .dcx()
-            .fatal("va_arg is not supported by the pliron backend yet")
+    fn va_arg(&mut self, list: Value, ty: TypeHandle) -> Value {
+        // `va_start` stored a cursor (pointer into the packed variadic-arg
+        // buffer) at offset 0 of the VaList place: align it to `ty`, load, and
+        // advance by `ty`'s size, matching the packing in the call lowering.
+        let (size, align) = crate::types::size_align(&self.cx.pctx.borrow(), ty);
+        let ptr = self.type_ptr();
+        let isize = self.type_isize();
+        let cur_p = self.load(ptr, list, Align::EIGHT);
+        let cur = self.ptrtoint(cur_p, isize);
+        let a1 = self.const_usize(align - 1);
+        let mask = self.const_usize(!(align - 1));
+        let cur_a1 = self.add(cur, a1);
+        let aligned = self.and(cur_a1, mask);
+        let p = self.inttoptr(aligned, ptr);
+        let v = self.load(ty, p, Align::from_bytes(align).unwrap());
+        let sz = self.const_usize(size);
+        let next = self.add(aligned, sz);
+        let next = self.inttoptr(next, ptr);
+        self.store(next, list, Align::EIGHT);
+        v
     }
 
     fn extract_element(&mut self, vec: Value, idx: Value) -> Value {
@@ -1008,7 +1024,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         return_slot: ReturnSlot<Value>,
         args: &[Value],
         _funclet: Option<&Value>,
-        _instance: Option<Instance<'tcx>>,
+        instance: Option<Instance<'tcx>>,
     ) -> Value {
         let mut full = Vec::with_capacity(args.len() + 1);
         if let ReturnSlot::Indirect(p) = return_slot {
@@ -1016,7 +1032,41 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         full.extend_from_slice(args);
         let exts = fn_abi.map(crate::type_of::exts_of).unwrap_or_default();
-        self.call_raw(llty, llfn, &full, exts)
+        let v = self.call_raw(llty, llfn, &full, exts);
+        // `foreign` callees get variadic args via the real C ABI: extern items,
+        // and `#[naked]` definitions, whose hand-written asm reads the native
+        // varargs convention (register save area) rather than our buffer.
+        let (foreign, cc) = match instance {
+            Some(i)
+                if fn_abi.is_some_and(|a| a.c_variadic)
+                    && matches!(i.def, rustc_middle::ty::InstanceKind::Item(_)) =>
+            {
+                let foreign = self.tcx.is_foreign_item(i.def_id())
+                    || self
+                        .tcx
+                        .codegen_fn_attrs(i.def_id())
+                        .flags
+                        .contains(
+                            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
+                        );
+                let cc = match self.tcx.fn_sig(i.def_id()).skip_binder().abi() {
+                    rustc_abi::ExternAbi::Win64 { .. } => {
+                        Some(cranelift_codegen::isa::CallConv::WindowsFastcall)
+                    }
+                    _ => None,
+                };
+                (foreign, cc)
+            }
+            _ => (false, None),
+        };
+        let lc = self.st.borrow().last_call;
+        if let Some(p) = lc {
+            let mut st = self.st.borrow_mut();
+            let info = st.calls.get_mut(&p).unwrap();
+            info.foreign = foreign;
+            info.cc = cc;
+        }
+        v
     }
 
     fn tail_call(
