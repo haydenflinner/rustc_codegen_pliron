@@ -557,6 +557,56 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             .collect()
     }
 
+    /// One `br_table` over `[min, max]` (holes go to `d`) when the cases are
+    /// at least 10% dense (LLVM's `-O` jump-table density). Cranelift's
+    /// `Switch` splits on every hole and binary-searches between the runs.
+    fn dense_switch(&mut self, x: ir::Value, vals: &[(u128, Block)], d: Block) -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_SWITCH_DENSE"));
+        let ty = self.b.func.dfg.value_type(x);
+        if !*ON || vals.len() < 4 || ty.bits() > 64 {
+            return false;
+        }
+        let lo = vals.iter().map(|v| v.0).min().unwrap();
+        let hi = vals.iter().map(|v| v.0).max().unwrap();
+        let span = hi - lo + 1;
+        if span > 4096 || span > vals.len() as u128 * 10 {
+            return false;
+        }
+        let mut idx = if lo == 0 {
+            x
+        } else {
+            self.b.ins().iadd_imm_s(x, (lo as i64).wrapping_neg())
+        };
+        if ty.bits() > 32 {
+            let ok = self.b.create_block();
+            let oob = self
+                .b
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThan, idx, (span - 1) as i64);
+            self.b.ins().brif(oob, d, &[], ok, &[]);
+            self.b.switch_to_block(ok);
+            idx = self.b.ins().ireduce(clt::I32, idx);
+        } else if ty.bits() < 32 {
+            idx = self.b.ins().uextend(clt::I32, idx);
+        }
+        let mut table = vec![d; span as usize];
+        for &(v, b) in vals {
+            table[(v - lo) as usize] = b;
+        }
+        let pool = &mut self.b.func.dfg.value_lists;
+        let def = ir::BlockCall::new(d, std::iter::empty(), pool);
+        let entries: Vec<ir::BlockCall> = table
+            .iter()
+            .map(|&b| ir::BlockCall::new(b, std::iter::empty(), pool))
+            .collect();
+        let jt = self
+            .b
+            .create_jump_table(ir::JumpTableData::new(def, &entries));
+        self.b.ins().br_table(idx, jt);
+        true
+    }
+
     fn get1(&mut self, v: Value) -> ir::Value {
         let x = self.get(v);
         assert_eq!(x.len(), 1, "expected a scalar");
@@ -855,12 +905,18 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     && cases.iter().all(|c| c.dest_opds.is_empty()),
                 "switch with block arguments"
             );
-            let mut s = cranelift_frontend::Switch::new();
-            for c in &cases {
-                s.set_entry(c.value.value().to_u128(), self.blocks[&c.dest]);
-            }
             let d = self.blocks[&sw.default_dest(ctx)];
-            s.emit(&mut self.b, x, d);
+            let vals: Vec<(u128, Block)> = cases
+                .iter()
+                .map(|c| (c.value.value().to_u128(), self.blocks[&c.dest]))
+                .collect();
+            if !self.dense_switch(x, &vals, d) {
+                let mut s = cranelift_frontend::Switch::new();
+                for &(v, b) in &vals {
+                    s.set_entry(v, b);
+                }
+                s.emit(&mut self.b, x, d);
+            }
             self.terminated = true;
         } else if is!(CondBrOp) {
             let c = self.get1(opnds[0]);
