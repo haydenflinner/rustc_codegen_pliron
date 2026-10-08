@@ -346,6 +346,7 @@ pub fn frozen_loads(
     frozen: &rustc_data_structures::fx::FxHashMap<Value, u64>,
 ) -> usize {
     let mut n = 0;
+    let mut hoist = Vec::new();
     let insts: Vec<Inst> = func
         .layout
         .blocks()
@@ -396,6 +397,58 @@ pub fn frozen_loads(
             *flags = nf;
         }
         n += 1;
+        if let Ok(off) = i32::try_from(lo) {
+            // Without `can_move` the egraph keeps the load where we put it
+            // instead of sinking it back to its (in-loop) uses.
+            let hf = func.dfg.mem_flags.insert_unchecked(d.with_readonly());
+            hoist.push((i, opcode, base, off, hf));
+        }
+    }
+    // Opt-in: on hm.rs it pins the key's fields in callee-saved registers
+    // across the probe loop and costs +7% instructions.
+    if !hoist.is_empty() && std::env::var("PLIRON_FROZEN_HOIST").is_ok_and(|v| v == "1") {
+        hoist_frozen(func, hoist);
     }
     n
+}
+
+/// Frozen memory is dereferenceable and immutable for the whole call, so a
+/// load of it inside a loop can be done once in the entry block. Cranelift's
+/// own LICM skips these when they are `uload8/16` (not "pure" for its egraph).
+fn hoist_frozen(
+    func: &mut Function,
+    hoist: Vec<(Inst, Opcode, Value, i32, cranelift_codegen::ir::MemFlags)>,
+) {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    use cranelift_codegen::loop_analysis::LoopAnalysis;
+    let Some(entry) = func.layout.entry_block() else {
+        return;
+    };
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    la.compute(func, &cfg, &dt);
+    let mut done: rustc_data_structures::fx::FxHashMap<
+        (Opcode, cranelift_codegen::ir::Type, Value, i32),
+        Value,
+    > = Default::default();
+    for (i, opcode, base, off, flags) in hoist {
+        let Some(b) = func.layout.inst_block(i) else {
+            continue;
+        };
+        if la.innermost_loop(b).is_none() || !dt.is_reachable(b) {
+            continue;
+        }
+        let r = func.dfg.first_result(i);
+        let ty = func.dfg.value_type(r);
+        let nv = *done.entry((opcode, ty, base, off)).or_insert_with(|| {
+            let mut pos = FuncCursor::new(func).at_first_insertion_point(entry);
+            let (ni, dfg) = pos.ins().Load(opcode, ty, flags, off.into(), base);
+            dfg.first_result(ni)
+        });
+        func.layout.remove_inst(i);
+        func.dfg.clear_results(i);
+        func.dfg.change_to_alias(r, nv);
+    }
 }

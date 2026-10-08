@@ -324,7 +324,14 @@ pub fn lower_to_object(
             }
         }
         if !frozen.is_empty() {
-            crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
+            let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
+            if dump {
+                eprintln!(
+                    "==== clif {n}: {k} frozen loads, params {:?} ====\n{}",
+                    frozen,
+                    clctx.func.display()
+                );
+            }
         }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
