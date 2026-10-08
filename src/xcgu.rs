@@ -68,39 +68,69 @@ pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<
             }
         }
     }
-    if cands.is_empty() {
-        return cands;
-    }
-    let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
-    let mut need: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
-    for &c in &cands {
-        let Some(us) = used(tcx, c) else { continue };
-        refs.insert(c, us);
-        need.extend(
-            us.iter()
-                .map(|u| u.node)
-                .filter(|m| !ours.contains_key(m) && !direct.contains(m)),
-        );
-    }
-    let mut visible: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
-    if !need.is_empty() {
-        for other in tcx.collect_and_partition_mono_items(()).codegen_units {
-            for m in &need {
-                if let Some(d) = other.items().get(m)
-                    && !d.inlined
-                    && matches!(d.linkage, Linkage::External)
-                {
-                    visible.insert(*m);
+    // Callees of accepted copies are candidates too (up to `PLIRON_XCGU_DEPTH`
+    // levels), so a small wrapper's own small callee in a third CGU inlines.
+    let depth = std::env::var("PLIRON_XCGU_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3usize);
+    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+    let mut seen: FxHashSet<MonoItem<'tcx>> = direct.clone();
+    let mut accepted: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+    let mut out = Vec::new();
+    for _ in 0..depth {
+        if cands.is_empty() {
+            break;
+        }
+        let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
+        let mut need: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+        for &c in &cands {
+            let Some(us) = used(tcx, c) else { continue };
+            refs.insert(c, us);
+            need.extend(
+                us.iter()
+                    .map(|u| u.node)
+                    .filter(|m| !ours.contains_key(m) && !direct.contains(m)),
+            );
+        }
+        let mut visible: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+        if !need.is_empty() {
+            for other in parts {
+                for m in &need {
+                    if let Some(d) = other.items().get(m)
+                        && !d.inlined
+                        && matches!(d.linkage, Linkage::External)
+                    {
+                        visible.insert(*m);
+                    }
                 }
             }
         }
-    }
-    cands.retain(|c| {
-        refs.get(c).is_some_and(|us| {
-            us.iter().all(|u| {
-                ours.contains_key(&u.node) || direct.contains(&u.node) || visible.contains(&u.node)
+        cands.retain(|c| {
+            refs.get(c).is_some_and(|us| {
+                us.iter().all(|u| {
+                    ours.contains_key(&u.node)
+                        || direct.contains(&u.node)
+                        || visible.contains(&u.node)
+                        || accepted.contains(&u.node)
+                })
             })
-        })
-    });
-    cands
+        });
+        let mut next = Vec::new();
+        for &c in &cands {
+            accepted.insert(MonoItem::Fn(c));
+            for u in refs[&c] {
+                if seen.insert(u.node)
+                    && let MonoItem::Fn(c2) = u.node
+                    && !ours.contains_key(&u.node)
+                    && copyable(tcx, c2, limit)
+                {
+                    next.push(c2);
+                }
+            }
+        }
+        out.append(&mut cands);
+        cands = next;
+    }
+    out
 }
