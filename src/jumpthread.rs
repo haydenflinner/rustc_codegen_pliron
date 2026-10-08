@@ -981,6 +981,17 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                     hi = hi.min(h);
                 }
             }
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } => {
+                if let Some((l, h)) = urange(func, fs, arg, depth + 1)
+                    && h <= full
+                {
+                    lo = lo.max(l);
+                    hi = hi.min(h);
+                }
+            }
             InstructionData::Binary {
                 opcode: Opcode::Band,
                 args,
@@ -1098,7 +1109,7 @@ fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> 
 /// ends in `brif c` knows `c` (or its complement), as do the blocks it
 /// dominates; equal operands or a constant against a known range decide it.
 /// Returns the icmps folded.
-fn fold_dominated_conds(func: &mut Function) -> usize {
+pub fn fold_dominated_conds(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let fact = edge_facts(func, &cfg);

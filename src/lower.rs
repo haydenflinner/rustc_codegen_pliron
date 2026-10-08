@@ -314,8 +314,18 @@ pub fn lower_to_object(
         }
         if crate::pass_enabled("PLIRON_SWITCHMAP") {
             let k = crate::switchmap::run(&mut clctx.func);
+            // The new bounds tests are often implied by a dominating check.
+            let f = if k > 0
+                && crate::pass_enabled("PLIRON_DOMCOND")
+                && crate::pass_enabled("PLIRON_SWITCHMAP_FOLD")
+                && crate::jumpthread::fold_dominated_conds(&mut clctx.func) > 0
+            {
+                crate::jumpthread::fold_const_branches(&mut clctx.func)
+            } else {
+                0
+            };
             if k > 0 && std::env::var_os("PLIRON_SWITCHMAP_DEBUG").is_some() {
-                eprintln!("switchmap {k} {n}");
+                eprintln!("switchmap {k} fold {f} {n}");
             }
             if std::env::var_os("PLIRON_VERIFY").is_some()
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
