@@ -191,6 +191,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
+    let eh_invoke = crate::pass_enabled("PLIRON_INLINE_EH_INVOKE");
     let mut ok: FxHashMap<String, (Ptr<Operation>, bool)> = FxHashMap::default();
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
@@ -221,8 +222,15 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
                 let Some(&(callee, eh)) = ok.get(cs) else {
                     continue;
                 };
-                // A callee with its own landing pads only goes into plain call sites.
-                if eh && st.invokes.contains_key(&op) {
+                // A callee with landing pads may go into an invoke whose pad is a
+                // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
+                // into a catch pad: unwinder phase 1 would never see that catch.
+                if eh
+                    && st
+                        .invokes
+                        .get(&op)
+                        .is_some_and(|&(_, catch)| catch || !eh_invoke)
+                {
                     continue;
                 }
                 if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty {
@@ -267,7 +275,7 @@ fn left_stats(ctx: &Context, st: &State<'_>, ok: &FxHashMap<String, (Ptr<Operati
                     "self"
                 } else if let Some(&(_, eh)) = ok.get(cs) {
                     if eh && st.invokes.contains_key(&op) {
-                        "eh callee at invoke"
+                        "eh callee at invoke (catch pad / EH_INVOKE=0)"
                     } else if st.calls[&op].fn_ty != g.ty {
                         "fn type mismatch"
                     } else {
