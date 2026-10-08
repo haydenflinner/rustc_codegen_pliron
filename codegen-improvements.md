@@ -86,6 +86,15 @@ Correctness fix, not a speedup: the coretests `split_off*_max_range*` compare `[
 slices, a `usize::MAX`-iteration loop of `() == ()` that LLVM deletes and we used to run.
 With the pass, `./x test --stage 1 library/coretests -- split_off max_range` runs its 26 tests,
 including the six `*_max_range*` ones that used to hang, in 0.7 ms.
+
+Branches inside the loop are decided with the values `jumpthread` can prove without rewriting
+the function (constants and conditions implied by a dominating test, `known_values`), and uses of
+loop values only count in blocks still reachable once the loop is bypassed. That deletes the
+`<`/`<=`/`cmp`/`partial_cmp` loops on two `[(); usize::MAX]` slices at -O and at
+`-Copt-level=3 -Cdebug-assertions=y` (6 loops, same output as LLVM; with `PLIRON_LOOPDEL=0` it
+still hangs). -O0 runs no CLIF passes and LLVM -O0 hangs on it too. Bounds checks the loop test
+does not imply (`v[i]` with `i < n`, `v[i + 1]`, ZST `v[i]` past the length) still panic like
+LLVM. regex-syntax at -O: 0 loops deleted, `.text` 558312 B → 558296 B (−16 B).
 regex-syntax at -O: 0 loops deleted, `.text` 585355 B → 585363 B (+8 B) with the pass on, so
 the stage2 bench is unchanged (not rebuilt). The pass kept `i += 2` / `<=` / `loop {}` /
 used-result / storing loops in a negative test, and that test's output matches LLVM.

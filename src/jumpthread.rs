@@ -1249,12 +1249,46 @@ fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> 
 /// dominates; equal operands or a constant against a known range decide it.
 /// Returns the icmps folded.
 pub fn fold_dominated_conds(func: &mut Function) -> usize {
+    let folds = dominated_conds(func);
+    for &(i, k) in &folds {
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        func.replace(i).iconst(ty, i64::from(k));
+    }
+    folds.len()
+}
+
+/// The values of `fold_dominated_conds` and `fold_const_branches` without rewriting `func`.
+pub fn known_values(func: &Function) -> FxHashMap<Value, u64> {
+    let mut env: FxHashMap<Value, u64> = dominated_conds(func)
+        .into_iter()
+        .map(|(i, k)| (func.dfg.first_result(i), u64::from(k)))
+        .collect();
+    for _ in 0..2 {
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if func.dfg.inst_results(i).len() == 1
+                    && !env.contains_key(&func.dfg.first_result(i))
+                    && let Some(c) = eval(func, &env, &|_| false, &|_| None, i)
+                {
+                    env.insert(func.dfg.first_result(i), c);
+                }
+            }
+        }
+    }
+    env
+}
+
+pub fn known_value(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
+    known(func, env, v)
+}
+
+fn dominated_conds(func: &Function) -> Vec<(Inst, bool)> {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let fact = edge_facts(func, &cfg);
     let tfact = table_facts(func, &cfg);
     if fact.is_empty() && tfact.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut folds = Vec::new();
     for b in func.layout.blocks() {
@@ -1319,11 +1353,7 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
             }
         }
     }
-    for &(i, k) in &folds {
-        let ty = func.dfg.value_type(func.dfg.first_result(i));
-        func.replace(i).iconst(ty, i64::from(k));
-    }
-    folds.len()
+    folds
 }
 
 /// Block params whose every incoming `jump`/`brif` arg is one value `v` (or

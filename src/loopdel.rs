@@ -27,11 +27,12 @@ pub fn run(func: &mut Function) -> usize {
     while n < MAX_DELETIONS {
         let cfg = ControlFlowGraph::with_function(func);
         let dt = DominatorTree::with_function(func, &cfg);
+        let env = crate::jumpthread::known_values(func);
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
         let Some((lp, exit, args)) = la
             .loops()
-            .find_map(|lp| deletable(func, &cfg, &dt, &la, lp))
+            .find_map(|lp| deletable(func, &cfg, &dt, &la, &env, lp))
         else {
             break;
         };
@@ -108,6 +109,37 @@ fn canon(func: &Function, cfg: &ControlFlowGraph, mut v: Value) -> Value {
     v
 }
 
+/// Blocks reachable from the entry when edges into `h` go to `e` instead.
+fn reachable_without(
+    func: &Function,
+    la: &LoopAnalysis,
+    lp: Loop,
+    h: Block,
+    e: Block,
+) -> Vec<Block> {
+    let Some(entry) = func.layout.entry_block() else {
+        return Vec::new();
+    };
+    let mut seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut work = vec![entry];
+    let mut out = Vec::new();
+    while let Some(b) = work.pop() {
+        let b = if b == h { e } else { b };
+        if la.is_in_loop(b, lp) || !seen.insert(b) {
+            continue;
+        }
+        out.push(b);
+        if let Some(t) = func.layout.last_inst(b) {
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                work.push(bc.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    out
+}
+
 fn def_block(func: &Function, v: Value) -> Option<Block> {
     match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -116,15 +148,18 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
     }
 }
 
-/// Live successors of `b`'s terminator: a `brif` on a constant has one.
-fn live_dests(func: &Function, b: Block) -> Vec<(Block, Vec<BlockArg>)> {
+type Env = rustc_data_structures::fx::FxHashMap<Value, u64>;
+
+/// Live successors of `b`'s terminator: a `brif` on a known value (a constant, or a
+/// condition decided by a dominating test such as the loop's own `i < n`) has one.
+fn live_dests(func: &Function, env: &Env, b: Block) -> Vec<(Block, Vec<BlockArg>)> {
     let Some(t) = func.layout.last_inst(b) else {
         return Vec::new();
     };
     let data = &func.dfg.insts[t];
     let dests = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
     let live: Vec<usize> = match *data {
-        InstructionData::Brif { arg, .. } => match iconst(func, arg) {
+        InstructionData::Brif { arg, .. } => match crate::jumpthread::known_value(func, env, arg) {
             Some(c) => vec![if c != 0 { 0 } else { 1 }],
             None => vec![0, 1],
         },
@@ -146,6 +181,7 @@ fn deletable(
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
+    env: &Env,
     lp: Loop,
 ) -> Option<(Loop, Block, Vec<BlockArg>)> {
     let h = la.loop_header(lp);
@@ -178,7 +214,7 @@ fn deletable(
         if func.layout.last_inst(b).is_none() {
             return None;
         }
-        for (d, args) in live_dests(func, b) {
+        for (d, args) in live_dests(func, env, b) {
             if la.is_in_loop(d, lp) {
                 if d == h {
                     latches.push((b, args));
@@ -202,7 +238,9 @@ fn deletable(
     if latches.is_empty() {
         return None;
     }
-    for b in func.layout.blocks().filter(|&b| !la.is_in_loop(b, lp)) {
+    // Only blocks still reachable once the loop is bypassed must not use its values;
+    // panic paths left behind by its decided branches become dead.
+    for b in reachable_without(func, la, lp, h, e) {
         for inst in func.layout.block_insts(b) {
             if func.dfg.inst_args(inst).iter().any(|&a| inside(a)) {
                 return None;
