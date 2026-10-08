@@ -23,12 +23,11 @@ const ready = (async () => {
   return { rustc, ld, sysroot: toDir(root) };
 })();
 
-async function run(mod, args, work, sysroot) {
-  const log = s => postMessage({ log: s });
+async function run(mod, args, work, sysroot, out = s => postMessage({ log: s })) {
   const fds = [
     new OpenFile(new File([])),
-    ConsoleStdout.lineBuffered(log),
-    ConsoleStdout.lineBuffered(log),
+    ConsoleStdout.lineBuffered(out),
+    ConsoleStdout.lineBuffered(out),
     new PreopenDirectory('/', new Map([['sysroot', sysroot], ['work', work]])),
   ];
   const wasi = new WASI(args, ['RUSTC_SYSROOT=/sysroot'], fds);
@@ -36,20 +35,39 @@ async function run(mod, args, work, sysroot) {
   return wasi.start(inst);
 }
 
+const secs = t => ((performance.now() - t) / 1000).toFixed(2);
+
+// std program: rustc links it in-process (pliron-wasm-ld is linked into rustc.wasm), then it runs on WASI here.
+async function runStd(rustc, src, sysroot) {
+  const work = new Directory([['main.rs', new File(new TextEncoder().encode(src))]]);
+  let t = performance.now();
+  let code = await run(rustc, ['rustc', '--sysroot', '/sysroot', '--target', 'wasm32-wasip1',
+    '--crate-type', 'bin', '--crate-name', 'main', '-Copt-level=1', '-Cpanic=abort',
+    '-Zcodegen-backend=pliron', '-Clinker=pliron-wasm-ld', '-Clink-self-contained=no',
+    '-Lnative=/sysroot/wasi-libc', '/work/main.rs', '-o', '/work/main.wasm'], work, sysroot);
+  postMessage({ log: `rustc (compile + link) exit ${code} in ${secs(t)}s` });
+  if (code) return postMessage({ done: true });
+  const prog = await WebAssembly.compile(work.contents.get('main.wasm').data);
+  t = performance.now();
+  code = await run(prog, ['main'], new Directory([]), new Directory([]), s => postMessage({ out: s }));
+  postMessage({ log: `main.wasm exit ${code} in ${secs(t)}s`, done: true, ran: true });
+}
+
 onmessage = async ({ data: { src, exports } }) => {
   try {
     const { rustc, ld, sysroot } = await ready;
+    if (/\bfn\s+main\s*\(/.test(src)) return await runStd(rustc, src, sysroot);
     const work = new Directory([['main.rs', new File(new TextEncoder().encode(src))]]);
     let t = performance.now();
     let code = await run(rustc, ['rustc', '--sysroot', '/sysroot', '--target', 'wasm32-unknown-unknown',
       '--crate-type', 'staticlib', '--crate-name', 'main', '-Copt-level=1', '-Cpanic=abort',
       '-Zcodegen-backend=pliron', '/work/main.rs', '-o', '/work/libmain.a'], work, sysroot);
-    postMessage({ log: `rustc exit ${code} in ${((performance.now() - t) / 1000).toFixed(2)}s` });
+    postMessage({ log: `rustc exit ${code} in ${secs(t)}s` });
     if (code) return postMessage({ done: true });
     t = performance.now();
     code = await run(ld, ['pliron-wasm-ld', '--no-entry', ...exports.flatMap(e => ['--export', e]),
       '/work/libmain.a', '-o', '/work/main.wasm'], work, sysroot);
-    postMessage({ log: `pliron-wasm-ld exit ${code} in ${((performance.now() - t) / 1000).toFixed(2)}s` });
+    postMessage({ log: `pliron-wasm-ld exit ${code} in ${secs(t)}s` });
     postMessage({ done: true, wasm: code ? null : work.contents.get('main.wasm').data });
   } catch (e) {
     postMessage({ log: String(e?.stack ?? e), done: true });

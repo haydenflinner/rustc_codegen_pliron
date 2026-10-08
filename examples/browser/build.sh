@@ -13,8 +13,14 @@ WASI_LIBC=$ROOT/target/wasm/wasi-libc/wasm32-wasip1/release
   CARGO_TARGET_DIR=$ROOT/target/wasm/ld cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_abort)
 cp $ROOT/target/wasm/ld/wasm32-wasip1/release/pliron-wasm-ld.wasm ld.wasm
 wasm-tools strip --all $S/bin/rustc.wasm -o rustc.wasm
-rm -rf sysroot && mkdir -p sysroot/lib/rustlib/wasm32-unknown-unknown/lib
+rm -rf sysroot && mkdir -p sysroot/lib/rustlib/wasm32-unknown-unknown/lib sysroot/lib/rustlib/wasm32-wasip1/lib sysroot/wasi-libc
 cp $LIB/*.rlib $LIB/*.rmeta sysroot/lib/rustlib/wasm32-unknown-unknown/lib/
+# std for wasm32-wasip1 programs; libtest/getopts/proc_macro are never linked into a bin.
+WLIB=${LIB%/wasm32-unknown-unknown/lib}/wasm32-wasip1/lib
+for f in $WLIB/*.rlib $WLIB/*.rmeta; do
+  case $(basename $f) in libtest-*|libgetopts-*|libproc_macro-*) ;; *) cp $f sysroot/lib/rustlib/wasm32-wasip1/lib/ ;; esac
+done
+cp $WASI_LIBC/libpliron_wasi_libc.a sysroot/wasi-libc/libc.a
 (cd sysroot && find . -type f | sed 's|^\./||' | sort | python3 -c "import sys,json;print(json.dumps([l.strip() for l in sys.stdin]))") > manifest.json
 npm i --silent
 echo "serve with: python3 -m http.server 8787   (then open http://localhost:8787/)"

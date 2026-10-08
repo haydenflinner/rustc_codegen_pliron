@@ -1163,7 +1163,62 @@ pub unsafe extern "C" fn pwritev(fd: c_int, iov: *const iovec, n: c_int, off: of
         )
     })
 }
+// C math for std's `f64::exp` etc. (wasi-libc normally provides these), forwarded to `libm`.
+macro_rules! libm_c {
+    ($($name:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {$(
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $name($($a: $t),*) -> $r {
+            libm::$name($($a),*)
+        }
+    )*};
+}
+libm_c! {
+    acos(x: f64) -> f64; asin(x: f64) -> f64; atan(x: f64) -> f64; atan2(y: f64, x: f64) -> f64;
+    cbrt(x: f64) -> f64; ceil(x: f64) -> f64; copysign(x: f64, y: f64) -> f64; cos(x: f64) -> f64;
+    cosh(x: f64) -> f64; erf(x: f64) -> f64; erfc(x: f64) -> f64; exp(x: f64) -> f64;
+    exp10(x: f64) -> f64; exp2(x: f64) -> f64; expm1(x: f64) -> f64; fabs(x: f64) -> f64;
+    fdim(x: f64, y: f64) -> f64; floor(x: f64) -> f64; fma(x: f64, y: f64, z: f64) -> f64;
+    fmax(x: f64, y: f64) -> f64; fmin(x: f64, y: f64) -> f64; fmod(x: f64, y: f64) -> f64;
+    hypot(x: f64, y: f64) -> f64; ldexp(x: f64, n: i32) -> f64; lgamma(x: f64) -> f64;
+    log(x: f64) -> f64; log10(x: f64) -> f64; log1p(x: f64) -> f64; log2(x: f64) -> f64;
+    nextafter(x: f64, y: f64) -> f64; pow(x: f64, y: f64) -> f64; remainder(x: f64, y: f64) -> f64;
+    rint(x: f64) -> f64; round(x: f64) -> f64; scalbn(x: f64, n: i32) -> f64; sin(x: f64) -> f64;
+    sinh(x: f64) -> f64; sqrt(x: f64) -> f64; tan(x: f64) -> f64; tanh(x: f64) -> f64;
+    tgamma(x: f64) -> f64; trunc(x: f64) -> f64;
+    acosf(x: f32) -> f32; asinf(x: f32) -> f32; atanf(x: f32) -> f32; atan2f(y: f32, x: f32) -> f32;
+    cbrtf(x: f32) -> f32; ceilf(x: f32) -> f32; copysignf(x: f32, y: f32) -> f32; cosf(x: f32) -> f32;
+    coshf(x: f32) -> f32; erff(x: f32) -> f32; erfcf(x: f32) -> f32; expf(x: f32) -> f32;
+    exp10f(x: f32) -> f32; exp2f(x: f32) -> f32; expm1f(x: f32) -> f32; fabsf(x: f32) -> f32;
+    fdimf(x: f32, y: f32) -> f32; floorf(x: f32) -> f32; fmaf(x: f32, y: f32, z: f32) -> f32;
+    fmaxf(x: f32, y: f32) -> f32; fminf(x: f32, y: f32) -> f32; fmodf(x: f32, y: f32) -> f32;
+    hypotf(x: f32, y: f32) -> f32; ldexpf(x: f32, n: i32) -> f32; lgammaf(x: f32) -> f32;
+    logf(x: f32) -> f32; log10f(x: f32) -> f32; log1pf(x: f32) -> f32; log2f(x: f32) -> f32;
+    nextafterf(x: f32, y: f32) -> f32; powf(x: f32, y: f32) -> f32; remainderf(x: f32, y: f32) -> f32;
+    rintf(x: f32) -> f32; roundf(x: f32) -> f32; scalbnf(x: f32, n: i32) -> f32; sinf(x: f32) -> f32;
+    sinhf(x: f32) -> f32; sqrtf(x: f32) -> f32; tanf(x: f32) -> f32; tanhf(x: f32) -> f32;
+    tgammaf(x: f32) -> f32; truncf(x: f32) -> f32;
+}
 #[unsafe(no_mangle)]
-pub extern "C" fn sin(x: f64) -> f64 {
-    libm::sin(x)
+pub unsafe extern "C" fn lgamma_r(x: f64, sign: *mut i32) -> f64 {
+    let (r, s) = libm::lgamma_r(x);
+    unsafe { *sign = s };
+    r
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lgammaf_r(x: f32, sign: *mut i32) -> f32 {
+    let (r, s) = libm::lgammaf_r(x);
+    unsafe { *sign = s };
+    r
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frexp(x: f64, e: *mut i32) -> f64 {
+    let (r, n) = libm::frexp(x);
+    unsafe { *e = n };
+    r
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frexpf(x: f32, e: *mut i32) -> f32 {
+    let (r, n) = libm::frexpf(x);
+    unsafe { *e = n };
+    r
 }

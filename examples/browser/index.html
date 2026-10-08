@@ -8,36 +8,24 @@
   pre { background: #f4f4f4; padding: 8px; min-height: 80px; white-space: pre-wrap; }
 </style>
 <h3>rustc → wasm, running in your browser</h3>
-<p>rustc itself is compiled to wasm by the pliron backend; it compiles this crate to wasm with the same backend, and pliron-wasm-ld links it. Exported <code>extern "C"</code> functions with no arguments are called; <code>print(ptr, len)</code> writes to the output.</p>
-<textarea id="src" spellcheck="false">#![no_std]
-use core::fmt::Write;
+<p>rustc itself is compiled to wasm by the pliron backend; it compiles this crate to wasm with the same backend and links it with pliron-wasm-ld. A crate with <code>fn main</code> is built against std for <code>wasm32-wasip1</code> and run on WASI; a <code>#![no_std]</code> crate without <code>main</code> targets <code>wasm32-unknown-unknown</code>, its zero-argument <code>extern "C"</code> exports are called, and <code>print(ptr, len)</code> writes to the output.</p>
+<textarea id="src" spellcheck="false">use std::collections::HashMap;
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
-
-unsafe extern "C" {
-    fn print(ptr: *const u8, len: usize);
-}
-
-struct Out;
-impl Write for Out {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        unsafe { print(s.as_ptr(), s.len()) };
-        Ok(())
+fn main() {
+    let text = "the quick brown fox jumps over the lazy dog and the cat";
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for w in text.split_whitespace() {
+        *counts.entry(w).or_default() += 1;
     }
-}
+    let mut v: Vec<_> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    println!("top words: {:?}", &v[..3]);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn run() -> u64 {
-    let mut v = [5u32, 3, 9, 1, 7];
-    v.sort_unstable();
-    writeln!(Out, "sorted: {v:?}").unwrap();
-    for i in 1..=5 {
-        writeln!(Out, "{i}^2 = {}, {i}/3 = {:.3}", i * i, i as f64 / 3.0).unwrap();
-    }
-    (1..=10u64).map(|i| i * i).sum()
+    let primes: Vec<u32> = (2..60).filter(|n| (2..*n).all(|d| n % d != 0)).collect();
+    println!("primes: {primes:?}");
+    println!("sqrt(2) = {:.6}, e = {:.6}", 2f64.sqrt(), 1f64.exp());
+    let s: String = "wasm".chars().rev().collect();
+    println!("{s} <- reversed, {} bytes on the heap", s.capacity());
 }
 </textarea>
 <p><button id="go" disabled>Loading…</button></p>
@@ -53,6 +41,7 @@ worker.onmessage = async ({ data }) => {
     log(data.log);
     if (first && data.log.startsWith('loaded')) { first = false; $('go').disabled = false; $('go').textContent = 'Compile & run'; }
   }
+  if (data.out !== undefined) $('out').textContent += data.out + '\n';
   if (!data.done) return;
   $('go').disabled = false;
   if (!data.wasm) { window.__done = true; return; }

@@ -56,5 +56,10 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     check("systemtime", now.as_secs() > 1_700_000_000);
+    let x = std::hint::black_box(1.0f64);
+    check(
+        "libm",
+        (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+    );
     eprintln!("wasi std OK");
 }

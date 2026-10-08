@@ -1,4 +1,6 @@
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
+const srcFile = process.argv[2];
 const b = await chromium.connectOverCDP('http://localhost:29229');
 const ctx = b.contexts()[0];
 const p = await ctx.newPage();
@@ -6,6 +8,7 @@ p.on('console', m => console.log('console:', m.text()));
 p.on('pageerror', e => console.log('pageerror:', e.message));
 await p.goto('http://localhost:8787/');
 await p.waitForFunction(() => !document.getElementById('go').disabled, null, { timeout: 600000 });
+if (srcFile) await p.fill('#src', fs.readFileSync(srcFile, 'utf8'));
 await p.click('#go');
 await p.waitForFunction(() => window.__done !== false && !document.getElementById('go').disabled, null, { timeout: 600000, polling: 1000 });
 await new Promise(r => setTimeout(r, 1000));
