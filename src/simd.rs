@@ -267,6 +267,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let in_ty = args[0].layout.ty;
         let (in_len, in_elem) = if base == "select_bitmask" {
             (0, in_ty)
+        } else if base == "select" {
+            // The mask is the "argument" for select diagnostics in cg_llvm.
+            require_simd!(in_ty, SimdArgument)
         } else {
             require_simd!(in_ty, SimdInput)
         };
@@ -284,7 +287,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     IM::ReturnIntegerType { span, name: name_sym, ret_ty: ret_rty, out_ty }
                 );
             }
-            "and" | "or" | "xor" | "shl" | "shr" | "saturating_add" | "saturating_sub" => {
+            "and" | "or" | "xor" | "shl" | "shr" => {
+                require!(
+                    in_elem.is_integral(),
+                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
+                );
+            }
+            "saturating_add" | "saturating_sub" => {
                 require!(
                     in_elem.is_integral(),
                     IM::ExpectedVectorElementType {
@@ -293,6 +302,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         expected_element: in_elem,
                         vector_type: in_ty
                     }
+                );
+            }
+            "bswap" | "bitreverse" | "ctlz" | "ctpop" | "cttz" | "carryless_mul"
+            | "funnel_shl" | "funnel_shr" => {
+                require!(
+                    in_elem.is_integral(),
+                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
                 );
             }
             "cast" => {
@@ -309,8 +325,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     in_elem.is_integral(),
                     IM::MaskWrongElementType { span, name: name_sym, ty: in_elem }
                 );
-                let (v_len, _) = require_simd!(args[1].layout.ty, SimdSecond);
-                require_simd!(args[2].layout.ty, SimdThird);
+                let (v_len, _) = require_simd!(args[1].layout.ty, SimdArgument);
+                require_simd!(args[2].layout.ty, SimdArgument);
                 require!(
                     v_len == in_len,
                     IM::MismatchedLengths { span, name: name_sym, m_len: in_len, v_len }
@@ -458,7 +474,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     ExpectedPointerMutability::Not
                 };
                 require!(
-                    matches!(*pointer_ty.kind(), ty::RawPtr(p_ty, _) if p_ty == values_elem),
+                    matches!(*pointer_ty.kind(), ty::RawPtr(p_ty, m) if p_ty == values_elem
+                        && (matches!(mutability, ExpectedPointerMutability::Not) || m.is_mut())),
                     IM::ExpectedElementType {
                         span,
                         name: name_sym,
@@ -554,27 +571,37 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
             }
             _ if base.starts_with("reduce_") => {
-                if matches!(
-                    base,
-                    "reduce_all" | "reduce_any" | "reduce_and" | "reduce_or" | "reduce_xor"
-                ) {
-                    require!(
-                        in_elem.is_integral(),
-                        IM::UnsupportedSymbol {
-                            span,
-                            name: name_sym,
-                            symbol: name_sym,
-                            in_ty,
-                            in_elem,
-                            ret_ty: ret_rty
-                        }
-                    );
-                } else {
+                // cg_llvm's structure: all/any take no ReturnType check (the
+                // non-int mask element is reported first); every other reduce
+                // checks ret == elem before the op-type check.
+                if !matches!(base, "reduce_all" | "reduce_any") {
                     require!(
                         ret_rty == in_elem,
-                        IM::ReturnType { span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty }
+                        IM::ReturnType {
+                            span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty
+                        }
                     );
                 }
+                let int_only = !matches!(
+                    base,
+                    "reduce_add" | "reduce_mul" | "reduce_add_ordered" | "reduce_mul_ordered"
+                        | "reduce_add_unordered" | "reduce_mul_unordered"
+                );
+                require!(
+                    if int_only {
+                        in_elem.is_integral()
+                    } else {
+                        matches!(in_elem.kind(), ty::Int(_) | ty::Uint(_) | ty::Float(_))
+                    },
+                    IM::UnsupportedSymbol {
+                        span,
+                        name: name_sym,
+                        symbol: name_sym,
+                        in_ty,
+                        in_elem,
+                        ret_ty: ret_rty
+                    }
+                );
             }
             _ => {}
         }

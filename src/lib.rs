@@ -154,8 +154,18 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         },
     )
     .unwrap();
+    // Inline stack probes keep large frames from jumping the guard page.
+    // `inline` needs no `__cranelift_probestack` helper (only emitted on
+    // x86_64/aarch64/riscv64 anyway).
     let triple = target_lexicon::Triple::from_str(&sess.target.llvm_target)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("unsupported target: {e}")));
+    if let target_lexicon::Architecture::Aarch64(_)
+    | target_lexicon::Architecture::Riscv64(_)
+    | target_lexicon::Architecture::X86_64 = triple.architecture
+    {
+        fb.enable("enable_probestack").unwrap();
+        fb.set("probestack_strategy", "inline").unwrap();
+    }
     let flags = settings::Flags::new(fb);
     let isa = cranelift_codegen::isa::lookup(triple)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));

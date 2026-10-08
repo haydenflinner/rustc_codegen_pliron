@@ -640,7 +640,9 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 mutable: true,
                 tls: attrs.flags.contains(F::THREAD_LOCAL),
                 linkage: map_linkage(linkage, visibility),
-                used: attrs.flags.intersects(F::USED_COMPILER | F::USED_LINKER),
+                // `used(compiler)` only forces emission; `used(linker)` asks the
+                // linker to keep the symbol through GC.
+                used: attrs.flags.contains(F::USED_LINKER),
                 section: attrs.link_section.map(|s| s.to_string()),
             },
         );
