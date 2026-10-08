@@ -1386,6 +1386,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let mut sh = 0;
             for j in 0..k {
                 let x = part(j)[0];
+                let x = self.sign_source(x);
                 let m = self.b.ins().vhigh_bits(clt::I32, x);
                 let m = if sh > 0 {
                     let s = self.b.ins().iconst(clt::I32, sh);
@@ -1406,6 +1407,30 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.set(op, r);
     }
 
+    /// `vhigh_bits(icmp slt y, 0)` reads the same sign bits as `vhigh_bits(y)`.
+    fn sign_source(&self, x: ir::Value) -> ir::Value {
+        let dfg = &self.b.func.dfg;
+        let Some(d) = dfg.value_def(x).inst() else {
+            return x;
+        };
+        let ir::InstructionData::IntCompare { cond, args, .. } = dfg.insts[d] else {
+            return x;
+        };
+        if cond != ir::condcodes::IntCC::SignedLessThan
+            || dfg.value_type(args[0]).lane_bits() != dfg.value_type(x).lane_bits()
+        {
+            return x;
+        }
+        let zero = dfg.value_def(args[1]).inst().is_some_and(|z| match dfg.insts[z] {
+            ir::InstructionData::UnaryConst {
+                opcode: ir::Opcode::Vconst,
+                constant_handle,
+            } => dfg.constants.get(constant_handle).as_slice().iter().all(|&b| b == 0),
+            _ => false,
+        });
+        if zero { args[0] } else { x }
+    }
+
     /// One native `pliron.v*` op; `rt` is the (part) result type.
     fn vec_op(&mut self, name: &str, a: &[ir::Value], rt: ClType) -> ir::Value {
         match name {
@@ -1415,7 +1440,8 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             "pliron.vhigh_bits" => {
                 let t = rt;
-                let m = self.b.ins().vhigh_bits(clt::I32, a[0]);
+                let x = self.sign_source(a[0]);
+                let m = self.b.ins().vhigh_bits(clt::I32, x);
                 self.resize(m, t, false)
             }
             "pliron.vbitselect" => {
