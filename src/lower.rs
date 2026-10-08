@@ -257,7 +257,14 @@ pub fn lower_to_object(
         write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
         let mut desc = DataDescription::new();
         desc.define(bytes.into_boxed_slice());
-        desc.set_align(g.align.max(1));
+        // LLVM places constants in 16-byte-capped mergeable/aligned sections;
+        // crates that reinterpret `&[u8]` statics rely on that by accident.
+        let mut align = g.align.max(1);
+        if !g.mutable && g.section.is_none() {
+            let pref = if size > 16 { 16 } else if size.is_power_of_two() { size } else { 1 };
+            align = align.max(pref);
+        }
+        desc.set_align(align);
         if g.used {
             desc.set_used(true);
         }
@@ -282,6 +289,38 @@ pub fn lower_to_object(
     }
     let mut product = m.finish();
     eh.emit(&mut product);
+    for (alias, target, weak) in &st.aliases {
+        let tsym = match ids.get(target).copied() {
+            Some(Sym::F(id, _)) => product.function_symbol(id),
+            Some(Sym::D(id, _)) => product.data_symbol(id),
+            None => continue,
+        };
+        let t = product.object.symbol(tsym);
+        let (value, size, kind, section) = (t.value, t.size, t.kind, t.section);
+        if !matches!(section, object::write::SymbolSection::Section(_)) {
+            continue;
+        }
+        let scope = match t.scope {
+            object::SymbolScope::Compilation => object::SymbolScope::Linkage,
+            s => s,
+        };
+        let obj = &mut product.object;
+        let id = obj.symbol_id(alias.as_bytes()).unwrap_or_else(|| {
+            obj.add_symbol(object::write::Symbol {
+                name: alias.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind,
+                scope,
+                weak: *weak,
+                section: object::write::SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            })
+        });
+        let s = obj.symbol_mut(id);
+        (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
+            (value, size, kind, scope, *weak, section);
+    }
     if !st.asm.is_empty() || !hot_asm.is_empty() {
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
         let asm = format!("{}\n{hot_asm}", st.asm);

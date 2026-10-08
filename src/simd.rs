@@ -196,7 +196,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // Opaque pointers: pointer-to-pointer lane casts are no-ops.
             return Some(a(0));
         }
-        let (n, e) = self.elem_of(args[0].layout.ty);
+        // `select_bitmask` takes an integer mask first; its arm uses `args[1]`.
+        let (n, e) = if args[0].layout.ty.is_simd() {
+            self.elem_of(args[0].layout.ty)
+        } else {
+            (0, Elem { signed: false, float: false })
+        };
         let base = op.strip_suffix("_dyn").unwrap_or(op);
         match base {
             "add" | "sub" | "mul" | "div" | "rem" | "shl" | "shr" | "and" | "or" | "xor"

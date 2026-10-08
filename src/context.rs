@@ -119,6 +119,8 @@ pub struct State<'tcx> {
     pub counter: usize,
     pub cgu: String,
     pub asm: String,
+    /// EII symbol aliases: (alias, aliasee, weak); emitted as extra object symbols.
+    pub aliases: Vec<(String, String, bool)>,
     /// call op → (landing block, is catch_unwind catch-all)
     pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
@@ -589,6 +591,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 section: attrs.link_section.map(|s| s.to_string()),
             },
         );
+        self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 
     fn predefine_fn(
@@ -608,6 +611,25 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
+        let attrs = self.tcx.codegen_instance_attrs(instance.def);
+        self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
+    }
+}
+
+impl<'tcx> CodegenCx<'tcx> {
+    fn add_aliases(
+        &self,
+        aliasee: &str,
+        aliases: &[(rustc_hir::def_id::DefId, RLinkage, Visibility)],
+    ) {
+        for &(alias, linkage, _) in aliases {
+            let name = self.tcx.symbol_name(Instance::mono(self.tcx, alias)).name;
+            let weak = matches!(linkage, RLinkage::WeakAny | RLinkage::WeakODR);
+            self.st
+                .borrow_mut()
+                .aliases
+                .push((name.to_string(), aliasee.to_string(), weak));
+        }
     }
 }
 

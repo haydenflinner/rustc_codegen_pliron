@@ -248,6 +248,8 @@ impl CodegenBackend for PlironCodegenBackend {
         // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
         rustc_session::CodegenBackendInit {
             thin_lto_supported: false,
+            #[cfg(rustc_in_tree)]
+            fat_lto_supported: false,
             ..Default::default()
         }
     }
