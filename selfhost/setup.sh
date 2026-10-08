@@ -17,6 +17,6 @@ if [[ ! -d "$WT" ]]; then
 fi
 # -c, no -t: changed files get a fresh mtime, so cargo rebuilds the backend even
 # when the edit is older than the last build artifact.
-rsync -rlpc --delete --exclude target --exclude rust-toolchain.toml --exclude examples --exclude .git \
+rsync -rlpc --delete --exclude 'target*' --exclude rust-toolchain.toml --exclude examples --exclude .git \
     "$B/" "$WT/compiler/rustc_codegen_pliron/"
 echo "now: cd $WT && ./x build --stage 1 library && ./x build --stage 2 compiler"

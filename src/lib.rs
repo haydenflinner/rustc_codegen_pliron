@@ -103,6 +103,9 @@ impl ModuleBufferMethods for PlironBuffer {
 fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     fb.set("is_pic", "true").unwrap();
+    if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
+        fb.set("regalloc_checker", "true").unwrap();
+    }
     fb.set(
         "enable_verifier",
         if cfg!(debug_assertions) {
