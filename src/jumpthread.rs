@@ -1102,7 +1102,7 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32, range2: bool) -> Op
             _ => {}
         }
     }
-    if depth < 4
+    if depth < if range2 { 8 } else { 4 }
         && let Some(i) = func.dfg.value_def(v).inst()
     {
         match func.dfg.insts[i] {
