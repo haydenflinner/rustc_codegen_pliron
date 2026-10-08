@@ -208,6 +208,7 @@ pub fn lower_to_object(
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
+    let mut threaded = 0usize;
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -239,6 +240,21 @@ pub fn lower_to_object(
             fl.lower(f.op);
             fl.b.finalize(cfg);
         }
+        let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
+        if dump {
+            eprintln!("==== clif {n} ====\n{}", clctx.func.display());
+        }
+        if st.jumpthread {
+            threaded += crate::jumpthread::run(&mut clctx.func);
+            if dump {
+                eprintln!("==== clif {n} after jumpthread ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
         }
@@ -246,6 +262,9 @@ pub fn lower_to_object(
         m.clear_context(&mut clctx);
     }
 
+    if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("jumpthread {name}: {threaded} edges threaded");
+    }
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else {
