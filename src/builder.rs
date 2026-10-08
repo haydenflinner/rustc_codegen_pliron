@@ -273,7 +273,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return self.br(else_llbb);
         }
         let ty = self.val_ty(v);
-        if crate::pass_enabled("PLIRON_SWITCH") {
+        // wasm.rs has no SwitchOp lowering; it gets the compare chain.
+        if crate::pass_enabled("PLIRON_SWITCH") && !self.cx.tcx.sess.target.is_like_wasm {
             let w = self.int_width(ty) as usize;
             let cases = {
                 let c = self.cx.pctx.borrow();

@@ -143,6 +143,7 @@ pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
 
 pub fn lower_to_object(
     unwind: bool,
+    hot: bool,
     ctx: &Context,
     st: &State<'_>,
     isa: Arc<dyn TargetIsa>,
@@ -162,6 +163,8 @@ pub fn lower_to_object(
         }
     };
     let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
+    let mut hot_bodies: FxHashMap<String, FuncId> = FxHashMap::default();
+    let mut hot_asm = String::new();
     for (n, f) in &st.funcs {
         if st.dead_fns.contains(n) {
             continue;
@@ -170,6 +173,16 @@ pub fn lower_to_object(
         let mut l = f.linkage;
         if l == Linkage::Import && has_body(ctx, f.op) {
             l = Linkage::Export;
+        }
+        if hot && has_body(ctx, f.op) && crate::hot::patchable(n) {
+            let body = m
+                .declare_function(&crate::hot::body_name(n), Linkage::Hidden, &sig)
+                .unwrap();
+            let thunk = m.declare_function(n, Linkage::Import, &sig).unwrap();
+            hot_bodies.insert(n.clone(), body);
+            hot_asm.push_str(&crate::hot::thunk_asm(n, l));
+            ids.insert(n.clone(), Sym::F(thunk, f.ty));
+            continue;
         }
         let id = m
             .declare_function(n, l, &sig)
@@ -202,6 +215,7 @@ pub fn lower_to_object(
         let Sym::F(id, _) = ids[n] else {
             unreachable!()
         };
+        let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
@@ -268,14 +282,15 @@ pub fn lower_to_object(
     }
     let mut product = m.finish();
     eh.emit(&mut product);
-    if !st.asm.is_empty() {
+    if !st.asm.is_empty() || !hot_asm.is_empty() {
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        crate::objmerge::assemble_into(&mut product.object, &st.asm, x86);
+        let asm = format!("{}\n{hot_asm}", st.asm);
+        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
     product.emit().unwrap()
 }
 
-fn write_const(
+pub(crate) fn write_const(
     ctx: &Context,
     st: &State<'_>,
     v: Value,
@@ -1364,17 +1379,26 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             _ => self.cc,
         };
-        let sig = make_sig(ctx, fn_ty, &info.exts, cc);
+        let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         for a in args {
             cargs.extend(self.get(a));
         }
+        // C variadic: fn_ty only has the fixed params; on SysV the rest are
+        // passed like ordinary arguments of their own types.
+        let var_arg = matches!(classify(ctx, fn_ty), TyK::Func(_, _, true));
+        if var_arg {
+            for &v in &cargs[sig.params.len()..] {
+                sig.params
+                    .push(AbiParam::new(self.b.func.dfg.value_type(v)));
+            }
+        }
         let target = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
                 let sym = &self.st.ident_to_sym[&ident.to_string()];
                 match self.ids.get(sym).copied() {
-                    Some(Sym::F(fid, declty)) if declty == fn_ty => Ok(self.fref(fid)),
+                    Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => Ok(self.fref(fid)),
                     _ => {
                         let addr = self.sym_addr(&sym.clone());
                         Err((addr, self.b.import_signature(sig)))
@@ -1713,7 +1737,7 @@ fn cold_blocks(
     cold
 }
 
-fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
         b.deref(ctx)
             .iter(ctx)

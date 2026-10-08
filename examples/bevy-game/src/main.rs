@@ -27,6 +27,7 @@ const W: f32 = 640.0;
 const H: f32 = 480.0;
 
 fn main() {
+    pliron_hot::start();
     let limit = std::env::args()
         .skip_while(|a| a != "--frames")
         .nth(1)

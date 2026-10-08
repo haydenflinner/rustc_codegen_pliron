@@ -1,0 +1,10 @@
+[package]
+name = "pliron_hot"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "elf"] }
+libc = "0.2"

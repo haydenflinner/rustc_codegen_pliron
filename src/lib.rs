@@ -11,6 +11,7 @@ extern crate rustc_attr_ir;
 extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
+#[cfg(not(target_family = "wasm"))]
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
@@ -26,6 +27,7 @@ mod builder;
 mod consts;
 mod context;
 mod eh;
+mod hot;
 mod inline;
 mod instcombine;
 mod intrinsic;
@@ -37,6 +39,7 @@ mod simd;
 mod sroa;
 mod type_of;
 mod types;
+mod wasm;
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -179,9 +182,20 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             inline::dead_fns(ctx, st);
         }
     }
+    if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
+        let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);
+        return PlironModule {
+            obj,
+            ir,
+            asm: String::new(),
+        };
+    }
     let isa = build_isa(cx.tcx.sess);
+    let hot = std::env::var("PLIRON_HOT")
+        .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
     let obj = lower::lower_to_object(
         cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+        hot,
         &cx.pctx.borrow(),
         &cx.st.borrow(),
         isa,
@@ -193,13 +207,17 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
 
 impl CodegenBackend for PlironCodegenBackend {
     fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
+        types::PTR32.store(
+            sess.target.pointer_width == 32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         use rustc_target::spec::{Arch, Os};
         let feats: Vec<Symbol> = match sess.target.arch {
             Arch::X86_64 if sess.target.os != Os::None => ["fxsr", "sse", "sse2", "x87"]
                 .iter()
                 .map(|f| Symbol::intern(f))
                 .collect(),
-            Arch::AArch64 if sess.target.os != Os::None => vec![Symbol::intern("neon")],
+            Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
             _ => vec![],
         };
         TargetConfig {

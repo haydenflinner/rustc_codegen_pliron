@@ -27,7 +27,25 @@ rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranel
   Its target crates are compiled by this backend and linked with wild, and it runs on Vulkan (tested on Mesa lavapipe).
   `--frames N --autoplay` gives an unattended smoke run.
   `build.sh --host` also compiles all proc macros and build scripts with this backend (they load into stock rustc, against the prebuilt host std); `build.sh -Zbuild-std=std,panic_unwind` rebuilds the game's std with it. All modes render.
-- Not done yet: optimizations, debuginfo, LTO, and targets other than x86_64.
+- Hot reload (subsecond-style, no linker in the loop): with `PLIRON_HOT=<crate>` (and `-Ccodegen-units=1`), each function of that crate is emitted as `<sym>.hot` behind a `jmp *__hot_slot.<sym>` thunk (`src/hot.rs`).
+  A patch is the crate recompiled normally with `--emit=obj`. `examples/pliron-hot` (call `pliron_hot::start()`) loads it in the running process: it maps the object next to the executable, resolves symbols against the executable's own symbol table, keeps Rust statics bound to the live copies, registers `.eh_frame`, and repoints the slots of the functions whose code changed.
+  `examples/bevy-game/hot.sh` is the edit loop: save `src/main.rs`, the patch builds in ~1.2s and applies in ~50ms, and ECS state is kept. `tests/hot/run.sh` is a smoke test.
+  Limits: x86_64 ELF only, no new thread-locals in patches, changed struct layouts need a restart.
+- Mid-level passes: a small same-CGU inliner (`src/inline.rs`, at -O; `PLIRON_INLINE=0` disables it).
+- Not done yet: debuginfo, LTO, and targets other than x86_64.
+
+## wasm32 (in progress)
+
+`--target wasm32-unknown-unknown` lowers the pliron LLVM dialect to
+[waffle](https://github.com/bytecodealliance/waffle) IR, which does the
+reducify/stackify/localify into structured wasm (`src/wasm.rs`). Each
+codegen unit becomes a wasm "object" that imports memory, the stack pointer,
+the function table and GOT-style globals, plus a `pliron.link` custom section
+with data and relocations. `tools/pliron-wasm-ld` links those objects and
+rlibs into one module (wasm-ld is LLVM, so it is not used).
+
+`tests/wasm/run.sh` builds core, compiler_builtins and a test crate this way
+and runs it in node. Not done yet: std, unwinding, rustc itself as wasm.
 
 ## Usage
 ```

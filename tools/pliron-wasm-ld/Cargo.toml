@@ -1,0 +1,12 @@
+[package]
+name = "pliron-wasm-ld"
+version = "0.1.0"
+edition = "2024"
+description = "Links rustc_codegen_pliron wasm32 objects into one module (no wasm-ld/LLVM)."
+
+[dependencies]
+wasmparser = "0.248"
+wasm-encoder = { version = "0.248", features = ["wasmparser"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "archive"] }
+
+[workspace]

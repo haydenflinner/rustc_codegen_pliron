@@ -1,0 +1,19 @@
+[package]
+name = "pliron-wasi-libc"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust replacement for the slice of wasi-libc that std's wasm32-wasip1 backend calls"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+libc = { version = "0.2.190", default-features = false }
+wasip1 = { version = "1.0.0", default-features = false }
+dlmalloc = { version = "0.2.14", default-features = false }
+libm = "0.2"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

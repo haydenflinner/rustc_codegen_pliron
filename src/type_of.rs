@@ -361,7 +361,12 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 self.type_void()
             }
         };
-        for arg in fn_abi.args.iter() {
+        let nargs = if fn_abi.c_variadic {
+            fn_abi.fixed_count as usize
+        } else {
+            fn_abi.args.len()
+        };
+        for arg in &fn_abi.args[..nargs] {
             let t = match &arg.mode {
                 PassMode::Ignore => continue,
                 PassMode::Direct(_) => self.immediate_backend_type(arg.layout),

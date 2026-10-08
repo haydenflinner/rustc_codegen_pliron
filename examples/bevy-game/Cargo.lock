@@ -2640,6 +2640,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "offset-allocator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,6 +2778,15 @@ name = "pliron_bevy_game"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "pliron_hot",
+]
+
+[[package]]
+name = "pliron_hot"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "object",
 ]
 
 [[package]]
