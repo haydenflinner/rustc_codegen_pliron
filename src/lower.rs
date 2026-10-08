@@ -209,6 +209,7 @@ pub fn lower_to_object(
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     let mut threaded = 0usize;
+    let mut dead_params = 0usize;
     let mut merged = 0usize;
     let mut unreached = 0usize;
     let mut dupd = 0usize;
@@ -262,7 +263,9 @@ pub fn lower_to_object(
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         if st.jumpthread {
-            threaded += crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
+            let (n, dead) = crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
+            threaded += n;
+            dead_params += dead;
             if dump {
                 eprintln!(
                     "==== clif {n} after jumpthread ====\n{}",
@@ -378,7 +381,7 @@ pub fn lower_to_object(
     }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
         eprintln!(
-            "jumpthread {name}: {threaded} edges threaded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
+            "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
         );
     }
     for (n, g) in &st.globals {

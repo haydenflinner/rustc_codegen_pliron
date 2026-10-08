@@ -16,8 +16,8 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
-    ValueDef,
+    Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
+    Opcode, Type, Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -1433,19 +1433,193 @@ pub fn remove_trivial_params(func: &mut Function) -> usize {
     rm.len()
 }
 
+fn mark_live_param(
+    func: &Function,
+    value: Value,
+    live: &mut FxHashMap<Block, Vec<bool>>,
+    work: &mut Vec<(Block, usize)>,
+) {
+    let value = func.dfg.resolve_aliases(value);
+    let ValueDef::Param(block, index) = func.dfg.value_def(value) else {
+        return;
+    };
+    let Some(is_live) = live
+        .get_mut(&block)
+        .and_then(|params| params.get_mut(index))
+    else {
+        return;
+    };
+    if !*is_live {
+        *is_live = true;
+        work.push((block, index));
+    }
+}
+
+pub fn remove_dead_params(func: &mut Function) -> usize {
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut live: FxHashMap<Block, Vec<bool>> = blocks
+        .iter()
+        .map(|&block| (block, vec![false; func.dfg.num_block_params(block)]))
+        .collect();
+    let mut protected: FxHashSet<Block> = func.layout.entry_block().into_iter().collect();
+    let mut preds: FxHashMap<Block, Vec<Vec<BlockArg>>> = FxHashMap::default();
+    let mut insts = Vec::new();
+
+    for &block in &blocks {
+        for inst in func.layout.block_insts(block) {
+            insts.push(inst);
+            let data = &func.dfg.insts[inst];
+            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                let target = call.block(&func.dfg.value_lists);
+                let args: Vec<BlockArg> = call.args(&func.dfg.value_lists).collect();
+                if args.iter().any(|arg| !matches!(arg, BlockArg::Value(_))) {
+                    protected.insert(target);
+                }
+                preds.entry(target).or_default().push(args);
+            }
+            if let Some(table) = data.exception_table() {
+                for target in func.dfg.exception_tables[table].all_branches() {
+                    protected.insert(target.block(&func.dfg.value_lists));
+                }
+            }
+        }
+    }
+
+    let mut work = Vec::new();
+    for &block in &blocks {
+        if protected.contains(&block) {
+            for (index, is_live) in live.get_mut(&block).unwrap().iter_mut().enumerate() {
+                if !*is_live {
+                    *is_live = true;
+                    work.push((block, index));
+                }
+            }
+        }
+    }
+    for inst in &insts {
+        for &value in func.dfg.inst_args(*inst) {
+            mark_live_param(func, value, &mut live, &mut work);
+        }
+        if let Some(table) = func.dfg.insts[*inst].exception_table() {
+            for item in func.dfg.exception_tables[table].items() {
+                if let ExceptionTableItem::Context(value) = item {
+                    mark_live_param(func, value, &mut live, &mut work);
+                }
+            }
+        }
+    }
+
+    while let Some((target, index)) = work.pop() {
+        let Some(incoming) = preds.get(&target) else {
+            continue;
+        };
+        for args in incoming {
+            if let Some(BlockArg::Value(value)) = args.get(index).copied() {
+                mark_live_param(func, value, &mut live, &mut work);
+            }
+        }
+    }
+
+    let mut dead: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for &block in &blocks {
+        if protected.contains(&block) {
+            continue;
+        }
+        for (index, &is_live) in live.get(&block).unwrap().iter().enumerate() {
+            if !is_live {
+                dead.entry(block).or_default().push(index);
+            }
+        }
+    }
+    if dead.is_empty() {
+        return 0;
+    }
+    for indices in dead.values_mut() {
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+    }
+
+    let terms: Vec<Inst> = blocks
+        .iter()
+        .filter_map(|&block| func.layout.last_inst(block))
+        .collect();
+    for term in terms {
+        let dfg = &mut func.dfg;
+        for call in
+            dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if let Some(indices) = dead.get(&call.block(&dfg.value_lists)) {
+                for &index in indices {
+                    call.remove(index, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+
+    let removed = dead.values().map(Vec::len).sum();
+    for (&block, indices) in &dead {
+        for &index in indices {
+            let param = func.dfg.block_params(block)[index];
+            func.dfg.remove_block_param(param);
+        }
+    }
+    removed
+}
+
+fn remove_unused_notrap_loads(func: &mut Function) {
+    loop {
+        let mut used: FxHashSet<Value> = FxHashSet::default();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                for value in func.dfg.inst_values(inst) {
+                    used.insert(func.dfg.resolve_aliases(value));
+                }
+            }
+        }
+
+        let dead: Vec<Inst> = func
+            .layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|&inst| {
+                let InstructionData::Load { flags, .. } = func.dfg.insts[inst] else {
+                    return false;
+                };
+                func.dfg.mem_flags[flags].notrap()
+                    && !used.contains(&func.dfg.resolve_aliases(func.dfg.first_result(inst)))
+            })
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for inst in dead {
+            func.layout.remove_inst(inst);
+            func.dfg.clear_results(inst);
+        }
+    }
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
     derived: &FxHashMap<Value, Value>,
-) -> usize {
+) -> (usize, usize) {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
+    let deadp = crate::pass_enabled("PLIRON_DEADPARAM");
     let mut total = 0;
+    let mut dead_params = 0;
     for _ in 0..8 {
         if trivp {
             remove_trivial_params(func);
+        }
+        if deadp {
+            let removed = remove_dead_params(func);
+            dead_params += removed;
+            if removed != 0 {
+                remove_unused_notrap_loads(func);
+            }
         }
         let nn = NonNull::new(func, loads, derived);
         let dc = if domcond {
@@ -1460,7 +1634,69 @@ pub fn run(
         }
     }
     let nn = NonNull::new(func, loads, derived);
-    total + fold_null_tests(func, &nn)
+    (total + fold_null_tests(func, &nn), dead_params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_dead_params;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    #[test]
+    fn removes_cycle_only_param_and_keeps_exit_condition_param() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (loop_block, exit_block) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let loop_block = builder.create_block();
+            let exit_block = builder.create_block();
+            builder.append_block_param(loop_block, types::I64);
+            builder.append_block_param(loop_block, types::I64);
+            builder.append_block_param(exit_block, types::I64);
+
+            builder.switch_to_block(entry);
+            let zero = builder.ins().iconst(types::I64, 0);
+            let entry_args = [BlockArg::Value(zero), BlockArg::Value(zero)];
+            builder.ins().jump(loop_block, &entry_args);
+
+            builder.switch_to_block(loop_block);
+            let cycle = builder.block_params(loop_block)[0];
+            let counter = builder.block_params(loop_block)[1];
+            let next = builder.ins().iadd_imm_s(counter, 1);
+            let condition = builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThan, counter, 4);
+            let loop_args = [BlockArg::Value(cycle), BlockArg::Value(next)];
+            let exit_args = [BlockArg::Value(counter)];
+            builder
+                .ins()
+                .brif(condition, loop_block, &loop_args, exit_block, &exit_args);
+
+            builder.switch_to_block(exit_block);
+            let result = builder.block_params(exit_block)[0];
+            builder.ins().return_(&[result]);
+            builder.seal_all_blocks();
+            (loop_block, exit_block)
+        };
+
+        assert_eq!(remove_dead_params(&mut func), 1);
+        assert_eq!(func.dfg.num_block_params(loop_block), 1);
+        assert_eq!(func.dfg.num_block_params(exit_block), 1);
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                for call in func.dfg.insts[inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if call.block(&func.dfg.value_lists) == loop_block {
+                        assert_eq!(call.len(&func.dfg.value_lists), 1);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Turns `brif`/`br_table` on a compile-time constant into a `jump`. Later passes (load
