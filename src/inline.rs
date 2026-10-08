@@ -16,7 +16,8 @@ use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{Typed, TypedHandle};
-use pliron_llvm::ops::{BrOp, CallOp, ReturnOp};
+use pliron::value::Value;
+use pliron_llvm::ops::{BrOp, CallOp, GetElementPtrOp, LoadOp, ReturnOp};
 use pliron_llvm::types::FuncType;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -81,6 +82,46 @@ fn eligible(
         limit
     })
     .then_some((eh, n))
+}
+
+/// Parameter indices of `f` that (through loads / GEPs) feed an indirect call's
+/// target: a constant address there (a vtable, a fn pointer) lets `devirt`
+/// make the call direct once `f` is inlined, as LLVM's inline-cost bonus does.
+fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else {
+        return Vec::new();
+    };
+    let params: Vec<Value> = entry.deref(ctx).arguments().collect();
+    let mut out = Vec::new();
+    for &b in &bs {
+        for op in ops(ctx, b) {
+            let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+                continue;
+            };
+            let CallOpCallable::Indirect(mut p) = c.callee(ctx) else {
+                continue;
+            };
+            for _ in 0..4 {
+                if let Some(i) = params.iter().position(|&a| a == p) {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                    break;
+                }
+                match p.defining_op() {
+                    Some(d)
+                        if Operation::is_op::<LoadOp>(d, ctx)
+                            || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
+                    {
+                        p = d.deref(ctx).get_operand(0);
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    out
 }
 
 fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
@@ -209,13 +250,35 @@ pub fn run(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
+    // Callees up to `bonus`x the limit whose indirect call target comes from a
+    // parameter are inlined where that argument is a constant address
+    // (`PLIRON_INLINE_DEVIRT=<x>`; e.g. hashbrown's `find_or_find_insert_index_inner`
+    // taking `&mut dyn FnMut`).
+    let bonus: usize = std::env::var("PLIRON_INLINE_DEVIRT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 4 });
     let mut ok: FxHashMap<String, (Ptr<Operation>, bool, usize)> = FxHashMap::default();
+    let mut dv: FxHashMap<String, (Ptr<Operation>, bool, usize, Vec<usize>)> = FxHashMap::default();
+    let devirt_ok = |ctx: &Context, st: &State<'_>, sym: &str, dv: &mut FxHashMap<_, _>| {
+        if bonus <= 1 {
+            return;
+        }
+        if let Some((eh, n)) = eligible(ctx, st, sym, limit * bonus, false) {
+            let ps = devirt_params(ctx, st.funcs[sym].op);
+            if !ps.is_empty() {
+                dv.insert(sym.to_string(), (st.funcs[sym].op, eh, n, ps));
+            }
+        }
+    };
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
             if let Some((eh, n)) = eligible(ctx, st, sym, limit, single.contains(sym)) {
                 ok.insert(sym.clone(), (st.funcs[sym].op, eh, n));
+            } else {
+                devirt_ok(ctx, st, sym, &mut dv);
             }
         }
         st.funcs
@@ -240,7 +303,17 @@ pub fn run(
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
-                let Some(&(callee, eh, n)) = ok.get(cs) else {
+                let Some((callee, eh, n)) = ok.get(cs).copied().or_else(|| {
+                    let (f, eh, n, ps) = dv.get(cs)?;
+                    let args = Operation::get_op::<CallOp>(op, ctx)?.args(ctx);
+                    ps.iter()
+                        .any(|&i| {
+                            args.get(i).is_some_and(|a| {
+                                matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
+                            })
+                        })
+                        .then_some((*f, *eh, *n))
+                }) else {
                     continue;
                 };
                 // A callee with landing pads may go into an invoke whose pad is a
@@ -268,6 +341,8 @@ pub fn run(
         if bottom_up {
             if let Some((eh, n)) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
                 ok.insert(sym.clone(), (caller, eh, n));
+            } else {
+                devirt_ok(ctx, st, &sym, &mut dv);
             }
         }
     }
