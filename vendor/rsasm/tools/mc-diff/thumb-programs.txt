@@ -1,0 +1,59 @@
+=== short backward branch
+start:
+        movs    r0, 0
+        adds    r0, 1
+        b       start
+=== short forward branch
+        b       done
+        movs    r0, 1
+done:
+        nop
+=== conditional branches
+loop:
+        subs    r0, 1
+        bne     loop
+        beq     out
+        cmp     r0, 0
+        bgt     loop
+out:
+        nop
+=== bl to a local label
+target:
+        nop
+        bl      target
+=== explicitly wide branches
+here:
+        b.w     here
+        bne.w   here
+        nop
+=== branches that do fit the 16-bit form
+near:
+        nop
+        b       near
+        bne     near
+=== a branch too far for the 16-bit form
+far:
+        nop
+        .space  4096
+        b       far
+        bne     far
+=== numeric local labels
+1:      adds    r0, 1
+        cmp     r0, 16
+        blt     1b
+        b       2f
+        nop
+2:      nop
+=== starting in thumb and switching to arm on a word boundary
+        adds    r0, r1, r2
+        movs    r3, 7
+        .arm
+        add     r0, r1, r2
+=== alignment padding in thumb code
+        movs    r0, r0
+        .balign 8
+        movs    r0, r0
+        @ GNU as, and rsasm, pad the end of a code section to its alignment
+        @ up to a word; llvm-mc does not. Ending on a word keeps that out of
+        @ this case.
+        movs    r0, r0

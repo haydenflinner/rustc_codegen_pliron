@@ -1,0 +1,1118 @@
+# The SIMD and newer extensions, 64-bit mode, Intel syntax.
+#
+# One or two cases per mnemonic of every extension rsasm has beyond SSE and
+# AVX2, generated from GNU's opcode table by the fuzzer's form reader
+# (tools/fuzz/simd.py) and kept where GNU as 2.47, llvm-mc 22 and rsasm all
+# agree. They vary the vector length, the EVEX-only registers, memory operands
+# at every disp8*N scale, writemasks, {z}, broadcast and rounding; the named
+# compare predicates are represented by their `eq` spellings. The same file is
+# in tools/gas-diff and tools/mc-diff; where the two references disagree, the
+# case is in neither and the split is listed in tools/fuzz/x86.py.
+# ---- AVX-512F and AVX-512VL --------------------------------------------------
+kandnw k0, k4, k0
+kandw k6, k0, k5
+kmovw k1, k2
+knotw k4, k5
+kortestw k7, k4
+korw k4, k6, k3
+kshiftlw k2, k3, 0x1
+kshiftrw k4, k2, 0x1
+kunpckbw k6, k5, k5
+kxnorw k3, k0, k3
+kxorw k1, k3, k1
+vaddpd ymm3{k2}{z}, ymm24, qword ptr [rsi+0x1]{1to4}
+vaddps zmm3, zmm5, zmm3
+vaddsd xmm6, xmm15, xmm13, {ru-sae}
+vaddss xmm15{k6}{z}, xmm8, dword ptr [ebx+0x0]
+valignd ymm5, ymm4, [eax+esi*1+0x100]{1to8}, 0x0
+valignq xmm6{k5}, xmm1, xmm13, 0xff
+vblendmpd ymm19{k2}, ymm11, ymm27
+vblendmps zmm30, zmm19, zmmword ptr [r10+0x2]
+vbroadcastf32x4 zmm16{k5}, [r8+r8*1+0x1000]
+vbroadcastf64x4 zmm0{k5}, [rsi+0x80]
+vbroadcasti32x4 ymm11, [rax+0x1]
+vbroadcasti64x4 zmm18, ymmword ptr [rbp+0x200]
+vbroadcastsd ymm14, xmm17
+vcmpeq_oqpd k0{k3}, ymm0, qword ptr [r13+0x2]{1to4}
+vcmpeq_oqps k2, ymm25, ymm7
+vcmpeq_oqsd k0, xmm7, qword ptr [rdx+0x12345]
+vcmpeq_oqss k0, xmm23, xmm14
+vcmpeq_ospd k3, zmm12, qword ptr [rcx+0x1000]{1to8}
+vcmpeq_osps k0{k3}, zmm11, zmm31
+vcmpeq_ossd k4, xmm23, qword ptr [edi+r8d*4+0x0]
+vcmpeq_osss k4{k1}, xmm23, xmm6, {sae}
+vcmpeq_uqpd k6, zmm17, zmmword ptr [rax+0x40]
+vcmpeq_uqps k4, zmm26, zmm13
+vcmpeq_uqsd k0, xmm25, qword ptr [rsp+0x40]
+vcmpeq_uqss k3, xmm13, dword ptr [rdx+r14*4+0x10]
+vcmpeq_uspd k0{k2}, ymm6, ymm15
+vcmpeq_usps k2, zmm0, dword ptr [r8+0x40]{1to16}
+vcmpeq_ussd k0{k6}, xmm23, xmm0
+vcmpeq_usss k4, xmm16, xmm0
+vcmpeqpd k6, ymm17, qword ptr [rax+rcx*8+0x4]{1to4}
+vcmpeqps k1, zmm11, [r14+r13*1+0x3f]
+vcmpeqsd k2, xmm16, xmm8, {sae}
+vcmpeqss k2, xmm4, xmm10, {sae}
+vcmppd k4, ymm19, qword ptr [rbp+rbp*1+0x8]{1to4}, 0x7f
+vcmpps k5, xmm4, xmm15, 0x1
+vcmpsd k0, xmm14, xmm22, 0x0
+vcmpss k2{k3}, xmm21, xmm4, 0x1
+vcomisd xmm9, xmm30
+vcomiss xmm1, xmm29, {sae}
+vcompresspd zmmword ptr [rbp+0x7f0]{k1}, zmm7
+vcompressps [r12-0x2000], ymm1
+vcvtdq2pd xmm12, [r11-0x2000]
+vcvtdq2ph xmm20, dword ptr [r9-0x2000]{1to4}
+vcvtdq2ps zmm16, zmm13
+vcvtpd2dq ymm7, zmm4
+vcvtpd2ps ymm14, [r14+rax*1+0x80]
+vcvtpd2udq ymm2, zmm24, {rd-sae}
+vcvtph2pd xmm12, xmm18
+vcvtps2dq zmm12{k6}{z}, zmm14
+vcvtps2pd zmm25{k2}, [r10]{1to8}
+vcvtps2phx xmm15, ymmword ptr [rbp+0x80]
+vcvtps2qq ymm15, xmmword ptr [rbx*4+0x40]
+vcvtps2udq zmm22{k5}{z}, [r14+0x100]
+vcvtqq2ps xmm20, ymm7
+vcvtsd2si ebx, qword ptr [r9d+eax*2+0x100]
+vcvtsd2ss xmm0{k5}, xmm4, xmm21
+vcvtsd2usi r10d, qword ptr [r9-0x100]
+vcvtsi2sd xmm17, xmm22, r9d
+vcvtsi2ss xmm10, xmm13, dword ptr [eax+r10d*4+0x7f0]
+vcvtss2sd xmm12, xmm7, [rsi*4+0x4]
+vcvtss2si rcx, xmm12, {rd-sae}
+vcvtss2usi r15, xmm22, {rz-sae}
+vcvttpd2dq ymm4{k7}{z}, zmmword ptr [r12+0x40]
+vcvttpd2udq ymm10{k6}, zmm11, {sae}
+vcvttph2dq ymm13{k6}, xmm7
+vcvttps2dq zmm9, [r10d+0x0]{1to16}
+vcvttps2qq xmm17, xmm15
+vcvttps2udq zmm2, zmm21
+vcvttps2uqq xmm0{k1}, xmm0
+vcvttsd2si rbx, xmm14
+vcvttsd2usi r8d, qword ptr [r8-0x2000]
+vcvttss2si r15, dword ptr [rsp]
+vcvttss2usi r8d, xmm9
+vcvtudq2pd xmm9, xmm5
+vcvtudq2ph xmm15, ymm21
+vcvtudq2ps zmm18{k2}, zmm4, {rz-sae}
+vcvtusi2sd xmm2, xmm13, qword ptr [r15+0x40]
+vcvtusi2ss xmm19, xmm12, rbp
+vdivpd xmm3{k2}{z}, xmm3, xmm4
+vdivps zmm22{k6}{z}, zmm6, [r9+rdx*2+0x7f0]
+vdivsd xmm21, xmm22, xmm27, {ru-sae}
+vdivss xmm26{k1}{z}, xmm11, xmm27, {rd-sae}
+vexpandpd zmm7, zmm29
+vexpandps zmm25{k1}, zmmword ptr [rdx+0x12345]
+vextractf32x4 [rbp+r14*8+0x8], zmm8, 0x0
+vextractf64x4 ymm19{k4}, zmm1, 0x3
+vextracti32x4 xmmword ptr [esi+0x8]{k3}, zmm22, 0xff
+vextracti64x4 ymm7, zmm5, 0x3
+vfixupimmpd ymm1{k6}, ymm26, ymmword ptr [rbp+r9*8+0x200], 0x0
+vfixupimmps zmm17{k3}, zmm11, dword ptr [rbx+r11*8-0x40]{1to16}, 0x1
+vfixupimmsd xmm30{k2}, xmm11, xmm17, {sae}, 0x7f
+vfixupimmss xmm5{k4}{z}, xmm2, dword ptr [r15d+ebp*1+0x10], 0x3
+vgatherdps zmm12{k3}, dword ptr [r13+zmm0*8+0x40]
+vgatherqpd zmm2{k5}, qword ptr [rbp+zmm30*1+0x1]
+vgetexppd zmm2{k6}{z}, zmm13
+vgetexpps ymm7, dword ptr [r13+0x20]{1to8}
+vgetexpsd xmm10, xmm14, [eax+0x7f0]
+vgetexpss xmm11, xmm12, dword ptr [rbp-0x40]
+vgetmantpd ymm1{k4}{z}, ymm25, 0x7f
+vgetmantps ymm2, [r10+0x1000], 0x11
+vgetmantsd xmm10, xmm0, xmm1, {sae}, 0x1
+vgetmantss xmm31, xmm28, [edx+r13d*1+0x200], 0x0
+vgf2p8affineinvqb zmm2{k2}{z}, zmm17, [rax-0x40], 0x11
+vinsertf32x4 zmm29, zmm11, xmm26, 0x7f
+vinsertf64x4 zmm14{k7}, zmm18, ymm23, 0x0
+vinserti32x4 ymm6{k5}, ymm3, xmm31, 0x3
+vinserti64x4 zmm7, zmm3, ymm11, 0x11
+vinsertps xmm18, xmm13, xmm12, 0x11
+vmaxpd xmm3, xmm22, xmmword ptr [r11+0x3f]
+vmaxps zmm27{k2}{z}, zmm15, [r8+0x10]{1to16}
+vmaxsd xmm21, xmm18, qword ptr [r13d+0x8]
+vmaxss xmm5, xmm4, xmm10, {sae}
+vminpd ymm13, ymm26, ymm25
+vminps ymm26, ymm26, ymm0
+vminsd xmm24, xmm6, qword ptr [r12+0x40]
+vminss xmm0{k2}{z}, xmm6, dword ptr [rbp+0x3f]
+vmovapd ymm30, ymmword ptr [r14+r11*2-0x80]
+vmovaps xmm31{k5}, [rcx+0x100]
+vmovddup xmm28, xmm26
+vmovdqa32 xmm17, xmmword ptr [rbp+0x8]
+vmovdqa64 ymm12, ymmword ptr [r8d+0x8]
+vmovdqu32 ymm9, ymm6
+vmovdqu64 xmm4, xmmword ptr [r10-0x100]
+vmovhlps xmm1, xmm30, xmm14
+vmovhpd qword ptr [r12+0x4], xmm24
+vmovhps xmm12, xmm3, [r9*8+0x4]
+vmovlhps xmm3, xmm0, xmm3
+vmovlpd qword ptr [rcx+rsi*2+0x80], xmm5
+vmovlps qword ptr [rbp+rbp*4+0x4], xmm2
+vmovntdq [r8d+0x3f], ymm25
+vmovntdqa xmm10, [rbx+0x1]
+vmovntpd [rbx-0x80], zmm7
+vmovntps [r12+r8*2+0x40], zmm2
+vmovsd xmm10, [r14+rax*8+0x8]
+vmovshdup xmm12{k6}, xmm19
+vmovsldup zmm10, zmm1
+vmovss xmm7{k1}, xmm0, xmm12
+vmovupd xmm11{k1}{z}, xmm2
+vmovups zmm8, zmm10
+vmulpd zmm21, zmm23, zmm17
+vmulps xmm14, xmm9, [r11+0x40]{1to4}
+vmulsd xmm8, xmm26, xmm31
+vmulss xmm5, xmm5, [rdx+r13*1+0x40]
+vpabsd ymm30{k3}{z}, ymm14
+vpabsq xmm0, [r12*4+0x200]{1to2}
+vpaddd xmm28, xmm10, [r14+rdx*4+0x1000]{1to4}
+vpaddq ymm0, ymm13, ymm20
+vpandd xmm28, xmm4, xmm9
+vpandnd ymm22{k7}, ymm30, ymmword ptr [r14*4-0x40]
+vpandnq ymm12{k6}, ymm26, [rsi+rbp*8+0x40]{1to4}
+vpandq xmm21{k2}{z}, xmm28, xmm29
+vpblendmd ymm27, ymm27, ymm12
+vpblendmq ymm12{k4}, ymm26, [rbp+rdx*4+0x20]{1to4}
+vpbroadcastq ymm13, r14
+vpcmpd k5{k3}, zmm29, [rax+0x4]{1to16}, 0x1
+vpcmpeqd k0, zmm2, zmmword ptr [r11+0x12345]
+vpcmpeqq k7, ymm28, ymm21
+vpcmpequd k6, ymm15, dword ptr [r15d+0x1]{1to8}
+vpcmpequq k2, ymm21, [r13-0x80]
+vpcmpq k2, zmm2, zmm6, 0x7f
+vpcmpud k5, ymm8, ymm19, 0x1
+vpcmpuq k3, xmm1, xmm15, 0x11
+vpcompressd [rax+0x0]{k1}, ymm26
+vpcompressq xmm11{k4}, xmm14
+vpermi2d zmm17, zmm23, zmm16
+vpermi2pd zmm11{k6}, zmm20, [r12+0x4]{1to8}
+vpermi2ps xmm12, xmm5, dword ptr [r14+r11*8-0x2000]{1to4}
+vpermi2q zmm17{k7}, zmm23, zmmword ptr [rdx+0x3f]
+vpermilpd xmm14, xmm27, xmm4
+vpermpd ymm4{k6}{z}, ymm7, qword ptr [r9+r12*2+0x20]{1to4}
+vpermq ymm4, ymm22, ymm0
+vpermt2d zmm6, zmm0, zmm29
+vpermt2pd xmm2, xmm27, xmmword ptr [r13-0x80]
+vpermt2ps zmm11, zmm1, zmm2
+vpermt2q xmm19, xmm0, xmm12
+vpexpandd xmm22{k3}, [r15+0x4]
+vpexpandq zmm3{k7}{z}, zmmword ptr [rdx+0x8]
+vpgatherdd ymm6{k1}, dword ptr [rcx+ymm7*1+0x8]
+vpgatherdq zmm5{k3}, qword ptr [rdx+ymm11*1-0x40]
+vpgatherqd xmm2{k1}, [r15+ymm3*4-0x40]
+vpgatherqq zmm5{k4}, qword ptr [rbp+zmm7*2+0x100]
+vpmaxsd zmm6{k2}, zmm24, dword ptr [rcx+0x1]{1to16}
+vpmaxsq xmm8{k1}{z}, xmm5, xmmword ptr [r12+0x1]
+vpmaxud ymm19{k5}, ymm0, ymm20
+vpmaxuq xmm11{k6}{z}, xmm11, xmm30
+vpminsd ymm6, ymm9, [rsi+0x40]
+vpminsq zmm26{k7}, zmm20, zmm9
+vpminud ymm3{k1}, ymm1, [r13d+0x20]
+vpminuq ymm9, ymm8, ymm27
+vpmovdb [rdx+r12*1+0x4]{k3}, ymm9
+vpmovdw xmm2, xmm20
+vpmovqb xmm6, zmm7
+vpmovqd ymmword ptr [rsi*2+0x10], zmm19
+vpmovqw xmm21, ymm30
+vpmovsdb xmm22, ymm13
+vpmovsdw ymm19, zmm4
+vpmovsqb [r15+0x1]{k7}, zmm20
+vpmovsqd ymm20{k5}{z}, zmm12
+vpmovsqw [r11+0x100], zmm24
+vpmovswb xmm7, ymm7
+vpmovsxbd zmm27, xmmword ptr [rbp-0x2000]
+vpmovsxdq ymm25{k3}, xmmword ptr [r12d+0x40]
+vpmovsxwq zmm20, xmmword ptr [rbp+rcx*8-0x40]
+vpmovusdb xmm8, ymm24
+vpmovusdw xmmword ptr [rax], ymm29
+vpmovusqb xmm12, zmm28
+vpmovusqd xmm14{k7}, ymm10
+vpmovusqw xmm15{k6}{z}, xmm13
+vpmovuswb [r11+0x40], ymm7
+vpmovzxbq zmm6, xmm26
+vpmovzxdq xmm15{k5}, [rax+0x7f0]
+vpmovzxwq zmm3{k2}, xmm10
+vpmuldq ymm12, ymm12, ymm1
+vpmulld ymm19, ymm22, ymm15
+vpmuludq xmm2{k1}, xmm2, [rdi+0x1]
+vpord zmm31, zmm1, zmm11
+vporq ymm30, ymm7, ymm26
+vprold xmm15, xmm14, 0x11
+vprolq zmm16, zmmword ptr [r8*1+0x20], 0x11
+vprolvd xmm16, xmm21, [r8d+0x0]
+vprolvq xmm3{k4}, xmm7, qword ptr [r8*1-0x100]{1to2}
+vprord xmm6{k1}, xmm5, 0x7f
+vprorq xmm31{k6}, [r10+rcx*1-0x100], 0x7f
+vprorvd ymm15, ymm19, ymm0
+vprorvq zmm8, zmm9, [rbx+0x200]
+vpscatterdq qword ptr [rbp+ymm6*4+0x100]{k4}, zmm9
+vpscatterqd dword ptr [rbx+ymm0*2+0x1000]{k6}, xmm27
+vpshufd xmm30, xmm4, 0x11
+vpslld xmm28{k3}, xmm2, 0xff
+vpsllq ymm8{k7}, ymm31, 0x0
+vpsrad xmm23, [rax-0x40], 0x7f
+vpsraq ymm20{k6}{z}, ymm26, 0x1
+vpsravq ymm6{k1}{z}, ymm14, [r9+r12*8-0x100]
+vpsrld ymm9{k2}, dword ptr [rdi+0x12345]{1to8}, 0x7f
+vpsrlq ymm6, ymm2, xmm30
+vpsubd ymm0{k5}{z}, ymm12, ymmword ptr [r11d+r9d*2-0x80]
+vpsubq xmm0, xmm31, qword ptr [rcx+0x100]{1to2}
+vpternlogd ymm14{k4}, ymm12, ymm25, 0x3
+vpternlogq ymm24{k5}, ymm6, ymm16, 0x0
+vptestmd k2{k1}, ymm29, ymm10
+vptestmq k0{k6}, zmm10, zmm31
+vptestnmd k6, ymm27, ymm2
+vptestnmq k7, xmm3, [r10+0x0]{1to2}
+vpunpckhdq zmm30, zmm5, zmm21
+vpunpckhqdq xmm2{k1}, xmm4, xmmword ptr [r12+rcx*4+0x0]
+vpunpckldq zmm14{k4}{z}, zmm29, dword ptr [rcx*1+0x8]{1to16}
+vpunpcklqdq ymm28{k1}, ymm19, ymmword ptr [r15+0x0]
+vpxord zmm30{k3}, zmm27, zmm11
+vpxorq ymm7, ymm6, ymm11
+vrcp14pd zmm3, qword ptr [rbx*2-0x40]{1to8}
+vrcp14ps xmm6, [r14+0x12345]
+vrcp14sd xmm13, xmm11, qword ptr [ebx+0x3f]
+vrcp14ss xmm13, xmm25, xmm22
+vrndscalepd xmm14, xmmword ptr [rsp+0x0], 0x3
+vrndscaleps xmm0{k5}, xmm19, 0xff
+vrndscalesd xmm21, xmm24, qword ptr [r10+0x200], 0xff
+vrndscaless xmm25{k2}{z}, xmm27, xmm25, 0x3
+vrsqrt14pd xmm29, xmmword ptr [rsi+0x10]
+vrsqrt14ps ymm16, ymm6
+vrsqrt14sd xmm11, xmm5, [rcx*2-0x40]
+vrsqrt14ss xmm15{k6}, xmm26, dword ptr [rsp+0x2]
+vscalefpd zmm29, zmm5, zmm4
+vscalefps zmm29{k4}, zmm5, [rcx+r10*4+0x4]
+vscalefsd xmm17, xmm8, xmm30
+vscalefss xmm9, xmm13, dword ptr [rbp+0x80]
+vscatterdpd [rsp+ymm27*2+0x1]{k4}, zmm4
+vscatterqps dword ptr [r14+zmm3*1+0x4]{k7}, ymm3
+vshuff32x4 ymm9{k2}{z}, ymm10, ymm15, 0x7f
+vshuff64x2 ymm5{k7}, ymm25, [r12+0x100]{1to4}, 0x11
+vshufi32x4 ymm3{k6}, ymm22, ymm23, 0x11
+vshufi64x2 ymm8, ymm16, ymm10, 0xff
+vshufpd ymm19{k1}, ymm15, qword ptr [r9*4+0x20]{1to4}, 0x11
+vshufps ymm3, ymm2, dword ptr [r8*2+0x7f0]{1to8}, 0xff
+vsqrtpd xmm2, xmm1
+vsqrtps ymm6, ymm16
+vsqrtsd xmm4, xmm31, [r12+0x80]
+vsqrtss xmm30, xmm30, xmm6, {rn-sae}
+vsubpd zmm13, zmm8, zmm4, {ru-sae}
+vsubps xmm22, xmm12, [r8*2+0x40]{1to4}
+vsubsd xmm1{k3}, xmm14, qword ptr [r15+0x1000]
+vsubss xmm27, xmm8, xmm26
+vucomisd xmm28, xmm27
+vucomiss xmm1, xmm19
+vunpckhpd ymm17{k2}{z}, ymm3, [r14d+r11d*1-0x80]
+vunpckhps xmm28, xmm14, xmmword ptr [r8+0x8]
+vunpcklpd xmm31, xmm10, xmm9
+vunpcklps zmm27, zmm20, zmm16
+# ---- AVX-512BW ---------------------------------------------------------------
+kaddd k4, k7, k4
+kaddq k1, k3, k5
+kandd k4, k5, k1
+kandnd k0, k0, k0
+kandnq k4, k0, k0
+kandq k3, k7, k7
+kmovd [eax+0x2], k1
+kmovq k6, [rbx+rdi*8-0x100]
+knotd k0, k0
+knotq k2, k3
+kord k7, k7, k4
+korq k3, k6, k2
+kortestd k6, k3
+kortestq k1, k5
+kshiftld k1, k2, 0x3
+kshiftlq k4, k2, 0x0
+kshiftrd k4, k2, 0x7f
+kshiftrq k4, k0, 0x7f
+ktestd k2, k6
+ktestq k5, k3
+kunpckdq k0, k6, k7
+kunpckwd k5, k6, k0
+kxnord k0, k7, k0
+kxnorq k7, k1, k0
+kxord k6, k7, k7
+kxorq k3, k5, k6
+vdbpsadbw zmm16{k6}{z}, zmm5, zmm26, 0x7f
+vmovdqu16 ymm20, ymmword ptr [r9*2-0x80]
+vmovdqu8 xmm2{k3}{z}, xmmword ptr [edi+esi*2+0x20]
+vpabsb zmm4, zmm8
+vpabsw zmm20, zmm26
+vpackssdw ymm4, ymm12, [rcx+0x80]{1to8}
+vpacksswb xmm15, xmm11, xmm22
+vpackusdw zmm31, zmm10, zmm10
+vpackuswb ymm7, ymm13, ymm11
+vpaddb ymm8, ymm11, ymmword ptr [r11+0x8]
+vpaddsb ymm23{k2}, ymm9, ymmword ptr [rcx+0x200]
+vpaddsw ymm5{k3}{z}, ymm24, ymm12
+vpaddusb zmm22{k3}, zmm5, zmmword ptr [rsi+0x40]
+vpaddusw ymm15{k3}, ymm12, ymm2
+vpaddw ymm6{k6}, ymm19, ymmword ptr [rdx-0x80]
+vpalignr ymm3{k4}, ymm11, ymmword ptr [rbx+r11*4-0x40], 0x7f
+vpavgb xmm10, xmm4, xmmword ptr [rbp+r11*2+0x1]
+vpavgw xmm30, xmm3, [rbp-0x2000]
+vpblendmb zmm2{k4}, zmm18, zmmword ptr [rax+r12*1+0x8]
+vpblendmw xmm24{k4}{z}, xmm5, [rcx+0x40]
+vpbroadcastb xmm17, esp
+vpbroadcastw xmm8{k7}, r11d
+vpcmpb k6{k3}, ymm31, ymm13, 0x1
+vpcmpeqb k5{k3}, ymm8, ymm11
+vpcmpequb k0, zmm22, zmm9
+vpcmpequw k1{k7}, xmm0, xmm18
+vpcmpeqw k0, zmm13, zmmword ptr [r10+r10*2+0x4]
+vpcmpub k3, zmm28, zmm10, 0x3
+vpcmpuw k3, zmm14, zmmword ptr [r10-0x80], 0x0
+vpcmpw k3{k1}, ymm22, ymm5, 0xff
+vpermi2w ymm8, ymm10, ymm17
+vpermt2w ymm7{k7}{z}, ymm9, ymm4
+vpermw xmm22, xmm7, xmm28
+vpextrb r12d, xmm0, 0x11
+vpextrw r14d, xmm7, 0xff
+vpinsrb xmm7, xmm25, r12d, 0x11
+vpinsrw xmm1, xmm1, word ptr [rax+rdi*1+0x80], 0x7f
+vpmaddubsw zmm10{k4}, zmm11, zmmword ptr [rcx+0x10]
+vpmaddwd xmm11{k4}, xmm0, xmm13
+vpmaxsb xmm0, xmm18, xmm7
+vpmaxsw xmm0, xmm18, xmm8
+vpmaxub ymm21{k5}, ymm2, ymm18
+vpmaxuw ymm17, ymm6, ymm10
+vpminsb zmm21, zmm12, zmmword ptr [rbp+0x20]
+vpminsw xmm27{k2}, xmm9, xmm25
+vpminub xmm22{k2}, xmm10, xmm14
+vpminuw xmm3{k5}{z}, xmm7, [rax*4+0x1000]
+vpmovb2m k0, ymm8
+vpmovm2b zmm19, k7
+vpmovm2w xmm9, k6
+vpmovsxbw zmm7, ymm18
+vpmovw2m k7, xmm24
+vpmovwb ymm22{k1}, zmm5
+vpmovzxbw zmm7, ymm27
+vpmulhrsw ymm3{k7}, ymm9, ymmword ptr [rax-0x100]
+vpmulhuw zmm15{k2}, zmm7, zmmword ptr [rax+0x200]
+vpmulhw ymm19, ymm9, ymm8
+vpmullw ymm19, ymm17, [r11+rbx*4+0x3f]
+vpsadbw zmm15, zmm9, zmm8
+vpshufb zmm1, zmm2, zmmword ptr [rsp+0x7f0]
+vpshufhw zmm8{k1}{z}, zmm8, 0x0
+vpshuflw ymm0, ymm12, 0xff
+vpslldq xmm0, xmm6, 0x11
+vpsllvw xmm2{k4}, xmm6, xmm26
+vpsllw zmm2, zmm16, 0x7f
+vpsravw zmm3, zmm8, zmmword ptr [rbp+rdx*8-0x80]
+vpsraw ymm27, ymm9, 0x11
+vpsrldq ymm4, ymmword ptr [ebp+0x1], 0x1
+vpsrlvw zmm8, zmm5, zmmword ptr [rdi+0x40]
+vpsrlw zmm6{k6}{z}, zmm27, [rcx-0x100]
+vpsubb zmm10{k2}{z}, zmm8, [r12+0x1]
+vpsubsb zmm11, zmm20, zmm27
+vpsubsw ymm0, ymm4, [r15+rdx*1-0x100]
+vpsubusb xmm6{k4}{z}, xmm10, xmm5
+vpsubusw ymm19{k5}, ymm1, ymmword ptr [rsi+0x8]
+vpsubw zmm4{k2}, zmm29, [r14*8+0x10]
+vptestmb k5, xmm28, xmmword ptr [eax-0x80]
+vptestmw k5, xmm0, xmmword ptr [eax-0x40]
+vptestnmb k2, zmm23, zmm15
+vptestnmw k3{k7}, xmm11, xmmword ptr [rbx+r15*8+0x10]
+vpunpckhbw xmm3{k2}{z}, xmm9, xmm30
+vpunpckhwd ymm15{k1}, ymm10, ymmword ptr [r13+rdi*2-0x40]
+vpunpcklbw xmm5, xmm8, xmm11
+vpunpcklwd ymm0{k1}{z}, ymm17, [rdi+0x8]
+# ---- AVX-512DQ ---------------------------------------------------------------
+kaddb k5, k3, k5
+kaddw k5, k6, k5
+kandb k6, k5, k5
+kandnb k7, k4, k0
+kmovb k4, r8d
+knotb k6, k6
+korb k0, k1, k5
+kortestb k4, k2
+kshiftlb k7, k2, 0x11
+kshiftrb k1, k7, 0x11
+ktestb k4, k1
+ktestw k4, k0
+kxnorb k4, k4, k1
+kxorb k1, k4, k5
+vandnpd xmm3, xmm3, xmm20
+vandnps zmm12, zmm4, zmm15
+vandpd xmm12{k7}{z}, xmm19, xmm1
+vandps ymm15, ymm30, dword ptr [r9+rdx*1]{1to8}
+vbroadcastf32x2 zmm21, [rdi*1-0x100]
+vbroadcastf32x8 zmm31, ymmword ptr [rax]
+vbroadcastf64x2 zmm25{k7}, [r10+0x20]
+vbroadcasti32x2 zmm15, xmm14
+vbroadcasti32x8 zmm16{k1}{z}, ymmword ptr [rax+r8*1+0x3f]
+vbroadcasti64x2 ymm31, [rbp+rdi*2+0x1]
+vcvtpd2qq xmm25, xmm6
+vcvtpd2uqq xmm27, qword ptr [r10+rax*4+0x7f0]{1to2}
+vcvtps2uqq zmm15, ymmword ptr [r15d+0x80]
+vcvtqq2pd ymm6{k2}, ymmword ptr [r14+0x80]
+vcvttpd2qq xmm15{k1}{z}, qword ptr [r12+0x40]{1to2}
+vcvttpd2uqq xmm1, xmm3
+vcvtuqq2pd zmm21{k3}, zmm15, {ru-sae}
+vcvtuqq2ps ymm12{k5}, qword ptr [r14+0x100]{1to8}
+vextractf32x8 ymmword ptr [r15-0x80], zmm31, 0xff
+vextractf64x2 xmmword ptr [rbx+0x12345], ymm10, 0x1
+vextracti32x8 ymm16, zmm26, 0x7f
+vextracti64x2 xmmword ptr [r14+r13*4+0x1000], ymm27, 0xff
+vfpclasspd k2{k4}, zmmword ptr [rax+0x0], 0x3
+vfpclassps k1, zmmword ptr [rcx+0x12345], 0xff
+vfpclasssd k1, [rsp+rdx*4+0x3f], 0x0
+vfpclassss k0{k1}, xmm5, 0x7f
+vinsertf32x8 zmm12{k3}, zmm30, ymm4, 0x1
+vinsertf64x2 zmm3, zmm2, [rcx+0x100], 0x1
+vinserti32x8 zmm29, zmm8, [r14+0x100], 0x11
+vinserti64x2 ymm25, ymm5, xmm12, 0x7f
+vorpd zmm2, zmm19, [r9+r8*4+0x2]{1to8}
+vorps zmm8, zmm9, zmm13
+vpextrd [r15-0x100], xmm10, 0x0
+vpextrq qword ptr [r10+rdi*2+0x40], xmm28, 0xff
+vpinsrd xmm3, xmm18, ebx, 0x11
+vpinsrq xmm0, xmm12, rax, 0x11
+vpmovd2m k6, zmm7
+vpmovm2d zmm19, k4
+vpmovm2q zmm9, k1
+vpmovq2m k1, xmm16
+vpmullq ymm26{k1}, ymm29, qword ptr [r9-0x80]{1to4}
+vrangepd zmm17, zmm17, zmm0, {sae}, 0x3
+vrangeps xmm28{k4}, xmm13, xmm7, 0xff
+vrangesd xmm9, xmm1, qword ptr [rax+0x20], 0x7f
+vrangess xmm20{k1}, xmm4, xmm18, {sae}, 0x0
+vreducepd ymm4, [rcx+0x0], 0xff
+vreduceps zmm7{k2}{z}, zmm30, {sae}, 0x0
+vreducesd xmm0, xmm5, xmm3, 0x7f
+vreducess xmm8{k3}, xmm0, dword ptr [rsp-0x40], 0x11
+vxorpd xmm21, xmm29, xmm5
+vxorps zmm21{k7}, zmm12, zmmword ptr [rbp+r9*2+0x200]
+# ---- AVX-512CD ---------------------------------------------------------------
+vpbroadcastmb2q xmm21, k7
+vpbroadcastmw2d xmm11, k7
+vpconflictd xmm15{k5}, xmm7
+vpconflictq ymm18, [r15+0x40]
+vplzcntd zmm26{k3}{z}, zmm7
+vplzcntq xmm16, xmmword ptr [r13+0x1000]
+# ---- AVX-512ER and AVX-512PF -------------------------------------------------
+vexp2pd zmm28, qword ptr [r9+0x20]{1to8}
+vexp2ps zmm29, zmm5
+vrcp28pd zmm6{k1}, zmmword ptr [r15+0x100]
+vrcp28ps zmm27, zmm7
+vrcp28sd xmm19, xmm2, xmm28, {sae}
+vrcp28ss xmm6, xmm23, dword ptr [eax+0x7f0]
+vrsqrt28pd zmm11{k4}, zmm3, {sae}
+vrsqrt28ps zmm4, dword ptr [rdi*4+0x12345]{1to16}
+vrsqrt28sd xmm3, xmm25, xmm22
+vrsqrt28ss xmm5{k4}, xmm2, xmm9, {sae}
+# ---- AVX-512IFMA, VBMI and VBMI2 ---------------------------------------------
+vpcompressb ymmword ptr [r9+r14*1-0x100], ymm14
+vpcompressw zmm27{k5}, zmm12
+vpermb xmm21{k7}, xmm7, xmm29
+vpermi2b ymm30, ymm22, [rdi]
+vpermt2b ymm26, ymm10, ymm6
+vpexpandb ymm9, [r14d+r11d*2-0x80]
+vpexpandw ymm0, [rsi+0x40]
+vpmadd52luq xmm7, xmm7, xmm18
+vpmultishiftqb ymm22{k7}, ymm5, ymm5
+vpshldd ymm13{k6}{z}, ymm0, ymm22, 0x7f
+vpshldq zmm4{k1}{z}, zmm0, zmm14, 0xff
+vpshldvd zmm12{k2}, zmm3, zmm7
+vpshldvq zmm7{k1}, zmm13, zmmword ptr [rsi+0x12345]
+vpshldvw zmm23, zmm3, zmmword ptr [rax-0x2000]
+vpshldw zmm22{k7}{z}, zmm19, zmm22, 0x1
+vpshrdd ymm1{k4}{z}, ymm29, ymmword ptr [r15+rbx*2+0x8], 0x1
+vpshrdq zmm18{k4}{z}, zmm17, qword ptr [r10+rbx*2+0x1]{1to8}, 0x0
+vpshrdvd xmm14, xmm31, xmmword ptr [r15+0x1]
+vpshrdvq zmm26{k3}, zmm10, qword ptr [rdx+rbp*1+0x4]{1to8}
+vpshrdvw ymm8{k1}, ymm7, ymm29
+vpshrdw xmm2{k7}, xmm23, xmm20, 0x11
+# ---- AVX-512VNNI, BITALG, VPOPCNTDQ, VP2INTERSECT and BF16 -------------------
+vcvtne2ps2bf16 ymm28{k7}, ymm17, ymmword ptr [rax+0x20]
+vcvtneps2bf16 ymm5, [rdx+0x2]
+vdpbf16ps ymm19, ymm7, ymmword ptr [r11-0x40]
+vp2intersectd k6, ymm19, ymm18
+vp2intersectq k0, ymm13, ymm17
+vpdpbusds xmm1{k7}, xmm7, xmm30
+vpdpwssd xmm4, xmm4, xmmword ptr [rax+rbx*4+0x1000]
+vpopcntb xmm25, xmm0
+vpopcntd zmm22{k2}, zmm10
+vpopcntq zmm17, zmm0
+vpopcntw zmm3{k3}{z}, [rdx+r9*2+0x3f]
+vpshufbitqmb k7{k1}, xmm14, xmm15
+# ---- AVX-512FP16 -------------------------------------------------------------
+vaddph zmm18, zmm2, [r11]
+vaddsh xmm13{k4}, xmm4, xmm9, {ru-sae}
+vcmpeq_oqph k5{k7}, ymm7, ymm27
+vcmpeq_oqsh k3{k2}, xmm15, word ptr [r9+rdx*1-0x100]
+vcmpeq_osph k0{k2}, zmm14, zmm7
+vcmpeq_ossh k5, xmm20, xmm8
+vcmpeq_uqph k2{k4}, ymm16, [r13+0x1000]{1to16}
+vcmpeq_uqsh k6{k4}, xmm19, [r10+0x7f0]
+vcmpeq_usph k5, xmm15, [rdx+0x200]
+vcmpeq_ussh k1, xmm3, xmm11
+vcmpeqph k7, zmm9, zmm27, {sae}
+vcmpeqsh k4, xmm6, [rdi+r13*1+0x3f]
+vcmpph k2, zmm5, zmmword ptr [rdx+r14*8+0x80], 0x1
+vcmpsh k0{k2}, xmm14, xmm10, 0xff
+vcomish xmm18, xmm0, {sae}
+vcvtpd2ph xmm6{k6}{z}, qword ptr [r14+0x40]{1to4}
+vcvtph2dq zmm13{k7}{z}, ymm5
+vcvtph2psx zmm1, word ptr [rbp+rsi*8+0x3f]{1to16}
+vcvtph2qq zmm22, word ptr [r10+r10*1+0x7f0]{1to8}
+vcvtph2udq zmm8{k4}, ymmword ptr [rax+0x1000]
+vcvtph2uqq zmm7{k4}{z}, xmm1
+vcvtph2uw xmm11{k2}{z}, xmm27
+vcvtph2w zmm15, [rax+0x7f0]
+vcvtqq2ph xmm22{k7}, zmmword ptr [rax+0x1000]
+vcvtsd2sh xmm1, xmm21, qword ptr [r12+r9*4+0x40]
+vcvtsh2sd xmm15{k4}, xmm31, xmm15
+vcvtsh2si r10d, [r15+r15*8+0x12345]
+vcvtsh2ss xmm6, xmm11, xmm3, {sae}
+vcvtsh2usi ecx, xmm0
+vcvtsi2sh xmm21, xmm9, qword ptr [r15+0x40]
+vcvtss2sh xmm1{k4}{z}, xmm28, dword ptr [rsp]
+vcvttph2qq zmm6, xmm7, {sae}
+vcvttph2udq zmm23, ymm10
+vcvttph2uqq zmm9{k2}{z}, word ptr [eax-0x80]{1to8}
+vcvttph2uw ymm2, [rsp+r11*2+0x10]{1to16}
+vcvttph2w xmm22, word ptr [rbx+0x20]{1to8}
+vcvttsh2si rdx, xmm12
+vcvttsh2usi r12, [rbp+0x12345]
+vcvtuqq2ph xmm18, qword ptr [rsp+0x80]{1to4}
+vcvtusi2sh xmm29, xmm6, {rz-sae}, r11
+vcvtuw2ph ymm18, ymmword ptr [rsp+0x8]
+vcvtw2ph zmm5, [r8+0x3f]{1to32}
+vdivph ymm13{k4}, ymm2, word ptr [rcx+0x2]{1to16}
+vdivsh xmm31{k4}, xmm4, xmm13, {rz-sae}
+vfcmaddcph zmm22, zmm27, zmm14, {rd-sae}
+vfcmaddcsh xmm26, xmm9, xmm2
+vfcmulcph zmm3{k7}, zmm13, zmm11
+vfcmulcsh xmm30{k2}{z}, xmm10, dword ptr [rbx+0x1000]
+vfmadd132ph zmm27, zmm13, [rcx+0x3f]
+vfmadd132sh xmm29, xmm21, xmm10
+vfmadd213ph ymm3, ymm23, word ptr [r11d+0x0]{1to16}
+vfmadd213sh xmm12{k4}{z}, xmm12, word ptr [r9*1+0x40]
+vfmadd231ph ymm21, ymm11, ymm22
+vfmadd231sh xmm24{k6}, xmm15, xmm12
+vfmaddcph ymm6{k5}, ymm10, ymm5
+vfmaddcsh xmm21, xmm2, dword ptr [rsi+rax*2-0x2000]
+vfmaddsub132ph zmm4{k7}, zmm20, [r8*8+0x3f]{1to32}
+vfmaddsub213ph ymm8{k5}{z}, ymm7, ymmword ptr [r12+0x10]
+vfmaddsub231ph zmm10, zmm9, zmmword ptr [rsi-0x40]
+vfmsub132ph zmm6, zmm18, word ptr [r12+0x1000]{1to32}
+vfmsub132sh xmm12{k4}, xmm4, [rax-0x40]
+vfmsub213ph xmm22{k4}, xmm14, xmm14
+vfmsub213sh xmm22, xmm14, [rbx+r15*8-0x2000]
+vfmsub231ph xmm19, xmm20, xmm1
+vfmsub231sh xmm12{k3}, xmm11, xmm17, {ru-sae}
+vfmsubadd132ph zmm29, zmm31, [r11+0x20]{1to32}
+vfmsubadd213ph ymm0{k6}{z}, ymm6, ymm20
+vfmsubadd231ph zmm15{k2}{z}, zmm10, zmm0, {ru-sae}
+vfmulcph ymm23{k4}, ymm10, [r12+0x1]
+vfmulcsh xmm4{k3}{z}, xmm3, xmm1, {rn-sae}
+vfnmadd132ph zmm31{k4}, zmm27, word ptr [rsi+0x10]{1to32}
+vfnmadd132sh xmm8, xmm5, word ptr [r8+rcx*1+0x1000]
+vfnmadd213ph xmm10, xmm14, [r14+rbx*1+0x1]{1to8}
+vfnmadd213sh xmm20, xmm9, xmm2, {ru-sae}
+vfnmadd231ph ymm11{k1}{z}, ymm7, ymm6
+vfnmadd231sh xmm27{k3}, xmm2, xmm21
+vfnmsub132ph zmm0, zmm18, zmm5, {rz-sae}
+vfnmsub132sh xmm14{k3}, xmm13, [r9+rbp*1-0x100]
+vfnmsub213ph xmm15, xmm11, xmm23
+vfnmsub213sh xmm2, xmm21, xmm13, {rd-sae}
+vfnmsub231ph zmm9{k4}{z}, zmm6, zmmword ptr [rax+0x20]
+vfnmsub231sh xmm17, xmm30, xmm9, {rn-sae}
+vfpclassph k7, ymm4, 0x1
+vfpclasssh k3{k5}, [r8+0x10], 0x3
+vgetexpph zmm11, zmm0
+vgetexpsh xmm2{k4}{z}, xmm0, [rbx]
+vgetmantph zmm14{k1}, zmm2, 0x1
+vgetmantsh xmm8, xmm19, xmm5, 0x7f
+vmaxph zmm20{k5}{z}, zmm29, zmmword ptr [rsi+0x7f0]
+vmaxsh xmm31{k3}{z}, xmm14, [r8+r10*2+0x7f0]
+vminph xmm15{k6}{z}, xmm27, word ptr [rbp+rsi*4+0x7f0]{1to8}
+vminsh xmm28, xmm23, xmm4, {sae}
+vmovsh xmm23{k5}{z}, [rsp+r15*8+0x40]
+vmulph xmm15{k3}, xmm18, xmm10
+vmulsh xmm16{k6}{z}, xmm2, [r15+r9*8+0x12345]
+vrcpph xmm25, xmm6
+vrcpsh xmm9{k6}, xmm3, word ptr [rsp+r13*1+0x12345]
+vreduceph ymm28, word ptr [rsi+rdi*2-0x2000]{1to16}, 0x7f
+vreducesh xmm30, xmm6, [rax+0x200], 0x7f
+vrndscaleph ymm31, ymm14, 0xff
+vrndscalesh xmm15{k3}{z}, xmm3, xmm5, {sae}, 0x0
+vrsqrtph xmm6, [esi+ebp*2+0x10]
+vrsqrtsh xmm6, xmm13, xmm0
+vscalefph ymm24, ymm9, [r13+0x10]
+vscalefsh xmm31{k4}{z}, xmm16, [rbx+r15*8+0x8]
+vsqrtph ymm18, [r12d+ecx*8-0x80]{1to16}
+vsqrtsh xmm0, xmm5, xmm2, {rn-sae}
+vsubph zmm17, zmm27, zmm13
+vsubsh xmm9{k3}{z}, xmm8, xmm28
+vucomish xmm18, word ptr [r15+0x200]
+# ---- GFNI, VAES, VPCLMULQDQ, SHA, SHA512, SM3, SM4, F16C ---------------------
+gf2p8affineinvqb xmm8, xmm2, 0x0
+gf2p8affineqb xmm4, xmmword ptr [r10+r8*2+0x0], 0x0
+gf2p8mulb xmm1, [rdi+rbx*2+0x200]
+sha1msg1 xmm12, xmm4
+sha1msg2 xmm0, xmm0
+sha1nexte xmm0, [eax+eax*8+0x20]
+sha1rnds4 xmm4, xmm13, 0xff
+sha256msg1 xmm7, xmm15
+sha256msg2 xmm5, xmm8
+sha256rnds2 xmm5, xmmword ptr [rbx+rcx*2-0x2000]
+vaesdec xmm7, xmm30, xmm27
+vaesdeclast zmm1, zmm1, zmm15
+vaesenc zmm4, zmm3, zmm19
+vaesenclast ymm31, ymm25, ymmword ptr [r15+r15*1+0x4]
+vcvtph2ps ymm8, xmmword ptr [rsi+rbp*2+0x4]
+vcvtps2ph xmm14, ymm0, 0x7f
+vgf2p8affineqb ymm11, ymm14, [ebp+ecx*8-0x80], 0x3
+vgf2p8mulb xmm0{k2}{z}, xmm14, xmm25
+vpclmulhqhqdq xmm29, xmm2, [r14+rax*1+0x20]
+vpclmulhqlqdq xmm30, xmm6, xmm11
+vpclmullqhqdq xmm0, xmm31, xmm9
+vpclmullqlqdq zmm15, zmm21, [r11*4+0x200]
+vpclmulqdq xmm21, xmm18, xmm8, 0x11
+vsha512msg1 ymm7, xmm0
+vsha512msg2 ymm13, ymm13
+vsha512rnds2 ymm15, ymm0, xmm14
+vsm3msg1 xmm1, xmm6, xmm0
+vsm3msg2 xmm8, xmm14, xmm3
+vsm3rnds2 xmm12, xmm10, [rax+rdi*4-0x80], 0x0
+vsm4key4 zmm15, zmm28, zmm8
+vsm4rnds4 xmm8, xmm10, xmm21
+# ---- AVX-VNNI, AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8/16 --------------------
+vbcstnebf162ps ymm12, word ptr [r14+0x0]
+vbcstnesh2ps xmm8, word ptr [r10+0x80]
+vcvtneebf162ps ymm9, [rax+0x10]
+vcvtneeph2ps xmm5, [r10+0x100]
+vcvtneobf162ps xmm11, [r15+r8*2+0x1]
+vcvtneoph2ps ymm10, [r15]
+vpdpbssds xmm5, xmm11, xmm5
+vpdpbsud xmm5, xmm2, xmm5
+vpdpbsuds xmm5, xmm9, xmm0
+vpdpbusd ymm1, ymm12, [r15+0x20]
+vpdpbuud xmm6, xmm10, xmm2
+vpdpbuuds xmm15, xmm6, [rbp+0x8]
+vpdpwssds ymm12, ymm4, ymm3
+vpdpwsud xmm12, xmm3, xmm4
+vpdpwsuds ymm7, ymm2, ymm11
+vpdpwusd xmm2, xmm0, xmmword ptr [rdx-0x40]
+vpdpwuud xmm11, xmm10, xmm9
+vpdpwuuds xmm12, xmm14, xmmword ptr [r15d+0x0]
+vpmadd52huq ymm11, ymm4, ymm15
+# ---- FMA, FMA4 and XOP -------------------------------------------------------
+vfmaddpd ymm7, ymm10, ymm2, ymm8
+vfmaddps ymm8, ymm2, ymm5, ymm8
+vfmaddsd xmm14, xmm6, xmm2, qword ptr [rcx+0x100]
+vfmaddss xmm15, xmm9, xmm3, xmm11
+vfmaddsubpd xmm2, xmm8, xmm11, xmmword ptr [r14+rbx*1-0x100]
+vfmaddsubps xmm4, xmm9, xmm2, xmmword ptr [r13d]
+vfmsubaddpd xmm6, xmm15, xmm6, [rcx+0x3f]
+vfmsubaddps ymm15, ymm14, ymm10, ymm11
+vfmsubpd xmm3, xmm14, xmm10, [r10-0x100]
+vfmsubps ymm7, ymm8, ymm15, ymm10
+vfmsubsd xmm12, xmm6, xmm4, qword ptr [r10*2-0x2000]
+vfmsubss xmm6, xmm1, xmm4, dword ptr [rsi+rdx*4+0x20]
+vfnmaddpd xmm9, xmm7, xmm12, [rbp+0x12345]
+vfnmaddps xmm9, xmm2, xmm0, xmm12
+vfnmaddsd xmm8, xmm11, xmm2, qword ptr [rdi-0x40]
+vfnmaddss xmm5, xmm4, xmm7, dword ptr [rbp-0x80]
+vfnmsubpd xmm10, xmm1, xmm0, xmm6
+vfnmsubps ymm14, ymm3, ymm2, [r8d+r12d*4+0x1]
+vfnmsubsd xmm6, xmm11, xmm8, xmm11
+vfnmsubss xmm1, xmm3, xmm0, dword ptr [rdi+0x1]
+vfrczpd xmm8, [r13+rdi*8-0x40]
+vfrczps xmm13, xmmword ptr [rdx+0x40]
+vfrczsd xmm12, xmm6
+vfrczss xmm12, xmm1
+vpcmov xmm2, xmm10, xmm2, xmm12
+vpcomb xmm8, xmm12, [rax+0x7f0], 0x7f
+vpcomd xmm1, xmm4, xmm11, 0x0
+vpcomeqb xmm0, xmm9, xmmword ptr [r14+r11*4-0x80]
+vpcomeqd xmm1, xmm6, [r14+rbp*1+0x0]
+vpcomeqq xmm9, xmm12, xmm2
+vpcomequb xmm5, xmm7, xmm13
+vpcomequd xmm10, xmm5, xmmword ptr [r11+rsi*2-0x100]
+vpcomequq xmm4, xmm8, xmm13
+vpcomequw xmm15, xmm5, [rdi-0x40]
+vpcomeqw xmm9, xmm4, xmmword ptr [r15+0x40]
+vpcomq xmm14, xmm10, xmm2, 0x1
+vpcomub xmm12, xmm14, xmm5, 0x0
+vpcomud xmm1, xmm7, xmmword ptr [rcx+rbx*8-0x80], 0x1
+vpcomuq xmm6, xmm5, xmm8, 0x7f
+vpcomuw xmm2, xmm8, xmm5, 0x1
+vpcomw xmm14, xmm9, xmm4, 0x11
+vpermil2pd ymm10, ymm14, ymm15, ymm15, 0x3
+vpermil2ps ymm13, ymm11, ymm11, [rdi+0x2], 0x1
+vphaddbd xmm5, xmm15
+vphaddbq xmm2, xmmword ptr [r11]
+vphaddbw xmm7, [rax]
+vphadddq xmm12, xmm9
+vphaddubd xmm8, [r15+r9*2+0x100]
+vphaddubq xmm3, xmmword ptr [r14+rbx*2+0x80]
+vphaddubw xmm3, [r14+0x8]
+vphaddudq xmm10, xmm0
+vphadduwd xmm5, xmmword ptr [rax+0x3f]
+vphadduwq xmm13, xmmword ptr [rdx+rax*2+0x0]
+vphaddwd xmm12, xmm11
+vphaddwq xmm5, xmm11
+vphsubbw xmm14, xmm2
+vphsubdq xmm8, [rdi-0x40]
+vphsubwd xmm9, [r12+0x1000]
+vpmacsdd xmm15, xmm10, xmmword ptr [r9+rbp*8+0x12345], xmm15
+vpmacsdqh xmm8, xmm7, xmm12, xmm9
+vpmacsdql xmm6, xmm1, xmmword ptr [r10+r12*4+0x8], xmm15
+vpmacssdd xmm12, xmm6, [r9d-0x100], xmm11
+vpmacssdqh xmm10, xmm9, xmm10, xmm14
+vpmacssdql xmm14, xmm4, xmm1, xmm7
+vpmacsswd xmm12, xmm0, xmm4, xmm12
+vpmacssww xmm2, xmm3, [r11d+r14d*2+0x7f0], xmm14
+vpmacswd xmm7, xmm7, xmm0, xmm12
+vpmacsww xmm4, xmm3, xmmword ptr [rbx+r8*4+0x0], xmm12
+vpmadcsswd xmm12, xmm12, [ebp+r14d*1+0x0], xmm0
+vpmadcswd xmm2, xmm0, xmmword ptr [r12+r10*4+0x2], xmm6
+vpperm xmm12, xmm14, xmm4, xmm5
+vprotb xmm15, xmm8, 0x11
+vprotd xmm11, xmm11, 0x3
+vprotq xmm15, xmm14, xmm0
+vprotw xmm12, xmm14, 0x11
+vpshab xmm7, [rcx+0x200], xmm10
+vpshad xmm12, xmmword ptr [rax-0x80], xmm8
+vpshaq xmm11, xmm9, xmm1
+vpshaw xmm11, xmm12, xmm8
+vpshlb xmm13, xmmword ptr [r13+rdx*2+0x7f0], xmm6
+vpshld xmm6, xmm6, xmm1
+vpshlq xmm6, [rdx+rsi*2+0x7f0], xmm12
+vpshlw xmm14, xmm15, xmm2
+# ---- BMI1, BMI2, TBM, LWP, ADX, LZCNT, POPCNT --------------------------------
+adcx r11, r14
+adox r13, [r14+rcx*1+0x100]
+andn r14d, r12d, dword ptr [r14+0x200]
+bextr r12, rax, rax
+blcfill rsi, [rax+0x2]
+blci r9, r12
+blcic r14, rdx
+blcmsk r8, [rsp+r10*8+0x1]
+blcs esi, eax
+blsfill r12, qword ptr [rdi+0x1000]
+blsi r12, [r9+r12*1+0x3f]
+blsic rdi, [rdx+r11*4]
+blsmsk r10d, eax
+blsr ebp, r10d
+bzhi eax, dword ptr [rdx+r8*4], r8d
+llwpcb rbx
+lwpins edi, r14d, 0x3
+lwpval eax, esp, 0x3
+lzcnt cx, bp
+mulx r11, rbp, qword ptr [rcx*4+0x80]
+pdep r11, r11, r15
+pext r13, rbp, [rbp-0x40]
+popcnt rax, qword ptr [rax*2-0x80]
+rorx r12, r14, 0x11
+sarx ebx, dword ptr [r8*8-0x100], r10d
+shlx edx, dword ptr [rsi+r15*4+0x40], r8d
+shrx r15, qword ptr [ecx+ecx*1+0x4], r11
+slwpcb r11
+t1mskc r9, rax
+tzcnt r11w, r9w
+tzmsk r12d, dword ptr [r8+0x80]
+# ---- AMX ---------------------------------------------------------------------
+ldtilecfg [rbp+r12*4+0x1]
+sttilecfg [rax+0x10]
+tcmmimfp16ps tmm6, tmm7, tmm2
+tcmmrlfp16ps tmm4, tmm6, tmm7
+tdpbf16ps tmm1, tmm2, tmm3
+tdpbssd tmm3, tmm4, tmm6
+tdpbsud tmm4, tmm5, tmm1
+tdpbusd tmm6, tmm2, tmm4
+tdpbuud tmm1, tmm5, tmm7
+tdpfp16ps tmm0, tmm4, tmm1
+tileloadd tmm3, [r10+0x4]
+tileloaddt1 tmm3, [r14+rbx*2+0x80]
+tilerelease
+tilestored [rbp+0x12345], tmm5
+tilezero tmm6
+# ---- AVX10.2 -----------------------------------------------------------------
+vaddbf16 ymm26{k1}{z}, ymm4, ymm18
+vcmpbf16 k2, zmm11, word ptr [r15+0x40]{1to32}, 0x0
+vcomisbf16 xmm9, xmm15
+vcomxsd xmm23, xmm8
+vcomxsh xmm19, xmm12
+vcomxss xmm3, xmm8, {sae}
+vcvt2ph2bf8 ymm19, ymm4, ymm5
+vcvt2ph2bf8s zmm2, zmm1, [rbp+0x40]{1to32}
+vcvt2ph2hf8 xmm0, xmm8, xmm9
+vcvt2ph2hf8s zmm5, zmm6, zmm27
+vcvt2ps2phx zmm0, zmm16, dword ptr [r13+0x100]{1to16}
+vcvtbf162ibs zmm24{k5}{z}, word ptr [r10+r8*8+0x20]{1to32}
+vcvtbf162iubs xmm12, xmmword ptr [ebx+r8d*4+0x0]
+vcvtbiasph2bf8 xmm29{k3}, xmm20, xmmword ptr [r15+r11*8+0x7f0]
+vcvtbiasph2bf8s xmm6, ymm18, ymm15
+vcvtbiasph2hf8 xmm15, ymm10, ymm15
+vcvtbiasph2hf8s xmm2, xmm18, xmmword ptr [edx+0x12345]
+vcvthf82ph xmm1{k3}, xmm8
+vcvtph2bf8 xmm11, xmm4
+vcvtph2bf8s ymm24, [rax+0x1]{1to32}
+vcvtph2hf8 ymm14, zmmword ptr [r13+0x40]
+vcvtph2hf8s xmm25{k1}, xmm12
+vcvtph2ibs xmm0{k1}, xmm29
+vcvtph2iubs xmm28{k4}{z}, xmmword ptr [rsi-0x80]
+vcvtps2ibs zmm30, zmm29
+vcvtps2iubs zmm14, dword ptr [rax+rbp*2-0x2000]{1to16}
+vcvttbf162ibs zmm7{k7}, [r12*1-0x80]
+vcvttbf162iubs zmm27, zmm17
+vcvttpd2dqs ymm27, [r11d+ebx*4+0x3f]{1to8}
+vcvttpd2qqs zmm14, zmmword ptr [rbp+r10*4+0x40]
+vcvttpd2udqs xmm12, ymmword ptr [r12*2+0x1]
+vcvttpd2uqqs zmm9{k3}, zmmword ptr [r10+r11*1+0x4]
+vcvttph2ibs zmm21, zmmword ptr [r15+0x40]
+vcvttph2iubs xmm2, [rcx-0x100]
+vcvttps2dqs zmm15, zmm12, {sae}
+vcvttps2ibs ymm20, ymmword ptr [r15d-0x40]
+vcvttps2iubs xmm30, xmm13
+vcvttps2qqs ymm9{k4}{z}, xmm24
+vcvttps2udqs xmm27, xmm2
+vcvttps2uqqs zmm15, ymm11
+vcvttsd2sis r11, xmm31
+vcvttsd2usis r14d, qword ptr [rax+0x40]
+vcvttss2sis esi, dword ptr [r13+r12*1-0x2000]
+vcvttss2usis r13, xmm22
+vdivbf16 zmm18, zmm6, [rbx-0x80]
+vdpphps xmm0{k5}{z}, xmm26, xmmword ptr [r15+0x100]
+vfmadd132bf16 xmm4, xmm0, [rax+0x1000]{1to8}
+vfmadd213bf16 zmm16, zmm4, zmm6
+vfmadd231bf16 xmm0{k3}, xmm12, [esi+0x0]
+vfmsub132bf16 zmm13{k2}{z}, zmm5, zmmword ptr [rdx+0x1000]
+vfmsub213bf16 ymm22, ymm13, ymm30
+vfmsub231bf16 ymm14{k7}{z}, ymm7, ymm27
+vfnmadd132bf16 ymm7, ymm17, ymmword ptr [rdi+0x10]
+vfnmadd213bf16 zmm20, zmm2, zmmword ptr [r12+rbp*4+0x20]
+vfnmadd231bf16 zmm2, zmm29, word ptr [r14+0x200]{1to32}
+vfnmsub132bf16 zmm29, zmm14, zmm28
+vfnmsub213bf16 xmm18{k7}, xmm20, xmm8
+vfnmsub231bf16 zmm25, zmm19, zmmword ptr [rcx+0x4]
+vfpclassbf16 k6, zmmword ptr [rsi-0x100], 0x7f
+vgetexpbf16 ymm14{k5}, [rsi]
+vgetmantbf16 ymm11, [r10+0x80], 0x1
+vmaxbf16 zmm30{k1}{z}, zmm13, word ptr [r13+0x1000]{1to32}
+vminbf16 zmm11{k7}, zmm7, zmm31
+vminmaxbf16 ymm15{k7}, ymm0, ymmword ptr [esp-0x2000], 0x3
+vminmaxpd zmm11, zmm1, [rbp-0x40]{1to8}, 0x1
+vminmaxph xmm24{k1}, xmm7, xmmword ptr [rbx+rcx*1+0x200], 0xff
+vminmaxps xmm16{k2}, xmm1, [rax+0x4], 0x11
+vminmaxsd xmm20, xmm31, xmm4, 0x1
+vminmaxsh xmm1, xmm12, [r10+r13*1+0x10], 0xff
+vminmaxss xmm23{k6}, xmm14, dword ptr [esi+edx*2+0x7f0], 0xff
+vmovrsb zmm25, [rbp+0x10]
+vmovrsd zmm5, [rdx+r12*4+0x0]
+vmovrsq ymm14{k4}{z}, [rsp+r9*1+0x40]
+vmovrsw ymm31, [rsp+rbx*2+0x1]
+vmovw xmm14, xmm9
+vmpsadbw xmm26{k2}, xmm10, xmmword ptr [rdi+0x12345], 0x7f
+vmulbf16 zmm17{k2}, zmm12, [rdi+0x12345]
+vpdpbssd ymm3, ymm28, ymmword ptr [r13+r13*8]
+vpdpwusds zmm13{k7}, zmm11, zmmword ptr [r14+0x2]
+vrcpbf16 zmm11{k3}, [rax+0x40]
+vreducebf16 xmm5, [rdi+0x1]{1to8}, 0x7f
+vrndscalebf16 ymm12, ymm3, 0x7f
+vrsqrtbf16 xmm7{k4}, xmm29
+vscalefbf16 xmm24, xmm8, xmmword ptr [r11-0x40]
+vsqrtbf16 xmm17{k7}{z}, xmm5
+vsubbf16 ymm13{k1}, ymm3, ymm14
+vucomxsd xmm4, xmm17
+vucomxsh xmm31, xmm9
+vucomxss xmm4, xmm13
+# ---- CET, Key Locker, TSX and system instructions ----------------------------
+aadd [r8+r10*1], ecx
+aand [r15+r14*2+0x2], ebp
+aesdec128kl xmm11, [rcx+rdx*2+0x1000]
+aesdec256kl xmm12, [rdi+0x0]
+aesdecwide128kl [r11+rdi*1+0x0]
+aesdecwide256kl [r9+rsi*4+0x12345]
+aesenc128kl xmm9, [r12+r13*1+0x2]
+aesenc256kl xmm0, [r13+0x10]
+aesencwide128kl [rbx*1+0x4]
+aesencwide256kl [rdx+r12*2-0x80]
+aor [rsp+0x2], r14
+axor [r14+0x1], ebp
+cldemote [rax+0x7f0]
+clflushopt [rax+0x200]
+clrssbsy [rcx+0x3f]
+clui
+clwb [edx-0x2000]
+clzero
+cmpaexadd [r8+0x0], r12, r12
+cmpaxadd [r12+rax*1+0x12345], r13d, r15d
+cmpbexadd [rax], ecx, r15d
+cmpbxadd [rbx*1+0x8], rax, rsp
+cmpcxadd [r13+0x80], r11d, eax
+cmpexadd [rax+0x100], r11, rbp
+cmpgexadd [r12+0x20], r13d, r12d
+cmpgxadd [rdi+0x100], r8d, r11d
+cmplexadd [r12+0x40], esi, r9d
+cmplxadd [r13+0x0], esi, eax
+cmpnaexadd [rsi+rax*1+0x3f], r10d, r11d
+cmpnaxadd [esp+r15d*1+0x1], rbx, r9
+cmpnbexadd [r10+rbp*2-0x80], r11, r15
+cmpnbxadd [ebx+0x40], rbx, rcx
+cmpncxadd [r15+r15*1], r9d, ebx
+cmpnexadd [r9], edx, ecx
+cmpngexadd [rcx+rbx*1+0x2], rdi, rcx
+cmpngxadd [eax+0x3f], r12, r12
+cmpnlexadd [rax-0x100], ebp, r15d
+cmpnlxadd [r9+r13*1+0x4], ebx, esi
+cmpnoxadd [rdx*1+0x7f0], r11d, r12d
+cmpnpxadd [r14+0x200], r10d, r13d
+cmpnsxadd [r11+rbp*1-0x100], rbp, r10
+cmpnzxadd [rbp+r10*4+0x7f0], rbx, r9
+cmpoxadd [rsi-0x100], edx, edx
+cmppexadd [rsp+r11*8-0x100], r9d, r13d
+cmppoxadd [rcx+0x20], r10d, r8d
+cmppxadd [r10-0x40], r13, r11
+cmpsxadd [rdx+0x10], r14, r15
+cmpzxadd [r8+0x3f], rdi, r13
+encodekey128 ecx, r14d
+encodekey256 r9d, r12d
+endbr32
+endbr64
+hreset 0x7f
+incsspd r12d
+incsspq r10
+invpcid r12, [rax+r8*8+0x40]
+loadiwkey xmm7, xmm2
+monitorx
+movdiri [rsp+r13*1+0x7f0], ebx
+movrs bx, [rcx]
+mwaitx
+pconfig
+prefetchit0 [r11+rsi*2+0x80]
+prefetchit1 [r10+rax*2+0x0]
+prefetchrst2 [rdi*8-0x100]
+prefetchwt1 [rsp+0x40]
+ptwrite r13
+rdfsbase r13
+rdgsbase rax
+rdmsrlist
+rdpid rsp
+rdpkru
+rdpru
+rdrand esp
+rdseed esp
+rdsspd ebp
+rdsspq r8
+rstorssp [rdi+0x200]
+saveprevssp
+senduipi rbx
+serialize
+setssbsy
+stui
+testui
+tpause r9d
+uiret
+umwait esi
+vbroadcastss zmm28, [r13+0x7f0]
+vextractps r8d, xmm18, 0x1
+vfmadd132pd zmm25, zmm13, [edi+0x100]{1to8}
+vfmadd132ps xmm19{k1}, xmm29, [r14+r10*1+0x0]{1to4}
+vfmadd132sd xmm31, xmm5, qword ptr [r12]
+vfmadd132ss xmm27, xmm19, [r9+r14*2+0x200]
+vfmadd213pd ymm31{k3}, ymm8, [rax+rax*8+0x1000]{1to4}
+vfmadd213ps xmm14, xmm23, xmm0
+vfmadd213sd xmm24{k6}, xmm29, xmm29
+vfmadd213ss xmm13, xmm25, xmm6
+vfmadd231pd xmm6, xmm0, xmm2
+vfmadd231ps ymm27, ymm3, dword ptr [r14+0x40]{1to8}
+vfmadd231sd xmm4{k5}, xmm22, xmm1
+vfmadd231ss xmm9, xmm21, [rdi+0x40]
+vfmaddsub132pd zmm16{k1}{z}, zmm9, zmm20, {rn-sae}
+vfmaddsub132ps zmm25, zmm30, [r13+0x2]
+vfmaddsub213pd xmm31, xmm0, [rdi+0x40]
+vfmaddsub213ps xmm15{k2}{z}, xmm17, dword ptr [r9d+0x3f]{1to4}
+vfmaddsub231pd xmm4{k7}{z}, xmm23, [rdi+0x8]
+vfmaddsub231ps zmm15{k5}, zmm6, zmm15
+vfmsub132pd xmm11{k2}, xmm13, xmm15
+vfmsub132ps ymm14, ymm10, ymm10
+vfmsub132sd xmm1, xmm0, xmm27
+vfmsub132ss xmm9, xmm5, [rax+rdi*2+0x1]
+vfmsub213pd zmm21{k2}, zmm0, [r9+0x20]
+vfmsub213ps xmm0, xmm15, [r15d+0x1000]{1to4}
+vfmsub213sd xmm21, xmm1, [esi+0x2]
+vfmsub213ss xmm16, xmm3, dword ptr [rbp-0x100]
+vfmsub231pd xmm16{k4}{z}, xmm22, [rsp-0x100]
+vfmsub231ps zmm5{k5}, zmm5, zmm17, {ru-sae}
+vfmsub231sd xmm13{k5}, xmm18, xmm13
+vfmsub231ss xmm15{k7}{z}, xmm4, dword ptr [r9+0x1]
+vfmsubadd132pd zmm20{k5}, zmm21, zmm9, {ru-sae}
+vfmsubadd132ps ymm14, ymm4, dword ptr [r8+r12*2+0x20]{1to8}
+vfmsubadd213pd xmm4, xmm19, xmm26
+vfmsubadd213ps xmm30{k6}{z}, xmm1, [rsp+rbx*1-0x80]
+vfmsubadd231pd xmm9, xmm31, xmmword ptr [r15+r14*8-0x2000]
+vfmsubadd231ps zmm13, zmm23, [rax+0x100]{1to16}
+vfnmadd132pd xmm11{k6}, xmm4, xmm31
+vfnmadd132ps zmm6{k2}, zmm15, dword ptr [rax+0x100]{1to16}
+vfnmadd132sd xmm1, xmm27, xmm13
+vfnmadd132ss xmm24, xmm22, xmm31
+vfnmadd213pd ymm17, ymm8, ymmword ptr [rax+r8*2+0x2]
+vfnmadd213ps ymm13, ymm2, ymmword ptr [rsi+r8*1+0x2]
+vfnmadd213sd xmm21, xmm12, xmm0
+vfnmadd213ss xmm8, xmm12, xmm12, {ru-sae}
+vfnmadd231pd xmm13, xmm10, qword ptr [rdx-0x40]{1to2}
+vfnmadd231ps zmm14, zmm21, [r8+0x7f0]
+vfnmadd231sd xmm10, xmm1, [r9+r8*1+0x1000]
+vfnmadd231ss xmm3{k4}, xmm4, xmm15, {ru-sae}
+vfnmsub132pd xmm14{k2}, xmm30, xmmword ptr [rbp*2+0x80]
+vfnmsub132ps zmm6{k7}, zmm3, dword ptr [rax-0x100]{1to16}
+vfnmsub132sd xmm16, xmm14, [r12+r13*4+0x200]
+vfnmsub132ss xmm3, xmm8, [rcx+0x40]
+vfnmsub213pd zmm5, zmm8, qword ptr [r9]{1to8}
+vfnmsub213ps zmm21{k4}{z}, zmm10, [rbp+0x40]
+vfnmsub213sd xmm11, xmm8, [r8+r13*2+0x4]
+vfnmsub213ss xmm24{k6}, xmm11, xmm6, {rz-sae}
+vfnmsub231pd zmm18, zmm28, [r12+0x8]{1to8}
+vfnmsub231ps xmm6{k6}{z}, xmm10, xmm14
+vfnmsub231sd xmm6, xmm18, xmm26
+vfnmsub231ss xmm16, xmm15, dword ptr [rsi+0x1]
+vmovd xmm25, esi
+vmovq xmm20, rcx
+vpbroadcastd xmm12{k6}, xmm9
+vpermd ymm24, ymm5, ymm6
+vpermilps xmm11, xmm9, 0x0
+vpermps ymm3, ymm0, ymm2
+vpmovsxbq xmm13, xmm18
+vpmovsxwd ymm10, xmmword ptr [esp+0x2]
+vpmovzxbd ymm1, xmm16
+vpmovzxwd ymm9, xmmword ptr [rcx+rdi*4+0x100]
+vpsllvd xmm9{k6}, xmm5, xmm12
+vpsllvq ymm0, ymm0, ymm12
+vpsravd xmm12{k1}, xmm4, xmm5
+vpsrlvd xmm25, xmm21, [rbp+0x40]{1to4}
+vpsrlvq zmm28{k2}, zmm6, [r8+r8*4+0x0]
+wbnoinvd
+wrfsbase r10d
+wrgsbase r9d
+wrmsrlist
+wrmsrns
+wrpkru
+wrssd [rsp+rdx*2+0x200], edx
+wrssq qword ptr [r14+0x100], rdx
+wrussd dword ptr [r9d*2+0x0], ebx
+wrussq qword ptr [r12*1-0x80], rax
+xabort 0xff
+xend
+xgetbv
+xresldtrk
+xrstor [ecx+0x3f]
+xrstor64 [r13+r14*2+0x4]
+xrstors [r14+0x2]
+xrstors64 [rax+0x200]
+xsave [rbp+r9*4+0x3f]
+xsave64 [r13+r10*8+0x2]
+xsavec [r13+0x40]
+xsavec64 [r10-0x2000]
+xsaveopt [r13-0x40]
+xsaveopt64 [r14+rsi*2+0x12345]
+xsaves [r12+0x7f0]
+xsaves64 [rax+rax*8+0x1000]
+xsetbv
+xsusldtrk
+xtest

@@ -1,0 +1,356 @@
+=== branches forward and back
+start:
+        bt      next
+        nop
+next:   bf      start
+        bra     start
+        nop
+        bsr     next
+        nop
+=== local labels
+1:      dt      r1
+        bf      1b
+        bt/s    2f
+        nop
+2:      rts
+        nop
+=== delayed conditional branches
+top:    bt/s    top
+        mov     r1, r2
+        bf/s    end
+        add     #1, r3
+end:    rts
+        nop
+=== bra and bsr at the ends of their reach
+        bra     far
+        nop
+        .space  4090
+far:    bsr     back
+        nop
+        .space  4088
+        .space  4
+back:   nop
+=== bra backward limit
+back:   nop
+        .space  4090
+        bra     back
+        nop
+=== bt forward limit fits
+        bt      far
+        .space  254
+far:    nop
+=== bt forward just past the limit relaxes
+        bt      far
+        .space  258
+far:    nop
+=== bf forward relaxes to bt over bra
+        bf      far
+        .space  300
+far:    nop
+=== bt backward limit fits
+far:    nop
+        .space  250
+        bt      far
+=== bt backward just past the limit relaxes
+far:    nop
+        .space  252
+        bt      far
+=== bt/s relaxes without a nop
+        bt/s    far
+        mov     r1, r2
+        .space  300
+far:    nop
+=== bf/s relaxes backward
+far:    nop
+        .space  400
+        bf/s    far
+        add     #1, r1
+=== relaxation that pushes a second branch out
+        bt      b
+        bt      a
+        .space  252
+a:      nop
+b:      nop
+=== two branches that both stay short
+        bt      a
+        bt      a
+        .space  250
+a:      nop
+=== mov.l from a literal pool, instruction on a 4-byte boundary
+        mov.l   lit, r1
+        jmp     @r1
+        nop
+        nop
+lit:    .long   0x12345678
+=== mov.l from a literal pool, instruction 2 bytes past a boundary
+        nop
+        mov.l   lit, r1
+        jmp     @r1
+        nop
+lit:    .long   0x89abcdef
+=== mova and mov.l share an aligned pool
+        nop
+        mova    tbl, r0
+        mov.l   tbl, r2
+        rts
+        nop
+        .balign 4
+tbl:    .long   1
+        .long   2
+=== mov.w from a word literal
+        mov.w   w1, r1
+        mov.w   w2, r2
+        rts
+        nop
+w1:     .word   0x1234
+w2:     .word   -2
+=== mov.l at the far end of its reach
+        mov.l   lit, r0
+        nop
+        .space  1016
+lit:    .long   7
+=== mov.w at the far end of its reach
+        mov.w   lit, r0
+        .space  508
+lit:    .word   7
+=== a function with a literal pool
+        .text
+        .globl  func
+func:
+        mov.l   r14, @-r15
+        sts.l   pr, @-r15
+        mov     r15, r14
+        mov.l   .Lstr, r4
+        mov.l   .Lputs, r1
+        jsr     @r1
+        nop
+        mov     r14, r15
+        lds.l   @r15+, pr
+        rts
+        mov.l   @r15+, r14
+        .balign 4
+.Lstr:  .long   0
+.Lputs: .long   0
+=== alignment in code pads with nops
+        nop
+        .balign 4
+        mov     #1, r0
+        .balign 4
+        nop
+        nop
+=== an odd pad gets a zero byte before the nops
+        .byte   1
+        .balign 4
+        nop
+        nop
+        nop
+        nop
+=== p2align
+        mov     #1, r0
+        .p2align 3
+        rts
+        nop
+        nop
+        nop
+=== label difference as an immediate and a displacement
+        mov     #b-a, r1
+        mov.l   @(b-a,r2), r3
+a:      nop
+        nop
+b:      nop
+        nop
+=== equates in operands
+        .equ    OFF, 8
+        .set    IMM, -3
+        mov.l   @(OFF,r1), r2
+        mov     #IMM, r3
+        mov.w   @(OFF*2,gbr), r0
+        trapa   #OFF
+=== deprecated @(label,pc)
+        mov.l   @(lit,pc), r1
+        nop
+lit:    .long   5
+=== the delay slot is left as written
+        jsr     @r1
+        mov     #0, r4
+        bra     1f
+        add     #1, r4
+1:      rts
+        mov     r4, r0
+=== fpu sequence
+        fldi1   fr0
+        fldi0   fr1
+        fadd    fr0, fr1
+        fmov    fr1, @-r15
+        fmov.s  @r15+, fr2
+        float   fpul, fr3
+        ftrc    fr3, fpul
+        fschg
+        fmov    dr2, dr4
+        fschg
+        rts
+        nop
+=== system register save and restore
+        stc.l   sr, @-r15
+        stc.l   gbr, @-r15
+        stc.l   vbr, @-r15
+        stc.l   ssr, @-r15
+        stc.l   spc, @-r15
+        sts.l   mach, @-r15
+        sts.l   macl, @-r15
+        lds.l   @r15+, macl
+        lds.l   @r15+, mach
+        ldc.l   @r15+, spc
+        ldc.l   @r15+, ssr
+        ldc.l   @r15+, vbr
+        ldc.l   @r15+, gbr
+        rte
+        ldc.l   @r15+, sr
+=== data after code
+        mov.l   x, r0
+        rts
+        nop
+        nop
+x:      .long   0x01020304
+        .word   0x0506
+        .byte   7, 8
+=== a relaxed branch pushes an earlier one out of reach
+        bt      b
+        bt      c
+        .space  252
+b:      nop
+        .space  300
+c:      nop
+=== a relaxed bt/s moves a longword load to the other boundary
+        nop
+        bt/s    far
+        nop
+        mov.l   lit, r1
+        nop
+        .balign 4
+lit:    .long   5
+        .space  300
+far:    nop
+        nop
+=== two relaxed delayed branches move a load twice
+        nop
+        bt/s    far
+        nop
+        bf/s    far
+        nop
+        mov.l   lit, r1
+        mova    lit, r0
+        .balign 4
+lit:    .long   5
+        .space  300
+far:    nop
+        nop
+=== literal with an offset
+        mov.l   tbl+4, r1
+        mov.w   tbl+2, r2
+        nop
+        nop
+tbl:    .long   0x11112222
+        .long   0x33334444
+=== a longword load two bytes past a boundary reaches 1020 bytes from pc+2
+        nop
+        mov.l   lit, r0
+        .space  1016
+lit:    .long   7
+=== a longword load two bytes past a boundary reaches the very next word
+        nop
+        mov.l   lit, r0
+lit:    .long   1
+=== at 2 pc from two bytes past a boundary
+        nop
+        mov.l   @(2,pc), r0
+        .long   5
+=== a word literal at the far end of reach
+        mov.w   lit, r0
+        .space  508
+lit:    .word   7
+=== a load at an odd address takes GNU as's base
+        .byte   1, 2, 3
+        mova    lit, r0
+        .align  2
+lit:    .long   1
+=== long data raises the section alignment, so the tail is padded
+        .long   1
+        nop
+=== unaligned data spellings
+        .byte   1
+        .ualong 2
+        .uaword 3
+        .4byte  4
+        .2byte  5
+        .8byte  6
+        .uaquad 7
+=== a branch sized in order stays short when an alignment absorbed the growth
+        bt      far
+        nop
+back:   nop
+        .space  246
+        .align  3
+        nop
+        nop
+        bf      back
+far:    nop
+=== an earlier load and an alignment between keep a backward bf short
+        mova    P1, r0
+        .space  2
+        mova    P2, r0
+        bt      C0
+        nop
+        nop
+C1:     nop
+        .space  240
+        mov.l   P0, r9
+        mov.l   P2, r0
+        .align  3
+        bf      C1
+C0:     bf      C1
+P0:     .long   0x506e4f97
+P1:     .long   0x8f444987
+P2:     .long   0x440c7ef3
+=== padding ahead of a long that the final layout does not need still sizes branches
+        bf/s    C0
+        mov     r1, r2
+        bt/s    C0
+        mov     r1, r2
+        mov     r3, r4
+        .long   94
+        .space  200
+W0:     .word   0x7a5b
+        bt/s    C1
+        mov     r1, r2
+        bt/s    C0
+        mov     r1, r2
+        bra     C1
+        nop
+        .space  10
+        .long   96
+        bf      C0
+        bf      C1
+        mov     r3, r4
+        .align  2
+P0:     .long   0x77826199
+P1:     .long   0xf2518742
+C0:
+C1:
+=== growth before an alignment is not assumed to carry a label past it
+        bt      far
+        bt      x
+        .space  256
+        .align  3
+x:      nop
+        .space  300
+far:    nop
+=== a branch that growth carried past its target beyond an alignment keeps its size
+far:    nop
+        .space  300
+        .rept   66
+        bt      far
+        .endr
+        bf      y
+        .align  2
+y:      nop

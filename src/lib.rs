@@ -36,6 +36,7 @@ mod instcombine;
 mod intrinsic;
 mod jumpthread;
 mod loadfwd;
+mod loopdel;
 mod looprot;
 mod unroll;
 mod lower;
@@ -105,7 +106,7 @@ impl ModuleBufferMethods for PlironBuffer {
     }
 }
 
-fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
+fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     fb.set("is_pic", "true").unwrap();
     if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
@@ -124,8 +125,10 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
     // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
     // `PLIRON_OMIT_FP=0` keeps them unconditionally.
     let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
-    let keep_fp =
-        fp != rustc_target::spec::FramePointer::MayOmit || !pass_enabled("PLIRON_OMIT_FP");
+    // Cranelift's x64 `return_call` emission requires frame pointers.
+    let keep_fp = fp != rustc_target::spec::FramePointer::MayOmit
+        || !pass_enabled("PLIRON_OMIT_FP")
+        || tail_calls;
     fb.set(
         "preserve_frame_pointers",
         if keep_fp { "true" } else { "false" },
@@ -163,8 +166,18 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
         },
     )
     .unwrap();
+    // Inline stack probes keep large frames from jumping the guard page.
+    // `inline` needs no `__cranelift_probestack` helper (only emitted on
+    // x86_64/aarch64/riscv64 anyway).
     let triple = target_lexicon::Triple::from_str(&sess.target.llvm_target)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("unsupported target: {e}")));
+    if let target_lexicon::Architecture::Aarch64(_)
+    | target_lexicon::Architecture::Riscv64(_)
+    | target_lexicon::Architecture::X86_64 = triple.architecture
+    {
+        fb.enable("enable_probestack").unwrap();
+        fb.set("probestack_strategy", "inline").unwrap();
+    }
     let flags = settings::Flags::new(fb);
     let isa = cranelift_codegen::isa::lookup(triple)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
@@ -173,6 +186,11 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
 }
 
 /// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
+/// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
+pub(crate) fn obj_sym(n: &str) -> &str {
+    n.strip_prefix('\u{1}').unwrap_or(n)
+}
+
 pub(crate) fn pass_enabled(var: &str) -> bool {
     std::env::var(var).map_or(true, |v| v != "0")
 }
@@ -193,6 +211,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if std::env::var_os("PLIRON_DUMP").is_some() {
         eprintln!("==== {name} ====\n{ir}");
     }
+    if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
+        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+        inline::run(ctx, st, true, None, true);
+        domcheck::run(ctx, st, "always-inline");
+        inline::dead_fns(ctx, st);
+    }
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
@@ -206,7 +230,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_NOALIAS_FWD") {
             st.noalias = context::noalias_values(ctx, st).into_iter().collect();
         }
-        inline::run(ctx, st, small, None);
+        inline::run(ctx, st, small, None, false);
         domcheck::run(ctx, st, "inline");
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
@@ -246,7 +270,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 let sites = inline::devirt(ctx, st);
                 domcheck::run(ctx, st, "devirt");
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    inline::run(ctx, st, small, Some(&sites));
+                    inline::run(ctx, st, small, Some(&sites), false);
                     domcheck::run(ctx, st, "devirt-inline");
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
                         sroa::forward(ctx, st);
@@ -282,14 +306,24 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);
+        let obj = wasm::lower_to_wasm(
+            &cx.pctx.borrow(),
+            &cx.st.borrow(),
+            name,
+            &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+            cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+        );
         return PlironModule {
             obj,
             ir,
             asm: String::new(),
         };
     }
-    let isa = build_isa(cx.tcx.sess);
+    let isa = build_isa(
+        cx.tcx.sess,
+        cx.tcx.features().enabled(rustc_span::sym::explicit_tail_calls)
+            || std::env::var("PLIRON_TAILCALL").is_ok(),
+    );
     let hot = std::env::var("PLIRON_HOT")
         .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
     let obj = lower::lower_to_object(
@@ -317,6 +351,10 @@ impl CodegenBackend for PlironCodegenBackend {
                 .map(|f| Symbol::intern(f))
                 .collect(),
             Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
+            Arch::Wasm32 => wasm::target_features(&sess.target, &sess.opts)
+                .iter()
+                .map(|f| Symbol::intern(f))
+                .collect(),
             _ => vec![],
         };
         TargetConfig {
@@ -337,6 +375,8 @@ impl CodegenBackend for PlironCodegenBackend {
         // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
         rustc_session::CodegenBackendInit {
             thin_lto_supported: false,
+            #[cfg(rustc_in_tree)]
+            fat_lto_supported: false,
             ..Default::default()
         }
     }

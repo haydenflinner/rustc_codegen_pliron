@@ -1,0 +1,220 @@
+=== la and lla of an external symbol relocate both halves
+        la      a0, ext
+        lla     a1, ext+4
+        la      a2, ext-8
+
+=== la of labels near and far
+        la      a0, value
+        lla     a1, here
+here:   ret
+        .data
+        .word   0
+value:  .word   1
+
+=== la of a plain number is li, in 32 bits
+        la      a0, 0x80000000
+        lla     a1, -0x800
+        la      a2, 0xfffff000
+
+=== loads and stores through a symbol
+        lb      a0, ext
+        lhu     a1, ext
+        lw      a2, ext+4
+        sb      a0, ext, t0
+        sw      a1, ext, t1
+        flw     fa0, ext, t2
+        fld     fa1, value, a3
+        fsd     fa1, value, a4
+        .data
+value:  .dword  0
+
+=== lga loads the slot at 32 bits
+        lga     a0, ext
+        lga     a1, local
+local:  nop
+
+=== option pic
+        .option push
+        .option pic
+        la      a0, ext
+        la      a1, 1f
+        la      a2, 0x10
+        .option pop
+        la      a3, ext
+1:      ret
+
+=== call, tail and jump
+        call    ext
+        tail    ext
+        jump    ext, t0
+        call    local
+        jump    local, t1
+local:  ret
+
+=== pcrel_hi and pcrel_lo name the auipc label
+1:      auipc   a0, %pcrel_hi(ext)
+        addi    a0, a0, %pcrel_lo(1b)
+        sw      a1, %pcrel_lo(1b)(a0)
+bar:    auipc   a2, %pcrel_hi(ext+4)
+        lw      a2, %pcrel_lo(bar)(a2)
+
+=== the pair label follows a branch that grew
+        bnez    a0, far
+        .space  300
+far:    lla     a0, ext
+        sw      a1, ext, t0
+
+=== data relocations
+        .data
+        .word   ext
+        .word   ext+4
+        .word   value
+value:  .word   0
+=== references to symbols in their own section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        call loc
+        call glob
+        call weak1
+        call hid
+        call prot
+        call intl
+        call whid
+        call lhid
+        call func
+        call late
+        call lweak
+        call lalias
+        call lwalias
+        call galias
+        call walias
+        j loc
+        j glob
+        j weak1
+        j lalias
+        j walias
+        jal loc
+        jal glob
+        jal weak1
+        jal lalias
+        jal walias
+        lla a0, loc
+        lla a0, glob
+        lla a0, weak1
+        lla a0, lalias
+        lla a0, galias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+
+=== references back to symbols in their own section
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        call loc
+        call glob
+        call weak1
+        call lalias
+        j loc
+        j glob
+        j weak1
+        jal loc
+        jal glob
+        jal weak1
+
+=== references out of their section, by binding
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        call oloc
+        call oglob
+        call oweak
+        call oalias
+        call ext
+        call uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+
+=== default section alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7
+
+=== differences the file cannot fold are relocation pairs
+        .text
+        .weak   uweak
+base:   nop
+        .long   ext - .
+        .long   ext - base + 4
+        .long   base - ext + 4
+        .short  ext - base
+        .byte   ext - base
+        .long   other - base
+        .long   uweak - base
+        .quad   ext - base
+        .data
+other:  .long   base - other
+

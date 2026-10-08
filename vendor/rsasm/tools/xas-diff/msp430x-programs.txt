@@ -1,0 +1,82 @@
+=== a large-model function with a pushm frame
+        .text
+        .globl  func
+func:   pushm.a #4, r10
+        mova    r12, r10
+        movx.w  &0x10000, r11
+        addx.a  r11, r10
+        calla   #helper
+        popm.a  #4, r10
+        reta
+helper: reta
+
+=== 20-bit arithmetic
+        .text
+        mova    #0x12345, r12
+        adda    #0x10000, r12
+        suba    r13, r12
+        cmpa    #0xfffff, r12
+        jz      1f
+        incdx.a r12
+        decx.a  r13
+1:      reta
+
+=== repeated shifts
+        .text
+        mov     #4, r14
+        rpt     r14
+        rrax.w  r12
+        rpt     #16
+        rlax.a  r13
+        rrcm.a  #4, r12
+        rram    #2, r13
+        rlam.a  #3, r14
+        rrum    #1, r15
+        rpt     #3 { rrux r12
+        reta
+
+=== far memory through the extension words
+        .text
+        movx.a  &0x12345, r5
+        movx.a  r5, &0x54321
+        movx    0x12345(r4), 0x2(r6)
+        movx.b  #0xff, &0x20000
+        bicx.a  #0xf0000, r7
+        bisx.a  #0x10000, 0x10000(r8)
+        pushx.a &0x12344
+        popx.a  r9
+        tstx.a  0x10002(r10)
+        swpbx   r11
+        sxtx.a  r12
+        reta
+
+=== address instructions in every form
+        .text
+        mova    r4, r5
+        mova    @r4, r5
+        mova    @r4+, r5
+        mova    &0x12345, r5
+        mova    0x1234(r4), r5
+        mova    #0x54321, r5
+        mova    r4, &0x12346
+        mova    r4, 0x1234(r5)
+        bra     r4
+        bra     @r4
+        bra     @r4+
+        bra     #0x12344
+        calla   r4
+        calla   @r4
+        calla   @r4+
+        calla   0x10(r4)
+        reta
+
+=== the core instruction set on the MSP430X
+        .text
+        mov     #0x1234, r5
+        push    #4
+        push    #8
+        call    #0x8000
+        br      #0x8000
+        mov.b   @r4+, 0(r5)
+        jmp     $+4
+        ret

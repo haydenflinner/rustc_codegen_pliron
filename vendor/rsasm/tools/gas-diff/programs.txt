@@ -1,0 +1,182 @@
+# Multi-line snippets, separated by `=== <name>`.
+#
+# Note: alignment padding with no fill byte is deliberately not compared.
+# GNU as chooses its no-op sequence by -mtune, so the bytes differ even
+# between GNU as versions; only the total length is fixed, and that is
+# checked hermetically in tests/directives.rs.
+
+=== forward branch short
+    jmp fwd
+    nop
+fwd:
+    ret
+=== backward branch
+back:
+    nop
+    jmp back
+=== branch needing relaxation
+    jmp far_away
+    .space 200
+far_away:
+    ret
+=== conditional branches
+    je 1f
+    jne 1f
+    jg 1f
+    jle 1f
+1:  ret
+=== call and relocation-free local call
+target:
+    ret
+    call target
+=== loop with alignment
+    .p2align 4
+loop:
+    decq %rax
+    jnz loop
+=== alignment honours an explicit fill byte
+    .section .text
+    .byte 1
+    .p2align 4, 0xcc
+    .byte 2
+    .balign 8, 0xaa
+    .byte 3
+=== align with explicit fill
+    nop
+    .balign 8, 0xcc
+    ret
+=== data directives
+    .byte 1, 2, 3
+    .short 0x1234
+    .long 0x11223344
+    .quad 0x1122334455667788
+    .ascii "hi"
+    .asciz "yo"
+=== leb128
+    .uleb128 0
+    .uleb128 624485
+    .sleb128 -2
+    .sleb128 -127
+=== space and fill
+    .space 4
+    .space 3, 0xaa
+    .fill 3, 2, 0x4142
+=== org
+    nop
+    .org 8
+    ret
+=== equ and expressions
+    .set n, 4
+    movq $n*2+1, %rax
+    .byte n, n*n
+=== local labels forward and backward
+1:  nop
+    jmp 1b
+    jmp 1f
+1:  ret
+=== symbol difference
+start:
+    nop
+    nop
+end:
+    .long end - start
+=== location counter
+here:
+    .long . - here
+    .quad .
+=== rip relative to local data
+    leaq msg(%rip), %rsi
+msg:
+    .ascii "x"
+=== conditional assembly
+    .set x, 1
+    .if x
+    nop
+    .else
+    hlt
+    .endif
+    .ifdef nosuch
+    hlt
+    .else
+    ret
+    .endif
+=== nested conditionals
+    .if 1
+      .if 0
+        hlt
+      .else
+        nop
+      .endif
+    .else
+      ud2
+    .endif
+=== intel syntax
+    .intel_syntax noprefix
+    mov rax, rbx
+    add rax, 1
+    mov qword ptr [rbx+8], rax
+    mov eax, dword ptr [rbx+rcx*4+16]
+    lea rax, [rip+2]
+    ret
+=== intel memory forms
+    .intel_syntax noprefix
+    mov rax, [rbx]
+    mov rax, [rbx+rcx]
+    mov rax, [rbx+rcx*8]
+    mov rax, [rcx*4]
+    mov rax, [rbx-8]
+    mov rax, [0x1000]
+=== mixed sections
+    .text
+    nop
+    .data
+    .byte 1
+    .text
+    ret
+=== code16 and code32
+    .code16
+    nop
+    .code32
+    nop
+    .code64
+    nop
+=== rip relative constant displacement
+    leaq 2(%rip), %rax
+    leaq -8(%rip), %rax
+    leaq (%rip), %rax
+    .intel_syntax noprefix
+    lea rax, [rip+2]
+    lea rax, [rip]
+=== 32-bit push and pop
+    .code32
+    pushl %ebx
+    popl %ebx
+    push %ebp
+    pop %esi
+    pushl (%eax)
+    popl 4(%esp)
+    push %bx
+    pop %di
+    .code64
+    push %rbx
+    pop %r12
+=== one-byte inc and dec outside long mode
+    .code32
+    incl %eax
+    decl %edi
+    inc %bx
+    dec %sp
+    inc %al
+    incl (%eax)
+    .code64
+    inc %eax
+    dec %r8d
+    inc %rax
+=== suffixed direct calls
+    .code32
+    calll 1f
+1:  call 1b
+    calll *%eax
+    .code64
+    callq 1b
+    callq *%rax

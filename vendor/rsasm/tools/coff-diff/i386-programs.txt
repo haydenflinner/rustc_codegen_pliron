@@ -1,0 +1,49 @@
+=== hello
+        .text
+        .globl  _main
+_main:
+        pushl   $msg
+        call    _puts
+        addl    $4, %esp
+        xorl    %eax, %eax
+        ret
+        .section .rdata,"dr"
+msg:    .asciz  "Hello from rsasm!"
+=== data, bss and common
+        .data
+        .globl  _counter
+_counter:
+        .long   0
+_table: .long   _f1, _f2, _counter
+        .long   _f1 - _table
+        .lcomm  _buf, 64
+        .comm   _shared, 16
+        .text
+_f1:    movl    _buf, %eax
+        ret
+_f2:    movl    _shared+4, %eax
+        ret
+=== absolute and set symbols
+        .globl  _abs
+        _abs = 0x1000
+        .text
+        movl    $_abs, %eax
+        .globl  _target
+_target:
+        ret
+        .set    _alias, _target
+        call    _alias
+        .long   _alias
+=== cross-section
+        .text
+        .globl  _code
+_code:  movl    _thing, %eax
+        call    _code
+        jmp     _helper
+_helper:
+        ret
+        .data
+_thing: .long   _code, _helper, _stuff
+        .section .rdata,"dr"
+_stuff: .long   _thing - _stuff
+        .long   _code - .

@@ -1,0 +1,52 @@
+[package]
+name = "rsasm"
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.89"
+description = "A multi-syntax, multi-architecture assembler"
+license = "MIT"
+repository = "https://github.com/KarpelesLab/rsasm"
+readme = "README.md"
+keywords = ["assembler", "asm", "x86", "codegen"]
+categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+# Document every architecture backend, not just the default set. Mirrors the
+# CI docs job.
+all-features = true
+
+[dependencies]
+
+[features]
+# One feature per CPU architecture backend. All are enabled by default; build
+# with --no-default-features --features <arch> for a slimmer binary. The core
+# must keep building with every one of them off, which CI checks.
+default = ["x86", "aarch64", "arm", "riscv", "powerpc", "mips", "sparc", "retro", "m68k", "v850", "rl78", "rx", "superh", "k78", "avr", "msp430"]
+x86 = []
+aarch64 = []
+arm = []
+riscv = []
+powerpc = []
+mips = []
+sparc = []
+retro = []
+m68k = []
+v850 = []
+rl78 = []
+rx = []
+superh = []
+k78 = []
+avr = []
+msp430 = []
+
+[lib]
+name = "rsasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsasm"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

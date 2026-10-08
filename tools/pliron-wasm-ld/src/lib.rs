@@ -8,8 +8,10 @@
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use wasm_encoder as we;
+use wasm_encoder::Encode;
 use wasm_encoder::reencode::{Error as ReError, Reencode};
 use wasmparser as wp;
 
@@ -51,6 +53,10 @@ struct Obj<'a> {
     bodies: Vec<wp::FunctionBody<'a>>,
     funcs: Vec<(String, u8)>,
     data: Vec<DataObj>,
+    /// Custom sections other than our own, concatenated by name into the output.
+    customs: Vec<(String, &'a [u8])>,
+    /// `+feature` names from the `target_features` section.
+    features: Vec<String>,
 }
 
 struct Rd<'a>(&'a [u8]);
@@ -88,6 +94,8 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
         bodies: vec![],
         funcs: vec![],
         data: vec![],
+        customs: vec![],
+        features: vec![],
     };
     for p in wp::Parser::new(0).parse_all(bytes) {
         match p? {
@@ -124,6 +132,22 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
                 }
             }
             wp::Payload::CodeSectionEntry(b) => o.bodies.push(b),
+            wp::Payload::CustomSection(c)
+                if !matches!(c.name(), "pliron.link" | "name" | "producers" | "target_features")
+                    && !c.name().starts_with("reloc.") =>
+            {
+                o.customs.push((c.name().to_string(), c.data()));
+            }
+            wp::Payload::CustomSection(c) if c.name() == "target_features" => {
+                let mut r = wp::BinaryReader::new(c.data(), 0);
+                for _ in 0..r.read_var_u32()? {
+                    let prefix = r.read_u8()?;
+                    let name = r.read_string()?;
+                    if prefix == b'+' {
+                        o.features.push(name.to_string());
+                    }
+                }
+            }
             wp::Payload::CustomSection(c) if c.name() == "pliron.link" => {
                 let mut r = Rd(c.data());
                 for _ in 0..r.u32() {
@@ -339,10 +363,25 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             included.push(p);
         }
     }
+    let def_obj = |d: &Def| match d {
+        Def::Func(oi, _) | Def::Data(oi, _) => *oi,
+    };
     while k < included.len() {
         let oi = included[k];
         for (n, d) in objs[oi].globals(oi) {
-            defs.entry(n.to_string()).or_insert(d);
+            // When several objects define a symbol, the earliest input wins
+            // (ELF's first-definition rule): e.g. std's panic_impl beats the
+            // same-named def in a later archive like libc.a.
+            match defs.entry(n.to_string()) {
+                Entry::Occupied(mut e) => {
+                    if def_obj(&d) < def_obj(e.get()) {
+                        e.insert(d);
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(d);
+                }
+            }
         }
         k += 1;
         if k == included.len() {
@@ -435,6 +474,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             cur += d.bytes.len() as u32;
         }
     }
+    // `__pliron_eh`: flag (+0) and exception pointer (+4) for the backend's
+    // emulated unwinding; zero-initialized, so no segment is emitted.
+    let eh = cur.next_multiple_of(8);
+    cur = eh + 8;
     let data_end = cur;
     let heap_base = cur.next_multiple_of(16);
     let pages = (heap_base as u64).div_ceil(65536) + 1;
@@ -460,6 +503,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                 (None, "__heap_base") => Ok(heap_base),
                 (None, "__data_end") => Ok(data_end),
                 (None, "__heap_end") => Ok(heap_end),
+                (None, "__pliron_eh") => Ok(eh),
                 (None, _) if func => {
                     let h = host
                         .iter()
@@ -533,6 +577,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     };
 
+    // Like LLVM's FixFunctionBitcasts: a no-arg `main` gets a C `main(argc, argv)`
+    // wrapper, which is the entry point wasm-bindgen and other hosts look for.
+    let main_void = match defs.get("main").copied() {
+        Some(d @ Def::Func(oi, f)) => {
+            let t = &types[tmaps[&oi][objs[oi].ftypes[(f - objs[oi].fimports.len() as u32) as usize] as usize] as usize];
+            (t.params().is_empty() && t.results() == [wp::ValType::I32]).then(|| func_out(d)).flatten()
+        }
+        _ => None,
+    };
+    let argc_ty = main_void.map(|_| {
+        let want = wp::FuncType::new([wp::ValType::I32, wp::ValType::I32], [wp::ValType::I32]);
+        match types.iter().position(|t| *t == want) {
+            Some(i) => i as u32,
+            None => {
+                types.push(want);
+                types.len() as u32 - 1
+            }
+        }
+    });
+    let main_fn = ctors_fn + 1;
+
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
     let names: Vec<String> = if exports.is_empty() {
@@ -559,6 +624,13 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
 
+    if main_void.is_some() {
+        match ex.iter_mut().find(|e| e.0 == "main") {
+            Some(e) => e.1 = main_fn,
+            None => ex.push(("main".into(), main_fn)),
+        }
+    }
+
     // Encode.
     let mut module = we::Module::new();
     let mut ts = we::TypeSection::new();
@@ -581,6 +653,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     fs.function(void_ty);
+    if let Some(t) = argc_ty {
+        fs.function(t);
+    }
     module.section(&fs);
     let mut tab = we::TableSection::new();
     let tsize = table.len() as u64 + 1;
@@ -652,6 +727,12 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     call_ctors.instruction(&we::Instruction::End);
     code.function(&call_ctors);
+    if let Some(orig) = main_void {
+        let mut w = we::Function::new([]);
+        w.instruction(&we::Instruction::Call(orig));
+        w.instruction(&we::Instruction::End);
+        code.function(&w);
+    }
     module.section(&code);
     let mut named: Vec<(u32, &str)> = host
         .iter()
@@ -664,6 +745,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     named.push((ctors_fn, CALL_CTORS));
+    if let Some(orig) = main_void {
+        named.push((orig, "__original_main"));
+        named.push((main_fn, "main"));
+    }
     named.sort();
     named.dedup_by_key(|x| x.0);
     let mut fnames = we::NameMap::new();
@@ -694,9 +779,44 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         );
     }
     module.section(&ds);
+    let mut customs: Vec<(&str, Vec<u8>)> = Vec::new();
+    for &oi in &included {
+        for (n, d) in &objs[oi].customs {
+            match customs.iter_mut().find(|(m, _)| m == n) {
+                Some((_, buf)) => buf.extend_from_slice(d),
+                None => customs.push((n, d.to_vec())),
+            }
+        }
+    }
+    for (name, data) in &customs {
+        module.section(&we::CustomSection {
+            name: (*name).into(),
+            data: data.as_slice().into(),
+        });
+    }
     let mut names = we::NameSection::new();
     names.functions(&fnames);
     module.section(&names);
+    let mut features: Vec<&str> = Vec::new();
+    for &oi in &included {
+        for f in &objs[oi].features {
+            if !features.contains(&f.as_str()) {
+                features.push(f);
+            }
+        }
+    }
+    if !features.is_empty() {
+        let mut tf = Vec::new();
+        features.len().encode(&mut tf);
+        for f in features {
+            tf.push(b'+');
+            f.encode(&mut tf);
+        }
+        module.section(&we::CustomSection {
+            name: "target_features".into(),
+            data: tf.into(),
+        });
+    }
     std::fs::write(&out, module.finish()).map_err(|e| format!("{out}: {e}"))?;
     if std::env::var_os("PLIRON_WASM_LD_VERBOSE").is_some() {
         eprintln!(

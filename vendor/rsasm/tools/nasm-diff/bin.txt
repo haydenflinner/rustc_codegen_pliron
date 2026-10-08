@@ -1,0 +1,224 @@
+=== data directives and strings
+db 1, 2, 0xff, -1
+dw 0x1234, 'ab', 'a'
+dd 0x12345678, 'abcde', "xy"
+dq 1, -2
+db 'hello', 0, "world", 10
+db `a\n\t\x41\101\\\``
+dw "abc"
+=== equ and local labels
+base:
+.x: db 1
+foo equ 3
+.y: db 2
+dw base.x, base.y, foo
+other:
+.x: db 3
+dw .x, base.x
+=== single-line macros
+%define twice(x) ((x)*2)
+%define ONE 1
+%define TWO ONE+ONE
+db twice(3), TWO, twice(TWO)
+%xdefine THREE TWO+ONE
+%undef ONE
+%define ONE 10
+db THREE
+%idefine loud 5
+db LOUD, Loud
+=== assign and rep
+%assign i 0
+%rep 4
+db i
+%assign i i+1
+%endrep
+%rep 10
+%if i == 7
+%exitrep
+%endif
+db i
+%assign i i+1
+%endrep
+=== multi-line macro parameters and defaults
+%macro m 1-3 7, 8
+db %0, %1, %2, %3
+%endmacro
+m 1
+m 1, 2
+lab: m 3
+%macro n 0-1
+db %0
+%endmacro
+lab2 n
+lab3: n 5
+dw lab, lab2, lab3
+=== macro label capture
+%macro here 0
+%00: db 0x42
+%endmacro
+spot here
+dw spot
+=== greedy parameters and rotate
+%macro bytes 1+
+db %1
+%endmacro
+bytes 1, 2, 3
+%macro rev 1-*
+%rep %0
+%rotate -1
+db %1
+%endrep
+%endmacro
+rev 1, 2, 3, 4
+%macro wrap 2+
+db %1
+db %2
+%endmacro
+wrap 9, 8, 7
+=== macro local labels and pasting
+%macro loopit 1
+%%top: db %1
+dw %%top
+%endmacro
+loopit 1
+loopit 2
+%macro mk 1
+lbl_%1: db 0
+val%{1}x equ 5
+%endmacro
+mk a
+mk b
+dw lbl_a, lbl_b, valax
+=== braces in macro arguments
+%macro two 2
+db %1
+db %2
+%endmacro
+two {1, 2}, 3
+=== conditionals
+%define X 1
+%ifdef X
+db 1
+%else
+db 2
+%endif
+%ifndef Y
+db 3
+%endif
+%if X > 0 && 2 == 2
+db 4
+%elif 1
+db 5
+%endif
+%if 0
+db 6
+%elif X
+db 7
+%else
+db 8
+%endif
+%ifidn foo, foo
+db 9
+%endif
+%ifidni FOO, foo
+db 10
+%endif
+%ifnum 42
+db 11
+%endif
+%ifstr 'x'
+db 12
+%endif
+%ifid abc
+db 13
+%endif
+%ifempty
+db 14
+%endif
+%macro mac 1
+%endmacro
+%ifmacro mac
+db 15
+%endif
+%ifnmacro nomac
+db 16
+%endif
+%if 0
+%if 1
+db 17
+%endif
+%else
+db 18
+%endif
+=== contexts
+%push outer
+%define %$v 1
+%push inner
+%define %$v 2
+db %$v, %$$v
+%pop
+db %$v
+%pop
+%macro ctxlabel 0
+%push ctx
+jmp %$done
+db 0
+%$done:
+%pop
+%endmacro
+=== strings in the preprocessor
+%strlen len 'hello'
+db len
+%substr ch 'hello' 2
+db ch
+%substr part 'hello' 2, 3
+db part
+%defstr s abc
+db s
+%strcat both 'ab', "cd"
+db both
+=== struc and istruc
+struc point
+.x: resd 1
+.y: resw 1
+.z: resb 1
+endstruc
+dd point.x, point.y, point.z, point_size
+pt: istruc point
+at point.x, dd 1
+at point.z, db 2
+iend
+db 0xee
+=== align in data
+db 1
+align 4
+db 2
+align 8, db 0
+db 3
+alignb 4
+db 4
+=== times with dollar
+db 1, 2, 3
+times 8-($-$$) db 0x90
+times 3 dw $
+db 'x'
+=== expression operators
+db 7 / 2, -7 // 2, 7 % 3, -7 %% 3
+db 1 << 3, 0x80 >> 3
+dw -16 >>> 2
+db 1 | 2 == 3
+db (1 < 2) + (2 <= 2) + (3 > 2) + (3 >= 4) + (1 != 2) + (1 <> 1)
+db 1 && 0, 1 || 0, 1 ^^ 1, !0, ~0 & 0xff
+db 5 <=> 3, 3 <=> 5
+=== numbers
+db 0ffh, $0f, 0xf, 0h1f, 17q, 17o, 0o17, 0q17, 1010b, 0b1010, 0y11, 11y, 99d, 0d99, 0t12
+dw 1_000
+=== include files
+%include "defs.inc"
+db VALUE
+incbin "blob.bin"
+incbin "blob.bin", 1, 2
+--- file defs.inc
+%define VALUE 0x33
+--- file blob.bin
+ABCDEF

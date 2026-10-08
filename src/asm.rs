@@ -136,7 +136,17 @@ impl<'tcx> CodegenCx<'tcx> {
                     .to_string()
             }
             "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n".into(),
+            "pliron.clmul64" if x86 => {
+                "    movq xmm0, rdi\n    movq xmm1, rsi\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [rdx], xmm0\n    ret\n".into()
+            }
             "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n".into(),
+            "llvm.x86.avx.vzeroupper" if x86 => "    vzeroupper\n    ret\n".into(),
+            "llvm.x86.avx.vzeroall" if x86 => "    vzeroall\n    ret\n".into(),
+            "llvm.x86.sse2.lfence" if x86 => "    lfence\n    ret\n".into(),
+            "llvm.x86.sse2.mfence" if x86 => "    mfence\n    ret\n".into(),
+            "llvm.x86.sse.sfence" if x86 => "    sfence\n    ret\n".into(),
+            // A prefetch is only a hint, so doing nothing is a valid lowering.
+            n if n.starts_with("llvm.prefetch") => "    ret\n".into(),
             _ if x86 => "    ud2\n".into(),
             _ => aarch64_stub_body(name).unwrap_or_else(|| "    brk #0x1\n".to_string()),
         };

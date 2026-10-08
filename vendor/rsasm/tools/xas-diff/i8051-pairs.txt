@@ -1,0 +1,44 @@
+=== DATA, IDATA, XDATA and CODE are EQU with an address space
+; AS has none of these ASM51 words; with no linker and no address-space
+; checks, each defines a plain value, which is what AS's EQU does.
+COUNTER DATA    30H
+STACK   IDATA   60H
+BUFFER  XDATA   8000H
+ENTRY   CODE    0100H
+        MOV     COUNTER,#0
+        MOV     SP,#STACK-1
+        MOV     DPTR,#BUFFER
+        MOVX    A,@DPTR
+        LJMP    ENTRY
+--- gnu
+COUNTER EQU     30H
+STACK   EQU     60H
+BUFFER  EQU     8000H
+ENTRY   EQU     0100H
+        MOV     COUNTER,#0
+        MOV     SP,#STACK-1
+        MOV     DPTR,#BUFFER
+        MOVX    A,@DPTR
+        LJMP    ENTRY
+=== an AJMP in the last two bytes of a block reaches the next one
+; The CPU takes the block from the address after the AJMP, 800H here. AS and
+; sdas8051 test the AJMP's own address, 7FEH, and refuse this; AS's generic
+; JMP tests the address after it, and assembles what the CPU does.
+        ORG     7FEH
+        AJMP    0FF0H
+--- gnu
+        ORG     7FEH
+        JMP     0FF0H
+=== an ACALL straddling a block boundary calls into the next one
+        ORG     17FFH
+        ACALL   1C00H
+--- gnu
+        ORG     17FFH
+        CALL    1C00H
+=== the data list location counter is the item's own
+; AS gives every item the statement's address.
+        ORG     40H
+        DW      $,$,$
+--- gnu
+        ORG     40H
+        DW      40H,42H,44H

@@ -1,0 +1,215 @@
+# One case per line, assembled as a file of its own; `;` separates the
+# statements of a case. See run.sh.
+#
+# ---- nothing but code ----
+nop
+ret
+pushq %rbp;movq %rsp, %rbp;popq %rbp;retq
+# ---- branches ----
+callq _ext
+jmp _ext
+je _ext
+jne _ext
+callq _ext+4
+callq _ext-4
+jmp _ext+100
+callq *_ext(%rip)
+jmp *_ext(%rip)
+callq _f;_f: ret
+jmp _f;_f: ret
+je _f;_f: ret
+callq Lf;Lf: ret
+jmp Lf;Lf: ret
+je Lf;Lf: ret
+_f: callq _f
+_f: jmp _f
+_f: callq Lf;Lf: ret
+_f: jmp Lf;Lf: ret
+_f: callq _g;_g: ret
+_f: jmp _g;_g: ret
+_f: je _g;_g: ret
+_f: nop;Lb: nop;_g: callq Lb
+_f: nop;Lb: nop;_g: jmp Lb
+.globl _f;_f: callq _f
+.globl _g;_f: callq _g;_g: ret
+.private_extern _g;_f: callq _g;_g: ret
+callq _f+2;_f: nop;nop;ret
+# ---- RIP-relative, with the bytes after the displacement ----
+leaq _ext(%rip), %rax
+leaq _ext+8(%rip), %rax
+leaq _ext-8(%rip), %rax
+movq _ext(%rip), %rax
+movl _ext(%rip), %eax
+movw _ext(%rip), %ax
+movb _ext(%rip), %al
+movq %rax, _ext(%rip)
+movb $1, _ext(%rip)
+movw $1, _ext(%rip)
+movl $1, _ext(%rip)
+movq $1, _ext(%rip)
+cmpl $1, _ext(%rip)
+cmpq $0x12345, _ext(%rip)
+addb $1, _ext+3(%rip)
+testb $1, _ext(%rip)
+cmpps $3, _ext(%rip), %xmm1
+vcmpps $3, _ext(%rip), %ymm1, %ymm2
+vpternlogd $0xff, _ext(%rip), %zmm1, %zmm2
+pinsrw $1, _ext(%rip), %xmm0
+imull $3, _ext(%rip), %eax
+imulw $0x1234, _ext(%rip), %ax
+leaq _f(%rip), %rax;_f: ret
+_f: leaq _f(%rip), %rax
+_f: leaq Lf(%rip), %rax;Lf: ret
+_f: leaq _g(%rip), %rax;_g: ret
+_f: movb $1, Lf(%rip);Lf: ret
+Lf: leaq Lf(%rip), %rax
+Lf: movl $1, Lf(%rip)
+# ---- through the GOT ----
+movq _ext@GOTPCREL(%rip), %rax
+movq _ext@GOTPCREL(%rip), %r12
+movl _ext@GOTPCREL(%rip), %eax
+leaq _ext@GOTPCREL(%rip), %rax
+addq _ext@GOTPCREL(%rip), %rax
+pushq _ext@GOTPCREL(%rip)
+callq *_ext@GOTPCREL(%rip)
+jmp *_ext@GOTPCREL(%rip)
+movq _ext@GOTPCREL+4(%rip), %rax
+cmpq $1, _ext@GOTPCREL(%rip)
+callq _ext@GOTPCREL
+_f: movq _f@GOTPCREL(%rip), %rax
+movq Lf@GOTPCREL(%rip), %rax;Lf: ret
+# ---- absolute references ----
+movl $_ext, %eax
+movl $_ext+4, %eax
+movabsq $_ext, %rax
+movabsq $_ext+16, %rax
+movq $_ext, %rax
+pushq $_ext
+movl _ext, %eax
+movq _ext(,%rax,8), %rcx
+leal _ext, %eax
+movl $_f, %eax;_f: ret
+movabsq $_f, %rax;_f: ret
+movabsq $Lf, %rax;Lf: ret
+_f: movabsq $Lf, %rax;Lf: ret
+addl $(_g - _f), %ebx;_f: nop;_g: nop
+_f: nop;_g: nop;addl $(_g - _f), %ebx
+Lf: nop;Lg: nop;addl $(Lg - Lf), %ebx
+_f: nop;Lg: nop;addl $(Lg - _f), %ebx
+Lf: nop;_g: nop;addl $(_g - Lf), %ebx
+_f: nop;_g: nop;movl $(_g - _f), %eax
+# ---- data ----
+.quad _ext
+.long _ext
+.quad _ext+8
+.quad _ext-8
+.long _ext+1
+.short _ext
+.byte _ext
+.quad _f;_f: ret
+.long _f;_f: ret
+.quad Lf;Lf: ret
+.quad Lf+3;Lf: ret
+_f: .quad Lf;Lf: ret
+.quad _f - _g;_f: ret;_g: ret
+.long _f - _g;_f: ret;_g: ret
+.quad _g - _f;_f: ret;_g: ret
+_f: ret;_g: ret;.long _g - _f
+_f: ret;_g: ret;.quad _g - _f + 5
+_f: jmp _ext;_g: ret;.long _g - _f
+.long _f - .;_f: ret
+.long . - _f;_f: ret
+_f: ret;.long _f - .
+.long Lf - .;Lf: ret
+.long _ext - .
+.long _ext - _f;_f: ret
+.long _ext@GOTPCREL
+.long _ext@GOTPCREL+4
+.long _ext@GOTPCREL-.
+.quad _ext@GOTPCREL
+# ---- sections ----
+.data;.quad 1
+.data;_d: .quad _d
+.data;.quad Ld;Ld: .quad 0
+.data;_d: .quad 0;.text;movq _d(%rip), %rax
+.data;Ld: .quad 0;.text;movq Ld(%rip), %rax
+.data;Ld: .quad 0;.text;movl $1, Ld(%rip)
+.data;Ld: .quad 0;.text;_f: movq Ld(%rip), %rax
+.const;_c: .quad 1;.text;leaq _c(%rip), %rax
+.cstring;Ls: .asciz "hi";.text;leaq Ls(%rip), %rdi
+.cstring;Ls: .asciz "hi";.text;leaq Ls+1(%rip), %rdi
+.cstring;Ls: .asciz "hi";.text;movb $0, Ls(%rip)
+.cstring;.asciz "a";Ls: .asciz "hi";.data;.quad Ls
+.cstring;.asciz "a";Ls: .asciz "hi";.data;.quad Ls+1
+.literal4;L4: .long 0x3f800000;.text;movss L4(%rip), %xmm0
+.literal8;L8: .quad 0x3ff0000000000000;.text;movsd L8(%rip), %xmm0
+.literal16;.quad 1, 2
+.bss;.space 8
+.bss;_b: .space 8;.text;movq _b(%rip), %rax
+.section __TEXT,__foo;.byte 1
+.section __DATA,__foo;.quad _ext
+.section __TEXT,__textcoal_nt,coalesced,pure_instructions;ret
+.section __DATA,__mod_init_func,mod_init_funcs;.quad _f;.text;_f: ret
+.mod_init_func;.quad _ext
+.mod_term_func;.quad _ext
+.non_lazy_symbol_pointer;.quad 0
+.lazy_symbol_pointer;.quad 0
+.tdata;.quad 1
+.tlv;.quad 0
+.const_data;.quad _ext
+.static_const;.byte 1
+.static_data;.byte 1
+.constructor;.byte 1
+.destructor;.byte 1
+.section __TEXT,__text;ret
+.section __TEXT,__cstring,cstring_literals;.asciz "x"
+.section __DATA,__data,regular,no_dead_strip;.byte 1
+.section __TEXT,__stub,symbol_stubs,pure_instructions,6;ret
+.section __DATA,__zz,zerofill;.space 4
+.rodata;.byte 1
+# ---- alignment ----
+.align 3;ret
+.p2align 4;ret
+.balign 16;ret
+nop;.align 3;ret
+nop;.p2align 4, 0x90;ret
+.data;.byte 1;.align 3;.byte 2
+.data;.byte 1;.p2align 2;.byte 2
+# ---- symbols ----
+.globl _g;_g: ret
+.globl _z, _a;_z: ret;_a: ret
+.private_extern _p;_p: ret
+.weak_definition _w;_w: ret
+.globl _w;.weak_definition _w;_w: ret
+.weak_reference _u;callq _u
+.weak_reference _u
+.alt_entry _a;_f: nop;_a: ret
+.no_dead_strip _f;_f: ret
+.globl _u;callq _u
+.comm _c, 8, 3
+.comm _c, 16
+.lcomm _l, 8, 3
+.lcomm _l, 8
+.zerofill __DATA,__common,_z,16,4
+.zerofill __DATA,__bss,_z,8
+_a = 5
+.globl _a;_a = 5
+_f: ret;_a = _f
+_f: ret;_a = _f + 1;.globl _a
+.set _a, 0x1234
+_Lnot_temp: ret
+lfoo: ret
+Lfoo: ret
+.subsections_via_symbols
+.subsections_via_symbols;_f: callq _g;_g: ret
+# ---- load commands ----
+.build_version macos, 14, 0
+.build_version macos, 10, 15, 7
+.build_version ios, 17, 2
+.build_version macos, 14, 0 sdk_version 14, 2
+.build_version tvos, 17, 0
+.build_version watchos, 10, 0
+.build_version macCatalyst, 17, 0
+.build_version iossimulator, 17, 0
+.build_version driverkit, 23, 0
+.build_version xros, 1, 0

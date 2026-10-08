@@ -1,0 +1,349 @@
+=== comments and labels
+; a comment line
+LABEL1:	MOV.L	[R1], R2	; Example of a mnemonic.
+	NOP
+--- gnu
+LABEL1:	mov.l	[r1], r2
+	nop
+=== numbers: B, O and H suffixes, and decimal
+	.LWORD	1011000B, 1011000b, 60702O, 60702o, 9243
+	.LWORD	0A5FH, 5FH, 0a5fh, 5fh, 0FFFFFF81H
+--- gnu
+	.long	88, 88, 25026, 25026, 9243
+	.long	0xa5f, 0x5f, 0xa5f, 0x5f, 0xffffff81
+=== characters and strings in .BYTE
+	.BYTE	"abcd", 'x', "A", 1, 2, 3
+--- gnu
+	.byte	0x61, 0x62, 0x63, 0x64, 0x78, 0x41, 1, 2, 3
+=== widths of .BYTE, .WORD and .LWORD
+	.BYTE	0FFH, -1
+	.WORD	1, 1234H
+	.LWORD	11111111H, 22222222H
+--- gnu
+	.byte	0xff, 0xff
+	.short	1, 0x1234
+	.long	0x11111111, 0x22222222
+=== operator precedence: shifts below `+`, `&` above `|` and `^`
+	.LWORD	1+2<<1, 2&1+1, 6|1^3, 1<<2+1, 7&3|8
+	.LWORD	10%4*2, ~0&0FFH, 2+3*4, 16>>2-1, -(3-5)
+--- gnu
+	.long	6, 2, 4, 8, 11
+	.long	4, 255, 14, 8, 2
+=== .EQU symbols in operands and expressions
+symbol	.EQU	1
+symbol1	.EQU	symbol+symbol
+CNT	.EQU	0FFH
+	MOV.L	#symbol1, R1
+	MOV.L	#CNT, R2
+	ADD	#symbol+2, R3
+--- gnu
+	mov.l	#2, r1
+	mov.l	#0xff, r2
+	add	#3, r3
+=== names with `$`, `_` and `.`
+	.GLB	name1, name2
+	.GLB	name4
+lab$1:	NOP
+_x.y:	NOP
+	BRA	lab$1
+	BRA	_x.y
+--- gnu
+lab_1:	nop
+x_y:	nop
+	bra	lab_1
+	bra	x_y
+=== `$` is the location symbol
+	BRA	$
+	.LWORD	$-lab
+lab:	NOP
+--- gnu
+	bra	.
+here:	.long	here-lab
+lab:	nop
+=== temporary labels `?:`, `?+` and `?-`
+?:
+	BRA	?+
+	NOP
+	NOP
+	NOP
+?:
+	BRA	?-
+	BRA	?-
+--- gnu
+1:
+	bra	2f
+	nop
+	nop
+	nop
+2:
+	bra	2b
+	bra	2b
+=== size specifiers
+	MOV.B	#0, [R3]
+	MOV.W	R1, R2
+	MOV.L	R1, R2
+	mov.b	[r1], r2
+	MOVU.W	4[R1], R2
+--- gnu
+	mov.b	#0, [r3]
+	mov.w	r1, r2
+	mov.l	r1, r2
+	mov.b	[r1], r2
+	movu.w	4[r1], r2
+=== branch distance specifiers
+L0:	BRA.S	L1
+	BEQ.S	L1
+	NOP
+	NOP
+L1:	BRA.B	L0
+	BRA.W	L0
+	BRA.A	L0
+	BRA.L	R1
+	BSR.W	L0
+	BSR.A	L0
+	BSR.L	R2
+	BNE.W	L0
+	BGT.B	L0
+	RTS
+--- gnu
+L0:	bra.s	L1
+	beq.s	L1
+	nop
+	nop
+L1:	bra.b	L0
+	bra.w	L0
+	bra.a	L0
+	bra.l	r1
+	bsr.w	L0
+	bsr.a	L0
+	bsr.l	r2
+	bne.w	L0
+	bgt.b	L0
+	rts
+=== branches without a specifier take the shortest distance
+L0:	BRA	L1
+	BEQ	L1
+	BNE	L0
+	BSR	L0
+L1:	RTS
+--- gnu
+L0:	bra	L1
+	beq	L1
+	bne	L0
+	bsr	L0
+L1:	rts
+=== the addressing modes of §5.1.5 (2)
+	ADD	R1, R2
+	ADD	[R1], R2
+	ADD	400[R1], R2
+	MOV.L	#-100, R2
+	RACW	#1
+	BSET	#7, R10
+	ADD	#15, R8
+	BSET	#31, R10
+	MOV.L	R3, 124[R1]
+	MOV.L	[R3+], R1
+	MOV.L	[-R3], R1
+	MOV.L	[R3,R1], R2
+	MOV.L	R3, [R1,R2]
+	MVFC	PSW, R2
+	CLRPSW	U
+	ADD	[R1].B, R2
+	AND	125[R1].UB, R2
+	MOV.L	SP, R1
+--- gnu
+	add	r1, r2
+	add	[r1], r2
+	add	400[r1], r2
+	mov.l	#-100, r2
+	racw	#1
+	bset	#7, r10
+	add	#15, r8
+	bset	#31, r10
+	mov.l	r3, 124[r1]
+	mov.l	[r3+], r1
+	mov.l	[-r3], r1
+	mov.l	[r3,r1], r2
+	mov.l	r3, [r1,r2]
+	mvfc	psw, r2
+	clrpsw	u
+	add	[r1].b, r2
+	and	125[r1].ub, r2
+	mov.l	r0, r1
+=== bit length specifiers naming the shortest form
+	MOV.L	#5:4, R1
+	MOV.L	#-100:8, R2
+	MOV.L	#200 :8, R2
+	DIV	#5:8, R1
+	ADD	#1000:16, R1
+	ADD	#-100000:24, R1
+	MOV.L	#12345678H:32, R1
+	MOV.B	#200:8, [R1]
+	MOV.W	#40000:16, [R1]
+	MOV.L	R3, 124:5[R1]
+	ADD	400:8[R1], R2
+	ADD	4000:16[R1], R2
+	MOV.L	#20:8, 4:5[R1]
+	BSET	#7:3, [R1].B
+	BSET	#31:5, R10
+	SHLR	#3:5, R4
+	MVTIPL	#9:4
+	RACW	#2:1
+--- gnu
+	mov.l	#5, r1
+	mov.l	#-100, r2
+	mov.l	#200, r2
+	div	#5, r1
+	add	#1000, r1
+	add	#-100000, r1
+	mov.l	#0x12345678, r1
+	mov.b	#200, [r1]
+	mov.w	#40000, [r1]
+	mov.l	r3, 124[r1]
+	add	400[r1], r2
+	add	4000[r1], r2
+	mov.l	#20, 4[r1]
+	bset	#7, [r1].b
+	bset	#31, r10
+	shlr	#3, r4
+	mvtipl	#9
+	racw	#2
+=== bit length specifiers on a folded difference and a symbol
+S:	.BYTE	1, 2, 3
+E:	MOV.L	#E-S:4, R1
+	MOV.L	#ext:32, R2
+	ADD	#ext:32, R3
+--- gnu
+s:	.byte	1, 2, 3
+e:	mov.l	#e-s, r1
+	mov.l	#ext, r2
+	add	#ext, r3
+=== substitute register names for the PID function
+	MOV.L	__PID_R13, __PID_R1
+	ADD	#4, __PID_R15, R6
+	MOV.L	4[__PID_R2], R3
+--- gnu
+	mov.l	r13, r1
+	add	#4, r15, r6
+	mov.l	4[r2], r3
+=== .MACRO with arguments, from the manual's example (page 486)
+mac	.MACRO	p1,p2,p3
+	.IF ..MACPARA == 3
+	.IF 'p1' == 'byte'
+	MOV.B #p2,[p3]
+	.ELSE
+	MOV.W #p2,[p3]
+	.ENDIF
+	.ELIF ..MACPARA == 2
+	.IF 'p1' == 'byte'
+	MOV.B #p2,[R3]
+	.ELSE
+	MOV.W #p2,[R3]
+	.ENDIF
+	.ELSE
+	MOV.W R3,R1
+	.ENDIF
+	.ENDM
+	mac word,10,R3
+	mac byte,20
+	mac byte
+--- gnu
+	mov.w	#10, [r3]
+	mov.b	#20, [r3]
+	mov.w	r3, r1
+=== `@` concatenates in a macro body (page 497)
+mov_nibble .MACRO p1,src,dest
+	MOV.@p1 src,dest
+	.ENDM
+	mov_nibble W,R1,R2
+	mov_nibble L,R3,R4
+--- gnu
+	mov.w	r1, r2
+	mov.l	r3, r4
+=== .EXITM and .LOCAL
+data1	.MACRO value
+	.IF value == 0
+	.EXITM
+	.ENDIF
+	.LOCAL m1
+m1:	NOP
+	BRA m1
+	.ENDM
+	data1 0
+	data1 1
+	data1 2
+--- gnu
+1:	nop
+	bra	1b
+2:	nop
+	bra	2b
+=== .MREPEAT and ..MACREP, from the manual's example (page 490)
+mac	.MACRO value,reg
+	.MREPEAT value
+	MOV.B #0,..MACREP[reg]
+	.ENDR
+	.ENDM
+	mac 3,R3
+--- gnu
+	mov.b	#0, 1[r3]
+	mov.b	#0, 2[r3]
+	mov.b	#0, 3[r3]
+=== .IF, .ELIF and .ELSE; an undefined symbol is 0
+TYPE	.EQU	1
+	.IF TYPE==0
+	.BYTE "Proto Type Mode"
+	.ELIF TYPE>0
+	.BYTE "Mass Production Mode"
+	.ELSE
+	.BYTE "Debug Mode"
+	.ENDIF
+	.IF UNDEFINED == 0
+	NOP
+	.ENDIF
+	.IF 'A' < 'B'
+	RTS
+	.ENDIF
+--- gnu
+	.ascii	"Mass Production Mode"
+	nop
+	rts
+=== .DEFINE replaces a name with a string (page 499)
+X_HI	.DEFINE	R1
+ARGS	.DEFINE	"#2, R3"
+	MOV.L	#0, X_HI
+	MOV.L	ARGS
+	.IF __RENESAS__ == 1
+	NOP
+	.ENDIF
+--- gnu
+	mov.l	#0, r1
+	mov.l	#2, r3
+	nop
+=== .ALIGN pads code with NOP (03H), which GNU as spells as `.skip`
+	MOV.L	R1, R2
+	.ALIGN	4
+	RTS
+	.ALIGN	2, FILL=0
+	NOP
+	RTS
+--- gnu
+	mov.l	r1, r2
+	.skip	4 - (. - P) % 4, 3
+	rts
+	.skip	(2 - (. - P) % 2) % 2, 3
+	nop
+	rts
+=== .OFFSET pads code with NOP (03H)
+	NOP
+	.OFFSET	8
+	RTS
+--- gnu
+	nop
+	.org	8, 3
+	rts
+=== .END ends the source
+	NOP
+	.END
+	this is not assembled
+--- gnu
+	nop

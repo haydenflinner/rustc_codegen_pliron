@@ -1,0 +1,560 @@
+# AArch64 (A64) differential corpus.
+#
+# Immediates are mostly written without the usual `#` sigil, which both
+# assemblers accept; the SIMD and SVE corpora (aarch64-*-words.txt) write it.
+
+# ---- add / subtract, immediate ----
+add x0, x1, 0
+add x0, x1, 1
+add w0, w1, 4095
+add x0, x1, 1, lsl 12
+add x0, x1, 4095, lsl 12
+adds x0, x1, 1
+adds w9, w10, 42
+sub x0, x1, 8
+sub w0, w1, 4095
+subs x0, x1, 1
+subs w0, w1, 4095, lsl 12
+add sp, sp, 16
+sub sp, sp, 512
+add x0, sp, 8
+sub x29, sp, 32
+# A negative immediate turns add into sub and back.
+add x0, x1, -1
+sub x0, x1, -1
+cmp x0, 0
+cmp x0, 4095
+cmp w3, 17
+cmn w0, 1
+cmn x0, 1, lsl 12
+cmp x0, -1
+
+# ---- add / subtract, shifted register ----
+add x0, x1, x2
+add w0, w1, w2
+add x0, x1, x2, lsl 3
+add x0, x1, x2, lsr 63
+add x0, x1, x2, asr 1
+adds x0, x1, x2, lsr 1
+sub w5, w6, w7, lsl 31
+subs x0, x1, x2
+subs xzr, x1, x2
+cmp x0, x1
+cmp w0, w1, lsl 4
+cmn x0, x1, asr 7
+neg x0, x1
+neg w0, w1, lsl 3
+negs x0, x1
+negs x0, x1, asr 2
+
+# ---- add / subtract, extended register ----
+add x0, x1, w2, uxtb
+add x0, x1, w2, uxth
+add x0, x1, w2, uxtw
+add x0, x1, x2, uxtx
+add x0, x1, w2, sxtb
+add x0, x1, w2, sxth
+add x0, x1, w2, sxtw
+add x0, x1, x2, sxtx
+add x0, x1, w2, uxtw 2
+add x0, sp, x1
+add sp, sp, x1
+adds x0, x1, w2, sxth 3
+cmp x0, w1, uxtb
+subs x0, sp, x1
+
+# ---- add / subtract with carry ----
+adc x0, x1, x2
+adcs w0, w1, w2
+sbc x0, x1, x2
+sbcs w0, w1, w2
+ngc x0, x1
+ngcs w0, w1
+
+# ---- logical, shifted register ----
+and x0, x1, x2
+and w3, w4, w5
+orr w3, w4, w5
+eor x6, x7, x8, lsl 4
+ands x9, x10, x11, asr 63
+bic x0, x1, x2
+bics x0, x1, x2
+orn w0, w1, w2
+eon x0, x1, x2
+and x0, x1, x2, ror 32
+tst x0, x1
+tst x0, x1, lsl 2
+mvn x0, x1
+mvn w0, w1, lsl 8
+mov x0, x1
+mov w0, w1
+mov sp, x0
+mov x0, sp
+mov w0, wzr
+mov x0, xzr
+
+# ---- the logical (bitmask) immediate ----
+and x0, x1, 0xff
+and w0, w1, 0xff
+and x0, x1, 1
+and x0, x1, 0xfffffffffffffffe
+and w0, w1, 0xfffffffe
+orr x0, x1, 0xffff0000ffff0000
+orr w0, w1, 0x55555555
+eor x0, x1, 1
+eor x0, x1, 0x5555555555555555
+ands w0, w1, 0x3ffc
+ands x0, x1, 0xf000000000000000
+tst x0, 0xf
+tst w0, 0x80000000
+and x0, x1, 0xf00000000000000f
+orr sp, x0, 0xfff
+
+# The inverted mnemonics, which assemble to the plain one of the complement.
+# GNU as takes only `bic` this way; llvm-mc takes all four, so they are here.
+bic x0, x1, 0xff
+bic w0, w1, 1
+bic sp, x1, 0xff
+bics x0, x1, 0xff
+bics xzr, x1, 0xff
+bics w0, w1, 0xf0f0f0f0
+orn x0, x1, 0xff
+orn w0, w1, 0xf
+eon x0, x1, 0xff
+eon w0, w1, 0x3ffc
+
+# ---- move wide ----
+movz x0, 0
+movz x0, 1
+movz x0, 65535
+movz x0, 1, lsl 16
+movz x0, 0xabcd, lsl 32
+movz x0, 0xabcd, lsl 48
+movz w0, 0x1234, lsl 16
+movk x0, 0x1234
+movk w0, 0x1234, lsl 16
+movk x0, 0xffff, lsl 48
+movn x0, 0
+movn w0, 65535, lsl 16
+mov x0, 1
+mov w0, 7
+mov x0, 65535
+mov x0, 0x10000
+mov w0, 0x10000
+mov x0, -1
+mov x0, 0xffff00000000
+mov x0, 0xffff0000ffff0000
+mov w0, 0xfffffffe
+
+# ---- bitfield ----
+sbfm x0, x1, 3, 7
+ubfm w0, w1, 4, 9
+bfm x0, x1, 8, 12
+sbfx x0, x1, 3, 5
+ubfx w0, w1, 2, 6
+bfxil x0, x1, 4, 8
+sbfiz x0, x1, 4, 8
+ubfiz w0, w1, 3, 9
+bfi x0, x1, 4, 8
+lsl x0, x1, 3
+lsl w0, w1, 31
+lsr w0, w1, 5
+lsr x0, x1, 63
+asr x0, x1, 9
+ror x0, x1, 5
+ror w0, w1, 31
+extr x0, x1, x2, 8
+extr w0, w1, w2, 31
+sxtb x0, w1
+sxtb w0, w1
+sxth w0, w1
+sxth x0, w1
+sxtw x0, w1
+uxtb w0, w1
+uxth w0, w1
+
+# ---- variable shifts, multiply, divide ----
+lsl x0, x1, x2
+lsr w0, w1, w2
+asr x0, x1, x2
+ror x0, x1, x2
+lslv x0, x1, x2
+rorv w0, w1, w2
+mul x0, x1, x2
+mul w0, w1, w2
+madd x0, x1, x2, x3
+msub w0, w1, w2, w3
+mneg x0, x1, x2
+smull x0, w1, w2
+umull x0, w1, w2
+smaddl x0, w1, w2, x3
+umaddl x0, w1, w2, x3
+smsubl x0, w1, w2, x3
+umsubl x0, w1, w2, x3
+smnegl x0, w1, w2
+umnegl x0, w1, w2
+smulh x0, x1, x2
+umulh x0, x1, x2
+sdiv x0, x1, x2
+udiv w0, w1, w2
+
+# ---- one-source data processing ----
+rbit x0, x1
+rbit w0, w1
+rev x0, x1
+rev w0, w1
+rev16 w0, w1
+rev16 x0, x1
+rev32 x0, x1
+clz x0, x1
+cls w0, w1
+
+# ---- conditional ----
+csel x0, x1, x2, eq
+csel w0, w1, w2, hs
+csinc w0, w1, w2, ne
+csinv x0, x1, x2, lt
+csneg x0, x1, x2, ge
+cset w0, eq
+cset x0, lo
+csetm x0, ne
+cinc x0, x1, eq
+cinv x0, x1, vs
+cneg w0, w1, mi
+ccmp x0, x1, 3, eq
+ccmp w0, 5, 0, ne
+ccmn x0, x1, 15, al
+ccmn w0, 31, 7, le
+
+# ---- branches to registers ----
+br x0
+blr x1
+ret
+ret x30
+ret x0
+eret
+
+# ---- loads and stores, unsigned offset ----
+ldr x0, [x1]
+ldr x0, [x1, 8]
+ldr w0, [x1, 4]
+ldr x0, [x1, 32760]
+ldr x0, [sp, 16]
+str x0, [x1, 8]
+str w0, [sp]
+strb w0, [x1, 1]
+ldrb w0, [x1, 4095]
+ldrh w0, [x1, 8190]
+strh w0, [x1, 2]
+ldrsw x0, [x1, 4]
+ldrsb x0, [x1, 1]
+ldrsb w0, [x1, 1]
+ldrsh x0, [x1, 2]
+ldrsh w0, [x1, 2]
+ldr q0, [x1, 16]
+str q0, [x1]
+ldr d0, [x1, 8]
+str s0, [x1, 4]
+ldr b0, [x1]
+ldr h0, [x1, 2]
+prfm pldl1keep, [x0]
+prfm pstl2strm, [x0, 64]
+
+# ---- loads and stores, unscaled and indexed ----
+ldur x0, [x1, -8]
+ldur x0, [x1]
+stur w0, [x1, 255]
+sturb w0, [x1, -1]
+ldursw x0, [x1, -4]
+ldr x0, [x1, 8]!
+ldr x0, [x1], 8
+str x0, [sp, -16]!
+ldr x0, [sp], 16
+strb w0, [x1, -1]!
+ldrh w0, [x1], 2
+
+# ---- loads and stores, register offset ----
+ldr x0, [x1, x2]
+ldr x0, [x1, x2, lsl 3]
+ldr w0, [x1, w2, uxtw 2]
+ldr w0, [x1, w2, sxtw]
+ldr x0, [x1, x2, sxtx 3]
+str x0, [x1, x2, lsl 3]
+strb w0, [x1, x2]
+ldrh w0, [x1, x2, lsl 1]
+ldrsw x0, [x1, x2, lsl 2]
+ldr q0, [x1, x2, lsl 4]
+ldr d0, [x1, x2]
+
+# ---- load and store pairs ----
+ldp x0, x1, [x2]
+ldp x0, x1, [x2, 16]
+ldp x0, x1, [x2, -512]
+stp x29, x30, [sp, -16]!
+ldp x29, x30, [sp], 16
+stp w0, w1, [x2, 8]
+ldpsw x0, x1, [x2, 8]
+stp d0, d1, [sp, -16]!
+ldp q0, q1, [x0, 32]
+ldp s0, s1, [x0]
+stnp x0, x1, [x2, 16]
+ldnp w0, w1, [x2]
+
+# ---- system ----
+nop
+yield
+wfe
+wfi
+sev
+sevl
+hint 7
+svc 0
+svc 65535
+hvc 1
+smc 2
+brk 0
+brk 1000
+hlt 1
+isb
+isb sy
+dmb sy
+dmb ish
+dmb ishst
+dmb ld
+dsb nsh
+dsb oshst
+clrex
+clrex 5
+mrs x0, nzcv
+mrs x0, daif
+mrs x1, fpcr
+mrs x2, fpsr
+mrs x0, tpidr_el0
+mrs x0, ctr_el0
+mrs x0, midr_el1
+mrs x0, cntvct_el0
+mrs x0, s3_3_c13_c0_3
+msr nzcv, x0
+msr tpidr_el0, x1
+msr fpcr, x0
+msr daifset, 2
+msr daifclr, 3
+msr spsel, 0
+
+# ---- a little SIMD ----
+add v0.4s, v1.4s, v2.4s
+add v0.8b, v1.8b, v2.8b
+add v0.2d, v1.2d, v2.2d
+sub v0.16b, v1.16b, v2.16b
+sub v3.4h, v4.4h, v5.4h
+and v0.8b, v1.8b, v2.8b
+orr v0.16b, v1.16b, v2.16b
+eor v0.16b, v1.16b, v2.16b
+bic v0.8b, v1.8b, v2.8b
+mov v0.16b, v1.16b
+mov v0.8b, v1.8b
+dup v0.4s, w1
+dup v0.8b, w1
+dup v0.2d, x1
+dup v0.4s, v1.s[2]
+dup v0.16b, v1.b[15]
+fmov d0, x1
+fmov x0, d1
+fmov s0, w1
+fmov w0, s1
+fmov d0, d1
+fmov s0, s1
+
+# ---- a sweep of the bitmask-immediate encoding ----
+# Sampled from the 5334 encodable 64-bit patterns and the 32-bit subset, so
+# that every element width (2, 4, 8, 16, 32, 64) and both the plain and the
+# wrapped rotation cases are exercised against llvm-mc.
+and x0, x1, 0x1fe0000
+and x0, x1, 0xf000000
+and x0, x1, 0xffffc00
+and x0, x1, 0x10000000
+and x0, x1, 0x7ff00000
+and x0, x1, 0x7ffff800
+and x0, x1, 0xffe00000
+and x0, x1, 0x3fe000000
+and x0, x1, 0x3fffffff0
+and x0, x1, 0x1fffffe000
+and x0, x1, 0x3ffffc0000
+and x0, x1, 0x7c0000007c
+and x0, x1, 0xc0000000000
+and x0, x1, 0x1ffe00000000
+and x0, x1, 0x7ffffffff000
+and x0, x1, 0x3fffffffffffff
+and x0, x1, 0x7fffff007fffff
+and x0, x1, 0x7fffffffff8000
+and x0, x1, 0x1fffc0001fffc00
+and x0, x1, 0x1fffc0001fffc000
+and x0, x1, 0x7fffffffffffc000
+and x0, x1, 0xe1ffffffe1ffffff
+and x0, x1, 0xfc000000000fffff
+and x0, x1, 0xfc000001ffffffff
+and x0, x1, 0xff000000007fffff
+and x0, x1, 0xff0000007fffffff
+and x0, x1, 0xff07ffffffffffff
+and x0, x1, 0xff807fffff807fff
+and x0, x1, 0xffffc000000000ff
+and x0, x1, 0xfffffc0000001fff
+and x0, x1, 0xffffff03ffffff03
+and x0, x1, 0xffffff81ffffff81
+and x0, x1, 0xffffffe00000ffff
+and x0, x1, 0xfffffff81fffffff
+and x0, x1, 0xfffffffe00000003
+and x0, x1, 0xfffffffe00000007
+and x0, x1, 0xfffffffe00ffffff
+and x0, x1, 0xfffffffffff07fff
+and x0, x1, 0xfffffffffffc0007
+and x0, x1, 0xfffffffffffffffd
+orr w2, w3, 0xe000
+orr w2, w3, 0xff80
+orr w2, w3, 0xc000c
+orr w2, w3, 0xfff00
+orr w2, w3, 0x1ffff0
+orr w2, w3, 0x7fff00
+orr w2, w3, 0x1ffffff
+orr w2, w3, 0x3f003f0
+orr w2, w3, 0x7c007c0
+orr w2, w3, 0x7ffe0000
+orr w2, w3, 0xe0000003
+orr w2, w3, 0xff81ff81
+orr w2, w3, 0xfff0003f
+orr w2, w3, 0xfff80001
+orr w2, w3, 0xfff87fff
+orr w2, w3, 0xfffdffff
+orr w2, w3, 0xfffe007f
+orr w2, w3, 0xffff0007
+orr w2, w3, 0xffff81ff
+orr w2, w3, 0xffffff01
+
+# ---- odds and ends ----
+add x28, x29, x30
+mov x30, x29
+and w28, w29, w30
+ldur x0, [x1, 255]
+ldur x0, [x1, -256]
+ldursb x0, [x1, -1]
+ldursb w0, [x1, 1]
+ldursh x0, [x1, -2]
+ldurh w0, [x1, 3]
+ldurb w0, [x1, 7]
+sturh w0, [x1, -3]
+prfm 31, [x0]
+prfm plil3strm, [x0]
+prfm pldl2keep, [x0, x1, lsl 3]
+ldr x0, [x1, 32768 - 8]
+ldp x0, x1, [x2, 504]
+stp q0, q1, [x2, 1008]
+ldp d0, d1, [x2, -512]
+mrs x0, cntpct_el0
+mrs x0, cntfrq_el0
+mrs x0, mpidr_el1
+mrs x0, sctlr_el1
+mrs x0, vbar_el1
+mrs x0, ttbr0_el1
+mrs x0, ttbr1_el1
+mrs x0, tcr_el1
+mrs x0, mair_el1
+mrs x0, esr_el1
+mrs x0, far_el1
+mrs x0, elr_el1
+mrs x0, spsr_el1
+mrs x0, currentel
+mrs x0, dczid_el0
+mrs x0, tpidrro_el0
+mrs x0, s3_0_c1_c0_0
+msr s3_0_c1_c0_0, x1
+ccmp x0, x1, 0, hs
+ccmp x0, x1, 0, lo
+ccmp x0, x1, 0, hi
+ccmp x0, x1, 0, ls
+ccmp x0, x1, 0, vs
+ccmp x0, x1, 0, vc
+ccmp x0, x1, 0, mi
+ccmp x0, x1, 0, pl
+ccmp x0, x1, 0, gt
+ccmp x0, x1, 0, le
+ccmp x0, x1, 0, nv
+csel x0, xzr, x2, eq
+csel x0, x1, xzr, ne
+
+# ---- stack-pointer and shift-amount corner cases ----
+# With SP on either side only the extended form exists, and `lsl` there is
+# the natural extend for the operation width.
+add w0, wsp, w1
+add wsp, w1, w2, lsl 2
+add sp, x1, x2, lsl 3
+sub sp, sp, x1, lsl 2
+sub x0, sp, x1, lsl 4
+adds x0, sp, x1
+cmp sp, x1
+cmp wsp, w1
+cmn sp, 4
+mov wsp, w1
+mov w0, wsp
+and sp, x1, 3
+str xzr, [sp]
+add x0, x1, w2, uxtw 4
+# A byte access has only one shift amount, but an explicit `lsl 0` still sets S.
+ldrb w0, [x1, x2, lsl 0]
+ldrh w0, [x1, x2, lsl 0]
+ldr x0, [x1, x2, lsl 0]
+ldr w0, [x1, w2, uxtw 0]
+# An offset that is not a multiple of the access size falls back to `ldur`.
+ldr x0, [x1, 3]
+ldr w0, [x1, -4]
+mov x0, 0
+mov w0, -1
+mov w0, 0xffff0000
+mov x0, 0xffffffff
+mov x0, 0x0000ffffffffffff
+mov x0, 0xffffffffffff0000
+# An unshifted multiple of 4096 moves into the shifted field by itself.
+add x0, x1, 4096
+add x0, x1, 0x7ff000
+add x0, x1, 0xfff000
+sub w0, w1, -4096
+cmp x0, 8192
+# Flag-setting forms write register 31 as the zero register.
+adds xzr, x1, 1
+ands xzr, x1, 1
+add x0, x1, xzr
+# `spsel` is a PSTATE field with an immediate and a system register with a register.
+msr spsel, x0
+mrs x0, spsel
+msr daifset, 15
+msr daif, x1
+dup v0.2d, v1.d[1]
+dup v0.8h, w3
+dup v0.4h, v2.h[7]
+
+# ---- SME: its mode switches and zeroing ZA ----
+smstart
+smstart sm
+smstart za
+smstop
+smstop sm
+smstop za
+zero {za}
+
+# ---- SIMD and SVE written as people write them ----
+# The aarch64-*-words.txt corpora spell every form as llvm-mc prints it;
+# these are the other spellings both references take.
+ld1d z0.d, p0/z, [x0]
+st1w z1.s, p2, [x3, x4, lsl #2]
+fmov d0, #1
+movi v0.16b, 0x12
+ld1 {v0.16b-v3.16b}, [x0], 64
+st1 { v0.8b }, [sp], #8
+ADD V0.8B, V1.8B, V2.8B
+FMOV Z3.D, #1.5
+mov z0.h, #0xfff0
+mov z0.h, #0xff00
+mov z0.b, #240
+mov z0.s, #0xffffff80
+and z0.b, z0.b, #-2
+dup z0.h, #0xff00
+movi v0.4s, #0x12, lsl 8

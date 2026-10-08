@@ -1,0 +1,118 @@
+=== references to symbols in their own section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        jarl loc, lp
+        jarl glob, lp
+        jarl weak1, lp
+        jarl hid, lp
+        jarl prot, lp
+        jarl intl, lp
+        jarl whid, lp
+        jarl lhid, lp
+        jarl func, lp
+        jarl late, lp
+        jarl lweak, lp
+        jarl lalias, lp
+        jarl lwalias, lp
+        jarl galias, lp
+        jarl walias, lp
+        jr loc
+        jr glob
+        jr weak1
+        jr lalias
+        jr walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+
+=== references back to symbols in their own section
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        jarl loc, lp
+        jarl glob, lp
+        jarl weak1, lp
+        jarl lalias, lp
+        jr loc
+        jr glob
+        jr weak1
+
+=== references out of their section, by binding
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        jarl oloc, lp
+        jarl oglob, lp
+        jarl oweak, lp
+        jarl oalias, lp
+        jarl ext, lp
+        jarl uweak, lp
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+
+=== default section alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7
+

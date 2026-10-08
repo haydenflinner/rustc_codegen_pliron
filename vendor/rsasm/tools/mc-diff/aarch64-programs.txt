@@ -1,0 +1,170 @@
+=== unconditional branches
+start:
+        nop
+back:
+        b       back
+        b       fwd
+        bl      back
+        bl      fwd
+fwd:
+        ret
+
+=== conditional branches
+top:
+        b.eq    top
+        b.ne    bottom
+        b.lt    top
+        b.ge    bottom
+        b.hi    top
+        b.ls    bottom
+        b.hs    top
+        b.lo    bottom
+        b.mi    top
+        b.pl    bottom
+        b.vs    top
+        b.vc    bottom
+        b.gt    top
+        b.le    bottom
+        b.al    top
+bottom:
+        nop
+
+=== compare and branch
+loop:
+        cbz     x0, loop
+        cbnz    x1, out
+        cbz     w2, loop
+        cbnz    w3, out
+        tbz     x0, 0, loop
+        tbnz    x0, 63, out
+        tbz     w1, 31, loop
+        tbnz    x2, 32, out
+out:
+        ret
+
+=== branch over data
+        b       past
+        .quad   0x1122334455667788
+past:
+        nop
+
+=== pc-relative addressing
+here:
+        adr     x0, here
+        adr     x1, there
+        adr     x2, here - 4
+there:
+        nop
+
+=== adrp always relocates
+# The page difference is not known until the linker places the section, so both
+# assemblers leave the field zero and emit R_AARCH64_ADR_PREL_PG_HI21.
+base:
+        adrp    x0, base
+        adrp    x1, elsewhere
+        adrp    x2, extern_thing
+elsewhere:
+        nop
+
+=== literal loads
+pool:
+        .quad   0x0011223344556677
+code:
+        ldr     x0, pool
+        ldr     w1, pool
+        ldr     q2, pool
+        ldr     d3, pool
+        ldr     s4, pool
+
+=== a leaf function
+        .text
+        .globl  add3
+add3:
+        stp     x29, x30, [sp, -32]!
+        mov     x29, sp
+        add     w0, w0, w1
+        add     w0, w0, w2
+        ldp     x29, x30, [sp], 32
+        ret
+
+=== a loop with a memcpy shape
+copy:
+        cbz     x2, done
+1:
+        ldrb    w3, [x1], 1
+        strb    w3, [x0], 1
+        subs    x2, x2, 1
+        b.ne    1b
+done:
+        ret
+
+=== alignment padding uses real nops
+        nop
+        .p2align 4
+        ret
+
+=== symbol arithmetic in an immediate
+        .set    slot, 3
+        add     x0, x1, slot * 8
+        ldr     x2, [x3, slot * 8]
+        movz    x4, slot
+        lsl     x5, x6, slot
+
+=== switch table
+dispatch:
+        adr     x1, table
+        ldrsw   x2, [x1, x0, lsl 2]
+        add     x1, x1, x2
+        br      x1
+table:
+        # `.4byte`, not `.word`: GNU as makes `.word` four bytes on AArch64 and
+        # two on x86, and rsasm's core currently uses the x86 size everywhere.
+        .4byte  case0 - table
+        .4byte  case1 - table
+case0:
+        mov     w0, 0
+        ret
+case1:
+        mov     w0, 1
+        ret
+
+=== adrp with its :lo12: and :got: companions
+# Every field here is filled by the linker, so the bytes are the bare opcodes;
+# the relocation types are checked in tests/aarch64.rs.
+        .text
+f:
+        adrp    x0, var
+        add     x0, x0, :lo12:var
+        ldr     x2, [x0, :lo12:var]
+        ldr     w3, [x0, :lo12:var]
+        ldrb    w4, [x0, :lo12:var]
+        ldrh    w5, [x0, :lo12:var]
+        ldr     q6, [x0, :lo12:var]
+        str     x7, [x0, :lo12:var]
+        adrp    x8, :got:var
+        ldr     x9, [x8, :got_lo12:var]
+        add     x10, x10, :lo12:local
+local:
+        nop
+
+=== a PC-relative number is an offset from the instruction, not an address
+        nop
+        nop
+        b       #16
+        bl      #-8
+        b.eq    #12
+        cbz     x0, #8
+        tbz     x1, #3, #20
+        ldr     x0, #16
+        ldr     s10, #196
+        adr     x0, #20
+
+=== movprfx, followed by the instruction it prefixes
+# llvm-mc refuses anything else after a movprfx, so it cannot be in the
+# one-line corpora.
+        movprfx z0, z1
+        add     z0.d, p0/m, z0.d, z2.d
+        movprfx z3.s, p1/m, z4.s
+        mul     z3.s, p1/m, z3.s, z5.s
+        movprfx z6.b, p2/z, z7.b
+        lsl     z6.b, p2/m, z6.b, #3

@@ -1,0 +1,142 @@
+=== rows over one- and two-word instructions
+	.arch avr5
+	.file 1 "main.c"
+	.text
+	.globl main
+main:
+	.loc 1 3 0
+	ldi r24, lo8(msg)
+	ldi r25, hi8(msg)
+	.loc 1 4 5 prologue_end
+	call puts
+	.loc 1 5 1
+	lds r0, var
+	sts var, r1
+	.loc 1 6 1 is_stmt 0
+	jmp main
+	.data
+msg:	.asciz "hi"
+var:	.byte 0
+=== rows around branches, which are left to the linker
+	.file 1 "loop.c"
+	.text
+f:
+	.loc 1 10 0
+	ldi r24, 10
+.L2:
+	.loc 1 11 3
+	dec r24
+	.loc 1 11 3
+	brne .L2
+	.loc 1 12 1
+	rcall f
+	ret
+=== rows around alignment and .org, which are recorded in .avr.prop
+	.file 1 "a.c"
+	.text
+	.loc 1 1 0
+	nop
+	.balign 4
+	.loc 1 2 0
+	nop
+	.org 0x10
+	.loc 1 3 0
+	ret
+=== a frame as avr-gcc writes one
+	.file 1 "frame.c"
+	.text
+	.globl f
+	.type f, @function
+f:
+	.loc 1 2 1
+	.cfi_startproc
+	push r28
+	.cfi_def_cfa_offset 3
+	.cfi_offset 28, -2
+	push r29
+	.cfi_def_cfa_offset 4
+	.cfi_offset 29, -3
+	in r28, 0x3d
+	in r29, 0x3e
+	.cfi_def_cfa_register 28
+	sbiw r28, 4
+	.loc 1 3 5 prologue_end
+	std Y+1, r24
+	.loc 1 4 1
+	adiw r28, 4
+	.cfi_def_cfa_register 32
+	pop r29
+	.cfi_restore 29
+	pop r28
+	.cfi_restore 28
+	.cfi_def_cfa_offset 2
+	ret
+	.cfi_endproc
+	.size f, .-f
+=== frames in .debug_frame, for a core with a 22-bit program counter
+	.arch avr6
+	.cfi_sections .debug_frame
+	.text
+g:
+	.cfi_startproc
+	push r16
+	.cfi_adjust_cfa_offset 1
+	.cfi_rel_offset 16, 0
+	eicall
+	pop r16
+	.cfi_adjust_cfa_offset -1
+	ret
+	.cfi_endproc
+=== two code sections
+	.file 1 "a.c"
+	.section .init0, "ax", @progbits
+	.loc 1 1 0
+	clr r1
+	.loc 1 2 0
+	out 0x3f, r1
+	.text
+	.loc 1 5 0
+	nop
+	.section .init0, "ax", @progbits
+	.loc 1 3 0
+	nop
+=== the source itself | -g
+	.text
+	.globl __vectors
+__vectors:
+	rjmp reset
+	rjmp reset
+reset:
+	ldi r16, 0xff
+	out 0x17, r16
+1:	sbi 0x18, 0
+	cbi 0x18, 0
+	rjmp 1b
+=== the source through a macro and a loop | -g
+	.macro toggle bit
+	sbi 0x18, \bit
+	cbi 0x18, \bit
+	.endm
+	.text
+f:	toggle 0
+	.rept 2
+	nop
+	.endr
+	toggle 1
+	ret
+=== the source in two sections with alignment | -g
+	.section .vectors, "ax", @progbits
+	rjmp main
+	.balign 4
+	.text
+main:
+	ldi r24, 1
+	.p2align 2
+	ret
+=== the source as DWARF 5 | --gdwarf-5
+	.text
+	nop
+	ldi r30, lo8(pm(f))
+	ldi r31, hi8(pm(f))
+f:	icall
+	ret

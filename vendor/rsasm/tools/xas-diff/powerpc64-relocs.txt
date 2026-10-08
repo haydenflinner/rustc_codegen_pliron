@@ -1,0 +1,12 @@
+=== 34-bit absolute references, which llvm-mc 22 cannot write
+        .text
+        .globl  glob
+start:
+        paddi   3, 4, ext, 0
+        pld     3, ext(4), 0
+        pstd    3, glob(0), 0
+        pli     5, ext
+        plxv    35, dat(9), 0
+glob:   nop
+        .data
+dat:    .long 0

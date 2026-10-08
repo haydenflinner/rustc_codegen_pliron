@@ -1,0 +1,335 @@
+# RH850 against `v850-elf-as -mv850e3v5`. One statement per line; `#` lines
+# are comments. Cases that assemble the same as on V850 live in v850.txt; this
+# file has what RH850 adds or encodes differently.
+
+# ---- the base set, spot-checked under -mv850e3v5
+mov r1, r2
+add -16, r2
+movhi hi(0x12348000), r0, r2
+ld.w 8[r1], r2
+jarl 2, lp
+ldsr r1, psw
+stsr psw, r1
+bz -2
+
+# ---- 48-bit mov, chosen when the value misses the 5-bit form
+mov 16, r10
+mov -17, r10
+mov 0x12345678, r10
+mov -0x80000000, r1
+mov 0xffffffff, r1
+mov 5, r0
+mov hilo(0x12345678), r1
+mov hilo(5), r1
+
+# ---- three-operand shifts and rotates, saturating arithmetic
+shl r1, r2, r3
+shr r1, r2, r3
+sar r1, r2, r3
+rotl r1, r2, r3
+rotl 5, r2, r3
+rotl 31, r31, r1
+satadd r1, r2, r3
+satsub r1, r2, r3
+adf z, r1, r2, r3
+sbf nz, r1, r2, r3
+
+# ---- multiply and divide
+mul r1, r2, r3
+mul 5, r2, r3
+mul -256, r2, r3
+mul 255, r2, r3
+mulu r1, r2, r3
+mulu 511, r2, r3
+div r1, r2, r3
+divu r1, r2, r3
+divh r1, r2, r3
+divhu r1, r2, r3
+divq r1, r2, r3
+divqu r1, r2, r3
+mac r1, r2, r4, r6
+macu r1, r2, r4, r6
+
+# ---- byte swaps and bit searches
+bsh r1, r2
+bsw r1, r2
+hsh r1, r2
+hsw r1, r2
+sch0l r1, r2
+sch0r r1, r2
+sch1l r1, r2
+sch1r r1, r2
+bsw r31, r0
+
+# ---- bins: the three encodings for a field above, across and below bit 16
+bins r1, 0, 8, r2
+bins r1, 8, 16, r2
+bins r1, 20, 4, r2
+bins r1, 0, 32, r2
+bins r1, 15, 2, r2
+bins r1, 31, 1, r2
+bins r1, 16, 16, r2
+bins r1, 15, 1, r2
+bins r1, 0, 16, r2
+bins r1, 16, 1, r2
+bins r1, 0, 1, r2
+bins r1, 20, 12, r2
+
+# ---- sign and zero extension, conditional move and set
+sxb r1
+sxh r1
+zxb r1
+zxh r1
+cmov z, r1, r2, r3
+cmov nz, 5, r2, r3
+cmov sa, r1, r2, r3
+sasf c, r1
+sasf sa, r1
+
+# ---- short loads without sign extension
+sld.bu 5[ep], r2
+sld.bu 15[ep], r2
+sld.bu -1[ep], r2
+sld.hu 6[ep], r2
+sld.hu 30[ep], r2
+ld.bu 5[r1], r2
+ld.bu -1[r1], r2
+ld.bu 0x7fff[r1], r2
+ld.hu 6[r1], r2
+ld.bu lo(0x12348001)[r1], r2
+
+# ---- 48-bit loads and stores, chosen when the displacement misses 16 bits
+ld.b 0x8000[r1], r2
+ld.b 0x3fffff[r1], r2
+ld.bu 0x8000[r1], r2
+ld.bu -32769[r1], r2
+ld.bu -0x8001[r1], r2
+ld.hu 0x8000[r1], r2
+ld.h 0x8000[r1], r2
+ld.w 0x10000[r1], r2
+ld.w -0x400000[r1], r2
+ld.w 0x3ffffe[r1], r2
+st.w r2, 0x10000[r1]
+st.h r2, -0x8002[r1]
+ld.dw 8[r1], r2
+st.dw r2, 8[r1]
+st.dw r2, 0x10000[r1]
+ldl.w [r1], r2
+stc.w r2, [r1]
+
+# ---- jumps: through a register, and the 48-bit forms for far constants
+jarl [r1], r2
+jarl r1, lp
+jarl 0x200000, r1
+jr 0x200000
+jr -0x200002
+jmp 0x12345678[r1]
+jmp -2[r1]
+jmp 0x80000000[r1]
+switch r1
+callt 0
+callt 63
+ctret
+
+# ---- bit operations with the bit number in a register
+set1 r1, [r2]
+clr1 r1, [r2]
+tst1 r1, [r2]
+not1 r1, [r2]
+
+# ---- system registers with a group, and the RH850 names
+ldsr r1, psw, 1
+ldsr r1, sr31, 31
+ldsr r1, ctbp
+ldsr r1, 31
+ldsr r1, 32
+ldsr r1, 1023
+stsr psw, r1, 1
+stsr 5, r1
+stsr ctpc, r1
+stsr fpsr, r1
+stsr 1023, r1
+ldtc.gr r1, r2
+ldtc.sr r1, 5
+ldtc.vr r1, vr5
+ldtc.pc r1
+ldvc.sr r1, 5
+sttc.gr r1, r2
+sttc.sr 5, r1
+sttc.vr vr5, r1
+sttc.pc r1
+stvc.sr 5, r1
+
+# ---- prepare and dispose
+prepare {r20-r29, r31}, 4
+prepare {r31}, 0
+prepare {}, 0
+prepare {r20}, 31
+prepare {r30}, 0
+prepare {ep, lp}, 1
+prepare {r29, r28, r20}, 2
+prepare {r20 - r22}, 0
+prepare {r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31}, 0
+prepare 0xfff, 0
+prepare {r20-r29, r31}, 4, sp
+prepare {r20-r29, r31}, 4, 0x10
+prepare {r20-r29, r31}, 4, -1
+prepare {r20-r29, r31}, 4, 0x8000
+prepare {r20-r29, r31}, 4, 0x10000
+prepare {r20-r29, r31}, 4, 0x12345678
+prepare {}, 0, 0
+prepare {}, 0, 0xffffffff
+prepare {}, 0, 0xffff8000
+prepare {}, 0, -0x8001
+prepare {}, 0, 0x7fff
+prepare {}, 0, 0xffff
+prepare {}, 0, hi(0x12348000)
+prepare {}, 0, lo(0x12348000)
+prepare {}, 0, hilo(0x12348000)
+dispose 4, {r20-r29, r31}
+dispose 4, {r20-r29, r31}, r31
+dispose 0, {r31}, [lp]
+dispose 0, {}
+dispose 31, {r30}
+dispose 0, {}, [r31]
+dispose 0, {}, r1
+
+# ---- stack and debug
+pushsp r20-r25
+pushsp r20, r25
+pushsp r20-r20
+pushsp r25-r20
+pushsp r0-r31
+popsp r20-r25
+popsp r1, r1
+dbpush r1-r3
+dbtag 5
+dbtag 1023
+dbtrap
+dbret
+dbcp
+dbhvtrap
+
+# ---- exceptions, traps and control
+eiret
+feret
+fetrap 1
+fetrap 15
+syscall 0
+syscall 255
+hvcall 5
+hvcall 255
+hvtrap 5
+hvtrap 31
+rie
+rie 1, 2
+rie 31, 15
+rmtrap
+synce
+synci
+syncm
+syncp
+snooze
+tlbai
+tlbr
+tlbs
+tlbvi
+tlbw
+dst
+est
+caxi [r1], r2, r3
+caxi r1, r2, r3
+cache chbii, [r1]
+cache cistd, [r1]
+cache 0x7f, [r1]
+pref prefi, [r1]
+pref prefd, [r1]
+pref 4, [r1]
+
+# ---- loop with a numeric backward distance
+loop r1, 10
+loop r1, 0xfffe
+
+# ---- floating point
+absf.d r2, r4
+absf.s r1, r2
+addf.d r2, r4, r6
+addf.s r1, r2, r3
+ceilf.dl r2, r4
+ceilf.dul r2, r4
+ceilf.duw r2, r3
+ceilf.dw r2, r3
+ceilf.sl r1, r4
+ceilf.sul r1, r4
+ceilf.suw r1, r3
+ceilf.sw r1, r3
+cmovf.d 1, r2, r4, r6
+cmovf.d r2, r4, r6
+cmovf.s 7, r1, r2, r3
+cmovf.s r1, r2, r3
+cmpf.d eq, r2, r4
+cmpf.d eq, r2, r4, 3
+cmpf.s lt, r1, r2
+cmpf.s ule, r1, r2, 7
+cmpf.s 5, r1, r2
+cvtf.dl r2, r4
+cvtf.ds r2, r3
+cvtf.dul r2, r4
+cvtf.duw r2, r3
+cvtf.dw r2, r3
+cvtf.hs r1, r2
+cvtf.ld r2, r4
+cvtf.ls r2, r3
+cvtf.sd r1, r4
+cvtf.sl r1, r4
+cvtf.sh r1, r2
+cvtf.sul r1, r4
+cvtf.suw r1, r3
+cvtf.sw r1, r3
+cvtf.uld r2, r4
+cvtf.uls r2, r3
+cvtf.uwd r1, r4
+cvtf.uws r1, r3
+cvtf.wd r1, r4
+cvtf.ws r1, r3
+divf.d r2, r4, r6
+divf.s r1, r2, r3
+floorf.dl r2, r4
+floorf.dul r2, r4
+floorf.duw r2, r3
+floorf.dw r2, r3
+floorf.sl r1, r4
+floorf.sul r1, r4
+floorf.suw r1, r3
+floorf.sw r1, r3
+fmaf.s r1, r2, r3
+fmsf.s r1, r2, r3
+fnmaf.s r1, r2, r3
+fnmsf.s r1, r2, r3
+maxf.d r2, r4, r6
+maxf.s r1, r2, r3
+minf.d r2, r4, r6
+minf.s r1, r2, r3
+mulf.d r2, r4, r6
+mulf.s r1, r2, r3
+negf.d r2, r4
+negf.s r1, r2
+recipf.d r2, r4
+recipf.s r1, r2
+rsqrtf.d r2, r4
+rsqrtf.s r1, r2
+sqrtf.d r2, r4
+sqrtf.s r1, r2
+subf.d r2, r4, r6
+subf.s r1, r2, r3
+trfsr
+trfsr 3
+trfsr 7
+trncf.dl r2, r4
+trncf.dul r2, r4
+trncf.duw r2, r3
+trncf.dw r2, r3
+trncf.sl r1, r4
+trncf.sul r1, r4
+trncf.suw r1, r3
+trncf.sw r1, r3

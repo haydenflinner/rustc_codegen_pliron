@@ -1,0 +1,29 @@
+# Relocations from single statements, as whole objects against llvm-mc and
+# as relocations against GNU as. Symbols carry the leading underscore i386
+# Windows code uses: it is part of the name as the source writes it.
+call _foo
+call _foo+4
+jmp _foo
+je _foo-8
+movl _foo, %eax
+movl _foo+4, %eax
+movl $_foo, %eax
+movl %eax, _foo(,%ecx,4)
+leal _foo+12, %edx
+pushl $_foo
+.long _foo
+.long _foo+8
+.rva _foo
+.rva _foo+3
+.secrel32 _foo
+.secrel32 _foo+1
+.secidx _foo
+.long _foo@IMGREL
+.long _foo - .
+.data; .long _foo - .
+.text; .globl _foo; _foo: ret; call _foo
+.text; _foo: ret; .long _foo
+.data; _foo: .long 0; .long _foo+4
+.text; call _bar; .data; _bar: .long 1
+.data; .rva _bar; .text; _bar: ret
+.data; .long _bar - .; .text; _bar: ret

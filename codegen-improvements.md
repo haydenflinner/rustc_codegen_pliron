@@ -86,3 +86,47 @@ digest checked against the LLVM build.
 | + remove unused `notrap` loads (Cranelift keeps them), alternating with slot DSE so a load whose only user was a dead store stops keeping its slot alive (`PLIRON_DEAD_LOADS`) | 3.038B (1.14×, −7.3%) | kept. `compress` 804 → 748 instructions, stack refs 123 → 83: the 16 unrolled `try_into` temporaries (`movb $0,(%rsp)` + stores into 8-byte slots) are gone. regex-syntax -O `.text` 557,338 → 555,055 B |
 | + the same dead-code sweep also drops unused side-effect-free, non-trapping ops (and `udiv`/`urem` by a nonzero constant) (`PLIRON_DEAD_PURE`) | 3.038B (flat) | kept for size: regex-syntax -O `.text` 555,055 → 554,093 B |
 | + after a successful unroll: drop the skipped loop's now-unreachable blocks, fold `brif c, B(a), B(a)` to `jump`, then dead params / dead code to a fixpoint (`PLIRON_UNROLL_CLEANUP`), so the leftover trip-count `isub end, base` no longer escapes the `[u32; 16]` slot and slot DSE deletes its 16 stores + zeroing | 2.925B (1.10×, −3.7%) | kept. `compress` 748 → 716 instructions, stack refs 83 → 74. regex-syntax `.text` 554,093 → 554,085 B |
+
+Re-run after merging into the backend feature branch (87db5c8, with 6c68ff9's wasm/size inline
+limits): stage2 rebuilt with full-bootstrap, 6.86B / 15.10B instructions, 1.61s / 2.95s wall;
+`tests/ui_run_pass.py` (debug) 2537 pass / 57 environment failures, same as before.
+
+## Loop deletion (`PLIRON_LOOPDEL`)
+
+`src/loopdel.rs` (LLVM `loop-deletion`, on CLIF): a single-level loop with no calls, loads,
+stores or traps, whose values are not used after it, and with one exit block taking
+loop-invariant arguments, is skipped by sending its preheader edges straight to that exit.
+It must also be provably finite: a test that runs every iteration exits once a ±1 induction
+variable reaches an invariant bound (`!=`, or `<`/`>` in the step direction). Rust allows
+`loop {}`, so loops that might not terminate are kept.
+
+Before deleting, it folds debug-assertion overflow checks on `i + 1` when a dominating guard
+(`i < n`, `i != MAX`) already rules overflow out. The coretests build with debug assertions,
+and without this fold their loops keep a panic exit and are not deleted.
+
+Correctness fix, not a speedup: the coretests `split_off*_max_range*` compare `[(); usize::MAX]`
+slices, a `usize::MAX`-iteration loop of `() == ()` that LLVM deletes and we used to run.
+With the pass, `./x test --stage 1 library/coretests -- split_off max_range` runs its 26 tests,
+including the six `*_max_range*` ones that used to hang, in 0.7 ms.
+
+Branches inside the loop are decided with the values `jumpthread` can prove without rewriting
+the function (constants and conditions implied by a dominating test, `known_values`), and uses of
+loop values only count in blocks still reachable once the loop is bypassed. That deletes the
+`<`/`<=`/`cmp`/`partial_cmp` loops on two `[(); usize::MAX]` slices at -O and at
+`-Copt-level=3 -Cdebug-assertions=y` (6 loops, same output as LLVM; with `PLIRON_LOOPDEL=0` it
+still hangs). -O0 runs no CLIF passes and LLVM -O0 hangs on it too. Bounds checks the loop test
+does not imply (`v[i]` with `i < n`, `v[i + 1]`, ZST `v[i]` past the length) still panic like
+LLVM. regex-syntax at -O: 0 loops deleted, `.text` 558312 B → 558296 B (−16 B).
+regex-syntax at -O: 0 loops deleted, `.text` 585355 B → 585363 B (+8 B) with the pass on, so
+the stage2 bench is unchanged (not rebuilt). The pass kept `i += 2` / `<=` / `loop {}` /
+used-result / storing loops in a negative test, and that test's output matches LLVM.
+
+## Linker: wild vs mold
+
+Relinking the bevy game (`examples/bevy-game`, `--host -Zbuild-std`, 323 MB debug binary) with the
+captured `cc` line, best of 5, idle 8-core VM. Both outputs run (300 autoplay frames).
+
+| linker | wall | notes |
+|---|---:|---|
+| Wild 0.10.0 | 0.22s | pure Rust |
+| mold 3.0.0 (Rust rewrite, release) | 0.30s | links C `zstd-sys` (required) and `mold-mimalloc-sys` (off with `system-allocator`) |

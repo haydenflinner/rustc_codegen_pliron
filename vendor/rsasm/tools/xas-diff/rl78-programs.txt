@@ -1,0 +1,114 @@
+=== short conditional branches, backward and forward
+top:
+	bc $top
+	bnc $top
+	bz $fwd
+	bnz $fwd
+	bh $top
+	bnh $fwd
+fwd:
+	nop
+=== unconditional relative branches and calls
+start:
+	br $start
+	br $!start
+	call $!start
+	br $!later
+	call $!later
+	br $later
+later:
+	ret
+=== bit tests with short displacements
+here:
+	bt a.0, $here
+	bf a.7, $here
+	btclr a.1, $here
+	bt 0xffe30.2, $here
+	bf 0xfff20.3, $here
+	btclr 0xfff10.4, $here
+	bt psw.5, $there
+	bf [hl].6, $there
+	btclr es:[hl].1, $there
+	bt es:[hl].2, $there
+there:
+	nop
+=== conditional branch relaxed to the long form
+	bc $far
+	bnc $far
+	bz $far
+	bnz $far
+	bh $far
+	bnh $far
+	.space 300
+far:
+	nop
+=== bit tests relaxed to the long form
+	bt a.0, $far
+	bf a.1, $far
+	bt 0xffe30.2, $far
+	bf 0xfff20.3, $far
+	bt psw.4, $far
+	bt [hl].5, $far
+	bf es:[hl].6, $far
+	.space 300
+far:
+	nop
+=== backward long branches
+back:
+	.space 300
+	bc $back
+	bnh $back
+	bt a.3, $back
+	br $!back
+=== edge of the short range, forward, as the reference measures it
+	bc $edge
+	.space 125
+edge:
+	nop
+=== one past the short range, forward
+	bc $edge
+	.space 128
+edge:
+	nop
+=== edge of the short range, backward
+edge:
+	.space 126
+	bz $edge
+=== data and alignment
+	mov a, #1
+	.byte 1, 2, 3
+	.short 0x1234
+	.long 0x12345678
+	.balign 4
+	ret
+	nop
+	nop
+	nop
+=== label differences as immediates and displacements
+start:
+	nop
+	nop
+	nop
+end:
+	movw ax, #end - start
+	mov a, #end - start
+	mov a, [hl+end-start]
+	movw ax, end-start[bc]
+=== a relative branch to a label defined by .set
+	.set target, .
+	nop
+	bnz $target
+=== equated constants pick the direct-address form
+	.set PORT, 0xfff20
+	.set FLAGS, 0xffe30
+	mov PORT, #1
+	mov a, FLAGS
+	set1 PORT.3
+	bt FLAGS.1, $done
+done:
+	ret
+=== comments and statement separators
+	mov a, #1 ; a comment
+# a line comment
+	mov x, #2 @ mov b, #3
+	nop /* block */

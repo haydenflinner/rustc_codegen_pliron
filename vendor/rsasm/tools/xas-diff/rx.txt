@@ -1,0 +1,581 @@
+# Renesas RX, GNU syntax, against rx-elf-as (binutils 2.47, default CPU).
+# One statement per line. Code lands in section P, which the harness extracts.
+
+# ---- no operands
+brk
+dbt
+rts
+nop
+rtfi
+rte
+wait
+satr
+scmpu
+smovu
+smovb
+smovf
+suntil
+suntil.b
+suntil.w
+suntil.l
+swhile.b
+swhile.w
+swhile
+sstr.b
+sstr.w
+sstr
+rmpa.b
+rmpa.w
+rmpa.l
+
+# ---- registers, case, and statement syntax
+mov r0, r15
+mov r15, r0
+MOV R1, R2
+Mov.L r3, r4
+nop ! nop
+nop ; a comment
+
+# ---- mov: immediate to register, by size class
+mov #0, r1
+mov #1, r1
+mov #15, r15
+mov #16, r1
+mov #255, r7
+mov #256, r1
+mov #-1, r1
+mov #-128, r1
+mov #-129, r1
+mov #127, r2
+mov #0x7fff, r2
+mov #0x8000, r2
+mov #-32768, r2
+mov #-32769, r2
+mov #0x7fffff, r3
+mov #0x800000, r3
+mov #-0x800000, r3
+mov #-0x800001, r3
+mov #0x7fffffff, r3
+mov #0x80000000, r3
+mov #0xffffffff, r3
+mov #0xfffffffe, r3
+mov.l #1, r1
+mov.l #1000, r9
+mov #ext, r1
+mov #ext+4, r2
+
+# ---- mov: register to register
+mov.b r1, r2
+mov.w r1, r2
+mov.l r1, r2
+
+# ---- mov: register indirect and displacement
+mov.b r1, [r2]
+mov.w r1, [r2]
+mov.l r1, [r2]
+mov.l r8, [r9]
+mov.b [r1], r2
+mov.w [r1], r2
+mov.l [r1], r2
+mov.l [r15], r14
+mov.b r1, 0[r2]
+mov.b r1, 1[r2]
+mov.b r1, 31[r2]
+mov.b r1, 32[r2]
+mov.b r1, 255[r2]
+mov.b r1, 256[r2]
+mov.b r1, 65535[r2]
+mov.w r1, 2[r2]
+mov.w r1, 62[r2]
+mov.w r1, 64[r2]
+mov.w r1, 510[r2]
+mov.w r1, 512[r2]
+mov.w r1, 131070[r2]
+mov.l r1, 4[r2]
+mov.l r1, 124[r2]
+mov.l r1, 128[r2]
+mov.l r1, 1020[r2]
+mov.l r1, 1024[r2]
+mov.l r1, 262140[r2]
+mov.l r8, 4[r2]
+mov.l r1, 4[r8]
+mov.b 4[r1], r2
+mov.w 4[r1], r2
+mov.l 4[r1], r2
+mov.l 0[r1], r2
+mov.l 8[r7], r7
+mov.l 8[r7], r8
+mov.l 400[r7], r3
+mov.b 300[r1], r2
+mov.l 70000[r1], r2
+mov 4[r1], r2
+mov r1, 4[r2]
+
+# ---- mov: memory to memory
+mov.b [r1], [r2]
+mov.w [r1], 2[r2]
+mov.l 4[r1], [r2]
+mov.l 4[r1], 8[r2]
+mov.b 300[r1], 1000[r2]
+mov.l [r10], [r11]
+
+# ---- mov: post-increment, pre-decrement, indexed
+mov.b r1, [r2+]
+mov.w r1, [r2+]
+mov.l r1, [r2+]
+mov.b r1, [-r2]
+mov.w r1, [-r2]
+mov.l r1, [-r2]
+mov.b [r1+], r2
+mov.w [r1+], r2
+mov.l [r1+], r2
+mov.b [-r1], r2
+mov.w [-r1], r2
+mov.l [-r1], r2
+mov.b r1, [ r2 + ]
+mov.b r1, [ - r2 ]
+mov.b r3, [r1, r2]
+mov.w r3, [r1, r2]
+mov.l r3, [r1, r2]
+mov.b [r1, r2], r3
+mov.w [r1, r2], r3
+mov.l [r1, r2], r3
+mov [r14, r15], r13
+
+# ---- mov: immediate to memory
+mov.b #1, [r1]
+mov.w #1, [r1]
+mov.l #1, [r1]
+mov.b #255, [r1]
+mov.b #-1, [r1]
+mov.w #0x1234, [r1]
+mov.w #-1, [r1]
+mov.w #0xffff, [r1]
+mov.l #0x12345678, [r1]
+mov.l #-1, [r1]
+mov.b #1, 0[r1]
+mov.b #1, 4[r1]
+mov.b #200, 31[r7]
+mov.b #1, 32[r1]
+mov.b #1, 4[r8]
+mov.b #-1, 4[r1]
+mov.w #1, 4[r1]
+mov.w #1, 62[r1]
+mov.w #1, 64[r1]
+mov.w #0x1234, 4[r1]
+mov.w #256, 4[r1]
+mov.l #1, 4[r1]
+mov.l #1, 124[r1]
+mov.l #1, 128[r1]
+mov.l #0x12345678, 8[r3]
+mov.l #-1, 8[r3]
+mov.l #300, 8[r12]
+mov.b #ext, 4[r1]
+mov.w #ext, [r1]
+mov.l #ext, 4[r1]
+
+# ---- movu
+movu.b r1, r2
+movu.w r1, r2
+movu r1, r2
+movu.b [r1], r2
+movu.w [r1], r2
+movu.b 4[r1], r2
+movu.w 4[r1], r2
+movu.b 31[r7], r7
+movu.b 32[r1], r2
+movu.w 62[r1], r2
+movu.w 64[r1], r2
+movu.b 4[r8], r2
+movu.w 1000[r1], r2
+movu.b [r1+], r2
+movu.w [r1+], r2
+movu.b [-r1], r2
+movu.w [-r1], r2
+movu.b [r1, r2], r3
+movu.w [r1, r2], r3
+
+# ---- stack
+push r1
+push.b r1
+push.w r1
+push.l r15
+push.b [r1]
+push.w 2[r1]
+push.l 400[r1]
+push 4[r2]
+pop r1
+pop r15
+pushc psw
+pushc pc
+pushc usp
+pushc fpsw
+pushc bpsw
+pushc bpc
+pushc isp
+pushc fintv
+pushc intb
+popc psw
+popc usp
+popc isp
+popc intb
+pushm r1-r1
+pushm r1-r2
+pushm r1-r15
+pushm r6-r13
+popm r1-r1
+popm r1-r15
+popm r6-r13
+rtsd #0
+rtsd #8
+rtsd #1020
+rtsd #8, r1-r7
+rtsd #1020, r15-r15
+
+# ---- exchange and conversion
+xchg r1, r2
+xchg [r1].ub, r2
+xchg 4[r1].ub, r2
+xchg [r1], r2
+xchg [r1].b, r2
+xchg 2[r1].w, r2
+xchg 4[r1].l, r2
+xchg 4[r1], r2
+xchg 2[r1].uw, r2
+xchg 400[r1].l, r2
+itof r1, r2
+itof 4[r1].ub, r2
+itof 4[r1], r2
+itof 2[r1].w, r2
+utof r1, r2
+utof [r1].ub, r2
+utof 4[r1].l, r2
+
+# ---- add, sub, mul, and, or
+add r1, r2
+sub r1, r2
+mul r1, r2
+and r1, r2
+or r1, r2
+add [r1].ub, r2
+sub 4[r1].ub, r2
+mul 300[r1].ub, r2
+and [r1].ub, r2
+or 1[r1].ub, r2
+add [r1], r2
+add [r1].b, r2
+add 4[r1].w, r2
+add 8[r1].l, r2
+add 2[r1].uw, r2
+sub 8[r1], r2
+mul 8[r1].w, r2
+and 400[r1].l, r2
+or 4[r1].b, r2
+add r1, r2, r3
+sub r1, r2, r3
+mul r1, r2, r3
+and r1, r2, r3
+or r1, r2, r3
+add #0, r1
+add #15, r1
+add #16, r1
+add #-1, r1
+add #127, r1
+add #128, r1
+add #0x7fff, r1
+add #0x8000, r1
+add #0x800000, r1
+add #0x80000000, r1
+add #ext, r1
+add #1, r1, r2
+add #0, r1, r2
+add #1000, r1, r2
+add #0x12345678, r1, r2
+sub #0, r1
+sub #15, r1
+sub #16, r1
+sub #128, r1
+sub #129, r1
+sub #-1, r1
+sub #0x10000, r1
+mul #0, r1
+mul #15, r1
+mul #16, r1
+mul #-1, r1
+mul #1000, r1
+and #15, r1
+and #0xff, r1
+and #0xffff, r1
+and #-16, r1
+or #1, r1
+or #0x100, r1
+or #0x80000000, r1
+mul #ext, r1
+and #ext, r1
+or #ext, r1
+
+# ---- cmp
+cmp r1, r2
+cmp [r1].ub, r2
+cmp 4[r1].ub, r2
+cmp [r1], r2
+cmp 4[r1].b, r2
+cmp 4[r1].w, r2
+cmp 4[r1].l, r2
+cmp 2[r1].uw, r2
+cmp #0, r1
+cmp #15, r1
+cmp #16, r1
+cmp #255, r1
+cmp #256, r1
+cmp #-1, r1
+cmp #-128, r1
+cmp #0x12345, r1
+cmp #ext, r1
+
+# ---- adc, sbb
+adc r1, r2
+adc [r1], r2
+adc 4[r1], r2
+adc 4[r1].l, r2
+adc #1, r1
+adc #1000, r1
+adc #ext, r1
+sbb r1, r2
+sbb [r1], r2
+sbb 400[r1].l, r2
+sbb #1, r1
+sbb #0, r1
+sbb #-1, r1
+sbb #1000, r1
+
+# ---- neg, not, abs
+neg r1
+neg r1, r2
+not r1
+not r1, r2
+abs r1
+abs r1, r2
+
+# ---- max, min, emul, emulu, div, divu, tst, xor
+max r1, r2
+min r1, r2
+emul r1, r2
+emulu r1, r2
+div r1, r2
+divu r1, r2
+tst r1, r2
+xor r1, r2
+max [r1].ub, r2
+min 4[r1].ub, r2
+emul [r1], r2
+emulu 4[r1].w, r2
+div 8[r1].l, r2
+divu 2[r1].uw, r2
+tst 4[r1].b, r2
+xor 400[r1], r2
+max #1, r1
+min #-1, r1
+emul #1000, r1
+emulu #0x12345678, r1
+div #127, r1
+divu #128, r1
+tst #0xff, r1
+xor #0x8000, r1
+max #ext, r1
+tst #ext, r1
+
+# ---- stz, stnz
+stz #1, r1
+stz #1000, r2
+stnz #-1, r3
+stnz #0x12345678, r4
+stz #ext, r1
+
+# ---- shifts and rotates
+shlr #0, r1
+shlr #1, r1
+shlr #31, r15
+shar #1, r1
+shar #16, r2
+shll #1, r1
+shll #31, r2
+shlr #3, r1, r2
+shar #3, r1, r2
+shll #31, r1, r2
+shlr r1, r2
+shar r1, r2
+shll r1, r2
+rotl #0, r1
+rotl #1, r1
+rotl #31, r2
+rotr #1, r1
+rotr #17, r2
+rotl r1, r2
+rotr r1, r2
+revw r1, r2
+revl r1, r2
+rolc r1
+rorc r2
+sat r3
+
+# ---- bit operations
+bset #0, r1
+bset #31, r15
+bclr #1, r2
+bclr #16, r2
+btst #5, r3
+btst #31, r3
+bnot #0, r1
+bnot #31, r2
+bset #1, [r1].b
+bset #7, 4[r1].b
+bclr #0, 300[r2].b
+btst #3, 4[r1].b
+bnot #1, 4[r1]
+bnot #7, [r1].b
+bset r1, r2
+bclr r1, r2
+btst r1, r2
+bnot r1, r2
+bset r1, [r2]
+bclr r1, 4[r2]
+btst r1, 4[r2].b
+bnot r1, 300[r2]
+bmc #1, r2
+bmnc #31, r2
+bmeq #3, r1
+bmne #3, r1
+bmz #0, r1
+bmnz #0, r1
+bmgeu #1, r1
+bmltu #1, r1
+bmgtu #1, r1
+bmleu #1, r1
+bmpz #1, r1
+bmn #1, r1
+bmge #1, r1
+bmlt #1, r1
+bmgt #1, r1
+bmle #1, r1
+bmo #1, r1
+bmno #1, r1
+bmc #1, 4[r1]
+bmeq #7, [r1].b
+bmne #0, 300[r2]
+
+# ---- store condition
+sceq.l r1
+scne.l r2
+scgt.l r3
+sceq [r1]
+sceq.b [r1]
+sceq.w 2[r1]
+sceq.l 4[r1]
+scle.b 4[r1]
+scltu.w 400[r1]
+
+# ---- system and register transfer
+int #0
+int #255
+int #ext
+mvtipl #0
+mvtipl #15
+setpsw c
+setpsw z
+setpsw s
+setpsw o
+setpsw i
+setpsw u
+clrpsw c
+clrpsw i
+clrpsw u
+mvtc r1, psw
+mvtc r2, usp
+mvtc r3, isp
+mvtc r4, intb
+mvtc r5, bpc
+mvtc r6, fintv
+mvtc r7, fpsw
+mvtc #1, psw
+mvtc #0x10000, intb
+mvtc #-1, usp
+mvtc #ext, intb
+mvfc psw, r1
+mvfc pc, r2
+mvfc usp, r3
+mvfc isp, r4
+mvfc intb, r5
+mvfc bpsw, r6
+
+# ---- jumps and register branches
+jmp r1
+jmp r15
+jsr r1
+jsr r15
+bra r1
+bra.l r2
+bsr r3
+bsr.l r4
+
+# ---- branches to external symbols take their widest form
+bra ext
+bsr ext
+bra.a ext
+bsr.a ext
+bra.b ext
+bra.w ext
+bsr.w ext
+beq.b ext
+bne.b ext
+bgt.b ext
+beq.w ext
+bne.w ext
+bra.s ext
+beq.s ext
+bne.s ext
+
+# ---- floating point
+fadd r1, r2
+fsub r1, r2
+fmul r1, r2
+fdiv r1, r2
+fcmp r1, r2
+ftoi r1, r2
+round r1, r2
+fsqrt r1, r2
+ftou r1, r2
+fadd [r1], r2
+fsub 4[r1], r2
+fmul 4[r1].l, r2
+fdiv 400[r1], r2
+fcmp [r1].l, r2
+ftoi 8[r1], r2
+round [r1], r2
+fadd #0x3fc00000, r1
+fsub #1, r2
+fmul #ext, r3
+fdiv #0, r4
+fcmp #-1, r5
+
+# ---- DSP
+mulhi r1, r2
+mullo r1, r2
+machi r1, r2
+maclo r1, r2
+mvtachi r1
+mvtaclo r2
+mvfachi r3
+mvfaclo r4
+mvfacmi r5
+racw #1
+racw #2
+
+# ---- data
+.byte 1, 2, 0xff
+.short 0x1234
+.word 0x12345678
+.long 0x12345678
+.byte ext
+.short ext
+.long ext

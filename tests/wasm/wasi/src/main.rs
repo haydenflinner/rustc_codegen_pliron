@@ -1,4 +1,5 @@
 //! std on wasm32-wasip1 with tools/pliron-wasi-libc instead of wasi-libc.
+
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -42,6 +43,7 @@ fn main() {
         .collect();
     names.sort();
     check("read_dir+rename", names == ["nested"]);
+    check("readdir align", readdir_aligned(&d));
     check(
         "exists",
         fs::metadata(format!("{d}/nested/b.txt")).unwrap().is_file(),
@@ -58,8 +60,53 @@ fn main() {
     check("systemtime", now.as_secs() > 1_700_000_000);
     let x = std::hint::black_box(1.0f64);
     check(
+        "variadic",
+        unsafe { vsum(3, 10i32, 20i64, 30.5f64) == 60.5 },
+    );
+    check(
         "libm",
         (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
     );
     eprintln!("wasi std OK");
+}
+
+unsafe extern "C" fn vsum(n: i32, mut ap: ...) -> f64 {
+    let mut s = 0.0;
+    for i in 0..n {
+        s += unsafe {
+            match i {
+                0 => ap.next_arg::<i32>() as f64,
+                1 => ap.next_arg::<i64>() as f64,
+                _ => ap.next_arg::<f64>(),
+            }
+        };
+    }
+    s
+}
+
+// std dereferences the returned `dirent` directly, so it must be suitably aligned.
+fn readdir_aligned(dir: &str) -> bool {
+    use std::ffi::{CString, c_char, c_void};
+    unsafe extern "C" {
+        fn opendir(p: *const c_char) -> *mut c_void;
+        fn readdir(d: *mut c_void) -> *mut u8;
+        fn closedir(d: *mut c_void) -> i32;
+    }
+    let p = CString::new(dir).unwrap();
+    unsafe {
+        let d = opendir(p.as_ptr());
+        if d.is_null() {
+            return false;
+        }
+        let mut ok = true;
+        loop {
+            let e = readdir(d);
+            if e.is_null() {
+                break;
+            }
+            ok &= e as usize % 8 == 0;
+        }
+        closedir(d);
+        ok
+    }
 }

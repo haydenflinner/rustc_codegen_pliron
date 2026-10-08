@@ -1,0 +1,31 @@
+=== one instruction at address 0
+        NOP
+=== records of sixteen bytes and a short last one
+        ORG     0
+        MOV     SP,#5FH
+        MOV     TMOD,#01H
+        MOV     TH0,#0FCH
+        MOV     TL0,#18H
+        SETB    TR0
+        SETB    ET0
+        SETB    EA
+        MOV     DPTR,#TABLE
+        CLR     A
+        MOVC    A,@A+DPTR
+LOOP:   SJMP    LOOP
+TABLE:  DB      3FH,06H,5BH,4FH,66H,6DH,7DH,07H,7FH,6FH
+=== a start that is not on a record boundary
+        ORG     1235H
+        LJMP    1235H
+        DB      1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
+=== exactly sixteen bytes
+        ORG     8000H
+        DB      0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+=== the last bytes of the address space
+        ORG     0FFF0H
+        DB      0,1,2,3,4,5,6,7,8,9,10,11,12,13,14
+        RET
+=== bytes whose checksum wraps
+        ORG     0FF00H
+        DB      0FFH,0FFH,0FFH,0FFH,0FFH,0FFH,0FFH,0FFH
+        DB      80H,80H,80H,80H

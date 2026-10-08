@@ -1,0 +1,35 @@
+Lines before the first snippet are not assembled.
+
+GNU as creates `.data` before any section the source names, and rsasm creates
+it when it is first used. A snippet with both says `.data` first, so the
+sections come out in the same order.
+
+=== absolute references into another section
+        .text
+        mov     #msg, r1
+        mov.l   #msg + 4, r2
+        rts
+        .data
+        .space  0x100
+msg:    .long   1
+
+=== calls and branches into another section
+        .data
+        .text
+entry:
+        bsr.a   helper
+        bra.a   helper
+        bra.w   helper
+        .section .text.helper, "ax"
+helper:
+        bsr.a   entry
+        bsr.w   entry
+        rts
+
+=== data across sections
+        .text
+entry:
+        rts
+        .data
+        .long   entry
+        .long   entry - .

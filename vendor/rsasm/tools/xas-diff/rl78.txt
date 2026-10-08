@@ -1,0 +1,541 @@
+# RL78, checked against rl78-elf-as (GNU binutils). One statement per line.
+#
+# Addresses: 0xffe30 is a short-direct (saddr) address only, 0xfff20 an SFR
+# only, and 0xfff10 lies in both ranges, which is where the per-instruction
+# preference order shows.
+#
+# Not here, because rsasm differs from the reference on purpose or the
+# harness cannot run them (tests/rl78.rs covers the first three, and the
+# relocations of the last):
+#   - the G14 multiply/divide group, which the reference rejects without -mg14;
+#   - constants too wide for their field, which the reference truncates silently;
+#   - relative branches within a few bytes of the short range, where the
+#     reference's relaxation misjudges the reach;
+#   - `.balign` as the last thing in .text, after which the reference also pads
+#     the section's size;
+#   - absolute references to labels in relocatable output, where the reference
+#     also writes the address into the field it relocates.
+
+# ---- no operands -----------------------------------------------------------
+nop
+brk
+brk1
+halt
+stop
+ret
+reti
+retb
+ei
+di
+skc
+skh
+sknc
+sknh
+sknz
+skz
+mulu x
+MULU X
+
+# ---- mov: register and immediate ---------------------------------------------
+mov a, #0x10
+mov a, #10H
+mov a, #0ffh
+mov a, #101B
+mov a, #17o
+mov a, #99d
+mov a, #010
+mov a, #-1
+mov a, #'a'
+mov a, #1+2*3
+MOV A, #1
+mov x, #1
+mov c, #2
+mov b, #3
+mov e, #4
+mov d, #5
+mov l, #6
+mov h, #7
+mov r0, #1
+mov r7, #1
+mov a, x
+mov a, c
+mov a, h
+mov x, a
+mov b, a
+mov l, a
+mov r3, r1
+
+# ---- mov: special registers --------------------------------------------------
+mov spl, #5
+mov sph, #5
+mov psw, #5
+mov cs, #5
+mov es, #5
+mov pmc, #5
+mov mem, #5
+mov a, psw
+mov a, es
+mov a, cs
+mov a, spl
+mov psw, a
+mov es, a
+mov cs, a
+mov es, 0xffe30
+
+# ---- mov: direct addresses ---------------------------------------------------
+mov 0xffe20, #5
+mov 0xfff1f, #5
+mov 0xffe30, #5
+mov 0xfff20, #5
+mov 0xfff10, #5
+mov 0xfffff, #5
+mov a, 0xffe30
+mov a, 0xfff20
+mov a, 0xfff10
+mov 0xffe30, a
+mov 0xfff20, a
+mov 0xfff10, a
+mov x, 0xffe30
+mov b, 0xffe30
+mov c, 0xffe30
+mov !0x1234, #5
+mov es:!0x1234, #5
+mov a, !0x1234
+mov a, es:!0x1234
+mov !0x1234, a
+mov es:!0x1234, a
+mov x, !0x1234
+mov b, !0x1234
+mov c, !0x1234
+mov c, es:!0x1234
+mov a, !0xffff
+mov a, !0
+
+# ---- mov: indirect and based -------------------------------------------------
+mov a, [de]
+mov a, es:[de]
+mov [de], a
+mov es:[de], a
+mov a, [de+5]
+mov a, es:[de+5]
+mov [de+5], a
+mov [de+5], #9
+mov es:[de+5], #9
+mov a, [hl]
+mov a, es:[hl]
+mov [hl], a
+mov a, [hl+5]
+mov a, [hl + 5]
+mov a, [ hl ]
+mov a, [hl+5+3]
+mov a, [hl+(5)]
+mov a, [hl+0]
+mov a, [de+0]
+mov [hl+0xff], a
+mov [hl+5], #9
+mov es:[hl+5], #9
+mov a, [hl+b]
+mov a, es:[hl+b]
+mov [hl+b], a
+mov a, [hl+c]
+mov [hl+c], a
+mov es:[hl+c], a
+mov a, 0x1234[b]
+mov a, es:0x1234[b]
+mov 0x1234[b], a
+mov 0x1234[b], #9
+mov a, 0x1234[c]
+mov 0x1234[c], a
+mov 0x1234[c], #9
+mov a, 0x1234[bc]
+mov 0x1234[bc], a
+mov 0x1234[bc], #9
+mov es:0x1234[bc], #9
+mov a, [bc]
+mov [bc], a
+mov [bc], #9
+mov es:[bc], #9
+mov a, [sp+4]
+mov a, [sp]
+mov [sp+4], a
+mov [sp], a
+mov [sp+4], #9
+mov [sp], #9
+
+# ---- xch ---------------------------------------------------------------------
+xch a, x
+xch a, c
+xch a, b
+xch a, e
+xch a, d
+xch a, l
+xch a, h
+xch a, !0x1234
+xch a, es:!0x1234
+xch a, [de]
+xch a, es:[de]
+xch a, [de+3]
+xch a, [hl]
+xch a, [hl+3]
+xch a, es:[hl+3]
+xch a, [hl+b]
+xch a, [hl+c]
+xch a, 0xffe30
+xch a, 0xfff20
+xch a, 0xfff10
+
+# ---- movw --------------------------------------------------------------------
+movw ax, #0x1234
+movw bc, #0x1234
+movw de, #0x1234
+movw hl, #0x1234
+movw rp2, #1
+movw 0xffe30, #0x1234
+movw 0xfff20, #0x1234
+movw 0xfff10, #0x1234
+movw ax, 0xffe30
+movw ax, 0xfff20
+movw ax, 0xfff10
+movw 0xffe30, ax
+movw 0xfff20, ax
+movw 0xfff10, ax
+movw ax, bc
+movw ax, de
+movw ax, hl
+movw bc, ax
+movw de, ax
+movw hl, ax
+movw ax, !0x1234
+movw ax, es:!0x1234
+movw !0x1234, ax
+movw es:!0x1234, ax
+movw ax, [de]
+movw [de], ax
+movw ax, [de+2]
+movw [de+2], ax
+movw ax, [hl]
+movw es:[hl], ax
+movw ax, [hl+2]
+movw [hl+2], ax
+movw ax, 0x1234[b]
+movw 0x1234[b], ax
+movw ax, 0x1234[c]
+movw 0x1234[c], ax
+movw ax, 0x1234[bc]
+movw ax, [bc]
+movw 0x1234[bc], ax
+movw [bc], ax
+movw es:[bc], ax
+movw ax, [sp+2]
+movw ax, [sp]
+movw [sp+2], ax
+movw [sp], ax
+movw bc, 0xffe30
+movw de, 0xffe30
+movw hl, 0xffe30
+movw bc, !0x1234
+movw de, es:!0x1234
+movw hl, !0x1234
+movw sp, #0x1234
+movw sp, ax
+movw ax, sp
+movw bc, sp
+movw de, sp
+movw hl, sp
+
+# ---- xchw --------------------------------------------------------------------
+xchw ax, bc
+xchw ax, de
+xchw ax, hl
+
+# ---- oneb / clrb / onew / clrw / cmp0 ----------------------------------------
+oneb a
+oneb x
+oneb b
+oneb c
+oneb 0xffe30
+oneb !0x1234
+oneb es:!0x1234
+clrb a
+clrb x
+clrb b
+clrb c
+clrb 0xffe30
+clrb !0x1234
+onew ax
+onew bc
+clrw ax
+clrw bc
+cmp0 a
+cmp0 x
+cmp0 b
+cmp0 c
+cmp0 0xffe30
+cmp0 !0x1234
+cmp0 es:!0x1234
+
+# ---- movs / cmps -------------------------------------------------------------
+movs [hl+4], x
+movs es:[hl+4], x
+cmps x, [hl+4]
+cmps x, es:[hl+4]
+
+# ---- 8-bit arithmetic --------------------------------------------------------
+add a, #1
+addc a, #1
+sub a, #1
+subc a, #1
+cmp a, #1
+and a, #1
+or a, #1
+xor a, #1
+add 0xffe30, #1
+cmp 0xffe30, #1
+xor 0xffe30, #1
+add a, a
+sub a, a
+xor a, a
+add a, x
+add a, c
+add a, h
+sub a, b
+or a, l
+add x, a
+add c, a
+and h, a
+cmp e, a
+add a, 0xffe30
+subc a, 0xffe30
+add a, !0x1234
+add a, es:!0x1234
+and a, !0x1234
+add a, [hl]
+add a, es:[hl]
+or a, [hl]
+add a, [hl+7]
+xor a, es:[hl+7]
+add a, [hl+b]
+add a, [hl+c]
+cmp a, [hl+b]
+xor a, es:[hl+c]
+cmp !0x1234, #1
+cmp es:!0x1234, #1
+addc x, a
+subc c, a
+
+# ---- 16-bit arithmetic -------------------------------------------------------
+addw ax, #0x1234
+subw ax, #0x1234
+cmpw ax, #0x1234
+addw ax, ax
+addw ax, bc
+addw ax, de
+addw ax, hl
+subw ax, bc
+cmpw ax, hl
+addw ax, 0xffe30
+subw ax, 0xffe30
+cmpw ax, 0xffe30
+addw ax, !0x1234
+subw ax, es:!0x1234
+cmpw ax, !0x1234
+addw ax, [hl+2]
+subw ax, es:[hl+2]
+cmpw ax, [hl+2]
+addw ax, [hl]
+cmpw ax, es:[hl]
+addw sp, #4
+subw sp, #4
+
+# ---- inc / dec ---------------------------------------------------------------
+inc x
+inc a
+inc c
+inc b
+inc e
+inc d
+inc l
+inc h
+dec x
+dec a
+dec h
+inc 0xffe30
+dec 0xffe30
+inc !0x1234
+dec !0x1234
+inc es:!0x1234
+dec es:!0x1234
+inc [hl+3]
+dec [hl+3]
+inc es:[hl+3]
+dec es:[hl+3]
+incw ax
+incw bc
+incw de
+incw hl
+decw ax
+decw hl
+incw 0xffe30
+decw 0xffe30
+incw !0x1234
+decw es:!0x1234
+incw [hl+3]
+decw es:[hl+3]
+
+# ---- shifts and rotates ------------------------------------------------------
+rol a, 1
+rolc a, 1
+rolwc ax, 1
+rolwc bc, 1
+ror a, 1
+rorc a, 1
+sar a, 1
+sar a, 7
+sarw ax, 1
+sarw ax, 15
+shl a, 1
+shl a, 7
+shl b, 3
+shl c, 2
+shlw ax, 4
+shlw bc, 15
+shr a, 6
+shrw ax, 9
+
+# ---- bit operations ----------------------------------------------------------
+set1 cy
+clr1 cy
+not1 cy
+set1 psw.7
+clr1 psw.0
+set1 es.3
+set1 0xffe30.3
+clr1 0xffe30.3
+set1 0xfff20.1
+clr1 0xfff20.1
+set1 0xfff10.2
+set1 a.5
+clr1 a.5
+set1 !0x1234.6
+clr1 !0x1234.6
+set1 es:!0x1234.6
+set1 [hl].4
+clr1 [hl].4
+clr1 es:[hl].4
+mov1 cy, 0xffe30.2
+mov1 cy, 0xfff20.2
+mov1 cy, 0xfff10.2
+mov1 cy, a.2
+mov1 cy, psw.2
+mov1 cy, [hl].2
+mov1 cy, es:[hl].2
+mov1 0xffe30.2, cy
+mov1 0xfff20.2, cy
+mov1 0xfff10.2, cy
+mov1 a.2, cy
+mov1 psw.2, cy
+mov1 [hl].2, cy
+mov1 es:[hl].2, cy
+and1 cy, psw.1
+or1 cy, psw.1
+xor1 cy, psw.1
+and1 cy, 0xfff20.1
+or1 cy, 0xffe30.1
+xor1 cy, 0xfff10.1
+and1 cy, a.3
+or1 cy, a.3
+xor1 cy, a.3
+and1 cy, [hl].3
+or1 cy, es:[hl].3
+xor1 cy, [hl].0
+
+# ---- branches and calls with absolute targets --------------------------------
+br ax
+br !0x1234
+br !!0x12345
+call ax
+call bc
+call de
+call hl
+call !0x1234
+call !!0x12345
+callt [0x80]
+callt [0x82]
+callt [0x90]
+callt [0xbe]
+push ax
+push bc
+push de
+push hl
+push psw
+pop ax
+pop bc
+pop de
+pop hl
+pop psw
+sel rb0
+sel rb1
+sel RB2
+sel rb3
+
+# ---- operand spellings -------------------------------------------------------
+MOV A, 0FFE30H
+MOV 0FFF20H, #0FFH
+SET1 PSW.7
+CLR1 0FFE30H.0
+AND1 CY, 0FFF20H.7
+movw rp1, rp0
+movw rp3, #0ffffh
+xchw rp0, rp2
+mov r2, r1
+add r1, #1
+set1 a . 3
+set1 psw . 2
+set1 !0x1234 . 2
+mov1 cy, 0xfff20 . 2
+set1 (0xfff20).3
+set1 (0xffe20+0x10).4
+mov a, [hl+-1]
+movw ax, #-1
+movw ax, #0xffff
+mov a, #255
+mov a, #-128
+mov a, [hl+255]
+mov a, #(1<<7)|1
+mov a, [ de + 2 ]
+mov a , [hl]
+xch a,[hl+c]
+mov a, !0xf1234
+mov a, es:!0xf1234
+movw ax, 0xffffa
+movw 0xfff20, #-1
+
+# ---- symbolic operands -------------------------------------------------------
+# The reference leaves these fields zero and emits a relocation.
+mov a, #ext
+movw ax, #ext
+mov a, !ext
+mov a, es:!ext
+mov a, ext
+mov ext, #1
+mov a, [hl+ext]
+mov a, ext[b]
+movw ax, ext
+br !ext
+br !!ext
+call !ext
+call !!ext
+set1 ext.3
+set1 !ext.3
+bt a.1, $.+3
+mov1 cy, sym.2
+xch a, sym
+movw bc, sym
+
+# ---- data --------------------------------------------------------------------
+.byte 1, 2, 0xff
+.short 0x1234
+.hword 0x1234
+.word 0x1234
+.int 0x12345678
+.long 0x12345678

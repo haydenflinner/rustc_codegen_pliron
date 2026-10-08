@@ -1,0 +1,742 @@
+# T32 corpus for GNU as, which checks what llvm-mc's own corpus cannot:
+# the instructions the security, virtualization and divide extensions add,
+# the banked registers of `msr` and `mrs`, and the shifted operands, whose
+# amount llvm-mc wants a `#` on that this assembler's GAS-dialect lexer eats
+# as a comment.
+#
+# GNU as runs with `-march=armv7ve`; see run.sh.
+
+# ---- the 32-bit data-processing forms ----
+and r0, r1, r2
+and.w r0, r1, r2
+ands r0, r1, r2
+and r0, r1, 255
+and r0, r1, 0x00ab00ab
+and r0, r1, 0xab00ab00
+and r0, r1, 0xabababab
+and r0, r1, 0xfffffffe
+eor r0, r1, r2
+eor.w r0, r1, r2
+orr r0, r1, r2
+orn r0, r1, r2
+orns r0, r1, r2
+orn r0, r1, 255
+bic r0, r1, r2
+bic.w r0, r1, 1
+add.w r0, r1, r2
+adds.w r0, r1, r2
+adc r0, r1, r2
+adcs.w r0, r1, r2
+sbc r0, r1, r2
+sbc.w r0, r1, 255
+sub.w r0, r1, r2
+rsb r0, r1, r2
+rsb r0, r1, 255
+rsbs r0, r1, 0
+teq r0, r1
+teq r0, 255
+tst.w r0, r1
+tst.w r0, 255
+cmp.w r0, r1
+cmn.w r0, r1
+cmn r0, 255
+mov.w r0, r1
+movs.w r0, r1
+mvn.w r0, r1
+mvn r0, 255
+neg r0, r1
+negs r0, r1
+addw r0, r1, 0
+addw r0, r1, 4095
+subw r0, r1, 100
+add r0, pc, 4
+adds r6, -1
+add r0, r1, -1
+sub.w r5, r11, 2880154540
+
+# ---- the 32-bit shifts ----
+lsl.w r0, r1, 3
+lsls.w r0, r1, 31
+lsr.w r0, r1, 32
+asr.w r0, r1, 1
+ror.w r0, r1, 15
+lsl r0, r1, r2
+lsls.w r0, r1, r2
+lsr r0, r1, r2
+asr r0, r1, r2
+ror r0, r1, r2
+rrx r0, r1
+rrxs r0, r1
+mov r0, r1, lsl r2
+movs r7, r5, lsl 29
+
+# ---- the 32-bit loads and stores ----
+ldr.w r0, [r1]
+ldr r0, [r1, 4095]
+ldr r0, [r1, -255]
+ldr r0, [r1, 4]!
+ldr r0, [r1], 4
+ldr r0, [r1], -4
+ldr.w r0, [r1, r2]
+ldrb.w r0, [r1, 8]
+ldrb r0, [r1, -8]
+ldrsb r0, [r1, 8]
+ldrsb.w r0, [r1, r2]
+ldrh.w r0, [r1, 8]
+ldrsh r0, [r1, 8]
+str.w r0, [r1, 8]
+strb r0, [r1, -8]
+strh.w r0, [r1, 8]
+ldrt r0, [r1, 4]
+strt r0, [r1, 255]
+ldrbt r0, [r1]
+strbt r0, [r1, 4]
+ldrht r0, [r1, 4]
+strht r0, [r1, 4]
+ldrsbt r0, [r1, 4]
+ldrsht r0, [r1, 4]
+ldrb r5, [pc, -64]
+ldrb r5, [pc, 64]
+
+# ---- the doubleword transfers ----
+ldrd r0, [r1]
+ldrd r0, r1, [r2]
+ldrd r0, r1, [r2, 1020]
+ldrd r0, r1, [r2, -1020]
+ldrd r0, r1, [r2, 8]!
+ldrd r0, r1, [r2], 8
+ldrd r1, r2, [r3]
+strd r0, r1, [r2]
+strd r4, r5, [r6, 8]
+strd r0, r1, [r2, -8]!
+strd r0, r1, [r2], -8
+
+# ---- the block transfers ----
+ldm r0, {r1, r2}
+ldm.w r0!, {r1, r8}
+ldmia.w r0, {r1, r2}
+ldmdb r0, {r1, r2}
+ldmdb r0!, {r1, r2}
+stmia.w r0!, {r1, r2}
+stmdb r0!, {r1, r2}
+push {r0, r8}
+pop {r4, lr}
+pop.w {r4, r5}
+push.w {r4}
+pop.w {r4}
+ldm r6, {r7}
+ldm r0!, {r1}
+stmdb r0!, {r1}
+
+# ---- the compare-and-branch and the table branches ----
+tbb [r0, r1]
+tbh [r0, r1, lsl 1]
+
+# ---- the exclusives ----
+ldrex r0, [r1]
+ldrex r0, [r1, 4]
+ldrexb r0, [r1]
+ldrexh r0, [r1]
+ldrexd r0, r1, [r2]
+strex r0, r1, [r2]
+strex r0, r1, [r2, 8]
+strexb r0, r1, [r2]
+strexh r0, r1, [r2]
+strexd r0, r2, r3, [r1]
+clrex
+
+# ---- saturating, packing and the parallel arithmetic ----
+ssat r0, 1, r1
+ssat16 r0, 1, r1
+usat r0, 0, r1
+usat16 r0, 15, r1
+pkhbt r0, r1, r2
+pkhtb r0, r1, r2
+qadd r0, r1, r2
+qdadd r0, r1, r2
+qsub r0, r1, r2
+qdsub r0, r1, r2
+sadd8 r0, r1, r2
+sadd16 r0, r1, r2
+sasx r0, r1, r2
+ssax r0, r1, r2
+ssub8 r0, r1, r2
+ssub16 r0, r1, r2
+qadd8 r0, r1, r2
+qadd16 r0, r1, r2
+qasx r0, r1, r2
+qsax r0, r1, r2
+qsub8 r0, r1, r2
+qsub16 r0, r1, r2
+shadd8 r0, r1, r2
+shadd16 r0, r1, r2
+shasx r0, r1, r2
+shsax r0, r1, r2
+shsub8 r0, r1, r2
+shsub16 r0, r1, r2
+uadd8 r0, r1, r2
+uadd16 r0, r1, r2
+uasx r0, r1, r2
+usax r0, r1, r2
+usub8 r0, r1, r2
+usub16 r0, r1, r2
+uqadd8 r0, r1, r2
+uqadd16 r0, r1, r2
+uqasx r0, r1, r2
+uqsax r0, r1, r2
+uqsub8 r0, r1, r2
+uqsub16 r0, r1, r2
+uhadd8 r0, r1, r2
+uhadd16 r0, r1, r2
+uhasx r0, r1, r2
+uhsax r0, r1, r2
+uhsub8 r0, r1, r2
+uhsub16 r0, r1, r2
+sel r0, r1, r2
+usad8 r0, r1, r2
+usada8 r0, r1, r2, r3
+
+# ---- the extends, wide and narrow ----
+sxtb r0, r1
+sxtb.w r0, r1
+sxtb r8, r9
+sxth.w r0, r1
+sxtb16 r0, r1
+uxtb.w r0, r1
+uxth r0, r1
+uxtb16 r0, r1
+sxtab r0, r1, r2
+sxtah r0, r1, r2
+sxtab16 r0, r1, r2
+uxtab r0, r1, r2
+uxtah r0, r1, r2
+uxtab16 r0, r1, r2
+
+# ---- bitfields and bit counting ----
+bfc r0, 0, 32
+bfi r0, r1, 4, 8
+sbfx r0, r1, 7, 9
+ubfx r0, r1, 0, 32
+rbit r0, r1
+rev.w r0, r1
+rev16.w r0, r1
+revsh.w r0, r1
+clz r0, r1
+
+# ---- the multiplies ----
+mul.w r0, r1, r2
+mul r0, r1
+mla r0, r1, r2, r3
+mls r0, r1, r2, r3
+smull r0, r1, r2, r3
+umull r0, r1, r2, r3
+smlal r0, r1, r2, r3
+umlal r0, r1, r2, r3
+umaal r0, r1, r2, r3
+smlabb r0, r1, r2, r3
+smlabt r0, r1, r2, r3
+smlatb r0, r1, r2, r3
+smlatt r0, r1, r2, r3
+smlawb r0, r1, r2, r3
+smlawt r0, r1, r2, r3
+smulbb r0, r1, r2
+smulbt r0, r1, r2
+smultb r0, r1, r2
+smultt r0, r1, r2
+smulwb r0, r1, r2
+smulwt r0, r1, r2
+smlalbb r0, r1, r2, r3
+smlalbt r0, r1, r2, r3
+smlaltb r0, r1, r2, r3
+smlaltt r0, r1, r2, r3
+smuad r0, r1, r2
+smuadx r0, r1, r2
+smusd r0, r1, r2
+smusdx r0, r1, r2
+smlad r0, r1, r2, r3
+smladx r0, r1, r2, r3
+smlsd r0, r1, r2, r3
+smlsdx r0, r1, r2, r3
+smlald r0, r1, r2, r3
+smlaldx r0, r1, r2, r3
+smlsld r0, r1, r2, r3
+smlsldx r0, r1, r2, r3
+smmul r0, r1, r2
+smmulr r0, r1, r2
+smmla r0, r1, r2, r3
+smmlar r0, r1, r2, r3
+smmls r0, r1, r2, r3
+smmlsr r0, r1, r2, r3
+sdiv r0, r1, r2
+udiv r0, r1, r2
+sdiv r0, r1
+
+# ---- the coprocessor instructions ----
+mcr p15, 0, r0, c1, c0, 0
+mcr2 p10, 3, r1, c2, c3, 4
+mrc p15, 0, r0, c1, c0, 0
+mrc2 p10, 3, r1, c2, c3, 4
+mcrr p1, 2, r3, r4, c5
+mrrc p1, 2, r3, r4, c5
+mrrc2 p1, 2, r3, r4, c5
+cdp p1, 2, c3, c4, c5
+cdp2 p1, 2, c3, c4, c5, 6
+ldc p1, c2, [r3]
+ldc p1, c2, [r3, 8]
+ldcl p1, c2, [r3, -8]
+ldc p1, c2, [r3, 8]!
+ldc p1, c2, [r3], 8
+ldc p1, c2, [r3], {8}
+stc p1, c2, [r3]
+stc2l p1, c2, [r3, 1020]
+
+# ---- hints, barriers and the system space ----
+nop.w
+yield
+yield.w
+wfe.w
+wfi
+sev.w
+dbg 3
+csdb
+ssbb
+pssbb
+dmb
+dmb sy
+dmb ish
+dmb oshst
+dmb 5
+dsb ish
+isb
+isb sy
+setend be
+setend le
+cps 19
+cpsie i
+cpsie aif
+cpsid if
+cpsie f, 16
+cpsid a, 31
+bkpt 0
+bkpt 255
+udf 0
+udf 255
+udf.w 0x1234
+svc 0
+svc 255
+bxj r0
+smc 15
+hvc 0x1234
+
+# ---- the exception-return transfers ----
+srs sp!, 19
+srs 19
+srsia sp!, 31
+srsdb sp!, 0
+rfeia r0
+rfeia r0!
+rfedb r1
+rfe r0
+
+# ---- the status registers ----
+mrs r0, cpsr
+mrs r0, spsr
+mrs r0, apsr
+mrs r0, sp_usr
+mrs r1, r8_fiq
+mrs r2, spsr_fiq
+mrs r3, lr_irq
+mrs r4, sp_svc
+mrs r5, spsr_abt
+mrs r6, lr_und
+mrs r7, sp_mon
+mrs r8, elr_hyp
+mrs r9, sp_hyp
+mrs r10, spsr_hyp
+msr cpsr_f, r0
+msr cpsr_fsxc, r0
+msr spsr_cxsf, r0
+msr apsr_g, r0
+msr apsr_nzcvq, r0
+msr sp_usr, r0
+msr elr_hyp, r1
+movs pc, lr
+
+# ---- the preloads ----
+pld [r0]
+pld [r0, 4]
+pld [r0, -4]
+pld [r0, r1]
+pldw [r0, 8]
+pli [r0, 4]
+pli [r0, -4]
+pli [r0, r1]
+
+# ============ the floating-point unit and NEON ============
+#
+# GNU as runs with `-mfpu=neon-vfpv4`; see run.sh.
+
+# ---- the VFP arithmetic ----
+vadd.f32 s0, s1, s2
+vadd.f64 d0, d1, d2
+vsub.f32 s15, s14, s13
+vsub.f64 d15, d14, d13
+vmul.f32 s3, s4, s5
+vmul.f64 d3, d4, d5
+vnmul.f32 s3, s4, s5
+vnmul.f64 d3, d4, d5
+vdiv.f32 s31, s30, s29
+vdiv.f64 d31, d30, d29
+vmla.f32 s0, s1, s2
+vmla.f64 d0, d1, d2
+vmls.f32 s0, s1, s2
+vmls.f64 d0, d1, d2
+vnmla.f32 s0, s1, s2
+vnmla.f64 d0, d1, d2
+vnmls.f32 s0, s1, s2
+vnmls.f64 d0, d1, d2
+vfma.f32 s0, s1, s2
+vfma.f64 d0, d1, d2
+vfms.f32 s0, s1, s2
+vfms.f64 d0, d1, d2
+vfnma.f32 s0, s1, s2
+vfnma.f64 d0, d1, d2
+vfnms.f32 s0, s1, s2
+vfnms.f64 d0, d1, d2
+vsub.f32 d0, d1, d2
+vfma.f32 d0, d1, d2
+
+# ---- the VFP unary operations and comparisons ----
+vabs.f32 s7, s8
+vabs.f64 d7, d8
+vneg.f32 s7, s8
+vneg.f64 d7, d8
+vsqrt.f32 s7, s8
+vsqrt.f64 d7, d8
+vmov.f32 s0, s1
+vmov.f64 d0, d1
+vcmp.f32 s0, s1
+vcmp.f64 d0, d1
+vcmpe.f32 s0, s1
+vcmpe.f64 d0, d1
+vcmp.f32 s0, 0
+vcmp.f64 d0, 0
+vcmpe.f32 s0, 0
+
+# ---- the VFP conversions ----
+vcvt.f64.f32 d0, s1
+vcvt.f32.f64 s0, d1
+vcvt.f32.s32 s0, s1
+vcvt.f32.u32 s0, s1
+vcvt.s32.f32 s0, s1
+vcvt.u32.f32 s0, s1
+vcvt.f64.s32 d0, s1
+vcvt.s32.f64 s0, d1
+vcvtr.s32.f32 s0, s1
+vcvtr.u32.f64 s0, d1
+vcvt.f32.s16 s0, s0, 4
+vcvt.f32.u32 s2, s2, 7
+vcvt.s16.f64 d0, d0, 3
+vcvt.u32.f32 s5, s5, 31
+vcvt.s32.f32 d0, d1
+vcvt.f32.u32 d0, d1, 1
+vcvt.f16.f32 d0, q1
+
+# ---- a condition on a VFP instruction ----
+vmls.f32 q0, q1, q2
+vceq.i8 d0, d1, d2
+vceq.f32 q0, q1, q2
+vcge.s16 d0, d1, d2
+vcgt.u32 q0, q1, q2
+vcle.s8 d0, d1, d2
+vclt.s8 d0, d1, d2
+vceq.i8 d0, d1, 0
+vcge.s16 q0, q1, 0
+vcgt.f32 d0, d1, 0
+vcle.s32 d0, d1, 0
+vclt.s8 q0, q1, 0
+vcls.s8 d0, d1
+vacge.f32 d0, d1, d2
+vacgt.f32 q0, q1, q2
+vclt.u16 q0, q1, q2
+vcle.f32 d0, d1, d2
+vacle.f32 d0, d1, d2
+vaclt.f32 q0, q1, q2
+
+# ---- the VFP loads, stores and block transfers ----
+vldr s0, [r1, 8]
+vldr s0, [r1]
+vstr s0, [r1, 1020]
+vstr d3, [r2]
+vldmia r0!, {s0-s3}
+vldmia r0, {d0-d3}
+vldmdb r0!, {s0-s3}
+vstmia r0!, {d0-d1}
+vstmdb r0!, {s4-s7}
+vpush {d0-d3}
+vpop {s0}
+vpush {s0, s1, s2}
+vpop {d8-d15}
+fldmiax r0!, {d0-d3}
+fstmdbx r0!, {d0-d3}
+
+# ---- the moves between core and vector registers ----
+vmov s0, r1
+vmov r1, s0
+vmov r0, r1, d2
+vmov d2, r0, r1
+vmov r0, r1, s2, s3
+vmov s2, s3, r0, r1
+vmov.8 d0[3], r1
+vmov.16 d0[2], r1
+vmov.32 d0[1], r1
+vmov.s8 r1, d0[3]
+vmov.u16 r1, d0[2]
+vmov.32 r1, d0[1]
+vmov d0, d1
+
+# ---- the floating-point status register ----
+vmrs r0, fpscr
+vmrs apsr_nzcv, fpscr
+vmsr fpscr, r0
+vmrs r0, fpsid
+vmsr fpexc, r3
+
+# ---- the NEON three-register arithmetic ----
+vadd.i8 d0, d1, d2
+vadd.i16 q0, q1, q2
+vadd.i32 d3, d4, d5
+vadd.i64 q3, q4, q5
+vadd.f32 q0, q1, q2
+vsub.i8 d0, d1, d2
+vmul.i16 q8, q9, q10
+vmul.f32 q8, q9, q10
+vmul.p8 d0, d1, d2
+vmla.i32 d0, d1, d2
+vand d0, d1, d2
+vand q0, q1, q2
+vorr d0, d1, d2
+veor q0, q1, q2
+vbic d0, d1, d2
+vorn d0, d1, d2
+vbsl d0, d1, d2
+vbit q0, q1, q2
+vbif d0, d1, d2
+vqadd.s8 d0, d1, d2
+vqsub.u16 q0, q1, q2
+vhadd.s8 d0, d1, d2
+vhsub.u32 q0, q1, q2
+vrhadd.s16 d0, d1, d2
+vmax.s8 d0, d1, d2
+vmin.f32 q0, q1, q2
+vpadd.i8 d0, d1, d2
+vpadd.f32 d0, d1, d2
+vpmax.s16 d0, d1, d2
+vpmin.u8 d0, d1, d2
+vabd.s8 d0, d1, d2
+vabd.f32 q0, q1, q2
+vaba.s8 d0, d1, d2
+vaddl.s8 q0, d1, d2
+vaddw.u16 q0, q1, d2
+vsubl.s32 q0, d1, d2
+vsubhn.i16 d0, q1, q2
+vmull.s8 q0, d1, d2
+vmull.p8 q0, d1, d2
+vmlal.s16 q0, d1, d2
+vmlsl.u32 q0, d1, d2
+vmul.i16 d0, d1, d2[1]
+vmul.f32 q0, q1, d2[0]
+vmla.i32 d0, d1, d2[1]
+vmlal.s16 q0, d1, d2[3]
+vpaddl.s8 d0, d1
+vrecps.f32 d0, d1, d2
+vrsqrts.f32 q0, q1, q2
+vtst.8 d0, d1, d2
+vaddhn.i16 d0, q1, q2
+vfms.f32 q0, q1, q2
+vadd.i8 d0, d1
+vmul.f32 q0, q1
+vpmax.s8 d0, d1
+vqadd.s8 d0, d1
+vabd.s8 d5, d6
+vorr d0, d1
+vtst.8 d0, d1
+
+# ---- the NEON widening, narrowing and long forms ----
+vshll.s8 q0, d1, 8
+vshll.i8 q0, d1, 8
+vmovl.s8 q0, d1
+vmovn.i16 d0, q1
+vqmovn.s16 d0, q1
+vqmovun.s16 d0, q1
+vraddhn.i32 d0, q1, q2
+vqdmull.s16 q0, d1, d2
+vqdmlal.s16 q0, d1, d2
+vqdmull.s32 q0, d1, d2[1]
+vshll.u16 q0, d1, 16
+vshll.i32 q0, d1, 32
+vshll.s8 q0, d1, 3
+
+# ---- the NEON shifts ----
+vshl.s8 d0, d1, d2
+vshl.u16 q0, q1, q2
+vqshl.s32 d0, d1, d2
+vrshl.s8 d0, d1, d2
+vshl.i8 d0, d1, 3
+vshl.i32 q0, q1, 31
+vshr.s8 d0, d1, 8
+vshr.u16 q0, q1, 1
+vsra.s32 d0, d1, 32
+vrshr.s8 d0, d1, 4
+vrsra.u16 q0, q1, 16
+vsri.8 d0, d1, 8
+vsli.16 q0, q1, 15
+vqshl.s8 d0, d1, 7
+vqshlu.s8 d0, d1, 7
+vshrn.i16 d0, q1, 8
+vqshrn.s16 d0, q1, 8
+vqshrun.s16 d0, q1, 8
+vrshrn.i32 d0, q1, 16
+vshl.s8 d0, d1, 3
+vshl.u8 d0, d1, 3
+vshl.i64 q0, q1, 33
+vqshrun.s32 d0, q1, 16
+vshl.s8 d0, d1
+vqshl.s8 d0, d1, 0
+vsli.8 d0, d1, 0
+vshl.i8 d0, d1, 0
+vqshlu.s8 d0, d1, 0
+vsri.8 d0, d1, 1
+
+# ---- the NEON scalar multiplies ----
+vqdmulh.s16 d0, d1, d2[2]
+
+# ---- the NEON multiplies that saturate and round ----
+vqdmulh.s16 d0, d1, d2
+vqrdmulh.s32 q0, q1, q2
+
+# ---- the NEON conversions ----
+vcvt.f32.u32 q0, q1
+vcvt.s32.f32 q0, q1, 3
+vcvt.f32.f16 q0, d1
+
+# ---- the NEON register move ----
+vmov q0, q1
+
+# ---- the NEON unary operations and permutes ----
+vabs.s8 d0, d1
+vabs.f32 q0, q1
+vneg.s16 d0, d1
+vext.8 d0, d1, d2, 3
+vext.8 q0, q1, q2, 7
+vrev16.8 d0, d1
+vrev32.16 q0, q1
+vrev64.32 d0, d1
+vclz.i16 q0, q1
+vcnt.8 d0, d1
+vmvn d0, d1
+vpadal.u16 q0, q1
+vqabs.s8 d0, d1
+vqneg.s16 q0, q1
+vrecpe.u32 d0, d1
+vrecpe.f32 q0, q1
+vrsqrte.f32 d0, d1
+vdup.8 d0, d1[3]
+vdup.16 q0, d1[2]
+vdup.32 d0, d1[1]
+vdup.8 d0, r1
+vdup.16 q0, r1
+vdup.32 d0, r2
+vtbl.8 d0, {d1}, d2
+vtbl.8 d0, {d1-d2}, d3
+vtbl.8 d0, {d1-d3}, d4
+vtbl.8 d0, {d1-d4}, d5
+vtbx.8 d0, {d1-d2}, d3
+vswp d0, d1
+vswp q0, q1
+vtrn.8 d0, d1
+vuzp.16 q0, q1
+vzip.32 d0, d1
+vzip.8 d0, d1
+vzip.16 d0, d1
+vuzp.32 d0, d1
+vuzp.8 q0, q1
+vmvn.i32 d0, 0xff
+vmvn q0, q1
+vext.8 q0, q1, q2, 9
+vext.8 q0, q1, q2, 15
+vext.8 d0, d1, 3
+
+# ---- the NEON modified immediate ----
+vorr.i16 q0, 0x100
+vbic.i32 d0, 0xff0000
+vmov.i8 d0, 0x12
+vmov.i16 q0, 0x1200
+vmov.i32 d0, 0xff0000
+vmov.i64 q0, 0xff00ff00ff00ff00
+
+# ---- the NEON structure loads and stores ----
+vld1.8 {d0}, [r0]
+vld1.8 {d0}, [r0], r1
+vld1.8 {d0, d1}, [r0]
+vld1.8 {d0, d1}, [r0], r1
+vld1.8 {d0, d1}, [r0:128]
+vld1.8 {d0, d1, d2}, [r0]!
+vld1.8 {d0, d1, d2}, [r0:64]
+vld1.8 {d0, d1, d2, d3}, [r0]!
+vld1.8 {d0, d1, d2, d3}, [r0:64]
+vld1.8 {d0, d1, d2, d3}, [r0:256]
+vld1.8 {d0[0]}, [r0]!
+vld1.8 {d0[1]}, [r0]
+vld1.8 {d0[1]}, [r0], r2
+vld1.8 {d0[2]}, [r0]!
+vld1.8 {d0[3]}, [r0]
+vld1.8 {d0[3]}, [r0], r2
+vld1.8 {d0[4]}, [r0]!
+vld1.8 {d0[5]}, [r0]
+vld1.8 {d0[5]}, [r0], r2
+vld1.8 {d0[6]}, [r0]!
+vld1.8 {d0[7]}, [r0]
+vld1.8 {d0[7]}, [r0], r2
+vld1.8 {d0[]}, [r0]!
+vld1.8 {d0[], d1[]}, [r0]
+vld1.8 {d0[], d1[]}, [r0], r3
+vld1.16 {d0}, [r0]!
+vld1.16 {d0}, [r0:64]
+vld1.16 {d0, d1}, [r0]!
+vld1.16 {d0, d1}, [r0:64]
+vld1.16 {d0, d1, d2}, [r0]
+vld1.16 {d0, d1, d2}, [r0], r1
+vld1.16 {d0, d1, d2, d3}, [r0]
+vld1.16 {d0, d1, d2, d3}, [r0], r1
+vld1.16 {d0, d1, d2, d3}, [r0:128]
+vld1.16 {d0[0]}, [r0]
+vld1.16 {d0[0]}, [r0], r2
+vld1.16 {d0[1]}, [r0]
+vld1.16 {d0[1]}, [r0], r2
+vld1.16 {d0[2]}, [r0]
+vld1.16 {d0[2]}, [r0], r2
+vld1.16 {d0[3]}, [r0]
+vld1.16 {d0[3]}, [r0], r2
+vld1.16 {d0[]}, [r0]
+vld1.16 {d0[]}, [r0], r3
+vld1.16 {d0[], d1[]}, [r0]
+vld1.16 {d0[], d1[]}, [r0], r3
+vld1.32 {d0}, [r0]
+vld1.32 {d0}, [r0], r1
+vld1.32 {d0, d1}, [r0]
+vld1.32 {d0, d1}, [r0], r1
+vld1.32 {d0, d1}, [r0:128]
+vld1.32 {d0, d1, d2}, [r0]!
+vld1.32 {d0, d1, d2}, [r0:64]
+vld1.32 {d0, d1, d2, d3}, [r0]!
+vld1.32 {d0, d1, d2, d3}, [r0:64]
+vld1.32 {d0, d1, d2, d3}, [r0:256]
+vld1.32 {d0[0]}, [r0]!
+vld1.32 {d0[0]}, [r0:32]
+vld1.32 {d0[1]}, [r0]!
+vld1.32 {d0[1]}, [r0:32]
+vld1.32 {d0[]}, [r0]!
+vld1.32 {d0[]}, [r0:32]
+vld1.32 {d0[], d1[]}, [r0]!
+vld1.32 {d0[], d1[]}, [r0:32]

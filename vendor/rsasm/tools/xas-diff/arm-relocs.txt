@@ -1,0 +1,452 @@
+=== a function
+        .syntax unified
+        .text
+        .global f
+f:      add     r0, r0, r1
+        bx      lr
+=== data in code marks each change
+        .syntax unified
+f:      mov     r0, r1
+        .word   1, 2
+        .byte   3
+        .p2align 2
+        mov     r1, r2
+        .ascii  "ab"
+        .balign 4, 0xaa
+        bx      lr
+=== data before any code is marked from the start
+        .syntax unified
+        .byte   1
+        .p2align 1
+        mov     r0, r0
+=== space and fill mark their own start
+        .syntax unified
+        .section .t2, "ax"
+        .space  4
+        bx      lr
+        .section .rodata
+        .byte   1
+        .space  3
+        .byte   2
+        .fill   2, 1, 0xee
+=== data sections
+        .syntax unified
+        .data
+        .word   1
+        .p2align 3
+        .word   2
+        .section .d2, "aw"
+        .p2align 2
+        .byte   2
+=== an alignment that the code already marked keeps the section's alignment
+        .syntax unified
+        .p2align 1
+        mov     r0, r0
+        .byte   1
+=== switching to thumb and back within a section
+        .syntax unified
+        .section .t3, "ax"
+        mov     r0, r0
+        .thumb
+        movs    r0, r0
+        .arm
+        mov     r0, r0
+        .thumb
+        bx      lr
+=== code 16 and code 32
+        .syntax unified
+        mov     r0, r0
+        .code   16
+        adds    r0, r1, r2
+        .code   32
+        bx      lr
+=== a section ending in data is padded with no-ops
+        .syntax unified
+        mov     r0, r0
+        .byte   1, 2, 3
+=== an odd alignment remainder in code is data
+        .syntax unified
+        mov     r0, r0
+        .byte   1
+        .p2align 3
+        mov     r1, r1
+=== literal pool at the end of the section
+        .syntax unified
+f:      ldr     r0, =0x12345678
+        ldr     r1, =0x12345678
+        ldr     r2, =foo
+        ldr     r3, =foo + 4
+        ldr     r4, =0xff
+        ldr     r5, =0xffffff00
+        ldr     r6, =f
+        ldr     r7, =-1
+        ldr     r8, =0xffffffff
+        ldr     r9, =-0x12345678
+        ldr     r10, =0xedcba988
+        bx      lr
+=== ltorg places the pool and starts a new one
+        .syntax unified
+f:      ldr     r0, =0x12345678
+        mov     r0, r1
+        .ltorg
+        ldr     r0, =0x12345678
+        ldreq   r1, =0x87654321
+        ldrne   r2, =0x100
+        bx      lr
+        .pool
+        .ltorg
+        mov     r0, r0
+=== an empty ltorg does nothing
+        .syntax unified
+        mov     r0, r0
+        .ltorg
+        .byte   1
+        .ltorg
+        mov     r1, r1
+=== a pool after data is aligned with zeros
+        .syntax unified
+f:      ldr     r0, =label
+        .byte   1, 2, 3
+        .ltorg
+label:  bx      lr
+=== each section has its own pool
+        .syntax unified
+        .text
+        ldr     r0, =0x11111111
+        .section .text.b, "ax"
+        ldr     r0, =0x11111111
+        ldr     r1, =0x22222222
+        .text
+        ldr     r2, =0x22222222
+        .data
+        .word   0
+=== numbers and symbols do not share an entry
+        .syntax unified
+        .equ    later, 0x12345678
+        ldr     r0, =0x12345678
+        ldr     r1, =later
+        ldr     r2, =sym
+        ldr     r3, =sym + 0
+        ldr     r4, =sym - 4
+        ldr     r5, =1f
+        ldr     r6, =1f
+1:      bx      lr
+=== a load reaches a pool 4092 bytes past the PC
+        .syntax unified
+        ldr     r0, =0x12345678
+        .space  4092
+        bx      lr
+=== refused: a load that does not reach its pool
+        .syntax unified
+        ldr     r0, =0x12345678
+        .space  4096
+        bx      lr
+=== a pool reached backwards is not reused
+        .syntax unified
+        ldr     r0, =0x12345678
+        .ltorg
+        .space  8
+        ldr     r1, =0x12345678
+=== adr forward and back
+        .syntax unified
+back:   nop
+        adr     r0, back
+        adr     r1, fwd
+        adreq   r2, fwd
+        adr     r3, .
+        adr     lr, back + 4
+fwd:    bx      lr
+=== adr to a label an add can reach only at a rotated offset
+        .syntax unified
+        adr     r0, far
+        .space  1012
+far:    bx      lr
+=== refused: adr to an offset no modified immediate holds
+        .syntax unified
+        adr     r0, far
+        .space  1014
+far:    bx      lr
+=== adrl in one instruction and in two
+        .syntax unified
+back:   adrl    r0, near
+        adrl    r1, far
+        adrl    r2, back
+near:   nop
+        .space  0x10000
+far:    adrl    r3, back
+        adrlne  r4, near
+        bx      lr
+=== refused: adr to another section
+        .syntax unified
+        adr     r0, other
+        .data
+other:  .word   0
+=== calls between ARM and Thumb functions
+        .syntax unified
+        .arm
+        .global armf
+        .type   armf, %function
+armf:   bl      thumbf
+        blx     thumbf
+        bl      armf2
+        blx     armf2
+        bl      ext
+        blx     ext
+        b       thumbf
+        bx      lr
+armf2:  bx      lr
+        .thumb
+        .thumb_func
+thumbf: bl      armf
+        blx     armf
+        bl      thumbf2
+        blx     thumbf2
+        bl      ext
+        blx     ext
+        b.w     armf
+        bx      lr
+        .type   thumbf2, %function
+thumbf2:
+        bx      lr
+plain:  bx      lr
+        .data
+        .word   thumbf, armf, thumbf2, plain
+=== conditional branches and calls to a Thumb function
+        .syntax unified
+        bleq    tf
+        beq     tf
+        b       tf
+        bl      tf
+        bx      lr
+        .thumb
+        .type   tf, %function
+tf:     bx      lr
+=== a local ARM function called from Thumb in the same section
+        .syntax unified
+        .type   af, %function
+af:     bx      lr
+        .thumb
+tstart: bl      af
+        blx     af
+        b.w     af
+        beq.w   af
+        b       af
+        bne     af
+        bx      lr
+=== branches to global and weak symbols in the same section
+        .syntax unified
+        .global g
+        .weak   w
+        .global h
+        .hidden h
+g:      b       g
+w:      bl      w
+h:      b       h
+        blx     g
+        .thumb
+        .global tg
+tg:     b       tg
+        bl      tg
+        beq     tg
+        .global th
+        .hidden th
+th:     b       th
+        bx      lr
+=== thumb_func names the next label that is not a local one
+        .syntax unified
+        .thumb_func
+.Lskip: nop
+real:   bx      lr
+        .thumb_func
+        .arm
+armcode:
+        bx      lr
+        .thumb
+        .data
+        .thumb_func
+datalabel:
+        .word   0
+        .text
+later:  bx      lr
+        .word   real, later, datalabel
+=== the type may come before the label or after it
+        .syntax unified
+        .thumb
+        .type   before, %function
+before: bx      lr
+after:  bx      lr
+        .type   after, %function
+        .global before, after
+        .arm
+        bl      before
+        bl      after
+        .word   before, after
+=== addresses of Thumb functions
+        .syntax unified
+        .thumb
+        .thumb_func
+tf:     bx      lr
+        .arm
+        adr     r0, tf
+        adr     r1, later
+        ldr     r2, =tf
+        ldr     r3, =later
+        .thumb
+        adr     r4, tf
+        .p2align 2, 0
+        .thumb_func
+later:  bx      lr
+=== calls into another section
+        .syntax unified
+        bl      other
+        blx     other
+        bl      tother
+        blx     tother
+        .thumb
+        bl      other
+        blx     other
+        bl      tother
+        blx     tother
+        .section .text.b, "ax"
+        .arm
+        .type   other, %function
+other:  bx      lr
+        .thumb
+        .thumb_func
+tother: bx      lr
+=== references to symbols in their own section, by binding
+        .syntax unified
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        bl loc
+        bl glob
+        bl weak1
+        bl hid
+        bl prot
+        bl intl
+        bl whid
+        bl lhid
+        bl func
+        bl late
+        bl lweak
+        bl lalias
+        bl lwalias
+        bl galias
+        bl walias
+        b loc
+        b glob
+        b weak1
+        b lalias
+        b walias
+        beq loc
+        beq glob
+        beq weak1
+        beq lalias
+        beq walias
+        bleq loc
+        bleq glob
+        bleq weak1
+        bleq lalias
+        bleq walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+=== references back to symbols in their own section
+        .syntax unified
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        bl loc
+        bl glob
+        bl weak1
+        bl lalias
+        b loc
+        b glob
+        b weak1
+        beq loc
+        beq glob
+        beq weak1
+        bleq loc
+        bleq glob
+        bleq weak1
+=== references out of their section, by binding
+        .syntax unified
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        bl oloc
+        bl oglob
+        bl oweak
+        bl oalias
+        bl ext
+        bl uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+=== data referring to symbols, by binding
+        .syntax unified
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+=== default section alignment
+        .syntax unified
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7

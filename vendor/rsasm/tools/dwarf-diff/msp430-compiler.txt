@@ -1,0 +1,1677 @@
+=== clang -O0 -g
+	.file	"compiler.c"
+	.file	0 "/build" "/home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c" md5 0x6ab117db4f2f54234432b36109083dac
+	.text
+	.globl	sum                             ; -- Begin function sum
+	.p2align	1
+	.type	sum,@function
+sum:                                    ; @sum
+.Lfunc_begin0:
+	.loc	0 5 0                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:5:0
+; %bb.0:
+	sub	#10, r1
+	mov	12(r1), r12
+.Ltmp0:
+	.loc	0 6 19 prologue_end             ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:6:19
+	clr	6(r1)
+	mov	r1, r12
+	add	#14, r12
+	.loc	0 7 3                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:7:3
+	mov	r12, 8(r1)
+.Ltmp1:
+	.loc	0 8 12                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:12
+	clr	4(r1)
+	.loc	0 8 8 is_stmt 0                 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:8
+	jmp	.LBB0_1
+.LBB0_1:                                ; =>This Inner Loop Header: Depth=1
+.Ltmp2:
+	.loc	0 8 19                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:19
+	mov	4(r1), r12
+	.loc	0 8 23                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:23
+	mov	12(r1), r13
+.Ltmp3:
+	.loc	0 8 3                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:3
+	cmp	r13, r12
+	jge	.LBB0_4
+	jmp	.LBB0_2
+.LBB0_2:                                ;   in Loop: Header=BB0_1 Depth=1
+.Ltmp4:
+	.loc	0 8 36                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:36
+	mov	8(r1), r12
+	inc	r12
+	and	#-2, r12
+	mov	r12, r13
+	incd	r13
+	mov	r13, 8(r1)
+	mov	0(r12), r12
+	mov	r12, 2(r1)
+	mov	2(r1), r13
+	.loc	0 8 33                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:33
+	mov	6(r1), r12
+	add	r13, r12
+	mov	r12, 6(r1)
+	.loc	0 8 31                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:31
+	jmp	.LBB0_3
+.LBB0_3:                                ;   in Loop: Header=BB0_1 Depth=1
+	.loc	0 8 27                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:27
+	mov	4(r1), r12
+	inc	r12
+	mov	r12, 4(r1)
+	.loc	0 8 3                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:3
+	jmp	.LBB0_1
+.Ltmp5:
+.LBB0_4:
+	.loc	0 10 10 is_stmt 1               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:10
+	mov	6(r1), r12
+	.loc	0 10 14 is_stmt 0               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:14
+	mov	r12, 0(r1)                      ; 2-byte Folded Spill
+	call	#helper
+	mov	r12, r13
+	.loc	0 10 12                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:12
+	mov	0(r1), r12                      ; 2-byte Folded Reload
+	add	r13, r12
+	.loc	0 10 3 epilogue_begin           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:3
+	add	#10, r1
+	ret
+.Ltmp6:
+.Lfunc_end0:
+	.size	sum, .Lfunc_end0-sum
+                                        ; -- End function
+	.p2align	1                               ; -- Begin function helper
+	.type	helper,@function
+helper:                                 ; @helper
+.Lfunc_begin1:
+	.loc	0 4 0 is_stmt 1                 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:0
+; %bb.0:
+	sub	#6, r1
+	mov	r12, 4(r1)
+.Ltmp7:
+	.loc	0 4 35 prologue_end             ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:35
+	mov	4(r1), r12
+	.loc	0 4 37 is_stmt 0                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:37
+	mov	r12, 0(r1)                      ; 2-byte Folded Spill
+	mov	#3, r13
+	call	#__mspabi_mpyi
+	mov	r12, r13
+	.loc	0 4 43                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:43
+	mov	0(r1), r12                      ; 2-byte Folded Reload
+	mov	r13, 2(r1)                      ; 2-byte Folded Spill
+	call	#g
+	mov	r12, r13
+	.loc	0 4 41                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:41
+	mov	2(r1), r12                      ; 2-byte Folded Reload
+	add	r13, r12
+	.loc	0 4 28 epilogue_begin           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:28
+	add	#6, r1
+	ret
+.Ltmp8:
+.Lfunc_end1:
+	.size	helper, .Lfunc_end1-helper
+                                        ; -- End function
+	.globl	big                             ; -- Begin function big
+	.p2align	1
+	.type	big,@function
+big:                                    ; @big
+.Lfunc_begin2:
+	.loc	0 12 0 is_stmt 1                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:12:0
+; %bb.0:
+	sub	#268, r1
+	mov	r12, 262(r1)
+	mov	r13, 260(r1)
+.Ltmp9:
+	.loc	0 14 12 prologue_end            ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:12
+	clr	2(r1)
+	.loc	0 14 8 is_stmt 0                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:8
+	jmp	.LBB2_1
+.LBB2_1:                                ; =>This Inner Loop Header: Depth=1
+.Ltmp10:
+	.loc	0 14 19                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:19
+	mov	2(r1), r12
+.Ltmp11:
+	.loc	0 14 3                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:3
+	cmp	#256, r12
+	jge	.LBB2_4
+	jmp	.LBB2_2
+.LBB2_2:                                ;   in Loop: Header=BB2_1 Depth=1
+.Ltmp12:
+	.loc	0 14 49                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:49
+	mov	2(r1), r14
+	.loc	0 14 53                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:53
+	mov	260(r1), r13
+	.loc	0 14 51                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:51
+	mov	r14, r12
+	xor	r13, r12
+	.loc	0 14 42                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:42
+	mov.b	r12, r13
+	mov	r1, r12
+	add	#4, r12
+	.loc	0 14 33                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:33
+	add	r14, r12
+	.loc	0 14 40                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:40
+	mov.b	r13, 0(r12)
+	.loc	0 14 33                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:33
+	jmp	.LBB2_3
+.LBB2_3:                                ;   in Loop: Header=BB2_1 Depth=1
+	.loc	0 14 29                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:29
+	mov	2(r1), r12
+	inc	r12
+	mov	r12, 2(r1)
+	.loc	0 14 3                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:3
+	jmp	.LBB2_1
+.Ltmp13:
+.LBB2_4:
+	.loc	0 15 7 is_stmt 1                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:7
+	mov	260(r1), r12
+	.loc	0 15 9 is_stmt 0                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:9
+	cmp	#11, r12
+	jl	.LBB2_6
+	jmp	.LBB2_5
+.LBB2_5:
+	.loc	0 15 22                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:22
+	mov	262(r1), r13
+	.loc	0 15 25                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:25
+	mov	4(r13), r12
+	mov	2(r13), r14
+	.loc	0 15 33                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:33
+	mov.b	260(r1), r15
+	mov	r1, r13
+	add	#4, r13
+	.loc	0 15 29                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:29
+	add	r15, r13
+	mov.b	0(r13), r15
+	.loc	0 15 27                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:27
+	mov	r14, r13
+	add	r15, r13
+	cmp	r14, r13
+	mov	r2, r15
+	mov	#1, r14
+	bic	r15, r14
+	add	r14, r12
+	.loc	0 15 15                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:15
+	mov	r13, 264(r1)
+	mov	r12, 266(r1)
+	jmp	.LBB2_7
+.Ltmp14:
+.LBB2_6:
+	.loc	0 16 10 is_stmt 1               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:10
+	mov	262(r1), r12
+	.loc	0 16 13 is_stmt 0               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:13
+	mov	0(r12), r12
+	.loc	0 16 19                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:19
+	mov	r12, 0(r1)                      ; 2-byte Folded Spill
+	mov.b	7(r1), r12
+	.loc	0 16 17                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:17
+	call	#g
+	mov	0(r1), r13                      ; 2-byte Folded Reload
+	.loc	0 16 15                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:15
+	add	r12, r13
+	.loc	0 16 10                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:10
+	mov	r13, r12
+	swpb	r12
+	sxt	r12
+	rra	r12
+	rra	r12
+	rra	r12
+	rra	r12
+	rra	r12
+	rra	r12
+	rra	r12
+	.loc	0 16 3                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:3
+	mov	r13, 264(r1)
+	mov	r12, 266(r1)
+	jmp	.LBB2_7
+.LBB2_7:
+	.loc	0 17 1 is_stmt 1                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:17:1
+	mov	264(r1), r12
+	mov	266(r1), r13
+	.loc	0 17 1 epilogue_begin is_stmt 0 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:17:1
+	add	#268, r1
+	ret
+.Ltmp15:
+.Lfunc_end2:
+	.size	big, .Lfunc_end2-big
+                                        ; -- End function
+	.globl	leaf                            ; -- Begin function leaf
+	.p2align	1
+	.type	leaf,@function
+leaf:                                   ; @leaf
+.Lfunc_begin3:
+; %bb.0:
+	.loc	0 18 18 prologue_end is_stmt 1  ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:18:18
+	ret
+.Ltmp16:
+.Lfunc_end3:
+	.size	leaf, .Lfunc_end3-leaf
+                                        ; -- End function
+	.file	1 "/usr/lib/llvm/22/bin/../../../../lib/clang/22/include" "__stdarg_va_list.h" md5 0x7bd78a282b99fcfe41a9e3c566d14f7d
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	37                              ; DW_AT_producer
+	.byte	37                              ; DW_FORM_strx1
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	114                             ; DW_AT_str_offsets_base
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	37                              ; DW_FORM_strx1
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	115                             ; DW_AT_addr_base
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	2                               ; Abbreviation Code
+	.byte	36                              ; DW_TAG_base_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	62                              ; DW_AT_encoding
+	.byte	11                              ; DW_FORM_data1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	3                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	64                              ; DW_AT_frame_base
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	63                              ; DW_AT_external
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	4                               ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	5                               ; Abbreviation Code
+	.byte	52                              ; DW_TAG_variable
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	6                               ; Abbreviation Code
+	.byte	11                              ; DW_TAG_lexical_block
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	7                               ; Abbreviation Code
+	.byte	24                              ; DW_TAG_unspecified_parameters
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	8                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	64                              ; DW_AT_frame_base
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	9                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	64                              ; DW_AT_frame_base
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	63                              ; DW_AT_external
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	10                              ; Abbreviation Code
+	.byte	22                              ; DW_TAG_typedef
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	11                              ; Abbreviation Code
+	.byte	22                              ; DW_TAG_typedef
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	12                              ; Abbreviation Code
+	.byte	15                              ; DW_TAG_pointer_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	13                              ; Abbreviation Code
+	.byte	19                              ; DW_TAG_structure_type
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	14                              ; Abbreviation Code
+	.byte	13                              ; DW_TAG_member
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	56                              ; DW_AT_data_member_location
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	15                              ; Abbreviation Code
+	.byte	1                               ; DW_TAG_array_type
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	16                              ; Abbreviation Code
+	.byte	33                              ; DW_TAG_subrange_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	55                              ; DW_AT_count
+	.byte	5                               ; DW_FORM_data2
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	17                              ; Abbreviation Code
+	.byte	36                              ; DW_TAG_base_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	62                              ; DW_AT_encoding
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	5                               ; DWARF version number
+	.byte	1                               ; DWARF Unit Type
+	.byte	4                               ; Address Size (in bytes)
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	1                               ; Abbrev [1] 0xc:0x114 DW_TAG_compile_unit
+	.byte	0                               ; DW_AT_producer
+	.short	29                              ; DW_AT_language
+	.byte	1                               ; DW_AT_name
+	.long	.Lstr_offsets_base0             ; DW_AT_str_offsets_base
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.byte	2                               ; DW_AT_comp_dir
+	.byte	0                               ; DW_AT_low_pc
+	.long	.Lfunc_end3-.Lfunc_begin0       ; DW_AT_high_pc
+	.long	.Laddr_table_base0              ; DW_AT_addr_base
+	.byte	2                               ; Abbrev [2] 0x23:0x4 DW_TAG_base_type
+	.byte	3                               ; DW_AT_name
+	.byte	8                               ; DW_AT_encoding
+	.byte	1                               ; DW_AT_byte_size
+	.byte	3                               ; Abbrev [3] 0x27:0x44 DW_TAG_subprogram
+	.byte	0                               ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+	.byte	4                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	5                               ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	214                             ; DW_AT_type
+                                        ; DW_AT_external
+	.byte	4                               ; Abbrev [4] 0x36:0xb DW_TAG_formal_parameter
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	12
+	.byte	10                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	5                               ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	5                               ; Abbrev [5] 0x41:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	8
+	.byte	11                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	6                               ; DW_AT_decl_line
+	.long	222                             ; DW_AT_type
+	.byte	5                               ; Abbrev [5] 0x4c:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	6
+	.byte	14                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	6                               ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	6                               ; Abbrev [6] 0x57:0x12 DW_TAG_lexical_block
+	.byte	1                               ; DW_AT_low_pc
+	.long	.Ltmp5-.Ltmp1                   ; DW_AT_high_pc
+	.byte	5                               ; Abbrev [5] 0x5d:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	4
+	.byte	15                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	8                               ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	7                               ; Abbrev [7] 0x69:0x1 DW_TAG_unspecified_parameters
+	.byte	0                               ; End Of Children Mark
+	.byte	8                               ; Abbrev [8] 0x6b:0x1b DW_TAG_subprogram
+	.byte	2                               ; DW_AT_low_pc
+	.long	.Lfunc_end1-.Lfunc_begin1       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+	.byte	6                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	4                               ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	214                             ; DW_AT_type
+	.byte	4                               ; Abbrev [4] 0x7a:0xb DW_TAG_formal_parameter
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	4
+	.byte	16                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	4                               ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	3                               ; Abbrev [3] 0x86:0x45 DW_TAG_subprogram
+	.byte	3                               ; DW_AT_low_pc
+	.long	.Lfunc_end2-.Lfunc_begin2       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+	.byte	7                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	218                             ; DW_AT_type
+                                        ; DW_AT_external
+	.byte	4                               ; Abbrev [4] 0x95:0xc DW_TAG_formal_parameter
+	.byte	3                               ; DW_AT_location
+	.byte	145
+	.ascii	"\206\002"
+	.byte	17                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.long	241                             ; DW_AT_type
+	.byte	4                               ; Abbrev [4] 0xa1:0xc DW_TAG_formal_parameter
+	.byte	3                               ; DW_AT_location
+	.byte	145
+	.ascii	"\204\002"
+	.byte	21                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	5                               ; Abbrev [5] 0xad:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	4
+	.byte	22                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	13                              ; DW_AT_decl_line
+	.long	270                             ; DW_AT_type
+	.byte	6                               ; Abbrev [6] 0xb8:0x12 DW_TAG_lexical_block
+	.byte	4                               ; DW_AT_low_pc
+	.long	.Ltmp13-.Ltmp9                  ; DW_AT_high_pc
+	.byte	5                               ; Abbrev [5] 0xbe:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	2
+	.byte	15                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	14                              ; DW_AT_decl_line
+	.long	214                             ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+	.byte	9                               ; Abbrev [9] 0xcb:0xb DW_TAG_subprogram
+	.byte	5                               ; DW_AT_low_pc
+	.long	.Lfunc_end3-.Lfunc_begin3       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+	.byte	9                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	18                              ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+                                        ; DW_AT_external
+	.byte	2                               ; Abbrev [2] 0xd6:0x4 DW_TAG_base_type
+	.byte	5                               ; DW_AT_name
+	.byte	5                               ; DW_AT_encoding
+	.byte	2                               ; DW_AT_byte_size
+	.byte	2                               ; Abbrev [2] 0xda:0x4 DW_TAG_base_type
+	.byte	8                               ; DW_AT_name
+	.byte	5                               ; DW_AT_encoding
+	.byte	4                               ; DW_AT_byte_size
+	.byte	10                              ; Abbrev [10] 0xde:0x8 DW_TAG_typedef
+	.long	230                             ; DW_AT_type
+	.byte	13                              ; DW_AT_name
+	.byte	1                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.byte	11                              ; Abbrev [11] 0xe6:0x6 DW_TAG_typedef
+	.long	236                             ; DW_AT_type
+	.byte	12                              ; DW_AT_name
+	.byte	12                              ; Abbrev [12] 0xec:0x5 DW_TAG_pointer_type
+	.long	35                              ; DW_AT_type
+	.byte	12                              ; Abbrev [12] 0xf1:0x5 DW_TAG_pointer_type
+	.long	246                             ; DW_AT_type
+	.byte	13                              ; Abbrev [13] 0xf6:0x18 DW_TAG_structure_type
+	.byte	20                              ; DW_AT_name
+	.byte	6                               ; DW_AT_byte_size
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	14                              ; Abbrev [14] 0xfb:0x9 DW_TAG_member
+	.byte	18                              ; DW_AT_name
+	.long	214                             ; DW_AT_type
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	0                               ; DW_AT_data_member_location
+	.byte	14                              ; Abbrev [14] 0x104:0x9 DW_TAG_member
+	.byte	19                              ; DW_AT_name
+	.long	218                             ; DW_AT_type
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	2                               ; DW_AT_data_member_location
+	.byte	0                               ; End Of Children Mark
+	.byte	15                              ; Abbrev [15] 0x10e:0xd DW_TAG_array_type
+	.long	35                              ; DW_AT_type
+	.byte	16                              ; Abbrev [16] 0x113:0x7 DW_TAG_subrange_type
+	.long	283                             ; DW_AT_type
+	.short	256                             ; DW_AT_count
+	.byte	0                               ; End Of Children Mark
+	.byte	17                              ; Abbrev [17] 0x11b:0x4 DW_TAG_base_type
+	.byte	23                              ; DW_AT_name
+	.byte	8                               ; DW_AT_byte_size
+	.byte	7                               ; DW_AT_encoding
+	.byte	0                               ; End Of Children Mark
+.Ldebug_info_end0:
+	.section	.debug_str_offsets,"",@progbits
+	.long	100                             ; Length of String Offsets Set
+	.short	5
+	.short	0
+.Lstr_offsets_base0:
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.byte	0                               ; string offset=0
+.Linfo_string1:
+	.asciz	"/home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c" ; string offset=1
+.Linfo_string2:
+	.asciz	"/build"                        ; string offset=103
+.Linfo_string3:
+	.asciz	"char"                          ; string offset=110
+.Linfo_string4:
+	.asciz	"sum"                           ; string offset=115
+.Linfo_string5:
+	.asciz	"int"                           ; string offset=119
+.Linfo_string6:
+	.asciz	"helper"                        ; string offset=123
+.Linfo_string7:
+	.asciz	"big"                           ; string offset=130
+.Linfo_string8:
+	.asciz	"long"                          ; string offset=134
+.Linfo_string9:
+	.asciz	"leaf"                          ; string offset=139
+.Linfo_string10:
+	.asciz	"n"                             ; string offset=144
+.Linfo_string11:
+	.asciz	"ap"                            ; string offset=146
+.Linfo_string12:
+	.asciz	"__builtin_va_list"             ; string offset=149
+.Linfo_string13:
+	.asciz	"va_list"                       ; string offset=167
+.Linfo_string14:
+	.asciz	"s"                             ; string offset=175
+.Linfo_string15:
+	.asciz	"i"                             ; string offset=177
+.Linfo_string16:
+	.asciz	"x"                             ; string offset=179
+.Linfo_string17:
+	.asciz	"p"                             ; string offset=181
+.Linfo_string18:
+	.asciz	"a"                             ; string offset=183
+.Linfo_string19:
+	.asciz	"b"                             ; string offset=185
+.Linfo_string20:
+	.asciz	"S"                             ; string offset=187
+.Linfo_string21:
+	.asciz	"k"                             ; string offset=189
+.Linfo_string22:
+	.asciz	"buf"                           ; string offset=191
+.Linfo_string23:
+	.asciz	"__ARRAY_SIZE_TYPE__"           ; string offset=195
+	.section	.debug_str_offsets,"",@progbits
+	.long	.Linfo_string0
+	.long	.Linfo_string1
+	.long	.Linfo_string2
+	.long	.Linfo_string3
+	.long	.Linfo_string4
+	.long	.Linfo_string5
+	.long	.Linfo_string6
+	.long	.Linfo_string7
+	.long	.Linfo_string8
+	.long	.Linfo_string9
+	.long	.Linfo_string10
+	.long	.Linfo_string11
+	.long	.Linfo_string12
+	.long	.Linfo_string13
+	.long	.Linfo_string14
+	.long	.Linfo_string15
+	.long	.Linfo_string16
+	.long	.Linfo_string17
+	.long	.Linfo_string18
+	.long	.Linfo_string19
+	.long	.Linfo_string20
+	.long	.Linfo_string21
+	.long	.Linfo_string22
+	.long	.Linfo_string23
+	.section	.debug_addr,"",@progbits
+	.long	.Ldebug_addr_end0-.Ldebug_addr_start0 ; Length of contribution
+.Ldebug_addr_start0:
+	.short	5                               ; DWARF version number
+	.byte	4                               ; Address size
+	.byte	0                               ; Segment selector size
+.Laddr_table_base0:
+	.long	.Lfunc_begin0
+	.long	.Ltmp1
+	.long	.Lfunc_begin1
+	.long	.Lfunc_begin2
+	.long	.Ltmp9
+	.long	.Lfunc_begin3
+.Ldebug_addr_end0:
+	.section	".note.GNU-stack","",@progbits
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:
+=== clang -O2 -g
+	.file	"compiler.c"
+	.file	0 "/build" "/home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c" md5 0x6ab117db4f2f54234432b36109083dac
+	.text
+	.globl	sum                             ; -- Begin function sum
+	.p2align	1
+	.type	sum,@function
+sum:                                    ; @sum
+.Lfunc_begin0:
+	.loc	0 5 0                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:5:0
+; %bb.0:
+	push	r10
+	sub	#2, r1
+.Ltmp0:
+	;DEBUG_VALUE: sum:n <- [DW_OP_plus_uconst 6] [$sp+0]
+	mov	r1, r12
+	add	#8, r12
+.Ltmp1:
+	;DEBUG_VALUE: sum:s <- 0
+	.loc	0 7 3 prologue_end              ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:7:3
+	mov	r12, 0(r1)
+	mov	6(r1), r12
+.Ltmp2:
+	;DEBUG_VALUE: i <- 0
+	.loc	0 0 3 is_stmt 0                 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:0:3
+	clr	r10
+.Ltmp3:
+	.loc	0 8 3 is_stmt 1                 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:3
+	cmp	#1, r12
+	jl	.LBB0_2
+.Ltmp4:
+.LBB0_1:                                ; =>This Inner Loop Header: Depth=1
+	;DEBUG_VALUE: sum:n <- [DW_OP_plus_uconst 6] [$sp+0]
+	;DEBUG_VALUE: sum:s <- $r10
+	;DEBUG_VALUE: i <- [DW_OP_LLVM_arg 0, DW_OP_LLVM_arg 0, DW_OP_minus, DW_OP_consts 18446744073709551615, DW_OP_div, DW_OP_stack_value] undef
+	.loc	0 8 36                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:36
+	mov	#1, r13
+	add	0(r1), r13
+	and	#-2, r13
+	mov	r13, r14
+	incd	r14
+	mov	r14, 0(r1)
+	.loc	0 8 33 is_stmt 0                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:33
+	add	0(r13), r10
+.Ltmp5:
+	;DEBUG_VALUE: sum:s <- $r10
+	;DEBUG_VALUE: i <- [DW_OP_LLVM_arg 0, DW_OP_LLVM_arg 0, DW_OP_minus, DW_OP_consts 18446744073709551615, DW_OP_div, DW_OP_consts 1, DW_OP_plus, DW_OP_stack_value] undef
+	.loc	0 8 21 is_stmt 1                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:21
+	add	#-1, r12
+.Ltmp6:
+	.loc	0 8 3                           ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:8:3
+	tst	r12
+	jne	.LBB0_1
+.Ltmp7:
+.LBB0_2:
+	;DEBUG_VALUE: sum:n <- [DW_OP_plus_uconst 6] [$sp+0]
+	;DEBUG_VALUE: helper:x <- $r10
+	.loc	0 4 43                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:43 @[ /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:14 ]
+	mov	r10, r12
+	call	#g
+.Ltmp8:
+	.loc	0 4 41                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:4:41 @[ /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:14 ]
+	add	r10, r10
+.Ltmp9:
+	add	r10, r10
+.Ltmp10:
+	.loc	0 10 12                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:12
+	add	r10, r12
+	.loc	0 10 3 epilogue_begin is_stmt 0 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:10:3
+	add	#2, r1
+	pop	r10
+	ret
+.Ltmp11:
+.Lfunc_end0:
+	.size	sum, .Lfunc_end0-sum
+                                        ; -- End function
+	.globl	big                             ; -- Begin function big
+	.p2align	1
+	.type	big,@function
+big:                                    ; @big
+.Lfunc_begin1:
+	.loc	0 12 0 is_stmt 1                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:12:0
+; %bb.0:
+	;DEBUG_VALUE: big:p <- $r12
+	;DEBUG_VALUE: big:k <- $r13
+	push	r10
+	sub	#256, r1
+	clr	r14
+	;DEBUG_VALUE: i <- 0
+.Ltmp12:
+.LBB1_1:                                ; =>This Inner Loop Header: Depth=1
+	;DEBUG_VALUE: big:k <- $r13
+	;DEBUG_VALUE: big:p <- $r12
+	;DEBUG_VALUE: i <- $r14
+	mov	r1, r15
+.Ltmp13:
+	.loc	0 14 33 prologue_end            ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:33
+	add	r14, r15
+	.loc	0 14 51 is_stmt 0               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:51
+	mov	r14, r11
+	xor	r13, r11
+	.loc	0 14 40                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:40
+	mov.b	r11, 0(r15)
+	.loc	0 14 29 is_stmt 1               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:29
+	inc	r14
+.Ltmp14:
+	;DEBUG_VALUE: i <- $r14
+	.loc	0 14 3                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:14:3
+	cmp	#256, r14
+	jne	.LBB1_1
+.Ltmp15:
+; %bb.2:
+	;DEBUG_VALUE: big:k <- $r13
+	;DEBUG_VALUE: big:p <- $r12
+	.loc	0 15 9                          ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:9
+	cmp	#11, r13
+	jl	.LBB1_4
+.Ltmp16:
+; %bb.3:
+	;DEBUG_VALUE: big:k <- $r13
+	;DEBUG_VALUE: big:p <- $r12
+	.loc	0 15 35                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:35
+	mov.b	r13, r13
+.Ltmp17:
+	.loc	0 0 35 is_stmt 0                ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:0:35
+	mov	r1, r14
+	.loc	0 15 29                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:29
+	add	r13, r14
+	mov.b	0(r14), r14
+	.loc	0 15 25                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:25
+	mov	2(r12), r13
+	.loc	0 15 27                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:27
+	add	r13, r14
+	cmp	r13, r14
+	mov	#1, r13
+	bic	r2, r13
+	add	4(r12), r13
+	mov	r14, r12
+.Ltmp18:
+	.loc	0 15 15                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:15:15
+	jmp	.LBB1_5
+.Ltmp19:
+.LBB1_4:
+	;DEBUG_VALUE: big:k <- $r13
+	;DEBUG_VALUE: big:p <- $r12
+	.loc	0 16 13 is_stmt 1               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:13
+	mov	0(r12), r10
+	.loc	0 16 19 is_stmt 0               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:19
+	mov.b	3(r1), r12
+.Ltmp20:
+	.loc	0 16 17                         ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:17
+	call	#g
+.Ltmp21:
+	.loc	0 16 15 is_stmt 1               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:15
+	add	r10, r12
+	.loc	0 16 10 is_stmt 0               ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:16:10
+	mov	r12, r13
+	swpb	r13
+	sxt	r13
+	rra	r13
+	rra	r13
+	rra	r13
+	rra	r13
+	rra	r13
+	rra	r13
+	rra	r13
+.LBB1_5:
+	.loc	0 17 1 epilogue_begin is_stmt 1 ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:17:1
+	add	#256, r1
+	pop	r10
+	ret
+.Ltmp22:
+.Lfunc_end1:
+	.size	big, .Lfunc_end1-big
+                                        ; -- End function
+	.globl	leaf                            ; -- Begin function leaf
+	.p2align	1
+	.type	leaf,@function
+leaf:                                   ; @leaf
+.Lfunc_begin2:
+; %bb.0:
+	.loc	0 18 18 prologue_end            ; /home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c:18:18
+	ret
+.Ltmp23:
+.Lfunc_end2:
+	.size	leaf, .Lfunc_end2-leaf
+                                        ; -- End function
+	.file	1 "/usr/lib/llvm/22/bin/../../../../lib/clang/22/include" "__stdarg_va_list.h" md5 0x7bd78a282b99fcfe41a9e3c566d14f7d
+	.section	.debug_loclists,"",@progbits
+	.long	.Ldebug_list_header_end0-.Ldebug_list_header_start0 ; Length
+.Ldebug_list_header_start0:
+	.short	5                               ; Version
+	.byte	4                               ; Address size
+	.byte	0                               ; Segment selector size
+	.long	5                               ; Offset entry count
+.Lloclists_table_base0:
+	.long	.Ldebug_loc0-.Lloclists_table_base0
+	.long	.Ldebug_loc1-.Lloclists_table_base0
+	.long	.Ldebug_loc2-.Lloclists_table_base0
+	.long	.Ldebug_loc3-.Lloclists_table_base0
+	.long	.Ldebug_loc4-.Lloclists_table_base0
+.Ldebug_loc0:
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp1-.Lfunc_begin0           ;   starting offset
+	.uleb128 .Ltmp4-.Lfunc_begin0           ;   ending offset
+	.byte	3                               ; Loc expr size
+	.byte	17                              ; DW_OP_consts
+	.byte	0                               ; 0
+	.byte	159                             ; DW_OP_stack_value
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp4-.Lfunc_begin0           ;   starting offset
+	.uleb128 .Ltmp7-.Lfunc_begin0           ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	90                              ; DW_OP_reg10
+	.byte	0                               ; DW_LLE_end_of_list
+.Ldebug_loc1:
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp2-.Lfunc_begin0           ;   starting offset
+	.uleb128 .Ltmp4-.Lfunc_begin0           ;   ending offset
+	.byte	3                               ; Loc expr size
+	.byte	17                              ; DW_OP_consts
+	.byte	0                               ; 0
+	.byte	159                             ; DW_OP_stack_value
+	.byte	0                               ; DW_LLE_end_of_list
+.Ldebug_loc2:
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp7-.Lfunc_begin0           ;   starting offset
+	.uleb128 .Ltmp9-.Lfunc_begin0           ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	90                              ; DW_OP_reg10
+	.byte	0                               ; DW_LLE_end_of_list
+.Ldebug_loc3:
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Lfunc_begin1-.Lfunc_begin0    ;   starting offset
+	.uleb128 .Ltmp18-.Lfunc_begin0          ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	92                              ; DW_OP_reg12
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp19-.Lfunc_begin0          ;   starting offset
+	.uleb128 .Ltmp20-.Lfunc_begin0          ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	92                              ; DW_OP_reg12
+	.byte	0                               ; DW_LLE_end_of_list
+.Ldebug_loc4:
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Lfunc_begin1-.Lfunc_begin0    ;   starting offset
+	.uleb128 .Ltmp17-.Lfunc_begin0          ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	93                              ; DW_OP_reg13
+	.byte	4                               ; DW_LLE_offset_pair
+	.uleb128 .Ltmp19-.Lfunc_begin0          ;   starting offset
+	.uleb128 .Ltmp21-.Lfunc_begin0          ;   ending offset
+	.byte	1                               ; Loc expr size
+	.byte	93                              ; DW_OP_reg13
+	.byte	0                               ; DW_LLE_end_of_list
+.Ldebug_list_header_end0:
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	37                              ; DW_AT_producer
+	.byte	37                              ; DW_FORM_strx1
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	114                             ; DW_AT_str_offsets_base
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	37                              ; DW_FORM_strx1
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	115                             ; DW_AT_addr_base
+	.byte	23                              ; DW_FORM_sec_offset
+	.ascii	"\214\001"                      ; DW_AT_loclists_base
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	2                               ; Abbreviation Code
+	.byte	36                              ; DW_TAG_base_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	62                              ; DW_AT_encoding
+	.byte	11                              ; DW_FORM_data1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	3                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	32                              ; DW_AT_inline
+	.byte	33                              ; DW_FORM_implicit_const
+	.byte	1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	4                               ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	5                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	64                              ; DW_AT_frame_base
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	122                             ; DW_AT_call_all_calls
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	63                              ; DW_AT_external
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	6                               ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	7                               ; Abbreviation Code
+	.byte	52                              ; DW_TAG_variable
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	8                               ; Abbreviation Code
+	.byte	52                              ; DW_TAG_variable
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	34                              ; DW_FORM_loclistx
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	9                               ; Abbreviation Code
+	.byte	11                              ; DW_TAG_lexical_block
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	10                              ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	11                              ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	34                              ; DW_FORM_loclistx
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	12                              ; Abbreviation Code
+	.byte	24                              ; DW_TAG_unspecified_parameters
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	13                              ; Abbreviation Code
+	.byte	72                              ; DW_TAG_call_site
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	127                             ; DW_AT_call_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	125                             ; DW_AT_call_return_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	14                              ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	60                              ; DW_AT_declaration
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	63                              ; DW_AT_external
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	15                              ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	16                              ; Abbreviation Code
+	.byte	5                               ; DW_TAG_formal_parameter
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	2                               ; DW_AT_location
+	.byte	34                              ; DW_FORM_loclistx
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	17                              ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	17                              ; DW_AT_low_pc
+	.byte	27                              ; DW_FORM_addrx
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	64                              ; DW_AT_frame_base
+	.byte	24                              ; DW_FORM_exprloc
+	.byte	122                             ; DW_AT_call_all_calls
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	39                              ; DW_AT_prototyped
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	63                              ; DW_AT_external
+	.byte	25                              ; DW_FORM_flag_present
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	18                              ; Abbreviation Code
+	.byte	22                              ; DW_TAG_typedef
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	19                              ; Abbreviation Code
+	.byte	22                              ; DW_TAG_typedef
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	20                              ; Abbreviation Code
+	.byte	15                              ; DW_TAG_pointer_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	21                              ; Abbreviation Code
+	.byte	1                               ; DW_TAG_array_type
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	22                              ; Abbreviation Code
+	.byte	33                              ; DW_TAG_subrange_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	55                              ; DW_AT_count
+	.byte	5                               ; DW_FORM_data2
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	23                              ; Abbreviation Code
+	.byte	36                              ; DW_TAG_base_type
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	62                              ; DW_AT_encoding
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	24                              ; Abbreviation Code
+	.byte	19                              ; DW_TAG_structure_type
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	11                              ; DW_AT_byte_size
+	.byte	11                              ; DW_FORM_data1
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	25                              ; Abbreviation Code
+	.byte	13                              ; DW_TAG_member
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	37                              ; DW_FORM_strx1
+	.byte	73                              ; DW_AT_type
+	.byte	19                              ; DW_FORM_ref4
+	.byte	58                              ; DW_AT_decl_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	59                              ; DW_AT_decl_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	56                              ; DW_AT_data_member_location
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	5                               ; DWARF version number
+	.byte	1                               ; DWARF Unit Type
+	.byte	4                               ; Address Size (in bytes)
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	1                               ; Abbrev [1] 0xc:0x131 DW_TAG_compile_unit
+	.byte	0                               ; DW_AT_producer
+	.short	29                              ; DW_AT_language
+	.byte	1                               ; DW_AT_name
+	.long	.Lstr_offsets_base0             ; DW_AT_str_offsets_base
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.byte	2                               ; DW_AT_comp_dir
+	.byte	0                               ; DW_AT_low_pc
+	.long	.Lfunc_end2-.Lfunc_begin0       ; DW_AT_high_pc
+	.long	.Laddr_table_base0              ; DW_AT_addr_base
+	.long	.Lloclists_table_base0          ; DW_AT_loclists_base
+	.byte	2                               ; Abbrev [2] 0x27:0x4 DW_TAG_base_type
+	.byte	3                               ; DW_AT_name
+	.byte	8                               ; DW_AT_encoding
+	.byte	1                               ; DW_AT_byte_size
+	.byte	3                               ; Abbrev [3] 0x2b:0x11 DW_TAG_subprogram
+	.byte	4                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	4                               ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	60                              ; DW_AT_type
+                                        ; DW_AT_inline
+	.byte	4                               ; Abbrev [4] 0x33:0x8 DW_TAG_formal_parameter
+	.byte	6                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	4                               ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	2                               ; Abbrev [2] 0x3c:0x4 DW_TAG_base_type
+	.byte	5                               ; DW_AT_name
+	.byte	5                               ; DW_AT_encoding
+	.byte	2                               ; DW_AT_byte_size
+	.byte	5                               ; Abbrev [5] 0x40:0x5a DW_TAG_subprogram
+	.byte	0                               ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+                                        ; DW_AT_call_all_calls
+	.byte	8                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	5                               ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	60                              ; DW_AT_type
+                                        ; DW_AT_external
+	.byte	6                               ; Abbrev [6] 0x4f:0xb DW_TAG_formal_parameter
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	6
+	.byte	15                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	5                               ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	7                               ; Abbrev [7] 0x5a:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	0
+	.byte	12                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	6                               ; DW_AT_decl_line
+	.long	251                             ; DW_AT_type
+	.byte	8                               ; Abbrev [8] 0x65:0x9 DW_TAG_variable
+	.byte	0                               ; DW_AT_location
+	.byte	16                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	6                               ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	9                               ; Abbrev [9] 0x6e:0x10 DW_TAG_lexical_block
+	.byte	1                               ; DW_AT_low_pc
+	.long	.Ltmp7-.Ltmp3                   ; DW_AT_high_pc
+	.byte	8                               ; Abbrev [8] 0x74:0x9 DW_TAG_variable
+	.byte	1                               ; DW_AT_location
+	.byte	17                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	8                               ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	10                              ; Abbrev [10] 0x7e:0x14 DW_TAG_inlined_subroutine
+	.long	43                              ; DW_AT_abstract_origin
+	.byte	2                               ; DW_AT_low_pc
+	.long	.Ltmp10-.Ltmp7                  ; DW_AT_high_pc
+	.byte	0                               ; DW_AT_call_file
+	.byte	10                              ; DW_AT_call_line
+	.byte	14                              ; DW_AT_call_column
+	.byte	11                              ; Abbrev [11] 0x8b:0x6 DW_TAG_formal_parameter
+	.byte	2                               ; DW_AT_location
+	.long	51                              ; DW_AT_abstract_origin
+	.byte	0                               ; End Of Children Mark
+	.byte	12                              ; Abbrev [12] 0x92:0x1 DW_TAG_unspecified_parameters
+	.byte	13                              ; Abbrev [13] 0x93:0x6 DW_TAG_call_site
+	.long	154                             ; DW_AT_call_origin
+	.byte	3                               ; DW_AT_call_return_pc
+	.byte	0                               ; End Of Children Mark
+	.byte	14                              ; Abbrev [14] 0x9a:0xe DW_TAG_subprogram
+	.byte	7                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	3                               ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	60                              ; DW_AT_type
+                                        ; DW_AT_declaration
+                                        ; DW_AT_external
+	.byte	15                              ; Abbrev [15] 0xa2:0x5 DW_TAG_formal_parameter
+	.long	60                              ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	5                               ; Abbrev [5] 0xa8:0x44 DW_TAG_subprogram
+	.byte	4                               ; DW_AT_low_pc
+	.long	.Lfunc_end1-.Lfunc_begin1       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+                                        ; DW_AT_call_all_calls
+	.byte	9                               ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+	.long	247                             ; DW_AT_type
+                                        ; DW_AT_external
+	.byte	16                              ; Abbrev [16] 0xb7:0x9 DW_TAG_formal_parameter
+	.byte	3                               ; DW_AT_location
+	.byte	20                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.long	287                             ; DW_AT_type
+	.byte	16                              ; Abbrev [16] 0xc0:0x9 DW_TAG_formal_parameter
+	.byte	4                               ; DW_AT_location
+	.byte	24                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	7                               ; Abbrev [7] 0xc9:0xb DW_TAG_variable
+	.byte	2                               ; DW_AT_location
+	.byte	145
+	.byte	0
+	.byte	18                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	13                              ; DW_AT_decl_line
+	.long	270                             ; DW_AT_type
+	.byte	9                               ; Abbrev [9] 0xd4:0x11 DW_TAG_lexical_block
+	.byte	5                               ; DW_AT_low_pc
+	.long	.Ltmp15-.Ltmp13                 ; DW_AT_high_pc
+	.byte	7                               ; Abbrev [7] 0xda:0xa DW_TAG_variable
+	.byte	1                               ; DW_AT_location
+	.byte	94
+	.byte	17                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	14                              ; DW_AT_decl_line
+	.long	60                              ; DW_AT_type
+	.byte	0                               ; End Of Children Mark
+	.byte	13                              ; Abbrev [13] 0xe5:0x6 DW_TAG_call_site
+	.long	154                             ; DW_AT_call_origin
+	.byte	6                               ; DW_AT_call_return_pc
+	.byte	0                               ; End Of Children Mark
+	.byte	17                              ; Abbrev [17] 0xec:0xb DW_TAG_subprogram
+	.byte	7                               ; DW_AT_low_pc
+	.long	.Lfunc_end2-.Lfunc_begin2       ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_frame_base
+	.byte	81
+                                        ; DW_AT_call_all_calls
+	.byte	11                              ; DW_AT_name
+	.byte	0                               ; DW_AT_decl_file
+	.byte	18                              ; DW_AT_decl_line
+                                        ; DW_AT_prototyped
+                                        ; DW_AT_external
+	.byte	2                               ; Abbrev [2] 0xf7:0x4 DW_TAG_base_type
+	.byte	10                              ; DW_AT_name
+	.byte	5                               ; DW_AT_encoding
+	.byte	4                               ; DW_AT_byte_size
+	.byte	18                              ; Abbrev [18] 0xfb:0x8 DW_TAG_typedef
+	.long	259                             ; DW_AT_type
+	.byte	14                              ; DW_AT_name
+	.byte	1                               ; DW_AT_decl_file
+	.byte	12                              ; DW_AT_decl_line
+	.byte	19                              ; Abbrev [19] 0x103:0x6 DW_TAG_typedef
+	.long	265                             ; DW_AT_type
+	.byte	13                              ; DW_AT_name
+	.byte	20                              ; Abbrev [20] 0x109:0x5 DW_TAG_pointer_type
+	.long	39                              ; DW_AT_type
+	.byte	21                              ; Abbrev [21] 0x10e:0xd DW_TAG_array_type
+	.long	39                              ; DW_AT_type
+	.byte	22                              ; Abbrev [22] 0x113:0x7 DW_TAG_subrange_type
+	.long	283                             ; DW_AT_type
+	.short	256                             ; DW_AT_count
+	.byte	0                               ; End Of Children Mark
+	.byte	23                              ; Abbrev [23] 0x11b:0x4 DW_TAG_base_type
+	.byte	19                              ; DW_AT_name
+	.byte	8                               ; DW_AT_byte_size
+	.byte	7                               ; DW_AT_encoding
+	.byte	20                              ; Abbrev [20] 0x11f:0x5 DW_TAG_pointer_type
+	.long	292                             ; DW_AT_type
+	.byte	24                              ; Abbrev [24] 0x124:0x18 DW_TAG_structure_type
+	.byte	23                              ; DW_AT_name
+	.byte	6                               ; DW_AT_byte_size
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	25                              ; Abbrev [25] 0x129:0x9 DW_TAG_member
+	.byte	21                              ; DW_AT_name
+	.long	60                              ; DW_AT_type
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	0                               ; DW_AT_data_member_location
+	.byte	25                              ; Abbrev [25] 0x132:0x9 DW_TAG_member
+	.byte	22                              ; DW_AT_name
+	.long	247                             ; DW_AT_type
+	.byte	0                               ; DW_AT_decl_file
+	.byte	2                               ; DW_AT_decl_line
+	.byte	2                               ; DW_AT_data_member_location
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+.Ldebug_info_end0:
+	.section	.debug_str_offsets,"",@progbits
+	.long	104                             ; Length of String Offsets Set
+	.short	5
+	.short	0
+.Lstr_offsets_base0:
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.byte	0                               ; string offset=0
+.Linfo_string1:
+	.asciz	"/home/magicaltux/projects/rsasm/.claude/worktrees/agent-af52de4cee8200c8d/tools/dwarf-diff/compiler.c" ; string offset=1
+.Linfo_string2:
+	.asciz	"/build"                        ; string offset=103
+.Linfo_string3:
+	.asciz	"char"                          ; string offset=110
+.Linfo_string4:
+	.asciz	"helper"                        ; string offset=115
+.Linfo_string5:
+	.asciz	"int"                           ; string offset=122
+.Linfo_string6:
+	.asciz	"x"                             ; string offset=126
+.Linfo_string7:
+	.asciz	"g"                             ; string offset=128
+.Linfo_string8:
+	.asciz	"sum"                           ; string offset=130
+.Linfo_string9:
+	.asciz	"big"                           ; string offset=134
+.Linfo_string10:
+	.asciz	"long"                          ; string offset=138
+.Linfo_string11:
+	.asciz	"leaf"                          ; string offset=143
+.Linfo_string12:
+	.asciz	"ap"                            ; string offset=148
+.Linfo_string13:
+	.asciz	"__builtin_va_list"             ; string offset=151
+.Linfo_string14:
+	.asciz	"va_list"                       ; string offset=169
+.Linfo_string15:
+	.asciz	"n"                             ; string offset=177
+.Linfo_string16:
+	.asciz	"s"                             ; string offset=179
+.Linfo_string17:
+	.asciz	"i"                             ; string offset=181
+.Linfo_string18:
+	.asciz	"buf"                           ; string offset=183
+.Linfo_string19:
+	.asciz	"__ARRAY_SIZE_TYPE__"           ; string offset=187
+.Linfo_string20:
+	.asciz	"p"                             ; string offset=207
+.Linfo_string21:
+	.asciz	"a"                             ; string offset=209
+.Linfo_string22:
+	.asciz	"b"                             ; string offset=211
+.Linfo_string23:
+	.asciz	"S"                             ; string offset=213
+.Linfo_string24:
+	.asciz	"k"                             ; string offset=215
+	.section	.debug_str_offsets,"",@progbits
+	.long	.Linfo_string0
+	.long	.Linfo_string1
+	.long	.Linfo_string2
+	.long	.Linfo_string3
+	.long	.Linfo_string4
+	.long	.Linfo_string5
+	.long	.Linfo_string6
+	.long	.Linfo_string7
+	.long	.Linfo_string8
+	.long	.Linfo_string9
+	.long	.Linfo_string10
+	.long	.Linfo_string11
+	.long	.Linfo_string12
+	.long	.Linfo_string13
+	.long	.Linfo_string14
+	.long	.Linfo_string15
+	.long	.Linfo_string16
+	.long	.Linfo_string17
+	.long	.Linfo_string18
+	.long	.Linfo_string19
+	.long	.Linfo_string20
+	.long	.Linfo_string21
+	.long	.Linfo_string22
+	.long	.Linfo_string23
+	.long	.Linfo_string24
+	.section	.debug_addr,"",@progbits
+	.long	.Ldebug_addr_end0-.Ldebug_addr_start0 ; Length of contribution
+.Ldebug_addr_start0:
+	.short	5                               ; DWARF version number
+	.byte	4                               ; Address size
+	.byte	0                               ; Segment selector size
+.Laddr_table_base0:
+	.long	.Lfunc_begin0
+	.long	.Ltmp3
+	.long	.Ltmp7
+	.long	.Ltmp8
+	.long	.Lfunc_begin1
+	.long	.Ltmp13
+	.long	.Ltmp21
+	.long	.Lfunc_begin2
+.Ldebug_addr_end0:
+	.section	".note.GNU-stack","",@progbits
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:

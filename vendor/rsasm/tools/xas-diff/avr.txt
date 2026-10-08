@@ -1,0 +1,1468 @@
+# AVR, checked against avr-elf-as (GNU binutils 2.47) with no -mmcu, which
+# assembles for the AVR2 instruction set: no jmp, call, movw, mul or break.
+# One statement per line. Generated from every row of the opcode table,
+# include/opcode/avr.h, and kept to what the reference accepts; avr51.txt,
+# avrxmega.txt and avrtiny.txt hold what only a larger or different core has.
+#
+# A branch to a label is relocated even within its section (linker
+# relaxation), so its field is zero on both sides and says nothing here; the
+# branches below go to plain numbers, which GNU as resolves, measured from the
+# start of the section. avr-relocs.txt and tools/flat-diff/avr.txt check the
+# rest.
+#
+# Not here, because rsasm refuses on purpose what the reference accepts with
+# a warning (tests/avr.rs covers them): an ldi constant below -255, an
+# AVR-tiny lds/sts address outside 0x40-0xbf, and lo8(gs()) of a number,
+# which is a fatal error there.
+
+# ---- no operands -----------------------------------------------------------
+clc
+clh
+cli
+cln
+cls
+clt
+clv
+clz
+sec
+seh
+sei
+sen
+ses
+set
+sev
+sez
+
+# ---- SREG bit set and clear ------------------------------------------------
+bclr 0
+bclr 1
+bclr 5
+bclr 7
+bset 0
+bset 1
+bset 5
+bset 7
+
+# ---- no operands -----------------------------------------------------------
+icall
+ijmp
+
+# ---- program memory load ---------------------------------------------------
+lpm
+lpm r0, Z
+lpm r0, z
+lpm r5, Z
+lpm r5, z
+lpm r16, Z
+lpm r16, z
+lpm r31, Z
+lpm r31, z
+
+# ---- no operands -----------------------------------------------------------
+nop
+ret
+reti
+sleep
+wdr
+
+# ---- two registers ---------------------------------------------------------
+adc r0, r5
+adc r1, r5
+adc r7, r5
+adc r15, r5
+adc r16, r5
+adc r17, r5
+adc r23, r5
+adc r24, r5
+adc r25, r5
+adc r26, r5
+adc r29, r5
+adc r30, r5
+adc r31, r5
+adc r5, r0
+adc r5, r1
+adc r5, r7
+adc r5, r15
+adc r5, r16
+adc r5, r17
+adc r5, r23
+adc r5, r24
+adc r5, r25
+adc r5, r26
+adc r5, r29
+adc r5, r30
+adc r5, r31
+adc r31,r31
+adc R16, R17
+adc 3, 4
+adc xl, zh
+add r0, r5
+add r1, r5
+add r7, r5
+add r15, r5
+add r16, r5
+add r17, r5
+add r23, r5
+add r24, r5
+add r25, r5
+add r26, r5
+add r29, r5
+add r30, r5
+add r31, r5
+add r5, r0
+add r5, r1
+add r5, r7
+add r5, r15
+add r5, r16
+add r5, r17
+add r5, r23
+add r5, r24
+add r5, r25
+add r5, r26
+add r5, r29
+add r5, r30
+add r5, r31
+add r31,r31
+add R16, R17
+add 3, 4
+add xl, zh
+and r0, r5
+and r1, r5
+and r7, r5
+and r15, r5
+and r16, r5
+and r17, r5
+and r23, r5
+and r24, r5
+and r25, r5
+and r26, r5
+and r29, r5
+and r30, r5
+and r31, r5
+and r5, r0
+and r5, r1
+and r5, r7
+and r5, r15
+and r5, r16
+and r5, r17
+and r5, r23
+and r5, r24
+and r5, r25
+and r5, r26
+and r5, r29
+and r5, r30
+and r5, r31
+and r31,r31
+and R16, R17
+and 3, 4
+and xl, zh
+cp r0, r5
+cp r1, r5
+cp r7, r5
+cp r15, r5
+cp r16, r5
+cp r17, r5
+cp r23, r5
+cp r24, r5
+cp r25, r5
+cp r26, r5
+cp r29, r5
+cp r30, r5
+cp r31, r5
+cp r5, r0
+cp r5, r1
+cp r5, r7
+cp r5, r15
+cp r5, r16
+cp r5, r17
+cp r5, r23
+cp r5, r24
+cp r5, r25
+cp r5, r26
+cp r5, r29
+cp r5, r30
+cp r5, r31
+cp r31,r31
+cp R16, R17
+cp 3, 4
+cp xl, zh
+cpc r0, r5
+cpc r1, r5
+cpc r7, r5
+cpc r15, r5
+cpc r16, r5
+cpc r17, r5
+cpc r23, r5
+cpc r24, r5
+cpc r25, r5
+cpc r26, r5
+cpc r29, r5
+cpc r30, r5
+cpc r31, r5
+cpc r5, r0
+cpc r5, r1
+cpc r5, r7
+cpc r5, r15
+cpc r5, r16
+cpc r5, r17
+cpc r5, r23
+cpc r5, r24
+cpc r5, r25
+cpc r5, r26
+cpc r5, r29
+cpc r5, r30
+cpc r5, r31
+cpc r31,r31
+cpc R16, R17
+cpc 3, 4
+cpc xl, zh
+cpse r0, r5
+cpse r1, r5
+cpse r7, r5
+cpse r15, r5
+cpse r16, r5
+cpse r17, r5
+cpse r23, r5
+cpse r24, r5
+cpse r25, r5
+cpse r26, r5
+cpse r29, r5
+cpse r30, r5
+cpse r31, r5
+cpse r5, r0
+cpse r5, r1
+cpse r5, r7
+cpse r5, r15
+cpse r5, r16
+cpse r5, r17
+cpse r5, r23
+cpse r5, r24
+cpse r5, r25
+cpse r5, r26
+cpse r5, r29
+cpse r5, r30
+cpse r5, r31
+cpse r31,r31
+cpse R16, R17
+cpse 3, 4
+cpse xl, zh
+eor r0, r5
+eor r1, r5
+eor r7, r5
+eor r15, r5
+eor r16, r5
+eor r17, r5
+eor r23, r5
+eor r24, r5
+eor r25, r5
+eor r26, r5
+eor r29, r5
+eor r30, r5
+eor r31, r5
+eor r5, r0
+eor r5, r1
+eor r5, r7
+eor r5, r15
+eor r5, r16
+eor r5, r17
+eor r5, r23
+eor r5, r24
+eor r5, r25
+eor r5, r26
+eor r5, r29
+eor r5, r30
+eor r5, r31
+eor r31,r31
+eor R16, R17
+eor 3, 4
+eor xl, zh
+mov r0, r5
+mov r1, r5
+mov r7, r5
+mov r15, r5
+mov r16, r5
+mov r17, r5
+mov r23, r5
+mov r24, r5
+mov r25, r5
+mov r26, r5
+mov r29, r5
+mov r30, r5
+mov r31, r5
+mov r5, r0
+mov r5, r1
+mov r5, r7
+mov r5, r15
+mov r5, r16
+mov r5, r17
+mov r5, r23
+mov r5, r24
+mov r5, r25
+mov r5, r26
+mov r5, r29
+mov r5, r30
+mov r5, r31
+mov r31,r31
+mov R16, R17
+mov 3, 4
+mov xl, zh
+or r0, r5
+or r1, r5
+or r7, r5
+or r15, r5
+or r16, r5
+or r17, r5
+or r23, r5
+or r24, r5
+or r25, r5
+or r26, r5
+or r29, r5
+or r30, r5
+or r31, r5
+or r5, r0
+or r5, r1
+or r5, r7
+or r5, r15
+or r5, r16
+or r5, r17
+or r5, r23
+or r5, r24
+or r5, r25
+or r5, r26
+or r5, r29
+or r5, r30
+or r5, r31
+or r31,r31
+or R16, R17
+or 3, 4
+or xl, zh
+sbc r0, r5
+sbc r1, r5
+sbc r7, r5
+sbc r15, r5
+sbc r16, r5
+sbc r17, r5
+sbc r23, r5
+sbc r24, r5
+sbc r25, r5
+sbc r26, r5
+sbc r29, r5
+sbc r30, r5
+sbc r31, r5
+sbc r5, r0
+sbc r5, r1
+sbc r5, r7
+sbc r5, r15
+sbc r5, r16
+sbc r5, r17
+sbc r5, r23
+sbc r5, r24
+sbc r5, r25
+sbc r5, r26
+sbc r5, r29
+sbc r5, r30
+sbc r5, r31
+sbc r31,r31
+sbc R16, R17
+sbc 3, 4
+sbc xl, zh
+sub r0, r5
+sub r1, r5
+sub r7, r5
+sub r15, r5
+sub r16, r5
+sub r17, r5
+sub r23, r5
+sub r24, r5
+sub r25, r5
+sub r26, r5
+sub r29, r5
+sub r30, r5
+sub r31, r5
+sub r5, r0
+sub r5, r1
+sub r5, r7
+sub r5, r15
+sub r5, r16
+sub r5, r17
+sub r5, r23
+sub r5, r24
+sub r5, r25
+sub r5, r26
+sub r5, r29
+sub r5, r30
+sub r5, r31
+sub r31,r31
+sub R16, R17
+sub 3, 4
+sub xl, zh
+
+# ---- one register standing for two -----------------------------------------
+clr r0
+clr r1
+clr r7
+clr r15
+clr r16
+clr r17
+clr r23
+clr r24
+clr r25
+clr r26
+clr r29
+clr r30
+clr r31
+clr yl
+clr YH
+lsl r0
+lsl r1
+lsl r7
+lsl r15
+lsl r16
+lsl r17
+lsl r23
+lsl r24
+lsl r25
+lsl r26
+lsl r29
+lsl r30
+lsl r31
+lsl yl
+lsl YH
+rol r0
+rol r1
+rol r7
+rol r15
+rol r16
+rol r17
+rol r23
+rol r24
+rol r25
+rol r26
+rol r29
+rol r30
+rol r31
+rol yl
+rol YH
+tst r0
+tst r1
+tst r7
+tst r15
+tst r16
+tst r17
+tst r23
+tst r24
+tst r25
+tst r26
+tst r29
+tst r30
+tst r31
+tst yl
+tst YH
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+andi r16, 0x55
+andi r17, 0x55
+andi r24, 0x55
+andi r31, 0x55
+andi r20, 0
+andi r20, 1
+andi r20, 0x0f
+andi r20, 0x10
+andi r20, 0x7f
+andi r20, 0x80
+andi r20, 0xf0
+andi r20, 0xff
+andi r20, 255
+andi r20, -1
+andi r20, -128
+andi r20, -255
+andi r20, 'A'
+andi r20, lo8(0x1234)
+andi r20, hi8(0x1234)
+andi r20, hh8(0x123456)
+andi r20, hlo8(0x123456)
+andi r20, hhi8(0x12345678)
+andi r20, pm_lo8(0x1234)
+andi r20, pm_hi8(0x1234)
+andi r20, pm_hh8(0x123456)
+andi r20, lo8(-(0x1234))
+andi r20, hi8(-(0x1234))
+andi r20, hh8(-(0x123456))
+andi r20, hhi8(-(0x12345678))
+andi r20, lo8(pm(0x1234))
+andi r20, hi8(pm(0x1234))
+andi r20, hh8(pm(0x123456))
+andi r20, pm_lo8(-(0x1234))
+andi r20, pm_hi8(-(0x1234))
+andi r20, pm_hh8(-(0x123456))
+andi r20, lo8(-(pm(0x1234)))
+andi r20, hi8(-(pm(0x1234)))
+andi r20, hh8(-(pm(0x123456)))
+andi r20, lo8(0x12 + 3)
+andi r20, (1 << 4) | 3
+andi r20, ~0 & 0xff
+
+# ---- cbr, a complemented andi ----------------------------------------------
+cbr r16, 0x55
+cbr r17, 0x55
+cbr r24, 0x55
+cbr r31, 0x55
+cbr r20, 0
+cbr r20, 1
+cbr r20, 0xf0
+cbr r20, 0xff
+cbr r20, 7
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+ldi r16, 0x55
+ldi r17, 0x55
+ldi r24, 0x55
+ldi r31, 0x55
+ldi r20, 0
+ldi r20, 1
+ldi r20, 0x0f
+ldi r20, 0x10
+ldi r20, 0x7f
+ldi r20, 0x80
+ldi r20, 0xf0
+ldi r20, 0xff
+ldi r20, 255
+ldi r20, -1
+ldi r20, -128
+ldi r20, -255
+ldi r20, 'A'
+ldi r20, lo8(0x1234)
+ldi r20, hi8(0x1234)
+ldi r20, hh8(0x123456)
+ldi r20, hlo8(0x123456)
+ldi r20, hhi8(0x12345678)
+ldi r20, pm_lo8(0x1234)
+ldi r20, pm_hi8(0x1234)
+ldi r20, pm_hh8(0x123456)
+ldi r20, lo8(-(0x1234))
+ldi r20, hi8(-(0x1234))
+ldi r20, hh8(-(0x123456))
+ldi r20, hhi8(-(0x12345678))
+ldi r20, lo8(pm(0x1234))
+ldi r20, hi8(pm(0x1234))
+ldi r20, hh8(pm(0x123456))
+ldi r20, pm_lo8(-(0x1234))
+ldi r20, pm_hi8(-(0x1234))
+ldi r20, pm_hh8(-(0x123456))
+ldi r20, lo8(-(pm(0x1234)))
+ldi r20, hi8(-(pm(0x1234)))
+ldi r20, hh8(-(pm(0x123456)))
+ldi r20, lo8(0x12 + 3)
+ldi r20, (1 << 4) | 3
+ldi r20, ~0 & 0xff
+
+# ---- ser -------------------------------------------------------------------
+ser r16
+ser r17
+ser r24
+ser r31
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+ori r16, 0x55
+ori r17, 0x55
+ori r24, 0x55
+ori r31, 0x55
+ori r20, 0
+ori r20, 1
+ori r20, 0x0f
+ori r20, 0x10
+ori r20, 0x7f
+ori r20, 0x80
+ori r20, 0xf0
+ori r20, 0xff
+ori r20, 255
+ori r20, -1
+ori r20, -128
+ori r20, -255
+ori r20, 'A'
+ori r20, lo8(0x1234)
+ori r20, hi8(0x1234)
+ori r20, hh8(0x123456)
+ori r20, hlo8(0x123456)
+ori r20, hhi8(0x12345678)
+ori r20, pm_lo8(0x1234)
+ori r20, pm_hi8(0x1234)
+ori r20, pm_hh8(0x123456)
+ori r20, lo8(-(0x1234))
+ori r20, hi8(-(0x1234))
+ori r20, hh8(-(0x123456))
+ori r20, hhi8(-(0x12345678))
+ori r20, lo8(pm(0x1234))
+ori r20, hi8(pm(0x1234))
+ori r20, hh8(pm(0x123456))
+ori r20, pm_lo8(-(0x1234))
+ori r20, pm_hi8(-(0x1234))
+ori r20, pm_hh8(-(0x123456))
+ori r20, lo8(-(pm(0x1234)))
+ori r20, hi8(-(pm(0x1234)))
+ori r20, hh8(-(pm(0x123456)))
+ori r20, lo8(0x12 + 3)
+ori r20, (1 << 4) | 3
+ori r20, ~0 & 0xff
+sbr r16, 0x55
+sbr r17, 0x55
+sbr r24, 0x55
+sbr r31, 0x55
+sbr r20, 0
+sbr r20, 1
+sbr r20, 0x0f
+sbr r20, 0x10
+sbr r20, 0x7f
+sbr r20, 0x80
+sbr r20, 0xf0
+sbr r20, 0xff
+sbr r20, 255
+sbr r20, -1
+sbr r20, -128
+sbr r20, -255
+sbr r20, 'A'
+sbr r20, lo8(0x1234)
+sbr r20, hi8(0x1234)
+sbr r20, hh8(0x123456)
+sbr r20, hlo8(0x123456)
+sbr r20, hhi8(0x12345678)
+sbr r20, pm_lo8(0x1234)
+sbr r20, pm_hi8(0x1234)
+sbr r20, pm_hh8(0x123456)
+sbr r20, lo8(-(0x1234))
+sbr r20, hi8(-(0x1234))
+sbr r20, hh8(-(0x123456))
+sbr r20, hhi8(-(0x12345678))
+sbr r20, lo8(pm(0x1234))
+sbr r20, hi8(pm(0x1234))
+sbr r20, hh8(pm(0x123456))
+sbr r20, pm_lo8(-(0x1234))
+sbr r20, pm_hi8(-(0x1234))
+sbr r20, pm_hh8(-(0x123456))
+sbr r20, lo8(-(pm(0x1234)))
+sbr r20, hi8(-(pm(0x1234)))
+sbr r20, hh8(-(pm(0x123456)))
+sbr r20, lo8(0x12 + 3)
+sbr r20, (1 << 4) | 3
+sbr r20, ~0 & 0xff
+cpi r16, 0x55
+cpi r17, 0x55
+cpi r24, 0x55
+cpi r31, 0x55
+cpi r20, 0
+cpi r20, 1
+cpi r20, 0x0f
+cpi r20, 0x10
+cpi r20, 0x7f
+cpi r20, 0x80
+cpi r20, 0xf0
+cpi r20, 0xff
+cpi r20, 255
+cpi r20, -1
+cpi r20, -128
+cpi r20, -255
+cpi r20, 'A'
+cpi r20, lo8(0x1234)
+cpi r20, hi8(0x1234)
+cpi r20, hh8(0x123456)
+cpi r20, hlo8(0x123456)
+cpi r20, hhi8(0x12345678)
+cpi r20, pm_lo8(0x1234)
+cpi r20, pm_hi8(0x1234)
+cpi r20, pm_hh8(0x123456)
+cpi r20, lo8(-(0x1234))
+cpi r20, hi8(-(0x1234))
+cpi r20, hh8(-(0x123456))
+cpi r20, hhi8(-(0x12345678))
+cpi r20, lo8(pm(0x1234))
+cpi r20, hi8(pm(0x1234))
+cpi r20, hh8(pm(0x123456))
+cpi r20, pm_lo8(-(0x1234))
+cpi r20, pm_hi8(-(0x1234))
+cpi r20, pm_hh8(-(0x123456))
+cpi r20, lo8(-(pm(0x1234)))
+cpi r20, hi8(-(pm(0x1234)))
+cpi r20, hh8(-(pm(0x123456)))
+cpi r20, lo8(0x12 + 3)
+cpi r20, (1 << 4) | 3
+cpi r20, ~0 & 0xff
+sbci r16, 0x55
+sbci r17, 0x55
+sbci r24, 0x55
+sbci r31, 0x55
+sbci r20, 0
+sbci r20, 1
+sbci r20, 0x0f
+sbci r20, 0x10
+sbci r20, 0x7f
+sbci r20, 0x80
+sbci r20, 0xf0
+sbci r20, 0xff
+sbci r20, 255
+sbci r20, -1
+sbci r20, -128
+sbci r20, -255
+sbci r20, 'A'
+sbci r20, lo8(0x1234)
+sbci r20, hi8(0x1234)
+sbci r20, hh8(0x123456)
+sbci r20, hlo8(0x123456)
+sbci r20, hhi8(0x12345678)
+sbci r20, pm_lo8(0x1234)
+sbci r20, pm_hi8(0x1234)
+sbci r20, pm_hh8(0x123456)
+sbci r20, lo8(-(0x1234))
+sbci r20, hi8(-(0x1234))
+sbci r20, hh8(-(0x123456))
+sbci r20, hhi8(-(0x12345678))
+sbci r20, lo8(pm(0x1234))
+sbci r20, hi8(pm(0x1234))
+sbci r20, hh8(pm(0x123456))
+sbci r20, pm_lo8(-(0x1234))
+sbci r20, pm_hi8(-(0x1234))
+sbci r20, pm_hh8(-(0x123456))
+sbci r20, lo8(-(pm(0x1234)))
+sbci r20, hi8(-(pm(0x1234)))
+sbci r20, hh8(-(pm(0x123456)))
+sbci r20, lo8(0x12 + 3)
+sbci r20, (1 << 4) | 3
+sbci r20, ~0 & 0xff
+subi r16, 0x55
+subi r17, 0x55
+subi r24, 0x55
+subi r31, 0x55
+subi r20, 0
+subi r20, 1
+subi r20, 0x0f
+subi r20, 0x10
+subi r20, 0x7f
+subi r20, 0x80
+subi r20, 0xf0
+subi r20, 0xff
+subi r20, 255
+subi r20, -1
+subi r20, -128
+subi r20, -255
+subi r20, 'A'
+subi r20, lo8(0x1234)
+subi r20, hi8(0x1234)
+subi r20, hh8(0x123456)
+subi r20, hlo8(0x123456)
+subi r20, hhi8(0x12345678)
+subi r20, pm_lo8(0x1234)
+subi r20, pm_hi8(0x1234)
+subi r20, pm_hh8(0x123456)
+subi r20, lo8(-(0x1234))
+subi r20, hi8(-(0x1234))
+subi r20, hh8(-(0x123456))
+subi r20, hhi8(-(0x12345678))
+subi r20, lo8(pm(0x1234))
+subi r20, hi8(pm(0x1234))
+subi r20, hh8(pm(0x123456))
+subi r20, pm_lo8(-(0x1234))
+subi r20, pm_hi8(-(0x1234))
+subi r20, pm_hh8(-(0x123456))
+subi r20, lo8(-(pm(0x1234)))
+subi r20, hi8(-(pm(0x1234)))
+subi r20, hh8(-(pm(0x123456)))
+subi r20, lo8(0x12 + 3)
+subi r20, (1 << 4) | 3
+subi r20, ~0 & 0xff
+
+# ---- register bits ---------------------------------------------------------
+sbrc r0, 0
+sbrc r0, 1
+sbrc r0, 5
+sbrc r0, 7
+sbrc r16, 0
+sbrc r16, 1
+sbrc r16, 5
+sbrc r16, 7
+sbrc r31, 0
+sbrc r31, 1
+sbrc r31, 5
+sbrc r31, 7
+sbrs r0, 0
+sbrs r0, 1
+sbrs r0, 5
+sbrs r0, 7
+sbrs r16, 0
+sbrs r16, 1
+sbrs r16, 5
+sbrs r16, 7
+sbrs r31, 0
+sbrs r31, 1
+sbrs r31, 5
+sbrs r31, 7
+bld r0, 0
+bld r0, 1
+bld r0, 5
+bld r0, 7
+bld r16, 0
+bld r16, 1
+bld r16, 5
+bld r16, 7
+bld r31, 0
+bld r31, 1
+bld r31, 5
+bld r31, 7
+bst r0, 0
+bst r0, 1
+bst r0, 5
+bst r0, 7
+bst r16, 0
+bst r16, 1
+bst r16, 5
+bst r16, 7
+bst r31, 0
+bst r31, 1
+bst r31, 5
+bst r31, 7
+
+# ---- I/O ports -------------------------------------------------------------
+in r0, 0
+in r0, 1
+in r0, 0x1f
+in r0, 0x20
+in r0, 0x3f
+in r16, 0
+in r16, 1
+in r16, 0x1f
+in r16, 0x20
+in r16, 0x3f
+in r31, 0
+in r31, 1
+in r31, 0x1f
+in r31, 0x20
+in r31, 0x3f
+out 0, r0
+out 1, r0
+out 0x1f, r0
+out 0x20, r0
+out 0x3f, r0
+out 0, r16
+out 1, r16
+out 0x1f, r16
+out 0x20, r16
+out 0x3f, r16
+out 0, r31
+out 1, r31
+out 0x1f, r31
+out 0x20, r31
+out 0x3f, r31
+
+# ---- 16-bit add and subtract on a register pair ----------------------------
+adiw r24, 0
+adiw r24, 1
+adiw r24, 0x20
+adiw r24, 63
+adiw r26, 0
+adiw r26, 1
+adiw r26, 0x20
+adiw r26, 63
+adiw r28, 0
+adiw r28, 1
+adiw r28, 0x20
+adiw r28, 63
+adiw r30, 0
+adiw r30, 1
+adiw r30, 0x20
+adiw r30, 63
+adiw x, 0
+adiw x, 1
+adiw x, 0x20
+adiw x, 63
+adiw y, 0
+adiw y, 1
+adiw y, 0x20
+adiw y, 63
+adiw z, 0
+adiw z, 1
+adiw z, 0x20
+adiw z, 63
+sbiw r24, 0
+sbiw r24, 1
+sbiw r24, 0x20
+sbiw r24, 63
+sbiw r26, 0
+sbiw r26, 1
+sbiw r26, 0x20
+sbiw r26, 63
+sbiw r28, 0
+sbiw r28, 1
+sbiw r28, 0x20
+sbiw r28, 63
+sbiw r30, 0
+sbiw r30, 1
+sbiw r30, 0x20
+sbiw r30, 63
+sbiw x, 0
+sbiw x, 1
+sbiw x, 0x20
+sbiw x, 63
+sbiw y, 0
+sbiw y, 1
+sbiw y, 0x20
+sbiw y, 63
+sbiw z, 0
+sbiw z, 1
+sbiw z, 0x20
+sbiw z, 63
+
+# ---- I/O bits --------------------------------------------------------------
+cbi 0, 0
+cbi 0, 1
+cbi 0, 5
+cbi 0, 7
+cbi 1, 0
+cbi 1, 1
+cbi 1, 5
+cbi 1, 7
+cbi 0x10, 0
+cbi 0x10, 1
+cbi 0x10, 5
+cbi 0x10, 7
+cbi 0x1f, 0
+cbi 0x1f, 1
+cbi 0x1f, 5
+cbi 0x1f, 7
+sbi 0, 0
+sbi 0, 1
+sbi 0, 5
+sbi 0, 7
+sbi 1, 0
+sbi 1, 1
+sbi 1, 5
+sbi 1, 7
+sbi 0x10, 0
+sbi 0x10, 1
+sbi 0x10, 5
+sbi 0x10, 7
+sbi 0x1f, 0
+sbi 0x1f, 1
+sbi 0x1f, 5
+sbi 0x1f, 7
+sbic 0, 0
+sbic 0, 1
+sbic 0, 5
+sbic 0, 7
+sbic 1, 0
+sbic 1, 1
+sbic 1, 5
+sbic 1, 7
+sbic 0x10, 0
+sbic 0x10, 1
+sbic 0x10, 5
+sbic 0x10, 7
+sbic 0x1f, 0
+sbic 0x1f, 1
+sbic 0x1f, 5
+sbic 0x1f, 7
+sbis 0, 0
+sbis 0, 1
+sbis 0, 5
+sbis 0, 7
+sbis 1, 0
+sbis 1, 1
+sbis 1, 5
+sbis 1, 7
+sbis 0x10, 0
+sbis 0x10, 1
+sbis 0x10, 5
+sbis 0x10, 7
+sbis 0x1f, 0
+sbis 0x1f, 1
+sbis 0x1f, 5
+sbis 0x1f, 7
+
+# ---- conditional branches, to numbers: measured from the section start -----
+brcc 0
+brcc 2
+brcc 4
+brcc -2
+brcc 128
+brcc -126
+brcc 0x40
+brcs 0
+brcs 2
+brcs 4
+brcs -2
+brcs 128
+brcs -126
+brcs 0x40
+breq 0
+breq 2
+breq 4
+breq -2
+breq 128
+breq -126
+breq 0x40
+brge 0
+brge 2
+brge 4
+brge -2
+brge 128
+brge -126
+brge 0x40
+brhc 0
+brhc 2
+brhc 4
+brhc -2
+brhc 128
+brhc -126
+brhc 0x40
+brhs 0
+brhs 2
+brhs 4
+brhs -2
+brhs 128
+brhs -126
+brhs 0x40
+brid 0
+brid 2
+brid 4
+brid -2
+brid 128
+brid -126
+brid 0x40
+brie 0
+brie 2
+brie 4
+brie -2
+brie 128
+brie -126
+brie 0x40
+brlo 0
+brlo 2
+brlo 4
+brlo -2
+brlo 128
+brlo -126
+brlo 0x40
+brlt 0
+brlt 2
+brlt 4
+brlt -2
+brlt 128
+brlt -126
+brlt 0x40
+brmi 0
+brmi 2
+brmi 4
+brmi -2
+brmi 128
+brmi -126
+brmi 0x40
+brne 0
+brne 2
+brne 4
+brne -2
+brne 128
+brne -126
+brne 0x40
+brpl 0
+brpl 2
+brpl 4
+brpl -2
+brpl 128
+brpl -126
+brpl 0x40
+brsh 0
+brsh 2
+brsh 4
+brsh -2
+brsh 128
+brsh -126
+brsh 0x40
+brtc 0
+brtc 2
+brtc 4
+brtc -2
+brtc 128
+brtc -126
+brtc 0x40
+brts 0
+brts 2
+brts 4
+brts -2
+brts 128
+brts -126
+brts 0x40
+brvc 0
+brvc 2
+brvc 4
+brvc -2
+brvc 128
+brvc -126
+brvc 0x40
+brvs 0
+brvs 2
+brvs 4
+brvs -2
+brvs 128
+brvs -126
+brvs 0x40
+brbc 0, 0
+brbc 0, 2
+brbc 0, -2
+brbc 1, 0
+brbc 1, 2
+brbc 1, -2
+brbc 5, 0
+brbc 5, 2
+brbc 5, -2
+brbc 7, 0
+brbc 7, 2
+brbc 7, -2
+brbs 0, 0
+brbs 0, 2
+brbs 0, -2
+brbs 1, 0
+brbs 1, 2
+brbs 1, -2
+brbs 5, 0
+brbs 5, 2
+brbs 5, -2
+brbs 7, 0
+brbs 7, 2
+brbs 7, -2
+
+# ---- relative jump and call, to numbers ------------------------------------
+rcall 0
+rcall 2
+rcall -2
+rcall 4096
+rcall -4094
+rcall 0x100
+rjmp 0
+rjmp 2
+rjmp -2
+rjmp 4096
+rjmp -4094
+rjmp 0x100
+
+# ---- one register ----------------------------------------------------------
+asr r0
+asr r1
+asr r7
+asr r15
+asr r16
+asr r17
+asr r23
+asr r24
+asr r25
+asr r26
+asr r29
+asr r30
+asr r31
+com r0
+com r1
+com r7
+com r15
+com r16
+com r17
+com r23
+com r24
+com r25
+com r26
+com r29
+com r30
+com r31
+dec r0
+dec r1
+dec r7
+dec r15
+dec r16
+dec r17
+dec r23
+dec r24
+dec r25
+dec r26
+dec r29
+dec r30
+dec r31
+inc r0
+inc r1
+inc r7
+inc r15
+inc r16
+inc r17
+inc r23
+inc r24
+inc r25
+inc r26
+inc r29
+inc r30
+inc r31
+lsr r0
+lsr r1
+lsr r7
+lsr r15
+lsr r16
+lsr r17
+lsr r23
+lsr r24
+lsr r25
+lsr r26
+lsr r29
+lsr r30
+lsr r31
+neg r0
+neg r1
+neg r7
+neg r15
+neg r16
+neg r17
+neg r23
+neg r24
+neg r25
+neg r26
+neg r29
+neg r30
+neg r31
+pop r0
+pop r1
+pop r7
+pop r15
+pop r16
+pop r17
+pop r23
+pop r24
+pop r25
+pop r26
+pop r29
+pop r30
+pop r31
+push r0
+push r1
+push r7
+push r15
+push r16
+push r17
+push r23
+push r24
+push r25
+push r26
+push r29
+push r30
+push r31
+ror r0
+ror r1
+ror r7
+ror r15
+ror r16
+ror r17
+ror r23
+ror r24
+ror r25
+ror r26
+ror r29
+ror r30
+ror r31
+swap r0
+swap r1
+swap r7
+swap r15
+swap r16
+swap r17
+swap r23
+swap r24
+swap r25
+swap r26
+swap r29
+swap r30
+swap r31
+
+# ---- direct load and store -------------------------------------------------
+sts 0x40, r20
+sts 0x41, r20
+sts 0x7f, r20
+sts 0x80, r20
+sts 0xbf, r20
+sts 0, r0
+sts 0, r16
+sts 0, r31
+sts 0x60, r0
+sts 0x60, r16
+sts 0x60, r31
+sts 0x1234, r0
+sts 0x1234, r16
+sts 0x1234, r31
+sts 0xffff, r0
+sts 0xffff, r16
+sts 0xffff, r31
+lds r20, 0x40
+lds r20, 0x41
+lds r20, 0x7f
+lds r20, 0x80
+lds r20, 0xbf
+lds r0, 0
+lds r16, 0
+lds r31, 0
+lds r0, 0x60
+lds r16, 0x60
+lds r31, 0x60
+lds r0, 0x1234
+lds r16, 0x1234
+lds r31, 0x1234
+lds r0, 0xffff
+lds r16, 0xffff
+lds r31, 0xffff
+
+# ---- load and store with displacement --------------------------------------
+ldd r0, Y+0
+ldd r0, Y+1
+ldd r0, Y+63
+ldd r0, Z+0
+ldd r0, Z+7
+ldd r0, Z+0x28
+ldd r0, y+32
+ldd r0, z+(2*3)
+ldd r16, Y+0
+ldd r16, Y+1
+ldd r16, Y+63
+ldd r16, Z+0
+ldd r16, Z+7
+ldd r16, Z+0x28
+ldd r16, y+32
+ldd r16, z+(2*3)
+ldd r31, Y+0
+ldd r31, Y+1
+ldd r31, Y+63
+ldd r31, Z+0
+ldd r31, Z+7
+ldd r31, Z+0x28
+ldd r31, y+32
+ldd r31, z+(2*3)
+
+# ---- load and store through a pointer --------------------------------------
+ld r0, X
+ld r0, X+
+ld r0, -X
+ld r0, Y
+ld r0, Y+
+ld r0, -Y
+ld r0, Z
+ld r0, Z+
+ld r0, -Z
+ld r0, x
+ld r0, y+
+ld r0, -z
+ld r5, X
+ld r5, X+
+ld r5, -X
+ld r5, Y
+ld r5, Y+
+ld r5, -Y
+ld r5, Z
+ld r5, Z+
+ld r5, -Z
+ld r5, x
+ld r5, y+
+ld r5, -z
+ld r16, X
+ld r16, X+
+ld r16, -X
+ld r16, Y
+ld r16, Y+
+ld r16, -Y
+ld r16, Z
+ld r16, Z+
+ld r16, -Z
+ld r16, x
+ld r16, y+
+ld r16, -z
+ld r31, X
+ld r31, X+
+ld r31, -X
+ld r31, Y
+ld r31, Y+
+ld r31, -Y
+ld r31, Z
+ld r31, Z+
+ld r31, -Z
+ld r31, x
+ld r31, y+
+ld r31, -z
+
+# ---- load and store with displacement --------------------------------------
+std Y+0, r0
+std Y+1, r0
+std Y+63, r0
+std Z+0, r0
+std Z+7, r0
+std Z+0x28, r0
+std y+32, r0
+std z+(2*3), r0
+std Y+0, r16
+std Y+1, r16
+std Y+63, r16
+std Z+0, r16
+std Z+7, r16
+std Z+0x28, r16
+std y+32, r16
+std z+(2*3), r16
+std Y+0, r31
+std Y+1, r31
+std Y+63, r31
+std Z+0, r31
+std Z+7, r31
+std Z+0x28, r31
+std y+32, r31
+std z+(2*3), r31
+
+# ---- load and store through a pointer --------------------------------------
+st X, r0
+st X+, r0
+st -X, r0
+st Y, r0
+st Y+, r0
+st -Y, r0
+st Z, r0
+st Z+, r0
+st -Z, r0
+st x, r0
+st y+, r0
+st -z, r0
+st X, r5
+st X+, r5
+st -X, r5
+st Y, r5
+st Y+, r5
+st -Y, r5
+st Z, r5
+st Z+, r5
+st -Z, r5
+st x, r5
+st y+, r5
+st -z, r5
+st X, r16
+st X+, r16
+st -X, r16
+st Y, r16
+st Y+, r16
+st -Y, r16
+st Z, r16
+st Z+, r16
+st -Z, r16
+st x, r16
+st y+, r16
+st -z, r16
+st X, r31
+st X+, r31
+st -X, r31
+st Y, r31
+st Y+, r31
+st -Y, r31
+st Z, r31
+st Z+, r31
+st -Z, r31
+st x, r31
+st y+, r31
+st -z, r31
+
+# ---- relative jumps to numbers beyond 2K words, which wrap at 8K ------------
+rjmp 0xe042
+rcall 0x865a
+rjmp -0x2000
+rcall 0x2002

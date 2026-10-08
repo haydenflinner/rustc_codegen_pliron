@@ -1,0 +1,176 @@
+=== references to symbols in their own section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        bl loc
+        bl glob
+        bl weak1
+        bl hid
+        bl prot
+        bl intl
+        bl whid
+        bl lhid
+        bl func
+        bl late
+        bl lweak
+        bl lalias
+        bl lwalias
+        bl galias
+        bl walias
+        b loc
+        b glob
+        b weak1
+        b lalias
+        b walias
+        beq loc
+        beq glob
+        beq weak1
+        beq lalias
+        beq walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+
+=== references back to symbols in their own section
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        bl loc
+        bl glob
+        bl weak1
+        bl lalias
+        b loc
+        b glob
+        b weak1
+        beq loc
+        beq glob
+        beq weak1
+
+=== references out of their section, by binding
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        bl oloc
+        bl oglob
+        bl oweak
+        bl oalias
+        bl ext
+        bl uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+
+=== default section alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7
+
+
+=== prefixed PC-relative references, by binding
+        .text
+        .globl  glob
+        .weak   weak1
+start:
+        pld     3, ext@pcrel(0), 1
+        paddi   3, 0, ext@pcrel+8, 1
+        plxv    33, ext@pcrel(0), 1
+        pld     4, ext@got@pcrel(0), 1
+        paddi   3, 0, loc@pcrel, 1
+        paddi   3, 0, glob@pcrel, 1
+        paddi   3, 0, weak1@pcrel, 1
+        pstd    3, dat@pcrel(0), 1
+        plwz    3, dat@pcrel+4(0), 1
+        plfd    1, ext@pcrel-8(0), 1
+        plxsd   2, start@pcrel(0), 1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .data
+dat:    .long 0
+
+=== DS- and DQ-form displacements against a symbol
+        lxv     35, ext@l(4)
+        stxv    3, ext(4)
+        lxsd    2, ext@l(4)
+        stxssp  2, ext(4)
+        lxvp    34, ext@l(4)
+
+=== a prefixed instruction is never split across a 64-byte boundary
+        .text
+start:
+        .fill   15, 4, 0x60000000
+lab:
+        paddi   3, 4, 100, 0
+        b       lab
+        .fill   11, 4, 0x60000000
+lab2:   pli     3, 1
+        b       lab2
+        .fill   13, 4, 0x60000000
+lab3:   pld     3, 8(4), 0
+        b       lab3
+        .long   lab - start, lab2 - start, lab3 - start
+        .section .rodata.x, "a"
+dstart: .fill   15, 4, 1
+dlab:   xxspltiw 3, 1
+        .long   dlab - dstart

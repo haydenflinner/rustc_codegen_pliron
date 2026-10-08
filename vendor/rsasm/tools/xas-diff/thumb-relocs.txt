@@ -1,0 +1,445 @@
+=== a function
+        .syntax unified
+        .global f
+f:      adds    r0, r0, r1
+        bx      lr
+=== literal loads and the moves that replace them
+        .syntax unified
+f:      ldr     r0, =0x12345678
+        ldr     r1, =0xff
+        ldr     r2, =0x1234
+        ldr     r3, =0xffffff00
+        ldr     r4, =foo
+        ldr     r5, =0x00ab00ab
+        ldr     r6, =0xfffe0000
+        ldr     r8, =0x12345678
+        ldr     r0, =0x12345678
+        ldr     sp, =0x100
+        ldr     r7, =-1
+        bx      lr
+=== a pool after an odd halfword is padded with zeros
+        .syntax unified
+f:      ldr     r0, =0x12345678
+        movs    r0, r0
+        bx      lr
+        .ltorg
+        movs    r1, r1
+=== a narrow load reaches 1020 bytes
+        .syntax unified
+        ldr     r0, =0x12345678
+        .space  1018
+        .ltorg
+=== a load past 1020 bytes is 32 bits
+        .syntax unified
+        ldr     r0, =0x12345678
+        .space  1020
+        .ltorg
+=== a load grows when the code before its pool grows
+        .syntax unified
+        ldr     r0, =0x12345678
+        ldr     r1, =0x12345679
+        .space  1014
+        b       far
+        .ltorg
+        .space  2048
+far:    bx      lr
+=== loads either side of the 1020-byte limit as the code grows
+        .syntax unified
+        ldr     r0, =0x12345678
+        ldr     r1, =0x12345679
+        ldr     r2, =0x1234567a
+        .space  1008
+        b       far
+        b       far
+        .ltorg
+        .space  2048
+far:    bx      lr
+=== a load whose pool an alignment keeps in reach
+        .syntax unified
+        ldr     r0, =0x12345678
+        ldr     r1, =0x12345679
+        .space  1010
+        b       far
+        @ Zeros, since GNU as pads Thumb-2 code with 32-bit no-ops where
+        @ rsasm uses 16-bit ones.
+        .p2align 3, 0
+        .ltorg
+        .space  2048
+far:    bx      lr
+=== width suffixes
+        .syntax unified
+        ldr.w   r0, =0x12345678
+        ldr.n   r1, =0x12345678
+        ldr.w   r2, =0x11111111
+        ldr     r9, =0x11111111
+        .pool
+=== refused: a narrow load that does not reach its pool
+        .syntax unified
+        ldr.n   r0, =0x12345678
+        .space  1026
+        .ltorg
+=== a thumb pool at the end of the section
+        .syntax unified
+        .text
+        ldr     r0, =label
+        ldr     r1, =label + 1
+label:  bx      lr
+=== adr forward and back
+        .syntax unified
+back:   nop
+        adr     r0, back
+        adr     r1, fwd
+        adr     r8, fwd
+        adr.w   r2, fwd
+        nop
+        .p2align 2, 0
+fwd:    bx      lr
+        adr.n   r3, fwd2
+        .p2align 2, 0
+fwd2:   nop
+=== adr to a label not on a word boundary is 32 bits
+        .syntax unified
+        adr     r0, odd
+        nop
+odd:    bx      lr
+=== adr past 1020 bytes is 32 bits
+        .syntax unified
+        adr     r0, near
+        adr     r1, far
+        .space  1016
+        .p2align 2, 0
+near:   .space  8
+far:    bx      lr
+=== refused: adr beyond 4095 bytes
+        .syntax unified
+        adr     r0, far
+        .space  4096
+far:    bx      lr
+=== a Thumb function calling ARM and Thumb code
+        .syntax unified
+        .global main
+        .thumb_func
+main:   push    {r4, lr}
+        bl      helper
+        blx     armhelper
+        bl      armhelper
+        blx     helper
+        bl      puts
+        pop     {r4, pc}
+        .thumb_func
+helper: bx      lr
+        .arm
+        .type   armhelper, %function
+armhelper:
+        blx     helper
+        bl      helper
+        b       helper
+        bx      lr
+=== a branch to an ARM function is always 32 bits and relocated
+        .syntax unified
+        b       armf
+        beq     armf
+        b       near
+near:   bx      lr
+        .arm
+        .type   armf, %function
+armf:   bx      lr
+=== literal loads of Thumb functions
+        .syntax unified
+        .thumb_func
+f:      ldr     r0, =f
+        ldr     r1, =g
+        adr     r2, f
+        bx      lr
+        .type   g, %function
+g:      bx      lr
+=== adr of Thumb functions defined before and after it
+        .syntax unified
+        .thumb_func
+f:      bx      lr
+        adr     r0, f
+        adr     r1, g
+        adr.w   r2, g
+        adr     r8, g
+        .p2align 2, 0
+        .thumb_func
+g:      bx      lr
+=== it blocks and the instructions in them
+        .syntax unified
+f:      it      eq
+        addeq   r0, r1, r2
+        itt     ne
+        addne   r0, r1, r2
+        addsne  r0, r1, r2
+        ite     cs
+        movcs   r0, #1
+        movcc   r0, #2
+        itete   gt
+        addgt   r0, #1
+        suble   r0, #1
+        mulgt   r0, r1, r0
+        lslle   r0, r1, #2
+        adds    r0, r1, r2
+        add     r0, r1, r2
+        it      mi
+        bmi     f
+        it      lt
+        bxlt    lr
+        itt     eq
+        moveq   r0, r1
+        bleq    f
+        bx      lr
+=== every it pattern and condition
+        .syntax unified
+        itttt   eq
+        addeq   r0, r1
+        addeq   r0, r1
+        addeq   r0, r1
+        addeq   r0, r1
+        iteee   ne
+        addne   r0, r1
+        addeq   r0, r1
+        addeq   r0, r1
+        addeq   r0, r1
+        ittet   cs
+        addcs   r0, r1
+        addcs   r0, r1
+        addcc   r0, r1
+        addcs   r0, r1
+        itett   vc
+        addvc   r0, r1
+        addvs   r0, r1
+        addvc   r0, r1
+        addvc   r0, r1
+        iteet   hi
+        addhi   r0, r1
+        addls   r0, r1
+        addls   r0, r1
+        addhi   r0, r1
+        itte    le
+        addle   r0, r1
+        addle   r0, r1
+        addgt   r0, r1
+        itet    pl
+        addpl   r0, r1
+        addmi   r0, r1
+        addpl   r0, r1
+=== flags in and out of it blocks
+        .syntax unified
+        ittt    eq
+        andeq   r0, r1
+        orreq   r0, r1
+        lsleq   r0, r1
+        ittt    eq
+        mvneq   r0, r1
+        muleq   r0, r1, r0
+        asreq   r0, r1, #3
+        itt     eq
+        addseq  r0, r1, r2
+        subseq  r0, r0, #300
+        ite     ne
+        movne   r0, #1
+        moveq   r0, #0
+        itee    ge
+        addge   r0, r1, r2
+        sublt   r0, r1, r2
+        rsblt   r0, r0, #0
+        itt     eq
+        cmpeq   r0, #1
+        moveq   r0, #300
+        ands    r0, r1
+        muls    r0, r1, r0
+=== a literal pool load and a long branch in it blocks
+        .syntax unified
+        itt     eq
+        ldreq   r0, =0x12345678
+        ldreq   r1, =0x12345678
+        it      eq
+        beq     far
+        it      ne
+        bne.w   near
+near:   .space  4000
+far:    bx      lr
+=== it in ARM code emits nothing
+        .syntax unified
+        .arm
+        it      eq
+        addeq   r0, r1, r2
+        add     r0, r1, r2
+=== refused: an instruction without the block's condition
+        .syntax unified
+        it      eq
+        add     r0, r1, r2
+=== refused: the wrong condition
+        .syntax unified
+        it      eq
+        addne   r0, r1, r2
+=== refused: a conditional instruction outside a block
+        .syntax unified
+        addeq   r0, r1, r2
+=== refused: a branch that is not last
+        .syntax unified
+        itt     eq
+        beq     x
+        addeq   r0, r1
+x:      bx      lr
+=== refused: a PC change that is not last
+        .syntax unified
+        itt     eq
+        moveq   pc, lr
+        addeq   r0, r1
+=== refused: it within an it block
+        .syntax unified
+        itt     eq
+        it      eq
+        addeq   r0, r1
+=== refused: instructions in an al block
+        .syntax unified
+        it      al
+        add     r0, r1, r2
+=== an adr that stays short once an earlier one has grown
+        .syntax unified
+        adr     r3, l2
+        adr     r0, l0
+        b       l5
+        ldr     r12, =l1
+l0:     bx      lr
+l1:     nop
+l2:     nop
+l3:     nop
+l4:     bx      lr
+l5:     bx      lr
+=== growth that an alignment absorbs does not move a later target
+        .syntax unified
+        adr     r3, odd
+        adr     r0, after
+        .p2align 2, 0
+        .space  1014
+after:  bx      lr
+odd:    nop
+        bx      lr
+=== references to symbols in their own section, by binding
+        .syntax unified
+        .text
+        .globl  glob, hid, prot, intl, galias
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .hidden lhid
+start:
+        bl loc
+        bl glob
+        bl weak1
+        bl hid
+        bl prot
+        bl intl
+        bl whid
+        bl lhid
+        bl late
+        bl lweak
+        bl lalias
+        bl lwalias
+        bl galias
+        bl walias
+        b loc
+        b glob
+        b weak1
+        b lalias
+        b walias
+        beq loc
+        beq glob
+        beq weak1
+        beq lalias
+        beq walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+=== references back to symbols in their own section
+        .syntax unified
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        bl loc
+        bl glob
+        bl weak1
+        bl lalias
+        b loc
+        b glob
+        b weak1
+        beq loc
+        beq glob
+        beq weak1
+=== references out of their section, by binding
+        .syntax unified
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        bl oloc
+        bl oglob
+        bl oweak
+        bl oalias
+        bl ext
+        bl uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+=== data referring to symbols, by binding
+        .syntax unified
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+=== default section alignment
+        .syntax unified
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7

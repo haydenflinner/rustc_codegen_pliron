@@ -1,0 +1,214 @@
+=== a program at the reset vector, with an interrupt vector
+	.org 0
+	ljmp main
+	.org 0x0b
+	cpl P1.0
+	reti
+	.org 0x30
+main:	mov SP,#0x5f
+	mov TMOD,#0x01
+	mov TH0,#0xfc
+	mov TL0,#0x18
+	setb TR0
+	setb ET0
+	setb EA
+loop:	sjmp loop
+=== the register and bit names both references define
+	mov A,P0
+	mov A,SP
+	mov A,DPL
+	mov A,DPH
+	mov A,PCON
+	mov A,TCON
+	mov A,TMOD
+	mov A,TL0
+	mov A,TL1
+	mov A,TH0
+	mov A,TH1
+	mov A,P1
+	mov A,SCON
+	mov A,SBUF
+	mov A,P2
+	mov A,IE
+	mov A,P3
+	mov A,IP
+	mov A,PSW
+	mov A,ACC
+	mov A,B
+	setb IT0
+	setb IE0
+	setb IT1
+	setb IE1
+	setb TR0
+	setb TF0
+	setb TR1
+	setb TF1
+	setb RI
+	setb TI
+	setb RB8
+	setb TB8
+	setb REN
+	setb SM2
+	setb SM1
+	setb SM0
+	setb EX0
+	setb ET0
+	setb EX1
+	setb ET1
+	setb ES
+	setb EA
+	setb RXD
+	setb TXD
+	setb INT0
+	setb INT1
+	setb PX0
+	setb PT0
+	setb PX1
+	setb PT1
+	setb PS
+	setb P
+	setb OV
+	setb RS0
+	setb RS1
+	setb F0
+	setb AC
+	jb CY,.
+=== register bits by name
+	mov C,ACC.7
+	mov PSW.5,C
+	jb TCON.5,.
+	jnb B.0,.
+	anl C,/P3.2
+	orl C,SCON.0
+	setb P0.0
+	clr IP.5
+	setb IE.7
+	cpl P1.3
+=== forward references
+	.org 0x100
+start:	mov A,#8
+	mov R0,#0x30
+	mov DPTR,#table
+	lcall fill
+	ljmp done
+fill:	mov @R0,A
+	inc R0
+	djnz ACC,fill
+	ret
+table:	.db 1,2,3,4
+done:	sjmp done
+=== AJMP and ACALL to every page of their block
+; By label: sdld refuses a numeric target outside block 0 as off the page.
+	.org 0x800
+p0:	ajmp p0
+	ajmp p1
+	ajmp p2
+	ajmp p3
+	acall p4
+	acall p5
+	acall p6
+	acall p7
+	.org 0x900
+p1:	nop
+	.org 0xa00
+p2:	nop
+	.org 0xb00
+p3:	nop
+	.org 0xc00
+p4:	nop
+	.org 0xd00
+p5:	nop
+	.org 0xe00
+p6:	nop
+	.org 0xfff
+p7:	nop
+=== AJMP and ACALL to labels either side of the instruction
+	.org 0x1000
+top:	nop
+	.org 0x1400
+	ajmp top
+	acall bottom
+	ajmp .
+	.org 0x17f0
+bottom:	ret
+=== AJMP ending a block, two bytes before its boundary
+	.org 0x7fa
+	ajmp 0
+	acall 0x7ff
+	nop
+	nop
+=== relative branches at the edge of their reach, by label
+	.org 0x100
+	sjmp fwd
+	.ds 127
+fwd:	nop
+bwd:	.ds 126
+	sjmp bwd
+	jz fwd2
+	.ds 127
+fwd2:	nop
+=== three-byte branches at the edge of their reach
+	.org 0x200
+	cjne A,#1,fwd
+	.ds 127
+fwd:	djnz 0x30,bwd
+bwd:	nop
+	.ds 124
+	jb 0x20,bwd
+=== relative branches at the edge of their reach, from the location counter
+	.org 0x100
+	sjmp .+129
+	sjmp .-126
+	jnc .-126
+	djnz R2,.-126
+	jbc 0x91,.-125
+	cjne R3,#0,.-125
+	cjne @R0,#0,.+130
+	cjne A,0x30,.-125
+	djnz 0x30,.+130
+=== bytes, strings and reserved space
+	.org 0
+	mov DPTR,#msg
+	movc A,@A+DPTR
+	ret
+msg:	.db 0x48,0x65,0x6c,0x6c,0x6f,13,10,0
+	.ds 4
+	.db 65,-1,255
+	nop
+=== a lookup table through MOVC A,@A+PC
+	.org 0
+	inc A
+	movc A,@A+PC
+	ret
+	.db 0x3f,0x06,0x5b,0x4f
+=== an equate
+count	.equ 8
+buffer	.equ 0x30
+	mov A,#count
+	mov R0,#buffer
+	mov buffer,#count
+=== nested delay loops
+	.org 0
+delay:	mov R7,#10
+d1:	mov R6,#200
+d2:	mov R5,#250
+d3:	djnz R5,d3
+	djnz R6,d2
+	djnz R7,d1
+	ret
+=== external memory through DPTR and R0/R1
+	.org 0
+	mov DPTR,#0x8000
+	movx A,@DPTR
+	inc DPTR
+	movx @DPTR,A
+	mov R0,#0x40
+	movx A,@R0
+	movx @R1,A
+	xch A,@R1
+	xchd A,@R0
+=== the location counter
+	.org 0x1234
+	mov DPTR,#.
+	mov DPTR,#.+3
+	sjmp .+2

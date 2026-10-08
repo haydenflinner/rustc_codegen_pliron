@@ -1,0 +1,2319 @@
+# The SIMD and newer extensions, 64-bit mode, AT&T syntax.
+#
+# One or two cases per mnemonic of every extension rsasm has beyond SSE and
+# AVX2, generated from GNU's opcode table by the fuzzer's form reader
+# (tools/fuzz/simd.py) and kept where GNU as 2.47, llvm-mc 22 and rsasm all
+# agree. They vary the vector length, the EVEX-only registers, memory operands
+# at every disp8*N scale, writemasks, {z}, broadcast and rounding; the named
+# compare predicates are represented by their `eq` spellings. The same file is
+# in tools/gas-diff and tools/mc-diff; where the two references disagree, the
+# case is in neither and the split is listed in tools/fuzz/x86.py.
+# ---- AVX-512F and AVX-512VL --------------------------------------------------
+kandnw %k3, %k1, %k4
+kandnw %k0, %k7, %k3
+kandw %k6, %k4, %k0
+kandw %k2, %k4, %k6
+kmovw %k7, 0x200(%r9,%r14,8)
+kmovw %edi, %k2
+knotw %k0, %k1
+knotw %k2, %k7
+kortestw %k3, %k3
+kortestw %k7, %k6
+korw %k6, %k3, %k2
+korw %k6, %k6, %k7
+kshiftlw $0x1, %k2, %k4
+kshiftlw $0x1, %k7, %k2
+kshiftrw $0xff, %k0, %k2
+kshiftrw $0x11, %k3, %k0
+kunpckbw %k2, %k2, %k2
+kunpckbw %k5, %k0, %k4
+kxnorw %k7, %k7, %k0
+kxnorw %k6, %k1, %k2
+kxorw %k5, %k7, %k1
+kxorw %k5, %k4, %k3
+vaddpd 0x40(%rsp){1to8}, %zmm13, %zmm29{%k6}
+vaddpd 0x12345(%r10d), %zmm20, %zmm20{%k3}{z}
+vaddps %xmm2, %xmm11, %xmm15
+vaddps 0x80(%rdx,%rax,8){1to8}, %ymm24, %ymm6{%k4}
+vaddsd %xmm6, %xmm3, %xmm23
+vaddsd {rz-sae}, %xmm10, %xmm25, %xmm12
+vaddss {ru-sae}, %xmm1, %xmm9, %xmm7
+vaddss -0x2000(%rsp), %xmm8, %xmm9{%k2}{z}
+valignd $0x3, %zmm26, %zmm3, %zmm15
+valignd $0x11, %ymm9, %ymm4, %ymm20{%k5}
+valignq $0x11, %zmm15, %zmm13, %zmm0{%k7}
+valignq $0x0, 0x1000(%rdi), %xmm30, %xmm8
+vblendmpd %ymm19, %ymm23, %ymm11
+vblendmpd %zmm9, %zmm7, %zmm10{%k1}
+vblendmps %zmm25, %zmm11, %zmm25
+vblendmps %ymm7, %ymm8, %ymm17
+vbroadcastf32x4 0x100(%eax,%edi,1), %ymm10{%k5}
+vbroadcastf32x4 0x40(%ecx), %ymm7{%k4}{z}
+vbroadcastf64x4 0x1000(%rsi), %zmm14{%k7}
+vbroadcastf64x4 -0x80(%rsi), %zmm28
+vbroadcasti32x4 0x1000(%r11), %ymm1{%k2}
+vbroadcasti32x4 -0x80(,%rdx,2), %ymm6
+vbroadcasti64x4 0x8(%r12), %zmm31
+vbroadcasti64x4 0x8(%r12), %zmm17
+vbroadcastsd %xmm9, %ymm12
+vbroadcastsd 0x20(%rax,%rsi,1), %ymm9
+vcmpeq_oqpd %zmm6, %zmm23, %k3{%k5}
+vcmpeq_oqpd 0x10(%r10), %xmm5, %k7{%k6}
+vcmpeq_oqps %ymm24, %ymm4, %k6
+vcmpeq_oqps 0x12345(%rbx,%r13,8), %ymm4, %k5
+vcmpeq_oqsd 0x3f(%eax,%eax,8), %xmm5, %k5{%k6}
+vcmpeq_oqsd %xmm13, %xmm11, %k3
+vcmpeq_oqss 0x1000(%rsp), %xmm11, %k6
+vcmpeq_oqss %xmm23, %xmm24, %k3
+vcmpeq_ospd -0x80(%r14){1to2}, %xmm9, %k6
+vcmpeq_ospd 0x3f(%rdi,%r11,8), %ymm18, %k4
+vcmpeq_osps %xmm17, %xmm13, %k6
+vcmpeq_osps %ymm8, %ymm31, %k7
+vcmpeq_ossd %xmm10, %xmm8, %k4
+vcmpeq_ossd {sae}, %xmm14, %xmm14, %k2
+vcmpeq_osss 0x1000(%r11), %xmm5, %k5
+vcmpeq_osss %xmm3, %xmm13, %k1{%k5}
+vcmpeq_uqpd %xmm0, %xmm15, %k4{%k2}
+vcmpeq_uqpd 0x40(%r15){1to8}, %zmm29, %k6
+vcmpeq_uqps 0x3f(%rdi){1to16}, %zmm8, %k0
+vcmpeq_uqps {sae}, %zmm23, %zmm10, %k1
+vcmpeq_uqsd 0x12345(%r8), %xmm18, %k0
+vcmpeq_uqsd %xmm3, %xmm10, %k7
+vcmpeq_uqss %xmm7, %xmm27, %k3
+vcmpeq_uqss %xmm11, %xmm5, %k3{%k7}
+vcmpeq_uspd 0x80(%rbp,%r11,4), %zmm6, %k1
+vcmpeq_uspd %zmm14, %zmm12, %k0{%k1}
+vcmpeq_usps 0x10(%rbp,%rdi,1), %zmm7, %k7{%k6}
+vcmpeq_usps %zmm13, %zmm5, %k0
+vcmpeq_ussd 0x1000(%r9d,%eax,1), %xmm8, %k7
+vcmpeq_ussd 0x40(%rsp,%r10,1), %xmm1, %k7
+vcmpeq_usss 0x8(%rsp), %xmm22, %k2
+vcmpeq_usss %xmm1, %xmm5, %k5
+vcmpeqpd 0x3f(%rsi){1to8}, %zmm23, %k0
+vcmpeqpd {sae}, %zmm2, %zmm30, %k6
+vcmpeqps %ymm0, %ymm8, %k7
+vcmpeqps 0x1(%rsi,%r13,2){1to8}, %ymm8, %k3
+vcmpeqsd %xmm13, %xmm0, %k3{%k7}
+vcmpeqsd %xmm17, %xmm14, %k5
+vcmpeqss %xmm0, %xmm13, %k4{%k1}
+vcmpeqss (,%rbx,8), %xmm21, %k7
+vcmppd $0x3, %xmm27, %xmm16, %k3
+vcmppd $0x11, 0x3f(%rbp), %xmm14, %k3{%k7}
+vcmpps $0x11, -0x100(%r9), %ymm11, %k7
+vcmpps $0x1, 0x7f0(%r13), %zmm30, %k1{%k5}
+vcmpsd $0x0, 0x10(%rbp), %xmm8, %k0
+vcmpsd $0x3, %xmm7, %xmm11, %k1
+vcmpss $0x0, 0x20(%rax), %xmm29, %k3
+vcmpss $0x7f, -0x80(%rax), %xmm20, %k4
+vcomisd 0x40(%rcx), %xmm21
+vcomisd -0x80(%rax), %xmm13
+vcomiss %xmm13, %xmm19
+vcomiss 0x100(%rbp), %xmm29
+vcompresspd %ymm10, 0x2(%rax)
+vcompresspd %zmm9, 0x1(%rbp)
+vcompressps %zmm6, 0x100(%r13)
+vcompressps %xmm31, %xmm4{%k3}{z}
+vcvtdq2pd 0x40(%rbx), %zmm17{%k5}
+vcvtdq2pd %xmm15, %xmm9
+vcvtdq2ph %xmm23, %xmm9
+vcvtdq2ph 0x20(%rax){1to8}, %xmm0
+vcvtdq2phx 0x4(%rbp), %xmm10
+vcvtdq2phx %xmm10, %xmm1
+vcvtdq2phy %ymm13, %xmm15
+vcvtdq2phy 0x10(%r14), %xmm21
+vcvtdq2ps %zmm31, %zmm17
+vcvtdq2ps %xmm29, %xmm21
+vcvtneps2bf16 %ymm29, %xmm7{%k4}
+vcvtneps2bf16 0x2(%rax){1to4}, %xmm2
+vcvtneps2bf16x %xmm12, %xmm11
+vcvtneps2bf16y %ymm7, %xmm25
+vcvtpd2dq {rn-sae}, %zmm26, %ymm15{%k1}
+vcvtpd2dq %xmm14, %xmm13
+vcvtpd2dqx -0x40(%rbp), %xmm9{%k3}{z}
+vcvtpd2dqx 0x8(%r15), %xmm9{%k4}
+vcvtpd2dqy 0x0(%rdi,%r11,8), %xmm4{%k7}{z}
+vcvtpd2dqy %ymm22, %xmm14
+vcvtpd2phx %xmm2, %xmm16
+vcvtpd2phx 0x40(%rsi,%r11,1), %xmm0
+vcvtpd2phy %ymm26, %xmm8{%k1}
+vcvtpd2phy 0x1000(%rax,%rbp,8), %xmm28{%k4}
+vcvtpd2ps %xmm13, %xmm5{%k5}{z}
+vcvtpd2ps %zmm30, %ymm18{%k7}{z}
+vcvtpd2psx -0x2000(%rcx){1to2}, %xmm25{%k1}
+vcvtpd2psx 0x1000(%rdx,%r11,4), %xmm27
+vcvtpd2psy %ymm13, %xmm21
+vcvtpd2psy 0x1000(%rdx){1to4}, %xmm30
+vcvtpd2udq %ymm24, %xmm1{%k3}{z}
+vcvtpd2udq %xmm4, %xmm9
+vcvtpd2udqx 0x3f(%rbx){1to2}, %xmm15
+vcvtpd2udqx -0x100(%rdx), %xmm1
+vcvtpd2udqy %ymm15, %xmm21{%k6}{z}
+vcvtpd2udqy -0x2000(%r12), %xmm29
+vcvtph2dq 0x200(%r15){1to8}, %ymm12
+vcvtph2dq 0x20(%rax), %ymm7
+vcvtph2pd %xmm1, %ymm26
+vcvtph2pd (%r14), %xmm6
+vcvtph2psx -0x2000(%r12), %xmm5
+vcvtph2qq 0x1000(%r10,%rcx,4), %xmm12
+vcvtph2udq (%rbx), %xmm5
+vcvtph2udq %xmm28, %ymm22
+vcvtph2uqq %xmm13, %ymm17
+vcvtph2uqq -0x2000(%rsi), %ymm14{%k3}{z}
+vcvtps2dq %zmm27, %zmm11
+vcvtps2dq 0x100(%r8), %ymm28{%k1}{z}
+vcvtps2pd 0x100(%rax,%rdx,8){1to4}, %ymm28
+vcvtps2pd %xmm14, %ymm9
+vcvtps2ph $0x3, {sae}, %zmm29, %ymm24{%k7}{z}
+vcvtps2phx 0x3f(,%r10,8){1to4}, %xmm30{%k2}
+vcvtps2phxx 0x40(%rax), %xmm2{%k3}
+vcvtps2phxx %xmm16, %xmm29
+vcvtps2phxy %ymm13, %xmm22
+vcvtps2phxy %ymm15, %xmm28{%k1}{z}
+vcvtps2qq %xmm4, %xmm18{%k3}{z}
+vcvtps2udq %zmm0, %zmm12{%k7}
+vcvtps2udq %zmm13, %zmm7
+vcvtps2uqq 0x200(%r9,%r15,1), %ymm9{%k2}
+vcvtqq2phx 0x100(%r11), %xmm8
+vcvtqq2phx -0x40(,%rbp,2), %xmm23
+vcvtqq2phy 0x40(%rbp,%r8,2){1to4}, %xmm30{%k7}
+vcvtqq2phy 0x10(%rcx), %xmm0
+vcvtqq2ps %ymm4, %xmm22{%k6}
+vcvtqq2psx 0x100(%r13), %xmm9
+vcvtqq2psx 0x100(%rbx), %xmm14
+vcvtqq2psy %ymm1, %xmm1{%k5}{z}
+vcvtqq2psy %ymm15, %xmm8{%k4}{z}
+vcvtsd2si 0x100(%rsp,%r9,1), %rsi
+vcvtsd2si {rd-sae}, %xmm15, %r8d
+vcvtsd2ss %xmm26, %xmm15, %xmm31
+vcvtsd2ss %xmm27, %xmm18, %xmm5
+vcvtsd2usi %xmm3, %r10d
+vcvtsd2usi %xmm17, %esp
+vcvtsi2sdl -0x100(%r14,%rdx,1), %xmm9, %xmm12
+vcvtsi2sd %r9d, %xmm8, %xmm13
+vcvtsi2ssl 0x40(%eax), %xmm2, %xmm11
+vcvtsi2ssq 0x3f(%r13,%rbx,4), %xmm21, %xmm11
+vcvtss2sd 0x40(%rdx), %xmm0, %xmm6{%k5}
+vcvtss2sd 0x40(%r13), %xmm13, %xmm29
+vcvtss2si 0x200(%rbp), %esp
+vcvtss2si -0x100(%r13), %rdx
+vcvtss2usi 0x200(%rbp,%rsi,8), %r12
+vcvtss2usi %xmm3, %ebp
+vcvttpd2dq 0x100(%rsi,%r10,4), %ymm7
+vcvttpd2dq -0x40(%r11,%r15,8){1to8}, %ymm16
+vcvttpd2dqx %xmm14, %xmm4
+vcvttpd2dqx 0x40(%rdi,%rbp,4){1to2}, %xmm9
+vcvttpd2dqy %ymm26, %xmm1{%k6}
+vcvttpd2dqy %ymm28, %xmm31
+vcvttpd2udq 0x80(%r11,%r14,4), %ymm7
+vcvttpd2udq 0x40(%rax){1to8}, %ymm31
+vcvttpd2udqx 0x80(%r12d,%r15d,4){1to2}, %xmm7
+vcvttpd2udqx %xmm24, %xmm10
+vcvttpd2udqy 0x0(%rax), %xmm0
+vcvttpd2udqy 0x1000(%rdi), %xmm31
+vcvttph2dq -0x80(%r13d,%r12d,8), %xmm14
+vcvttph2qq 0x3f(%rcx,%rdi,1), %xmm21
+vcvttph2udq %xmm28, %ymm6{%k7}
+vcvttph2uqq -0x100(%r15), %ymm16{%k4}{z}
+vcvttph2uqq %xmm26, %ymm10
+vcvttps2dq %zmm16, %zmm10
+vcvttps2dq %ymm13, %ymm11
+vcvttps2qq -0x40(%rdi), %xmm12
+vcvttps2udq -0x100(%rdx,%r15,4){1to4}, %xmm20{%k6}
+vcvttps2udq 0x1000(%rax){1to4}, %xmm11
+vcvttps2uqq %xmm13, %xmm13{%k6}{z}
+vcvttps2uqq %xmm19, %xmm4
+vcvttsd2si -0x40(,%rdx,4), %esp
+vcvttsd2si %xmm10, %rdx
+vcvttsd2usi %xmm13, %rbp
+vcvttsd2usi -0x80(%rdi,%rdx,1), %rbx
+vcvttss2si 0x12345(%r13), %r12
+vcvttss2si %xmm15, %eax
+vcvttss2usi %xmm29, %esi
+vcvttss2usi 0x80(%r8), %r10
+vcvtudq2pd %xmm14, %xmm18
+vcvtudq2pd -0x80(%r13,%r12,8){1to8}, %zmm10
+vcvtudq2ph %ymm21, %xmm12
+vcvtudq2phx -0x80(%rdx,%r15,8), %xmm10{%k7}{z}
+vcvtudq2phx %xmm31, %xmm5{%k5}
+vcvtudq2phy %ymm10, %xmm15
+vcvtudq2phy 0x0(%r15), %xmm11
+vcvtudq2ps %xmm30, %xmm1{%k3}{z}
+vcvtudq2ps 0x200(%r13), %zmm5
+vcvtuqq2phx 0x1000(%rdi), %xmm18
+vcvtuqq2phx %xmm25, %xmm15{%k6}
+vcvtuqq2phy -0x80(%r13), %xmm8
+vcvtuqq2phy 0x1000(%r9d){1to4}, %xmm29
+vcvtuqq2ps %ymm8, %xmm5
+vcvtuqq2psx -0x40(%r14,%r10,2), %xmm15
+vcvtuqq2psx %xmm3, %xmm6{%k5}
+vcvtuqq2psy 0x3f(%rsi){1to4}, %xmm13
+vcvtuqq2psy %ymm1, %xmm22{%k7}{z}
+vcvtusi2sdq 0x20(%r8), %xmm9, %xmm26
+vcvtusi2sdq 0x40(%r14,%r9,4), %xmm6, %xmm2
+vcvtusi2ssq 0x0(%r8,%r8,1), %xmm10, %xmm31
+vcvtusi2ss %r15d, {rn-sae}, %xmm15, %xmm3
+vdivpd 0x1(%r10), %ymm8, %ymm6{%k2}{z}
+vdivpd %xmm4, %xmm23, %xmm19
+vdivps 0x10(%rax), %xmm5, %xmm5
+vdivps %xmm20, %xmm14, %xmm10
+vdivsd %xmm25, %xmm15, %xmm16{%k4}
+vdivsd %xmm2, %xmm0, %xmm4
+vdivss %xmm15, %xmm5, %xmm7{%k6}
+vdivss %xmm17, %xmm29, %xmm4
+vexpandpd 0x10(%rdi), %ymm23
+vexpandpd -0x80(%r15), %zmm6{%k4}
+vexpandps -0x40(%rsp), %zmm2
+vexpandps %zmm14, %zmm6
+vextractf32x4 $0x11, %ymm8, (%rbp,%r14,8)
+vextractf32x4 $0x1, %ymm5, %xmm1
+vextractf64x4 $0x11, %zmm5, 0x12345(%rsp)
+vextractf64x4 $0x0, %zmm9, 0x100(%rdi,%r15,4)
+vextracti32x4 $0x3, %ymm14, %xmm28
+vextracti32x4 $0x1, %ymm15, %xmm5
+vextracti64x4 $0x1, %zmm5, 0x3f(%r15){%k2}
+vextracti64x4 $0xff, %zmm6, 0x2(%r15d,%ebp,8)
+vfixupimmpd $0x0, 0x40(%rbp), %ymm3, %ymm13{%k6}
+vfixupimmpd $0x1, {sae}, %zmm2, %zmm7, %zmm13
+vfixupimmps $0x7f, 0x10(%r9d), %zmm14, %zmm19{%k6}
+vfixupimmps $0x11, %zmm18, %zmm11, %zmm13
+vfixupimmsd $0x3, 0x80(%rbp), %xmm7, %xmm1
+vfixupimmsd $0x0, %xmm3, %xmm1, %xmm10{%k3}{z}
+vfixupimmss $0x7f, 0x8(%r12d,%r14d,1), %xmm19, %xmm12
+vfixupimmss $0x11, %xmm7, %xmm22, %xmm23{%k3}
+vfpclasspdx $0x0, 0x40(%r8d,%edi,2), %k7
+vfpclasspdx $0x7f, %xmm13, %k6{%k5}
+vfpclasspdy $0x11, %ymm25, %k5{%k3}
+vfpclasspdy $0xff, %ymm7, %k4{%k1}
+vfpclassphx $0x0, 0x2(%rdi), %k1
+vfpclassphx $0x3, %xmm29, %k3
+vfpclassphy $0x11, 0x1(%r12,%rdx,1), %k6
+vfpclassphy $0x7f, 0x4(%r12,%r11,4){1to16}, %k1
+vfpclasspsx $0x3, 0x10(%r9), %k5
+vfpclasspsx $0x7f, %xmm30, %k7{%k1}
+vfpclasspsy $0x0, %ymm19, %k4
+vfpclasspsy $0x3, %ymm9, %k6
+vgatherdpd 0x12345(%r10,%xmm14,8), %xmm1{%k5}
+vgatherdpd 0x200(%r9,%ymm10,8), %zmm3{%k4}
+vgatherdps -0x80(%rbx,%xmm21,8), %xmm11{%k1}
+vgatherqps 0x7f0(%ebp,%xmm2,2), %xmm17{%k6}
+vgetexppd 0x80(%r10,%r11,4), %xmm31
+vgetexppd 0x2(%r12), %zmm5
+vgetexpps %xmm12, %xmm23
+vgetexpps 0x40(%rax,%rcx,4), %zmm0{%k7}
+vgetexpsd %xmm13, %xmm0, %xmm11{%k4}
+vgetexpsd -0x100(%r12,%rbp,8), %xmm14, %xmm6{%k4}
+vgetexpss %xmm17, %xmm17, %xmm14
+vgetexpss %xmm19, %xmm6, %xmm9
+vgetmantpd $0x11, %xmm2, %xmm3{%k6}
+vgetmantpd $0x11, 0x8(%edi), %xmm12{%k2}{z}
+vgetmantps $0x3, %xmm11, %xmm29
+vgetmantps $0x11, 0x3f(%rbx,%r9,2), %zmm12
+vgetmantsd $0xff, {sae}, %xmm3, %xmm18, %xmm7
+vgetmantsd $0x1, %xmm27, %xmm11, %xmm17{%k1}
+vgetmantss $0x0, %xmm14, %xmm13, %xmm12
+vgetmantss $0xff, %xmm4, %xmm10, %xmm6
+vgf2p8affineinvqb $0x11, %xmm7, %xmm9, %xmm11
+vgf2p8affineqb $0x11, 0x1000(%rax,%rdx,8){1to2}, %xmm17, %xmm4{%k4}
+vgf2p8affineqb $0xff, (%rbp,%r13,1), %zmm12, %zmm0
+vinsertf32x4 $0x1, 0x40(%eax), %ymm0, %ymm0
+vinsertf32x4 $0x1, 0x100(%rax), %zmm4, %zmm11{%k5}{z}
+vinsertf64x4 $0xff, 0x1000(%r9,%r14,8), %zmm27, %zmm2{%k2}
+vinsertf64x4 $0x11, %ymm9, %zmm19, %zmm5
+vinserti32x4 $0x3, -0x40(%edx,%esi,2), %zmm23, %zmm28
+vinserti32x4 $0x7f, 0x40(%rbp,%r11,4), %ymm11, %ymm30
+vinserti64x4 $0xff, %ymm4, %zmm9, %zmm21
+vinserti64x4 $0x1, %ymm20, %zmm5, %zmm18
+vinsertps $0x0, 0x3f(%r9), %xmm26, %xmm29
+vinsertps $0x1, -0x100(%r14,%r11,1), %xmm0, %xmm13
+vmaxpd %xmm14, %xmm9, %xmm6
+vmaxpd %ymm21, %ymm26, %ymm6
+vmaxps 0x2(%rsi,%r9,8){1to8}, %ymm11, %ymm2{%k3}
+vmaxps {sae}, %zmm8, %zmm6, %zmm30
+vmaxsd %xmm10, %xmm9, %xmm16{%k4}{z}
+vmaxsd -0x2000(%edi), %xmm21, %xmm9{%k3}
+vmaxss {sae}, %xmm15, %xmm13, %xmm10{%k3}{z}
+vmaxss 0x1000(%r14), %xmm25, %xmm2
+vminpd %xmm28, %xmm31, %xmm16
+vminpd 0x80(%r8), %xmm3, %xmm1{%k5}
+vminps 0x1(%r10), %ymm10, %ymm3
+vminps %ymm0, %ymm27, %ymm1{%k4}{z}
+vminsd %xmm14, %xmm13, %xmm24{%k6}
+vminsd {sae}, %xmm31, %xmm22, %xmm23
+vminss 0x80(%r15), %xmm22, %xmm22
+vminss 0x4(%rcx), %xmm7, %xmm30{%k3}
+vmovapd 0x10(%r15), %zmm5
+vmovapd (%r13d,%r15d,2), %ymm8{%k1}
+vmovaps 0x100(%r11,%rsi,4), %zmm9{%k6}
+vmovaps 0x7f0(%rbp), %zmm30
+vmovddup %zmm22, %zmm10
+vmovddup 0x3f(%r15,%rax,2), %xmm28
+vmovdqa32 0x100(%r14), %xmm5
+vmovdqa32 -0x100(%r14), %xmm1
+vmovdqa64 %xmm21, %xmm17
+vmovdqa64 0x1000(%esp), %xmm26
+vmovdqu32 0x0(%rbx), %xmm21{%k2}
+vmovdqu32 0x2(%r13,%r8,1), %xmm12
+vmovdqu64 0x40(%r14), %zmm3
+vmovdqu64 %xmm5, %xmm1{%k2}
+vmovhlps %xmm8, %xmm15, %xmm27
+vmovhlps %xmm4, %xmm10, %xmm2
+vmovhpd %xmm14, 0x10(%rdi,%r15,2)
+vmovhpd %xmm11, 0x12345(%r9,%r15,2)
+vmovhps 0x80(%rsi), %xmm23, %xmm7
+vmovhps %xmm7, 0x40(%r13)
+vmovlhps %xmm11, %xmm10, %xmm5
+vmovlhps %xmm0, %xmm18, %xmm18
+vmovlpd %xmm6, 0x20(%r15d)
+vmovlpd %xmm10, -0x80(%rcx)
+vmovlps %xmm10, 0x200(%rsi,%rbp,1)
+vmovlps (%ecx,%r15d,8), %xmm19, %xmm1
+vmovntdq %xmm16, 0x100(%rdx,%rdx,4)
+vmovntdq %xmm31, 0x1000(%r15)
+vmovntdqa 0x20(%r14,%rdx,8), %ymm15
+vmovntdqa 0x80(%rbp), %ymm11
+vmovntpd %zmm10, 0x1(%r14,%rdx,4)
+vmovntpd %xmm23, 0x20(%r10)
+vmovntps %zmm21, 0x80(,%r14,2)
+vmovntps %xmm25, 0x4(%rdx,%r12,8)
+vmovsd -0x40(%rdx,%rax,8), %xmm30
+vmovsd %xmm2, %xmm22, %xmm8
+vmovshdup %ymm13, %ymm9{%k3}{z}
+vmovshdup (%r14,%r13,4), %zmm15{%k5}
+vmovsldup 0x0(%r15), %ymm26
+vmovsldup %ymm2, %ymm17{%k4}
+vmovss 0x1(%rdx), %xmm14
+vmovss 0x8(%rax), %xmm8
+vmovupd -0x40(%rax), %xmm0{%k7}{z}
+vmovupd %xmm18, %xmm4
+vmovups 0x4(%r9), %zmm31
+vmovups -0x100(%rbp), %xmm1{%k5}
+vmulpd 0x8(%rbp), %xmm24, %xmm4{%k2}
+vmulpd 0x40(%rbp){1to8}, %zmm6, %zmm6
+vmulps %zmm6, %zmm10, %zmm10
+vmulps %zmm17, %zmm21, %zmm1{%k2}
+vmulsd 0x8(%r8d), %xmm12, %xmm1
+vmulsd %xmm7, %xmm4, %xmm2
+vmulss {rn-sae}, %xmm22, %xmm26, %xmm0
+vmulss 0x1(%rbx,%rbx,1), %xmm6, %xmm21
+vpabsd %xmm5, %xmm1{%k6}
+vpabsd %zmm12, %zmm29
+vpabsq -0x100(%r9,%r10,8), %ymm3
+vpabsq 0x10(%r14d), %zmm27{%k6}
+vpaddd 0x1(%rax,%r11,2), %ymm20, %ymm15{%k7}{z}
+vpaddd -0x100(%r13,%r8,8), %zmm2, %zmm0
+vpaddq 0x7f0(,%rcx,2), %ymm0, %ymm0
+vpaddq 0x3f(%rsp,%rbx,4), %xmm3, %xmm25{%k2}{z}
+vpandd %zmm3, %zmm24, %zmm10
+vpandd %xmm19, %xmm12, %xmm16
+vpandnd 0x3f(%r11), %xmm14, %xmm4
+vpandnd %ymm6, %ymm5, %ymm9{%k2}{z}
+vpandnq -0x80(,%rcx,1), %ymm26, %ymm0{%k5}{z}
+vpandnq -0x2000(%r14,%rcx,8){1to4}, %ymm7, %ymm18
+vpandq 0x20(%r8){1to2}, %xmm13, %xmm18
+vpandq %zmm4, %zmm7, %zmm22
+vpblendmd 0x8(%rbx,%rdi,2), %ymm28, %ymm31
+vpblendmd %xmm5, %xmm9, %xmm1
+vpblendmq %ymm21, %ymm14, %ymm9{%k5}
+vpblendmq %xmm17, %xmm8, %xmm22{%k3}
+vpbroadcastq %xmm4, %ymm3
+vpbroadcastq %xmm5, %zmm25
+vpcmpd $0x3, %ymm13, %ymm4, %k3
+vpcmpd $0x11, 0x8(%edi,%r9d,8){1to16}, %zmm4, %k6{%k4}
+vpcmpeqd 0x4(%r10), %xmm1, %k7
+vpcmpeqd %xmm30, %xmm6, %k6
+vpcmpeqq 0x200(%rcx,%rbp,4), %ymm12, %k1{%k1}
+vpcmpeqq -0x2000(%r10){1to2}, %xmm10, %k5{%k1}
+vpcmpequd 0x10(%rax), %ymm29, %k1
+vpcmpequd -0x40(%rax){1to16}, %zmm22, %k5
+vpcmpequq %ymm25, %ymm15, %k0
+vpcmpequq %zmm15, %zmm9, %k5{%k3}
+vpcmpq $0x7f, %zmm4, %zmm13, %k0
+vpcmpq $0x0, 0x40(%rax){1to4}, %ymm15, %k1
+vpcmpud $0x11, %ymm13, %ymm30, %k7
+vpcmpud $0x0, %zmm2, %zmm27, %k2{%k4}
+vpcmpuq $0x1, 0x20(%r14), %ymm26, %k7{%k6}
+vpcmpuq $0x1, %zmm25, %zmm31, %k3
+vpcompressd %xmm12, %xmm15
+vpcompressd %zmm10, %zmm1
+vpcompressq %xmm8, 0x80(%rbp,%rbp,1)
+vpcompressq %zmm0, %zmm22{%k6}
+vpermi2d -0x40(%rbx,%r9,8), %ymm15, %ymm14{%k1}
+vpermi2d 0x200(%r10), %xmm8, %xmm7{%k3}{z}
+vpermi2pd 0x12345(%r11,%rdx,4), %ymm11, %ymm8{%k6}
+vpermi2pd 0x0(%r14), %zmm14, %zmm6
+vpermi2ps %zmm5, %zmm12, %zmm25{%k3}{z}
+vpermi2ps %xmm22, %xmm6, %xmm13
+vpermi2q %ymm29, %ymm11, %ymm5{%k6}
+vpermi2q 0x40(%rbx,%r15,4), %zmm30, %zmm3{%k5}{z}
+vpermilpd 0x10(%r10,%r8,1), %ymm1, %ymm2
+vpermilpd $0xff, 0x100(%r15,%r9,2){1to4}, %ymm23{%k4}
+vpermpd -0x40(%r14), %ymm13, %ymm20
+vpermt2d %zmm5, %zmm25, %zmm1
+vpermt2d 0x200(%r12), %ymm31, %ymm14
+vpermt2pd 0x20(%rax), %zmm4, %zmm3
+vpermt2pd 0x8(%r8d){1to8}, %zmm7, %zmm28{%k1}{z}
+vpermt2ps 0x40(%r11), %xmm23, %xmm1
+vpermt2ps 0x80(%r11,%rax,1){1to8}, %ymm7, %ymm26{%k1}{z}
+vpermt2q %xmm21, %xmm28, %xmm0{%k3}{z}
+vpermt2q 0x1(%rax), %xmm7, %xmm25
+vpexpandd %zmm9, %zmm1
+vpexpandd 0x1(%rcx,%rdx,8), %ymm3
+vpexpandq 0x2(%rdx,%r8,8), %ymm7
+vpexpandq 0x8(%r8), %zmm4
+vpgatherdd -0x40(%r14,%ymm29,1), %ymm3{%k7}
+vpgatherdd (%r10,%zmm17,1), %zmm7{%k6}
+vpgatherdq 0x20(%rcx,%xmm16,1), %ymm0{%k2}
+vpgatherdq 0x100(%rbp,%ymm7,4), %zmm14{%k3}
+vpgatherqd 0x40(%r14d,%ymm7,4), %xmm2{%k5}
+vpgatherqq 0x2(%rsp,%zmm18,4), %zmm31{%k1}
+vpgatherqq 0x100(,%zmm23,2), %zmm12{%k6}
+vpmaxsd 0x200(%r8){1to8}, %ymm8, %ymm15
+vpmaxsd 0x100(%r8,%r12,8), %ymm21, %ymm28
+vpmaxsq 0x20(%rcx,%r9,4){1to8}, %zmm31, %zmm12{%k5}
+vpmaxsq 0x10(%rdx,%r15,2), %xmm2, %xmm13
+vpmaxud %ymm16, %ymm7, %ymm12{%k4}
+vpmaxud %zmm8, %zmm20, %zmm9
+vpmaxuq 0x3f(%r10,%r15,8), %zmm2, %zmm13
+vpmaxuq %zmm21, %zmm13, %zmm14
+vpminsd %zmm31, %zmm12, %zmm8
+vpminsd %zmm0, %zmm4, %zmm7
+vpminsq 0x80(%rsp){1to4}, %ymm27, %ymm15
+vpminsq -0x80(%rsp), %xmm1, %xmm9
+vpminud %ymm27, %ymm4, %ymm1
+vpminud %zmm15, %zmm11, %zmm5
+vpminuq %zmm0, %zmm26, %zmm13
+vpminuq %ymm9, %ymm15, %ymm10
+vpmovdb %ymm21, %xmm12
+vpmovdb %xmm23, 0x40(%r15)
+vpmovdw %zmm5, %ymm15
+vpmovdw %xmm14, %xmm27{%k6}{z}
+vpmovqb %ymm30, %xmm16
+vpmovqb %zmm25, -0x80(%rcx,%rbp,2)
+vpmovqd %zmm4, 0x80(%r14,%r13,8){%k2}
+vpmovqd %zmm8, %ymm7
+vpmovqw %zmm31, 0x40(%rdi)
+vpmovqw %xmm6, 0x20(%r9,%rbx,4)
+vpmovsdb %zmm7, %xmm24
+vpmovsdb %xmm26, %xmm4
+vpmovsdw %ymm1, %xmm7
+vpmovsdw %zmm2, 0x100(%rsp,%rsi,1)
+vpmovsqb %xmm6, -0x80(%rax){%k3}
+vpmovsqb %zmm21, %xmm24{%k1}{z}
+vpmovsqd %ymm20, %xmm30{%k7}
+vpmovsqd %xmm14, -0x2000(%r9,%r11,2){%k7}
+vpmovsqw %ymm6, %xmm5
+vpmovsqw %zmm21, %xmm29
+vpmovswb %ymm19, -0x100(%r11)
+vpmovswb %ymm29, -0x40(%r11)
+vpmovsxbd 0x80(%rcx,%rcx,2), %zmm13{%k3}
+vpmovsxbw -0x40(%eax), %ymm15{%k7}
+vpmovsxdq %xmm21, %xmm9
+vpmovsxdq %xmm31, %ymm14
+vpmovsxwd 0x80(%rdi), %zmm24
+vpmovusdb %zmm1, %xmm5
+vpmovusdb %xmm31, %xmm12{%k3}{z}
+vpmovusdw %ymm23, -0x2000(%r10)
+vpmovusdw %xmm18, %xmm15{%k6}{z}
+vpmovusqb %xmm18, %xmm4{%k6}
+vpmovusqb %ymm5, 0x20(%rdi)
+vpmovusqd %ymm20, %xmm29
+vpmovusqd %zmm7, %ymm8
+vpmovusqw %zmm19, -0x100(%rdx){%k7}
+vpmovusqw %xmm24, 0x2(%rsp){%k7}
+vpmovuswb %xmm11, 0x80(%rdi,%rdx,1)
+vpmovwb %xmm13, -0x2000(%rdi,%rsi,4)
+vpmovzxbq 0x3f(%rsi,%r14,8), %zmm15
+vpmovzxbw %xmm2, %xmm12{%k4}{z}
+vpmovzxdq %xmm6, %ymm26{%k6}{z}
+vpmovzxdq -0x80(%rsp), %ymm3
+vpmovzxwd 0x100(%rdi), %zmm14
+vpmuldq %ymm28, %ymm29, %ymm13{%k1}{z}
+vpmuldq -0x100(%r14d){1to2}, %xmm13, %xmm25
+vpmulld %xmm18, %xmm1, %xmm0
+vpmulld %zmm12, %zmm0, %zmm5
+vpmuludq %zmm5, %zmm10, %zmm9{%k6}{z}
+vpmuludq -0x40(%rsi){1to2}, %xmm31, %xmm2{%k5}
+vpord 0x20(%rsp){1to16}, %zmm19, %zmm2{%k6}{z}
+vpord %ymm19, %ymm16, %ymm8{%k2}
+vporq %ymm11, %ymm14, %ymm3
+vporq %xmm10, %xmm9, %xmm0{%k1}
+vprold $0x1, %ymm3, %ymm27{%k2}{z}
+vprold $0x11, %zmm28, %zmm9
+vprolq $0x1, 0x100(,%rdx,2){1to4}, %ymm18
+vprolq $0x3, %xmm0, %xmm11{%k1}{z}
+vprolvd 0x100(%r12){1to8}, %ymm3, %ymm16{%k7}{z}
+vprolvd %zmm2, %zmm25, %zmm3
+vprolvq 0x7f0(%rax){1to8}, %zmm7, %zmm16
+vprolvq 0x8(%r12){1to2}, %xmm18, %xmm18
+vprord $0xff, 0x20(%rbp,%r12,1), %ymm20
+vprord $0xff, 0x8(%rbp), %xmm24
+vprorq $0x11, %ymm14, %ymm31{%k7}{z}
+vprorq $0xff, %xmm4, %xmm0
+vprorvd 0x8(%rdx), %ymm30, %ymm5
+vprorvd 0x12345(%rax){1to4}, %xmm28, %xmm18
+vprorvq %xmm26, %xmm9, %xmm9
+vprorvq 0x1(%ebx,%r11d,4){1to8}, %zmm29, %zmm21
+vpscatterdd %ymm13, 0x20(%rsi,%ymm21,2){%k3}
+vpscatterdd %xmm11, 0x40(%rbp,%xmm31,8){%k1}
+vpscatterqd %ymm14, 0x40(%r14,%zmm30,4){%k5}
+vpscatterqd %ymm9, 0x20(,%zmm7,1){%k3}
+vpscatterqq %ymm30, 0x12345(%r11,%ymm6,4){%k2}
+vpscatterqq %zmm10, 0x1000(%edx,%zmm10,1){%k1}
+vpshufd $0x7f, 0x100(%rcx,%r11,4), %ymm0
+vpshufd $0x3, 0x1000(%rsp){1to4}, %xmm7{%k7}
+vpslld 0x100(%r8), %zmm8, %zmm10
+vpslld 0x2(,%r14,1), %zmm25, %zmm16{%k7}
+vpsllq (%rax), %zmm29, %zmm8{%k3}
+vpsllq %xmm21, %ymm2, %ymm16
+vpsrad %xmm27, %ymm23, %ymm26
+vpsrad 0x80(%r13), %xmm7, %xmm23{%k4}{z}
+vpsraq %xmm7, %ymm28, %ymm19
+vpsraq $0x0, -0x2000(%r12), %xmm23{%k6}
+vpsravq 0x40(%r8), %ymm7, %ymm4
+vpsravq 0x100(%rdi){1to2}, %xmm10, %xmm13{%k5}
+vpsrld $0x11, 0x40(%r9,%rcx,8){1to16}, %zmm12
+vpsrld 0x200(%r11), %xmm13, %xmm3
+vpsrlq $0x11, -0x80(%edx,%edi,2), %zmm7
+vpsrlq 0x40(%rax,%rdi,1), %ymm4, %ymm10{%k1}{z}
+vpsubd 0x20(%r11), %xmm1, %xmm14
+vpsubd %xmm24, %xmm1, %xmm15{%k3}
+vpsubq %ymm12, %ymm1, %ymm1
+vpsubq 0x1(%r12), %xmm27, %xmm21{%k6}
+vpternlogd $0x3, -0x80(%r10d), %ymm8, %ymm9
+vpternlogd $0x1, 0x200(%r13,%r10,2), %xmm13, %xmm22
+vpternlogq $0x1, 0x12345(%r15), %xmm14, %xmm8
+vpternlogq $0x0, %xmm19, %xmm2, %xmm11{%k4}
+vptestmd %xmm27, %xmm8, %k2
+vptestmd 0x40(%r15){1to16}, %zmm28, %k0
+vptestmq %ymm3, %ymm16, %k4
+vptestmq %xmm16, %xmm1, %k3
+vptestnmd %xmm21, %xmm7, %k2{%k6}
+vptestnmd %xmm5, %xmm9, %k5{%k2}
+vptestnmq 0x80(%rdx,%r13,4), %zmm16, %k2
+vptestnmq %ymm9, %ymm21, %k1
+vpunpckhdq %xmm31, %xmm9, %xmm15
+vpunpckhdq 0x1000(%ecx,%eax,8){1to8}, %ymm31, %ymm4{%k3}
+vpunpckhqdq -0x80(%rbp), %xmm30, %xmm9
+vpunpckhqdq 0x0(%r9,%rbx,8){1to2}, %xmm9, %xmm10{%k6}
+vpunpckldq %xmm12, %xmm1, %xmm17{%k1}
+vpunpckldq %zmm12, %zmm15, %zmm23
+vpunpcklqdq %xmm0, %xmm20, %xmm26
+vpunpcklqdq 0x40(%r12d), %ymm8, %ymm20{%k1}
+vpxord 0x100(%r13), %xmm19, %xmm16{%k5}
+vpxord %ymm20, %ymm0, %ymm9
+vpxorq %zmm11, %zmm7, %zmm26
+vpxorq 0x40(%r12,%r9,1), %xmm10, %xmm7{%k2}{z}
+vrcp14pd 0x40(%rbx), %ymm21{%k7}{z}
+vrcp14pd 0x40(%r12), %ymm8{%k5}
+vrcp14ps 0x80(%rdi), %zmm12{%k3}
+vrcp14ps -0x2000(%rdx){1to4}, %xmm5{%k6}
+vrcp14sd -0x80(%rax), %xmm10, %xmm19{%k5}{z}
+vrcp14sd 0x40(%r8,%r10,8), %xmm13, %xmm31
+vrcp14ss %xmm19, %xmm4, %xmm26{%k2}{z}
+vrcp14ss 0x1(%rbx,%rdx,4), %xmm22, %xmm25{%k2}{z}
+vrndscalepd $0x3, 0x10(%r9,%rcx,8){1to4}, %ymm13
+vrndscalepd $0x11, 0x10(%esi), %ymm17
+vrndscaleps $0x1, -0x100(%r8,%rdx,8), %ymm4
+vrndscaleps $0x3, 0x10(%r11){1to4}, %xmm24
+vrndscalesd $0x0, -0x80(%r13), %xmm13, %xmm10
+vrndscalesd $0x1, 0x1000(%r13), %xmm27, %xmm22
+vrndscaless $0x11, %xmm24, %xmm26, %xmm7{%k3}{z}
+vrndscaless $0x0, %xmm7, %xmm21, %xmm9
+vrsqrt14pd %ymm26, %ymm11
+vrsqrt14pd %zmm11, %zmm0
+vrsqrt14ps -0x100(%r9d), %zmm7
+vrsqrt14ps %ymm8, %ymm7{%k1}
+vrsqrt14sd %xmm6, %xmm6, %xmm27{%k6}
+vrsqrt14sd 0x200(%r8,%rax,4), %xmm3, %xmm0{%k1}
+vrsqrt14ss (%r14), %xmm6, %xmm27
+vrsqrt14ss (%r12,%r9,2), %xmm4, %xmm3
+vscalefpd %xmm1, %xmm17, %xmm9
+vscalefpd 0x20(%r15,%r14,1), %zmm11, %zmm23
+vscalefps 0x40(%rcx){1to4}, %xmm7, %xmm17{%k1}
+vscalefps 0x8(%rdi,%r8,2), %xmm10, %xmm29
+vscalefsd %xmm10, %xmm22, %xmm27{%k7}{z}
+vscalefsd {rd-sae}, %xmm25, %xmm24, %xmm14{%k6}
+vscalefss (%r11), %xmm1, %xmm31
+vscalefss %xmm27, %xmm3, %xmm24{%k4}{z}
+vscatterdpd %xmm17, -0x100(%r10d,%xmm26,2){%k4}
+vscatterdps %zmm6, -0x40(,%zmm6,1){%k4}
+vscatterqpd %zmm29, -0x80(%r8,%zmm12,4){%k7}
+vscatterqpd %xmm15, 0x12345(,%xmm11,4){%k1}
+vscatterqps %xmm14, 0x20(%r13,%ymm29,2){%k4}
+vscatterqps %ymm8, (,%zmm0,1){%k3}
+vshuff32x4 $0x7f, %zmm14, %zmm2, %zmm14{%k1}{z}
+vshuff32x4 $0x3, %ymm4, %ymm0, %ymm20{%k6}
+vshuff64x2 $0x3, -0x40(%r10,%rbp,1), %zmm4, %zmm29
+vshuff64x2 $0x3, 0x1(%esi), %ymm4, %ymm13{%k4}
+vshufi32x4 $0x11, 0x10(%rsp){1to16}, %zmm8, %zmm2
+vshufi32x4 $0x7f, %ymm0, %ymm20, %ymm6
+vshufi64x2 $0x11, %ymm16, %ymm7, %ymm8{%k7}
+vshufi64x2 $0x11, %zmm26, %zmm21, %zmm16{%k1}
+vshufpd $0x11, -0x2000(%r10,%rbp,1), %zmm1, %zmm1
+vshufpd $0x3, 0x40(%rcx){1to4}, %ymm20, %ymm30{%k6}{z}
+vshufps $0x0, 0x12345(%rbx), %xmm23, %xmm1{%k1}
+vshufps $0x0, 0x80(%r11), %ymm20, %ymm21
+vsqrtpd -0x100(%rax), %zmm19{%k5}
+vsqrtpd 0x8(%rax), %ymm1
+vsqrtps 0x12345(%r10d), %zmm19
+vsqrtps 0x0(%r12,%rsi,4){1to8}, %ymm17{%k2}{z}
+vsqrtsd -0x80(%r14), %xmm6, %xmm31{%k7}
+vsqrtsd 0x40(%r13,%r14,2), %xmm28, %xmm27
+vsqrtss {rd-sae}, %xmm1, %xmm1, %xmm3
+vsqrtss -0x40(%r12), %xmm23, %xmm16
+vsubpd {rz-sae}, %zmm13, %zmm22, %zmm7
+vsubpd 0x4(%r13), %xmm13, %xmm12{%k2}{z}
+vsubps 0x80(%r15,%r9,4), %xmm21, %xmm5
+vsubps 0x7f0(%r9d,%edx,4){1to4}, %xmm3, %xmm11{%k4}{z}
+vsubsd 0x2(%r12), %xmm6, %xmm23
+vsubsd %xmm12, %xmm6, %xmm10
+vsubss 0x8(%rax), %xmm3, %xmm1
+vsubss -0x40(%rax), %xmm10, %xmm19{%k5}
+vucomisd {sae}, %xmm12, %xmm1
+vucomisd -0x100(%rsi), %xmm13
+vucomiss (%rsi,%rbp,4), %xmm11
+vucomiss 0x10(%rax), %xmm13
+vunpckhpd %xmm23, %xmm14, %xmm5{%k5}
+vunpckhpd %xmm20, %xmm9, %xmm3{%k3}
+vunpckhps 0x4(%r13d), %zmm3, %zmm16
+vunpckhps 0x200(%r13){1to16}, %zmm10, %zmm9{%k5}
+vunpcklpd %ymm13, %ymm31, %ymm22{%k4}
+vunpcklpd %ymm13, %ymm0, %ymm12{%k6}
+vunpcklps 0x4(%rax,%r11,4), %ymm20, %ymm1
+vunpcklps -0x2000(%rsp), %xmm5, %xmm14{%k5}{z}
+# ---- AVX-512BW ---------------------------------------------------------------
+kaddd %k6, %k5, %k0
+kaddd %k0, %k4, %k7
+kaddq %k3, %k7, %k1
+kaddq %k2, %k1, %k6
+kandd %k3, %k7, %k5
+kandd %k2, %k2, %k7
+kandnd %k2, %k0, %k6
+kandnd %k1, %k4, %k6
+kandnq %k5, %k0, %k3
+kandnq %k0, %k1, %k3
+kandq %k6, %k5, %k3
+kandq %k2, %k5, %k2
+kmovd %k2, 0x2(%r10)
+kmovd %r12d, %k4
+kmovq %rsp, %k6
+kmovq %rbp, %k7
+knotd %k0, %k2
+knotd %k6, %k5
+knotq %k0, %k7
+knotq %k4, %k4
+kord %k5, %k4, %k3
+kord %k2, %k4, %k0
+korq %k3, %k6, %k2
+korq %k5, %k2, %k5
+kortestd %k3, %k0
+kortestd %k0, %k7
+kortestq %k5, %k3
+kortestq %k0, %k1
+kshiftld $0xff, %k6, %k7
+kshiftld $0x0, %k2, %k3
+kshiftlq $0x0, %k5, %k5
+kshiftlq $0x0, %k5, %k1
+kshiftrd $0x7f, %k7, %k0
+kshiftrd $0x1, %k6, %k1
+kshiftrq $0x3, %k6, %k4
+kshiftrq $0x3, %k7, %k0
+ktestd %k3, %k3
+ktestd %k1, %k0
+ktestq %k2, %k4
+ktestq %k6, %k1
+kunpckdq %k4, %k6, %k4
+kunpckdq %k3, %k7, %k5
+kunpckwd %k3, %k7, %k5
+kunpckwd %k3, %k7, %k4
+kxnord %k0, %k2, %k1
+kxnord %k7, %k7, %k3
+kxnorq %k1, %k5, %k0
+kxnorq %k2, %k7, %k2
+kxord %k6, %k0, %k0
+kxord %k7, %k0, %k1
+kxorq %k4, %k4, %k3
+kxorq %k1, %k4, %k6
+vdbpsadbw $0x7f, (%rsp,%rdi,4), %ymm23, %ymm9
+vdbpsadbw $0x11, -0x80(%ebx,%ebp,4), %ymm16, %ymm22{%k1}
+vmovdqu16 0x20(%r14), %zmm1{%k4}
+vmovdqu16 %zmm24, %zmm0
+vmovdqu8 0x40(%rcx,%r9,2), %xmm9
+vmovdqu8 %zmm3, %zmm3
+vpabsb %ymm13, %ymm6{%k7}
+vpabsb 0x1(%r14), %zmm14{%k1}
+vpabsw %ymm24, %ymm13
+vpabsw %zmm11, %zmm5{%k7}
+vpackssdw %ymm16, %ymm7, %ymm10
+vpackssdw %zmm29, %zmm10, %zmm24{%k5}
+vpacksswb 0x3f(%r10), %zmm28, %zmm1{%k4}
+vpacksswb %ymm24, %ymm11, %ymm21{%k7}{z}
+vpackusdw -0x2000(%r12,%r13,1), %ymm7, %ymm26{%k4}
+vpackusdw 0x200(%r13), %ymm6, %ymm28{%k7}
+vpackuswb %xmm11, %xmm0, %xmm23
+vpackuswb -0x80(%rbx), %zmm10, %zmm19
+vpaddb 0x1000(%rbx), %xmm2, %xmm3
+vpaddb %ymm29, %ymm31, %ymm3
+vpaddsb %xmm17, %xmm10, %xmm10{%k6}{z}
+vpaddsb 0x1000(%r12,%r8,4), %zmm8, %zmm14{%k5}
+vpaddsw %xmm7, %xmm8, %xmm31{%k7}
+vpaddsw 0x100(%rdx), %ymm13, %ymm10{%k3}{z}
+vpaddusb 0x80(,%r14,2), %zmm13, %zmm2{%k2}
+vpaddusb %zmm16, %zmm13, %zmm22
+vpaddusw 0x12345(%rax), %xmm23, %xmm27
+vpaddusw 0x40(%r11), %xmm14, %xmm12
+vpaddw %xmm16, %xmm10, %xmm13
+vpaddw %xmm4, %xmm25, %xmm5
+vpalignr $0x7f, 0x40(%rax), %xmm11, %xmm9{%k6}
+vpalignr $0xff, %xmm21, %xmm5, %xmm13{%k4}
+vpavgb 0x1(%r8), %zmm16, %zmm11
+vpavgb %ymm19, %ymm2, %ymm11{%k1}{z}
+vpavgw 0x2(%rsp), %ymm7, %ymm31
+vpavgw 0x80(%r10), %xmm10, %xmm22{%k1}{z}
+vpblendmb %zmm5, %zmm12, %zmm0
+vpblendmb %zmm30, %zmm5, %zmm16
+vpblendmw 0x40(%rsi), %xmm25, %xmm25
+vpblendmw %ymm8, %ymm8, %ymm10
+vpbroadcastb -0x2000(%rsp,%r9,1), %ymm4{%k6}
+vpbroadcastb %xmm29, %ymm10{%k2}
+vpbroadcastw %r10d, %ymm8
+vpbroadcastw %edx, %zmm21
+vpcmpb $0x1, -0x80(%esp), %zmm21, %k6{%k1}
+vpcmpb $0x1, %ymm3, %ymm6, %k1
+vpcmpeqb %zmm25, %zmm0, %k0
+vpcmpeqb 0x3f(%r14), %ymm26, %k6
+vpcmpequb 0x8(%rbp,%r14,2), %zmm25, %k6
+vpcmpequb %zmm17, %zmm23, %k1
+vpcmpequw 0x40(%r12,%r13,8), %ymm2, %k7
+vpcmpequw -0x80(%r10,%rbp,2), %xmm11, %k6
+vpcmpeqw 0x1000(%r15), %ymm2, %k5
+vpcmpeqw 0x1(%r9), %zmm7, %k4{%k1}
+vpcmpub $0xff, 0x4(%r14), %xmm5, %k5{%k7}
+vpcmpub $0x7f, %xmm12, %xmm25, %k4{%k1}
+vpcmpuw $0x1, %zmm5, %zmm15, %k5
+vpcmpuw $0x3, 0x7f0(%r8,%r15,8), %zmm0, %k5
+vpcmpw $0x1, 0x80(%r9,%rsi,2), %xmm20, %k0
+vpcmpw $0x7f, %xmm21, %xmm7, %k4
+vpermi2w 0x80(%r11), %ymm14, %ymm11
+vpermi2w %xmm13, %xmm4, %xmm11{%k2}
+vpermt2w 0x3f(%rsp), %ymm7, %ymm15
+vpermt2w 0x3f(%eax), %zmm29, %zmm15
+vpermw %ymm4, %ymm15, %ymm1
+vpermw 0x1000(%r15), %zmm26, %zmm27
+vpextrb $0xff, %xmm18, 0x80(%edi)
+vpextrb $0x1, %xmm7, %ebp
+vpextrw $0x7f, %xmm3, 0x80(%r10)
+vpextrw $0x7f, %xmm4, %r13
+vpinsrb $0x1, 0x7f0(%rbp), %xmm3, %xmm12
+vpinsrb $0x1, %edx, %xmm2, %xmm28
+vpinsrw $0x7f, 0x3f(%r10), %xmm19, %xmm9
+vpinsrw $0x3, 0x200(%rdx), %xmm11, %xmm11
+vpmaddubsw %ymm3, %ymm16, %ymm7
+vpmaddubsw %xmm15, %xmm6, %xmm21
+vpmaddwd %zmm15, %zmm12, %zmm16
+vpmaddwd -0x2000(%rcx,%rdi,8), %zmm3, %zmm13
+vpmaxsb %zmm25, %zmm12, %zmm28
+vpmaxsb 0x40(%r15), %zmm11, %zmm30{%k6}
+vpmaxsw 0x10(%rdx), %xmm13, %xmm4
+vpmaxsw 0x1(%r14,%rcx,4), %ymm14, %ymm26
+vpmaxub %xmm9, %xmm14, %xmm12
+vpmaxub (%r9,%rsi,4), %ymm31, %ymm8{%k3}{z}
+vpmaxuw %xmm4, %xmm10, %xmm13{%k1}{z}
+vpmaxuw 0x4(%rdx), %zmm16, %zmm1{%k6}
+vpminsb %ymm7, %ymm3, %ymm31{%k5}
+vpminsb %xmm3, %xmm7, %xmm8{%k6}{z}
+vpminsw %xmm15, %xmm30, %xmm3{%k6}
+vpminsw 0x40(%r12,%rsi,1), %ymm20, %ymm11
+vpminub 0x12345(%rax), %zmm27, %zmm3
+vpminub %xmm27, %xmm27, %xmm21
+vpminuw 0x20(%rdi), %ymm8, %ymm30{%k1}
+vpminuw -0x80(%rsi), %ymm14, %ymm8
+vpmovb2m %ymm28, %k2
+vpmovb2m %zmm28, %k4
+vpmovm2b %k5, %xmm17
+vpmovm2b %k5, %ymm1
+vpmovm2w %k0, %xmm15
+vpmovm2w %k1, %zmm22
+vpmovsxbw 0x100(%rdi,%r8,2), %zmm16{%k3}{z}
+vpmovuswb %zmm14, 0x2(%r14,%r11,4)
+vpmovw2m %zmm11, %k1
+vpmovw2m %xmm27, %k2
+vpmovwb %zmm12, %ymm13
+vpmovzxbw 0x200(%rcx), %zmm15{%k4}
+vpmulhrsw %ymm11, %ymm12, %ymm5
+vpmulhrsw %zmm0, %zmm6, %zmm24
+vpmulhuw 0x3f(%r9), %ymm9, %ymm26
+vpmulhuw %ymm13, %ymm20, %ymm3{%k7}{z}
+vpmulhw -0x2000(%rdx,%rsi,2), %xmm20, %xmm12
+vpmulhw 0x2(%rbx), %zmm4, %zmm17
+vpmullw %xmm28, %xmm21, %xmm6{%k3}
+vpmullw %zmm20, %zmm26, %zmm5
+vpsadbw %zmm2, %zmm8, %zmm0
+vpsadbw 0x1(%rsi,%rcx,8), %zmm28, %zmm0
+vpshufb 0x1(%r15,%r9,8), %zmm1, %zmm15{%k1}
+vpshufb 0x8(%eax), %xmm12, %xmm13{%k1}{z}
+vpshufhw $0xff, 0x40(%rdi), %xmm18{%k2}
+vpshufhw $0x11, 0x8(%rdx), %zmm6{%k1}
+vpshuflw $0x7f, 0x1(%rax,%r9,4), %zmm13
+vpshuflw $0x3, %ymm31, %ymm5
+vpslldq $0xff, 0x4(%rdx), %xmm4
+vpslldq $0x7f, (,%r14,8), %ymm0
+vpsllvw %zmm16, %zmm22, %zmm16
+vpsllvw -0x40(%ecx), %ymm16, %ymm7{%k2}
+vpsllw 0x0(%r15), %zmm0, %zmm19
+vpsllw $0x11, 0x40(%ebx,%eax,4), %xmm3{%k4}{z}
+vpsravw 0x40(%rdi,%rcx,1), %xmm6, %xmm11
+vpsravw %zmm3, %zmm11, %zmm1
+vpsraw %xmm4, %xmm3, %xmm15{%k3}{z}
+vpsraw %xmm23, %zmm19, %zmm7
+vpsrldq $0x1, 0x100(%rbx,%rdi,1), %xmm21
+vpsrldq $0x1, (%r12d), %zmm0
+vpsrlvw 0x1000(%rax), %ymm18, %ymm28
+vpsrlvw %zmm21, %zmm16, %zmm5
+vpsrlw $0x1, 0x3f(%r9,%r8,1), %ymm6
+vpsrlw $0x0, %xmm2, %xmm15
+vpsubb %ymm12, %ymm9, %ymm8
+vpsubb 0x40(%rax), %ymm1, %ymm21
+vpsubsb -0x40(%rax), %xmm5, %xmm19{%k2}
+vpsubsb %xmm12, %xmm0, %xmm28
+vpsubsw %ymm3, %ymm16, %ymm31
+vpsubsw %xmm11, %xmm24, %xmm2{%k4}{z}
+vpsubusb %zmm26, %zmm20, %zmm28
+vpsubusb %zmm3, %zmm8, %zmm25{%k6}
+vpsubusw %zmm1, %zmm25, %zmm12{%k6}
+vpsubusw 0x1000(%rax,%rcx,4), %xmm3, %xmm2
+vpsubw -0x80(%rdi), %ymm23, %ymm6{%k1}
+vpsubw %ymm24, %ymm3, %ymm6
+vptestmb 0x200(%r8), %zmm14, %k7
+vptestmb -0x2000(%rbp), %ymm2, %k4
+vptestmw (%rcx,%rdx,1), %zmm4, %k4
+vptestmw -0x80(%rcx,%rdi,1), %xmm10, %k4{%k7}
+vptestnmb %xmm11, %xmm5, %k4
+vptestnmb %xmm30, %xmm13, %k2
+vptestnmw (%r8), %zmm7, %k7
+vptestnmw 0x4(%r11), %xmm19, %k5
+vpunpckhbw 0x8(%r9,%rdi,1), %ymm8, %ymm6
+vpunpckhbw %zmm3, %zmm29, %zmm14{%k5}
+vpunpckhwd 0x1000(%rdi,%r8,8), %zmm0, %zmm25
+vpunpckhwd 0x40(%r9), %zmm12, %zmm12{%k4}{z}
+vpunpcklbw -0x80(%rdi), %zmm7, %zmm0
+vpunpcklbw %ymm13, %ymm5, %ymm5
+vpunpcklwd %xmm15, %xmm15, %xmm8
+vpunpcklwd %ymm13, %ymm30, %ymm4{%k6}{z}
+# ---- AVX-512DQ ---------------------------------------------------------------
+kaddb %k3, %k4, %k7
+kaddb %k1, %k1, %k5
+kaddw %k6, %k3, %k2
+kaddw %k4, %k1, %k7
+kandb %k7, %k7, %k3
+kandb %k7, %k1, %k0
+kandnb %k4, %k4, %k2
+kandnb %k1, %k2, %k6
+kmovb %r11d, %k1
+kmovb 0x40(%r10), %k2
+knotb %k5, %k5
+knotb %k4, %k6
+korb %k7, %k7, %k3
+korb %k4, %k2, %k4
+kortestb %k6, %k2
+kortestb %k4, %k6
+kshiftlb $0x7f, %k5, %k5
+kshiftlb $0x7f, %k7, %k6
+kshiftrb $0x3, %k4, %k0
+kshiftrb $0xff, %k4, %k2
+ktestb %k0, %k2
+ktestb %k5, %k0
+ktestw %k4, %k0
+ktestw %k3, %k7
+kxnorb %k6, %k4, %k1
+kxnorb %k2, %k5, %k5
+kxorb %k7, %k4, %k7
+kxorb %k7, %k2, %k2
+vandnpd 0x10(%rbx,%rcx,2), %zmm1, %zmm8{%k1}
+vandnpd (,%rsi,2), %ymm19, %ymm5
+vandnps -0x40(,%r9,4){1to8}, %ymm9, %ymm15{%k4}
+vandnps 0x10(%rcx){1to16}, %zmm12, %zmm23{%k5}{z}
+vandpd -0x80(%esp), %ymm8, %ymm6{%k7}{z}
+vandpd %xmm7, %xmm12, %xmm14
+vandps 0x8(%r10d,%r13d,4), %zmm11, %zmm5
+vandps (%rbx,%r10,8), %ymm5, %ymm4{%k3}{z}
+vbroadcastf32x2 %xmm5, %zmm24
+vbroadcastf32x2 0x100(%rax), %zmm5
+vbroadcastf32x8 0x10(%rbp,%r15,8), %zmm23
+vbroadcastf32x8 -0x100(%rcx,%rdx,1), %zmm5
+vbroadcastf64x2 0x20(%rdi), %ymm26
+vbroadcastf64x2 0x3f(%rbx,%rsi,2), %zmm11
+vbroadcasti32x2 %xmm22, %zmm1
+vbroadcasti32x2 0x2(%r12,%rbp,4), %ymm17
+vbroadcasti32x8 -0x100(%r15,%rdx,1), %zmm12{%k1}{z}
+vbroadcasti32x8 -0x2000(%r14), %zmm19
+vbroadcasti64x2 0x1(%r13), %ymm12
+vbroadcasti64x2 0x12345(%r8,%r12,4), %zmm31
+vcvtpd2qq {rz-sae}, %zmm24, %zmm22
+vcvtpd2qq {rn-sae}, %zmm8, %zmm15
+vcvtpd2uqq {rz-sae}, %zmm1, %zmm3
+vcvtpd2uqq %ymm6, %ymm3{%k2}{z}
+vcvtps2qq 0x200(%r15), %zmm12
+vcvtps2uqq %ymm8, %zmm10
+vcvtqq2pd %zmm2, %zmm6{%k3}
+vcvtqq2pd (%r14d), %xmm6
+vcvtqq2ps %zmm19, %ymm6
+vcvttpd2qq -0x2000(%eax,%r10d,1){1to2}, %xmm9
+vcvttpd2qq 0x100(%r11), %xmm4
+vcvttpd2uqq -0x100(%rbx,%r9,1){1to2}, %xmm31
+vcvttpd2uqq 0x8(%r8,%rdi,2){1to8}, %zmm6{%k5}
+vcvttps2qq 0x40(%r12,%rdi,1), %zmm18{%k6}
+vcvtuqq2pd -0x100(%rsp), %ymm9
+vcvtuqq2pd 0x40(%rbp,%rdx,4), %xmm2
+vcvtuqq2ps {rd-sae}, %zmm18, %ymm7
+vextractf32x8 $0xff, %zmm22, 0x12345(%r13,%r12,8){%k2}
+vextractf32x8 $0x1, %zmm2, %ymm1{%k7}{z}
+vextractf64x2 $0x1, %zmm24, %xmm18{%k6}
+vextractf64x2 $0xff, %ymm29, %xmm3{%k3}{z}
+vextracti32x8 $0x7f, %zmm5, 0x12345(%r14)
+vextracti32x8 $0x11, %zmm10, %ymm6{%k3}{z}
+vextracti64x2 $0x3, %ymm5, 0x40(%rax)
+vextracti64x2 $0x7f, %ymm7, %xmm11
+vfpclasspd $0xff, %xmm2, %k3
+vfpclasspd $0x3, 0x40(%r14){1to8}, %k5
+vfpclasspdz $0xff, %zmm3, %k7{%k7}
+vfpclasspdz $0x0, 0x3f(%rsi,%rbp,4){1to8}, %k6
+vfpclassps $0xff, %ymm8, %k7
+vfpclassps $0x1, %ymm17, %k6{%k6}
+vfpclasspsz $0x7f, %zmm24, %k0{%k2}
+vfpclasspsz $0x3, 0x7f0(%rdx,%r11,1){1to16}, %k1
+vfpclasssd $0x0, 0x200(%rdi), %k1
+vfpclasssd $0x3, (%rsi,%r13,8), %k5
+vfpclassss $0xff, -0x2000(%r10), %k4
+vfpclassss $0xff, %xmm3, %k6
+vinsertf32x8 $0x0, %ymm13, %zmm3, %zmm9
+vinsertf32x8 $0x7f, 0x200(%rdx,%rbp,1), %zmm4, %zmm18
+vinsertf64x2 $0x3, 0x40(%esi,%r10d,4), %ymm6, %ymm27
+vinsertf64x2 $0x1, %xmm5, %ymm1, %ymm23
+vinserti32x8 $0xff, 0x12345(%r13), %zmm11, %zmm13{%k6}
+vinserti32x8 $0x7f, 0x40(%rsp,%r15,2), %zmm9, %zmm9
+vinserti64x2 $0x7f, 0x40(%rbp), %ymm1, %ymm3
+vinserti64x2 $0x1, (%r13), %ymm5, %ymm15
+vorpd %ymm2, %ymm15, %ymm10
+vorpd %ymm2, %ymm3, %ymm3
+vorps (%rcx), %ymm4, %ymm20{%k7}
+vorps 0x10(%rsp), %ymm19, %ymm10
+vpextrd $0x0, %xmm3, %r11d
+vpextrd $0xff, %xmm7, 0x7f0(%r10)
+vpextrq $0x0, %xmm11, 0x2(%r12,%rsi,4)
+vpextrq $0x0, %xmm11, -0x2000(%r10d,%r13d,8)
+vpinsrd $0x3, 0x1000(%r12,%rdx,4), %xmm28, %xmm7
+vpinsrd $0xff, %r10d, %xmm8, %xmm28
+vpinsrq $0x1, 0x20(%r11), %xmm7, %xmm5
+vpinsrq $0x7f, %rbx, %xmm3, %xmm10
+vpmovd2m %zmm1, %k0
+vpmovd2m %xmm14, %k5
+vpmovm2d %k6, %xmm29
+vpmovm2d %k0, %ymm1
+vpmovm2q %k1, %zmm8
+vpmovm2q %k2, %ymm0
+vpmovq2m %ymm15, %k5
+vpmovq2m %ymm1, %k4
+vpmullq %xmm0, %xmm9, %xmm17{%k2}{z}
+vpmullq %xmm14, %xmm24, %xmm11
+vrangepd $0x3, -0x100(%r8,%rax,2){1to4}, %ymm0, %ymm11
+vrangepd $0xff, 0x100(%rbx,%r14,2), %ymm10, %ymm23{%k5}
+vrangeps $0x11, 0x1(%r8,%rbp,2), %zmm4, %zmm9
+vrangeps $0x7f, 0x2(%r12), %zmm3, %zmm18{%k4}{z}
+vrangesd $0x3, 0x2(%r10), %xmm12, %xmm7
+vrangesd $0x11, %xmm15, %xmm27, %xmm2{%k4}
+vrangess $0x11, 0x40(%rcx), %xmm24, %xmm13
+vrangess $0x7f, -0x40(%r13), %xmm3, %xmm28
+vreducepd $0x0, 0x20(%r9), %ymm3{%k4}{z}
+vreducepd $0x0, %ymm27, %ymm26{%k1}{z}
+vreduceps $0xff, %xmm30, %xmm29
+vreduceps $0xff, 0x2(%r14){1to4}, %xmm30
+vreducesd $0x1, 0x100(%rsp), %xmm13, %xmm4{%k3}
+vreducesd $0x0, -0x80(%r9), %xmm27, %xmm4{%k1}{z}
+vreducess $0x0, 0x200(,%r12,1), %xmm6, %xmm30
+vreducess $0x7f, 0x80(%rbp), %xmm6, %xmm10{%k4}
+vxorpd 0x7f0(%rbp){1to8}, %zmm3, %zmm15
+vxorpd %zmm17, %zmm7, %zmm1{%k6}
+vxorps (%r9), %ymm12, %ymm9{%k1}{z}
+vxorps 0x80(%r10,%r14,1), %zmm7, %zmm18
+# ---- AVX-512CD ---------------------------------------------------------------
+vpbroadcastmb2q %k7, %ymm1
+vpbroadcastmb2q %k3, %zmm27
+vpbroadcastmw2d %k0, %zmm19
+vpbroadcastmw2d %k6, %xmm3
+vpconflictd -0x80(%rdx), %ymm14{%k3}
+vpconflictd %xmm3, %xmm29{%k7}
+vpconflictq %ymm2, %ymm0{%k7}
+vpconflictq %zmm12, %zmm14{%k1}
+vplzcntd %xmm11, %xmm12
+vplzcntd -0x80(%rbp), %zmm10{%k3}{z}
+vplzcntq %zmm12, %zmm14{%k3}
+vplzcntq %ymm7, %ymm26
+# ---- AVX-512ER and AVX-512PF -------------------------------------------------
+vexp2pd {sae}, %zmm5, %zmm5{%k3}{z}
+vexp2pd -0x2000(%r10,%rbp,1), %zmm15
+vexp2ps 0x2(,%rsi,2){1to16}, %zmm15
+vexp2ps 0x100(%r11), %zmm30
+vgatherpf0dpd 0x100(%rbp,%ymm5,4){%k3}
+vgatherpf0dpd 0x80(%r9d,%ymm3,4){%k2}
+vgatherpf0dps 0x8(%r12,%zmm10,8){%k5}
+vgatherpf0dps 0x20(%rbx,%zmm21,1){%k7}
+vgatherpf0qpd 0x200(%r13d,%zmm0,4){%k1}
+vgatherpf0qpd 0x0(%r11,%zmm2,2){%k3}
+vgatherpf0qps 0x20(,%zmm13,1){%k1}
+vgatherpf1dpd 0x4(,%ymm9,2){%k2}
+vgatherpf1dps 0x10(%rbp,%zmm2,2){%k5}
+vgatherpf1dps 0x200(%r11,%zmm7,4){%k5}
+vgatherpf1qpd 0x8(%rsp,%zmm3,1){%k7}
+vgatherpf1qps 0x1000(%rcx,%zmm27,2){%k3}
+vgatherpf1qps 0x1000(%rdx,%zmm5,2){%k3}
+vrcp28pd 0x12345(%rbp){1to8}, %zmm9
+vrcp28pd 0x1(%r9,%rsi,8){1to8}, %zmm28{%k1}
+vrcp28ps 0x40(%r8), %zmm15
+vrcp28ps %zmm5, %zmm0{%k6}{z}
+vrcp28sd -0x80(%r10,%r13,4), %xmm5, %xmm3{%k6}
+vrcp28sd 0x100(%rsi,%r13,8), %xmm28, %xmm4{%k6}
+vrcp28ss {sae}, %xmm11, %xmm4, %xmm31
+vrcp28ss {sae}, %xmm2, %xmm19, %xmm30
+vrsqrt28pd {sae}, %zmm11, %zmm9
+vrsqrt28pd %zmm24, %zmm7{%k4}{z}
+vrsqrt28ps -0x80(%ebp,%edi,8){1to16}, %zmm16{%k4}
+vrsqrt28ps (%rax), %zmm20
+vrsqrt28sd %xmm14, %xmm8, %xmm0
+vrsqrt28sd %xmm20, %xmm11, %xmm11
+vrsqrt28ss %xmm18, %xmm18, %xmm6{%k1}{z}
+vrsqrt28ss %xmm2, %xmm26, %xmm30{%k4}
+vscatterpf0dpd 0x4(%rcx,%ymm12,2){%k1}
+vscatterpf0dpd -0x100(%r9,%ymm15,1){%k6}
+vscatterpf0qpd 0x40(%rax,%zmm12,2){%k6}
+vscatterpf0qpd -0x100(,%zmm2,8){%k4}
+vscatterpf0qps (%r13,%zmm7,1){%k6}
+vscatterpf1dpd 0x12345(%r8,%ymm29,8){%k6}
+vscatterpf1dps 0x0(%edx,%zmm7,4){%k7}
+vscatterpf1qps 0x2(%r13,%zmm10,1){%k4}
+vscatterpf1qps 0x0(%rsi,%zmm10,1){%k7}
+# ---- AVX-512IFMA, VBMI and VBMI2 ---------------------------------------------
+vpcompressb %zmm9, 0x8(%r12,%rbx,4){%k5}
+vpcompressb %ymm14, 0x1000(%rcx)
+vpcompressw %zmm6, %zmm10
+vpcompressw %zmm11, %zmm9
+vpermb 0x40(%ebp), %zmm8, %zmm26{%k3}{z}
+vpermb -0x100(%r15), %xmm17, %xmm8
+vpermi2b %xmm8, %xmm22, %xmm23{%k7}
+vpermi2b %ymm10, %ymm30, %ymm13{%k2}{z}
+vpermt2b %ymm10, %ymm24, %ymm10{%k2}
+vpermt2b %xmm6, %xmm16, %xmm12
+vpexpandb %ymm17, %ymm23{%k6}
+vpexpandb %zmm29, %zmm21{%k1}
+vpexpandw %ymm2, %ymm16
+vpexpandw %ymm25, %ymm27{%k3}{z}
+vpmadd52huq -0x40(%rsp), %zmm19, %zmm22{%k1}{z}
+vpmultishiftqb %zmm13, %zmm21, %zmm6
+vpmultishiftqb 0x4(%r12,%r14,2), %ymm11, %ymm19{%k2}
+vpshldd $0x1, %xmm7, %xmm27, %xmm15
+vpshldd $0xff, %xmm14, %xmm1, %xmm10
+vpshldq $0xff, 0x40(%ebx,%ebx,8), %ymm0, %ymm27{%k7}
+vpshldq $0x11, -0x80(%r9d), %ymm25, %ymm2
+vpshldvd %ymm12, %ymm11, %ymm22
+vpshldvd 0x1(%rdx), %zmm4, %zmm10
+vpshldvq 0x2(%r11){1to8}, %zmm6, %zmm5
+vpshldvq -0x40(%r12){1to8}, %zmm5, %zmm10
+vpshldvw (%r11), %ymm7, %ymm31{%k3}
+vpshldvw 0x1(%rsp), %zmm15, %zmm17{%k7}
+vpshldw $0x7f, %ymm26, %ymm30, %ymm0
+vpshldw $0x0, %ymm15, %ymm25, %ymm16
+vpshrdd $0x7f, 0x80(,%r11d,2), %zmm9, %zmm28
+vpshrdd $0x7f, 0x8(%r14), %ymm24, %ymm17{%k4}
+vpshrdq $0x0, %zmm14, %zmm11, %zmm12{%k4}{z}
+vpshrdq $0x3, 0x100(%r9,%r10,8), %xmm17, %xmm10
+vpshrdvd 0x7f0(%r9,%r8,8), %ymm0, %ymm12
+vpshrdvd %zmm13, %zmm1, %zmm0
+vpshrdvq 0x3f(%rsi,%rdi,8), %xmm7, %xmm5
+vpshrdvq -0x2000(%rax), %ymm17, %ymm14{%k6}{z}
+vpshrdvw -0x80(%rax,%rdi,1), %xmm14, %xmm13{%k2}{z}
+vpshrdvw %ymm21, %ymm1, %ymm16
+vpshrdw $0x3, %zmm9, %zmm16, %zmm11
+vpshrdw $0xff, -0x80(%ecx), %zmm1, %zmm2
+# ---- AVX-512VNNI, BITALG, VPOPCNTDQ, VP2INTERSECT and BF16 -------------------
+vcvtne2ps2bf16 %ymm11, %ymm9, %ymm18{%k5}{z}
+vcvtne2ps2bf16 %ymm5, %ymm2, %ymm28
+vdpbf16ps %xmm7, %xmm29, %xmm2{%k1}
+vdpbf16ps %xmm13, %xmm9, %xmm21{%k1}
+vp2intersectd %ymm25, %ymm5, %k6
+vp2intersectd %zmm13, %zmm26, %k0
+vp2intersectq %ymm4, %ymm3, %k6
+vp2intersectq 0x10(%r15), %xmm28, %k4
+vpdpbusd 0x2(%r14){1to4}, %xmm2, %xmm18{%k6}{z}
+vpdpbusds %ymm1, %ymm10, %ymm3{%k1}{z}
+vpdpwssd %ymm11, %ymm23, %ymm3{%k7}
+vpdpwssds %xmm5, %xmm3, %xmm25{%k5}{z}
+vpdpwssds 0x20(%r9){1to8}, %ymm18, %ymm11{%k1}{z}
+vpopcntb %ymm9, %ymm5
+vpopcntb 0x0(%rbx), %ymm22{%k3}{z}
+vpopcntd 0x4(%ebx){1to8}, %ymm26
+vpopcntd %ymm24, %ymm4
+vpopcntq %ymm2, %ymm9{%k1}{z}
+vpopcntq %zmm15, %zmm5{%k1}{z}
+vpopcntw %xmm7, %xmm19
+vpopcntw 0x4(%ebp,%r13d,4), %zmm14{%k5}
+vpshufbitqmb %xmm13, %xmm4, %k2
+vpshufbitqmb 0x0(,%r9,4), %zmm8, %k6
+# ---- AVX-512FP16 -------------------------------------------------------------
+vaddph %zmm10, %zmm18, %zmm12
+vaddph %xmm21, %xmm10, %xmm27{%k5}
+vaddsh -0x2000(%r9d), %xmm12, %xmm14
+vaddsh {rz-sae}, %xmm5, %xmm9, %xmm1
+vcmpeq_oqph %zmm16, %zmm0, %k1{%k6}
+vcmpeq_oqph 0x7f0(%rbx), %xmm1, %k7
+vcmpeq_oqsh %xmm12, %xmm22, %k7
+vcmpeq_oqsh {sae}, %xmm6, %xmm6, %k3
+vcmpeq_osph 0x40(%ecx,%r15d,1){1to32}, %zmm2, %k5
+vcmpeq_osph -0x40(%r15,%r12,8), %zmm4, %k2{%k3}
+vcmpeq_ossh %xmm21, %xmm25, %k1
+vcmpeq_ossh 0x3f(%rsp,%r13,2), %xmm7, %k3{%k5}
+vcmpeq_uqph -0x100(%r9,%rcx,2){1to8}, %xmm0, %k5
+vcmpeq_uqph %xmm10, %xmm11, %k5
+vcmpeq_uqsh 0x3f(%r9,%r9,2), %xmm16, %k0{%k2}
+vcmpeq_uqsh %xmm20, %xmm28, %k7{%k3}
+vcmpeq_usph %zmm15, %zmm22, %k6
+vcmpeq_usph 0x1000(%r13,%r11,4), %ymm4, %k3{%k6}
+vcmpeq_ussh -0x100(%r11), %xmm14, %k7{%k3}
+vcmpeq_ussh {sae}, %xmm13, %xmm12, %k7
+vcmpeqph 0x4(%rsp){1to16}, %ymm20, %k2
+vcmpeqph 0x40(%rbx){1to8}, %xmm1, %k2{%k2}
+vcmpeqsh {sae}, %xmm1, %xmm7, %k6
+vcmpeqsh %xmm17, %xmm1, %k4
+vcmpph $0xff, 0x200(%rax){1to16}, %ymm18, %k2{%k5}
+vcmpph $0x11, {sae}, %zmm19, %zmm2, %k3
+vcmpsh $0x1, 0x40(%r12), %xmm10, %k0{%k3}
+vcmpsh $0x0, %xmm10, %xmm20, %k3{%k5}
+vcomish {sae}, %xmm24, %xmm9
+vcomish (%rdx), %xmm18
+vcvtpd2ph %ymm3, %xmm31
+vcvtpd2ph %ymm0, %xmm7
+vcvtpd2phz %zmm5, %xmm6{%k5}{z}
+vcvtpd2phz 0x7f0(%rbx,%r10,2), %xmm5{%k7}
+vcvtph2psx 0x1000(%r11), %zmm21
+vcvtph2qq 0x100(%rdi), %zmm21
+vcvtph2uw %ymm7, %ymm9
+vcvtph2uw 0x4(,%rdi,8){1to8}, %xmm5
+vcvtph2w 0x3f(%rax), %ymm10
+vcvtph2w {rz-sae}, %zmm10, %zmm5
+vcvtps2phx -0x2000(%esp), %ymm3{%k3}{z}
+vcvtqq2ph %zmm10, %xmm6{%k1}
+vcvtqq2ph 0x0(%rbp,%r10,2){1to4}, %xmm23{%k7}
+vcvtqq2phz %zmm10, %xmm5
+vcvtqq2phz %zmm8, %xmm29{%k2}{z}
+vcvtsd2sh 0x1000(%r10), %xmm4, %xmm29{%k2}{z}
+vcvtsd2sh 0x3f(%r13), %xmm11, %xmm2
+vcvtsh2sd {sae}, %xmm1, %xmm16, %xmm13
+vcvtsh2sd {sae}, %xmm3, %xmm0, %xmm11{%k6}{z}
+vcvtsh2si %xmm11, %ebx
+vcvtsh2si {rd-sae}, %xmm20, %r10
+vcvtsh2ss %xmm23, %xmm22, %xmm22
+vcvtsh2ss {sae}, %xmm8, %xmm0, %xmm25
+vcvtsh2usi {rn-sae}, %xmm27, %r13
+vcvtsh2usi 0x4(%rsi), %rsi
+vcvtsi2sh %r13d, %xmm10, %xmm4
+vcvtsi2shl -0x40(%rax), %xmm11, %xmm6
+vcvtss2sh %xmm15, %xmm28, %xmm5{%k7}
+vcvtss2sh {rd-sae}, %xmm11, %xmm8, %xmm30
+vcvttph2dq %ymm30, %zmm17
+vcvttph2qq %xmm13, %zmm19{%k4}{z}
+vcvttph2udq {sae}, %ymm20, %zmm12
+vcvttph2uw 0x12345(%esi,%r11d,1){1to8}, %xmm9
+vcvttph2uw %zmm5, %zmm6
+vcvttph2w %zmm12, %zmm0{%k5}
+vcvttph2w -0x2000(%r15){1to16}, %ymm12
+vcvttsh2si {sae}, %xmm9, %esi
+vcvttsh2si %xmm12, %rdx
+vcvttsh2usi 0x12345(%r10,%rbx,2), %r12d
+vcvttsh2usi 0x0(,%r12d,8), %edx
+vcvtudq2ph %zmm24, %ymm28
+vcvtuqq2ph %zmm29, %xmm4
+vcvtuqq2ph %zmm6, %xmm31
+vcvtuqq2phz 0x10(%r15){1to8}, %xmm4
+vcvtuqq2phz 0x80(%rax), %xmm22
+vcvtusi2sh %r9d, {rn-sae}, %xmm4, %xmm6
+vcvtusi2sh %r12d, {rn-sae}, %xmm10, %xmm9
+vcvtuw2ph {rd-sae}, %zmm16, %zmm13{%k4}{z}
+vcvtuw2ph %zmm3, %zmm15
+vcvtw2ph %zmm12, %zmm5
+vcvtw2ph 0x1(%r9), %xmm9{%k6}{z}
+vdivph 0x200(%r10,%r11,1){1to32}, %zmm15, %zmm23{%k1}{z}
+vdivph %xmm22, %xmm2, %xmm10{%k2}{z}
+vdivsh 0x0(%r8), %xmm14, %xmm31{%k7}{z}
+vdivsh 0x12345(%rbx), %xmm8, %xmm2
+vfcmaddcph 0x200(%rsi,%r12,4){1to16}, %zmm10, %zmm24{%k3}{z}
+vfcmaddcph 0x8(%rdx){1to4}, %xmm6, %xmm27
+vfcmaddcsh -0x80(%rdi,%rbp,4), %xmm8, %xmm2
+vfcmaddcsh 0x3f(%r12), %xmm13, %xmm18{%k6}
+vfcmulcph %xmm15, %xmm0, %xmm14{%k1}{z}
+vfcmulcph 0x20(,%rsi,8), %xmm9, %xmm11
+vfcmulcsh 0x40(%r14,%r11,8), %xmm9, %xmm6
+vfcmulcsh {rn-sae}, %xmm17, %xmm15, %xmm5
+vfmadd132ph -0x40(%rax), %ymm9, %ymm25
+vfmadd132ph -0x80(%rbx,%rcx,4){1to32}, %zmm31, %zmm12{%k1}{z}
+vfmadd132sh %xmm6, %xmm17, %xmm17
+vfmadd132sh 0x100(%rax), %xmm15, %xmm29{%k1}
+vfmadd213ph 0x40(%r11){1to8}, %xmm10, %xmm24
+vfmadd213ph 0x1(%rsp), %xmm19, %xmm8{%k1}
+vfmadd213sh 0x40(%r13,%r11,8), %xmm0, %xmm12{%k3}
+vfmadd213sh 0x8(%rsi,%rax,2), %xmm3, %xmm4
+vfmadd231ph -0x2000(%r9,%rcx,2){1to32}, %zmm7, %zmm3{%k2}{z}
+vfmadd231ph %zmm24, %zmm11, %zmm14
+vfmadd231sh 0x80(%rdi,%r10,4), %xmm0, %xmm15{%k1}
+vfmadd231sh 0x2(%rsp), %xmm30, %xmm2
+vfmaddcph 0x1(%rsp), %xmm23, %xmm9
+vfmaddcph -0x40(%rbp), %xmm9, %xmm25{%k1}{z}
+vfmaddcsh 0x1000(%ebp), %xmm26, %xmm4{%k4}
+vfmaddcsh 0x7f0(%r15), %xmm28, %xmm7
+vfmaddsub132ph %zmm10, %zmm27, %zmm31{%k6}{z}
+vfmaddsub132ph {ru-sae}, %zmm3, %zmm1, %zmm0
+vfmaddsub213ph %zmm28, %zmm4, %zmm5
+vfmaddsub213ph %zmm3, %zmm12, %zmm15{%k2}{z}
+vfmaddsub231ph 0x1000(%r13,%rsi,4), %ymm29, %ymm24{%k3}
+vfmaddsub231ph 0x0(%rsi,%r11,4), %xmm21, %xmm20{%k1}
+vfmsub132ph {rd-sae}, %zmm15, %zmm30, %zmm0
+vfmsub132ph %ymm21, %ymm4, %ymm14{%k6}
+vfmsub132sh 0x12345(%r13), %xmm3, %xmm11
+vfmsub132sh 0x80(%rbx), %xmm1, %xmm29{%k2}
+vfmsub213ph %ymm19, %ymm0, %ymm27
+vfmsub213ph %xmm14, %xmm4, %xmm28{%k1}
+vfmsub213sh %xmm0, %xmm3, %xmm4
+vfmsub213sh %xmm14, %xmm11, %xmm15
+vfmsub231ph %xmm12, %xmm10, %xmm30{%k5}
+vfmsub231ph %ymm25, %ymm6, %ymm29
+vfmsub231sh 0x40(%r13,%r11,1), %xmm28, %xmm17{%k4}{z}
+vfmsub231sh {rn-sae}, %xmm11, %xmm11, %xmm1
+vfmsubadd132ph %xmm10, %xmm22, %xmm12{%k2}{z}
+vfmsubadd132ph %ymm0, %ymm15, %ymm4{%k3}
+vfmsubadd213ph 0x12345(%edx,%esi,1), %ymm10, %ymm9
+vfmsubadd213ph 0x0(%rcx,%rbx,8), %ymm18, %ymm24
+vfmsubadd231ph -0x40(%rdi,%rsi,4), %xmm12, %xmm8
+vfmsubadd231ph -0x100(%r11){1to32}, %zmm6, %zmm1{%k1}
+vfmulcph 0x40(%r10), %ymm26, %ymm2
+vfmulcph 0x40(%rbx), %ymm14, %ymm31
+vfmulcsh 0x40(%rax), %xmm10, %xmm4{%k3}
+vfmulcsh 0x8(%r9), %xmm11, %xmm23
+vfnmadd132ph 0x40(,%rbp,8){1to8}, %xmm6, %xmm24
+vfnmadd132ph 0x40(%r13){1to16}, %ymm8, %ymm22
+vfnmadd132sh 0x12345(%rdi,%rcx,4), %xmm22, %xmm15
+vfnmadd132sh %xmm4, %xmm3, %xmm8
+vfnmadd213ph 0x1000(%r10d,%ebx,4), %zmm3, %zmm18
+vfnmadd213ph 0x200(%rbp), %ymm18, %ymm4{%k7}{z}
+vfnmadd213sh 0x80(%r11), %xmm24, %xmm13{%k6}
+vfnmadd213sh {rd-sae}, %xmm1, %xmm14, %xmm11
+vfnmadd231ph 0x7f0(%r12,%r8,4), %ymm23, %ymm28
+vfnmadd231ph %xmm29, %xmm13, %xmm3
+vfnmadd231sh %xmm17, %xmm13, %xmm11{%k3}
+vfnmadd231sh -0x40(%r10,%r11,4), %xmm6, %xmm8
+vfnmsub132ph %zmm13, %zmm14, %zmm3{%k4}
+vfnmsub132ph %ymm1, %ymm29, %ymm7
+vfnmsub132sh %xmm25, %xmm0, %xmm8{%k2}
+vfnmsub132sh %xmm5, %xmm24, %xmm18
+vfnmsub213ph 0x0(%rdx), %zmm21, %zmm17
+vfnmsub213ph %ymm6, %ymm21, %ymm13
+vfnmsub213sh %xmm21, %xmm4, %xmm26{%k2}{z}
+vfnmsub213sh {ru-sae}, %xmm14, %xmm4, %xmm26{%k5}
+vfnmsub231ph {ru-sae}, %zmm14, %zmm16, %zmm29{%k1}
+vfnmsub231ph %ymm4, %ymm8, %ymm3{%k7}
+vfnmsub231sh %xmm10, %xmm21, %xmm22
+vfnmsub231sh {rd-sae}, %xmm1, %xmm0, %xmm29
+vfpclassph $0x1, %ymm30, %k6
+vfpclassph $0x3, %zmm24, %k1{%k6}
+vfpclassphz $0xff, 0x1(%r12){1to32}, %k4
+vfpclassphz $0x3, 0x3f(%rdi), %k6
+vfpclasssh $0x7f, %xmm2, %k3
+vfpclasssh $0xff, 0x1000(,%r10d,2), %k6{%k6}
+vgetexpph 0x8(%rdi), %ymm9{%k4}{z}
+vgetexpph 0x1(%rcx), %xmm11{%k5}
+vgetexpsh %xmm4, %xmm17, %xmm1
+vgetexpsh {sae}, %xmm13, %xmm28, %xmm11{%k6}
+vgetmantph $0x0, %xmm15, %xmm29{%k1}
+vgetmantph $0xff, -0x40(%rsp), %xmm2{%k3}
+vgetmantsh $0x11, %xmm11, %xmm3, %xmm5
+vgetmantsh $0x7f, 0x200(%r11), %xmm5, %xmm27
+vmaxph 0x80(%r15){1to8}, %xmm18, %xmm14
+vmaxph %xmm0, %xmm3, %xmm12
+vmaxsh %xmm31, %xmm19, %xmm21
+vmaxsh {sae}, %xmm12, %xmm21, %xmm9{%k3}
+vminph %xmm16, %xmm28, %xmm7{%k5}
+vminph {sae}, %zmm12, %zmm0, %zmm20
+vminsh %xmm30, %xmm7, %xmm31
+vminsh 0x3f(%rcx), %xmm13, %xmm26{%k6}{z}
+vmovsh %xmm4, %xmm20, %xmm28
+vmovsh %xmm12, %xmm21, %xmm13
+vmovw %xmm17, %r12d
+vmovw 0x20(%eax,%esi,2), %xmm10
+vmulph 0x20(%r14,%r11,4){1to16}, %ymm13, %ymm6
+vmulph %zmm5, %zmm14, %zmm29{%k6}{z}
+vmulsh {ru-sae}, %xmm5, %xmm3, %xmm3
+vmulsh %xmm27, %xmm19, %xmm12
+vrcpph %zmm12, %zmm17
+vrcpph 0x200(%rbp){1to16}, %ymm25
+vrcpsh %xmm0, %xmm24, %xmm5
+vrcpsh (%rdx,%r8,1), %xmm11, %xmm2{%k2}
+vreduceph $0x3, 0x7f0(%r12), %xmm1
+vreduceph $0x3, -0x100(%r12){1to16}, %ymm9
+vreducesh $0x11, {sae}, %xmm20, %xmm7, %xmm15
+vreducesh $0x7f, 0x10(%r8,%r13,1), %xmm4, %xmm31
+vrndscaleph $0x7f, 0x3f(%r10,%r14,4), %zmm8{%k4}
+vrndscaleph $0x0, %zmm28, %zmm9
+vrndscalesh $0x1, {sae}, %xmm13, %xmm25, %xmm16
+vrndscalesh $0x7f, 0x4(%r11), %xmm17, %xmm24{%k7}{z}
+vrsqrtph 0x3f(%rbp), %zmm23{%k5}
+vrsqrtph 0x20(%rbx){1to32}, %zmm17{%k3}
+vrsqrtsh %xmm4, %xmm11, %xmm15
+vrsqrtsh -0x2000(%r10), %xmm5, %xmm1
+vscalefph %zmm8, %zmm5, %zmm26{%k3}
+vscalefph -0x2000(%r9,%r11,1), %xmm0, %xmm9
+vscalefsh 0x20(%r13d), %xmm3, %xmm1{%k2}
+vscalefsh %xmm2, %xmm16, %xmm8{%k1}{z}
+vsqrtph 0x200(%rbx,%rcx,2), %xmm8
+vsqrtph %zmm15, %zmm20
+vsqrtsh 0x1000(%r8), %xmm26, %xmm20
+vsqrtsh 0x4(%r10,%rbp,2), %xmm3, %xmm22{%k6}{z}
+vsubph -0x100(%rax), %zmm27, %zmm16
+vsubph 0x20(%r10), %ymm4, %ymm5{%k6}{z}
+vsubsh %xmm25, %xmm14, %xmm31
+vsubsh 0x40(%r11,%rcx,4), %xmm12, %xmm11
+vucomish %xmm7, %xmm10
+vucomish 0x100(%rcx,%rsi,1), %xmm5
+# ---- GFNI, VAES, VPCLMULQDQ, SHA, SHA512, SM3, SM4, F16C ---------------------
+gf2p8affineinvqb $0x11, %xmm10, %xmm0
+gf2p8affineinvqb $0x0, -0x40(%rcx,%r14,1), %xmm4
+gf2p8affineqb $0x7f, %xmm1, %xmm8
+gf2p8affineqb $0x0, -0x2000(%rax), %xmm15
+gf2p8mulb %xmm0, %xmm15
+gf2p8mulb 0x80(%rsp), %xmm13
+sha1msg1 %xmm15, %xmm4
+sha1msg1 %xmm4, %xmm13
+sha1msg2 %xmm9, %xmm0
+sha1msg2 0x10(%r10), %xmm13
+sha1nexte 0x3f(%rbp), %xmm8
+sha1nexte -0x100(%rcx,%rsi,4), %xmm8
+sha1rnds4 $0x3, %xmm0, %xmm7
+sha1rnds4 $0x3, %xmm10, %xmm8
+sha256msg1 0x80(%rax), %xmm8
+sha256msg1 %xmm14, %xmm4
+sha256msg2 0x8(%rdx,%r11,4), %xmm7
+sha256msg2 0x0(,%rcx,8), %xmm14
+sha256rnds2 %xmm6, %xmm4
+sha256rnds2 0x40(%rbp), %xmm12
+vaesdec 0x4(%r13), %zmm29, %zmm5
+vaesdec %zmm27, %zmm1, %zmm1
+vaesdeclast %xmm13, %xmm3, %xmm11
+vaesdeclast 0x40(%rax), %zmm13, %zmm13
+vaesenc %xmm8, %xmm6, %xmm10
+vaesenc (%r14), %zmm10, %zmm7
+vaesenclast 0x0(%rax), %xmm2, %xmm9
+vaesenclast %zmm19, %zmm2, %zmm12
+vcvtph2ps %xmm7, %xmm14
+vcvtph2ps 0x200(%rax), %ymm10
+vcvtps2ph $0x3, %ymm0, 0x1000(%rax)
+vgf2p8affineinvqb $0xff, %xmm14, %xmm12, %xmm2
+vgf2p8mulb 0x8(%rsp,%r9,1), %zmm5, %zmm3{%k6}{z}
+vgf2p8mulb 0x12345(%r9,%r10,1), %zmm15, %zmm8{%k7}
+vpclmulhqhqdq %xmm1, %xmm7, %xmm28
+vpclmulhqhqdq %zmm2, %zmm6, %zmm11
+vpclmulhqlqdq 0x1(%r12d,%esi,4), %xmm21, %xmm4
+vpclmulhqlqdq %zmm25, %zmm9, %zmm24
+vpclmullqhqdq 0x0(%rax), %zmm6, %zmm12
+vpclmullqhqdq 0x100(%rbp,%r8,8), %ymm5, %ymm14
+vpclmullqlqdq %ymm19, %ymm6, %ymm8
+vpclmullqlqdq %zmm5, %zmm12, %zmm18
+vpclmulqdq $0x11, %ymm14, %ymm15, %ymm28
+vpclmulqdq $0x3, %zmm16, %zmm10, %zmm0
+vsha512msg1 %xmm10, %ymm15
+vsha512msg1 %xmm2, %ymm5
+vsha512msg2 %ymm5, %ymm2
+vsha512msg2 %ymm6, %ymm6
+vsha512rnds2 %xmm9, %ymm12, %ymm9
+vsha512rnds2 %xmm5, %ymm8, %ymm9
+vsm3msg1 0x2(%r13), %xmm6, %xmm0
+vsm3msg1 0x0(%rsp,%r13,2), %xmm14, %xmm5
+vsm3msg2 0x4(%rsp,%rsi,2), %xmm5, %xmm4
+vsm3msg2 %xmm11, %xmm8, %xmm5
+vsm3rnds2 $0x0, 0x8(%rbp), %xmm5, %xmm1
+vsm3rnds2 $0x3, 0x80(%rdi), %xmm3, %xmm10
+vsm4key4 %ymm1, %ymm15, %ymm1
+vsm4key4 %xmm7, %xmm3, %xmm11
+vsm4rnds4 0x3f(%rax,%r9,4), %ymm12, %ymm7
+vsm4rnds4 %ymm5, %ymm16, %ymm9
+# ---- AVX-VNNI, AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8/16 --------------------
+vbcstnebf162ps 0x8(%r15), %ymm0
+vbcstnebf162ps 0x10(%r10d), %ymm5
+vbcstnesh2ps 0x0(%r9,%r10,8), %xmm15
+vbcstnesh2ps 0x200(%rbx), %ymm7
+vcvtneebf162ps 0x7f0(%rcx), %ymm9
+vcvtneebf162ps 0x12345(%rbx,%rax,2), %xmm15
+vcvtneeph2ps -0x80(%r15,%rsi,1), %xmm0
+vcvtneeph2ps 0x20(%rsp), %xmm7
+vcvtneobf162ps 0x10(%rbx), %xmm2
+vcvtneobf162ps -0x2000(%rbx), %ymm15
+vcvtneoph2ps 0x0(%r14,%r9,2), %xmm13
+vcvtneoph2ps -0x40(%r11,%r8,2), %ymm1
+vcvtneps2bf16x 0x10(%rax,%r12,8), %xmm15
+vcvtneps2bf16y -0x40(%rcx), %xmm9
+vpdpbssd 0x40(%rcx), %ymm3, %ymm3
+vpdpbssds 0x10(,%eax,8), %ymm6, %ymm0
+vpdpbssds 0x1(%rdi), %xmm9, %xmm1
+vpdpbsud %xmm6, %xmm1, %xmm5
+vpdpbusd 0x4(%r15,%r9,2), %ymm13, %ymm9
+vpdpbusds -0x80(%rax,%r11,1), %xmm14, %xmm2
+vpdpbuud 0x40(%rdi,%r13,2), %xmm13, %xmm0
+vpdpbuuds %xmm9, %xmm0, %xmm15
+vpdpwssd %ymm12, %ymm0, %ymm6
+vpdpwsuds %xmm15, %xmm7, %xmm13
+vpdpwsuds 0x3f(%rsp), %ymm13, %ymm1
+vpdpwusd %xmm10, %xmm11, %xmm9
+vpdpwusd %ymm2, %ymm4, %ymm0
+vpdpwusds %xmm11, %xmm6, %xmm5
+vpdpwuud %ymm2, %ymm5, %ymm0
+vpdpwuuds %ymm8, %ymm11, %ymm7
+vpdpwuuds 0x12345(%rsp,%rcx,4), %ymm0, %ymm11
+vpmadd52huq 0x1000(%rsp,%r15,8), %ymm7, %ymm2
+vpmadd52luq %ymm14, %ymm11, %ymm13
+vpmadd52luq %xmm2, %xmm12, %xmm11
+# ---- FMA, FMA4 and XOP -------------------------------------------------------
+vfmaddpd %ymm14, %ymm2, %ymm14, %ymm0
+vfmaddpd %ymm6, %ymm6, %ymm4, %ymm1
+vfmaddps %ymm7, %ymm3, %ymm7, %ymm9
+vfmaddps (%rdx,%rdx,4), %ymm13, %ymm12, %ymm7
+vfmaddsd %xmm4, %xmm13, %xmm3, %xmm11
+vfmaddsd 0x100(%rdi), %xmm15, %xmm2, %xmm15
+vfmaddss %xmm2, %xmm11, %xmm8, %xmm9
+vfmaddss %xmm4, %xmm15, %xmm9, %xmm8
+vfmaddsubpd (%rax,%r14,2), %ymm11, %ymm12, %ymm4
+vfmaddsubpd %xmm13, %xmm6, %xmm11, %xmm9
+vfmaddsubps 0x40(%rax), %xmm8, %xmm12, %xmm9
+vfmaddsubps %ymm2, %ymm15, %ymm2, %ymm5
+vfmsubaddpd 0x20(%r15d), %xmm12, %xmm8, %xmm15
+vfmsubaddpd %xmm2, %xmm7, %xmm14, %xmm4
+vfmsubaddps %xmm14, %xmm11, %xmm5, %xmm14
+vfmsubaddps %xmm13, %xmm7, %xmm6, %xmm11
+vfmsubpd -0x2000(%r14,%rbx,8), %xmm12, %xmm2, %xmm4
+vfmsubpd %ymm11, %ymm10, %ymm10, %ymm14
+vfmsubps 0x1(,%rsi,8), %xmm8, %xmm4, %xmm4
+vfmsubps %ymm6, %ymm0, %ymm15, %ymm0
+vfmsubsd 0x7f0(%r11), %xmm6, %xmm15, %xmm0
+vfmsubsd %xmm5, %xmm1, %xmm14, %xmm1
+vfmsubss %xmm13, %xmm10, %xmm4, %xmm7
+vfmsubss -0x2000(%eax), %xmm5, %xmm0, %xmm13
+vfnmaddpd %xmm8, %xmm6, %xmm12, %xmm12
+vfnmaddpd %xmm12, %xmm4, %xmm8, %xmm15
+vfnmaddps 0x10(%rbp), %ymm8, %ymm6, %ymm10
+vfnmaddps %ymm0, %ymm12, %ymm7, %ymm7
+vfnmaddsd -0x80(%r10), %xmm4, %xmm1, %xmm15
+vfnmaddsd -0x100(%r14d), %xmm1, %xmm6, %xmm4
+vfnmaddss 0x12345(%rax), %xmm14, %xmm6, %xmm8
+vfnmaddss 0x40(%r12,%rcx,1), %xmm5, %xmm11, %xmm10
+vfnmsubpd %xmm11, %xmm1, %xmm4, %xmm5
+vfnmsubpd %xmm10, %xmm8, %xmm0, %xmm13
+vfnmsubps 0x20(%rcx), %ymm14, %ymm5, %ymm6
+vfnmsubps -0x2000(%rax), %xmm12, %xmm12, %xmm11
+vfnmsubsd 0x20(%rax), %xmm11, %xmm9, %xmm9
+vfnmsubsd 0x40(%rsp,%r11,4), %xmm2, %xmm13, %xmm3
+vfnmsubss 0x8(%r12), %xmm13, %xmm4, %xmm9
+vfnmsubss 0x3f(%rax), %xmm0, %xmm5, %xmm0
+vfrczpd %ymm14, %ymm10
+vfrczpd 0x2(%r8), %ymm9
+vfrczps 0x200(%rax), %xmm2
+vfrczps 0x10(%rcx), %xmm1
+vfrczsd 0x10(%r15d), %xmm3
+vfrczsd 0x7f0(%r10,%r11,1), %xmm0
+vfrczss 0x20(%rdx), %xmm6
+vfrczss -0x2000(%r12), %xmm4
+vpcmov %xmm11, -0x2000(%rax), %xmm13, %xmm11
+vpcmov %xmm5, %xmm15, %xmm11, %xmm0
+vpcomb $0xff, %xmm0, %xmm13, %xmm11
+vpcomb $0xff, %xmm4, %xmm9, %xmm6
+vpcomd $0x1, 0x200(%r13,%rdx,2), %xmm11, %xmm14
+vpcomd $0x3, %xmm0, %xmm6, %xmm15
+vpcomeqb %xmm13, %xmm6, %xmm10
+vpcomeqb %xmm0, %xmm4, %xmm11
+vpcomeqd %xmm10, %xmm14, %xmm12
+vpcomeqd %xmm14, %xmm15, %xmm11
+vpcomeqq 0x7f0(%r15), %xmm0, %xmm15
+vpcomeqq 0x200(%rax,%rcx,4), %xmm4, %xmm11
+vpcomequb %xmm11, %xmm10, %xmm8
+vpcomequb -0x100(%r11), %xmm13, %xmm9
+vpcomequd %xmm15, %xmm1, %xmm10
+vpcomequd %xmm1, %xmm1, %xmm6
+vpcomequq %xmm6, %xmm3, %xmm10
+vpcomequq %xmm11, %xmm13, %xmm3
+vpcomequw %xmm0, %xmm8, %xmm12
+vpcomequw %xmm9, %xmm1, %xmm5
+vpcomeqw 0x4(%r10), %xmm15, %xmm0
+vpcomeqw %xmm8, %xmm10, %xmm6
+vpcomq $0xff, %xmm6, %xmm3, %xmm15
+vpcomq $0x1, 0x200(%r12), %xmm15, %xmm2
+vpcomub $0x1, 0x2(%r12), %xmm8, %xmm6
+vpcomub $0x3, %xmm15, %xmm13, %xmm10
+vpcomud $0x7f, %xmm4, %xmm8, %xmm0
+vpcomud $0xff, -0x40(%r14,%r11,8), %xmm2, %xmm5
+vpcomuq $0x7f, %xmm15, %xmm14, %xmm12
+vpcomuq $0x3, -0x100(%r13), %xmm12, %xmm2
+vpcomuw $0x0, 0x7f0(%r12), %xmm1, %xmm6
+vpcomuw $0x1, 0x12345(%r8,%rbx,1), %xmm15, %xmm4
+vpcomw $0x1, %xmm15, %xmm5, %xmm0
+vpcomw $0x11, %xmm1, %xmm1, %xmm7
+vpermil2pd $0x3, %ymm1, 0x7f0(%rcx), %ymm0, %ymm9
+vpermil2pd $0x2, -0x40(%rbx), %ymm9, %ymm7, %ymm10
+vpermil2ps $0x2, %ymm12, %ymm6, %ymm8, %ymm13
+vpermil2ps $0x0, 0x8(%rax,%r12,1), %ymm14, %ymm4, %ymm4
+vphaddbd %xmm9, %xmm1
+vphaddbd %xmm9, %xmm9
+vphaddbq %xmm13, %xmm5
+vphaddbq 0x20(,%rax,4), %xmm10
+vphaddbw -0x2000(%r14,%rbx,4), %xmm2
+vphaddbw 0x8(%rsp), %xmm11
+vphadddq %xmm5, %xmm5
+vphadddq -0x40(%r15,%rbp,8), %xmm15
+vphaddubd 0x3f(%r14), %xmm10
+vphaddubd 0x3f(,%rdi,1), %xmm2
+vphaddubq %xmm11, %xmm7
+vphaddubq %xmm6, %xmm1
+vphaddubw 0x3f(%rcx,%rdi,8), %xmm2
+vphaddubw 0x80(%r11), %xmm6
+vphaddudq 0x100(%rdi,%r15,4), %xmm14
+vphaddudq 0x8(%rsp), %xmm4
+vphadduwd -0x100(%r8), %xmm11
+vphadduwd 0x20(%rax), %xmm9
+vphadduwq %xmm12, %xmm9
+vphadduwq -0x100(%rsp), %xmm6
+vphaddwd 0x2(%rsi), %xmm1
+vphaddwd -0x40(%rsp), %xmm14
+vphaddwq %xmm14, %xmm5
+vphaddwq -0x2000(%rcx), %xmm2
+vphsubbw -0x2000(%rcx), %xmm0
+vphsubbw %xmm7, %xmm13
+vphsubdq %xmm13, %xmm1
+vphsubdq %xmm4, %xmm14
+vphsubwd 0x7f0(%rbx,%rbx,4), %xmm10
+vphsubwd %xmm8, %xmm0
+vpmacsdd %xmm13, %xmm6, %xmm11, %xmm12
+vpmacsdd %xmm7, 0x80(%rbp,%rbx,4), %xmm14, %xmm2
+vpmacsdqh %xmm7, 0x3f(%r11), %xmm10, %xmm2
+vpmacsdqh %xmm2, %xmm4, %xmm13, %xmm12
+vpmacsdql %xmm5, %xmm5, %xmm5, %xmm11
+vpmacsdql %xmm14, %xmm5, %xmm8, %xmm2
+vpmacssdd %xmm2, %xmm13, %xmm2, %xmm10
+vpmacssdd %xmm4, 0x20(%r15), %xmm14, %xmm11
+vpmacssdqh %xmm15, 0x0(%r10), %xmm6, %xmm1
+vpmacssdqh %xmm14, 0x1(%rsi), %xmm13, %xmm4
+vpmacssdql %xmm13, %xmm0, %xmm15, %xmm3
+vpmacssdql %xmm8, %xmm0, %xmm6, %xmm5
+vpmacsswd %xmm15, 0x8(%rax), %xmm14, %xmm2
+vpmacsswd %xmm13, %xmm3, %xmm10, %xmm0
+vpmacssww %xmm15, %xmm12, %xmm4, %xmm5
+vpmacssww %xmm4, 0x7f0(%eax), %xmm15, %xmm2
+vpmacswd %xmm5, 0x40(%rdi), %xmm8, %xmm11
+vpmacswd %xmm12, 0x40(%r13), %xmm5, %xmm2
+vpmacsww %xmm13, 0x40(%r13), %xmm0, %xmm7
+vpmacsww %xmm3, 0x0(%r8), %xmm1, %xmm12
+vpmadcsswd %xmm0, %xmm3, %xmm13, %xmm7
+vpmadcsswd %xmm5, %xmm8, %xmm1, %xmm12
+vpmadcswd %xmm5, %xmm7, %xmm10, %xmm9
+vpmadcswd %xmm5, %xmm3, %xmm11, %xmm9
+vpperm %xmm11, %xmm1, %xmm3, %xmm8
+vpperm %xmm0, %xmm14, %xmm4, %xmm12
+vprotb %xmm6, %xmm6, %xmm9
+vprotb %xmm7, %xmm5, %xmm2
+vprotd $0x11, %xmm9, %xmm6
+vprotd $0x0, %xmm1, %xmm8
+vprotq $0x7f, -0x2000(%r14), %xmm3
+vprotq %xmm9, -0x80(%rbp), %xmm6
+vprotw %xmm12, %xmm13, %xmm14
+vprotw $0x11, %xmm8, %xmm12
+vpshab %xmm3, %xmm2, %xmm5
+vpshab %xmm11, 0x4(%rsi), %xmm13
+vpshad %xmm7, 0x3f(%rcx), %xmm0
+vpshad %xmm13, 0x4(%r9,%r10,2), %xmm10
+vpshaq %xmm1, %xmm10, %xmm0
+vpshaq %xmm11, %xmm10, %xmm14
+vpshaw %xmm2, %xmm10, %xmm1
+vpshaw %xmm11, -0x80(%r15,%rbp,2), %xmm13
+vpshlb %xmm6, %xmm9, %xmm5
+vpshlb %xmm5, (%r13d,%r14d,1), %xmm15
+vpshld %xmm11, %xmm10, %xmm1
+vpshld %xmm12, 0x20(%rsp,%r11,1), %xmm13
+vpshlq %xmm2, 0x1000(%rcx,%r8,4), %xmm4
+vpshlq %xmm5, %xmm12, %xmm8
+vpshlw %xmm13, 0x3f(%rbp), %xmm3
+vpshlw %xmm15, 0x20(%rbx), %xmm6
+# ---- BMI1, BMI2, TBM, LWP, ADX, LZCNT, POPCNT --------------------------------
+adcx 0x2(%esp,%r11d,1), %r14d
+adcx 0x10(%rcx,%r11,4), %rsi
+adox %r14, %r12
+adox %r14d, %r12d
+andn %rdi, %r12, %r11
+andn %r12d, %r8d, %edx
+bextr $0x7fffffff, %rdi, %r13
+bextr $0x3, %ebx, %r13d
+blcfill 0x2(%r14,%rbp,1), %ecx
+blcfill 0x12345(,%r14,1), %r15d
+blci %rbx, %r14
+blci -0x100(%rdx), %r12
+blcic 0x8(%rdx), %r14d
+blcic -0x80(%r13d,%r14d,8), %r8d
+blcmsk %r13d, %edx
+blcmsk 0x40(%rax), %edi
+blcs %r15, %r11
+blcs %rax, %rsp
+blsfill -0x100(%r12,%rdi,1), %r13d
+blsfill -0x40(%rbp), %rdi
+blsi 0x40(%rbx), %ecx
+blsi 0x80(%rsi,%rbp,2), %r14
+blsic %r13d, %esp
+blsic (,%rsi,4), %rbx
+blsmsk %r9, %rcx
+blsmsk %ebx, %eax
+blsr %r10d, %ebp
+blsr 0x1000(%rdi), %r13
+bzhi %r12d, %r9d, %edi
+bzhi %r10, %rbp, %r10
+llwpcb %r11d
+llwpcb %r13d
+lwpins $0x7fffffff, %edi, %r8d
+lwpins $0x7f, %r10d, %r14d
+lwpval $0x3, 0x40(%rbp,%rbp,1), %eax
+lwpval $0x7fffffff, -0x80(%rax), %esi
+lzcnt %edx, %esi
+lzcnt %r9, %r12
+mulx 0x2(%rax), %eax, %esi
+mulx 0x0(,%r15,2), %rbp, %r10
+pdep 0x0(%r12,%rdi,8), %edi, %ecx
+pdep 0x2(%rcx), %r12, %r9
+pext %r10, %rbp, %r10
+pext 0x40(%rdx), %ebp, %r11d
+popcnt 0x0(%rsi), %rsp
+popcnt -0x80(%r8), %edi
+rorx $0x7f, 0x1000(%rdx,%rax,1), %rbp
+rorx $0x11, %r14, %rdi
+sarx %eax, 0x100(%rbp,%r15,1), %ecx
+sarx %r14d, %ecx, %r15d
+shlx %eax, %esp, %r12d
+shlx %ebp, 0x0(%rbp), %edi
+shrx %eax, %r13d, %r10d
+shrx %r10, %rdi, %rdi
+slwpcb %r12d
+slwpcb %rdi
+t1mskc %r14, %r13
+t1mskc -0x2000(,%r8d,4), %r10d
+tzcnt 0x4(%rcx), %r11w
+tzcnt 0x100(%rax,%r12,1), %r14w
+tzmsk 0x3f(%rbx,%r11,2), %r13
+tzmsk %r15d, %esp
+# ---- AMX ---------------------------------------------------------------------
+ldtilecfg -0x40(%rcx)
+ldtilecfg (%r8,%r14,4)
+sttilecfg 0x4(,%rsi,4)
+sttilecfg 0x0(%r12,%rbp,8)
+tcmmimfp16ps %tmm1, %tmm5, %tmm0
+tcmmimfp16ps %tmm2, %tmm7, %tmm0
+tcmmrlfp16ps %tmm7, %tmm2, %tmm4
+tcmmrlfp16ps %tmm3, %tmm7, %tmm1
+tdpbf16ps %tmm3, %tmm5, %tmm2
+tdpbf16ps %tmm2, %tmm5, %tmm7
+tdpbssd %tmm2, %tmm7, %tmm6
+tdpbssd %tmm2, %tmm3, %tmm6
+tdpbsud %tmm4, %tmm2, %tmm0
+tdpbsud %tmm5, %tmm2, %tmm4
+tdpbusd %tmm3, %tmm6, %tmm4
+tdpbusd %tmm0, %tmm5, %tmm2
+tdpbuud %tmm6, %tmm1, %tmm7
+tdpbuud %tmm2, %tmm4, %tmm7
+tdpfp16ps %tmm1, %tmm7, %tmm3
+tdpfp16ps %tmm1, %tmm5, %tmm4
+tileloadd 0x100(%r11,%r15,2), %tmm4
+tileloadd 0x40(%r12d), %tmm3
+tileloaddt1 -0x80(%rbp,%rsi,1), %tmm3
+tileloaddt1 -0x2000(%r10), %tmm0
+tilerelease
+tilestored %tmm3, 0x200(%rdi)
+tilestored %tmm7, -0x40(%rbx)
+tilezero %tmm5
+tilezero %tmm7
+# ---- AVX10.2 -----------------------------------------------------------------
+vaddbf16 %xmm2, %xmm13, %xmm23{%k5}{z}
+vaddbf16 -0x40(,%r8,1), %ymm1, %ymm31
+vcmpbf16 $0x0, 0x7f0(%r9,%rcx,4), %zmm3, %k5{%k6}
+vcmpbf16 $0x0, 0x200(%rcx,%r10,1), %xmm3, %k2
+vcomisbf16 0x0(%rax), %xmm0
+vcomisbf16 %xmm26, %xmm11
+vcomxsd 0x7f0(%r14), %xmm14
+vcomxsd %xmm7, %xmm13
+vcomxsh %xmm5, %xmm0
+vcomxsh %xmm7, %xmm14
+vcomxss %xmm6, %xmm1
+vcomxss {sae}, %xmm2, %xmm29
+vcvt2ph2bf8 -0x100(%rdi), %xmm22, %xmm31
+vcvt2ph2bf8 0x4(%rcx,%rcx,4), %zmm28, %zmm20{%k1}{z}
+vcvt2ph2bf8s %ymm6, %ymm2, %ymm3
+vcvt2ph2bf8s %zmm28, %zmm15, %zmm7{%k1}
+vcvt2ph2hf8 %zmm2, %zmm12, %zmm14
+vcvt2ph2hf8 0x12345(%r10d,%r11d,1), %ymm24, %ymm1
+vcvt2ph2hf8s 0x12345(%rsi,%rdx,1), %ymm1, %ymm26
+vcvt2ph2hf8s %zmm20, %zmm6, %zmm14{%k4}{z}
+vcvt2ps2phx %xmm19, %xmm10, %xmm7{%k1}
+vcvt2ps2phx 0x200(%r13){1to8}, %ymm15, %ymm20
+vcvtbf162ibs %xmm2, %xmm18
+vcvtbf162ibs %xmm23, %xmm3{%k4}
+vcvtbf162iubs 0x2(%rsp,%rcx,2), %ymm12
+vcvtbf162iubs 0x40(%rbx,%rbx,1), %ymm1{%k3}
+vcvtbiasph2bf8 %zmm31, %zmm6, %ymm11
+vcvtbiasph2bf8 %zmm20, %zmm8, %ymm7
+vcvtbiasph2bf8s -0x100(%rsp), %zmm31, %ymm7{%k5}{z}
+vcvtbiasph2bf8s 0x100(%rcx){1to32}, %zmm19, %ymm26
+vcvtbiasph2hf8 0x3f(%r14), %zmm0, %ymm14
+vcvtbiasph2hf8 %xmm16, %xmm20, %xmm16{%k2}
+vcvtbiasph2hf8s (%r9), %xmm22, %xmm14
+vcvtbiasph2hf8s -0x2000(%rsp,%r8,2){1to32}, %zmm19, %ymm25{%k7}{z}
+vcvthf82ph %xmm0, %ymm6{%k4}{z}
+vcvthf82ph %xmm15, %xmm9{%k7}
+vcvtph2bf8 %xmm4, %xmm22{%k4}{z}
+vcvtph2bf8 %zmm5, %ymm2{%k3}{z}
+vcvtph2bf8s %xmm0, %xmm1{%k3}
+vcvtph2bf8s %zmm12, %ymm4{%k7}
+vcvtph2bf8sx 0x3f(%rbp), %xmm21
+vcvtph2bf8sx %xmm23, %xmm8
+vcvtph2bf8sy %ymm29, %xmm30
+vcvtph2bf8sy 0x40(%edx), %xmm6{%k6}
+vcvtph2bf8x %xmm7, %xmm0
+vcvtph2bf8x 0x40(%r12d), %xmm6
+vcvtph2bf8y 0x7f0(,%rdi,1), %xmm14{%k4}
+vcvtph2bf8y 0x80(%r15,%r8,4), %xmm12
+vcvtph2hf8 %xmm7, %xmm11{%k2}{z}
+vcvtph2hf8 %zmm21, %ymm21{%k1}
+vcvtph2hf8s %zmm17, %ymm8
+vcvtph2hf8s %zmm8, %ymm0{%k7}
+vcvtph2hf8sx %xmm3, %xmm2
+vcvtph2hf8sx 0x12345(%rax,%r10,2), %xmm15
+vcvtph2hf8sy %ymm14, %xmm3
+vcvtph2hf8sy 0x100(%rbx), %xmm13
+vcvtph2hf8x %xmm2, %xmm31
+vcvtph2hf8x %xmm11, %xmm13
+vcvtph2hf8y %ymm15, %xmm22
+vcvtph2hf8y %ymm21, %xmm16
+vcvtph2ibs 0x7f0(%r11), %xmm8
+vcvtph2ibs %zmm22, %zmm2{%k4}
+vcvtph2iubs %xmm23, %xmm0{%k5}
+vcvtph2iubs 0x7f0(%rax){1to16}, %ymm5
+vcvtps2ibs 0x3f(%r14), %ymm15
+vcvtps2ibs %xmm14, %xmm29
+vcvtps2iubs 0x2(%ebx), %xmm10
+vcvtps2iubs %ymm2, %ymm28
+vcvttbf162ibs 0x3f(,%r9,4), %zmm24
+vcvttbf162ibs %zmm9, %zmm28
+vcvttbf162iubs %ymm8, %ymm19
+vcvttbf162iubs 0x80(%rbx), %xmm9
+vcvttpd2dqs %ymm20, %xmm0
+vcvttpd2dqs {sae}, %zmm10, %ymm3{%k5}{z}
+vcvttpd2dqsx %xmm1, %xmm8{%k3}
+vcvttpd2dqsx 0x100(%rax){1to2}, %xmm19
+vcvttpd2dqsy %ymm4, %xmm9
+vcvttpd2dqsy %ymm5, %xmm27
+vcvttpd2qqs %zmm0, %zmm1
+vcvttpd2qqs %zmm18, %zmm24
+vcvttpd2udqs %zmm10, %ymm3{%k3}{z}
+vcvttpd2udqs %xmm28, %xmm26
+vcvttpd2udqsx %xmm5, %xmm29{%k1}
+vcvttpd2udqsx 0x0(%r8,%r8,2), %xmm4
+vcvttpd2udqsy %ymm23, %xmm22
+vcvttpd2udqsy %ymm28, %xmm16{%k2}
+vcvttpd2uqqs 0x1(%rdx), %ymm11
+vcvttpd2uqqs 0x8(%rcx,%r12,8), %zmm24{%k4}{z}
+vcvttph2ibs %xmm12, %xmm13
+vcvttph2ibs -0x2000(%rbp,%rsi,4){1to32}, %zmm11{%k6}
+vcvttph2iubs 0x40(%rax), %xmm27{%k7}{z}
+vcvttph2iubs %ymm29, %ymm2
+vcvttps2dqs 0x20(%r10,%r9,8){1to4}, %xmm24
+vcvttps2dqs 0x100(%edx), %zmm4{%k5}
+vcvttps2ibs 0x12345(%rdx), %zmm2
+vcvttps2ibs -0x2000(%rax), %ymm12{%k6}{z}
+vcvttps2iubs %ymm24, %ymm15
+vcvttps2iubs 0x1000(,%r12d,1), %xmm19{%k1}
+vcvttps2qqs -0x100(%r8d), %xmm7
+vcvttps2qqs 0x200(%rbx,%r14,4), %xmm19{%k4}
+vcvttps2udqs 0x80(%r14), %ymm15
+vcvttps2udqs %zmm31, %zmm28{%k7}{z}
+vcvttps2uqqs 0x40(%rcx){1to8}, %zmm11
+vcvttps2uqqs 0x1(%r10,%r9,4), %xmm0
+vcvttsd2sis %xmm12, %r8d
+vcvttsd2sis {sae}, %xmm15, %r13d
+vcvttsd2usis %xmm10, %r14
+vcvttsd2usis 0x100(,%rdx,8), %r8
+vcvttss2sis %xmm7, %r13
+vcvttss2sis %xmm30, %r10
+vcvttss2usis %xmm6, %rdi
+vcvttss2usis 0x12345(%rax,%rcx,2), %r15d
+vdivbf16 0x20(%r8), %zmm2, %zmm30{%k2}{z}
+vdivbf16 %zmm6, %zmm3, %zmm8
+vdpphps %zmm29, %zmm1, %zmm13
+vdpphps (%r8d,%ebp,1), %ymm31, %ymm11{%k3}
+vfmadd132bf16 %zmm4, %zmm30, %zmm23
+vfmadd132bf16 %ymm5, %ymm28, %ymm22
+vfmadd213bf16 -0x80(%r10,%rbp,2), %zmm0, %zmm31{%k2}
+vfmadd213bf16 %xmm11, %xmm29, %xmm7
+vfmadd231bf16 %zmm11, %zmm23, %zmm14
+vfmadd231bf16 %zmm27, %zmm10, %zmm14
+vfmsub132bf16 0x4(%rsp), %zmm20, %zmm12{%k5}{z}
+vfmsub132bf16 %zmm5, %zmm5, %zmm27
+vfmsub213bf16 %xmm22, %xmm6, %xmm0
+vfmsub213bf16 %zmm9, %zmm0, %zmm10{%k1}
+vfmsub231bf16 0x4(%r13), %xmm18, %xmm7{%k5}{z}
+vfmsub231bf16 0x10(%r9,%r13,2), %zmm0, %zmm20
+vfnmadd132bf16 0x8(%rdi,%rbx,4), %xmm16, %xmm1{%k1}
+vfnmadd132bf16 %ymm2, %ymm7, %ymm10
+vfnmadd213bf16 %zmm8, %zmm10, %zmm12{%k1}
+vfnmadd213bf16 -0x100(%r12,%r15,1), %zmm13, %zmm3{%k2}{z}
+vfnmadd231bf16 0x100(%r15,%r14,1){1to16}, %ymm29, %ymm11{%k4}{z}
+vfnmadd231bf16 %ymm21, %ymm6, %ymm7{%k7}{z}
+vfnmsub132bf16 %ymm27, %ymm2, %ymm12{%k6}{z}
+vfnmsub132bf16 0x40(%rbx), %zmm1, %zmm15{%k6}{z}
+vfnmsub213bf16 0x12345(%r8,%r9,2){1to32}, %zmm22, %zmm31{%k6}
+vfnmsub213bf16 -0x40(%rax), %xmm8, %xmm20
+vfnmsub231bf16 0x40(%r9,%r15,4), %ymm25, %ymm16{%k6}
+vfnmsub231bf16 0x100(%r11d), %ymm6, %ymm22{%k4}{z}
+vfpclassbf16 $0x7f, %xmm14, %k3
+vfpclassbf16 $0xff, (%r14d){1to8}, %k2
+vfpclassbf16x $0x0, %xmm10, %k7
+vfpclassbf16x $0xff, 0x100(%rbx,%rbp,1), %k6{%k2}
+vfpclassbf16y $0x11, %ymm15, %k2
+vfpclassbf16y $0x0, 0x1(%rdi), %k4
+vfpclassbf16z $0x0, 0x12345(%rax), %k7
+vfpclassbf16z $0x3, -0x80(%rbx), %k6{%k7}
+vgetexpbf16 %ymm4, %ymm1
+vgetexpbf16 0x0(%r15), %ymm9
+vgetmantbf16 $0x0, %ymm21, %ymm12
+vgetmantbf16 $0xff, 0x40(%r13), %zmm1
+vmaxbf16 %ymm15, %ymm8, %ymm21{%k7}{z}
+vmaxbf16 %xmm10, %xmm6, %xmm9
+vminbf16 %xmm7, %xmm14, %xmm7{%k1}{z}
+vminbf16 %xmm6, %xmm21, %xmm1
+vminmaxbf16 $0x11, %zmm5, %zmm5, %zmm31
+vminmaxbf16 $0xff, -0x40(%r14,%rdx,4){1to32}, %zmm3, %zmm6{%k2}
+vminmaxpd $0x11, -0x80(%rsi,%r11,2){1to8}, %zmm20, %zmm1{%k1}
+vminmaxpd $0x0, 0x200(%rdx){1to2}, %xmm10, %xmm26
+vminmaxph $0xff, %zmm25, %zmm21, %zmm18
+vminmaxph $0x3, 0x2(%r11d), %xmm1, %xmm8{%k4}
+vminmaxps $0x7f, 0x40(%rdi), %zmm28, %zmm15
+vminmaxps $0xff, 0x40(%r10,%r9,2){1to4}, %xmm15, %xmm0
+vminmaxsd $0x11, 0x1000(%r15,%rbx,2), %xmm11, %xmm6{%k4}
+vminmaxsd $0x0, 0x1000(%rdi), %xmm8, %xmm28
+vminmaxsh $0x7f, 0x40(%rdi), %xmm8, %xmm27
+vminmaxsh $0x1, {sae}, %xmm26, %xmm25, %xmm19
+vminmaxss $0x0, 0x7f0(%r9,%rdx,2), %xmm26, %xmm31{%k5}{z}
+vminmaxss $0x11, %xmm14, %xmm5, %xmm28{%k4}{z}
+vmovd %xmm7, 0x80(%r14,%r10,2)
+vmovd %xmm25, 0x4(%rcx)
+vmovrsb -0x100(,%r14,1), %ymm4{%k7}
+vmovrsb 0x80(%edx), %zmm7{%k1}{z}
+vmovrsd 0x4(%r15), %zmm10
+vmovrsd -0x100(%rax,%r11,1), %ymm15{%k6}
+vmovrsq -0x100(%r8), %xmm9
+vmovrsq -0x80(%rcx,%r9,4), %ymm24
+vmovrsw 0x40(%r11,%rax,8), %xmm1
+vmovrsw 0x40(%r13d), %xmm13
+vmpsadbw $0x3, %zmm0, %zmm28, %zmm7
+vmpsadbw $0xff, %ymm7, %ymm6, %ymm15{%k3}
+vmulbf16 %zmm4, %zmm11, %zmm2
+vmulbf16 %zmm0, %zmm8, %zmm8
+vpdpbssd 0x100(%rbx,%rbx,2), %xmm12, %xmm2
+vpdpbsud 0x40(%rax), %xmm11, %xmm14
+vpdpbsuds %zmm7, %zmm4, %zmm13
+vpdpbsuds %ymm14, %ymm8, %ymm27
+vpdpbuud %zmm20, %zmm14, %zmm15
+vpdpbuuds %ymm5, %ymm15, %ymm9
+vpdpwsud 0x40(%r10,%rdx,1), %xmm0, %xmm14{%k5}
+vpdpwsud %zmm7, %zmm13, %zmm11{%k3}{z}
+vpdpwusds -0x80(%r9,%rbp,8), %ymm1, %ymm6{%k3}
+vpdpwuud %ymm30, %ymm16, %ymm1{%k7}
+vrcpbf16 0x8(%rax), %zmm14{%k5}
+vrcpbf16 0x10(%r13){1to16}, %ymm17
+vreducebf16 $0x0, %zmm12, %zmm0
+vreducebf16 $0x7f, 0x200(%r14), %zmm29{%k5}
+vrndscalebf16 $0x11, 0x7f0(%rcx,%rdi,8){1to8}, %xmm17
+vrndscalebf16 $0x7f, 0x100(%r15,%rcx,2){1to32}, %zmm27
+vrsqrtbf16 -0x2000(%r10,%r14,4){1to8}, %xmm9{%k7}{z}
+vrsqrtbf16 0x12345(%rsi){1to32}, %zmm19{%k6}
+vscalefbf16 0x0(%r11){1to16}, %ymm9, %ymm7
+vscalefbf16 %ymm11, %ymm26, %ymm1
+vsqrtbf16 0x40(%ebx), %zmm18
+vsqrtbf16 -0x40(,%r14,1), %ymm15
+vsubbf16 %zmm2, %zmm12, %zmm5
+vsubbf16 -0x80(%rsi,%rcx,1){1to32}, %zmm3, %zmm21{%k4}
+vucomxsd 0x10(%rdx,%r9,1), %xmm14
+vucomxsd {sae}, %xmm5, %xmm2
+vucomxsh 0x7f0(%r9), %xmm9
+vucomxsh %xmm25, %xmm4
+vucomxss %xmm27, %xmm14
+vucomxss 0x1(%r14), %xmm10
+# ---- CET, Key Locker, TSX and system instructions ----------------------------
+aadd %r15d, -0x40(%r9d)
+aadd %esi, -0x40(%r10)
+aand %r14, 0x3f(%rdx)
+aand %rbp, -0x2000(%eax)
+aesdec128kl -0x80(%r9,%r13,8), %xmm13
+aesdec128kl 0x20(%rbx), %xmm3
+aesdec256kl 0x3f(%r9,%r14,2), %xmm9
+aesdec256kl 0x1000(%r13,%r10,4), %xmm3
+aesdecwide128kl 0x3f(%r10)
+aesdecwide128kl -0x100(%rbp)
+aesdecwide256kl 0x0(%r13,%rcx,8)
+aesdecwide256kl 0x40(%rsp,%r12,8)
+aesenc128kl 0x20(%r8), %xmm3
+aesenc128kl 0x80(%r8d), %xmm0
+aesenc256kl 0x12345(%rbx), %xmm6
+aesenc256kl 0x100(%rbx), %xmm7
+aesencwide128kl -0x40(%r9)
+aesencwide128kl 0x40(%rsi)
+aesencwide256kl -0x2000(%r10)
+aesencwide256kl -0x2000(%rcx)
+aor %r12d, 0x7f0(%r13,%r12,8)
+aor %r8, 0x10(%rax)
+axor %esi, 0x80(%r8)
+axor %rsp, 0x1000(%r8,%rcx,4)
+cldemote 0x0(%rax)
+cldemote -0x40(%rax)
+clflushopt (%r8)
+clflushopt 0x12345(%rcx)
+clrssbsy 0x0(%r10)
+clrssbsy -0x80(%rbx,%rbx,1)
+clui
+clwb 0x1(%ebx,%r9d,4)
+clwb 0x100(%rdi)
+clzero
+cmpaexadd %r12, %rsi, 0x2(%r8,%r8,8)
+cmpaexadd %r13, %rsp, 0x40(%rbx,%rdi,2)
+cmpaxadd %r9, %rsp, 0x20(%r8)
+cmpaxadd %r13d, %r11d, 0x40(%r12d)
+cmpbexadd %r15d, %r9d, 0x1(%r10)
+cmpbexadd %eax, %ecx, 0x1(%rsi)
+cmpbxadd %rbx, %r8, (%rax)
+cmpbxadd %r9, %r12, 0x80(%rbp,%r8,4)
+cmpcxadd %rbp, %r9, -0x100(%rax)
+cmpcxadd %ebp, %r9d, 0x1(%r11,%rcx,8)
+cmpexadd %r12, %r9, 0x1000(%r11)
+cmpexadd %eax, %eax, 0x7f0(%r8)
+cmpgexadd %eax, %esi, 0x20(%rbx)
+cmpgexadd %r9, %rsi, 0x2(%rbp)
+cmpgxadd %rdx, %r9, 0x100(%edi)
+cmpgxadd %r10, %rdi, 0x1000(%r13,%r9,8)
+cmplexadd %rbx, %r10, 0x12345(%r8,%r15,2)
+cmplexadd %r13d, %r12d, 0x3f(,%rdx,2)
+cmplxadd %esp, %r8d, 0x40(%rbx)
+cmplxadd %rdx, %r11, 0x100(%r11,%r15,8)
+cmpnaexadd %rsp, %r9, 0x200(%rbx)
+cmpnaexadd %r9d, %ecx, 0x20(%esi)
+cmpnaxadd %edi, %r8d, 0x200(%r14d)
+cmpnaxadd %r10, %r10, -0x40(%rax)
+cmpnbexadd %r13, %rax, 0x40(%rdx)
+cmpnbexadd %r14, %rbp, 0x200(%rsi,%rbx,8)
+cmpnbxadd %r15d, %r13d, 0x40(%rax)
+cmpnbxadd %r8d, %ebp, 0x1000(%r14)
+cmpncxadd %rcx, %r8, 0x7f0(%rax)
+cmpncxadd %rbp, %rax, 0x12345(%r8,%r10,2)
+cmpnexadd %r13d, %ecx, 0x200(%rax)
+cmpnexadd %rbx, %rdi, 0x1000(%r12)
+cmpngexadd %rbp, %rdx, 0x2(%r10)
+cmpngexadd %rax, %rbp, 0x20(%rdx,%rbp,4)
+cmpngxadd %rsp, %r13, 0x80(%rbx,%rbx,2)
+cmpngxadd %r10, %rdx, 0x2(%rdi,%rbp,1)
+cmpnlexadd %rsi, %rcx, 0x200(%r14,%r10,2)
+cmpnlexadd %r14d, %r15d, 0x80(%r8,%r15,4)
+cmpnlxadd %ebp, %edi, 0x80(%rcx,%rbx,1)
+cmpnlxadd %ebx, %r10d, 0x4(%r11,%rbp,8)
+cmpnoxadd %r9, %rdi, -0x80(%r8)
+cmpnoxadd %r13d, %r9d, 0x0(%r11)
+cmpnpxadd %ebx, %edx, 0x12345(%r14)
+cmpnpxadd %rbx, %r8, 0x7f0(%rcx,%rcx,8)
+cmpnsxadd %r15d, %esp, -0x100(,%rsi,1)
+cmpnsxadd %rcx, %rax, 0x2(%rbx)
+cmpnzxadd %r8, %rbx, 0x40(%r14)
+cmpnzxadd %rbx, %rax, 0x3f(%rbx)
+cmpoxadd %r12, %rbp, 0x40(%r10)
+cmpoxadd %r13, %r9, -0x80(%rbx,%r9,8)
+cmppexadd %rdx, %rbp, 0x2(%r9)
+cmppexadd %esp, %r15d, 0x1(%r14)
+cmppoxadd %r13d, %r14d, 0x1000(,%r12,1)
+cmppoxadd %ebx, %esp, 0x40(%r15)
+cmppxadd %r9, %r15, 0x1(%r8)
+cmppxadd %r8d, %r8d, 0x3f(%r8d,%r13d,8)
+cmpsxadd %rdx, %rax, 0x12345(%r8,%rbp,2)
+cmpsxadd %rdx, %r8, -0x2000(%r12d,%esi,1)
+cmpzxadd %r15, %rbp, 0x1(%r10,%r15,2)
+cmpzxadd %rsp, %r13, 0x3f(%r15)
+encodekey128 %esp, %eax
+encodekey128 %edi, %r8d
+encodekey256 %edx, %r15d
+encodekey256 %r10d, %ecx
+endbr32
+endbr64
+hreset $0x11
+hreset $0x1
+incsspd %r13d
+incsspd %ecx
+incsspq %rdx
+incsspq %rsi
+invpcid 0x80(%rax), %rsi
+invpcid 0x40(,%rcx,8), %r11
+loadiwkey %xmm1, %xmm6
+loadiwkey %xmm6, %xmm13
+monitorx
+movdiri %r10d, -0x2000(%r15)
+movdiri %r8, 0x3f(%r11)
+movrs 0x1000(%r9,%r13,2), %dx
+movrs 0x3f(%r14), %ebp
+mwaitx
+pconfig
+prefetchit0 0x8(%rsp)
+prefetchit0 0x40(%rax)
+prefetchit1 0x0(%rax,%r15,4)
+prefetchit1 0x1(%r13)
+prefetchrst2 0x200(%rsi)
+prefetchrst2 -0x40(%r8d,%ebp,8)
+prefetchwt1 -0x2000(%rcx)
+prefetchwt1 0x1000(%r10)
+ptwriteq 0x8(%rax,%rbx,1)
+ptwrite %r8d
+rdfsbase %r11
+rdfsbase %rbp
+rdgsbase %ecx
+rdgsbase %r9
+rdmsrlist
+rdpid %rdi
+rdpid %rsi
+rdpkru
+rdpru
+rdrand %r9d
+rdrand %r8w
+rdseed %r10w
+rdseed %rdi
+rdsspd %r13d
+rdsspd %edi
+rdsspq %rcx
+rdsspq %r13
+rstorssp 0x8(%rbp)
+rstorssp 0x200(%r9,%rbx,1)
+saveprevssp
+senduipi %r12
+senduipi %rbp
+serialize
+setssbsy
+stui
+testui
+tpause %eax
+tpause %ebx
+uiret
+umwait %r15d
+umwait %esi
+vbroadcastss 0x20(%r8), %xmm19
+vbroadcastss 0x1(%r14,%rsi,1), %xmm2
+vextractps $0x1, %xmm28, %rax
+vextractps $0x0, %xmm25, %r9d
+vfmadd132pd 0x200(%r11d,%r13d,8){1to4}, %ymm13, %ymm31
+vfmadd132pd 0x12345(%edx), %ymm4, %ymm3
+vfmadd132ps %xmm7, %xmm16, %xmm18
+vfmadd132ps 0x10(%rax,%rbp,8), %zmm30, %zmm9{%k5}
+vfmadd132sd -0x40(%rsi,%r15,8), %xmm18, %xmm2
+vfmadd132sd 0x0(%rcx), %xmm30, %xmm7{%k4}
+vfmadd132ss -0x40(%r12), %xmm15, %xmm9
+vfmadd132ss 0x8(%r15d), %xmm20, %xmm11{%k7}
+vfmadd213pd 0x200(%ebx), %zmm12, %zmm20{%k4}
+vfmadd213pd %xmm2, %xmm2, %xmm19
+vfmadd213ps 0x40(,%rdi,8), %xmm6, %xmm16{%k2}{z}
+vfmadd213ps 0x80(%rsp,%r10,8), %xmm0, %xmm9{%k6}
+vfmadd213sd 0x10(%r12,%rdi,2), %xmm9, %xmm30
+vfmadd213sd %xmm12, %xmm21, %xmm15
+vfmadd213ss 0x7f0(%r12,%rbp,4), %xmm23, %xmm12
+vfmadd213ss {ru-sae}, %xmm14, %xmm6, %xmm15{%k6}
+vfmadd231pd 0x40(%r14,%rax,4){1to2}, %xmm15, %xmm16
+vfmadd231pd 0x20(%rax), %xmm20, %xmm23
+vfmadd231ps {rz-sae}, %zmm0, %zmm0, %zmm1
+vfmadd231ps %ymm12, %ymm29, %ymm25
+vfmadd231sd 0x1000(%rdi), %xmm3, %xmm14
+vfmadd231sd %xmm23, %xmm5, %xmm4
+vfmadd231ss 0x20(%r8d,%r9d,1), %xmm12, %xmm10{%k3}
+vfmadd231ss 0x40(%rcx), %xmm5, %xmm28{%k5}{z}
+vfmaddsub132pd 0x3f(%r12,%rax,4){1to8}, %zmm9, %zmm1
+vfmaddsub132pd 0x1(%r11d){1to4}, %ymm25, %ymm8
+vfmaddsub132ps 0x10(%rsp), %zmm11, %zmm17
+vfmaddsub132ps %ymm20, %ymm9, %ymm2{%k1}{z}
+vfmaddsub213pd 0x0(%rsp,%rax,2){1to2}, %xmm23, %xmm7
+vfmaddsub213pd %xmm12, %xmm10, %xmm21
+vfmaddsub213ps %ymm2, %ymm20, %ymm4
+vfmaddsub213ps 0x10(%r8), %zmm9, %zmm1
+vfmaddsub231pd 0x100(%rsp,%r14,1), %xmm28, %xmm9
+vfmaddsub231pd %ymm7, %ymm24, %ymm21
+vfmaddsub231ps 0x2(%r11,%rbx,8){1to16}, %zmm21, %zmm26{%k7}
+vfmaddsub231ps %xmm16, %xmm14, %xmm21{%k4}
+vfmsub132pd %zmm19, %zmm13, %zmm28
+vfmsub132pd 0x2(%edx,%ebp,8), %xmm27, %xmm1
+vfmsub132ps {rz-sae}, %zmm3, %zmm29, %zmm26{%k1}{z}
+vfmsub132ps -0x100(%rdx,%rbp,4), %xmm12, %xmm27{%k7}
+vfmsub132sd 0x40(%rbp,%rbp,4), %xmm29, %xmm8
+vfmsub132sd 0x200(%rbp,%rsi,8), %xmm2, %xmm5{%k2}
+vfmsub132ss 0x12345(%r12d,%edx,8), %xmm3, %xmm5
+vfmsub132ss -0x40(%rdi,%rbp,4), %xmm5, %xmm5{%k1}
+vfmsub213pd 0x1(%rdx,%rsi,2), %xmm29, %xmm0
+vfmsub213pd -0x80(%r10,%r15,8), %ymm14, %ymm3
+vfmsub213ps 0x80(%rax), %ymm25, %ymm12
+vfmsub213ps %xmm20, %xmm14, %xmm6{%k5}{z}
+vfmsub213sd 0x1(%rbp,%rbp,8), %xmm4, %xmm13
+vfmsub213sd {rd-sae}, %xmm3, %xmm12, %xmm0
+vfmsub213ss %xmm0, %xmm20, %xmm21
+vfmsub213ss {rd-sae}, %xmm0, %xmm23, %xmm24
+vfmsub231pd 0x80(%rdi){1to2}, %xmm16, %xmm5
+vfmsub231pd 0x100(%r15,%r9,2){1to8}, %zmm5, %zmm29
+vfmsub231ps 0x2(%rax), %zmm11, %zmm8{%k1}{z}
+vfmsub231ps 0x7f0(%r13d,%eax,4), %zmm31, %zmm7{%k6}{z}
+vfmsub231sd {rz-sae}, %xmm4, %xmm18, %xmm1
+vfmsub231sd {ru-sae}, %xmm23, %xmm8, %xmm2
+vfmsub231ss 0x20(,%rdx,2), %xmm0, %xmm20
+vfmsub231ss 0x1000(%rax), %xmm3, %xmm24
+vfmsubadd132pd %xmm2, %xmm4, %xmm14
+vfmsubadd132pd {ru-sae}, %zmm28, %zmm12, %zmm7
+vfmsubadd132ps %xmm10, %xmm8, %xmm2{%k3}
+vfmsubadd132ps -0x100(%r12), %xmm10, %xmm10
+vfmsubadd213pd %zmm3, %zmm27, %zmm23{%k7}
+vfmsubadd213pd {ru-sae}, %zmm5, %zmm20, %zmm2
+vfmsubadd213ps 0x1000(%rbp), %ymm2, %ymm25{%k4}
+vfmsubadd213ps 0x10(%r8,%rdi,8), %ymm12, %ymm1
+vfmsubadd231pd %xmm3, %xmm4, %xmm11
+vfmsubadd231pd -0x40(%rdx){1to4}, %ymm16, %ymm18
+vfmsubadd231ps %xmm10, %xmm31, %xmm7
+vfmsubadd231ps %ymm5, %ymm1, %ymm4
+vfnmadd132pd %zmm6, %zmm9, %zmm14{%k2}
+vfnmadd132pd %zmm30, %zmm4, %zmm28
+vfnmadd132ps 0x0(,%ebp,8), %zmm12, %zmm15
+vfnmadd132ps {rn-sae}, %zmm23, %zmm26, %zmm19{%k4}{z}
+vfnmadd132sd -0x2000(%rsi), %xmm7, %xmm3
+vfnmadd132sd {rz-sae}, %xmm30, %xmm2, %xmm13
+vfnmadd132ss 0x12345(%rax), %xmm0, %xmm11{%k3}
+vfnmadd132ss 0x40(%r15), %xmm14, %xmm10
+vfnmadd213pd %xmm4, %xmm18, %xmm27
+vfnmadd213pd 0x40(%rdx), %zmm25, %zmm6
+vfnmadd213ps %xmm19, %xmm20, %xmm11
+vfnmadd213ps %ymm26, %ymm17, %ymm6{%k6}
+vfnmadd213sd {rz-sae}, %xmm0, %xmm4, %xmm5{%k5}{z}
+vfnmadd213sd -0x2000(%rax), %xmm8, %xmm5
+vfnmadd213ss 0x200(%r9), %xmm2, %xmm21
+vfnmadd213ss %xmm3, %xmm12, %xmm7{%k7}{z}
+vfnmadd231pd 0x2(%r12){1to8}, %zmm13, %zmm9
+vfnmadd231pd %ymm28, %ymm29, %ymm14
+vfnmadd231ps %ymm11, %ymm18, %ymm14
+vfnmadd231ps %ymm23, %ymm0, %ymm3
+vfnmadd231sd %xmm6, %xmm8, %xmm9{%k2}
+vfnmadd231sd %xmm18, %xmm30, %xmm15{%k5}
+vfnmadd231ss %xmm5, %xmm8, %xmm11
+vfnmadd231ss (%rdi), %xmm11, %xmm24{%k2}
+vfnmsub132pd %ymm12, %ymm24, %ymm9
+vfnmsub132pd %ymm16, %ymm6, %ymm1{%k6}
+vfnmsub132ps -0x2000(%rdi), %ymm1, %ymm19
+vfnmsub132ps {rn-sae}, %zmm21, %zmm8, %zmm7
+vfnmsub132sd {rn-sae}, %xmm10, %xmm12, %xmm30{%k6}
+vfnmsub132sd -0x80(%rdx), %xmm3, %xmm8{%k7}
+vfnmsub132ss 0x80(%esi), %xmm14, %xmm5{%k7}
+vfnmsub132ss 0x20(%r15d), %xmm1, %xmm11
+vfnmsub213pd 0x80(%rsi), %zmm21, %zmm10
+vfnmsub213pd %xmm17, %xmm19, %xmm11
+vfnmsub213ps 0x8(%rcx), %ymm25, %ymm2
+vfnmsub213ps -0x80(%r14){1to16}, %zmm1, %zmm1{%k6}{z}
+vfnmsub213sd 0x4(%rbp,%r15,8), %xmm4, %xmm21
+vfnmsub213sd 0x1000(%r9,%r10,4), %xmm13, %xmm9{%k3}
+vfnmsub213ss %xmm1, %xmm19, %xmm15
+vfnmsub213ss 0x0(%r9), %xmm27, %xmm0{%k3}
+vfnmsub231pd %zmm24, %zmm5, %zmm22
+vfnmsub231pd %ymm23, %ymm2, %ymm13{%k3}
+vfnmsub231ps 0x12345(%rax), %ymm25, %ymm19{%k6}
+vfnmsub231ps 0x200(%r10), %xmm22, %xmm5{%k7}
+vfnmsub231sd 0x3f(%rsi,%r12,2), %xmm5, %xmm20
+vfnmsub231sd 0x200(%r14,%rdx,2), %xmm2, %xmm11{%k4}
+vfnmsub231ss 0x40(%r9,%rax,8), %xmm17, %xmm29
+vfnmsub231ss %xmm19, %xmm13, %xmm27
+vmovq 0x3f(%rdi), %xmm8
+vmovq %rax, %xmm0
+vpbroadcastd %xmm6, %zmm5
+vpbroadcastd 0x0(%r11,%r13,1), %xmm12
+vpermd %ymm8, %ymm23, %ymm4{%k2}
+vpermd -0x80(%rsi), %ymm18, %ymm9
+vpermilps $0x1, -0x100(%rbp,%rdi,4), %xmm5
+vpermilps $0x11, %xmm10, %xmm0{%k5}
+vpermpd $0x3, %ymm25, %ymm13
+vpermps %ymm27, %ymm18, %ymm10
+vpermps -0x100(,%r15,8), %ymm18, %ymm5{%k6}{z}
+vpermq $0xff, 0x0(%r12,%r9,2), %ymm31
+vpermq $0x11, %ymm25, %ymm27{%k5}{z}
+vpmovsxbd %xmm4, %ymm12{%k3}{z}
+vpmovsxbq %xmm13, %ymm25{%k3}
+vpmovsxbq %xmm0, %xmm10{%k6}
+vpmovsxwd 0x100(%rbx,%rax,1), %ymm23
+vpmovsxwq %xmm11, %ymm9{%k7}
+vpmovsxwq -0x40(%rcx), %xmm7
+vpmovzxbd 0x12345(%rbp,%rbx,1), %xmm22{%k5}{z}
+vpmovzxbd -0x80(%r11,%r14,2), %ymm31{%k6}{z}
+vpmovzxbq 0x20(%rsp), %ymm16{%k7}{z}
+vpmovzxwd %xmm12, %ymm0
+vpmovzxwq 0x40(%r10), %xmm13
+vpmovzxwq 0x4(%r11d,%esi,2), %xmm24
+vpsllvd %zmm14, %zmm6, %zmm2
+vpsllvd %ymm20, %ymm6, %ymm18{%k2}
+vpsllvq 0x10(%r15), %ymm6, %ymm20{%k5}{z}
+vpsllvq 0x3f(%r13,%r12,4){1to4}, %ymm18, %ymm14{%k6}
+vpsravd 0x8(%r11,%r14,4), %xmm0, %xmm13
+vpsravd -0x80(%rcx,%rbx,8){1to8}, %ymm6, %ymm29
+vpsrlvd 0x0(%r15d), %xmm5, %xmm3
+vpsrlvd 0x2(%r9), %xmm9, %xmm15
+vpsrlvq 0x2(%rbx){1to4}, %ymm23, %ymm10
+vpsrlvq %xmm30, %xmm27, %xmm1
+wbnoinvd
+wrfsbase %r9
+wrfsbase %r15d
+wrgsbase %r9d
+wrgsbase %rbp
+wrmsrlist
+wrmsrns
+wrpkru
+wrssd %ebx, 0x2(%r10)
+wrssd %r9d, 0x7f0(%r15,%rbx,2)
+wrssq %r12, 0x3f(%r12,%r10,8)
+wrssq %rbp, 0x1000(%rax)
+wrussd %r13d, 0x0(%ecx,%edi,8)
+wrussd %r15d, 0x1000(%r13)
+wrussq %r9, 0x1(%rcx)
+wrussq %rsp, 0x1(%r13)
+xabort $0x3
+xabort $0x0
+xend
+xgetbv
+xresldtrk
+xrstor 0x40(%rbp)
+xrstor 0x2(%r14,%r13,1)
+xrstor64 0x8(%r13d)
+xrstor64 0x0(%rdx,%r9,2)
+xrstors 0x1(%eax)
+xrstors 0x2(%rdx)
+xrstors64 -0x100(%r9d,%eax,8)
+xrstors64 0x1000(%rdx)
+xsave -0x2000(%r9,%rax,1)
+xsave -0x80(%r14)
+xsave64 0x40(%r13)
+xsave64 0x7f0(%rsp)
+xsavec 0x1000(%rdi)
+xsavec 0x80(%r8,%rbp,1)
+xsavec64 0x4(%r11,%rbp,1)
+xsavec64 0x4(%r13)
+xsaveopt 0x40(%rbp)
+xsaveopt (%r14)
+xsaveopt64 -0x100(%rax)
+xsaveopt64 0x8(%rbx)
+xsaves 0x20(%rdi,%r10,1)
+xsaves 0x20(%r12)
+xsaves64 0x0(%rdx)
+xsaves64 0x20(%rdi,%r13,2)
+xsetbv
+xsusldtrk
+xtest

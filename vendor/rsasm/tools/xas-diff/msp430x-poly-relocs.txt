@@ -1,0 +1,273 @@
+# Whole objects, compared by tools/mc-diff/canon.sh: each reference form
+# through each kind of symbol. GNU as relocates every reference from code on
+# this target, even to the label before it, and names a code label itself
+# rather than its section.
+#
+# Three things GNU as does that rsasm does not copy are kept out, none of
+# which changes what a linker makes of the object:
+#
+# - the addend of the last R_MSP430_SYM_DIFF in a section, which GNU as
+#   writes as the subtrahend's negated value where it writes zero for every
+#   other, so a difference is never the last relocation in a section here;
+# - where a `.section .data` directive, which refers to `__crt0_movedata` as
+#   it is read, falls among the undefined symbols, since rsasm orders those
+#   by where they are relocated;
+# - a number `.set` after the code that uses it, which GNU as relocates
+#   against the symbol and rsasm writes into the field.
+=== an undefined symbol
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+
+=== a local label in the same section
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+X:      nop
+
+=== a local label earlier in the section
+        .text
+X:      nop
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+
+=== a local label in another code section
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+        .section .text.other, "ax"
+X:      nop
+
+=== a local label in a data section
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+        .data
+        .word 0
+X:      .word 1
+
+=== a local label in .bss
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+        .bss
+        .space 2
+X:      .space 2
+
+=== a global label in the same section
+        .text
+        .globl  X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+X:      nop
+
+=== a global label in a data section
+        .text
+        .globl  X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+        .data
+X:      .word 1
+
+=== a weak label
+        .text
+        .weak   X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+X:      nop
+
+=== a weak undefined symbol
+        .text
+        .weak   X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+
+=== a hidden global label
+        .text
+        .globl  X
+        .hidden X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+X:      nop
+
+=== a protected global label
+        .text
+        .globl  X
+        .protected X
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+X:      nop
+
+=== a local alias of a global label
+        .text
+        .globl  G
+        .set    X, G
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+G:      nop
+
+=== a global alias of a local label
+        .text
+        .globl  X
+        .set    X, L
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+L:      nop
+
+=== a label made global after use
+        .text
+        jump    X
+        beq     X
+        bne     X
+        blt     X
+        bltu    X
+        bge     X
+        bgeu    X
+        bltn    X
+        bgt     X
+        bgtu    X
+        bleu    X
+        ble     X
+        .globl  X
+X:      nop
+

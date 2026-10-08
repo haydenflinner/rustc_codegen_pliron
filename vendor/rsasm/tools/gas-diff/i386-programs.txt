@@ -1,0 +1,141 @@
+# 32-bit mode snippets, separated by `=== <name>`, checked against GNU as.
+# Alignment padding is left out, as in programs.txt: GNU as picks its no-ops
+# by -mtune.
+
+=== short branches both ways
+back:
+    nop
+    jmp back
+    jne fwd
+    call back
+fwd:
+    ret
+
+=== branches that need the long form
+    jmp far
+    je far
+    jb far
+    .space 200
+far:
+    jg 1f
+    .space 130
+1:  ret
+
+=== a branch just in range of the short form
+    jmp 1f
+    .space 127
+1:  jmp 2f
+    .space 128
+2:  ret
+
+=== counter branches
+1:  loop 1b
+    loope 1b
+    loopne 1b
+    jecxz 1b
+    jcxz 1b
+    jecxz 2f
+    nop
+2:  ret
+
+=== local addresses as data and displacements
+    movl $msg, %eax
+    leal msg(%ebx), %ecx
+    movl msg, %edx
+    movw $msg, %ax
+    pushl $msg
+    .long msg, msg - ., . - msg
+    .word msg - start
+msg:
+    .ascii "hi"
+start:
+    ret
+
+=== a far jump and call to a local label
+    ljmp $0x08, $target
+    lcall $0x10, $target
+    ljmpw $0x18, $target
+target:
+    lret
+
+=== intel syntax: labels are memory unless offset is written
+    .intel_syntax noprefix
+    mov eax, value
+    mov eax, offset value
+    lea ecx, value
+    push offset value
+    push value
+    jmp next
+next:
+    call next
+value:
+    .long 1
+
+=== intel syntax: far pointers and string operands
+    .intel_syntax noprefix
+    jmp 0x10:0x2000
+    call 0x20:there
+    movs byte ptr es:[edi], byte ptr fs:[esi]
+    rep stos dword ptr es:[edi]
+there:
+    retf
+
+=== 16-bit code in a 32-bit file
+    .code16
+    jmp 1f
+    jmp 2f
+1:  je 2f
+    call 1b
+    .space 300
+2:  movw $1, %ax
+    movl $1, %eax
+    .code32
+    movw $1, %ax
+    movl $1, %eax
+
+=== 16-bit branches that need the long form
+    .code16
+    jmp far16
+    jne far16
+    jcxz near16
+    .space 100
+near16:
+    .space 100
+far16:
+    loop near16
+    ret
+
+=== code16gcc widens the stack to 32 bits
+    .code16gcc
+    push %eax
+    push $1
+    pushl %ds
+    pusha
+    pushf
+    call 1f
+1:  ret
+    leave
+    lret
+    popf
+    popa
+    pop %ebx
+    iret
+    jmp *(%bx)
+    .code16
+    push $1
+    call 1b
+    ret
+
+=== x87 register stack operations in sequence
+    fld1
+    fldpi
+    faddp
+    fldz
+    fxch %st(1)
+    fsub %st, %st(1)
+    fsubr %st(1), %st
+    fdivp %st, %st(1)
+    fstps (%esp)
+    fcomip %st(1), %st
+    fcmovne %st(1), %st
+    ffreep %st(0)

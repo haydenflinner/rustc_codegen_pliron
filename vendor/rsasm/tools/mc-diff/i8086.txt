@@ -1,0 +1,937 @@
+# x86 in 16-bit mode (`.code16`, in a 32-bit object), AT&T syntax: one instruction per line, checked against
+# llvm-mc by tools/mc-diff/run.sh, which adds the directives for the mode and
+# syntax (see its ARCHES table).
+#
+# The same cases as tools/gas-diff/i8086.txt. Where the two references
+# disagree rsasm follows GNU as, and the case is commented out here with
+# llvm-mc's answer beside it. The differences are conventions rather than
+# errors on either side:
+#
+# - prefix order: GNU as writes the operand size prefix before `rep`, llvm-mc
+#   after it;
+# - a segment override the address already implies (`%ds:(%ebx)`,
+#   `%ss:(%ebp)`) is left out by GNU as and kept by llvm-mc;
+# - `xchg` between two registers puts them in the opposite ModRM fields;
+# - an unsized memory operand is refused by llvm-mc, where GNU as warns and
+#   takes the mode's size;
+# - llvm-mc's Intel syntax adds a `66` prefix to segment pushes and pops, and
+#   in 16-bit code to `ret`, `iret` and far returns, and moves a segment
+#   register to or from a GPR with the other register's operand size;
+# - llvm-mc has no `int1`, `enterw`/`leavew`, `fnsetpm`/`fneni`/`fndisi`, and
+#   no Intel `seg:offset` far pointers;
+# - `xlat` with a segment keeps its prefix in GNU as only, and GNU as reads an
+#   Intel `jmp dword ptr` in 16-bit code as a far jump.
+# ---- addressing: every ModRM form of the mode, through mov -----------------
+mov (%bx,%si), %ax
+mov %cl, (%bx,%si)
+mov (%bx,%di), %ax
+mov %cl, (%bx,%di)
+mov (%bp,%si), %ax
+mov %cl, (%bp,%si)
+mov (%bp,%di), %ax
+mov %cl, (%bp,%di)
+mov (%si), %ax
+mov %cl, (%si)
+mov (%di), %ax
+mov %cl, (%di)
+mov (%bp), %ax
+mov %cl, (%bp)
+mov (%bx), %ax
+mov %cl, (%bx)
+mov 4(%bx,%si), %ax
+mov %cl, 4(%bx,%si)
+mov -2(%bp), %ax
+mov %cl, -2(%bp)
+mov 0x1234(%di), %ax
+mov %cl, 0x1234(%di)
+mov 0x1234, %dl
+mov 0x1234, %edx
+
+# ---- addressing: the other address size, with 0x67 -------------------------
+mov (%ebx), %eax
+lea (%ebx), %ax
+mov 8(%esi), %eax
+lea 8(%esi), %ax
+mov 4(%edx,%edi,4), %eax
+lea 4(%edx,%edi,4), %ax
+mov (%esp), %eax
+lea (%esp), %ax
+mov (%ebp), %eax
+lea (%ebp), %ax
+
+# ---- addressing: segment overrides, and the ones left out as redundant -----
+movb %es:(%bx), %al
+movb %al, %es:(%bp)
+movb %cs:(%bx), %al
+movb %al, %cs:(%bp)
+movb %ss:(%bx), %al
+# movb %al, %ss:(%bp)                      llvm-mc 36 88 46 00
+# movb %ds:(%bx), %al                      llvm-mc 3e 8a 07
+movb %al, %ds:(%bp)
+movb %fs:(%bx), %al
+movb %al, %fs:(%bp)
+movb %gs:(%bx), %al
+movb %al, %gs:(%bp)
+movl %fs:0x10, %eax
+movw %gs:0x10, %ax
+movb %es:0x10, %al
+fs movw (%bx), %ax
+
+# ---- accumulator moves to and from an absolute address ---------------------
+mov 0x1000, %al
+mov %al, 0x1000
+mov 0x1000, %ax
+mov %ax, 0x1000
+mov 0x1000, %eax
+mov %eax, 0x1000
+
+# ---- operand sizes: 8, 16 and 32 bits --------------------------------------
+mov %bl, %al
+mov %bl, (%bx,%di)
+mov (%bx,%di), %bl
+mov $18, %al
+movb $127, (%bx,%di)
+mov %bx, %ax
+mov %bx, (%bx,%di)
+mov (%bx,%di), %bx
+mov $18, %ax
+movw $127, (%bx,%di)
+mov %ebx, %eax
+mov %ebx, (%bx,%di)
+mov (%bx,%di), %ebx
+mov $18, %eax
+movl $127, (%bx,%di)
+
+# ---- the eight arithmetic operations ---------------------------------------
+add %cl, %al
+add %bx, %dx
+add %edi, %esi
+add (%bp,%si), %ecx
+add %bp, (%bp,%si)
+or %cl, %al
+or %bx, %dx
+or %edi, %esi
+or (%bp,%si), %ecx
+or %bp, (%bp,%si)
+adc %cl, %al
+adc %bx, %dx
+adc %edi, %esi
+adc (%bp,%si), %ecx
+adc %bp, (%bp,%si)
+sbb %cl, %al
+sbb %bx, %dx
+sbb %edi, %esi
+sbb (%bp,%si), %ecx
+sbb %bp, (%bp,%si)
+and %cl, %al
+and %bx, %dx
+and %edi, %esi
+and (%bp,%si), %ecx
+and %bp, (%bp,%si)
+sub %cl, %al
+sub %bx, %dx
+sub %edi, %esi
+sub (%bp,%si), %ecx
+sub %bp, (%bp,%si)
+xor %cl, %al
+xor %bx, %dx
+xor %edi, %esi
+xor (%bp,%si), %ecx
+xor %bp, (%bp,%si)
+cmp %cl, %al
+cmp %bx, %dx
+cmp %edi, %esi
+cmp (%bp,%si), %ecx
+cmp %bp, (%bp,%si)
+add $1, %al
+add $127, %al
+add $128, %al
+add $-128, %al
+add $1, %ax
+add $127, %ax
+add $128, %ax
+add $-128, %ax
+add $1, %eax
+add $127, %eax
+add $128, %eax
+add $-128, %eax
+add $4660, %bx
+add $305419896, %ebx
+add $-2, %ebx
+addb $5, (%bp,%si)
+addw $-5, (%bp,%si)
+addw $4660, (%bp,%si)
+addl $128, (%bp,%si)
+add $65535, %ax
+add $4294967295, %ecx
+sub $1, %al
+sub $127, %al
+sub $128, %al
+sub $-128, %al
+sub $1, %ax
+sub $127, %ax
+sub $128, %ax
+sub $-128, %ax
+sub $1, %eax
+sub $127, %eax
+sub $128, %eax
+sub $-128, %eax
+sub $4660, %bx
+sub $305419896, %ebx
+sub $-2, %ebx
+subb $5, (%bp,%si)
+subw $-5, (%bp,%si)
+subw $4660, (%bp,%si)
+subl $128, (%bp,%si)
+sub $65535, %ax
+sub $4294967295, %ecx
+cmp $1, %al
+cmp $127, %al
+cmp $128, %al
+cmp $-128, %al
+cmp $1, %ax
+cmp $127, %ax
+cmp $128, %ax
+cmp $-128, %ax
+cmp $1, %eax
+cmp $127, %eax
+cmp $128, %eax
+cmp $-128, %eax
+cmp $4660, %bx
+cmp $305419896, %ebx
+cmp $-2, %ebx
+cmpb $5, (%bp,%si)
+cmpw $-5, (%bp,%si)
+cmpw $4660, (%bp,%si)
+cmpl $128, (%bp,%si)
+cmp $65535, %ax
+cmp $4294967295, %ecx
+
+# ---- shifts and rotates ----------------------------------------------------
+rol $1, %al
+rol $3, %bx
+rol %cl, %ecx
+roll $1, (%bp,%si)
+rolw %cl, (%bp,%si)
+ror $1, %al
+ror $3, %bx
+ror %cl, %ecx
+rorl $1, (%bp,%si)
+rorw %cl, (%bp,%si)
+rcl $1, %al
+rcl $3, %bx
+rcl %cl, %ecx
+rcll $1, (%bp,%si)
+rclw %cl, (%bp,%si)
+rcr $1, %al
+rcr $3, %bx
+rcr %cl, %ecx
+rcrl $1, (%bp,%si)
+rcrw %cl, (%bp,%si)
+shl $1, %al
+shl $3, %bx
+shl %cl, %ecx
+shll $1, (%bp,%si)
+shlw %cl, (%bp,%si)
+sal $1, %al
+sal $3, %bx
+sal %cl, %ecx
+sall $1, (%bp,%si)
+salw %cl, (%bp,%si)
+shr $1, %al
+shr $3, %bx
+shr %cl, %ecx
+shrl $1, (%bp,%si)
+shrw %cl, (%bp,%si)
+sar $1, %al
+sar $3, %bx
+sar %cl, %ecx
+sarl $1, (%bp,%si)
+sarw %cl, (%bp,%si)
+shl %eax
+sarw (%bx)
+
+# ---- unary operations, multiplication and division -------------------------
+not %bl
+not %si
+not %edi
+notl (%bp,%si)
+notb (%bp,%si)
+neg %bl
+neg %si
+neg %edi
+negl (%bp,%si)
+negb (%bp,%si)
+mul %bl
+mul %si
+mul %edi
+mull (%bp,%si)
+mulb (%bp,%si)
+div %bl
+div %si
+div %edi
+divl (%bp,%si)
+divb (%bp,%si)
+idiv %bl
+idiv %si
+idiv %edi
+idivl (%bp,%si)
+idivb (%bp,%si)
+imul %cl
+imul %ecx
+imulw (%bp,%si)
+imul %ebx, %eax
+imul (%bp,%si), %dx
+imul $5, %ebx, %eax
+imul $500, %ebx, %eax
+imul $-3, (%bp,%si), %cx
+imul $9, %esi
+idiv %ecx, %eax
+div %bl, %al
+
+# ---- test, lea and the extending moves -------------------------------------
+test %bl, %al
+test %dx, %cx
+test %esi, %eax
+test $3, %al
+test $768, %ax
+test $196608, %eax
+testl $1, (%bp,%si)
+test %edx, (%bp,%si)
+lea (%bp,%si), %eax
+lea (%bp,%si), %si
+lea (%ebx), %eax
+movzbl %al, %ebx
+movzwl %ax, %ebx
+movzbw %al, %bx
+movsbl %cl, %edx
+movswl %cx, %edx
+movsbw %dl, %si
+movzbl (%si), %eax
+movsx %al, %ecx
+movzx %al, %cx
+
+# ---- increment and decrement, with their one-byte register forms -----------
+inc %ax
+inc %bp
+inc %di
+inc %eax
+inc %esp
+inc %edi
+inc %al
+inc %bh
+incw (%bp,%si)
+incl (%bp,%si)
+dec %ax
+dec %bp
+dec %di
+dec %eax
+dec %esp
+dec %edi
+dec %al
+dec %bh
+decw (%bp,%si)
+decl (%bp,%si)
+
+# ---- exchange, with its one-byte accumulator forms -------------------------
+xchg %bx, %ax
+xchg %ax, %cx
+xchg %edi, %eax
+xchg %eax, %esi
+xchg %eax, %eax
+xchg %ax, %ax
+# xchg %dl, %cl                            llvm-mc 86 ca
+xchg (%bp,%si), %ebx
+xchg %bp, (%bp,%si)
+
+# ---- stack: registers, segment registers, immediates and memory ------------
+push %ax
+pop %ax
+push %sp
+pop %sp
+push %di
+pop %di
+push %eax
+pop %eax
+push %esp
+pop %esp
+push %edi
+pop %edi
+push %es
+pop %es
+push %cs
+push %ss
+pop %ss
+push %ds
+pop %ds
+push %fs
+pop %fs
+push %gs
+pop %gs
+pushw %ds
+pushl %es
+popw %fs
+popl %gs
+push $1
+push $-1
+push $128
+push $4660
+push $305419896
+pushw $1
+pushl $1
+pushw $0x1234
+pushl $0x12345678
+push (%bp,%si)
+pop (%bp,%si)
+pushw (%bp,%si)
+pushl (%bp,%si)
+popw (%bp,%si)
+pusha
+popa
+pushf
+popf
+pushaw
+pushal
+popaw
+popal
+pushfw
+pushfl
+popfw
+popfl
+lahf
+sahf
+enter $16, $0
+enter $0x1000, $3
+# enterw $8, $1                            llvm-mc ERROR
+# enterl $8, $1                            llvm-mc ERROR
+leave
+# leavew                                   llvm-mc ERROR
+# leavel                                   llvm-mc c9
+
+# ---- sign extension of the accumulator -------------------------------------
+cbtw
+cwtl
+cwtd
+cltd
+cbw
+cwde
+cwd
+cdq
+
+# ---- decimal adjustment and the other instructions long mode dropped -------
+daa
+das
+aaa
+aas
+aam
+aad
+aam $16
+aad $16
+into
+salc
+bound %eax, (%bp,%si)
+bound %bx, (%bp,%si)
+arpl %ax, %bx
+arpl %cx, (%bp,%si)
+les (%bp,%si), %eax
+les (%bp,%si), %bx
+lds (%bp,%si), %eax
+lds (%bp,%si), %bx
+lss (%bp,%si), %esp
+lss (%bp,%si), %si
+lfs (%bp,%si), %esp
+lfs (%bp,%si), %si
+lgs (%bp,%si), %esp
+lgs (%bp,%si), %si
+
+# ---- interrupts and returns ------------------------------------------------
+int $33
+int $3
+int3
+iret
+# int1                                     llvm-mc ERROR
+iretw
+iretl
+ret
+ret $8
+retw
+retl
+retw $4
+retl $4
+lret
+lret $8
+lretw
+lretl
+lretw $2
+
+# ---- indirect and far branches ---------------------------------------------
+jmp *%eax
+jmp *%ax
+call *%ebx
+call *%bx
+jmp *(%bp,%si)
+call *(%bp,%si)
+jmpw *(%bp,%si)
+jmpl *(%bp,%si)
+callw *(%bp,%si)
+calll *(%bp,%si)
+ljmp $0x10, $0x1000
+lcall $0x10, $0x1000
+ljmpw $0x10, $0x1000
+ljmpl $0x10, $0x1000
+lcallw $0x8, $0x1234
+jmp $0x18, $0x5678
+ljmp *(%bp,%si)
+lcall *(%bp,%si)
+ljmpw *(%bp,%si)
+lcalll *(%bp,%si)
+
+# ---- string instructions, with and without their operands ------------------
+movsb
+movsw
+movsl
+rep movsb
+# repe movsl                               llvm-mc f3 66 a5
+cmpsb
+cmpsw
+cmpsl
+rep cmpsb
+# repe cmpsl                               llvm-mc f3 66 a7
+stosb
+stosw
+stosl
+rep stosb
+# repe stosl                               llvm-mc f3 66 ab
+lodsb
+lodsw
+lodsl
+rep lodsb
+# repe lodsl                               llvm-mc f3 66 ad
+scasb
+scasw
+scasl
+rep scasb
+# repe scasl                               llvm-mc f3 66 af
+insb
+insw
+insl
+rep insb
+# repe insl                                llvm-mc f3 66 6d
+outsb
+outsw
+outsl
+rep outsb
+# repe outsl                               llvm-mc f3 66 6f
+repne scasb
+repnz cmpsw
+repz cmpsb
+rep stosw
+movsb (%si), %es:(%di)
+movsl %fs:(%si), (%di)
+movsw (%esi), (%edi)
+cmpsb %es:(%di), %gs:(%si)
+lodsl %ss:(%si)
+stosw %es:(%di)
+scasb (%edi)
+insb (%dx), %es:(%di)
+outsw %fs:(%si), (%dx)
+# rep movsl (%esi), %es:(%edi)             llvm-mc f3 67 66 a5
+xlat
+xlatb
+# xlat %fs:(%bx)                           llvm-mc d7
+
+# ---- port input and output -------------------------------------------------
+in $96, %al
+in $96, %ax
+in $96, %eax
+in %dx, %al
+in %dx, %ax
+in %dx, %eax
+out %al, $128
+out %ax, $128
+out %eax, $128
+out %al, %dx
+out %ax, %dx
+out %eax, %dx
+inb $0x60
+inw %dx
+inl (%dx), %eax
+outb $0x80
+outl %dx
+outw %ax, (%dx)
+
+# ---- bit operations --------------------------------------------------------
+bt %bx, %ax
+bt %ebx, %eax
+bt %ecx, (%bp,%si)
+bt $3, %si
+bt $31, %edi
+btw $7, (%bp,%si)
+bts %bx, %ax
+bts %ebx, %eax
+bts %ecx, (%bp,%si)
+bts $3, %si
+bts $31, %edi
+btsw $7, (%bp,%si)
+btr %bx, %ax
+btr %ebx, %eax
+btr %ecx, (%bp,%si)
+btr $3, %si
+btr $31, %edi
+btrw $7, (%bp,%si)
+btc %bx, %ax
+btc %ebx, %eax
+btc %ecx, (%bp,%si)
+btc $3, %si
+btc $31, %edi
+btcw $7, (%bp,%si)
+bsf %bx, %ax
+bsf (%bp,%si), %eax
+bsr %bx, %ax
+bsr (%bp,%si), %eax
+shld $4, %bx, %ax
+shld %cl, %ebx, %eax
+shld $1, %edx, (%bp,%si)
+shrd $4, %bx, %ax
+shrd %cl, %ebx, %eax
+shrd $1, %edx, (%bp,%si)
+xadd %bl, %al
+xadd %edx, %ecx
+xadd %si, (%bp,%si)
+cmpxchg %cl, %bl
+cmpxchg %edx, %ecx
+cmpxchg %ebx, (%bp,%si)
+cmpxchg8b (%bp,%si)
+bswap %eax
+bswap %edi
+popcnt %ebx, %eax
+lzcnt (%bp,%si), %cx
+tzcnt %esi, %edx
+movbe (%bp,%si), %eax
+movbe %cx, (%bp,%si)
+rdrand %eax
+rdseed %bx
+seto %al
+cmovo (%bp,%si), %eax
+cmovo %cx, %bx
+setb %al
+cmovb (%bp,%si), %eax
+cmovb %cx, %bx
+sete %al
+cmove (%bp,%si), %eax
+cmove %cx, %bx
+setne %al
+cmovne (%bp,%si), %eax
+cmovne %cx, %bx
+setbe %al
+cmovbe (%bp,%si), %eax
+cmovbe %cx, %bx
+seta %al
+cmova (%bp,%si), %eax
+cmova %cx, %bx
+sets %al
+cmovs (%bp,%si), %eax
+cmovs %cx, %bx
+setp %al
+cmovp (%bp,%si), %eax
+cmovp %cx, %bx
+setl %al
+cmovl (%bp,%si), %eax
+cmovl %cx, %bx
+setge %al
+cmovge (%bp,%si), %eax
+cmovge %cx, %bx
+setle %al
+cmovle (%bp,%si), %eax
+cmovle %cx, %bx
+setg %al
+cmovg (%bp,%si), %eax
+cmovg %cx, %bx
+
+# ---- system instructions ---------------------------------------------------
+mov %cr0, %eax
+mov %ebx, %cr3
+mov %eax, %cr4
+mov %dr7, %edx
+mov %ecx, %dr0
+mov %ds, %ax
+mov %es, %eax
+mov %bx, %ss
+mov %eax, %fs
+mov %gs, (%bp,%si)
+mov (%bp,%si), %ds
+sgdt (%bp,%si)
+sidt (%bp,%si)
+lgdt (%bp,%si)
+lidt (%bp,%si)
+invlpg (%bp,%si)
+smsw %ax
+smsw %eax
+lmsw %ax
+sldt %ax
+sldt %eax
+sldt (%bp,%si)
+str %ax
+str %eax
+str (%bp,%si)
+lldt %ax
+lldt (%bp,%si)
+ltr %ax
+ltr (%bp,%si)
+verr %ax
+verr (%bp,%si)
+verw %ax
+verw (%bp,%si)
+lar %bx, %eax
+lsl (%bp,%si), %ax
+lar %edx, %ecx
+clts
+hlt
+cli
+sti
+cld
+std
+clc
+stc
+cmc
+cpuid
+rdtsc
+rdtscp
+rdmsr
+wrmsr
+rdpmc
+sysenter
+sysexit
+rsm
+invd
+wbinvd
+ud2
+pause
+nop
+xgetbv
+xsetbv
+endbr32
+# int1                                     llvm-mc ERROR
+nop %ax
+nop %eax
+nopl (%bp,%si)
+nopw (%bp,%si)
+fxsave (%bp,%si)
+fxrstor (%bp,%si)
+xsave (%bp,%si)
+xrstor (%bp,%si)
+xsaveopt (%bp,%si)
+clflush (%bp,%si)
+ud1 %ebx, %eax
+
+# ---- x87 -------------------------------------------------------------------
+fld1
+fldz
+fldpi
+fldl2e
+fldl2t
+fldlg2
+fldln2
+fchs
+fabs
+ftst
+fxam
+f2xm1
+fyl2x
+fptan
+fpatan
+fxtract
+fprem1
+fdecstp
+fincstp
+fprem
+fyl2xp1
+fsqrt
+fsincos
+frndint
+fscale
+fsin
+fcos
+fnop
+fcompp
+fucompp
+fninit
+finit
+fnclex
+fclex
+fwait
+# fnsetpm                                  llvm-mc ERROR
+# fneni                                    llvm-mc ERROR
+# fndisi                                   llvm-mc ERROR
+fld %st(3)
+fst %st(3)
+fstp %st(3)
+fxch %st(3)
+fucom %st(3)
+fucomp %st(3)
+fcom %st(3)
+fcomp %st(3)
+ffree %st(3)
+ffreep %st(3)
+fcomi %st(2), %st
+fucomi %st(2), %st
+fcomip %st(2), %st
+fucomip %st(2), %st
+fcmovb %st(2), %st
+fcmove %st(2), %st
+fcmovbe %st(2), %st
+fcmovu %st(2), %st
+fcmovnb %st(2), %st
+fcmovne %st(2), %st
+fcmovnbe %st(2), %st
+fcmovnu %st(2), %st
+fadd %st(1), %st
+fadd %st, %st(4)
+faddp %st, %st(2)
+faddp %st(5)
+fadd
+faddp
+fadds (%bp,%si)
+faddl (%bp,%si)
+fiadds (%bp,%si)
+fiaddl (%bp,%si)
+fmul %st(1), %st
+fmul %st, %st(4)
+fmulp %st, %st(2)
+fmulp %st(5)
+fmul
+fmulp
+fmuls (%bp,%si)
+fmull (%bp,%si)
+fimuls (%bp,%si)
+fimull (%bp,%si)
+fsub %st(1), %st
+fsub %st, %st(4)
+fsubp %st, %st(2)
+fsubp %st(5)
+fsub
+fsubp
+fsubs (%bp,%si)
+fsubl (%bp,%si)
+fisubs (%bp,%si)
+fisubl (%bp,%si)
+fsubr %st(1), %st
+fsubr %st, %st(4)
+fsubrp %st, %st(2)
+fsubrp %st(5)
+fsubr
+fsubrp
+fsubrs (%bp,%si)
+fsubrl (%bp,%si)
+fisubrs (%bp,%si)
+fisubrl (%bp,%si)
+fdiv %st(1), %st
+fdiv %st, %st(4)
+fdivp %st, %st(2)
+fdivp %st(5)
+fdiv
+fdivp
+fdivs (%bp,%si)
+fdivl (%bp,%si)
+fidivs (%bp,%si)
+fidivl (%bp,%si)
+fdivr %st(1), %st
+fdivr %st, %st(4)
+fdivrp %st, %st(2)
+fdivrp %st(5)
+fdivr
+fdivrp
+fdivrs (%bp,%si)
+fdivrl (%bp,%si)
+fidivrs (%bp,%si)
+fidivrl (%bp,%si)
+fcoms (%bp,%si)
+fcoml (%bp,%si)
+fcomps (%bp,%si)
+ficoml (%bp,%si)
+ficomps (%bp,%si)
+flds (%bp,%si)
+fldl (%bp,%si)
+fldt (%bp,%si)
+filds (%bp,%si)
+fildl (%bp,%si)
+fildll (%bp,%si)
+fildq (%bp,%si)
+fsts (%bp,%si)
+fstl (%bp,%si)
+fstps (%bp,%si)
+fstpl (%bp,%si)
+fstpt (%bp,%si)
+fists (%bp,%si)
+fistl (%bp,%si)
+fistps (%bp,%si)
+fistpl (%bp,%si)
+fistpll (%bp,%si)
+fisttpl (%bp,%si)
+fisttpll (%bp,%si)
+fbld (%bp,%si)
+fbstp (%bp,%si)
+fldcw (%bp,%si)
+fnstcw (%bp,%si)
+fstcw (%bp,%si)
+fnstsw (%bp,%si)
+fstsw (%bp,%si)
+fnstsw %ax
+fstsw %ax
+fldenv (%bp,%si)
+fnstenv (%bp,%si)
+fstenv (%bp,%si)
+frstor (%bp,%si)
+fnsave (%bp,%si)
+fsave (%bp,%si)
+# fld (%bp,%si)                            llvm-mc ERROR
+# fild (%bp,%si)                           llvm-mc ERROR
+
+# ---- prefixes --------------------------------------------------------------
+lock incw (%bx)
+lock addw $1, (%bp,%si)
+# data32 nop                               llvm-mc 90
+# addr32 lodsb                             llvm-mc ERROR
+rep
+lock
+fs
+gs
+data32
+
+# ---- SSE, AVX and AVX-512 in 16-bit mode -----------------------------------
+movaps %xmm2, %xmm1
+movups (%bp,%si), %xmm3
+movapd %xmm7, (%bp,%si)
+addps %xmm1, %xmm0
+mulsd (%bp,%si), %xmm2
+sqrtss (%bp,%si), %xmm1
+cvtsi2sd %eax, %xmm1
+cvttsd2si %xmm1, %eax
+cvtsi2ss (%bp,%si), %xmm0
+movd %eax, %xmm0
+movd %xmm1, (%bp,%si)
+movq %xmm1, %xmm0
+pxor %xmm7, %xmm6
+paddd %mm1, %mm0
+pshufd $5, %xmm1, %xmm0
+crc32 %bl, %eax
+crc32 %cx, %eax
+# crc32 (%bp,%si), %eax                    llvm-mc ERROR
+pextrw $1, %xmm1, %eax
+pinsrw $2, %ecx, %xmm2
+movmskps %xmm3, %eax
+vaddps %ymm2, %ymm1, %ymm0
+vmovdqu (%bp,%si), %ymm7
+vpxor %xmm3, %xmm2, %xmm1
+vcvtsi2sd %eax, %xmm1, %xmm0
+vmovd %ecx, %xmm0
+vpbroadcastd %xmm2, %ymm1
+vaddps %zmm2, %zmm1, %zmm0
+vmovdqu32 (%bp,%si), %zmm7
+vpaddd %zmm3, %zmm2, %zmm1
+aesenc %xmm2, %xmm1
+pclmulqdq $0x11, %xmm2, %xmm1
+emms
+sfence
+ldmxcsr (%bp,%si)
+stmxcsr (%bp,%si)

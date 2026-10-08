@@ -1,0 +1,108 @@
+=== backward branch to a label
+start:
+        add     a0, a0, a1
+        addi    a1, a1, -1
+        bnez    a1, start
+        ret
+
+=== forward branch to a label
+        beqz    a0, done
+        li      a0, 1
+done:
+        ret
+
+=== a branch too far for the compressed form
+        beqz    a0, far
+        .space  300
+far:
+        ret
+
+=== a branch too far for any branch, needing the layout pass to notice early
+        bnez    a0, near
+near:
+        nop
+
+=== jump range
+        j       ahead
+        .space  4000
+ahead:
+        j       back
+back:
+        nop
+
+=== a jump past the reach of c.j
+        j       ahead
+        .space  4000
+        nop
+ahead:
+        ret
+
+=== call and tail to a local label
+target:
+        ret
+        call    target
+        tail    target
+
+=== call to an undefined symbol
+        call    external
+        tail    external
+
+=== la of a local label
+        la      a0, value
+        lla     a1, value
+value:
+        ret
+
+=== an explicit pcrel_hi / pcrel_lo pair
+1:      auipc   a0, %pcrel_hi(sym)
+        addi    a0, a0, %pcrel_lo(1b)
+        lw      a1, %pcrel_lo(1b)(a0)
+
+=== hi and lo of an absolute symbol
+        lui     a0, %hi(sym)
+        addi    a0, a0, %lo(sym)
+        sw      a1, %lo(sym)(a0)
+
+=== norvc turns compression off
+        .option norvc
+        add     a0, a0, a1
+        mv      a1, a2
+        ret
+        .option rvc
+        add     a0, a0, a1
+
+=== option push and pop restore the previous setting
+        add     a0, a0, a1
+        .option push
+        .option norvc
+        add     a0, a0, a1
+        .option pop
+        add     a0, a0, a1
+
+=== a prologue and epilogue in the usual style
+func:
+        addi    sp, sp, -32
+        sd      ra, 24(sp)
+        sd      s0, 16(sp)
+        addi    s0, sp, 32
+        li      a0, 0
+        call    helper
+        ld      ra, 24(sp)
+        ld      s0, 16(sp)
+        addi    sp, sp, 32
+        ret
+
+=== a loop with local labels
+        li      t0, 10
+1:      addi    t0, t0, -1
+        bnez    t0, 1b
+        j       2f
+        nop
+2:      ret
+
+=== alignment padding is real no-ops
+        add     a0, a0, a1
+        .p2align 3
+        add     a0, a0, a1
+        .p2align 2
+        ret

@@ -1,0 +1,13 @@
+=== DS- and DQ-form displacements against a symbol in 32-bit code
+# The DS relocations belong to PowerPC64; GNU as writes the plain halfword ones
+# here, where llvm-mc writes numbers R_PPC_* does not define. The alignment is
+# spelled out, since GNU as leaves `.text` at 1 and llvm-mc, which rsasm
+# follows, gives it 4.
+        .text
+        .p2align 2
+        lxsd    3, ext(4)
+        lxv     35, ext@l(4)
+        stxssp  3, ext@l(4)
+        stxv    3, dat(4)
+        .data
+dat:    .long 0

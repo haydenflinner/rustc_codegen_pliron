@@ -24,6 +24,25 @@ node tests/wasm/run_std.mjs "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/wa
   --target wasm32-wasip1 -Zbuild-std=core,panic_abort)
 WASI_LIBC=$CARGO_TARGET_DIR/wasi-libc/wasm32-wasip1/release
 ln -sf libpliron_wasi_libc.a "$WASI_LIBC/libc.a"
+# std's panic=unwind links ask for -lc and -lunwind; the Rust `unwind` rlib and
+# our libc provide the symbols, so an empty archive satisfies the -l flag.
+printf '!<arch>\n' > "$WASI_LIBC/libunwind.a"
 (cd tests/wasm/wasi && RUSTFLAGS="$RUSTFLAGS -Clink-self-contained=no -Lnative=$WASI_LIBC" \
   cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_abort)
 node --no-warnings tests/wasm/run_wasi.mjs "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasmwasitest.wasm"
+# panic=unwind: emulated EH (__pliron_eh flag+exn) — catch_unwind, drop order,
+# payloads, resume_unwind.
+(cd tests/wasm/unwind && \
+  RUSTFLAGS="$RUSTFLAGS -Cpanic=unwind -Clink-self-contained=no -Lnative=$WASI_LIBC" \
+  CARGO_TARGET_DIR=$CARGO_TARGET_DIR/eh \
+  cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_unwind)
+node --no-warnings tests/wasm/run_wasi.mjs \
+  "$CARGO_TARGET_DIR/eh/wasm32-wasip1/release/wasmunwindtest.wasm"
+# panic=unwind on wasm32-unknown-unknown: same emulated EH via the literal
+# `llvm.wasm.throw` symbol std's unwind::wasm uses.
+(cd tests/wasm/unwind-unknown && \
+  RUSTFLAGS="$RUSTFLAGS -Cpanic=unwind" \
+  CARGO_TARGET_DIR=$CARGO_TARGET_DIR/eh-unk \
+  cargo build -q --release --target wasm32-unknown-unknown -Zbuild-std=std,panic_unwind)
+node --no-warnings tests/wasm/run_eh_unk.mjs \
+  "$CARGO_TARGET_DIR/eh-unk/wasm32-unknown-unknown/release/wasmunwindunk.wasm"

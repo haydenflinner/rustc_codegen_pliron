@@ -1,0 +1,69 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 1`; GNU as gives V850 code that alignment and
+pads the end of the section to it.
+
+=== hi, lo and hi0 of a label in another section
+        .text
+        .p2align 1
+        movhi   hi(msg), r0, r1
+        movea   lo(msg), r1, r1
+        movhi   hi0(msg), r0, r2
+        ori     lo(msg), r2, r2
+        ld.w    lo(msg)[r1], r3
+        jmp     [lp]
+        .data
+        .p2align 1
+        .space  0x8010
+msg:    .long   1
+
+=== hi and lo where the low half is negative @ 0x107ff0
+        .text
+        .p2align 1
+here:
+        movhi   hi(there), r0, r1
+        movea   lo(there), r1, r1
+        movhi   hi(here), r0, r2
+        movea   lo(here), r2, r2
+        jmp     [lp]
+there:
+        jmp     [lp]
+
+=== jarl and jr into another section
+        .text
+        .p2align 1
+entry:
+        jarl    helper, lp
+        jr      helper
+        .section .text.helper, "ax"
+        .p2align 1
+helper:
+        jr      entry
+
+=== data across sections
+        .text
+        .p2align 1
+entry:
+        jmp     [lp]
+        .data
+        .p2align 1
+        .long   entry
+
+=== refused: zdaoff of a label above 32 KiB
+        .text
+        .p2align 1
+        movea   zdaoff(msg), r0, r1
+        jmp     [lp]
+        .data
+        .p2align 1
+msg:    .long   1
+
+=== zdaoff of a label in the bottom 32 KiB @ 0x1000
+        .text
+        .p2align 1
+        movea   zdaoff(msg), r0, r1
+        addi    zdaoff(msg), r1, r2
+        jmp     [lp]
+        .data
+        .p2align 1
+msg:    .long   1

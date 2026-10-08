@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 
+use cranelift_codegen::isa::CallConv;
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SingleBlockRegionInterface;
@@ -106,6 +107,17 @@ pub struct GlobalInfo {
 pub struct CallInfo {
     pub fn_ty: TypeHandle,
     pub exts: Exts,
+    /// Whether the callee is a foreign (extern) function; only meaningful for
+    /// C-variadic signatures, where foreign callees get real inline C-ABI
+    /// arguments and Rust callees get a packed buffer pointer.
+    pub foreign: bool,
+    /// Explicit calling convention for the call (e.g. `extern "win64"` calls
+    /// on non-Windows hosts). None = the default for the callee kind.
+    pub cc: Option<CallConv>,
+    /// `become f(...)`: emit a `return_call`/`return_call_indirect` (real TCO)
+    /// instead of call+ret. Only honored when the caller's own convention is
+    /// `CallConv::Tail` (Cranelift requires it).
+    pub tail: bool,
 }
 
 #[derive(Default)]
@@ -128,6 +140,8 @@ pub struct State<'tcx> {
     pub counter: usize,
     pub cgu: String,
     pub asm: String,
+    /// EII symbol aliases: (alias, aliasee, weak); emitted as extra object symbols.
+    pub aliases: Vec<(String, String, bool)>,
     /// call op → (landing block, is catch_unwind catch-all)
     pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
@@ -490,7 +504,7 @@ impl<'tcx> CodegenCx<'tcx> {
 impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Function = Ptr<Operation>;
     type BasicBlock = Ptr<BasicBlock>;
-    type Funclet = ();
+    type Funclet = Value;
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
@@ -525,9 +539,16 @@ impl<'tcx> HasTypingEnv<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'tcx> {
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        self.tcx
-            .dcx()
-            .span_fatal(span, format!("failed to get layout for `{ty}`: {err:?}"))
+        if let LayoutError::SizeOverflow(_)
+        | LayoutError::ReferencesError(_)
+        | LayoutError::InvalidSimd { .. } = err
+        {
+            self.tcx.dcx().span_fatal(span, err.to_string())
+        } else {
+            self.tcx
+                .dcx()
+                .emit_fatal(rustc_codegen_ssa::diagnostics::FailedToGetLayout { span, ty, err })
+        }
     }
 }
 
@@ -628,10 +649,13 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 mutable: true,
                 tls: attrs.flags.contains(F::THREAD_LOCAL),
                 linkage: map_linkage(linkage, visibility),
-                used: attrs.flags.intersects(F::USED_COMPILER | F::USED_LINKER),
+                // `used(compiler)` only forces emission; `used(linker)` asks the
+                // linker to keep the symbol through GC.
+                used: attrs.flags.contains(F::USED_LINKER),
                 section: attrs.link_section.map(|s| s.to_string()),
             },
         );
+        self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 
     fn predefine_fn(
@@ -651,6 +675,25 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
+        let attrs = self.tcx.codegen_instance_attrs(instance.def);
+        self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
+    }
+}
+
+impl<'tcx> CodegenCx<'tcx> {
+    fn add_aliases(
+        &self,
+        aliasee: &str,
+        aliases: &[(rustc_hir::def_id::DefId, RLinkage, Visibility)],
+    ) {
+        for &(alias, linkage, _) in aliases {
+            let name = self.tcx.symbol_name(Instance::mono(self.tcx, alias)).name;
+            let weak = matches!(linkage, RLinkage::WeakAny | RLinkage::WeakODR);
+            self.st
+                .borrow_mut()
+                .aliases
+                .push((name.to_string(), aliasee.to_string(), weak));
+        }
     }
 }
 

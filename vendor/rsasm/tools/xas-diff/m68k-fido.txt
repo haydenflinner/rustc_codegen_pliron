@@ -1,0 +1,9 @@
+# Every form of GNU's m68k opcode table that Fido has and no CPU
+# before it in tools/fuzz/m68k.py's CORPUS_ORDER does, one line each, with
+# operands that form takes and no earlier form of the mnemonic does.
+# GNU syntax.
+#
+#   tools/fuzz/m68k.py corpus --first --cpu fidoa --syntax gas
+
+sleep
+trapx	#4

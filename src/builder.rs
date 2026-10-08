@@ -54,7 +54,8 @@ impl<'a, 'tcx> Deref for Builder<'a, 'tcx> {
 impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Function = Ptr<Operation>;
     type BasicBlock = Ptr<BasicBlock>;
-    type Funclet = ();
+    /// Funclet token: the exception value the pad delivered (`pliron.eh.exn`).
+    type Funclet = Value;
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
@@ -204,7 +205,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.st
             .borrow_mut()
             .calls
-            .insert(p, CallInfo { fn_ty, exts });
+            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false });
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -351,7 +352,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         args: &[Value],
         then: Ptr<BasicBlock>,
         catch: Ptr<BasicBlock>,
-        funclet: Option<&()>,
+        funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) -> Value {
         self.st.borrow_mut().last_call = None;
@@ -851,10 +852,41 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| SelectOp::new(c, cond, then_val, else_val))
     }
 
-    fn va_arg(&mut self, _list: Value, _ty: TypeHandle) -> Value {
-        self.tcx
-            .dcx()
-            .fatal("va_arg is not supported by the pliron backend yet")
+    fn va_arg(&mut self, list: Value, ty: TypeHandle) -> Value {
+        // SysV `__va_list_tag`: the cursor lives in `overflow_arg_area` (+8);
+        // gp/fp offsets are exhausted so every type takes the overflow path.
+        // Each argument sits in an 8-byte slot aligned to its alignment (capped
+        // at 16), matching the packing in the call lowering and what a foreign
+        // callee's va_arg decodes from a forwarded VaList.
+        let (size, align) = crate::types::size_align(&self.cx.pctx.borrow(), ty);
+        let ptr = self.type_ptr();
+        let isize = self.type_isize();
+        let i8t = self.type_i8();
+        // wasm's va_list is an opaque pointer: the place itself is the cursor.
+        let cur_off = if self.tcx().sess.target.is_like_wasm {
+            0
+        } else {
+            8
+        };
+        let cur_slot = if cur_off == 0 {
+            list
+        } else {
+            self.gep(i8t, list, &[self.const_usize(cur_off)])
+        };
+        let cur_p = self.load(ptr, cur_slot, Align::EIGHT);
+        let cur = self.ptrtoint(cur_p, isize);
+        let a_eff = align.clamp(8, 16);
+        let a1 = self.const_usize(a_eff - 1);
+        let mask = self.const_usize(!(a_eff - 1));
+        let cur_a1 = self.add(cur, a1);
+        let aligned = self.and(cur_a1, mask);
+        let p = self.inttoptr(aligned, ptr);
+        let v = self.load(ty, p, Align::from_bytes(align).unwrap());
+        let sz = self.const_usize(size.max(8).next_multiple_of(8));
+        let next = self.add(aligned, sz);
+        let next = self.inttoptr(next, ptr);
+        self.store(next, cur_slot, Align::EIGHT);
+        v
     }
 
     fn extract_element(&mut self, vec: Value, idx: Value) -> Value {
@@ -893,21 +925,43 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.call_sym("_Unwind_Resume", void, &[exn0]);
         self.unreachable();
     }
-    fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) {}
-    fn cleanup_ret(&mut self, _funclet: &(), _unwind: Option<Ptr<BasicBlock>>) {
-        self.unreachable();
+    // Wasm funclets map onto our emulated EH (see wasm.rs): an unwind in
+    // flight sets the `__pliron_eh` flag+exception words; landing pads read
+    // the exception through `pliron.eh.exn`, which also clears the flag.
+    fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) -> Value {
+        let ptr = self.type_ptr();
+        self.intrinsic("pliron.eh.exn", ptr, &[])
     }
-    fn catch_pad(&mut self, _parent: Value, _args: &[Value]) {}
+    fn cleanup_ret(&mut self, _funclet: &Value, unwind: Option<Ptr<BasicBlock>>) {
+        match unwind {
+            Some(bb) => {
+                self.br(bb);
+            }
+            None => {
+                let void = self.type_void();
+                self.intrinsic("pliron.eh.rethrow", void, &[]);
+                self.unreachable();
+            }
+        }
+    }
+    fn catch_pad(&mut self, _parent: Value, _args: &[Value]) -> Value {
+        let ptr = self.type_ptr();
+        self.intrinsic("pliron.eh.exn", ptr, &[])
+    }
     fn catch_switch(
         &mut self,
         _parent: Option<Value>,
         _unwind: Option<Ptr<BasicBlock>>,
-        _handlers: &[Ptr<BasicBlock>],
+        handlers: &[Ptr<BasicBlock>],
     ) -> Value {
-        panic!("funclets are not supported by the pliron backend")
+        // All our handlers are catch-all (`catch (...)`), so a switch always
+        // takes its first handler.
+        let v = self.const_i32(0);
+        self.br(handlers[0]);
+        v
     }
-    fn get_funclet_cleanuppad(&self, _funclet: &()) -> Value {
-        panic!("funclets are not supported by the pliron backend")
+    fn get_funclet_cleanuppad(&self, funclet: &Value) -> Value {
+        *funclet
     }
 
     fn atomic_cmpxchg(
@@ -984,8 +1038,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Value,
         return_slot: ReturnSlot<Value>,
         args: &[Value],
-        _funclet: Option<&()>,
-        _instance: Option<Instance<'tcx>>,
+        _funclet: Option<&Value>,
+        instance: Option<Instance<'tcx>>,
     ) -> Value {
         let mut full = Vec::with_capacity(args.len() + 1);
         if let ReturnSlot::Indirect(p) = return_slot {
@@ -993,7 +1047,41 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         full.extend_from_slice(args);
         let exts = fn_abi.map(crate::type_of::exts_of).unwrap_or_default();
-        self.call_raw(llty, llfn, &full, exts)
+        let v = self.call_raw(llty, llfn, &full, exts);
+        // `foreign` callees get variadic args via the real C ABI: extern items,
+        // and `#[naked]` definitions, whose hand-written asm reads the native
+        // varargs convention (register save area) rather than our buffer.
+        let (foreign, cc) = match instance {
+            Some(i)
+                if fn_abi.is_some_and(|a| a.c_variadic)
+                    && matches!(i.def, rustc_middle::ty::InstanceKind::Item(_)) =>
+            {
+                let foreign = self.tcx.is_foreign_item(i.def_id())
+                    || self
+                        .tcx
+                        .codegen_fn_attrs(i.def_id())
+                        .flags
+                        .contains(
+                            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
+                        );
+                let cc = match self.tcx.fn_sig(i.def_id()).skip_binder().abi() {
+                    rustc_abi::ExternAbi::Win64 { .. } => {
+                        Some(cranelift_codegen::isa::CallConv::WindowsFastcall)
+                    }
+                    _ => None,
+                };
+                (foreign, cc)
+            }
+            _ => (false, None),
+        };
+        let lc = self.st.borrow().last_call;
+        if let Some(p) = lc {
+            let mut st = self.st.borrow_mut();
+            let info = st.calls.get_mut(&p).unwrap();
+            info.foreign = foreign;
+            info.cc = cc;
+        }
+        v
     }
 
     fn tail_call(
@@ -1004,7 +1092,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Value,
         return_slot: ReturnSlot<Value>,
         args: &[Value],
-        funclet: Option<&()>,
+        funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) {
         let r = self.call(
@@ -1017,6 +1105,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             funclet,
             instance,
         );
+        // `become`: mark the call as a tail call; the following Return op is
+        // skipped by the terminator logic once `return_call` is emitted.
+        let lc = self.st.borrow().last_call;
+        if let Some(p) = lc {
+            self.st.borrow_mut().calls.get_mut(&p).unwrap().tail = true;
+        }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
             _ => self.ret(r),
@@ -1195,7 +1289,7 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         line_spans: &[Span],
         instance: Instance<'_>,
         dest: Option<Ptr<BasicBlock>>,
-        _catch_funclet: Option<(Ptr<BasicBlock>, Option<&()>)>,
+        _catch_funclet: Option<(Ptr<BasicBlock>, Option<&Value>)>,
     ) {
         self.inline_asm(template, operands, options, line_spans, instance, dest)
     }

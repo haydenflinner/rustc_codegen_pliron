@@ -143,6 +143,8 @@ struct Obj<'a, 'tcx> {
     sp: Global,
     table: Table,
     mem: Memory,
+    /// panic=unwind: emulated EH (see `FL::eh_check`).
+    unwind: bool,
 }
 
 impl<'a, 'tcx> Obj<'a, 'tcx> {
@@ -199,7 +201,46 @@ impl<'a, 'tcx> Obj<'a, 'tcx> {
     }
 }
 
-pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
+/// LLVM's `generic` wasm CPU features, adjusted by `-Ctarget-cpu=mvp` and
+/// `-Ctarget-feature`. Tools like wasm-bindgen read them from `target_features`.
+pub fn target_features(
+    target: &rustc_target::spec::Target,
+    opts: &rustc_session::config::Options,
+) -> Vec<String> {
+    let mut f: Vec<String> = if opts.cg.target_cpu.as_deref() == Some("mvp") {
+        vec![]
+    } else {
+        [
+            "bulk-memory",
+            "multivalue",
+            "mutable-globals",
+            "nontrapping-fptoint",
+            "reference-types",
+            "sign-ext",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let cg = opts.cg.target_feature.as_str();
+    for t in target.features.split(',').chain(cg.split(',')).map(str::trim) {
+        if let Some(n) = t.strip_prefix('+') {
+            if !f.iter().any(|x| x == n) {
+                f.push(n.into());
+            }
+        } else if let Some(n) = t.strip_prefix('-') {
+            f.retain(|x| x != n);
+        }
+    }
+    f
+}
+
+pub fn lower_to_wasm(
+    ctx: &Context,
+    st: &State<'_>,
+    name: &str,
+    features: &[String],
+    unwind: bool,
+) -> Vec<u8> {
     let mut m = Module::empty();
     let mem = m.memories.push(MemoryData {
         initial_pages: 0,
@@ -233,10 +274,14 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
         sp: Global::invalid(),
         table,
         mem,
+        unwind,
     };
     o.sp = o.import_global("env", "__stack_pointer", true);
 
     for (n, f) in &st.funcs {
+        if st.dead_fns.contains(n) {
+            continue;
+        }
         let s = wsig(ctx, f.ty);
         let sig = o.sig(s);
         o.funcs.push(FDecl {
@@ -251,7 +296,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
     let mut stubs = 0;
     let mut defined = 0;
     for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
         }
         defined += 1;
@@ -265,6 +310,16 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
             Ok(b) => b,
             Err(e) => {
                 stubs += 1;
+                if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    writeln!(s, "stub {n}: {e}").unwrap();
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(f)
+                        .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
+                }
                 if verbose {
                     eprintln!("pliron-wasm: stub {n}: {e}");
                 }
@@ -305,7 +360,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
                     .wasm_imports
                     .get(&d.name)
                     .cloned()
-                    .unwrap_or_else(|| ("env".into(), d.name));
+                    .unwrap_or_else(|| ("env".into(), crate::obj_sym(&d.name).to_string()));
                 o.m.imports.push(Import {
                     module,
                     name,
@@ -322,6 +377,18 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
                     Ok(Ok(c)) => c.into_raw_body(),
                     Ok(Err(e)) | Err(e) => {
                         stubs += 1;
+                        if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                            let _ = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(f)
+                                .map(|mut x| {
+                                    std::io::Write::write_all(
+                                        &mut x,
+                                        format!("stub {} (backend): {e}\n", d.name).as_bytes(),
+                                    )
+                                });
+                        }
                         if verbose {
                             eprintln!("pliron-wasm: stub {} (backend): {e}", d.name);
                         }
@@ -331,7 +398,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
                 o.m.funcs
                     .push(FuncDecl::Compiled(d.sig, d.name.clone(), bytes));
                 o.m.exports.push(Export {
-                    name: d.name,
+                    name: crate::obj_sym(&d.name).to_string(),
                     kind: ExportKind::Func(f),
                 });
             }
@@ -346,7 +413,31 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
+    let mut tf = Vec::new();
+    leb(&mut tf, features.len() as u32);
+    for f in features {
+        tf.push(b'+');
+        leb(&mut tf, f.len() as u32);
+        tf.extend_from_slice(f.as_bytes());
+    }
+    custom_section(&mut bytes, "target_features", &tf);
+    // `#[link_section = "name"]` statics are wasm custom sections, which the
+    // linker concatenates (wasm-bindgen's `__wasm_bindgen_unstable` metadata).
+    for (n, g) in &st.globals {
+        if let (Some(sec), Some(init)) = (custom_section_name(g), g.init) {
+            let (size, _) = size_align(ctx, init.get_type(ctx));
+            let mut data = vec![0u8; size as usize];
+            let mut relocs = Vec::new();
+            write_const(ctx, st, init, 0, &mut data, &mut relocs);
+            assert!(relocs.is_empty(), "pliron-wasm: {n}: relocations in custom section {sec}");
+            custom_section(&mut bytes, sec, &data);
+        }
+    }
     bytes
+}
+
+fn custom_section_name(g: &crate::context::GlobalInfo) -> Option<&str> {
+    g.section.as_deref().filter(|s| !s.starts_with('.'))
 }
 
 fn stub(m: &Module, sig: Signature) -> FunctionBody {
@@ -407,7 +498,7 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     let fs: Vec<_> = st
         .funcs
         .iter()
-        .filter(|(_, f)| has_body(ctx, f.op))
+        .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_fns.contains(*n))
         .collect();
     put_u32(&mut out, fs.len() as u32);
     for (n, f) in fs {
@@ -422,7 +513,9 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     let gs: Vec<_> = st
         .globals
         .iter()
-        .filter(|(n, g)| g.init.is_some() && !st.funcs.contains_key(*n))
+        .filter(|(n, g)| {
+            g.init.is_some() && !st.funcs.contains_key(*n) && custom_section_name(g).is_none()
+        })
         .collect();
     put_u32(&mut out, gs.len() as u32);
     for (n, g) in gs {
@@ -472,10 +565,18 @@ struct FL<'o, 'a, 'tcx> {
     mask_c: WV,
     frame: u64,
     frame_align: u64,
+    /// Shared "an unwind is in flight" epilogue: restores SP and returns
+    /// dummy values so the caller sees the flag and keeps unwinding.
+    epi: Option<WBlock>,
+    /// This function's wasm result types, for the epilogue's dummy values.
+    rets: Vec<WT>,
+    /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
+    va_buf: Option<WV>,
 }
 
 impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     fn new(o: &'o mut Obj<'a, 'tcx>, sig: Signature) -> Self {
+        let rets = o.m.signatures[sig].returns.clone();
         let b = FunctionBody::new(&o.m, sig);
         let cur = b.entry;
         let (ctx, st) = (o.ctx, o.st);
@@ -489,12 +590,15 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             cconst: FxHashMap::default(),
             blocks: FxHashMap::default(),
             terminated: false,
+            epi: None,
+            rets,
             sp0: WV::invalid(),
             fp: WV::invalid(),
             frame_c: WV::invalid(),
             mask_c: WV::invalid(),
             frame: 0,
             frame_align: 16,
+            va_buf: None,
         };
         let sp = fl.o.sp;
         fl.sp0 = fl.op(O::GlobalGet { global_index: sp }, &[], WT::I32);
@@ -854,6 +958,10 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }
+        if i < params.len() {
+            // Variadic functions carry one extra hidden param (see wsig).
+            self.va_buf = Some(params[i]);
+        }
         for pb in rpo(ctx, self.st, &pblocks) {
             self.cur = self.blocks[&pb];
             self.cconst.clear();
@@ -886,6 +994,84 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         let c = self.cur;
         self.b.set_terminator(c, t);
         self.terminated = true;
+    }
+
+    /// Emulated EH storage: `__pliron_eh` is an 8-byte data symbol synthesized
+    /// by the linker; +0 is the "unwind in flight" flag, +4 the exception ptr.
+    fn eh_addr(&mut self) -> WV {
+        let g = self.o.got("__pliron_eh");
+        self.op(O::GlobalGet { global_index: g }, &[], WT::I32)
+    }
+
+    fn eh_flag(&mut self) -> WV {
+        let p = self.eh_addr();
+        self.load(clt::I32, p, 0)
+    }
+
+    fn zero_of(&mut self, t: WT) -> WV {
+        self.op(
+            match t {
+                WT::I32 => O::I32Const { value: 0 },
+                WT::I64 => O::I64Const { value: 0 },
+                WT::F32 => O::F32Const { value: 0 },
+                WT::F64 => O::F64Const { value: 0 },
+                WT::V128 => O::V128Const { value: 0 },
+                t => panic!("eh epilogue return type {t:?}"),
+            },
+            &[],
+            t,
+        )
+    }
+
+    /// The shared epilogue reached when an unwind propagates out of this
+    /// function: restore the stack pointer and return dummy values; the
+    /// caller's own flag check keeps unwinding.
+    fn unwind_epilogue(&mut self) -> WBlock {
+        if let Some(b) = self.epi {
+            return b;
+        }
+        let b = self.b.add_block();
+        let (sp, sp0) = (self.o.sp, self.sp0);
+        let save = std::mem::replace(&mut self.cur, b);
+        self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
+        let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
+        self.b.set_terminator(b, Terminator::Return { values });
+        self.cur = save;
+        self.epi = Some(b);
+        b
+    }
+
+    /// panic=unwind check after a call: if the callee started an unwind, go to
+    /// `landing` (the invoke's cleanup pad) or propagate out of this function.
+    fn eh_check(&mut self, landing: Option<Ptr<BasicBlock>>) {
+        if !self.o.unwind {
+            return;
+        }
+        let f = self.eh_flag();
+        let cont = self.b.add_block();
+        let if_true = match landing {
+            Some(pb) => BlockTarget {
+                block: self.blocks[&pb],
+                args: vec![],
+            },
+            None => BlockTarget {
+                block: self.unwind_epilogue(),
+                args: vec![],
+            },
+        };
+        let c = self.cur;
+        self.b.set_terminator(
+            c,
+            Terminator::CondBr {
+                cond: f,
+                if_true,
+                if_false: BlockTarget {
+                    block: cont,
+                    args: vec![],
+                },
+            },
+        );
+        self.cur = cont;
     }
 
     fn icmp(&mut self, pred: ICmpPredicateAttr, a: &[WV], b: &[WV], w: u32) -> WV {
@@ -1640,10 +1826,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     fn lower_call(&mut self, op: Ptr<Operation>) {
         let ctx = self.ctx;
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
-        assert!(
-            !self.st.invokes.contains_key(&op),
-            "invoke on wasm (needs panic=abort)"
-        );
+        // panic=unwind only: where an in-flight unwind is delivered.
+        let landing = self.st.invokes.get(&op).map(|&(b, _)| b);
+        if landing.is_some() && !self.o.unwind {
+            panic!("invoke on wasm needs panic=unwind");
+        }
         let info = &self.st.calls[&op];
         let fn_ty = info.fn_ty;
         let exts = info.exts.clone();
@@ -1654,10 +1841,10 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             TyK::Func(_, a, v) => (a.len(), v),
             _ => unreachable!(),
         };
-        let mut va: Vec<WV> = Vec::new();
+        let mut va_args: Vec<Value> = Vec::new();
         for (i, a) in call.args(ctx).into_iter().enumerate() {
             if var_arg && i >= nfixed {
-                va.extend(self.get(a));
+                va_args.push(a);
                 continue;
             }
             let vs = self.get(a);
@@ -1678,27 +1865,23 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
         }
         if var_arg {
-            // Each variadic argument at its natural alignment, as clang does.
+            // SysV overflow-area layout, matching va_start/va_arg's tag walk:
+            // each vararg in an 8-byte slot aligned to its alignment (<=16).
             let mut off = 0u64;
-            let lay: Vec<(ClType, u64)> = va
-                .iter()
-                .map(|&v| {
-                    let (t, n) = match self.ty_of(v) {
-                        WT::I32 => (clt::I32, 4),
-                        WT::I64 => (clt::I64, 8),
-                        WT::F32 => (clt::F32, 4),
-                        WT::F64 => (clt::F64, 8),
-                        t => panic!("variadic argument of type {t:?}"),
-                    };
-                    off = off.next_multiple_of(n);
-                    let at = off;
-                    off += n;
-                    (t, at)
-                })
-                .collect();
+            let mut plan = Vec::new();
+            for &a in &va_args {
+                let ty = a.get_type(ctx);
+                let (size, align) = size_align(ctx, ty);
+                off = off.next_multiple_of(align.clamp(8, 16));
+                let slot = off;
+                off += size.max(8).next_multiple_of(8);
+                plan.push((a, ty, slot));
+            }
             let buf = self.slot(off.max(1), 16);
-            for (&v, &(t, at)) in va.iter().zip(&lay) {
-                self.store(t, v, buf, at);
+            for (a, ty, slot) in plan {
+                for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                    self.store(lt, v, buf, slot + lo);
+                }
             }
             wargs.push(buf);
         }
@@ -1714,6 +1897,35 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
             if sym.starts_with("__pliron_llvm_wasm_memory_size") {
                 let v = self.op(O::MemorySize { mem }, &[], WT::I32);
+                return self.set(op, smallvec![v]);
+            }
+            // wasm EH intrinsics on the emulated-EH flag/exception words.
+            if sym == "__pliron_llvm_wasm_throw" || sym == "llvm.wasm.throw" {
+                let p = self.eh_addr();
+                self.store(clt::I32, wargs[1], p, 4);
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                self.eh_check(None);
+                return;
+            }
+            if sym == "__pliron_llvm_wasm_rethrow" || sym == "llvm.wasm.rethrow" {
+                let p = self.eh_addr();
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                self.eh_check(None);
+                return;
+            }
+            if sym == "__pliron_llvm_wasm_get_exception" || sym == "llvm.wasm.get_exception" {
+                let p = self.eh_addr();
+                let v = self.load(clt::I32, p, 4);
+                return self.set(op, smallvec![v]);
+            }
+            if sym == "__pliron_llvm_wasm_get_ehselector"
+                || sym == "__pliron_llvm_wasm_landingpad_index"
+                || sym == "llvm.wasm.get_ehselector"
+                || sym == "llvm.wasm.landingpad_index"
+            {
+                let v = self.i32c(0);
                 return self.set(op, smallvec![v]);
             }
         }
@@ -1752,6 +1964,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
         }
+        self.eh_check(landing);
     }
 
     fn fcvt_sat(&mut self, signed: bool, w: u32, x: WV) -> Vals {
@@ -1902,6 +2115,33 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 self.term(Terminator::Unreachable);
                 return;
             }
+            // Landing-pad read of the in-flight exception: delivers the
+            // exception pointer and clears the unwind flag so the handler's
+            // own calls work normally.
+            "pliron.eh.exn" => {
+                let p = self.eh_addr();
+                let exn = self.load(clt::I32, p, 4);
+                let z = self.i32c(0);
+                self.store(clt::I32, z, p, 0);
+                self.set(op, smallvec![exn]);
+                return;
+            }
+            "pliron.va.buf" => {
+                let v = self.va_buf.expect("pliron.va.buf in a non-variadic function");
+                self.set(op, smallvec![v]);
+                return;
+            }
+            // Rethrow: the unwind continues out of this function.
+            "pliron.eh.rethrow" => {
+                let p = self.eh_addr();
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                let (sp, sp0) = (self.o.sp, self.sp0);
+                self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
+                let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
+                self.term(Terminator::Return { values });
+                return;
+            }
             _ => {}
         }
         let a: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
@@ -1988,6 +2228,22 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             "llvm.bitreverse" => {
                 let w = w(self, 0);
                 smallvec![self.bitrev(a0, w)]
+            }
+            "llvm.fshl" | "llvm.fshr" if w(self, 0) == 128 => {
+                let c127 = self.i64c(127);
+                let s = self.op(O::I64And, &[a[2][0], c127], WT::I64);
+                let c128 = self.i64c(128);
+                let inv = self.op(O::I64Sub, &[c128, s], WT::I64);
+                let left = name == "llvm.fshl";
+                let (sx, sy) = if left { (s, inv) } else { (inv, s) };
+                let (x, y) = ([a[0][0], a[0][1]], [a[1][0], a[1][1]]);
+                let hi = self.shift128(ShlOp::get_opid_static(), &x, sx);
+                let lo = self.shift128(LShrOp::get_opid_static(), &y, sy);
+                let c0 = self.op(O::I64Or, &[hi[0], lo[0]], WT::I64);
+                let c1 = self.op(O::I64Or, &[hi[1], lo[1]], WT::I64);
+                let z = self.op(O::I64Eqz, &[s], WT::I32);
+                let keep = if left { x } else { y };
+                smallvec![self.sel(z, keep[0], c0), self.sel(z, keep[1], c1)]
             }
             "llvm.fshl" | "llvm.fshr" => {
                 let w = w(self, 0);

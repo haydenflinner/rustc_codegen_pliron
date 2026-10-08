@@ -1,0 +1,27 @@
+=== the 68000 integer instructions a ColdFire kept
+ movel %d0,%d1
+ movel #0x12345678,%a0@
+ moveb %a1@+,%a2@-
+ addl %d0,%a1@(8)
+ subl %a0,%d3
+ lea %a0@(8,%d1:l:4),%a2
+ moveml %d0-%d3/%a2,%sp@
+ moveml %sp@,%d0-%d3/%a2
+ tstl %a0@
+ cmpl %d1,%d2
+ mulsl %d0,%d1
+ divuw %d2,%d3
+ swap %d4
+ extbl %d5
+ negl %d6
+ seq %d7
+=== jra and jbsr to an address register
+ jra %a0@
+ jbsr %a1@(4)
+=== a ColdFire ISA_B relaxes branches to 32 bits
+top: nop
+ jbeq far
+ jra far
+ jbsr far
+ .space 40000
+far: rts

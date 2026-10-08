@@ -1,0 +1,185 @@
+# MIPS32, little endian. Compared against `llvm-mc -triple=mipsel`.
+#
+# Deliberately the same instruction list as mips.txt: the point of this file is
+# that every word comes out byte-reversed and nothing else changes. See
+# mips.txt for the notes on reorder and macro mode.
+# ---- R-format arithmetic and logic ----
+add $1, $2, $3
+add $t0, $t1, $t2
+add $zero, $at, $v0
+add $sp, $fp, $ra
+addu $a0, $a1, $a2
+addu $30, $29, $28
+sub $s0, $s1, $s2
+sub $27, $26, $25
+subu $v0, $v1, $a0
+and $t3, $t4, $t5
+or $t6, $t7, $s0
+xor $s1, $s2, $s3
+nor $s4, $s5, $s6
+slt $s7, $t8, $t9
+sltu $k0, $k1, $gp
+mul $4, $5, $6
+movz $4, $5, $6
+movn $4, $5, $6
+
+# ---- shifts ----
+sll $1, $2, 0
+sll $1, $2, 3
+sll $1, $2, 31
+srl $3, $4, 1
+sra $5, $6, 16
+sllv $7, $8, $9
+srlv $10, $11, $12
+srav $13, $14, $15
+
+# ---- multiply, divide, HI/LO ----
+mult $4, $5
+multu $6, $7
+div $zero, $8, $9
+divu $zero, $10, $11
+madd $4, $5
+maddu $4, $5
+msub $4, $5
+msubu $4, $5
+mfhi $16
+mflo $17
+mthi $18
+mtlo $19
+
+# ---- I-format arithmetic ----
+addi $4, $5, 0
+addi $4, $5, -1
+addi $4, $5, 32767
+addi $4, $5, -32768
+addiu $a0, $a1, 100
+addiu $a0, $a1, -100
+addiu $4, $5, 0xffff
+slti $4, $5, -1
+sltiu $4, $5, 1000
+andi $4, $5, 0
+andi $4, $5, 0xffff
+ori $4, $5, 0x1234
+xori $4, $5, 0xabcd
+lui $4, 0
+lui $4, 0xffff
+lui $at, 0x1234
+
+# ---- loads and stores ----
+lb $4, 0($5)
+lb $4, -1($5)
+lbu $4, 1($5)
+lh $4, 2($5)
+lhu $4, 4($5)
+lw $4, 8($5)
+lw $4, -8($5)
+lw $4, 32767($5)
+lw $4, -32768($5)
+lwl $4, 3($5)
+lwr $4, 0($5)
+sb $4, 0($5)
+sh $4, 2($5)
+sw $4, 4($5)
+swl $4, 3($5)
+swr $4, 0($5)
+lw $t0, ($sp)
+sw $ra, 28($sp)
+ll $4, 8($5)
+sc $4, 8($5)
+
+# ---- register-to-register pseudo-instructions ----
+nop
+move $4, $5
+move $a0, $v0
+not $4, $5
+neg $4, $5
+negu $4, $5
+
+# ---- li / la: the one- and two-instruction split ----
+li $4, 0
+li $4, 1
+li $4, -1
+li $4, 0x7fff
+li $4, 0x8000
+li $4, 0xffff
+li $4, 0x10000
+li $4, 0x12345
+li $4, -32768
+li $4, -32769
+li $4, 0x7fffffff
+li $4, -0x80000000
+li $4, 0xffff0000
+li $4, 0xffffffff
+li $a0, 0x1230000
+la $4, 0x12345
+la $4, 8
+
+# ---- system ----
+syscall
+syscall 3
+break
+break 7
+break 7, 8
+sync
+sync 1
+eret
+teq $4, $5
+tne $4, $5
+tge $4, $5
+tgeu $4, $5
+tlt $4, $5
+tltu $4, $5
+teq $4, $5, 7
+tne $4, $5, 1023
+mfc0 $4, $12
+mtc0 $4, $12
+mfc0 $4, $12, 1
+
+# ---- coprocessor 1 ----
+mfc1 $4, $f0
+mtc1 $4, $f12
+lwc1 $f0, 8($4)
+ldc1 $f2, 16($sp)
+swc1 $f4, 0($5)
+sdc1 $f6, 24($sp)
+add.s $f0, $f2, $f4
+add.d $f0, $f2, $f4
+sub.s $f0, $f2, $f4
+sub.d $f6, $f8, $f10
+mul.s $f0, $f2, $f4
+mul.d $f0, $f2, $f4
+div.s $f0, $f2, $f4
+div.d $f0, $f2, $f4
+abs.s $f0, $f2
+abs.d $f0, $f2
+neg.s $f0, $f2
+neg.d $f0, $f2
+mov.s $f0, $f2
+mov.d $f30, $f28
+sqrt.s $f0, $f2
+sqrt.d $f0, $f2
+cvt.s.d $f0, $f2
+cvt.s.w $f0, $f2
+cvt.d.s $f0, $f2
+cvt.d.w $f0, $f2
+cvt.w.s $f0, $f2
+cvt.w.d $f0, $f2
+trunc.w.s $f0, $f2
+trunc.w.d $f0, $f2
+round.w.s $f0, $f2
+ceil.w.s $f0, $f2
+floor.w.s $f0, $f2
+c.f.d $f0, $f2
+c.un.s $f0, $f2
+c.eq.s $f0, $f2
+c.eq.d $f0, $f2
+c.ueq.s $f0, $f2
+c.olt.s $f0, $f2
+c.ult.s $f0, $f2
+c.ole.s $f0, $f2
+c.ule.s $f0, $f2
+c.lt.s $f0, $f2
+c.lt.d $f0, $f2
+c.nge.s $f0, $f2
+c.le.s $f0, $f2
+c.ngt.s $f0, $f2

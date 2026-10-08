@@ -1,0 +1,66 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`, which is llvm-mc's default alignment for
+SPARC code and data and not rsasm's; see mips.txt.
+
+=== hi and lo of a label in another section
+        .text
+        .p2align 2
+        sethi   %hi(msg), %o0
+        or      %o0, %lo(msg), %o0
+        ld      [%o0 + %lo(msg)], %o1
+        retl
+        nop
+        .data
+        .p2align 2
+        .space  0x1400
+msg:    .word   1
+
+=== hi and lo with an addend
+        .text
+        .p2align 2
+        sethi   %hi(msg + 0x3ff), %o0
+        add     %o0, %lo(msg + 0x3ff), %o0
+        sethi   %hi(msg - 1), %o1
+        retl
+        nop
+        .data
+        .p2align 2
+msg:    .word   1
+
+=== call and branches into another section
+        .text
+        .p2align 2
+entry:
+        call    helper
+        nop
+        ba      helper
+        nop
+        .section .text.helper, "ax"
+        .p2align 2
+helper:
+        bne     entry
+        nop
+
+=== data across sections
+        .text
+        .p2align 2
+entry:
+        retl
+        nop
+        .data
+        .p2align 2
+        .word   entry
+        .word   entry - .
+
+=== set of a label
+        .text
+        .p2align 2
+        set     msg, %g1
+        set     msg + 0x400, %g2
+        retl
+        nop
+        .data
+        .p2align 2
+        .space  0x2000
+msg:    .word   1

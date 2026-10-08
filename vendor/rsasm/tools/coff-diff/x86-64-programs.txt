@@ -1,0 +1,136 @@
+=== hello
+        .text
+        .globl  main
+main:
+        subq    $40, %rsp
+        leaq    msg(%rip), %rcx
+        call    puts
+        xorl    %eax, %eax
+        addq    $40, %rsp
+        ret
+        .section .rdata,"dr"
+msg:    .asciz  "Hello from rsasm!"
+=== data and bss
+        .data
+        .globl  counter
+counter:
+        .long   0
+table:  .quad   f1, f2, counter
+        .long   f1 - table
+        .bss
+buf:    .space  64
+        .globl  big
+big:    .zero   16
+        .text
+f1:     ret
+f2:     ret
+=== lcomm and comm
+        .lcomm  local_buf, 32
+        .lcomm  aligned, 8, 4
+        .comm   shared, 24
+        .comm   shared4, 8, 4
+        .text
+        movq    local_buf(%rip), %rax
+        movq    shared(%rip), %rax
+        leaq    aligned(%rip), %rcx
+=== section flags
+        .section .code,"xr"
+        ret
+        .section .rodat,"dr"
+        .long   1
+        .section .rw,"dw"
+        .long   2
+        .section .shared,"ds"
+        .long   3
+        .section .unread,"yd"
+        .long   4
+        .section .ubss,"b"
+        .space  12
+        .section .info,"i"
+        .ascii  "note"
+=== drectve
+        .section .drectve,"yn"
+        .ascii  " /DEFAULTLIB:msvcrt"
+        .ascii  " -export:func"
+=== long section and symbol names
+        .section .averyverylongsectionname,"dr"
+        .globl  a_very_long_symbol_name_indeed
+a_very_long_symbol_name_indeed:
+        .long   1
+        .quad   another_long_undefined_symbol
+=== dollar-grouped sections
+        .section .text$mn,"xr"
+        .globl  fn
+fn:     ret
+        .section .rdata$zzz,"dr"
+        .long   fn
+        .section .CRT$XCU,"dr"
+        .quad   fn
+=== alignment
+        .data
+        .byte   1
+        .balign 8
+        .quad   2
+        .section .big,"dr"
+        .p2align 12
+        .long   3
+=== absolute symbols
+        .globl  abs_global
+        abs_global = 0x1234
+        local_abs = 42
+        .set    later, 7
+        .text
+        movl    $abs_global, %eax
+        movl    $local_abs, %ecx
+=== set aliases
+        .text
+        .globl  target
+target: ret
+        .set    alias, target
+        .globl  galias
+        galias = target + 1
+        call    alias
+        .quad   galias
+=== rva and secrel tables
+        .text
+        .globl  entry
+entry:  ret
+local:  ret
+        .data
+        .rva    entry, local, local+1
+        .secrel32 entry
+        .secrel32 local
+        .secidx entry
+        .secidx local
+        .long   entry@IMGREL
+=== cross-section references
+        .text
+        .globl  code
+code:
+        movq    thing(%rip), %rax
+        leaq    stuff+4(%rip), %rdx
+        call    code
+        jmp     helper
+helper: ret
+        .data
+thing:  .quad   code, helper, stuff
+        .section .rdata,"dr"
+stuff:  .long   thing - stuff
+        .long   code - .
+=== file symbol
+        .file   "hello.c"
+        .text
+        .globl  f
+f:      ret
+=== long file name
+        .file   "a/path/that/is/more/than/eighteen/bytes/long.c"
+        .text
+        ret
+=== several relocations
+        .text
+        call    a
+        call    b
+        call    a
+        movl    $0, c(%rip)
+        leaq    d+100(%rip), %r8
+        .quad   a, b, c, d

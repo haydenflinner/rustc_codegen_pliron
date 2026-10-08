@@ -1,0 +1,79 @@
+Lines before the first snippet are not assembled.
+
+The avr51 core, as avr-elf-as -mmcu=avr51 assembles it and avr-elf-ld -m avr51
+links it: jmp, call and the 24-bit ldi modifiers over a larger address space.
+
+=== jmp and call into another section
+        .text
+        .globl  _start
+_start: jmp     main
+        call    helper
+        call    far + 2
+        .section .text.helper, "ax", @progbits
+helper: ret
+main:   jmp     _start
+far:    nop
+        ret
+
+=== ldi on every byte of a code and a data address
+        .text
+start:  ldi     r16, lo8(var)
+        ldi     r17, hi8(var)
+        ldi     r18, hh8(var)
+        ldi     r19, hlo8(var)
+        ldi     r20, hhi8(var)
+        ldi     r21, lo8(-(var))
+        ldi     r22, hi8(-(var))
+        ldi     r23, hh8(-(var))
+        ldi     r24, hhi8(-(var))
+        ldi     r30, pm_lo8(func)
+        ldi     r31, pm_hi8(func)
+        ldi     r26, pm_hh8(func)
+        ldi     r27, lo8(pm(func))
+        ldi     r28, hi8(pm(func))
+        ldi     r29, hh8(pm(func))
+        ldi     r30, lo8(gs(func))
+        ldi     r31, hi8(gs(func))
+        ldi     r16, pm_lo8(-(func))
+        ldi     r17, pm_hi8(-(func))
+        ldi     r18, lo8(-(pm(func)))
+        andi    r20, lo8(var + 3)
+        cpi     r21, hi8(var - 1)
+        ret
+        .space  0x1234
+func:   ret
+        .data
+        .space  0x52
+var:    .byte   1
+
+=== refused: an ldi constant that is an address above 255
+        .text
+        ldi     r19, var
+        .space  0x200
+var:    ret
+
+=== jmp and call beyond 64K
+        .text
+        jmp     high
+        call    high + 2
+        .space  0x12340
+high:   ret
+        nop
+
+=== the third byte of an address beyond 64K
+        .text
+        ldi     r16, hh8(high)
+        ldi     r17, hh8(pm(high))
+        ldi     r18, pm_hh8(high)
+        ldi     r19, hlo8(high)
+        ldi     r20, hh8(-(high))
+        ldi     r21, pm_hh8(-(high))
+        ret
+        .space  0x2a000
+high:   ret
+
+=== refused: breq out of reach
+        .text
+        breq    far
+        .space  0x80
+far:    ret

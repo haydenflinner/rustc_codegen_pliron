@@ -1,6 +1,7 @@
 //! Rust intrinsics -> pliron ops / `llvm.*` intrinsic calls / libm calls.
 
 use pliron::value::Value;
+use rustc_abi::Align;
 use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
@@ -73,7 +74,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         };
         let n = name.as_str();
         if n.starts_with("simd_") {
-            return match self.simd_intrinsic(n, args, result_layout.ty, ret) {
+            return match self.simd_intrinsic(n, args, result_layout.ty, ret, _span, instance) {
                 Some(v) => imm(v),
                 None => self.tcx.dcx().fatal(format!(
                     "SIMD intrinsic `{n}` is not supported by the pliron backend yet"
@@ -89,7 +90,22 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             return imm(self.call_sym(f, ret, &vs));
         }
         let r = match name {
+            sym::va_arg => {
+                let v = self.va_arg(a(0), ret);
+                return imm(v);
+            }
             sym::ctpop | sym::ctlz | sym::cttz | sym::ctlz_nonzero | sym::cttz_nonzero => {
+                let ty = args[0].layout.ty;
+                if !ty.is_integral() {
+                    let err = self.tcx.dcx().emit_err(
+                        rustc_codegen_ssa::diagnostics::InvalidMonomorphization::BasicIntegerType {
+                            span: _span,
+                            name,
+                            ty,
+                        },
+                    );
+                    return IntrinsicResult::Err(err);
+                }
                 let x = a(0);
                 let ty = self.val_ty(x);
                 let i = match name {
@@ -101,6 +117,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 self.intcast(r, ret, false)
             }
             sym::bswap | sym::bitreverse => {
+                let ty = args[0].layout.ty;
+                if !ty.is_integral() {
+                    let err = self.tcx.dcx().emit_err(
+                        rustc_codegen_ssa::diagnostics::InvalidMonomorphization::BasicIntegerType {
+                            span: _span,
+                            name,
+                            ty,
+                        },
+                    );
+                    return IntrinsicResult::Err(err);
+                }
                 let x = a(0);
                 let ty = self.val_ty(x);
                 let i = if name == sym::bswap {
@@ -306,9 +333,29 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         panic!("type_checked_load is not supported by the pliron backend")
     }
-    fn va_start(&mut self, _val: Value) {
-        self.tcx
-            .dcx()
-            .fatal("C-variadic functions are not supported by the pliron backend yet")
+    fn va_start(&mut self, val: Value) {
+        // The variadic-argument buffer pointer, delivered by the lowering as the
+        // hidden extra parameter of a C-variadic function. The VaList place gets
+        // a real SysV `__va_list_tag`: gp/fp offsets exhausted so every va_arg
+        // (ours and a forwarded foreign callee's alike) walks `overflow_arg_area`,
+        // which points at the packed buffer.
+        let buf = self.intrinsic("pliron.va.buf", self.type_ptr(), &[]);
+        if self.tcx.sess.target.is_like_wasm {
+            // wasm's va_list is a single opaque pointer: the place itself is
+            // the cursor into the packed buffer.
+            self.store(buf, val, Align::from_bytes(4).unwrap());
+            return;
+        }
+        let i8t = self.type_i8();
+        let i32t = self.type_i32();
+        let gp = self.const_int(i32t, 48);
+        self.store(gp, val, Align::from_bytes(4).unwrap());
+        let p4 = self.gep(i8t, val, &[self.const_usize(4)]);
+        let fp = self.const_int(i32t, 304);
+        self.store(fp, p4, Align::from_bytes(4).unwrap());
+        let p8 = self.gep(i8t, val, &[self.const_usize(8)]);
+        self.store(buf, p8, Align::EIGHT);
+        let p16 = self.gep(i8t, val, &[self.const_usize(16)]);
+        self.store(buf, p16, Align::EIGHT);
     }
 }

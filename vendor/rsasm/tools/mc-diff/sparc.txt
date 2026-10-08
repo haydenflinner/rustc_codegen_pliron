@@ -1,0 +1,205 @@
+# SPARC V8 corpus. The harness assembles these with the `sparc` triple, which
+# is 32-bit only: llvm-mc rejects every V9 mnemonic on it, so the V9 forms this
+# backend supports are checked in tests/sparc.rs against `-triple=sparcv9`
+# instead. See the module comment there.
+
+# ---- arithmetic and logic, register form ----------------------------------
+add %g1, %g2, %g3
+addcc %g1, %g2, %g3
+addx %g1, %g2, %g3
+addxcc %g1, %g2, %g3
+sub %g1, %g2, %g3
+subcc %g1, %g2, %g3
+subx %g1, %g2, %g3
+subxcc %g1, %g2, %g3
+and %g1, %g2, %g3
+andcc %g1, %g2, %g3
+andn %g1, %g2, %g3
+andncc %g1, %g2, %g3
+or %g1, %g2, %g3
+orcc %g1, %g2, %g3
+orn %g1, %g2, %g3
+orncc %g1, %g2, %g3
+xor %g1, %g2, %g3
+xorcc %g1, %g2, %g3
+xnor %g1, %g2, %g3
+xnorcc %g1, %g2, %g3
+umul %g1, %g2, %g3
+umulcc %g1, %g2, %g3
+smul %g1, %g2, %g3
+smulcc %g1, %g2, %g3
+udiv %g1, %g2, %g3
+udivcc %g1, %g2, %g3
+sdiv %g1, %g2, %g3
+sdivcc %g1, %g2, %g3
+mulscc %g1, %g2, %g3
+taddcc %g1, %g2, %g3
+tsubcc %g1, %g2, %g3
+
+# ---- the 13-bit immediate form, and its edges -----------------------------
+add %g1, 1, %g2
+add %g1, -1, %g2
+add %g1, 4095, %g2
+add %g1, -4096, %g2
+sub %o0, 16, %o1
+and %l0, 0xff, %l1
+or %i0, 0x3ff, %i1
+xor %g7, -2, %g6
+
+# ---- shifts ---------------------------------------------------------------
+sll %g1, %g2, %g3
+srl %g1, %g2, %g3
+sra %g1, %g2, %g3
+sll %g1, 0, %g2
+sll %g1, 3, %g2
+srl %g1, 16, %g2
+sra %g1, 31, %g2
+
+# ---- every register spelling ----------------------------------------------
+add %g0, %g7, %o0
+add %o0, %o7, %l0
+add %l0, %l7, %i0
+add %i0, %i7, %g1
+add %sp, %fp, %g1
+add %r0, %r15, %r16
+add %r8, %r23, %r24
+# Deliberate divergence: llvm-mc parses `%r31` as the start of a relocation
+# specifier and rejects it, so that one spelling cannot be compared here.
+# tests/sparc.rs checks `%r31` == `%i7` instead.
+mov %r14, %r30
+
+# ---- sethi and the %hi()/%lo() pair ---------------------------------------
+sethi 0, %g0
+sethi 1023, %g1
+sethi 4194303, %g1
+sethi %hi(0x40000), %o0
+sethi %hi(0x12345), %o0
+or %o0, %lo(0x12345), %o0
+add %g1, %lo(0x12345), %g2
+ld [%g1 + %lo(0x12345)], %g2
+
+# ---- loads and stores ------------------------------------------------------
+ld [%o0], %o1
+ld [%o0 + 4], %o1
+ld [%o0 - 4], %o1
+ld [%o0 + %o1], %o2
+ldub [%g1], %g2
+ldub [%g1 - 1], %g2
+ldsb [%g1], %g2
+ldsb [%g1 + %g2], %g3
+lduh [%g1 + 2], %g2
+ldsh [%g1 + 2], %g2
+ldd [%sp], %o2
+ldd [%g1 + %g2], %g2
+st %o1, [%o0]
+st %o1, [%sp + 64]
+st %o1, [%fp - 8]
+st %g3, [%g1 + %g2]
+stb %g3, [%g1 + %g2]
+sth %g3, [%g1 + 2]
+std %o2, [%sp]
+std %g2, [%g1 + %g2]
+# The float forms of ld/st are picked by the register class, not the mnemonic.
+ld [%o0], %f1
+st %f1, [%o0]
+ldd [%o0], %f0
+std %f0, [%o0]
+
+# ---- register windows ------------------------------------------------------
+save %sp, -96, %sp
+save %g1, %g2, %g3
+save
+restore %g1, %g2, %g3
+restore
+
+# ---- jumps and calls -------------------------------------------------------
+jmpl %o7 + 8, %g0
+jmpl %g1 + %g2, %g3
+jmpl %o7, %g0
+jmp %o7 + 8
+jmp %o7
+ret
+retl
+call %o7
+call %g1 + %g2
+
+# ---- traps, state registers, misc -----------------------------------------
+ta 3
+ta 0
+tn 1
+tne 2
+te 3
+tvc 4
+flush %g1
+flush %g1 + 8
+unimp 0
+rd %y, %g1
+wr %g1, %y
+wr %g1, %g2, %y
+
+# ---- floating point --------------------------------------------------------
+fadds %f0, %f1, %f2
+faddd %f0, %f2, %f4
+faddq %f0, %f4, %f8
+fsubs %f0, %f1, %f2
+fsubd %f0, %f2, %f4
+fmuls %f0, %f1, %f2
+fmuld %f0, %f2, %f4
+fdivs %f0, %f1, %f2
+fdivd %f0, %f2, %f4
+fsmuld %f0, %f1, %f2
+fmovs %f1, %f2
+fnegs %f1, %f2
+fabss %f1, %f2
+fsqrts %f1, %f2
+fsqrtd %f0, %f2
+fitos %f1, %f2
+fitod %f1, %f2
+fstoi %f1, %f2
+fdtoi %f0, %f2
+fstod %f1, %f2
+fdtos %f0, %f2
+fcmps %f0, %f1
+fcmpd %f0, %f2
+fcmpes %f0, %f1
+fcmped %f0, %f2
+
+# ---- synthetics ------------------------------------------------------------
+nop
+mov %g1, %g2
+mov 1, %g2
+mov -1, %g2
+mov %y, %g1
+mov %g1, %y
+cmp %o0, %o1
+cmp %o0, 1
+tst %g1
+clr %g1
+clr [%o0]
+not %g1
+not %g1, %g2
+neg %g1
+neg %g1, %g2
+inc %g1
+inc 4, %g1
+dec %g1
+dec 4, %g1
+btst 1, %g1
+bset 2, %g1
+bclr 4, %g1
+btog 8, %g1
+# `set` picks one instruction or two, depending on the constant.
+set 0, %o0
+set 1, %o0
+set 4095, %o0
+set -4096, %o0
+set -1, %o0
+set 0xffffffff, %o0
+set 4096, %o0
+set 0x1000, %o0
+set 0x40000, %o0
+set 0x80000000, %o0
+set 0x12345, %o0
+set -4097, %o0
+set -5000, %o0
+set 2147483647, %o0

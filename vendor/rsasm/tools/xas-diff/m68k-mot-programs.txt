@@ -1,0 +1,250 @@
+=== bra to the next instruction cannot be short
+ bra next
+next nop
+=== bsr and beq to the next instruction
+ bsr next
+next beq next2
+next2 rts
+=== short branches both ways
+back nop
+ bra back
+ bne fwd
+ nop
+fwd rts
+=== every Bcc, backward
+top nop
+ bhi top
+ bls top
+ bcc top
+ bcs top
+ bne top
+ beq top
+ bvc top
+ bvs top
+ bpl top
+ bmi top
+ bge top
+ blt top
+ bgt top
+ ble top
+ bra top
+ bsr top
+=== every DBcc
+top nop
+ dbt d0,top
+ dbf d0,top
+ dbra d0,top
+ dbhi d1,top
+ dbls d1,top
+ dbcc d1,top
+ dbhs d1,top
+ dbcs d1,top
+ dbne d1,top
+ dbeq d1,top
+ dbvc d1,top
+ dbvs d1,top
+ dbpl d1,top
+ dbmi d1,top
+ dbge d1,top
+ dblt d1,top
+ dbgt d1,top
+ dble d7,top
+=== explicit branch sizes
+top2 nop
+ bra.s top2
+ bra.b top2
+ bra.w top2
+ bra.l top2
+ bsr.s top2
+ bsr.w top2
+ bsr.l top2
+ beq.s top2
+ beq.w top2
+ beq.l top2
+ bhs.s top2
+ blo.w top2
+ dbeq.w d0,top2
+ bras top2
+ braw top2
+ bral top2
+ bsrs top2
+=== a branch just out of 8-bit reach becomes a word
+* Gaps are written as data, not `ds.b`: GNU as `--mri` sizes a `ds` during
+* relaxation, and its first pass then sees a branch to the next instruction.
+ bra far
+ dc.l 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ dc.w 0,0
+far rts
+=== a branch just inside 8-bit reach stays short
+ bra near
+ dc.l 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+near rts
+=== the longest forward short branch
+ bra near
+ dc.l 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ dc.w 0
+near rts
+=== backward reach limit of a short branch
+back ds.b 126
+ bra back
+ bra back
+=== relaxing to 32 bits past 16-bit reach
+ beq far
+ bsr far
+ bra far
+ ds.b 40000
+far rts
+=== a relaxed branch pushes another out of reach
+* `bra far` needs 16 bits, which moves `t` two bytes on: from 126 bytes
+* away, a short branch, to 128, which is not.
+ bra t
+ bra far
+ dc.l 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+t rts
+ dc.l 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+far rts
+=== undefined targets take the widest form
+ bsr ext
+ bra ext
+ bne ext
+ jsr ext
+ jmp ext
+=== the location counter
+ bra *
+ dbf d0,*
+=== a counting loop
+ moveq #9,d0
+loop move.b (a0)+,(a1)+
+ dbf d0,loop
+ rts
+=== PC-relative references to labels
+ lea data(pc),a0
+ move.w data(pc),d0
+ move.w data(pc,d1.w),d2
+ pea back(pc)
+ jsr back(pc)
+ jmp data(pc,d0.l)
+back rts
+data dc.w 1,2,3
+=== PC-relative references beyond 16 bits use a full extension word
+ lea far(pc),a0
+ move.w far(pc,d0.w),d1
+ ds.b 40000
+far dc.l 0
+=== PC-relative references to undefined symbols
+ lea ext(pc),a0
+ move.w ext(pc,d0.w),d1
+=== constants defined before use
+BASE equ $dff000
+DMACON equ $96
+LVO equ -198
+SIZE equ 16
+ move.w #$7fff,BASE+DMACON
+ lea BASE,a5
+ move.w #$8200,DMACON(a5)
+ jsr LVO(a6)
+ moveq #SIZE,d0
+ move.l #SIZE*400,d1
+ lea SIZE(a0,d0.w),a1
+=== constants defined after use
+ move.w d0,FWD
+ move.l d0,FWDL
+ jsr FWD(a6)
+ move.w FWD(a0,d0.w),d1
+ move.w #FWD,d2
+FWD equ -30
+FWDL equ $12345
+=== code after odd data is word-aligned
+ dc.b 1
+ rts
+ dc.b 1,2,3
+ move.w d0,d1
+ ds.b 1
+ nop
+=== data between code
+ bra.s skip
+ dc.w $4afc
+ dc.l $12345678
+skip moveq #0,d0
+ rts
+=== Amiga library call
+ move.l 4.w,a6
+ lea gfxname(pc),a1
+ moveq #0,d0
+ jsr -552(a6)
+ move.l d0,gfxbase
+ beq.s fail
+ move.l d0,a1
+ jsr -414(a6)
+fail moveq #0,d0
+ rts
+gfxname dc.b 'graphics.library',0
+ even
+gfxbase dc.l 0
+=== quoted strings
+ dc.b 'text',0
+ dc.b 'it''s',0
+ dc.b 'a\n',0
+ dc.w 'ab'
+ dc.l 'abcd'
+ move.l #'abcd',d0
+ rts
+=== copper wait loop
+ lea $dff000,a5
+wait move.l 4(a5),d0
+ andi.l #$1ff00,d0
+ cmpi.l #$12c00,d0
+ bne.s wait
+ btst #6,$bfe001
+ bne.s wait
+ rts
+=== interrupt-safe critical section
+ move.w sr,-(sp)
+ ori.w #$0700,sr
+ movem.l d0-d7/a0-a6,-(sp)
+ movem.l (sp)+,d0-d7/a0-a6
+ move.w (sp)+,sr
+ rte
+=== stack frame
+ link a6,#-8
+ move.l 8(a6),d0
+ move.l d0,-4(a6)
+ unlk a6
+ rts
+=== case-insensitive source
+Start MOVE.L #$12345678,D0
+ LEA Start(PC),A0
+ BNE Start
+ RTS
+=== FPU and MMU branches, and relaxing ones
+top fnop
+ fbeq top
+ fbne.l top
+ fjgt top
+ fjogl mid
+ pbbs top
+ pbbs.w top
+ pbbs mid
+ fdbne d0,top
+ pdbws d1,top
+ ds.b 40000
+mid rts
+=== a DBcc beyond reach becomes dbcc, bra.s and bra.l
+ dbra d0,far
+ dbeq d1,near
+near nop
+ ds.b 40000
+far rts
+=== bra and bsr to a number jump absolutely
+ bra $1000
+ bsr $12345678
+ bne $8000
+=== an FPU exception handler's register frame
+ fmovem.x fp0-fp7,-(sp)
+ fmovem.l fpcr/fpsr/fpiar,-(sp)
+ fmove.l fpsr,d0
+ andi.l #$ff00,d0
+ fmove.l d0,fpsr
+ fmovem.l (sp)+,fpcr/fpsr/fpiar
+ fmovem.x (sp)+,fp0-fp7
+ rte

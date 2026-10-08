@@ -1,0 +1,28 @@
+=== extended instructions between rows
+	.file 1 "a.c"
+	.text
+f:
+	.loc 1 3 0
+	pushm.a #2, r10
+	.loc 1 4 0
+	movx.a #0x12345, r10
+	.loc 1 5 0
+	rpt #4
+	rrax.a r10
+	.loc 1 6 0
+	calla #g
+	popm.a #2, r11
+	reta
+=== address instructions with -g | -g
+	.text
+	mova #0x12345, r12
+	adda r12, r13
+	calla r13
+	reta
+=== the repeat prefix with -g | -g
+	.text
+f:	rpt #4
+	rrax.a r12
+	rpt r5 { rlax r13
+	jmp f
+	reta

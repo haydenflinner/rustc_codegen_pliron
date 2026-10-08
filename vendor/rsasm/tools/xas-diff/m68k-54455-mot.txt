@@ -1,0 +1,11 @@
+# Every form of GNU's m68k opcode table that the ColdFire 54455 (ISA_C) has and no CPU
+# before it in tools/fuzz/m68k.py's CORPUS_ORDER does, one line each, with
+# operands that form takes and no earlier form of the mnemonic does.
+# Motorola syntax, checked against GNU as --mri.
+#
+#   tools/fuzz/m68k.py corpus --first --cpu 54455 --syntax mot
+
+	bitrev	d2
+	byterev	d1
+	ff1	d4
+	stldsr	#1

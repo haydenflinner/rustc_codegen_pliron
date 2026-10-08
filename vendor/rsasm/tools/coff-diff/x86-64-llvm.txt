@@ -1,0 +1,181 @@
+# Cases compared against llvm-mc alone.
+#
+# A sign-extended 32-bit absolute field (R_X86_64_32S in ELF): llvm-mc writes
+# IMAGE_REL_AMD64_ADDR32, the only 32-bit absolute type the PE specification
+# has, and rsasm follows it. GNU as writes type 17, which the specification
+# names IMAGE_REL_AMD64_SSPAN32 and BFD uses for its own purposes.
+=== sign-extended immediate
+        movq    $foo, %rax
+=== sign-extended displacement
+        movl    foo, %eax
+        movl    foo+4(,%rax,8), %ecx
+# GNU as for mingw reads `@GOTPCREL` as part of the symbol's name; llvm-mc
+# takes it as the plain RIP-relative reference it is in a Windows object.
+=== GOTPCREL
+        movq    foo@GOTPCREL(%rip), %rax
+# A call to a function (`.type 32`) in its own section: llvm-mc keeps the
+# relocation, for the MSVC linker's incremental linking and control flow
+# guard; GNU as resolves it like any other local reference.
+=== def, scl and type
+        .text
+        .def    func
+        .scl    2
+        .type   32
+        .endef
+        .globl  func
+func:   ret
+        .def    helper
+        .scl    3
+        .type   32
+        .endef
+helper: ret
+        call    helper
+# Weak symbols. A weak definition becomes an undefined weak external whose
+# fallback is a global under a made-up name, `.weak.<name>.default.<first
+# global defined in the object>`; GNU as leaves out `.default`. A reference to
+# a weak definition in its own section is resolved by llvm-mc, which GNU as
+# relocates.
+=== weak definition and reference
+        .text
+        .globl  first
+first:  ret
+        .weak   w
+w:      ret
+        call    w
+        .weak   wu
+        call    wu
+        .quad   w, wu
+=== weak with no global defined
+        .text
+        call    undef
+        .weak   w
+w:      ret
+=== weak data
+        .data
+        .weak   wd
+wd:     .long   1
+        .globl  after
+after:  .long   wd
+# COMDAT sections, which GNU as writes with a symbol order and alignment of
+# its own.
+=== comdat any
+        .section .text$f,"xr",discard,f
+        .globl  f
+f:      ret
+        .section .rdata$c,"dr",same_size,c
+        .globl  c
+c:      .long   4
+        .text
+        call    f
+=== comdat selections
+        .section .s1,"dr",one_only,s1
+        .globl  s1
+s1:     .byte   1
+        .section .s3,"dr",same_contents,s3
+        .globl  s3
+s3:     .byte   3
+        .section .s4,"dr",largest,s4
+        .globl  s4
+s4:     .byte   4
+        .section .s5,"dr",newest,s5
+        .globl  s5
+s5:     .byte   5
+=== linkonce
+        .section .lo,"dr"
+        .linkonce discard
+lo:     .long   5
+        .section .lo2,"dr"
+        .linkonce same_size
+        .long   6
+# Unwind data for x86-64 functions. llvm-mc counts the prologue from the
+# instructions' lengths, which GNU as does too, but writes `.xdata` and
+# `.pdata` aligned to four bytes and names the function's section rather than
+# the function in `.pdata`.
+=== seh frame
+        .text
+        .globl  f
+        .def    f; .scl 2; .type 32; .endef
+        .seh_proc f
+f:
+        pushq   %rbp
+        .seh_pushreg %rbp
+        subq    $32, %rsp
+        .seh_stackalloc 32
+        movq    %rsp, %rbp
+        .seh_setframe %rbp, 0
+        .seh_endprologue
+        nop
+        addq    $32, %rsp
+        popq    %rbp
+        ret
+        .seh_endproc
+=== seh two functions
+        .text
+        .seh_proc f
+f:      pushq   %rbp
+        .seh_pushreg %rbp
+        .seh_endprologue
+        popq    %rbp
+        ret
+        .seh_endproc
+        .seh_proc g
+g:      pushq   %rbx
+        .seh_pushreg %rbx
+        pushq   %r12
+        .seh_pushreg %r12
+        .seh_endprologue
+        popq    %r12
+        popq    %rbx
+        ret
+        .seh_endproc
+=== seh large allocations and saves
+        .text
+        .seh_proc big
+big:
+        subq    $4096, %rsp
+        .seh_stackalloc 4096
+        movq    %rsi, 16(%rsp)
+        .seh_savereg %rsi, 16
+        movaps  %xmm6, 32(%rsp)
+        .seh_savexmm %xmm6, 32
+        subq    $0x100000, %rsp
+        .seh_stackalloc 0x100000
+        .seh_endprologue
+        ret
+        .seh_endproc
+=== seh handler
+        .text
+        .seh_proc h
+h:      pushq   %rbp
+        .seh_pushreg %rbp
+        .seh_handler handler, @except, @unwind
+        .seh_endprologue
+        ret
+        .seh_endproc
+=== seh handler data
+        .text
+        .seh_proc h
+h:      subq    $8, %rsp
+        .seh_stackalloc 8
+        .seh_endprologue
+        .seh_handler handler, @except
+        .seh_handlerdata
+        .long   0x1234
+        .text
+        ret
+        .seh_endproc
+=== seh pushframe
+        .text
+        .seh_proc isr
+isr:    .seh_pushframe @code
+        .seh_endprologue
+        iretq
+        .seh_endproc
+=== associative comdat
+        .section .text$f,"xr",discard,f
+        .globl  f
+f:      ret
+        .section .xdata$f,"dr",associative,f
+        .long   1
+        .section .data$d,"dw",associative,f
+        .long   f

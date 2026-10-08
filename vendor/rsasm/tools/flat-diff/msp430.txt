@@ -1,0 +1,247 @@
+Lines before the first snippet are not assembled.
+
+Every reference in MSP430 code is left to the linker by GNU as, even a jump
+to the label before it (see src/arch/msp430), so every snippet here checks
+what rsasm resolves against what GNU ld resolves. The reference is run with
+`-mP` for the polymorphic branches, which changes nothing else in a code
+section.
+
+GNU as creates `.data` before any section the source names, and rsasm creates
+it when it is first used. A snippet with both says `.data` first, so the
+sections come out in the same order.
+
+=== jumps in both directions
+        .text
+start:  nop
+back:   jz      fwd
+        jmp     back
+        jnz     start
+        jc      fwd
+        jnc     back
+        jn      fwd
+        jge     back
+        jl      fwd
+fwd:    ret
+
+=== the longest jumps
+        .text
+start:  jmp     far
+        .space  1020
+far:    jmp     start
+        .space  1018
+        jmp     far
+
+=== the longest jump forward
+        .text
+start:  jmp     far
+        .space  1022
+far:    ret
+
+=== refused: a jump that does not reach
+        .text
+start:  jmp     far
+        .space  1024
+far:    ret
+
+=== refused: a jump back that does not reach
+        .text
+start:  ret
+        .space  1024
+        jmp     start
+
+=== symbolic, absolute and immediate references to labels
+        .data
+        .text
+start:  mov     var, r5
+        mov     &var, r5
+        mov     #var, r5
+        mov     r5, var
+        mov     r5, &var
+        mov     var, var2
+        mov     &var, &var2
+        mov     #start, r6
+        mov.b   var, r7
+        mov.b   &var, var2
+        add     back, r5
+        cmp     #back, r6
+        br      #start
+        br      &var
+        br      back
+        call    #start
+        call    &var
+        call    back
+        push    #var
+        push    var
+back:   ret
+        .data
+        .space  0x10
+var:    .word   1
+var2:   .word   2
+
+=== indexed addressing with labels as the offset
+        .data
+        .text
+start:  mov     var(r4), r5
+        mov     r5, var2(r6)
+        mov     var(r4), var2(r5)
+        inc     var(r4)
+        tst.b   var2(r7)
+        ret
+        .data
+        .space  0x20
+var:    .word   1
+var2:   .word   2
+
+=== emulated instructions on labels
+        .data
+        .text
+        clr     var
+        inc     &var
+        incd    var(r4)
+        dec     var
+        decd    &var
+        tst     var
+        inv     var
+        adc     &var
+        sbc     var
+        dadc    var
+        rla     var
+        rlc     &var
+        pop     var
+        ret
+        .data
+var:    .word   0
+
+=== labels past the constant generators
+        .text
+        .word   0, 1, 2, 3
+l4:     mov     #l4, r5
+        mov     #l8, r5
+l8:     ret
+
+=== the halves of an address
+        .data
+        .text
+        mov     #lo(var), r5
+        mov     #hi(var), r5
+        mov     #llo(var), r5
+        mov     #lhi(var), r5
+        mov     #lo(var+0x10000), r6
+        ret
+        .data
+        .space  0x30
+var:    .word   1
+
+=== data across sections
+        .data
+        .text
+entry:  ret
+        .data
+        .word   entry
+        .long   entry
+        .byte   entry - entry
+        .word   entry + 2
+        .long   entry - 4
+
+=== differences of code labels, which GNU as leaves to the linker
+        .text
+a:      nop
+        nop
+b:      nop
+        .word   b - a
+        .long   b - a
+        .byte   b - a
+        .word   a - b
+        .word   b - a + 3
+        .data
+        .word   b - a
+        .long   b - a
+
+=== differences of data labels
+        .data
+c:      .word   1
+d:      .word   2
+        .word   d - c
+        .long   c - d
+
+=== a jump table
+        .data
+        .text
+start:  mov     table(r5), r0
+one:    ret
+two:    ret
+three:  ret
+        .data
+table:  .word   one, two, three
+
+=== calls and branches into another section
+        .text
+entry:  call    #helper
+        call    helper
+        br      #helper
+        br      helper
+        mov     helper, r5
+        jmp     entry
+        .section .text.helper, "ax"
+helper: call    #entry
+        call    entry
+        ret
+
+=== references with addends
+        .data
+        .text
+start:  mov     var+2, r5
+        mov     &var+4, r5
+        mov     #var-2, r5
+        jmp     start+4
+        nop
+        nop
+        call    #var+0x100
+        ret
+        .data
+var:    .word   1, 2, 3
+
+=== the polymorphic branches
+        .text
+start:  jump    fwd
+        beq     start
+        bne     fwd
+        blt     start
+        bltu    fwd
+        bge     start
+        bgeu    fwd
+        bltn    start
+        bgt     fwd
+        bgtu    start
+        bleu    fwd
+        ble     start
+fwd:    ret
+
+=== polymorphic branches into another section
+        .text
+start:  beq     helper
+        bgt     helper
+        jump    helper
+        .section .text.helper, "ax"
+helper: jump    start
+        bltn    start
+
+=== alignment and section tails
+        .text
+start:  nop
+        .balign 4
+        jmp     start
+        .p2align 3
+        mov     #start, r5
+        .data
+        .byte   1
+        .balign 4
+        .word   start
+
+=== constant jumps
+        .text
+        jmp     $+4
+        jmp     $-2
+        jz      4
+        nop
+        ret

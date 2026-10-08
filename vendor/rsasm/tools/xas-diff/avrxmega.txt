@@ -1,0 +1,26 @@
+# AVR, checked against avr-elf-as -mmcu=atxmega128a1u (GNU binutils 2.47): the
+# forms only an XMEGA has on top of avr51.txt — des, eijmp and eicall, and the
+# read-modify-write instructions of the "U" devices. One statement per line.
+
+# ---- XMEGA read-modify-write -----------------------------------------------
+xch Z, r0
+xch Z, r16
+xch Z, r31
+las Z, r0
+las Z, r16
+las Z, r31
+lac Z, r0
+lac Z, r16
+lac Z, r31
+lat Z, r0
+lat Z, r16
+lat Z, r31
+
+# ---- no operands -----------------------------------------------------------
+eicall
+eijmp
+
+# ---- des -------------------------------------------------------------------
+des 0
+des 1
+des 15

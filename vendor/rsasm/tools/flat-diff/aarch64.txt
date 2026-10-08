@@ -1,0 +1,94 @@
+=== adrp to a label on the same page
+start:
+        adrp    x0, here
+        add     x0, x0, :lo12:here
+here:
+        ret
+
+=== adrp to a later page in the same section
+        adrp    x0, far
+        add     x0, x0, :lo12:far
+        ret
+        .space  0x2000 - 12
+        nop
+far:
+        ret
+
+=== adrp back to an earlier page
+back:
+        ret
+        .space  0x3000
+        adrp    x1, back
+        add     x1, x1, :lo12:back
+
+=== adrp from a page boundary @ 0x400ff8
+        nop
+        adrp    x0, next
+        adrp    x1, next
+        add     x1, x1, :lo12:next
+next:
+        ret
+
+=== adrp into another section
+        .text
+        adrp    x0, msg
+        add     x0, x0, :lo12:msg
+        ldrb    w1, [x0, :lo12:msg]
+        ret
+        .data
+        .space  0x1234
+msg:    .ascii  "hi"
+
+=== scaled :lo12: loads into another section
+        .text
+        adrp    x0, vars
+        ldr     x1, [x0, :lo12:vars]
+        ldr     w2, [x0, :lo12:vars + 8]
+        ldrh    w3, [x0, :lo12:vars + 12]
+        ldr     q4, [x0, :lo12:vars + 16]
+        str     x5, [x0, :lo12:vars]
+        ret
+        .data
+        .p2align 4
+        .space  0xff0
+vars:   .quad   1, 2, 3, 4
+
+=== adrp with an addend
+        .text
+        adrp    x0, table + 0x1000
+        add     x0, x0, :lo12:table + 0x1000
+        adrp    x1, table - 4
+        add     x1, x1, :lo12:table - 4
+        ret
+        .data
+table:  .quad   0
+
+=== adr and literal loads into another section
+        .text
+        adr     x0, value
+        ldr     x1, value
+        ldr     w2, value
+        b       .
+        .data
+value:  .quad   0x1122334455667788
+
+=== branches and data across sections
+        .text
+entry:
+        bl      helper
+        b       helper
+        .section .text.helper, "ax"
+helper:
+        ret
+        .data
+        .quad   entry
+        .4byte  helper - .
+        .8byte  entry - .
+
+=== executable sections start on an instruction boundary
+        .text
+        .byte   1
+        .section .text.b,"ax"
+        .byte   2
+        .data
+        .byte   3

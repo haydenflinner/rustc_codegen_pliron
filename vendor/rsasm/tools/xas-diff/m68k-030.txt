@@ -1,0 +1,12 @@
+# Every form of GNU's m68k opcode table that the 68030 has and no CPU
+# before it in tools/fuzz/m68k.py's CORPUS_ORDER does, one line each, with
+# operands that form takes and no earlier form of the mnemonic does.
+# GNU syntax.
+#
+#   tools/fuzz/m68k.py corpus --first --cpu 68030 --syntax gas
+
+pmove	%a1@,%tt1
+pmove	%tt1,ext
+pmovefd	%sp,%tc
+pmovefd	-127(%a0,%d7.w*8),%drp
+pmovefd	%d0,%tt1

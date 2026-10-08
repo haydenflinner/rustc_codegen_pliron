@@ -1,0 +1,128 @@
+=== short branches both ways
+start:
+        bz start
+        bnz 1f
+        br 1f
+        bsa 1f
+        nop
+1:      bge start
+        blt 1b
+=== jr and jarl to labels
+top:    jr top
+        jarl top, lp
+        jarl next, r10
+        nop
+next:   jr top
+=== conditional branch relaxes to an inverted branch over jr
+        bnz far
+        bz far
+        bgt far
+        .space 0x200
+far:    nop
+=== br relaxes to jr, bsa to its 8-byte form
+        br far
+        bsa far
+        jbr far
+        .space 0x200
+far:    nop
+=== backward branches past the 9-bit reach
+back:   nop
+        .space 0x100
+        bz back
+        br back
+        bsa back
+=== the boundaries of the short branch
+        bz fwd
+        .space 0xfa
+fwd:    nop
+back:   .space 0xfe
+        bz back
+=== one past the boundaries
+        bz fwd
+        .space 0xfc
+fwd:    nop
+back:   .space 0x100
+        bz back
+=== a relaxed branch pushes a later one out of range
+        bz a
+        bz b
+        .space 0xf8
+a:      nop
+b:      nop
+=== branches to an undefined symbol far from the section start
+        .space 0x10000
+        bz ext
+        br ext
+        bsa ext
+        jr ext
+        jarl ext, lp
+=== hi() and lo() of a .set constant, at the carry boundary
+        .set addr, 0x12348000
+        movhi hi(addr), r0, r1
+        movea lo(addr), r1, r1
+        .set addr2, 0x12347fff
+        movhi hi(addr2), r0, r1
+        movea lo(addr2), r1, r1
+        .set addr3, 0xffff8000
+        movhi hi(addr3), r0, r1
+        movea lo(addr3), r1, r1
+=== hi() and lo() of symbols leave the fields to relocations
+        movhi hi(foo), r0, r1
+        movea lo(foo), r1, r1
+        movhi hi0(foo), r0, r1
+        movea foo, r0, r1
+        ld.b lo(foo)[r1], r2
+        ld.w lo(foo)[r1], r2
+        st.h r3, lo(foo)[r1]
+        jarl foo, lp
+=== label differences resolve
+start:  movea end - start, r0, r1
+        addi end - start, r1, r1
+        ld.w (end - start)[r1], r2
+        nop
+end:
+=== data widths
+        .byte 1, 2
+        .short 0x1234
+        .word 0x12345678
+        .long 0x9abcdef0
+=== comments and statement separators
+        mov r1, r2    # a comment
+        mov r3, r4; mov r5, r6
+# a whole-line comment
+        nop
+=== alignment pads with nop
+# GNU as also pads the end of a section to its alignment, which rsasm does
+# not, so the code after the directive fills the last 8 bytes itself.
+        mov r1, r2
+        halt
+        .p2align 3
+        nop
+        movea 1, r0, r1
+        nop
+=== an interrupt handler
+handler:
+        st.w r1, -4[sp]
+        add -4, sp
+        ldsr r1, eipc
+        shl 2, r1
+        ld.w 0[sp], r1
+        add 4, sp
+        reti
+=== a copy loop
+        movhi hi(0x12340000), r0, r6
+        movea lo(0x12340000), r6, r6
+        movea 16, r0, r7
+1:      sld.b 0[ep], r8
+        st.b r8, 0[r6]
+        add 1, r6
+        add -1, r7
+        bnz 1b
+        jmp [lp]
+=== .v850e3v5 and .v850 switch the instruction set
+        mov r1, r2
+        .v850e3v5
+        callt 3
+        mov 16, r1
+        .v850
+        mov 5, r1

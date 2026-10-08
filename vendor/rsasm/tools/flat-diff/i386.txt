@@ -1,0 +1,36 @@
+Lines before the first snippet are not assembled.
+
+=== absolute references into another section
+        .text
+        movl    $msg, %eax
+        movl    msg, %ecx
+        leal    msg + 4, %edx
+        ret
+        .data
+        .space  0x100
+msg:    .long   1
+
+=== calls into another section
+        .text
+entry:
+        call    helper
+        call    helper@PLT
+        .section .text.helper, "ax"
+helper:
+        ret
+
+=== data across sections
+        .text
+entry:
+        ret
+        .data
+        .long   entry
+        .long   entry - .
+        .long   entry@PLT
+
+=== the location counter in each item of a data list
+        .text
+entry:
+        ret
+        .long   ., ., . - entry
+        .byte   . - entry, . - entry

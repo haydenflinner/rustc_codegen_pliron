@@ -1,0 +1,25 @@
+=== registers by name
+	.text
+f:
+	.cfi_startproc
+	push {r4, r7, lr}
+	.cfi_def_cfa_offset 12
+	.cfi_offset lr, -4
+	.cfi_offset r7, -8
+	.cfi_offset r4, -12
+	add r7, sp, #4
+	.cfi_def_cfa r7, 8
+	.cfi_offset d8, -24
+	.cfi_offset fp, -28
+	pop {r4, r7, pc}
+	.cfi_endproc
+=== lines in Thumb code
+	.file 1 "a.c"
+	.text
+f:
+	.loc 1 3 0
+	push {r7, lr}
+	.loc 1 4 5 prologue_end
+	movs r0, #0
+	.loc 1 5 1
+	pop {r7, pc}

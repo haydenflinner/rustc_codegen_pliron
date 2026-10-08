@@ -1,0 +1,96 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 4`, which is llvm-mc's default alignment for
+PowerPC code and data and not rsasm's; see mips.txt.
+
+=== ha and l of a label in another section
+	.text
+	.p2align 4
+	lis 3, msg@ha
+	addi 3, 3, msg@l
+	lwz 4, msg@l(3)
+	ld 5, msg+8@l(3)
+	std 5, msg+8@l(3)
+	blr
+	.data
+	.p2align 4
+	.space 0x8010
+msg:	.quad 1, 2
+
+=== h and ha differ where bit 15 is set @ 0x10007ff0
+	.text
+	.p2align 4
+here:
+	lis 3, there@h
+	ori 3, 3, there@l
+	lis 4, there@ha
+	addi 4, 4, there@l
+	blr
+there:
+	blr
+
+=== ha and l with an addend
+	.text
+	.p2align 4
+	lis 3, table+0x10000@ha
+	addi 3, 3, table+0x10000@l
+	lis 4, table-8@ha
+	addi 4, 4, table-8@l
+	blr
+	.data
+	.p2align 4
+table:	.quad 0
+
+=== branches into another section
+	.text
+	.p2align 4
+entry:
+	bl helper
+	b helper
+	beq helper
+	.section .text.helper, "ax"
+	.p2align 4
+helper:
+	b entry
+	bdnz entry
+
+=== data across sections
+	.text
+	.p2align 4
+entry:
+	blr
+	.data
+	.p2align 4
+	.quad entry
+	.long entry - .
+	.quad entry - .
+
+=== prefixed PC-relative references to another section
+	.text
+	.p2align 4
+	paddi 3, 0, msg@pcrel, 1
+	pld 4, msg@pcrel+8(0), 1
+	pstd 5, msg@pcrel(0), 1
+	plxv 33, msg@pcrel+16(0), 1
+	blr
+	.data
+	.p2align 4
+	.space 0x8010
+msg:	.quad 1, 2, 3, 4
+
+=== a prefixed PC-relative reference within its own section
+	.text
+	.p2align 4
+	paddi 3, 0, there@pcrel, 1
+	plwz 4, back@pcrel(0), 1
+	nop
+there:
+	blr
+back:	.long 7
+
+=== a prefixed instruction padded off a 64-byte boundary
+	.text
+	.p2align 6
+	.fill 15, 4, 0x60000000
+here:	paddi 3, 0, here@pcrel, 1
+	b here

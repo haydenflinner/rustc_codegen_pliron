@@ -1,0 +1,28 @@
+=== jal to a label compresses to c.jal on RV32
+        jal     target
+        nop
+target:
+        ret
+
+=== a jal too far for c.jal
+        jal     target
+        .space  3000
+target:
+        ret
+
+=== branch relaxation
+        beqz    a0, out
+        .space  400
+out:
+        ret
+
+=== call and la
+        call    target
+        la      a0, target
+target:
+        ret
+
+=== norvc
+        .option norvc
+        mv      a0, a1
+        ret

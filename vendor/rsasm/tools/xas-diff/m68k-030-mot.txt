@@ -1,0 +1,12 @@
+# Every form of GNU's m68k opcode table that the 68030 has and no CPU
+# before it in tools/fuzz/m68k.py's CORPUS_ORDER does, one line each, with
+# operands that form takes and no earlier form of the mnemonic does.
+# Motorola syntax, checked against GNU as --mri.
+#
+#   tools/fuzz/m68k.py corpus --first --cpu 68030 --syntax mot
+
+	pmove	(a1),tt1
+	pmove	tt0,ext+4
+	pmovefd	($3e8,d3.w*4),tc
+	pmovefd	$3a90,crp
+	pmovefd	a5,tt0

@@ -1,0 +1,290 @@
+=== comments: `;` anywhere, `#` at the start of a line
+# a comment line
+	.CSEG	TEXT
+START:	MOV	A, #1		; trailing comment
+	# indented comment
+	NOP
+--- gnu
+	.text
+START:	mov	a, #1
+	nop
+=== numbers: prefix, suffix and leading-zero octal
+	.DB	0x1F, 0X1F, 1FH, 0FFh, 0b101, 101B, 074, 74O, 128, 0
+--- gnu
+	.byte	0x1f, 0x1f, 0x1f, 0xff, 5, 5, 60, 60, 128, 0
+=== character constants and strings with escapes
+	.DB	'A', ' ', '\n', '\'', "AB", "\x41\101\\", "q""q"
+--- gnu
+	.byte	0x41, 0x20, 10, 0x27, 0x41, 0x42, 0x41, 0x41, 0x5c, 0x71, 0x22, 0x71
+=== operator precedence: shifts bind like `*`, `+` binds tighter than `&`
+	.DB	1 + 2 << 1, 2 & 1 + 1, 6 | 1 ^ 3, 2 * 0x0F - 0x0B & 0x0A | 0x0F, 5+8-6*2/4
+--- gnu
+	.byte	5, 2, 4, 15, 10
+=== relational and logical operators yield 0 or 1
+	.DB	1 == 1, 1 != 1, 2 > 1, 2 >= 3, 1 < 2, 3 <= 2, 1 && 0, 1 || 0, 256 % 50
+--- gnu
+	.byte	1, 0, 1, 0, 1, 0, 0, 1, 6
+=== `>>` shifts the 32-bit value, and past 31 gives 0
+	.DB4	0xFFFFFFFF >> 4, 1 >> 32
+	.DB	0x01AF >> 5
+--- gnu
+	.long	0x0fffffff, 0
+	.byte	0x0d
+=== byte and word separators, with and without parentheses
+	.DB	HIGH(0x1234), LOW(0x1234), HIGH 0x0FFFF, LOW(~3)
+	.DB2	HIGHW(0x12345678), LOWW(0x12345678), LOWW 0x12345678 + 1
+--- gnu
+	.byte	0x12, 0x34, 0xff, 0xfc
+	.short	0x1234, 0x5678, 0x5679
+=== separators in instruction operands
+	MOVW	AX, #HIGHW(0x12345678)
+	MOVW	BC, #LOWW(0x12345678)
+	MOV	A, #LOW(0x1234)
+	MOV	A, #HIGH(0x1234)
+--- gnu
+	movw	ax, #0x1234
+	movw	bc, #0x5678
+	mov	a, #0x34
+	mov	a, #0x12
+=== .EQU and .SET
+SYM1	.EQU	0x10
+CNT	.SET	1
+	MOV	A, #SYM1
+	MOV	A, #CNT
+CNT	.SET	CNT + 1
+	MOV	A, #CNT
+--- gnu
+	mov	a, #0x10
+	mov	a, #1
+	mov	a, #2
+=== data directives of every width
+LABEL:	.DB	10, "ABC"
+	.DB2	0x1234
+	.DB4	0x12345678
+	.DB8	0x1234567890ABCDEF
+--- gnu
+LABEL:	.byte	10, 0x41, 0x42, 0x43
+	.short	0x1234
+	.long	0x12345678
+	.long	0x90abcdef, 0x12345678
+=== .DS reserves zeroed bytes
+	.DB	1
+	.DS	3
+	.DB	2
+--- gnu
+	.byte	1
+	.space	3
+	.byte	2
+=== .ALIGN pads with zeros
+	.DB	1
+	.ALIGN	4
+	.DB	2
+	.ALIGN	2
+	.DB	3
+--- gnu
+	.byte	1
+	.balign	4, 0
+	.byte	2
+	.balign	2, 0
+	.byte	3
+=== .OFFSET moves to an offset from the section start
+	.DB	1
+	.OFFSET	4
+	.DB	2
+--- gnu
+	.byte	1
+	.org	4
+	.byte	2
+=== $IF, $ELSEIF, $ELSE and $ENDIF
+SW	.SET	2
+$IF SW == 1
+	.DB	1
+$ELSEIF SW == 2
+	.DB	2
+$ELSE
+	.DB	3
+$ENDIF
+ $ IFN SW
+	.DB	4
+ $ ELSEIFN SW - 2
+	.DB	5
+ $ ENDIF
+--- gnu
+	.byte	2
+	.byte	5
+=== $IFDEF and $IFNDEF, nested inside a false branch
+DEFINED	.EQU	1
+$IFDEF DEFINED
+	.DB	1
+$ENDIF
+$IFNDEF DEFINED
+	.DB	2
+$IF 1
+	.DB	3
+$ENDIF
+$ELSE
+	.DB	4
+$ENDIF
+--- gnu
+	.byte	1
+	.byte	4
+=== .MACRO with parameters, and `?` concatenation
+LAB5	.EQU	0x55
+ADMAC	.MACRO	PARA1, PARA2
+	MOV	A, #PARA1
+	ADD	A, #PARA2
+	.DB	LAB?PARA1
+	.ENDM
+	ADMAC	5, 0x20
+--- gnu
+	mov	a, #5
+	add	a, #0x20
+	.byte	0x55
+=== a parameter is a whole word, and strings and comments are left alone
+X	.MACRO	A1
+	.DB	A1, "A1"	; A1
+	.DB	A12
+	.ENDM
+A12	.EQU	9
+	X	7
+--- gnu
+	.byte	7, 0x41, 0x31
+	.byte	9
+=== .LOCAL gives each expansion its own label
+M1	.MACRO	PAR
+	.LOCAL	AA, BB
+AA:	.DB	PAR
+	BR	$AA
+BB:	.DB	BB - AA
+	.ENDM
+	M1	1
+	M1	2
+--- gnu
+L1:	.byte	1
+	br	$L1
+L2:	.byte	L2 - L1
+L3:	.byte	2
+	br	$L3
+L4:	.byte	L4 - L3
+=== .REPT and .IRP end with .ENDM, and nest in a macro
+	.REPT	2 + 1
+	INC	B
+	.ENDM
+	.IRP	PAR 0x10, 0x20
+	ADD	A, #PAR
+	.ENDM
+TWICE	.MACRO	V
+	.REPT	2
+	.DB	V
+	.ENDM
+	.ENDM
+	TWICE	7
+--- gnu
+	inc	b
+	inc	b
+	inc	b
+	add	a, #0x10
+	add	a, #0x20
+	.byte	7, 7
+=== .EXITM leaves the innermost repeat
+	.REPT	3
+	.REPT	2
+	INC	B
+	.EXITM
+	.ENDM
+	DEC	C
+	.ENDM
+--- gnu
+	inc	b
+	dec	c
+	inc	b
+	dec	c
+	inc	b
+	dec	c
+=== [DE] and [HL] stand for a zero displacement where the manual lists it
+	MOV	[DE], #1
+	MOV	[HL], #2
+	MOV	ES:[DE], #3
+	MOVS	[HL], X
+	CMPS	X, [HL]
+	ADDW	AX, [HL]
+	SUBW	AX, ES:[HL]
+	CMPW	AX, [HL]
+	INC	[HL]
+	DEC	ES:[HL]
+	INCW	[HL]
+	DECW	[HL]
+--- gnu
+	mov	[de+0], #1
+	mov	[hl+0], #2
+	mov	es:[de+0], #3
+	movs	[hl+0], x
+	cmps	x, [hl+0]
+	addw	ax, [hl+0]
+	subw	ax, es:[hl+0]
+	cmpw	ax, [hl+0]
+	inc	[hl+0]
+	dec	es:[hl+0]
+	incw	[hl+0]
+	decw	[hl+0]
+=== operand sigils: #, !, !!, $, $!, ES: and bit positions
+	.CSEG	TEXT
+TOP:	MOV	A, !0xFE00
+	MOV	ES:!0x1234, A
+	MOV	A, 0xFFE30
+	MOVW	AX, 0xFFF90
+	BR	!!0x12345
+	CALL	!0x1000
+	BR	$TOP
+	BR	$!TOP
+	SET1	0xFFE20.3
+	CLR1	A.5
+	MOV1	CY, [HL].2
+	BT	0xFFE21.0, $TOP
+	MOV	A, [HL+B]
+	MOV	A, 0x1234[B]
+	MOV	A, ES:0x1234[BC]
+--- gnu
+TOP:	mov	a, !0xfe00
+	mov	es:!0x1234, a
+	mov	a, 0xffe30
+	movw	ax, 0xfff90
+	br	!!0x12345
+	call	!0x1000
+	br	$TOP
+	br	$!TOP
+	set1	0xffe20.3
+	clr1	a.5
+	mov1	cy, [hl].2
+	bt	0xffe21.0, $TOP
+	mov	a, [hl+b]
+	mov	a, 0x1234[b]
+	mov	a, es:0x1234[bc]
+=== symbols may contain @ and $
+A@B	.EQU	3
+C$D	.EQU	4
+@E:	.DB	A@B, C$D
+--- gnu
+	.byte	3, 4
+=== the manual's own examples from the operator sections
+	MOV	A, #2 * 3
+	MOV	A, #250 / 50
+	MOV	A, #256 % 50
+	MOV	A, #LOW(~3)
+	MOV	A, #0x6FA & 0x0F
+	MOV	A, #0x0A | 0b1101
+	MOV	A, #0x9A ^ 0x9D
+	MOVW	AX, #0x01AF >> 5
+	MOV	A, #0x21 << 2
+	MOV	A, #(4 + 3) * 2
+--- gnu
+	mov	a, #6
+	mov	a, #5
+	mov	a, #6
+	mov	a, #0xfc
+	mov	a, #0x0a
+	mov	a, #0x0f
+	mov	a, #0x07
+	movw	ax, #0x0d
+	mov	a, #0x84
+	mov	a, #14

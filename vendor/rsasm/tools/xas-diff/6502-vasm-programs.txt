@@ -1,0 +1,72 @@
+=== labels without colons and a load address
+        org $c000
+reset   sei
+        cld
+        ldx #$ff
+        txs
+loop    lda msg,x
+        beq done
+        jsr putc
+        inx
+        bne loop
+done    jmp done
+putc    sta $d012
+        rts
+msg     byte "HI",0
+=== equates with equ and =
+screen  equ $0400
+colour  = $d800
+width   equ 40
+        org $1000
+        lda #width
+        sta screen
+        sta colour+width-1
+        ldx #<screen
+        ldy #>screen
+        rts
+=== data directives
+        org $2000
+start   db 1,2,3
+        byte $ff,%1010,'a'
+        dw start,$1234
+        word *
+        ds 3
+        blk 2,$55
+        rts
+=== zero page constants and absolute addresses
+ptr     equ $fb
+        org $0801
+        lda ptr
+        sta ptr+1
+        lda (ptr),y
+        ldx ptr,y
+        lda $0400,x
+        lda $d020
+        jmp ($fffc)
+        rts
+=== branches and the location counter
+        org $8000
+top     bne *+4
+        nop
+        nop
+        beq top
+        bcc fwd
+        nop
+fwd     rts
+        jmp *
+=== instructions in every addressing mode
+        org $0600
+        lda #$12
+        lda $12
+        lda $12,x
+        lda $1234
+        lda $1234,x
+        lda $1234,y
+        lda ($12,x)
+        lda ($12),y
+        ldx $12,y
+        stx $12,y
+        asl a
+        asl
+        jmp ($1234)
+        brk

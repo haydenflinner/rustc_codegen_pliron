@@ -1,0 +1,122 @@
+Lines before the first snippet are not assembled.
+
+Literal pools, `adr` and interworking, checked against GNU as, which is what
+the source that uses them was written for; see tools/xas-diff/README.md.
+Every snippet starts with `.syntax unified`. GNU as gives ARM code a section
+alignment of 4 and pads the end of a code section to a word, and so does
+rsasm, so sections need no `.p2align` of their own here.
+
+=== literals loaded from a pool at the end of the section
+        .syntax unified
+        .text
+entry:  ldr     r0, =0x12345678
+        ldr     r1, =msg
+        ldr     r2, =msg + 3
+        ldr     r3, =entry
+        ldr     r4, =0x100
+        bx      lr
+        .data
+msg:    .ascii  "hello"
+
+=== a pool placed by ltorg, and a second one after it
+        .syntax unified
+entry:  ldr     r0, =table
+        b       over
+        .ltorg
+over:   ldr     r1, =table + 4
+        ldr     r2, =0xdeadbeef
+        bx      lr
+        .section .rodata
+        .byte   1
+table:  .word   1, 2, 3
+
+=== adr and adrl within a section @ 0x10000
+        .syntax unified
+back:   adr     r0, back
+        adr     r1, fwd
+        adrl    r2, far
+        adrl    r3, back
+fwd:    nop
+        .space  0x2000
+far:    bx      lr
+
+=== pools in two code sections
+        .syntax unified
+        .text
+start:  ldr     r0, =other
+        bx      lr
+        .section .text.other, "ax"
+other:  ldr     r0, =0x11223344
+        ldr     r1, =start
+        bx      lr
+
+=== calls between ARM and Thumb functions in two sections
+        .syntax unified
+        .text
+        .global start
+        .type   start, %function
+start:  bl      tfunc
+        blx     tfunc
+        bl      afunc
+        blx     afunc
+        bl      local
+        bx      lr
+        .type   local, %function
+local:  bx      lr
+        .section .text.thumb, "ax"
+        .thumb
+        .thumb_func
+tfunc:  bl      afunc
+        blx     afunc
+        bl      tfunc2
+        blx     tfunc2
+        bl      start
+        bx      lr
+        .thumb_func
+tfunc2: bx      lr
+        .section .text.arm, "ax"
+        .arm
+        .type   afunc, %function
+afunc:  bx      lr
+
+=== addresses of Thumb functions in data and literal pools
+        .syntax unified
+        .text
+        ldr     r0, =tfunc
+        ldr     r1, =afunc
+        bx      lr
+        .type   afunc, %function
+afunc:  bx      lr
+        .thumb
+        .thumb_func
+tfunc:  bx      lr
+        .data
+        .word   tfunc, afunc, tfunc + 4
+
+=== global Thumb functions called from the same section
+        .syntax unified
+        .global g
+        .thumb
+        .thumb_func
+g:      bx      lr
+        .arm
+        bl      g
+        blx     g
+        .thumb
+        blx     g
+        bl      g
+        bx      lr
+
+=== a code section ending in Thumb is padded with Thumb no-ops
+        .syntax unified
+        .text
+        .type   fa, %function
+fa:     bx      lr
+        .thumb
+        .thumb_func
+fb:     bx      lr
+        .section .text.b, "ax"
+        .arm
+        .type   fc, %function
+fc:     bl      fb
+        bx      lr

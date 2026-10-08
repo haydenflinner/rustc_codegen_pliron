@@ -1,0 +1,46 @@
+Lines before the first snippet are not assembled.
+
+GNU as creates `.data` before any section the source names, and rsasm creates
+it when it is first used. A snippet with both says `.data` first, so the
+sections come out in the same order.
+
+Not here: a label as a short direct address (`mov a, label`). The reference
+pair disagrees with itself there: GNU as encodes `mov a, 0xffe20` as `8d 20`,
+the low byte of the address, which is what the RL78 decodes back to 0xFFE20,
+while GNU ld resolves `R_RL78_RH_SADDR` as the address minus 0xFFE20 and
+writes `8d 00` for a label there (bfd/elf32-rl78.c), which the CPU reads as
+0xFFF00. rsasm writes the low byte in both cases; see tests/rl78.rs.
+
+=== absolute references into another section
+        .data
+        .text
+        movw    ax, #msg
+        movw    ax, !msg
+        call    !!helper
+        call    !helper
+        ret
+        .data
+        .space  0x100
+msg:    .word   1
+        .section .text.helper, "ax"
+helper:
+        ret
+
+=== relative calls and branches into another section
+        .text
+entry:
+        call    $!helper
+        br      $!helper
+        .section .text.helper, "ax"
+helper:
+        br      $!entry
+        ret
+
+=== data across sections
+        .text
+entry:
+        ret
+        .data
+        .long   entry
+        .long   entry - .
+        .word   entry
