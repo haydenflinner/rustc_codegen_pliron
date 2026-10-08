@@ -218,6 +218,7 @@ pub fn lower_to_object(
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
         }
+        CUR_FN.with(|c| c.borrow_mut().clone_from(n));
         let Sym::F(id, _) = ids[n] else {
             unreachable!()
         };
@@ -414,6 +415,11 @@ pub(crate) fn write_const(
     }
 }
 
+thread_local! {
+    /// Symbol being lowered, for panic messages.
+    static CUR_FN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 struct FnLower<'a, 'b, 'tcx> {
     ctx: &'a Context,
     st: &'a State<'tcx>,
@@ -498,8 +504,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }
-        for pb in rpo(ctx, self.st, &pblocks) {
+        let (order, live) = rpo_split(ctx, self.st, &pblocks);
+        for (k, pb) in order.into_iter().enumerate() {
             self.b.switch_to_block(self.blocks[&pb]);
+            // Unreachable blocks may use values from each other in any order
+            // (e.g. after inlining into dead code); they never run.
+            if k >= live {
+                self.b.ins().trap(TrapCode::unwrap_user(1));
+                continue;
+            }
             if pb == pblocks[0] {
                 let z = self.b.ins().iconst(pt, 0);
                 self.b.def_var(exn, z);
@@ -566,7 +579,8 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 }
                 None => "a block argument".to_string(),
             };
-            panic!("value used before its definition was lowered: {why}");
+            let f = CUR_FN.with(|c| c.borrow().clone());
+            panic!("value used before its definition was lowered in {f}: {why}");
         };
         let r = self.mat(v.get_type(self.ctx), cv);
         self.cconst.insert(v, r.clone());
@@ -1421,13 +1435,21 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         {
             return x;
         }
-        let zero = dfg.value_def(args[1]).inst().is_some_and(|z| match dfg.insts[z] {
-            ir::InstructionData::UnaryConst {
-                opcode: ir::Opcode::Vconst,
-                constant_handle,
-            } => dfg.constants.get(constant_handle).as_slice().iter().all(|&b| b == 0),
-            _ => false,
-        });
+        let zero = dfg
+            .value_def(args[1])
+            .inst()
+            .is_some_and(|z| match dfg.insts[z] {
+                ir::InstructionData::UnaryConst {
+                    opcode: ir::Opcode::Vconst,
+                    constant_handle,
+                } => dfg
+                    .constants
+                    .get(constant_handle)
+                    .as_slice()
+                    .iter()
+                    .all(|&b| b == 0),
+                _ => false,
+            });
         if zero { args[0] } else { x }
     }
 
@@ -2007,6 +2029,16 @@ pub(crate) fn rpo(
     st: &State<'_>,
     blocks: &[Ptr<BasicBlock>],
 ) -> Vec<Ptr<BasicBlock>> {
+    rpo_split(ctx, st, blocks).0
+}
+
+/// Reverse post-order of the reachable blocks, then the unreachable ones;
+/// also returns how many are reachable.
+fn rpo_split(
+    ctx: &Context,
+    st: &State<'_>,
+    blocks: &[Ptr<BasicBlock>],
+) -> (Vec<Ptr<BasicBlock>>, usize) {
     // Invoke landing pads count as successors so values defined before an
     // invoke are lowered before the landing-pad code that uses them.
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
@@ -2036,8 +2068,9 @@ pub(crate) fn rpo(
         }
     }
     post.reverse();
+    let n = post.len();
     post.extend(blocks.iter().copied().filter(|b| !seen.contains(b)));
-    post
+    (post, n)
 }
 
 /// Constant-size mem{cpy,move,set} up to this many bytes are expanded inline

@@ -6,11 +6,11 @@
 //! trapping (volatile) stores kill everything; only `notrap` loads/stores
 //! (all non-volatile accesses at -O) are forwarded.
 
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value,
 };
-use cranelift_codegen::entity::packed_option::ReservedValue;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_ENTRIES: usize = 64;

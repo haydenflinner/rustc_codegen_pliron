@@ -148,6 +148,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.mk(|c| T::new(c, a, b))
     }
 
+    /// Integer op that carries (empty) overflow flags, as the printer requires.
+    fn binf<T: pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag>(
+        &mut self,
+        a: Value,
+        b: Value,
+    ) -> Value {
+        let flags = pliron_llvm::attributes::IntegerOverflowFlagsAttr {
+            nsw: false,
+            nuw: false,
+        };
+        self.mk(|c| T::new_with_overflow_flag(c, a, b, flags))
+    }
+
     fn cast<T: CastOpInterface>(&mut self, v: Value, ty: TypeHandle) -> Value {
         self.mk(|c| T::new(c, v, ty))
     }
@@ -365,7 +378,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn add(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<AddOp>(a, b)
+        self.binf::<AddOp>(a, b)
     }
     fn fadd(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FAddOp>(a, b)
@@ -377,7 +390,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FAddOp>(a, b)
     }
     fn sub(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<SubOp>(a, b)
+        self.binf::<SubOp>(a, b)
     }
     fn fsub(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FSubOp>(a, b)
@@ -389,7 +402,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FSubOp>(a, b)
     }
     fn mul(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<MulOp>(a, b)
+        self.binf::<MulOp>(a, b)
     }
     fn fmul(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FMulOp>(a, b)
@@ -437,7 +450,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FRemOp>(a, b)
     }
     fn shl(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<ShlOp>(a, b)
+        self.binf::<ShlOp>(a, b)
     }
     fn lshr(&mut self, a: Value, b: Value) -> Value {
         self.bin::<LShrOp>(a, b)

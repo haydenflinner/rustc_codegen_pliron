@@ -24,15 +24,16 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod builder;
+mod clifpeep;
 mod constload;
 mod consts;
 mod context;
+mod domcheck;
 mod eh;
 mod hot;
 mod inline;
 mod instcombine;
 mod intrinsic;
-mod clifpeep;
 mod jumpthread;
 mod loadfwd;
 mod lower;
@@ -44,9 +45,9 @@ mod simd;
 mod sroa;
 mod taildup;
 mod tailmerge;
-mod unreach;
 mod type_of;
 mod types;
+mod unreach;
 mod wasm;
 mod xcgu;
 
@@ -171,57 +172,73 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
-            || matches!(cx.tcx.sess.opts.optimize, OptLevel::Size | OptLevel::SizeMin);
+            || matches!(
+                cx.tcx.sess.opts.optimize,
+                OptLevel::Size | OptLevel::SizeMin
+            );
         inline::run(ctx, st, small, None);
+        domcheck::run(ctx, st, "inline");
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }
         if pass_enabled("PLIRON_SRET2REG") {
             abi::run(ctx, st);
+            domcheck::run(ctx, st, "abi");
         }
         if std::env::var("PLIRON_DEADARG").is_ok_and(|v| v == "1") {
             abi::dead_args(ctx, st);
         }
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
+            domcheck::run(ctx, st, "instcombine");
         }
         if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
             memcpyopt::run(ctx, st);
         }
         if pass_enabled("PLIRON_PHISIMP") {
             phisimp::run(ctx, st);
+            domcheck::run(ctx, st, "phisimp");
         }
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);
+            domcheck::run(ctx, st, "sroa");
         }
         if pass_enabled("PLIRON_CONSTLOAD") {
             constload::run(ctx, st);
+            domcheck::run(ctx, st, "constload");
             // Inlining + SROA make vtable pointers constant: call those slots
             // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
             if pass_enabled("PLIRON_DEVIRT") {
                 let sites = inline::devirt(ctx, st);
-                if !sites.is_empty() {
+                domcheck::run(ctx, st, "devirt");
+                if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
                     inline::run(ctx, st, small, Some(&sites));
-                    if pass_enabled("PLIRON_PHISIMP") {
+                    domcheck::run(ctx, st, "devirt-inline");
+                    if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
                         phisimp::run(ctx, st);
                     }
-                    if pass_enabled("PLIRON_SROA") {
+                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_DEVIRT_SROA") {
                         sroa::run(ctx, st);
                     }
-                    constload::run(ctx, st);
+                    if pass_enabled("PLIRON_DEVIRT_CL") {
+                        constload::run(ctx, st);
+                    }
                 }
             }
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
-    st.loadfwd = pass_enabled("PLIRON_LOADFWD");
-    st.peep = pass_enabled("PLIRON_PEEP");
-    st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
-    st.unreach = pass_enabled("PLIRON_UNREACH");
-    st.taildup = pass_enabled("PLIRON_TAILDUP");
+        st.loadfwd = pass_enabled("PLIRON_LOADFWD");
+        st.peep = pass_enabled("PLIRON_PEEP");
+        st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
+        st.unreach = pass_enabled("PLIRON_UNREACH");
+        st.taildup = pass_enabled("PLIRON_TAILDUP");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
+    }
+    if std::env::var_os("PLIRON_DUMP_OPT").is_some() {
+        eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
         let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);

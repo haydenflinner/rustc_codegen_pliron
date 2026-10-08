@@ -299,9 +299,11 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
                 let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(&p) else {
                     continue;
                 };
-                let (Some(fi), Some(info), Some(id)) =
-                    (st.funcs.get(sym), st.calls.get(&c), st.sym_to_ident.get(sym))
-                else {
+                let (Some(fi), Some(info), Some(id)) = (
+                    st.funcs.get(sym),
+                    st.calls.get(&c),
+                    st.sym_to_ident.get(sym),
+                ) else {
                     continue;
                 };
                 if info.fn_ty != fi.ty {
@@ -329,6 +331,14 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
                 }
                 Operation::erase(c, ctx);
                 out.insert(nc);
+                if std::env::var_os("PLIRON_STATS_DEVIRT").is_some() {
+                    let caller = st
+                        .funcs
+                        .iter()
+                        .find(|(_, x)| x.op == f)
+                        .map(|(n, _)| n.clone());
+                    eprintln!("devirt {caller:?} -> {sym}");
+                }
             }
         }
     }
@@ -428,11 +438,20 @@ fn inline_call(
             if st.inbounds.contains(&op) {
                 st.inbounds.insert(new);
             }
+            if st.bool01.contains(&op) {
+                st.bool01.insert(new);
+            }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
                 let (v, nv) = (op.deref(ctx).get_result(i), new.deref(ctx).get_result(i));
                 if let Some(a) = st.allocas.get(&v).copied() {
                     st.allocas.insert(nv, a);
+                }
+                if let Some(t) = st.promoted.get(&v).copied() {
+                    st.promoted.insert(nv, t);
+                }
+                if let Some(c) = st.consts.get(&v).cloned() {
+                    st.consts.insert(nv, c);
                 }
             }
             if let Some(r) = Operation::get_op::<ReturnOp>(new, ctx) {
