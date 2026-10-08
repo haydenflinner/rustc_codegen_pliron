@@ -144,6 +144,8 @@ impl<'tcx> CodegenCx<'tcx> {
             "llvm.x86.sse2.lfence" if x86 => "    lfence\n    ret\n",
             "llvm.x86.sse2.mfence" if x86 => "    mfence\n    ret\n",
             "llvm.x86.sse.sfence" if x86 => "    sfence\n    ret\n",
+            // A prefetch is only a hint, so doing nothing is a valid lowering.
+            n if n.starts_with("llvm.prefetch") => "    ret\n",
             _ if x86 => "    ud2\n",
             _ => "    brk #0x1\n",
         };

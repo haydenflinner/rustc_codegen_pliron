@@ -20,6 +20,25 @@ fn main() {
     println!("{x} {y} {} {z}", std::str::from_utf8(&dst).unwrap());
     clmul();
     fcmp();
+    minmax_prefetch();
+}
+
+fn minmax_prefetch() {
+    use std::arch::x86_64::*;
+    let v = [3.0f32, -1.0, 7.5, 0.25];
+    unsafe {
+        _mm_prefetch::<_MM_HINT_T0>(v.as_ptr().cast());
+        _mm_prefetch::<_MM_HINT_NTA>(v.as_ptr().cast());
+        let (a, b) = (_mm_loadu_ps(v.as_ptr()), _mm_set_ps(1.0, 1.0, 1.0, 1.0));
+        let (mut lo, mut hi) = ([0f32; 4], [0f32; 4]);
+        _mm_storeu_ps(lo.as_mut_ptr(), _mm_min_ps(a, b));
+        _mm_storeu_ps(hi.as_mut_ptr(), _mm_max_ps(a, b));
+        assert_eq!((lo, hi), ([1.0, -1.0, 1.0, 0.25], [3.0, 1.0, 7.5, 1.0]));
+        let mut d = [0f64; 2];
+        _mm_storeu_pd(d.as_mut_ptr(), _mm_min_pd(_mm_set_pd(2.0, -4.0), _mm_set1_pd(0.5)));
+        assert_eq!(d, [-4.0, 0.5]);
+    }
+    println!("min/prefetch ok");
 }
 
 // At -O0 the predicate immediate reaches the backend as a runtime value.

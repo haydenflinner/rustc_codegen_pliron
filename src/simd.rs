@@ -532,6 +532,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
+            "llvm.x86.sse.min.ps"
+            | "llvm.x86.sse2.min.pd"
+            | "llvm.x86.avx.min.ps.256"
+            | "llvm.x86.avx.min.pd.256"
+            | "llvm.x86.avx512.min.ps.512"
+            | "llvm.x86.avx512.min.pd.512" => {
+                // minps returns the second operand unless a < b (NaNs, +-0).
+                let (n, _) = self.elem_of(ret_rty);
+                let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
+                let mut out = Vec::new();
+                for (x, y) in xs.into_iter().zip(ys) {
+                    let c = self.fcmp(RealOLT, x, y);
+                    out.push(self.select(c, x, y));
+                }
+                Some(self.build_vec(ret, out))
+            }
             "llvm.x86.avx512.mask.cmp.ps.512" | "llvm.x86.avx512.mask.cmp.pd.512" => {
                 // (a, b, imm, k, sae) -> integer bitmask of the predicate, ANDed with k.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
