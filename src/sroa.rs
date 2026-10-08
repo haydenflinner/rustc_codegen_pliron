@@ -528,6 +528,10 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 break;
             }
         }
+        // And after splitting: a slice left holding one stored value.
+        if crate::pass_enabled("PLIRON_SROA_FWD") {
+            forward_single_store(ctx, st, f);
+        }
         for op in allocas(ctx, f) {
             let a = op.deref(ctx).get_result(0);
             if !a.is_used(ctx) {
@@ -769,7 +773,8 @@ fn forward_single_store(ctx: &mut Context, st: &State<'_>, f: Ptr<Operation>) ->
                         true
                     } else if Operation::is_op::<GetElementPtrOp>(o, ctx)
                         && u.find_index(ctx) == 0
-                        && gep_offset(ctx, st, o) == Some(0)
+                        && (gep_offset(ctx, st, o) == Some(0)
+                            || o.deref(ctx).get_result(0).uses(ctx).is_empty())
                     {
                         geps.push(o);
                         work.push(o.deref(ctx).get_result(0));
