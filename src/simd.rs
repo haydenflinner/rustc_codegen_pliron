@@ -31,11 +31,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         )
     }
 
-    /// Whether `ty` lowers to one native Cranelift SIMD value.
+    /// Whether `ty` lowers to native Cranelift SIMD values.
     pub(crate) fn native(&self, ty: TypeHandle) -> bool {
         match self.cx.kind(ty) {
             crate::types::TyK::Vector(e, n) => {
-                crate::types::native_vec(&self.cx.pctx.borrow(), e, n as u64).is_some()
+                crate::types::vec_parts(&self.cx.pctx.borrow(), e, n as u64).is_some()
             }
             _ => false,
         }

@@ -168,8 +168,8 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
             }
         }
         TyK::Vector(e, n) => {
-            if let Some(t) = native_vec(ctx, e, n as u64) {
-                return out.push((base, t));
+            if let Some((t, k)) = vec_parts(ctx, e, n as u64) {
+                return out.extend((0..k).map(|i| (base + i * 16, t)));
             }
             let (s, _) = size_align(ctx, e);
             for i in 0..n as u64 {
@@ -202,6 +202,17 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
         return None;
     }
     lane.by(n as u32)
+}
+
+/// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
+/// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
+pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    if let Some(t) = native_vec(ctx, e, n) {
+        return Some((t, 1));
+    }
+    (n % 2 == 0)
+        .then(|| native_vec(ctx, e, n / 2))?
+        .map(|t| (t, 2))
 }
 
 /// Element types of an aggregate (struct fields, or `n` copies of the element).
