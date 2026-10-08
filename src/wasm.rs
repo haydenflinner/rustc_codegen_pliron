@@ -1980,6 +1980,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 let w = w(self, 0);
                 smallvec![self.bswap(a0, w)]
             }
+            "llvm.bitreverse" if w(self, 0) == 128 => {
+                let lo = self.bitrev(a[0][1], 64);
+                let hi = self.bitrev(a[0][0], 64);
+                smallvec![lo, hi]
+            }
             "llvm.bitreverse" => {
                 let w = w(self, 0);
                 smallvec![self.bitrev(a0, w)]
