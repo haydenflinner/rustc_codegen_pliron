@@ -15,6 +15,7 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | naga 30 | native, `RUST_MIN_STACK=16777216` | 386 pass, 6 fail (need spirv-as/val/cross; same under LLVM) |
 | naga `recursion_depth_template` | native, debug | stack overflow at 2 MB; passes with `RUST_MIN_STACK=16777216` (frames larger than LLVM's) |
 | wgpu-core 30 | native | 64/64 |
+| rapier2d + rapier3d (Wild) | `ct-oot.sh test -p rapier3d -p rapier2d --no-fail-fast` | 659 pass, 0 fail; before c832d82, 72 test binaries died with SIGILL in the `ud2` stubs for `llvm.prefetch` and `llvm.x86.sse.min.ps` (now a no-op and a real lowering, checked in `tests/asm`) |
 | wgpu-examples 30 | wasm32-unknown-unknown, `webgpu`, wasm-bindgen 0.2.129, headless Chrome + SwiftShader | page boots, all 30 examples listed; `hello_synchronization` GPU readback identical to LLVM build |
 | serde_json, regex, hashbrown, itertools, rand, memchr (git HEAD) | native, `cargo test` | 236 / 319 / 389 / 655 / 164 / 166 pass, 0 fail |
 | memchr, rand, serde_json, regex (wasm32-wasip1, node 22) | `ct-wasi.sh test` (in-process panic=abort tests; doctests via `RUSTDOCFLAGS`) | memchr 107/107, rand 159/159, serde_json 160/160 (its TCP test aborts: no sockets on WASI), regex integration 62/62 (2 tests that build huge regexes segfault node on exit, same with stock LLVM) |
