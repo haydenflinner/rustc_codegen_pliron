@@ -210,6 +210,7 @@ pub fn lower_to_object(
     let mut clctx = m.make_context();
     let mut threaded = 0usize;
     let mut dead_params = 0usize;
+    let mut dominated_folds = 0usize;
     let mut merged = 0usize;
     let mut unreached = 0usize;
     let mut dupd = 0usize;
@@ -263,9 +264,10 @@ pub fn lower_to_object(
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         if st.jumpthread {
-            let (n, dead) = crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
+            let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
             threaded += n;
             dead_params += dead;
+            dominated_folds += folds;
             if dump {
                 eprintln!(
                     "==== clif {n} after jumpthread ====\n{}",
@@ -322,9 +324,14 @@ pub fn lower_to_object(
             let f = if k > 0
                 && crate::pass_enabled("PLIRON_DOMCOND")
                 && crate::pass_enabled("PLIRON_SWITCHMAP_FOLD")
-                && crate::jumpthread::fold_dominated_conds(&mut clctx.func) > 0
             {
-                crate::jumpthread::fold_const_branches(&mut clctx.func)
+                let folds = crate::jumpthread::fold_dominated_conds(&mut clctx.func);
+                dominated_folds += folds;
+                if folds > 0 {
+                    crate::jumpthread::fold_const_branches(&mut clctx.func)
+                } else {
+                    0
+                }
             } else {
                 0
             };
@@ -381,7 +388,7 @@ pub fn lower_to_object(
     }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
         eprintln!(
-            "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
+            "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
         );
     }
     for (n, g) in &st.globals {

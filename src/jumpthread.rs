@@ -461,6 +461,7 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
     };
     let entry = func.layout.entry_block();
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
+    let range2 = crate::pass_enabled("PLIRON_RANGE2");
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -554,7 +555,7 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 if !fs.is_empty() {
                     for (&p, &v) in &argv {
                         if !env.contains_key(&p)
-                            && let Some(r) = urange(func, &fs, v, 0)
+                            && let Some(r) = urange(func, &fs, v, 0, range2)
                         {
                             prange.insert(p, r);
                         }
@@ -1053,7 +1054,25 @@ fn range_cmp(
 
 /// Unsigned range of `v` from its width, `uextend`/`band` with a constant,
 /// and the facts `fs` known where it is used.
-fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64)> {
+fn full_range(func: &Function, v: Value) -> Option<(u64, u64)> {
+    if func.dfg.value_type(v).is_vector() {
+        return None;
+    }
+    let w = bits(func, v)?;
+    Some((0, mask(u64::MAX, w)))
+}
+
+fn urange_or_full(
+    func: &Function,
+    fs: &[Cmp],
+    v: Value,
+    depth: u32,
+    range2: bool,
+) -> Option<(u64, u64)> {
+    urange(func, fs, v, depth, range2).or_else(|| range2.then(|| full_range(func, v)).flatten())
+}
+
+fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32, range2: bool) -> Option<(u64, u64)> {
     let v = func.dfg.resolve_aliases(v);
     let w = bits(func, v)?;
     if func.dfg.value_type(v).is_vector() {
@@ -1091,7 +1110,7 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                 opcode: Opcode::Uextend,
                 arg,
             } => {
-                if let Some((l, h)) = urange(func, fs, arg, depth + 1) {
+                if let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2) {
                     lo = lo.max(l);
                     hi = hi.min(h);
                 }
@@ -1100,8 +1119,17 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                 opcode: opcode @ (Opcode::Iadd | Opcode::Isub),
                 args,
             } => {
+                if range2
+                    && opcode == Opcode::Isub
+                    && let Some(k) = known(func, &env, args[0])
+                    && let Some((l, h)) = urange_or_full(func, fs, args[1], depth + 1, range2)
+                    && h <= k
+                {
+                    lo = lo.max(k - h);
+                    hi = hi.min(k - l);
+                }
                 if let Some(k) = known(func, &env, args[1])
-                    && let Some((l, h)) = urange(func, fs, args[0], depth + 1)
+                    && let Some((l, h)) = urange_or_full(func, fs, args[0], depth + 1, range2)
                 {
                     let (l2, h2) = if opcode == Opcode::Isub {
                         (l.wrapping_sub(k), h.wrapping_sub(k))
@@ -1121,10 +1149,60 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                 }
             }
             InstructionData::Unary {
+                opcode: opcode @ (Opcode::Clz | Opcode::Ctz | Opcode::Popcnt),
+                arg,
+            } if range2 => {
+                if let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2) {
+                    let w = bits(func, arg)?;
+                    let r = match opcode {
+                        Opcode::Clz => {
+                            let clzw = |x: u64| {
+                                if x == 0 {
+                                    w
+                                } else {
+                                    x.leading_zeros() - (64 - w)
+                                }
+                            };
+                            (u64::from(clzw(h)), u64::from(clzw(l)))
+                        }
+                        Opcode::Ctz => (0, u64::from(if l > 0 { w - 1 } else { w })),
+                        Opcode::Popcnt => (u64::from(l > 0), u64::from(w)),
+                        _ => unreachable!(),
+                    };
+                    lo = lo.max(r.0);
+                    hi = hi.min(r.1);
+                }
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Ushr,
+                args,
+            } if range2 => {
+                if let Some(s) = known(func, &env, args[1])
+                    && s < u64::from(w)
+                    && let Some((l, h)) = urange_or_full(func, fs, args[0], depth + 1, range2)
+                {
+                    lo = lo.max(l >> s);
+                    hi = hi.min(h >> s);
+                }
+            }
+            InstructionData::BinaryImm8 {
+                opcode: Opcode::Ushr,
+                arg,
+                imm,
+            } if range2 => {
+                let s = u64::from(imm);
+                if s < u64::from(w)
+                    && let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2)
+                {
+                    lo = lo.max(l >> s);
+                    hi = hi.min(h >> s);
+                }
+            }
+            InstructionData::Unary {
                 opcode: Opcode::Ireduce,
                 arg,
             } => {
-                if let Some((l, h)) = urange(func, fs, arg, depth + 1)
+                if let Some((l, h)) = urange(func, fs, arg, depth + 1, range2)
                     && h <= full
                 {
                     lo = lo.max(l);
@@ -1249,11 +1327,12 @@ fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> 
 /// dominates; equal operands or a constant against a known range decide it.
 /// Returns the icmps folded.
 pub fn fold_dominated_conds(func: &mut Function) -> usize {
+    let range2 = crate::pass_enabled("PLIRON_RANGE2");
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let fact = edge_facts(func, &cfg);
     let tfact = table_facts(func, &cfg);
-    if fact.is_empty() && tfact.is_empty() {
+    if !range2 && fact.is_empty() && tfact.is_empty() {
         return 0;
     }
     let mut folds = Vec::new();
@@ -1268,7 +1347,7 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
             }
             cur = domtree.idom(c);
         }
-        if fs.is_empty() && env.is_empty() {
+        if !range2 && fs.is_empty() && env.is_empty() {
             continue;
         }
         // `x == y` facts let a query on `y` be decided through `x`.
@@ -1301,8 +1380,8 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
                 q.0,
                 ka,
                 kb,
-                urange(func, &fs, q.1, 0),
-                urange(func, &fs, q.2, 0),
+                urange(func, &fs, q.1, 0, range2),
+                urange(func, &fs, q.2, 0, range2),
                 w,
             )
         };
@@ -1603,13 +1682,14 @@ pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
     derived: &FxHashMap<Value, Value>,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
     let deadp = crate::pass_enabled("PLIRON_DEADPARAM");
     let mut total = 0;
     let mut dead_params = 0;
+    let mut dominated_folds = 0;
     for _ in 0..8 {
         if trivp {
             remove_trivial_params(func);
@@ -1627,6 +1707,7 @@ pub fn run(
         } else {
             0
         };
+        dominated_folds += dc;
         let n = dc + bypass_forwarders(func) + round(func, &nn, domcond);
         total += n;
         if n == 0 {
@@ -1634,7 +1715,11 @@ pub fn run(
         }
     }
     let nn = NonNull::new(func, loads, derived);
-    (total + fold_null_tests(func, &nn), dead_params)
+    (
+        total + fold_null_tests(func, &nn),
+        dead_params,
+        dominated_folds,
+    )
 }
 
 #[cfg(test)]
