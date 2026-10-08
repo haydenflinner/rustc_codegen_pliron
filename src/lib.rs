@@ -24,6 +24,7 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod builder;
+mod constload;
 mod consts;
 mod context;
 mod eh;
@@ -180,6 +181,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_CONSTLOAD") {
+            constload::run(ctx, st);
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         if pass_enabled("PLIRON_DEADFN") {
