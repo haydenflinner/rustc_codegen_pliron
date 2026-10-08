@@ -155,6 +155,91 @@ fn eval(
     Some(mask(r, w))
 }
 
+type KBits = FxHashMap<Value, (u64, u64)>;
+
+/// Known `(zero, one)` bit masks of `v` from constants, `env`, `kenv` and
+/// bitwise ops / constant shifts / extends on them.
+fn kbits(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    kenv: &KBits,
+    v: Value,
+    depth: u32,
+) -> (u64, u64) {
+    let v = func.dfg.resolve_aliases(v);
+    let Some(w) = bits(func, v) else {
+        return (0, 0);
+    };
+    let full = mask(u64::MAX, w);
+    if let Some(c) = known(func, env, v) {
+        return (!c & full, c);
+    }
+    if let Some(&k) = kenv.get(&v) {
+        return k;
+    }
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return (0, 0);
+    };
+    if depth >= 6 {
+        return (0, 0);
+    }
+    let sub = |x: Value| kbits(func, env, kenv, x, depth + 1);
+    let op = |opcode: Opcode, a: (u64, u64), b: (u64, u64)| -> (u64, u64) {
+        let s = (b.0 | b.1 == full)
+            .then_some(b.1)
+            .filter(|&s| s < u64::from(w));
+        match (opcode, s) {
+            (Opcode::Band, _) => (a.0 | b.0, a.1 & b.1),
+            (Opcode::Bor, _) => (a.0 & b.0, a.1 | b.1),
+            (Opcode::Bxor, _) => ((a.0 & b.0) | (a.1 & b.1), (a.0 & b.1) | (a.1 & b.0)),
+            (Opcode::Ishl, Some(s)) => ((a.0 << s) | ((1u64 << s) - 1), a.1 << s),
+            (Opcode::Ushr, Some(s)) => ((a.0 >> s) | !(full >> s), a.1 >> s),
+            _ => (0, 0),
+        }
+    };
+    let r = match func.dfg.insts[i] {
+        InstructionData::Binary { opcode, args } => op(opcode, sub(args[0]), sub(args[1])),
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let a = sub(arg);
+            let aw = bits(func, arg).unwrap_or(w);
+            (a.0 | (full & !mask(u64::MAX, aw)), a.1)
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => sub(arg),
+        _ => (0, 0),
+    };
+    (r.0 & full, r.1 & full)
+}
+
+/// Constant result of body instruction `i` from known bits: fully known
+/// values, and `x ==/!= k` where a known bit of `x` differs from `k`.
+fn kfold(func: &Function, env: &FxHashMap<Value, u64>, kenv: &KBits, i: Inst) -> Option<u64> {
+    if kenv.is_empty() {
+        return None;
+    }
+    if let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] {
+        if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+            return None;
+        }
+        let (x, k) = match (known(func, env, args[0]), known(func, env, args[1])) {
+            (None, Some(k)) => (args[0], k),
+            (Some(k), None) => (args[1], k),
+            _ => return None,
+        };
+        let (z, o) = kbits(func, env, kenv, x, 0);
+        return ((o & !k) | (z & k) != 0).then_some(u64::from(cond == IntCC::NotEqual));
+    }
+    let r = func.dfg.first_result(i);
+    let full = mask(u64::MAX, bits(func, r)?);
+    let (z, o) = kbits(func, env, kenv, r, 0);
+    (z | o == full).then_some(o)
+}
+
 fn pure_op(func: &Function, inst: Inst) -> bool {
     use Opcode::*;
     matches!(
@@ -362,6 +447,7 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
         FxHashMap::default()
     };
     let entry = func.layout.entry_block();
+    let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -432,6 +518,19 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 if !ok {
                     continue;
                 }
+                // Known bits of non-constant incoming args (e.g. a packed `Option` tag).
+                let mut kenv: KBits = FxHashMap::default();
+                if kb_on {
+                    let none = FxHashMap::default();
+                    for (&p, &v) in &argv {
+                        if !env.contains_key(&p) {
+                            let k = kbits(func, &env, &none, v, 0);
+                            if k != (0, 0) {
+                                kenv.insert(p, k);
+                            }
+                        }
+                    }
+                }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
                     nn.is(func, v) || pn.contains(&v)
@@ -450,13 +549,16 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 }
                 let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
                 for &i in body {
-                    if let Some(c) = eval(func, &env, &nz, &rg, i) {
+                    if let Some(c) =
+                        eval(func, &env, &nz, &rg, i).or_else(|| kfold(func, &env, &kenv, i))
+                    {
                         env.insert(func.dfg.first_result(i), c);
                     }
                 }
                 let taken = match known(func, &env, cond) {
                     Some(c) => c != 0,
                     None if nz(cond) => true,
+                    None if !kenv.is_empty() && kbits(func, &env, &kenv, cond, 0).1 != 0 => true,
                     None => continue,
                 };
                 let ti = if taken { 0 } else { 1 };
@@ -979,6 +1081,30 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                 if let Some((l, h)) = urange(func, fs, arg, depth + 1) {
                     lo = lo.max(l);
                     hi = hi.min(h);
+                }
+            }
+            InstructionData::Binary {
+                opcode: opcode @ (Opcode::Iadd | Opcode::Isub),
+                args,
+            } => {
+                if let Some(k) = known(func, &env, args[1])
+                    && let Some((l, h)) = urange(func, fs, args[0], depth + 1)
+                {
+                    let (l2, h2) = if opcode == Opcode::Isub {
+                        (l.wrapping_sub(k), h.wrapping_sub(k))
+                    } else {
+                        (l.wrapping_add(k), h.wrapping_add(k))
+                    };
+                    // Only when the whole range moves without wrapping.
+                    let nowrap = if opcode == Opcode::Isub {
+                        l >= k
+                    } else {
+                        h <= full - k
+                    };
+                    if nowrap {
+                        lo = lo.max(l2);
+                        hi = hi.min(h2);
+                    }
                 }
             }
             InstructionData::Unary {
