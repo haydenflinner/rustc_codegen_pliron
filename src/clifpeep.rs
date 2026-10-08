@@ -58,6 +58,52 @@ fn bit_test(func: &Function, v: Value) -> Option<((i64, i64), Value)> {
     None
 }
 
+/// `amt` as i64 when it is `uextend x` or `uextend x & m` (`m` < 2^63).
+fn narrow(pos: &mut FuncCursor, amt: Value) -> Option<Value> {
+    let f = &*pos.func;
+    let (a, m) = match f.dfg.insts[f.dfg.value_def(amt).inst()?] {
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let (a, b) = (
+                f.dfg.resolve_aliases(args[0]),
+                f.dfg.resolve_aliases(args[1]),
+            );
+            match (const128(f, a), const128(f, b)) {
+                (_, Some((m, 0))) => (a, Some(m)),
+                (Some((m, 0)), _) => (b, Some(m)),
+                _ => return None,
+            }
+        }
+        _ => (amt, None),
+    };
+    let InstructionData::Unary {
+        opcode: Opcode::Uextend,
+        arg,
+    } = f.dfg.insts[f.dfg.value_def(a).inst()?]
+    else {
+        return None;
+    };
+    let x = f.dfg.resolve_aliases(arg);
+    let xt = f.dfg.value_type(x);
+    if xt.is_vector() || !xt.is_int() || xt.bits() > 64 {
+        return None;
+    }
+    let x64 = if xt == types::I64 {
+        x
+    } else {
+        pos.ins().uextend(types::I64, x)
+    };
+    Some(match m {
+        Some(m) => {
+            let c = pos.ins().iconst(types::I64, m);
+            pos.ins().band(x64, c)
+        }
+        None => x64,
+    })
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
@@ -90,7 +136,10 @@ pub fn run(func: &mut Function) -> usize {
             };
             // i128 `ishl` masks its amount to 0..128: bit 6 picks the half.
             let s = match pos.func.dfg.value_type(amt) {
-                types::I128 => pos.ins().isplit(amt).0,
+                types::I128 => match narrow(&mut pos, amt) {
+                    Some(s) => s,
+                    None => pos.ins().isplit(amt).0,
+                },
                 types::I64 => amt,
                 _ => continue,
             };

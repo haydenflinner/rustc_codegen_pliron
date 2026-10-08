@@ -13,7 +13,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
@@ -705,6 +705,178 @@ fn bypass_forwarders(func: &mut Function) -> usize {
     n
 }
 
+/// The icmp a branch condition tests, through `band 1` and extends of its 0/1 result.
+fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
+    let env = FxHashMap::default();
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..6 {
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                ..
+            } => return Some(i),
+            InstructionData::Unary {
+                opcode: Opcode::Uextend | Opcode::Ireduce,
+                arg,
+            } => v = func.dfg.resolve_aliases(arg),
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => {
+                let (a, b) = (
+                    func.dfg.resolve_aliases(args[0]),
+                    func.dfg.resolve_aliases(args[1]),
+                );
+                if known(func, &env, b) == Some(1) {
+                    v = a;
+                } else if known(func, &env, a) == Some(1) {
+                    v = b;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+type Cmp = (IntCC, Value, Value);
+
+/// A scalar icmp as `(cc, x, y)`; `(x - y) ==/!= 0` becomes `x ==/!= y`.
+fn norm_icmp(func: &Function, i: Inst) -> Option<Cmp> {
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (mut a, mut b) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    if func.dfg.value_type(a).is_vector() {
+        return None;
+    }
+    if matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+        let env = FxHashMap::default();
+        if known(func, &env, a) == Some(0) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if known(func, &env, b) == Some(0)
+            && let Some(d) = func.dfg.value_def(a).inst()
+            && let InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args: s,
+            } = func.dfg.insts[d]
+        {
+            return Some((
+                cond,
+                func.dfg.resolve_aliases(s[0]),
+                func.dfg.resolve_aliases(s[1]),
+            ));
+        }
+    }
+    Some((cond, a, b))
+}
+
+/// What a true fact `f` says about query `q`, if anything.
+fn implied(f: Cmp, q: Cmp) -> Option<bool> {
+    use IntCC::*;
+    let (fc, fx, fy) = f;
+    let qc = if (q.1, q.2) == (fx, fy) {
+        q.0
+    } else if (q.1, q.2) == (fy, fx) {
+        q.0.swap_args()
+    } else {
+        return None;
+    };
+    if qc == fc {
+        return Some(true);
+    }
+    if qc == fc.complement() {
+        return Some(false);
+    }
+    match fc {
+        Equal => Some(matches!(
+            qc,
+            UnsignedGreaterThanOrEqual
+                | UnsignedLessThanOrEqual
+                | SignedGreaterThanOrEqual
+                | SignedLessThanOrEqual
+        )),
+        UnsignedLessThan | UnsignedGreaterThan | SignedLessThan | SignedGreaterThan => match qc {
+            NotEqual => Some(true),
+            Equal => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Fold icmps decided by a dominating branch: a block whose only predecessor
+/// ends in `brif c` knows `c` (or its complement), as do the blocks it
+/// dominates. Returns the icmps folded.
+fn fold_dominated_conds(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let mut fact: FxHashMap<Block, Cmp> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else {
+            continue;
+        };
+        if p.block == b {
+            continue;
+        }
+        let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst] else {
+            continue;
+        };
+        let t = blocks[0].block(&func.dfg.value_lists);
+        if t == blocks[1].block(&func.dfg.value_lists) {
+            continue;
+        }
+        let Some((c, x, y)) = cond_icmp(func, arg).and_then(|i| norm_icmp(func, i)) else {
+            continue;
+        };
+        fact.insert(b, (if b == t { c } else { c.complement() }, x, y));
+    }
+    if fact.is_empty() {
+        return 0;
+    }
+    let mut folds = Vec::new();
+    for b in func.layout.blocks() {
+        let mut fs = Vec::new();
+        let mut cur = Some(b);
+        for _ in 0..64 {
+            let Some(c) = cur else { break };
+            if let Some(&f) = fact.get(&c) {
+                fs.push(f);
+            }
+            cur = domtree.idom(c);
+        }
+        if fs.is_empty() {
+            continue;
+        }
+        for i in func.layout.block_insts(b) {
+            let Some(q) = norm_icmp(func, i) else {
+                continue;
+            };
+            if let Some(k) = fs.iter().find_map(|&f| implied(f, q)) {
+                folds.push((i, k));
+            }
+        }
+    }
+    for &(i, k) in &folds {
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        func.replace(i).iconst(ty, i64::from(k));
+    }
+    folds.len()
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
@@ -712,10 +884,16 @@ pub fn run(
     derived: &FxHashMap<Value, Value>,
 ) -> usize {
     merge_chains(func);
+    let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let mut total = 0;
     for _ in 0..8 {
         let nn = NonNull::new(func, loads, derived);
-        let n = bypass_forwarders(func) + round(func, &nn);
+        let dc = if domcond {
+            fold_dominated_conds(func)
+        } else {
+            0
+        };
+        let n = dc + bypass_forwarders(func) + round(func, &nn);
         total += n;
         if n == 0 {
             break;
