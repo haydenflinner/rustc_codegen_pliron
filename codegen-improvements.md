@@ -39,3 +39,17 @@ Net at the current defaults: 6.88B / 15.18B instructions (−54% / −53% vs bas
 1.66s / 3.11s wall (stage1 LLVM-built: 0.79s metadata).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
+
+Re-run after merging into the backend feature branch (87db5c8, with 6c68ff9's wasm/size inline
+limits): stage2 rebuilt with full-bootstrap, 6.86B / 15.10B instructions, 1.61s / 2.95s wall;
+`tests/ui_run_pass.py` (debug) 2537 pass / 57 environment failures, same as before.
+
+## Linker: wild vs mold
+
+Relinking the bevy game (`examples/bevy-game`, `--host -Zbuild-std`, 323 MB debug binary) with the
+captured `cc` line, best of 5, idle 8-core VM. Both outputs run (300 autoplay frames).
+
+| linker | wall | notes |
+|---|---:|---|
+| Wild 0.10.0 | 0.22s | pure Rust |
+| mold 3.0.0 (Rust rewrite, release) | 0.30s | links C `zstd-sys` (required) and `mold-mimalloc-sys` (off with `system-allocator`) |
