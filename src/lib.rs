@@ -24,14 +24,18 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod builder;
+mod clifpeep;
 mod constload;
 mod consts;
 mod context;
+mod domcheck;
 mod eh;
 mod hot;
 mod inline;
 mod instcombine;
 mod intrinsic;
+mod jumpthread;
+mod loadfwd;
 mod lower;
 mod memcpyopt;
 mod nounwind;
@@ -39,9 +43,13 @@ mod objmerge;
 mod phisimp;
 mod simd;
 mod sroa;
+mod taildup;
+mod tailmerge;
 mod type_of;
 mod types;
+mod unreach;
 mod wasm;
+mod xcgu;
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -96,6 +104,9 @@ impl ModuleBufferMethods for PlironBuffer {
 fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     fb.set("is_pic", "true").unwrap();
+    if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
+        fb.set("regalloc_checker", "true").unwrap();
+    }
     fb.set(
         "enable_verifier",
         if cfg!(debug_assertions) {
@@ -161,36 +172,76 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
-            || matches!(cx.tcx.sess.opts.optimize, OptLevel::Size | OptLevel::SizeMin);
-        inline::run(ctx, st, small);
+            || matches!(
+                cx.tcx.sess.opts.optimize,
+                OptLevel::Size | OptLevel::SizeMin
+            );
+        if pass_enabled("PLIRON_FROZEN") {
+            st.frozen = context::frozen_values(ctx, st).into_iter().collect();
+        }
+        inline::run(ctx, st, small, None);
+        domcheck::run(ctx, st, "inline");
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }
         if pass_enabled("PLIRON_SRET2REG") {
             abi::run(ctx, st);
+            domcheck::run(ctx, st, "abi");
         }
         if std::env::var("PLIRON_DEADARG").is_ok_and(|v| v == "1") {
             abi::dead_args(ctx, st);
         }
         if pass_enabled("PLIRON_INSTCOMBINE") {
             instcombine::run(ctx, st);
+            domcheck::run(ctx, st, "instcombine");
         }
         if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
             memcpyopt::run(ctx, st);
         }
         if pass_enabled("PLIRON_PHISIMP") {
             phisimp::run(ctx, st);
+            domcheck::run(ctx, st, "phisimp");
         }
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);
+            domcheck::run(ctx, st, "sroa");
         }
         if pass_enabled("PLIRON_CONSTLOAD") {
             constload::run(ctx, st);
+            domcheck::run(ctx, st, "constload");
+            // Inlining + SROA make vtable pointers constant: call those slots
+            // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
+            if pass_enabled("PLIRON_DEVIRT") {
+                let sites = inline::devirt(ctx, st);
+                domcheck::run(ctx, st, "devirt");
+                if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
+                    inline::run(ctx, st, small, Some(&sites));
+                    domcheck::run(ctx, st, "devirt-inline");
+                    if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
+                        phisimp::run(ctx, st);
+                    }
+                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_DEVIRT_SROA") {
+                        sroa::run(ctx, st);
+                    }
+                    if pass_enabled("PLIRON_DEVIRT_CL") {
+                        constload::run(ctx, st);
+                    }
+                }
+            }
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
+        st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
+        st.loadfwd = pass_enabled("PLIRON_LOADFWD");
+        st.peep = pass_enabled("PLIRON_PEEP");
+        st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
+        st.unreach = pass_enabled("PLIRON_UNREACH");
+        st.taildup = pass_enabled("PLIRON_TAILDUP");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
+    }
+    if std::env::var_os("PLIRON_DUMP_OPT").is_some() {
+        eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
         let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);
@@ -346,6 +397,26 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
     let mono_items = cgu.items_in_deterministic_order(tcx);
+    let extra = if tcx.sess.opts.optimize != OptLevel::No
+        && pass_enabled("PLIRON_XCGU")
+        && !tcx.sess.target.is_like_wasm
+        && std::env::var_os("PLIRON_HOT").is_none()
+    {
+        xcgu::copies(tcx, cgu)
+    } else {
+        Vec::new()
+    };
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("xcgu {cgu_name}: {} local copies", extra.len());
+    }
+    for &inst in &extra {
+        rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
+            &mut cx,
+            cgu_name.as_str(),
+            rustc_attr_ir::Linkage::Internal,
+            rustc_middle::mono::Visibility::Default,
+        );
+    }
     for &(mono_item, data) in &mono_items {
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
@@ -356,6 +427,19 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     }
     for &(mono_item, data) in &mono_items {
         mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
+    }
+    for &inst in &extra {
+        let data = rustc_middle::mono::MonoItemData {
+            inlined: true,
+            linkage: rustc_attr_ir::Linkage::Internal,
+            visibility: rustc_middle::mono::Visibility::Default,
+            size_estimate: 0,
+        };
+        rustc_middle::mono::MonoItem::Fn(inst).define::<Builder<'_, '_>>(
+            &mut cx,
+            cgu_name.as_str(),
+            data,
+        );
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
     let m = finish_module(&cx, cgu_name.as_str());
