@@ -200,7 +200,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     st.peep = pass_enabled("PLIRON_PEEP");
     st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
     st.unreach = pass_enabled("PLIRON_UNREACH");
-    st.taildup = std::env::var("PLIRON_TAILDUP").is_ok_and(|v| v == "1");
+    st.taildup = pass_enabled("PLIRON_TAILDUP");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }

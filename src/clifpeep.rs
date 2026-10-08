@@ -142,7 +142,7 @@ fn widen(pos: &mut FuncCursor, inst: Inst, arg: Value) -> bool {
 
 fn widen_on() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("PLIRON_WIDEN").is_ok_and(|v| v == "1"));
+        std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_WIDEN"));
     *ON
 }
 
@@ -207,7 +207,7 @@ fn uloads(func: &mut Function) -> usize {
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
-    if std::env::var("PLIRON_ULOAD").is_ok_and(|v| v == "1") {
+    if crate::pass_enabled("PLIRON_ULOAD") {
         n += uloads(func);
     }
     let mut pos = FuncCursor::new(func);

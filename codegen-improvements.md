@@ -42,9 +42,10 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | one CGU per crate (`rust.codegen-units = 1`), so the inliner sees the whole crate | – | – | – | – | not measurable here: stage2 build OOM-killed (28 GB RSS) on `rustc_query_impl` and `cranelift-codegen`; pliron IR for a whole large crate doesn't fit in 31 GB |
 | Cranelift `opt_level=speed` instead of `speed_and_size` | – | – | – | – | not tried: Cranelift 0.135 only checks `opt_level != none` (context.rs), so the two are identical |
 | + tail merging of identical exit blocks (`PLIRON_TAILMERGE`), dropping edges into `unreachable`/`assume(false)` blocks (`PLIRON_UNREACH`), one dense `br_table` per switch at LLVM's 10% density (`PLIRON_SWITCH_DENSE`); vs range threading 6.04B / 13.49B | 1.31s | 2.44s | 5.98B (−1.0%) | 13.36B (−1.0%) | kept |
-| + experimental batch (all opt-in): tail duplication of ≤4-inst return blocks into jump preds (`PLIRON_TAILDUP=1`), narrow and/or/xor widened before `uextend` (`PLIRON_WIDEN=1`), `uload8/16` for extended narrow loads (`PLIRON_ULOAD=1`); plus `[0,1]` load ranges skip the i1 `band` (`PLIRON_BOOLRANGE`, default on) | 1.29s | 2.45s | 5.91B (−1.2%) | 13.21B (−1.1%) | ablations running; this stage2 build found and fixed a taildup alias/dominance bug (bfc5941) and a uload i128 bug (ad2f84f) |
+| + batch: tail duplication of ≤4-inst return blocks into jump preds (`PLIRON_TAILDUP`), narrow and/or/xor widened before `uextend` (`PLIRON_WIDEN`), `uload8/16` for extended narrow loads (`PLIRON_ULOAD`); plus `[0,1]` load ranges skip the i1 `band` (`PLIRON_BOOLRANGE`) | 1.29s | 2.45s | 5.91B (−1.2%) | 13.21B (−1.1%) | all kept, now default on; this stage2 build found and fixed a taildup alias/dominance bug (bfc5941) and a uload i128 bug (ad2f84f) |
+| ablation of the batch: `PLIRON_TAILDUP=0` | 1.26s | 2.44s | 5.95B (+0.7%) | 13.28B (+0.5%) | tail duplication kept (rustc_lexer `.text` +1%, but fewer instructions executed) |
 
-Net at the current defaults: 5.98B / 13.36B instructions (−60% / −58% vs baseline),
-1.31s / 2.44s wall (stage1 LLVM-built: 0.79s metadata).
+Net at the current defaults: 5.91B / 13.21B instructions (−60% / −59% vs baseline),
+1.29s / 2.45s wall (stage1 LLVM-built: 0.79s metadata).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
