@@ -341,7 +341,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[Stri
                     .wasm_imports
                     .get(&d.name)
                     .cloned()
-                    .unwrap_or_else(|| ("env".into(), d.name));
+                    .unwrap_or_else(|| ("env".into(), crate::obj_sym(&d.name).to_string()));
                 o.m.imports.push(Import {
                     module,
                     name,
@@ -367,7 +367,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[Stri
                 o.m.funcs
                     .push(FuncDecl::Compiled(d.sig, d.name.clone(), bytes));
                 o.m.exports.push(Export {
-                    name: d.name,
+                    name: crate::obj_sym(&d.name).to_string(),
                     kind: ExportKind::Func(f),
                 });
             }

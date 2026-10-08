@@ -178,14 +178,14 @@ pub fn lower_to_object(
             let body = m
                 .declare_function(&crate::hot::body_name(n), Linkage::Hidden, &sig)
                 .unwrap();
-            let thunk = m.declare_function(n, Linkage::Import, &sig).unwrap();
+            let thunk = m.declare_function(crate::obj_sym(n), Linkage::Import, &sig).unwrap();
             hot_bodies.insert(n.clone(), body);
             hot_asm.push_str(&crate::hot::thunk_asm(n, l));
             ids.insert(n.clone(), Sym::F(thunk, f.ty));
             continue;
         }
         let id = m
-            .declare_function(n, l, &sig)
+            .declare_function(crate::obj_sym(n), l, &sig)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
         ids.insert(n.clone(), Sym::F(id, f.ty));
     }
@@ -199,7 +199,7 @@ pub fn lower_to_object(
             g.linkage
         };
         let id = m
-            .declare_data(n, l, g.mutable, g.tls)
+            .declare_data(crate::obj_sym(n), l, g.mutable, g.tls)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
         ids.insert(n.clone(), Sym::D(id, g.tls));
     }
@@ -904,7 +904,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         sig.returns.extend(rets.iter().map(|t| AbiParam::new(*t)));
         let id = self
             .m
-            .declare_function(name, Linkage::Import, &sig)
+            .declare_function(crate::obj_sym(name), Linkage::Import, &sig)
             .unwrap();
         let fr = self.fref(id);
         let c = self.b.ins().call(fr, args);

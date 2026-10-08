@@ -150,6 +150,11 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
 }
 
 /// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
+/// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
+pub(crate) fn obj_sym(n: &str) -> &str {
+    n.strip_prefix('\u{1}').unwrap_or(n)
+}
+
 pub(crate) fn pass_enabled(var: &str) -> bool {
     std::env::var(var).map_or(true, |v| v != "0")
 }
