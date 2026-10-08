@@ -2051,6 +2051,22 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 let w = w(self, 0);
                 smallvec![self.bitrev(a0, w)]
             }
+            "llvm.fshl" | "llvm.fshr" if w(self, 0) == 128 => {
+                let c127 = self.i64c(127);
+                let s = self.op(O::I64And, &[a[2][0], c127], WT::I64);
+                let c128 = self.i64c(128);
+                let inv = self.op(O::I64Sub, &[c128, s], WT::I64);
+                let left = name == "llvm.fshl";
+                let (sx, sy) = if left { (s, inv) } else { (inv, s) };
+                let (x, y) = ([a[0][0], a[0][1]], [a[1][0], a[1][1]]);
+                let hi = self.shift128(ShlOp::get_opid_static(), &x, sx);
+                let lo = self.shift128(LShrOp::get_opid_static(), &y, sy);
+                let c0 = self.op(O::I64Or, &[hi[0], lo[0]], WT::I64);
+                let c1 = self.op(O::I64Or, &[hi[1], lo[1]], WT::I64);
+                let z = self.op(O::I64Eqz, &[s], WT::I32);
+                let keep = if left { x } else { y };
+                smallvec![self.sel(z, keep[0], c0), self.sel(z, keep[1], c1)]
+            }
             "llvm.fshl" | "llvm.fshr" => {
                 let w = w(self, 0);
                 assert!(w <= 64, "funnel shift i{w}");
