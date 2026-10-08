@@ -44,6 +44,7 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + tail merging of identical exit blocks (`PLIRON_TAILMERGE`), dropping edges into `unreachable`/`assume(false)` blocks (`PLIRON_UNREACH`), one dense `br_table` per switch at LLVM's 10% density (`PLIRON_SWITCH_DENSE`); vs range threading 6.04B / 13.49B | 1.31s | 2.44s | 5.98B (−1.0%) | 13.36B (−1.0%) | kept |
 | + batch: tail duplication of ≤4-inst return blocks into jump preds (`PLIRON_TAILDUP`), narrow and/or/xor widened before `uextend` (`PLIRON_WIDEN`), `uload8/16` for extended narrow loads (`PLIRON_ULOAD`); plus `[0,1]` load ranges skip the i1 `band` (`PLIRON_BOOLRANGE`) | 1.29s | 2.45s | 5.91B (−1.2%) | 13.21B (−1.1%) | all kept, now default on; this stage2 build found and fixed a taildup alias/dominance bug (bfc5941) and a uload i128 bug (ad2f84f) |
 | ablation of the batch: `PLIRON_TAILDUP=0` | 1.26s | 2.44s | 5.95B (+0.7%) | 13.28B (+0.5%) | tail duplication kept (rustc_lexer `.text` +1%, but fewer instructions executed) |
+| + regalloc2 spill priority weight/(4·√len) instead of weight/len (vendored regalloc2 patch, separate branch) | 1.33s | 2.54s | 5.90B (−0.2%) | 13.17B (−0.3%) | not merged: rustc_lexer `advance_token` stack refs 292→91, but the end-to-end gain is too small to justify vendoring regalloc2 |
 
 Net at the current defaults: 5.91B / 13.21B instructions (−60% / −59% vs baseline),
 1.29s / 2.45s wall (stage1 LLVM-built: 0.79s metadata).
