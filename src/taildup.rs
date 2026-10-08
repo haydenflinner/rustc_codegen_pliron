@@ -1,20 +1,25 @@
 //! Duplicate small return blocks into their `jump` predecessors (LLVM's
 //! tail duplication of return blocks). Helpers like `derive(PartialEq)`
 //! end every arm with `jump ret(v)`; copying the `return` into each arm
-//! removes the jump and the block-parameter move.
+//! removes the jump and the block-parameter move. Small `brif` blocks whose
+//! values are only used inside them (a `bool` merged through a block
+//! parameter, then tested) are copied the same way, so the `icmp` in each
+//! predecessor feeds its own branch.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, BlockArg, Function, InstructionData, Value, ValueDef};
+use cranelift_codegen::ir::{Block, BlockArg, Function, InstructionData, Opcode, Value, ValueDef};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 4;
 
-fn candidate(func: &Function, b: Block) -> bool {
+fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
     let Some(t) = func.layout.last_inst(b) else {
         return false;
     };
-    if !func.dfg.insts[t].opcode().is_return() {
+    let brif =
+        func.dfg.insts[t].opcode() == Opcode::Brif && crate::pass_enabled("PLIRON_TAILDUP_BRIF");
+    if !func.dfg.insts[t].opcode().is_return() && !(brif && local_values(func, uses, b)) {
         return false;
     }
     let mut n = 0;
@@ -38,6 +43,32 @@ fn candidate(func: &Function, b: Block) -> bool {
     n <= MAX_INSTS
 }
 
+/// For each used value: the one block using it, or `None` if several do.
+fn use_blocks(func: &Function) -> FxHashMap<Value, Option<Block>> {
+    let mut m: FxHashMap<Value, Option<Block>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let e = m.entry(func.dfg.resolve_aliases(v)).or_insert(Some(b));
+                if *e != Some(b) {
+                    *e = None;
+                }
+            }
+        }
+    }
+    m
+}
+
+/// No parameter or result of `b` is used outside `b` (so copies need no SSA repair).
+fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
+    let ok = |v: &Value| uses.get(v).is_none_or(|&u| u == Some(b));
+    func.dfg.block_params(b).iter().all(ok)
+        && func
+            .layout
+            .block_insts(b)
+            .all(|i| func.dfg.inst_results(i).iter().all(ok))
+}
+
 /// Every value `r` uses from outside `r` is available at the end of `p`.
 fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) -> bool {
     func.layout.block_insts(r).all(|i| {
@@ -55,10 +86,11 @@ fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) 
 /// Returns the number of jumps replaced by a copy of the return block.
 pub fn run(func: &mut Function) -> usize {
     let entry = func.layout.entry_block();
+    let uses = use_blocks(func);
     let rets: FxHashSet<Block> = func
         .layout
         .blocks()
-        .filter(|&b| Some(b) != entry && candidate(func, b))
+        .filter(|&b| Some(b) != entry && candidate(func, &uses, b))
         .collect();
     if rets.is_empty() {
         return 0;
@@ -104,6 +136,12 @@ pub fn run(func: &mut Function) -> usize {
             .collect();
         for i in body {
             let ni = func.dfg.clone_inst(i);
+            let dfg = &mut func.dfg;
+            let mut data = dfg.insts[ni];
+            for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                *d = d.deep_clone(&mut dfg.value_lists);
+            }
+            dfg.insts[ni] = data;
             let mut data = func.dfg.insts[ni];
             let dfg = &mut func.dfg;
             data.map_values(
