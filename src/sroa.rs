@@ -262,6 +262,7 @@ fn int_bytes(ctx: &Context, t: TypeHandle) -> Option<u64> {
 /// `Result`, say) is allowed and rewritten as shift/mask of the slice.
 fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str> {
     let subint = crate::pass_enabled("PLIRON_SROA_SUBINT");
+    let wide = crate::pass_enabled("PLIRON_SROA_GAPWIDE");
     let mut order: Vec<(&Access, TypeHandle, u64)> = acc
         .iter()
         .filter_map(|a| access_ty(ctx, a).map(|t| (a, t, size_align(ctx, t).0)))
@@ -325,7 +326,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
         let mut o = s;
         while o < e {
             let mut k = 8;
-            while o % k != 0 || o + k > e {
+            while (!wide && o % k != 0) || o + k > e {
                 k /= 2;
             }
             gaps.push((o, k));
