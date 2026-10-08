@@ -35,6 +35,7 @@ mod lower;
 mod memcpyopt;
 mod nounwind;
 mod objmerge;
+mod phisimp;
 mod simd;
 mod sroa;
 mod type_of;
@@ -173,6 +174,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
             memcpyopt::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_PHISIMP") {
+            phisimp::run(ctx, st);
         }
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);

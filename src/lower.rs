@@ -404,7 +404,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }
-        for pb in rpo(ctx, &pblocks) {
+        for pb in rpo(ctx, self.st, &pblocks) {
             self.b.switch_to_block(self.blocks[&pb]);
             if pb == pblocks[0] {
                 let z = self.b.ins().iconst(pt, 0);
@@ -1737,11 +1737,21 @@ fn cold_blocks(
     cold
 }
 
-pub(crate) fn rpo(ctx: &Context, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn rpo(
+    ctx: &Context,
+    st: &State<'_>,
+    blocks: &[Ptr<BasicBlock>],
+) -> Vec<Ptr<BasicBlock>> {
+    // Invoke landing pads count as successors so values defined before an
+    // invoke are lowered before the landing-pad code that uses them.
     let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
         b.deref(ctx)
             .iter(ctx)
-            .flat_map(|op| op.deref(ctx).successors().collect::<Vec<_>>())
+            .flat_map(|op| {
+                let mut v: Vec<_> = op.deref(ctx).successors().collect();
+                v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+                v
+            })
             .collect()
     };
     let mut seen = std::collections::HashSet::new();
