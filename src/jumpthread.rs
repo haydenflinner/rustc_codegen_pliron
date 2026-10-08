@@ -256,6 +256,9 @@ fn pure_op(func: &Function, inst: Inst) -> bool {
             | Iadd
             | Isub
             | Select
+            | Ishl
+            | Ushr
+            | StackAddr
     ) && func.dfg.inst_results(inst).len() == 1
 }
 
