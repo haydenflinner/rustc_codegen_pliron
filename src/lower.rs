@@ -323,7 +323,7 @@ pub fn lower_to_object(
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if crate::pass_enabled("PLIRON_LOOPROT") {
+        if std::env::var("PLIRON_LOOPROT").is_ok_and(|v| v == "1") {
             crate::looprot::run(&mut clctx.func);
             if dump {
                 eprintln!("==== clif {n} after looprot ====\n{}", clctx.func.display());
@@ -628,7 +628,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     /// One `br_table` over `[min, max]` (holes go to `d`) when the cases are
     /// at least 10% dense (LLVM's `-O` jump-table density). Cranelift's
     /// `Switch` splits on every hole and binary-searches between the runs.
-    fn dense_switch(&mut self, x: ir::Value, vals: &[(u128, Block)], d: Block) -> bool {
+    fn dense_switch(
+        &mut self,
+        x: ir::Value,
+        vals: &[(u128, Block)],
+        d: Block,
+        dead_default: bool,
+    ) -> bool {
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_SWITCH_DENSE"));
         let ty = self.b.func.dfg.value_type(x);
@@ -640,6 +646,39 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let span = hi - lo + 1;
         if span > 4096 || span > vals.len() as u128 * 10 {
             return false;
+        }
+        // A default that can't happen (enum discriminants): pad the table to a
+        // power of two and mask the index, so Cranelift needs no bounds clamp.
+        static MASK: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_SWITCH_MASK"));
+        if dead_default && *MASK {
+            let p = span.next_power_of_two();
+            let mut idx = if lo == 0 {
+                x
+            } else {
+                self.b.ins().iadd_imm_s(x, (lo as i64).wrapping_neg())
+            };
+            if ty.bits() > 32 {
+                idx = self.b.ins().ireduce(clt::I32, idx);
+            } else if ty.bits() < 32 {
+                idx = self.b.ins().uextend(clt::I32, idx);
+            }
+            let idx = self.b.ins().band_imm(idx, (p - 1) as i64);
+            let mut table = vec![d; p as usize];
+            for &(v, b) in vals {
+                table[(v - lo) as usize] = b;
+            }
+            let pool = &mut self.b.func.dfg.value_lists;
+            let def = ir::BlockCall::new(d, std::iter::empty(), pool);
+            let entries: Vec<ir::BlockCall> = table
+                .iter()
+                .map(|&b| ir::BlockCall::new(b, std::iter::empty(), pool))
+                .collect();
+            let jt = self
+                .b
+                .create_jump_table(ir::JumpTableData::new(def, &entries));
+            self.b.ins().br_table(idx, jt);
+            return true;
         }
         let mut idx = if lo == 0 {
             x
@@ -978,7 +1017,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .iter()
                 .map(|c| (c.value.value().to_u128(), self.blocks[&c.dest]))
                 .collect();
-            if !self.dense_switch(x, &vals, d) {
+            let dead_default = sw
+                .default_dest(ctx)
+                .deref(ctx)
+                .iter(ctx)
+                .next()
+                .is_some_and(|o| Operation::is_op::<UnreachableOp>(o, ctx));
+            if !self.dense_switch(x, &vals, d, dead_default) {
                 let mut s = cranelift_frontend::Switch::new();
                 for &(v, b) in &vals {
                     s.set_entry(v, b);
