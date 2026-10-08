@@ -133,21 +133,119 @@ impl<'tcx> CodegenCx<'tcx> {
         let body = match name {
             "llvm.x86.xgetbv" if x86 => {
                 "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n"
+                    .to_string()
             }
-            "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
-            "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n",
-            _ if x86 => "    ud2\n",
-            _ => "    brk #0x1\n",
+            "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n".into(),
+            "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n".into(),
+            _ if x86 => "    ud2\n".into(),
+            _ => aarch64_stub_body(name).unwrap_or_else(|| "    brk #0x1\n".to_string()),
         };
         let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
         let back = if x86 { ".att_syntax\n" } else { "" };
-        write!(
-            st.asm,
-            ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
-        )
-        .unwrap();
+        if self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::MachO {
+            write!(
+                st.asm,
+                ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{body}"
+            )
+            .unwrap();
+        } else {
+            write!(
+                st.asm,
+                ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
+            )
+            .unwrap();
+        }
         sym
     }
+}
+
+/// Real bodies for `llvm.aarch64.*` intrinsics that get executed on arm64
+/// (e.g. the NEON ops used by memchr); anything unknown still traps.
+/// Vector args arrive in v0, v1 and the result leaves in v0 per AAPCS64.
+fn aarch64_stub_body(name: &str) -> Option<String> {
+    match name {
+        "llvm.aarch64.isb" => return Some("    isb\n    ret\n".into()),
+        "llvm.aarch64.dmb" => return Some("    dmb ish\n    ret\n".into()),
+        "llvm.aarch64.dsb" => return Some("    dsb ish\n    ret\n".into()),
+        _ => {}
+    }
+    let rest = name.strip_prefix("llvm.aarch64.neon.")?;
+    let (op, ty) = rest.rsplit_once('.')?;
+    let suf = match ty {
+        "v16i8" => "16b",
+        "v8i8" => "8b",
+        "v8i16" => "8h",
+        "v4i16" => "4h",
+        "v4i32" => "4s",
+        "v2i32" => "2s",
+        "v2i64" => "2d",
+        "v1i64" => "1d",
+        "v4f32" => "4s",
+        "v2f32" => "2s",
+        "v2f64" => "2d",
+        _ => return None,
+    };
+    // 3-vector ops (elementwise and pairwise share the same encoding shape).
+    const BINARY: &[&str] = &[
+        "addp", "smaxp", "sminp", "umaxp", "uminp", "srhadd", "urhadd", "shadd", "uhadd", "sqadd",
+        "uqadd", "sqsub", "uqsub", "sshl", "ushl", "srshl", "urshl", "sqshl", "uqshl", "sqrshl",
+        "uqrshl", "sabd", "uabd", "saba", "uaba", "mls", "mla", "pmul", "cmeq", "cmge", "cmgt",
+        "cmhs", "cmhi", "cmtst", "fadd", "fsub", "fmul", "fdiv", "fmla", "fmls", "fmax", "fmin",
+        "fmaxnm", "fminnm", "faddp", "fmaxp", "fminp", "fmaxnmp", "fminnmp", "fcmeq", "fcmge",
+        "fcmgt", "facge", "facgt", "fabd", "frecps", "frsqrts",
+    ];
+    if BINARY.contains(&op) {
+        return Some(format!("    {op} v0.{suf}, v0.{suf}, v1.{suf}\n    ret\n"));
+    }
+    // 2-vector unary ops.
+    const UNARY: &[&str] = &[
+        "abs", "sqabs", "neg", "sqneg", "cls", "clz", "cnt", "rbit", "rev16", "rev32", "rev64",
+        "urecpe", "ursqrte", "fabs", "fneg", "fsqrt", "frinti", "frintm", "frintn", "frintp",
+        "frintx", "frintz", "frecpe", "frsqrte",
+    ];
+    if UNARY.contains(&op) {
+        return Some(format!("    {op} v0.{suf}, v0.{suf}\n    ret\n"));
+    }
+    // Across-lane reductions: vector in v0, scalar result in the low lane.
+    const REDUCE: &[&str] = &[
+        "smaxv", "sminv", "umaxv", "uminv", "addv", "fmaxv", "fminv", "fmaxnmv", "fminnmv",
+    ];
+    const REDUCE_WIDE: &[&str] = &["saddlv", "uaddlv"];
+    let signed = op.starts_with('s');
+    let elem = suf.rsplit(|c: char| c.is_ascii_digit()).next()?;
+    if REDUCE.contains(&op) {
+        if ty.starts_with('v') && ty.ends_with("f32") {
+            // fmaxv &co. exist only for the 4s arrangement.
+            if ty != "v4f32" || op == "addv" {
+                return None;
+            }
+            return Some(format!("    {op} s0, v0.{suf}\n    ret\n"));
+        }
+        if !ty.starts_with('v') || ty == "v1i64" {
+            return None;
+        }
+        let extract = match elem {
+            "b" | "h" if signed => format!("    smov w0, v0.{elem}[0]\n"),
+            "b" | "h" => format!("    umov w0, v0.{elem}[0]\n"),
+            "s" => "    fmov w0, s0\n".to_string(),
+            "d" => "    fmov x0, d0\n".to_string(),
+            _ => return None,
+        };
+        return Some(format!("    {op} {elem}0, v0.{suf}\n{extract}    ret\n"));
+    }
+    if REDUCE_WIDE.contains(&op) {
+        let (wide, extract) = match elem {
+            "b" if signed => ("h", "    smov w0, v0.h[0]\n"),
+            "b" => ("h", "    umov w0, v0.h[0]\n"),
+            "h" if signed => ("s", "    fmov w0, s0\n"),
+            "h" => ("s", "    fmov w0, s0\n"),
+            "s" if signed => ("d", "    fmov x0, d0\n"),
+            "s" => ("d", "    fmov x0, d0\n"),
+            _ => return None,
+        };
+        return Some(format!("    {op} {wide}0, v0.{suf}\n{extract}    ret\n"));
+    }
+    None
 }
 
 struct Gen<'a, 'tcx> {
@@ -414,9 +512,16 @@ impl Gen<'_, '_> {
     }
 
     fn wrapper(&self, name: &str) -> String {
+        let macho = self.tcx.sess.target.options.binary_format
+            == rustc_target::spec::BinaryFormat::MachO;
         let mut s = String::new();
-        writeln!(s, ".globl {name}\n.hidden {name}\n.type {name},@function").unwrap();
-        writeln!(s, ".section .text.{name},\"ax\",@progbits\n{name}:").unwrap();
+        if macho {
+            writeln!(s, ".globl {name}\n.private_extern {name}").unwrap();
+            writeln!(s, ".section __TEXT,__text,regular,pure_instructions\n{name}:").unwrap();
+        } else {
+            writeln!(s, ".globl {name}\n.hidden {name}\n.type {name},@function").unwrap();
+            writeln!(s, ".section .text.{name},\"ax\",@progbits\n{name}:").unwrap();
+        }
         let x86 = self.arch == InlineAsmArch::X86_64;
         let att = self.options.contains(InlineAsmOptions::ATT_SYNTAX);
         let noreturn = self.options.contains(InlineAsmOptions::NORETURN);
@@ -494,7 +599,9 @@ impl Gen<'_, '_> {
         if x86 {
             s.push_str(".att_syntax\n");
         }
-        writeln!(s, ".size {name}, .-{name}\n.text\n").unwrap();
+        if !macho {
+            writeln!(s, ".size {name}, .-{name}\n.text\n").unwrap();
+        }
         s
     }
 }

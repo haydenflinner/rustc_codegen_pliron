@@ -10,15 +10,20 @@ skipped; edition defaults to 2015 like compiletest.
 import collections, concurrent.futures as cf, json, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUST = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/work/rust")
+_sibling = os.path.join(ROOT, "..", "rust")
+_default = _sibling if os.path.isdir(os.path.join(_sibling, "tests/ui")) else os.path.expanduser("~/work/rust")
+RUST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("RUST_CHECKOUT", _default)
 FILTER = sys.argv[2] if len(sys.argv) > 2 else ""
 OUT = os.path.join(ROOT, "target/ui")
 SKIP = re.compile(r"^//@\s*(aux-|compile-flags|revisions|ignore-|only-|needs-|edition|check-run-results|exec-env|run-flags|run-fail|should-fail|force-host|no-prefer-dynamic|unset-exec-env|known-bug|proc-macro|build-aux|incremental)", re.M)
 # Tests run with cwd = their own dir, so pin the toolchain explicitly.
 os.environ["RUSTUP_TOOLCHAIN"] = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
-BE = f"-Zcodegen-backend={ROOT}/target/debug/librustc_codegen_pliron.so"
+SO = "dylib" if sys.platform == "darwin" else "so"
+BE = f"-Zcodegen-backend={ROOT}/target/debug/librustc_codegen_pliron.{SO}"
 EXTRA = os.environ.get("UI_FLAGS", "").split()  # e.g. UI_FLAGS=-O
-WILD = ["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options", f"-Clink-arg=-B{ROOT}/target/wild-ld"]
+WILD = (["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options",
+         f"-Clink-arg=-B{ROOT}/target/wild-ld"]
+        if os.path.exists(f"{ROOT}/target/wild-ld/ld") else [])
 
 def tests():
     for d, _, fs in os.walk(os.path.join(RUST, "tests/ui")):

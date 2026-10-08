@@ -14,6 +14,4 @@ debug-assertions = false
 channel = "nightly"
 lld = false
 incremental = false
-[target.x86_64-unknown-linux-gnu]
-# cc for crt/libc paths; wild does the linking
-linker = "/home/ubuntu/work/rustc_codegen_pliron/selfhost/cc-wild"
+# setup.sh appends a [target.*] linker stanza on Linux (cc-wild); macOS uses the system linker.

@@ -150,11 +150,27 @@ pub fn lower_to_object(
     name: &str,
 ) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
-    b.per_function_section(true);
-    b.per_data_object_section(true);
+    // Mach-O symbols index sections with a u8 (max 255): per-symbol sections
+    // overflow, and Mach-O already strips dead code via subsections-at-symbols.
+    let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
+    b.per_function_section(!macho);
+    b.per_data_object_section(!macho);
     let mut m = ObjectModule::new(b);
     let cc = isa.default_call_conv();
-    let internal = internal_fns(ctx, st);
+    let mut internal = internal_fns(ctx, st);
+    if matches!(
+        isa.triple().architecture,
+        target_lexicon::Architecture::Aarch64(_)
+    ) {
+        // aarch64 has no StructReturn support for the tail CC: sret functions
+        // that sret2reg didn't convert keep the platform ABI.
+        internal.retain(|n| {
+            !st.funcs[n]
+                .exts
+                .params
+                .contains(&crate::context::ArgExt::SRet)
+        });
+    }
     let cc_of = |n: &str| {
         if internal.contains(n) {
             CallConv::Tail
@@ -163,6 +179,7 @@ pub fn lower_to_object(
         }
     };
     let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
+    let mut verbatim_syms: Vec<String> = Vec::new();
     let mut hot_bodies: FxHashMap<String, FuncId> = FxHashMap::default();
     let mut hot_asm = String::new();
     for (n, f) in &st.funcs {
@@ -187,6 +204,9 @@ pub fn lower_to_object(
         let id = m
             .declare_function(n, l, &sig)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        if n.starts_with('\x01') {
+            verbatim_syms.push(n.clone());
+        }
         ids.insert(n.clone(), Sym::F(id, f.ty));
     }
     for (n, g) in &st.globals {
@@ -198,9 +218,20 @@ pub fn lower_to_object(
         } else {
             g.linkage
         };
+        // Mach-O custom sections are emitted by emit_merged_custom_sections
+        // post-finish, so declare them Import to satisfy finish()'s
+        // defined-symbol check.
+        let l = if macho && g.section.is_some() && g.init.is_some() {
+            Linkage::Import
+        } else {
+            l
+        };
         let id = m
             .declare_data(n, l, g.mutable, g.tls)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        if n.starts_with('\x01') {
+            verbatim_syms.push(n.clone());
+        }
         ids.insert(n.clone(), Sym::D(id, g.tls));
     }
 
@@ -208,6 +239,7 @@ pub fn lower_to_object(
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
+    let mut asm_stubs = rustc_data_structures::fx::FxHashSet::default();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -235,9 +267,11 @@ pub fn lower_to_object(
                 internal: &internal,
                 exn: None,
                 vars: FxHashMap::default(),
+                stubs: rustc_data_structures::fx::FxHashSet::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
+            asm_stubs.extend(fl.stubs.iter().copied());
         }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
@@ -246,6 +280,17 @@ pub fn lower_to_object(
         m.clear_context(&mut clctx);
     }
 
+    // (name, bytes, align, relocs, writable, used, section name, linkage)
+    let mut custom_secs: Vec<(
+        String,
+        Vec<u8>,
+        u64,
+        Vec<(u64, String, i64)>,
+        bool,
+        bool,
+        String,
+        Linkage,
+    )> = Vec::new();
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else {
@@ -255,6 +300,23 @@ pub fn lower_to_object(
         let mut bytes = vec![0u8; size as usize];
         let mut relocs = Vec::new();
         write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
+        if macho && g.section.is_some() {
+            // cranelift-object calls add_section per data object, and it never
+            // merges same-named sections, so N linkme/#[link_section] statics
+            // would produce N sections and overflow Mach-O's u8 n_sect field.
+            // Emit them into shared sections ourselves after finish().
+            custom_secs.push((
+                n.clone(),
+                bytes,
+                g.align.max(1),
+                relocs,
+                g.mutable,
+                g.used,
+                g.section.clone().unwrap(),
+                g.linkage,
+            ));
+            continue;
+        }
         let mut desc = DataDescription::new();
         desc.define(bytes.into_boxed_slice());
         desc.set_align(g.align.max(1));
@@ -281,13 +343,231 @@ pub fn lower_to_object(
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
     let mut product = m.finish();
+    // `\x01name` is LLVM's no-mangle marker: emit the rest verbatim, without
+    // the platform prefix (e.g. `_`) that add_symbol already prepended.
+    for n in &verbatim_syms {
+        let sid = product
+            .object
+            .symbol_id(n.as_bytes())
+            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
+        let name = &mut product.object.symbol_mut(sid).name;
+        *name = name
+            .strip_prefix(b"_\x01")
+            .or_else(|| name.strip_prefix(b"\x01"))
+            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"))
+            .to_vec();
+    }
+    if !custom_secs.is_empty() {
+        emit_merged_custom_sections(&mut product.object, custom_secs);
+    }
     eh.emit(&mut product);
-    if !st.asm.is_empty() || !hot_asm.is_empty() {
+    let mut asm = format!("{}\n{hot_asm}", st.asm);
+    for s in &asm_stubs {
+        asm.push_str(&atomic_stub_asm(s, macho));
+    }
+    if !asm.trim().is_empty() {
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        let asm = format!("{}\n{hot_asm}", st.asm);
         crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
     product.emit().unwrap()
+}
+
+/// Mach-O caps section ordinals at 255 (n_sect is a u8), so all globals that
+/// share a `#[link_section]`/`linkme` name must land in one section. The
+/// module already declared their symbols (undefined); define them here in a
+/// single section per name.
+fn emit_merged_custom_sections(
+    obj: &mut object::write::Object<'_>,
+    globals: Vec<(String, Vec<u8>, u64, Vec<(u64, String, i64)>, bool, bool, String, Linkage)>,
+) {
+    use object::write::{Relocation, Symbol as WSymbol, SymbolSection};
+    use object::{
+        RelocationEncoding, RelocationFlags, RelocationKind, SectionKind, SymbolFlags, SymbolKind,
+        SymbolScope, macho,
+    };
+    // Group by parsed (segment, section) name; the merged kind must satisfy
+    // every member.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: FxHashMap<String, (bool, bool, u32)> = FxHashMap::default();
+    for (_, _, _, relocs, writable, _, secname, _) in &globals {
+        let (seg, sec, flags) = parse_macho_section(secname);
+        let key = format!("{seg},{sec}");
+        let e = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            (false, false, 0)
+        });
+        e.0 |= *writable;
+        e.1 |= !relocs.is_empty();
+        e.2 |= flags;
+    }
+    let mut sections: FxHashMap<String, object::write::SectionId> = FxHashMap::default();
+    for key in order {
+        let (writable, has_relocs, flags) = groups[&key];
+        let kind = if writable {
+            SectionKind::Data
+        } else if has_relocs {
+            SectionKind::ReadOnlyDataWithRel
+        } else {
+            SectionKind::ReadOnlyData
+        };
+        let (seg, sec) = key.split_once(',').unwrap();
+        let sid = obj.add_section(seg.as_bytes().to_vec(), sec.as_bytes().to_vec(), kind);
+        obj.section_mut(sid).flags = object::SectionFlags::MachO { flags };
+        sections.insert(key.clone(), sid);
+    }
+    for (name, bytes, align, relocs, _, used, secname, linkage) in globals {
+        let (seg, sec, _) = parse_macho_section(&secname);
+        let sid = sections[&format!("{seg},{sec}")];
+        let off = obj.append_section_data(sid, &bytes, align);
+        let sym = match obj.symbol_id(name.as_bytes()) {
+            Some(s) => s,
+            None => obj.add_symbol(WSymbol {
+                name: name.clone().into_bytes(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Data,
+                scope: SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Undefined,
+                flags: SymbolFlags::None,
+            }),
+        };
+        obj.symbol_mut(sym).scope = match linkage {
+            Linkage::Export | Linkage::Preemptible => SymbolScope::Dynamic,
+            Linkage::Hidden => SymbolScope::Linkage,
+            _ => SymbolScope::Compilation,
+        };
+        obj.set_symbol_data(sym, sid, off, bytes.len() as u64);
+        if used {
+            if let SymbolFlags::MachO { n_desc } = obj.symbol_flags_mut(sym) {
+                *n_desc |= macho::N_NO_DEAD_STRIP;
+            }
+        }
+        for (o, s, a) in relocs {
+            let target = obj
+                .symbol_id(s.as_bytes())
+                .unwrap_or_else(|| panic!("reloc to undeclared symbol {s} in {name}"));
+            obj.add_relocation(
+                sid,
+                Relocation {
+                    offset: off + o,
+                    symbol: target,
+                    addend: a,
+                    flags: RelocationFlags::Generic {
+                        kind: RelocationKind::Absolute,
+                        encoding: RelocationEncoding::Generic,
+                        size: 64,
+                    },
+                },
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// `#[link_section]` values carry the full `seg,sec[,type[,attrs]]` Mach-O
+/// form; split the name out and translate the flags (same table as
+/// cranelift-object's parse_section).
+fn parse_macho_section(section: &str) -> (&str, &str, u32) {
+    use object::macho::*;
+    const TYPES: &[(&str, u32)] = &[
+        ("regular", S_REGULAR),
+        ("zerofill", S_ZEROFILL),
+        ("cstring_literals", S_CSTRING_LITERALS),
+        ("4byte_literals", S_4BYTE_LITERALS),
+        ("8byte_literals", S_8BYTE_LITERALS),
+        ("literal_pointers", S_LITERAL_POINTERS),
+        ("non_lazy_symbol_pointers", S_NON_LAZY_SYMBOL_POINTERS),
+        ("lazy_symbol_pointers", S_LAZY_SYMBOL_POINTERS),
+        ("mod_init_funcs", S_MOD_INIT_FUNC_POINTERS),
+        ("mod_term_funcs", S_MOD_TERM_FUNC_POINTERS),
+        ("coalesced", S_COALESCED),
+        ("interposing", S_INTERPOSING),
+        ("16byte_literals", S_16BYTE_LITERALS),
+        ("thread_local_regular", S_THREAD_LOCAL_REGULAR),
+        ("thread_local_zerofill", S_THREAD_LOCAL_ZEROFILL),
+        ("thread_local_variables", S_THREAD_LOCAL_VARIABLES),
+        (
+            "thread_local_variable_pointers",
+            S_THREAD_LOCAL_VARIABLE_POINTERS,
+        ),
+        (
+            "thread_local_init_function_pointers",
+            S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+        ),
+    ];
+    const ATTRS: &[(&str, u32)] = &[
+        ("pure_instructions", S_ATTR_PURE_INSTRUCTIONS),
+        ("no_toc", S_ATTR_NO_TOC),
+        ("strip_static_syms", S_ATTR_STRIP_STATIC_SYMS),
+        ("no_dead_strip", S_ATTR_NO_DEAD_STRIP),
+        ("live_support", S_ATTR_LIVE_SUPPORT),
+        ("self_modifying_code", S_ATTR_SELF_MODIFYING_CODE),
+        ("debug", S_ATTR_DEBUG),
+    ];
+    let mut parts = section.split(',');
+    let seg = parts.next().unwrap();
+    let Some(sec) = parts.next() else {
+        return ("", section, 0);
+    };
+    let ty = parts.next().unwrap_or("regular");
+    let mut flags = TYPES
+        .iter()
+        .find(|(n, _)| *n == ty)
+        .unwrap_or_else(|| panic!("unsupported Mach-O section type `{ty}` in `{section}`"))
+        .1;
+    if let Some(attrs) = parts.next() {
+        for a in attrs.split('+') {
+            flags |= ATTRS
+                .iter()
+                .find(|(n, _)| *n == a)
+                .unwrap_or_else(|| {
+                    panic!("unsupported Mach-O section attribute `{a}` in `{section}`")
+                })
+                .1;
+        }
+    }
+    (seg, sec, flags)
+}
+
+/// 16-byte atomic helpers for aarch64: Cranelift can't lower i128 atomic ops
+/// there, so loads go through `ldaxp`/`stlxp` and RMW/CAS through `ldxp`/`stlxp`
+/// loops. All three take pointers so the CAS retry loop can stay in CLIF:
+///   __pliron_a64_atomic_ld_16(x0=ptr, x1=out16)
+///   __pliron_a64_atomic_st_16(x0=ptr, x1=&val16)
+///   __pliron_a64_atomic_cas_16(x0=ptr, x1=&expected in/out16, x2=&desired16) -> w0
+fn atomic_stub_asm(name: &str, macho: bool) -> String {
+    // rsasm knows no exclusive loads/stores, so they're emitted as .word.
+    // Local labels get per-stub names to stay unique when combined.
+    let body = match name {
+        // ldaxp x2,x3,[x0]; stlxp w8,x2,x3,[x0]; retry; stp x2,x3,[x1]
+        "__pliron_a64_atomic_ld_16" => concat!(
+            "Lald_1: .word 0xc87f8c02\n.word 0xc8288c02\ncbnz w8, Lald_1\n",
+            "stp x2, x3, [x1]\nret\n"
+        ),
+        // ldp x2,x3,[x1]; ldxp x6,x7,[x0]; stlxp w8,x2,x3,[x0]; retry
+        "__pliron_a64_atomic_st_16" => concat!(
+            "ldp x2, x3, [x1]\nLast_1: .word 0xc87f1c06\n.word 0xc8288c02\n",
+            "cbnz w8, Last_1\nret\n"
+        ),
+        // x4:x5 = expected, x9:x10 = desired; CAS loop, fail writes back current
+        "__pliron_a64_atomic_cas_16" => concat!(
+            ".word 0xc87f1424\nldp x9, x10, [x2]\n",
+            "Lacas_1: .word 0xc87f1c06\ncmp x6, x4\nb.ne Lacas_2\ncmp x7, x5\nb.ne Lacas_2\n",
+            ".word 0xc828a809\ncbnz w8, Lacas_1\nmov w0, #1\nret\n",
+            "Lacas_2: .word 0xd5033f5f\nstp x6, x7, [x1]\nmov w0, #0\nret\n"
+        ),
+        _ => unreachable!("unknown atomic stub {name}"),
+    };
+    if macho {
+        format!(
+            ".section __TEXT,__text,regular,pure_instructions\n.private_extern {name}\n{name}:\n{body}"
+        )
+    } else {
+        format!(
+            ".section .text.{name},\"ax\",@progbits\n.globl {name}\n.hidden {name}\n.type {name},@function\n{name}:\n{body}.size {name}, .-{name}\n.text\n"
+        )
+    }
 }
 
 pub(crate) fn write_const(
@@ -344,6 +624,8 @@ struct FnLower<'a, 'b, 'tcx> {
     exn: Option<cranelift_frontend::Variable>,
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
+    /// 16-byte atomic helper stubs this function needs (aarch64 only).
+    stubs: rustc_data_structures::fx::FxHashSet<&'static str>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -681,6 +963,141 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let fr = self.fref(id);
         let c = self.b.ins().call(fr, args);
         self.b.inst_results(c).to_vec()
+    }
+
+    /// Cranelift can't lower 16-byte atomic ops on aarch64: route them through
+    /// the `ldxp`/`stlxp` assembly stubs emitted by `lower_to_object`.
+    fn needs_atomic_stub(&self, t: ClType) -> bool {
+        t == clt::I128
+            && matches!(
+                self.m.isa().triple().architecture,
+                target_lexicon::Architecture::Aarch64(_)
+            )
+    }
+
+    fn atomic_load_stub(&mut self, p: ir::Value, o: u64) -> ir::Value {
+        let tmp = self.slot(16, 16);
+        let p = if o > 0 {
+            self.b.ins().iadd_imm_s(p, o as i64)
+        } else {
+            p
+        };
+        self.stubs.insert("__pliron_a64_atomic_ld_16");
+        self.libcall(
+            "__pliron_a64_atomic_ld_16",
+            &[clt::I64, clt::I64],
+            &[],
+            &[p, tmp],
+        );
+        self.b.ins().load(clt::I128, MemFlagsData::trusted(), tmp, 0)
+    }
+
+    fn atomic_store_stub(&mut self, p: ir::Value, o: u64, v: ir::Value) {
+        let tmp = self.slot(16, 16);
+        self.b.ins().store(MemFlagsData::trusted(), v, tmp, 0);
+        let p = if o > 0 {
+            self.b.ins().iadd_imm_s(p, o as i64)
+        } else {
+            p
+        };
+        self.stubs.insert("__pliron_a64_atomic_st_16");
+        self.libcall(
+            "__pliron_a64_atomic_st_16",
+            &[clt::I64, clt::I64],
+            &[],
+            &[p, tmp],
+        );
+    }
+
+    fn atomic_cas_stub(&mut self, op: Ptr<Operation>, p: ir::Value, c: ir::Value, n: ir::Value) {
+        let mf = MemFlagsData::trusted();
+        let exp = self.slot(16, 16);
+        let des = self.slot(16, 16);
+        self.b.ins().store(mf, c, exp, 0);
+        self.b.ins().store(mf, n, des, 0);
+        self.stubs.insert("__pliron_a64_atomic_cas_16");
+        let ok = self.libcall(
+            "__pliron_a64_atomic_cas_16",
+            &[clt::I64, clt::I64, clt::I64],
+            &[clt::I8],
+            &[p, exp, des],
+        )[0];
+        let old = self.b.ins().load(clt::I128, mf, exp, 0);
+        self.set(op, smallvec![old, ok]);
+    }
+
+    fn atomic_rmw_stub(
+        &mut self,
+        op: Ptr<Operation>,
+        p: ir::Value,
+        v: ir::Value,
+        k: cranelift_codegen::ir::AtomicRmwOp,
+    ) {
+        use cranelift_codegen::ir::AtomicRmwOp as R;
+        let mf = MemFlagsData::trusted();
+        let exp = self.slot(16, 16);
+        let des = self.slot(16, 16);
+        self.stubs.insert("__pliron_a64_atomic_ld_16");
+        self.stubs.insert("__pliron_a64_atomic_cas_16");
+        self.libcall(
+            "__pliron_a64_atomic_ld_16",
+            &[clt::I64, clt::I64],
+            &[],
+            &[p, exp],
+        );
+        let retry = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().jump(retry, &[]);
+        self.b.switch_to_block(retry);
+        let old = self.b.ins().load(clt::I128, mf, exp, 0);
+        let new = match k {
+            R::Xchg => v,
+            R::Add => self.b.ins().iadd(old, v),
+            R::Sub => self.b.ins().isub(old, v),
+            R::And => self.b.ins().band(old, v),
+            R::Nand => {
+                let a = self.b.ins().band(old, v);
+                self.b.ins().bnot(a)
+            }
+            R::Or => self.b.ins().bor(old, v),
+            R::Xor => self.b.ins().bxor(old, v),
+            // aarch64 lowers no i128 select/minmax: compare hi, then lo on tie.
+            R::Smax => self.minmax128(IntCC::SignedGreaterThan, old, v),
+            R::Smin => self.minmax128(IntCC::SignedLessThan, old, v),
+            R::Umax => self.minmax128(IntCC::UnsignedGreaterThan, old, v),
+            R::Umin => self.minmax128(IntCC::UnsignedLessThan, old, v),
+        };
+        self.b.ins().store(mf, new, des, 0);
+        let ok = self.libcall(
+            "__pliron_a64_atomic_cas_16",
+            &[clt::I64, clt::I64, clt::I64],
+            &[clt::I8],
+            &[p, exp, des],
+        )[0];
+        self.b.ins().brif(ok, done, &[], retry, &[]);
+        self.b.switch_to_block(done);
+        let r = self.b.ins().load(clt::I128, mf, exp, 0);
+        self.set1(op, r);
+    }
+
+    /// `a cc b ? a : b` for i128 via i64 halves; `cc` selects hi-word ordering,
+    /// the lo word always compares unsigned.
+    fn minmax128(&mut self, cc: IntCC, a: ir::Value, b: ir::Value) -> ir::Value {
+        let (a_lo, a_hi) = self.b.ins().isplit(a);
+        let (b_lo, b_hi) = self.b.ins().isplit(b);
+        let hi = self.b.ins().icmp(cc, a_hi, b_hi);
+        let eq = self.b.ins().icmp(IntCC::Equal, a_hi, b_hi);
+        let lo_cc = match cc {
+            IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => {
+                IntCC::UnsignedGreaterThan
+            }
+            _ => IntCC::UnsignedLessThan,
+        };
+        let lo = self.b.ins().icmp(lo_cc, a_lo, b_lo);
+        let c = self.b.ins().select(eq, lo, hi);
+        let lo = self.b.ins().select(c, a_lo, b_lo);
+        let hi = self.b.ins().select(c, a_hi, b_hi);
+        self.b.ins().iconcat(lo, hi)
     }
 
     fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
@@ -1037,7 +1454,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .ty_leaves(self.res_ty(op))
                 .into_iter()
                 .map(|(o, t)| {
-                    if atomic {
+                    if atomic && self.needs_atomic_stub(t) {
+                        self.atomic_load_stub(p, o)
+                    } else if atomic {
                         self.b.ins().atomic_load(t, MemFlagsData::trusted(), p)
                     } else {
                         self.b.ins().load(t, mf, p, o as i32)
@@ -1050,8 +1469,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let p = self.get1(opnds[1]);
             let lv = self.ty_leaves(opnds[0].get_type(ctx));
             let mf = self.plain_mf(op);
-            for (v, (o, _)) in vs.into_iter().zip(lv) {
-                if is!(AtomicStoreOp) {
+            for (v, (o, t)) in vs.into_iter().zip(lv) {
+                if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
+                    self.atomic_store_stub(p, o, v);
+                } else if is!(AtomicStoreOp) {
                     self.b.ins().atomic_store(MemFlagsData::trusted(), v, p);
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
@@ -1075,15 +1496,23 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 AtomicRmwBinOp::AtomicUMin => R::Umin,
             };
             let t = self.b.func.dfg.value_type(v);
-            let r = self.b.ins().atomic_rmw(t, MemFlagsData::trusted(), k, p, v);
-            self.set1(op, r);
+            if self.needs_atomic_stub(t) {
+                self.atomic_rmw_stub(op, p, v, k);
+            } else {
+                let r = self.b.ins().atomic_rmw(t, MemFlagsData::trusted(), k, p, v);
+                self.set1(op, r);
+            }
         } else if is!(AtomicCmpxchgOp) {
             let p = self.get1(opnds[0]);
             let c = self.get1(opnds[1]);
             let n = self.get1(opnds[2]);
-            let old = self.b.ins().atomic_cas(MemFlagsData::trusted(), p, c, n);
-            let ok = self.b.ins().icmp(IntCC::Equal, old, c);
-            self.set(op, smallvec![old, ok]);
+            if self.needs_atomic_stub(self.b.func.dfg.value_type(c)) {
+                self.atomic_cas_stub(op, p, c, n);
+            } else {
+                let old = self.b.ins().atomic_cas(MemFlagsData::trusted(), p, c, n);
+                let ok = self.b.ins().icmp(IntCC::Equal, old, c);
+                self.set(op, smallvec![old, ok]);
+            }
         } else if is!(FenceOp) {
             self.b.ins().fence();
         } else if is!(GetElementPtrOp) {
@@ -1505,9 +1934,32 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         // passed like ordinary arguments of their own types.
         let var_arg = matches!(classify(ctx, fn_ty), TyK::Func(_, _, true));
         if var_arg {
-            for &v in &cargs[sig.params.len()..] {
+            let fixed = sig.params.len();
+            for &v in &cargs[fixed..] {
                 sig.params
                     .push(AbiParam::new(self.b.func.dfg.value_type(v)));
+            }
+            if cc == CallConv::AppleAarch64 && sig.params.len() > fixed {
+                // Darwin puts every variadic argument on the stack, but
+                // Cranelift does not distinguish variadic params: pad the
+                // argument list with dummy integers so the real variadic
+                // arguments land past x7. Non-integer parameters are not
+                // representable this way (same restriction as cg_clif).
+                assert!(
+                    sig.params.iter().all(|p| p.value_type.is_int()),
+                    "non-integer argument in C-variadic call on aarch64-apple-darwin"
+                );
+                let sret = usize::from(
+                    matches!(sig.params[0].purpose, ArgumentPurpose::StructReturn),
+                );
+                let used: usize = sig.params[sret..fixed]
+                    .iter()
+                    .map(|p| if p.value_type.bits() == 128 { 2 } else { 1 })
+                    .sum();
+                for _ in used..8 {
+                    sig.params.insert(fixed, AbiParam::new(clt::I64));
+                    cargs.insert(fixed, self.b.ins().iconst(clt::I64, 0));
+                }
             }
         }
         let target = match call.callee(ctx) {

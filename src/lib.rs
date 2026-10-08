@@ -116,7 +116,13 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
         if keep_fp { "true" } else { "false" },
     )
     .unwrap();
-    fb.set("tls_model", "elf_gd").unwrap();
+    let tls_model = match sess.target.options.binary_format {
+        rustc_target::spec::BinaryFormat::Elf => "elf_gd",
+        rustc_target::spec::BinaryFormat::MachO => "macho",
+        rustc_target::spec::BinaryFormat::Coff => "coff",
+        _ => "none",
+    };
+    fb.set("tls_model", tls_model).unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
     fb.set(

@@ -37,6 +37,11 @@ pub struct UnwindContext {
     frame_table: FrameTable,
     cie_id: Option<CieId>,
     lsda: bool,
+    /// FuncId of `rust_eh_personality` when the CIE references it directly
+    /// (Mach-O); the ld64 personality reloc points at the function and gets a
+    /// POINTER_TO_GOT reloc instead of a DW.ref slot.
+    personality_fn: Option<u32>,
+    macho: bool,
 }
 
 impl UnwindContext {
@@ -47,6 +52,9 @@ impl UnwindContext {
             Endianness::Big => RunTimeEndian::Big,
         };
         let mut frame_table = FrameTable::default();
+        let macho =
+            module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+        let mut personality_fn = None;
         let cie_id = module.isa().create_systemv_cie().map(|mut cie| {
             let ptr_enc = if pic {
                 gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
@@ -56,9 +64,12 @@ impl UnwindContext {
             cie.fde_address_encoding = ptr_enc;
             if unwind {
                 let code_enc = if pic {
-                    let fmt = if module.isa().triple().architecture
-                        == target_lexicon::Architecture::X86_64
+                    let fmt = if module.isa().triple().binary_format
+                        == target_lexicon::BinaryFormat::Macho
+                        || module.isa().triple().architecture
+                            == target_lexicon::Architecture::X86_64
                     {
+                        // ld64/ld64.lld require sdata4 for the CIE personality.
                         gimli::DW_EH_PE_sdata4
                     } else {
                         gimli::DW_EH_PE_sdata8
@@ -88,17 +99,25 @@ impl UnwindContext {
                             .unwrap()
                     }
                 };
-                // Indirect so the personality may live in another DSO.
-                let pref = module
-                    .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
-                    .unwrap();
-                let mut d = DataDescription::new();
-                // Must not be zero-init: the unwinder can't handle it in .bss.
-                d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
-                let fr = module.declare_func_in_data(personality, &mut d);
-                d.write_function_addr(0, fr);
-                module.define_data(pref, &d).unwrap();
-                cie.personality = Some((code_enc, address_for_data(pref)));
+                if macho {
+                    // Mach-O: the CIE personality reloc points at the function
+                    // itself and is emitted as POINTER_TO_GOT; the linker GOT
+                    // supplies the `indirect` hop, so no DW.ref slot is needed.
+                    personality_fn = Some(personality.as_u32());
+                    cie.personality = Some((code_enc, address_for_func(personality)));
+                } else {
+                    // Indirect so the personality may live in another DSO.
+                    let pref = module
+                        .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+                        .unwrap();
+                    let mut d = DataDescription::new();
+                    // Must not be zero-init: the unwinder can't handle it in .bss.
+                    d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
+                    let fr = module.declare_func_in_data(personality, &mut d);
+                    d.write_function_addr(0, fr);
+                    module.define_data(pref, &d).unwrap();
+                    cie.personality = Some((code_enc, address_for_data(pref)));
+                }
             }
             frame_table.add_cie(cie)
         });
@@ -107,6 +126,8 @@ impl UnwindContext {
             frame_table,
             cie_id,
             lsda: unwind,
+            personality_fn,
+            macho,
         }
     }
 
@@ -164,7 +185,12 @@ impl UnwindContext {
             t.write(&mut w, encoding).unwrap();
             let mut data = DataDescription::new();
             data.define(w.writer.into_vec().into_boxed_slice());
-            data.set_custom_section(".gcc_except_table");
+            // Mach-O custom sections never dedup, and n_sect is a u8: emit
+            // LSDAs into the shared read-only-data section instead of one
+            // `__gcc_except_tab` per FDE.
+            if !self.macho {
+                data.set_custom_section(".gcc_except_table");
+            }
             for r in &w.relocs {
                 let DebugRelocName::Symbol(id) = r.name else {
                     unreachable!()
@@ -192,6 +218,14 @@ impl UnwindContext {
         if w.writer.slice().is_empty() {
             return;
         }
+        // The CIE record is written first; its personality field is the only
+        // relocated field inside it. Restrict the Mach-O personality reloc to
+        // offsets within the CIE so that an FDE for the personality function
+        // itself (e.g. when building std, which defines rust_eh_personality)
+        // still gets a normal pc_begin reloc.
+        let cie_end = 4 + u64::from(u32::from_le_bytes(
+            w.writer.slice()[0..4].try_into().unwrap(),
+        ));
         let sec = product.object.section_id(StandardSection::EhFrame);
         product
             .object
@@ -207,11 +241,42 @@ impl UnwindContext {
                     } else {
                         product.data_symbol(DataId::from_u32(id & !(1 << 31)))
                     };
-                    product
-                        .object
-                        .symbol_section_and_offset(s)
-                        .unwrap_or((s, 0))
+                    if self.macho {
+                        // ld64's eh_frame parser reads every reloc as a symbol
+                        // index, so reference the symbol itself, never the
+                        // section+offset form.
+                        (s, 0)
+                    } else {
+                        product
+                            .object
+                            .symbol_section_and_offset(s)
+                            .unwrap_or((s, 0))
+                    }
                 }
+            };
+            let (flags, addend) = if self.macho
+                && matches!(r.name, DebugRelocName::Symbol(id) if self.personality_fn == Some(id as u32))
+                && u64::from(r.offset) < cie_end
+            {
+                // CIE personality: ld64 stores the symbol index in the field
+                // and turns it into a GOT pcrel fixup in the linked image.
+                (
+                    RelocationFlags::MachO {
+                        r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
+                        r_pcrel: true,
+                        r_length: 2,
+                    },
+                    0,
+                )
+            } else {
+                (
+                    RelocationFlags::Generic {
+                        kind: r.kind,
+                        encoding: RelocationEncoding::Generic,
+                        size: r.size * 8,
+                    },
+                    off as i64 + r.addend,
+                )
             };
             product
                 .object
@@ -220,12 +285,8 @@ impl UnwindContext {
                     Relocation {
                         offset: u64::from(r.offset),
                         symbol,
-                        flags: RelocationFlags::Generic {
-                            kind: r.kind,
-                            encoding: RelocationEncoding::Generic,
-                            size: r.size * 8,
-                        },
-                        addend: off as i64 + r.addend,
+                        flags,
+                        addend,
                     },
                 )
                 .unwrap();

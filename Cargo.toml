@@ -17,7 +17,7 @@ cranelift-frontend = "0.135.5"
 cranelift-module = "0.135.5"
 cranelift-object = "0.135.5"
 target-lexicon = "0.13"
-object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf", "macho"] }
 smallvec = "1"
 egg = "0.10"
 waffle = "0.3.2"

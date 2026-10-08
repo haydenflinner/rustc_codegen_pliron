@@ -5,7 +5,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml
-export RUSTFLAGS="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/librustc_codegen_pliron.so} -Clinker=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld"
+case "$(uname -s)" in
+  Darwin) so=dylib ;;
+  *)      so=so ;;
+esac
+export RUSTFLAGS="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/librustc_codegen_pliron.$so} -Clinker=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld"
 export CARGO_TARGET_DIR=$ROOT/target/wasm
 # cargo doesn't track the backend dylib; start clean so core is rebuilt by the current backend.
 rm -rf "$CARGO_TARGET_DIR"
