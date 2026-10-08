@@ -139,6 +139,10 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
             rustc_target::spec::TlsModel::InitialExec | rustc_target::spec::TlsModel::LocalExec
         )
         && pass_enabled("PLIRON_TLS_IE");
+    crate::lower::RET_NOEXT.store(
+        sess.target.arch == rustc_target::spec::Arch::X86_64 && pass_enabled("PLIRON_RET_NOEXT"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     fb.set("tls_model", if ie { "elf_ie" } else { "elf_gd" })
         .unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();

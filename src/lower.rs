@@ -40,6 +40,12 @@ enum Sym {
     D(DataId, bool),
 }
 
+/// Set when the target ABI leaves the upper bits of narrow return values
+/// unspecified (x86-64 SysV: only `%al`/`%ax` are significant, and neither
+/// LLVM nor gcc/clang callers rely on more), so callees needn't extend them
+/// (`PLIRON_RET_NOEXT`).
+pub static RET_NOEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
     let TyK::Func(ret, args, _) = classify(ctx, fn_ty) else {
         panic!("not a function type")
@@ -67,10 +73,16 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
     }
     let lv = leaves(ctx, ret);
     let single = lv.len() == 1;
+    let ret_ext = match exts.ret {
+        ArgExt::Zext | ArgExt::Sext if RET_NOEXT.load(std::sync::atomic::Ordering::Relaxed) => {
+            ArgExt::default()
+        }
+        e => e,
+    };
     for (_, t) in lv {
         let p = AbiParam::new(t);
         sig.returns
-            .push(if single { apply(p, exts.ret, t) } else { p });
+            .push(if single { apply(p, ret_ext, t) } else { p });
     }
     sig
 }
