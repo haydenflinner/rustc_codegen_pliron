@@ -336,3 +336,66 @@ pub fn run(func: &mut Function) -> usize {
     }
     n
 }
+
+/// Loads within the dereferenceable bytes of a frozen param (rustc `noalias
+/// readonly` `&T`: immutable and live for the whole call) become `readonly
+/// can_move`, which Cranelift's egraph treats as pure: it merges repeats and
+/// hoists them out of loops, as LLVM's LICM/GVN do with the same facts.
+pub fn frozen_loads(
+    func: &mut Function,
+    frozen: &rustc_data_structures::fx::FxHashMap<Value, u64>,
+) -> usize {
+    let mut n = 0;
+    let insts: Vec<Inst> = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .collect();
+    for i in insts {
+        let InstructionData::Load {
+            opcode,
+            arg,
+            flags,
+            offset,
+        } = func.dfg.insts[i]
+        else {
+            continue;
+        };
+        let bytes = match opcode {
+            Opcode::Load => func.dfg.value_type(func.dfg.first_result(i)).bytes(),
+            Opcode::Uload8 | Opcode::Sload8 => 1,
+            Opcode::Uload16 | Opcode::Sload16 => 2,
+            Opcode::Uload32 | Opcode::Sload32 => 4,
+            _ => continue,
+        };
+        let a = func.dfg.resolve_aliases(arg);
+        let (base, k) = if frozen.contains_key(&a) {
+            (a, 0)
+        } else {
+            match bin_k(func, a, Opcode::Iadd) {
+                Some(xk) => xk,
+                None => continue,
+            }
+        };
+        let Some(&size) = frozen.get(&base) else {
+            continue;
+        };
+        let lo = k + i64::from(offset);
+        if lo < 0 || lo as u64 + u64::from(bytes) > size {
+            continue;
+        }
+        let d = func.dfg.mem_flags[flags];
+        if !d.notrap() || (d.readonly() && d.can_move()) {
+            continue;
+        }
+        let nf = func
+            .dfg
+            .mem_flags
+            .insert_unchecked(d.with_readonly().with_can_move());
+        if let InstructionData::Load { flags, .. } = &mut func.dfg.insts[i] {
+            *flags = nf;
+        }
+        n += 1;
+    }
+    n
+}

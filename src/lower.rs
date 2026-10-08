@@ -226,6 +226,7 @@ pub fn lower_to_object(
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
         let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
+        let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -247,11 +248,13 @@ pub fn lower_to_object(
                 nonnull: FxHashSet::default(),
                 bool01: FxHashSet::default(),
                 derived: FxHashMap::default(),
+                frozen: FxHashMap::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
             nonnull = std::mem::take(&mut fl.nonnull);
             derived = std::mem::take(&mut fl.derived);
+            frozen = std::mem::take(&mut fl.frozen);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -319,6 +322,9 @@ pub fn lower_to_object(
             {
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
             }
+        }
+        if !frozen.is_empty() {
+            crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
         }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
@@ -444,6 +450,8 @@ struct FnLower<'a, 'b, 'tcx> {
     bool01: FxHashSet<cranelift_codegen::ir::Value>,
     /// Inbounds GEP result → base (null only if the base is).
     derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
+    /// Entry params pointing at frozen memory → dereferenceable bytes.
+    frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -501,6 +509,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
         for arg in args {
             let n = leaves(ctx, arg.get_type(ctx)).len();
+            if n == 1
+                && let Some(&s) = self.st.frozen.get(&arg)
+            {
+                self.frozen.insert(params[i], s);
+            }
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }

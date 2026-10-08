@@ -82,6 +82,11 @@ pub struct FuncInfo {
     pub nounwind: bool,
     /// Backend type of the value returned through the sret pointer.
     pub sret_ty: Option<TypeHandle>,
+    /// Params pointing at memory rustc marks `noalias readonly` (frozen `&T`):
+    /// (param index, dereferenceable bytes), valid when the function has
+    /// `nparams` params.
+    pub frozen: Vec<(usize, u64)>,
+    pub nparams: usize,
 }
 
 pub struct GlobalInfo {
@@ -127,6 +132,9 @@ pub struct State<'tcx> {
     pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Loads whose (pointer) result rustc marked `!nonnull`.
     pub nonnull: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// Entry params of local functions that point at frozen memory, with
+    /// their dereferenceable size (see `FuncInfo::frozen`).
+    pub frozen: FxHashMap<Value, u64>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// `inbounds` GEPs: null only if their base is.
@@ -294,6 +302,8 @@ impl<'tcx> CodegenCx<'tcx> {
                 cold: false,
                 nounwind: false,
                 sret_ty: None,
+                frozen: Vec::new(),
+                nparams: 0,
             },
         );
         op
@@ -369,6 +379,7 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
+            (f.frozen, f.nparams) = frozen_params(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
             let t = self.backend_type(fn_abi.ret.layout);
@@ -698,4 +709,63 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
         _ => None,
     };
     (l.ty, v)
+}
+
+/// Frozen pointer params of `fn_abi` by backend param index (the layout of
+/// `fn_decl_backend_type`), and the backend param count.
+fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, usize) {
+    use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
+    let size = |a: &ArgAttributes| {
+        let n = a.pointee_size.bytes();
+        (a.regular.contains(A::NoAlias | A::ReadOnly) && n > 0).then_some(n)
+    };
+    let mut v = Vec::new();
+    let mut i = usize::from(matches!(fn_abi.ret.mode, PassMode::Indirect { .. }));
+    let nargs = if fn_abi.c_variadic {
+        fn_abi.fixed_count as usize
+    } else {
+        fn_abi.args.len()
+    };
+    for arg in &fn_abi.args[..nargs] {
+        let (a, n) = match &arg.mode {
+            PassMode::Ignore => continue,
+            PassMode::Direct(a) => (Some(a), 1),
+            PassMode::Pair(a, _) => (Some(a), 2),
+            PassMode::Indirect {
+                meta_attrs: Some(_),
+                ..
+            } => (None, 2),
+            PassMode::Cast { pad_i32_count, .. } => (None, *pad_i32_count as usize + 1),
+            PassMode::Indirect {
+                attrs,
+                meta_attrs: None,
+                ..
+            } => (Some(attrs), 1),
+        };
+        if let Some(s) = a.and_then(size) {
+            v.push((i, s));
+        }
+        i += n;
+    }
+    (v, i)
+}
+
+/// Entry-block params of bodies in this module that point at frozen memory.
+pub fn frozen_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64)> {
+    let mut out = Vec::new();
+    for f in st.funcs.values() {
+        if f.frozen.is_empty() {
+            continue;
+        }
+        let Some(e) = Operation::get_op::<FuncOp>(f.op, ctx).and_then(|o| o.get_entry_block(ctx))
+        else {
+            continue;
+        };
+        let args: Vec<Value> = e.deref(ctx).arguments().collect();
+        if args.len() != f.nparams {
+            continue;
+        }
+        out.extend(f.frozen.iter().map(|&(i, s)| (args[i], s)));
+    }
+    out
 }

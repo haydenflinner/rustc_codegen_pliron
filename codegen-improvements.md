@@ -46,6 +46,7 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | ablation of the batch: `PLIRON_TAILDUP=0` | 1.26s | 2.44s | 5.95B (+0.7%) | 13.28B (+0.5%) | tail duplication kept (rustc_lexer `.text` +1%, but fewer instructions executed) |
 | + regalloc2 spill priority weight/(4·√len) instead of weight/len (vendored regalloc2, see `vendor/regalloc2/PLIRON_PATCH.md`) | 1.33s | 2.54s | 5.90B (−0.2%) | 13.17B (−0.3%) | kept: rustc_lexer `advance_token` stack refs 292→91; to be upstreamed once proven |
 | + devirtualization of calls through folded vtable/fn-pointer slots + targeted inline round (`PLIRON_DEVIRT`), `vhigh_bits(icmp slt x, 0)` → `vhigh_bits(x)` (one `pcmpgtb` less per hashbrown probe), brif-block tail duplication (`PLIRON_TAILDUP_BRIF`), unreachable blocks lowered as `trap` | 1.25s | 2.41s | 5.77B (−2.2%) | 12.92B (−1.9%) | kept. synthetic hashbrown (`/tmp/rs/hm.rs`): 151.0M → 114.9M instructions. Unreachable-block lowering order fixed a stage2 panic in `AdtDef::eval_explicit_discr` that devirt exposed |
+| + `br_table` arm index facts and `x == y` dominating facts in condition folding (`PLIRON_DOMCOND`), dead blocks dropped before taildup | 1.25s | 2.40s | 5.77B (±0) | 12.91B (−0.1%) | kept: no stage2 change, but synthetic hashbrown 114.9M → 106.8M and `hm::eq` 0x15c → 0x134 B (derive(PartialEq) enum compares re-test the discriminant) |
 
 Net at the current defaults: 5.77B / 12.92B instructions (−61% / −60% vs baseline),
 1.25s / 2.41s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.86×).
