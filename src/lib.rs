@@ -160,7 +160,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        inline::run(ctx, st);
+        let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
+            || matches!(cx.tcx.sess.opts.optimize, OptLevel::Size | OptLevel::SizeMin);
+        inline::run(ctx, st, small);
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }

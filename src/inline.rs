@@ -23,6 +23,7 @@ use crate::context::State;
 use crate::lower::has_body;
 
 const DEFAULT_LIMIT: usize = 320;
+const SMALL_LIMIT: usize = 40;
 
 pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
@@ -160,17 +161,20 @@ fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+/// `small`: size-sensitive output (wasm, -Copt-level=s/z) keeps the old 40-op limit and no
+/// single-caller inlining; rustc.wasm tripled in code size (past V8's 1 GB module cap) without it.
+pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     let limit = std::env::var("PLIRON_INLINE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_LIMIT);
+        .unwrap_or(if small { SMALL_LIMIT } else { DEFAULT_LIMIT });
     if limit == 0 {
         return;
     }
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
-    let single: FxHashSet<String> = if crate::pass_enabled("PLIRON_INLINE_ONCE") {
+    let once = std::env::var("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    let single: FxHashSet<String> = if once {
         let taken = crate::lower::address_taken(ctx, st);
         let counts = call_counts(ctx, st);
         st.funcs
