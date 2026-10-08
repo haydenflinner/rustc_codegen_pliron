@@ -17,7 +17,7 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
 use pliron_llvm::ops::{BrOp, CallOp, ReturnOp};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::context::State;
 use crate::lower::has_body;
@@ -44,7 +44,7 @@ pub(crate) fn direct_callee<'a>(
     st.ident_to_sym.get(&id.to_string())
 }
 
-fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize) -> bool {
+fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> bool {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
         return false;
@@ -65,7 +65,62 @@ fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize) -> bool {
             }
         }
     }
-    n <= if f.always_inline { limit * 10 } else { limit }
+    n <= if f.always_inline || once {
+        limit * 10
+    } else {
+        limit
+    }
+}
+
+fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
+    let mut n: FxHashMap<String, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
+            continue;
+        }
+        for b in blocks(ctx, f.op) {
+            for op in ops(ctx, b) {
+                if let Some(c) = direct_callee(ctx, st, op) {
+                    *n.entry(c.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Marks local fns that nothing references any more (typically fully inlined)
+/// so lowering skips them. Iterates because a dead fn's calls don't count.
+/// `PLIRON_DEADFN=0` disables it.
+pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
+    let taken = crate::lower::address_taken(ctx, st);
+    loop {
+        let counts = call_counts(ctx, st);
+        let dead: Vec<String> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !st.dead_fns.contains(n.as_str())
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        st.dead_fns.extend(dead);
+    }
+    if std::env::var("PLIRON_STATS").is_ok() {
+        eprintln!(
+            "deadfn {}: {} of {} fns not lowered",
+            st.cgu,
+            st.dead_fns.len(),
+            st.funcs.len()
+        );
+    }
 }
 
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
@@ -110,6 +165,23 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
     if limit == 0 {
         return;
     }
+    // Local fns with one direct call site and no address use get 10x the limit:
+    // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
+    let single: FxHashSet<String> = if crate::pass_enabled("PLIRON_INLINE_ONCE") {
+        let taken = crate::lower::address_taken(ctx, st);
+        let counts = call_counts(ctx, st);
+        st.funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && !taken.contains(n.as_str())
+                    && counts.get(n.as_str()) == Some(&1)
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
     let mut ok: FxHashMap<String, Ptr<Operation>> = FxHashMap::default();
@@ -117,7 +189,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
-            if eligible(ctx, st, sym, limit) {
+            if eligible(ctx, st, sym, limit, single.contains(sym)) {
                 ok.insert(sym.clone(), st.funcs[sym].op);
             }
         }
@@ -150,7 +222,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         for (call, callee) in sites {
             inline_call(ctx, st, &mut rw, call, callee);
         }
-        if bottom_up && eligible(ctx, st, &sym, limit) {
+        if bottom_up && eligible(ctx, st, &sym, limit, single.contains(&sym)) {
             ok.insert(sym.clone(), caller);
         }
     }

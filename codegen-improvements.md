@@ -26,7 +26,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | inline size limit 40 → 80 ops (`PLIRON_INLINE=80`) | 2.03s | 3.70s | 8.29B (−6.6%) | 18.09B (−6.3%) | kept; stage2 build time unchanged (5:55 vs 6:26) |
 | inline size limit 80 → 160 ops (`PLIRON_INLINE=160`) | 1.88s | 3.42s | 7.99B (−3.6%) | 17.37B (−4.0%) | kept; librustc_driver.so +1.8%, stage2 build 6:12 |
 | inline size limit 160 → 320 ops (`PLIRON_INLINE=320`, new default) | 1.89s (noise) | 3.50s (noise) | 7.83B (−2.0%) | 17.04B (−1.9%) | kept as default; librustc_driver.so +3% vs 160 (260 MB), stage2 build 6:39; returns diminishing (−6.5% → −3.8% → −2% per doubling) |
+| + single-caller local fns inlined at 10× the size limit (`PLIRON_INLINE_ONCE`) + unreferenced local fns not lowered (`PLIRON_DEADFN`) | 1.84s | 3.42s | 7.70B (−1.7%) | 16.80B (−1.4%) | kept. Ablation (stage2 rebuilt with `PLIRON_INLINE_ONCE=0`): 7.83B / 17.03B, so all of the runtime gain comes from single-caller inlining; `PLIRON_DEADFN` only cuts backend work (regex-syntax at -O: 1280 of 1956 fns not lowered, compile 3.70s → 3.42s, `.text` −21%; with both: 2.71s, −23%). librustc_driver.so 260.4 → 256.7 MB |
 | + memcpyopt sret call-slot forwarding (`PLIRON_MEMCPYOPT=1`) | 2.59s | 5.23s (noise) | 11.87B (−0.1%) | 25.63B (±0) | dropped (opt-in only) |
+| one CGU per crate (`rust.codegen-units = 1`), so the inliner sees the whole crate | – | – | – | – | not measurable here: stage2 build OOM-killed (28 GB RSS) on `rustc_query_impl` and `cranelift-codegen`; pliron IR for a whole large crate doesn't fit in 31 GB |
 
 Net at the current defaults: 7.83B / 17.04B instructions (−47% / −47% vs baseline),
 1.89s / 3.50s wall (stage1 LLVM-built: 0.79s metadata).

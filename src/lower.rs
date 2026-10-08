@@ -82,38 +82,56 @@ pub(crate) fn internal_fns(
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();
     }
+    let mut taken = address_taken(ctx, st);
+    // A `try_call` into a tail-CC callee clobbers every register, so callees
+    // reached by an invoke keep the platform ABI.
+    taken.extend(
+        st.invokes
+            .keys()
+            .filter_map(|&op| crate::inline::direct_callee(ctx, st, op))
+            .cloned(),
+    );
+    st.funcs
+        .iter()
+        .filter(|(n, f)| {
+            f.linkage == Linkage::Local
+                && !taken.contains(n.as_str())
+                && !matches!(classify(ctx, f.ty), TyK::Func(_, _, true))
+                && has_body(ctx, f.op)
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// Functions whose address is used other than as a direct callee: symbol
+/// constants that are used or sit in global/aggregate initializers, and names
+/// mentioned in asm.
+pub(crate) fn address_taken(
+    ctx: &Context,
+    st: &State<'_>,
+) -> rustc_data_structures::fx::FxHashSet<String> {
+    use rustc_data_structures::fx::FxHashSet;
     let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
     for c in st.consts.values() {
         if let ConstVal::Agg(vs) = c {
             escaped.extend(vs.iter().copied());
         }
     }
-    // A `try_call` into a tail-CC callee clobbers every register, so callees
-    // reached by an invoke keep the platform ABI.
-    let mut taken: FxHashSet<&str> = st
-        .invokes
-        .keys()
-        .filter_map(|&op| crate::inline::direct_callee(ctx, st, op))
-        .map(|s| s.as_str())
-        .collect();
+    let mut taken = FxHashSet::default();
     for (v, c) in &st.consts {
         if let ConstVal::Sym { sym, .. } = c {
             if v.is_used(ctx) || escaped.contains(v) {
-                taken.insert(sym.as_str());
+                taken.insert(sym.clone());
             }
         }
     }
-    st.funcs
-        .iter()
-        .filter(|(n, f)| {
-            f.linkage == Linkage::Local
-                && !taken.contains(n.as_str())
-                && !st.asm.contains(n.as_str())
-                && !matches!(classify(ctx, f.ty), TyK::Func(_, _, true))
-                && has_body(ctx, f.op)
-        })
-        .map(|(n, _)| n.clone())
-        .collect()
+    taken.extend(
+        st.funcs
+            .keys()
+            .filter(|n| st.asm.contains(n.as_str()))
+            .cloned(),
+    );
+    taken
 }
 
 pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
@@ -145,6 +163,9 @@ pub fn lower_to_object(
     };
     let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
     for (n, f) in &st.funcs {
+        if st.dead_fns.contains(n) {
+            continue;
+        }
         let sig = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let mut l = f.linkage;
         if l == Linkage::Import && has_body(ctx, f.op) {
@@ -175,7 +196,7 @@ pub fn lower_to_object(
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
         }
         let Sym::F(id, _) = ids[n] else {

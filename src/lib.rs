@@ -175,6 +175,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             sroa::run(ctx, st);
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
+        if pass_enabled("PLIRON_DEADFN") {
+            inline::dead_fns(ctx, st);
+        }
     }
     let isa = build_isa(cx.tcx.sess);
     let obj = lower::lower_to_object(
