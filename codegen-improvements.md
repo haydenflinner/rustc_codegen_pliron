@@ -60,6 +60,7 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + direct PLT32 `call` to functions in other CGUs instead of GOT load + `call *reg` (`PLIRON_PLTCALL`, vendored Cranelift emit); alias block params fed one value by every predecessor before condition folding (`PLIRON_TRIVPARAM`) | 1.15s | 2.25s | 5.39B (−0.7%) | 12.11B (−1.2%) | kept; regex-syntax `.text` −1.5% / −0.6% |
 | + cross-CGU copies also for small callees of copied callees, 3 levels (`PLIRON_XCGU_DEPTH`) | 1.12s | 2.18s | 5.37B (−0.4%) | 12.06B (−0.4%) | kept; regex-syntax (16 CGUs) 136 → 147 copies |
 | + non-null facts for TLS/symbol/function/stack addresses (`PLIRON_NN_ADDR`) + inliner diagnostics | 1.18s | 2.35s | 5.37B (±0) | 12.06B (±0) | kept; no regex-syntax change (the facts matter in rustc code, not this crate) |
+| + xcgu copies for `InstanceKind::Shim` (drop glue, closure-once, reify/fnptr shims) | 1.17s | 2.27s | 5.37B (±0) | 12.06B (±0) | kept; no regex-syntax change either — shims are rare in this crate — but it's the right thing (LLVM can inline those bodies) |
 
 Net at the current defaults: 5.37B / 12.06B instructions (−64% / −62% vs baseline),
 1.18s / 2.35s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.73×).
