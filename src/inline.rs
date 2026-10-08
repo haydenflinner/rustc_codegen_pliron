@@ -15,11 +15,12 @@ use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::Typed;
+use pliron::r#type::{Typed, TypedHandle};
 use pliron_llvm::ops::{BrOp, CallOp, ReturnOp};
+use pliron_llvm::types::FuncType;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
-use crate::context::State;
+use crate::context::{ConstVal, State};
 use crate::lower::has_body;
 
 const DEFAULT_LIMIT: usize = 320;
@@ -169,7 +170,12 @@ fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
 
 /// `small`: size-sensitive output (wasm, -Copt-level=s/z) keeps the old 40-op limit and no
 /// single-caller inlining; rustc.wasm tripled in code size (past V8's 1 GB module cap) without it.
-pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
+pub fn run(
+    ctx: &mut Context,
+    st: &mut State<'_>,
+    small: bool,
+    only: Option<&FxHashSet<Ptr<Operation>>>,
+) {
     let limit = std::env::var("PLIRON_INLINE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -228,6 +234,9 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
                 if !bottom_up && st.invokes.contains_key(&op) {
                     continue;
                 }
+                if only.is_some_and(|o| !o.contains(&op)) {
+                    continue;
+                }
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
@@ -265,6 +274,68 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     if std::env::var("PLIRON_STATS").is_ok() {
         left_stats(ctx, st, &ok);
     }
+}
+
+/// Indirect calls whose callee is a constant function address (a vtable slot
+/// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
+/// become direct calls. Returns the rewritten calls, for a second inline round.
+pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>> {
+    let mut out = FxHashSet::default();
+    let fns: Vec<_> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| has_body(ctx, f))
+        .collect();
+    for f in fns {
+        for b in blocks(ctx, f) {
+            for c in ops(ctx, b) {
+                let Some(call) = Operation::get_op::<CallOp>(c, ctx) else {
+                    continue;
+                };
+                let CallOpCallable::Indirect(p) = call.callee(ctx) else {
+                    continue;
+                };
+                let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(&p) else {
+                    continue;
+                };
+                let (Some(fi), Some(info), Some(id)) =
+                    (st.funcs.get(sym), st.calls.get(&c), st.sym_to_ident.get(sym))
+                else {
+                    continue;
+                };
+                if info.fn_ty != fi.ty {
+                    continue;
+                }
+                let (id, fty) = (id.clone(), info.fn_ty);
+                let fty = TypedHandle::<FuncType>::from_handle(fty, ctx).unwrap();
+                let args = call.args(ctx);
+                let nc = CallOp::new(ctx, CallOpCallable::Direct(id), fty, args).get_operation();
+                nc.insert_before(ctx, c);
+                if c.deref(ctx).get_num_results() > 0 {
+                    let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                    old.replace_all_uses_with(ctx, &new);
+                }
+                let info = st.calls.remove(&c).unwrap();
+                st.calls.insert(nc, info);
+                if let Some(u) = st.invokes.remove(&c) {
+                    st.invokes.insert(nc, u);
+                }
+                if let Some(e) = st.expect.remove(&c) {
+                    st.expect.insert(nc, e);
+                }
+                if st.last_call == Some(c) {
+                    st.last_call = Some(nc);
+                }
+                Operation::erase(c, ctx);
+                out.insert(nc);
+            }
+        }
+    }
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("devirt {}: {} calls", st.cgu, out.len());
+    }
+    out
 }
 
 /// Why direct calls to defined functions were left in place (`PLIRON_STATS`).

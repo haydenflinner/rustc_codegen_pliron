@@ -172,7 +172,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
             || matches!(cx.tcx.sess.opts.optimize, OptLevel::Size | OptLevel::SizeMin);
-        inline::run(ctx, st, small);
+        inline::run(ctx, st, small, None);
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }
@@ -196,6 +196,21 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         if pass_enabled("PLIRON_CONSTLOAD") {
             constload::run(ctx, st);
+            // Inlining + SROA make vtable pointers constant: call those slots
+            // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
+            if pass_enabled("PLIRON_DEVIRT") {
+                let sites = inline::devirt(ctx, st);
+                if !sites.is_empty() {
+                    inline::run(ctx, st, small, Some(&sites));
+                    if pass_enabled("PLIRON_PHISIMP") {
+                        phisimp::run(ctx, st);
+                    }
+                    if pass_enabled("PLIRON_SROA") {
+                        sroa::run(ctx, st);
+                    }
+                    constload::run(ctx, st);
+                }
+            }
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
