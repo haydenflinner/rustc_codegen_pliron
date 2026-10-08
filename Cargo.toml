@@ -35,4 +35,5 @@ opt-level = 3
 rustc_private = true
 
 [patch.crates-io]
+# One-line spill-priority change; see vendor/regalloc2/PLIRON_PATCH.md.
 regalloc2 = { path = "vendor/regalloc2" }
