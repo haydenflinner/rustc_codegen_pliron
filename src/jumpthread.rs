@@ -84,6 +84,7 @@ fn eval(
     func: &Function,
     env: &FxHashMap<Value, u64>,
     nz: &dyn Fn(Value) -> bool,
+    rg: &dyn Fn(Value) -> Option<(u64, u64)>,
     inst: Inst,
 ) -> Option<u64> {
     let res = func.dfg.first_result(inst);
@@ -95,7 +96,16 @@ fn eval(
         } => imm.bits() as u64,
         InstructionData::IntCompare { cond, args, .. } => {
             let aw = bits(func, args[0])?;
+            let ranged = range_cmp(
+                cond,
+                known(func, env, args[0]),
+                known(func, env, args[1]),
+                rg(args[0]),
+                rg(args[1]),
+                aw,
+            );
             match (known(func, env, args[0]), known(func, env, args[1])) {
+                _ if ranged.is_some() => u64::from(ranged == Some(true)),
                 (Some(a), Some(b)) => icmp(cond, a, b, aw) as u64,
                 (Some(0), None) | (None, Some(0)) => {
                     let x = if known(func, env, args[0]).is_some() {
@@ -342,10 +352,15 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
-fn round(func: &mut Function, nn: &NonNull) -> usize {
+fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let users = users(func);
+    let facts = if domcond {
+        edge_facts(func, &cfg)
+    } else {
+        FxHashMap::default()
+    };
     let entry = func.layout.entry_block();
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -421,8 +436,21 @@ fn round(func: &mut Function, nn: &NonNull) -> usize {
                     let v = func.dfg.resolve_aliases(v);
                     nn.is(func, v) || pn.contains(&v)
                 };
+                // Ranges of the incoming args implied by branches dominating the pred.
+                let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
+                let fs = facts_at(&domtree, &facts, pblock);
+                if !fs.is_empty() {
+                    for (&p, &v) in &argv {
+                        if !env.contains_key(&p)
+                            && let Some(r) = urange(func, &fs, v, 0)
+                        {
+                            prange.insert(p, r);
+                        }
+                    }
+                }
+                let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
                 for &i in body {
-                    if let Some(c) = eval(func, &env, &nz, i) {
+                    if let Some(c) = eval(func, &env, &nz, &rg, i) {
                         env.insert(func.dfg.first_result(i), c);
                     }
                 }
@@ -625,10 +653,12 @@ fn bypass_forwarders(func: &mut Function) -> usize {
     // Block params used outside their own block: bypassing that block would
     // leave those uses undominated.
     let mut escaping: FxHashSet<Value> = FxHashSet::default();
+    let mut uses: FxHashMap<Value, u32> = FxHashMap::default();
     for &x in &blocks {
         for i in func.layout.block_insts(x) {
             let mut note = |v: Value| {
                 let v = func.dfg.resolve_aliases(v);
+                *uses.entry(v).or_default() += 1;
                 if let ValueDef::Param(d, _) = func.dfg.value_def(v)
                     && d != x
                 {
@@ -658,10 +688,23 @@ fn bypass_forwarders(func: &mut Function) -> usize {
         {
             continue;
         }
-        let Some(term) = func.layout.first_inst(b) else {
+        let Some(term) = func.layout.last_inst(b) else {
             continue;
         };
-        if func.layout.last_inst(b) != Some(term) {
+        // Any other insts must be pure and used only by each other.
+        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
+        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
+        for &i in &body {
+            for &a in func.dfg.inst_args(i) {
+                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+        }
+        if !body.iter().all(|&i| {
+            pure_op(func, i) && {
+                let r = func.dfg.first_result(i);
+                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
+            }
+        }) {
             continue;
         }
         let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
@@ -848,12 +891,113 @@ fn implied(f: Cmp, q: Cmp) -> Option<bool> {
     }
 }
 
-/// Fold icmps decided by a dominating branch: a block whose only predecessor
-/// ends in `brif c` knows `c` (or its complement), as do the blocks it
-/// dominates. Returns the icmps folded.
-fn fold_dominated_conds(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+/// Decide `a cc b` when one side is the constant `k` and the other lies in
+/// the unsigned range `[lo, hi]` (`w`-bit compare).
+fn range_cmp(
+    cc: IntCC,
+    a: Option<u64>,
+    b: Option<u64>,
+    ra: Option<(u64, u64)>,
+    rb: Option<(u64, u64)>,
+    w: u32,
+) -> Option<bool> {
+    use IntCC::*;
+    let (cc, (lo, hi), k) = match (a, b) {
+        (None, Some(k)) => (cc, ra?, k),
+        (Some(k), None) => (cc.swap_args(), rb?, k),
+        _ => return None,
+    };
+    let half = 1u64 << (w - 1);
+    let cc = match cc {
+        _ if hi >= half || k >= half => cc,
+        SignedLessThan => UnsignedLessThan,
+        SignedLessThanOrEqual => UnsignedLessThanOrEqual,
+        SignedGreaterThan => UnsignedGreaterThan,
+        SignedGreaterThanOrEqual => UnsignedGreaterThanOrEqual,
+        c => c,
+    };
+    let dec = |t: bool, f: bool| {
+        if t {
+            Some(true)
+        } else if f {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    match cc {
+        UnsignedLessThan => dec(hi < k, lo >= k),
+        UnsignedLessThanOrEqual => dec(hi <= k, lo > k),
+        UnsignedGreaterThan => dec(lo > k, hi <= k),
+        UnsignedGreaterThanOrEqual => dec(lo >= k, hi < k),
+        Equal => dec(lo == k && hi == k, k < lo || k > hi),
+        NotEqual => dec(k < lo || k > hi, lo == k && hi == k),
+        _ => None,
+    }
+}
+
+/// Unsigned range of `v` from its width, `uextend`/`band` with a constant,
+/// and the facts `fs` known where it is used.
+fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64)> {
+    let v = func.dfg.resolve_aliases(v);
+    let w = bits(func, v)?;
+    if func.dfg.value_type(v).is_vector() {
+        return None;
+    }
+    let full = mask(u64::MAX, w);
+    let (mut lo, mut hi) = (0u64, full);
+    let env = FxHashMap::default();
+    for &(cc, a, b) in fs {
+        let (cc, k) = if a == v {
+            (cc, known(func, &env, b))
+        } else if b == v {
+            (cc.swap_args(), known(func, &env, a))
+        } else {
+            continue;
+        };
+        let Some(k) = k else { continue };
+        match cc {
+            IntCC::UnsignedLessThan if k > 0 => hi = hi.min(k - 1),
+            IntCC::UnsignedLessThanOrEqual => hi = hi.min(k),
+            IntCC::UnsignedGreaterThan if k < full => lo = lo.max(k + 1),
+            IntCC::UnsignedGreaterThanOrEqual => lo = lo.max(k),
+            IntCC::Equal => {
+                lo = lo.max(k);
+                hi = hi.min(k);
+            }
+            _ => {}
+        }
+    }
+    if depth < 4
+        && let Some(i) = func.dfg.value_def(v).inst()
+    {
+        match func.dfg.insts[i] {
+            InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } => {
+                if let Some((l, h)) = urange(func, fs, arg, depth + 1) {
+                    lo = lo.max(l);
+                    hi = hi.min(h);
+                }
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => {
+                if let Some(m) = known(func, &env, args[1]).or(known(func, &env, args[0])) {
+                    hi = hi.min(m);
+                }
+            }
+            _ => {}
+        }
+    }
+    (lo <= hi && (lo, hi) != (0, full)).then_some((lo, hi))
+}
+
+/// The condition known on entry to each block whose only predecessor ends
+/// in `brif c` (`c` or its complement).
+fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Cmp> {
     let mut fact: FxHashMap<Block, Cmp> = FxHashMap::default();
     for b in func.layout.blocks() {
         let mut preds = cfg.pred_iter(b);
@@ -875,20 +1019,41 @@ fn fold_dominated_conds(func: &mut Function) -> usize {
         };
         fact.insert(b, (if b == t { c } else { c.complement() }, x, y));
     }
+    fact
+}
+
+/// Facts holding throughout `b`: those of `b` and its dominators.
+fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> Vec<Cmp> {
+    let mut fs = Vec::new();
+    if fact.is_empty() {
+        return fs;
+    }
+    let mut cur = Some(b);
+    for _ in 0..64 {
+        let Some(c) = cur else { break };
+        if let Some(&f) = fact.get(&c) {
+            fs.push(f);
+        }
+        cur = domtree.idom(c);
+    }
+    fs
+}
+
+/// Fold icmps decided by a dominating branch: a block whose only predecessor
+/// ends in `brif c` knows `c` (or its complement), as do the blocks it
+/// dominates; equal operands or a constant against a known range decide it.
+/// Returns the icmps folded.
+fn fold_dominated_conds(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let fact = edge_facts(func, &cfg);
     if fact.is_empty() {
         return 0;
     }
+    let env = FxHashMap::default();
     let mut folds = Vec::new();
     for b in func.layout.blocks() {
-        let mut fs = Vec::new();
-        let mut cur = Some(b);
-        for _ in 0..64 {
-            let Some(c) = cur else { break };
-            if let Some(&f) = fact.get(&c) {
-                fs.push(f);
-            }
-            cur = domtree.idom(c);
-        }
+        let fs = facts_at(&domtree, &fact, b);
         if fs.is_empty() {
             continue;
         }
@@ -896,7 +1061,17 @@ fn fold_dominated_conds(func: &mut Function) -> usize {
             let Some(q) = norm_icmp(func, i) else {
                 continue;
             };
-            if let Some(k) = fs.iter().find_map(|&f| implied(f, q)) {
+            let r = fs.iter().find_map(|&f| implied(f, q)).or_else(|| {
+                range_cmp(
+                    q.0,
+                    known(func, &env, q.1),
+                    known(func, &env, q.2),
+                    urange(func, &fs, q.1, 0),
+                    urange(func, &fs, q.2, 0),
+                    bits(func, q.1)?,
+                )
+            });
+            if let Some(k) = r {
                 folds.push((i, k));
             }
         }
@@ -924,7 +1099,7 @@ pub fn run(
         } else {
             0
         };
-        let n = dc + bypass_forwarders(func) + round(func, &nn);
+        let n = dc + bypass_forwarders(func) + round(func, &nn, domcond);
         total += n;
         if n == 0 {
             break;
