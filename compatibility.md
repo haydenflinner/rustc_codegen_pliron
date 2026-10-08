@@ -23,6 +23,9 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | uuid, anyhow, bytes (wasm32-wasip1, node 22) | `ct-wasi.sh test --no-fail-fast` | uuid 128/128; anyhow 98/98 (its trybuild `compiletest` needs to spawn cargo: no processes on WASI; std `read_dir` panicked on a misaligned `dirent` until the pure-Rust libc aligned it); bytes 803 pass, 0 fail (`test_bytes` segfaults node in `advance_bytes_mut_remaining_capacity`, same with stock LLVM) |
 | parking_lot (wasm32-wasip1) | as above | 1 pass; the rest spawn threads, which wasm32-wasip1 doesn't have |
 | serde, smallvec (wasm32-wasip1) | as above | not run: `serde_core` fails `deny(unused_imports)` on WASI (`OsStr`/`OsString`); smallvec's dev-dep `iai-callgrind-runner` needs serde for `OsString` |
+| itoa, ryu, semver, byteorder (wasm32-wasip1) | `ct-wasi.sh test --no-fail-fast` | 13 / 50 / 38 / 514 pass, 0 fail |
+| indexmap, bitflags (wasm32-wasip1) | as above | indexmap 170 pass; its quickcheck `tests/quick.rs` traps at the first property expected to panic (`drain_bounds`, `replace_index`), because with panic=abort `catch_unwind` cannot recover; stock LLVM traps on the same test. bitflags 78 pass; its trybuild `compile` test needs to spawn cargo |
+| base64, unicode-segmentation (wasm32-wasip1) | as above | not run: dev-deps `criterion` (Rayon) and `wait-timeout` do not build for WASI |
 | polars-core (wasm32-wasip1) | as above | not run: dependency `tokio` is built with features it rejects on wasm |
 | bytes, smallvec, crossbeam (`--workspace`), rayon, parking_lot, anyhow (native) | `compat/pop/run2.sh` | 1305 / 82 / 1037 / 578 / 116 / 99 pass, 0 fail |
 | tokio, serde, syn (`--all-features --release`), clap, uuid (native) | `compat/pop/run3.sh` | 2986 / 480 / 285 / 1787 / 181 pass, 0 fail (syn's rust-src round-trip tests download via reqwest + rustls/aws-lc-rs) |
