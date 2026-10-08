@@ -234,6 +234,7 @@ pub fn lower_to_object(
         let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
+        let nowrite: FxHashMap<FuncRef, bool>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -258,6 +259,7 @@ pub fn lower_to_object(
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
+                nowrite: FxHashMap::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -265,6 +267,7 @@ pub fn lower_to_object(
             derived = std::mem::take(&mut fl.derived);
             frozen = std::mem::take(&mut fl.frozen);
             noalias = std::mem::take(&mut fl.noalias);
+            nowrite = std::mem::take(&mut fl.nowrite);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -315,7 +318,7 @@ pub fn lower_to_object(
             }
         }
         if st.loadfwd {
-            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias);
+            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
             if dump {
                 eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
             }
@@ -514,6 +517,8 @@ struct FnLower<'a, 'b, 'tcx> {
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
     /// Entry params rustc marks `noalias`.
     noalias: FxHashSet<cranelift_codegen::ir::Value>,
+    /// FuncRefs of calls to write-free functions (nowrite.rs).
+    nowrite: FxHashMap<FuncRef, bool>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -1861,7 +1866,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let sym = &self.st.ident_to_sym[&ident.to_string()];
                 match self.ids.get(sym).copied() {
                     Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => {
-                        Ok(self.call_fref(fid))
+                        let nw = self.st.nowrite.get(sym).copied();
+                        let fr = self.call_fref(fid);
+                        if let Some(strict) = nw {
+                            self.nowrite.insert(fr, strict);
+                        }
+                        Ok(fr)
                     }
                     _ => {
                         let addr = self.sym_addr(&sym.clone());

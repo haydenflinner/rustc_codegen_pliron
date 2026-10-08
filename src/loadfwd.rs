@@ -9,6 +9,7 @@
 
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value,
 };
@@ -88,6 +89,16 @@ fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
     });
 }
 
+/// A direct call to a function that writes no memory before returning
+/// normally; across `try_call` it must not write at all (nowrite.rs).
+fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>) -> bool {
+    match func.dfg.insts[i] {
+        InstructionData::Call { func_ref, .. } => nw.contains_key(&func_ref),
+        InstructionData::TryCall { func_ref, .. } => nw.get(&func_ref) == Some(&true),
+        _ => false,
+    }
+}
+
 /// Roots whose memory is reachable only through addresses with that root:
 /// stack slots (`PLIRON_FWD_SLOTS`) and rustc-`noalias` entry params
 /// (`PLIRON_NOALIAS_FWD`) that never escape. Every use of a value with such
@@ -134,6 +145,7 @@ fn transfer(
     av: &mut Avail,
     rw: Option<&mut Vec<(Inst, Value)>>,
     iso: &FxHashSet<Root>,
+    nw: &FxHashMap<FuncRef, bool>,
 ) {
     let mut rw = rw;
     for i in func.layout.block_insts(b) {
@@ -172,7 +184,11 @@ fn transfer(
                     av.insert((r, o, ty), val);
                 }
             }
-            _ if op.is_call() => av.retain(|&(r, _, _), _| iso.contains(&r)),
+            _ if op.is_call() => {
+                if !write_free(func, i, nw) {
+                    av.retain(|&(r, _, _), _| iso.contains(&r));
+                }
+            }
             _ if op.can_store()
                 || op.other_side_effects()
                 || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
@@ -192,7 +208,11 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 }
 
 /// Forward loads in `func`; returns the number removed.
-pub fn run(func: &mut Function, noalias: &FxHashSet<Value>) -> usize {
+pub fn run(
+    func: &mut Function,
+    noalias: &FxHashSet<Value>,
+    nw: &FxHashMap<FuncRef, bool>,
+) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -242,7 +262,7 @@ pub fn run(func: &mut Function, noalias: &FxHashSet<Value>) -> usize {
             let Some(mut av) = input(&out, b) else {
                 continue;
             };
-            transfer(func, b, &mut av, None, &iso);
+            transfer(func, b, &mut av, None, &iso, nw);
             if out.get(&b) != Some(&av) {
                 out.insert(b, av);
                 changed = true;
@@ -259,7 +279,7 @@ pub fn run(func: &mut Function, noalias: &FxHashSet<Value>) -> usize {
     let mut fwd = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
-            transfer(func, b, &mut av, Some(&mut fwd), &iso);
+            transfer(func, b, &mut av, Some(&mut fwd), &iso, nw);
         }
     }
     for &(i, v) in &fwd {
@@ -335,6 +355,7 @@ fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type) {
 /// sets follow `transfer` exactly, so every needed end value exists.
 fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block) -> usize {
     let iso: FxHashSet<Root> = FxHashSet::default();
+    let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
     let mut out: FxHashMap<Block, FxHashSet<Loc>> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, FxHashSet<Loc>>, b: Block| -> Option<FxHashSet<Loc>> {
@@ -363,7 +384,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 .into_iter()
                 .map(|k| (k, Value::reserved_value()))
                 .collect();
-            transfer(func, b, &mut av, None, &iso);
+            transfer(func, b, &mut av, None, &iso, nw);
             let ks: FxHashSet<Loc> = av.into_keys().collect();
             if out.get(&b) != Some(&ks) {
                 out.insert(b, ks);

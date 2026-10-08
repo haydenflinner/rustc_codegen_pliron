@@ -141,6 +141,8 @@ pub struct State<'tcx> {
     pub frozen: FxHashMap<Value, u64>,
     /// Entry params of local functions that rustc marks `noalias`.
     pub noalias: rustc_data_structures::fx::FxHashSet<Value>,
+    /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
+    pub nowrite: rustc_data_structures::fx::FxHashMap<String, bool>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// `inbounds` GEPs: null only if their base is.

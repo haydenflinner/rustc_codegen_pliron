@@ -40,6 +40,7 @@ mod looprot;
 mod lower;
 mod memcpyopt;
 mod nounwind;
+mod nowrite;
 mod objmerge;
 mod phisimp;
 mod simd;
@@ -250,6 +251,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     }
                 }
             }
+        }
+        if pass_enabled("PLIRON_NOWRITE") {
+            nowrite::run(ctx, st);
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
