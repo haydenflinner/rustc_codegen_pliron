@@ -1,0 +1,15 @@
+import { chromium } from 'playwright-core';
+const b = await chromium.connectOverCDP('http://localhost:29229');
+const ctx = b.contexts()[0];
+const p = await ctx.newPage();
+p.on('console', m => console.log('console:', m.text()));
+p.on('pageerror', e => console.log('pageerror:', e.message));
+await p.goto('http://localhost:8787/');
+await p.waitForFunction(() => !document.getElementById('go').disabled, null, { timeout: 600000 });
+await p.click('#go');
+await p.waitForFunction(() => window.__done !== false && !document.getElementById('go').disabled, null, { timeout: 600000, polling: 1000 });
+await new Promise(r => setTimeout(r, 1000));
+console.log('LOG:\n' + await p.textContent('#log'));
+console.log('OUT:\n' + await p.textContent('#out'));
+await p.screenshot({ path: 'shot.png', fullPage: true });
+await b.close();

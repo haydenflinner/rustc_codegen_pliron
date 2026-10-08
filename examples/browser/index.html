@@ -1,0 +1,80 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rustc in the browser (pliron, no LLVM)</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; max-width: 900px; }
+  textarea, pre { width: 100%; box-sizing: border-box; font: 13px ui-monospace, monospace; }
+  textarea { height: 300px; }
+  pre { background: #f4f4f4; padding: 8px; min-height: 80px; white-space: pre-wrap; }
+</style>
+<h3>rustc → wasm, running in your browser</h3>
+<p>rustc itself is compiled to wasm by the pliron backend; it compiles this crate to wasm with the same backend, and pliron-wasm-ld links it. Exported <code>extern "C"</code> functions with no arguments are called; <code>print(ptr, len)</code> writes to the output.</p>
+<textarea id="src" spellcheck="false">#![no_std]
+use core::fmt::Write;
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+unsafe extern "C" {
+    fn print(ptr: *const u8, len: usize);
+}
+
+struct Out;
+impl Write for Out {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        unsafe { print(s.as_ptr(), s.len()) };
+        Ok(())
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn run() -> u64 {
+    let mut v = [5u32, 3, 9, 1, 7];
+    v.sort_unstable();
+    writeln!(Out, "sorted: {v:?}").unwrap();
+    for i in 1..=5 {
+        writeln!(Out, "{i}^2 = {}, {i}/3 = {:.3}", i * i, i as f64 / 3.0).unwrap();
+    }
+    (1..=10u64).map(|i| i * i).sum()
+}
+</textarea>
+<p><button id="go" disabled>Loading…</button></p>
+<h4>Compiler</h4><pre id="log"></pre>
+<h4>Program</h4><pre id="out"></pre>
+<script type="module">
+const $ = id => document.getElementById(id);
+const worker = new Worker('worker.js', { type: 'module' });
+const log = s => { $('log').textContent += s + '\n'; };
+let first = true;
+worker.onmessage = async ({ data }) => {
+  if (data.log !== undefined) {
+    log(data.log);
+    if (first && data.log.startsWith('loaded')) { first = false; $('go').disabled = false; $('go').textContent = 'Compile & run'; }
+  }
+  if (!data.done) return;
+  $('go').disabled = false;
+  if (!data.wasm) { window.__done = true; return; }
+  const out = $('out');
+  let mem;
+  const dec = new TextDecoder();
+  const { instance } = await WebAssembly.instantiate(data.wasm, {
+    env: { print: (p, n) => { out.textContent += dec.decode(new Uint8Array(mem.buffer, p, n)); } },
+  });
+  mem = instance.exports.memory;
+  for (const [name, f] of Object.entries(instance.exports)) {
+    if (typeof f === 'function' && f.length === 0) {
+      try { const r = f(); out.textContent += `${name}() = ${r}\n`; } catch (e) { out.textContent += `${name}() trapped: ${e}\n`; }
+    }
+  }
+  window.__done = true;
+};
+$('go').onclick = () => {
+  const src = $('src').value;
+  const exports = [...src.matchAll(/#\[(?:unsafe\()?no_mangle\)?\]\s*pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(\w+)/g)].map(m => m[1]);
+  $('log').textContent = ''; $('out').textContent = ''; window.__done = false;
+  $('go').disabled = true;
+  worker.postMessage({ src, exports });
+};
+</script>
