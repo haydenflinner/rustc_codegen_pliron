@@ -44,32 +44,35 @@ pub(crate) fn direct_callee<'a>(
     st.ident_to_sym.get(&id.to_string())
 }
 
-fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> bool {
+/// `Some(has_eh)` if `sym` may be inlined; `has_eh` = it has invokes or reads
+/// the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees outright.
+fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> Option<bool> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
-        return false;
+        return None;
     }
-    let mut n = 0;
+    let (mut n, mut eh) = (0, false);
     for b in blocks(ctx, f.op) {
         for op in ops(ctx, b) {
             n += 1;
-            let eh_or_va = st
-                .intrinsics
-                .get(&op)
-                .is_some_and(|s| s.starts_with("pliron.eh") || s.starts_with("llvm.va_"));
-            if eh_or_va
-                || st.invokes.contains_key(&op)
+            let intr = st.intrinsics.get(&op);
+            if intr.is_some_and(|s| s.starts_with("llvm.va_"))
                 || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
             {
-                return false;
+                return None;
             }
+            eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
         }
     }
-    n <= if f.always_inline || once {
+    if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
+        return None;
+    }
+    (n <= if f.always_inline || once {
         limit * 10
     } else {
         limit
-    }
+    })
+    .then_some(eh)
 }
 
 fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
@@ -184,13 +187,13 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
-    let mut ok: FxHashMap<String, Ptr<Operation>> = FxHashMap::default();
+    let mut ok: FxHashMap<String, (Ptr<Operation>, bool)> = FxHashMap::default();
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
-            if eligible(ctx, st, sym, limit, single.contains(sym)) {
-                ok.insert(sym.clone(), st.funcs[sym].op);
+            if let Some(eh) = eligible(ctx, st, sym, limit, single.contains(sym)) {
+                ok.insert(sym.clone(), (st.funcs[sym].op, eh));
             }
         }
         st.funcs
@@ -211,9 +214,13 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
-                let Some(&callee) = ok.get(cs) else {
+                let Some(&(callee, eh)) = ok.get(cs) else {
                     continue;
                 };
+                // A callee with its own landing pads only goes into plain call sites.
+                if eh && st.invokes.contains_key(&op) {
+                    continue;
+                }
                 if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty {
                     sites.push((op, callee));
                 }
@@ -222,8 +229,10 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         for (call, callee) in sites {
             inline_call(ctx, st, &mut rw, call, callee);
         }
-        if bottom_up && eligible(ctx, st, &sym, limit, single.contains(&sym)) {
-            ok.insert(sym.clone(), caller);
+        if bottom_up {
+            if let Some(eh) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
+                ok.insert(sym.clone(), (caller, eh));
+            }
         }
     }
 }
@@ -250,7 +259,10 @@ fn inline_call(
         for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
             if let Some(c) = st.calls.get(&op).cloned() {
                 st.calls.insert(new, c);
-                if let Some(u) = unwind {
+                if let Some(&(lp, catch)) = st.invokes.get(&op) {
+                    st.invokes
+                        .insert(new, (map.lookup_block(lp).unwrap(), catch));
+                } else if let Some(u) = unwind {
                     st.invokes.insert(new, u);
                 }
             }
