@@ -209,6 +209,7 @@ pub fn lower_to_object(
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     let mut threaded = 0usize;
+    let mut forwarded = 0usize;
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -264,6 +265,17 @@ pub fn lower_to_object(
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.loadfwd {
+            forwarded += crate::loadfwd::run(&mut clctx.func);
+            if dump {
+                eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
         }
@@ -271,6 +283,9 @@ pub fn lower_to_object(
         m.clear_context(&mut clctx);
     }
 
+    if st.loadfwd && std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("loadfwd {name}: {forwarded} loads forwarded");
+    }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
         eprintln!("jumpthread {name}: {threaded} edges threaded");
     }

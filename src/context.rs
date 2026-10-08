@@ -135,6 +135,9 @@ pub struct State<'tcx> {
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).
     pub jumpthread: bool,
+
+    /// Run `loadfwd` on each lowered Cranelift function (`-O`, `PLIRON_LOADFWD`).
+    pub loadfwd: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
