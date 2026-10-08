@@ -244,6 +244,7 @@ pub fn lower_to_object(
                 exn: None,
                 vars: FxHashMap::default(),
                 nonnull: FxHashSet::default(),
+                bool01: FxHashSet::default(),
                 derived: FxHashMap::default(),
             };
             fl.lower(f.op);
@@ -422,6 +423,8 @@ struct FnLower<'a, 'b, 'tcx> {
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
     /// Results of `!nonnull` memory loads.
     nonnull: FxHashSet<cranelift_codegen::ir::Value>,
+    /// Results of `bool` loads known to be 0 or 1.
+    bool01: FxHashSet<cranelift_codegen::ir::Value>,
     /// Inbounds GEP result → base (null only if the base is).
     derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
 }
@@ -1037,7 +1040,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let dts = self.ty_leaves(self.res_ty(op));
             let mut r = Vals::new();
             for (x, (_, t)) in xs.into_iter().zip(dts) {
-                let v = if is!(TruncOp) && dst_w == 1 {
+                let v = if is!(TruncOp) && dst_w == 1 && self.bool01.contains(&x) {
+                    self.resize(x, clt::I8, false)
+                } else if is!(TruncOp) && dst_w == 1 {
                     let x = self.resize(x, clt::I8, false);
                     self.b.ins().band_imm_u(x, 1)
                 } else if is!(SExtOp) && src_w == 1 {
@@ -1182,6 +1187,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .collect();
             if r.len() == 1 && self.st.nonnull.contains(&op) {
                 self.nonnull.insert(r[0]);
+            }
+            if r.len() == 1 && self.st.bool01.contains(&op) {
+                self.bool01.insert(r[0]);
             }
             self.set(op, r);
         } else if is!(StoreOp) || is!(AtomicStoreOp) {

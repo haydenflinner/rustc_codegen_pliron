@@ -125,6 +125,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         {
             self.nonnull_metadata(load);
         }
+        if matches!(s.primitive(), rustc_abi::Primitive::Int(..)) && !s.is_always_valid(&*self) {
+            let r = s.valid_range(&*self);
+            self.range_metadata(load, r);
+        }
     }
 
     fn mark_volatile(&mut self, volatile: bool) {
@@ -635,7 +639,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.switch_to_block(next);
     }
 
-    fn range_metadata(&mut self, _load: Value, _range: WrappingRange) {}
+    fn range_metadata(&mut self, load: Value, range: WrappingRange) {
+        if range.start == 0
+            && range.end == 1
+            && crate::pass_enabled("PLIRON_BOOLRANGE")
+            && let Some(op) = load.defining_op()
+        {
+            self.st.borrow_mut().bool01.insert(op);
+        }
+    }
     fn nonnull_metadata(&mut self, load: Value) {
         if let Some(op) = load.defining_op() {
             self.st.borrow_mut().nonnull.insert(op);
