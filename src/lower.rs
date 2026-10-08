@@ -239,6 +239,7 @@ pub fn lower_to_object(
                 cconst: FxHashMap::default(),
                 blocks: FxHashMap::default(),
                 frefs: FxHashMap::default(),
+                cfrefs: FxHashMap::default(),
                 gvs: FxHashMap::default(),
                 terminated: false,
                 cc,
@@ -475,6 +476,9 @@ struct FnLower<'a, 'b, 'tcx> {
     cconst: FxHashMap<Value, Vals>,
     blocks: FxHashMap<Ptr<BasicBlock>, Block>,
     frefs: FxHashMap<FuncId, FuncRef>,
+    /// Call-only refs marked colocated: direct `call` (PLT32 under PIC) instead of
+    /// loading the callee from the GOT and calling through a register.
+    cfrefs: FxHashMap<FuncId, FuncRef>,
     gvs: FxHashMap<DataId, GlobalValue>,
     terminated: bool,
     cc: CallConv,
@@ -888,6 +892,19 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         f
     }
 
+    fn call_fref(&mut self, id: FuncId) -> FuncRef {
+        if !crate::pass_enabled("PLIRON_PLTCALL") {
+            return self.fref(id);
+        }
+        if let Some(f) = self.cfrefs.get(&id) {
+            return *f;
+        }
+        let f = self.m.declare_func_in_func(id, self.b.func);
+        self.b.func.dfg.ext_funcs[f].colocated = true;
+        self.cfrefs.insert(id, f);
+        f
+    }
+
     fn sym_addr(&mut self, sym: &str) -> ir::Value {
         match self
             .ids
@@ -927,7 +944,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             .m
             .declare_function(name, Linkage::Import, &sig)
             .unwrap();
-        let fr = self.fref(id);
+        let fr = self.call_fref(id);
         let c = self.b.ins().call(fr, args);
         self.b.inst_results(c).to_vec()
     }
@@ -1821,7 +1838,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             CallOpCallable::Direct(ident) => {
                 let sym = &self.st.ident_to_sym[&ident.to_string()];
                 match self.ids.get(sym).copied() {
-                    Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => Ok(self.fref(fid)),
+                    Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => {
+                        Ok(self.call_fref(fid))
+                    }
                     _ => {
                         let addr = self.sym_addr(&sym.clone());
                         Err((addr, self.b.import_signature(sig)))

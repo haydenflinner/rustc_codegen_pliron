@@ -20,3 +20,11 @@ once proven out on the stage2 benchmark, then drop this copy.
    a `__tls_get_addr` call. New `Reloc::ElfX86_64GotTpOff`, mapped to
    `R_X86_64_GOTTPOFF` in `vendor/cranelift-object`; both of those crates are
    vendored only for this.
+
+## x64 PIC calls use PLT32
+
+`CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`
+when `is_pic` is set (`isa/x64/inst/emit.rs`). Together with the backend marking
+direct-call `FuncRef`s colocated (`PLIRON_PLTCALL`), calls to symbols from other
+CGUs become `call rel32` (the linker resolves PLT32 directly when the definition
+is local, else through the PLT) instead of a GOT load plus `call *reg`.

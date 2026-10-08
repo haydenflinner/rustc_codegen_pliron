@@ -420,7 +420,14 @@ pub(crate) fn emit(
             // The addend adjusts for the difference between the end of the
             // instruction and the beginning of the immediate field.
             let len = sink.cur_offset();
-            sink.add_reloc_at_offset(len - 4, Reloc::X86CallPCRel4, &call_info.dest, -4);
+            // PLIRON: PLT32 under PIC so calls to non-colocated symbols can be direct
+            // (the linker resolves PLT32 to the definition when it is local).
+            let reloc = if info.flags.is_pic() {
+                Reloc::X86CallPLTRel4
+            } else {
+                Reloc::X86CallPCRel4
+            };
+            sink.add_reloc_at_offset(len - 4, reloc, &call_info.dest, -4);
 
             if let Some(s) = stack_map {
                 sink.push_user_stack_map(state, len, s);
@@ -478,7 +485,12 @@ pub(crate) fn emit(
             let offset = sink.cur_offset();
             // The addend adjusts for the difference between the end of the instruction and the
             // beginning of the immediate field.
-            sink.add_reloc_at_offset(offset - 4, Reloc::X86CallPCRel4, &call_info.dest, -4);
+            let reloc = if info.flags.is_pic() {
+                Reloc::X86CallPLTRel4
+            } else {
+                Reloc::X86CallPCRel4
+            };
+            sink.add_reloc_at_offset(offset - 4, reloc, &call_info.dest, -4);
             sink.add_call_site();
         }
 
