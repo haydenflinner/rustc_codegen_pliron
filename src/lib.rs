@@ -36,6 +36,7 @@ mod instcombine;
 mod intrinsic;
 mod jumpthread;
 mod loadfwd;
+mod loopdel;
 mod looprot;
 mod lower;
 mod memcpyopt;
@@ -274,7 +275,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name, &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts));
+        let obj = wasm::lower_to_wasm(
+            &cx.pctx.borrow(),
+            &cx.st.borrow(),
+            name,
+            &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+        );
         return PlironModule {
             obj,
             ir,

@@ -178,7 +178,9 @@ pub fn lower_to_object(
             let body = m
                 .declare_function(&crate::hot::body_name(n), Linkage::Hidden, &sig)
                 .unwrap();
-            let thunk = m.declare_function(crate::obj_sym(n), Linkage::Import, &sig).unwrap();
+            let thunk = m
+                .declare_function(crate::obj_sym(n), Linkage::Import, &sig)
+                .unwrap();
             hot_bodies.insert(n.clone(), body);
             hot_asm.push_str(&crate::hot::thunk_asm(n, l));
             ids.insert(n.clone(), Sym::F(thunk, f.ty));
@@ -345,6 +347,17 @@ pub fn lower_to_object(
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.jumpthread && crate::pass_enabled("PLIRON_LOOPDEL") {
+            let k = crate::loopdel::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("loopdel {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("loopdel broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if std::env::var("PLIRON_LOOPROT").is_ok_and(|v| v == "1") {
             crate::looprot::run(&mut clctx.func);
             if dump {
@@ -396,7 +409,13 @@ pub fn lower_to_object(
         // crates that reinterpret `&[u8]` statics rely on that by accident.
         let mut align = g.align.max(1);
         if !g.mutable && g.section.is_none() {
-            let pref = if size > 16 { 16 } else if size.is_power_of_two() { size } else { 1 };
+            let pref = if size > 16 {
+                16
+            } else if size.is_power_of_two() {
+                size
+            } else {
+                1
+            };
             align = align.max(pref);
         }
         desc.set_align(align);

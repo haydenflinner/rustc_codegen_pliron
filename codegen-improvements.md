@@ -69,6 +69,21 @@ Re-run after merging into the backend feature branch (87db5c8, with 6c68ff9's wa
 limits): stage2 rebuilt with full-bootstrap, 6.86B / 15.10B instructions, 1.61s / 2.95s wall;
 `tests/ui_run_pass.py` (debug) 2537 pass / 57 environment failures, same as before.
 
+## Loop deletion (`PLIRON_LOOPDEL`)
+
+`src/loopdel.rs` (LLVM `loop-deletion`, on CLIF): a single-level loop with no calls, loads,
+stores or traps, whose values are not used after it, and with one exit block taking
+loop-invariant arguments, is skipped by sending its preheader edges straight to that exit.
+It must also be provably finite: a test that runs every iteration exits once a ±1 induction
+variable reaches an invariant bound (`!=`, or `<`/`>` in the step direction). Rust allows
+`loop {}`, so loops that might not terminate are kept.
+
+Correctness fix, not a speedup: the coretests `split_off*_max_range*` compare `[(); usize::MAX]`
+slices, a `usize::MAX`-iteration loop of `() == ()` that LLVM deletes and we used to run.
+regex-syntax at -O: 0 loops deleted, `.text` identical (585355 B) with the pass on or off, so
+the stage2 bench is unchanged (not rebuilt). The pass kept `i += 2` / `<=` / `loop {}` /
+used-result / storing loops in a negative test, and that test's output matches LLVM.
+
 ## Linker: wild vs mold
 
 Relinking the bevy game (`examples/bevy-game`, `--host -Zbuild-std`, 323 MB debug binary) with the
