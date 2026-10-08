@@ -155,6 +155,91 @@ fn eval(
     Some(mask(r, w))
 }
 
+type KBits = FxHashMap<Value, (u64, u64)>;
+
+/// Known `(zero, one)` bit masks of `v` from constants, `env`, `kenv` and
+/// bitwise ops / constant shifts / extends on them.
+fn kbits(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    kenv: &KBits,
+    v: Value,
+    depth: u32,
+) -> (u64, u64) {
+    let v = func.dfg.resolve_aliases(v);
+    let Some(w) = bits(func, v) else {
+        return (0, 0);
+    };
+    let full = mask(u64::MAX, w);
+    if let Some(c) = known(func, env, v) {
+        return (!c & full, c);
+    }
+    if let Some(&k) = kenv.get(&v) {
+        return k;
+    }
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return (0, 0);
+    };
+    if depth >= 6 {
+        return (0, 0);
+    }
+    let sub = |x: Value| kbits(func, env, kenv, x, depth + 1);
+    let op = |opcode: Opcode, a: (u64, u64), b: (u64, u64)| -> (u64, u64) {
+        let s = (b.0 | b.1 == full)
+            .then_some(b.1)
+            .filter(|&s| s < u64::from(w));
+        match (opcode, s) {
+            (Opcode::Band, _) => (a.0 | b.0, a.1 & b.1),
+            (Opcode::Bor, _) => (a.0 & b.0, a.1 | b.1),
+            (Opcode::Bxor, _) => ((a.0 & b.0) | (a.1 & b.1), (a.0 & b.1) | (a.1 & b.0)),
+            (Opcode::Ishl, Some(s)) => ((a.0 << s) | ((1u64 << s) - 1), a.1 << s),
+            (Opcode::Ushr, Some(s)) => ((a.0 >> s) | !(full >> s), a.1 >> s),
+            _ => (0, 0),
+        }
+    };
+    let r = match func.dfg.insts[i] {
+        InstructionData::Binary { opcode, args } => op(opcode, sub(args[0]), sub(args[1])),
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let a = sub(arg);
+            let aw = bits(func, arg).unwrap_or(w);
+            (a.0 | (full & !mask(u64::MAX, aw)), a.1)
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => sub(arg),
+        _ => (0, 0),
+    };
+    (r.0 & full, r.1 & full)
+}
+
+/// Constant result of body instruction `i` from known bits: fully known
+/// values, and `x ==/!= k` where a known bit of `x` differs from `k`.
+fn kfold(func: &Function, env: &FxHashMap<Value, u64>, kenv: &KBits, i: Inst) -> Option<u64> {
+    if kenv.is_empty() {
+        return None;
+    }
+    if let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] {
+        if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+            return None;
+        }
+        let (x, k) = match (known(func, env, args[0]), known(func, env, args[1])) {
+            (None, Some(k)) => (args[0], k),
+            (Some(k), None) => (args[1], k),
+            _ => return None,
+        };
+        let (z, o) = kbits(func, env, kenv, x, 0);
+        return ((o & !k) | (z & k) != 0).then_some(u64::from(cond == IntCC::NotEqual));
+    }
+    let r = func.dfg.first_result(i);
+    let full = mask(u64::MAX, bits(func, r)?);
+    let (z, o) = kbits(func, env, kenv, r, 0);
+    (z | o == full).then_some(o)
+}
+
 fn pure_op(func: &Function, inst: Inst) -> bool {
     use Opcode::*;
     matches!(
@@ -171,6 +256,9 @@ fn pure_op(func: &Function, inst: Inst) -> bool {
             | Iadd
             | Isub
             | Select
+            | Ishl
+            | Ushr
+            | StackAddr
     ) && func.dfg.inst_results(inst).len() == 1
 }
 
@@ -274,7 +362,7 @@ impl<'a> NonNull<'a> {
     fn is(&self, func: &Function, v: Value) -> bool {
         let mut v = func.dfg.resolve_aliases(v);
         for _ in 0..8 {
-            if self.loads.contains(&v) || self.params.contains(&v) {
+            if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {
                 return true;
             }
             match self.derived.get(&v) {
@@ -284,6 +372,16 @@ impl<'a> NonNull<'a> {
         }
         false
     }
+}
+
+/// Addresses of symbols, thread-locals and stack slots are never null.
+fn addr_of_symbol(func: &Function, v: Value) -> bool {
+    func.dfg.value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr | Opcode::StackAddr
+        ) && crate::pass_enabled("PLIRON_NN_ADDR")
+    })
 }
 
 /// `icmp eq/ne x, 0` with `x` known non-null → constant.
@@ -362,6 +460,7 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
         FxHashMap::default()
     };
     let entry = func.layout.entry_block();
+    let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -432,6 +531,19 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 if !ok {
                     continue;
                 }
+                // Known bits of non-constant incoming args (e.g. a packed `Option` tag).
+                let mut kenv: KBits = FxHashMap::default();
+                if kb_on {
+                    let none = FxHashMap::default();
+                    for (&p, &v) in &argv {
+                        if !env.contains_key(&p) {
+                            let k = kbits(func, &env, &none, v, 0);
+                            if k != (0, 0) {
+                                kenv.insert(p, k);
+                            }
+                        }
+                    }
+                }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
                     nn.is(func, v) || pn.contains(&v)
@@ -450,13 +562,16 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 }
                 let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
                 for &i in body {
-                    if let Some(c) = eval(func, &env, &nz, &rg, i) {
+                    if let Some(c) =
+                        eval(func, &env, &nz, &rg, i).or_else(|| kfold(func, &env, &kenv, i))
+                    {
                         env.insert(func.dfg.first_result(i), c);
                     }
                 }
                 let taken = match known(func, &env, cond) {
                     Some(c) => c != 0,
                     None if nz(cond) => true,
+                    None if !kenv.is_empty() && kbits(func, &env, &kenv, cond, 0).1 != 0 => true,
                     None => continue,
                 };
                 let ti = if taken { 0 } else { 1 };
@@ -982,6 +1097,41 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32) -> Option<(u64, u64
                 }
             }
             InstructionData::Binary {
+                opcode: opcode @ (Opcode::Iadd | Opcode::Isub),
+                args,
+            } => {
+                if let Some(k) = known(func, &env, args[1])
+                    && let Some((l, h)) = urange(func, fs, args[0], depth + 1)
+                {
+                    let (l2, h2) = if opcode == Opcode::Isub {
+                        (l.wrapping_sub(k), h.wrapping_sub(k))
+                    } else {
+                        (l.wrapping_add(k), h.wrapping_add(k))
+                    };
+                    // Only when the whole range moves without wrapping.
+                    let nowrap = if opcode == Opcode::Isub {
+                        l >= k
+                    } else {
+                        h <= full - k
+                    };
+                    if nowrap {
+                        lo = lo.max(l2);
+                        hi = hi.min(h2);
+                    }
+                }
+            }
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } => {
+                if let Some((l, h)) = urange(func, fs, arg, depth + 1)
+                    && h <= full
+                {
+                    lo = lo.max(l);
+                    hi = hi.min(h);
+                }
+            }
+            InstructionData::Binary {
                 opcode: Opcode::Band,
                 args,
             } => {
@@ -1098,7 +1248,7 @@ fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> 
 /// ends in `brif c` knows `c` (or its complement), as do the blocks it
 /// dominates; equal operands or a constant against a known range decide it.
 /// Returns the icmps folded.
-fn fold_dominated_conds(func: &mut Function) -> usize {
+pub fn fold_dominated_conds(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let fact = edge_facts(func, &cfg);
@@ -1176,6 +1326,113 @@ fn fold_dominated_conds(func: &mut Function) -> usize {
     folds.len()
 }
 
+/// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
+/// the param itself) become aliases of `v`. Threading's SSA repair creates
+/// these, and Cranelift only removes them after our condition folding ran, so
+/// the same value seen through two params would not match a dominating test.
+pub fn remove_trivial_params(func: &mut Function) -> usize {
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        Unset,
+        One(Value),
+        Many,
+    }
+    let entry = func.layout.entry_block();
+    let mut inc: FxHashMap<Block, Vec<In>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let fixed = matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif);
+        for bc in
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let s = bc.block(&func.dfg.value_lists);
+            let params = func.dfg.block_params(s);
+            let st = inc
+                .entry(s)
+                .or_insert_with(|| vec![In::Unset; params.len()]);
+            if !fixed {
+                st.iter_mut().for_each(|x| *x = In::Many);
+                continue;
+            }
+            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                let new = match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        if v == params[i] {
+                            continue;
+                        }
+                        In::One(v)
+                    }
+                    _ => In::Many,
+                };
+                st[i] = match (st[i], new) {
+                    (In::Unset, x) => x,
+                    (In::One(a), In::One(b)) if a == b => In::One(a),
+                    _ => In::Many,
+                };
+            }
+        }
+    }
+    let def_block = |func: &Function, v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
+    for (&b, st) in &inc {
+        if Some(b) == entry {
+            continue;
+        }
+        let ps = func.dfg.block_params(b);
+        for (i, s) in st.iter().enumerate() {
+            if let In::One(v) = *s
+                && def_block(func, v) != Some(b)
+            {
+                rm.push((b, i, ps[i], v));
+            }
+        }
+    }
+    // No alias chains between params removed together (avoids alias loops).
+    let gone: FxHashSet<Value> = rm.iter().map(|r| r.2).collect();
+    rm.retain(|r| !gone.contains(&r.3));
+    if rm.is_empty() {
+        return 0;
+    }
+    let mut idx: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for r in &rm {
+        idx.entry(r.0).or_default().push(r.1);
+    }
+    for v in idx.values_mut() {
+        v.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for b in blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
+            continue;
+        }
+        let dfg = &mut func.dfg;
+        for bc in
+            dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if let Some(is) = idx.get(&bc.block(&dfg.value_lists)) {
+                for &i in is {
+                    bc.remove(i, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    for &(_, _, p, v) in &rm {
+        func.dfg.remove_block_param(p);
+        func.dfg.change_to_alias(p, v);
+    }
+    rm.len()
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
@@ -1184,8 +1441,12 @@ pub fn run(
 ) -> usize {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
+    let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
     let mut total = 0;
     for _ in 0..8 {
+        if trivp {
+            remove_trivial_params(func);
+        }
         let nn = NonNull::new(func, loads, derived);
         let dc = if domcond {
             fold_dominated_conds(func)

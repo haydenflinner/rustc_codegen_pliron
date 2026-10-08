@@ -219,7 +219,7 @@
 (extern extractor jump_table_targets jump_table_targets)
 
 ;; The size of the jump table.
-(decl jump_table_size (BoxVecMachLabel) u32)
+(decl pure jump_table_size (BoxVecMachLabel) u32)
 (extern constructor jump_table_size jump_table_size)
 
 ;;;; Helper Clif Extractors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1053,7 +1053,7 @@
 
 ;; This definition should be kept up to date with the values defined in
 ;; cranelift/codegen/meta/src/shared/settings.rs
-(type TlsModel extern (enum (None) (ElfGd) (Macho) (Coff)))
+(type TlsModel extern (enum (None) (ElfGd) (Macho) (Coff) (ElfIe)))
 
 (decl tls_model (TlsModel) Type)
 (extern extractor infallible tls_model tls_model)

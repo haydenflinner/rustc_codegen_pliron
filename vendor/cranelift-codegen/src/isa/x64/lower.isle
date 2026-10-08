@@ -3617,6 +3617,13 @@
               (cmove ty (CC.B) idx_reg size_reg))))
       (emit_side_effect (jmp_table_seq ty clamped_idx default_target jt_targets))))
 
+;; PLIRON: an index already masked below the table size needs no clamp.
+(rule 1 (lower_branch (br_table idx @ (value_type ty) _) (jump_table_targets default_target jt_targets))
+      (if-let (band _ _ (u32_from_iconst k)) idx)
+      (if-let true (u32_lt k (jump_table_size jt_targets)))
+      (let ((idx_reg Gpr (extend_to_gpr idx $I64 (ExtendKind.Zero))))
+      (emit_side_effect (jmp_table_seq ty idx_reg default_target jt_targets))))
+
 ;; Rules for `select_spectre_guard` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (select_spectre_guard _ cond x y))
@@ -5070,6 +5077,9 @@
 
 (rule (lower (tls_value (tls_model (TlsModel.ElfGd)) (symbol_value_data name _ _)))
       (elf_tls_get_addr name))
+
+(rule (lower (tls_value (tls_model (TlsModel.ElfIe)) (symbol_value_data name _ _)))
+      (elf_tls_ie name))
 
 (rule (lower (tls_value (tls_model (TlsModel.Macho)) (symbol_value_data name _ _)))
       (macho_tls_get_addr name))

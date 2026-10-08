@@ -116,6 +116,8 @@ pub struct State<'tcx> {
     pub allocas: FxHashMap<Value, (u64, u64)>,
     /// Allocas lowered as Cranelift variables (see sroa.rs), with their value type.
     pub promoted: FxHashMap<Value, TypeHandle>,
+    /// Fresh copies SROA makes for a diverging call; never split again.
+    pub escape_copies: rustc_data_structures::fx::FxHashSet<Value>,
     pub calls: FxHashMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: FxHashMap<Ptr<Operation>, String>,
     pub rmw: FxHashMap<Ptr<Operation>, AtomicRmwBinOp>,

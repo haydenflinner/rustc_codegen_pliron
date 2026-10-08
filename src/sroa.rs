@@ -6,14 +6,22 @@
 //! across `try_call` exception edges) is done by cranelift-frontend.
 //! `PLIRON_SROA=0` disables it.
 
+use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::linked_list::ContainsLinkedList;
+use pliron::linked_list::{ContainsLinkedList, LinkedList};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
-use pliron_llvm::ops::{AllocaOp, GepIndex, GetElementPtrOp, LoadOp, StoreOp, UndefOp};
+use pliron_llvm::attributes::IntegerOverflowFlagsAttr;
+use pliron_llvm::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
+use pliron_llvm::ops::{
+    AllocaOp, AndOp, CallOp, GepIndex, GetElementPtrOp, LShrOp, LoadOp, OrOp, ShlOp, StoreOp,
+    TruncOp, UndefOp, UnreachableOp, ZExtOp,
+};
 use pliron_llvm::types::ArrayType;
 use rustc_data_structures::fx::FxHashSet;
 
@@ -36,6 +44,11 @@ enum Kind {
     Set {
         n: u64,
         byte: u8,
+    },
+    /// Operand `idx` of a call straight before `unreachable`: gets a fresh
+    /// copy of the whole alloca, so the rest can still be split.
+    Escape {
+        idx: usize,
     },
 }
 
@@ -97,6 +110,19 @@ pub(crate) fn gep_offset(ctx: &Context, st: &State<'_>, op: Ptr<Operation>) -> O
         }
     }
     Some(off)
+}
+
+/// `p` is an argument (not the callee) of `op`, a plain call that diverges:
+/// nothing after it can read the alloca, and an unwind leaves the frame.
+fn diverging_arg(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
+    let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+        return false;
+    };
+    op.deref(ctx)
+        .get_next()
+        .is_some_and(|n| Operation::is_op::<UnreachableOp>(n, ctx))
+        && !matches!(c.callee(ctx), CallOpCallable::Indirect(f) if f == p)
+        && crate::pass_enabled("PLIRON_SROA_ESCAPE")
 }
 
 fn intrinsic<'a>(st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a str> {
@@ -182,6 +208,12 @@ fn accesses(
                     off: base as u64,
                     kind,
                 });
+            } else if diverging_arg(ctx, op, p) && in_range(base, 0) {
+                out.push(Access {
+                    op,
+                    off: base as u64,
+                    kind: Kind::Escape { idx },
+                });
             } else {
                 return None;
             }
@@ -216,14 +248,29 @@ fn access_ty(ctx: &Context, a: &Access) -> Option<TypeHandle> {
     }
 }
 
+/// Byte width of a plain integer type.
+fn int_bytes(ctx: &Context, t: TypeHandle) -> Option<u64> {
+    match classify(ctx, t) {
+        TyK::Int(b) if b % 8 == 0 && b <= 128 => Some(b as u64 / 8),
+        _ => None,
+    }
+}
+
 /// Partition the alloca into slices; None if typed accesses overlap
-/// inconsistently or a copy/set cuts through a typed slice.
+/// inconsistently or a copy/set cuts through a typed slice. An integer access
+/// inside a wider integer slice (an enum tag byte of a register-returned
+/// `Result`, say) is allowed and rewritten as shift/mask of the slice.
 fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str> {
+    let subint = crate::pass_enabled("PLIRON_SROA_SUBINT");
+    let mut order: Vec<(&Access, TypeHandle, u64)> = acc
+        .iter()
+        .filter_map(|a| access_ty(ctx, a).map(|t| (a, t, size_align(ctx, t).0)))
+        .collect();
+    if subint {
+        order.sort_by_key(|x| std::cmp::Reverse(x.2));
+    }
     let mut typed: Vec<Slice> = Vec::new();
-    for a in acc {
-        let Some(ty) = access_ty(ctx, a) else {
-            continue;
-        };
+    for (a, ty, _) in order {
         let size = size_align(ctx, ty).0;
         if size == 0 {
             return Err("zero-size access");
@@ -233,6 +280,12 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
             .find(|s| s.off < a.off + size && a.off < s.off + s.size)
         {
             Some(s) if s.off == a.off && s.size == size && leaf_compatible(ctx, s.ty, ty) => {}
+            Some(s)
+                if subint
+                    && s.off <= a.off
+                    && a.off + size <= s.off + s.size
+                    && int_bytes(ctx, ty) == Some(size)
+                    && int_bytes(ctx, s.ty) == Some(s.size) => {}
             Some(_) => return Err("typed accesses overlap"),
             None => typed.push(Slice {
                 off: a.off,
@@ -369,6 +422,9 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
     let Some(&(size, align)) = st.allocas.get(&a) else {
         return false;
     };
+    if st.escape_copies.contains(&a) {
+        return false;
+    }
     if st.promoted.contains_key(&a) {
         validate(ctx, st, a);
         if st.promoted.contains_key(&a) {
@@ -384,7 +440,8 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
     if acc.is_empty() {
         return false;
     }
-    if let Some(t) = trivially_promotable(ctx, &acc, &geps, size) {
+    let escapes = acc.iter().any(|x| matches!(x.kind, Kind::Escape { .. }));
+    if !escapes && let Some(t) = trivially_promotable(ctx, &acc, &geps, size) {
         st.promoted.insert(a, t);
         return true;
     }
@@ -411,11 +468,61 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
             v
         })
         .collect();
-    let find = |off: u64| sl.iter().position(|s| s.off == off).unwrap();
+    let find = |off: u64| {
+        sl.iter()
+            .position(|s| s.off <= off && off < s.off + s.size)
+            .unwrap()
+    };
     for x in &acc {
         match x.kind {
-            Kind::Load => Operation::replace_operand(x.op, ctx, 0, new[find(x.off)]),
-            Kind::Store => Operation::replace_operand(x.op, ctx, 1, new[find(x.off)]),
+            Kind::Load | Kind::Store => {
+                let (i, ty) = (find(x.off), access_ty(ctx, x).unwrap());
+                let (s, n) = (&sl[i], size_align(ctx, ty).0);
+                if s.off == x.off && s.size == n {
+                    let k = if x.kind == Kind::Load { 0 } else { 1 };
+                    Operation::replace_operand(x.op, ctx, k, new[i]);
+                    continue;
+                }
+                let sh = (x.off - s.off) * 8;
+                let shc = mk_const(ctx, st, s.ty, ConstVal::Bits(sh as u128));
+                let ins = |ctx: &mut Context, o: Ptr<Operation>| {
+                    o.insert_before(ctx, x.op);
+                    o.deref(ctx).get_result(0)
+                };
+                let w = LoadOp::new(ctx, new[i], s.ty).get_operation();
+                let w = ins(ctx, w);
+                if x.kind == Kind::Load {
+                    let v = LShrOp::new(ctx, w, shc).get_operation();
+                    let v = ins(ctx, v);
+                    let v = TruncOp::new(ctx, v, ty).get_operation();
+                    let v = ins(ctx, v);
+                    let r = x.op.deref(ctx).get_result(0);
+                    r.replace_all_uses_with(ctx, &v);
+                } else {
+                    let flags = IntegerOverflowFlagsAttr {
+                        nsw: false,
+                        nuw: false,
+                    };
+                    let val = x.op.deref(ctx).get_operand(0);
+                    let z = ZExtOp::new_with_nneg(ctx, val, s.ty, false).get_operation();
+                    let z = ins(ctx, z);
+                    let z = ShlOp::new_with_overflow_flag(ctx, z, shc, flags).get_operation();
+                    let z = ins(ctx, z);
+                    let keep = mask(
+                        !(mask(u128::MAX, (n * 8) as u32) << sh),
+                        (s.size * 8) as u32,
+                    );
+                    let kc = mk_const(ctx, st, s.ty, ConstVal::Bits(keep));
+                    let m = AndOp::new(ctx, w, kc).get_operation();
+                    let m = ins(ctx, m);
+                    let o = OrOp::new(ctx, m, z).get_operation();
+                    let o = ins(ctx, o);
+                    StoreOp::new(ctx, o, new[i])
+                        .get_operation()
+                        .insert_before(ctx, x.op);
+                }
+                Operation::erase(x.op, ctx);
+            }
             Kind::Copy { dst, n } => {
                 let other = x.op.deref(ctx).get_operand(if dst { 1 } else { 0 });
                 let mut stores = Vec::new();
@@ -458,6 +565,25 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
                 }
                 st.intrinsics.remove(&x.op);
                 Operation::erase(x.op, ctx);
+            }
+            Kind::Escape { idx } => {
+                let arr = ArrayType::get(ctx, i8t, size).into();
+                let tmp = AllocaOp::new(ctx, arr, count, 0).get_operation();
+                tmp.insert_before(ctx, alloca);
+                let tmp = tmp.deref(ctx).get_result(0);
+                st.allocas.insert(tmp, (size, align));
+                st.escape_copies.insert(tmp);
+                for (i, s) in sl.iter().enumerate() {
+                    let l = LoadOp::new(ctx, new[i], s.ty).get_operation();
+                    l.insert_before(ctx, x.op);
+                    let v = l.deref(ctx).get_result(0);
+                    let to = ptr_plus(ctx, st, tmp, s.off, x.op);
+                    StoreOp::new(ctx, v, to)
+                        .get_operation()
+                        .insert_before(ctx, x.op);
+                }
+                let p = ptr_plus(ctx, st, tmp, x.off, x.op);
+                Operation::replace_operand(x.op, ctx, idx, p);
             }
         }
     }
@@ -690,6 +816,8 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 && const_int(ctx, st, op.deref(ctx).get_operand(2)).is_some()
             {
                 uses.push("mem");
+            } else if diverging_arg(ctx, op, p) {
+                uses.push("escape");
             } else {
                 let n = st
                     .intrinsics

@@ -44,6 +44,7 @@ mod objmerge;
 mod phisimp;
 mod simd;
 mod sroa;
+mod switchmap;
 mod taildup;
 mod tailmerge;
 mod type_of;
@@ -128,7 +129,17 @@ fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
         if keep_fp { "true" } else { "false" },
     )
     .unwrap();
-    fb.set("tls_model", "elf_gd").unwrap();
+    // `-Ztls-model=initial-exec` (bootstrap passes it for rustc itself): no
+    // `__tls_get_addr` call per access. `PLIRON_TLS_IE=0` keeps general-dynamic.
+    let ie = sess.target.arch == rustc_target::spec::Arch::X86_64
+        && sess.target.binary_format == rustc_target::spec::BinaryFormat::Elf
+        && matches!(
+            sess.tls_model(),
+            rustc_target::spec::TlsModel::InitialExec | rustc_target::spec::TlsModel::LocalExec
+        )
+        && pass_enabled("PLIRON_TLS_IE");
+    fb.set("tls_model", if ie { "elf_ie" } else { "elf_gd" })
+        .unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
     fb.set(

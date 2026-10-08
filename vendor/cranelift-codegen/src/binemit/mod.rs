@@ -50,6 +50,10 @@ pub enum Reloc {
     /// Elf x86_64 32 bit signed PC relative offset to two GOT entries for GD symbol.
     ElfX86_64TlsGd,
 
+    /// Elf x86_64 32 bit signed PC relative offset to the GOT entry holding an
+    /// IE symbol's offset from the thread pointer.
+    ElfX86_64GotTpOff,
+
     /// Mach-O x86_64 32 bit signed PC relative offset to a `__thread_vars` entry.
     MachOX86_64Tlv,
 
@@ -161,6 +165,7 @@ impl fmt::Display for Reloc {
             Self::RiscvPCRelHi20 => write!(f, "RiscvPCRelHi20"),
             Self::RiscvPCRelLo12I => write!(f, "RiscvPCRelLo12I"),
             Self::ElfX86_64TlsGd => write!(f, "ElfX86_64TlsGd"),
+            Self::ElfX86_64GotTpOff => write!(f, "ElfX86_64GotTpOff"),
             Self::MachOX86_64Tlv => write!(f, "MachOX86_64Tlv"),
             Self::MachOAarch64TlsAdrPage21 => write!(f, "MachOAarch64TlsAdrPage21"),
             Self::MachOAarch64TlsAdrPageOff12 => write!(f, "MachOAarch64TlsAdrPageOff12"),

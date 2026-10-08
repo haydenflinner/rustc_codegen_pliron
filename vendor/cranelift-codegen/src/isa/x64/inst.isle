@@ -286,6 +286,10 @@
        ;; See `XmmUninitializedValue` above.
        (GprUninitializedValue (dst WritableGpr))
 
+       ;; ELF initial-exec TLS: `mov %fs:0, dst; add sym@gottpoff(%rip), dst`.
+       (ElfTlsIe (symbol ExternalName)
+                 (dst WritableGpr))
+
        ;; A call to the `ElfTlsGetAddr` libcall. Returns address of TLS symbol
        ;; `dst`, which is constrained to `rax`.
        (ElfTlsGetAddr (symbol ExternalName)
@@ -4326,6 +4330,13 @@
 (extern extractor perm_from_mask_with_zeros perm_from_mask_with_zeros)
 
 ;;;; TLS Values ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Helper for emitting ElfTlsIe.
+(decl elf_tls_ie (ExternalName) Gpr)
+(rule (elf_tls_ie name)
+      (let ((dst WritableGpr (temp_writable_gpr))
+            (_ Unit (emit (MInst.ElfTlsIe name dst))))
+        dst))
 
 ;; Helper for emitting ElfTlsGetAddr.
 (decl elf_tls_get_addr (ExternalName) Gpr)

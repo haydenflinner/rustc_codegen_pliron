@@ -420,7 +420,14 @@ pub(crate) fn emit(
             // The addend adjusts for the difference between the end of the
             // instruction and the beginning of the immediate field.
             let len = sink.cur_offset();
-            sink.add_reloc_at_offset(len - 4, Reloc::X86CallPCRel4, &call_info.dest, -4);
+            // PLIRON: PLT32 under PIC so calls to non-colocated symbols can be direct
+            // (the linker resolves PLT32 to the definition when it is local).
+            let reloc = if info.flags.is_pic() {
+                Reloc::X86CallPLTRel4
+            } else {
+                Reloc::X86CallPCRel4
+            };
+            sink.add_reloc_at_offset(len - 4, reloc, &call_info.dest, -4);
 
             if let Some(s) = stack_map {
                 sink.push_user_stack_map(state, len, s);
@@ -478,7 +485,12 @@ pub(crate) fn emit(
             let offset = sink.cur_offset();
             // The addend adjusts for the difference between the end of the instruction and the
             // beginning of the immediate field.
-            sink.add_reloc_at_offset(offset - 4, Reloc::X86CallPCRel4, &call_info.dest, -4);
+            let reloc = if info.flags.is_pic() {
+                Reloc::X86CallPLTRel4
+            } else {
+                Reloc::X86CallPCRel4
+            };
+            sink.add_reloc_at_offset(offset - 4, reloc, &call_info.dest, -4);
             sink.add_call_site();
         }
 
@@ -1737,6 +1749,24 @@ pub(crate) fn emit(
                 -4,
             );
             sink.put4(0); // offset
+        }
+
+        Inst::ElfTlsIe { symbol, dst } => {
+            let e = dst.to_reg().to_reg().to_real_reg().unwrap().hw_enc();
+            let rex = 0x48 | ((e >> 3) & 1) << 2;
+            // mov %fs:0, dst
+            sink.put1(0x64);
+            sink.put1(rex);
+            sink.put1(0x8b);
+            sink.put1(((e & 7) << 3) | 0b100);
+            sink.put1(0x25);
+            sink.put4(0);
+            // add sym@gottpoff(%rip), dst
+            sink.put1(rex);
+            sink.put1(0x03);
+            sink.put1(((e & 7) << 3) | 0b101);
+            emit_reloc(sink, Reloc::ElfX86_64GotTpOff, symbol, -4);
+            sink.put4(0);
         }
 
         Inst::MachOTlsGetAddr { symbol, dst } => {
