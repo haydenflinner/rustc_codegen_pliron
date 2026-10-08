@@ -622,9 +622,40 @@ fn bypass_forwarders(func: &mut Function) -> usize {
     let domtree = DominatorTree::with_function(func, &cfg);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
+    // Block params used outside their own block: bypassing that block would
+    // leave those uses undominated.
+    let mut escaping: FxHashSet<Value> = FxHashSet::default();
+    for &x in &blocks {
+        for i in func.layout.block_insts(x) {
+            let mut note = |v: Value| {
+                let v = func.dfg.resolve_aliases(v);
+                if let ValueDef::Param(d, _) = func.dfg.value_def(v)
+                    && d != x
+                {
+                    escaping.insert(v);
+                }
+            };
+            func.dfg.inst_args(i).iter().for_each(|&v| note(v));
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        note(v);
+                    }
+                }
+            }
+        }
+    }
     let mut n = 0;
     for b in blocks {
-        if Some(b) == entry {
+        if Some(b) == entry
+            || func
+                .dfg
+                .block_params(b)
+                .iter()
+                .any(|p| escaping.contains(p))
+        {
             continue;
         }
         let Some(term) = func.layout.first_inst(b) else {
