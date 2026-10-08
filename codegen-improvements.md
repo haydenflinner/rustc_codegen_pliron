@@ -31,11 +31,12 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + inline callees that have their own landing pads, at plain call sites (`PLIRON_INLINE_EH`) | 1.71s | 3.32s | 7.40B (−2.2%) | 16.33B (−1.7%) | kept; librustc_driver.so +2.3%. Calls to `core::hint::select_unpredictable` went 7546 → 0 |
 | + drop block args whose incoming values are all one value, so inlined alloca addresses reach SROA (`PLIRON_PHISIMP`) | 1.60s | 2.97s | 6.94B (−6.2%) | 15.33B (−6.1%) | kept; regex-syntax -O: 39.8k block args removed, `.text` −9%. Found via the stage1/stage2 per-function diff: `rustc_lexer::Cursor::eat_while` was 26× stage1, its `Chars` clone stayed on the stack |
 | + fold loads from immutable globals with known initializers (`PLIRON_CONSTLOAD`) | 1.66s | 3.11s | 6.88B (−0.9%) | 15.18B (−1.0%) | kept; regex-syntax -O: 4019 loads folded |
+| + batch: cross-CGU internal copies of small callees (`PLIRON_XCGU`), EH callees inlined into cleanup invoke sites (`PLIRON_INLINE_EH_INVOKE`), caller growth capped at 20k ops (`PLIRON_INLINE_CALLER_MAX`), dead allocas dropped after SROA | 1.47s | 2.69s | 6.42B (−6.7%) | 14.25B (−6.1%) | kept, per-toggle ablation below; without the cap one rustc hit ~20 GB on cranelift-codegen and the stage2 build was OOM-killed (2.08 GB with it). regex-syntax -O: 136 cross-CGU copies, EH invoke sites left 1193 → 167 |
 | + memcpyopt sret call-slot forwarding (`PLIRON_MEMCPYOPT=1`) | 2.59s | 5.23s (noise) | 11.87B (−0.1%) | 25.63B (±0) | dropped (opt-in only) |
 | one CGU per crate (`rust.codegen-units = 1`), so the inliner sees the whole crate | – | – | – | – | not measurable here: stage2 build OOM-killed (28 GB RSS) on `rustc_query_impl` and `cranelift-codegen`; pliron IR for a whole large crate doesn't fit in 31 GB |
 | Cranelift `opt_level=speed` instead of `speed_and_size` | – | – | – | – | not tried: Cranelift 0.135 only checks `opt_level != none` (context.rs), so the two are identical |
 
-Net at the current defaults: 6.88B / 15.18B instructions (−54% / −53% vs baseline),
-1.66s / 3.11s wall (stage1 LLVM-built: 0.79s metadata).
+Net at the current defaults: 6.42B / 14.25B instructions (−57% / −56% vs baseline),
+1.47s / 2.69s wall (stage1 LLVM-built: 0.79s metadata).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
