@@ -491,6 +491,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
+            "llvm.x86.pclmulqdq" | "llvm.x86.pclmulqdq.256" | "llvm.x86.pclmulqdq.512" => {
+                // Per 128-bit lane: carry-less multiply of the qwords picked by imm bits 0 and 4.
+                // At -O0 the immediate arrives as a runtime `IMM8 as u8`, so select on it.
+                let imm = a(2);
+                let (m0, m4) = (self.const_u8(1), self.const_u8(0x10));
+                let (b0, b4) = (self.and(imm, m0), self.and(imm, m4));
+                let (hi_a, hi_b) = (self.nonzero(b0), self.nonzero(b4));
+                let (n, _) = self.elem_of(ret_rty);
+                let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
+                let stub = self.cx.llvm_intrinsic_stub("pliron.clmul64");
+                let (i64t, void) = (self.type_i64(), self.type_void());
+                let al = rustc_abi::Align::EIGHT;
+                let slot = self.alloca(rustc_abi::Size::from_bytes(16), al);
+                let eight = self.const_usize(8);
+                let mut out = Vec::new();
+                for l in 0..n as usize / 2 {
+                    let x = self.select(hi_a, xs[2 * l + 1], xs[2 * l]);
+                    let y = self.select(hi_b, ys[2 * l + 1], ys[2 * l]);
+                    self.call_sym(&stub, void, &[x, y, slot]);
+                    out.push(self.load(i64t, slot, al));
+                    let hi = self.inbounds_ptradd(slot, eight);
+                    out.push(self.load(i64t, hi, al));
+                }
+                Some(self.build_vec(ret, out))
+            }
             "llvm.x86.sse.max.ps"
             | "llvm.x86.sse2.max.pd"
             | "llvm.x86.avx.max.ps.256"

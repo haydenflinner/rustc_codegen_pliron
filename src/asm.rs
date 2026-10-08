@@ -135,6 +135,9 @@ impl<'tcx> CodegenCx<'tcx> {
                 "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n"
             }
             "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
+            "pliron.clmul64" if x86 => {
+                "    movq xmm0, rdi\n    movq xmm1, rsi\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [rdx], xmm0\n    ret\n"
+            }
             "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n",
             "llvm.x86.avx.vzeroupper" if x86 => "    vzeroupper\n    ret\n",
             "llvm.x86.avx.vzeroall" if x86 => "    vzeroall\n    ret\n",
