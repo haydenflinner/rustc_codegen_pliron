@@ -90,11 +90,29 @@ fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
 }
 
 /// A direct call to a function that writes no memory before returning
-/// normally; across `try_call` it must not write at all (nowrite.rs).
-fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>) -> bool {
+/// normally; across `try_call` it must not write at all unless `eh`, where
+/// [`unwind_edge`] clears the exception edges instead (nowrite.rs).
+fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>, eh: bool) -> bool {
     match func.dfg.insts[i] {
         InstructionData::Call { func_ref, .. } => nw.contains_key(&func_ref),
-        InstructionData::TryCall { func_ref, .. } => nw.get(&func_ref) == Some(&true),
+        InstructionData::TryCall { func_ref, .. } => {
+            nw.get(&func_ref).is_some_and(|&strict| strict || eh)
+        }
+        _ => false,
+    }
+}
+
+/// An exception edge `inst -> b` of a `try_call` whose callee may have written
+/// before unwinding: loads available after the call don't survive into `b`.
+fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bool>) -> bool {
+    match func.dfg.insts[inst] {
+        InstructionData::TryCall { func_ref, exception, .. } => {
+            nw.get(&func_ref) == Some(&false)
+                && func.dfg.exception_tables[exception]
+                    .normal_return()
+                    .block(&func.dfg.value_lists)
+                    != b
+        }
         _ => false,
     }
 }
@@ -146,6 +164,7 @@ fn transfer(
     rw: Option<&mut Vec<(Inst, Value)>>,
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
+    eh: bool,
 ) {
     let mut rw = rw;
     for i in func.layout.block_insts(b) {
@@ -185,7 +204,7 @@ fn transfer(
                 }
             }
             _ if op.is_call() => {
-                if !write_free(func, i, nw) {
+                if !write_free(func, i, nw, eh) {
                     av.retain(|&(r, _, _), _| iso.contains(&r));
                 }
             }
@@ -242,6 +261,7 @@ pub fn run(
         return pre(func, &cfg, &rpo, entry);
     }
     let iso = isolated(func, noalias);
+    let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, Avail>, b: Block| -> Option<Avail> {
         if b == entry {
@@ -250,7 +270,13 @@ pub fn run(
         let mut acc = None;
         for p in cfg.pred_iter(b) {
             if let Some(o) = out.get(&p.block) {
-                meet(&mut acc, o);
+                if eh && unwind_edge(func, p.inst, b, nw) {
+                    let mut o = o.clone();
+                    o.retain(|&(r, _, _), _| iso.contains(&r));
+                    meet(&mut acc, &o);
+                } else {
+                    meet(&mut acc, o);
+                }
             }
         }
         acc
@@ -262,7 +288,7 @@ pub fn run(
             let Some(mut av) = input(&out, b) else {
                 continue;
             };
-            transfer(func, b, &mut av, None, &iso, nw);
+            transfer(func, b, &mut av, None, &iso, nw, eh);
             if out.get(&b) != Some(&av) {
                 out.insert(b, av);
                 changed = true;
@@ -279,7 +305,7 @@ pub fn run(
     let mut fwd = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
-            transfer(func, b, &mut av, Some(&mut fwd), &iso, nw);
+            transfer(func, b, &mut av, Some(&mut fwd), &iso, nw, eh);
         }
     }
     for &(i, v) in &fwd {
@@ -356,6 +382,7 @@ fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type) {
 fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block) -> usize {
     let iso: FxHashSet<Root> = FxHashSet::default();
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
+    let eh = false;
     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
     let mut out: FxHashMap<Block, FxHashSet<Loc>> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, FxHashSet<Loc>>, b: Block| -> Option<FxHashSet<Loc>> {
@@ -384,7 +411,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 .into_iter()
                 .map(|k| (k, Value::reserved_value()))
                 .collect();
-            transfer(func, b, &mut av, None, &iso, nw);
+            transfer(func, b, &mut av, None, &iso, nw, eh);
             let ks: FxHashSet<Loc> = av.into_keys().collect();
             if out.get(&b) != Some(&ks) {
                 out.insert(b, ks);
