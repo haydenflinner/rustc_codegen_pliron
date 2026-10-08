@@ -362,7 +362,7 @@ impl<'a> NonNull<'a> {
     fn is(&self, func: &Function, v: Value) -> bool {
         let mut v = func.dfg.resolve_aliases(v);
         for _ in 0..8 {
-            if self.loads.contains(&v) || self.params.contains(&v) {
+            if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {
                 return true;
             }
             match self.derived.get(&v) {
@@ -372,6 +372,16 @@ impl<'a> NonNull<'a> {
         }
         false
     }
+}
+
+/// Addresses of symbols, thread-locals and stack slots are never null.
+fn addr_of_symbol(func: &Function, v: Value) -> bool {
+    func.dfg.value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr | Opcode::StackAddr
+        ) && crate::pass_enabled("PLIRON_NN_ADDR")
+    })
 }
 
 /// `icmp eq/ne x, 0` with `x` known non-null → constant.
