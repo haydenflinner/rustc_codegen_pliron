@@ -1197,6 +1197,12 @@ libm_c! {
     rintf(x: f32) -> f32; roundf(x: f32) -> f32; scalbnf(x: f32, n: i32) -> f32; sinf(x: f32) -> f32;
     sinhf(x: f32) -> f32; sqrtf(x: f32) -> f32; tanf(x: f32) -> f32; tanhf(x: f32) -> f32;
     tgammaf(x: f32) -> f32; truncf(x: f32) -> f32;
+    acosh(x: f64) -> f64; asinh(x: f64) -> f64; atanh(x: f64) -> f64;
+    ilogb(x: f64) -> i32; j0(x: f64) -> f64; j1(x: f64) -> f64; jn(n: i32, x: f64) -> f64;
+    y0(x: f64) -> f64; y1(x: f64) -> f64; yn(n: i32, x: f64) -> f64;
+    acoshf(x: f32) -> f32; asinhf(x: f32) -> f32; atanhf(x: f32) -> f32;
+    ilogbf(x: f32) -> i32; j0f(x: f32) -> f32; j1f(x: f32) -> f32; jnf(n: i32, x: f32) -> f32;
+    y0f(x: f32) -> f32; y1f(x: f32) -> f32; ynf(n: i32, x: f32) -> f32;
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lgamma_r(x: f64, sign: *mut i32) -> f64 {

@@ -18,6 +18,7 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | wgpu-examples 30 | wasm32-unknown-unknown, `webgpu`, wasm-bindgen 0.2.129, headless Chrome + SwiftShader | page boots, all 30 examples listed; `hello_synchronization` GPU readback identical to LLVM build |
 | serde_json, regex, hashbrown, itertools, rand, memchr (git HEAD) | native, `cargo test` | 236 / 319 / 389 / 655 / 164 / 166 pass, 0 fail |
 | memchr, rand, serde_json, regex (wasm32-wasip1, node 22) | `ct-wasi.sh test` (in-process panic=abort tests; doctests via `RUSTDOCFLAGS`) | memchr 107/107, rand 159/159, serde_json 160/160 (its TCP test aborts: no sockets on WASI), regex integration 62/62 (2 tests that build huge regexes segfault node on exit, same with stock LLVM) |
+| burn-ndarray (wasm32-wasip1, node 22) | `ct-wasi.sh test -p burn-ndarray --lib` | 38 pass, 0 fail, 3 ignored (needed `acoshf`/`asinhf` in the pure-Rust libc) |
 | hashbrown, itertools (wasm32-wasip1) | as above | not run: dev-dep `criterion` refuses to build on WASI |
 | wasm-bindgen 0.2.129 | minimal lib + bin | exports, strings, `console.log` from `fn main` all work |
 
