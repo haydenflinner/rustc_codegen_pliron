@@ -39,7 +39,7 @@ let first = true;
 worker.onmessage = async ({ data }) => {
   if (data.log !== undefined) {
     log(data.log);
-    if (first && data.log.startsWith('loaded')) { first = false; $('go').disabled = false; $('go').textContent = 'Compile & run'; }
+    if (first && data.log.startsWith('loaded rustc')) { first = false; $('go').disabled = false; $('go').textContent = 'Compile & run'; }
   }
   if (data.out !== undefined) $('out').textContent += data.out + '\n';
   if (!data.done) return;

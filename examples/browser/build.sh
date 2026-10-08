@@ -21,6 +21,27 @@ for f in $WLIB/*.rlib $WLIB/*.rmeta; do
   case $(basename $f) in libtest-*|libgetopts-*|libproc_macro-*) ;; *) cp $f sysroot/lib/rustlib/wasm32-wasip1/lib/ ;; esac
 done
 cp $WASI_LIBC/libpliron_wasi_libc.a sysroot/wasi-libc/libc.a
-(cd sysroot && find . -type f | sed 's|^\./||' | sort | python3 -c "import sys,json;print(json.dumps([l.strip() for l in sys.stdin]))") > manifest.json
+# One gzip bundle per target (fetched on first use) + manifest of [path, offset, len]; served as-is and
+# decompressed in the worker with DecompressionStream, so any static server works.
+python3 - <<'PY'
+import gzip, json, os, hashlib
+out = {"targets": {}}
+for t in sorted(os.listdir("sysroot/lib/rustlib")):
+    files, blob = [], bytearray()
+    roots = [f"lib/rustlib/{t}/lib"] + (["wasi-libc"] if t == "wasm32-wasip1" else [])
+    for r in roots:
+        for f in sorted(os.listdir(f"sysroot/{r}")):
+            d = open(f"sysroot/{r}/{f}", "rb").read()
+            files.append([f"{r}/{f}", len(blob), len(d)]); blob += d
+    open(f"sysroot-{t}.bin.gz", "wb").write(gzip.compress(bytes(blob), 6))
+    out["targets"][t] = files
+for f in ["rustc.wasm", "ld.wasm"]:
+    open(f + ".gz", "wb").write(gzip.compress(open(f, "rb").read(), 6))
+h = hashlib.sha256()
+for f in sorted(x for x in os.listdir(".") if x.endswith(".gz")):
+    h.update(open(f, "rb").read())
+out["version"] = h.hexdigest()[:16]
+json.dump(out, open("manifest.json", "w"))
+PY
 npm i --silent
 echo "serve with: python3 -m http.server 8787   (then open http://localhost:8787/)"

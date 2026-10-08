@@ -5,3 +5,4 @@ ld.wasm
 manifest.json
 shot.png
 package-lock.json
+*.gz

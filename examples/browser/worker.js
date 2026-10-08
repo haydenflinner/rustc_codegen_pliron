@@ -1,27 +1,57 @@
 import { WASI, File, Directory, OpenFile, PreopenDirectory, ConsoleStdout } from './node_modules/@bjorn3/browser_wasi_shim/dist/index.js';
 
-const ready = (async () => {
+const manifest = fetch('manifest.json', { cache: 'no-cache' }).then(r => r.json());
+
+// gzip assets, kept in Cache Storage per build version so repeat visits skip the download.
+async function fetchGz(name) {
+  const { version } = await manifest;
+  const url = `${name}?v=${version}`;
+  const cache = await caches.open('rustc-wasm');
+  let r = await cache.match(url);
+  if (!r) {
+    r = await fetch(url);
+    if (!r.ok) throw new Error(`${name}: HTTP ${r.status}`);
+    await cache.put(url, r.clone());
+    for (const k of await cache.keys()) if (!k.url.endsWith(`?v=${version}`)) cache.delete(k);
+  }
+  return r.body.pipeThrough(new DecompressionStream('gzip'));
+}
+
+const wasm = async name =>
+  WebAssembly.compileStreaming(new Response(await fetchGz(name), { headers: { 'content-type': 'application/wasm' } }));
+
+const timed = async (what, p) => {
   const t = performance.now();
-  const [rustc, ld, manifest] = await Promise.all([
-    WebAssembly.compileStreaming(fetch('rustc.wasm')),
-    WebAssembly.compileStreaming(fetch('ld.wasm')),
-    fetch('manifest.json').then(r => r.json()),
-  ]);
-  const root = new Map();
-  await Promise.all(manifest.map(async p => {
-    const data = await (await fetch('sysroot/' + p)).arrayBuffer();
-    const parts = p.split('/');
-    let dir = root;
-    for (const d of parts.slice(0, -1)) {
-      if (!dir.has(d)) dir.set(d, new Map());
-      dir = dir.get(d);
+  const v = await p;
+  postMessage({ log: `loaded ${what} in ${((performance.now() - t) / 1000).toFixed(1)}s` });
+  return v;
+};
+const ready = timed('rustc + linker', Promise.all([wasm('rustc.wasm.gz'), wasm('ld.wasm.gz')]));
+
+// Sysroot holds only the targets loaded so far; each target's libs arrive as one bundle.
+const sysroot = new Directory([]);
+const loaded = new Map();
+function loadTarget(t) {
+  if (!loaded.has(t)) loaded.set(t, timed(`${t} sysroot`, (async () => {
+    const files = (await manifest).targets[t];
+    const blob = new Uint8Array(await new Response(await fetchGz(`sysroot-${t}.bin.gz`)).arrayBuffer());
+    for (const [p, off, len] of files) {
+      const parts = p.split('/');
+      let dir = sysroot;
+      for (const d of parts.slice(0, -1)) {
+        let next = dir.contents.get(d);
+        if (!next) {
+          next = new Directory([]);
+          next.parent = dir;
+          dir.contents.set(d, next);
+        }
+        dir = next;
+      }
+      dir.contents.set(parts.at(-1), new File(blob.subarray(off, off + len), { readonly: true }));
     }
-    dir.set(parts.at(-1), new File(data, { readonly: true }));
-  }));
-  const toDir = m => new Directory([...m].map(([k, v]) => [k, v instanceof Map ? toDir(v) : v]));
-  postMessage({ log: `loaded rustc + sysroot in ${((performance.now() - t) / 1000).toFixed(1)}s` });
-  return { rustc, ld, sysroot: toDir(root) };
-})();
+  })()));
+  return loaded.get(t);
+}
 
 async function run(mod, args, work, sysroot, out = s => postMessage({ log: s })) {
   const fds = [
@@ -55,8 +85,10 @@ async function runStd(rustc, src, sysroot) {
 
 onmessage = async ({ data: { src, exports } }) => {
   try {
-    const { rustc, ld, sysroot } = await ready;
-    if (/\bfn\s+main\s*\(/.test(src)) return await runStd(rustc, src, sysroot);
+    const [rustc, ld] = await ready;
+    const std = /\bfn\s+main\s*\(/.test(src);
+    await loadTarget(std ? 'wasm32-wasip1' : 'wasm32-unknown-unknown');
+    if (std) return await runStd(rustc, src, sysroot);
     const work = new Directory([['main.rs', new File(new TextEncoder().encode(src))]]);
     let t = performance.now();
     let code = await run(rustc, ['rustc', '--sysroot', '/sysroot', '--target', 'wasm32-unknown-unknown',
