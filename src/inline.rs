@@ -239,6 +239,48 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
             }
         }
     }
+    if std::env::var("PLIRON_STATS").is_ok() {
+        left_stats(ctx, st, &ok);
+    }
+}
+
+/// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
+fn left_stats(ctx: &Context, st: &State<'_>, ok: &FxHashMap<String, (Ptr<Operation>, bool)>) {
+    let mut why: FxHashMap<&str, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op) {
+            continue;
+        }
+        for b in blocks(ctx, f.op) {
+            for op in ops(ctx, b) {
+                let Some(cs) = direct_callee(ctx, st, op) else {
+                    continue;
+                };
+                let g = &st.funcs[cs];
+                let r = if !has_body(ctx, g.op) {
+                    "external"
+                } else if g.no_inline {
+                    "no_inline"
+                } else if g.linkage == Linkage::Preemptible {
+                    "preemptible"
+                } else if cs == sym {
+                    "self"
+                } else if let Some(&(_, eh)) = ok.get(cs) {
+                    if eh && st.invokes.contains_key(&op) {
+                        "eh callee at invoke"
+                    } else if st.calls[&op].fn_ty != g.ty {
+                        "fn type mismatch"
+                    } else {
+                        "eligible but left"
+                    }
+                } else {
+                    "too big / recursive / va"
+                };
+                *why.entry(r).or_default() += 1;
+            }
+        }
+    }
+    eprintln!("inline left {}: {why:?}", st.cgu);
 }
 
 fn inline_call(
