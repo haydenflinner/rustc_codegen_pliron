@@ -65,7 +65,7 @@ fn eligible(
         for op in ops(ctx, b) {
             n += 1;
             let intr = st.intrinsics.get(&op);
-            if intr.is_some_and(|s| s.starts_with("llvm.va_"))
+            if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
                 || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
             {
                 return None;

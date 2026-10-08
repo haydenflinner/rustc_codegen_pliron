@@ -74,7 +74,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         };
         let n = name.as_str();
         if n.starts_with("simd_") {
-            return match self.simd_intrinsic(n, args, result_layout.ty, ret) {
+            return match self.simd_intrinsic(n, args, result_layout.ty, ret, _span, instance) {
                 Some(v) => imm(v),
                 None => self.tcx.dcx().fatal(format!(
                     "SIMD intrinsic `{n}` is not supported by the pliron backend yet"
@@ -313,9 +313,27 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
     fn va_start(&mut self, val: Value) {
         // The variadic-argument buffer pointer, delivered by the lowering as the
-        // hidden extra parameter of a C-variadic function; the VaList place is
-        // used as a cursor into it.
+        // hidden extra parameter of a C-variadic function. The VaList place gets
+        // a real SysV `__va_list_tag`: gp/fp offsets exhausted so every va_arg
+        // (ours and a forwarded foreign callee's alike) walks `overflow_arg_area`,
+        // which points at the packed buffer.
         let buf = self.intrinsic("pliron.va.buf", self.type_ptr(), &[]);
-        self.store(buf, val, Align::EIGHT);
+        if self.tcx.sess.target.is_like_wasm {
+            // wasm's va_list is a single opaque pointer: the place itself is
+            // the cursor into the packed buffer.
+            self.store(buf, val, Align::from_bytes(4).unwrap());
+            return;
+        }
+        let i8t = self.type_i8();
+        let i32t = self.type_i32();
+        let gp = self.const_int(i32t, 48);
+        self.store(gp, val, Align::from_bytes(4).unwrap());
+        let p4 = self.gep(i8t, val, &[self.const_usize(4)]);
+        let fp = self.const_int(i32t, 304);
+        self.store(fp, p4, Align::from_bytes(4).unwrap());
+        let p8 = self.gep(i8t, val, &[self.const_usize(8)]);
+        self.store(buf, p8, Align::EIGHT);
+        let p16 = self.gep(i8t, val, &[self.const_usize(16)]);
+        self.store(buf, p16, Align::EIGHT);
     }
 }

@@ -853,24 +853,39 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn va_arg(&mut self, list: Value, ty: TypeHandle) -> Value {
-        // `va_start` stored a cursor (pointer into the packed variadic-arg
-        // buffer) at offset 0 of the VaList place: align it to `ty`, load, and
-        // advance by `ty`'s size, matching the packing in the call lowering.
+        // SysV `__va_list_tag`: the cursor lives in `overflow_arg_area` (+8);
+        // gp/fp offsets are exhausted so every type takes the overflow path.
+        // Each argument sits in an 8-byte slot aligned to its alignment (capped
+        // at 16), matching the packing in the call lowering and what a foreign
+        // callee's va_arg decodes from a forwarded VaList.
         let (size, align) = crate::types::size_align(&self.cx.pctx.borrow(), ty);
         let ptr = self.type_ptr();
         let isize = self.type_isize();
-        let cur_p = self.load(ptr, list, Align::EIGHT);
+        let i8t = self.type_i8();
+        // wasm's va_list is an opaque pointer: the place itself is the cursor.
+        let cur_off = if self.tcx().sess.target.is_like_wasm {
+            0
+        } else {
+            8
+        };
+        let cur_slot = if cur_off == 0 {
+            list
+        } else {
+            self.gep(i8t, list, &[self.const_usize(cur_off)])
+        };
+        let cur_p = self.load(ptr, cur_slot, Align::EIGHT);
         let cur = self.ptrtoint(cur_p, isize);
-        let a1 = self.const_usize(align - 1);
-        let mask = self.const_usize(!(align - 1));
+        let a_eff = align.clamp(8, 16);
+        let a1 = self.const_usize(a_eff - 1);
+        let mask = self.const_usize(!(a_eff - 1));
         let cur_a1 = self.add(cur, a1);
         let aligned = self.and(cur_a1, mask);
         let p = self.inttoptr(aligned, ptr);
         let v = self.load(ty, p, Align::from_bytes(align).unwrap());
-        let sz = self.const_usize(size);
+        let sz = self.const_usize(size.max(8).next_multiple_of(8));
         let next = self.add(aligned, sz);
         let next = self.inttoptr(next, ptr);
-        self.store(next, list, Align::EIGHT);
+        self.store(next, cur_slot, Align::EIGHT);
         v
     }
 

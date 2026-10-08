@@ -273,6 +273,7 @@ pub fn lower_to_object(
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 va_buf: None,
+                va_fids: FxHashMap::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -496,9 +497,10 @@ pub fn lower_to_object(
         (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
             (value, size, kind, scope, *weak, section);
     }
-    if !st.asm.is_empty() || !hot_asm.is_empty() {
+    let va_asm: String = VA_TRAMPS.with(|v| v.borrow_mut().drain().collect());
+    if !st.asm.is_empty() || !hot_asm.is_empty() || !va_asm.is_empty() {
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        let asm = format!("{}\n{hot_asm}", st.asm);
+        let asm = format!("{}\n{hot_asm}\n{va_asm}", st.asm);
         crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
     product.emit().unwrap()
@@ -543,6 +545,28 @@ pub(crate) fn write_const(
 thread_local! {
     /// Symbol being lowered, for panic messages.
     static CUR_FN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// `%al=8` trampoline asm texts to assemble into the object (see `va_sym`
+    /// and the variadic indirect-call path in `lower_call`).
+    static VA_TRAMPS: std::cell::RefCell<FxHashSet<String>> =
+        std::cell::RefCell::new(FxHashSet::default());
+}
+
+/// `%al=8` + tail-`jmp` stub so foreign variadic callees dump all xmm regs.
+fn va_tramp_asm(sym: &str) -> String {
+    let sym = crate::obj_sym(sym);
+    let t = format!("__pliron_va8.{sym}");
+    format!(
+        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
+    )
+}
+
+/// `%al=8` + `jmp *<reg>` stub for calls through variadic function pointers:
+/// the fp is appended as a hidden last argument, landing in `reg`.
+fn va_tramp_ind_asm(reg: &str) -> String {
+    let t = format!("__pliron_va8_ind_{reg}");
+    format!(
+        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
+    )
 }
 
 struct FnLower<'a, 'b, 'tcx> {
@@ -579,6 +603,8 @@ struct FnLower<'a, 'b, 'tcx> {
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<ir::Value>,
+    /// `__pliron_va8.<sym>` trampoline imports declared for this module.
+    va_fids: FxHashMap<String, FuncId>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -947,8 +973,19 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         match cv {
             ConstVal::Bits(bits) => {
                 let lv = self.ty_leaves(ty);
-                assert_eq!(lv.len(), 1);
-                smallvec![self.iconst_any(lv[0].1, bits)]
+                if lv.len() == 1 {
+                    smallvec![self.iconst_any(lv[0].1, bits)]
+                } else {
+                    // Packed vector constant: `bits` holds the leaves
+                    // back-to-back.
+                    lv.iter()
+                        .map(|&(lo, lt)| {
+                            let w = lt.bits() as u64;
+                            let m = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+                            self.iconst_any(lt, bits >> (lo * 8) & m)
+                        })
+                        .collect()
+                }
             }
             ConstVal::Zero | ConstVal::Undef => self
                 .ty_leaves(ty)
@@ -993,10 +1030,39 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         f
     }
 
+    /// Foreign variadic callees can't be given `%al` (the xmm vararg count) by
+    /// Cranelift, so calls to them go through a `__pliron_va8.<sym>` stub that
+    /// sets it to 8 and tail-jumps (emitted into `st.asm` at emit time).
+    fn va_sym(&mut self, sym: &str) -> String {
+        let foreign_variadic = self.st.funcs.get(sym).is_some_and(|f| {
+            !has_body(self.ctx, f.op)
+                && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
+        });
+        if !foreign_variadic {
+            return sym.to_string();
+        }
+        let t = format!("__pliron_va8.{}", crate::obj_sym(sym));
+        if !self.va_fids.contains_key(&t) {
+            let sig = Signature::new(self.cc);
+            let id = self
+                .m
+                .declare_function(&t, Linkage::Import, &sig)
+                .unwrap();
+            self.va_fids.insert(t.clone(), id);
+        }
+        VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_asm(sym)));
+        t
+    }
+
     fn sym_addr(&mut self, sym: &str) -> ir::Value {
+        let sym = self.va_sym(sym);
+        if let Some(&id) = self.va_fids.get(&sym) {
+            let fr = self.fref(id);
+            return self.b.ins().func_addr(clt::I64, fr);
+        }
         match self
             .ids
-            .get(sym)
+            .get(&sym)
             .copied()
             .unwrap_or_else(|| panic!("unknown symbol {sym}"))
         {
@@ -2035,8 +2101,8 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
-        for a in args {
-            cargs.extend(self.get(a));
+        for a in &args {
+            cargs.extend(self.get(*a));
         }
         // C variadic: fn_ty only has the fixed params. Foreign callees get the
         // real SysV ABI (extra args passed like ordinary arguments); callees
@@ -2044,7 +2110,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         // address is the extra param make_sig appends.
         let var_arg = matches!(classify(ctx, fn_ty), TyK::Func(_, _, true));
         if var_arg {
-            let foreign = info.foreign;
+            // Indirect calls could target foreign variadic callees, so they
+            // always use the real SysV convention (fn pointers to our own
+            // variadic defs aren't distinguishable and would need a shim).
+            // Direct calls whose sym is a foreign variadic get the real
+            // convention too: sym_addr redirects them to the %al trampoline.
+            let foreign = info.foreign
+                || match call.callee(ctx) {
+                    CallOpCallable::Indirect(_) => true,
+                    CallOpCallable::Direct(ident) => {
+                        let sym = &self.st.ident_to_sym[&ident.to_string()];
+                        self.st.funcs.get(sym).is_some_and(|f| {
+                            !has_body(self.ctx, f.op)
+                                && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
+                        })
+                    }
+                };
             if foreign {
                 sig.params.pop();
                 for &v in &cargs[sig.params.len()..] {
@@ -2052,23 +2133,37 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                         .push(AbiParam::new(self.b.func.dfg.value_type(v)));
                 }
             } else {
-                let va: Vec<ir::Value> =
-                    cargs.drain(sig.params.len() - 1..).collect();
+                // SysV overflow-area layout: each vararg in an 8-byte slot
+                // aligned to its alignment (capped at 16), leaves at their
+                // struct offsets. A VaList forwarding this buffer to a foreign
+                // callee then decodes it identically to a real register-save
+                // area's overflow region.
+                let fixed = sig.params.len() - 1;
+                let mut seen = 0usize;
+                let mut first = args.len();
+                for (i, &a) in args.iter().enumerate() {
+                    if seen >= fixed {
+                        first = i;
+                        break;
+                    }
+                    seen += self.get(a).len();
+                }
+                cargs.drain(fixed..);
                 let mut off = 0u64;
-                let lay: Vec<(u64, ClType)> = va
-                    .iter()
-                    .map(|&v| {
-                        let t = self.b.func.dfg.value_type(v);
-                        let n = t.bytes() as u64;
-                        off = off.next_multiple_of(n);
-                        let at = off;
-                        off += n;
-                        (at, t)
-                    })
-                    .collect();
+                let mut plan = Vec::new();
+                for &a in &args[first..] {
+                    let ty = a.get_type(ctx);
+                    let (size, align) = size_align(ctx, ty);
+                    off = off.next_multiple_of(align.clamp(8, 16));
+                    let slot = off;
+                    off += size.max(8).next_multiple_of(8);
+                    plan.push((a, ty, slot));
+                }
                 let buf = self.slot(off.max(1), 16);
-                for (&v, &(at, t)) in va.iter().zip(&lay) {
-                    self.b.ins().store(MemFlagsData::new(), v, buf, at as i32);
+                for (a, ty, slot) in plan {
+                    for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        self.b.ins().store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
+                    }
                 }
                 cargs.push(buf);
             }
@@ -2088,7 +2183,41 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             CallOpCallable::Indirect(v) => {
                 let addr = self.get1(v);
-                Err((addr, self.b.import_signature(sig)))
+                if var_arg {
+                    // fp appended as a hidden last argument; a per-register
+                    // stub sets %al=8 then tail-jumps to it (fp's SysV
+                    // register is computed positionally).
+                    cargs.push(addr);
+                    sig.params.push(AbiParam::new(clt::I64));
+                    const INT_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+                    let n_int = sig.params[..sig.params.len() - 1]
+                        .iter()
+                        .filter(|p| {
+                            p.value_type.is_int()
+                                && p.purpose == cranelift_codegen::ir::ArgumentPurpose::Normal
+                        })
+                        .count();
+                    match INT_REGS.get(n_int) {
+                        Some(reg) => {
+                            let t = format!("__pliron_va8_ind_{reg}");
+                            if !self.va_fids.contains_key(&t) {
+                                let id = self
+                                    .m
+                                    .declare_function(&t, Linkage::Import, &sig)
+                                    .unwrap();
+                                self.va_fids.insert(t.clone(), id);
+                            }
+                            VA_TRAMPS
+                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg)));
+                            Ok(self.call_fref(self.va_fids[&t]))
+                        }
+                        // fp lands on the stack (rare): call it directly; %al
+                        // stays wrong for float varargs there.
+                        None => Err((addr, self.b.import_signature(sig))),
+                    }
+                } else {
+                    Err((addr, self.b.import_signature(sig)))
+                }
             }
         };
         if info.tail && self.own_tail {
@@ -2177,9 +2306,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
             "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
-            "pliron.va.buf" => {
-                self.va_buf.expect("pliron.va.buf in a non-variadic function")
-            }
+            "pliron.va.buf" => self.va_buf.unwrap_or_else(|| {
+                panic!(
+                    "pliron.va.buf in a non-variadic function {}",
+                    CUR_FN.with(|c| c.borrow().clone())
+                )
+            }),
             "llvm.memcpy" | "llvm.memmove" => {
                 if let Some(n) = self
                     .const_int(opnds[2])

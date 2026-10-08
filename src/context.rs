@@ -530,9 +530,16 @@ impl<'tcx> HasTypingEnv<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'tcx> {
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        self.tcx
-            .dcx()
-            .span_fatal(span, format!("failed to get layout for `{ty}`: {err:?}"))
+        if let LayoutError::SizeOverflow(_)
+        | LayoutError::ReferencesError(_)
+        | LayoutError::InvalidSimd { .. } = err
+        {
+            self.tcx.dcx().span_fatal(span, err.to_string())
+        } else {
+            self.tcx
+                .dcx()
+                .emit_fatal(rustc_codegen_ssa::diagnostics::FailedToGetLayout { span, ty, err })
+        }
     }
 }
 

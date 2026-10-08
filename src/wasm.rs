@@ -1841,10 +1841,10 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             TyK::Func(_, a, v) => (a.len(), v),
             _ => unreachable!(),
         };
-        let mut va: Vec<WV> = Vec::new();
+        let mut va_args: Vec<Value> = Vec::new();
         for (i, a) in call.args(ctx).into_iter().enumerate() {
             if var_arg && i >= nfixed {
-                va.extend(self.get(a));
+                va_args.push(a);
                 continue;
             }
             let vs = self.get(a);
@@ -1865,27 +1865,23 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
         }
         if var_arg {
-            // Each variadic argument at its natural alignment, as clang does.
+            // SysV overflow-area layout, matching va_start/va_arg's tag walk:
+            // each vararg in an 8-byte slot aligned to its alignment (<=16).
             let mut off = 0u64;
-            let lay: Vec<(ClType, u64)> = va
-                .iter()
-                .map(|&v| {
-                    let (t, n) = match self.ty_of(v) {
-                        WT::I32 => (clt::I32, 4),
-                        WT::I64 => (clt::I64, 8),
-                        WT::F32 => (clt::F32, 4),
-                        WT::F64 => (clt::F64, 8),
-                        t => panic!("variadic argument of type {t:?}"),
-                    };
-                    off = off.next_multiple_of(n);
-                    let at = off;
-                    off += n;
-                    (t, at)
-                })
-                .collect();
+            let mut plan = Vec::new();
+            for &a in &va_args {
+                let ty = a.get_type(ctx);
+                let (size, align) = size_align(ctx, ty);
+                off = off.next_multiple_of(align.clamp(8, 16));
+                let slot = off;
+                off += size.max(8).next_multiple_of(8);
+                plan.push((a, ty, slot));
+            }
             let buf = self.slot(off.max(1), 16);
-            for (&v, &(t, at)) in va.iter().zip(&lay) {
-                self.store(t, v, buf, at);
+            for (a, ty, slot) in plan {
+                for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                    self.store(lt, v, buf, slot + lo);
+                }
             }
             wargs.push(buf);
         }
