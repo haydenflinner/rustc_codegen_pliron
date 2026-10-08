@@ -1245,12 +1245,20 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn slot(&mut self, size: u64, align: u64) -> ir::Value {
+        // Cranelift frames are only 16-byte aligned; over-allocate and round up.
+        let align = align.max(1);
+        let over = if align > 16 { align } else { 0 };
         let ss = self.b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            size as u32,
-            align.max(1).trailing_zeros() as u8,
+            (size + over) as u32,
+            align.min(16).trailing_zeros() as u8,
         ));
-        self.b.ins().stack_addr(clt::I64, ss, 0)
+        let p = self.b.ins().stack_addr(clt::I64, ss, 0);
+        if over == 0 {
+            return p;
+        }
+        let p = self.b.ins().iadd_imm(p, align as i64 - 1);
+        self.b.ins().band_imm(p, -(align as i64))
     }
 
     /// A `pliron.v*` op on vectors split into several native parts.
@@ -1757,6 +1765,39 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 };
                 self.set(op, smallvec![r, of]);
                 return;
+            }
+            "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                let (x, y) = (a[0], a[1]);
+                let t = self.b.func.dfg.value_type(x);
+                if t.is_vector() {
+                    let ins = self.b.ins();
+                    match name {
+                        "llvm.uadd.sat" => ins.uadd_sat(x, y),
+                        "llvm.usub.sat" => ins.usub_sat(x, y),
+                        "llvm.sadd.sat" => ins.sadd_sat(x, y),
+                        _ => ins.ssub_sat(x, y),
+                    }
+                } else {
+                    let (r, of) = match name {
+                        "llvm.uadd.sat" => self.b.ins().uadd_overflow(x, y),
+                        "llvm.usub.sat" => self.b.ins().usub_overflow(x, y),
+                        "llvm.sadd.sat" => self.b.ins().sadd_overflow(x, y),
+                        _ => self.b.ins().ssub_overflow(x, y),
+                    };
+                    let zero = self.b.ins().iconst(t, 0);
+                    let ones = self.b.ins().bnot(zero);
+                    let sat = match name {
+                        "llvm.uadd.sat" => ones,
+                        "llvm.usub.sat" => zero,
+                        _ => {
+                            // x < 0 saturates to MIN (= !MAX), else to MAX.
+                            let max = self.b.ins().ushr_imm(ones, 1);
+                            let sign = self.b.ins().sshr_imm(x, t.bits() as i64 - 1);
+                            self.b.ins().bxor(sign, max)
+                        }
+                    };
+                    self.b.ins().select(of, sat, r)
+                }
             }
             "llvm.fptoui.sat" | "llvm.fptosi.sat" => {
                 let t = self.ty_leaves(self.res_ty(op))[0].1;
