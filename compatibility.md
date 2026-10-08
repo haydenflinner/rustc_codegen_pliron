@@ -5,6 +5,9 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | target | config | result |
 |---|---|---|
 | rustc `tests/ui` (stage1, fork) | `./x test tests/ui --no-fail-fast` | 21,544 pass, 182 fail, 797 ignored (before LTO/EII/SIMD fixes) |
+| coretests (stage1, fork) | `./x test library/coretests --skip _max_range` | 2,722 + 596 bench-tests pass, 0 fail |
+| coretests `split_off*_max_range*` (6) | as above | hang: comparing `usize::MAX` ZSTs is an unremoved loop (no loop deletion yet; upstream notes the same for unoptimized rustc) |
+| alloctests (stage1, fork) | `./x test library/alloctests` | 335 + 1,490 + 573 + 2 pass, 0 fail |
 | burn-ndarray 0.22 | native, `--lib` | 41/41 |
 | burn-backend-tests | native, ndarray | 694 + 1,801 pass, 18 ignored |
 | polars-core 0.55.1 | native, `--features object` | 107 pass, 2 fail (same under LLVM: proptest `unreachable!`) |
@@ -17,3 +20,5 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 Fixes made for these: `simd_select_bitmask` mask arg, LLVM-like constant alignment, >16-byte stack alignment, `llvm.{u,s}{add,sub}.sat`, x86 `vzeroupper`/`vzeroall`/fences, wasm custom sections + `target_features`, `-O0` always-inline (wasm-bindgen describe shims), no-arg `main` → C `main(argc, argv)` wrapper in pliron-wasm-ld.
 
 Not verified: rendered pixels in the browser — headless SwiftShader shows a blank canvas for both the pliron and the LLVM build.
+
+Flaky: the WASI `sleep+instant` check (5 ms sleep, `elapsed() >= 5ms`) failed once under heavy load and passed on rerun.
