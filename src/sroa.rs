@@ -518,7 +518,14 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             }
         }
         for op in allocas(ctx, f) {
-            validate(ctx, st, op.deref(ctx).get_result(0));
+            let a = op.deref(ctx).get_result(0);
+            if !a.is_used(ctx) {
+                st.allocas.remove(&a);
+                st.promoted.remove(&a);
+                Operation::erase(op, ctx);
+                continue;
+            }
+            validate(ctx, st, a);
         }
     }
     if std::env::var_os("PLIRON_STATS").is_some() {
