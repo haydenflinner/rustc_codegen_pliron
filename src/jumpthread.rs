@@ -1108,3 +1108,53 @@ pub fn run(
     let nn = NonNull::new(func, loads, derived);
     total + fold_null_tests(func, &nn)
 }
+
+/// Turns `brif`/`br_table` on a compile-time constant into a `jump`. Later passes (load
+/// forwarding) expose constants after threading ran, and Cranelift never folds branches,
+/// so the dead successor's block arguments would otherwise stay live.
+pub fn fold_const_branches(func: &mut Function) -> usize {
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for _ in 0..2 {
+        for &b in &blocks {
+            for i in func.layout.block_insts(b) {
+                if func.dfg.inst_results(i).len() == 1
+                    && let Some(c) = eval(func, &env, &|_| false, &|_| None, i)
+                {
+                    env.insert(func.dfg.first_result(i), c);
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for &b in &blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let dest = match func.dfg.insts[t] {
+            InstructionData::Brif { arg, blocks, .. } => {
+                let arg = func.dfg.resolve_aliases(arg);
+                known(func, &env, arg).map(|c| blocks[usize::from(c == 0)])
+            }
+            InstructionData::BranchTable { arg, table, .. } => {
+                let arg = func.dfg.resolve_aliases(arg);
+                known(func, &env, arg).map(|c| {
+                    let jt = &func.dfg.jump_tables[table];
+                    usize::try_from(c)
+                        .ok()
+                        .and_then(|c| jt.as_slice().get(c).copied())
+                        .unwrap_or(jt.default_block())
+                })
+            }
+            _ => None,
+        };
+        if let Some(d) = dest {
+            func.dfg.insts[t] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: d,
+            };
+            n += 1;
+        }
+    }
+    n
+}

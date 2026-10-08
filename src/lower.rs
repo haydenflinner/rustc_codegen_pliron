@@ -308,6 +308,17 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if std::env::var("PLIRON_CONSTBR").is_ok_and(|v| v == "1") {
+            let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_CONSTBR_DEBUG").is_some() {
+                eprintln!("constbr {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
         }
