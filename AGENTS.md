@@ -23,7 +23,11 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 
 - `cargo build` → `target/debug/librustc_codegen_pliron.{so,dylib}`
 - `./test.sh` — smoke tests (nostd, std, unwind, asm, proc-macro, wasm if
-  node is installed); `--sysroot` also rebuilds std via `-Zbuild-std`
+  node is installed); `--sysroot` also rebuilds std via `-Zbuild-std`;
+  `--mold` cross-links the std test to `*-linux-musl` with mold (PATH or a
+  sibling `mold` checkout built with `cargo build --release`) and runs it
+  under docker/qemu when available — the pure-Rust link path, since mold is
+  ELF-only (no Mach-O)
 - `tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]` — runs directive-free
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)
