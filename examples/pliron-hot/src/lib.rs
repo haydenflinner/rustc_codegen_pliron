@@ -86,6 +86,7 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
     let len = align(len, 4096);
     let mut hint = align(end, 1 << 21) + (64 << 20);
     for _ in 0..24 {
+        #[cfg(target_os = "linux")]
         let p = unsafe {
             libc::mmap(
                 hint as *mut _,
@@ -95,6 +96,27 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
                 -1,
                 0,
             )
+        };
+        // Darwin has no MAP_FIXED_NOREPLACE: map at the hint, then unmap and
+        // advance when the kernel picked a spot beyond PC32 reach.
+        #[cfg(not(target_os = "linux"))]
+        let p = {
+            let p = unsafe {
+                libc::mmap(
+                    hint as *mut _,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED && (p as i64 - end as i64).unsigned_abs() >= (1 << 31) {
+                unsafe { libc::munmap(p, len) };
+                libc::MAP_FAILED
+            } else {
+                p
+            }
         };
         if p != libc::MAP_FAILED {
             return Ok(p as usize);

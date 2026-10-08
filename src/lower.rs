@@ -1405,11 +1405,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     /// Foreign variadic callees can't be given `%al` (the xmm vararg count) by
     /// Cranelift, so calls to them go through a `__pliron_va8.<sym>` stub that
     /// sets it to 8 and tail-jumps (emitted into `st.asm` at emit time).
+    /// SysV x86-64 only: on aarch64 there is no register count to fake (Darwin
+    /// puts every variadic arg on the stack), so no redirect is needed.
     fn va_sym(&mut self, sym: &str) -> String {
-        let foreign_variadic = self.st.funcs.get(sym).is_some_and(|f| {
-            !has_body(self.ctx, f.op)
-                && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
-        });
+        let foreign_variadic = self.m.isa().triple().architecture
+            == target_lexicon::Architecture::X86_64
+            && self.st.funcs.get(sym).is_some_and(|f| {
+                !has_body(self.ctx, f.op)
+                    && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
+            });
         if !foreign_variadic {
             return sym.to_string();
         }
@@ -2730,7 +2734,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             }
             CallOpCallable::Indirect(v) => {
                 let addr = self.get1(v);
-                if var_arg {
+                if var_arg
+                    && self.m.isa().triple().architecture
+                        == target_lexicon::Architecture::X86_64
+                {
                     // fp appended as a hidden last argument; a per-register
                     // stub sets %al=8 then tail-jumps to it (fp's SysV
                     // register is computed positionally).

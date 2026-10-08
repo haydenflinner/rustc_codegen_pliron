@@ -181,6 +181,8 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
     }
     let rest = name.strip_prefix("llvm.aarch64.neon.")?;
     let (op, ty) = rest.rsplit_once('.')?;
+    // Reductions carry a scalar-type infix (`faddv.f32.v4f32`); drop it.
+    let op = op.split_once('.').map_or(op, |(o, _)| o);
     let suf = match ty {
         "v16i8" => "16b",
         "v8i8" => "8b",
@@ -207,6 +209,25 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
     if BINARY.contains(&op) {
         return Some(format!("    {op} v0.{suf}, v0.{suf}, v1.{suf}\n    ret\n"));
     }
+    // Byte-table lookups (v16i8 only): tbl takes its table in v0..v{n-1} and
+    // the indices in the last arg; tbx is the same but v0 is the passthru
+    // destination, so the table is v1..v{n}.
+    if let Some(n) = op
+        .strip_prefix("tbl")
+        .or_else(|| op.strip_prefix("tbx"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (1..=4).contains(&n))
+    {
+        if suf != "16b" {
+            return None;
+        }
+        if op.starts_with("tbl") {
+            let tbl = (0..n).map(|r| format!("v{r}.16b")).collect::<Vec<_>>().join(", ");
+            return Some(format!("    tbl v0.16b, {{{tbl}}}, v{n}.16b\n    ret\n"));
+        }
+        let tbl = (1..=n).map(|r| format!("v{r}.16b")).collect::<Vec<_>>().join(", ");
+        return Some(format!("    tbx v0.16b, {{{tbl}}}, v{}.16b\n    ret\n", n + 1));
+    }
     // 2-vector unary ops.
     const UNARY: &[&str] = &[
         "abs", "sqabs", "neg", "sqneg", "cls", "clz", "cnt", "rbit", "rev16", "rev32", "rev64",
@@ -215,6 +236,13 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
     ];
     if UNARY.contains(&op) {
         return Some(format!("    {op} v0.{suf}, v0.{suf}\n    ret\n"));
+    }
+    // NEON f32x4 sum; rsasm only knows the SVE `faddv`, so pairwise-add instead.
+    if op == "faddv" {
+        if ty != "v4f32" {
+            return None;
+        }
+        return Some("    faddp v0.4s, v0.4s, v0.4s\n    faddp s0, v0.2s\n    ret\n".into());
     }
     // Across-lane reductions: vector in v0, scalar result in the low lane.
     const REDUCE: &[&str] = &[
