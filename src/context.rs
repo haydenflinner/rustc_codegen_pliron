@@ -125,6 +125,8 @@ pub struct State<'tcx> {
     pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
     /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
     pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// Loads whose (pointer) result rustc marked `!nonnull`.
+    pub nonnull: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
     pub dead_fns: rustc_data_structures::fx::FxHashSet<String>,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).

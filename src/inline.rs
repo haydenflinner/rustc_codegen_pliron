@@ -351,6 +351,9 @@ fn inline_call(
             if st.volatile.contains(&op) {
                 st.volatile.insert(new);
             }
+            if st.nonnull.contains(&op) {
+                st.nonnull.insert(new);
+            }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
                 let (v, nv) = (op.deref(ctx).get_result(i), new.deref(ctx).get_result(i));

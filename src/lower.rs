@@ -26,7 +26,7 @@ use pliron::value::Value;
 use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
 use pliron_llvm::ops::*;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use crate::context::{ArgExt, ConstVal, Exts, State, mask};
@@ -218,6 +218,7 @@ pub fn lower_to_object(
         };
         let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
+        let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -236,16 +237,18 @@ pub fn lower_to_object(
                 internal: &internal,
                 exn: None,
                 vars: FxHashMap::default(),
+                nonnull: FxHashSet::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
+            nonnull = std::mem::take(&mut fl.nonnull);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         if st.jumpthread {
-            threaded += crate::jumpthread::run(&mut clctx.func);
+            threaded += crate::jumpthread::run(&mut clctx.func, &nonnull);
             if dump {
                 eprintln!("==== clif {n} after jumpthread ====\n{}", clctx.func.display());
             }
@@ -363,6 +366,8 @@ struct FnLower<'a, 'b, 'tcx> {
     exn: Option<cranelift_frontend::Variable>,
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
+    /// Results of `!nonnull` memory loads.
+    nonnull: FxHashSet<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -1063,6 +1068,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     }
                 })
                 .collect();
+            if r.len() == 1 && self.st.nonnull.contains(&op) {
+                self.nonnull.insert(r[0]);
+            }
             self.set(op, r);
         } else if is!(StoreOp) || is!(AtomicStoreOp) {
             let vs = self.get(opnds[0]);

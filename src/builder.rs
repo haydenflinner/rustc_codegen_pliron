@@ -622,7 +622,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn range_metadata(&mut self, _load: Value, _range: WrappingRange) {}
-    fn nonnull_metadata(&mut self, _load: Value) {}
+    fn nonnull_metadata(&mut self, load: Value) {
+        if let Some(op) = load.defining_op() {
+            self.st.borrow_mut().nonnull.insert(op);
+        }
+    }
 
     fn store(&mut self, val: Value, ptr: Value, _align: Align) -> Value {
         self.mk_op(|c| StoreOp::new(c, val, ptr));

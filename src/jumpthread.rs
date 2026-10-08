@@ -11,10 +11,11 @@
 //! target without passing through the merge block, so dominance still holds.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
     ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -78,7 +79,12 @@ fn icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
 }
 
 /// Evaluate one pure body instruction of a merge block.
-fn eval(func: &Function, env: &FxHashMap<Value, u64>, inst: Inst) -> Option<u64> {
+fn eval(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    nz: &dyn Fn(Value) -> bool,
+    inst: Inst,
+) -> Option<u64> {
     let res = func.dfg.first_result(inst);
     let w = bits(func, res)?;
     let r = match func.dfg.insts[inst] {
@@ -88,8 +94,22 @@ fn eval(func: &Function, env: &FxHashMap<Value, u64>, inst: Inst) -> Option<u64>
         } => imm.bits() as u64,
         InstructionData::IntCompare { cond, args, .. } => {
             let aw = bits(func, args[0])?;
-            let (a, b) = (known(func, env, args[0])?, known(func, env, args[1])?);
-            icmp(cond, a, b, aw) as u64
+            match (known(func, env, args[0]), known(func, env, args[1])) {
+                (Some(a), Some(b)) => icmp(cond, a, b, aw) as u64,
+                (Some(0), None) | (None, Some(0)) => {
+                    let x = if known(func, env, args[0]).is_some() {
+                        args[1]
+                    } else {
+                        args[0]
+                    };
+                    match (cond, nz(x)) {
+                        (IntCC::Equal, true) => 0,
+                        (IntCC::NotEqual, true) => 1,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
         }
         InstructionData::Unary { opcode, arg } => {
             let aw = bits(func, arg)?;
@@ -179,45 +199,58 @@ fn users(func: &Function) -> FxHashMap<Block, FxHashSet<Block>> {
 
 const MAX_WALK: usize = 4096;
 
-/// Whether a block in `uses` is reachable from `s` without passing through `b`
-/// (following both the CFG and edges added earlier this round). If so, threading
-/// an edge to `s` would let a path bypass `b`'s definitions. Gives up (true) on
-/// very large walks.
-fn bypasses(
-    cfg: &ControlFlowGraph,
-    extra: &FxHashMap<Block, Vec<Block>>,
-    b: Block,
+enum Arg {
+    V(Value),
+    K(u64, Type),
+}
+
+/// A retargeted edge `pinst`'s destination `di` → `s`. With `repair`, the values
+/// of the bypassed merge block that are used from `s` on become new params of
+/// `s` (fed by the merge block's own branch `term`/`ti` and by the new edge).
+struct Edit {
+    pinst: Inst,
+    di: usize,
     s: Block,
-    uses: &FxHashSet<Block>,
-) -> bool {
+    args: Vec<Arg>,
+    repair: Option<(Inst, usize, Vec<Value>, Vec<Block>)>,
+}
+
+/// Blocks reachable from `s` without entering `b`, or None past MAX_WALK.
+fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
     let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut order = Vec::new();
     let mut work = vec![s];
     while let Some(x) = work.pop() {
         if x == b || !seen.insert(x) {
             continue;
         }
-        if uses.contains(&x) || seen.len() > MAX_WALK {
-            return true;
+        order.push(x);
+        if order.len() > MAX_WALK {
+            return None;
         }
         work.extend(cfg.succ_iter(x));
-        if let Some(e) = extra.get(&x) {
-            work.extend(e.iter().copied());
-        }
     }
-    false
+    Some(order)
 }
 
 /// Thread one round; returns the number of edges retargeted.
-fn round(func: &mut Function) -> usize {
+fn round(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
     let users = users(func);
-    let none = FxHashSet::default();
-    let mut extra: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
     let entry = func.layout.entry_block();
-    let mut edits: Vec<(Inst, usize, Block, Vec<Result<Value, (u64, Value)>>)> = Vec::new();
+    let def_block = |v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    let mut edits: Vec<Edit> = Vec::new();
     let mut touched: FxHashSet<Inst> = FxHashSet::default();
+    // Blocks taking part in any edit, and blocks no later edit may touch.
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut locked: FxHashSet<Block> = FxHashSet::default();
     for b in func.layout.blocks() {
-        if Some(b) == entry {
+        if Some(b) == entry || locked.contains(&b) {
             continue;
         }
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
@@ -237,9 +270,10 @@ fn round(func: &mut Function) -> usize {
         };
         let params = func.dfg.block_params(b).to_vec();
         let body_vals: FxHashSet<Value> = body.iter().map(|&i| func.dfg.first_result(i)).collect();
+        let b_users = users.get(&b);
         for pred in cfg.pred_iter(b) {
             let (pinst, pblock) = (pred.inst, pred.block);
-            if pblock == b || touched.contains(&pinst) {
+            if pblock == b || touched.contains(&pinst) || locked.contains(&pblock) {
                 continue;
             }
             if !matches!(func.dfg.insts[pinst].opcode(), Opcode::Jump | Opcode::Brif) {
@@ -252,9 +286,13 @@ fn round(func: &mut Function) -> usize {
                     continue;
                 }
                 let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                if args.len() != params.len() {
+                    continue;
+                }
                 let mut env: FxHashMap<Value, u64> = FxHashMap::default();
                 let mut argv: FxHashMap<Value, Value> = FxHashMap::default();
-                let mut ok = args.len() == params.len();
+                let mut pn: FxHashSet<Value> = FxHashSet::default();
+                let mut ok = true;
                 for (&p, a) in params.iter().zip(&args) {
                     let BlockArg::Value(v) = *a else {
                         ok = false;
@@ -264,71 +302,159 @@ fn round(func: &mut Function) -> usize {
                     argv.insert(p, v);
                     if let Some(c) = known(func, &env, v) {
                         env.insert(p, c);
+                    } else if nonnull.contains(&v) {
+                        pn.insert(p);
                     }
                 }
                 if !ok {
                     continue;
                 }
+                let nz = |v: Value| {
+                    let v = func.dfg.resolve_aliases(v);
+                    nonnull.contains(&v) || pn.contains(&v)
+                };
                 for &i in body {
-                    if let Some(c) = eval(func, &env, i) {
+                    if let Some(c) = eval(func, &env, &nz, i) {
                         env.insert(func.dfg.first_result(i), c);
                     }
                 }
-                let Some(c) = known(func, &env, cond) else {
-                    continue;
+                let taken = match known(func, &env, cond) {
+                    Some(c) => c != 0,
+                    None if nz(cond) => true,
+                    None => continue,
                 };
-                let t = targets[if c != 0 { 0 } else { 1 }];
+                let ti = if taken { 0 } else { 1 };
+                let t = targets[ti];
                 let s = t.block(&func.dfg.value_lists);
-                if s == b || bypasses(&cfg, &extra, b, s, users.get(&b).unwrap_or(&none)) {
+                if s == b || locked.contains(&s) {
                     continue;
                 }
+                let Some(reg) = region(&cfg, b, s) else {
+                    continue;
+                };
+                // B's values used from `s` on (resolved), in first-use order.
+                let mut needed: Vec<Value> = Vec::new();
+                if let Some(bu) = b_users
+                    && reg.iter().any(|x| bu.contains(x))
+                {
+                    for &x in &reg {
+                        if !bu.contains(&x) {
+                            continue;
+                        }
+                        for inst in func.layout.block_insts(x) {
+                            for v in func.dfg.inst_values(inst) {
+                                let r = func.dfg.resolve_aliases(v);
+                                if def_block(r) == Some(b) && !needed.contains(&r) {
+                                    needed.push(r);
+                                }
+                            }
+                        }
+                    }
+                }
+                let repair = !needed.is_empty();
+                if repair
+                    && (cfg.pred_iter(s).count() != 1
+                        || targets[1 - ti].block(&func.dfg.value_lists) == s
+                        || seen.contains(&b)
+                        || seen.contains(&s)
+                        || seen.contains(&pblock)
+                        || reg.iter().any(|x| seen.contains(x))
+                        || !reg
+                            .iter()
+                            .filter(|x| b_users.is_some_and(|bu| bu.contains(x)))
+                            .all(|&x| domtree.block_dominates(s, x)))
+                {
+                    continue;
+                }
+                let map = |v: Value, out: &mut Vec<Arg>| -> bool {
+                    if let Some(&pv) = argv.get(&v) {
+                        out.push(Arg::V(pv));
+                    } else if body_vals.contains(&v) {
+                        match env.get(&v) {
+                            Some(&k) => out.push(Arg::K(k, func.dfg.value_type(v))),
+                            None => return false,
+                        }
+                    } else {
+                        out.push(Arg::V(v));
+                    }
+                    true
+                };
                 let mut new = Vec::new();
                 for a in t.args(&func.dfg.value_lists) {
                     let BlockArg::Value(v) = a else {
                         ok = false;
                         break;
                     };
-                    let v = func.dfg.resolve_aliases(v);
-                    if let Some(&pv) = argv.get(&v) {
-                        new.push(Ok(pv));
-                    } else if body_vals.contains(&v) {
-                        match env.get(&v) {
-                            Some(&k) => new.push(Err((k, v))),
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    } else {
-                        new.push(Ok(v));
-                    }
+                    ok &= map(func.dfg.resolve_aliases(v), &mut new);
                 }
-                if ok {
-                    touched.insert(pinst);
-                    extra.entry(pblock).or_default().push(s);
-                    edits.push((pinst, di, s, new));
-                    break;
+                for &w in &needed {
+                    ok &= map(w, &mut new);
                 }
+                if !ok {
+                    continue;
+                }
+                touched.insert(pinst);
+                seen.extend([b, s, pblock]);
+                let repair = repair.then(|| {
+                    touched.insert(term);
+                    locked.extend([b, s, pblock]);
+                    locked.extend(reg.iter().copied());
+                    (term, ti, needed, reg)
+                });
+                edits.push(Edit {
+                    pinst,
+                    di,
+                    s,
+                    args: new,
+                    repair,
+                });
+                break;
             }
         }
     }
     let n = edits.len();
-    for (pinst, di, s, new) in edits {
-        let mut args = Vec::with_capacity(new.len());
-        for a in new {
+    for e in edits {
+        if let Some((term, ti, needed, reg)) = e.repair {
+            let mut to: FxHashMap<Value, Value> = FxHashMap::default();
+            for &w in &needed {
+                let ty = func.dfg.value_type(w);
+                to.insert(w, func.dfg.append_block_param(e.s, ty));
+            }
+            for x in reg {
+                let insts: Vec<Inst> = func.layout.block_insts(x).collect();
+                for inst in insts {
+                    let repl: FxHashMap<Value, Value> = func
+                        .dfg
+                        .inst_values(inst)
+                        .filter_map(|v| to.get(&func.dfg.resolve_aliases(v)).map(|&n| (v, n)))
+                        .collect();
+                    if !repl.is_empty() {
+                        func.dfg
+                            .map_inst_values(inst, |v| repl.get(&v).copied().unwrap_or(v));
+                    }
+                }
+            }
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[term]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[ti];
+            for &w in &needed {
+                bc.append_argument(w, &mut dfg.value_lists);
+            }
+        }
+        let mut args = Vec::with_capacity(e.args.len());
+        for a in e.args {
             args.push(BlockArg::Value(match a {
-                Ok(v) => v,
-                Err((k, like)) => {
-                    let ty = func.dfg.value_type(like);
-                    let mut cur = FuncCursor::new(func).at_inst(pinst);
+                Arg::V(v) => v,
+                Arg::K(k, ty) => {
+                    let mut cur = FuncCursor::new(func).at_inst(e.pinst);
                     cur.ins().iconst(ty, k as i64)
                 }
             }));
         }
-        let bc = BlockCall::new(s, args, &mut func.dfg.value_lists);
+        let bc = BlockCall::new(e.s, args, &mut func.dfg.value_lists);
         let dfg = &mut func.dfg;
-        dfg.insts[pinst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-            [di] = bc;
+        dfg.insts[e.pinst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e.di] = bc;
     }
     n
 }
@@ -380,11 +506,11 @@ fn merge_chains(func: &mut Function) {
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
     merge_chains(func);
     let mut total = 0;
-    for _ in 0..4 {
-        let n = round(func);
+    for _ in 0..8 {
+        let n = round(func, nonnull);
         total += n;
         if n == 0 {
             break;
