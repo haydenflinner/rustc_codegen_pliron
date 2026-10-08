@@ -197,7 +197,8 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
-    let eh_invoke = crate::pass_enabled("PLIRON_INLINE_EH_INVOKE");
+    // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
+    let eh_invoke = std::env::var("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
     let cap: usize = std::env::var("PLIRON_INLINE_CALLER_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
