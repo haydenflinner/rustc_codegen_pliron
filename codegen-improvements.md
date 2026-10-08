@@ -45,8 +45,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + batch: tail duplication of ≤4-inst return blocks into jump preds (`PLIRON_TAILDUP`), narrow and/or/xor widened before `uextend` (`PLIRON_WIDEN`), `uload8/16` for extended narrow loads (`PLIRON_ULOAD`); plus `[0,1]` load ranges skip the i1 `band` (`PLIRON_BOOLRANGE`) | 1.29s | 2.45s | 5.91B (−1.2%) | 13.21B (−1.1%) | all kept, now default on; this stage2 build found and fixed a taildup alias/dominance bug (bfc5941) and a uload i128 bug (ad2f84f) |
 | ablation of the batch: `PLIRON_TAILDUP=0` | 1.26s | 2.44s | 5.95B (+0.7%) | 13.28B (+0.5%) | tail duplication kept (rustc_lexer `.text` +1%, but fewer instructions executed) |
 | + regalloc2 spill priority weight/(4·√len) instead of weight/len (vendored regalloc2, see `vendor/regalloc2/PLIRON_PATCH.md`) | 1.33s | 2.54s | 5.90B (−0.2%) | 13.17B (−0.3%) | kept: rustc_lexer `advance_token` stack refs 292→91; to be upstreamed once proven |
+| + devirtualization of calls through folded vtable/fn-pointer slots + targeted inline round (`PLIRON_DEVIRT`), `vhigh_bits(icmp slt x, 0)` → `vhigh_bits(x)` (one `pcmpgtb` less per hashbrown probe), brif-block tail duplication (`PLIRON_TAILDUP_BRIF`), unreachable blocks lowered as `trap` | 1.25s | 2.41s | 5.77B (−2.2%) | 12.92B (−1.9%) | kept. synthetic hashbrown (`/tmp/rs/hm.rs`): 151.0M → 114.9M instructions. Unreachable-block lowering order fixed a stage2 panic in `AdtDef::eval_explicit_discr` that devirt exposed |
 
-Net at the current defaults: 5.91B / 13.21B instructions (−60% / −59% vs baseline),
-1.29s / 2.45s wall (stage1 LLVM-built: 0.79s metadata).
+Net at the current defaults: 5.77B / 12.92B instructions (−61% / −60% vs baseline),
+1.25s / 2.41s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.86×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
