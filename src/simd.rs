@@ -491,30 +491,54 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
-            "llvm.x86.sse.cmp.ps" | "llvm.x86.sse2.cmp.pd" => {
+            "llvm.x86.sse.max.ps"
+            | "llvm.x86.sse2.max.pd"
+            | "llvm.x86.avx.max.ps.256"
+            | "llvm.x86.avx.max.pd.256"
+            | "llvm.x86.avx512.max.ps.512"
+            | "llvm.x86.avx512.max.pd.512" => {
+                // maxps returns the second operand unless a > b (NaNs, +-0).
+                let (n, _) = self.elem_of(ret_rty);
+                let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
+                let mut out = Vec::new();
+                for (x, y) in xs.into_iter().zip(ys) {
+                    let c = self.fcmp(RealOGT, x, y);
+                    out.push(self.select(c, x, y));
+                }
+                Some(self.build_vec(ret, out))
+            }
+            "llvm.x86.avx512.mask.cmp.ps.512" | "llvm.x86.avx512.mask.cmp.pd.512" => {
+                // (a, b, imm, k, sae) -> integer bitmask of the predicate, ANDed with k.
+                let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
+                let (n, _) = self.elem_of(args[0].layout.ty);
+                let mt = self.val_ty(a(3));
+                let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
+                let mut acc = self.const_int(mt, 0);
+                for (i, (x, y)) in xs.into_iter().zip(ys).enumerate() {
+                    let bit = match X86_CMP[imm as usize] {
+                        RealPredicateFalse => continue,
+                        RealPredicateTrue => self.const_int(mt, 1),
+                        p => {
+                            let c = self.fcmp(p, x, y);
+                            self.zext(c, mt)
+                        }
+                    };
+                    let sh = self.const_int(mt, i as i64);
+                    let bit = self.shl(bit, sh);
+                    acc = self.or(acc, bit);
+                }
+                Some(self.and(acc, a(3)))
+            }
+            "llvm.x86.sse.cmp.ps"
+            | "llvm.x86.sse2.cmp.pd"
+            | "llvm.x86.avx.cmp.ps.256"
+            | "llvm.x86.avx.cmp.pd.256" => {
                 // Predicates 16..31 only differ in signaling, so the low 4 bits suffice.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
-                let pred = [
-                    RealOEQ,
-                    RealOLT,
-                    RealOLE,
-                    RealUNO,
-                    RealUNE,
-                    RealUGE,
-                    RealUGT,
-                    RealORD,
-                    RealUEQ,
-                    RealULT,
-                    RealULE,
-                    RealPredicateFalse,
-                    RealONE,
-                    RealOGE,
-                    RealOGT,
-                    RealPredicateTrue,
-                ][imm as usize];
+                let pred = X86_CMP[imm as usize];
                 let (n, _) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
-                let it = self.type_ix(if name.ends_with(".ps") { 32 } else { 64 });
+                let it = self.type_ix(if name.contains(".ps") { 32 } else { 64 });
                 let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -548,3 +572,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 }
+
+/// x86 `cmpps` immediate (low 4 bits) to predicate.
+const X86_CMP: [rustc_codegen_ssa::common::RealPredicate; 16] = {
+    use rustc_codegen_ssa::common::RealPredicate::*;
+    [RealOEQ, RealOLT, RealOLE, RealUNO, RealUNE, RealUGE, RealUGT, RealORD, RealUEQ, RealULT, RealULE, RealPredicateFalse, RealONE, RealOGE, RealOGT, RealPredicateTrue]
+};
