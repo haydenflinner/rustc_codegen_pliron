@@ -33,3 +33,6 @@ opt-level = 3
 
 [package.metadata.rust-analyzer]
 rustc_private = true
+
+[patch.crates-io]
+regalloc2 = { path = "vendor/regalloc2" }
