@@ -26,6 +26,8 @@ tests="std unwind"
 # asm test has x86-64 and aarch64 variants; other targets unsupported.
 case "$(uname -m)" in x86_64|aarch64|arm64) tests="$tests asm" ;; esac
 for t in $tests; do rustc $BE --edition 2024 tests/$t/main.rs -o $out/$t && $out/$t; done
+# -O passes (full unroll of constant-trip loops): output must match stock LLVM rustc's
+rustc $BE --edition 2021 -O tests/unroll/main.rs -o $out/unroll && $out/unroll | diff - tests/unroll/expected.out
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user

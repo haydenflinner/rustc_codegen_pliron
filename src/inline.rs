@@ -13,19 +13,25 @@ use pliron::irbuild::inserter::OpInsertionPoint;
 use pliron::irbuild::listener::DummyListener;
 use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron::linked_list::ContainsLinkedList;
+use pliron::operation::OpDbg;
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::Typed;
-use pliron_llvm::ops::{BrOp, CallOp, ReturnOp};
+use pliron::r#type::{Typed, TypedHandle};
+use pliron::value::Value;
+use pliron_llvm::ops::{BrOp, CallOp, GetElementPtrOp, LoadOp, ReturnOp};
+use pliron_llvm::types::FuncType;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
-use crate::context::State;
+use crate::context::{ConstVal, State};
 use crate::lower::has_body;
 
 const DEFAULT_LIMIT: usize = 320;
 const SMALL_LIMIT: usize = 40;
 
 pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+    if f.deref(ctx).regions().next().is_none() {
+        panic!("blocks: op has no regions: {}", OpDbg { op: f, ctx });
+    }
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
 }
 
@@ -47,7 +53,13 @@ pub(crate) fn direct_callee<'a>(
 
 /// `Some(has_eh)` if `sym` may be inlined; `has_eh` = it has invokes or reads
 /// the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees outright.
-fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> Option<bool> {
+fn eligible(
+    ctx: &Context,
+    st: &State<'_>,
+    sym: &str,
+    limit: usize,
+    once: bool,
+) -> Option<(bool, usize)> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
         return None;
@@ -73,7 +85,47 @@ fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) 
     } else {
         limit
     })
-    .then_some(eh)
+    .then_some((eh, n))
+}
+
+/// Parameter indices of `f` that (through loads / GEPs) feed an indirect call's
+/// target: a constant address there (a vtable, a fn pointer) lets `devirt`
+/// make the call direct once `f` is inlined, as LLVM's inline-cost bonus does.
+fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else {
+        return Vec::new();
+    };
+    let params: Vec<Value> = entry.deref(ctx).arguments().collect();
+    let mut out = Vec::new();
+    for &b in &bs {
+        for op in ops(ctx, b) {
+            let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+                continue;
+            };
+            let CallOpCallable::Indirect(mut p) = c.callee(ctx) else {
+                continue;
+            };
+            for _ in 0..4 {
+                if let Some(i) = params.iter().position(|&a| a == p) {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                    break;
+                }
+                match p.defining_op() {
+                    Some(d)
+                        if Operation::is_op::<LoadOp>(d, ctx)
+                            || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
+                    {
+                        p = d.deref(ctx).get_operand(0);
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    out
 }
 
 fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
@@ -163,7 +215,12 @@ fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
 
 /// `small`: size-sensitive output (wasm, -Copt-level=s/z) keeps the old 40-op limit and no
 /// single-caller inlining; rustc.wasm tripled in code size (past V8's 1 GB module cap) without it.
-pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
+pub fn run(
+    ctx: &mut Context,
+    st: &mut State<'_>,
+    small: bool,
+    only: Option<&FxHashSet<Ptr<Operation>>>,
+) {
     let limit = std::env::var("PLIRON_INLINE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -191,13 +248,41 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
-    let mut ok: FxHashMap<String, (Ptr<Operation>, bool)> = FxHashMap::default();
+    // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
+    let eh_invoke = std::env::var("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
+    let cap: usize = std::env::var("PLIRON_INLINE_CALLER_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    // Callees up to `bonus`x the limit whose indirect call target comes from a
+    // parameter are inlined where that argument is a constant address
+    // (`PLIRON_INLINE_DEVIRT=<x>`; e.g. hashbrown's `find_or_find_insert_index_inner`
+    // taking `&mut dyn FnMut`).
+    let bonus: usize = std::env::var("PLIRON_INLINE_DEVIRT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 4 });
+    let mut ok: FxHashMap<String, (Ptr<Operation>, bool, usize)> = FxHashMap::default();
+    let mut dv: FxHashMap<String, (Ptr<Operation>, bool, usize, Vec<usize>)> = FxHashMap::default();
+    let devirt_ok = |ctx: &Context, st: &State<'_>, sym: &str, dv: &mut FxHashMap<_, _>| {
+        if bonus <= 1 {
+            return;
+        }
+        if let Some((eh, n)) = eligible(ctx, st, sym, limit * bonus, false) {
+            let ps = devirt_params(ctx, st.funcs[sym].op);
+            if !ps.is_empty() {
+                dv.insert(sym.to_string(), (st.funcs[sym].op, eh, n, ps));
+            }
+        }
+    };
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
-            if let Some(eh) = eligible(ctx, st, sym, limit, single.contains(sym)) {
-                ok.insert(sym.clone(), (st.funcs[sym].op, eh));
+            if let Some((eh, n)) = eligible(ctx, st, sym, limit, single.contains(sym)) {
+                ok.insert(sym.clone(), (st.funcs[sym].op, eh, n));
+            } else {
+                devirt_ok(ctx, st, sym, &mut dv);
             }
         }
         st.funcs
@@ -210,22 +295,46 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
     for sym in order {
         let caller = st.funcs[&sym].op;
         let mut sites = Vec::new();
+        let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
         for b in blocks(ctx, caller) {
             for op in ops(ctx, b) {
                 if !bottom_up && st.invokes.contains_key(&op) {
                     continue;
                 }
+                if only.is_some_and(|o| !o.contains(&op)) {
+                    continue;
+                }
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
-                let Some(&(callee, eh)) = ok.get(cs) else {
+                let Some((callee, eh, n)) = ok.get(cs).copied().or_else(|| {
+                    let (f, eh, n, ps) = dv.get(cs)?;
+                    let args = Operation::get_op::<CallOp>(op, ctx)?.args(ctx);
+                    ps.iter()
+                        .any(|&i| {
+                            args.get(i).is_some_and(|a| {
+                                matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
+                            })
+                        })
+                        .then_some((*f, *eh, *n))
+                }) else {
                     continue;
                 };
-                // A callee with its own landing pads only goes into plain call sites.
-                if eh && st.invokes.contains_key(&op) {
+                // A callee with landing pads may go into an invoke whose pad is a
+                // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
+                // into a catch pad: unwinder phase 1 would never see that catch.
+                if eh
+                    && st
+                        .invokes
+                        .get(&op)
+                        .is_some_and(|&(_, catch)| catch || !eh_invoke)
+                {
                     continue;
                 }
-                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty {
+                // Stop growing a caller past the cap: huge generated functions
+                // (cranelift's ISLE lowering) would otherwise blow up memory.
+                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty && size + n <= cap {
+                    size += n;
                     sites.push((op, callee));
                 }
             }
@@ -234,11 +343,131 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>, small: bool) {
             inline_call(ctx, st, &mut rw, call, callee);
         }
         if bottom_up {
-            if let Some(eh) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
-                ok.insert(sym.clone(), (caller, eh));
+            if let Some((eh, n)) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
+                ok.insert(sym.clone(), (caller, eh, n));
+            } else {
+                devirt_ok(ctx, st, &sym, &mut dv);
             }
         }
     }
+    if std::env::var("PLIRON_STATS").is_ok() {
+        left_stats(ctx, st, &ok);
+    }
+}
+
+/// Indirect calls whose callee is a constant function address (a vtable slot
+/// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
+/// become direct calls. Returns the rewritten calls, for a second inline round.
+pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>> {
+    let mut out = FxHashSet::default();
+    let fns: Vec<_> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| has_body(ctx, f))
+        .collect();
+    for f in fns {
+        for b in blocks(ctx, f) {
+            for c in ops(ctx, b) {
+                let Some(call) = Operation::get_op::<CallOp>(c, ctx) else {
+                    continue;
+                };
+                let CallOpCallable::Indirect(p) = call.callee(ctx) else {
+                    continue;
+                };
+                let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(&p) else {
+                    continue;
+                };
+                let (Some(fi), Some(info), Some(id)) = (
+                    st.funcs.get(sym),
+                    st.calls.get(&c),
+                    st.sym_to_ident.get(sym),
+                ) else {
+                    continue;
+                };
+                if info.fn_ty != fi.ty {
+                    continue;
+                }
+                let (id, fty) = (id.clone(), info.fn_ty);
+                let fty = TypedHandle::<FuncType>::from_handle(fty, ctx).unwrap();
+                let args = call.args(ctx);
+                let nc = CallOp::new(ctx, CallOpCallable::Direct(id), fty, args).get_operation();
+                nc.insert_before(ctx, c);
+                if c.deref(ctx).get_num_results() > 0 {
+                    let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                    old.replace_all_uses_with(ctx, &new);
+                }
+                let info = st.calls.remove(&c).unwrap();
+                st.calls.insert(nc, info);
+                if let Some(u) = st.invokes.remove(&c) {
+                    st.invokes.insert(nc, u);
+                }
+                if let Some(e) = st.expect.remove(&c) {
+                    st.expect.insert(nc, e);
+                }
+                if st.last_call == Some(c) {
+                    st.last_call = Some(nc);
+                }
+                Operation::erase(c, ctx);
+                out.insert(nc);
+                if std::env::var_os("PLIRON_STATS_DEVIRT").is_some() {
+                    let caller = st
+                        .funcs
+                        .iter()
+                        .find(|(_, x)| x.op == f)
+                        .map(|(n, _)| n.clone());
+                    eprintln!("devirt {caller:?} -> {sym}");
+                }
+            }
+        }
+    }
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("devirt {}: {} calls", st.cgu, out.len());
+    }
+    out
+}
+
+/// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
+fn left_stats(
+    ctx: &Context,
+    st: &State<'_>,
+    ok: &FxHashMap<String, (Ptr<Operation>, bool, usize)>,
+) {
+    let mut why: FxHashMap<&str, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op) {
+            continue;
+        }
+        for b in blocks(ctx, f.op) {
+            for op in ops(ctx, b) {
+                let Some(cs) = direct_callee(ctx, st, op) else {
+                    continue;
+                };
+                let g = &st.funcs[cs];
+                let r = if !has_body(ctx, g.op) {
+                    "external"
+                } else if g.no_inline {
+                    "no_inline"
+                } else if g.linkage == Linkage::Preemptible {
+                    "preemptible"
+                } else if cs == sym {
+                    "self"
+                } else if let Some(&(_, eh, _)) = ok.get(cs) {
+                    if eh && st.invokes.contains_key(&op) {
+                        "eh callee at invoke (catch pad / EH_INVOKE=0)"
+                    } else if st.calls[&op].fn_ty != g.ty {
+                        "fn type mismatch"
+                    } else {
+                        "eligible but left"
+                    }
+                } else {
+                    "too big / recursive / va"
+                };
+                *why.entry(r).or_default() += 1;
+            }
+        }
+    }
+    eprintln!("inline left {}: {why:?}", st.cgu);
 }
 
 fn inline_call(
@@ -282,11 +511,26 @@ fn inline_call(
             if st.volatile.contains(&op) {
                 st.volatile.insert(new);
             }
+            if st.nonnull.contains(&op) {
+                st.nonnull.insert(new);
+            }
+            if st.inbounds.contains(&op) {
+                st.inbounds.insert(new);
+            }
+            if st.bool01.contains(&op) {
+                st.bool01.insert(new);
+            }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
                 let (v, nv) = (op.deref(ctx).get_result(i), new.deref(ctx).get_result(i));
                 if let Some(a) = st.allocas.get(&v).copied() {
                     st.allocas.insert(nv, a);
+                }
+                if let Some(t) = st.promoted.get(&v).copied() {
+                    st.promoted.insert(nv, t);
+                }
+                if let Some(c) = st.consts.get(&v).cloned() {
+                    st.consts.insert(nv, c);
                 }
             }
             if let Some(r) = Operation::get_op::<ReturnOp>(new, ctx) {

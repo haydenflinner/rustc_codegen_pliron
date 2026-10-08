@@ -488,6 +488,12 @@ impl Operation {
 
     /// Get a [Ptr] to the `reg_idx`th region. Panics on invalid index.
     pub fn get_region(&self, reg_idx: usize) -> Ptr<Region> {
+        assert!(
+            reg_idx < self.regions.len(),
+            "get_region({reg_idx}) on {} with {} region(s)",
+            (self.concrete_op.0)(self.self_ptr).get_opid(),
+            self.regions.len()
+        );
         self.regions[reg_idx]
     }
 

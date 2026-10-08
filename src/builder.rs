@@ -118,6 +118,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         p
     }
 
+    /// Record a pointer load whose layout excludes null (`!nonnull` in LLVM).
+    fn scalar_nonnull(&mut self, load: Value, s: rustc_abi::Scalar) {
+        if matches!(s.primitive(), rustc_abi::Primitive::Pointer(_))
+            && !s.valid_range(&*self).contains(0)
+        {
+            self.nonnull_metadata(load);
+        }
+        if matches!(s.primitive(), rustc_abi::Primitive::Int(..)) && !s.is_always_valid(&*self) {
+            let r = s.valid_range(&*self);
+            self.range_metadata(load, r);
+        }
+    }
+
     fn mark_volatile(&mut self, volatile: bool) {
         if volatile {
             use pliron::linked_list::ContainsLinkedList;
@@ -133,6 +146,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     fn bin<T: BinArithOp>(&mut self, a: Value, b: Value) -> Value {
         self.mk(|c| T::new(c, a, b))
+    }
+
+    /// Integer op that carries (empty) overflow flags, as the printer requires.
+    fn binf<T: pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag>(
+        &mut self,
+        a: Value,
+        b: Value,
+    ) -> Value {
+        let flags = pliron_llvm::attributes::IntegerOverflowFlagsAttr {
+            nsw: false,
+            nuw: false,
+        };
+        self.mk(|c| T::new_with_overflow_flag(c, a, b, flags))
     }
 
     fn cast<T: CastOpInterface>(&mut self, v: Value, ty: TypeHandle) -> Value {
@@ -352,7 +378,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn add(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<AddOp>(a, b)
+        self.binf::<AddOp>(a, b)
     }
     fn fadd(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FAddOp>(a, b)
@@ -364,7 +390,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FAddOp>(a, b)
     }
     fn sub(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<SubOp>(a, b)
+        self.binf::<SubOp>(a, b)
     }
     fn fsub(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FSubOp>(a, b)
@@ -376,7 +402,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FSubOp>(a, b)
     }
     fn mul(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<MulOp>(a, b)
+        self.binf::<MulOp>(a, b)
     }
     fn fmul(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FMulOp>(a, b)
@@ -424,7 +450,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.bin::<FRemOp>(a, b)
     }
     fn shl(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<ShlOp>(a, b)
+        self.binf::<ShlOp>(a, b)
     }
     fn lshr(&mut self, a: Value, b: Value) -> Value {
         self.bin::<LShrOp>(a, b)
@@ -564,6 +590,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ) {
             let llty = self.backend_type(place.layout);
             let v = self.load(llty, place.val.llval, place.val.align);
+            if let BackendRepr::Scalar(s) = place.layout.backend_repr {
+                self.scalar_nonnull(v, s);
+            }
             OperandValue::Immediate(match place.layout.backend_repr {
                 BackendRepr::Scalar(s) => self.to_immediate_scalar(v, s),
                 _ => v,
@@ -572,10 +601,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             let t0 = self.scalar_pair_element_backend_type(place.layout, 0, false);
             let t1 = self.scalar_pair_element_backend_type(place.layout, 1, false);
             let v0 = self.load(t0, place.val.llval, place.val.align);
+            self.scalar_nonnull(v0, a);
             let v0 = self.to_immediate_scalar(v0, a);
             let off = self.const_usize(b_offset.bytes());
             let p1 = self.inbounds_ptradd(place.val.llval, off);
             let v1 = self.load(t1, p1, place.val.align.restrict_for_offset(b_offset));
+            self.scalar_nonnull(v1, b);
             let v1 = self.to_immediate_scalar(v1, b);
             OperandValue::Pair(v0, v1)
         } else {
@@ -621,8 +652,20 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.switch_to_block(next);
     }
 
-    fn range_metadata(&mut self, _load: Value, _range: WrappingRange) {}
-    fn nonnull_metadata(&mut self, _load: Value) {}
+    fn range_metadata(&mut self, load: Value, range: WrappingRange) {
+        if range.start == 0
+            && range.end == 1
+            && crate::pass_enabled("PLIRON_BOOLRANGE")
+            && let Some(op) = load.defining_op()
+        {
+            self.st.borrow_mut().bool01.insert(op);
+        }
+    }
+    fn nonnull_metadata(&mut self, load: Value) {
+        if let Some(op) = load.defining_op() {
+            self.st.borrow_mut().nonnull.insert(op);
+        }
+    }
 
     fn store(&mut self, val: Value, ptr: Value, _align: Align) -> Value {
         self.mk_op(|c| StoreOp::new(c, val, ptr));
@@ -649,7 +692,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| GetElementPtrOp::new(c, ptr, idx, ty))
     }
     fn inbounds_gep(&mut self, ty: TypeHandle, ptr: Value, indices: &[Value]) -> Value {
-        self.gep(ty, ptr, indices)
+        let v = self.gep(ty, ptr, indices);
+        if let Some(op) = v.defining_op() {
+            self.st.borrow_mut().inbounds.insert(op);
+        }
+        v
     }
 
     fn trunc(&mut self, v: Value, t: TypeHandle) -> Value {
@@ -659,7 +706,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.cast::<SExtOp>(v, t)
     }
     fn zext(&mut self, v: Value, t: TypeHandle) -> Value {
-        self.cast::<ZExtOp>(v, t)
+        use pliron_llvm::op_interfaces::CastOpWithNNegInterface;
+        self.mk(|c| ZExtOp::new_with_nneg(c, v, t, false))
     }
     fn fptoui_sat(&mut self, v: Value, t: TypeHandle) -> Value {
         self.intrinsic("llvm.fptoui.sat", t, &[v])
