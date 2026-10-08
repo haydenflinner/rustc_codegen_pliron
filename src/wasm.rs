@@ -199,7 +199,40 @@ impl<'a, 'tcx> Obj<'a, 'tcx> {
     }
 }
 
-pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
+/// LLVM's `generic` wasm CPU features, adjusted by `-Ctarget-cpu=mvp` and
+/// `-Ctarget-feature`. Tools like wasm-bindgen read them from `target_features`.
+pub fn target_features(
+    target: &rustc_target::spec::Target,
+    opts: &rustc_session::config::Options,
+) -> Vec<String> {
+    let mut f: Vec<String> = if opts.cg.target_cpu.as_deref() == Some("mvp") {
+        vec![]
+    } else {
+        [
+            "bulk-memory",
+            "multivalue",
+            "mutable-globals",
+            "nontrapping-fptoint",
+            "reference-types",
+            "sign-ext",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let cg = opts.cg.target_feature.as_str();
+    for t in target.features.split(',').chain(cg.split(',')).map(str::trim) {
+        if let Some(n) = t.strip_prefix('+') {
+            if !f.iter().any(|x| x == n) {
+                f.push(n.into());
+            }
+        } else if let Some(n) = t.strip_prefix('-') {
+            f.retain(|x| x != n);
+        }
+    }
+    f
+}
+
+pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[String]) -> Vec<u8> {
     let mut m = Module::empty();
     let mem = m.memories.push(MemoryData {
         initial_pages: 0,
@@ -237,6 +270,9 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
     o.sp = o.import_global("env", "__stack_pointer", true);
 
     for (n, f) in &st.funcs {
+        if st.dead_fns.contains(n) {
+            continue;
+        }
         let s = wsig(ctx, f.ty);
         let sig = o.sig(s);
         o.funcs.push(FDecl {
@@ -251,7 +287,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
     let mut stubs = 0;
     let mut defined = 0;
     for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
         }
         defined += 1;
@@ -346,7 +382,31 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str) -> Vec<u8> {
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
+    let mut tf = Vec::new();
+    leb(&mut tf, features.len() as u32);
+    for f in features {
+        tf.push(b'+');
+        leb(&mut tf, f.len() as u32);
+        tf.extend_from_slice(f.as_bytes());
+    }
+    custom_section(&mut bytes, "target_features", &tf);
+    // `#[link_section = "name"]` statics are wasm custom sections, which the
+    // linker concatenates (wasm-bindgen's `__wasm_bindgen_unstable` metadata).
+    for (n, g) in &st.globals {
+        if let (Some(sec), Some(init)) = (custom_section_name(g), g.init) {
+            let (size, _) = size_align(ctx, init.get_type(ctx));
+            let mut data = vec![0u8; size as usize];
+            let mut relocs = Vec::new();
+            write_const(ctx, st, init, 0, &mut data, &mut relocs);
+            assert!(relocs.is_empty(), "pliron-wasm: {n}: relocations in custom section {sec}");
+            custom_section(&mut bytes, sec, &data);
+        }
+    }
     bytes
+}
+
+fn custom_section_name(g: &crate::context::GlobalInfo) -> Option<&str> {
+    g.section.as_deref().filter(|s| !s.starts_with('.'))
 }
 
 fn stub(m: &Module, sig: Signature) -> FunctionBody {
@@ -407,7 +467,7 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     let fs: Vec<_> = st
         .funcs
         .iter()
-        .filter(|(_, f)| has_body(ctx, f.op))
+        .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_fns.contains(*n))
         .collect();
     put_u32(&mut out, fs.len() as u32);
     for (n, f) in fs {
@@ -422,7 +482,9 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     let gs: Vec<_> = st
         .globals
         .iter()
-        .filter(|(n, g)| g.init.is_some() && !st.funcs.contains_key(*n))
+        .filter(|(n, g)| {
+            g.init.is_some() && !st.funcs.contains_key(*n) && custom_section_name(g).is_none()
+        })
         .collect();
     put_u32(&mut out, gs.len() as u32);
     for (n, g) in gs {

@@ -175,17 +175,21 @@ pub fn run(
     st: &mut State<'_>,
     small: bool,
     only: Option<&FxHashSet<Ptr<Operation>>>,
+    always_only: bool,
 ) {
     let limit = std::env::var("PLIRON_INLINE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { SMALL_LIMIT } else { DEFAULT_LIMIT });
+    // -O0 still honours `#[inline(always)]` like LLVM's AlwaysInliner: wasm-bindgen
+    // needs its describe markers inlined into each monomorphised shim.
+    let limit = if always_only { usize::MAX / 16 } else { limit };
     if limit == 0 {
         return;
     }
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
-    let once = std::env::var("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    let once = !always_only && std::env::var("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
     let single: FxHashSet<String> = if once {
         let taken = crate::lower::address_taken(ctx, st);
         let counts = call_counts(ctx, st);
@@ -202,7 +206,7 @@ pub fn run(
         FxHashSet::default()
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
-    let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
+    let bottom_up = !always_only && crate::pass_enabled("PLIRON_INLINE_BU");
     // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
     let eh_invoke = std::env::var("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
     let cap: usize = std::env::var("PLIRON_INLINE_CALLER_MAX")
@@ -214,6 +218,9 @@ pub fn run(
         post_order(ctx, st)
     } else {
         for sym in st.funcs.keys() {
+            if always_only && !st.funcs[sym].always_inline {
+                continue;
+            }
             if let Some((eh, n)) = eligible(ctx, st, sym, limit, single.contains(sym)) {
                 ok.insert(sym.clone(), (st.funcs[sym].op, eh, n));
             }

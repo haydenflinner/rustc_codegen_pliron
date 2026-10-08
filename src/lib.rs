@@ -169,6 +169,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     if std::env::var_os("PLIRON_DUMP").is_some() {
         eprintln!("==== {name} ====\n{ir}");
     }
+    if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
+        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+        inline::run(ctx, st, true, None, true);
+        domcheck::run(ctx, st, "always-inline");
+        inline::dead_fns(ctx, st);
+    }
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
@@ -179,7 +185,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_FROZEN") {
             st.frozen = context::frozen_values(ctx, st).into_iter().collect();
         }
-        inline::run(ctx, st, small, None);
+        inline::run(ctx, st, small, None, false);
         domcheck::run(ctx, st, "inline");
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
@@ -215,7 +221,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 let sites = inline::devirt(ctx, st);
                 domcheck::run(ctx, st, "devirt");
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    inline::run(ctx, st, small, Some(&sites));
+                    inline::run(ctx, st, small, Some(&sites), false);
                     domcheck::run(ctx, st, "devirt-inline");
                     if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
                         phisimp::run(ctx, st);
@@ -244,7 +250,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);
+        let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name, &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts));
         return PlironModule {
             obj,
             ir,
@@ -279,6 +285,10 @@ impl CodegenBackend for PlironCodegenBackend {
                 .map(|f| Symbol::intern(f))
                 .collect(),
             Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
+            Arch::Wasm32 => wasm::target_features(&sess.target, &sess.opts)
+                .iter()
+                .map(|f| Symbol::intern(f))
+                .collect(),
             _ => vec![],
         };
         TargetConfig {
