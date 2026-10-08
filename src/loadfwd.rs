@@ -523,39 +523,6 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
     fwd.len()
 }
 
-/// Remove `notrap` loads whose results are unused (Cranelift keeps them),
-/// so they no longer count as reads of their stack slot in `dead_slot_stores`.
-pub fn dead_loads(func: &mut Function) -> usize {
-    let mut n = 0;
-    loop {
-        let mut used = FxHashSet::default();
-        for b in func.layout.blocks() {
-            for i in func.layout.block_insts(b) {
-                used.extend(func.dfg.inst_values(i).map(|v| func.dfg.resolve_aliases(v)));
-            }
-        }
-        let mut dead = Vec::new();
-        for b in func.layout.blocks() {
-            for i in func.layout.block_insts(b) {
-                if let InstructionData::Load { flags, .. } = func.dfg.insts[i]
-                    && func.dfg.insts[i].opcode().can_load()
-                    && func.dfg.mem_flags[flags].notrap()
-                    && func.dfg.inst_results(i).iter().all(|r| !used.contains(r))
-                {
-                    dead.push(i);
-                }
-            }
-        }
-        if dead.is_empty() {
-            return n;
-        }
-        n += dead.len();
-        for i in dead {
-            func.layout.remove_inst(i);
-        }
-    }
-}
-
 /// Remove stores into stack slots that nothing reads and whose address never
 /// escapes, typically left behind once every load out of the slot has been
 /// forwarded (`PLIRON_SLOT_DSE`). Returns the number of stores removed.

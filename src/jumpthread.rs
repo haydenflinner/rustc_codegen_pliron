@@ -1662,6 +1662,117 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
 }
 
 fn remove_unused_notrap_loads(func: &mut Function) {
+    remove_dead_insts(func, false);
+}
+
+/// Drop blocks not reachable from the entry, unless a reachable instruction
+/// uses a value they define (then nothing is removed). Returns blocks removed.
+pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> usize {
+    let Some(entry) = func.layout.entry_block() else {
+        return 0;
+    };
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut work = vec![entry];
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if let Some(term) = func.layout.last_inst(b) {
+            let data = &func.dfg.insts[term];
+            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                work.push(call.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    let dead: Vec<Block> = func.layout.blocks().filter(|b| !seen.contains(b)).collect();
+    if dead.is_empty() {
+        return 0;
+    }
+    let defined_in_dead =
+        |func: &Function, v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            ValueDef::Result(i, _) => func
+                .layout
+                .inst_block(i)
+                .is_some_and(|b| !seen.contains(&b)),
+            ValueDef::Param(b, _) => !seen.contains(&b),
+            _ => false,
+        };
+    for &b in &seen {
+        for i in func.layout.block_insts(b) {
+            if func.dfg.inst_values(i).any(|v| defined_in_dead(func, v)) {
+                return 0;
+            }
+        }
+    }
+    for &b in &dead {
+        while let Some(i) = func.layout.last_inst(b) {
+            func.layout.remove_inst(i);
+        }
+        func.layout.remove_block(b);
+    }
+    dead.len()
+}
+
+/// `brif c, B(args), B(args)` -> `jump B(args)`. Returns branches folded.
+pub(crate) fn fold_same_target_brifs(func: &mut Function) -> usize {
+    let mut n = 0;
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for b in blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif { blocks: [x, y], .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        let pool = &func.dfg.value_lists;
+        if x.block(pool) == y.block(pool) && x.args(pool).eq(y.args(pool)) {
+            func.dfg.insts[t] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: x,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
+fn nonzero_iconst(func: &Function, v: Value) -> bool {
+    let Some(i) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+        return false;
+    };
+    matches!(
+        func.dfg.insts[i],
+        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } if imm.bits() != 0
+    )
+}
+
+/// Can `inst` be deleted when none of its results are used? Always true for
+/// `notrap` loads; with `pure`, also for side-effect-free, non-trapping ops
+/// (plus `udiv`/`urem` by a nonzero constant).
+fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
+    let data = &func.dfg.insts[inst];
+    if let InstructionData::Load { flags, .. } = *data {
+        return func.dfg.mem_flags[flags].notrap();
+    }
+    let op = data.opcode();
+    pure && !(op.is_call()
+        || op.is_branch()
+        || op.is_terminator()
+        || op.can_load()
+        || op.can_store()
+        || op.other_side_effects())
+        && (!op.can_trap()
+            || matches!(
+                *data,
+                InstructionData::Binary { opcode: Opcode::Udiv | Opcode::Urem, args }
+                    if nonzero_iconst(func, args[1])
+            ))
+}
+
+/// Delete instructions whose results are all unused (see `removable`),
+/// repeating until nothing changes. Returns the number deleted.
+pub(crate) fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
+    let mut n = 0;
     loop {
         let mut used: FxHashSet<Value> = FxHashSet::default();
         for block in func.layout.blocks() {
@@ -1677,16 +1788,18 @@ fn remove_unused_notrap_loads(func: &mut Function) {
             .blocks()
             .flat_map(|block| func.layout.block_insts(block))
             .filter(|&inst| {
-                let InstructionData::Load { flags, .. } = func.dfg.insts[inst] else {
-                    return false;
-                };
-                func.dfg.mem_flags[flags].notrap()
-                    && !used.contains(&func.dfg.resolve_aliases(func.dfg.first_result(inst)))
+                let results = func.dfg.inst_results(inst);
+                !results.is_empty()
+                    && results
+                        .iter()
+                        .all(|&r| !used.contains(&func.dfg.resolve_aliases(r)))
+                    && removable(func, inst, pure)
             })
             .collect();
         if dead.is_empty() {
-            break;
+            return n;
         }
+        n += dead.len();
         for inst in dead {
             func.layout.remove_inst(inst);
             func.dfg.clear_results(inst);

@@ -305,6 +305,25 @@ pub fn lower_to_object(
         }
         if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") {
             let k = crate::unroll::run(&mut clctx.func, &nonnull, &derived);
+            // The skipped loop is now unreachable, and its trip count still
+            // flows into dead params/branches; dropping them frees the slot
+            // address arithmetic so slot DSE can see the slot doesn't escape.
+            if k > 0 && crate::pass_enabled("PLIRON_UNROLL_CLEANUP") {
+                let ub = crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
+                let (mut dp, mut di) = (0, 0);
+                for _ in 0..4 {
+                    let p = crate::jumpthread::remove_dead_params(&mut clctx.func)
+                        + crate::jumpthread::fold_same_target_brifs(&mut clctx.func);
+                    let i = crate::jumpthread::remove_dead_insts(&mut clctx.func, true);
+                    (dp, di) = (dp + p, di + i);
+                    if p + i == 0 {
+                        break;
+                    }
+                }
+                if std::env::var_os("PLIRON_UNROLL_DEBUG").is_some() {
+                    eprintln!("unroll cleanup {n}: {ub} blocks, {dp} params, {di} insts");
+                }
+            }
             if k > 0 && std::env::var_os("PLIRON_UNROLL_DEBUG").is_some() {
                 eprintln!("unroll {k} {n}");
             }
@@ -352,7 +371,10 @@ pub fn lower_to_object(
                 for _ in 0..4 {
                     slot_dse += crate::loadfwd::dead_slot_stores(&mut clctx.func);
                     if !crate::pass_enabled("PLIRON_DEAD_LOADS")
-                        || crate::loadfwd::dead_loads(&mut clctx.func) == 0
+                        || crate::jumpthread::remove_dead_insts(
+                            &mut clctx.func,
+                            crate::pass_enabled("PLIRON_DEAD_PURE"),
+                        ) == 0
                     {
                         break;
                     }
