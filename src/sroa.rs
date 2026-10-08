@@ -513,6 +513,11 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
+        // Again after `phisimp`: loads that went through trivial block args
+        // now name the slot directly.
+        if crate::pass_enabled("PLIRON_SROA_FWD") {
+            forward_single_store(ctx, st, f);
+        }
         for _round in 0..3 {
             let allocas = allocas(ctx, f);
             let mut changed = false;
@@ -522,6 +527,10 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             if !changed {
                 break;
             }
+        }
+        // And after splitting: a slice left holding one stored value.
+        if crate::pass_enabled("PLIRON_SROA_FWD") {
+            forward_single_store(ctx, st, f);
         }
         for op in allocas(ctx, f) {
             let a = op.deref(ctx).get_result(0);
@@ -716,4 +725,94 @@ fn why2(ctx: &mut Context, st: &State<'_>, a: Value) -> String {
         Err(e) => e.into(),
         Ok(_) => "splittable (round limit?)".into(),
     }
+}
+
+/// `forward_single_store` on every body; run before `phisimp` so block args
+/// that only ever carry the forwarded value collapse before `split`.
+pub fn forward(ctx: &mut Context, st: &State<'_>) {
+    let funcs: Vec<Ptr<Operation>> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| has_body(ctx, f))
+        .collect();
+    let n: usize = funcs
+        .into_iter()
+        .map(|f| forward_single_store(ctx, st, f))
+        .sum();
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("sroa-fwd {}: {n} single-store allocas forwarded", st.cgu);
+    }
+}
+
+/// mem2reg's single-store case: an alloca whose only uses are one store and
+/// same-typed loads that the store dominates (directly or through zero-offset
+/// GEPs) is replaced by the stored value. This frees allocas whose address
+/// was parked in such a slot (e.g. a closure's captured `&&K`), so `split`
+/// can promote them too.
+fn forward_single_store(ctx: &mut Context, st: &State<'_>, f: Ptr<Operation>) -> usize {
+    let Some(dom) = crate::domcheck::Dom::new(ctx, st, f) else {
+        return 0;
+    };
+    let pos = |ctx: &Context, o: Ptr<Operation>| {
+        let b = o.deref(ctx).get_parent_block().unwrap();
+        crate::inline::ops(ctx, b).iter().position(|&x| x == o)
+    };
+    let mut n = 0;
+    for op in allocas(ctx, f) {
+        let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
+        let mut work = vec![op.deref(ctx).get_result(0)];
+        while let Some(p) = work.pop() {
+            for u in p.uses(ctx) {
+                let o = u.user_op();
+                ok &= !st.volatile.contains(&o)
+                    && if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
+                        store.replace(o).is_none()
+                    } else if Operation::is_op::<LoadOp>(o, ctx) {
+                        loads.push(o);
+                        true
+                    } else if Operation::is_op::<GetElementPtrOp>(o, ctx)
+                        && u.find_index(ctx) == 0
+                        && (gep_offset(ctx, st, o) == Some(0)
+                            || o.deref(ctx).get_result(0).uses(ctx).is_empty())
+                    {
+                        geps.push(o);
+                        work.push(o.deref(ctx).get_result(0));
+                        true
+                    } else {
+                        false
+                    };
+            }
+        }
+        let Some(s) = store.filter(|_| ok && !loads.is_empty()) else {
+            continue;
+        };
+        let v = s.deref(ctx).get_operand(0);
+        let vt = v.get_type(ctx);
+        let sb = s.deref(ctx).get_parent_block().unwrap();
+        let fwd = dom.idx.contains_key(&sb)
+            && loads.iter().all(|&l| {
+                let lb = l.deref(ctx).get_parent_block().unwrap();
+                // Unreachable loads never run (lowering traps those blocks).
+                l.deref(ctx).get_result(0).get_type(ctx) == vt
+                    && (!dom.idx.contains_key(&lb)
+                        || if lb == sb {
+                            pos(ctx, s) < pos(ctx, l)
+                        } else {
+                            dom.dominates(sb, lb)
+                        })
+            });
+        if !fwd {
+            continue;
+        }
+        for l in loads {
+            let r = l.deref(ctx).get_result(0);
+            r.replace_all_uses_with(ctx, &v);
+            Operation::erase(l, ctx);
+        }
+        Operation::erase(s, ctx);
+        erase_dead(ctx, geps);
+        n += 1;
+    }
+    n
 }

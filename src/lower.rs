@@ -323,8 +323,26 @@ pub fn lower_to_object(
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if crate::pass_enabled("PLIRON_LOOPROT") {
+            crate::looprot::run(&mut clctx.func);
+            if dump {
+                eprintln!("==== clif {n} after looprot ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("looprot broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if !frozen.is_empty() {
-            crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
+            let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
+            if dump {
+                eprintln!(
+                    "==== clif {n}: {k} frozen loads, params {:?} ====\n{}",
+                    frozen,
+                    clctx.func.display()
+                );
+            }
         }
         if let Err(e) = m.define_function(id, &mut clctx) {
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());

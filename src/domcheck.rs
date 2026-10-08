@@ -34,71 +34,9 @@ fn succs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBloc
 
 fn check(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> Option<String> {
     let bs = blocks(ctx, f);
-    let entry = *bs.first()?;
-    // Reverse post-order over reachable blocks.
-    let mut seen = FxHashMap::default();
-    let mut post = Vec::new();
-    let mut stack = vec![(entry, succs(ctx, st, entry), 0usize)];
-    seen.insert(entry, ());
-    while let Some((b, ss, i)) = stack.last_mut() {
-        if let Some(&n) = ss.get(*i) {
-            *i += 1;
-            if seen.insert(n, ()).is_none() {
-                let ns = succs(ctx, st, n);
-                stack.push((n, ns, 0));
-            }
-        } else {
-            post.push(*b);
-            stack.pop();
-        }
-    }
-    post.reverse();
-    let idx: FxHashMap<Ptr<BasicBlock>, usize> =
-        post.iter().enumerate().map(|(i, &b)| (b, i)).collect();
-    let mut preds = vec![Vec::new(); post.len()];
-    for (i, &b) in post.iter().enumerate() {
-        for s in succs(ctx, st, b) {
-            preds[idx[&s]].push(i);
-        }
-    }
-    let mut idom = vec![usize::MAX; post.len()];
-    idom[0] = 0;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in 1..post.len() {
-            let mut new = usize::MAX;
-            for &p in &preds[b] {
-                if idom[p] == usize::MAX {
-                    continue;
-                }
-                new = if new == usize::MAX {
-                    p
-                } else {
-                    let (mut x, mut y) = (new, p);
-                    while x != y {
-                        while x > y {
-                            x = idom[x];
-                        }
-                        while y > x {
-                            y = idom[y];
-                        }
-                    }
-                    x
-                };
-            }
-            if new != idom[b] {
-                idom[b] = new;
-                changed = true;
-            }
-        }
-    }
-    let dominates = |a: usize, mut b: usize| {
-        while b > a {
-            b = idom[b];
-        }
-        b == a
-    };
+    let dom = Dom::new(ctx, st, f)?;
+    let (post, idx) = (&dom.order, &dom.idx);
+    let dominates = |a: usize, b: usize| dom.dom_idx(a, b);
     let all: FxHashMap<Ptr<BasicBlock>, usize> =
         bs.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     for (bi, &b) in post.iter().enumerate() {
@@ -138,4 +76,98 @@ fn check(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> Option<String> {
         }
     }
     None
+}
+
+/// Dominator tree over the blocks reachable from the entry (counting invoke
+/// landing-pad edges).
+pub(crate) struct Dom {
+    /// Reachable blocks in reverse post-order.
+    pub order: Vec<Ptr<BasicBlock>>,
+    pub idx: FxHashMap<Ptr<BasicBlock>, usize>,
+    idom: Vec<usize>,
+}
+
+impl Dom {
+    pub fn new(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> Option<Dom> {
+        let bs = blocks(ctx, f);
+        let entry = *bs.first()?;
+        // Reverse post-order over reachable blocks.
+        let mut seen = FxHashMap::default();
+        let mut post = Vec::new();
+        let mut stack = vec![(entry, succs(ctx, st, entry), 0usize)];
+        seen.insert(entry, ());
+        while let Some((b, ss, i)) = stack.last_mut() {
+            if let Some(&n) = ss.get(*i) {
+                *i += 1;
+                if seen.insert(n, ()).is_none() {
+                    let ns = succs(ctx, st, n);
+                    stack.push((n, ns, 0));
+                }
+            } else {
+                post.push(*b);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        let idx: FxHashMap<Ptr<BasicBlock>, usize> =
+            post.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let mut preds = vec![Vec::new(); post.len()];
+        for (i, &b) in post.iter().enumerate() {
+            for s in succs(ctx, st, b) {
+                preds[idx[&s]].push(i);
+            }
+        }
+        let mut idom = vec![usize::MAX; post.len()];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..post.len() {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut x, mut y) = (new, p);
+                        while x != y {
+                            while x > y {
+                                x = idom[x];
+                            }
+                            while y > x {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if new != idom[b] {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        Some(Dom {
+            order: post,
+            idx,
+            idom,
+        })
+    }
+
+    fn dom_idx(&self, a: usize, mut b: usize) -> bool {
+        while b > a {
+            b = self.idom[b];
+        }
+        b == a
+    }
+
+    /// Whether reachable block `a` dominates reachable block `b`.
+    pub fn dominates(&self, a: Ptr<BasicBlock>, b: Ptr<BasicBlock>) -> bool {
+        match (self.idx.get(&a), self.idx.get(&b)) {
+            (Some(&a), Some(&b)) => self.dom_idx(a, b),
+            _ => false,
+        }
+    }
 }

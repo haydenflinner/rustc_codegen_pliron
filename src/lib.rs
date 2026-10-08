@@ -36,6 +36,7 @@ mod instcombine;
 mod intrinsic;
 mod jumpthread;
 mod loadfwd;
+mod looprot;
 mod lower;
 mod memcpyopt;
 mod nounwind;
@@ -204,6 +205,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
             memcpyopt::run(ctx, st);
         }
+        if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
+            sroa::forward(ctx, st);
+            domcheck::run(ctx, st, "sroa-fwd");
+        }
         if pass_enabled("PLIRON_PHISIMP") {
             phisimp::run(ctx, st);
             domcheck::run(ctx, st, "phisimp");
@@ -223,6 +228,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
                     inline::run(ctx, st, small, Some(&sites), false);
                     domcheck::run(ctx, st, "devirt-inline");
+                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
+                        sroa::forward(ctx, st);
+                    }
                     if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
                         phisimp::run(ctx, st);
                     }
