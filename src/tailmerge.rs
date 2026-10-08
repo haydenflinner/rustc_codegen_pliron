@@ -4,7 +4,7 @@
 //! blocks without params and without successors whose instructions print
 //! identically (internal results renamed) are redirected to one copy.
 
-use cranelift_codegen::ir::{Block, Function, Value};
+use cranelift_codegen::ir::{Block, Function, Opcode, Value};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 32;
@@ -38,6 +38,10 @@ fn key(func: &Function, b: Block) -> Option<String> {
                 && let Some(k) = local.get(&Value::from_u32(n))
             {
                 s.push_str(&format!("%{k}"));
+            } else if let Some(n) = tok.strip_prefix('v').and_then(|d| d.parse::<u32>().ok())
+                && let Some(c) = constant(func, Value::from_u32(n))
+            {
+                s.push_str(&c);
             } else {
                 s.push_str(tok);
             }
@@ -55,6 +59,33 @@ fn key(func: &Function, b: Block) -> Option<String> {
         s.push('\n');
     }
     Some(s)
+}
+
+/// Argument-free pure definitions (constants, symbol addresses) compare by
+/// their text, so copies materialized in different blocks still match.
+fn constant(func: &Function, v: Value) -> Option<String> {
+    if !func.dfg.value_is_valid(v) {
+        return None;
+    }
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    if !func.dfg.inst_args(i).is_empty()
+        || !matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::Iconst
+                | Opcode::F32const
+                | Opcode::F64const
+                | Opcode::Vconst
+                | Opcode::SymbolValue
+                | Opcode::FuncAddr
+        )
+    {
+        return None;
+    }
+    let t = func.dfg.display_inst(i).to_string();
+    Some(format!(
+        "{{{}}}",
+        t.split_once(" = ").map_or(t.as_str(), |x| x.1)
+    ))
 }
 
 /// Returns the number of blocks merged away.
