@@ -44,6 +44,7 @@ mod objmerge;
 mod phisimp;
 mod simd;
 mod sroa;
+mod switchmap;
 mod taildup;
 mod tailmerge;
 mod type_of;

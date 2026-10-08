@@ -312,6 +312,17 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if crate::pass_enabled("PLIRON_SWITCHMAP") {
+            let k = crate::switchmap::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_SWITCHMAP_DEBUG").is_some() {
+                eprintln!("switchmap {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("switchmap broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if std::env::var("PLIRON_CONSTBR").is_ok_and(|v| v == "1") {
             let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_CONSTBR_DEBUG").is_some() {
@@ -663,7 +674,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             } else if ty.bits() < 32 {
                 idx = self.b.ins().uextend(clt::I32, idx);
             }
-            let idx = self.b.ins().band_imm(idx, (p - 1) as i64);
+            let idx = self.b.ins().band_imm_u(idx, (p - 1) as i64);
             let mut table = vec![d; p as usize];
             for &(v, b) in vals {
                 table[(v - lo) as usize] = b;
