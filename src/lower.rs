@@ -254,14 +254,6 @@ pub fn lower_to_object(
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
-        if st.unreach {
-            unreached += crate::unreach::run(&mut clctx.func);
-            if std::env::var_os("PLIRON_VERIFY").is_some()
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
         if st.jumpthread {
             threaded += crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
             if dump {
@@ -274,6 +266,14 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        if st.unreach {
+            unreached += crate::unreach::run(&mut clctx.func);
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         if st.peep {
