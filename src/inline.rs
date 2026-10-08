@@ -13,6 +13,7 @@ use pliron::irbuild::inserter::OpInsertionPoint;
 use pliron::irbuild::listener::DummyListener;
 use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron::linked_list::ContainsLinkedList;
+use pliron::operation::OpDbg;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{Typed, TypedHandle};
@@ -28,6 +29,9 @@ const DEFAULT_LIMIT: usize = 320;
 const SMALL_LIMIT: usize = 40;
 
 pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+    if f.deref(ctx).regions().next().is_none() {
+        panic!("blocks: op has no regions: {}", OpDbg { op: f, ctx });
+    }
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
 }
 
