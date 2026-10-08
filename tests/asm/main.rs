@@ -19,6 +19,39 @@ fn main() {
     let z = unsafe { pliron_ga_add(1, 2) };
     println!("{x} {y} {} {z}", std::str::from_utf8(&dst).unwrap());
     clmul();
+    fcmp();
+}
+
+// At -O0 the predicate immediate reaches the backend as a runtime value.
+fn fcmp() {
+    use std::arch::x86_64::*;
+    if !is_x86_feature_detected!("avx") {
+        return;
+    }
+    #[target_feature(enable = "avx")]
+    fn f<const P: i32>(a: [f32; 4], b: [f32; 4]) -> [u32; 4] {
+        unsafe { std::mem::transmute(_mm_cmp_ps::<P>(std::mem::transmute(a), std::mem::transmute(b))) }
+    }
+    let (a, b) = ([1.0, 2.0, f32::NAN, 4.0], [2.0, 2.0, 1.0, 3.0]);
+    unsafe {
+        assert_eq!(f::<_CMP_LT_OQ>(a, b), [!0, 0, 0, 0]);
+        assert_eq!(f::<_CMP_LE_OQ>(a, b), [!0, !0, 0, 0]);
+        assert_eq!(f::<_CMP_UNORD_Q>(a, b), [0, 0, !0, 0]);
+        assert_eq!(f::<_CMP_TRUE_UQ>(a, b), [!0; 4]);
+    }
+    if is_x86_feature_detected!("avx512f") {
+        #[target_feature(enable = "avx512f")]
+        fn g<const P: i32>(a: [f32; 16], b: [f32; 16]) -> u16 {
+            unsafe { _mm512_cmp_ps_mask::<P>(std::mem::transmute(a), std::mem::transmute(b)) }
+        }
+        let a: [f32; 16] = std::array::from_fn(|i| i as f32);
+        unsafe {
+            assert_eq!(g::<_CMP_LT_OQ>(a, [8.0; 16]), 0x00ff);
+            assert_eq!(g::<_CMP_GE_OQ>(a, [8.0; 16]), 0xff00);
+        }
+        println!("avx512 cmp ok");
+    }
+    println!("cmp ok");
 }
 
 fn clmul_ref(a: u64, b: u64) -> u128 {
