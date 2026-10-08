@@ -613,6 +613,98 @@ fn merge_chains(func: &mut Function) {
     }
 }
 
+/// Retarget edges into blocks that only `jump` onward straight to the final
+/// target, so a constant arg reaches the block that tests it. Each forwarded
+/// arg must be a param of the bypassed block or defined where it dominates
+/// the predecessor's branch. Returns the edges retargeted.
+fn bypass_forwarders(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut n = 0;
+    for b in blocks {
+        if Some(b) == entry {
+            continue;
+        }
+        let Some(term) = func.layout.first_inst(b) else {
+            continue;
+        };
+        if func.layout.last_inst(b) != Some(term) {
+            continue;
+        }
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+            continue;
+        };
+        let t = destination.block(&func.dfg.value_lists);
+        if t == b {
+            continue;
+        }
+        let mut targs = Vec::new();
+        for a in destination.args(&func.dfg.value_lists) {
+            match a {
+                BlockArg::Value(v) => targs.push(func.dfg.resolve_aliases(v)),
+                _ => targs.clear(),
+            }
+        }
+        if targs.len() != func.dfg.num_block_params(t) {
+            continue;
+        }
+        let params = func.dfg.block_params(b).to_vec();
+        let preds: Vec<(Block, Inst)> = cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
+        for (pb, pinst) in preds {
+            if pb == b
+                || !matches!(
+                    func.dfg.insts[pinst].opcode(),
+                    Opcode::Jump | Opcode::Brif | Opcode::BrTable
+                )
+            {
+                continue;
+            }
+            let dests: Vec<BlockCall> = func.dfg.insts[pinst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .to_vec();
+            for (di, bc) in dests.into_iter().enumerate() {
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                let pargs: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                if pargs.len() != params.len() {
+                    continue;
+                }
+                let mut new = Vec::with_capacity(targs.len());
+                for &v in &targs {
+                    if let Some(k) = params.iter().position(|&p| p == v) {
+                        new.push(pargs[k]);
+                        continue;
+                    }
+                    let ok = match func.dfg.value_def(v) {
+                        ValueDef::Result(i, _) => {
+                            i != pinst && domtree.dominates(i, pinst, &func.layout)
+                        }
+                        ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
+                        _ => false,
+                    };
+                    if !ok {
+                        break;
+                    }
+                    new.push(BlockArg::Value(v));
+                }
+                if new.len() != targs.len() {
+                    continue;
+                }
+                let nbc = BlockCall::new(t, new, &mut func.dfg.value_lists);
+                let dfg = &mut func.dfg;
+                dfg.insts[pinst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
+                    nbc;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
@@ -623,7 +715,7 @@ pub fn run(
     let mut total = 0;
     for _ in 0..8 {
         let nn = NonNull::new(func, loads, derived);
-        let n = round(func, &nn);
+        let n = bypass_forwarders(func) + round(func, &nn);
         total += n;
         if n == 0 {
             break;
