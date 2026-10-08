@@ -118,6 +118,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         p
     }
 
+    /// Record a pointer load whose layout excludes null (`!nonnull` in LLVM).
+    fn scalar_nonnull(&mut self, load: Value, s: rustc_abi::Scalar) {
+        if matches!(s.primitive(), rustc_abi::Primitive::Pointer(_))
+            && !s.valid_range(&*self).contains(0)
+        {
+            self.nonnull_metadata(load);
+        }
+    }
+
     fn mark_volatile(&mut self, volatile: bool) {
         if volatile {
             use pliron::linked_list::ContainsLinkedList;
@@ -564,6 +573,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ) {
             let llty = self.backend_type(place.layout);
             let v = self.load(llty, place.val.llval, place.val.align);
+            if let BackendRepr::Scalar(s) = place.layout.backend_repr {
+                self.scalar_nonnull(v, s);
+            }
             OperandValue::Immediate(match place.layout.backend_repr {
                 BackendRepr::Scalar(s) => self.to_immediate_scalar(v, s),
                 _ => v,
@@ -572,10 +584,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             let t0 = self.scalar_pair_element_backend_type(place.layout, 0, false);
             let t1 = self.scalar_pair_element_backend_type(place.layout, 1, false);
             let v0 = self.load(t0, place.val.llval, place.val.align);
+            self.scalar_nonnull(v0, a);
             let v0 = self.to_immediate_scalar(v0, a);
             let off = self.const_usize(b_offset.bytes());
             let p1 = self.inbounds_ptradd(place.val.llval, off);
             let v1 = self.load(t1, p1, place.val.align.restrict_for_offset(b_offset));
+            self.scalar_nonnull(v1, b);
             let v1 = self.to_immediate_scalar(v1, b);
             OperandValue::Pair(v0, v1)
         } else {
