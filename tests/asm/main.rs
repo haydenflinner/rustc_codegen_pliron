@@ -27,6 +27,7 @@ fn main() {
     minmax_prefetch();
 }
 
+#[cfg(target_arch = "x86_64")]
 fn minmax_prefetch() {
     use std::arch::x86_64::*;
     let v = [3.0f32, -1.0, 7.5, 0.25];
@@ -46,6 +47,7 @@ fn minmax_prefetch() {
 }
 
 // At -O0 the predicate immediate reaches the backend as a runtime value.
+#[cfg(target_arch = "x86_64")]
 fn fcmp() {
     use std::arch::x86_64::*;
     if !is_x86_feature_detected!("avx") {
@@ -77,11 +79,13 @@ fn fcmp() {
     println!("cmp ok");
 }
 
+#[cfg(target_arch = "x86_64")]
 fn clmul_ref(a: u64, b: u64) -> u128 {
     (0..64).filter(|i| b >> i & 1 == 1).fold(0, |r, i| r ^ (a as u128) << i)
 }
 
 // crc32fast picks these paths at runtime; the intrinsics used to be `ud2` stubs.
+#[cfg(target_arch = "x86_64")]
 fn clmul() {
     use std::arch::x86_64::*;
     let (a, b) = ([0x8000_0000_0000_0001u64, 0x1234_5678_9abc_def0], [0xffff_ffff_0000_0001u64, 0x0f0f]);
