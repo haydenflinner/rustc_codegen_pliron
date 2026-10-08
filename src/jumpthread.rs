@@ -1022,6 +1022,61 @@ fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Cmp> 
     fact
 }
 
+/// Index constants known on entry to blocks whose only predecessor is a
+/// `br_table` listing them once (not as default): `idx == k`, and also
+/// `x == k` when `idx = ireduce x` and `x` is a `uextend` no wider than `idx`.
+fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<(Value, u64)>> {
+    let mut m: FxHashMap<Block, Vec<(Value, u64)>> = FxHashMap::default();
+    let pool = &func.dfg.value_lists;
+    for b in func.layout.blocks() {
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else {
+            continue;
+        };
+        if p.block == b {
+            continue;
+        }
+        let InstructionData::BranchTable { arg, table, .. } = func.dfg.insts[p.inst] else {
+            continue;
+        };
+        let jt = &func.dfg.jump_tables[table];
+        if jt.default_block().block(pool) == b {
+            continue;
+        }
+        let mut hits = jt
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.block(pool) == b);
+        let (Some((k, _)), None) = (hits.next(), hits.next()) else {
+            continue;
+        };
+        let arg = func.dfg.resolve_aliases(arg);
+        let mut v = vec![(arg, k as u64)];
+        if let Some(i) = func.dfg.value_def(arg).inst()
+            && let InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg: x,
+            } = func.dfg.insts[i]
+        {
+            let x = func.dfg.resolve_aliases(x);
+            if let Some(j) = func.dfg.value_def(x).inst()
+                && let InstructionData::Unary {
+                    opcode: Opcode::Uextend,
+                    arg: n,
+                } = func.dfg.insts[j]
+                && bits(func, n)
+                    .zip(bits(func, arg))
+                    .is_some_and(|(n, a)| n <= a)
+            {
+                v.push((x, k as u64));
+            }
+        }
+        m.insert(b, v);
+    }
+    m
+}
+
 /// Facts holding throughout `b`: those of `b` and its dominators.
 fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> Vec<Cmp> {
     let mut fs = Vec::new();
@@ -1047,30 +1102,68 @@ fn fold_dominated_conds(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let fact = edge_facts(func, &cfg);
-    if fact.is_empty() {
+    let tfact = table_facts(func, &cfg);
+    if fact.is_empty() && tfact.is_empty() {
         return 0;
     }
-    let env = FxHashMap::default();
     let mut folds = Vec::new();
     for b in func.layout.blocks() {
         let fs = facts_at(&domtree, &fact, b);
-        if fs.is_empty() {
+        let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+        let mut cur = Some(b);
+        for _ in 0..64 {
+            let Some(c) = cur else { break };
+            for &(v, k) in tfact.get(&c).into_iter().flatten() {
+                env.insert(v, k);
+            }
+            cur = domtree.idom(c);
+        }
+        if fs.is_empty() && env.is_empty() {
             continue;
         }
+        // `x == y` facts let a query on `y` be decided through `x`.
+        let eqs: Vec<(Value, Value)> = fs
+            .iter()
+            .filter(|f| f.0 == IntCC::Equal)
+            .map(|f| (f.1, f.2))
+            .collect();
+        let alts = |v: Value| {
+            let mut a = vec![v];
+            for &(x, y) in &eqs {
+                if x == v {
+                    a.push(y);
+                } else if y == v {
+                    a.push(x);
+                }
+            }
+            a
+        };
+        let decide = |q: Cmp| -> Option<bool> {
+            if let Some(r) = fs.iter().find_map(|&f| implied(f, q)) {
+                return Some(r);
+            }
+            let w = bits(func, q.1)?;
+            let (ka, kb) = (known(func, &env, q.1), known(func, &env, q.2));
+            if let (Some(a), Some(b)) = (ka, kb) {
+                return Some(icmp(q.0, a, b, w));
+            }
+            range_cmp(
+                q.0,
+                ka,
+                kb,
+                urange(func, &fs, q.1, 0),
+                urange(func, &fs, q.2, 0),
+                w,
+            )
+        };
         for i in func.layout.block_insts(b) {
             let Some(q) = norm_icmp(func, i) else {
                 continue;
             };
-            let r = fs.iter().find_map(|&f| implied(f, q)).or_else(|| {
-                range_cmp(
-                    q.0,
-                    known(func, &env, q.1),
-                    known(func, &env, q.2),
-                    urange(func, &fs, q.1, 0),
-                    urange(func, &fs, q.2, 0),
-                    bits(func, q.1)?,
-                )
-            });
+            let r = alts(q.1)
+                .into_iter()
+                .flat_map(|a| alts(q.2).into_iter().map(move |b| (q.0, a, b)))
+                .find_map(decide);
             if let Some(k) = r {
                 folds.push((i, k));
             }

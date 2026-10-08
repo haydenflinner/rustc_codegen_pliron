@@ -43,10 +43,11 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
     n <= MAX_INSTS
 }
 
-/// For each used value: the one block using it, or `None` if several do.
-fn use_blocks(func: &Function) -> FxHashMap<Value, Option<Block>> {
+/// For each value used in reachable code: the one block using it, or `None`
+/// if several do.
+fn use_blocks(func: &Function, domtree: &DominatorTree) -> FxHashMap<Value, Option<Block>> {
     let mut m: FxHashMap<Value, Option<Block>> = FxHashMap::default();
-    for b in func.layout.blocks() {
+    for b in func.layout.blocks().filter(|&b| domtree.is_reachable(b)) {
         for i in func.layout.block_insts(b) {
             for v in func.dfg.inst_values(i) {
                 let e = m.entry(func.dfg.resolve_aliases(v)).or_insert(Some(b));
@@ -86,7 +87,26 @@ fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) 
 /// Returns the number of jumps replaced by a copy of the return block.
 pub fn run(func: &mut Function) -> usize {
     let entry = func.layout.entry_block();
-    let uses = use_blocks(func);
+    let mut cfg = ControlFlowGraph::with_function(func);
+    let mut domtree = DominatorTree::with_function(func, &cfg);
+    // Dead blocks would pin values as used elsewhere and keep dangling refs
+    // to removed blocks; they never run, so drop them first.
+    let dead: Vec<Block> = func
+        .layout
+        .blocks()
+        .filter(|&b| !domtree.is_reachable(b))
+        .collect();
+    if !dead.is_empty() {
+        for &b in &dead {
+            while let Some(i) = func.layout.first_inst(b) {
+                func.layout.remove_inst(i);
+            }
+            func.layout.remove_block(b);
+        }
+        cfg = ControlFlowGraph::with_function(func);
+        domtree = DominatorTree::with_function(func, &cfg);
+    }
+    let uses = use_blocks(func, &domtree);
     let rets: FxHashSet<Block> = func
         .layout
         .blocks()
@@ -95,8 +115,6 @@ pub fn run(func: &mut Function) -> usize {
     if rets.is_empty() {
         return 0;
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for p in blocks {
