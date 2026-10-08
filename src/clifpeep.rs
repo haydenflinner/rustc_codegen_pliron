@@ -204,6 +204,65 @@ fn uloads(func: &mut Function) -> usize {
     n
 }
 
+/// The `(op, x, k)` of `v = op x, k` for constant `k` (either operand).
+fn bin_k(func: &Function, v: Value, op: Opcode) -> Option<(Value, i64)> {
+    let i = func.dfg.value_def(v).inst()?;
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    if opcode != op {
+        return None;
+    }
+    let a = args.map(|a| func.dfg.resolve_aliases(a));
+    iconst(func, a[1])
+        .map(|k| (a[0], k))
+        .or_else(|| iconst(func, a[0]).map(|k| (a[1], k)))
+}
+
+/// Whether `v` is always 0 or 1.
+fn is01(func: &Function, v: Value, depth: u32) -> bool {
+    if let Some(i) = func.dfg.value_def(v).inst()
+        && matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp)
+    {
+        return true;
+    }
+    bin_k(func, v, Opcode::Band).is_some_and(|(_, k)| k == 1)
+        || (depth > 0
+            && bin_k(func, v, Opcode::Bxor)
+                .is_some_and(|(x, k)| k == 1 && is01(func, x, depth - 1)))
+}
+
+/// `brif (bxor (band c, 1), 1), a, b` (rustc's `!bool` after `i1`
+/// normalization) becomes `brif c, b, a`.
+fn brif_not(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
+        return false;
+    };
+    let (mut v, mut neg) = (func.dfg.resolve_aliases(arg), false);
+    for _ in 0..8 {
+        match (bin_k(func, v, Opcode::Band), bin_k(func, v, Opcode::Bxor)) {
+            (Some((x, 1)), _) if is01(func, x, 4) => v = x,
+            (_, Some((x, 1))) if is01(func, x, 4) => {
+                v = x;
+                neg = !neg;
+            }
+            _ => break,
+        }
+    }
+    if v == func.dfg.resolve_aliases(arg) {
+        return false;
+    }
+    let blocks = if neg { [blocks[1], blocks[0]] } else { blocks };
+    if let InstructionData::Brif {
+        arg: a, blocks: bs, ..
+    } = &mut func.dfg.insts[inst]
+    {
+        *a = v;
+        *bs = blocks;
+    }
+    true
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
@@ -213,6 +272,12 @@ pub fn run(func: &mut Function) -> usize {
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
+            if pos.func.dfg.insts[inst].opcode() == Opcode::Brif {
+                if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+                    n += 1;
+                }
+                continue;
+            }
             if let InstructionData::Unary {
                 opcode: Opcode::Uextend,
                 arg,
