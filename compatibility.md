@@ -6,7 +6,7 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 |---|---|---|
 | rustc `tests/ui` (stage1, fork) | `./x test tests/ui --no-fail-fast` | 21,544 pass, 182 fail, 797 ignored (before LTO/EII/SIMD fixes) |
 | coretests (stage1, fork) | `./x test library/coretests --skip _max_range` | 2,722 + 596 bench-tests pass, 0 fail |
-| coretests `split_off*_max_range*` (6) | as above | hang: comparing `usize::MAX` ZSTs is an unremoved loop (no loop deletion yet; upstream notes the same for unoptimized rustc) |
+| coretests `split_off*_max_range*` (6) | `./x test library/coretests -- max_range` | 6/6 pass since loop deletion (`PLIRON_LOOPDEL`) removes the `usize::MAX`-long ZST compare loop; they hung before |
 | alloctests (stage1, fork) | `./x test library/alloctests` | 335 + 1,490 + 573 + 2 pass, 0 fail |
 | std (stage1, fork) | `./x test library/std` | 2,349 pass, 0 fail, 93 ignored |
 | burn-ndarray 0.22 | native, `--lib` | 41/41 |
