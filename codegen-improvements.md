@@ -49,8 +49,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + `br_table` arm index facts and `x == y` dominating facts in condition folding (`PLIRON_DOMCOND`), dead blocks dropped before taildup | 1.25s | 2.40s | 5.77B (±0) | 12.91B (−0.1%) | kept: no stage2 change, but synthetic hashbrown 114.9M → 106.8M and `hm::eq` 0x15c → 0x134 B (derive(PartialEq) enum compares re-test the discriminant) |
 | + `brif` on a normalized `!bool` branches on the original (`PLIRON_BRIFNOT`), loads within frozen `&T` params marked `readonly can_move` (`PLIRON_FROZEN`) | 1.26s | 2.39s | 5.75B (−0.3%) | 12.87B (−0.3%) | kept; `hm::eq` 0x134 → 0xfe B |
 | + single-store alloca forwarding before and after SROA splitting (`PLIRON_SROA_FWD`); in-loop frozen `&T` load hoisting written but opt-in (`PLIRON_FROZEN_HOIST=1`, +7% on `hm.rs`) | 1.24s | 2.44s | 5.73B (−0.3%) | 12.85B (−0.2%) | kept; `hm::get` 0x258 → 0x230 B, `hm.rs` 109.7M → 103.5M |
+| + inline callees up to 4× the limit at sites passing a constant address into their indirect-call target (`PLIRON_INLINE_DEVIRT`; hashbrown's `find_or_find_insert_index_inner` taking `&mut dyn FnMut`) | 1.25s | 2.40s | 5.71B (−0.3%) | 12.78B (−0.5%) | kept; 3-monomorph `HashMap::insert` test 361.9M → 224.2M (LLVM 176.7M) |
 
-Net at the current defaults: 5.73B / 12.85B instructions (−61% / −60% vs baseline),
-1.24s / 2.44s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
+Net at the current defaults: 5.71B / 12.78B instructions (−62% / −60% vs baseline),
+1.25s / 2.40s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
