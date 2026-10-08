@@ -1,6 +1,6 @@
 # Compatibility
 
-Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-2026-10-06; wasm via pliron-wasm-ld). Native rows are linked by wild only with `-Clinker-features=-lld -Zunstable-options`: without it stock nightly adds `-fuse-ld=lld` and rust-lld silently wins over `-Clinker=cc-wild`. Rows marked (lld) were last run that way. "Same under LLVM" means stock rustc fails the same tests.
+Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-2026-10-06; wasm via pliron-wasm-ld). Native rows are linked by wild only with `-Clinker-features=-lld -Zunstable-options`: without it stock nightly adds `-fuse-ld=lld` and rust-lld silently wins over `-Clinker=cc-wild`. "Same under LLVM" means stock rustc fails the same tests.
 
 | target | config | result |
 |---|---|---|
@@ -10,10 +10,10 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | alloctests (stage1, fork) | `./x test library/alloctests` | 335 + 1,490 + 573 + 2 pass, 0 fail |
 | std (stage1, fork) | `./x test library/std` | 2,349 pass, 0 fail, 93 ignored |
 | burn-ndarray 0.22 | native, `--lib` | 41/41 |
-| burn-backend-tests (lld) | native, ndarray | 694 + 1,801 pass, 18 ignored |
+| burn-backend-tests | native, `--features ndarray` | 2,495 pass, 0 fail |
 | polars-core 0.55.1 | native, `--features object` | 107 pass, 2 fail (same under LLVM: proptest `unreachable!`) |
-| naga 30 (lld) | native | ~380 pass, 6 fail (need spirv-as/val/cross; same under LLVM) |
-| naga `recursion_depth_template` (lld) | native, debug | stack overflow at 2 MB; passes with `RUST_MIN_STACK=16777216` (frames larger than LLVM's) |
+| naga 30 | native, `RUST_MIN_STACK=16777216` | 386 pass, 6 fail (need spirv-as/val/cross; same under LLVM) |
+| naga `recursion_depth_template` | native, debug | stack overflow at 2 MB; passes with `RUST_MIN_STACK=16777216` (frames larger than LLVM's) |
 | wgpu-core 30 | native | 64/64 |
 | wgpu-examples 30 | wasm32-unknown-unknown, `webgpu`, wasm-bindgen 0.2.129, headless Chrome + SwiftShader | page boots, all 30 examples listed; `hello_synchronization` GPU readback identical to LLVM build |
 | serde_json, regex, hashbrown, itertools, rand, memchr (git HEAD) | native, `cargo test` | 236 / 319 / 389 / 655 / 164 / 166 pass, 0 fail |
