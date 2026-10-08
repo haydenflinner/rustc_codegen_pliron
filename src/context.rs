@@ -127,6 +127,8 @@ pub struct State<'tcx> {
     pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Loads whose (pointer) result rustc marked `!nonnull`.
     pub nonnull: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// `inbounds` GEPs: null only if their base is.
+    pub inbounds: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
     pub dead_fns: rustc_data_structures::fx::FxHashSet<String>,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).

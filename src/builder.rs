@@ -667,7 +667,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| GetElementPtrOp::new(c, ptr, idx, ty))
     }
     fn inbounds_gep(&mut self, ty: TypeHandle, ptr: Value, indices: &[Value]) -> Value {
-        self.gep(ty, ptr, indices)
+        let v = self.gep(ty, ptr, indices);
+        if let Some(op) = v.defining_op() {
+            self.st.borrow_mut().inbounds.insert(op);
+        }
+        v
     }
 
     fn trunc(&mut self, v: Value, t: TypeHandle) -> Value {

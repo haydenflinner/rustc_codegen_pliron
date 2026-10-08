@@ -14,6 +14,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
     ValueDef,
@@ -199,6 +200,113 @@ fn users(func: &Function) -> FxHashMap<Block, FxHashSet<Block>> {
 
 const MAX_WALK: usize = 4096;
 
+/// Values known non-null: `!nonnull` loads, inbounds offsets of non-null
+/// pointers, and block params whose every incoming argument is non-null
+/// (greatest fixpoint).
+pub struct NonNull<'a> {
+    loads: &'a FxHashSet<Value>,
+    derived: &'a FxHashMap<Value, Value>,
+    params: FxHashSet<Value>,
+}
+
+impl<'a> NonNull<'a> {
+    fn new(
+        func: &Function,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a FxHashMap<Value, Value>,
+    ) -> Self {
+        let mut nn = NonNull {
+            loads,
+            derived,
+            params: FxHashSet::default(),
+        };
+        if loads.is_empty() {
+            return nn;
+        }
+        let entry = func.layout.entry_block();
+        for b in func.layout.blocks() {
+            if Some(b) != entry {
+                nn.params.extend(
+                    func.dfg
+                        .block_params(b)
+                        .iter()
+                        .copied()
+                        .filter(|&p| func.dfg.value_type(p) == types::I64),
+                );
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in func.layout.blocks() {
+                let Some(t) = func.layout.last_inst(b) else {
+                    continue;
+                };
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    let d = bc.block(&func.dfg.value_lists);
+                    let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                    for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
+                        if nn.params.contains(&p)
+                            && !matches!(args.get(i), Some(&BlockArg::Value(v)) if nn.is(func, v))
+                        {
+                            nn.params.remove(&p);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        nn
+    }
+
+    fn is(&self, func: &Function, v: Value) -> bool {
+        let mut v = func.dfg.resolve_aliases(v);
+        for _ in 0..8 {
+            if self.loads.contains(&v) || self.params.contains(&v) {
+                return true;
+            }
+            match self.derived.get(&v) {
+                Some(&b) => v = func.dfg.resolve_aliases(b),
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+/// `icmp eq/ne x, 0` with `x` known non-null → constant.
+fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
+    let none = FxHashMap::default();
+    let mut hits = Vec::new();
+    for b in func.layout.blocks() {
+        for inst in func.layout.block_insts(b) {
+            let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
+                continue;
+            };
+            if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
+                || func.dfg.value_type(args[0]).is_vector()
+            {
+                continue;
+            }
+            let x = match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (Some(0), None) => args[1],
+                (None, Some(0)) => args[0],
+                _ => continue,
+            };
+            if nn.is(func, x) {
+                hits.push((inst, (cond == IntCC::NotEqual) as i64));
+            }
+        }
+    }
+    for &(inst, k) in &hits {
+        let ty = func.dfg.value_type(func.dfg.first_result(inst));
+        func.replace(inst).iconst(ty, k);
+    }
+    hits.len()
+}
+
 enum Arg {
     V(Value),
     K(u64, Type),
@@ -234,7 +342,7 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
-fn round(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
+fn round(func: &mut Function, nn: &NonNull) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let users = users(func);
@@ -302,7 +410,7 @@ fn round(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
                     argv.insert(p, v);
                     if let Some(c) = known(func, &env, v) {
                         env.insert(p, c);
-                    } else if nonnull.contains(&v) {
+                    } else if nn.is(func, v) {
                         pn.insert(p);
                     }
                 }
@@ -311,7 +419,7 @@ fn round(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
                 }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
-                    nonnull.contains(&v) || pn.contains(&v)
+                    nn.is(func, v) || pn.contains(&v)
                 };
                 for &i in body {
                     if let Some(c) = eval(func, &env, &nz, i) {
@@ -506,15 +614,21 @@ fn merge_chains(func: &mut Function) {
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.
-pub fn run(func: &mut Function, nonnull: &FxHashSet<Value>) -> usize {
+pub fn run(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &FxHashMap<Value, Value>,
+) -> usize {
     merge_chains(func);
     let mut total = 0;
     for _ in 0..8 {
-        let n = round(func, nonnull);
+        let nn = NonNull::new(func, loads, derived);
+        let n = round(func, &nn);
         total += n;
         if n == 0 {
             break;
         }
     }
-    total
+    let nn = NonNull::new(func, loads, derived);
+    total + fold_null_tests(func, &nn)
 }

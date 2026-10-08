@@ -219,6 +219,7 @@ pub fn lower_to_object(
         let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
+        let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -238,19 +239,24 @@ pub fn lower_to_object(
                 exn: None,
                 vars: FxHashMap::default(),
                 nonnull: FxHashSet::default(),
+                derived: FxHashMap::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
             nonnull = std::mem::take(&mut fl.nonnull);
+            derived = std::mem::take(&mut fl.derived);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         if st.jumpthread {
-            threaded += crate::jumpthread::run(&mut clctx.func, &nonnull);
+            threaded += crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
             if dump {
-                eprintln!("==== clif {n} after jumpthread ====\n{}", clctx.func.display());
+                eprintln!(
+                    "==== clif {n} after jumpthread ====\n{}",
+                    clctx.func.display()
+                );
             }
             if std::env::var_os("PLIRON_VERIFY").is_some()
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
@@ -368,6 +374,8 @@ struct FnLower<'a, 'b, 'tcx> {
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
     /// Results of `!nonnull` memory loads.
     nonnull: FxHashSet<cranelift_codegen::ir::Value>,
+    /// Inbounds GEP result → base (null only if the base is).
+    derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -1403,6 +1411,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let idxs = gep.indices(ctx);
         let mut cur = gep.src_elem_type(ctx);
         let mut addr = self.get1(base);
+        let base_v = addr;
         for (k, idx) in idxs.iter().enumerate() {
             let c = match idx {
                 GepIndex::Constant(c) => Some(*c as i128),
@@ -1439,6 +1448,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 (None, GepIndex::Value(v)) => addr = self.dyn_index(addr, *v, scale),
                 _ => unreachable!(),
             }
+        }
+        if addr != base_v && self.st.inbounds.contains(&op) {
+            self.derived.insert(addr, base_v);
         }
         self.set1(op, addr);
     }
