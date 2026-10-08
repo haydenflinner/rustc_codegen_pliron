@@ -14,3 +14,9 @@ once proven out on the stage2 benchmark, then drop this copy.
    `k < table size` skips the `cmp; cmov` bounds clamp. Our `dense_switch`
    emits that form (`PLIRON_SWITCH_MASK`) when the switch default is
    `unreachable`, padding the table to a power of two.
+3. ELF initial-exec TLS on x64: `tls_model = "elf_ie"` (added to
+   `vendor/cranelift-codegen-meta/src/shared/settings.rs`) lowers `tls_value`
+   to `mov %fs:0, r; add sym@gottpoff(%rip), r` (`Inst::ElfTlsIe`) instead of
+   a `__tls_get_addr` call. New `Reloc::ElfX86_64GotTpOff`, mapped to
+   `R_X86_64_GOTTPOFF` in `vendor/cranelift-object`; both of those crates are
+   vendored only for this.

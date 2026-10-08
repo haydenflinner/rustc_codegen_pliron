@@ -39,3 +39,6 @@ rustc_private = true
 regalloc2 = { path = "vendor/regalloc2" }
 # Frameless x64 leaf functions + unclamped masked br_table; see vendor/cranelift-codegen/PLIRON_PATCH.md.
 cranelift-codegen = { path = "vendor/cranelift-codegen" }
+# `elf_ie` TLS model setting and the R_X86_64_GOTTPOFF reloc; see vendor/cranelift-codegen/PLIRON_PATCH.md.
+cranelift-codegen-meta = { path = "vendor/cranelift-codegen-meta" }
+cranelift-object = { path = "vendor/cranelift-object" }

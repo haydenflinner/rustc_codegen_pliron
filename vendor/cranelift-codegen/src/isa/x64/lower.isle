@@ -5078,6 +5078,9 @@
 (rule (lower (tls_value (tls_model (TlsModel.ElfGd)) (symbol_value_data name _ _)))
       (elf_tls_get_addr name))
 
+(rule (lower (tls_value (tls_model (TlsModel.ElfIe)) (symbol_value_data name _ _)))
+      (elf_tls_ie name))
+
 (rule (lower (tls_value (tls_model (TlsModel.Macho)) (symbol_value_data name _ _)))
       (macho_tls_get_addr name))
 

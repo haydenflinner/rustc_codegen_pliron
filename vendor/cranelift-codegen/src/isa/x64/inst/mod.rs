@@ -104,6 +104,7 @@ impl Inst {
             | Inst::XmmUninitializedValue { .. }
             | Inst::GprUninitializedValue { .. }
             | Inst::ElfTlsGetAddr { .. }
+            | Inst::ElfTlsIe { .. }
             | Inst::MachOTlsGetAddr { .. }
             | Inst::CoffTlsGetAddr { .. }
             | Inst::Unwind { .. }
@@ -807,6 +808,11 @@ impl PrettyPrint for Inst {
                 format!("{dst} = elf_tls_get_addr {symbol:?}")
             }
 
+            Inst::ElfTlsIe { symbol, dst } => {
+                let dst = pretty_print_reg(dst.to_reg().to_reg(), 8);
+                format!("{dst} = elf_tls_ie {symbol:?}")
+            }
+
             Inst::MachOTlsGetAddr { symbol, dst } => {
                 let dst = pretty_print_reg(dst.to_reg().to_reg(), 8);
                 format!("{dst} = macho_tls_get_addr {symbol:?}")
@@ -1174,6 +1180,10 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         | Inst::TrapIfAnd { .. }
         | Inst::TrapIfOr { .. } => {
             // No registers are used.
+        }
+
+        Inst::ElfTlsIe { dst, .. } => {
+            collector.reg_def(dst);
         }
 
         Inst::ElfTlsGetAddr { dst, .. } | Inst::MachOTlsGetAddr { dst, .. } => {

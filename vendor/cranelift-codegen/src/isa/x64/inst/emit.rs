@@ -1739,6 +1739,24 @@ pub(crate) fn emit(
             sink.put4(0); // offset
         }
 
+        Inst::ElfTlsIe { symbol, dst } => {
+            let e = dst.to_reg().to_reg().to_real_reg().unwrap().hw_enc();
+            let rex = 0x48 | ((e >> 3) & 1) << 2;
+            // mov %fs:0, dst
+            sink.put1(0x64);
+            sink.put1(rex);
+            sink.put1(0x8b);
+            sink.put1(((e & 7) << 3) | 0b100);
+            sink.put1(0x25);
+            sink.put4(0);
+            // add sym@gottpoff(%rip), dst
+            sink.put1(rex);
+            sink.put1(0x03);
+            sink.put1(((e & 7) << 3) | 0b101);
+            emit_reloc(sink, Reloc::ElfX86_64GotTpOff, symbol, -4);
+            sink.put4(0);
+        }
+
         Inst::MachOTlsGetAddr { symbol, dst } => {
             let dst = dst.to_reg().to_reg();
             debug_assert_eq!(dst, regs::rax());
