@@ -86,6 +86,8 @@ pub struct FuncInfo {
     /// (param index, dereferenceable bytes), valid when the function has
     /// `nparams` params.
     pub frozen: Vec<(usize, u64)>,
+    /// Params rustc marks `noalias`, by the same backend index as `frozen`.
+    pub noalias: Vec<usize>,
     pub nparams: usize,
 }
 
@@ -137,6 +139,8 @@ pub struct State<'tcx> {
     /// Entry params of local functions that point at frozen memory, with
     /// their dereferenceable size (see `FuncInfo::frozen`).
     pub frozen: FxHashMap<Value, u64>,
+    /// Entry params of local functions that rustc marks `noalias`.
+    pub noalias: rustc_data_structures::fx::FxHashSet<Value>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// `inbounds` GEPs: null only if their base is.
@@ -305,6 +309,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 nounwind: false,
                 sret_ty: None,
                 frozen: Vec::new(),
+                noalias: Vec::new(),
                 nparams: 0,
             },
         );
@@ -381,7 +386,7 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
-            (f.frozen, f.nparams) = frozen_params(fn_abi);
+            (f.frozen, f.noalias, f.nparams) = frozen_params(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
             let t = self.backend_type(fn_abi.ret.layout);
@@ -715,13 +720,14 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
 
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of
 /// `fn_decl_backend_type`), and the backend param count.
-fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, usize) {
+fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<usize>, usize) {
     use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
     let size = |a: &ArgAttributes| {
         let n = a.pointee_size.bytes();
         (a.regular.contains(A::NoAlias | A::ReadOnly) && n > 0).then_some(n)
     };
     let mut v = Vec::new();
+    let mut na = Vec::new();
     let mut i = usize::from(matches!(fn_abi.ret.mode, PassMode::Indirect { .. }));
     let nargs = if fn_abi.c_variadic {
         fn_abi.fixed_count as usize
@@ -747,9 +753,32 @@ fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, usize) {
         if let Some(s) = a.and_then(size) {
             v.push((i, s));
         }
+        if a.is_some_and(|a| a.regular.contains(A::NoAlias)) {
+            na.push(i);
+        }
         i += n;
     }
-    (v, i)
+    (v, na, i)
+}
+
+/// Entry-block params of bodies in this module that rustc marks `noalias`.
+pub fn noalias_values(ctx: &Context, st: &State<'_>) -> Vec<Value> {
+    let mut out = Vec::new();
+    for f in st.funcs.values() {
+        if f.noalias.is_empty() {
+            continue;
+        }
+        let Some(e) = Operation::get_op::<FuncOp>(f.op, ctx).and_then(|o| o.get_entry_block(ctx))
+        else {
+            continue;
+        };
+        let args: Vec<Value> = e.deref(ctx).arguments().collect();
+        if args.len() != f.nparams {
+            continue;
+        }
+        out.extend(f.noalias.iter().map(|&i| args[i]));
+    }
+    out
 }
 
 /// Entry-block params of bodies in this module that point at frozen memory.

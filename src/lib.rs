@@ -191,6 +191,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_FROZEN") {
             st.frozen = context::frozen_values(ctx, st).into_iter().collect();
         }
+        if pass_enabled("PLIRON_NOALIAS_FWD") {
+            st.noalias = context::noalias_values(ctx, st).into_iter().collect();
+        }
         inline::run(ctx, st, small, None);
         domcheck::run(ctx, st, "inline");
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {

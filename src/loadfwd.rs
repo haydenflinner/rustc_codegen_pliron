@@ -2,9 +2,10 @@
 //! minus PRE). A location is a root (SSA pointer or stack slot) plus a
 //! constant offset and a type. Unlike Cranelift's alias analysis, a store
 //! only kills locations it may overlap: same root and overlapping bytes, or
-//! any location when the roots may alias. Calls, atomics, fences and
-//! trapping (volatile) stores kill everything; only `notrap` loads/stores
-//! (all non-volatile accesses at -O) are forwarded.
+//! any location when the roots may alias. Calls keep only isolated roots
+//! (see `isolated`); atomics, fences and trapping (volatile) stores kill
+//! everything. Only `notrap` loads/stores (all non-volatile accesses at -O)
+//! are forwarded.
 
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -78,17 +79,62 @@ fn notrap(func: &Function, i: Inst) -> bool {
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
-fn kill(av: &mut Avail, r: Root, o: i64, ty: Type) {
+fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
     let n = i64::from(ty.bytes());
     av.retain(|&(r2, o2, t2), _| match (r, r2) {
         _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
         (Root::S(_), Root::S(_)) => true,
-        _ => false,
+        _ => iso.contains(&r) || iso.contains(&r2),
     });
 }
 
+/// Roots whose memory is reachable only through addresses with that root:
+/// stack slots (`PLIRON_FWD_SLOTS`) and rustc-`noalias` entry params
+/// (`PLIRON_NOALIAS_FWD`) that never escape. Every use of a value with such
+/// a root must be a load/store address or a const `iadd` that `root` still
+/// resolves to it, so calls and stores through other roots can't touch it.
+fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet<Root> {
+    let mut iso: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
+    if crate::pass_enabled("PLIRON_FWD_SLOTS") {
+        iso.extend(func.sized_stack_slots.keys().map(Root::S));
+    }
+    if iso.is_empty() {
+        return iso;
+    }
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let data = &func.dfg.insts[i];
+            for (k, v) in func.dfg.inst_values(i).enumerate() {
+                let (r, _) = root(func, v);
+                if !iso.contains(&r) {
+                    continue;
+                }
+                let ok = match data {
+                    InstructionData::Load { .. } => k == 0,
+                    InstructionData::Store { .. } => k == 1,
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        ..
+                    } => root(func, func.dfg.first_result(i)).0 == r,
+                    _ => false,
+                };
+                if !ok {
+                    iso.remove(&r);
+                }
+            }
+        }
+    }
+    iso
+}
+
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
-fn transfer(func: &Function, b: Block, av: &mut Avail, rw: Option<&mut Vec<(Inst, Value)>>) {
+fn transfer(
+    func: &Function,
+    b: Block,
+    av: &mut Avail,
+    rw: Option<&mut Vec<(Inst, Value)>>,
+    iso: &FxHashSet<Root>,
+) {
     let mut rw = rw;
     for i in func.layout.block_insts(b) {
         let op = func.dfg.insts[i].opcode();
@@ -121,13 +167,13 @@ fn transfer(func: &Function, b: Block, av: &mut Avail, rw: Option<&mut Vec<(Inst
                 let ty = func.dfg.value_type(val);
                 let (r, o) = root(func, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
-                kill(av, r, o, ty);
+                kill(av, r, o, ty, iso);
                 if av.len() < MAX_ENTRIES {
                     av.insert((r, o, ty), val);
                 }
             }
-            _ if op.is_call()
-                || op.can_store()
+            _ if op.is_call() => av.retain(|&(r, _, _), _| iso.contains(&r)),
+            _ if op.can_store()
                 || op.other_side_effects()
                 || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
             {
@@ -146,7 +192,7 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 }
 
 /// Forward loads in `func`; returns the number removed.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, noalias: &FxHashSet<Value>) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -175,6 +221,7 @@ pub fn run(func: &mut Function) -> usize {
     if std::env::var("PLIRON_LOADPRE").is_ok_and(|v| v == "1") {
         return pre(func, &cfg, &rpo, entry);
     }
+    let iso = isolated(func, noalias);
     let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, Avail>, b: Block| -> Option<Avail> {
         if b == entry {
@@ -195,7 +242,7 @@ pub fn run(func: &mut Function) -> usize {
             let Some(mut av) = input(&out, b) else {
                 continue;
             };
-            transfer(func, b, &mut av, None);
+            transfer(func, b, &mut av, None, &iso);
             if out.get(&b) != Some(&av) {
                 out.insert(b, av);
                 changed = true;
@@ -212,7 +259,7 @@ pub fn run(func: &mut Function) -> usize {
     let mut fwd = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
-            transfer(func, b, &mut av, Some(&mut fwd));
+            transfer(func, b, &mut av, Some(&mut fwd), &iso);
         }
     }
     for &(i, v) in &fwd {
@@ -287,6 +334,7 @@ fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type) {
 /// predecessor, even as different values, becomes a block param. The key
 /// sets follow `transfer` exactly, so every needed end value exists.
 fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block) -> usize {
+    let iso: FxHashSet<Root> = FxHashSet::default();
     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
     let mut out: FxHashMap<Block, FxHashSet<Loc>> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, FxHashSet<Loc>>, b: Block| -> Option<FxHashSet<Loc>> {
@@ -315,7 +363,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 .into_iter()
                 .map(|k| (k, Value::reserved_value()))
                 .collect();
-            transfer(func, b, &mut av, None);
+            transfer(func, b, &mut av, None, &iso);
             let ks: FxHashSet<Loc> = av.into_keys().collect();
             if out.get(&b) != Some(&ks) {
                 out.insert(b, ks);

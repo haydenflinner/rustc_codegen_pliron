@@ -229,6 +229,7 @@ pub fn lower_to_object(
         let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
         let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
+        let noalias: FxHashSet<cranelift_codegen::ir::Value>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -252,12 +253,14 @@ pub fn lower_to_object(
                 bool01: FxHashSet::default(),
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
+                noalias: FxHashSet::default(),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
             nonnull = std::mem::take(&mut fl.nonnull);
             derived = std::mem::take(&mut fl.derived);
             frozen = std::mem::take(&mut fl.frozen);
+            noalias = std::mem::take(&mut fl.noalias);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -308,7 +311,7 @@ pub fn lower_to_object(
             }
         }
         if st.loadfwd {
-            forwarded += crate::loadfwd::run(&mut clctx.func);
+            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias);
             if dump {
                 eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
             }
@@ -505,6 +508,8 @@ struct FnLower<'a, 'b, 'tcx> {
     derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
     /// Entry params pointing at frozen memory → dereferenceable bytes.
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
+    /// Entry params rustc marks `noalias`.
+    noalias: FxHashSet<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -566,6 +571,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 && let Some(&s) = self.st.frozen.get(&arg)
             {
                 self.frozen.insert(params[i], s);
+            }
+            if n == 1 && self.st.noalias.contains(&arg) {
+                self.noalias.insert(params[i]);
             }
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
