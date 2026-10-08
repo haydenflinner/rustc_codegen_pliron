@@ -52,6 +52,7 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + inline callees up to 4× the limit at sites passing a constant address into their indirect-call target (`PLIRON_INLINE_DEVIRT`; hashbrown's `find_or_find_insert_index_inner` taking `&mut dyn FnMut`) | 1.25s | 2.40s | 5.71B (−0.3%) | 12.78B (−0.5%) | kept; 3-monomorph `HashMap::insert` test 361.9M → 224.2M (LLVM 176.7M) |
 | + loop rotation on CLIF: header exit test copied into the latch (`PLIRON_LOOPROT`) | 1.22s | 2.40s | 5.70B (−0.2%) | 12.87B (+0.7%) | opt-in only (`=1`): link got worse; `derive(Hash)` enum test 931.5M → 906.7M |
 | + vendored Cranelift x64: frameless leaf functions (no `push rbp`/`mov rbp,rsp` without calls, clobbers or stack), and switches with an `unreachable` default as a power-of-two table indexed by a masked value, which skips the `cmp`/`cmov` clamp (`PLIRON_SWITCH_MASK`) | 1.30s | 2.42s | 5.59B (−2.1%) | 12.50B (−2.2%) | kept (both on); `derive(Hash)` enum test 906.7M → 855.5M (frameless) → 808.3M (mask) |
+| + switch to arithmetic: a `br_table` whose cases all pass constants linear in the index to one block or `return` becomes `idx*s+b` plus one bounds test, none when the default is `unreachable` (`PLIRON_SWITCHMAP`) | 1.22s | 2.39s | 5.57B (−0.4%) | 12.48B (−0.2%) | kept; rewrites 10 tables in regex-syntax, `.text` 663.8 → 662.5 KB |
 
 Net at the current defaults: 5.59B / 12.50B instructions (−62% / −61% vs baseline),
 1.30s / 2.42s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
