@@ -218,7 +218,7 @@ fn access_ty(ctx: &Context, a: &Access) -> Option<TypeHandle> {
 
 /// Partition the alloca into slices; None if typed accesses overlap
 /// inconsistently or a copy/set cuts through a typed slice.
-fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
+fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str> {
     let mut typed: Vec<Slice> = Vec::new();
     for a in acc {
         let Some(ty) = access_ty(ctx, a) else {
@@ -226,14 +226,14 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
         };
         let size = size_align(ctx, ty).0;
         if size == 0 {
-            return None;
+            return Err("zero-size access");
         }
         match typed
             .iter()
             .find(|s| s.off < a.off + size && a.off < s.off + s.size)
         {
             Some(s) if s.off == a.off && s.size == size && leaf_compatible(ctx, s.ty, ty) => {}
-            Some(_) => return None,
+            Some(_) => return Err("typed accesses overlap"),
             None => typed.push(Slice {
                 off: a.off,
                 size,
@@ -253,7 +253,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
                 .iter()
                 .any(|t| (t.off < s && s < t.off + t.size) || (t.off < e && e < t.off + t.size))
             {
-                return None;
+                return Err("copy/set cuts a typed slice");
             }
             cuts.extend([s, e]);
             ranges.push((s, e));
@@ -284,7 +284,13 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
         typed.push(Slice { off, size: k, ty });
     }
     typed.sort_by_key(|s| s.off);
-    (!typed.is_empty() && typed.len() <= MAX_SLICES).then_some(typed)
+    if typed.is_empty() {
+        return Err("no typed slices");
+    }
+    if typed.len() > MAX_SLICES {
+        return Err("too many slices");
+    }
+    Ok(typed)
 }
 
 pub(crate) fn mk_const(
@@ -382,7 +388,7 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
         st.promoted.insert(a, t);
         return true;
     }
-    let Some(sl) = slices(ctx, &acc) else {
+    let Ok(sl) = slices(ctx, &acc) else {
         return false;
     };
 
@@ -611,11 +617,17 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         }
         if std::env::var_os("PLIRON_STATS_WHY").is_some() {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
-            for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
-                for op in allocas(ctx, f.op) {
+            let fs: Vec<_> = st
+                .funcs
+                .values()
+                .map(|f| f.op)
+                .filter(|&f| has_body(ctx, f))
+                .collect();
+            for f in fs {
+                for op in allocas(ctx, f) {
                     let a = op.deref(ctx).get_result(0);
                     if !st.promoted.contains_key(&a) {
-                        *h.entry(why(ctx, st, a)).or_default() += 1;
+                        *h.entry(why2(ctx, st, a)).or_default() += 1;
                     }
                 }
             }
@@ -662,6 +674,13 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 uses.push("load");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
+            } else if matches!(
+                intrinsic(st, op),
+                Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
+            ) && (idx == 0 || (idx == 1 && intrinsic(st, op) != Some("llvm.memset")))
+                && const_int(ctx, st, op.deref(ctx).get_operand(2)).is_some()
+            {
+                uses.push("mem");
             } else {
                 let n = st
                     .intrinsics
@@ -673,4 +692,28 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
         }
     }
     format!("layout ({} accesses)", uses.len().min(10))
+}
+
+/// `why`, refined with the accesses/slices verdict (PLIRON_STATS_WHY).
+fn why2(ctx: &mut Context, st: &State<'_>, a: Value) -> String {
+    let w = why(ctx, st, a);
+    if !w.starts_with("layout") {
+        return w;
+    }
+    let Some(&(size, _)) = st.allocas.get(&a) else {
+        return "not in st.allocas".into();
+    };
+    if size == 0 || size > MAX_SIZE {
+        return format!("size {}", if size == 0 { "0" } else { "> MAX_SIZE" });
+    }
+    let Some((acc, _)) = accesses(ctx, st, a, size) else {
+        return "accesses: out of range / self-copy".into();
+    };
+    if acc.is_empty() {
+        return "no accesses".into();
+    }
+    match slices(ctx, &acc) {
+        Err(e) => e.into(),
+        Ok(_) => "splittable (round limit?)".into(),
+    }
 }
