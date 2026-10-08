@@ -48,8 +48,9 @@ Stage1 (LLVM-built) rustc: 0.79s metadata.
 | + devirtualization of calls through folded vtable/fn-pointer slots + targeted inline round (`PLIRON_DEVIRT`), `vhigh_bits(icmp slt x, 0)` → `vhigh_bits(x)` (one `pcmpgtb` less per hashbrown probe), brif-block tail duplication (`PLIRON_TAILDUP_BRIF`), unreachable blocks lowered as `trap` | 1.25s | 2.41s | 5.77B (−2.2%) | 12.92B (−1.9%) | kept. synthetic hashbrown (`/tmp/rs/hm.rs`): 151.0M → 114.9M instructions. Unreachable-block lowering order fixed a stage2 panic in `AdtDef::eval_explicit_discr` that devirt exposed |
 | + `br_table` arm index facts and `x == y` dominating facts in condition folding (`PLIRON_DOMCOND`), dead blocks dropped before taildup | 1.25s | 2.40s | 5.77B (±0) | 12.91B (−0.1%) | kept: no stage2 change, but synthetic hashbrown 114.9M → 106.8M and `hm::eq` 0x15c → 0x134 B (derive(PartialEq) enum compares re-test the discriminant) |
 | + `brif` on a normalized `!bool` branches on the original (`PLIRON_BRIFNOT`), loads within frozen `&T` params marked `readonly can_move` (`PLIRON_FROZEN`) | 1.26s | 2.39s | 5.75B (−0.3%) | 12.87B (−0.3%) | kept; `hm::eq` 0x134 → 0xfe B |
+| + single-store alloca forwarding before and after SROA splitting (`PLIRON_SROA_FWD`); in-loop frozen `&T` load hoisting written but opt-in (`PLIRON_FROZEN_HOIST=1`, +7% on `hm.rs`) | 1.24s | 2.44s | 5.73B (−0.3%) | 12.85B (−0.2%) | kept; `hm::get` 0x258 → 0x230 B, `hm.rs` 109.7M → 103.5M |
 
-Net at the current defaults: 5.75B / 12.87B instructions (−61% / −60% vs baseline),
-1.26s / 2.39s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
+Net at the current defaults: 5.73B / 12.85B instructions (−61% / −60% vs baseline),
+1.24s / 2.44s wall (stage1 LLVM-built: 3.10B, 0.79s metadata; we're at 1.85×).
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
