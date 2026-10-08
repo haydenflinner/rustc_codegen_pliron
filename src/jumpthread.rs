@@ -1316,6 +1316,113 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
     folds.len()
 }
 
+/// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
+/// the param itself) become aliases of `v`. Threading's SSA repair creates
+/// these, and Cranelift only removes them after our condition folding ran, so
+/// the same value seen through two params would not match a dominating test.
+pub fn remove_trivial_params(func: &mut Function) -> usize {
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        Unset,
+        One(Value),
+        Many,
+    }
+    let entry = func.layout.entry_block();
+    let mut inc: FxHashMap<Block, Vec<In>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let fixed = matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif);
+        for bc in
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let s = bc.block(&func.dfg.value_lists);
+            let params = func.dfg.block_params(s);
+            let st = inc
+                .entry(s)
+                .or_insert_with(|| vec![In::Unset; params.len()]);
+            if !fixed {
+                st.iter_mut().for_each(|x| *x = In::Many);
+                continue;
+            }
+            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                let new = match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        if v == params[i] {
+                            continue;
+                        }
+                        In::One(v)
+                    }
+                    _ => In::Many,
+                };
+                st[i] = match (st[i], new) {
+                    (In::Unset, x) => x,
+                    (In::One(a), In::One(b)) if a == b => In::One(a),
+                    _ => In::Many,
+                };
+            }
+        }
+    }
+    let def_block = |func: &Function, v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
+    for (&b, st) in &inc {
+        if Some(b) == entry {
+            continue;
+        }
+        let ps = func.dfg.block_params(b);
+        for (i, s) in st.iter().enumerate() {
+            if let In::One(v) = *s
+                && def_block(func, v) != Some(b)
+            {
+                rm.push((b, i, ps[i], v));
+            }
+        }
+    }
+    // No alias chains between params removed together (avoids alias loops).
+    let gone: FxHashSet<Value> = rm.iter().map(|r| r.2).collect();
+    rm.retain(|r| !gone.contains(&r.3));
+    if rm.is_empty() {
+        return 0;
+    }
+    let mut idx: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for r in &rm {
+        idx.entry(r.0).or_default().push(r.1);
+    }
+    for v in idx.values_mut() {
+        v.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for b in blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
+            continue;
+        }
+        let dfg = &mut func.dfg;
+        for bc in
+            dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if let Some(is) = idx.get(&bc.block(&dfg.value_lists)) {
+                for &i in is {
+                    bc.remove(i, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    for &(_, _, p, v) in &rm {
+        func.dfg.remove_block_param(p);
+        func.dfg.change_to_alias(p, v);
+    }
+    rm.len()
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
@@ -1324,8 +1431,12 @@ pub fn run(
 ) -> usize {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
+    let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
     let mut total = 0;
     for _ in 0..8 {
+        if trivp {
+            remove_trivial_params(func);
+        }
         let nn = NonNull::new(func, loads, derived);
         let dc = if domcond {
             fold_dominated_conds(func)
