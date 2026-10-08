@@ -78,9 +78,15 @@ It must also be provably finite: a test that runs every iteration exits once a Â
 variable reaches an invariant bound (`!=`, or `<`/`>` in the step direction). Rust allows
 `loop {}`, so loops that might not terminate are kept.
 
+Before deleting, it folds debug-assertion overflow checks on `i + 1` when a dominating guard
+(`i < n`, `i != MAX`) already rules overflow out. The coretests build with debug assertions,
+and without this fold their loops keep a panic exit and are not deleted.
+
 Correctness fix, not a speedup: the coretests `split_off*_max_range*` compare `[(); usize::MAX]`
 slices, a `usize::MAX`-iteration loop of `() == ()` that LLVM deletes and we used to run.
-regex-syntax at -O: 0 loops deleted, `.text` identical (585355 B) with the pass on or off, so
+With the pass, `./x test --stage 1 library/coretests -- split_off max_range` runs its 26 tests,
+including the six `*_max_range*` ones that used to hang, in 0.7 ms.
+regex-syntax at -O: 0 loops deleted, `.text` 585355 B â†’ 585363 B (+8 B) with the pass on, so
 the stage2 bench is unchanged (not rebuilt). The pass kept `i += 2` / `<=` / `loop {}` /
 used-result / storing loops in a negative test, and that test's output matches LLVM.
 

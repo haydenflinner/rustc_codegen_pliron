@@ -10,22 +10,29 @@
 //! Motivating case: `[(); usize::MAX] == [(); usize::MAX]`, a `usize::MAX`
 //! iteration loop of `() == ()` that LLVM deletes. `PLIRON_LOOPDEL=0` disables.
 
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::{Block, BlockArg, Function, InstructionData, Opcode, Value, ValueDef};
+use cranelift_codegen::ir::{
+    Block, BlockArg, Function, InstBuilder, InstructionData, Opcode, Value, ValueDef, types,
+};
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 
 const MAX_DELETIONS: usize = 16;
 
 pub fn run(func: &mut Function) -> usize {
+    fold_inc_overflow(func);
     let mut n = 0;
     while n < MAX_DELETIONS {
         let cfg = ControlFlowGraph::with_function(func);
         let dt = DominatorTree::with_function(func, &cfg);
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
-        let Some((lp, exit, args)) = la.loops().find_map(|lp| deletable(func, &dt, &la, lp)) else {
+        let Some((lp, exit, args)) = la
+            .loops()
+            .find_map(|lp| deletable(func, &cfg, &dt, &la, lp))
+        else {
             break;
         };
         let h = la.loop_header(lp);
@@ -64,6 +71,43 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+/// `v` with aliases and block parameters that receive one value on every edge looked through.
+fn canon(func: &Function, cfg: &ControlFlowGraph, mut v: Value) -> Value {
+    for _ in 0..8 {
+        v = func.dfg.resolve_aliases(v);
+        let ValueDef::Param(b, i) = func.dfg.value_def(v) else {
+            break;
+        };
+        let mut same: Option<Value> = None;
+        for p in cfg.pred_iter(b) {
+            let dests = func.dfg.insts[p.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for bc in dests {
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(i) else {
+                    return v;
+                };
+                let a = func.dfg.resolve_aliases(a);
+                if a == v {
+                    continue;
+                }
+                match same {
+                    None => same = Some(a),
+                    Some(s) if s == a => {}
+                    Some(_) => return v,
+                }
+            }
+        }
+        match same {
+            Some(s) => v = s,
+            None => break,
+        }
+    }
+    v
+}
+
 fn def_block(func: &Function, v: Value) -> Option<Block> {
     match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -99,6 +143,7 @@ fn live_dests(func: &Function, b: Block) -> Vec<(Block, Vec<BlockArg>)> {
 
 fn deletable(
     func: &Function,
+    cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
@@ -174,12 +219,13 @@ fn deletable(
             }
         }
     }
-    finite(func, dt, la, lp, &latches).then_some((lp, e, eargs))
+    finite(func, cfg, dt, la, lp, &latches).then_some((lp, e, eargs))
 }
 
 /// Step of header param `i` on every latch: each passes `i ± 1` for it.
 fn step(
     func: &Function,
+    cfg: &ControlFlowGraph,
     h: Block,
     i: usize,
     latches: &[(Block, Vec<BlockArg>)],
@@ -190,7 +236,7 @@ fn step(
         let BlockArg::Value(v) = *args.get(i)? else {
             return None;
         };
-        let v = func.dfg.resolve_aliases(v);
+        let v = canon(func, cfg, v);
         let ValueDef::Result(inst, _) = func.dfg.value_def(v) else {
             return None;
         };
@@ -199,9 +245,9 @@ fn step(
                 opcode: Opcode::Iadd,
                 args: [a, b],
             } => {
-                if func.dfg.resolve_aliases(a) == p {
+                if canon(func, cfg, a) == p {
                     iconst(func, b)?
-                } else if func.dfg.resolve_aliases(b) == p {
+                } else if canon(func, cfg, b) == p {
                     iconst(func, a)?
                 } else {
                     return None;
@@ -210,7 +256,7 @@ fn step(
             InstructionData::Binary {
                 opcode: Opcode::Isub,
                 args: [a, b],
-            } if func.dfg.resolve_aliases(a) == p => iconst(func, b)?.checked_neg()?,
+            } if canon(func, cfg, a) == p => iconst(func, b)?.checked_neg()?,
             _ => return None,
         };
         if s != 1 && s != -1 {
@@ -227,6 +273,7 @@ fn step(
 
 fn finite(
     func: &Function,
+    cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
@@ -238,7 +285,7 @@ fn finite(
     };
     let steps: Vec<(Value, i64, Value)> = (0..func.dfg.block_params(h).len())
         .filter_map(|i| {
-            step(func, h, i, latches).map(|(s, next)| (func.dfg.block_params(h)[i], s, next))
+            step(func, cfg, h, i, latches).map(|(s, next)| (func.dfg.block_params(h)[i], s, next))
         })
         .collect();
     if steps.is_empty() {
@@ -262,7 +309,7 @@ fn finite(
         if then_in == else_in {
             continue;
         }
-        let ValueDef::Result(c, _) = func.dfg.value_def(func.dfg.resolve_aliases(arg)) else {
+        let ValueDef::Result(c, _) = func.dfg.value_def(canon(func, cfg, arg)) else {
             continue;
         };
         let InstructionData::IntCompare {
@@ -273,7 +320,7 @@ fn finite(
         else {
             continue;
         };
-        let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+        let (x, y) = (canon(func, cfg, x), canon(func, cfg, y));
         for &(p, s, next) in &steps {
             let cc = if (x == p || x == next) && invariant(y) {
                 cond
@@ -296,4 +343,130 @@ fn finite(
         }
     }
     false
+}
+
+/// `x` if `c` is an unsigned overflow test of `x + 1`: `(x+1) < x`, `x > (x+1)`, `(x+1) == 0`.
+fn inc_overflow_of(func: &Function, cfg: &ControlFlowGraph, c: Value) -> Option<Value> {
+    let r = |v| canon(func, cfg, v);
+    let ValueDef::Result(i, _) = func.dfg.value_def(r(c)) else {
+        return None;
+    };
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args: [a, b],
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (a, b) = (r(a), r(b));
+    let inc = |s: Value| -> Option<Value> {
+        let ValueDef::Result(i, _) = func.dfg.value_def(s) else {
+            return None;
+        };
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [p, q],
+        } = func.dfg.insts[i]
+        else {
+            return None;
+        };
+        match (iconst(func, p), iconst(func, q)) {
+            (_, Some(1)) => Some(r(p)),
+            (Some(1), _) => Some(r(q)),
+            _ => None,
+        }
+    };
+    match cond {
+        IntCC::UnsignedLessThan => inc(a).filter(|&x| x == b),
+        IntCC::UnsignedGreaterThan => inc(b).filter(|&x| x == a),
+        IntCC::Equal if iconst(func, b) == Some(0) => inc(a),
+        _ => None,
+    }
+}
+
+fn is_umax(func: &Function, v: Value) -> bool {
+    let bits = func.dfg.value_type(v).bits();
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    iconst(func, v).is_some_and(|c| c as u64 & mask == mask)
+}
+
+/// Which edge of a `brif` on `c` implies `x != uMAX`: `x < y`, `y > x`, `x != MAX` (then),
+/// `x >= y`, `y <= x`, `x == MAX` (else).
+fn guard_edge(func: &Function, cfg: &ControlFlowGraph, c: Value, x: Value) -> Option<usize> {
+    let r = |v| canon(func, cfg, v);
+    let ValueDef::Result(i, _) = func.dfg.value_def(r(c)) else {
+        return None;
+    };
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args: [a, b],
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (a, b) = (r(a), r(b));
+    let (cc, other) = if a == x {
+        (cond, b)
+    } else if b == x {
+        (cond.swap_args(), a)
+    } else {
+        return None;
+    };
+    match cc {
+        IntCC::UnsignedLessThan => Some(0),
+        IntCC::UnsignedGreaterThanOrEqual => Some(1),
+        IntCC::NotEqual if is_umax(func, other) => Some(0),
+        IntCC::Equal if is_umax(func, other) => Some(1),
+        _ => None,
+    }
+}
+
+/// Debug-assertion overflow checks on `i + 1` in `while i < n` loops: the guard already
+/// proves `i < uMAX`, so the panic edge is dead. Folding it lets such loops be deleted.
+fn fold_inc_overflow(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut todo = Vec::new();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        let Some(x) = inc_overflow_of(func, &cfg, arg) else {
+            continue;
+        };
+        let mut cur = b;
+        while let Some(d) = dt.idom(cur) {
+            if let Some(di) = func.layout.last_inst(d)
+                && let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[di]
+                && let Some(e) = guard_edge(func, &cfg, c, x)
+            {
+                let tgt = blocks[e].block(&func.dfg.value_lists);
+                if tgt != blocks[1 - e].block(&func.dfg.value_lists)
+                    && cfg.pred_iter(tgt).count() == 1
+                    && dt.dominates(tgt, b, &func.layout)
+                {
+                    todo.push(t);
+                    break;
+                }
+            }
+            cur = d;
+        }
+    }
+    for &t in &todo {
+        let mut pos = FuncCursor::new(func).at_inst(t);
+        let z = pos.ins().iconst(types::I8, 0);
+        if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[t] {
+            *arg = z;
+        }
+    }
+    todo.len()
 }
