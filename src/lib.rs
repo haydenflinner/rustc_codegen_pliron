@@ -42,6 +42,7 @@ mod sroa;
 mod type_of;
 mod types;
 mod wasm;
+mod xcgu;
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -344,6 +345,26 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
     let mono_items = cgu.items_in_deterministic_order(tcx);
+    let extra = if tcx.sess.opts.optimize != OptLevel::No
+        && pass_enabled("PLIRON_XCGU")
+        && !tcx.sess.target.is_like_wasm
+        && std::env::var_os("PLIRON_HOT").is_none()
+    {
+        xcgu::copies(tcx, cgu)
+    } else {
+        Vec::new()
+    };
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("xcgu {cgu_name}: {} local copies", extra.len());
+    }
+    for &inst in &extra {
+        rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
+            &mut cx,
+            cgu_name.as_str(),
+            rustc_attr_ir::Linkage::Internal,
+            rustc_middle::mono::Visibility::Default,
+        );
+    }
     for &(mono_item, data) in &mono_items {
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
@@ -354,6 +375,19 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     }
     for &(mono_item, data) in &mono_items {
         mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
+    }
+    for &inst in &extra {
+        let data = rustc_middle::mono::MonoItemData {
+            inlined: true,
+            linkage: rustc_attr_ir::Linkage::Internal,
+            visibility: rustc_middle::mono::Visibility::Default,
+            size_estimate: 0,
+        };
+        rustc_middle::mono::MonoItem::Fn(inst).define::<Builder<'_, '_>>(
+            &mut cx,
+            cgu_name.as_str(),
+            data,
+        );
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
     let m = finish_module(&cx, cgu_name.as_str());
