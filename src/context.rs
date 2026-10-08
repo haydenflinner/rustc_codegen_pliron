@@ -483,7 +483,7 @@ impl<'tcx> CodegenCx<'tcx> {
 impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Function = Ptr<Operation>;
     type BasicBlock = Ptr<BasicBlock>;
-    type Funclet = ();
+    type Funclet = Value;
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;

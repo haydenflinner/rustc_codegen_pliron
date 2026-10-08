@@ -143,6 +143,8 @@ struct Obj<'a, 'tcx> {
     sp: Global,
     table: Table,
     mem: Memory,
+    /// panic=unwind: emulated EH (see `FL::eh_check`).
+    unwind: bool,
 }
 
 impl<'a, 'tcx> Obj<'a, 'tcx> {
@@ -232,7 +234,13 @@ pub fn target_features(
     f
 }
 
-pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[String]) -> Vec<u8> {
+pub fn lower_to_wasm(
+    ctx: &Context,
+    st: &State<'_>,
+    name: &str,
+    features: &[String],
+    unwind: bool,
+) -> Vec<u8> {
     let mut m = Module::empty();
     let mem = m.memories.push(MemoryData {
         initial_pages: 0,
@@ -266,6 +274,7 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[Stri
         sp: Global::invalid(),
         table,
         mem,
+        unwind,
     };
     o.sp = o.import_global("env", "__stack_pointer", true);
 
@@ -301,6 +310,16 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[Stri
             Ok(b) => b,
             Err(e) => {
                 stubs += 1;
+                if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    writeln!(s, "stub {n}: {e}").unwrap();
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(f)
+                        .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
+                }
                 if verbose {
                     eprintln!("pliron-wasm: stub {n}: {e}");
                 }
@@ -358,6 +377,18 @@ pub fn lower_to_wasm(ctx: &Context, st: &State<'_>, name: &str, features: &[Stri
                     Ok(Ok(c)) => c.into_raw_body(),
                     Ok(Err(e)) | Err(e) => {
                         stubs += 1;
+                        if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                            let _ = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(f)
+                                .map(|mut x| {
+                                    std::io::Write::write_all(
+                                        &mut x,
+                                        format!("stub {} (backend): {e}\n", d.name).as_bytes(),
+                                    )
+                                });
+                        }
                         if verbose {
                             eprintln!("pliron-wasm: stub {} (backend): {e}", d.name);
                         }
@@ -534,10 +565,16 @@ struct FL<'o, 'a, 'tcx> {
     mask_c: WV,
     frame: u64,
     frame_align: u64,
+    /// Shared "an unwind is in flight" epilogue: restores SP and returns
+    /// dummy values so the caller sees the flag and keeps unwinding.
+    epi: Option<WBlock>,
+    /// This function's wasm result types, for the epilogue's dummy values.
+    rets: Vec<WT>,
 }
 
 impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     fn new(o: &'o mut Obj<'a, 'tcx>, sig: Signature) -> Self {
+        let rets = o.m.signatures[sig].returns.clone();
         let b = FunctionBody::new(&o.m, sig);
         let cur = b.entry;
         let (ctx, st) = (o.ctx, o.st);
@@ -551,6 +588,8 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             cconst: FxHashMap::default(),
             blocks: FxHashMap::default(),
             terminated: false,
+            epi: None,
+            rets,
             sp0: WV::invalid(),
             fp: WV::invalid(),
             frame_c: WV::invalid(),
@@ -948,6 +987,84 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         let c = self.cur;
         self.b.set_terminator(c, t);
         self.terminated = true;
+    }
+
+    /// Emulated EH storage: `__pliron_eh` is an 8-byte data symbol synthesized
+    /// by the linker; +0 is the "unwind in flight" flag, +4 the exception ptr.
+    fn eh_addr(&mut self) -> WV {
+        let g = self.o.got("__pliron_eh");
+        self.op(O::GlobalGet { global_index: g }, &[], WT::I32)
+    }
+
+    fn eh_flag(&mut self) -> WV {
+        let p = self.eh_addr();
+        self.load(clt::I32, p, 0)
+    }
+
+    fn zero_of(&mut self, t: WT) -> WV {
+        self.op(
+            match t {
+                WT::I32 => O::I32Const { value: 0 },
+                WT::I64 => O::I64Const { value: 0 },
+                WT::F32 => O::F32Const { value: 0 },
+                WT::F64 => O::F64Const { value: 0 },
+                WT::V128 => O::V128Const { value: 0 },
+                t => panic!("eh epilogue return type {t:?}"),
+            },
+            &[],
+            t,
+        )
+    }
+
+    /// The shared epilogue reached when an unwind propagates out of this
+    /// function: restore the stack pointer and return dummy values; the
+    /// caller's own flag check keeps unwinding.
+    fn unwind_epilogue(&mut self) -> WBlock {
+        if let Some(b) = self.epi {
+            return b;
+        }
+        let b = self.b.add_block();
+        let (sp, sp0) = (self.o.sp, self.sp0);
+        let save = std::mem::replace(&mut self.cur, b);
+        self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
+        let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
+        self.b.set_terminator(b, Terminator::Return { values });
+        self.cur = save;
+        self.epi = Some(b);
+        b
+    }
+
+    /// panic=unwind check after a call: if the callee started an unwind, go to
+    /// `landing` (the invoke's cleanup pad) or propagate out of this function.
+    fn eh_check(&mut self, landing: Option<Ptr<BasicBlock>>) {
+        if !self.o.unwind {
+            return;
+        }
+        let f = self.eh_flag();
+        let cont = self.b.add_block();
+        let if_true = match landing {
+            Some(pb) => BlockTarget {
+                block: self.blocks[&pb],
+                args: vec![],
+            },
+            None => BlockTarget {
+                block: self.unwind_epilogue(),
+                args: vec![],
+            },
+        };
+        let c = self.cur;
+        self.b.set_terminator(
+            c,
+            Terminator::CondBr {
+                cond: f,
+                if_true,
+                if_false: BlockTarget {
+                    block: cont,
+                    args: vec![],
+                },
+            },
+        );
+        self.cur = cont;
     }
 
     fn icmp(&mut self, pred: ICmpPredicateAttr, a: &[WV], b: &[WV], w: u32) -> WV {
@@ -1702,10 +1819,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     fn lower_call(&mut self, op: Ptr<Operation>) {
         let ctx = self.ctx;
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
-        assert!(
-            !self.st.invokes.contains_key(&op),
-            "invoke on wasm (needs panic=abort)"
-        );
+        // panic=unwind only: where an in-flight unwind is delivered.
+        let landing = self.st.invokes.get(&op).map(|&(b, _)| b);
+        if landing.is_some() && !self.o.unwind {
+            panic!("invoke on wasm needs panic=unwind");
+        }
         let info = &self.st.calls[&op];
         let fn_ty = info.fn_ty;
         let exts = info.exts.clone();
@@ -1778,6 +1896,33 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 let v = self.op(O::MemorySize { mem }, &[], WT::I32);
                 return self.set(op, smallvec![v]);
             }
+            // wasm EH intrinsics on the emulated-EH flag/exception words.
+            if sym == "__pliron_llvm_wasm_throw" {
+                let p = self.eh_addr();
+                self.store(clt::I32, wargs[1], p, 4);
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                self.eh_check(None);
+                return;
+            }
+            if sym == "__pliron_llvm_wasm_rethrow" {
+                let p = self.eh_addr();
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                self.eh_check(None);
+                return;
+            }
+            if sym == "__pliron_llvm_wasm_get_exception" {
+                let p = self.eh_addr();
+                let v = self.load(clt::I32, p, 4);
+                return self.set(op, smallvec![v]);
+            }
+            if sym == "__pliron_llvm_wasm_get_ehselector"
+                || sym == "__pliron_llvm_wasm_landingpad_index"
+            {
+                let v = self.i32c(0);
+                return self.set(op, smallvec![v]);
+            }
         }
         let direct = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
@@ -1814,6 +1959,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
         }
+        self.eh_check(landing);
     }
 
     fn fcvt_sat(&mut self, signed: bool, w: u32, x: WV) -> Vals {
@@ -1962,6 +2108,28 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
             "llvm.trap" => {
                 self.term(Terminator::Unreachable);
+                return;
+            }
+            // Landing-pad read of the in-flight exception: delivers the
+            // exception pointer and clears the unwind flag so the handler's
+            // own calls work normally.
+            "pliron.eh.exn" => {
+                let p = self.eh_addr();
+                let exn = self.load(clt::I32, p, 4);
+                let z = self.i32c(0);
+                self.store(clt::I32, z, p, 0);
+                self.set(op, smallvec![exn]);
+                return;
+            }
+            // Rethrow: the unwind continues out of this function.
+            "pliron.eh.rethrow" => {
+                let p = self.eh_addr();
+                let one = self.i32c(1);
+                self.store(clt::I32, one, p, 0);
+                let (sp, sp0) = (self.o.sp, self.sp0);
+                self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
+                let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
+                self.term(Terminator::Return { values });
                 return;
             }
             _ => {}

@@ -11,6 +11,9 @@ use wasip1 as w;
 #[unsafe(no_mangle)]
 pub static mut errno: c_int = 0;
 
+// This #[panic_handler] also defines `rust_begin_unwind`; when the binary's
+// real panic_impl comes from std/panic_abort, pliron-wasm-ld keeps the
+// earliest input object's definition (std precedes libc.a on the link line).
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
@@ -1231,4 +1234,102 @@ pub unsafe extern "C" fn frexpf(x: f32, e: *mut i32) -> f32 {
     let (r, n) = libm::frexpf(x);
     unsafe { *e = n };
     r
+}
+
+// _Unwind API over the backend's emulated EH (__pliron_eh flag+exn slot).
+// RaiseException/Resume stash the exception and set the flag; the backend's
+// per-call checks propagate the unwind up the stack.
+#[repr(C)]
+pub struct _Unwind_Exception {
+    pub exception_class: u64,
+    pub exception_cleanup: Option<unsafe extern "C" fn(u32, *mut _Unwind_Exception)>,
+    pub private: [usize; 2],
+}
+
+unsafe extern "C" {
+    static __pliron_eh: u64;
+}
+
+unsafe fn eh_raise(exn: *mut u8) {
+    let p = &raw const __pliron_eh as *mut u8;
+    unsafe {
+        core::ptr::write_volatile(p.add(4).cast::<u32>(), exn as u32);
+        core::ptr::write_volatile(p.cast::<u32>(), 1);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn _Unwind_RaiseException(exn: *mut _Unwind_Exception) -> u32 {
+    unsafe { eh_raise(exn.cast()) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn _Unwind_Resume(exn: *mut _Unwind_Exception) -> ! {
+    unsafe { eh_raise(exn.cast()) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_DeleteException(exn: *mut _Unwind_Exception) {
+    if let Some(cleanup) = unsafe { (*exn).exception_cleanup } {
+        unsafe { cleanup(3 /* _URC_FOREIGN_EXCEPTION_CAUGHT */, exn) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetIP(_ctx: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetIPInfo(_ctx: *mut u8, ip_before_insn: *mut i32) -> usize {
+    unsafe { *ip_before_insn = 0 };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_SetIP(_ctx: *mut u8, _v: usize) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetGR(_ctx: *mut u8, _r: i32) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_SetGR(_ctx: *mut u8, _r: i32, _v: usize) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetLanguageSpecificData(_ctx: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetRegionStart(_ctx: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetTextRelBase(_ctx: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_GetDataRelBase(_ctx: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_FindEnclosingFunction(_pc: *mut u8) -> usize {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Unwind_Backtrace(
+    _cb: unsafe extern "C" fn(*mut u8, *mut u8) -> u32,
+    _a: *mut u8,
+) -> u32 {
+    5 // _URC_END_OF_STACK
 }

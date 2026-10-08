@@ -8,6 +8,7 @@
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use wasm_encoder as we;
 use wasm_encoder::Encode;
@@ -362,10 +363,25 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             included.push(p);
         }
     }
+    let def_obj = |d: &Def| match d {
+        Def::Func(oi, _) | Def::Data(oi, _) => *oi,
+    };
     while k < included.len() {
         let oi = included[k];
         for (n, d) in objs[oi].globals(oi) {
-            defs.entry(n.to_string()).or_insert(d);
+            // When several objects define a symbol, the earliest input wins
+            // (ELF's first-definition rule): e.g. std's panic_impl beats the
+            // same-named def in a later archive like libc.a.
+            match defs.entry(n.to_string()) {
+                Entry::Occupied(mut e) => {
+                    if def_obj(&d) < def_obj(e.get()) {
+                        e.insert(d);
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(d);
+                }
+            }
         }
         k += 1;
         if k == included.len() {
@@ -458,6 +474,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             cur += d.bytes.len() as u32;
         }
     }
+    // `__pliron_eh`: flag (+0) and exception pointer (+4) for the backend's
+    // emulated unwinding; zero-initialized, so no segment is emitted.
+    let eh = cur.next_multiple_of(8);
+    cur = eh + 8;
     let data_end = cur;
     let heap_base = cur.next_multiple_of(16);
     let pages = (heap_base as u64).div_ceil(65536) + 1;
@@ -483,6 +503,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                 (None, "__heap_base") => Ok(heap_base),
                 (None, "__data_end") => Ok(data_end),
                 (None, "__heap_end") => Ok(heap_end),
+                (None, "__pliron_eh") => Ok(eh),
                 (None, _) if func => {
                     let h = host
                         .iter()

@@ -280,6 +280,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             &cx.st.borrow(),
             name,
             &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+            cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
         );
         return PlironModule {
             obj,

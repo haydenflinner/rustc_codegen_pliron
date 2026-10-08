@@ -54,7 +54,8 @@ impl<'a, 'tcx> Deref for Builder<'a, 'tcx> {
 impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Function = Ptr<Operation>;
     type BasicBlock = Ptr<BasicBlock>;
-    type Funclet = ();
+    /// Funclet token: the exception value the pad delivered (`pliron.eh.exn`).
+    type Funclet = Value;
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
@@ -351,7 +352,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         args: &[Value],
         then: Ptr<BasicBlock>,
         catch: Ptr<BasicBlock>,
-        funclet: Option<&()>,
+        funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) -> Value {
         self.st.borrow_mut().last_call = None;
@@ -893,21 +894,43 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.call_sym("_Unwind_Resume", void, &[exn0]);
         self.unreachable();
     }
-    fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) {}
-    fn cleanup_ret(&mut self, _funclet: &(), _unwind: Option<Ptr<BasicBlock>>) {
-        self.unreachable();
+    // Wasm funclets map onto our emulated EH (see wasm.rs): an unwind in
+    // flight sets the `__pliron_eh` flag+exception words; landing pads read
+    // the exception through `pliron.eh.exn`, which also clears the flag.
+    fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) -> Value {
+        let ptr = self.type_ptr();
+        self.intrinsic("pliron.eh.exn", ptr, &[])
     }
-    fn catch_pad(&mut self, _parent: Value, _args: &[Value]) {}
+    fn cleanup_ret(&mut self, _funclet: &Value, unwind: Option<Ptr<BasicBlock>>) {
+        match unwind {
+            Some(bb) => {
+                self.br(bb);
+            }
+            None => {
+                let void = self.type_void();
+                self.intrinsic("pliron.eh.rethrow", void, &[]);
+                self.unreachable();
+            }
+        }
+    }
+    fn catch_pad(&mut self, _parent: Value, _args: &[Value]) -> Value {
+        let ptr = self.type_ptr();
+        self.intrinsic("pliron.eh.exn", ptr, &[])
+    }
     fn catch_switch(
         &mut self,
         _parent: Option<Value>,
         _unwind: Option<Ptr<BasicBlock>>,
-        _handlers: &[Ptr<BasicBlock>],
+        handlers: &[Ptr<BasicBlock>],
     ) -> Value {
-        panic!("funclets are not supported by the pliron backend")
+        // All our handlers are catch-all (`catch (...)`), so a switch always
+        // takes its first handler.
+        let v = self.const_i32(0);
+        self.br(handlers[0]);
+        v
     }
-    fn get_funclet_cleanuppad(&self, _funclet: &()) -> Value {
-        panic!("funclets are not supported by the pliron backend")
+    fn get_funclet_cleanuppad(&self, funclet: &Value) -> Value {
+        *funclet
     }
 
     fn atomic_cmpxchg(
@@ -984,7 +1007,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Value,
         return_slot: ReturnSlot<Value>,
         args: &[Value],
-        _funclet: Option<&()>,
+        _funclet: Option<&Value>,
         _instance: Option<Instance<'tcx>>,
     ) -> Value {
         let mut full = Vec::with_capacity(args.len() + 1);
@@ -1004,7 +1027,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Value,
         return_slot: ReturnSlot<Value>,
         args: &[Value],
-        funclet: Option<&()>,
+        funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) {
         let r = self.call(
@@ -1195,7 +1218,7 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         line_spans: &[Span],
         instance: Instance<'_>,
         dest: Option<Ptr<BasicBlock>>,
-        _catch_funclet: Option<(Ptr<BasicBlock>, Option<&()>)>,
+        _catch_funclet: Option<(Ptr<BasicBlock>, Option<&Value>)>,
     ) {
         self.inline_asm(template, operands, options, line_spans, instance, dest)
     }
