@@ -706,7 +706,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.cast::<SExtOp>(v, t)
     }
     fn zext(&mut self, v: Value, t: TypeHandle) -> Value {
-        self.cast::<ZExtOp>(v, t)
+        use pliron_llvm::op_interfaces::CastOpWithNNegInterface;
+        self.mk(|c| ZExtOp::new_with_nneg(c, v, t, false))
     }
     fn fptoui_sat(&mut self, v: Value, t: TypeHandle) -> Value {
         self.intrinsic("llvm.fptoui.sat", t, &[v])
