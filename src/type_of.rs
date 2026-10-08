@@ -1,20 +1,22 @@
 //! rustc layouts/ABIs -> pliron LLVM dialect types (port of cg_llvm's type_of.rs/abi.rs).
 
-use pliron::builtin::types::{FP16Type, FP32Type, FP64Type, BF16Type};
+use pliron::builtin::types::{BF16Type, FP16Type, FP32Type, FP64Type};
 use pliron::r#type::{TypeHandle, Typed};
 use pliron_llvm::types::{
     ArrayType, FuncType, PointerType, StructLayout, StructType, VectorType, VectorTypeKind,
     VoidType,
 };
 use rustc_abi::{
-    AddressSpace, Align, BackendRepr, FieldsShape, Float, Integer, Primitive, Reg, RegKind,
-    Scalar, Size,
+    AddressSpace, Align, BackendRepr, FieldsShape, Float, Integer, Primitive, Reg, RegKind, Scalar,
+    Size,
 };
 use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::traits::*;
-use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::Ty;
-use rustc_target::callconv::{ArgAttributes, ArgExtension, CastTarget, FnAbi, IndirectMode, PassMode};
+use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_target::callconv::{
+    ArgAttributes, ArgExtension, CastTarget, FnAbi, IndirectMode, PassMode,
+};
 
 use crate::context::{ArgExt, CodegenCx, Exts, layout_ty_key};
 use crate::types::{FP128Type, TyK};
@@ -43,7 +45,10 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
                 e.params.push(ext(a));
                 e.params.push(ext(b));
             }
-            PassMode::Indirect { meta_attrs: Some(_), .. } => {
+            PassMode::Indirect {
+                meta_attrs: Some(_),
+                ..
+            } => {
                 e.params.push(ArgExt::None);
                 e.params.push(ArgExt::None);
             }
@@ -53,10 +58,14 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
                 }
                 e.params.push(ArgExt::None);
             }
-            PassMode::Indirect { meta_attrs: None, mode: IndirectMode::OnStack, .. } => {
-                e.params.push(ArgExt::ByVal(arg.layout.size.bytes() as u32))
-            }
-            PassMode::Indirect { meta_attrs: None, .. } => e.params.push(ArgExt::None),
+            PassMode::Indirect {
+                meta_attrs: None,
+                mode: IndirectMode::OnStack,
+                ..
+            } => e.params.push(ArgExt::ByVal(arg.layout.size.bytes() as u32)),
+            PassMode::Indirect {
+                meta_attrs: None, ..
+            } => e.params.push(ArgExt::None),
         }
     }
     e
@@ -73,11 +82,21 @@ impl<'tcx> CodegenCx<'tcx> {
         VoidType::get(&mut self.pctx.borrow_mut()).into()
     }
     pub fn type_struct(&self, fields: &[TypeHandle], packed: bool) -> TypeHandle {
-        let l = if packed { StructLayout::Packed } else { StructLayout::Unpacked };
+        let l = if packed {
+            StructLayout::Packed
+        } else {
+            StructLayout::Unpacked
+        };
         StructType::get_unnamed(&mut self.pctx.borrow_mut(), (fields.to_vec(), l)).into()
     }
     pub fn type_vector(&self, elem: TypeHandle, n: u64) -> TypeHandle {
-        VectorType::get(&mut self.pctx.borrow_mut(), elem, n as u32, VectorTypeKind::Fixed).into()
+        VectorType::get(
+            &mut self.pctx.borrow_mut(),
+            elem,
+            n as u32,
+            VectorTypeKind::Fixed,
+        )
+        .into()
     }
     pub fn type_variadic_func(&self, args: &[TypeHandle], ret: TypeHandle) -> TypeHandle {
         FuncType::get(&mut self.pctx.borrow_mut(), ret, args.to_vec(), true).into()
@@ -142,7 +161,10 @@ impl<'tcx> CodegenCx<'tcx> {
             }
             BackendRepr::Memory { .. } => {}
             #[allow(unreachable_patterns)]
-            _ => self.tcx.dcx().fatal("scalable vectors are not supported by the pliron backend"),
+            _ => self
+                .tcx
+                .dcx()
+                .fatal("scalable vectors are not supported by the pliron backend"),
         }
         match layout.fields {
             FieldsShape::Primitive | FieldsShape::Union(_) => {
@@ -169,7 +191,11 @@ impl<'tcx> CodegenCx<'tcx> {
         for i in layout.fields.index_by_increasing_offset() {
             let target = layout.fields.offset(i);
             let field = layout.field(self, i);
-            let eff = layout.align.abi.min(field.align.abi).restrict_for_offset(target);
+            let eff = layout
+                .align
+                .abi
+                .min(field.align.abi)
+                .restrict_for_offset(target);
             packed |= eff < field.align.abi;
             assert!(target >= offset);
             let padding = target - offset;
@@ -307,7 +333,10 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         let rest_count = if cast.rest.total == Size::ZERO {
             0
         } else {
-            cast.rest.total.bytes().div_ceil(cast.rest.unit.size.bytes())
+            cast.rest
+                .total
+                .bytes()
+                .div_ceil(cast.rest.unit.size.bytes())
         };
         if cast.prefix.is_empty() {
             if rest_count == 1 && (!cast.rest.is_consecutive || cast.rest.unit != Reg::i128()) {
@@ -323,14 +352,20 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         let mut args = Vec::new();
         let ret = match &fn_abi.ret.mode {
             PassMode::Ignore => self.type_void(),
-            PassMode::Direct(_) | PassMode::Pair(..) => self.immediate_backend_type(fn_abi.ret.layout),
+            PassMode::Direct(_) | PassMode::Pair(..) => {
+                self.immediate_backend_type(fn_abi.ret.layout)
+            }
             PassMode::Cast { cast, .. } => self.cast_backend_type(cast),
             PassMode::Indirect { .. } => {
                 args.push(self.type_ptr());
                 self.type_void()
             }
         };
-        let nargs = if fn_abi.c_variadic { fn_abi.fixed_count as usize } else { fn_abi.args.len() };
+        let nargs = if fn_abi.c_variadic {
+            fn_abi.fixed_count as usize
+        } else {
+            fn_abi.args.len()
+        };
         for arg in &fn_abi.args[..nargs] {
             let t = match &arg.mode {
                 PassMode::Ignore => continue,
@@ -340,20 +375,28 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                     args.push(self.scalar_pair_element_backend_type(arg.layout, 1, true));
                     continue;
                 }
-                PassMode::Indirect { meta_attrs: Some(_), .. } => {
+                PassMode::Indirect {
+                    meta_attrs: Some(_),
+                    ..
+                } => {
                     let ptr_ty = Ty::new_mut_ptr(self.tcx, arg.layout.ty);
                     let pl = self.layout_of(ptr_ty);
                     args.push(self.scalar_pair_element_backend_type(pl, 0, true));
                     args.push(self.scalar_pair_element_backend_type(pl, 1, true));
                     continue;
                 }
-                PassMode::Cast { cast, pad_i32_count } => {
+                PassMode::Cast {
+                    cast,
+                    pad_i32_count,
+                } => {
                     for _ in 0..*pad_i32_count {
                         args.push(self.type_i32());
                     }
                     self.cast_backend_type(cast)
                 }
-                PassMode::Indirect { meta_attrs: None, .. } => self.type_ptr(),
+                PassMode::Indirect {
+                    meta_attrs: None, ..
+                } => self.type_ptr(),
             };
             args.push(t);
         }

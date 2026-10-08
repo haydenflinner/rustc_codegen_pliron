@@ -19,11 +19,17 @@ pub const EXCEPTION_HANDLER_CLEANUP: u32 = 0;
 pub const EXCEPTION_HANDLER_CATCH: u32 = 1;
 
 fn address_for_func(id: FuncId) -> Address {
-    Address::Symbol { symbol: id.as_u32() as usize, addend: 0 }
+    Address::Symbol {
+        symbol: id.as_u32() as usize,
+        addend: 0,
+    }
 }
 
 fn address_for_data(id: DataId) -> Address {
-    Address::Symbol { symbol: (id.as_u32() | 1 << 31) as usize, addend: 0 }
+    Address::Symbol {
+        symbol: (id.as_u32() | 1 << 31) as usize,
+        addend: 0,
+    }
 }
 
 pub struct UnwindContext {
@@ -50,7 +56,9 @@ impl UnwindContext {
             cie.fde_address_encoding = ptr_enc;
             if unwind {
                 let code_enc = if pic {
-                    let fmt = if module.isa().triple().architecture == target_lexicon::Architecture::X86_64 {
+                    let fmt = if module.isa().triple().architecture
+                        == target_lexicon::Architecture::X86_64
+                    {
                         gimli::DW_EH_PE_sdata4
                     } else {
                         gimli::DW_EH_PE_sdata8
@@ -75,11 +83,15 @@ impl UnwindContext {
                             returns: vec![AbiParam::new(types::I32)],
                             call_conv: module.target_config().default_call_conv,
                         };
-                        module.declare_function("rust_eh_personality", Linkage::Import, &sig).unwrap()
+                        module
+                            .declare_function("rust_eh_personality", Linkage::Import, &sig)
+                            .unwrap()
                     }
                 };
                 // Indirect so the personality may live in another DSO.
-                let pref = module.declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false).unwrap();
+                let pref = module
+                    .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+                    .unwrap();
                 let mut d = DataDescription::new();
                 // Must not be zero-init: the unwinder can't handle it in .bss.
                 d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
@@ -90,7 +102,12 @@ impl UnwindContext {
             }
             frame_table.add_cie(cie)
         });
-        UnwindContext { endian, frame_table, cie_id, lsda: unwind }
+        UnwindContext {
+            endian,
+            frame_table,
+            cie_id,
+            lsda: unwind,
+        }
     }
 
     pub fn add_function(&mut self, module: &mut ObjectModule, func_id: FuncId, context: &Context) {
@@ -112,20 +129,35 @@ impl UnwindContext {
                 type_info: TypeInfoTable::new(gimli::DW_EH_PE_udata4),
             };
             let catch_type = t.type_info.add(Address::Constant(0));
-            let catch_action = t.actions.add(Action { kind: ActionKind::Catch(catch_type), next_action: None });
+            let catch_action = t.actions.add(Action {
+                kind: ActionKind::Catch(catch_type),
+                next_action: None,
+            });
             for cs in code.buffer.call_sites() {
                 let start = u64::from(cs.ret_addr - 1);
                 if cs.exception_handlers.is_empty() {
-                    t.call_sites.0.push(CallSite { start, length: 1, landing_pad: 0, action_entry: None });
+                    t.call_sites.0.push(CallSite {
+                        start,
+                        length: 1,
+                        landing_pad: 0,
+                        action_entry: None,
+                    });
                 }
                 for &h in cs.exception_handlers {
-                    let FinalizedMachExceptionHandler::Tag(tag, lp) = h else { unreachable!() };
+                    let FinalizedMachExceptionHandler::Tag(tag, lp) = h else {
+                        unreachable!()
+                    };
                     let action_entry = match tag.as_u32() {
                         EXCEPTION_HANDLER_CLEANUP => None,
                         EXCEPTION_HANDLER_CATCH => Some(catch_action),
                         _ => unreachable!(),
                     };
-                    t.call_sites.0.push(CallSite { start, length: 1, landing_pad: u64::from(lp), action_entry });
+                    t.call_sites.0.push(CallSite {
+                        start,
+                        length: 1,
+                        landing_pad: u64::from(lp),
+                        action_entry,
+                    });
                 }
             }
             let mut w = WriterRelocate::new(self.endian);
@@ -134,13 +166,16 @@ impl UnwindContext {
             data.define(w.writer.into_vec().into_boxed_slice());
             data.set_custom_section(".gcc_except_table");
             for r in &w.relocs {
-                let DebugRelocName::Symbol(id) = r.name else { unreachable!() };
+                let DebugRelocName::Symbol(id) = r.name else {
+                    unreachable!()
+                };
                 let id = id as u32;
                 if id & 1 << 31 == 0 {
                     let fr = module.declare_func_in_data(FuncId::from_u32(id), &mut data);
                     data.write_function_addr(r.offset, fr);
                 } else {
-                    let gv = module.declare_data_in_data(DataId::from_u32(id & !(1 << 31)), &mut data);
+                    let gv =
+                        module.declare_data_in_data(DataId::from_u32(id & !(1 << 31)), &mut data);
                     data.write_data_addr(r.offset, gv, 0);
                 }
             }
@@ -158,7 +193,10 @@ impl UnwindContext {
             return;
         }
         let sec = product.object.section_id(StandardSection::EhFrame);
-        product.object.section_mut(sec).set_data(w.writer.into_vec(), 8);
+        product
+            .object
+            .section_mut(sec)
+            .set_data(w.writer.into_vec(), 8);
         for r in &w.relocs {
             let (symbol, off) = match r.name {
                 DebugRelocName::Section(_) => (product.object.section_symbol(sec), 0),
@@ -169,7 +207,10 @@ impl UnwindContext {
                     } else {
                         product.data_symbol(DataId::from_u32(id & !(1 << 31)))
                     };
-                    product.object.symbol_section_and_offset(s).unwrap_or((s, 0))
+                    product
+                        .object
+                        .symbol_section_and_offset(s)
+                        .unwrap_or((s, 0))
                 }
             };
             product
@@ -216,10 +257,26 @@ struct WriterRelocate {
 
 impl WriterRelocate {
     fn new(endian: RunTimeEndian) -> Self {
-        WriterRelocate { relocs: Vec::new(), writer: EndianVec::new(endian) }
+        WriterRelocate {
+            relocs: Vec::new(),
+            writer: EndianVec::new(endian),
+        }
     }
-    fn reloc(&mut self, offset: usize, size: u8, name: DebugRelocName, addend: i64, kind: object::RelocationKind) {
-        self.relocs.push(DebugReloc { offset: offset as u32, size, name, addend, kind });
+    fn reloc(
+        &mut self,
+        offset: usize,
+        size: u8,
+        name: DebugRelocName,
+        addend: i64,
+        kind: object::RelocationKind,
+    ) {
+        self.relocs.push(DebugReloc {
+            offset: offset as u32,
+            size,
+            name,
+            addend,
+            kind,
+        });
     }
 }
 
@@ -241,17 +298,41 @@ impl Writer for WriterRelocate {
         match address {
             Address::Constant(val) => self.write_udata(val, size),
             Address::Symbol { symbol, addend } => {
-                self.reloc(self.len(), size, DebugRelocName::Symbol(symbol), addend, object::RelocationKind::Absolute);
+                self.reloc(
+                    self.len(),
+                    size,
+                    DebugRelocName::Symbol(symbol),
+                    addend,
+                    object::RelocationKind::Absolute,
+                );
                 self.write_udata(0, size)
             }
         }
     }
     fn write_offset(&mut self, val: usize, section: SectionId, size: u8) -> Result<()> {
-        self.reloc(self.len(), size, DebugRelocName::Section(section), val as i64, object::RelocationKind::Absolute);
+        self.reloc(
+            self.len(),
+            size,
+            DebugRelocName::Section(section),
+            val as i64,
+            object::RelocationKind::Absolute,
+        );
         self.write_udata(0, size)
     }
-    fn write_offset_at(&mut self, offset: usize, val: usize, section: SectionId, size: u8) -> Result<()> {
-        self.reloc(offset, size, DebugRelocName::Section(section), val as i64, object::RelocationKind::Absolute);
+    fn write_offset_at(
+        &mut self,
+        offset: usize,
+        val: usize,
+        section: SectionId,
+        size: u8,
+    ) -> Result<()> {
+        self.reloc(
+            offset,
+            size,
+            DebugRelocName::Section(section),
+            val as i64,
+            object::RelocationKind::Absolute,
+        );
         self.write_udata_at(offset, 0, size)
     }
     fn write_eh_pointer(&mut self, address: Address, eh_pe: gimli::DwEhPe, size: u8) -> Result<()> {
@@ -271,11 +352,23 @@ impl Writer for WriterRelocate {
                         gimli::DW_EH_PE_sdata8 => 8,
                         _ => return Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
                     };
-                    self.reloc(self.len(), size, DebugRelocName::Symbol(symbol), addend, object::RelocationKind::Relative);
+                    self.reloc(
+                        self.len(),
+                        size,
+                        DebugRelocName::Symbol(symbol),
+                        addend,
+                        object::RelocationKind::Relative,
+                    );
                     self.write_udata(0, size)
                 }
                 gimli::DW_EH_PE_absptr => {
-                    self.reloc(self.len(), size, DebugRelocName::Symbol(symbol), addend, object::RelocationKind::Absolute);
+                    self.reloc(
+                        self.len(),
+                        size,
+                        DebugRelocName::Symbol(symbol),
+                        addend,
+                        object::RelocationKind::Absolute,
+                    );
                     self.write_udata(0, size)
                 }
                 _ => Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),

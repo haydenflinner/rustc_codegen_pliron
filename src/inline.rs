@@ -1,5 +1,7 @@
 //! Pliron-level inliner. Cranelift does no inlining, so small callees defined
-//! in the same CGU are copied into their (non-invoke) call sites before lowering.
+//! in the same CGU are copied into their call sites before lowering. Callees are
+//! processed bottom-up, so inlined bodies are inlined transitively; at invoke sites
+//! the callee's calls become invokes to the same landing pad.
 //! `PLIRON_INLINE=<max ops>` tunes the size limit; `0` disables it.
 
 use cranelift_module::Linkage;
@@ -15,73 +17,222 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
 use pliron_llvm::ops::{BrOp, CallOp, ReturnOp};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::context::State;
 use crate::lower::has_body;
 
-const DEFAULT_LIMIT: usize = 40;
+const DEFAULT_LIMIT: usize = 320;
 
-fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
 }
 
-fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
+pub(crate) fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
-fn direct_callee<'a>(ctx: &Context, st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a String> {
+pub(crate) fn direct_callee<'a>(
+    ctx: &Context,
+    st: &'a State<'_>,
+    op: Ptr<Operation>,
+) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
-    let CallOpCallable::Direct(id) = c.callee(ctx) else { return None };
+    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+        return None;
+    };
     st.ident_to_sym.get(&id.to_string())
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
-    let limit = std::env::var("PLIRON_INLINE").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_LIMIT);
-    if limit == 0 {
-        return;
+/// `Some(has_eh)` if `sym` may be inlined; `has_eh` = it has invokes or reads
+/// the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees outright.
+fn eligible(ctx: &Context, st: &State<'_>, sym: &str, limit: usize, once: bool) -> Option<bool> {
+    let f = &st.funcs[sym];
+    if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
+        return None;
     }
-    let mut eligible: FxHashMap<String, Ptr<Operation>> = FxHashMap::default();
+    let (mut n, mut eh) = (0, false);
+    for b in blocks(ctx, f.op) {
+        for op in ops(ctx, b) {
+            n += 1;
+            let intr = st.intrinsics.get(&op);
+            if intr.is_some_and(|s| s.starts_with("llvm.va_"))
+                || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
+            {
+                return None;
+            }
+            eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
+        }
+    }
+    if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
+        return None;
+    }
+    (n <= if f.always_inline || once {
+        limit * 10
+    } else {
+        limit
+    })
+    .then_some(eh)
+}
+
+fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
+    let mut n: FxHashMap<String, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
-        if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
             continue;
         }
-        let (mut n, mut ok) = (0, true);
         for b in blocks(ctx, f.op) {
             for op in ops(ctx, b) {
-                n += 1;
-                let eh_or_va =
-                    st.intrinsics.get(&op).is_some_and(|s| s.starts_with("pliron.eh") || s.starts_with("llvm.va_"));
-                if eh_or_va || st.invokes.contains_key(&op) || direct_callee(ctx, st, op) == Some(sym) {
-                    ok = false;
+                if let Some(c) = direct_callee(ctx, st, op) {
+                    *n.entry(c.clone()).or_default() += 1;
                 }
             }
         }
-        if ok && n <= if f.always_inline { limit * 10 } else { limit } {
-            eligible.insert(sym.clone(), f.op);
+    }
+    n
+}
+
+/// Marks local fns that nothing references any more (typically fully inlined)
+/// so lowering skips them. Iterates because a dead fn's calls don't count.
+/// `PLIRON_DEADFN=0` disables it.
+pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
+    let taken = crate::lower::address_taken(ctx, st);
+    loop {
+        let counts = call_counts(ctx, st);
+        let dead: Vec<String> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !st.dead_fns.contains(n.as_str())
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        st.dead_fns.extend(dead);
+    }
+    if std::env::var("PLIRON_STATS").is_ok() {
+        eprintln!(
+            "deadfn {}: {} of {} fns not lowered",
+            st.cgu,
+            st.dead_fns.len(),
+            st.funcs.len()
+        );
+    }
+}
+
+/// Functions with bodies, callees before callers (cycles broken arbitrarily).
+fn post_order(ctx: &Context, st: &State<'_>) -> Vec<String> {
+    let mut seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut out = Vec::new();
+    for root in st.funcs.keys() {
+        if !has_body(ctx, st.funcs[root].op) || !seen.insert(root.clone()) {
+            continue;
+        }
+        let mut stack = vec![(root.clone(), callees(ctx, st, root), 0usize)];
+        while let Some((sym, cs, i)) = stack.last_mut() {
+            if let Some(c) = cs.get(*i).cloned() {
+                *i += 1;
+                if has_body(ctx, st.funcs[&c].op) && seen.insert(c.clone()) {
+                    let cc = callees(ctx, st, &c);
+                    stack.push((c, cc, 0));
+                }
+            } else {
+                out.push(sym.clone());
+                stack.pop();
+            }
         }
     }
-    if eligible.is_empty() {
+    out
+}
+
+fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
+    blocks(ctx, st.funcs[sym].op)
+        .into_iter()
+        .flat_map(|b| ops(ctx, b))
+        .filter_map(|op| direct_callee(ctx, st, op).cloned())
+        .filter(|c| st.funcs.contains_key(c))
+        .collect()
+}
+
+pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+    let limit = std::env::var("PLIRON_INLINE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 {
         return;
     }
-    let callers: Vec<Ptr<Operation>> = st.funcs.values().map(|f| f.op).filter(|&f| has_body(ctx, f)).collect();
+    // Local fns with one direct call site and no address use get 10x the limit:
+    // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
+    let single: FxHashSet<String> = if crate::pass_enabled("PLIRON_INLINE_ONCE") {
+        let taken = crate::lower::address_taken(ctx, st);
+        let counts = call_counts(ctx, st);
+        st.funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && !taken.contains(n.as_str())
+                    && counts.get(n.as_str()) == Some(&1)
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+    // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
+    let bottom_up = crate::pass_enabled("PLIRON_INLINE_BU");
+    let mut ok: FxHashMap<String, (Ptr<Operation>, bool)> = FxHashMap::default();
+    let order: Vec<String> = if bottom_up {
+        post_order(ctx, st)
+    } else {
+        for sym in st.funcs.keys() {
+            if let Some(eh) = eligible(ctx, st, sym, limit, single.contains(sym)) {
+                ok.insert(sym.clone(), (st.funcs[sym].op, eh));
+            }
+        }
+        st.funcs
+            .iter()
+            .filter(|(_, f)| has_body(ctx, f.op))
+            .map(|(s, _)| s.clone())
+            .collect()
+    };
     let mut rw = IRRewriter::<DummyListener>::default();
-    for caller in callers {
+    for sym in order {
+        let caller = st.funcs[&sym].op;
         let mut sites = Vec::new();
         for b in blocks(ctx, caller) {
             for op in ops(ctx, b) {
-                if st.invokes.contains_key(&op) {
+                if !bottom_up && st.invokes.contains_key(&op) {
                     continue;
                 }
-                let Some(sym) = direct_callee(ctx, st, op) else { continue };
-                let Some(&callee) = eligible.get(sym) else { continue };
-                if callee != caller && st.calls[&op].fn_ty == st.funcs[sym].ty {
+                let Some(cs) = direct_callee(ctx, st, op) else {
+                    continue;
+                };
+                let Some(&(callee, eh)) = ok.get(cs) else {
+                    continue;
+                };
+                // A callee with its own landing pads only goes into plain call sites.
+                if eh && st.invokes.contains_key(&op) {
+                    continue;
+                }
+                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty {
                     sites.push((op, callee));
                 }
             }
         }
         for (call, callee) in sites {
             inline_call(ctx, st, &mut rw, call, callee);
+        }
+        if bottom_up {
+            if let Some(eh) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
+                ok.insert(sym.clone(), (caller, eh));
+            }
         }
     }
 }
@@ -97,6 +248,7 @@ fn inline_call(
     let region = block.deref(ctx).get_parent_region().unwrap();
     let args = Operation::get_op::<CallOp>(call, ctx).unwrap().args(ctx);
     let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(0));
+    let unwind = st.invokes.remove(&call);
     let cont = rw.split_block(ctx, block, OpInsertionPoint::AfterOperation(call), None);
 
     let src = blocks(ctx, callee);
@@ -107,12 +259,24 @@ fn inline_call(
         for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
             if let Some(c) = st.calls.get(&op).cloned() {
                 st.calls.insert(new, c);
+                if let Some(&(lp, catch)) = st.invokes.get(&op) {
+                    st.invokes
+                        .insert(new, (map.lookup_block(lp).unwrap(), catch));
+                } else if let Some(u) = unwind {
+                    st.invokes.insert(new, u);
+                }
             }
             if let Some(s) = st.intrinsics.get(&op).cloned() {
                 st.intrinsics.insert(new, s);
             }
             if let Some(r) = st.rmw.get(&op).copied() {
                 st.rmw.insert(new, r);
+            }
+            if let Some(e) = st.expect.get(&op).copied() {
+                st.expect.insert(new, e);
+            }
+            if st.volatile.contains(&op) {
+                st.volatile.insert(new);
             }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {

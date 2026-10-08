@@ -854,7 +854,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
         }
-        for pb in rpo(ctx, &pblocks) {
+        for pb in rpo(ctx, self.st, &pblocks) {
             self.cur = self.blocks[&pb];
             self.cconst.clear();
             self.terminated = false;

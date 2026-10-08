@@ -19,7 +19,11 @@ struct Pair {
 }
 
 fn fib(n: u32) -> u64 {
-    if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) }
+    if n < 2 {
+        n as u64
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
 }
 
 fn sum(xs: &[Pair]) -> u64 {

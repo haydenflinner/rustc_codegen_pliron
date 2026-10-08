@@ -18,7 +18,13 @@ fn boom(n: u32) -> u32 {
 
 fn main() {
     panic::set_hook(Box::new(|i| {
-        println!("hook: {}", i.payload().downcast_ref::<String>().map(|s| s.as_str()).unwrap_or("?"))
+        println!(
+            "hook: {}",
+            i.payload()
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .unwrap_or("?")
+        )
     }));
     let r = panic::catch_unwind(|| {
         let _o = D("outer");

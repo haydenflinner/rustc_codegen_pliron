@@ -69,7 +69,10 @@ impl GccExceptTable {
             // In this case we calculated the expected padding amount and used it to write the
             // classInfoOffset field. Assert that the expected value matched the actual value to catch
             // any inconsistency.
-            assert!(w.len().is_multiple_of(4), "type_info must be aligned to 4 bytes");
+            assert!(
+                w.len().is_multiple_of(4),
+                "type_info must be aligned to 4 bytes"
+            );
         } else {
             while !w.len().is_multiple_of(4) {
                 w.write_u8(0)?;
@@ -100,7 +103,11 @@ impl CallSiteTable {
     }
 
     fn write<W: Writer>(&self, w: &mut W) -> gimli::write::Result<()> {
-        let callsite_table_length = self.0.iter().map(|call_site| call_site.encoded_size()).sum();
+        let callsite_table_length = self
+            .0
+            .iter()
+            .map(|call_site| call_site.encoded_size())
+            .sum();
 
         // callsiteEncoding
         w.write_u8(DW_EH_PE_uleb128.0)?;
@@ -148,7 +155,10 @@ pub(super) struct ActionTable {
 
 impl ActionTable {
     pub(super) fn new() -> ActionTable {
-        ActionTable { actions: vec![], encoded_length: 0 }
+        ActionTable {
+            actions: vec![],
+            encoded_length: 0,
+        }
     }
 
     pub(super) fn add(&mut self, action: Action) -> ActionOffset {
@@ -220,7 +230,10 @@ pub(super) struct TypeInfoTable {
 
 impl TypeInfoTable {
     pub(super) fn new(ttype_encoding: gimli::DwEhPe) -> TypeInfoTable {
-        TypeInfoTable { ttype_encoding, type_info: vec![] }
+        TypeInfoTable {
+            ttype_encoding,
+            type_info: vec![],
+        }
     }
 
     pub(super) fn add(&mut self, type_info: Address) -> TypeInfoId {

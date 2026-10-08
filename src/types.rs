@@ -59,7 +59,10 @@ pub fn classify(ctx: &Context, ty: TypeHandle) -> TyK {
         return TyK::Array(a.elem_type(), a.size());
     }
     if let Some(s) = t.downcast_ref::<StructType>() {
-        return TyK::Struct(s.fields().collect(), matches!(s.layout(), StructLayout::Packed));
+        return TyK::Struct(
+            s.fields().collect(),
+            matches!(s.layout(), StructLayout::Packed),
+        );
     }
     if let Some(v) = t.downcast_ref::<VectorType>() {
         return TyK::Vector(v.elem_type(), v.num_elements());
@@ -92,7 +95,13 @@ pub fn size_align(ctx: &Context, ty: TypeHandle) -> (u64, u64) {
         TyK::F32 => (4, 4),
         TyK::F64 => (8, 8),
         TyK::F128 => (16, 16),
-        TyK::Ptr => if ptr32() { (4, 4) } else { (8, 8) },
+        TyK::Ptr => {
+            if ptr32() {
+                (4, 4)
+            } else {
+                (8, 8)
+            }
+        }
         TyK::Void | TyK::Func(..) | TyK::Other => (0, 1),
         TyK::Array(e, n) => {
             let (s, a) = size_align(ctx, e);
@@ -159,6 +168,9 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
             }
         }
         TyK::Vector(e, n) => {
+            if let Some((t, k)) = vec_parts(ctx, e, n as u64) {
+                return out.extend((0..k).map(|i| (base + i * 16, t)));
+            }
             let (s, _) = size_align(ctx, e);
             for i in 0..n as u64 {
                 leaves_into(ctx, e, base + i * s, out);
@@ -171,6 +183,36 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
             }
         }
     }
+}
+
+/// 128-bit int/float vectors are one native Cranelift SIMD leaf; other vectors
+/// are flattened lane-wise. `PLIRON_SIMD=0` flattens everything.
+pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
+        return None;
+    }
+    let lane = match classify(ctx, e) {
+        TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,
+        TyK::F32 => clt::F32,
+        TyK::F64 => clt::F64,
+        _ => return None,
+    };
+    if lane.bits() as u64 * n != 128 {
+        return None;
+    }
+    lane.by(n as u32)
+}
+
+/// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
+/// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
+pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    if let Some(t) = native_vec(ctx, e, n) {
+        return Some((t, 1));
+    }
+    (n % 2 == 0)
+        .then(|| native_vec(ctx, e, n / 2))?
+        .map(|t| (t, 2))
 }
 
 /// Element types of an aggregate (struct fields, or `n` copies of the element).

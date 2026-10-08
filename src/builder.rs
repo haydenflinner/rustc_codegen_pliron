@@ -1,17 +1,20 @@
 //! `BuilderMethods` emitting pliron LLVM-dialect operations.
 
+use std::num::NonZero;
 use std::ops::Deref;
 
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::attributes::StringAttr;
+use pliron::builtin::attributes::{IntegerAttr, StringAttr};
 use pliron::builtin::op_interfaces::CallOpCallable;
+use pliron::builtin::types::IntegerType;
 use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, TypedHandle};
+use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron_llvm::attributes::{
-    AtomicOrderingAttr, FastmathFlagsAttr, FCmpPredicateAttr, ICmpPredicateAttr, SyncScopeAttr,
+    AtomicOrderingAttr, FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr, SyncScopeAttr,
 };
 use pliron_llvm::op_interfaces::{BinArithOp, CastOpInterface};
 use pliron_llvm::ops::*;
@@ -115,6 +118,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         p
     }
 
+    fn mark_volatile(&mut self, volatile: bool) {
+        if volatile {
+            use pliron::linked_list::ContainsLinkedList;
+            let tail = self.block.deref(&self.cx.pctx.borrow()).get_tail().unwrap();
+            self.st.borrow_mut().volatile.insert(tail);
+        }
+    }
+
     pub(crate) fn mk<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Value {
         let p = f(&mut self.cx.pctx.borrow_mut()).get_operation();
         self.push(p).expect("op has no result")
@@ -134,14 +145,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
             let fty = TypedHandle::<FuncType>::from_handle(fty, &c).unwrap();
-            CallIntrinsicOp::new(&mut c, StringAttr::new(name.to_string()), fty, args.to_vec())
-                .get_operation()
+            CallIntrinsicOp::new(
+                &mut c,
+                StringAttr::new(name.to_string()),
+                fty,
+                args.to_vec(),
+            )
+            .get_operation()
         };
         self.st.borrow_mut().intrinsics.insert(p, name.to_string());
         self.push(p).unwrap_or_else(|| self.const_undef(ret))
     }
 
-    pub fn call_raw(&mut self, fn_ty: TypeHandle, callee: Value, args: &[Value], exts: Exts) -> Value {
+    pub fn call_raw(
+        &mut self,
+        fn_ty: TypeHandle,
+        callee: Value,
+        args: &[Value],
+        exts: Exts,
+    ) -> Value {
         let callable = match self.cval(callee) {
             Some(ConstVal::Sym { sym, off: 0 }) if self.st.borrow().funcs.contains_key(&sym) => {
                 CallOpCallable::Direct(self.ident(&sym))
@@ -153,7 +175,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let fty = TypedHandle::<FuncType>::from_handle(fn_ty, &c).unwrap();
             CallOp::new(&mut c, callable, fty, args.to_vec()).get_operation()
         };
-        self.st.borrow_mut().calls.insert(p, CallInfo { fn_ty, exts });
+        self.st
+            .borrow_mut()
+            .calls
+            .insert(p, CallInfo { fn_ty, exts });
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -224,6 +249,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| CondBrOp::new(c, cond, then_llbb, vec![], else_llbb, vec![]));
     }
 
+    fn cond_br_with_expect(
+        &mut self,
+        cond: Value,
+        then_llbb: Ptr<BasicBlock>,
+        else_llbb: Ptr<BasicBlock>,
+        expect: Option<bool>,
+    ) {
+        let op = self.mk_op(|c| CondBrOp::new(c, cond, then_llbb, vec![], else_llbb, vec![]));
+        if let Some(e) = expect {
+            self.st.borrow_mut().expect.insert(op, e);
+        }
+    }
+
     fn switch(
         &mut self,
         v: Value,
@@ -235,6 +273,34 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return self.br(else_llbb);
         }
         let ty = self.val_ty(v);
+        // wasm.rs has no SwitchOp lowering; it gets the compare chain.
+        if crate::pass_enabled("PLIRON_SWITCH") && !self.cx.tcx.sess.target.is_like_wasm {
+            let w = self.int_width(ty) as usize;
+            let cases = {
+                let c = self.cx.pctx.borrow();
+                let ity = TypedHandle::<IntegerType>::from_handle(ty, &c).unwrap();
+                cases
+                    .into_iter()
+                    .map(|(val, dest)| {
+                        let val = if w < 128 {
+                            val & ((1u128 << w) - 1)
+                        } else {
+                            val
+                        };
+                        SwitchCase {
+                            value: IntegerAttr::new(
+                                ity,
+                                APInt::from_u128(val, NonZero::new(w).unwrap()),
+                            ),
+                            dest,
+                            dest_opds: vec![],
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            self.mk_op(|c| SwitchOp::new(c, v, else_llbb, vec![], cases));
+            return;
+        }
         let n = cases.len();
         for (i, (val, dest)) in cases.into_iter().enumerate() {
             let c = self.const_uint_big(ty, val);
@@ -263,7 +329,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         instance: Option<Instance<'tcx>>,
     ) -> Value {
         self.st.borrow_mut().last_call = None;
-        let r = self.call(llty, fn_attrs, fn_abi, llfn, return_slot, args, funclet, instance);
+        let r = self.call(
+            llty,
+            fn_attrs,
+            fn_abi,
+            llfn,
+            return_slot,
+            args,
+            funclet,
+            instance,
+        );
         let last = self.st.borrow_mut().last_call.take();
         if let Some(op) = last {
             self.st.borrow_mut().invokes.insert(op, (catch, false));
@@ -276,36 +351,96 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| UnreachableOp::new(c));
     }
 
-    fn add(&mut self, a: Value, b: Value) -> Value { self.bin::<AddOp>(a, b) }
-    fn fadd(&mut self, a: Value, b: Value) -> Value { self.bin::<FAddOp>(a, b) }
-    fn fadd_fast(&mut self, a: Value, b: Value) -> Value { self.bin::<FAddOp>(a, b) }
-    fn fadd_algebraic(&mut self, a: Value, b: Value) -> Value { self.bin::<FAddOp>(a, b) }
-    fn sub(&mut self, a: Value, b: Value) -> Value { self.bin::<SubOp>(a, b) }
-    fn fsub(&mut self, a: Value, b: Value) -> Value { self.bin::<FSubOp>(a, b) }
-    fn fsub_fast(&mut self, a: Value, b: Value) -> Value { self.bin::<FSubOp>(a, b) }
-    fn fsub_algebraic(&mut self, a: Value, b: Value) -> Value { self.bin::<FSubOp>(a, b) }
-    fn mul(&mut self, a: Value, b: Value) -> Value { self.bin::<MulOp>(a, b) }
-    fn fmul(&mut self, a: Value, b: Value) -> Value { self.bin::<FMulOp>(a, b) }
-    fn fmul_fast(&mut self, a: Value, b: Value) -> Value { self.bin::<FMulOp>(a, b) }
-    fn fmul_algebraic(&mut self, a: Value, b: Value) -> Value { self.bin::<FMulOp>(a, b) }
-    fn udiv(&mut self, a: Value, b: Value) -> Value { self.bin::<UDivOp>(a, b) }
-    fn exactudiv(&mut self, a: Value, b: Value) -> Value { self.bin::<UDivOp>(a, b) }
-    fn sdiv(&mut self, a: Value, b: Value) -> Value { self.bin::<SDivOp>(a, b) }
-    fn exactsdiv(&mut self, a: Value, b: Value) -> Value { self.bin::<SDivOp>(a, b) }
-    fn fdiv(&mut self, a: Value, b: Value) -> Value { self.bin::<FDivOp>(a, b) }
-    fn fdiv_fast(&mut self, a: Value, b: Value) -> Value { self.bin::<FDivOp>(a, b) }
-    fn fdiv_algebraic(&mut self, a: Value, b: Value) -> Value { self.bin::<FDivOp>(a, b) }
-    fn urem(&mut self, a: Value, b: Value) -> Value { self.bin::<URemOp>(a, b) }
-    fn srem(&mut self, a: Value, b: Value) -> Value { self.bin::<SRemOp>(a, b) }
-    fn frem(&mut self, a: Value, b: Value) -> Value { self.bin::<FRemOp>(a, b) }
-    fn frem_fast(&mut self, a: Value, b: Value) -> Value { self.bin::<FRemOp>(a, b) }
-    fn frem_algebraic(&mut self, a: Value, b: Value) -> Value { self.bin::<FRemOp>(a, b) }
-    fn shl(&mut self, a: Value, b: Value) -> Value { self.bin::<ShlOp>(a, b) }
-    fn lshr(&mut self, a: Value, b: Value) -> Value { self.bin::<LShrOp>(a, b) }
-    fn ashr(&mut self, a: Value, b: Value) -> Value { self.bin::<AShrOp>(a, b) }
-    fn and(&mut self, a: Value, b: Value) -> Value { self.bin::<AndOp>(a, b) }
-    fn or(&mut self, a: Value, b: Value) -> Value { self.bin::<OrOp>(a, b) }
-    fn xor(&mut self, a: Value, b: Value) -> Value { self.bin::<XorOp>(a, b) }
+    fn add(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<AddOp>(a, b)
+    }
+    fn fadd(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FAddOp>(a, b)
+    }
+    fn fadd_fast(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FAddOp>(a, b)
+    }
+    fn fadd_algebraic(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FAddOp>(a, b)
+    }
+    fn sub(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<SubOp>(a, b)
+    }
+    fn fsub(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FSubOp>(a, b)
+    }
+    fn fsub_fast(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FSubOp>(a, b)
+    }
+    fn fsub_algebraic(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FSubOp>(a, b)
+    }
+    fn mul(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<MulOp>(a, b)
+    }
+    fn fmul(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FMulOp>(a, b)
+    }
+    fn fmul_fast(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FMulOp>(a, b)
+    }
+    fn fmul_algebraic(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FMulOp>(a, b)
+    }
+    fn udiv(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<UDivOp>(a, b)
+    }
+    fn exactudiv(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<UDivOp>(a, b)
+    }
+    fn sdiv(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<SDivOp>(a, b)
+    }
+    fn exactsdiv(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<SDivOp>(a, b)
+    }
+    fn fdiv(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FDivOp>(a, b)
+    }
+    fn fdiv_fast(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FDivOp>(a, b)
+    }
+    fn fdiv_algebraic(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FDivOp>(a, b)
+    }
+    fn urem(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<URemOp>(a, b)
+    }
+    fn srem(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<SRemOp>(a, b)
+    }
+    fn frem(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FRemOp>(a, b)
+    }
+    fn frem_fast(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FRemOp>(a, b)
+    }
+    fn frem_algebraic(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<FRemOp>(a, b)
+    }
+    fn shl(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<ShlOp>(a, b)
+    }
+    fn lshr(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<LShrOp>(a, b)
+    }
+    fn ashr(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<AShrOp>(a, b)
+    }
+    fn and(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<AndOp>(a, b)
+    }
+    fn or(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<OrOp>(a, b)
+    }
+    fn xor(&mut self, a: Value, b: Value) -> Value {
+        self.bin::<XorOp>(a, b)
+    }
 
     fn neg(&mut self, v: Value) -> Value {
         let z = self.const_null(self.val_ty(v));
@@ -360,7 +495,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
     fn to_immediate_scalar(&mut self, val: Value, scalar: Scalar) -> Value {
-        if scalar.is_bool() { self.trunc(val, self.type_i1()) } else { val }
+        if scalar.is_bool() {
+            self.trunc(val, self.type_i1())
+        } else {
+            val
+        }
     }
 
     fn alloca(&mut self, size: Size, align: Align) -> Value {
@@ -371,12 +510,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let v = {
             use pliron::linked_list::ContainsLinkedList;
             let ctx = self.cx.pctx.borrow();
-            let region = self.block.deref(&ctx).get_parent_region().expect("block has no region");
-            let entry = region.deref(&ctx).get_head().expect("function has no entry block");
+            let region = self
+                .block
+                .deref(&ctx)
+                .get_parent_region()
+                .expect("block has no region");
+            let entry = region
+                .deref(&ctx)
+                .get_head()
+                .expect("function has no entry block");
             op.insert_at_front(entry, &ctx);
             op.deref(&ctx).get_result(0)
         };
-        self.st.borrow_mut().allocas.insert(v, (size.bytes(), align.bytes()));
+        self.st
+            .borrow_mut()
+            .allocas
+            .insert(v, (size.bytes(), align.bytes()));
         v
     }
 
@@ -388,7 +537,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| LoadOp::new(c, ptr, ty))
     }
     fn volatile_load(&mut self, ty: TypeHandle, ptr: Value, _align: Align) -> Value {
-        self.mk(|c| LoadOp::new(c, ptr, ty))
+        let v = self.mk(|c| LoadOp::new(c, ptr, ty));
+        self.mark_volatile(true);
+        v
     }
     fn atomic_load(
         &mut self,
@@ -407,7 +558,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         let val = if place.val.llextra.is_some() {
             OperandValue::Ref(place.val)
-        } else if matches!(place.layout.backend_repr, BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. }) {
+        } else if matches!(
+            place.layout.backend_repr,
+            BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. }
+        ) {
             let llty = self.backend_type(place.layout);
             let v = self.load(llty, place.val.llval, place.val.align);
             OperandValue::Immediate(match place.layout.backend_repr {
@@ -427,7 +581,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         } else {
             OperandValue::Ref(place.val)
         };
-        OperandRef { val, layout: place.layout, move_annotation: None }
+        OperandRef {
+            val,
+            layout: place.layout,
+            move_annotation: None,
+        }
     }
 
     fn write_operand_repeatedly(
@@ -454,7 +612,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let off = self.mul(i, sz);
         let p = self.inbounds_ptradd(dest.val.llval, off);
         let align = dest.val.align.restrict_for_offset(elem.layout.size);
-        elem.val.store(self, PlaceRef::new_sized_aligned(p, elem.layout, align));
+        elem.val
+            .store(self, PlaceRef::new_sized_aligned(p, elem.layout, align));
         let one = self.const_usize(1);
         let i2 = self.add(i, one);
         self.store(i2, ctr, Align::EIGHT);
@@ -469,10 +628,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| StoreOp::new(c, val, ptr));
         val
     }
-    fn store_with_flags(&mut self, val: Value, ptr: Value, align: Align, _flags: MemFlags) -> Value {
-        self.store(val, ptr, align)
+    fn store_with_flags(&mut self, val: Value, ptr: Value, align: Align, flags: MemFlags) -> Value {
+        self.store(val, ptr, align);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
+        val
     }
-    fn atomic_store(&mut self, val: Value, ptr: Value, order: AtomicOrdering, _volatile: bool, _size: Size) {
+    fn atomic_store(
+        &mut self,
+        val: Value,
+        ptr: Value,
+        order: AtomicOrdering,
+        _volatile: bool,
+        _size: Size,
+    ) {
         self.mk_op(|c| AtomicStoreOp::new(c, val, ptr, ord(order), SyncScopeAttr::System));
     }
 
@@ -484,30 +652,60 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.gep(ty, ptr, indices)
     }
 
-    fn trunc(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<TruncOp>(v, t) }
-    fn sext(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<SExtOp>(v, t) }
-    fn zext(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<ZExtOp>(v, t) }
+    fn trunc(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<TruncOp>(v, t)
+    }
+    fn sext(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<SExtOp>(v, t)
+    }
+    fn zext(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<ZExtOp>(v, t)
+    }
     fn fptoui_sat(&mut self, v: Value, t: TypeHandle) -> Value {
         self.intrinsic("llvm.fptoui.sat", t, &[v])
     }
     fn fptosi_sat(&mut self, v: Value, t: TypeHandle) -> Value {
         self.intrinsic("llvm.fptosi.sat", t, &[v])
     }
-    fn fptoui(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<FPToUIOp>(v, t) }
-    fn fptosi(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<FPToSIOp>(v, t) }
-    fn uitofp(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<UIToFPOp>(v, t) }
-    fn sitofp(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<SIToFPOp>(v, t) }
-    fn fptrunc(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<FPTruncOp>(v, t) }
-    fn fpext(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<FPExtOp>(v, t) }
-    fn ptrtoint(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<PtrToIntOp>(v, t) }
-    fn inttoptr(&mut self, v: Value, t: TypeHandle) -> Value { self.cast::<IntToPtrOp>(v, t) }
+    fn fptoui(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<FPToUIOp>(v, t)
+    }
+    fn fptosi(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<FPToSIOp>(v, t)
+    }
+    fn uitofp(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<UIToFPOp>(v, t)
+    }
+    fn sitofp(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<SIToFPOp>(v, t)
+    }
+    fn fptrunc(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<FPTruncOp>(v, t)
+    }
+    fn fpext(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<FPExtOp>(v, t)
+    }
+    fn ptrtoint(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<PtrToIntOp>(v, t)
+    }
+    fn inttoptr(&mut self, v: Value, t: TypeHandle) -> Value {
+        self.cast::<IntToPtrOp>(v, t)
+    }
     fn bitcast(&mut self, v: Value, t: TypeHandle) -> Value {
-        if self.val_ty(v) == t { v } else { self.cast::<BitcastOp>(v, t) }
+        if self.val_ty(v) == t {
+            v
+        } else {
+            self.cast::<BitcastOp>(v, t)
+        }
     }
     fn intcast(&mut self, v: Value, t: TypeHandle, is_signed: bool) -> Value {
         let (fw, tw) = (self.int_width(self.val_ty(v)), self.int_width(t));
         if fw < tw {
-            if is_signed { self.sext(v, t) } else { self.zext(v, t) }
+            if is_signed {
+                self.sext(v, t)
+            } else {
+                self.zext(v, t)
+            }
         } else if fw > tw {
             self.trunc(v, t)
         } else {
@@ -564,11 +762,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         src: Value,
         _src_align: Align,
         size: Value,
-        _flags: MemFlags,
+        flags: MemFlags,
         _tt: Option<rustc_ast::expand::typetree::FncTree>,
     ) {
         let v = self.type_void();
         self.intrinsic("llvm.memcpy", v, &[dst, src, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
     fn memmove(
         &mut self,
@@ -577,14 +776,23 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         src: Value,
         _src_align: Align,
         size: Value,
-        _flags: MemFlags,
+        flags: MemFlags,
     ) {
         let v = self.type_void();
         self.intrinsic("llvm.memmove", v, &[dst, src, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
-    fn memset(&mut self, ptr: Value, fill_byte: Value, size: Value, _align: Align, _flags: MemFlags) {
+    fn memset(
+        &mut self,
+        ptr: Value,
+        fill_byte: Value,
+        size: Value,
+        _align: Align,
+        flags: MemFlags,
+    ) {
         let v = self.type_void();
         self.intrinsic("llvm.memset", v, &[ptr, fill_byte, size]);
+        self.mark_volatile(flags.contains(MemFlags::VOLATILE));
     }
 
     fn vscale(&mut self, _ty: TypeHandle) -> Value {
@@ -596,7 +804,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn va_arg(&mut self, _list: Value, _ty: TypeHandle) -> Value {
-        self.tcx.dcx().fatal("va_arg is not supported by the pliron backend yet")
+        self.tcx
+            .dcx()
+            .fatal("va_arg is not supported by the pliron backend yet")
     }
 
     fn extract_element(&mut self, vec: Value, idx: Value) -> Value {
@@ -604,6 +814,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn vector_splat(&mut self, num_elts: usize, elt: Value) -> Value {
         let ty = self.type_vector(self.val_ty(elt), num_elts as u64);
+        if self.native(ty) {
+            return self.intrinsic("pliron.vsplat", ty, &[elt]);
+        }
         let mut v = self.const_undef(ty);
         for i in 0..num_elts {
             let idx = self.const_i32(i as i32);
@@ -659,7 +872,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _weak: bool,
     ) -> (Value, Value) {
         let r = self.mk(|c| {
-            AtomicCmpxchgOp::new(c, dst, cmp, src, ord(order), ord(failure_order), SyncScopeAttr::System)
+            AtomicCmpxchgOp::new(
+                c,
+                dst,
+                cmp,
+                src,
+                ord(order),
+                ord(failure_order),
+                SyncScopeAttr::System,
+            )
         });
         (self.extract_value(r, 0), self.extract_value(r, 1))
     }
@@ -688,7 +909,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
-            AtomicRmwOp::new(&mut c, dst, src, kind, ord(order), SyncScopeAttr::System).get_operation()
+            AtomicRmwOp::new(&mut c, dst, src, kind, ord(order), SyncScopeAttr::System)
+                .get_operation()
         };
         self.st.borrow_mut().rmw.insert(p, op);
         self.push(p).unwrap()
@@ -737,7 +959,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         funclet: Option<&()>,
         instance: Option<Instance<'tcx>>,
     ) {
-        let r = self.call(llty, fn_attrs, Some(fn_abi), llfn, return_slot, args, funclet, instance);
+        let r = self.call(
+            llty,
+            fn_attrs,
+            Some(fn_abi),
+            llfn,
+            return_slot,
+            args,
+            funclet,
+            instance,
+        );
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
             _ => self.ret(r),
@@ -751,7 +982,10 @@ impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
     fn get_param(&mut self, index: usize) -> Value {
         let f = self.parent_fn();
         let ctx = self.cx.pctx.borrow();
-        let entry = Operation::get_op::<FuncOp>(f, &ctx).unwrap().get_entry_block(&ctx).unwrap();
+        let entry = Operation::get_op::<FuncOp>(f, &ctx)
+            .unwrap()
+            .get_entry_block(&ctx)
+            .unwrap();
         entry.deref(&ctx).get_argument(index)
     }
 }
@@ -776,7 +1010,10 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let b = next(self);
                 OperandValue::Pair(a, b).store(self, dst);
             }
-            PassMode::Indirect { meta_attrs: Some(_), .. } => {
+            PassMode::Indirect {
+                meta_attrs: Some(_),
+                ..
+            } => {
                 let a = next(self);
                 let b = next(self);
                 OperandValue::Ref(rustc_codegen_ssa::mir::place::PlaceValue {
@@ -786,7 +1023,11 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 })
                 .store(self, dst);
             }
-            PassMode::Direct(_) | PassMode::Indirect { meta_attrs: None, .. } | PassMode::Cast { .. } => {
+            PassMode::Direct(_)
+            | PassMode::Indirect {
+                meta_attrs: None, ..
+            }
+            | PassMode::Cast { .. } => {
                 if let PassMode::Cast { pad_i32_count, .. } = arg_abi.mode {
                     for _ in 0..pad_i32_count {
                         next(self);
@@ -807,7 +1048,9 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         use rustc_target::callconv::PassMode;
         match &arg_abi.mode {
             PassMode::Ignore => {}
-            PassMode::Indirect { meta_attrs: None, .. } => {
+            PassMode::Indirect {
+                meta_attrs: None, ..
+            } => {
                 let place = PlaceRef::new_sized(val, arg_abi.layout);
                 OperandValue::Ref(place.val).store(self, dst);
             }
@@ -818,7 +1061,15 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let scratch = self.alloca(size, align);
                 self.store(val, scratch, align);
                 let sz = self.const_usize(arg_abi.layout.size.bytes());
-                self.memcpy(dst.val.llval, dst.val.align, scratch, align, sz, MemFlags::empty(), None);
+                self.memcpy(
+                    dst.val.llval,
+                    dst.val.align,
+                    scratch,
+                    align,
+                    sz,
+                    MemFlags::empty(),
+                    None,
+                );
             }
             _ => {
                 OperandRef::from_immediate_or_packed_pair(self, val, arg_abi.layout)
@@ -827,11 +1078,15 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             }
         }
     }
-
 }
 
 impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
-    fn add_coverage(&mut self, _instance: Instance<'tcx>, _kind: &rustc_middle::mir::coverage::CoverageKind) {}
+    fn add_coverage(
+        &mut self,
+        _instance: Instance<'tcx>,
+        _kind: &rustc_middle::mir::coverage::CoverageKind,
+    ) {
+    }
 }
 
 impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {

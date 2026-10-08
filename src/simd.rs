@@ -22,7 +22,23 @@ struct Elem {
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn elem_of(&self, t: Ty<'tcx>) -> (u64, Elem) {
         let (n, et) = t.simd_size_and_type(self.tcx);
-        (n, Elem { signed: et.is_signed(), float: et.is_floating_point() })
+        (
+            n,
+            Elem {
+                signed: et.is_signed(),
+                float: et.is_floating_point(),
+            },
+        )
+    }
+
+    /// Whether `ty` lowers to native Cranelift SIMD values.
+    pub(crate) fn native(&self, ty: TypeHandle) -> bool {
+        match self.cx.kind(ty) {
+            crate::types::TyK::Vector(e, n) => {
+                crate::types::vec_parts(&self.cx.pctx.borrow(), e, n as u64).is_some()
+            }
+            _ => false,
+        }
     }
 
     fn lane(&mut self, v: Value, i: u64) -> Value {
@@ -71,7 +87,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ("min" | "fmin", _) | ("max" | "fmax", _) => {
                 let is_min = op.ends_with("min");
                 let c = if e.float {
-                    self.fcmp(if is_min { RealPredicate::RealOLT } else { RealPredicate::RealOGT }, x, y)
+                    self.fcmp(
+                        if is_min {
+                            RealPredicate::RealOLT
+                        } else {
+                            RealPredicate::RealOGT
+                        },
+                        x,
+                        y,
+                    )
                 } else {
                     let p = match (is_min, e.signed) {
                         (true, true) => IntPredicate::IntSLT,
@@ -158,7 +182,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let xs = self.lanes(a(0), n);
             let out = xs
                 .into_iter()
-                .map(|x| if op == "expose_provenance" { self.ptrtoint(x, et) } else { self.inttoptr(x, et) })
+                .map(|x| {
+                    if op == "expose_provenance" {
+                        self.ptrtoint(x, et)
+                    } else {
+                        self.inttoptr(x, et)
+                    }
+                })
                 .collect();
             return Some(self.build_vec(ret, out));
         }
@@ -169,13 +199,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (n, e) = self.elem_of(args[0].layout.ty);
         let base = op.strip_suffix("_dyn").unwrap_or(op);
         match base {
-            "add" | "sub" | "mul" | "div" | "rem" | "shl" | "shr" | "and" | "or" | "xor" | "fmin"
-            | "fmax" | "minimum_number_nsz" | "maximum_number_nsz" => {
+            "add" | "sub" | "mul" | "div" | "rem" | "shl" | "shr" | "and" | "or" | "xor"
+            | "fmin" | "fmax" | "minimum_number_nsz" | "maximum_number_nsz" => {
                 let op = match base {
                     "minimum_number_nsz" => "fmin",
                     "maximum_number_nsz" => "fmax",
                     o => o,
                 };
+                if self.native(ret) {
+                    let (x, y) = (a(0), a(1));
+                    let r = match (op, e.float) {
+                        ("add", false) => Some(self.add(x, y)),
+                        ("sub", false) => Some(self.sub(x, y)),
+                        ("and", false) => Some(self.and(x, y)),
+                        ("or", false) => Some(self.or(x, y)),
+                        ("xor", false) => Some(self.xor(x, y)),
+                        ("add", true) => Some(self.fadd(x, y)),
+                        ("sub", true) => Some(self.fsub(x, y)),
+                        ("mul", true) => Some(self.fmul(x, y)),
+                        ("div", true) => Some(self.fdiv(x, y)),
+                        _ => None,
+                    };
+                    if r.is_some() {
+                        return r;
+                    }
+                }
                 let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -184,20 +232,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 Some(self.build_vec(ret, out))
             }
             "saturating_add" | "saturating_sub" => {
-                let sym = if base == "saturating_add" { "add" } else { "sub" };
+                let sym = if base == "saturating_add" {
+                    "add"
+                } else {
+                    "sub"
+                };
                 let llvm = format!("llvm.{}{sym}.sat", if e.signed { "s" } else { "u" });
                 let et = self.element_type(ret);
                 let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
-                let out = xs.into_iter().zip(ys).map(|(x, y)| self.intrinsic(&llvm, et, &[x, y])).collect();
+                let out = xs
+                    .into_iter()
+                    .zip(ys)
+                    .map(|(x, y)| self.intrinsic(&llvm, et, &[x, y]))
+                    .collect();
                 Some(self.build_vec(ret, out))
             }
             "neg" => {
                 let xs = self.lanes(a(0), n);
-                let out = xs.into_iter().map(|x| if e.float { self.fneg(x) } else { self.neg(x) }).collect();
+                let out = xs
+                    .into_iter()
+                    .map(|x| if e.float { self.fneg(x) } else { self.neg(x) })
+                    .collect();
                 Some(self.build_vec(ret, out))
             }
-            "fabs" | "fsqrt" | "floor" | "ceil" | "trunc" | "round_ties_even" | "ctpop" | "ctlz"
-            | "cttz" | "bswap" | "bitreverse" | "round" => {
+            "fabs" | "fsqrt" | "floor" | "ceil" | "trunc" | "round_ties_even" | "ctpop"
+            | "ctlz" | "cttz" | "bswap" | "bitreverse" | "round" => {
                 let i = match base {
                     "fsqrt" => "llvm.sqrt".to_string(),
                     "round_ties_even" => "llvm.roundeven".to_string(),
@@ -205,8 +264,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 };
                 let et = self.element_type(ret);
                 let xs = self.lanes(a(0), n);
-                let out = xs.into_iter().map(|x| self.intrinsic(&i, et, &[x])).collect();
+                let out = xs
+                    .into_iter()
+                    .map(|x| self.intrinsic(&i, et, &[x]))
+                    .collect();
                 Some(self.build_vec(ret, out))
+            }
+            "eq" | "ne" | "lt" | "le" | "gt" | "ge"
+                if self.native(self.val_ty(a(0))) && self.native(ret) =>
+            {
+                let k = if e.float {
+                    "f"
+                } else if e.signed {
+                    "s"
+                } else {
+                    "u"
+                };
+                Some(self.intrinsic(&format!("pliron.vcmp.{base}.{k}"), ret, &[a(0), a(1)]))
+            }
+            "select" if self.native(self.val_ty(a(0))) && self.native(ret) => {
+                Some(self.intrinsic("pliron.vbitselect", ret, &[a(0), a(1), a(2)]))
+            }
+            "bitmask"
+                if self.native(self.val_ty(a(0))) && self.type_kind(ret) == TypeKind::Integer =>
+            {
+                Some(self.intrinsic("pliron.vhigh_bits", ret, &[a(0)]))
             }
             "eq" | "ne" | "lt" | "le" | "gt" | "ge" => {
                 let et = self.element_type(ret);
@@ -219,7 +301,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 Some(self.build_vec(ret, out))
             }
             "select" => {
-                let (ms, xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n), self.lanes(a(2), n));
+                let (ms, xs, ys) = (
+                    self.lanes(a(0), n),
+                    self.lanes(a(1), n),
+                    self.lanes(a(2), n),
+                );
                 let mut out = Vec::new();
                 for ((m, x), y) in ms.into_iter().zip(xs).zip(ys) {
                     let c = self.nonzero(m);
@@ -251,7 +337,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let (size, align) = (el.size, el.align.abi);
                 let et = self.element_type(ret);
                 let slot = self.alloca(size * n, align);
-                let (vs, ps, ms) = (self.lanes(a(0), n), self.lanes(a(1), n), self.lanes(a(2), n));
+                let (vs, ps, ms) = (
+                    self.lanes(a(0), n),
+                    self.lanes(a(1), n),
+                    self.lanes(a(2), n),
+                );
                 let mut out = Vec::new();
                 for (i, ((v, p), m)) in vs.into_iter().zip(ps).zip(ms).enumerate() {
                     let off = self.const_usize(size.bytes() * i as u64);
@@ -265,7 +355,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             "fma" | "relaxed_fma" => {
                 let et = self.element_type(ret);
-                let (xs, ys, zs) = (self.lanes(a(0), n), self.lanes(a(1), n), self.lanes(a(2), n));
+                let (xs, ys, zs) = (
+                    self.lanes(a(0), n),
+                    self.lanes(a(1), n),
+                    self.lanes(a(2), n),
+                );
                 let out = xs
                     .into_iter()
                     .zip(ys)
@@ -281,12 +375,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             "shuffle" => {
                 let idx = a(2);
-                let Some(ConstVal::Agg(ids)) = self.cval(idx) else { return None };
+                let Some(ConstVal::Agg(ids)) = self.cval(idx) else {
+                    return None;
+                };
                 let (xs, ys) = (self.lanes(a(0), n), self.lanes(a(1), n));
                 let mut out = Vec::new();
                 for i in ids {
                     let k = self.const_to_opt_u128(i, false)? as u64;
-                    out.push(if k < n { xs[k as usize] } else { ys[(k - n) as usize] });
+                    out.push(if k < n {
+                        xs[k as usize]
+                    } else {
+                        ys[(k - n) as usize]
+                    });
                 }
                 Some(self.build_vec(ret, out))
             }
@@ -313,7 +413,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let mut acc = self.const_bool(base == "reduce_all");
                 for x in xs {
                     let c = self.nonzero(x);
-                    acc = if base == "reduce_all" { self.and(acc, c) } else { self.or(acc, c) };
+                    acc = if base == "reduce_all" {
+                        self.and(acc, c)
+                    } else {
+                        self.or(acc, c)
+                    };
                 }
                 Some(acc)
             }
@@ -335,7 +439,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let (_, to) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
                 let xs = self.lanes(a(0), n);
-                let out = xs.into_iter().map(|x| self.lane_cast(x, e, to, et)).collect();
+                let out = xs
+                    .into_iter()
+                    .map(|x| self.lane_cast(x, e, to, et))
+                    .collect();
                 Some(self.build_vec(ret, out))
             }
             _ => None,
@@ -383,8 +490,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Predicates 16..31 only differ in signaling, so the low 4 bits suffice.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
                 let pred = [
-                    RealOEQ, RealOLT, RealOLE, RealUNO, RealUNE, RealUGE, RealUGT, RealORD, RealUEQ, RealULT,
-                    RealULE, RealPredicateFalse, RealONE, RealOGE, RealOGT, RealPredicateTrue,
+                    RealOEQ,
+                    RealOLT,
+                    RealOLE,
+                    RealUNO,
+                    RealUNE,
+                    RealUGE,
+                    RealUGT,
+                    RealORD,
+                    RealUEQ,
+                    RealULT,
+                    RealULE,
+                    RealPredicateFalse,
+                    RealONE,
+                    RealOGE,
+                    RealOGT,
+                    RealPredicateTrue,
                 ][imm as usize];
                 let (n, _) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);

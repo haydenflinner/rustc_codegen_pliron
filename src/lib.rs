@@ -6,8 +6,8 @@
 
 extern crate rustc_abi;
 extern crate rustc_apfloat;
-extern crate rustc_attr_ir;
 extern crate rustc_ast;
+extern crate rustc_attr_ir;
 extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
@@ -21,17 +21,24 @@ extern crate rustc_span;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 
+mod abi;
+mod asm;
 mod builder;
+mod constload;
 mod consts;
 mod context;
-mod asm;
 mod eh;
-mod objmerge;
-mod intrinsic;
-mod simd;
 mod hot;
 mod inline;
+mod instcombine;
+mod intrinsic;
 mod lower;
+mod memcpyopt;
+mod nounwind;
+mod objmerge;
+mod phisimp;
+mod simd;
+mod sroa;
 mod type_of;
 mod types;
 mod wasm;
@@ -89,45 +96,129 @@ impl ModuleBufferMethods for PlironBuffer {
 fn build_isa(sess: &Session) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     fb.set("is_pic", "true").unwrap();
-    fb.set("enable_verifier", if cfg!(debug_assertions) { "true" } else { "false" }).unwrap();
-    fb.set("preserve_frame_pointers", "true").unwrap();
+    fb.set(
+        "enable_verifier",
+        if cfg!(debug_assertions) {
+            "true"
+        } else {
+            "false"
+        },
+    )
+    .unwrap();
+    // Frame pointers follow the target default and `-Cforce-frame-pointers`, as in
+    // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
+    // `PLIRON_OMIT_FP=0` keeps them unconditionally.
+    let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
+    let keep_fp =
+        fp != rustc_target::spec::FramePointer::MayOmit || !pass_enabled("PLIRON_OMIT_FP");
+    fb.set(
+        "preserve_frame_pointers",
+        if keep_fp { "true" } else { "false" },
+    )
+    .unwrap();
     fb.set("tls_model", "elf_gd").unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
-    fb.set("opt_level", if sess.opts.optimize == OptLevel::No { "none" } else { "speed_and_size" })
-        .unwrap();
+    fb.set(
+        "opt_level",
+        if sess.opts.optimize == OptLevel::No {
+            "none"
+        } else {
+            "speed_and_size"
+        },
+    )
+    .unwrap();
     let triple = target_lexicon::Triple::from_str(&sess.target.llvm_target)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("unsupported target: {e}")));
     let flags = settings::Flags::new(fb);
     let isa = cranelift_codegen::isa::lookup(triple)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
-    isa.finish(flags).unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
+    isa.finish(flags)
+        .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
+}
+
+/// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
+pub(crate) fn pass_enabled(var: &str) -> bool {
+    std::env::var(var).map_or(true, |v| v != "0")
 }
 
 fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
-    let emit_ir = cx.tcx.sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+    let emit_ir = cx
+        .tcx
+        .sess
+        .opts
+        .output_types
+        .contains_key(&OutputType::LlvmAssembly)
         || std::env::var_os("PLIRON_DUMP").is_some();
-    let ir = if emit_ir { cx.print_ir() } else { String::new() };
+    let ir = if emit_ir {
+        cx.print_ir()
+    } else {
+        String::new()
+    };
     if std::env::var_os("PLIRON_DUMP").is_some() {
         eprintln!("==== {name} ====\n{ir}");
     }
     if cx.tcx.sess.opts.optimize != OptLevel::No {
-        inline::run(&mut cx.pctx.borrow_mut(), &mut cx.st.borrow_mut());
+        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+        inline::run(ctx, st);
+        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
+            nounwind::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_SRET2REG") {
+            abi::run(ctx, st);
+        }
+        if std::env::var("PLIRON_DEADARG").is_ok_and(|v| v == "1") {
+            abi::dead_args(ctx, st);
+        }
+        if pass_enabled("PLIRON_INSTCOMBINE") {
+            instcombine::run(ctx, st);
+        }
+        if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
+            memcpyopt::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_PHISIMP") {
+            phisimp::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_SROA") {
+            sroa::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_CONSTLOAD") {
+            constload::run(ctx, st);
+        }
+        st.notrap = pass_enabled("PLIRON_NOTRAP");
+        if pass_enabled("PLIRON_DEADFN") {
+            inline::dead_fns(ctx, st);
+        }
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
         let obj = wasm::lower_to_wasm(&cx.pctx.borrow(), &cx.st.borrow(), name);
-        return PlironModule { obj, ir, asm: String::new() };
+        return PlironModule {
+            obj,
+            ir,
+            asm: String::new(),
+        };
     }
     let isa = build_isa(cx.tcx.sess);
-    let hot = std::env::var("PLIRON_HOT").is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
-    let obj = lower::lower_to_object(cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind, hot, &cx.pctx.borrow(), &cx.st.borrow(), isa, name);
+    let hot = std::env::var("PLIRON_HOT")
+        .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
+    let obj = lower::lower_to_object(
+        cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+        hot,
+        &cx.pctx.borrow(),
+        &cx.st.borrow(),
+        isa,
+        name,
+    );
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }
 }
 
 impl CodegenBackend for PlironCodegenBackend {
     fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
-        types::PTR32.store(sess.target.pointer_width == 32, std::sync::atomic::Ordering::Relaxed);
+        types::PTR32.store(
+            sess.target.pointer_width == 32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         use rustc_target::spec::{Arch, Os};
         let feats: Vec<Symbol> = match sess.target.arch {
             Arch::X86_64 if sess.target.os != Os::None => ["fxsr", "sse", "sse2", "x87"]
@@ -153,7 +244,10 @@ impl CodegenBackend for PlironCodegenBackend {
 
     fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
         // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
-        rustc_session::CodegenBackendInit { thin_lto_supported: false, ..Default::default() }
+        rustc_session::CodegenBackendInit {
+            thin_lto_supported: false,
+            ..Default::default()
+        }
     }
 
     fn target_cpu(&self, _sess: &Session) -> String {
@@ -215,7 +309,13 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             let to = mangle_internal_symbol(tcx, &default_fn_name(method.name));
             wrapper(&cx, &from, Some(&to), &types, output);
         }
-        wrapper(&cx, &mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE), None, &[], None);
+        wrapper(
+            &cx,
+            &mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE),
+            None,
+            &[],
+            None,
+        );
         finish_module(&cx, module_name)
     }
 
@@ -243,7 +343,12 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     cx.st.borrow_mut().cgu = cgu_name.to_string();
     let mono_items = cgu.items_in_deterministic_order(tcx);
     for &(mono_item, data) in &mono_items {
-        mono_item.predefine::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data.linkage, data.visibility);
+        mono_item.predefine::<Builder<'_, '_>>(
+            &mut cx,
+            cgu_name.as_str(),
+            data.linkage,
+            data.visibility,
+        );
     }
     for &(mono_item, data) in &mono_items {
         mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
@@ -270,7 +375,11 @@ fn wrapper(
         let args: Vec<_> = (0..types.len()).map(|i| bx.get_param(i)).collect();
         let callee = cx.sym_addr(to);
         let r = bx.call_raw(fty, callee, &args, Exts::default());
-        if output.is_some() { bx.ret(r) } else { bx.ret_void() }
+        if output.is_some() {
+            bx.ret(r)
+        } else {
+            bx.ret_void()
+        }
     } else {
         bx.ret_void();
     }
@@ -286,7 +395,11 @@ impl WriteBackendMethods for PlironCodegenBackend {
         false
     }
 
-    fn target_machine_factory(&self, _sess: &Session, _opt_level: OptLevel) -> TargetMachineFactoryFn<Self> {
+    fn target_machine_factory(
+        &self,
+        _sess: &Session,
+        _opt_level: OptLevel,
+    ) -> TargetMachineFactoryFn<Self> {
         Arc::new(|_, _| ())
     }
 
