@@ -141,6 +141,9 @@ pub struct State<'tcx> {
 
     /// Run `clifpeep` on each lowered Cranelift function (`-O`, `PLIRON_PEEP`).
     pub peep: bool,
+
+    /// Run `tailmerge` on each lowered Cranelift function (`-O`, `PLIRON_TAILMERGE`).
+    pub tailmerge: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).

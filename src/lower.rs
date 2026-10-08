@@ -209,6 +209,7 @@ pub fn lower_to_object(
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     let mut threaded = 0usize;
+    let mut merged = 0usize;
     let mut forwarded = 0usize;
     let mut peeped = 0usize;
     for (n, f) in &st.funcs {
@@ -269,6 +270,14 @@ pub fn lower_to_object(
         if st.peep {
             peeped += crate::clifpeep::run(&mut clctx.func);
         }
+        if st.tailmerge {
+            merged += crate::tailmerge::run(&mut clctx.func);
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("tailmerge broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.loadfwd {
             forwarded += crate::loadfwd::run(&mut clctx.func);
             if dump {
@@ -291,7 +300,7 @@ pub fn lower_to_object(
         eprintln!("loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes");
     }
     if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
-        eprintln!("jumpthread {name}: {threaded} edges threaded");
+        eprintln!("jumpthread {name}: {threaded} edges threaded, {merged} exit blocks merged");
     }
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
