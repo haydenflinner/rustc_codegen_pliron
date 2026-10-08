@@ -1,0 +1,1875 @@
+# MSP430 instruction set, one statement per line, checked against
+# msp430-elf-as -mcpu=430 (and -mcpu=430xv2, which shares this corpus).
+# Operands that name a symbol leave the field to a relocation on both
+# sides; tools/xas-diff/msp430-relocs.txt checks those relocations.
+
+# two-operand instructions, every source mode
+	mov	r5, r6
+	mov	r0, r6
+	mov	pc, r6
+	mov	sp, r6
+	mov	r1, r6
+	mov	sr, r6
+	mov	r2, r6
+	mov	r3, r6
+	mov	r15, r6
+	mov	R12, r6
+	mov	#0, r6
+	mov	#1, r6
+	mov	#2, r6
+	mov	#-1, r6
+	mov	#4, r6
+	mov	#8, r6
+	mov	#3, r6
+	mov	#0x1234, r6
+	mov	#-2, r6
+	mov	#0xffff, r6
+	mov	#65535, r6
+	mov	#-32768, r6
+	mov	#0x8000, r6
+	mov	#lo(0x12345), r6
+	mov	#hi(0x12345), r6
+	mov	#llo(0x12345678), r6
+	mov	#lhi(0x12345678), r6
+	mov	#hlo(0x12345678), r6
+	mov	#hhi(0x12345678), r6
+	mov	#1+1, r6
+	mov	#sym, r6
+	mov	#sym+2, r6
+	mov	#lo(sym), r6
+	mov	#hi(sym), r6
+	mov	&0x200, r6
+	mov	&0, r6
+	mov	&0xffff, r6
+	mov	&sym, r6
+	mov	&sym+4, r6
+	mov	2(r4), r6
+	mov	0(r4), r6
+	mov	-2(r1), r6
+	mov	0x7fff(r15), r6
+	mov	sym(r4), r6
+	mov	(1+1)(r5), r6
+	mov	@r4, r6
+	mov	@r4+, r6
+	mov	@sp+, r6
+	mov	@r15, r6
+	mov	@r2, r6
+	mov	@r3+, r6
+	mov	sym, r6
+	mov	sym+2, r6
+	mov	0x200, r6
+	mov	-4, r6
+	mov	5, r6
+	mov	0x5, r6
+	mov.b	r5, r6
+	mov.b	r0, r6
+	mov.b	pc, r6
+	mov.b	sp, r6
+	mov.b	r1, r6
+	mov.b	sr, r6
+	mov.b	r2, r6
+	mov.b	r3, r6
+	mov.b	r15, r6
+	mov.b	R12, r6
+	mov.b	#0, r6
+	mov.b	#1, r6
+	mov.b	#2, r6
+	mov.b	#-1, r6
+	mov.b	#4, r6
+	mov.b	#8, r6
+	mov.b	#3, r6
+	mov.b	#0x1234, r6
+	mov.b	#-2, r6
+	mov.b	#0xffff, r6
+	mov.b	#65535, r6
+	mov.b	#-32768, r6
+	mov.b	#0x8000, r6
+	mov.b	#lo(0x12345), r6
+	mov.b	#hi(0x12345), r6
+	mov.b	#llo(0x12345678), r6
+	mov.b	#lhi(0x12345678), r6
+	mov.b	#hlo(0x12345678), r6
+	mov.b	#hhi(0x12345678), r6
+	mov.b	#1+1, r6
+	mov.b	#sym, r6
+	mov.b	#sym+2, r6
+	mov.b	#lo(sym), r6
+	mov.b	#hi(sym), r6
+	mov.b	&0x200, r6
+	mov.b	&0, r6
+	mov.b	&0xffff, r6
+	mov.b	&sym, r6
+	mov.b	&sym+4, r6
+	mov.b	2(r4), r6
+	mov.b	0(r4), r6
+	mov.b	-2(r1), r6
+	mov.b	0x7fff(r15), r6
+	mov.b	sym(r4), r6
+	mov.b	(1+1)(r5), r6
+	mov.b	@r4, r6
+	mov.b	@r4+, r6
+	mov.b	@sp+, r6
+	mov.b	@r15, r6
+	mov.b	@r2, r6
+	mov.b	@r3+, r6
+	mov.b	sym, r6
+	mov.b	sym+2, r6
+	mov.b	0x200, r6
+	mov.b	-4, r6
+	mov.b	5, r6
+	mov.b	0x5, r6
+	mov.w	r5, r6
+	mov.w	#0, r6
+	mov.w	#3, r6
+	mov.w	#0x1234, r6
+	mov.w	&0x200, r6
+	mov.w	2(r4), r6
+	mov.w	@r4, r6
+	mov.w	@r4+, r6
+	mov.w	sym, r6
+	add	r5, r6
+	add	r0, r6
+	add	pc, r6
+	add	sp, r6
+	add	r1, r6
+	add	sr, r6
+	add	r2, r6
+	add	r3, r6
+	add	r15, r6
+	add	R12, r6
+	add	#0, r6
+	add	#1, r6
+	add	#2, r6
+	add	#-1, r6
+	add	#4, r6
+	add	#8, r6
+	add	#3, r6
+	add	#0x1234, r6
+	add	#-2, r6
+	add	#0xffff, r6
+	add	#65535, r6
+	add	#-32768, r6
+	add	#0x8000, r6
+	add	#lo(0x12345), r6
+	add	#hi(0x12345), r6
+	add	#llo(0x12345678), r6
+	add	#lhi(0x12345678), r6
+	add	#hlo(0x12345678), r6
+	add	#hhi(0x12345678), r6
+	add	#1+1, r6
+	add	#sym, r6
+	add	#sym+2, r6
+	add	#lo(sym), r6
+	add	#hi(sym), r6
+	add	&0x200, r6
+	add	&0, r6
+	add	&0xffff, r6
+	add	&sym, r6
+	add	&sym+4, r6
+	add	2(r4), r6
+	add	0(r4), r6
+	add	-2(r1), r6
+	add	0x7fff(r15), r6
+	add	sym(r4), r6
+	add	(1+1)(r5), r6
+	add	@r4, r6
+	add	@r4+, r6
+	add	@sp+, r6
+	add	@r15, r6
+	add	@r2, r6
+	add	@r3+, r6
+	add	sym, r6
+	add	sym+2, r6
+	add	0x200, r6
+	add	-4, r6
+	add	5, r6
+	add	0x5, r6
+	add.b	r5, r6
+	add.b	r0, r6
+	add.b	pc, r6
+	add.b	sp, r6
+	add.b	r1, r6
+	add.b	sr, r6
+	add.b	r2, r6
+	add.b	r3, r6
+	add.b	r15, r6
+	add.b	R12, r6
+	add.b	#0, r6
+	add.b	#1, r6
+	add.b	#2, r6
+	add.b	#-1, r6
+	add.b	#4, r6
+	add.b	#8, r6
+	add.b	#3, r6
+	add.b	#0x1234, r6
+	add.b	#-2, r6
+	add.b	#0xffff, r6
+	add.b	#65535, r6
+	add.b	#-32768, r6
+	add.b	#0x8000, r6
+	add.b	#lo(0x12345), r6
+	add.b	#hi(0x12345), r6
+	add.b	#llo(0x12345678), r6
+	add.b	#lhi(0x12345678), r6
+	add.b	#hlo(0x12345678), r6
+	add.b	#hhi(0x12345678), r6
+	add.b	#1+1, r6
+	add.b	#sym, r6
+	add.b	#sym+2, r6
+	add.b	#lo(sym), r6
+	add.b	#hi(sym), r6
+	add.b	&0x200, r6
+	add.b	&0, r6
+	add.b	&0xffff, r6
+	add.b	&sym, r6
+	add.b	&sym+4, r6
+	add.b	2(r4), r6
+	add.b	0(r4), r6
+	add.b	-2(r1), r6
+	add.b	0x7fff(r15), r6
+	add.b	sym(r4), r6
+	add.b	(1+1)(r5), r6
+	add.b	@r4, r6
+	add.b	@r4+, r6
+	add.b	@sp+, r6
+	add.b	@r15, r6
+	add.b	@r2, r6
+	add.b	@r3+, r6
+	add.b	sym, r6
+	add.b	sym+2, r6
+	add.b	0x200, r6
+	add.b	-4, r6
+	add.b	5, r6
+	add.b	0x5, r6
+	add.w	r5, r6
+	add.w	#0, r6
+	add.w	#3, r6
+	add.w	#0x1234, r6
+	add.w	&0x200, r6
+	add.w	2(r4), r6
+	add.w	@r4, r6
+	add.w	@r4+, r6
+	add.w	sym, r6
+	addc	r5, r6
+	addc	#0, r6
+	addc	#3, r6
+	addc	#0x1234, r6
+	addc	&0x200, r6
+	addc	2(r4), r6
+	addc	@r4, r6
+	addc	@r4+, r6
+	addc	sym, r6
+	addc.b	r5, r6
+	addc.b	#0, r6
+	addc.b	#3, r6
+	addc.b	#0x1234, r6
+	addc.b	&0x200, r6
+	addc.b	2(r4), r6
+	addc.b	@r4, r6
+	addc.b	@r4+, r6
+	addc.b	sym, r6
+	addc.w	r5, r6
+	addc.w	#0, r6
+	addc.w	#3, r6
+	addc.w	#0x1234, r6
+	addc.w	&0x200, r6
+	addc.w	2(r4), r6
+	addc.w	@r4, r6
+	addc.w	@r4+, r6
+	addc.w	sym, r6
+	sub	r5, r6
+	sub	#0, r6
+	sub	#3, r6
+	sub	#0x1234, r6
+	sub	&0x200, r6
+	sub	2(r4), r6
+	sub	@r4, r6
+	sub	@r4+, r6
+	sub	sym, r6
+	sub.b	r5, r6
+	sub.b	#0, r6
+	sub.b	#3, r6
+	sub.b	#0x1234, r6
+	sub.b	&0x200, r6
+	sub.b	2(r4), r6
+	sub.b	@r4, r6
+	sub.b	@r4+, r6
+	sub.b	sym, r6
+	sub.w	r5, r6
+	sub.w	#0, r6
+	sub.w	#3, r6
+	sub.w	#0x1234, r6
+	sub.w	&0x200, r6
+	sub.w	2(r4), r6
+	sub.w	@r4, r6
+	sub.w	@r4+, r6
+	sub.w	sym, r6
+	subc	r5, r6
+	subc	#0, r6
+	subc	#3, r6
+	subc	#0x1234, r6
+	subc	&0x200, r6
+	subc	2(r4), r6
+	subc	@r4, r6
+	subc	@r4+, r6
+	subc	sym, r6
+	subc.b	r5, r6
+	subc.b	#0, r6
+	subc.b	#3, r6
+	subc.b	#0x1234, r6
+	subc.b	&0x200, r6
+	subc.b	2(r4), r6
+	subc.b	@r4, r6
+	subc.b	@r4+, r6
+	subc.b	sym, r6
+	subc.w	r5, r6
+	subc.w	#0, r6
+	subc.w	#3, r6
+	subc.w	#0x1234, r6
+	subc.w	&0x200, r6
+	subc.w	2(r4), r6
+	subc.w	@r4, r6
+	subc.w	@r4+, r6
+	subc.w	sym, r6
+	cmp	r5, r6
+	cmp	r0, r6
+	cmp	pc, r6
+	cmp	sp, r6
+	cmp	r1, r6
+	cmp	sr, r6
+	cmp	r2, r6
+	cmp	r3, r6
+	cmp	r15, r6
+	cmp	R12, r6
+	cmp	#0, r6
+	cmp	#1, r6
+	cmp	#2, r6
+	cmp	#-1, r6
+	cmp	#4, r6
+	cmp	#8, r6
+	cmp	#3, r6
+	cmp	#0x1234, r6
+	cmp	#-2, r6
+	cmp	#0xffff, r6
+	cmp	#65535, r6
+	cmp	#-32768, r6
+	cmp	#0x8000, r6
+	cmp	#lo(0x12345), r6
+	cmp	#hi(0x12345), r6
+	cmp	#llo(0x12345678), r6
+	cmp	#lhi(0x12345678), r6
+	cmp	#hlo(0x12345678), r6
+	cmp	#hhi(0x12345678), r6
+	cmp	#1+1, r6
+	cmp	#sym, r6
+	cmp	#sym+2, r6
+	cmp	#lo(sym), r6
+	cmp	#hi(sym), r6
+	cmp	&0x200, r6
+	cmp	&0, r6
+	cmp	&0xffff, r6
+	cmp	&sym, r6
+	cmp	&sym+4, r6
+	cmp	2(r4), r6
+	cmp	0(r4), r6
+	cmp	-2(r1), r6
+	cmp	0x7fff(r15), r6
+	cmp	sym(r4), r6
+	cmp	(1+1)(r5), r6
+	cmp	@r4, r6
+	cmp	@r4+, r6
+	cmp	@sp+, r6
+	cmp	@r15, r6
+	cmp	@r2, r6
+	cmp	@r3+, r6
+	cmp	sym, r6
+	cmp	sym+2, r6
+	cmp	0x200, r6
+	cmp	-4, r6
+	cmp	5, r6
+	cmp	0x5, r6
+	cmp.b	r5, r6
+	cmp.b	r0, r6
+	cmp.b	pc, r6
+	cmp.b	sp, r6
+	cmp.b	r1, r6
+	cmp.b	sr, r6
+	cmp.b	r2, r6
+	cmp.b	r3, r6
+	cmp.b	r15, r6
+	cmp.b	R12, r6
+	cmp.b	#0, r6
+	cmp.b	#1, r6
+	cmp.b	#2, r6
+	cmp.b	#-1, r6
+	cmp.b	#4, r6
+	cmp.b	#8, r6
+	cmp.b	#3, r6
+	cmp.b	#0x1234, r6
+	cmp.b	#-2, r6
+	cmp.b	#0xffff, r6
+	cmp.b	#65535, r6
+	cmp.b	#-32768, r6
+	cmp.b	#0x8000, r6
+	cmp.b	#lo(0x12345), r6
+	cmp.b	#hi(0x12345), r6
+	cmp.b	#llo(0x12345678), r6
+	cmp.b	#lhi(0x12345678), r6
+	cmp.b	#hlo(0x12345678), r6
+	cmp.b	#hhi(0x12345678), r6
+	cmp.b	#1+1, r6
+	cmp.b	#sym, r6
+	cmp.b	#sym+2, r6
+	cmp.b	#lo(sym), r6
+	cmp.b	#hi(sym), r6
+	cmp.b	&0x200, r6
+	cmp.b	&0, r6
+	cmp.b	&0xffff, r6
+	cmp.b	&sym, r6
+	cmp.b	&sym+4, r6
+	cmp.b	2(r4), r6
+	cmp.b	0(r4), r6
+	cmp.b	-2(r1), r6
+	cmp.b	0x7fff(r15), r6
+	cmp.b	sym(r4), r6
+	cmp.b	(1+1)(r5), r6
+	cmp.b	@r4, r6
+	cmp.b	@r4+, r6
+	cmp.b	@sp+, r6
+	cmp.b	@r15, r6
+	cmp.b	@r2, r6
+	cmp.b	@r3+, r6
+	cmp.b	sym, r6
+	cmp.b	sym+2, r6
+	cmp.b	0x200, r6
+	cmp.b	-4, r6
+	cmp.b	5, r6
+	cmp.b	0x5, r6
+	cmp.w	r5, r6
+	cmp.w	#0, r6
+	cmp.w	#3, r6
+	cmp.w	#0x1234, r6
+	cmp.w	&0x200, r6
+	cmp.w	2(r4), r6
+	cmp.w	@r4, r6
+	cmp.w	@r4+, r6
+	cmp.w	sym, r6
+	dadd	r5, r6
+	dadd	#0, r6
+	dadd	#3, r6
+	dadd	#0x1234, r6
+	dadd	&0x200, r6
+	dadd	2(r4), r6
+	dadd	@r4, r6
+	dadd	@r4+, r6
+	dadd	sym, r6
+	dadd.b	r5, r6
+	dadd.b	#0, r6
+	dadd.b	#3, r6
+	dadd.b	#0x1234, r6
+	dadd.b	&0x200, r6
+	dadd.b	2(r4), r6
+	dadd.b	@r4, r6
+	dadd.b	@r4+, r6
+	dadd.b	sym, r6
+	dadd.w	r5, r6
+	dadd.w	#0, r6
+	dadd.w	#3, r6
+	dadd.w	#0x1234, r6
+	dadd.w	&0x200, r6
+	dadd.w	2(r4), r6
+	dadd.w	@r4, r6
+	dadd.w	@r4+, r6
+	dadd.w	sym, r6
+	bit	r5, r6
+	bit	#0, r6
+	bit	#3, r6
+	bit	#0x1234, r6
+	bit	&0x200, r6
+	bit	2(r4), r6
+	bit	@r4, r6
+	bit	@r4+, r6
+	bit	sym, r6
+	bit.b	r5, r6
+	bit.b	#0, r6
+	bit.b	#3, r6
+	bit.b	#0x1234, r6
+	bit.b	&0x200, r6
+	bit.b	2(r4), r6
+	bit.b	@r4, r6
+	bit.b	@r4+, r6
+	bit.b	sym, r6
+	bit.w	r5, r6
+	bit.w	#0, r6
+	bit.w	#3, r6
+	bit.w	#0x1234, r6
+	bit.w	&0x200, r6
+	bit.w	2(r4), r6
+	bit.w	@r4, r6
+	bit.w	@r4+, r6
+	bit.w	sym, r6
+	bic	r5, r6
+	bic	#0, r6
+	bic	#3, r6
+	bic	#0x1234, r6
+	bic	&0x200, r6
+	bic	2(r4), r6
+	bic	@r4, r6
+	bic	@r4+, r6
+	bic	sym, r6
+	bic.b	r5, r6
+	bic.b	#0, r6
+	bic.b	#3, r6
+	bic.b	#0x1234, r6
+	bic.b	&0x200, r6
+	bic.b	2(r4), r6
+	bic.b	@r4, r6
+	bic.b	@r4+, r6
+	bic.b	sym, r6
+	bic.w	r5, r6
+	bic.w	#0, r6
+	bic.w	#3, r6
+	bic.w	#0x1234, r6
+	bic.w	&0x200, r6
+	bic.w	2(r4), r6
+	bic.w	@r4, r6
+	bic.w	@r4+, r6
+	bic.w	sym, r6
+	bis	r5, r6
+	bis	#0, r6
+	bis	#3, r6
+	bis	#0x1234, r6
+	bis	&0x200, r6
+	bis	2(r4), r6
+	bis	@r4, r6
+	bis	@r4+, r6
+	bis	sym, r6
+	bis.b	r5, r6
+	bis.b	#0, r6
+	bis.b	#3, r6
+	bis.b	#0x1234, r6
+	bis.b	&0x200, r6
+	bis.b	2(r4), r6
+	bis.b	@r4, r6
+	bis.b	@r4+, r6
+	bis.b	sym, r6
+	bis.w	r5, r6
+	bis.w	#0, r6
+	bis.w	#3, r6
+	bis.w	#0x1234, r6
+	bis.w	&0x200, r6
+	bis.w	2(r4), r6
+	bis.w	@r4, r6
+	bis.w	@r4+, r6
+	bis.w	sym, r6
+	xor	r5, r6
+	xor	#0, r6
+	xor	#3, r6
+	xor	#0x1234, r6
+	xor	&0x200, r6
+	xor	2(r4), r6
+	xor	@r4, r6
+	xor	@r4+, r6
+	xor	sym, r6
+	xor.b	r5, r6
+	xor.b	#0, r6
+	xor.b	#3, r6
+	xor.b	#0x1234, r6
+	xor.b	&0x200, r6
+	xor.b	2(r4), r6
+	xor.b	@r4, r6
+	xor.b	@r4+, r6
+	xor.b	sym, r6
+	xor.w	r5, r6
+	xor.w	#0, r6
+	xor.w	#3, r6
+	xor.w	#0x1234, r6
+	xor.w	&0x200, r6
+	xor.w	2(r4), r6
+	xor.w	@r4, r6
+	xor.w	@r4+, r6
+	xor.w	sym, r6
+	and	r5, r6
+	and	#0, r6
+	and	#3, r6
+	and	#0x1234, r6
+	and	&0x200, r6
+	and	2(r4), r6
+	and	@r4, r6
+	and	@r4+, r6
+	and	sym, r6
+	and.b	r5, r6
+	and.b	#0, r6
+	and.b	#3, r6
+	and.b	#0x1234, r6
+	and.b	&0x200, r6
+	and.b	2(r4), r6
+	and.b	@r4, r6
+	and.b	@r4+, r6
+	and.b	sym, r6
+	and.w	r5, r6
+	and.w	#0, r6
+	and.w	#3, r6
+	and.w	#0x1234, r6
+	and.w	&0x200, r6
+	and.w	2(r4), r6
+	and.w	@r4, r6
+	and.w	@r4+, r6
+	and.w	sym, r6
+
+# two-operand instructions, every destination mode
+	mov	r5, r6
+	mov	#0x1234, r6
+	mov	&0x202, r6
+	mov	sym2, r6
+	mov	r5, r0
+	mov	#0x1234, r0
+	mov	&0x202, r0
+	mov	sym2, r0
+	mov	r5, r2
+	mov	#0x1234, r2
+	mov	&0x202, r2
+	mov	sym2, r2
+	mov	r5, r3
+	mov	#0x1234, r3
+	mov	&0x202, r3
+	mov	sym2, r3
+	mov	r5, 4(r7)
+	mov	#0x1234, 4(r7)
+	mov	&0x202, 4(r7)
+	mov	sym2, 4(r7)
+	mov	r5, 0(r7)
+	mov	#0x1234, 0(r7)
+	mov	&0x202, 0(r7)
+	mov	sym2, 0(r7)
+	mov	r5, &0x300
+	mov	#0x1234, &0x300
+	mov	&0x202, &0x300
+	mov	sym2, &0x300
+	mov	r5, &sym
+	mov	#0x1234, &sym
+	mov	&0x202, &sym
+	mov	sym2, &sym
+	mov	r5, sym
+	mov	#0x1234, sym
+	mov	&0x202, sym
+	mov	sym2, sym
+	mov	r5, sym(r8)
+	mov	#0x1234, sym(r8)
+	mov	&0x202, sym(r8)
+	mov	sym2, sym(r8)
+	mov	r5, @r8
+	mov	#0x1234, @r8
+	mov	&0x202, @r8
+	mov	sym2, @r8
+	mov	r5, -2(sp)
+	mov	#0x1234, -2(sp)
+	mov	&0x202, -2(sp)
+	mov	sym2, -2(sp)
+	mov	r5, #0
+	mov	#0x1234, #0
+	mov	&0x202, #0
+	mov	sym2, #0
+	mov	r5, #1
+	mov	#0x1234, #1
+	mov	&0x202, #1
+	mov	sym2, #1
+	mov	r5, #2
+	mov	#0x1234, #2
+	mov	&0x202, #2
+	mov	sym2, #2
+	mov.b	r5, r6
+	mov.b	#0x1234, r6
+	mov.b	&0x202, r6
+	mov.b	sym2, r6
+	mov.b	r5, r0
+	mov.b	#0x1234, r0
+	mov.b	&0x202, r0
+	mov.b	sym2, r0
+	mov.b	r5, r2
+	mov.b	#0x1234, r2
+	mov.b	&0x202, r2
+	mov.b	sym2, r2
+	mov.b	r5, r3
+	mov.b	#0x1234, r3
+	mov.b	&0x202, r3
+	mov.b	sym2, r3
+	mov.b	r5, 4(r7)
+	mov.b	#0x1234, 4(r7)
+	mov.b	&0x202, 4(r7)
+	mov.b	sym2, 4(r7)
+	mov.b	r5, 0(r7)
+	mov.b	#0x1234, 0(r7)
+	mov.b	&0x202, 0(r7)
+	mov.b	sym2, 0(r7)
+	mov.b	r5, &0x300
+	mov.b	#0x1234, &0x300
+	mov.b	&0x202, &0x300
+	mov.b	sym2, &0x300
+	mov.b	r5, &sym
+	mov.b	#0x1234, &sym
+	mov.b	&0x202, &sym
+	mov.b	sym2, &sym
+	mov.b	r5, sym
+	mov.b	#0x1234, sym
+	mov.b	&0x202, sym
+	mov.b	sym2, sym
+	mov.b	r5, sym(r8)
+	mov.b	#0x1234, sym(r8)
+	mov.b	&0x202, sym(r8)
+	mov.b	sym2, sym(r8)
+	mov.b	r5, @r8
+	mov.b	#0x1234, @r8
+	mov.b	&0x202, @r8
+	mov.b	sym2, @r8
+	mov.b	r5, -2(sp)
+	mov.b	#0x1234, -2(sp)
+	mov.b	&0x202, -2(sp)
+	mov.b	sym2, -2(sp)
+	mov.b	r5, #0
+	mov.b	#0x1234, #0
+	mov.b	&0x202, #0
+	mov.b	sym2, #0
+	mov.b	r5, #1
+	mov.b	#0x1234, #1
+	mov.b	&0x202, #1
+	mov.b	sym2, #1
+	mov.b	r5, #2
+	mov.b	#0x1234, #2
+	mov.b	&0x202, #2
+	mov.b	sym2, #2
+	mov.w	r5, r6
+	mov.w	#0x1234, r6
+	mov.w	&0x202, r6
+	mov.w	sym2, r6
+	mov.w	r5, 4(r7)
+	mov.w	#0x1234, 4(r7)
+	mov.w	&0x202, 4(r7)
+	mov.w	sym2, 4(r7)
+	mov.w	r5, &0x300
+	mov.w	#0x1234, &0x300
+	mov.w	&0x202, &0x300
+	mov.w	sym2, &0x300
+	mov.w	r5, sym
+	mov.w	#0x1234, sym
+	mov.w	&0x202, sym
+	mov.w	sym2, sym
+	add	r5, r6
+	add	r5, 4(r7)
+	add	r5, &0x300
+	add	r5, sym
+	add.b	r5, r6
+	add.b	r5, 4(r7)
+	add.b	r5, &0x300
+	add.b	r5, sym
+	add.w	r5, r6
+	add.w	r5, 4(r7)
+	add.w	r5, &0x300
+	add.w	r5, sym
+	addc	r5, r6
+	addc	r5, 4(r7)
+	addc	r5, &0x300
+	addc	r5, sym
+	addc.b	r5, r6
+	addc.b	r5, 4(r7)
+	addc.b	r5, &0x300
+	addc.b	r5, sym
+	addc.w	r5, r6
+	addc.w	r5, 4(r7)
+	addc.w	r5, &0x300
+	addc.w	r5, sym
+	sub	r5, r6
+	sub	r5, 4(r7)
+	sub	r5, &0x300
+	sub	r5, sym
+	sub.b	r5, r6
+	sub.b	r5, 4(r7)
+	sub.b	r5, &0x300
+	sub.b	r5, sym
+	sub.w	r5, r6
+	sub.w	r5, 4(r7)
+	sub.w	r5, &0x300
+	sub.w	r5, sym
+	subc	r5, r6
+	subc	r5, 4(r7)
+	subc	r5, &0x300
+	subc	r5, sym
+	subc.b	r5, r6
+	subc.b	r5, 4(r7)
+	subc.b	r5, &0x300
+	subc.b	r5, sym
+	subc.w	r5, r6
+	subc.w	r5, 4(r7)
+	subc.w	r5, &0x300
+	subc.w	r5, sym
+	cmp	r5, r6
+	cmp	r5, 4(r7)
+	cmp	r5, &0x300
+	cmp	r5, sym
+	cmp.b	r5, r6
+	cmp.b	r5, 4(r7)
+	cmp.b	r5, &0x300
+	cmp.b	r5, sym
+	cmp.w	r5, r6
+	cmp.w	r5, 4(r7)
+	cmp.w	r5, &0x300
+	cmp.w	r5, sym
+	dadd	r5, r6
+	dadd	r5, 4(r7)
+	dadd	r5, &0x300
+	dadd	r5, sym
+	dadd.b	r5, r6
+	dadd.b	r5, 4(r7)
+	dadd.b	r5, &0x300
+	dadd.b	r5, sym
+	dadd.w	r5, r6
+	dadd.w	r5, 4(r7)
+	dadd.w	r5, &0x300
+	dadd.w	r5, sym
+	bit	r5, r6
+	bit	r5, 4(r7)
+	bit	r5, &0x300
+	bit	r5, sym
+	bit.b	r5, r6
+	bit.b	r5, 4(r7)
+	bit.b	r5, &0x300
+	bit.b	r5, sym
+	bit.w	r5, r6
+	bit.w	r5, 4(r7)
+	bit.w	r5, &0x300
+	bit.w	r5, sym
+	bic	r5, r6
+	bic	r5, r0
+	bic	r5, r2
+	bic	r5, r3
+	bic	r5, 4(r7)
+	bic	r5, 0(r7)
+	bic	r5, &0x300
+	bic	r5, &sym
+	bic	r5, sym
+	bic	r5, sym(r8)
+	bic	r5, @r8
+	bic	r5, -2(sp)
+	bic	r5, #0
+	bic	r5, #1
+	bic	r5, #2
+	bic.b	r5, r6
+	bic.b	r5, r0
+	bic.b	r5, r2
+	bic.b	r5, r3
+	bic.b	r5, 4(r7)
+	bic.b	r5, 0(r7)
+	bic.b	r5, &0x300
+	bic.b	r5, &sym
+	bic.b	r5, sym
+	bic.b	r5, sym(r8)
+	bic.b	r5, @r8
+	bic.b	r5, -2(sp)
+	bic.b	r5, #0
+	bic.b	r5, #1
+	bic.b	r5, #2
+	bic.w	r5, r6
+	bic.w	r5, 4(r7)
+	bic.w	r5, &0x300
+	bic.w	r5, sym
+	bis	r5, r6
+	bis	r5, 4(r7)
+	bis	r5, &0x300
+	bis	r5, sym
+	bis.b	r5, r6
+	bis.b	r5, 4(r7)
+	bis.b	r5, &0x300
+	bis.b	r5, sym
+	bis.w	r5, r6
+	bis.w	r5, 4(r7)
+	bis.w	r5, &0x300
+	bis.w	r5, sym
+	xor	r5, r6
+	xor	r5, 4(r7)
+	xor	r5, &0x300
+	xor	r5, sym
+	xor.b	r5, r6
+	xor.b	r5, 4(r7)
+	xor.b	r5, &0x300
+	xor.b	r5, sym
+	xor.w	r5, r6
+	xor.w	r5, 4(r7)
+	xor.w	r5, &0x300
+	xor.w	r5, sym
+	and	r5, r6
+	and	r5, 4(r7)
+	and	r5, &0x300
+	and	r5, sym
+	and.b	r5, r6
+	and.b	r5, 4(r7)
+	and.b	r5, &0x300
+	and.b	r5, sym
+	and.w	r5, r6
+	and.w	r5, 4(r7)
+	and.w	r5, &0x300
+	and.w	r5, sym
+
+# one-operand instructions
+	rrc	r5
+	rrc	sr
+	rrc	r3
+	rrc	#0
+	rrc	#1
+	rrc	#4
+	rrc	#8
+	rrc	#0x1234
+	rrc	#-1
+	rrc	#sym
+	rrc	&0x200
+	rrc	&sym
+	rrc	2(r4)
+	rrc	0(r4)
+	rrc	sym(r4)
+	rrc	@r4
+	rrc	@r4+
+	rrc	sym
+	rrc	0x200
+	rrc.b	r5
+	rrc.b	sr
+	rrc.b	r3
+	rrc.b	#0
+	rrc.b	#1
+	rrc.b	#4
+	rrc.b	#8
+	rrc.b	#0x1234
+	rrc.b	#-1
+	rrc.b	#sym
+	rrc.b	&0x200
+	rrc.b	&sym
+	rrc.b	2(r4)
+	rrc.b	0(r4)
+	rrc.b	sym(r4)
+	rrc.b	@r4
+	rrc.b	@r4+
+	rrc.b	sym
+	rrc.b	0x200
+	rrc.w	r5
+	rrc.w	sr
+	rrc.w	r3
+	rrc.w	#0
+	rrc.w	#1
+	rrc.w	#4
+	rrc.w	#8
+	rrc.w	#0x1234
+	rrc.w	#-1
+	rrc.w	#sym
+	rrc.w	&0x200
+	rrc.w	&sym
+	rrc.w	2(r4)
+	rrc.w	0(r4)
+	rrc.w	sym(r4)
+	rrc.w	@r4
+	rrc.w	@r4+
+	rrc.w	sym
+	rrc.w	0x200
+	swpb	r5
+	swpb	pc
+	swpb	sr
+	swpb	r3
+	swpb	#0
+	swpb	#1
+	swpb	#4
+	swpb	#8
+	swpb	#0x1234
+	swpb	#-1
+	swpb	#sym
+	swpb	&0x200
+	swpb	&sym
+	swpb	2(r4)
+	swpb	0(r4)
+	swpb	sym(r4)
+	swpb	@r4
+	swpb	@r4+
+	swpb	sym
+	swpb	0x200
+	swpb.b	r5
+	swpb.b	pc
+	swpb.b	sr
+	swpb.b	r3
+	swpb.b	#0
+	swpb.b	#1
+	swpb.b	#4
+	swpb.b	#8
+	swpb.b	#0x1234
+	swpb.b	#-1
+	swpb.b	#sym
+	swpb.b	&0x200
+	swpb.b	&sym
+	swpb.b	2(r4)
+	swpb.b	0(r4)
+	swpb.b	sym(r4)
+	swpb.b	@r4
+	swpb.b	@r4+
+	swpb.b	sym
+	swpb.b	0x200
+	swpb.w	r5
+	swpb.w	pc
+	swpb.w	sr
+	swpb.w	r3
+	swpb.w	#0
+	swpb.w	#1
+	swpb.w	#4
+	swpb.w	#8
+	swpb.w	#0x1234
+	swpb.w	#-1
+	swpb.w	#sym
+	swpb.w	&0x200
+	swpb.w	&sym
+	swpb.w	2(r4)
+	swpb.w	0(r4)
+	swpb.w	sym(r4)
+	swpb.w	@r4
+	swpb.w	@r4+
+	swpb.w	sym
+	swpb.w	0x200
+	rra	r5
+	rra	sr
+	rra	r3
+	rra	#0
+	rra	#1
+	rra	#4
+	rra	#8
+	rra	#0x1234
+	rra	#-1
+	rra	#sym
+	rra	&0x200
+	rra	&sym
+	rra	2(r4)
+	rra	0(r4)
+	rra	sym(r4)
+	rra	@r4
+	rra	@r4+
+	rra	sym
+	rra	0x200
+	rra.b	r5
+	rra.b	sr
+	rra.b	r3
+	rra.b	#0
+	rra.b	#1
+	rra.b	#4
+	rra.b	#8
+	rra.b	#0x1234
+	rra.b	#-1
+	rra.b	#sym
+	rra.b	&0x200
+	rra.b	&sym
+	rra.b	2(r4)
+	rra.b	0(r4)
+	rra.b	sym(r4)
+	rra.b	@r4
+	rra.b	@r4+
+	rra.b	sym
+	rra.b	0x200
+	rra.w	r5
+	rra.w	sr
+	rra.w	r3
+	rra.w	#0
+	rra.w	#1
+	rra.w	#4
+	rra.w	#8
+	rra.w	#0x1234
+	rra.w	#-1
+	rra.w	#sym
+	rra.w	&0x200
+	rra.w	&sym
+	rra.w	2(r4)
+	rra.w	0(r4)
+	rra.w	sym(r4)
+	rra.w	@r4
+	rra.w	@r4+
+	rra.w	sym
+	rra.w	0x200
+	sxt	r5
+	sxt	pc
+	sxt	sr
+	sxt	r3
+	sxt	#0
+	sxt	#1
+	sxt	#4
+	sxt	#8
+	sxt	#0x1234
+	sxt	#-1
+	sxt	#sym
+	sxt	&0x200
+	sxt	&sym
+	sxt	2(r4)
+	sxt	0(r4)
+	sxt	sym(r4)
+	sxt	@r4
+	sxt	@r4+
+	sxt	sym
+	sxt	0x200
+	sxt.b	r5
+	sxt.b	pc
+	sxt.b	sr
+	sxt.b	r3
+	sxt.b	#0
+	sxt.b	#1
+	sxt.b	#4
+	sxt.b	#8
+	sxt.b	#0x1234
+	sxt.b	#-1
+	sxt.b	#sym
+	sxt.b	&0x200
+	sxt.b	&sym
+	sxt.b	2(r4)
+	sxt.b	0(r4)
+	sxt.b	sym(r4)
+	sxt.b	@r4
+	sxt.b	@r4+
+	sxt.b	sym
+	sxt.b	0x200
+	sxt.w	r5
+	sxt.w	pc
+	sxt.w	sr
+	sxt.w	r3
+	sxt.w	#0
+	sxt.w	#1
+	sxt.w	#4
+	sxt.w	#8
+	sxt.w	#0x1234
+	sxt.w	#-1
+	sxt.w	#sym
+	sxt.w	&0x200
+	sxt.w	&sym
+	sxt.w	2(r4)
+	sxt.w	0(r4)
+	sxt.w	sym(r4)
+	sxt.w	@r4
+	sxt.w	@r4+
+	sxt.w	sym
+	sxt.w	0x200
+	push	r5
+	push	pc
+	push	sr
+	push	r3
+	push	#0
+	push	#1
+	push	#4
+	push	#8
+	push	#0x1234
+	push	#-1
+	push	#sym
+	push	&0x200
+	push	&sym
+	push	2(r4)
+	push	0(r4)
+	push	sym(r4)
+	push	@r4
+	push	@r4+
+	push	sym
+	push	0x200
+	push.b	r5
+	push.b	pc
+	push.b	sr
+	push.b	r3
+	push.b	#0
+	push.b	#1
+	push.b	#4
+	push.b	#8
+	push.b	#0x1234
+	push.b	#-1
+	push.b	#sym
+	push.b	&0x200
+	push.b	&sym
+	push.b	2(r4)
+	push.b	0(r4)
+	push.b	sym(r4)
+	push.b	@r4
+	push.b	@r4+
+	push.b	sym
+	push.b	0x200
+	push.w	r5
+	push.w	pc
+	push.w	sr
+	push.w	r3
+	push.w	#0
+	push.w	#1
+	push.w	#4
+	push.w	#8
+	push.w	#0x1234
+	push.w	#-1
+	push.w	#sym
+	push.w	&0x200
+	push.w	&sym
+	push.w	2(r4)
+	push.w	0(r4)
+	push.w	sym(r4)
+	push.w	@r4
+	push.w	@r4+
+	push.w	sym
+	push.w	0x200
+	call	r5
+	call	pc
+	call	sr
+	call	r3
+	call	#0
+	call	#1
+	call	#4
+	call	#8
+	call	#0x1234
+	call	#-1
+	call	#sym
+	call	&0x200
+	call	&sym
+	call	2(r4)
+	call	0(r4)
+	call	sym(r4)
+	call	@r4
+	call	@r4+
+	call	sym
+	call	0x200
+	call.b	r5
+	call.b	pc
+	call.b	sr
+	call.b	r3
+	call.b	#0
+	call.b	#1
+	call.b	#4
+	call.b	#8
+	call.b	#0x1234
+	call.b	#-1
+	call.b	#sym
+	call.b	&0x200
+	call.b	&sym
+	call.b	2(r4)
+	call.b	0(r4)
+	call.b	sym(r4)
+	call.b	@r4
+	call.b	@r4+
+	call.b	sym
+	call.b	0x200
+	call.w	r5
+	call.w	pc
+	call.w	sr
+	call.w	r3
+	call.w	#0
+	call.w	#1
+	call.w	#4
+	call.w	#8
+	call.w	#0x1234
+	call.w	#-1
+	call.w	#sym
+	call.w	&0x200
+	call.w	&sym
+	call.w	2(r4)
+	call.w	0(r4)
+	call.w	sym(r4)
+	call.w	@r4
+	call.w	@r4+
+	call.w	sym
+	call.w	0x200
+	reti
+
+# emulated instructions without operands
+	nop
+	ret
+	setc
+	setz
+	setn
+	clrc
+	clrz
+	clrn
+	dint
+	eint
+	NOP
+	Ret
+
+# emulated instructions with a destination
+	inv	r5
+	inv	pc
+	inv	sr
+	inv	4(r7)
+	inv	0(r7)
+	inv	&0x300
+	inv	&sym
+	inv	sym
+	inv	@r8
+	inv	sym(r4)
+	inv.b	r5
+	inv.b	pc
+	inv.b	sr
+	inv.b	4(r7)
+	inv.b	0(r7)
+	inv.b	&0x300
+	inv.b	&sym
+	inv.b	sym
+	inv.b	@r8
+	inv.b	sym(r4)
+	inv.w	r5
+	inv.w	pc
+	inv.w	sr
+	inv.w	4(r7)
+	inv.w	0(r7)
+	inv.w	&0x300
+	inv.w	&sym
+	inv.w	sym
+	inv.w	@r8
+	inv.w	sym(r4)
+	dadc	r5
+	dadc	pc
+	dadc	sr
+	dadc	4(r7)
+	dadc	0(r7)
+	dadc	&0x300
+	dadc	&sym
+	dadc	sym
+	dadc	@r8
+	dadc	sym(r4)
+	dadc.b	r5
+	dadc.b	pc
+	dadc.b	sr
+	dadc.b	4(r7)
+	dadc.b	0(r7)
+	dadc.b	&0x300
+	dadc.b	&sym
+	dadc.b	sym
+	dadc.b	@r8
+	dadc.b	sym(r4)
+	dadc.w	r5
+	dadc.w	pc
+	dadc.w	sr
+	dadc.w	4(r7)
+	dadc.w	0(r7)
+	dadc.w	&0x300
+	dadc.w	&sym
+	dadc.w	sym
+	dadc.w	@r8
+	dadc.w	sym(r4)
+	tst	r5
+	tst	pc
+	tst	sr
+	tst	4(r7)
+	tst	0(r7)
+	tst	&0x300
+	tst	&sym
+	tst	sym
+	tst	@r8
+	tst	sym(r4)
+	tst.b	r5
+	tst.b	pc
+	tst.b	sr
+	tst.b	4(r7)
+	tst.b	0(r7)
+	tst.b	&0x300
+	tst.b	&sym
+	tst.b	sym
+	tst.b	@r8
+	tst.b	sym(r4)
+	tst.w	r5
+	tst.w	pc
+	tst.w	sr
+	tst.w	4(r7)
+	tst.w	0(r7)
+	tst.w	&0x300
+	tst.w	&sym
+	tst.w	sym
+	tst.w	@r8
+	tst.w	sym(r4)
+	decd	r5
+	decd	pc
+	decd	sr
+	decd	4(r7)
+	decd	0(r7)
+	decd	&0x300
+	decd	&sym
+	decd	sym
+	decd	@r8
+	decd	sym(r4)
+	decd.b	r5
+	decd.b	pc
+	decd.b	sr
+	decd.b	4(r7)
+	decd.b	0(r7)
+	decd.b	&0x300
+	decd.b	&sym
+	decd.b	sym
+	decd.b	@r8
+	decd.b	sym(r4)
+	decd.w	r5
+	decd.w	pc
+	decd.w	sr
+	decd.w	4(r7)
+	decd.w	0(r7)
+	decd.w	&0x300
+	decd.w	&sym
+	decd.w	sym
+	decd.w	@r8
+	decd.w	sym(r4)
+	dec	r5
+	dec	pc
+	dec	sr
+	dec	4(r7)
+	dec	0(r7)
+	dec	&0x300
+	dec	&sym
+	dec	sym
+	dec	@r8
+	dec	sym(r4)
+	dec.b	r5
+	dec.b	pc
+	dec.b	sr
+	dec.b	4(r7)
+	dec.b	0(r7)
+	dec.b	&0x300
+	dec.b	&sym
+	dec.b	sym
+	dec.b	@r8
+	dec.b	sym(r4)
+	dec.w	r5
+	dec.w	pc
+	dec.w	sr
+	dec.w	4(r7)
+	dec.w	0(r7)
+	dec.w	&0x300
+	dec.w	&sym
+	dec.w	sym
+	dec.w	@r8
+	dec.w	sym(r4)
+	sbc	r5
+	sbc	pc
+	sbc	sr
+	sbc	4(r7)
+	sbc	0(r7)
+	sbc	&0x300
+	sbc	&sym
+	sbc	sym
+	sbc	@r8
+	sbc	sym(r4)
+	sbc.b	r5
+	sbc.b	pc
+	sbc.b	sr
+	sbc.b	4(r7)
+	sbc.b	0(r7)
+	sbc.b	&0x300
+	sbc.b	&sym
+	sbc.b	sym
+	sbc.b	@r8
+	sbc.b	sym(r4)
+	sbc.w	r5
+	sbc.w	pc
+	sbc.w	sr
+	sbc.w	4(r7)
+	sbc.w	0(r7)
+	sbc.w	&0x300
+	sbc.w	&sym
+	sbc.w	sym
+	sbc.w	@r8
+	sbc.w	sym(r4)
+	adc	r5
+	adc	pc
+	adc	sr
+	adc	4(r7)
+	adc	0(r7)
+	adc	&0x300
+	adc	&sym
+	adc	sym
+	adc	@r8
+	adc	sym(r4)
+	adc.b	r5
+	adc.b	pc
+	adc.b	sr
+	adc.b	4(r7)
+	adc.b	0(r7)
+	adc.b	&0x300
+	adc.b	&sym
+	adc.b	sym
+	adc.b	@r8
+	adc.b	sym(r4)
+	adc.w	r5
+	adc.w	pc
+	adc.w	sr
+	adc.w	4(r7)
+	adc.w	0(r7)
+	adc.w	&0x300
+	adc.w	&sym
+	adc.w	sym
+	adc.w	@r8
+	adc.w	sym(r4)
+	incd	r5
+	incd	pc
+	incd	sr
+	incd	4(r7)
+	incd	0(r7)
+	incd	&0x300
+	incd	&sym
+	incd	sym
+	incd	@r8
+	incd	sym(r4)
+	incd.b	r5
+	incd.b	pc
+	incd.b	sr
+	incd.b	4(r7)
+	incd.b	0(r7)
+	incd.b	&0x300
+	incd.b	&sym
+	incd.b	sym
+	incd.b	@r8
+	incd.b	sym(r4)
+	incd.w	r5
+	incd.w	pc
+	incd.w	sr
+	incd.w	4(r7)
+	incd.w	0(r7)
+	incd.w	&0x300
+	incd.w	&sym
+	incd.w	sym
+	incd.w	@r8
+	incd.w	sym(r4)
+	inc	r5
+	inc	pc
+	inc	sr
+	inc	4(r7)
+	inc	0(r7)
+	inc	&0x300
+	inc	&sym
+	inc	sym
+	inc	@r8
+	inc	sym(r4)
+	inc.b	r5
+	inc.b	pc
+	inc.b	sr
+	inc.b	4(r7)
+	inc.b	0(r7)
+	inc.b	&0x300
+	inc.b	&sym
+	inc.b	sym
+	inc.b	@r8
+	inc.b	sym(r4)
+	inc.w	r5
+	inc.w	pc
+	inc.w	sr
+	inc.w	4(r7)
+	inc.w	0(r7)
+	inc.w	&0x300
+	inc.w	&sym
+	inc.w	sym
+	inc.w	@r8
+	inc.w	sym(r4)
+	clr	r5
+	clr	pc
+	clr	sr
+	clr	4(r7)
+	clr	0(r7)
+	clr	&0x300
+	clr	&sym
+	clr	sym
+	clr	@r8
+	clr	sym(r4)
+	clr.b	r5
+	clr.b	pc
+	clr.b	sr
+	clr.b	4(r7)
+	clr.b	0(r7)
+	clr.b	&0x300
+	clr.b	&sym
+	clr.b	sym
+	clr.b	@r8
+	clr.b	sym(r4)
+	clr.w	r5
+	clr.w	pc
+	clr.w	sr
+	clr.w	4(r7)
+	clr.w	0(r7)
+	clr.w	&0x300
+	clr.w	&sym
+	clr.w	sym
+	clr.w	@r8
+	clr.w	sym(r4)
+	pop	r5
+	pop	pc
+	pop	sr
+	pop	4(r7)
+	pop	0(r7)
+	pop	&0x300
+	pop	&sym
+	pop	sym
+	pop	@r8
+	pop	sym(r4)
+	pop.b	r5
+	pop.b	pc
+	pop.b	sr
+	pop.b	4(r7)
+	pop.b	0(r7)
+	pop.b	&0x300
+	pop.b	&sym
+	pop.b	sym
+	pop.b	@r8
+	pop.b	sym(r4)
+	pop.w	r5
+	pop.w	pc
+	pop.w	sr
+	pop.w	4(r7)
+	pop.w	0(r7)
+	pop.w	&0x300
+	pop.w	&sym
+	pop.w	sym
+	pop.w	@r8
+	pop.w	sym(r4)
+	rla	r5
+	rla	sr
+	rla	4(r7)
+	rla	0(r7)
+	rla	&0x300
+	rla	&sym
+	rla	sym
+	rla	@r8
+	rla	sym(r4)
+	rla.b	r5
+	rla.b	sr
+	rla.b	4(r7)
+	rla.b	0(r7)
+	rla.b	&0x300
+	rla.b	&sym
+	rla.b	sym
+	rla.b	@r8
+	rla.b	sym(r4)
+	rla.w	r5
+	rla.w	sr
+	rla.w	4(r7)
+	rla.w	0(r7)
+	rla.w	&0x300
+	rla.w	&sym
+	rla.w	sym
+	rla.w	@r8
+	rla.w	sym(r4)
+	rlc	r5
+	rlc	sr
+	rlc	4(r7)
+	rlc	0(r7)
+	rlc	&0x300
+	rlc	&sym
+	rlc	sym
+	rlc	@r8
+	rlc	sym(r4)
+	rlc.b	r5
+	rlc.b	sr
+	rlc.b	4(r7)
+	rlc.b	0(r7)
+	rlc.b	&0x300
+	rlc.b	&sym
+	rlc.b	sym
+	rlc.b	@r8
+	rlc.b	sym(r4)
+	rlc.w	r5
+	rlc.w	sr
+	rlc.w	4(r7)
+	rlc.w	0(r7)
+	rlc.w	&0x300
+	rlc.w	&sym
+	rlc.w	sym
+	rlc.w	@r8
+	rlc.w	sym(r4)
+
+# br
+	br	r5
+	br	pc
+	br	#0x1234
+	br	#sym
+	br	#0
+	br	#1
+	br	&0x200
+	br	&sym
+	br	2(r4)
+	br	sym(r4)
+	br	@r4
+	br	@r4+
+	br	sym
+	br	0x200
+	br	-4
+
+# jumps
+	jmp	sym
+	jmp	sym+4
+	jmp	$+4
+	jmp	$-4
+	jmp	$+0
+	jmp	0
+	jmp	4
+	jmp	-4
+	jmp	$+1022
+	jmp	$-1020
+	jmp	1024
+	jmp	$+1026
+	jmp	3
+	jmp	$+3
+	jl	sym
+	jl	sym+4
+	jl	$+4
+	jl	$-4
+	jl	$+0
+	jl	0
+	jl	4
+	jl	-4
+	jl	$+1022
+	jl	$-1020
+	jl	1024
+	jl	$+1026
+	jl	3
+	jl	$+3
+	jge	sym
+	jge	sym+4
+	jge	$+4
+	jge	$-4
+	jge	$+0
+	jge	0
+	jge	4
+	jge	-4
+	jge	$+1022
+	jge	$-1020
+	jge	1024
+	jge	$+1026
+	jge	3
+	jge	$+3
+	jn	sym
+	jn	sym+4
+	jn	$+4
+	jn	$-4
+	jn	$+0
+	jn	0
+	jn	4
+	jn	-4
+	jn	$+1022
+	jn	$-1020
+	jn	1024
+	jn	$+1026
+	jn	3
+	jn	$+3
+	jc	sym
+	jc	sym+4
+	jc	$+4
+	jc	$-4
+	jc	$+0
+	jc	0
+	jc	4
+	jc	-4
+	jc	$+1022
+	jc	$-1020
+	jc	1024
+	jc	$+1026
+	jc	3
+	jc	$+3
+	jhs	sym
+	jhs	sym+4
+	jhs	$+4
+	jhs	$-4
+	jhs	$+0
+	jhs	0
+	jhs	4
+	jhs	-4
+	jhs	$+1022
+	jhs	$-1020
+	jhs	1024
+	jhs	$+1026
+	jhs	3
+	jhs	$+3
+	jnc	sym
+	jnc	sym+4
+	jnc	$+4
+	jnc	$-4
+	jnc	$+0
+	jnc	0
+	jnc	4
+	jnc	-4
+	jnc	$+1022
+	jnc	$-1020
+	jnc	1024
+	jnc	$+1026
+	jnc	3
+	jnc	$+3
+	jlo	sym
+	jlo	sym+4
+	jlo	$+4
+	jlo	$-4
+	jlo	$+0
+	jlo	0
+	jlo	4
+	jlo	-4
+	jlo	$+1022
+	jlo	$-1020
+	jlo	1024
+	jlo	$+1026
+	jlo	3
+	jlo	$+3
+	jz	sym
+	jz	sym+4
+	jz	$+4
+	jz	$-4
+	jz	$+0
+	jz	0
+	jz	4
+	jz	-4
+	jz	$+1022
+	jz	$-1020
+	jz	1024
+	jz	$+1026
+	jz	3
+	jz	$+3
+	jeq	sym
+	jeq	sym+4
+	jeq	$+4
+	jeq	$-4
+	jeq	$+0
+	jeq	0
+	jeq	4
+	jeq	-4
+	jeq	$+1022
+	jeq	$-1020
+	jeq	1024
+	jeq	$+1026
+	jeq	3
+	jeq	$+3
+	jnz	sym
+	jnz	sym+4
+	jnz	$+4
+	jnz	$-4
+	jnz	$+0
+	jnz	0
+	jnz	4
+	jnz	-4
+	jnz	$+1022
+	jnz	$-1020
+	jnz	1024
+	jnz	$+1026
+	jnz	3
+	jnz	$+3
+	jne	sym
+	jne	sym+4
+	jne	$+4
+	jne	$-4
+	jne	$+0
+	jne	0
+	jne	4
+	jne	-4
+	jne	$+1022
+	jne	$-1020
+	jne	1024
+	jne	$+1026
+	jne	3
+	jne	$+3
+
+# spellings
+	mov r5,r6
+	MOV R5, R6
+	mov.B #1, r6
+	mov.W #1, r6
+	mov	@R4+ , r6
+	mov 2 ( r4 ) , r6
+	mov #0FFh, r6
+	mov #010, r6
+	mov #0b101, r6
+	mov #'a', r6
+	mov r5, r6 { mov r6, r7
+	mov &0x200 + 2, r6
+	mov #(1<<4)|1, r6
+	mov rpc, r6
+	mov rsp, r6
+	mov rsr, r6
+	mov r0x5, r6
+	mov #-0x8000, r6
+

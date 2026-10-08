@@ -1,0 +1,599 @@
+# SuperH, little-endian, against sh-elf-as -little. One statement per line.
+# ---- registers and their spellings
+mov r0, r15
+mov sp, r0
+mov r15, sp
+mov ix, r0
+mov is, r1
+mov iy, r2
+MOV R3, R4
+Mov.L @R1+, R2
+mov r10, r11
+mov r12, r13
+ldc r4, r0_bank
+stc r1_bank, r5
+stc.l r6_bank, @-r15
+ldc.l @r15+, r2_bank
+# ---- immediates
+mov #0, r0
+mov #127, r1
+mov #-1, r2
+mov #255, r3
+mov #0x80, r4
+mov #-128, r5
+mov #'A', r6
+mov #1+2*3, r7
+mov #(8<<2)-1, r8
+add #-4, r15
+add #4, r15
+cmp/eq #0x55, r0
+and #0xf0, r0
+or #0x0f, r0
+xor #0xff, r0
+tst #1, r0
+and.b #0x80, @(r0,gbr)
+or.b #1, @(r0,gbr)
+xor.b #2, @(r0,gbr)
+tst.b #4, @(r0,gbr)
+trapa #0
+trapa #34
+trapa #0xc3
+# ---- scaled displacements
+mov.b @(0,r1), r0
+mov.b @(7,r2), r0
+mov.b @(15,r3), r0
+mov.w @(0,r1), r0
+mov.w @(2,r2), r0
+mov.w @(30,r3), r0
+mov.l @(0,r1), r2
+mov.l @(4,r2), r3
+mov.l @(32,r4), r5
+mov.l @(60,r6), r7
+mov.b r0, @(1,r1)
+mov.w r0, @(28,r2)
+mov.l r1, @(8,r2)
+mov.l r9, @(60,r10)
+mov.b @(1,gbr), r0
+mov.b @(200,gbr), r0
+mov.w @(2,gbr), r0
+mov.w @(400,gbr), r0
+mov.l @(4,gbr), r0
+mov.l @(1000,gbr), r0
+mov.b r0, @(100,gbr)
+mov.w r0, @(510,gbr)
+mov.l r0, @(1020,gbr)
+mov.l @(4*3,r1), r2
+mov.l @( 4 , r1 ), r2
+mov.l @ r1, r2
+mov.l @(r0,r3), r4
+mov.l r5, @(r0,r6)
+# ---- mnemonics with a slash, in every case
+cmp/eq r1, r2
+cmp/hs r3, r4
+cmp/ge r5, r6
+cmp/hi r7, r8
+cmp/gt r9, r10
+cmp/pz r11
+cmp/pl r12
+cmp/str r13, r14
+CMP/EQ r1, r2
+cmp/Gt r2, r1
+fcmp/eq fr1, fr2
+fcmp/gt dr2, dr4
+# ---- comments and separators
+nop ! a comment
+nop!no space
+  # a comment after indentation
+rts ; nop
+mov r1, r2 ; mov r3, r4 ! both
+mov.l @(4,r1),r2 /* block */
+# ---- aliases GNU as accepts
+muls r1, r2
+mulu r3, r4
+bt.s 8
+bf.s 8
+fmov.s @r1, fr2
+fmov.d dr2, @-r15
+# ---- branches to absolute addresses in the section
+bra 4
+bra 0
+bra 8
+bra 4098
+bra -4092
+bsr 100
+bt 4
+bt 0x102
+bt -0xfc
+bf 0
+bf/s 0x100
+bt/s 2
+jmp @r0
+jsr @r15
+braf r3
+bsrf r4
+# ---- PC-relative loads by address and by displacement
+mov.l 4, r0
+mov.l 8, r1
+mov.l 1024, r2
+mov.w 4, r3
+mov.w 514, r4
+mova 4, r0
+mova 1024, r0
+mov.l @(4,pc), r2
+mov.l @(12,pc), r2
+mov.l @(1024,pc), r2
+mov.w @(4,pc), r2
+mov.w @(6,pc), r2
+mov.w @(514,pc), r2
+mova @(8,pc), r0
+mova @(1020,pc), r0
+# ---- every opcode-table form, twice, with different operands
+mov #1, r1
+mov #-128, r14
+mov r2, r1
+mov r7, r14
+mov.b r2, @r1
+mov.b r7, @r14
+mov.b r2, @-r1
+mov.b r7, @-r14
+mov.b r2, @(r0,r1)
+mov.b r7, @(r0,r14)
+mov.b r0, @(1,r2)
+mov.b r0, @(15,r7)
+mov.b r0, @(1,gbr)
+mov.b r0, @(255,gbr)
+mov.b @r2, r1
+mov.b @r7, r14
+mov.b @r2+, r1
+mov.b @r7+, r14
+mov.b @(r0,r2), r1
+mov.b @(r0,r7), r14
+mov.b @(1,r2), r0
+mov.b @(15,r7), r0
+mov.b @(1,gbr), r0
+mov.b @(255,gbr), r0
+mov.w r2, @r1
+mov.w r7, @r14
+mov.w r2, @-r1
+mov.w r7, @-r14
+mov.w r2, @(r0,r1)
+mov.w r7, @(r0,r14)
+mov.w r0, @(2,r2)
+mov.w r0, @(30,r7)
+mov.w r0, @(2,gbr)
+mov.w r0, @(510,gbr)
+mov.w @r2, r1
+mov.w @r7, r14
+mov.w @r2+, r1
+mov.w @r7+, r14
+mov.w @(r0,r2), r1
+mov.w @(r0,r7), r14
+mov.w @(2,r2), r0
+mov.w @(30,r7), r0
+mov.w @(2,gbr), r0
+mov.w @(510,gbr), r0
+mov.l r2, @r1
+mov.l r7, @r14
+mov.l r2, @-r1
+mov.l r7, @-r14
+mov.l r2, @(r0,r1)
+mov.l r7, @(r0,r14)
+mov.l r2, @(4,r1)
+mov.l r7, @(60,r14)
+mov.l r0, @(4,gbr)
+mov.l r0, @(1020,gbr)
+mov.l @r2, r1
+mov.l @r7, r14
+mov.l @r2+, r1
+mov.l @r7+, r14
+mov.l @(r0,r2), r1
+mov.l @(r0,r7), r14
+mov.l @(4,r2), r1
+mov.l @(60,r7), r14
+mov.l @(4,gbr), r0
+mov.l @(1020,gbr), r0
+movt r1
+movt r14
+swap.b r2, r1
+swap.b r7, r14
+swap.w r2, r1
+swap.w r7, r14
+xtrct r2, r1
+xtrct r7, r14
+movca.l r0, @r1
+movca.l r0, @r14
+movli.l @r1, r0
+movli.l @r14, r0
+movco.l r0, @r1
+movco.l r0, @r14
+movua.l @r1, r0
+movua.l @r14, r0
+movua.l @r1+, r0
+movua.l @r14+, r0
+add #1, r1
+add #-128, r14
+add r2, r1
+add r7, r14
+addc r2, r1
+addc r7, r14
+addv r2, r1
+addv r7, r14
+sub r2, r1
+sub r7, r14
+subc r2, r1
+subc r7, r14
+subv r2, r1
+subv r7, r14
+cmp/eq #1, r0
+cmp/eq #-128, r0
+cmp/eq r2, r1
+cmp/eq r7, r14
+cmp/hs r2, r1
+cmp/hs r7, r14
+cmp/ge r2, r1
+cmp/ge r7, r14
+cmp/hi r2, r1
+cmp/hi r7, r14
+cmp/gt r2, r1
+cmp/gt r7, r14
+cmp/pz r1
+cmp/pz r14
+cmp/pl r1
+cmp/pl r14
+cmp/str r2, r1
+cmp/str r7, r14
+div0s r2, r1
+div0s r7, r14
+div0u
+div1 r2, r1
+div1 r7, r14
+dmuls.l r2, r1
+dmuls.l r7, r14
+dmulu.l r2, r1
+dmulu.l r7, r14
+mul.l r2, r1
+mul.l r7, r14
+muls.w r2, r1
+muls.w r7, r14
+muls r2, r1
+muls r7, r14
+mulu.w r2, r1
+mulu.w r7, r14
+mulu r2, r1
+mulu r7, r14
+mac.w @r2+, @r1+
+mac.w @r7+, @r14+
+mac.l @r2+, @r1+
+mac.l @r7+, @r14+
+neg r2, r1
+neg r7, r14
+negc r2, r1
+negc r7, r14
+dt r1
+dt r14
+exts.b r2, r1
+exts.b r7, r14
+exts.w r2, r1
+exts.w r7, r14
+extu.b r2, r1
+extu.b r7, r14
+extu.w r2, r1
+extu.w r7, r14
+and #1, r0
+and #-128, r0
+and r2, r1
+and r7, r14
+and.b #1, @(r0,gbr)
+and.b #-128, @(r0,gbr)
+or #1, r0
+or #-128, r0
+or r2, r1
+or r7, r14
+or.b #1, @(r0,gbr)
+or.b #-128, @(r0,gbr)
+xor #1, r0
+xor #-128, r0
+xor r2, r1
+xor r7, r14
+xor.b #1, @(r0,gbr)
+xor.b #-128, @(r0,gbr)
+tst #1, r0
+tst #-128, r0
+tst r2, r1
+tst r7, r14
+tst.b #1, @(r0,gbr)
+tst.b #-128, @(r0,gbr)
+not r2, r1
+not r7, r14
+tas.b @r1
+tas.b @r14
+shal r1
+shal r14
+shar r1
+shar r14
+shll r1
+shll r14
+shlr r1
+shlr r14
+shll2 r1
+shll2 r14
+shlr2 r1
+shlr2 r14
+shll8 r1
+shll8 r14
+shlr8 r1
+shlr8 r14
+shll16 r1
+shll16 r14
+shlr16 r1
+shlr16 r14
+rotl r1
+rotl r14
+rotr r1
+rotr r14
+rotcl r1
+rotcl r14
+rotcr r1
+rotcr r14
+shad r2, r1
+shad r7, r14
+shld r2, r1
+shld r7, r14
+braf r1
+braf r14
+bsrf r1
+bsrf r14
+jmp @r1
+jmp @r14
+jsr @r1
+jsr @r14
+rts
+rte
+trapa #1
+trapa #-128
+nop
+sleep
+clrmac
+clrt
+sett
+clrs
+sets
+ldtlb
+pref @r1
+pref @r14
+ocbi @r1
+ocbi @r14
+ocbp @r1
+ocbp @r14
+ocbwb @r1
+ocbwb @r14
+icbi @r1
+icbi @r14
+prefi @r1
+prefi @r14
+synco
+ldc r1, sr
+ldc r14, sr
+ldc r1, gbr
+ldc r14, gbr
+ldc r1, vbr
+ldc r14, vbr
+ldc r1, ssr
+ldc r14, ssr
+ldc r1, spc
+ldc r14, spc
+ldc r1, sgr
+ldc r14, sgr
+ldc r1, dbr
+ldc r14, dbr
+ldc r1, r3_bank
+ldc r14, r7_bank
+ldc.l @r1+, sr
+ldc.l @r14+, sr
+ldc.l @r1+, gbr
+ldc.l @r14+, gbr
+ldc.l @r1+, vbr
+ldc.l @r14+, vbr
+ldc.l @r1+, ssr
+ldc.l @r14+, ssr
+ldc.l @r1+, spc
+ldc.l @r14+, spc
+ldc.l @r1+, sgr
+ldc.l @r14+, sgr
+ldc.l @r1+, dbr
+ldc.l @r14+, dbr
+ldc.l @r1+, r3_bank
+ldc.l @r14+, r7_bank
+stc sr, r1
+stc sr, r14
+stc gbr, r1
+stc gbr, r14
+stc vbr, r1
+stc vbr, r14
+stc ssr, r1
+stc ssr, r14
+stc spc, r1
+stc spc, r14
+stc sgr, r1
+stc sgr, r14
+stc dbr, r1
+stc dbr, r14
+stc r3_bank, r1
+stc r7_bank, r14
+stc.l sr, @-r1
+stc.l sr, @-r14
+stc.l gbr, @-r1
+stc.l gbr, @-r14
+stc.l vbr, @-r1
+stc.l vbr, @-r14
+stc.l ssr, @-r1
+stc.l ssr, @-r14
+stc.l spc, @-r1
+stc.l spc, @-r14
+stc.l sgr, @-r1
+stc.l sgr, @-r14
+stc.l dbr, @-r1
+stc.l dbr, @-r14
+stc.l r3_bank, @-r1
+stc.l r7_bank, @-r14
+lds r1, mach
+lds r14, mach
+lds r1, macl
+lds r14, macl
+lds r1, pr
+lds r14, pr
+lds r1, fpul
+lds r14, fpul
+lds r1, fpscr
+lds r14, fpscr
+lds.l @r1+, mach
+lds.l @r14+, mach
+lds.l @r1+, macl
+lds.l @r14+, macl
+lds.l @r1+, pr
+lds.l @r14+, pr
+lds.l @r1+, fpul
+lds.l @r14+, fpul
+lds.l @r1+, fpscr
+lds.l @r14+, fpscr
+sts mach, r1
+sts mach, r14
+sts macl, r1
+sts macl, r14
+sts pr, r1
+sts pr, r14
+sts fpul, r1
+sts fpul, r14
+sts fpscr, r1
+sts fpscr, r14
+sts.l mach, @-r1
+sts.l mach, @-r14
+sts.l macl, @-r1
+sts.l macl, @-r14
+sts.l pr, @-r1
+sts.l pr, @-r14
+sts.l fpul, @-r1
+sts.l fpul, @-r14
+sts.l fpscr, @-r1
+sts.l fpscr, @-r14
+fabs fr1
+fabs fr14
+fabs dr2
+fabs dr14
+fadd fr2, fr1
+fadd fr7, fr14
+fadd dr4, dr2
+fadd dr0, dr14
+fsub fr2, fr1
+fsub fr7, fr14
+fsub dr4, dr2
+fsub dr0, dr14
+fmul fr2, fr1
+fmul fr7, fr14
+fmul dr4, dr2
+fmul dr0, dr14
+fdiv fr2, fr1
+fdiv fr7, fr14
+fdiv dr4, dr2
+fdiv dr0, dr14
+fcmp/eq fr2, fr1
+fcmp/eq fr7, fr14
+fcmp/eq dr4, dr2
+fcmp/eq dr0, dr14
+fcmp/gt fr2, fr1
+fcmp/gt fr7, fr14
+fcmp/gt dr4, dr2
+fcmp/gt dr0, dr14
+fneg fr1
+fneg fr14
+fneg dr2
+fneg dr14
+fsqrt fr1
+fsqrt fr14
+fsqrt dr2
+fsqrt dr14
+fldi0 fr1
+fldi0 fr14
+fldi1 fr1
+fldi1 fr14
+flds fr1, fpul
+flds fr14, fpul
+fsts fpul, fr1
+fsts fpul, fr14
+float fpul, fr1
+float fpul, fr14
+float fpul, dr2
+float fpul, dr14
+ftrc fr1, fpul
+ftrc fr14, fpul
+ftrc dr2, fpul
+ftrc dr14, fpul
+fcnvds dr2, fpul
+fcnvds dr14, fpul
+fcnvsd fpul, dr2
+fcnvsd fpul, dr14
+fmac fr0, fr2, fr1
+fmac fr0, fr7, fr14
+fsca fpul, dr2
+fsca fpul, dr14
+fsrra fr1
+fsrra fr14
+fipr fv8, fv4
+fipr fv0, fv12
+ftrv xmtrx, fv4
+ftrv xmtrx, fv12
+frchg
+fschg
+fpchg
+fmov fr2, fr1
+fmov fr7, fr14
+fmov @r2, fr1
+fmov @r7, fr14
+fmov fr2, @r1
+fmov fr7, @r14
+fmov @r2+, fr1
+fmov @r7+, fr14
+fmov fr2, @-r1
+fmov fr7, @-r14
+fmov @(r0,r2), fr1
+fmov @(r0,r7), fr14
+fmov fr2, @(r0,r1)
+fmov fr7, @(r0,r14)
+fmov dr4, dr2
+fmov dr0, dr14
+fmov @r2, dr2
+fmov @r7, dr14
+fmov dr4, @r1
+fmov dr0, @r14
+fmov @r2+, dr2
+fmov @r7+, dr14
+fmov dr4, @-r1
+fmov dr0, @-r14
+fmov @(r0,r2), dr2
+fmov @(r0,r7), dr14
+fmov dr4, @(r0,r1)
+fmov dr0, @(r0,r14)
+fmov.s @r2, fr1
+fmov.s @r7, fr14
+fmov.s fr2, @r1
+fmov.s fr7, @r14
+fmov.s @r2+, fr1
+fmov.s @r7+, fr14
+fmov.s fr2, @-r1
+fmov.s fr7, @-r14
+fmov.s @(r0,r2), fr1
+fmov.s @(r0,r7), fr14
+fmov.s fr2, @(r0,r1)
+fmov.s fr7, @(r0,r14)
+fmov.d @r2, dr2
+fmov.d @r7, dr14
+fmov.d dr4, @r1
+fmov.d dr0, @r14
+fmov.d @r2+, dr2
+fmov.d @r7+, dr14
+fmov.d dr4, @-r1
+fmov.d dr0, @-r14
+fmov.d @(r0,r2), dr2
+fmov.d @(r0,r7), dr14
+fmov.d dr4, @(r0,r1)
+fmov.d dr0, @(r0,r14)

@@ -1,0 +1,42 @@
+# Relocations from single statements, as whole objects against llvm-mc and
+# as relocations against GNU as. `foo` is undefined unless a case defines it.
+call foo
+call foo+4
+call foo-1
+jmp foo
+jmp foo+0x10
+je foo
+movl $0, foo(%rip)
+movw $1, foo(%rip)
+movb $2, foo(%rip)
+movq $3, foo(%rip)
+leaq foo(%rip), %rax
+leaq foo+8(%rip), %rax
+movabsq $foo, %rax
+movabsq $foo+16, %rax
+movl $foo, %eax
+.quad foo
+.quad foo+9
+.long foo
+.long foo+8
+.long foo-4
+.rva foo
+.rva foo+12
+.rva foo, foo+4
+.secrel32 foo
+.secrel32 foo+2
+.secidx foo
+.long foo@IMGREL
+.long foo@IMGREL+6
+.long foo - .
+.long foo + 3 - .
+.data; .long foo - .
+.text; .globl foo; foo: ret; call foo
+.text; foo: ret; call foo; jmp foo
+.text; .globl foo; foo: ret; .quad foo; .long foo
+.data; foo: .long 0; .long foo; .quad foo+2
+.text; call bar; .data; bar: .long 1
+.text; call bar; .data; .globl bar; bar: .long 1
+.data; .rva bar; .text; bar: ret
+.data; .long bar - .; .text; bar: ret
+.text; nop; nop; .long foo

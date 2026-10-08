@@ -1,0 +1,375 @@
+=== a program at the reset vector, with an interrupt vector
+        ORG     0
+        LJMP    MAIN
+        ORG     0BH             ; timer 0 overflow
+        CPL     P1.0
+        RETI
+        ORG     30H
+MAIN:   MOV     SP,#5FH
+        MOV     TMOD,#01H
+        MOV     TH0,#0FCH
+        MOV     TL0,#18H
+        SETB    TR0
+        SETB    ET0
+        SETB    EA
+LOOP:   SJMP    LOOP
+=== every register name
+        MOV     A,P0
+        MOV     A,SP
+        MOV     A,DPL
+        MOV     A,DPH
+        MOV     A,PCON
+        MOV     A,TCON
+        MOV     A,TMOD
+        MOV     A,TL0
+        MOV     A,TL1
+        MOV     A,TH0
+        MOV     A,TH1
+        MOV     A,P1
+        MOV     A,SCON
+        MOV     A,SBUF
+        MOV     A,P2
+        MOV     A,IE
+        MOV     A,IEC
+        MOV     A,P3
+        MOV     A,IP
+        MOV     A,IPC
+        MOV     A,PSW
+        MOV     A,ACC
+        MOV     A,B
+=== every bit name
+        SETB    IT0
+        SETB    IE0
+        SETB    IT1
+        SETB    IE1
+        SETB    TR0
+        SETB    TF0
+        SETB    TR1
+        SETB    TF1
+        SETB    RI
+        SETB    TI
+        SETB    RB8
+        SETB    TB8
+        SETB    REN
+        SETB    SM2
+        SETB    SM1
+        SETB    SM0
+        SETB    EX0
+        SETB    ET0
+        SETB    EX1
+        SETB    ET1
+        SETB    ES
+        SETB    EA
+        SETB    RXD
+        SETB    TXD
+        SETB    INT0
+        SETB    INT1
+        SETB    T0
+        SETB    T1
+        SETB    WR
+        SETB    RD
+        SETB    PX0
+        SETB    PT0
+        SETB    PX1
+        SETB    PT1
+        SETB    PS
+        SETB    P
+        SETB    OV
+        SETB    RS0
+        SETB    RS1
+        SETB    F0
+        SETB    AC
+        JB      CY,$
+=== names in lower case
+        mov     a,acc
+        mov     b,a
+        mov     psw,#0
+        mov     sp,#7
+        setb    tr1
+        clr     ea
+        jnb     ri,$
+        cpl     p1.7
+=== the bit notation, on RAM and on registers
+        SETB    20H.0
+        CLR     2FH.7
+        CPL     27H.4
+        CPL     P1.3
+        MOV     C,ACC.7
+        MOV     PSW.5,C
+        JB      TCON.5,$
+        JNB     B.0,$
+        JBC     20H.1,$
+        ANL     C,/P3.2
+        ORL     C,SCON.0
+        SETB    P0.0
+        CLR     IP.7
+        SETB    IE.7
+=== the bit notation with a named base and an expression
+BASE    EQU     24H
+        SETB    BASE.2
+        CLR     (BASE+1).6
+        MOV     C,P1.(1+2)
+        CPL     P2.7+0
+        SETB    20H+1.3
+        CPL     P1.1+2
+        CLR     BASE*1+1.8-1
+=== CY as the carry, and as a bit
+        CLR     CY
+        SETB    CY
+        CPL     CY
+        MOV     CY,20H.0
+        MOV     20H.1,CY
+        MOV     C,CY
+        ANL     CY,/ACC.0
+        ORL     CY,B.1
+        JB      CY,$
+        JNB     CY,$
+=== BIT and SFR symbols
+LED     BIT     P1.0
+FLAG    BIT     20H.3
+MIRROR  BIT     FLAG
+PORT    SFR     90H
+LATCH   SFRB    0A0H
+        SETB    LED
+        CLR     FLAG
+        JB      MIRROR,$
+        MOV     PORT,#0FFH
+        MOV     A,LATCH
+        SETB    LATCH.4
+=== BIT symbols used before they are defined
+        SETB    LATER
+        JNB     LATER,$
+        MOV     C,LATER
+LATER   BIT     2EH.5
+=== EQU constants and forward references
+        ORG     100H
+START:  MOV     A,#COUNT
+        MOV     R0,#BUFFER
+        MOV     DPTR,#TABLE
+        CALL    FILL
+        LJMP    DONE
+FILL:   MOV     @R0,A
+        INC     R0
+        DJNZ    ACC,FILL
+        RET
+TABLE:  DB      1,2,3,4
+DONE:   SJMP    DONE
+COUNT   EQU     8
+BUFFER  EQU     30H
+=== generic JMP and CALL, short, paged and long
+        ORG     0
+BACK:   JMP     BACK
+        CALL    BACK
+        JMP     NEAR
+        JMP     PAGED
+        CALL    PAGED
+        JMP     FAR
+        CALL    FAR
+NEAR:   NOP
+        ORG     400H
+PAGED:  RET
+        ORG     2000H
+FAR:    RET
+=== generic JMP and CALL across a block boundary
+        ORG     7F0H
+        JMP     810H
+        CALL    810H
+        JMP     900H
+        CALL    7F0H
+        ORG     900H
+        JMP     0
+        CALL    8F0H
+        JMP     @A+DPTR
+=== generic JMP that grows, moving a later jump out of its block
+        ORG     7C0H
+        JMP     FAR1
+        DS      3AH
+        CALL    NEAR1
+NEAR1:  RET
+        ORG     1000H
+FAR1:   RET
+=== AJMP and ACALL to every page of their block
+        ORG     800H
+        AJMP    800H
+        AJMP    900H
+        AJMP    0A00H
+        AJMP    0B00H
+        AJMP    0C00H
+        ACALL   0D00H
+        ACALL   0E00H
+        ACALL   0FFFH
+        ORG     0F00H
+        AJMP    800H
+        ACALL   0FFFH
+=== AJMP and ACALL to labels either side of the instruction
+        ORG     1000H
+TOP:    NOP
+        ORG     1400H
+        AJMP    TOP
+        ACALL   BOTTOM
+        AJMP    $
+        ORG     17F0H
+BOTTOM: RET
+=== AJMP ending a block, two bytes before its boundary
+        ORG     7FAH
+        AJMP    0
+        ACALL   7FFH
+        NOP
+        NOP
+=== relative branches at the edge of their reach, by label
+        ORG     100H
+        SJMP    FWD
+        DS      127
+FWD:    NOP
+BWD:    DS      126
+        SJMP    BWD
+        JZ      FWD2
+        DS      127
+FWD2:   NOP
+=== three-byte branches at the edge of their reach
+        ORG     200H
+        CJNE    A,#1,FWD
+        DS      127
+FWD:    DJNZ    30H,BWD
+BWD:    NOP
+        DS      124
+        JB      20H.0,BWD
+=== relative branches at the edge of their reach, from the location counter
+        ORG     100H
+        SJMP    $+129
+        SJMP    $-126
+        JNC     $-126
+        DJNZ    R2,$-126
+        JBC     P1.1,$-125
+        CJNE    R3,#0,$-125
+        CJNE    @R0,#0,$+130
+        CJNE    A,30H,$-125
+        DJNZ    30H,$+130
+=== DB, DW and DS
+        ORG     0
+        MOV     DPTR,#MSG
+        MOVC    A,@A+DPTR
+        RET
+MSG:    DB      'Hello',0DH,0AH,0
+        ; `$` first: AS gives every item the statement's address, rsasm
+        ; each item its own (see the 8-bit dialect notes).
+        DW      $,1234H,MSG
+        DS      4
+        DB      'A'+1,-1,255
+VEC:    DW      MSG
+=== a lookup table through MOVC A,@A+PC
+        ORG     0
+        INC     A
+        MOVC    A,@A+PC
+        RET
+        DB      3FH,06H,5BH,4FH
+=== USING and the AR names
+        USING   0
+        PUSH    AR0
+        PUSH    AR7
+        USING   1
+        PUSH    AR0
+        POP     AR7
+        USING   3
+        MOV     A,AR5
+        MOV     AR2,#1
+=== an 8052-style register defined in the program
+T2CON   SFRB    0C8H
+RCAP2L  SFR     0CAH
+TR2     BIT     T2CON.2
+        MOV     RCAP2L,#0
+        SETB    TR2
+        CLR     T2CON.7
+=== number spellings
+        MOV     A,#12H
+        MOV     A,#0FFH
+        MOV     A,#11001010B
+        MOV     A,#17Q
+        MOV     A,#123
+        MOV     A,#'Z'
+        MOV     A,#-1
+        MOV     A,#-128
+        MOV     DPTR,#-1
+        MOV     DPTR,#0FFFFH
+        LJMP    -1
+=== the location counter and arithmetic
+        ORG     1234H
+        MOV     DPTR,#$
+        MOV     A,#$ & 0FFH
+        MOV     B,#$ >> 8
+        DW      $+2
+        SJMP    $+2
+=== conditional assembly and a macro
+DEBUG   EQU     1
+OUT     MACRO   PORTNUM,VALUE
+        MOV     PORTNUM,#VALUE
+        ENDM
+        IF      DEBUG
+        OUT     P1,55H
+        ELSE
+        OUT     P1,0AAH
+        ENDIF
+        OUT     P2,1
+=== nested delay loops
+        ORG     0
+DELAY:  MOV     R7,#10
+D1:     MOV     R6,#200
+D2:     MOV     R5,#250
+D3:     DJNZ    R5,D3
+        DJNZ    R6,D2
+        DJNZ    R7,D1
+        RET
+=== serial port setup and a transmit routine
+        ORG     0
+        MOV     SCON,#50H
+        MOV     TMOD,#20H
+        MOV     TH1,#0FDH
+        SETB    TR1
+        MOV     A,#'U'
+        ACALL   PUTC
+HALT:   SJMP    HALT
+PUTC:   MOV     SBUF,A
+WAIT:   JNB     TI,WAIT
+        CLR     TI
+        RET
+=== external memory through DPTR and R0/R1
+        ORG     0
+        MOV     DPTR,#8000H
+        MOVX    A,@DPTR
+        INC     DPTR
+        MOVX    @DPTR,A
+        MOV     R0,#40H
+        MOVX    A,@R0
+        MOVX    @R1,A
+        XCH     A,@R1
+        XCHD    A,@R0
+=== every addressing mode of MOV with symbols
+SRC     EQU     31H
+DST     EQU     32H
+        MOV     A,R3
+        MOV     A,SRC
+        MOV     A,@R1
+        MOV     A,#SRC
+        MOV     R3,A
+        MOV     R3,SRC
+        MOV     R3,#SRC
+        MOV     DST,A
+        MOV     DST,R3
+        MOV     DST,SRC
+        MOV     DST,@R0
+        MOV     DST,#SRC
+        MOV     @R1,A
+        MOV     @R1,SRC
+        MOV     @R1,#SRC
+        MOV     DPTR,#DST*256+SRC
+        MOV     ACC,ACC
+        MOV     B,ACC
+=== labels without colons in the first column
+        ORG     0
+AGAIN   INC     R2
+        CJNE    R2,#10,AGAIN
+DONE    SJMP    DONE
+=== END stops assembly
+        NOP
+        END
+        NOP

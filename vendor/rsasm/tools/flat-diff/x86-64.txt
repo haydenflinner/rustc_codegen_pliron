@@ -1,0 +1,32 @@
+Lines before the first snippet are not assembled.
+
+=== rip-relative and absolute references into another section
+        .text
+        leaq    msg(%rip), %rsi
+        movl    $msg, %eax
+        movabsq $msg, %rdx
+        movq    msg(%rip), %rcx
+        ret
+        .data
+        .space  0x100
+msg:    .quad   1
+
+=== calls into another section
+        .text
+entry:
+        call    helper
+        call    helper@PLT
+        .section .text.helper, "ax"
+helper:
+        ret
+
+=== data across sections
+        .text
+entry:
+        ret
+        .data
+        .quad   entry
+        .long   entry
+        .long   entry - .
+        .quad   entry - .
+        .long   entry@PLT

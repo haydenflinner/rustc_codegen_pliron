@@ -1,0 +1,139 @@
+=== hello
+        global  main
+        extern  puts
+        section .text
+main:
+        sub     rsp, 40
+        lea     rcx, [rel msg]
+        call    puts
+        xor     eax, eax
+        add     rsp, 40
+        ret
+        section .rdata
+msg:    db      "Hello from rsasm!", 0
+=== externs and relocations
+        default rel
+        global  f, g
+        extern  ext
+        section .text
+f:      call    ext
+        call    g
+        call    local1
+        lea     rax, [data1]
+        lea     rcx, [ext+4]
+        mov     eax, [rel data1+8]
+        jmp     f
+g:      ret
+local1: ret
+.sub:   ret
+        section .data
+data1:  dq      f, g, local1, ext
+        dd      ext wrt ..imagebase
+        dd      f wrt ..imagebase
+        dd      data1 wrt ..imagebase
+=== standard sections
+        section .text
+        ret
+        section .data
+        dd      1
+        section .rdata
+        db      2
+        section .bss
+        resq    2
+=== section attributes
+        section .mysec
+        db      2
+        section .code2 code
+        ret
+        section .text2 text
+        ret
+        section .dat2 data align=8
+        dq      3
+        section .rd2 rdata align=2
+        db      4
+        section .b2 bss
+        resb    5
+        section .inf info
+        db      'x'
+        section .drectve info
+        db      ' /export:f'
+=== empty sections
+        section .foo
+        section .data
+        section .text
+        section .bar
+x:
+        section .baz
+        db      1
+=== data only
+        section .data
+x:      dd      1
+=== absolute and common
+        global  x
+x       equ     5
+        common  shared 16
+        section .text
+        mov     eax, x
+        mov     rax, [rel shared]
+=== pdata and xdata by name
+        section .text
+f:      ret
+        section .xdata
+        db      1, 0, 0, 0
+        section .pdata
+        dd      f wrt ..imagebase
+
+=== extern: call foo
+        extern  foo
+        call foo
+=== extern: call foo+4
+        extern  foo
+        call foo+4
+=== extern: jmp foo
+        extern  foo
+        jmp foo
+=== extern: jz foo
+        extern  foo
+        jz foo
+=== extern: mov eax, [rel foo]
+        extern  foo
+        mov eax, [rel foo]
+=== extern: mov dword [rel foo], 1
+        extern  foo
+        mov dword [rel foo], 1
+=== extern: mov word [rel foo], 2
+        extern  foo
+        mov word [rel foo], 2
+=== extern: mov byte [rel foo+3], 4
+        extern  foo
+        mov byte [rel foo+3], 4
+=== extern: lea rax, [rel foo+8]
+        extern  foo
+        lea rax, [rel foo+8]
+=== extern: mov rax, foo
+        extern  foo
+        mov rax, foo
+=== extern: mov eax, foo
+        extern  foo
+        mov eax, foo
+=== extern: mov rcx, [foo]
+        extern  foo
+        mov rcx, [foo]
+=== extern: push qword [rel foo]
+        extern  foo
+        push qword [rel foo]
+=== extern: dq foo
+        extern  foo
+        dq foo
+=== extern: dq foo+9
+        extern  foo
+        dq foo+9
+=== extern: dd foo
+        extern  foo
+        dd foo
+=== extern: dd foo wrt ..imagebase
+        extern  foo
+        dd foo wrt ..imagebase
+=== extern: dd foo+4 wrt ..imagebase
+        extern  foo
+        dd foo+4 wrt ..imagebase

@@ -1,0 +1,34 @@
+# Cases compared against llvm-mc alone; see x86-64-llvm.txt for why each
+# kind is here.
+=== weak
+        .text
+        .globl  _first
+_first: ret
+        .weak   _w
+_w:     ret
+        call    _w
+        .weak   _wu
+        call    _wu
+=== comdat
+        .section .text$f,"xr",discard,_f
+        .globl  _f
+_f:     ret
+        .text
+        call    _f
+=== def and file
+        .file   "x.c"
+        .def    _func; .scl 2; .type 32; .endef
+        .text
+        .globl  _func
+_func:  ret
+        call    _func
+# Private labels: llvm-mc's i386 Windows objects keep any local label that
+# starts with a capital L out of the symbol table, `Label` included, and keep
+# `.Lfoo`, which x86-64 and ARM64 leave out.
+=== private labels
+        .text
+Lx:     ret
+.Ly:    ret
+Label:  ret
+        .long   Lx, .Ly, Label
+        call    Label

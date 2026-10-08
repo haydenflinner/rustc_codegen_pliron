@@ -1,0 +1,405 @@
+# m68k, GNU syntax, against `m68k-elf-as` (which assumes a 68020).
+#
+# Registers need the `%` sigil here: without it `d0` is a symbol. Comments
+# start with `|`, and `#` is the immediate prefix.
+#
+# Left out on purpose, because rsasm and GNU as legitimately differ:
+#   - GNU as substitutes instructions: `movel #1,%d0` becomes `moveq`,
+#     `addw #1,%d0` becomes `addq`, and `cmp`/`and`/`or #imm,%dn` become the
+#     `I` forms. rsasm assembles what is written.
+#   - `label` as an absolute address, which GNU as turns into a PC-relative
+#     reference when the label is in the same section.
+
+# ---- the Amiga DMACON idiom ----
+movew #0x7fff,0xdff096
+movw #0x7fff,0xDFF096
+move.w #0x7fff,0xdff096
+
+# ---- register spellings and sizes ----
+movew %d0,%d1
+move.w %d0,%d1
+movw %d0,%d1
+movl %d0,%d1
+moveb %d0,%d1
+move %d0,%d1
+movb %d0,%d1
+movew %sp@,%d0
+movew %fp@,%d0
+movew %a6@,%d0
+movew %a7@,%d0
+movel %d0,%a1
+movew %d0,%a1
+moveal %d0,%a1
+movea %d0,%a1
+movew #1,%d0 | a comment
+movew #1+2*3,%d0
+movew #-1,%d0
+movew #0xffff,%d0
+moveb #0xff,%d0
+moveb #-128,%d0
+movew #'A',%d0
+movel #0x12345678,%d7
+
+# ---- MIT addressing modes ----
+movew %d0,%a0@
+movew %d0,%a0@+
+movew %d0,%a0@-
+movew %d0,%a0@(8)
+movew %d0,%a0@(-8)
+movew %d0,%a0@(8,%d1:w)
+movew %d0,%a0@(8,%d1:l)
+movew %d0,%a0@(8,%d1:w:4)
+movew %d0,%a0@(8,%d1:l:4)
+movew %d0,%a0@(%d1:w)
+movew %d0,%a1@(0,%a2:l)
+movew %a0@(8),%d0
+movew %a0@+,%d0
+movew %a0@-,%d0
+movew %pc@(8),%d0
+movew %pc@(8,%d0:w),%d0
+
+# ---- Motorola addressing modes, which GNU as also takes ----
+movew %d0,(%a0)
+movew %d0,(%a0)+
+movew %d0,-(%a0)
+movew %d0,8(%a0,%d1.w)
+movew %d0,8(%a0,%d1)
+movew %d0,(8,%a0,%d1.l*4)
+movew %d0,(%d1.w,%a0)
+movew %d0,(%a0,%d1.w)
+movew %d0,(%a1,%a2.l)
+movew 8(%pc),%d0
+movew %d0,-(%sp)
+movel %sp@+,%d0
+
+# ---- absolute addresses ----
+movew %d0,0x400
+movew %d0,0x400:w
+movew %d0,(0x400).w
+movew %d0,(0x400).l
+movew %d0,0x400:l
+movew %d0,0x8000
+movew %d0,0xffff8000
+movew %d0,-2
+movel 0x12345678,%d0
+
+# ---- MOVEQ, MOVEM, MOVEC, special registers ----
+moveq #1,%d0
+moveql #-128,%d0
+moveq #127,%d7
+moveml %d0-%d3/%a0-%a2,%sp@-
+moveml %d0-%d3/%a0-%a2,-(%sp)
+movem.l %d0-%d3/%a0-%a2,%sp@-
+moveml %sp@+,%d0-%d3/%a0-%a2
+moveml #0x3,%a0@
+movemw %d0/%d2,%a0@
+moveml %a0@(8),%d0-%a6
+movel %usp,%a0
+movel %a0,%usp
+movew %sr,%d0
+movew %d0,%ccr
+movew %d0,%sr
+movew #0x2700,%sr
+movew %ccr,%d0
+movec %d0,%vbr
+movecl %vbr,%a0
+
+# ---- LEA, PEA, EXG, SWAP, CLR, EXT ----
+leal %a0@,%a1
+lea %a0@(4),%a1
+lea %a0@(0),%a1
+pea %a0@
+peal %a0@(-4)
+exg %d0,%d1
+exg %a0,%a1
+exg %a1,%d0
+swap %d0
+swapw %d0
+clrb %d0
+clrw %d0
+clrl %a0@
+clr %d0
+extw %d0
+extl %d0
+extbl %d0
+
+# ---- arithmetic ----
+addw %d0,%d1
+addl %d0,%a1
+addal %d0,%a1
+addaw %d0,%a1
+addib #1,%d0
+addiw #1,%a0@
+addil #0x10000,%a0@(4)
+addqw #1,%d0
+addqb #1,%d0
+addq #8,%a0@+
+addql #1,%a7
+addxb %d0,%d1
+addxl %a0@-,%a1@-
+addxl -(%a0),-(%a1)
+subw %d0,%d1
+subl %a0@+,%d1
+subw %d1,%a0@
+subqw #1,%d0
+subil #1,%d0
+subxw %d0,%d1
+subaw %a0@,%a0
+cmpw %d0,%d1
+cmpb %a0@,%d0
+cmpal %a0,%a1
+cmpl %a0,%d1
+cmpmb %a0@+,%a1@+
+cmpib #1,%d0
+cmpiw #1,%a0@
+andw %d0,%d1
+andiw #1,%d0
+andw %d0,%a0@
+orl %d0,%d1
+oriw #1,%d0
+orb #1,%a0@
+eorw %d0,%d1
+eoriw #1,%d0
+eorl #1,%d0
+notw %d0
+negl %d0
+negxb %d0
+abcd %d0,%d1
+sbcd %a0@-,%a1@-
+nbcd %a0@
+muls %d0,%d1
+mulsw %d0,%d1
+mulul %d0,%d1
+mulsl %d0,%d2:%d1
+divu %d0,%d1
+divuw %d0,%d1
+divul %d0,%d1
+divsl %d0,%d1
+divsl %d0,%d2:%d1
+divsll %d0,%d2:%d1
+tstw %d0
+tstl %a0
+tstb %a0@(1)
+tas %d0
+tasb %d0
+chkw %d0,%d1
+chkl %d0,%d1
+chk %d0,%d1
+
+# ---- shifts and bits ----
+aslw #1,%d0
+lsll %d1,%d0
+lsrw %a0@
+rolb #1,%d0
+roxrw %d0,%d1
+lsl #1,%d0
+asrl #8,%d7
+rorw %a0@(2)
+btst #3,%d0
+btstb #3,%a0@
+btstl #3,%d0
+bset %d1,%d0
+bclr #1,%a0@
+bchg %d0,%a0@
+bset #31,%d7
+
+# ---- Scc, jumps, traps ----
+seq %d0
+seqb %d0
+st %d0
+sf %d0
+scc %d0
+sne %a0@
+jmp %a0@
+jmp %a0@(4)
+jmp 0x400:w
+jsr %a6@(-198)
+jsr -198(%a6)
+jsr 0x12345678
+rts
+rte
+rtr
+rtd #4
+trap #15
+trapv
+link %a6,#-4
+linkw %a6,#-4
+linkl %a6,#-4
+unlk %a6
+nop
+reset
+stop #0x2700
+illegal
+bkpt #1
+andiw #0xf8ff,%sr
+andi #0xf8ff,%sr
+andib #0xfe,%ccr
+andi #0xfe,%ccr
+oriw #0x700,%sr
+eorib #1,%ccr
+
+# ---- 68020 ----
+cmp2l %a0@,%d0
+chk2w %a0@,%d0
+bfextu %d0{#1:#8},%d1
+bftst %a0@{%d1:%d2}
+bfins %d1,%a0@{#0:#32}
+bfset %a0@(4){#3:#5}
+movew %d0,%a0@(8:w,%d1:w)
+movew %d0,%a0@(0x10000,%d1:w)
+movew %d0,%a0@(8)@(4)
+movew %d0,([8,%a0],%d1.w,4)
+movew %d0,([8,%a0,%d1.w],4)
+movew %d0,(8,%d1.w)
+movew (%d1),%d0
+movew %d0,(%d1.w*2)
+movew %a0@(0x12345),%d0
+
+# ---- the 68881, the 68851 and the rest of the 68020 set ----
+# (every form of GNU's table is also in m68k-020.txt and its siblings;
+# these are the readable spellings.) GNU as writes extended and packed
+# float immediates differently from vasm and rsasm, so only single and
+# double ones are here; see m68k-vasm-020.txt.
+fmove.x	%fp0,%fp1
+fmove.x	%fp7,%fp0
+fadd.x	%fp1,%fp2
+fsub.x	%fp3,%fp4
+fmul.x	%fp5,%fp6
+fdiv.x	%fp7,%fp0
+fsqrt.x	%fp0,%fp1
+fabs.x	%fp2
+fneg.x	%fp3,%fp3
+fmove.l	%d0,%fp0
+fmove.w	%d1,%fp2
+fmove.b	%d2,%fp3
+fmove.l	%fp0,%d0
+fmove.w	%fp1,%d1
+fmove.b	%fp2,%d2
+fmove.x	(%a0),%fp0
+fmove.x	%fp0,(%a0)
+fmove.x	(%a0)+,%fp1
+fmove.x	%fp1,-(%a7)
+fmove.d	0x10(%a0),%fp2
+fmove.s	%fp3,0x20(%a1)
+fmove.x	4(%a0,%d0.w),%fp4
+fmove.x	4(%a0,%d0.l*4),%fp5
+fmove.l	#1,%fp0
+fmove.w	#0x1234,%fp0
+fmove.b	#0x12,%fp0
+fmove.l	%fpcr,%d0
+fmove.l	%d0,%fpcr
+fmove.l	%fpsr,(%a0)
+fmove.l	%fpiar,%d1
+fmovem.x	%fp0-%fp3,-(%a7)
+fmovem.x	(%a7)+,%fp0-%fp3
+fmovem.x	%fp0/%fp2/%fp4,(%a0)
+fmovem.x	(%a0),%fp1/%fp3
+fmovem.l	%fpcr/%fpsr,-(%a7)
+fmovem.l	(%a7)+,%fpcr/%fpsr
+fmovem.l	%fpcr/%fpsr/%fpiar,(%a0)
+fmovecr	#0x32,%fp0
+fmovecr	#0,%fp1
+fsincos.x	%fp0,%fp1:%fp2
+fsincos.x	(%a0),%fp3:%fp4
+ftst.x	%fp0
+ftst.l	%d0
+ftst.x	(%a0)
+fint.x	%fp0,%fp1
+fintrz.x	%fp2
+fetox.x	%fp0,%fp1
+flogn.x	%fp2,%fp3
+fsin.x	%fp0
+fcos.x	%fp1
+ftan.x	%fp2
+fatan.x	%fp3
+fgetexp.x	%fp0,%fp1
+fgetman.x	%fp2,%fp3
+fscale.l	%d0,%fp0
+fmod.x	%fp1,%fp2
+frem.x	%fp3,%fp4
+fsgldiv.x	%fp0,%fp1
+fsglmul.x	%fp2,%fp3
+fnop
+fsave	-(%a7)
+frestore	(%a7)+
+fseq	%d0
+fsne	(%a0)
+fsgt	-(%a7)
+fsf	%d1
+fst	%d2
+ftrapeq
+ftrapne.w	#1
+ftrapgt.l	#0x12345678
+fmove.p	%fp0,(%a0){#5}
+fmove.p	%fp1,(%a1){%d2}
+pmove	%tc,(%a0)
+pmove	(%a0),%tc
+pmove	%crp,(%a1)
+pmove	%srp,-(%a7)
+pmove	%psr,%d0
+pmove	%d0,%psr
+pflush	#1,#2
+pflush	#1,#2,(%a0)
+ptestr	#1,(%a0),#7
+ptestw	#1,(%a0),#7,%a1
+pvalid	%val,(%a0)
+psave	-(%a7)
+prestore	(%a7)+
+cas.b	%d0,%d1,(%a0)
+cas.w	%d2,%d3,(%a1)
+cas.l	%d4,%d5,(%a2)
+cas2.w	%d0:%d1,%d2:%d3,(%a0):(%a1)
+cas2.l	%d0:%d1,%d2:%d3,(%a0):(%a1)
+callm	#0,(%a0)
+rtm	%d0
+pack	%d0,%d1,#0
+pack	-(%a0),-(%a1),#0x30
+unpk	%d0,%d1,#0x3030
+unpk	-(%a0),-(%a1),#0
+trapeq
+trapne.w	#1
+traphi.l	#0x12345678
+movep.w	%d0,0x10(%a0)
+movep.l	0x20(%a1),%d1
+moves.b	(%a0),%d0
+moves.w	%d1,(%a1)
+moves.l	(%a2)+,%a3
+fmove.s	#0r1.5,%fp0
+fmove.d	#0r1.5,%fp0
+fmove.s	#-0r0.1,%fp1
+fmove.d	#0r2.718281828,%fp1
+fadd.s	#0r0.5,%fp1
+fsub.d	#0r100.25,%fp2
+faddx	%fp0,%fp1
+fmovex	%a0@,%fp0
+fmovex	%fp0,%a1@-
+fmovemx	%fp0-%fp3,%sp@-
+fmovemx	%sp@+,%fp0-%fp3
+faddd	%a0@(8,%d1:l:4),%fp2
+fmovel	%fpcr,%a0@+
+fmoves	#0e1.5,%fp0
+fmoves	#0f2.25,%fp0
+fmoved	#0s1.0,%fp0
+fmoved	#0d-3.5,%fp0
+fmoved	#-0r3.5,%fp0
+fmovecrx	#0x0f,%fp7
+fsincosx	%a0@(4),%fp6:%fp7
+fmovep	%fp0,%a0@(12){#-3}
+fmovemx	%d7,%a2@
+fmovemx	%a3@+,%d6
+fmovem	%fp1,%a0@
+fmovem.x	#0x80,%a0@
+fmovem.x	%d1,-(%sp)
+fmovem.x	(%sp)+,%d1
+ptestr	%sfc,%a0@,#3,%a4
+pmove	%bad2,%a0@
+pmove	%a0@,%bac5
+pmove	%cal,%d1
+pmove	%scc,%d2
+pmove	%ac,%a0@
+pmove	%a0@,%val
+pflushr	%a0@
+pflushs	#3,#7
+ploadw	%dfc,%a0@
+pdbbc	%d7,.
+cas2w	%d0:%d1,%d2:%d3,%a0@:%a1@

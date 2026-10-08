@@ -1,0 +1,29 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`; see mips.txt. Code sections also end on a
+word: GNU as, and rsasm, pad the end of a code section to its alignment, up
+to a word, with no-ops, and llvm-mc does not.
+
+=== branches into another section
+        .text
+        .p2align 2
+entry:
+        bl      helper
+        b.w     helper
+        .section .text.helper, "ax"
+        .p2align 2
+helper:
+        bl      entry
+        bx      lr
+        nop
+
+=== data across sections
+        .text
+        .p2align 2
+entry:
+        bx      lr
+        nop
+        .data
+        .p2align 2
+        .word   entry
+        .word   entry - .

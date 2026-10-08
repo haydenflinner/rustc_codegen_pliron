@@ -1,0 +1,204 @@
+# V850 against `v850-elf-as` with no -m option: the original V850 instruction
+# set. One statement per line; `#` lines are comments.
+
+# ---- registers and their ABI names
+mov r1, r2
+mov R1, R2
+mov r31, r30
+mov zero, hp
+mov sp, gp
+mov tp, ep
+mov lp, r31
+mov r0, r1
+
+# ---- format I: register to register
+add r1, r2
+sub r1, r2
+cmp r1, r2
+and r3, r4
+or r3, r4
+xor r3, r4
+not r3, r4
+tst r3, r4
+subr r3, r4
+mulh r1, r2
+divh r1, r2
+satadd r1, r2
+satsub r1, r2
+satsubr r1, r2
+jmp [r1]
+jmp r1
+jmp [lp]
+nop
+breakpoint
+
+# ---- format II: 5-bit immediates, and the range GNU as accepts for them
+mov 5, r2
+mov -16, r10
+mov 15, r10
+add 3, r2
+add -16, r2
+add 16, r2
+add 31, r2
+cmp -1, r2
+cmp 15, r31
+satadd 5, r2
+satadd -16, r2
+mulh 5, r2
+mulh -1, r2
+shl 5, r6
+shr 31, r6
+sar 0, r6
+sar 17, r29
+
+# ---- format IV: short loads and stores relative to ep
+sld.b 5[ep], r1
+sld.b 127[ep], r1
+sld.b -1[ep], r1
+sld.b 5[r30], r1
+sld.h 6[ep], r2
+sld.h 254[ep], r2
+sld.w 8[ep], r2
+sld.w 252[ep], r2
+sst.b r1, 5[ep]
+sst.h r1, 6[ep]
+sst.w r1, 8[ep]
+sst.w r31, 0[ep]
+
+# ---- format VI: 16-bit immediates
+movea 5, r1, r2
+movea -1, r1, r2
+movea 0xffff, r1, r2
+movea 0x8000, r1, r2
+movea -32768, r1, r2
+movhi 0x1234, r0, r1
+addi 100, r1, r2
+addi -100, r0, r31
+andi 0xffff, r1, r2
+andi -1, r1, r2
+ori 0x8000, r1, r2
+xori 1, r1, r2
+mulhi 3, r1, r2
+satsubi 5, r1, r2
+
+# ---- hi(), lo() and hi0() on constants; hi() carries bit 15 of the low half
+movhi hi(0x12345678), r0, r1
+movhi hi(0x12348000), r0, r2
+movhi hi(0x12347fff), r0, r2
+movhi hi(0x1234ffff), r0, r2
+movhi hi0(0x12348000), r0, r2
+movhi hi(-1), r0, r2
+movhi hi(0x7fff8000), r0, r2
+movea lo(0x12348000), r1, r2
+movea lo(0x12347fff), r1, r2
+movea lo(-1), r1, r2
+movea hi(0x12348000), r1, r2
+movea zdaoff(0xfffff006), r0, r1
+
+# ---- format VII: 16-bit displacements
+ld.b 5[r1], r2
+ld.b -5[r1], r2
+ld.b 0x7fff[r1], r2
+ld.b -0x8000[r1], r2
+ld.h 6[r1], r2
+ld.w 8[r1], r2
+ld.w -8[sp], lp
+st.b r2, 5[r1]
+st.h r2, 6[r1]
+st.w r2, 8[r1]
+st.w lp, 0[sp]
+ld.b 5 [ r1 ] , r2
+ld.b lo(0x12348000)[r1], r2
+ld.w lo(0x12348002)[r1], r2
+
+# ---- format V: jumps with a numeric displacement
+jarl 0, r31
+jarl 2, lp
+jarl -2, r1
+jarl 0x1ffffe, r1
+jarl -0x200000, r1
+jr 100
+jr -100
+
+# ---- format III: conditional branches with a numeric displacement
+bz 8
+bz -2
+bz 0xfe
+bz -0x100
+br 6
+bsa 4
+bgt 6
+bge 6
+blt 6
+ble 6
+bh 6
+bnh 6
+bl 6
+bnl 6
+be 6
+bne 6
+bv 6
+bnv 6
+bn 6
+bp 6
+bc 6
+bnc 6
+bz 6
+bnz 6
+bt 6
+bf 6
+bsa 6
+jbr 6
+jgt 6
+jge 6
+jlt 6
+jle 6
+jh 6
+jnh 6
+jl 6
+jnl 6
+je 6
+jne 6
+jv 6
+jnv 6
+jn 6
+jp 6
+jc 6
+jnc 6
+jz 6
+jnz 6
+
+# ---- format VIII: bit manipulation
+set1 3, 5[r1]
+clr1 3, 5[r1]
+not1 3, 5[r1]
+tst1 7, -1[r1]
+set1 7, 0xffff[r1]
+set1 0, -32768[r31]
+
+# ---- format IX/X: shifts by register, conditions, system registers, control
+shl r1, r2
+shr r1, r2
+sar r1, r2
+setf z, r1
+setf nz, r1
+setf sa, r1
+setf Z, r1
+setf 5, r1
+setf ge, r1
+setf v, r31
+setf nh, r2
+ldsr r1, psw
+ldsr r1, 5
+ldsr r1, eipc
+ldsr r1, sr31
+stsr psw, r1
+stsr eipc, r1
+stsr 5, r1
+stsr fepsw, r31
+trap 0
+trap 31
+reti
+halt
+di
+ei

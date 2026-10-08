@@ -1,0 +1,110 @@
+Lines before the first snippet are not assembled.
+
+Every section starts and ends with `.p2align 4`. llvm-mc gives `.text`,
+`.data` and `.bss` an alignment of 16 by default, as rsasm does, but other
+sections 1; the explicit alignment keeps the cases that are not about that
+independent of it. The alignment at the end absorbs the `nop` llvm-mc adds
+after a jump or branch (see tools/mc-diff/mips-programs.txt), so those are
+written last in their section, where the extra word moves nothing. The last
+case is about the default alignment, and has none.
+
+=== hi and lo of a label in another section
+        .text
+        .p2align 4
+        lui     $a0, %hi(msg)
+        addiu   $a0, $a0, %lo(msg)
+        lw      $a1, %lo(msg)($a0)
+        sw      $a1, %lo(msg + 4)($a0)
+        .p2align 4
+        .data
+        .p2align 4
+        .space  0x8000
+msg:    .word   1, 2
+        .p2align 4
+
+=== hi and lo where the low half is negative @ 0x407ff0
+        .text
+        .p2align 4
+here:
+        lui     $a0, %hi(there)
+        addiu   $a0, $a0, %lo(there)
+        lui     $a1, %hi(here)
+        addiu   $a1, $a1, %lo(here)
+there:
+        .p2align 4
+
+=== la of a label
+        .text
+        .p2align 4
+        la      $a0, value
+        la      $a1, value + 0x10000
+        .p2align 4
+        .data
+        .p2align 4
+        .space  0x9000
+value:  .word   0x11223344
+        .p2align 4
+
+=== jal and j to labels in another section
+        .text
+        .p2align 4
+start:
+        jal     func
+        .p2align 4
+        .section .text.func, "ax"
+        .p2align 4
+func:
+        j       start
+        .p2align 4
+
+=== a branch into another section
+        .text
+        .p2align 4
+entry:
+        bal     helper
+        .p2align 4
+        .section .text.helper, "ax"
+        .p2align 4
+helper:
+        bal     entry
+        .p2align 4
+
+=== data across sections
+        .text
+        .p2align 4
+entry:
+        .word   0
+        .section .text.helper, "ax"
+        .p2align 4
+helper:
+        .word   0
+        .data
+        .p2align 4
+        .word   entry
+        .word   helper - .
+
+        .p2align 4
+
+=== refused: jal across a 256 MB region boundary @ 0xffffff0
+        .text
+        .p2align 4
+        jal     far
+        .p2align 4
+        .section .text.far, "ax"
+        .p2align 4
+far:
+        .word   0
+
+=== jal to a number takes its region from the jump @ 0xffffff0
+        .text
+        .p2align 4
+        jal     0x10000010
+        .p2align 4
+
+=== sections start at their default alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3

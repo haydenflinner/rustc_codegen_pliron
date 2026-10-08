@@ -1,0 +1,44 @@
+=== hello
+        global  _main
+        extern  _puts
+        section .text
+_main:
+        push    msg
+        call    _puts
+        add     esp, 4
+        xor     eax, eax
+        ret
+        section .rdata
+msg:    db      "Hello from rsasm!", 0
+=== externs and relocations
+        global  _f
+        extern  _ext
+        section .text
+_f:     call    _ext
+        mov     eax, [_data]
+        mov     eax, _ext+4
+        call    _g
+        ret
+_g:     ret
+        section .data
+_data:  dd      _f, _ext, _data
+        common  _c 8
+=== sections
+        section .text
+        ret
+        section .data
+        dd      1
+        section .bss
+        resd    1
+        section .other data align=16
+        dd      2
+=== extern references
+        extern  _foo
+        call    _foo
+        call    _foo+4
+        jmp     _foo
+        mov     eax, [_foo]
+        mov     eax, _foo+8
+        mov     [_foo+4], ecx
+        push    _foo
+        dd      _foo, _foo+3

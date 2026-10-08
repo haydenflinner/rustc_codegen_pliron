@@ -1,0 +1,16 @@
+=== refused: addi to memory on a ColdFire
+        addil   #5,%a0@
+=== refused: a byte-sized add on a ColdFire
+        addb    %d0,%d1
+=== refused: Scc to memory on a ColdFire
+        seq     %a0@
+=== refused: movem with predecrement on a ColdFire
+        moveml  %d0-%d3,%sp@-
+=== refused: a memory shift on a ColdFire
+        asl     %a0@
+=== refused: a word index register on a ColdFire
+        movel   %a0@(4,%d1:w),%d2
+=== refused: bra.l on a ColdFire ISA_A
+        .arch   5206
+        bral    far
+far:    rts

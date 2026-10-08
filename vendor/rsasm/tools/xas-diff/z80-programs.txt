@@ -1,0 +1,108 @@
+=== data directives
+        db 1,2,3
+        defb $ff, 0FFh, %101
+        db 'abc', "de", 0
+        db 'x'+1
+        defm "text"
+        dw $1234, 5678h, msg
+        defw 1
+        ds 3
+        defs 2,$aa
+        ds 4,0ffh
+msg:    db 0
+=== equates, forward and backward
+count   equ 10
+        ld b,count
+        ld hl,table
+        ld de,table+count
+        ld a,last-table
+table:  ds 10
+last:   ld c,size
+size    equ last-table
+=== defl can be redefined
+n       defl 1
+        ld a,n
+n       defl n+1
+        ld a,n
+=== the location counter
+        jr $
+        djnz $+2
+        ld hl,$
+        dw $, $+1, $
+        jp $+3
+=== relative jumps at the ends of their range
+top:    jr nz,fwd
+        ds 127
+fwd:    jr z,top2
+top2:   ds 126
+        jr c,top2
+        djnz top2+2
+=== a print loop
+        ld hl,msg
+loop:   ld a,(hl)
+        or a
+        ret z
+        call putc
+        inc hl
+        jr loop
+putc:   push hl
+        ld e,a
+        ld c,2
+        call 5
+        pop hl
+        ret
+msg:    db 'Hello, world',13,10,0
+=== index registers with symbolic displacements
+dx      equ 4
+dy      equ -2
+        ld ix,buf
+        ld a,(ix+dx)
+        ld (iy+dy),a
+        set 7,(ix+dx+1)
+        bit 0,(iy+dy-1)
+        ld (ix+dx),count
+count   equ 3
+buf:    ds 8
+=== block copy
+        ld hl,src
+        ld de,dst
+        ld bc,len
+        ldir
+        ret
+src:    db 1,2,3,4
+len     equ $-src
+dst:    ds len
+=== interrupt vectors and restarts
+        di
+        im 2
+        ld a,vec >> 8
+        ld i,a
+        ei
+        rst 38h
+        reti
+vec:    dw isr
+isr:    ex af,af'
+        exx
+        exx
+        ex af,af'
+        ei
+        reti
+=== comments and case
+        LD A,5          ; load
+        Ld (IX+1),A     ; mixed
+Loop:   DJNZ Loop       ; spin
+        JP Loop
+=== expressions
+        ld a,1+2*3
+        ld a,(1+2)*3
+        ld a,7 % 3
+        ld a,$f0 | $0f
+        ld a,$ff & $0f
+        ld a,$ff ^ $0f
+        ld a,~$0f & $ff
+        ld hl,1 << 15
+        ld hl,$8000 >> 4
+        ld a,-1
+        ld a,'A'
+        ld hl,lab & $ffff
+lab:    ret

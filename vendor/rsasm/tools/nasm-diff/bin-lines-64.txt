@@ -1,0 +1,96 @@
+; 64-bit forms, including the addressing modes syscall programs rely on.
+mov rax, rbx
+mov rax, 1
+mov rax, -1
+mov rax, 0x123456789
+mov eax, 1
+mov rax, [rbx]
+mov rax, [rbx+rcx*8]
+mov rax, [rbx+rcx*8+16]
+mov qword [rbx], 1
+mov dword [rbx], 1
+mov [rbx], byte 1
+mov r8, r9
+mov r8d, 1
+mov rax, [r8+r9*2]
+lea rax, [rbx+rcx]
+lea rax, [rax*4]
+lea rax, [rax*3]
+push rax
+push rbx
+pop rcx
+push r12
+pop r13
+push qword [rbx]
+add rax, 1
+add rax, 0x100000
+sub rbx, rcx
+xor eax, eax
+inc rax
+dec rcx
+inc qword [rax]
+mul rcx
+imul rax, rbx
+imul rax, rbx, 10
+neg rax
+not rbx
+shl rax, 4
+shr rax, cl
+sar rbx, 2
+bt rax, 3
+bts rax, rcx
+bsf rax, rbx
+bswap rax
+bswap r8
+cmpxchg rax, rbx
+xadd rax, rbx
+shld rax, rbx, 3
+movzx eax, al
+movzx rax, byte [rbx]
+movsx rax, byte [rbx]
+movsxd rax, dword [rbx]
+movsxd rax, ecx
+cdqe
+cqo
+cdq
+lodsq
+stosq
+movsq
+scasq
+rep movsb
+rep stosq
+syscall
+sysret
+cpuid
+rdtsc
+ret
+ret 8
+leave
+nop
+hlt
+int3
+int 0x80
+ud2
+endbr64
+jmp rax
+jmp [rbx]
+jmp qword [rbx]
+call rax
+call [rbx+8]
+jmp $
+mov rax, cr0
+mov cr3, rax
+mov cr8, rax
+mov rax, dr0
+cli
+sti
+pause
+lfence
+mfence
+sfence
+xchg rax, rbx
+xchg r8, rax
+test rax, rax
+cmp rax, 10
+setz al
+cmove rax, rbx

@@ -1,0 +1,65 @@
+=== functions and labels | -g
+	.text
+	.globl f
+	.type f, %function
+f:
+	ret
+	.size f, .-f
+_g:
+	nop
+__h:
+	nop
+	.data
+d:
+	.byte 1
+=== a macro in a repeat | -g
+	.macro two a
+	mov x0, #\a
+	mov x1, #\a
+	.endm
+	.text
+	.rept 2
+	two 1
+
+	two 2
+	.endr
+	ret
+=== sections, DWARF 3 | --gdwarf-3
+	.text
+	nop
+	.section .text.b,"ax",%progbits
+	nop
+	.section .text.c,"ax",%progbits
+	ret
+	.section .rodata,"a",%progbits
+x:
+	.long 1
+=== sections, DWARF 4 | --gdwarf-4
+	.section .text.b,"ax",%progbits
+b:
+	nop
+	.text
+t:
+	nop
+	.section .text.b,"ax",%progbits
+	nop
+=== sections, DWARF 2 | --gdwarf-2
+	.text
+	nop
+	.section .text.b,"ax",%progbits
+	nop
+=== a source file name | -g
+	.file "hello.c"
+	.text
+	ret
+=== a source file name in DWARF 5 | --gdwarf-5
+	.file "hello.c"
+	.text
+	ret
+=== a pushsection | -g
+	.text
+	nop
+	.pushsection .text.b,"ax",%progbits
+	nop
+	.popsection
+	nop

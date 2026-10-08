@@ -1,0 +1,1599 @@
+# MSP430X instruction set, checked against msp430-elf-as -mcpu=430x.
+
+# MSP430X two-operand instructions
+	movx	r5, r6
+	movx	pc, r6
+	movx	#0, r6
+	movx	#1, r6
+	movx	#2, r6
+	movx	#-1, r6
+	movx	#4, r6
+	movx	#8, r6
+	movx	#3, r6
+	movx	#0x1234, r6
+	movx	#0x12345, r6
+	movx	#0xfffff, r6
+	movx	#-0x80000, r6
+	movx	#0xffff, r6
+	movx	#sym, r6
+	movx	#lo(sym), r6
+	movx	#hi(sym), r6
+	movx	&0x200, r6
+	movx	&0x12345, r6
+	movx	&sym, r6
+	movx	2(r4), r6
+	movx	0x12345(r4), r6
+	movx	0(r4), r6
+	movx	sym(r4), r6
+	movx	@r4, r6
+	movx	@r4+, r6
+	movx	sym, r6
+	movx	0x12345, r6
+	movx	-4, r6
+	movx	r5, r6
+	movx	#0x12345, r6
+	movx	sym2, r6
+	movx	0x54321(r9), r6
+	movx	r5, 4(r7)
+	movx	#0x12345, 4(r7)
+	movx	sym2, 4(r7)
+	movx	0x54321(r9), 4(r7)
+	movx	r5, 0x12345(r7)
+	movx	#0x12345, 0x12345(r7)
+	movx	sym2, 0x12345(r7)
+	movx	0x54321(r9), 0x12345(r7)
+	movx	r5, &0x300
+	movx	#0x12345, &0x300
+	movx	sym2, &0x300
+	movx	0x54321(r9), &0x300
+	movx	r5, &0x12345
+	movx	#0x12345, &0x12345
+	movx	sym2, &0x12345
+	movx	0x54321(r9), &0x12345
+	movx	r5, &sym
+	movx	#0x12345, &sym
+	movx	sym2, &sym
+	movx	0x54321(r9), &sym
+	movx	r5, sym
+	movx	#0x12345, sym
+	movx	sym2, sym
+	movx	0x54321(r9), sym
+	movx	r5, sym(r8)
+	movx	#0x12345, sym(r8)
+	movx	sym2, sym(r8)
+	movx	0x54321(r9), sym(r8)
+	movx	r5, @r8
+	movx	#0x12345, @r8
+	movx	sym2, @r8
+	movx	0x54321(r9), @r8
+	movx.b	r5, r6
+	movx.b	pc, r6
+	movx.b	#0, r6
+	movx.b	#1, r6
+	movx.b	#2, r6
+	movx.b	#-1, r6
+	movx.b	#4, r6
+	movx.b	#8, r6
+	movx.b	#3, r6
+	movx.b	#0x1234, r6
+	movx.b	#0x12345, r6
+	movx.b	#0xfffff, r6
+	movx.b	#-0x80000, r6
+	movx.b	#0xffff, r6
+	movx.b	#sym, r6
+	movx.b	#lo(sym), r6
+	movx.b	#hi(sym), r6
+	movx.b	&0x200, r6
+	movx.b	&0x12345, r6
+	movx.b	&sym, r6
+	movx.b	2(r4), r6
+	movx.b	0x12345(r4), r6
+	movx.b	0(r4), r6
+	movx.b	sym(r4), r6
+	movx.b	@r4, r6
+	movx.b	@r4+, r6
+	movx.b	sym, r6
+	movx.b	0x12345, r6
+	movx.b	-4, r6
+	movx.b	r5, r6
+	movx.b	#0x12345, r6
+	movx.b	sym2, r6
+	movx.b	0x54321(r9), r6
+	movx.b	r5, 4(r7)
+	movx.b	#0x12345, 4(r7)
+	movx.b	sym2, 4(r7)
+	movx.b	0x54321(r9), 4(r7)
+	movx.b	r5, 0x12345(r7)
+	movx.b	#0x12345, 0x12345(r7)
+	movx.b	sym2, 0x12345(r7)
+	movx.b	0x54321(r9), 0x12345(r7)
+	movx.b	r5, &0x300
+	movx.b	#0x12345, &0x300
+	movx.b	sym2, &0x300
+	movx.b	0x54321(r9), &0x300
+	movx.b	r5, &0x12345
+	movx.b	#0x12345, &0x12345
+	movx.b	sym2, &0x12345
+	movx.b	0x54321(r9), &0x12345
+	movx.b	r5, &sym
+	movx.b	#0x12345, &sym
+	movx.b	sym2, &sym
+	movx.b	0x54321(r9), &sym
+	movx.b	r5, sym
+	movx.b	#0x12345, sym
+	movx.b	sym2, sym
+	movx.b	0x54321(r9), sym
+	movx.b	r5, sym(r8)
+	movx.b	#0x12345, sym(r8)
+	movx.b	sym2, sym(r8)
+	movx.b	0x54321(r9), sym(r8)
+	movx.b	r5, @r8
+	movx.b	#0x12345, @r8
+	movx.b	sym2, @r8
+	movx.b	0x54321(r9), @r8
+	movx.w	r5, r6
+	movx.w	pc, r6
+	movx.w	#0, r6
+	movx.w	#1, r6
+	movx.w	#2, r6
+	movx.w	#-1, r6
+	movx.w	#4, r6
+	movx.w	#8, r6
+	movx.w	#3, r6
+	movx.w	#0x1234, r6
+	movx.w	#0x12345, r6
+	movx.w	#0xfffff, r6
+	movx.w	#-0x80000, r6
+	movx.w	#0xffff, r6
+	movx.w	#sym, r6
+	movx.w	#lo(sym), r6
+	movx.w	#hi(sym), r6
+	movx.w	&0x200, r6
+	movx.w	&0x12345, r6
+	movx.w	&sym, r6
+	movx.w	2(r4), r6
+	movx.w	0x12345(r4), r6
+	movx.w	0(r4), r6
+	movx.w	sym(r4), r6
+	movx.w	@r4, r6
+	movx.w	@r4+, r6
+	movx.w	sym, r6
+	movx.w	0x12345, r6
+	movx.w	-4, r6
+	movx.w	r5, r6
+	movx.w	#0x12345, r6
+	movx.w	sym2, r6
+	movx.w	0x54321(r9), r6
+	movx.w	r5, 4(r7)
+	movx.w	#0x12345, 4(r7)
+	movx.w	sym2, 4(r7)
+	movx.w	0x54321(r9), 4(r7)
+	movx.w	r5, 0x12345(r7)
+	movx.w	#0x12345, 0x12345(r7)
+	movx.w	sym2, 0x12345(r7)
+	movx.w	0x54321(r9), 0x12345(r7)
+	movx.w	r5, &0x300
+	movx.w	#0x12345, &0x300
+	movx.w	sym2, &0x300
+	movx.w	0x54321(r9), &0x300
+	movx.w	r5, &0x12345
+	movx.w	#0x12345, &0x12345
+	movx.w	sym2, &0x12345
+	movx.w	0x54321(r9), &0x12345
+	movx.w	r5, &sym
+	movx.w	#0x12345, &sym
+	movx.w	sym2, &sym
+	movx.w	0x54321(r9), &sym
+	movx.w	r5, sym
+	movx.w	#0x12345, sym
+	movx.w	sym2, sym
+	movx.w	0x54321(r9), sym
+	movx.w	r5, sym(r8)
+	movx.w	#0x12345, sym(r8)
+	movx.w	sym2, sym(r8)
+	movx.w	0x54321(r9), sym(r8)
+	movx.w	r5, @r8
+	movx.w	#0x12345, @r8
+	movx.w	sym2, @r8
+	movx.w	0x54321(r9), @r8
+	movx.a	r5, r6
+	movx.a	pc, r6
+	movx.a	#0, r6
+	movx.a	#1, r6
+	movx.a	#2, r6
+	movx.a	#-1, r6
+	movx.a	#4, r6
+	movx.a	#8, r6
+	movx.a	#3, r6
+	movx.a	#0x1234, r6
+	movx.a	#0x12345, r6
+	movx.a	#0xfffff, r6
+	movx.a	#-0x80000, r6
+	movx.a	#0xffff, r6
+	movx.a	#sym, r6
+	movx.a	#lo(sym), r6
+	movx.a	#hi(sym), r6
+	movx.a	&0x200, r6
+	movx.a	&0x12345, r6
+	movx.a	&sym, r6
+	movx.a	2(r4), r6
+	movx.a	0x12345(r4), r6
+	movx.a	0(r4), r6
+	movx.a	sym(r4), r6
+	movx.a	@r4, r6
+	movx.a	@r4+, r6
+	movx.a	sym, r6
+	movx.a	0x12345, r6
+	movx.a	-4, r6
+	movx.a	r5, r6
+	movx.a	#0x12345, r6
+	movx.a	sym2, r6
+	movx.a	0x54321(r9), r6
+	movx.a	r5, 4(r7)
+	movx.a	#0x12345, 4(r7)
+	movx.a	sym2, 4(r7)
+	movx.a	0x54321(r9), 4(r7)
+	movx.a	r5, 0x12345(r7)
+	movx.a	#0x12345, 0x12345(r7)
+	movx.a	sym2, 0x12345(r7)
+	movx.a	0x54321(r9), 0x12345(r7)
+	movx.a	r5, &0x300
+	movx.a	#0x12345, &0x300
+	movx.a	sym2, &0x300
+	movx.a	0x54321(r9), &0x300
+	movx.a	r5, &0x12345
+	movx.a	#0x12345, &0x12345
+	movx.a	sym2, &0x12345
+	movx.a	0x54321(r9), &0x12345
+	movx.a	r5, &sym
+	movx.a	#0x12345, &sym
+	movx.a	sym2, &sym
+	movx.a	0x54321(r9), &sym
+	movx.a	r5, sym
+	movx.a	#0x12345, sym
+	movx.a	sym2, sym
+	movx.a	0x54321(r9), sym
+	movx.a	r5, sym(r8)
+	movx.a	#0x12345, sym(r8)
+	movx.a	sym2, sym(r8)
+	movx.a	0x54321(r9), sym(r8)
+	movx.a	r5, @r8
+	movx.a	#0x12345, @r8
+	movx.a	sym2, @r8
+	movx.a	0x54321(r9), @r8
+	addx	r5, r6
+	addx	pc, r6
+	addx	#0, r6
+	addx	#1, r6
+	addx	#2, r6
+	addx	#-1, r6
+	addx	#4, r6
+	addx	#8, r6
+	addx	#3, r6
+	addx	#0x1234, r6
+	addx	#0x12345, r6
+	addx	#0xfffff, r6
+	addx	#-0x80000, r6
+	addx	#0xffff, r6
+	addx	#sym, r6
+	addx	#lo(sym), r6
+	addx	#hi(sym), r6
+	addx	&0x200, r6
+	addx	&0x12345, r6
+	addx	&sym, r6
+	addx	2(r4), r6
+	addx	0x12345(r4), r6
+	addx	0(r4), r6
+	addx	sym(r4), r6
+	addx	@r4, r6
+	addx	@r4+, r6
+	addx	sym, r6
+	addx	0x12345, r6
+	addx	-4, r6
+	addx	r5, r6
+	addx	r5, &0x12345
+	addx	r5, sym
+	addx.b	r5, r6
+	addx.b	pc, r6
+	addx.b	#0, r6
+	addx.b	#1, r6
+	addx.b	#2, r6
+	addx.b	#-1, r6
+	addx.b	#4, r6
+	addx.b	#8, r6
+	addx.b	#3, r6
+	addx.b	#0x1234, r6
+	addx.b	#0x12345, r6
+	addx.b	#0xfffff, r6
+	addx.b	#-0x80000, r6
+	addx.b	#0xffff, r6
+	addx.b	#sym, r6
+	addx.b	#lo(sym), r6
+	addx.b	#hi(sym), r6
+	addx.b	&0x200, r6
+	addx.b	&0x12345, r6
+	addx.b	&sym, r6
+	addx.b	2(r4), r6
+	addx.b	0x12345(r4), r6
+	addx.b	0(r4), r6
+	addx.b	sym(r4), r6
+	addx.b	@r4, r6
+	addx.b	@r4+, r6
+	addx.b	sym, r6
+	addx.b	0x12345, r6
+	addx.b	-4, r6
+	addx.b	r5, r6
+	addx.b	r5, &0x12345
+	addx.b	r5, sym
+	addx.w	r5, r6
+	addx.w	pc, r6
+	addx.w	#0, r6
+	addx.w	#1, r6
+	addx.w	#2, r6
+	addx.w	#-1, r6
+	addx.w	#4, r6
+	addx.w	#8, r6
+	addx.w	#3, r6
+	addx.w	#0x1234, r6
+	addx.w	#0x12345, r6
+	addx.w	#0xfffff, r6
+	addx.w	#-0x80000, r6
+	addx.w	#0xffff, r6
+	addx.w	#sym, r6
+	addx.w	#lo(sym), r6
+	addx.w	#hi(sym), r6
+	addx.w	&0x200, r6
+	addx.w	&0x12345, r6
+	addx.w	&sym, r6
+	addx.w	2(r4), r6
+	addx.w	0x12345(r4), r6
+	addx.w	0(r4), r6
+	addx.w	sym(r4), r6
+	addx.w	@r4, r6
+	addx.w	@r4+, r6
+	addx.w	sym, r6
+	addx.w	0x12345, r6
+	addx.w	-4, r6
+	addx.w	r5, r6
+	addx.w	r5, &0x12345
+	addx.w	r5, sym
+	addx.a	r5, r6
+	addx.a	pc, r6
+	addx.a	#0, r6
+	addx.a	#1, r6
+	addx.a	#2, r6
+	addx.a	#-1, r6
+	addx.a	#4, r6
+	addx.a	#8, r6
+	addx.a	#3, r6
+	addx.a	#0x1234, r6
+	addx.a	#0x12345, r6
+	addx.a	#0xfffff, r6
+	addx.a	#-0x80000, r6
+	addx.a	#0xffff, r6
+	addx.a	#sym, r6
+	addx.a	#lo(sym), r6
+	addx.a	#hi(sym), r6
+	addx.a	&0x200, r6
+	addx.a	&0x12345, r6
+	addx.a	&sym, r6
+	addx.a	2(r4), r6
+	addx.a	0x12345(r4), r6
+	addx.a	0(r4), r6
+	addx.a	sym(r4), r6
+	addx.a	@r4, r6
+	addx.a	@r4+, r6
+	addx.a	sym, r6
+	addx.a	0x12345, r6
+	addx.a	-4, r6
+	addx.a	r5, r6
+	addx.a	r5, &0x12345
+	addx.a	r5, sym
+	addcx	r5, r6
+	addcx	#0x12345, r6
+	addcx	&0x12345, r6
+	addcx	sym, r6
+	addcx	@r4+, r6
+	addcx	r5, r6
+	addcx	r5, &0x12345
+	addcx	r5, sym
+	addcx.b	r5, r6
+	addcx.b	#0x12345, r6
+	addcx.b	&0x12345, r6
+	addcx.b	sym, r6
+	addcx.b	@r4+, r6
+	addcx.b	r5, r6
+	addcx.b	r5, &0x12345
+	addcx.b	r5, sym
+	addcx.w	r5, r6
+	addcx.w	#0x12345, r6
+	addcx.w	&0x12345, r6
+	addcx.w	sym, r6
+	addcx.w	@r4+, r6
+	addcx.w	r5, r6
+	addcx.w	r5, &0x12345
+	addcx.w	r5, sym
+	addcx.a	r5, r6
+	addcx.a	#0x12345, r6
+	addcx.a	&0x12345, r6
+	addcx.a	sym, r6
+	addcx.a	@r4+, r6
+	addcx.a	r5, r6
+	addcx.a	r5, &0x12345
+	addcx.a	r5, sym
+	subx	r5, r6
+	subx	#0x12345, r6
+	subx	&0x12345, r6
+	subx	sym, r6
+	subx	@r4+, r6
+	subx	r5, r6
+	subx	r5, &0x12345
+	subx	r5, sym
+	subx.b	r5, r6
+	subx.b	#0x12345, r6
+	subx.b	&0x12345, r6
+	subx.b	sym, r6
+	subx.b	@r4+, r6
+	subx.b	r5, r6
+	subx.b	r5, &0x12345
+	subx.b	r5, sym
+	subx.w	r5, r6
+	subx.w	#0x12345, r6
+	subx.w	&0x12345, r6
+	subx.w	sym, r6
+	subx.w	@r4+, r6
+	subx.w	r5, r6
+	subx.w	r5, &0x12345
+	subx.w	r5, sym
+	subx.a	r5, r6
+	subx.a	#0x12345, r6
+	subx.a	&0x12345, r6
+	subx.a	sym, r6
+	subx.a	@r4+, r6
+	subx.a	r5, r6
+	subx.a	r5, &0x12345
+	subx.a	r5, sym
+	subcx	r5, r6
+	subcx	#0x12345, r6
+	subcx	&0x12345, r6
+	subcx	sym, r6
+	subcx	@r4+, r6
+	subcx	r5, r6
+	subcx	r5, &0x12345
+	subcx	r5, sym
+	subcx.b	r5, r6
+	subcx.b	#0x12345, r6
+	subcx.b	&0x12345, r6
+	subcx.b	sym, r6
+	subcx.b	@r4+, r6
+	subcx.b	r5, r6
+	subcx.b	r5, &0x12345
+	subcx.b	r5, sym
+	subcx.w	r5, r6
+	subcx.w	#0x12345, r6
+	subcx.w	&0x12345, r6
+	subcx.w	sym, r6
+	subcx.w	@r4+, r6
+	subcx.w	r5, r6
+	subcx.w	r5, &0x12345
+	subcx.w	r5, sym
+	subcx.a	r5, r6
+	subcx.a	#0x12345, r6
+	subcx.a	&0x12345, r6
+	subcx.a	sym, r6
+	subcx.a	@r4+, r6
+	subcx.a	r5, r6
+	subcx.a	r5, &0x12345
+	subcx.a	r5, sym
+	cmpx	r5, r6
+	cmpx	pc, r6
+	cmpx	#0, r6
+	cmpx	#1, r6
+	cmpx	#2, r6
+	cmpx	#-1, r6
+	cmpx	#4, r6
+	cmpx	#8, r6
+	cmpx	#3, r6
+	cmpx	#0x1234, r6
+	cmpx	#0x12345, r6
+	cmpx	#0xfffff, r6
+	cmpx	#-0x80000, r6
+	cmpx	#0xffff, r6
+	cmpx	#sym, r6
+	cmpx	#lo(sym), r6
+	cmpx	#hi(sym), r6
+	cmpx	&0x200, r6
+	cmpx	&0x12345, r6
+	cmpx	&sym, r6
+	cmpx	2(r4), r6
+	cmpx	0x12345(r4), r6
+	cmpx	0(r4), r6
+	cmpx	sym(r4), r6
+	cmpx	@r4, r6
+	cmpx	@r4+, r6
+	cmpx	sym, r6
+	cmpx	0x12345, r6
+	cmpx	-4, r6
+	cmpx	r5, r6
+	cmpx	r5, &0x12345
+	cmpx	r5, sym
+	cmpx.b	r5, r6
+	cmpx.b	pc, r6
+	cmpx.b	#0, r6
+	cmpx.b	#1, r6
+	cmpx.b	#2, r6
+	cmpx.b	#-1, r6
+	cmpx.b	#4, r6
+	cmpx.b	#8, r6
+	cmpx.b	#3, r6
+	cmpx.b	#0x1234, r6
+	cmpx.b	#0x12345, r6
+	cmpx.b	#0xfffff, r6
+	cmpx.b	#-0x80000, r6
+	cmpx.b	#0xffff, r6
+	cmpx.b	#sym, r6
+	cmpx.b	#lo(sym), r6
+	cmpx.b	#hi(sym), r6
+	cmpx.b	&0x200, r6
+	cmpx.b	&0x12345, r6
+	cmpx.b	&sym, r6
+	cmpx.b	2(r4), r6
+	cmpx.b	0x12345(r4), r6
+	cmpx.b	0(r4), r6
+	cmpx.b	sym(r4), r6
+	cmpx.b	@r4, r6
+	cmpx.b	@r4+, r6
+	cmpx.b	sym, r6
+	cmpx.b	0x12345, r6
+	cmpx.b	-4, r6
+	cmpx.b	r5, r6
+	cmpx.b	r5, &0x12345
+	cmpx.b	r5, sym
+	cmpx.w	r5, r6
+	cmpx.w	pc, r6
+	cmpx.w	#0, r6
+	cmpx.w	#1, r6
+	cmpx.w	#2, r6
+	cmpx.w	#-1, r6
+	cmpx.w	#4, r6
+	cmpx.w	#8, r6
+	cmpx.w	#3, r6
+	cmpx.w	#0x1234, r6
+	cmpx.w	#0x12345, r6
+	cmpx.w	#0xfffff, r6
+	cmpx.w	#-0x80000, r6
+	cmpx.w	#0xffff, r6
+	cmpx.w	#sym, r6
+	cmpx.w	#lo(sym), r6
+	cmpx.w	#hi(sym), r6
+	cmpx.w	&0x200, r6
+	cmpx.w	&0x12345, r6
+	cmpx.w	&sym, r6
+	cmpx.w	2(r4), r6
+	cmpx.w	0x12345(r4), r6
+	cmpx.w	0(r4), r6
+	cmpx.w	sym(r4), r6
+	cmpx.w	@r4, r6
+	cmpx.w	@r4+, r6
+	cmpx.w	sym, r6
+	cmpx.w	0x12345, r6
+	cmpx.w	-4, r6
+	cmpx.w	r5, r6
+	cmpx.w	r5, &0x12345
+	cmpx.w	r5, sym
+	cmpx.a	r5, r6
+	cmpx.a	pc, r6
+	cmpx.a	#0, r6
+	cmpx.a	#1, r6
+	cmpx.a	#2, r6
+	cmpx.a	#-1, r6
+	cmpx.a	#4, r6
+	cmpx.a	#8, r6
+	cmpx.a	#3, r6
+	cmpx.a	#0x1234, r6
+	cmpx.a	#0x12345, r6
+	cmpx.a	#0xfffff, r6
+	cmpx.a	#-0x80000, r6
+	cmpx.a	#0xffff, r6
+	cmpx.a	#sym, r6
+	cmpx.a	#lo(sym), r6
+	cmpx.a	#hi(sym), r6
+	cmpx.a	&0x200, r6
+	cmpx.a	&0x12345, r6
+	cmpx.a	&sym, r6
+	cmpx.a	2(r4), r6
+	cmpx.a	0x12345(r4), r6
+	cmpx.a	0(r4), r6
+	cmpx.a	sym(r4), r6
+	cmpx.a	@r4, r6
+	cmpx.a	@r4+, r6
+	cmpx.a	sym, r6
+	cmpx.a	0x12345, r6
+	cmpx.a	-4, r6
+	cmpx.a	r5, r6
+	cmpx.a	r5, &0x12345
+	cmpx.a	r5, sym
+	daddx	r5, r6
+	daddx	#0x12345, r6
+	daddx	&0x12345, r6
+	daddx	sym, r6
+	daddx	@r4+, r6
+	daddx	r5, r6
+	daddx	r5, &0x12345
+	daddx	r5, sym
+	daddx.b	r5, r6
+	daddx.b	#0x12345, r6
+	daddx.b	&0x12345, r6
+	daddx.b	sym, r6
+	daddx.b	@r4+, r6
+	daddx.b	r5, r6
+	daddx.b	r5, &0x12345
+	daddx.b	r5, sym
+	daddx.w	r5, r6
+	daddx.w	#0x12345, r6
+	daddx.w	&0x12345, r6
+	daddx.w	sym, r6
+	daddx.w	@r4+, r6
+	daddx.w	r5, r6
+	daddx.w	r5, &0x12345
+	daddx.w	r5, sym
+	daddx.a	r5, r6
+	daddx.a	#0x12345, r6
+	daddx.a	&0x12345, r6
+	daddx.a	sym, r6
+	daddx.a	@r4+, r6
+	daddx.a	r5, r6
+	daddx.a	r5, &0x12345
+	daddx.a	r5, sym
+	bitx	r5, r6
+	bitx	#0x12345, r6
+	bitx	&0x12345, r6
+	bitx	sym, r6
+	bitx	@r4+, r6
+	bitx	r5, r6
+	bitx	r5, &0x12345
+	bitx	r5, sym
+	bitx.b	r5, r6
+	bitx.b	#0x12345, r6
+	bitx.b	&0x12345, r6
+	bitx.b	sym, r6
+	bitx.b	@r4+, r6
+	bitx.b	r5, r6
+	bitx.b	r5, &0x12345
+	bitx.b	r5, sym
+	bitx.w	r5, r6
+	bitx.w	#0x12345, r6
+	bitx.w	&0x12345, r6
+	bitx.w	sym, r6
+	bitx.w	@r4+, r6
+	bitx.w	r5, r6
+	bitx.w	r5, &0x12345
+	bitx.w	r5, sym
+	bitx.a	r5, r6
+	bitx.a	#0x12345, r6
+	bitx.a	&0x12345, r6
+	bitx.a	sym, r6
+	bitx.a	@r4+, r6
+	bitx.a	r5, r6
+	bitx.a	r5, &0x12345
+	bitx.a	r5, sym
+	bicx	r5, r6
+	bicx	#0x12345, r6
+	bicx	&0x12345, r6
+	bicx	sym, r6
+	bicx	@r4+, r6
+	bicx	r5, r6
+	bicx	r5, 4(r7)
+	bicx	r5, 0x12345(r7)
+	bicx	r5, &0x300
+	bicx	r5, &0x12345
+	bicx	r5, &sym
+	bicx	r5, sym
+	bicx	r5, sym(r8)
+	bicx	r5, @r8
+	bicx.b	r5, r6
+	bicx.b	#0x12345, r6
+	bicx.b	&0x12345, r6
+	bicx.b	sym, r6
+	bicx.b	@r4+, r6
+	bicx.b	r5, r6
+	bicx.b	r5, 4(r7)
+	bicx.b	r5, 0x12345(r7)
+	bicx.b	r5, &0x300
+	bicx.b	r5, &0x12345
+	bicx.b	r5, &sym
+	bicx.b	r5, sym
+	bicx.b	r5, sym(r8)
+	bicx.b	r5, @r8
+	bicx.w	r5, r6
+	bicx.w	#0x12345, r6
+	bicx.w	&0x12345, r6
+	bicx.w	sym, r6
+	bicx.w	@r4+, r6
+	bicx.w	r5, r6
+	bicx.w	r5, 4(r7)
+	bicx.w	r5, 0x12345(r7)
+	bicx.w	r5, &0x300
+	bicx.w	r5, &0x12345
+	bicx.w	r5, &sym
+	bicx.w	r5, sym
+	bicx.w	r5, sym(r8)
+	bicx.w	r5, @r8
+	bicx.a	r5, r6
+	bicx.a	#0x12345, r6
+	bicx.a	&0x12345, r6
+	bicx.a	sym, r6
+	bicx.a	@r4+, r6
+	bicx.a	r5, r6
+	bicx.a	r5, 4(r7)
+	bicx.a	r5, 0x12345(r7)
+	bicx.a	r5, &0x300
+	bicx.a	r5, &0x12345
+	bicx.a	r5, &sym
+	bicx.a	r5, sym
+	bicx.a	r5, sym(r8)
+	bicx.a	r5, @r8
+	bisx	r5, r6
+	bisx	#0x12345, r6
+	bisx	&0x12345, r6
+	bisx	sym, r6
+	bisx	@r4+, r6
+	bisx	r5, r6
+	bisx	r5, &0x12345
+	bisx	r5, sym
+	bisx.b	r5, r6
+	bisx.b	#0x12345, r6
+	bisx.b	&0x12345, r6
+	bisx.b	sym, r6
+	bisx.b	@r4+, r6
+	bisx.b	r5, r6
+	bisx.b	r5, &0x12345
+	bisx.b	r5, sym
+	bisx.w	r5, r6
+	bisx.w	#0x12345, r6
+	bisx.w	&0x12345, r6
+	bisx.w	sym, r6
+	bisx.w	@r4+, r6
+	bisx.w	r5, r6
+	bisx.w	r5, &0x12345
+	bisx.w	r5, sym
+	bisx.a	r5, r6
+	bisx.a	#0x12345, r6
+	bisx.a	&0x12345, r6
+	bisx.a	sym, r6
+	bisx.a	@r4+, r6
+	bisx.a	r5, r6
+	bisx.a	r5, &0x12345
+	bisx.a	r5, sym
+	xorx	r5, r6
+	xorx	#0x12345, r6
+	xorx	&0x12345, r6
+	xorx	sym, r6
+	xorx	@r4+, r6
+	xorx	r5, r6
+	xorx	r5, &0x12345
+	xorx	r5, sym
+	xorx.b	r5, r6
+	xorx.b	#0x12345, r6
+	xorx.b	&0x12345, r6
+	xorx.b	sym, r6
+	xorx.b	@r4+, r6
+	xorx.b	r5, r6
+	xorx.b	r5, &0x12345
+	xorx.b	r5, sym
+	xorx.w	r5, r6
+	xorx.w	#0x12345, r6
+	xorx.w	&0x12345, r6
+	xorx.w	sym, r6
+	xorx.w	@r4+, r6
+	xorx.w	r5, r6
+	xorx.w	r5, &0x12345
+	xorx.w	r5, sym
+	xorx.a	r5, r6
+	xorx.a	#0x12345, r6
+	xorx.a	&0x12345, r6
+	xorx.a	sym, r6
+	xorx.a	@r4+, r6
+	xorx.a	r5, r6
+	xorx.a	r5, &0x12345
+	xorx.a	r5, sym
+	andx	r5, r6
+	andx	#0x12345, r6
+	andx	&0x12345, r6
+	andx	sym, r6
+	andx	@r4+, r6
+	andx	r5, r6
+	andx	r5, &0x12345
+	andx	r5, sym
+	andx.b	r5, r6
+	andx.b	#0x12345, r6
+	andx.b	&0x12345, r6
+	andx.b	sym, r6
+	andx.b	@r4+, r6
+	andx.b	r5, r6
+	andx.b	r5, &0x12345
+	andx.b	r5, sym
+	andx.w	r5, r6
+	andx.w	#0x12345, r6
+	andx.w	&0x12345, r6
+	andx.w	sym, r6
+	andx.w	@r4+, r6
+	andx.w	r5, r6
+	andx.w	r5, &0x12345
+	andx.w	r5, sym
+	andx.a	r5, r6
+	andx.a	#0x12345, r6
+	andx.a	&0x12345, r6
+	andx.a	sym, r6
+	andx.a	@r4+, r6
+	andx.a	r5, r6
+	andx.a	r5, &0x12345
+	andx.a	r5, sym
+
+# MSP430X one-operand instructions
+	pushx	r5
+	pushx	#0x12345
+	pushx	#4
+	pushx	&0x12345
+	pushx	&sym
+	pushx	2(r4)
+	pushx	0x12345(r4)
+	pushx	@r4
+	pushx	@r4+
+	pushx	sym
+	pushx	#sym
+	pushx.b	r5
+	pushx.b	#0x12345
+	pushx.b	#4
+	pushx.b	&0x12345
+	pushx.b	&sym
+	pushx.b	2(r4)
+	pushx.b	0x12345(r4)
+	pushx.b	@r4
+	pushx.b	@r4+
+	pushx.b	sym
+	pushx.b	#sym
+	pushx.w	r5
+	pushx.w	#0x12345
+	pushx.w	#4
+	pushx.w	&0x12345
+	pushx.w	&sym
+	pushx.w	2(r4)
+	pushx.w	0x12345(r4)
+	pushx.w	@r4
+	pushx.w	@r4+
+	pushx.w	sym
+	pushx.w	#sym
+	pushx.a	r5
+	pushx.a	#0x12345
+	pushx.a	#4
+	pushx.a	&0x12345
+	pushx.a	&sym
+	pushx.a	2(r4)
+	pushx.a	0x12345(r4)
+	pushx.a	@r4
+	pushx.a	@r4+
+	pushx.a	sym
+	pushx.a	#sym
+	rrax	r5
+	rrax	&0x12345
+	rrax	&sym
+	rrax	2(r4)
+	rrax	0x12345(r4)
+	rrax	@r4
+	rrax	@r4+
+	rrax	sym
+	rrax.b	r5
+	rrax.b	&0x12345
+	rrax.b	&sym
+	rrax.b	2(r4)
+	rrax.b	0x12345(r4)
+	rrax.b	@r4
+	rrax.b	@r4+
+	rrax.b	sym
+	rrax.w	r5
+	rrax.w	&0x12345
+	rrax.w	&sym
+	rrax.w	2(r4)
+	rrax.w	0x12345(r4)
+	rrax.w	@r4
+	rrax.w	@r4+
+	rrax.w	sym
+	rrax.a	r5
+	rrax.a	&0x12345
+	rrax.a	&sym
+	rrax.a	2(r4)
+	rrax.a	0x12345(r4)
+	rrax.a	@r4
+	rrax.a	@r4+
+	rrax.a	sym
+	rrcx	r5
+	rrcx	&0x12345
+	rrcx	&sym
+	rrcx	2(r4)
+	rrcx	0x12345(r4)
+	rrcx	@r4
+	rrcx	@r4+
+	rrcx	sym
+	rrcx.b	r5
+	rrcx.b	&0x12345
+	rrcx.b	&sym
+	rrcx.b	2(r4)
+	rrcx.b	0x12345(r4)
+	rrcx.b	@r4
+	rrcx.b	@r4+
+	rrcx.b	sym
+	rrcx.w	r5
+	rrcx.w	&0x12345
+	rrcx.w	&sym
+	rrcx.w	2(r4)
+	rrcx.w	0x12345(r4)
+	rrcx.w	@r4
+	rrcx.w	@r4+
+	rrcx.w	sym
+	rrcx.a	r5
+	rrcx.a	&0x12345
+	rrcx.a	&sym
+	rrcx.a	2(r4)
+	rrcx.a	0x12345(r4)
+	rrcx.a	@r4
+	rrcx.a	@r4+
+	rrcx.a	sym
+	rrux	r5
+	rrux	&0x12345
+	rrux	&sym
+	rrux	2(r4)
+	rrux	0x12345(r4)
+	rrux	@r4
+	rrux	@r4+
+	rrux	sym
+	rrux.b	r5
+	rrux.b	&0x12345
+	rrux.b	&sym
+	rrux.b	2(r4)
+	rrux.b	0x12345(r4)
+	rrux.b	@r4
+	rrux.b	@r4+
+	rrux.b	sym
+	rrux.w	r5
+	rrux.w	&0x12345
+	rrux.w	&sym
+	rrux.w	2(r4)
+	rrux.w	0x12345(r4)
+	rrux.w	@r4
+	rrux.w	@r4+
+	rrux.w	sym
+	rrux.a	r5
+	rrux.a	&0x12345
+	rrux.a	&sym
+	rrux.a	2(r4)
+	rrux.a	0x12345(r4)
+	rrux.a	@r4
+	rrux.a	@r4+
+	rrux.a	sym
+	swpbx	r5
+	swpbx	&0x12345
+	swpbx	&sym
+	swpbx	2(r4)
+	swpbx	0x12345(r4)
+	swpbx	@r4
+	swpbx	@r4+
+	swpbx	sym
+	swpbx.w	r5
+	swpbx.w	&0x12345
+	swpbx.w	&sym
+	swpbx.w	2(r4)
+	swpbx.w	0x12345(r4)
+	swpbx.w	@r4
+	swpbx.w	@r4+
+	swpbx.w	sym
+	swpbx.a	r5
+	swpbx.a	&0x12345
+	swpbx.a	&sym
+	swpbx.a	2(r4)
+	swpbx.a	0x12345(r4)
+	swpbx.a	@r4
+	swpbx.a	@r4+
+	swpbx.a	sym
+	sxtx	r5
+	sxtx	&0x12345
+	sxtx	&sym
+	sxtx	2(r4)
+	sxtx	0x12345(r4)
+	sxtx	@r4
+	sxtx	@r4+
+	sxtx	sym
+	sxtx.w	r5
+	sxtx.w	&0x12345
+	sxtx.w	&sym
+	sxtx.w	2(r4)
+	sxtx.w	0x12345(r4)
+	sxtx.w	@r4
+	sxtx.w	@r4+
+	sxtx.w	sym
+	sxtx.a	r5
+	sxtx.a	&0x12345
+	sxtx.a	&sym
+	sxtx.a	2(r4)
+	sxtx.a	0x12345(r4)
+	sxtx.a	@r4
+	sxtx.a	@r4+
+	sxtx.a	sym
+
+# MSP430X emulated instructions
+	adcx	r5
+	adcx	4(r7)
+	adcx	0x12345(r7)
+	adcx	&0x12345
+	adcx	&sym
+	adcx	sym
+	adcx.b	r5
+	adcx.b	4(r7)
+	adcx.b	0x12345(r7)
+	adcx.b	&0x12345
+	adcx.b	&sym
+	adcx.b	sym
+	adcx.w	r5
+	adcx.w	4(r7)
+	adcx.w	0x12345(r7)
+	adcx.w	&0x12345
+	adcx.w	&sym
+	adcx.w	sym
+	adcx.a	r5
+	adcx.a	4(r7)
+	adcx.a	0x12345(r7)
+	adcx.a	&0x12345
+	adcx.a	&sym
+	adcx.a	sym
+	clra	r5
+	clra	4(r7)
+	clra	0x12345(r7)
+	clra	&0x12345
+	clra	&sym
+	clra	sym
+	clra.b	r5
+	clra.b	4(r7)
+	clra.b	0x12345(r7)
+	clra.b	&0x12345
+	clra.b	&sym
+	clra.b	sym
+	clra.w	r5
+	clra.w	4(r7)
+	clra.w	0x12345(r7)
+	clra.w	&0x12345
+	clra.w	&sym
+	clra.w	sym
+	clra.a	r5
+	clra.a	4(r7)
+	clra.a	0x12345(r7)
+	clra.a	&0x12345
+	clra.a	&sym
+	clra.a	sym
+	clrx	r5
+	clrx	4(r7)
+	clrx	0x12345(r7)
+	clrx	&0x12345
+	clrx	&sym
+	clrx	sym
+	clrx.b	r5
+	clrx.b	4(r7)
+	clrx.b	0x12345(r7)
+	clrx.b	&0x12345
+	clrx.b	&sym
+	clrx.b	sym
+	clrx.w	r5
+	clrx.w	4(r7)
+	clrx.w	0x12345(r7)
+	clrx.w	&0x12345
+	clrx.w	&sym
+	clrx.w	sym
+	clrx.a	r5
+	clrx.a	4(r7)
+	clrx.a	0x12345(r7)
+	clrx.a	&0x12345
+	clrx.a	&sym
+	clrx.a	sym
+	dadcx	r5
+	dadcx	4(r7)
+	dadcx	0x12345(r7)
+	dadcx	&0x12345
+	dadcx	&sym
+	dadcx	sym
+	dadcx.b	r5
+	dadcx.b	4(r7)
+	dadcx.b	0x12345(r7)
+	dadcx.b	&0x12345
+	dadcx.b	&sym
+	dadcx.b	sym
+	dadcx.w	r5
+	dadcx.w	4(r7)
+	dadcx.w	0x12345(r7)
+	dadcx.w	&0x12345
+	dadcx.w	&sym
+	dadcx.w	sym
+	dadcx.a	r5
+	dadcx.a	4(r7)
+	dadcx.a	0x12345(r7)
+	dadcx.a	&0x12345
+	dadcx.a	&sym
+	dadcx.a	sym
+	decx	r5
+	decx	4(r7)
+	decx	0x12345(r7)
+	decx	&0x12345
+	decx	&sym
+	decx	sym
+	decx.b	r5
+	decx.b	4(r7)
+	decx.b	0x12345(r7)
+	decx.b	&0x12345
+	decx.b	&sym
+	decx.b	sym
+	decx.w	r5
+	decx.w	4(r7)
+	decx.w	0x12345(r7)
+	decx.w	&0x12345
+	decx.w	&sym
+	decx.w	sym
+	decx.a	r5
+	decx.a	4(r7)
+	decx.a	0x12345(r7)
+	decx.a	&0x12345
+	decx.a	&sym
+	decx.a	sym
+	decda	r5
+	decda	4(r7)
+	decda	0x12345(r7)
+	decda	&0x12345
+	decda	&sym
+	decda	sym
+	decda.b	r5
+	decda.b	4(r7)
+	decda.b	0x12345(r7)
+	decda.b	&0x12345
+	decda.b	&sym
+	decda.b	sym
+	decda.w	r5
+	decda.w	4(r7)
+	decda.w	0x12345(r7)
+	decda.w	&0x12345
+	decda.w	&sym
+	decda.w	sym
+	decda.a	r5
+	decda.a	4(r7)
+	decda.a	0x12345(r7)
+	decda.a	&0x12345
+	decda.a	&sym
+	decda.a	sym
+	decdx	r5
+	decdx	4(r7)
+	decdx	0x12345(r7)
+	decdx	&0x12345
+	decdx	&sym
+	decdx	sym
+	decdx.b	r5
+	decdx.b	4(r7)
+	decdx.b	0x12345(r7)
+	decdx.b	&0x12345
+	decdx.b	&sym
+	decdx.b	sym
+	decdx.w	r5
+	decdx.w	4(r7)
+	decdx.w	0x12345(r7)
+	decdx.w	&0x12345
+	decdx.w	&sym
+	decdx.w	sym
+	decdx.a	r5
+	decdx.a	4(r7)
+	decdx.a	0x12345(r7)
+	decdx.a	&0x12345
+	decdx.a	&sym
+	decdx.a	sym
+	incx	r5
+	incx	4(r7)
+	incx	0x12345(r7)
+	incx	&0x12345
+	incx	&sym
+	incx	sym
+	incx.b	r5
+	incx.b	4(r7)
+	incx.b	0x12345(r7)
+	incx.b	&0x12345
+	incx.b	&sym
+	incx.b	sym
+	incx.w	r5
+	incx.w	4(r7)
+	incx.w	0x12345(r7)
+	incx.w	&0x12345
+	incx.w	&sym
+	incx.w	sym
+	incx.a	r5
+	incx.a	4(r7)
+	incx.a	0x12345(r7)
+	incx.a	&0x12345
+	incx.a	&sym
+	incx.a	sym
+	incda	r5
+	incda	4(r7)
+	incda	0x12345(r7)
+	incda	&0x12345
+	incda	&sym
+	incda	sym
+	incda.b	r5
+	incda.b	4(r7)
+	incda.b	0x12345(r7)
+	incda.b	&0x12345
+	incda.b	&sym
+	incda.b	sym
+	incda.w	r5
+	incda.w	4(r7)
+	incda.w	0x12345(r7)
+	incda.w	&0x12345
+	incda.w	&sym
+	incda.w	sym
+	incda.a	r5
+	incda.a	4(r7)
+	incda.a	0x12345(r7)
+	incda.a	&0x12345
+	incda.a	&sym
+	incda.a	sym
+	incdx	r5
+	incdx	4(r7)
+	incdx	0x12345(r7)
+	incdx	&0x12345
+	incdx	&sym
+	incdx	sym
+	incdx.b	r5
+	incdx.b	4(r7)
+	incdx.b	0x12345(r7)
+	incdx.b	&0x12345
+	incdx.b	&sym
+	incdx.b	sym
+	incdx.w	r5
+	incdx.w	4(r7)
+	incdx.w	0x12345(r7)
+	incdx.w	&0x12345
+	incdx.w	&sym
+	incdx.w	sym
+	incdx.a	r5
+	incdx.a	4(r7)
+	incdx.a	0x12345(r7)
+	incdx.a	&0x12345
+	incdx.a	&sym
+	incdx.a	sym
+	invx	r5
+	invx	4(r7)
+	invx	0x12345(r7)
+	invx	&0x12345
+	invx	&sym
+	invx	sym
+	invx.b	r5
+	invx.b	4(r7)
+	invx.b	0x12345(r7)
+	invx.b	&0x12345
+	invx.b	&sym
+	invx.b	sym
+	invx.w	r5
+	invx.w	4(r7)
+	invx.w	0x12345(r7)
+	invx.w	&0x12345
+	invx.w	&sym
+	invx.w	sym
+	invx.a	r5
+	invx.a	4(r7)
+	invx.a	0x12345(r7)
+	invx.a	&0x12345
+	invx.a	&sym
+	invx.a	sym
+	popx	r5
+	popx	4(r7)
+	popx	0x12345(r7)
+	popx	&0x12345
+	popx	&sym
+	popx	sym
+	popx.b	r5
+	popx.b	4(r7)
+	popx.b	0x12345(r7)
+	popx.b	&0x12345
+	popx.b	&sym
+	popx.b	sym
+	popx.w	r5
+	popx.w	4(r7)
+	popx.w	0x12345(r7)
+	popx.w	&0x12345
+	popx.w	&sym
+	popx.w	sym
+	popx.a	r5
+	popx.a	4(r7)
+	popx.a	0x12345(r7)
+	popx.a	&0x12345
+	popx.a	&sym
+	popx.a	sym
+	rlax	r5
+	rlax	4(r7)
+	rlax	0x12345(r7)
+	rlax	&0x12345
+	rlax	&sym
+	rlax	sym
+	rlax.b	r5
+	rlax.b	4(r7)
+	rlax.b	0x12345(r7)
+	rlax.b	&0x12345
+	rlax.b	&sym
+	rlax.b	sym
+	rlax.w	r5
+	rlax.w	4(r7)
+	rlax.w	0x12345(r7)
+	rlax.w	&0x12345
+	rlax.w	&sym
+	rlax.w	sym
+	rlax.a	r5
+	rlax.a	4(r7)
+	rlax.a	0x12345(r7)
+	rlax.a	&0x12345
+	rlax.a	&sym
+	rlax.a	sym
+	rlcx	r5
+	rlcx	4(r7)
+	rlcx	0x12345(r7)
+	rlcx	&0x12345
+	rlcx	&sym
+	rlcx	sym
+	rlcx.b	r5
+	rlcx.b	4(r7)
+	rlcx.b	0x12345(r7)
+	rlcx.b	&0x12345
+	rlcx.b	&sym
+	rlcx.b	sym
+	rlcx.w	r5
+	rlcx.w	4(r7)
+	rlcx.w	0x12345(r7)
+	rlcx.w	&0x12345
+	rlcx.w	&sym
+	rlcx.w	sym
+	rlcx.a	r5
+	rlcx.a	4(r7)
+	rlcx.a	0x12345(r7)
+	rlcx.a	&0x12345
+	rlcx.a	&sym
+	rlcx.a	sym
+	sbcx	r5
+	sbcx	4(r7)
+	sbcx	0x12345(r7)
+	sbcx	&0x12345
+	sbcx	&sym
+	sbcx	sym
+	sbcx.b	r5
+	sbcx.b	4(r7)
+	sbcx.b	0x12345(r7)
+	sbcx.b	&0x12345
+	sbcx.b	&sym
+	sbcx.b	sym
+	sbcx.w	r5
+	sbcx.w	4(r7)
+	sbcx.w	0x12345(r7)
+	sbcx.w	&0x12345
+	sbcx.w	&sym
+	sbcx.w	sym
+	sbcx.a	r5
+	sbcx.a	4(r7)
+	sbcx.a	0x12345(r7)
+	sbcx.a	&0x12345
+	sbcx.a	&sym
+	sbcx.a	sym
+	tsta	r5
+	tsta	4(r7)
+	tsta	0x12345(r7)
+	tsta	&0x12345
+	tsta	&sym
+	tsta	sym
+	tsta.b	r5
+	tsta.b	4(r7)
+	tsta.b	0x12345(r7)
+	tsta.b	&0x12345
+	tsta.b	&sym
+	tsta.b	sym
+	tsta.w	r5
+	tsta.w	4(r7)
+	tsta.w	0x12345(r7)
+	tsta.w	&0x12345
+	tsta.w	&sym
+	tsta.w	sym
+	tsta.a	r5
+	tsta.a	4(r7)
+	tsta.a	0x12345(r7)
+	tsta.a	&0x12345
+	tsta.a	&sym
+	tsta.a	sym
+	tstx	r5
+	tstx	4(r7)
+	tstx	0x12345(r7)
+	tstx	&0x12345
+	tstx	&sym
+	tstx	sym
+	tstx.b	r5
+	tstx.b	4(r7)
+	tstx.b	0x12345(r7)
+	tstx.b	&0x12345
+	tstx.b	&sym
+	tstx.b	sym
+	tstx.w	r5
+	tstx.w	4(r7)
+	tstx.w	0x12345(r7)
+	tstx.w	&0x12345
+	tstx.w	&sym
+	tstx.w	sym
+	tstx.a	r5
+	tstx.a	4(r7)
+	tstx.a	0x12345(r7)
+	tstx.a	&0x12345
+	tstx.a	&sym
+	tstx.a	sym
+
+# address instructions
+	calla	r6
+	calla	@r6
+	calla	@r6+
+	calla	#sym
+	calla	sym
+	calla	&sym
+	calla	sym(r6)
+	calla	1234(r6)
+	calla	#0x12345
+	mova r5, r6
+	mova @r5, r6
+	mova @r5+, r6
+	mova &0x12345, r6
+	mova &sym, r6
+	mova 0x1234(r5), r6
+	mova sym(r5), r6
+	mova -2(r5), r6
+	mova sym, r6
+	mova #0x12345, r6
+	mova #sym, r6
+	mova #1, r6
+	mova #0, r6
+	mova r5, &0x12345
+	mova r5, &sym
+	mova r5, 0x1234(r6)
+	mova r5, sym(r6)
+	mova r5, sym
+	mova r5, pc
+	mova pc, r5
+	mov.a r5, r6
+	mov.a #0x12345, r6
+	bra r5
+	bra @r5
+	bra @r5+
+	bra #0x12345
+	bra #sym
+	bra &0x12345
+	bra &sym
+	bra sym
+	bra 4(r5)
+	br.a r5
+	reta
+	ret.a
+	adda #0x12345, r6
+	adda #sym, r6
+	adda #1, r6
+	adda r5, r6
+	add.a r5, r6
+	cmpa #0x12345, r6
+	cmpa r5, r6
+	cmp.a #4, r6
+	suba #0xfffff, r6
+	suba r5, r6
+	sub.a #-1, r6
+	tst.a r6
+	clr.a r6
+	incd.a r6
+	decd.a r6
+	call.a r5
+	call.a #sym
+	pushm	#1, r10
+	pushm	#4, r10
+	pushm	#8, r15
+	pushm	#16, r15
+	pushm	#2, r4
+	pushm	#1, r4
+	pushm.a	#1, r10
+	pushm.a	#4, r10
+	pushm.a	#8, r15
+	pushm.a	#16, r15
+	pushm.a	#2, r4
+	pushm.a	#1, r4
+	pushm.w	#1, r10
+	pushm.w	#4, r10
+	pushm.w	#8, r15
+	pushm.w	#16, r15
+	pushm.w	#2, r4
+	pushm.w	#1, r4
+	popm	#1, r10
+	popm	#4, r10
+	popm	#8, r15
+	popm	#16, r15
+	popm	#2, r4
+	popm	#1, r4
+	popm.a	#1, r10
+	popm.a	#4, r10
+	popm.a	#8, r15
+	popm.a	#16, r15
+	popm.a	#2, r4
+	popm.a	#1, r4
+	popm.w	#1, r10
+	popm.w	#4, r10
+	popm.w	#8, r15
+	popm.w	#16, r15
+	popm.w	#2, r4
+	popm.w	#1, r4
+	rrcm	#1, r5
+	rrcm	#2, r6
+	rrcm	#3, r7
+	rrcm	#4, r8
+	rrcm.a	#1, r5
+	rrcm.a	#2, r6
+	rrcm.a	#3, r7
+	rrcm.a	#4, r8
+	rrcm.w	#1, r5
+	rrcm.w	#2, r6
+	rrcm.w	#3, r7
+	rrcm.w	#4, r8
+	rram	#1, r5
+	rram	#2, r6
+	rram	#3, r7
+	rram	#4, r8
+	rram.a	#1, r5
+	rram.a	#2, r6
+	rram.a	#3, r7
+	rram.a	#4, r8
+	rram.w	#1, r5
+	rram.w	#2, r6
+	rram.w	#3, r7
+	rram.w	#4, r8
+	rlam	#1, r5
+	rlam	#2, r6
+	rlam	#3, r7
+	rlam	#4, r8
+	rlam.a	#1, r5
+	rlam.a	#2, r6
+	rlam.a	#3, r7
+	rlam.a	#4, r8
+	rlam.w	#1, r5
+	rlam.w	#2, r6
+	rlam.w	#3, r7
+	rlam.w	#4, r8
+	rrum	#1, r5
+	rrum	#2, r6
+	rrum	#3, r7
+	rrum	#4, r8
+	rrum.a	#1, r5
+	rrum.a	#2, r6
+	rrum.a	#3, r7
+	rrum.a	#4, r8
+	rrum.w	#1, r5
+	rrum.w	#2, r6
+	rrum.w	#3, r7
+	rrum.w	#4, r8
+
+# repeat prefix
+	rpt #4 { rrax.a r6
+	rpt r5 { rrcx r6
+	rpt #16 { rlax r7
+	rpt #1 { rrux r7
+	rpt #2 { movx r5, r6
+	rpt r15 { addx.b r5, r6
+	rpt #3 { rrax r4
+	rpt #2 { clrx r5
+
+# core instructions on the MSP430X
+	push #4
+	push #8
+	push.b #4
+	mov @pc, r5
+	mov @pc+, r5
+	rra pc
+	call #sym
+	mov #hi(sym), r5
+	mov #lo(sym), r5
+

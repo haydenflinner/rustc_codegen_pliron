@@ -1,0 +1,227 @@
+=== blink an LED, with the watchdog held
+# Register addresses from the MSP430G2 family.
+        .equ    WDTCTL, 0x0120
+        .equ    WDTPW, 0x5a00
+        .equ    WDTHOLD, 0x0080
+        .equ    P1DIR, 0x0022
+        .equ    P1OUT, 0x0021
+        .equ    BIT0, 1
+
+        .text
+        .globl  main
+main:   mov.w   #WDTPW|WDTHOLD, &WDTCTL   ; stop the watchdog
+        mov     #0x0280, sp
+        bis.b   #BIT0, &P1DIR
+loop:   xor.b   #BIT0, &P1OUT
+        mov     #50000, r15
+1:      dec     r15
+        jnz     1b
+        jmp     loop
+
+        .section __reset_vector, "ax", @progbits
+        .word   main
+
+=== a delay routine with a register frame
+        .text
+delay:  push    r10
+        push    r11
+        mov     r15, r10
+outer:  mov     #1000, r11
+inner:  dec     r11
+        jnz     inner
+        dec     r10
+        jnz     outer
+        pop     r11
+        pop     r10
+        ret
+
+=== string output through a pointer
+        .equ    UCA0TXBUF, 0x0067
+        .equ    IFG2, 0x0003
+        .equ    UCA0TXIFG, 2
+        .text
+puts:   mov.b   @r15+, r14
+        tst.b   r14
+        jz      2f
+1:      bit.b   #UCA0TXIFG, &IFG2
+        jz      1b
+        mov.b   r14, &UCA0TXBUF
+        jmp     puts
+2:      ret
+        .section .rodata
+msg:    .asciz  "Hello, MSP430\r\n"
+
+=== arithmetic on 32-bit values held in pairs of registers
+        .text
+add32:  add     r12, r14
+        adc     r15
+        add     r13, r15
+        ret
+sub32:  sub     r12, r14
+        sbc     r15
+        sub     r13, r15
+        ret
+neg32:  inv     r14
+        inv     r15
+        inc     r14
+        adc     r15
+        ret
+shl32:  rla     r14
+        rlc     r15
+        ret
+shr32:  clrc
+        rrc     r15
+        rrc     r14
+        ret
+bcd:    clrc
+        dadd    r14, r15
+        dadc    r15
+        ret
+
+=== a jump table through local label differences
+        .text
+dispatch:
+        cmp     #3, r15
+        jhs     out
+        rla     r15
+        add     r15, pc
+        jmp     case0
+        jmp     case1
+        jmp     case2
+case0:  mov     #10, r15
+        ret
+case1:  mov     #20, r15
+        ret
+case2:  mov     #30, r15
+out:    ret
+        .word   2f - 1f
+1:      nop
+        nop
+2:      nop
+
+=== macros and repetition
+        .macro  save reg
+        push    \reg
+        .endm
+        .macro  restore reg
+        pop     \reg
+        .endm
+        .text
+isr:    save    r15
+        save    r14
+        .rept   3
+        rra     r14
+        .endr
+        .irp    r, r12, r13
+        clr     \r
+        .endr
+        restore r14
+        restore r15
+        reti
+
+=== conditional assembly
+        .equ    DEBUG, 1
+        .text
+        .if     DEBUG
+        mov     #0xdead, r15
+        .else
+        mov     #0, r15
+        .endif
+        .ifdef  UNDEFINED
+        nop
+        .endif
+        ret
+
+=== separators, comments and number spellings
+        .text
+        mov #0FFh, r15 { mov #10h, r14 ; two statements
+# a line comment
+        mov     #0x10, r13      ; a comment
+        mov     #010, r12       ; ten, not eight
+        mov     #0b1010, r11
+        mov     #'A', r10
+        mov     #(3 << 4) | 5, r9
+        mov     #-1 & 0xff, r8
+        ret
+
+=== every addressing mode of mov, with numbers
+        .text
+        mov     r4, r5
+        mov     4(r4), r5
+        mov     &0x0200, r5
+        mov     @r4, r5
+        mov     @r4+, r5
+        mov     #0x1234, r5
+        mov     r4, 4(r5)
+        mov     r4, &0x0202
+        mov     4(r4), 6(r5)
+        mov     &0x0200, &0x0202
+        mov     @r4+, 2(r5)
+        mov     #0x5678, &0x0204
+        mov.b   @r4, 0(r5)
+        ret
+
+=== the constant generators in every position
+        .text
+        mov     #0, r5
+        mov     #1, r5
+        mov     #2, r5
+        mov     #4, r5
+        mov     #8, r5
+        mov     #-1, r5
+        mov     #0xffff, r5
+        add     #2, 4(r5)
+        cmp.b   #8, &0x0200
+        bic     #4, sr
+        bis     #8, sr
+        push    #4
+        push    #8
+        push    #2
+        ret
+
+=== status bits
+        .text
+        dint
+        nop
+        setc
+        setz
+        setn
+        clrc
+        clrz
+        clrn
+        eint
+        nop
+        ret
+
+=== alignment within code
+        .text
+        nop
+        .balign 4
+        mov     #1, r5
+        .p2align 3
+        mov     #2, r5
+        .align  2
+        ret
+        .byte   1
+        .balign 2
+        ret
+
+=== data in a code section
+        .text
+        jmp     over
+        .byte   1, 2, 3
+        .balign 2
+        .word   0x1234, -1
+        .long   0x12345678
+        .ascii  "ab"
+        .space  4, 0xff
+over:   ret
+
+=== jumps to numbers
+        .text
+        jmp     $+4
+        nop
+        jz      $-2
+        jnz     2
+        jc      -2
+        ret

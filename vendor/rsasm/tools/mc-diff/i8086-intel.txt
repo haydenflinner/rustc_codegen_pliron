@@ -1,0 +1,851 @@
+# x86 in 16-bit mode (`.code16`, in a 32-bit object), Intel syntax: one instruction per line, checked against
+# llvm-mc by tools/mc-diff/run.sh, which adds the directives for the mode and
+# syntax (see its ARCHES table).
+#
+# The same cases as tools/gas-diff/i8086-intel.txt. Where the two references
+# disagree rsasm follows GNU as, and the case is commented out here with
+# llvm-mc's answer beside it. The differences are conventions rather than
+# errors on either side:
+#
+# - prefix order: GNU as writes the operand size prefix before `rep`, llvm-mc
+#   after it;
+# - a segment override the address already implies (`%ds:(%ebx)`,
+#   `%ss:(%ebp)`) is left out by GNU as and kept by llvm-mc;
+# - `xchg` between two registers puts them in the opposite ModRM fields;
+# - an unsized memory operand is refused by llvm-mc, where GNU as warns and
+#   takes the mode's size;
+# - llvm-mc's Intel syntax adds a `66` prefix to segment pushes and pops, and
+#   in 16-bit code to `ret`, `iret` and far returns, and moves a segment
+#   register to or from a GPR with the other register's operand size;
+# - llvm-mc has no `int1`, `enterw`/`leavew`, `fnsetpm`/`fneni`/`fndisi`, and
+#   no Intel `seg:offset` far pointers;
+# - `xlat` with a segment keeps its prefix in GNU as only, and GNU as reads an
+#   Intel `jmp dword ptr` in 16-bit code as a far jump.
+# ---- addressing: every ModRM form of the mode, through mov -----------------
+mov ax, [bx+si]
+mov [bx+si], cl
+mov ax, [bx+di]
+mov [bx+di], cl
+mov ax, [bp+si]
+mov [bp+si], cl
+mov ax, [bp+di]
+mov [bp+di], cl
+mov ax, [si]
+mov [si], cl
+mov ax, [di]
+mov [di], cl
+mov ax, [bp]
+mov [bp], cl
+mov ax, [bx]
+mov [bx], cl
+mov ax, [bx+si+4]
+mov [bx+si+4], cl
+mov ax, [bp-2]
+mov [bp-2], cl
+mov ax, [di+0x1234]
+mov [di+0x1234], cl
+# mov dl, ds:[0x1234]                      llvm-mc 3e 8a 16 34 12
+# mov edx, ds:[0x1234]                     llvm-mc 3e 66 8b 16 34 12
+
+# ---- addressing: the other address size, with 0x67 -------------------------
+mov eax, [ebx]
+lea ax, [ebx]
+mov eax, [esi+8]
+lea ax, [esi+8]
+mov eax, [edx+edi*4+4]
+lea ax, [edx+edi*4+4]
+mov eax, [esp]
+lea ax, [esp]
+mov eax, [ebp]
+lea ax, [ebp]
+
+# ---- addressing: segment overrides, and the ones left out as redundant -----
+mov al, byte ptr es:[bx]
+mov byte ptr es:[bp], al
+mov al, byte ptr cs:[bx]
+mov byte ptr cs:[bp], al
+mov al, byte ptr ss:[bx]
+# mov byte ptr ss:[bp], al                 llvm-mc 36 88 46 00
+# mov al, byte ptr ds:[bx]                 llvm-mc 3e 8a 07
+mov byte ptr ds:[bp], al
+mov al, byte ptr fs:[bx]
+mov byte ptr fs:[bp], al
+mov al, byte ptr gs:[bx]
+mov byte ptr gs:[bp], al
+
+# ---- accumulator moves to and from an absolute address ---------------------
+# mov al, byte ptr ds:[0x1000]             llvm-mc 3e a0 00 10
+# mov byte ptr ds:[0x1000], al             llvm-mc 3e a2 00 10
+# mov ax, word ptr ds:[0x1000]             llvm-mc 3e a1 00 10
+# mov word ptr ds:[0x1000], ax             llvm-mc 3e a3 00 10
+# mov eax, dword ptr ds:[0x1000]           llvm-mc 3e 66 a1 00 10
+# mov dword ptr ds:[0x1000], eax           llvm-mc 3e 66 a3 00 10
+
+# ---- operand sizes: 8, 16 and 32 bits --------------------------------------
+mov al, bl
+mov byte ptr [bx+di], bl
+mov bl, byte ptr [bx+di]
+mov al, 18
+mov byte ptr [bx+di], 127
+mov ax, bx
+mov word ptr [bx+di], bx
+mov bx, word ptr [bx+di]
+mov ax, 18
+mov word ptr [bx+di], 127
+mov eax, ebx
+mov dword ptr [bx+di], ebx
+mov ebx, dword ptr [bx+di]
+mov eax, 18
+mov dword ptr [bx+di], 127
+
+# ---- the eight arithmetic operations ---------------------------------------
+add al, cl
+add dx, bx
+add esi, edi
+add ecx, dword ptr [bp+si]
+add word ptr [bp+si], bp
+or al, cl
+or dx, bx
+or esi, edi
+or ecx, dword ptr [bp+si]
+or word ptr [bp+si], bp
+adc al, cl
+adc dx, bx
+adc esi, edi
+adc ecx, dword ptr [bp+si]
+adc word ptr [bp+si], bp
+sbb al, cl
+sbb dx, bx
+sbb esi, edi
+sbb ecx, dword ptr [bp+si]
+sbb word ptr [bp+si], bp
+and al, cl
+and dx, bx
+and esi, edi
+and ecx, dword ptr [bp+si]
+and word ptr [bp+si], bp
+sub al, cl
+sub dx, bx
+sub esi, edi
+sub ecx, dword ptr [bp+si]
+sub word ptr [bp+si], bp
+xor al, cl
+xor dx, bx
+xor esi, edi
+xor ecx, dword ptr [bp+si]
+xor word ptr [bp+si], bp
+cmp al, cl
+cmp dx, bx
+cmp esi, edi
+cmp ecx, dword ptr [bp+si]
+cmp word ptr [bp+si], bp
+add al, 1
+add al, 127
+add al, 128
+add al, -128
+add ax, 1
+add ax, 127
+add ax, 128
+add ax, -128
+add eax, 1
+add eax, 127
+add eax, 128
+add eax, -128
+add bx, 4660
+add ebx, 305419896
+add ebx, -2
+add byte ptr [bp+si], 5
+add word ptr [bp+si], -5
+add word ptr [bp+si], 4660
+add dword ptr [bp+si], 128
+add ax, 65535
+add ecx, 4294967295
+sub al, 1
+sub al, 127
+sub al, 128
+sub al, -128
+sub ax, 1
+sub ax, 127
+sub ax, 128
+sub ax, -128
+sub eax, 1
+sub eax, 127
+sub eax, 128
+sub eax, -128
+sub bx, 4660
+sub ebx, 305419896
+sub ebx, -2
+sub byte ptr [bp+si], 5
+sub word ptr [bp+si], -5
+sub word ptr [bp+si], 4660
+sub dword ptr [bp+si], 128
+sub ax, 65535
+sub ecx, 4294967295
+cmp al, 1
+cmp al, 127
+cmp al, 128
+cmp al, -128
+cmp ax, 1
+cmp ax, 127
+cmp ax, 128
+cmp ax, -128
+cmp eax, 1
+cmp eax, 127
+cmp eax, 128
+cmp eax, -128
+cmp bx, 4660
+cmp ebx, 305419896
+cmp ebx, -2
+cmp byte ptr [bp+si], 5
+cmp word ptr [bp+si], -5
+cmp word ptr [bp+si], 4660
+cmp dword ptr [bp+si], 128
+cmp ax, 65535
+cmp ecx, 4294967295
+
+# ---- shifts and rotates ----------------------------------------------------
+rol al, 1
+rol bx, 3
+rol ecx, cl
+rol dword ptr [bp+si], 1
+rol word ptr [bp+si], cl
+ror al, 1
+ror bx, 3
+ror ecx, cl
+ror dword ptr [bp+si], 1
+ror word ptr [bp+si], cl
+rcl al, 1
+rcl bx, 3
+rcl ecx, cl
+rcl dword ptr [bp+si], 1
+rcl word ptr [bp+si], cl
+rcr al, 1
+rcr bx, 3
+rcr ecx, cl
+rcr dword ptr [bp+si], 1
+rcr word ptr [bp+si], cl
+shl al, 1
+shl bx, 3
+shl ecx, cl
+shl dword ptr [bp+si], 1
+shl word ptr [bp+si], cl
+sal al, 1
+sal bx, 3
+sal ecx, cl
+sal dword ptr [bp+si], 1
+sal word ptr [bp+si], cl
+shr al, 1
+shr bx, 3
+shr ecx, cl
+shr dword ptr [bp+si], 1
+shr word ptr [bp+si], cl
+sar al, 1
+sar bx, 3
+sar ecx, cl
+sar dword ptr [bp+si], 1
+sar word ptr [bp+si], cl
+
+# ---- unary operations, multiplication and division -------------------------
+not bl
+not si
+not edi
+not dword ptr [bp+si]
+not byte ptr [bp+si]
+neg bl
+neg si
+neg edi
+neg dword ptr [bp+si]
+neg byte ptr [bp+si]
+mul bl
+mul si
+mul edi
+mul dword ptr [bp+si]
+mul byte ptr [bp+si]
+div bl
+div si
+div edi
+div dword ptr [bp+si]
+div byte ptr [bp+si]
+idiv bl
+idiv si
+idiv edi
+idiv dword ptr [bp+si]
+idiv byte ptr [bp+si]
+imul cl
+imul ecx
+imul word ptr [bp+si]
+imul eax, ebx
+imul dx, word ptr [bp+si]
+imul eax, ebx, 5
+imul eax, ebx, 500
+imul cx, word ptr [bp+si], -3
+imul esi, 9
+idiv eax, ecx
+div al, bl
+
+# ---- test, lea and the extending moves -------------------------------------
+test al, bl
+test cx, dx
+test eax, esi
+test al, 3
+test ax, 768
+test eax, 196608
+test dword ptr [bp+si], 1
+test dword ptr [bp+si], edx
+lea eax, [bp+si]
+lea si, [bp+si]
+lea eax, [ebx]
+movzx ebx, al
+movzx ebx, ax
+movzx bx, al
+movsx edx, cl
+movsx edx, cx
+movzx eax, byte ptr [bp+si]
+movsx ax, byte ptr [bp+si]
+movsx ecx, word ptr [bp+si]
+
+# ---- increment and decrement, with their one-byte register forms -----------
+inc ax
+inc bp
+inc di
+inc eax
+inc esp
+inc edi
+inc al
+inc bh
+inc word ptr [bp+si]
+inc dword ptr [bp+si]
+dec ax
+dec bp
+dec di
+dec eax
+dec esp
+dec edi
+dec al
+dec bh
+dec word ptr [bp+si]
+dec dword ptr [bp+si]
+
+# ---- exchange, with its one-byte accumulator forms -------------------------
+xchg ax, bx
+xchg cx, ax
+xchg eax, edi
+xchg esi, eax
+xchg eax, eax
+xchg ax, ax
+# xchg cl, dl                              llvm-mc 86 ca
+xchg ebx, dword ptr [bp+si]
+xchg word ptr [bp+si], bp
+
+# ---- stack: registers, segment registers, immediates and memory ------------
+push ax
+pop ax
+push sp
+pop sp
+push di
+pop di
+push eax
+pop eax
+push esp
+pop esp
+push edi
+pop edi
+push es
+pop es
+push cs
+push ss
+pop ss
+push ds
+pop ds
+push fs
+pop fs
+push gs
+pop gs
+push 1
+push -1
+push 128
+push 4660
+push 305419896
+push word ptr [bp+si]
+pop word ptr [bp+si]
+push word ptr [bp+si]
+push dword ptr [bp+si]
+pop word ptr [bp+si]
+pusha
+popa
+pushf
+popf
+pushad
+popad
+pushaw
+popaw
+pushfd
+popfd
+# pushfw                                   llvm-mc ERROR
+# popfw                                    llvm-mc ERROR
+lahf
+sahf
+enter 16, 0
+enter 0x1000, 3
+leave
+
+# ---- sign extension of the accumulator -------------------------------------
+cbw
+cwde
+cwd
+cdq
+
+# ---- decimal adjustment and the other instructions long mode dropped -------
+daa
+das
+aaa
+aas
+aam
+aad
+aam 16
+aad 16
+into
+salc
+# bound eax, qword ptr [bp+si]             llvm-mc ERROR
+# bound bx, dword ptr [bp+si]              llvm-mc ERROR
+arpl bx, ax
+arpl word ptr [bp+si], cx
+les eax, fword ptr [bp+si]
+les bx, dword ptr [bp+si]
+lds eax, fword ptr [bp+si]
+lds bx, dword ptr [bp+si]
+lss esp, fword ptr [bp+si]
+lss si, dword ptr [bp+si]
+lfs esp, fword ptr [bp+si]
+lfs si, dword ptr [bp+si]
+lgs esp, fword ptr [bp+si]
+lgs si, dword ptr [bp+si]
+
+# ---- interrupts and returns ------------------------------------------------
+int 33
+int 3
+int3
+iret
+# iretw                                    llvm-mc ERROR
+iretd
+# ret                                      llvm-mc 66 c3
+# ret 8                                    llvm-mc 66 c2 08 00
+# retf                                     llvm-mc 66 cb
+# retf 8                                   llvm-mc 66 ca 08 00
+
+# ---- indirect and far branches ---------------------------------------------
+jmp eax
+jmp ax
+call ebx
+call bx
+# jmp dword ptr [bp+si]                    llvm-mc 66 ff 22
+call word ptr [bp+si]
+jmp fword ptr [bp+si]
+call fword ptr [bp+si]
+# jmp 0x10:0x1000                          llvm-mc ERROR
+# call 0x10:0x1000                         llvm-mc ERROR
+
+# ---- string instructions, with and without their operands ------------------
+movsb
+movsw
+movsd
+rep movsb
+# repe movsd                               llvm-mc f3 66 a5
+cmpsb
+cmpsw
+cmpsd
+rep cmpsb
+# repe cmpsd                               llvm-mc f3 66 a7
+stosb
+stosw
+stosd
+rep stosb
+# repe stosd                               llvm-mc f3 66 ab
+lodsb
+lodsw
+lodsd
+rep lodsb
+# repe lodsd                               llvm-mc f3 66 ad
+scasb
+scasw
+scasd
+rep scasb
+# repe scasd                               llvm-mc f3 66 af
+insb
+insw
+insd
+rep insb
+# repe insd                                llvm-mc f3 66 6d
+outsb
+outsw
+outsd
+rep outsb
+# repe outsd                               llvm-mc f3 66 6f
+repne scasb
+repnz cmpsw
+repz cmpsb
+rep stosw
+movs byte ptr es:[di], byte ptr [si]
+movs dword ptr [di], dword ptr fs:[si]
+cmps word ptr [si], word ptr es:[di]
+lods byte ptr ss:[si]
+stos dword ptr es:[di]
+scas word ptr [esi]
+# xlat byte ptr [ebx]                      llvm-mc d7
+xlatb
+
+# ---- port input and output -------------------------------------------------
+in al, 96
+in ax, 96
+in eax, 96
+in al, dx
+in ax, dx
+in eax, dx
+out 128, al
+out 128, ax
+out 128, eax
+out dx, al
+out dx, ax
+out dx, eax
+
+# ---- bit operations --------------------------------------------------------
+bt ax, bx
+bt eax, ebx
+bt dword ptr [bp+si], ecx
+bt si, 3
+bt edi, 31
+bt word ptr [bp+si], 7
+bts ax, bx
+bts eax, ebx
+bts dword ptr [bp+si], ecx
+bts si, 3
+bts edi, 31
+bts word ptr [bp+si], 7
+btr ax, bx
+btr eax, ebx
+btr dword ptr [bp+si], ecx
+btr si, 3
+btr edi, 31
+btr word ptr [bp+si], 7
+btc ax, bx
+btc eax, ebx
+btc dword ptr [bp+si], ecx
+btc si, 3
+btc edi, 31
+btc word ptr [bp+si], 7
+bsf ax, bx
+bsf eax, dword ptr [bp+si]
+bsr ax, bx
+bsr eax, dword ptr [bp+si]
+shld ax, bx, 4
+shld eax, ebx, cl
+shld dword ptr [bp+si], edx, 1
+shrd ax, bx, 4
+shrd eax, ebx, cl
+shrd dword ptr [bp+si], edx, 1
+xadd al, bl
+xadd ecx, edx
+xadd word ptr [bp+si], si
+cmpxchg bl, cl
+cmpxchg ecx, edx
+cmpxchg dword ptr [bp+si], ebx
+cmpxchg8b qword ptr [bp+si]
+bswap eax
+bswap edi
+popcnt eax, ebx
+lzcnt cx, word ptr [bp+si]
+tzcnt edx, esi
+movbe eax, dword ptr [bp+si]
+movbe word ptr [bp+si], cx
+rdrand eax
+rdseed bx
+seto al
+cmovo eax, dword ptr [bp+si]
+cmovo bx, cx
+setb al
+cmovb eax, dword ptr [bp+si]
+cmovb bx, cx
+sete al
+cmove eax, dword ptr [bp+si]
+cmove bx, cx
+setne al
+cmovne eax, dword ptr [bp+si]
+cmovne bx, cx
+setbe al
+cmovbe eax, dword ptr [bp+si]
+cmovbe bx, cx
+seta al
+cmova eax, dword ptr [bp+si]
+cmova bx, cx
+sets al
+cmovs eax, dword ptr [bp+si]
+cmovs bx, cx
+setp al
+cmovp eax, dword ptr [bp+si]
+cmovp bx, cx
+setl al
+cmovl eax, dword ptr [bp+si]
+cmovl bx, cx
+setge al
+cmovge eax, dword ptr [bp+si]
+cmovge bx, cx
+setle al
+cmovle eax, dword ptr [bp+si]
+cmovle bx, cx
+setg al
+cmovg eax, dword ptr [bp+si]
+cmovg bx, cx
+
+# ---- system instructions ---------------------------------------------------
+mov eax, cr0
+mov cr3, ebx
+mov cr4, eax
+mov edx, dr7
+mov dr0, ecx
+mov ax, ds
+# mov eax, es                              llvm-mc 8c c0
+mov ss, bx
+# mov fs, eax                              llvm-mc 66 8e e0
+mov word ptr [bp+si], gs
+mov ds, word ptr [bp+si]
+sgdt [bp+si]
+sidt [bp+si]
+lgdt [bp+si]
+lidt [bp+si]
+invlpg [bp+si]
+smsw ax
+smsw eax
+lmsw ax
+sldt ax
+sldt eax
+sldt word ptr [bp+si]
+str ax
+str eax
+str word ptr [bp+si]
+lldt ax
+lldt word ptr [bp+si]
+ltr ax
+ltr word ptr [bp+si]
+verr ax
+verr word ptr [bp+si]
+verw ax
+verw word ptr [bp+si]
+lar eax, bx
+lsl ax, word ptr [bp+si]
+lar ecx, edx
+clts
+hlt
+cli
+sti
+cld
+std
+clc
+stc
+cmc
+cpuid
+rdtsc
+rdtscp
+rdmsr
+wrmsr
+rdpmc
+sysenter
+sysexit
+rsm
+invd
+wbinvd
+ud2
+pause
+nop
+xgetbv
+xsetbv
+endbr32
+cmc
+nop ax
+nop eax
+nop dword ptr [bp+si]
+nop word ptr [bp+si]
+fxsave [bp+si]
+fxrstor [bp+si]
+xsave [bp+si]
+xrstor [bp+si]
+xsaveopt [bp+si]
+clflush [bp+si]
+ud1 eax, ebx
+
+# ---- x87 -------------------------------------------------------------------
+fld1
+fldz
+fldpi
+fldl2e
+fldl2t
+fldlg2
+fldln2
+fchs
+fabs
+ftst
+fxam
+f2xm1
+fyl2x
+fptan
+fpatan
+fxtract
+fprem1
+fdecstp
+fincstp
+fprem
+fyl2xp1
+fsqrt
+fsincos
+frndint
+fscale
+fsin
+fcos
+fnop
+fcompp
+fucompp
+fninit
+finit
+fnclex
+fclex
+fwait
+# fnsetpm                                  llvm-mc ERROR
+# fneni                                    llvm-mc ERROR
+# fndisi                                   llvm-mc ERROR
+fld st(3)
+fst st(3)
+fstp st(3)
+fxch st(3)
+fucom st(3)
+fucomp st(3)
+fcom st(3)
+fcomp st(3)
+ffree st(3)
+ffreep st(3)
+fcomi st, st(2)
+fucomi st, st(2)
+fcomip st, st(2)
+fucomip st, st(2)
+fcmovb st, st(2)
+fcmove st, st(2)
+fcmovbe st, st(2)
+fcmovu st, st(2)
+fcmovnb st, st(2)
+fcmovne st, st(2)
+fcmovnbe st, st(2)
+fcmovnu st, st(2)
+fadd st, st(1)
+fadd st(4), st
+faddp st(2), st
+faddp st(5)
+fadd dword ptr [bp+si]
+fadd qword ptr [bp+si]
+fiadd word ptr [bp+si]
+fiadd dword ptr [bp+si]
+fmul st, st(1)
+fmul st(4), st
+fmulp st(2), st
+fmulp st(5)
+fmul dword ptr [bp+si]
+fmul qword ptr [bp+si]
+fimul word ptr [bp+si]
+fimul dword ptr [bp+si]
+fsub st, st(1)
+fsub st(4), st
+fsubp st(2), st
+fsubp st(5)
+fsub dword ptr [bp+si]
+fsub qword ptr [bp+si]
+fisub word ptr [bp+si]
+fisub dword ptr [bp+si]
+fsubr st, st(1)
+fsubr st(4), st
+fsubrp st(2), st
+fsubrp st(5)
+fsubr dword ptr [bp+si]
+fsubr qword ptr [bp+si]
+fisubr word ptr [bp+si]
+fisubr dword ptr [bp+si]
+fdiv st, st(1)
+fdiv st(4), st
+fdivp st(2), st
+fdivp st(5)
+fdiv dword ptr [bp+si]
+fdiv qword ptr [bp+si]
+fidiv word ptr [bp+si]
+fidiv dword ptr [bp+si]
+fdivr st, st(1)
+fdivr st(4), st
+fdivrp st(2), st
+fdivrp st(5)
+fdivr dword ptr [bp+si]
+fdivr qword ptr [bp+si]
+fidivr word ptr [bp+si]
+fidivr dword ptr [bp+si]
+fcom dword ptr [bp+si]
+fcomp qword ptr [bp+si]
+ficom word ptr [bp+si]
+ficomp dword ptr [bp+si]
+fld dword ptr [bp+si]
+fld qword ptr [bp+si]
+fld tbyte ptr [bp+si]
+fild word ptr [bp+si]
+fild dword ptr [bp+si]
+fild qword ptr [bp+si]
+fst dword ptr [bp+si]
+fstp tbyte ptr [bp+si]
+fist word ptr [bp+si]
+fistp qword ptr [bp+si]
+fisttp dword ptr [bp+si]
+fbld tbyte ptr [bp+si]
+fbstp tbyte ptr [bp+si]
+fldcw word ptr [bp+si]
+fnstcw word ptr [bp+si]
+fstcw word ptr [bp+si]
+fnstsw word ptr [bp+si]
+fnstsw ax
+fstsw ax
+fldenv [bp+si]
+fnsave [bp+si]
+frstor [bp+si]
+
+# ---- prefixes --------------------------------------------------------------
+lock inc dword ptr [bp+si]
+lock add word ptr [bp+si], 1
+
+# ---- SSE, AVX and AVX-512 in 16-bit mode -----------------------------------
+movaps xmm1, xmm2
+movups xmm3, xmmword ptr [bp+si]
+movapd xmmword ptr [bp+si], xmm7
+addps xmm0, xmm1
+mulsd xmm2, qword ptr [bp+si]
+sqrtss xmm1, dword ptr [bp+si]
+cvtsi2sd xmm1, eax
+cvttsd2si eax, xmm1
+cvtsi2ss xmm0, dword ptr [bp+si]
+movd xmm0, eax
+movd dword ptr [bp+si], xmm1
+movq xmm0, xmm1
+pxor xmm6, xmm7
+paddd mm0, mm1
+pshufd xmm0, xmm1, 5
+crc32 eax, bl
+crc32 eax, cx
+crc32 eax, dword ptr [bp+si]
+pextrw eax, xmm1, 1
+pinsrw xmm2, ecx, 2
+movmskps eax, xmm3
+vaddps ymm0, ymm1, ymm2
+vmovdqu ymm7, ymmword ptr [bp+si]
+vpxor xmm1, xmm2, xmm3
+vcvtsi2sd xmm0, xmm1, eax
+vmovd xmm0, ecx
+vpbroadcastd ymm1, xmm2
+vaddps zmm0, zmm1, zmm2
+vmovdqu32 zmm7, zmmword ptr [bp+si]
+vpaddd zmm1, zmm2, zmm3
+aesenc xmm1, xmm2
+pclmulqdq xmm1, xmm2, 0x11
+emms
+sfence
+ldmxcsr dword ptr [bp+si]
+stmxcsr dword ptr [bp+si]

@@ -1,0 +1,14 @@
+Lines before the first snippet are not assembled.
+
+The avr6 core, with its 22-bit program counter, which GNU ld links only with
+other avr6 objects (-m avr6).
+
+=== jmp and call at a base address
+        .text
+        jmp     target
+        call    target + 4
+        .space  0x100
+target: ret
+        nop
+        nop
+

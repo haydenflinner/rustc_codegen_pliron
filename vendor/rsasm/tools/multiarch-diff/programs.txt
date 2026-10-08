@@ -1,0 +1,290 @@
+=== x86-64 then m68k: `#` stops being a comment and `|` starts one
+.arch x86-64
+        movq    $1, %rax        # an x86 comment
+        ret
+.arch m68k
+        movew   #1, %d0         | an m68k comment
+        moveq   #-1, %d1
+        rts
+=== m68k then x86-64: `#` is a comment again
+.arch m68k
+        movel   #0x12345678, %d0
+.arch x86-64
+        movl    $0x12345678, %eax       # the same number, little-endian
+        movl    $1 | 2, %ebx
+=== the rest of the switching line is read by the old rules
+.arch x86-64
+        nop
+.arch m68k # this comment is x86's
+        moveq   #1, %d0
+=== x86-64, SuperH and back: `!` comments and `#` only in the first column
+.arch x86-64
+        movl    $7, %eax        # x86
+.arch sh
+# a first-column comment
+        mov     #7, r0          ! an SH comment
+        rts
+        nop
+.arch x86-64
+        ret
+=== ARM's `@` comments and AArch64's `//`
+.arch x86-64
+        movl    $1, %eax        # x86
+.arch arm
+        mov     r0, #1          @ arm
+        bx      lr
+.arch aarch64
+        mov     x0, #1          // aarch64
+        ret
+=== SPARC's `!` comments between two targets that have none
+.arch x86-64
+        nop
+.arch sparc
+        mov     1, %o0          ! sparc
+        retl
+        nop
+.arch x86-64
+        nop
+=== RL78's `10H` numbers only where RL78 is the target
+.arch x86-64
+        movl    $0x10, %eax
+.arch rl78
+        mov     a, #10H
+        movw    ax, #1234H
+        ret
+.arch x86-64
+        movl    $0x10, %eax
+=== RX, V850 and RL78 in a row
+.arch rx
+        mov     #1, r1
+        rts
+.arch v850
+        mov     5, r10
+        jmp     [lp]
+.arch rl78
+        mov     a, #1
+        ret
+=== byte order follows the target: data
+.arch m68k
+        .long   0x11223344
+        .word   0x5566
+.arch x86-64
+        .long   0x11223344
+        .word   0x5566
+.arch mips
+        .word   0x11223344
+.arch mipsel
+        .word   0x11223344
+=== byte order follows the target: fixups resolved at the end
+.arch x86-64
+        call    1f
+        nop
+1:      .long   2f - 1b
+2:      ret
+        nop
+.arch m68k
+        bsr     3f
+        nop
+3:      .long   4f - 3b
+4:      rts
+.arch sh
+        bsr     5f
+        nop
+        .align  2
+5:      .long   6f - 5b
+6:      rts
+        nop
+=== big- and little-endian SuperH
+.arch sh
+        mov     #1, r0
+        rts
+        nop
+        .align  2
+        .long   7f - .
+7:
+.arch shl
+        mov     #1, r0
+        rts
+        nop
+        .align  2
+        .long   8f - .
+8:
+=== i386 and x86-64: the mode goes with the target
+.arch x86-64
+        movl    (%eax), %ebx
+.arch i386
+        movl    (%eax), %ebx
+.arch x86-64
+        movl    (%eax), %ebx
+=== a PowerPC branch in big and little endian
+.arch powerpc
+        b       1f
+        nop
+1:      blr
+.arch powerpc64le
+        b       2f
+        nop
+2:      blr
+=== alignment is padded with the no-ops of the code before it
+.arch aarch64
+        mov     x0, #1
+        .p2align 3
+.arch m68k
+        moveq   #1, %d0
+        .p2align 2
+.arch sh
+        mov     #1, r0
+        .p2align 2
+.arch riscv64
+        addi    a0, a0, 1
+        .p2align 3
+=== a macro body is read by the rules where it is expanded
+.macro load_one
+        movew   #1, %d0         | m68k
+.endm
+.arch x86-64
+        movq    $1, %rax        # x86
+.arch m68k
+        load_one
+        rts
+--- split
+.arch x86-64
+        movq    $1, %rax
+.arch m68k
+        movew   #1, %d0
+        rts
+=== a switch inside a macro applies to the rest of the file
+.arch x86-64
+.macro to_m68k
+        .arch   m68k
+.endm
+        nop                     # x86
+        to_m68k
+        moveq   #3, %d0         | m68k
+        rts
+--- split
+.arch x86-64
+        nop
+.arch m68k
+        moveq   #3, %d0
+        rts
+=== a switch inside a macro applies to the rest of the expansion
+.arch x86-64
+.macro m68k_then_back n
+        .arch   m68k
+        moveq   #\n, %d0        | m68k
+        .arch   x86-64
+.endm
+        m68k_then_back 5
+        movl    $5, %eax        # x86
+--- split
+.arch x86-64
+.arch m68k
+        moveq   #5, %d0
+.arch x86-64
+        movl    $5, %eax
+=== a switch in a false conditional does not happen
+.arch x86-64
+        .if 0
+        .arch   m68k
+        .endif
+        movl    $1, %eax        # still x86
+        .if 1
+        .arch   m68k
+        .else
+        .arch   sh
+        .endif
+        moveq   #1, %d0         | m68k
+--- split
+.arch x86-64
+        movl    $1, %eax
+.arch m68k
+        moveq   #1, %d0
+=== a switch in a repeat block applies from where it is
+.arch x86-64
+        .rept   2
+        .arch   m68k
+        moveq   #2, %d0         | m68k
+        .arch   x86-64
+        movl    $2, %eax        # x86
+        .endr
+--- split
+.arch x86-64
+.arch m68k
+        moveq   #2, %d0
+.arch x86-64
+        movl    $2, %eax
+.arch m68k
+        moveq   #2, %d0
+.arch x86-64
+        movl    $2, %eax
+=== names that are not one token
+.arch x86-64
+        nop
+.arch 68000
+        moveq   #1, %d0
+.arch x86-64
+        nop
+=== the example in README.md
+.arch i386
+        movl    $0x10000, %esp          # x86: `#` starts a comment
+        .arch   m68k
+        movew   #0x2700, %sr            | m68k: `#` is an immediate, `|` a comment
+        .arch   sh
+        mov     #1, r0                  ! SuperH: `!` is the comment
+=== one 680x0 file for three CPUs, and x86 between them
+.arch 68040
+        move16  %a0@+,%a1@+
+        fsaddx  %fp0,%fp1
+        cinva   %ic
+.arch x86-64
+        ret
+.arch cpu32
+        bgnd
+        fmovex  %fp2,%fp3
+.arch 5475
+        mvsw    %d0,%d1
+        mov3ql  #-1,%d2
+        fmoved  %fp0,%fp1
+=== AVR's `$` separates statements where x86's is an immediate, and `;` comments
+.arch x86-64
+        movl    $1, %eax ; movl $2, %ebx        # `;` separates on x86
+.arch avr
+        ldi     r16, 1 $ ldi r17, 2             ; `$` separates on AVR, `;` comments
+# a first-column comment
+        ret
+.arch x86-64
+        ret
+=== an AVR core with more instructions, between RL78 and SuperH
+.arch rl78
+        mov     a, #0FFH                        ; RL78 reads `0FFH`
+.arch avr5
+        ldi     r24, lo8(0x1234)
+        ldi     r25, hi8(0x1234)
+        movw    r30, r24
+        call    0x100
+.arch sh
+        mov     #1, r0                          ! SuperH
+        rts
+        nop
+=== x86-64 then MSP430: `;` comments, `{` separates statements, `#` is an immediate
+.arch x86-64
+        movl    $0x0ff, %eax    # an x86 comment
+.arch msp430
+        mov     #0FFh, r15      ; an MSP430 comment { not a statement
+        mov     #1, r14 { mov #2, r13
+# a first-column comment
+        jmp     $+4
+        ret
+.arch x86-64
+        ret
+=== MSP430X, RL78 and back: two readings of `0FFh` and of `;`
+.arch msp430x
+        movx.a  #0x12345, r12   ; an MSP430 comment
+        rpt     #4 { rrax.a r12
+.arch rl78
+        mov     a, #0FFH        ; an RL78 comment
+        ret
+.arch msp430x
+        mova    #010, r13
+        reta

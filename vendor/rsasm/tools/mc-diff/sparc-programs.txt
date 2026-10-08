@@ -1,0 +1,124 @@
+=== every integer condition branch, backwards
+back:
+        nop
+        ba      back
+        bn      back
+        be      back
+        bne     back
+        bg      back
+        ble     back
+        bge     back
+        bl      back
+        bgu     back
+        bleu    back
+        bcc     back
+        bcs     back
+        bpos    back
+        bneg    back
+        bvc     back
+        bvs     back
+        nop
+
+=== forward branches and the annul bit
+        ba      fwd
+        ba,a    fwd
+        bne,a   fwd
+        be,a    fwd
+        nop
+        nop
+fwd:
+        retl
+        nop
+
+=== branch condition aliases
+back:
+        beq     back
+        bnz     back
+        blt     back
+        bgt     back
+        bgeu    back
+        blu     back
+        nop
+
+=== call, forwards and backwards
+start:
+        nop
+        call    start
+        nop
+        call    end
+        nop
+        call    start
+        nop
+end:
+        retl
+        nop
+
+=== a leaf function
+leaf:
+        add     %o0, %o1, %o0
+        retl
+        sll     %o0, 1, %o0
+
+=== a function with a register window
+        .globl  fn
+fn:
+        save    %sp, -96, %sp
+        ld      [%i0], %l0
+        ld      [%i0 + 4], %l1
+        add     %l0, %l1, %l2
+        st      %l2, [%i0 + 8]
+        ret
+        restore
+
+=== building a 32-bit address out of sethi and or
+        .text
+        sethi   %hi(table), %o0
+        or      %o0, %lo(table), %o0
+        ld      [%o0], %o1
+        ld      [%o0 + %lo(table)], %o2
+        add     %o0, %lo(table), %o3
+        set     table, %o4
+        set     table + 16, %o5
+        retl
+        nop
+        .align  8
+table:
+        .long   1, 2, 3, 4
+
+=== a loop
+        mov     0, %o0
+        mov     10, %o1
+loop:
+        add     %o0, 1, %o0
+        cmp     %o0, %o1
+        blu     loop
+        nop
+        retl
+        nop
+
+=== calls to an undefined symbol keep a zero displacement
+        call    external
+        nop
+        sethi   %hi(external), %g1
+        or      %g1, %lo(external), %g1
+        retl
+        nop
+
+=== data next to code
+# Deliberate divergence, spelled around here: rsasm's `.word` is two bytes (the
+# x86 meaning) while GNU as and llvm-mc make it four on SPARC. `.long` and
+# `.short` mean the same width everywhere, so the corpus uses those.
+        .text
+        nop
+here:
+        .long   here
+        .long   0x11223344
+        .short  0x5566
+        .byte   0x77
+        .align  4
+        nop
+
+=== alignment padding in a text section is nops
+        nop
+        .align  16
+        nop

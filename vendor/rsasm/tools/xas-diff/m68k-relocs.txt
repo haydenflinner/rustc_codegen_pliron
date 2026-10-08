@@ -1,0 +1,205 @@
+=== references to symbols in their own section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        bsr loc
+        bsr glob
+        bsr weak1
+        bsr hid
+        bsr prot
+        bsr intl
+        bsr whid
+        bsr lhid
+        bsr func
+        bsr late
+        bsr lweak
+        bsr lalias
+        bsr lwalias
+        bsr galias
+        bsr walias
+        jbsr loc
+        jbsr glob
+        jbsr weak1
+        jbsr lalias
+        jbsr walias
+        jra loc
+        jra glob
+        jra weak1
+        jra lalias
+        jra walias
+        beq loc
+        beq glob
+        beq weak1
+        beq lalias
+        beq walias
+        lea loc(%pc), %a0
+        lea glob(%pc), %a0
+        lea weak1(%pc), %a0
+        lea lalias(%pc), %a0
+        lea galias(%pc), %a0
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+
+=== references back to symbols in their own section
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        bsr loc
+        bsr glob
+        bsr weak1
+        bsr lalias
+        jbsr loc
+        jbsr glob
+        jbsr weak1
+        jra loc
+        jra glob
+        jra weak1
+        beq loc
+        beq glob
+        beq weak1
+
+=== references out of their section, by binding
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        bsr oloc
+        bsr oglob
+        bsr oweak
+        bsr oalias
+        bsr ext
+        bsr uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+
+=== default section alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7
+
+=== FPU and MMU operands referring to symbols
+        .text
+        .globl  glob
+start:
+        fmovex  ext,%fp0
+        faddd   ext+8,%fp1
+        fmoves  %fp2,ext
+        fmovex  ext(%pc),%fp3
+        fmovex  ext(%pc,%d0:l),%fp4
+        fmovel  #ext,%fpcr
+        fbeq    ext
+        fbnel   glob
+        fjgt    ext
+        fdbne   %d0,ext
+        ftrapeql #ext
+        pmove   ext,%tc
+        pbbs    ext
+        pdbbc   %d1,ext
+        callm   #ext,(%a0)
+        cas2l   %d0:%d1,%d2:%d3,(%a0):(%a1)
+        movepw  %d0,8(%a1)
+glob:   rts
+        .data
+        .long   ext
+=== DBcc to other sections and undefined symbols
+        .text
+        dbra    %d0,ext
+        dbne    %d1,other
+        dbeq    %d2,here
+here:   rts
+        .section .text.b,"ax",@progbits
+other:  rts
+=== refused: an FPU instruction without an FPU
+        .arch   68000
+        faddx   %fp0,%fp1
+=== refused: a 68851 instruction on a 68040
+        .arch   68040
+        pmove   %tc,%a0@
+=== refused: move16 on a 68030
+        .arch   68030
+        move16  %a0@+,%a1@+
+=== refused: callm beyond the 68020
+        .arch   68030
+        callm   #0,%a0@
+=== refused: a ColdFire instruction on a 68060
+        .arch   68060
+        mvsw    %d0,%d1
+=== refused: a movec register the CPU does not have
+        .arch   68010
+        movec   %d0,%cacr
+=== .arch picks the CPU, as -march and -mcpu do
+        .arch   68040
+        move16  ext,%a0@
+        cinva   %ic
+        pflush  %a1@
+        fsaddx  %fp0,%fp1
+=== .arch with an extension after a comma
+        .arch   68000,68881
+        faddx   %fp0,%fp1
+        fbeq    ext
+        jra     ext
+=== .cpu names a part rather than an architecture
+        .cpu    68332
+        bgnd

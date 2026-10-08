@@ -1,0 +1,42 @@
+=== registers by name
+	.text
+f:
+	.cfi_startproc
+	pushl %ebp
+	.cfi_def_cfa_offset 8
+	.cfi_offset %ebp, -8
+	movl %esp, %ebp
+	.cfi_def_cfa_register %ebp
+	pushl %ebx
+	.cfi_offset ebx, -12
+	.cfi_offset %xmm7, -16
+	.cfi_offset %st(3), -20
+	.cfi_offset %mm0, -24
+	.cfi_register %eip, %eax
+	.cfi_same_value %eflags
+	.cfi_undefined %es, %gs, %mxcsr
+	popl %ebx
+	.cfi_restore %ebx
+	popl %ebp
+	.cfi_def_cfa %esp, 4
+	ret
+	.cfi_endproc
+=== a frame in .debug_frame too
+	.cfi_sections .eh_frame, .debug_frame
+	.file 1 "a.c"
+	.text
+	.globl f
+f:
+	.loc 1 3 0
+	.cfi_startproc
+	pushl %ebx
+	.cfi_adjust_cfa_offset 4
+	.cfi_rel_offset %ebx, 0
+	.loc 1 4 5 prologue_end
+	movl 8(%esp), %eax
+	.loc 1 5 1 epilogue_begin
+	popl %ebx
+	.cfi_adjust_cfa_offset -4
+	.cfi_restore %ebx
+	ret
+	.cfi_endproc

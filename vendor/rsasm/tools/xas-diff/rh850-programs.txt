@@ -1,0 +1,116 @@
+=== short branches both ways
+start:
+        bz start
+        bnz 1f
+        br 1f
+        bsa 1f
+        nop
+1:      bge start
+        blt 1b
+=== a conditional branch relaxes to 17 bits first
+        bnz far
+        bsa far
+        br far
+        .space 0x200
+far:    nop
+=== and past 17 bits to an inverted branch over jr
+        bz vfar
+        bsa vfar
+        br vfar
+        .space 0x10000
+vfar:   nop
+=== backward branches of each size
+back:   nop
+        .space 0x100
+        bz back
+        bsa back
+        .space 0x10000
+        bz back
+        bsa back
+        br back
+=== the boundaries of the 17-bit branch
+        bz fwd
+        .space 0xfffa
+fwd:    nop
+back:   .space 0x10000
+        bz back
+=== one past the boundaries of the 17-bit branch
+        bz fwd
+        .space 0xfffc
+fwd:    nop
+back:   .space 0x10002
+        bz back
+=== branches to an undefined symbol far from the section start
+# GNU as sizes these as if `ext` were at address 0, so they need to be further
+# from it than any short form reaches for the two assemblers to agree.
+        .space 0x20004
+        bz ext
+        bsa ext
+        br ext
+        jr ext
+        jarl ext, lp
+        loop r2, ext
+=== loop back to a label
+top:    add 1, r6
+        loop r7, top
+        mov 5, r8
+1:      nop
+        loop r8, 1b
+=== loop to the edge of its reach
+top:    nop
+        .space 0xfffc
+        loop r1, top
+=== loop forward is two instructions
+        loop r3, fwd
+        nop
+fwd:    nop
+=== a function with prepare and dispose
+func:
+        prepare {r20-r22, r29, lp}, 2
+        mov r6, r20
+        movea 0x100, r0, r21
+        jarl callee, lp
+        mov r10, r22
+        add r20, r10
+        dispose 2, {r20-r22, r29, lp}, [lp]
+callee:
+        prepare {lp}, 0, sp
+        dispose 0, {lp}
+        jmp [lp]
+=== hilo() and friends of symbols leave the fields to relocations
+        mov hilo(foo), r1
+        prepare {}, 0, hilo(foo)
+        prepare {}, 0, hi(foo)
+        prepare {}, 0, lo(foo)
+        prepare {}, 0, foo
+        ld.b lo23(foo)[r1], r2
+        st.w r2, lo23(foo)[r1]
+        ld.bu lo(foo)[r1], r2
+=== hi() and lo() of a local label are relocated against the section
+        movhi hi(data), r0, r1
+        movea lo(data), r1, r1
+        mov hilo(data), r2
+        .space 0x8000
+data:   .long 1
+=== label differences resolve
+start:  movea end - start, r0, r1
+        mov hilo(end - start), r2
+        ld.bu (end - start)[r1], r2
+        ld.w (end - start)[r1], r2
+        nop
+end:
+=== a saturating accumulate with bins and rotl
+        mov 0, r10
+        bins r6, 8, 8, r10
+        rotl 4, r10, r11
+        satadd r11, r10, r12
+        cmov lt, r12, r10, r13
+        sch1l r13, r14
+        jmp [lp]
+=== floating point, single and double
+        cmpf.s olt, r6, r7
+        trfsr
+        cmovf.s r6, r7, r10
+        addf.d r6, r8, r10
+        cvtf.ds r10, r11
+        jmp [lp]

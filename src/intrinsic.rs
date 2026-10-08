@@ -95,6 +95,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 return imm(v);
             }
             sym::ctpop | sym::ctlz | sym::cttz | sym::ctlz_nonzero | sym::cttz_nonzero => {
+                let ty = args[0].layout.ty;
+                if !ty.is_integral() {
+                    let err = self.tcx.dcx().emit_err(
+                        rustc_codegen_ssa::diagnostics::InvalidMonomorphization::BasicIntegerType {
+                            span: _span,
+                            name,
+                            ty,
+                        },
+                    );
+                    return IntrinsicResult::Err(err);
+                }
                 let x = a(0);
                 let ty = self.val_ty(x);
                 let i = match name {
@@ -106,6 +117,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 self.intcast(r, ret, false)
             }
             sym::bswap | sym::bitreverse => {
+                let ty = args[0].layout.ty;
+                if !ty.is_integral() {
+                    let err = self.tcx.dcx().emit_err(
+                        rustc_codegen_ssa::diagnostics::InvalidMonomorphization::BasicIntegerType {
+                            span: _span,
+                            name,
+                            ty,
+                        },
+                    );
+                    return IntrinsicResult::Err(err);
+                }
                 let x = a(0);
                 let ty = self.val_ty(x);
                 let i = if name == sym::bswap {

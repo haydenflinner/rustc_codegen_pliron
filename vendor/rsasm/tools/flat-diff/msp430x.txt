@@ -1,0 +1,123 @@
+Lines before the first snippet are not assembled.
+
+MSP430X only: 20-bit addresses, which a snippet reaches by putting a section
+above 64 KiB with `=== name @ addr`, and the address instructions.
+
+Not here: `calla x(rN)` with `x` above 64 KiB. GNU ld keeps the low 16 bits of
+its `R_MSP430_ABS16` without a word, where rsasm refuses the value, as GNU ld
+itself does for the `R_MSP430X_ABS16` of `mova x(rN), rM`.
+
+=== extended instructions on labels
+        .data
+        .text
+start:  movx.a  #var, r5
+        movx.a  &var, r5
+        movx.a  var, r5
+        movx.a  var(r4), r5
+        movx.a  r5, &var
+        movx.a  r5, var
+        movx.a  r5, var(r6)
+        movx.a  &var, &var2
+        movx.a  var, var2
+        movx.a  var(r4), var2(r5)
+        movx    #var, r5
+        addx.b  &var, r6
+        pushx.a #var
+        pushx.a var
+        pushx.a &var
+        incx    var
+        clrx.a  &var
+        rlax.a  var
+        ret
+        .data
+        .space  0x10
+var:    .word   1
+var2:   .word   2
+
+=== extended instructions above 64 KiB @ 0x12340
+        .data
+        .text
+start:  movx.a  #var, r5
+        movx.a  &var, r5
+        movx.a  var, r5
+        movx.a  var(r4), r5
+        movx.a  r5, &var
+        movx.a  r5, var
+        movx.a  var, var2
+        movx.a  &var, var2(r5)
+        pushx.a #start
+        calla   #start
+        reta
+        .data
+        .space  0x10
+var:    .word   1
+var2:   .word   2
+
+=== address instructions on labels @ 0x1fff0
+        .data
+        .text
+start:  mova    #var, r5
+        mova    &var, r5
+        mova    var, r5
+        mova    r5, &var
+        adda    #var, r5
+        cmpa    #var, r5
+        suba    #var, r5
+        bra     #start
+        bra     &var
+        bra     back
+        calla   #start
+        calla   &var
+        calla   back
+back:   reta
+        .data
+var:    .word   1
+
+=== an index into the low 64 KiB
+        .data
+        .text
+start:  mova    var(r4), r5
+        mova    r5, var(r6)
+        calla   var(r5)
+        reta
+        .data
+var:    .word   1
+
+=== refused: an index above 64 KiB @ 0x1fff0
+        .data
+        .text
+start:  mova    var(r4), r5
+        reta
+        .data
+var:    .word   1
+
+=== address instructions with numbers
+        .text
+        calla   #0x12345
+        calla   &0x10
+        calla   1234(r6)
+        mova    #0x12345, r5
+        bra     #0x54321
+        adda    #0xfffff, r5
+        reta
+
+=== the repeat prefix and constant jumps
+        .text
+        rpt     #4
+        rrax    r5
+        rpt     r6
+        rrcx.a  r7
+        jmp     $+4
+        jmp     $-2
+        jz      4
+        nop
+        ret
+
+=== polymorphic branches on the MSP430X
+        .text
+start:  jump    fwd
+        beq     start
+        bltn    fwd
+        bgt     start
+        ble     fwd
+fwd:    reta

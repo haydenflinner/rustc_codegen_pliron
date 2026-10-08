@@ -1,0 +1,51 @@
+Lines before the first snippet are not assembled.
+
+The avr5 core of the ATmega328P (-mmcu=avr5, -m avr5).
+
+=== an interrupt vector table
+        .section .vectors, "ax", @progbits
+        .globl  __vectors
+__vectors:
+        jmp     __init
+        jmp     __bad_interrupt
+        jmp     __vector_2
+        jmp     __bad_interrupt
+        .text
+__init: clr     r1
+        out     0x3f, r1
+        ldi     r28, lo8(0x08ff)
+        ldi     r29, hi8(0x08ff)
+        out     0x3e, r29
+        out     0x3d, r28
+        call    main
+        jmp     _exit
+__bad_interrupt:
+        jmp     __vectors
+__vector_2:
+        push    r0
+        in      r0, 0x3f
+        push    r0
+        pop     r0
+        out     0x3f, r0
+        pop     r0
+        reti
+main:   ldi     r24, lo8(msg)
+        ldi     r25, hi8(msg)
+        rcall   puts
+        ret
+puts:   movw    r30, r24
+1:      ld      r24, Z+
+        tst     r24
+        breq    2f
+        rjmp    1b
+2:      ret
+_exit:  cli
+3:      rjmp    3b
+        .section .progmem.data, "a", @progbits
+msg:    .asciz  "hello"
+
+=== refused: rjmp out of reach on a device with more than 8K
+        .text
+        rjmp    far
+        .space  0x1000
+far:    ret

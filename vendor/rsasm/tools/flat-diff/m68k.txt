@@ -1,0 +1,68 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`, the alignment GNU as gives m68k sections.
+
+PC-relative references into another section are written with their 32-bit
+displacement: GNU as cannot know how far away another section is and takes
+the long form anyway, while rsasm in a flat image does know, and would choose
+the 16-bit form.
+
+=== absolute references into another section
+ .text
+ .p2align 2
+ lea msg,%a0
+ movel #msg,%d0
+ movel msg,%d1
+ jsr sub
+ rts
+ .data
+ .p2align 2
+ .space 0x100
+msg: .long 1
+sub: rts
+
+=== pc-relative references into another section
+ .text
+ .p2align 2
+ .cpu 68020
+ lea (msg:l,%pc),%a1
+ movew (msg:l,%pc),%d1
+ bsrl sub
+ rts
+ .data
+ .p2align 2
+ .space 0x100
+msg: .long 1
+sub: rts
+
+=== data across sections
+ .text
+ .p2align 2
+entry:
+ rts
+ .data
+ .p2align 2
+ .long entry
+ .long entry - .
+ .word entry - .
+
+=== sections start at their default alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+
+=== FPU operands reading labels in another section
+ .text
+ .p2align 2
+ faddd msg,%fp1
+ fbeql sub
+ fdbne %d0,here
+here: rts
+ .data
+ .p2align 2
+ .space 0x100
+msg: .long 1,2
+sub: rts

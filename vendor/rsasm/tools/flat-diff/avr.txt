@@ -1,0 +1,183 @@
+Lines before the first snippet are not assembled.
+
+AVR objects leave every branch to the linker, even one to the next
+instruction (linker relaxation), so this is where the displacements rsasm
+works out for itself are checked: against GNU ld, linking what GNU as wrote.
+GNU ld is run without --relax, which would delete code rsasm keeps.
+
+=== relative branches in both directions
+        .text
+back:   nop
+        breq    back
+        brne    fwd
+        brbs    3, back
+        brbc    6, fwd
+        rjmp    back
+        rcall   fwd
+        nop
+fwd:    ret
+
+=== the far ends of each branch's reach
+        .text
+start:  breq    far7
+        .space  124
+far7:   brne    start2
+        .space  2
+start2: nop
+        rjmp    far13
+        .space  4092
+far13:  rcall   start
+        nop
+
+=== data referring to code and to data
+        .text
+entry:  nop
+        rjmp    entry
+isr:    reti
+        .data
+        .byte   0
+        .word   pm(isr), gs(entry)
+        .word   entry, isr, var
+        .long   isr, var
+        .byte   lo8(isr), hi8(isr), hlo8(isr), hh8(isr)
+        .byte   lo8(var), hi8(var)
+        .long   entry - .
+var:    .word   0
+
+=== I/O addresses and small constants from symbols
+        .text
+        .set    PORTB, 0x18
+        .set    SREG, 0x3f
+        .set    off, 12
+        in      r0, SREG
+        out     PORTB, r1
+        cbi     PORTB, 3
+        sbi     PORTB + 1, 7
+        sbic    PORTB - 2, 0
+        adiw    r24, off
+        sbiw    r28, off + 1
+        ldd     r0, Y+off
+        std     Z+off, r1
+        lds     r0, var
+        sts     var + 1, r2
+        ret
+        .data
+var:    .word   0
+
+=== a location counter in operands is past the instruction
+        .text
+        rjmp    .
+        rjmp    . + 2
+        breq    . - 4
+        rcall   . + 0
+        nop
+        nop
+
+=== alignment and .org between a branch and its target
+        .text
+        rjmp    1f
+        nop
+        .balign 8
+1:      breq    2f
+        .balign 16, 0xff
+        .org    0x40
+2:      ret
+
+=== a small device with no jmp: rjmp vectors and the 8K wrap-around
+        .arch   attiny13
+        .text
+        rjmp    reset
+        rjmp    reset
+reset:  sbi     0x17, 0
+loop:   sbi     0x18, 0
+        cbi     0x18, 0
+        sbiw    r24, 1
+        brne    loop
+        rjmp    reset
+
+=== pm() of an odd address
+        .text
+        .data
+        .byte   1
+odd:    .byte   2
+        .word   odd
+        ldi     r16, lo8(odd)
+
+=== refused: a branch out of reach of another section
+        .text
+        breq    other
+        .section .text.far, "ax", @progbits
+        .space  0x200
+other:  ret
+
+=== branches and calls between sections, in both directions
+        .text
+start:  rcall   helper
+        breq    helper
+        brcs    near
+        rjmp    tail
+        .section .text.helper, "ax", @progbits
+helper: brne    start
+near:   rjmp    start
+tail:   ret
+
+=== at a base address, with data after the code
+        .text
+entry:  ldi     r30, lo8(table)
+        ldi     r31, hi8(table)
+        ldi     r24, pm_lo8(entry)
+        ldi     r25, pm_hi8(entry)
+        ldi     r26, lo8(pm(isr))
+        ldi     r27, hi8(pm(isr))
+        rjmp    entry
+isr:    reti
+        .data
+table:  .word   pm(entry), pm(isr), gs(isr)
+        .word   table, entry
+        .byte   lo8(table), hi8(table), hlo8(table)
+
+=== the same at a high base @ 0x1f00
+        .text
+entry:  ldi     r30, lo8(table)
+        ldi     r31, hi8(table)
+        ldi     r24, pm_lo8(entry)
+        ldi     r25, pm_hi8(entry)
+        ldi     r20, lo8(-(table))
+        ldi     r21, hi8(-(table))
+        ldi     r22, pm_lo8(-(isr))
+        ldi     r23, pm_hi8(-(isr))
+        rcall   isr
+isr:    reti
+        .data
+table:  .word   pm(entry), pm(isr)
+        .long   table, isr
+
+=== ldi modifiers on sums and differences
+        .text
+a:      ldi     r16, lo8(b - a)
+        ldi     r17, hi8(b + 0x100)
+        ldi     r18, lo8(pm(b + 2))
+        ldi     r19, lo8(-(b - 2))
+        subi    r30, lo8(-(b))
+        sbci    r31, hi8(-(b))
+        .space  0x300
+b:      ret
+
+=== a data word referring to a label at an odd address
+        .data
+        .byte   1
+odd:    .byte   2
+        .word   odd
+        .long   odd + 1
+
+=== refused: pm() of a label at an odd address
+        .data
+        .byte   1
+odd:    .byte   2
+        .word   pm(odd)
+
+=== rcall out of reach wraps around, as GNU ld wraps it for avr2, avr25 and avr4
+        .text
+        rcall   far
+        .space  0x1000
+far:    ret

@@ -1,0 +1,134 @@
+# m68k, Motorola syntax, against `vasmm68k_mot -no-opt -devpac` for a 68020
+# with a 68881 and a 68851.
+#
+# For the FPU and MMU instructions, and above all the float immediates,
+# where GNU as is wrong: it writes an extended-precision immediate without
+# the 68881 format's 16 zero bits, and refuses packed decimal. vasm writes
+# both from a C double, as rsasm does. The rule of m68k-vasm.txt holds
+# here too: nothing with a size choice in it.
+#
+# Left out: `pmove srp,<ea>`, which GNU as takes for the 68030 and vasm only
+# for the 68851.
+
+ fmove.x fp0,fp1
+ fmove.x fp7,fp0
+ fadd.x fp1,fp2
+ fsub.x fp3,fp4
+ fmul.x fp5,fp6
+ fdiv.x fp7,fp0
+ fsqrt.x fp0,fp1
+ fabs.x fp2
+ fneg.x fp3,fp3
+ fmove.s #1.5,fp0
+ fmove.d #1.5,fp0
+ fmove.x #1.5,fp0
+ fmove.p #1.5,fp0
+ fmove.x #0.1,fp1
+ fmove.x #-2.5,fp2
+ fmove.x #3.14159,fp3
+ fmove.x #1.0e10,fp4
+ fmove.x #-1.0e-5,fp5
+ fmove.p #0.1,fp1
+ fmove.p #-1.0e-5,fp2
+ fmove.p #12345.678,fp3
+ fmove.p #3.14159,fp4
+ fmove.s #-0.1,fp1
+ fmove.d #2.718281828,fp1
+ fadd.s #0.5,fp1
+ fsub.d #100.25,fp2
+ fcmp.x #1.0,fp0
+ fmove.l d0,fp0
+ fmove.w d1,fp2
+ fmove.b d2,fp3
+ fmove.l fp0,d0
+ fmove.w fp1,d1
+ fmove.b fp2,d2
+ fmove.x (a0),fp0
+ fmove.x fp0,(a0)
+ fmove.x (a0)+,fp1
+ fmove.x fp1,-(a7)
+ fmove.d $10(a0),fp2
+ fmove.s fp3,$20(a1)
+ fmove.x 4(a0,d0.w),fp4
+ fmove.x 4(a0,d0.l*4),fp5
+ fmove.l #1,fp0
+ fmove.w #$1234,fp0
+ fmove.b #$12,fp0
+ fmove.l fpcr,d0
+ fmove.l d0,fpcr
+ fmove.l fpsr,(a0)
+ fmove.l fpiar,d1
+ fmovem.x fp0-fp3,-(a7)
+ fmovem.x (a7)+,fp0-fp3
+ fmovem.x fp0/fp2/fp4,(a0)
+ fmovem.x (a0),fp1/fp3
+ fmovem.l fpcr/fpsr,-(a7)
+ fmovem.l (a7)+,fpcr/fpsr
+ fmovem.l fpcr/fpsr/fpiar,(a0)
+ fmovecr #$32,fp0
+ fmovecr #0,fp1
+ fsincos.x fp0,fp1:fp2
+ fsincos.x (a0),fp3:fp4
+ ftst.x fp0
+ ftst.l d0
+ ftst.x (a0)
+ fint.x fp0,fp1
+ fintrz.x fp2
+ fetox.x fp0,fp1
+ flogn.x fp2,fp3
+ fsin.x fp0
+ fcos.x fp1
+ ftan.x fp2
+ fatan.x fp3
+ fgetexp.x fp0,fp1
+ fgetman.x fp2,fp3
+ fscale.l d0,fp0
+ fmod.x fp1,fp2
+ frem.x fp3,fp4
+ fsgldiv.x fp0,fp1
+ fsglmul.x fp2,fp3
+ fnop
+ fsave -(a7)
+ frestore (a7)+
+ fseq d0
+ fsne (a0)
+ fsgt -(a7)
+ fsf d1
+ fst d2
+ ftrapeq
+ ftrapne.w #1
+ ftrapgt.l #$12345678
+ fmove.p fp0,(a0){#5}
+ fmove.p fp1,(a1){d2}
+ pmove tc,(a0)
+ pmove (a0),tc
+ pmove crp,(a1)
+ pmove psr,d0
+ pmove d0,psr
+ pflusha
+ pflush #1,#2
+ pflush #1,#2,(a0)
+ ptestr #1,(a0),#7
+ ptestw #1,(a0),#7,a1
+ pvalid val,(a0)
+ psave -(a7)
+ prestore (a7)+
+ cas.b d0,d1,(a0)
+ cas.w d2,d3,(a1)
+ cas.l d4,d5,(a2)
+ cas2.w d0:d1,d2:d3,(a0):(a1)
+ cas2.l d0:d1,d2:d3,(a0):(a1)
+ callm #0,(a0)
+ rtm d0
+ pack d0,d1,#0
+ pack -(a0),-(a1),#$30
+ unpk d0,d1,#$3030
+ unpk -(a0),-(a1),#0
+ trapeq
+ trapne.w #1
+ traphi.l #$12345678
+ movep.w d0,$10(a0)
+ movep.l $20(a1),d1
+ moves.b (a0),d0
+ moves.w d1,(a1)
+ moves.l (a2)+,a3

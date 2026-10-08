@@ -1,0 +1,55 @@
+=== backward branch to a named label
+start:
+        mov     r0, 0
+        add     r0, r0, 1
+        b       start
+=== forward branch
+        b       done
+        mov     r0, 1
+        mov     r1, 2
+done:
+        nop
+=== conditional branches around a loop
+loop:
+        subs    r0, r0, 1
+        bne     loop
+        bgt     out
+        cmp     r0, 0
+        beq     loop
+out:
+        nop
+=== numeric local labels
+1:      add     r0, r0, 1
+        cmp     r0, 16
+        blt     1b
+        b       2f
+        nop
+2:      nop
+=== branch to an absolute expression
+        b       . + 8
+        nop
+        nop
+        b       . - 4
+=== switching to thumb and back
+        add     r0, r1, r2
+        .thumb
+        adds    r0, r1, r2
+        movs    r3, 7
+        .arm
+        add     r0, r1, r2
+=== mixing code and data
+        mov     r0, 1
+        .long   0x12345678
+        .byte   1, 2, 3, 4
+        mov     r1, 2
+=== code 16 and code 32 select the instruction set
+        add     r0, r1, r2
+        .code   16
+        adds    r0, r1, r2
+        movs    r3, 7
+        .code   32
+        add     r0, r1, r2
+=== alignment padding in arm code
+        mov     r0, r0
+        .balign 16
+        mov     r0, r0

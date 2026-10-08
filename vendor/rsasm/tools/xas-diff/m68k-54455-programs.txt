@@ -1,0 +1,9 @@
+=== a ColdFire ISA_C has 32-bit Bcc and bsr, but not bra
+top: nop
+ jbne far
+ jbsr far
+ jra far
+ bnel far
+ bsrl far
+ .space 40000
+far: rts

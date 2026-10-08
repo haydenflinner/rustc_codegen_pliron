@@ -1,0 +1,197 @@
+# Alignment padding in code, which llvm-mc fills with no-ops of its own
+# choosing and GNU as with others: compared against llvm-mc alone.
+=== code padding of 1 bytes
+        .text
+        .fill   63, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 2 bytes
+        .text
+        .fill   62, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 3 bytes
+        .text
+        .fill   61, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 4 bytes
+        .text
+        .fill   60, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 5 bytes
+        .text
+        .fill   59, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 6 bytes
+        .text
+        .fill   58, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 7 bytes
+        .text
+        .fill   57, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 8 bytes
+        .text
+        .fill   56, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 9 bytes
+        .text
+        .fill   55, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 10 bytes
+        .text
+        .fill   54, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 11 bytes
+        .text
+        .fill   53, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 12 bytes
+        .text
+        .fill   52, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 13 bytes
+        .text
+        .fill   51, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 14 bytes
+        .text
+        .fill   50, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 15 bytes
+        .text
+        .fill   49, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 16 bytes
+        .text
+        .fill   48, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 17 bytes
+        .text
+        .fill   47, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 18 bytes
+        .text
+        .fill   46, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 19 bytes
+        .text
+        .fill   45, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 20 bytes
+        .text
+        .fill   44, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 21 bytes
+        .text
+        .fill   43, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 22 bytes
+        .text
+        .fill   42, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 23 bytes
+        .text
+        .fill   41, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 24 bytes
+        .text
+        .fill   40, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 25 bytes
+        .text
+        .fill   39, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 26 bytes
+        .text
+        .fill   38, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 27 bytes
+        .text
+        .fill   37, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 28 bytes
+        .text
+        .fill   36, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 29 bytes
+        .text
+        .fill   35, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 30 bytes
+        .text
+        .fill   34, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 31 bytes
+        .text
+        .fill   33, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 32 bytes
+        .text
+        .fill   32, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 33 bytes
+        .text
+        .fill   31, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 34 bytes
+        .text
+        .fill   30, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 35 bytes
+        .text
+        .fill   29, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 36 bytes
+        .text
+        .fill   28, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 37 bytes
+        .text
+        .fill   27, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 38 bytes
+        .text
+        .fill   26, 1, 0xcc
+        .p2align 6
+        ret
+=== code padding of 39 bytes
+        .text
+        .fill   25, 1, 0xcc
+        .p2align 6
+        ret

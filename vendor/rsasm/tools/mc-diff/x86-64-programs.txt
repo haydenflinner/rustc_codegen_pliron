@@ -1,0 +1,87 @@
+=== RIP-relative with a trailing immediate, legacy and VEX and EVEX
+cmpps $3, data(%rip), %xmm1
+vcmpps $3, data(%rip), %ymm1, %ymm2
+vpternlogd $0xff, data(%rip), %zmm1, %zmm2
+vpcmpd $1, data(%rip), %zmm1, %k1
+ret
+data:
+.quad 0
+=== RIP-relative broadcast is never disp8-compressed
+vaddps data(%rip){1to16}, %zmm1, %zmm2
+ret
+data:
+.long 0
+=== AVX-512 in a loop body
+top:
+vmovups (%rdi,%rax,4), %zmm0 {%k1}{z}
+vpaddd (%rsi){1to16}, %zmm0, %zmm0
+vmovups %zmm0, (%rdx,%rax,4) {%k1}
+addq $16, %rax
+cmpq %rcx, %rax
+jb top
+vzeroupper
+ret
+=== Intel syntax: MMX, 3DNow! and SSE
+.intel_syntax noprefix
+paddb mm2, mm1
+pfadd mm2, qword ptr [rax]
+movq mm0, rax
+movq xmm1, xmm0
+movd xmm0, dword ptr [rax]
+addps xmm2, xmmword ptr [rax]
+addss xmm2, dword ptr [rax+8]
+addsd xmm2, qword ptr [rax]
+cmpps xmm2, xmm1, 3
+pshufd xmm2, xmm1, 0x1b
+cvtsi2sd xmm1, rax
+cvtsi2ss xmm1, dword ptr [rax]
+pextrd eax, xmm0, 1
+pinsrq xmm0, rax, 1
+crc32 eax, byte ptr [rax]
+crc32 rax, qword ptr [rax]
+popcnt rax, rbx
+=== Intel syntax: AVX and gathers
+.intel_syntax noprefix
+vaddps ymm3, ymm2, ymm1
+vaddps ymm3, ymm2, ymmword ptr [rax+8]
+vmovaps xmm1, xmm9
+vgatherdps xmm3, [rax+xmm1*4], xmm2
+vgatherqps xmm3, dword ptr [rax+ymm1*4], xmm2
+vpblendvb xmm3, xmm2, xmm1, xmm4
+vfmadd231sd xmm3, xmm2, qword ptr [rax]
+vinsertf128 ymm3, ymm2, xmm1, 1
+=== Intel syntax: AVX-512 decorators
+.intel_syntax noprefix
+vaddps zmm3 {k1} {z}, zmm2, zmm1
+vaddps zmm3, zmm2, zmm1, {rn-sae}
+vaddps zmm3, zmm2, zmmword ptr [rax+64]
+vaddps zmm3, zmm2, dword ptr [rax]{1to16}
+vaddpd zmm3, zmm2, qword ptr [rax+8]{1to8}
+vpaddd zmm3, zmm2, dword ptr [rax]{1to16}
+vcmpps k1 {k2}, zmm2, zmm1, 0
+vcmpps k1, zmm2, zmm1, {sae}, 0
+vpcmpeqd k3 {k4}, zmm2, zmm1
+vgatherdps zmm2 {k1}, [rax+zmm1*4]
+vgatherdps zmm2 {k1}, dword ptr [rax+zmm17*4+8]
+vscatterdps [rax+zmm1*4] {k1}, zmm2
+kmovw k2, k1
+kmovw k1, word ptr [rax]
+kandw k3, k2, k1
+vmovdqu64 zmm2 {k5}, zmmword ptr [rax]
+vpternlogd zmm3, zmm2, zmm1, 0xff
+vpbroadcastd zmm2, eax
+vextracti64x4 ymmword ptr [rax+32], zmm1, 1
+=== 32-bit mode: SSE, VEX and EVEX without extension bits
+.code32
+paddb %mm1, %mm2
+movq %mm1, %mm2
+movq %xmm0, %xmm1
+addps (%eax), %xmm1
+pfadd %mm1, %mm2
+vaddps %ymm1, %ymm2, %ymm3
+vaddps 8(%eax), %ymm2, %ymm3
+vpermq $1, %ymm1, %ymm2
+vgatherdps %xmm2, (%eax,%xmm1,4), %xmm3
+vaddps %zmm1, %zmm2, %zmm3 {%k1}
+vmovaps 64(%eax), %zmm0
+kmovw %k1, %k2

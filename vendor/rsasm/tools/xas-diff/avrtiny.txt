@@ -1,0 +1,288 @@
+# AVR, checked against avr-elf-as -mmcu=avrtiny (GNU binutils 2.47): the
+# reduced core of the ATtiny4-40, with only r16-r31 and one-word lds and sts
+# that reach 0x40-0xbf. Every lds and sts form, and a few of every other
+# instruction, which encode as they do in avr.txt. One statement per line.
+
+# ---- no operands -----------------------------------------------------------
+clc
+clh
+cli
+cln
+cls
+clt
+clv
+clz
+sec
+seh
+sei
+sen
+ses
+set
+sev
+sez
+
+# ---- SREG bit set and clear ------------------------------------------------
+bclr 0
+bclr 1
+bclr 5
+bset 0
+bset 1
+bset 5
+
+# ---- no operands -----------------------------------------------------------
+icall
+ijmp
+nop
+ret
+reti
+sleep
+break
+wdr
+
+# ---- two registers ---------------------------------------------------------
+adc r31,r31
+adc R16, R17
+adc xl, zh
+add r31,r31
+add R16, R17
+add xl, zh
+and r31,r31
+and R16, R17
+and xl, zh
+cp r31,r31
+cp R16, R17
+cp xl, zh
+cpc r31,r31
+cpc R16, R17
+cpc xl, zh
+cpse r31,r31
+cpse R16, R17
+cpse xl, zh
+eor r31,r31
+eor R16, R17
+eor xl, zh
+mov r31,r31
+mov R16, R17
+mov xl, zh
+or r31,r31
+or R16, R17
+or xl, zh
+sbc r31,r31
+sbc R16, R17
+sbc xl, zh
+sub r31,r31
+sub R16, R17
+sub xl, zh
+
+# ---- one register standing for two -----------------------------------------
+clr r16
+clr r17
+clr r23
+lsl r16
+lsl r17
+lsl r23
+rol r16
+rol r17
+rol r23
+tst r16
+tst r17
+tst r23
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+andi r16, 0x55
+andi r17, 0x55
+andi r24, 0x55
+
+# ---- cbr, a complemented andi ----------------------------------------------
+cbr r16, 0x55
+cbr r17, 0x55
+cbr r24, 0x55
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+ldi r16, 0x55
+ldi r17, 0x55
+ldi r24, 0x55
+
+# ---- ser -------------------------------------------------------------------
+ser r16
+ser r17
+ser r24
+
+# ---- 8-bit immediates, with and without modifiers --------------------------
+ori r16, 0x55
+ori r17, 0x55
+ori r24, 0x55
+sbr r16, 0x55
+sbr r17, 0x55
+sbr r24, 0x55
+cpi r16, 0x55
+cpi r17, 0x55
+cpi r24, 0x55
+sbci r16, 0x55
+sbci r17, 0x55
+sbci r24, 0x55
+subi r16, 0x55
+subi r17, 0x55
+subi r24, 0x55
+
+# ---- register bits ---------------------------------------------------------
+sbrc r16, 0
+sbrc r16, 1
+sbrc r16, 5
+sbrs r16, 0
+sbrs r16, 1
+sbrs r16, 5
+bld r16, 0
+bld r16, 1
+bld r16, 5
+bst r16, 0
+bst r16, 1
+bst r16, 5
+
+# ---- I/O ports -------------------------------------------------------------
+in r16, 0
+in r16, 1
+in r16, 0x1f
+out 0, r16
+out 1, r16
+out 0x1f, r16
+
+# ---- I/O bits --------------------------------------------------------------
+cbi 0, 0
+cbi 0, 1
+cbi 0, 5
+sbi 0, 0
+sbi 0, 1
+sbi 0, 5
+sbic 0, 0
+sbic 0, 1
+sbic 0, 5
+sbis 0, 0
+sbis 0, 1
+sbis 0, 5
+
+# ---- conditional branches, to numbers: measured from the section start -----
+brcc 0
+brcc 2
+brcc 4
+brcs 0
+brcs 2
+brcs 4
+breq 0
+breq 2
+breq 4
+brge 0
+brge 2
+brge 4
+brhc 0
+brhc 2
+brhc 4
+brhs 0
+brhs 2
+brhs 4
+brid 0
+brid 2
+brid 4
+brie 0
+brie 2
+brie 4
+brlo 0
+brlo 2
+brlo 4
+brlt 0
+brlt 2
+brlt 4
+brmi 0
+brmi 2
+brmi 4
+brne 0
+brne 2
+brne 4
+brpl 0
+brpl 2
+brpl 4
+brsh 0
+brsh 2
+brsh 4
+brtc 0
+brtc 2
+brtc 4
+brts 0
+brts 2
+brts 4
+brvc 0
+brvc 2
+brvc 4
+brvs 0
+brvs 2
+brvs 4
+brbc 0, 0
+brbc 0, 2
+brbc 0, -2
+brbs 0, 0
+brbs 0, 2
+brbs 0, -2
+
+# ---- relative jump and call, to numbers ------------------------------------
+rcall 0
+rcall 2
+rcall -2
+rjmp 0
+rjmp 2
+rjmp -2
+
+# ---- one register ----------------------------------------------------------
+asr r16
+asr r17
+asr r23
+com r16
+com r17
+com r23
+dec r16
+dec r17
+dec r23
+inc r16
+inc r17
+inc r23
+lsr r16
+lsr r17
+lsr r23
+neg r16
+neg r17
+neg r23
+pop r16
+pop r17
+pop r23
+push r16
+push r17
+push r23
+ror r16
+ror r17
+ror r23
+swap r16
+swap r17
+swap r23
+
+# ---- direct load and store -------------------------------------------------
+sts 0x40, r20
+sts 0x41, r20
+sts 0x7f, r20
+sts 0x80, r20
+sts 0xbf, r20
+sts 0x60, r16
+sts 0x60, r31
+lds r20, 0x40
+lds r20, 0x41
+lds r20, 0x7f
+lds r20, 0x80
+lds r20, 0xbf
+lds r16, 0x60
+lds r31, 0x60
+
+# ---- load and store through a pointer --------------------------------------
+ld r16, X
+ld r16, X+
+ld r16, -X
+st X, r16
+st X+, r16
+st -X, r16

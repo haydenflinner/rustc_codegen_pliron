@@ -1,4 +1,21 @@
 #!/bin/bash
 # Linker driver for bootstrap: cc for crt/libc paths, wild as the actual linker.
+# Wild 0.10 doesn't know `-z text`; the flag only asks the linker to error on
+# text relocations, which this backend's codegen never emits, so dropping it
+# preserves the link result.
 D="$(cd "$(dirname "$0")/.." && pwd)/target/wild-ld"
-exec cc -B"$D" "$@"
+args=()
+prev_z=0
+for a in "$@"; do
+    if [ "$prev_z" = 1 ]; then
+        prev_z=0
+        if [ "$a" = "text" ]; then continue; fi
+        args+=("-Wl,-z")
+    fi
+    case "$a" in
+        -Wl,-z,text|-Wl,-ztext) continue ;;
+        -Wl,-z) prev_z=1; continue ;;
+    esac
+    args+=("$a")
+done
+exec cc -B"$D" "${args[@]}"

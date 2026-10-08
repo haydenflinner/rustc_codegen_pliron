@@ -1,0 +1,95 @@
+=== a CP/M program at its load address
+BDOS    EQU     5
+WRITE   EQU     9
+        ORG     100H
+START:  LXI     D,MSG
+        MVI     C,WRITE
+        CALL    BDOS
+        RET
+MSG:    DB      'Hello, world',0DH,0AH,'$'
+=== labels without colons in the first column
+        ORG     0
+LOOP    DCR     C
+        JNZ     LOOP
+DONE    HLT
+        JMP     DONE
+=== forward references
+        ORG     1000H
+        LXI     H,TABLE
+        LXI     SP,STACK
+        CALL    SUB
+        JMP     START
+SUB:    MOV     A,M
+        RET
+START:  LDA     VAR
+        STA     VAR+1
+        LHLD    PTR
+        SHLD    PTR
+        HLT
+TABLE:  DB      1,2,3
+VAR:    DS      2
+PTR:    DW      TABLE
+STACK   EQU     2000H
+=== the location counter
+        ORG     200H
+        JMP     $
+        LXI     H,$+3
+        DW      $
+        MVI     A,$ & 0FFH
+=== a redefinable SET
+N       SET     1
+        MVI     A,N
+N       SET     N+1
+        MVI     A,N
+N       SET     N*4
+        MVI     B,N
+=== reserved space and data between code
+        ORG     40H
+        JMP     MAIN
+BUF:    DS      16
+COUNT:  DB      0
+WORDS:  DW      1,2,MAIN
+MAIN:   LXI     H,BUF
+        MVI     B,16
+FILL:   MVI     M,0FFH
+        INX     H
+        DCR     B
+        JNZ     FILL
+        HLT
+=== interrupt vectors at the restart addresses
+        ORG     0
+        JMP     RESET
+        ORG     38H
+        PUSH    PSW
+        IN      10H
+        OUT     11H
+        POP     PSW
+        EI
+        RET
+RESET:  LXI     SP,0
+        EI
+        HLT
+=== expressions
+V       EQU     1234H
+        MVI     A,V >> 8
+        MVI     B,V & 0FFH
+        LXI     H,V >> 4
+        MVI     A,~0 & 0FFH
+        MVI     A,5 | 2
+        MVI     A,(1+2)*3
+=== case in names
+        ORG     10H
+Start:  LXI     H,Text
+        JMP     Start
+Text:   DB      "it's",0
+=== a macro with parameters, and conditional assembly
+LOAD    MACRO   REG,VAL
+        MVI     REG,VAL
+        ENDM
+        LOAD    A,12H
+        LOAD    B,3
+        IF      1
+        NOP
+        ELSE
+        HLT
+        ENDIF

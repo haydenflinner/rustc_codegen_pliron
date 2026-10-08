@@ -783,8 +783,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rsasm"
 version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "120f78fcb5febcab9e5a2ce43f3df7e4e6040f026d37d7fa6c9b27a68684726f"
 
 [[package]]
 name = "rustc-hash"

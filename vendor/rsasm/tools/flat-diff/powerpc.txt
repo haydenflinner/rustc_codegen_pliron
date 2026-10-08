@@ -1,0 +1,85 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`, which is llvm-mc's default alignment for
+PowerPC code and data and not rsasm's; see mips.txt.
+
+=== ha and l of a label in another section
+	.text
+	.p2align 2
+	lis 3, msg@ha
+	addi 3, 3, msg@l
+	lwz 4, msg@l(3)
+	stw 4, msg+4@l(3)
+	blr
+	.data
+	.p2align 2
+	.space 0x8010
+msg:	.long 1, 2
+
+=== h and ha differ where bit 15 is set @ 0x10007ff0
+	.text
+	.p2align 2
+here:
+	lis 3, there@h
+	ori 3, 3, there@l
+	lis 4, there@ha
+	addi 4, 4, there@l
+	blr
+there:
+	blr
+
+=== ha of a label below 0x8000 of its page @ 0x1000fff0
+	.text
+	.p2align 2
+	lis 3, next@ha
+	addi 3, 3, next@l
+	lis 4, next@h
+next:
+	blr
+
+=== ha and l with an addend
+	.text
+	.p2align 2
+	lis 3, table+0x10000@ha
+	addi 3, 3, table+0x10000@l
+	lis 4, table-8@ha
+	addi 4, 4, table-8@l
+	blr
+	.data
+	.p2align 2
+table:	.long 0
+
+=== branches into another section
+	.text
+	.p2align 2
+entry:
+	bl helper
+	b helper
+	beq helper
+	.section .text.helper, "ax"
+	.p2align 2
+helper:
+	b entry
+	bdnz entry
+
+=== absolute branches to labels @ 0x1000
+	.text
+	.p2align 2
+entry:
+	bla target
+	ba target
+	.section .text.helper, "ax"
+	.p2align 2
+target:
+	blr
+	.org 0x40
+
+=== data across sections
+	.text
+	.p2align 2
+entry:
+	blr
+	.data
+	.p2align 2
+	.long entry
+	.long entry - .

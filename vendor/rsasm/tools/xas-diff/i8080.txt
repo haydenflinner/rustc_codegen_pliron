@@ -1,0 +1,271 @@
+# Every 8080 instruction in Intel mnemonics, as the Macro Assembler AS reads
+# them: `12H`, `11B` and `17Q` numbers, `M` for the byte at HL, and a pair
+# named by its high register.
+	MOV B,B
+	MOV B,C
+	MOV B,D
+	MOV B,E
+	MOV B,H
+	MOV B,L
+	MOV B,M
+	MOV B,A
+	MOV C,B
+	MOV C,C
+	MOV C,D
+	MOV C,E
+	MOV C,H
+	MOV C,L
+	MOV C,M
+	MOV C,A
+	MOV D,B
+	MOV D,C
+	MOV D,D
+	MOV D,E
+	MOV D,H
+	MOV D,L
+	MOV D,M
+	MOV D,A
+	MOV E,B
+	MOV E,C
+	MOV E,D
+	MOV E,E
+	MOV E,H
+	MOV E,L
+	MOV E,M
+	MOV E,A
+	MOV H,B
+	MOV H,C
+	MOV H,D
+	MOV H,E
+	MOV H,H
+	MOV H,L
+	MOV H,M
+	MOV H,A
+	MOV L,B
+	MOV L,C
+	MOV L,D
+	MOV L,E
+	MOV L,H
+	MOV L,L
+	MOV L,M
+	MOV L,A
+	MOV M,B
+	MOV M,C
+	MOV M,D
+	MOV M,E
+	MOV M,H
+	MOV M,L
+	MOV M,A
+	MOV A,B
+	MOV A,C
+	MOV A,D
+	MOV A,E
+	MOV A,H
+	MOV A,L
+	MOV A,M
+	MOV A,A
+	MVI B,12H
+	INR B
+	DCR B
+	MVI C,12H
+	INR C
+	DCR C
+	MVI D,12H
+	INR D
+	DCR D
+	MVI E,12H
+	INR E
+	DCR E
+	MVI H,12H
+	INR H
+	DCR H
+	MVI L,12H
+	INR L
+	DCR L
+	MVI M,12H
+	INR M
+	DCR M
+	MVI A,12H
+	INR A
+	DCR A
+	ADD B
+	ADD C
+	ADD D
+	ADD E
+	ADD H
+	ADD L
+	ADD M
+	ADD A
+	ADC B
+	ADC C
+	ADC D
+	ADC E
+	ADC H
+	ADC L
+	ADC M
+	ADC A
+	SUB B
+	SUB C
+	SUB D
+	SUB E
+	SUB H
+	SUB L
+	SUB M
+	SUB A
+	SBB B
+	SBB C
+	SBB D
+	SBB E
+	SBB H
+	SBB L
+	SBB M
+	SBB A
+	ANA B
+	ANA C
+	ANA D
+	ANA E
+	ANA H
+	ANA L
+	ANA M
+	ANA A
+	XRA B
+	XRA C
+	XRA D
+	XRA E
+	XRA H
+	XRA L
+	XRA M
+	XRA A
+	ORA B
+	ORA C
+	ORA D
+	ORA E
+	ORA H
+	ORA L
+	ORA M
+	ORA A
+	CMP B
+	CMP C
+	CMP D
+	CMP E
+	CMP H
+	CMP L
+	CMP M
+	CMP A
+	ADI 0FFH
+	ADI 'A'
+	ACI 0FFH
+	ACI 'A'
+	SUI 0FFH
+	SUI 'A'
+	SBI 0FFH
+	SBI 'A'
+	ANI 0FFH
+	ANI 'A'
+	XRI 0FFH
+	XRI 'A'
+	ORI 0FFH
+	ORI 'A'
+	CPI 0FFH
+	CPI 'A'
+	LXI B,1234H
+	DAD B
+	INX B
+	DCX B
+	LXI D,1234H
+	DAD D
+	INX D
+	DCX D
+	LXI H,1234H
+	DAD H
+	INX H
+	DCX H
+	LXI SP,1234H
+	DAD SP
+	INX SP
+	DCX SP
+	PUSH B
+	POP B
+	PUSH D
+	POP D
+	PUSH H
+	POP H
+	PUSH PSW
+	POP PSW
+	STAX B
+	LDAX B
+	STAX D
+	LDAX D
+	RNZ
+	JNZ 1234H
+	CNZ 1234H
+	RZ
+	JZ 1234H
+	CZ 1234H
+	RNC
+	JNC 1234H
+	CNC 1234H
+	RC
+	JC 1234H
+	CC 1234H
+	RPO
+	JPO 1234H
+	CPO 1234H
+	RPE
+	JPE 1234H
+	CPE 1234H
+	RP
+	JP 1234H
+	CP 1234H
+	RM
+	JM 1234H
+	CM 1234H
+	RST 0
+	RST 1
+	RST 2
+	RST 3
+	RST 4
+	RST 5
+	RST 6
+	RST 7
+	SHLD 1234H
+	LHLD 1234H
+	STA 1234H
+	LDA 1234H
+	JMP 1234H
+	CALL 1234H
+	IN 12H
+	OUT 34H
+	NOP
+	RLC
+	RRC
+	RAL
+	RAR
+	DAA
+	CMA
+	STC
+	CMC
+	HLT
+	RET
+	PCHL
+	XTHL
+	XCHG
+	SPHL
+	DI
+	EI
+	mvi a,10
+	mvi a,11110000B
+	mvi a,377Q
+	mvi a,0
+	lxi h,65535
+	mvi a,1+2*3
+	mvi a,(1+2)*3
+	lxi d,0FF00H+0FFH
+	mvi a,-1
+	Mov A,m
+	jmp 0
+	cpi 'z'-'a'
+	DB 1,2,3
+	DB 'Hello',0DH,0AH
+	DB "it's"
+	DW 1234H,5

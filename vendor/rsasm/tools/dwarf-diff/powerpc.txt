@@ -1,0 +1,39 @@
+=== registers by name
+	.text
+f:
+	.cfi_startproc
+	mflr 0
+	stwu 1, -32(1)
+	.cfi_def_cfa_offset 32
+	.cfi_register lr, r0
+	stw 31, 28(1)
+	stw 0, 36(1)
+	.cfi_offset lr, 4
+	.cfi_offset r31, -4
+	.cfi_offset %r30, -8
+	.cfi_offset f14, -16
+	.cfi_offset v20, -24
+	.cfi_offset cr2, -28
+	.cfi_same_value ctr
+	mr 31, 1
+	.cfi_def_cfa_register r31
+	lwz 0, 36(1)
+	lwz 31, 28(1)
+	mtlr 0
+	addi 1, 1, 32
+	.cfi_def_cfa r1, 0
+	.cfi_restore lr
+	.cfi_restore r31
+	blr
+	.cfi_endproc
+=== lines counted in instructions
+	.file 1 "a.c"
+	.text
+f:
+	.loc 1 3 0
+	li 3, 0
+	.loc 1 4 5
+	.skip 400
+	li 3, 1
+	.loc 1 5 1
+	blr

@@ -1,0 +1,156 @@
+; One instruction per line, assembled by NASM and rsasm after `bits 32`.
+mov eax, ebx
+mov eax, 1
+mov al, 0x12
+mov ax, 0x1234
+mov [eax], ebx
+mov ebx, [eax]
+mov byte [eax], 1
+mov word [eax], 1
+mov dword [eax], 1
+mov [eax], byte 1
+mov eax, [ebx+4]
+mov eax, [ebx+ecx*4+8]
+mov eax, [ecx*4]
+mov eax, [esp]
+mov eax, [ebp]
+mov eax, [es:ebx]
+lea eax, [eax*3]
+lea eax, [eax*5+1]
+lea eax, [eax*9]
+lea esi, [esi]
+push eax
+push ebx
+pop ecx
+push 5
+push 1000
+push byte 5
+push dword 5
+push es
+push ds
+pop ds
+push fs
+pop gs
+pushad
+popad
+pushfd
+popfd
+pusha
+popa
+pushf
+popf
+add eax, 1
+add eax, 1000
+add al, 5
+add ebx, 1000
+sub ecx, edx
+and eax, 0xff
+or byte [ebx], 1
+xor eax, eax
+cmp eax, 10
+test eax, eax
+test al, 1
+test ebx, 0x100
+inc eax
+dec ecx
+inc byte [eax]
+dec dword [eax]
+neg eax
+not ebx
+mul ecx
+imul eax, ebx
+imul eax, ebx, 10
+imul eax, ebx, 1000
+div ecx
+idiv dword [ebx]
+shl eax, 1
+shl eax, 4
+shr eax, cl
+sar ebx, 2
+rol eax, 1
+xchg eax, ebx
+xchg ebx, eax
+xchg ecx, edx
+movzx eax, al
+movzx eax, word [ebx]
+movsx eax, byte [ebx]
+movsx ax, bl
+cdq
+cbw
+cwd
+cwde
+lodsb
+lodsw
+lodsd
+stosb
+stosw
+stosd
+movsb
+movsw
+movsd
+scasb
+cmpsb
+rep movsb
+rep stosd
+repne scasb
+cld
+std
+cli
+sti
+hlt
+nop
+int 0x80
+int3
+int 3
+iret
+iretd
+ret
+ret 8
+retf
+leave
+in al, dx
+in al, 0x60
+out dx, al
+out 0x80, al
+in eax, dx
+out dx, ax
+bt eax, 3
+bts eax, ecx
+btr dword [ebx], 5
+btc eax, ebx
+bsf eax, ebx
+bsr eax, [ebx]
+bswap eax
+cmpxchg eax, ebx
+xadd eax, ebx
+shld eax, ebx, 3
+shrd eax, ebx, cl
+setz al
+cmove eax, ebx
+lahf
+sahf
+cpuid
+rdtsc
+lidt [0x1000]
+mov cr0, eax
+mov eax, cr0
+mov cr3, eax
+mov ds, ax
+mov ax, ds
+mov es, ax
+mov ss, ax
+xlatb
+salc
+jmp eax
+jmp [ebx]
+call eax
+call [ebx+4]
+call dword [ebx]
+loop $
+jecxz $
+jmp $
+aaa
+daa
+aam
+aad
+into

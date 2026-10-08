@@ -1,0 +1,75 @@
+=== a 32-bit syscall program
+        global _start
+        section .text
+_start:
+        mov     eax, 4
+        mov     ebx, 1
+        mov     ecx, msg
+        mov     edx, msglen
+        int     0x80
+        mov     eax, 1
+        xor     ebx, ebx
+        int     0x80
+        section .data
+msg:    db      "hi", 10
+msglen  equ     $ - msg
+=== data and symbols
+        global x, y, f
+        section .data
+x:      dd      1
+y:      dd      2
+        section .text
+f:      ret
+        section .bss
+        global buf
+buf:    resd    4
+=== externs and relocations
+        extern printf
+        extern value
+        global main
+        section .text
+main:
+        call    printf
+        mov     eax, [value]
+        push    dword value
+        ret
+        section .data
+        dd      value
+        dd      main
+=== relative data and label differences
+        section .text
+a:      nop
+b:      nop
+        section .data
+        dd      b - a
+        dd      a
+tab:    dd      a - tab
+=== local labels
+        section .text
+        global f
+f:
+        jmp     .loop
+.loop:
+        jmp     .loop
+        dd      f.loop - f
+=== plt and got in pic
+        extern ext
+        global f
+        section .text
+f:
+        call    ext wrt ..plt
+        mov     eax, [ext wrt ..got]
+        section .data
+        dd      ext wrt ..sym
+=== struc
+        struc rec
+        .a: resd 1
+        .b: resd 1
+        endstruc
+        section .data
+        global r
+r:      istruc rec
+        at rec.a, dd 1
+        at rec.b, dd 2
+        iend
+        dd      rec_size

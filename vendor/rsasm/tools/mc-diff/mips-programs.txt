@@ -1,0 +1,234 @@
+# MIPS32 big endian: snippets that need labels.
+#
+# ---- Why every snippet ends with `.p2align 6` ----
+#
+# rsasm always assembles as `.set noreorder`: what is written is what is
+# emitted. llvm-mc defaults to `.set reorder`, where it appends a `nop` to fill
+# the delay slot of every branch and jump, making its output one word longer.
+# rsasm's core `.set` directive does not yet accept GNU as's MIPS options, so
+# `.set noreorder` cannot simply be written at the top of the file.
+#
+# The padding absorbs the difference: MIPS `nop` is the all-zero word, and so
+# is alignment fill, so once both outputs are rounded up to the same multiple
+# of 64 they are byte-identical -- and the branch word itself, which is the
+# thing under test, is still compared.
+#
+# This only works when the extra word cannot move anything the branch measures
+# against, so every snippet branches *backwards* to a label at its top and puts
+# the branch last.
+
+=== beq backward
+foo:
+beq $1, $2, foo
+.p2align 6
+
+=== beq across two instructions
+foo:
+addiu $4, $4, 1
+addiu $5, $5, -1
+beq $4, $5, foo
+.p2align 6
+
+=== bne
+foo:
+bne $a0, $a1, foo
+.p2align 6
+
+=== blez
+foo:
+blez $a0, foo
+.p2align 6
+
+=== bgtz
+foo:
+bgtz $a0, foo
+.p2align 6
+
+=== bltz
+foo:
+bltz $a0, foo
+.p2align 6
+
+=== bgez
+foo:
+bgez $a0, foo
+.p2align 6
+
+=== bltzal
+foo:
+bltzal $a0, foo
+.p2align 6
+
+=== bgezal
+foo:
+bgezal $a0, foo
+.p2align 6
+
+=== b
+foo:
+b foo
+.p2align 6
+
+=== bal
+foo:
+bal foo
+.p2align 6
+
+=== beqz
+foo:
+beqz $v0, foo
+.p2align 6
+
+=== bnez
+foo:
+bnez $v0, foo
+.p2align 6
+
+=== bge
+foo:
+bge $a0, $a1, foo
+.p2align 6
+
+=== bgt
+foo:
+bgt $a0, $a1, foo
+.p2align 6
+
+=== ble
+foo:
+ble $a0, $a1, foo
+.p2align 6
+
+=== blt
+foo:
+blt $a0, $a1, foo
+.p2align 6
+
+=== bgeu
+foo:
+bgeu $a0, $a1, foo
+.p2align 6
+
+=== bgtu
+foo:
+bgtu $a0, $a1, foo
+.p2align 6
+
+=== bleu
+foo:
+bleu $a0, $a1, foo
+.p2align 6
+
+=== bltu
+foo:
+bltu $a0, $a1, foo
+.p2align 6
+
+=== bge against zero folds to bgez
+foo:
+bge $a0, $zero, foo
+.p2align 6
+
+=== blt against zero folds to bltz
+foo:
+blt $a0, $zero, foo
+.p2align 6
+
+=== jr
+foo:
+jr $ra
+.p2align 6
+
+=== jalr one operand links through ra
+foo:
+jalr $t9
+.p2align 6
+
+=== jalr two operands
+foo:
+jalr $s0, $t9
+.p2align 6
+
+=== bc1f
+foo:
+bc1f foo
+.p2align 6
+
+=== bc1t
+foo:
+bc1t foo
+.p2align 6
+
+=== a backwards loop
+loop:
+lw $t0, 0($a0)
+addiu $a0, $a0, 4
+addiu $a1, $a1, -1
+sw $t0, 0($a1)
+bnez $a1, loop
+.p2align 6
+
+# A forward branch would normally be thrown off by llvm-mc's inserted delay
+# slot, since the extra word sits between the branch and its target. Aligning
+# the target absorbs that word too, so the measured distance stays the same.
+=== beq forward over an alignment
+beq $1, $2, end
+.p2align 6
+end:
+nop
+
+=== bnez forward over an alignment
+bnez $a0, end
+.p2align 6
+end:
+nop
+
+=== j
+foo:
+j foo
+.p2align 6
+
+=== jal
+foo:
+jal foo
+.p2align 6
+
+# Unresolved references leave their field zero and emit a relocation, so the
+# .text bytes are comparable even though the addresses are not yet known.
+=== la of an external symbol
+la $a0, extern_sym
+nop
+
+=== explicit hi and lo halves
+lui $a0, %hi(extern_sym)
+addiu $a0, $a0, %lo(extern_sym)
+lw $a1, %lo(extern_sym)($a0)
+nop
+
+=== hi and lo of a local symbol
+sym = 0x12345678
+lui $a0, %hi(sym)
+addiu $a0, $a0, %lo(sym)
+nop
+
+=== hi and lo where the low half is negative
+sym = 0x1234abcd
+lui $a0, %hi(sym)
+addiu $a0, $a0, %lo(sym)
+nop
+
+# `j` takes an absolute address, so a number means the same thing to both
+# assemblers here (unlike a conditional branch, where llvm-mc reads a bare
+# number as the displacement). The top four bits come from the PC, so a target
+# above 256 MB is not out of range.
+=== j to an absolute address
+j 0x400000
+.p2align 6
+
+=== jal into kseg0
+jal 0x80001000
+.p2align 6
+
+=== j to the last word of a region
+j 0x0ffffffc
+.p2align 6

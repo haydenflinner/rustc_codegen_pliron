@@ -1,0 +1,67 @@
+=== a CP/M program at its load address, labels without colons
+bdos    equ 5
+        org 100h
+start   ld de,msg
+        ld c,9
+        call bdos
+        ret
+msg     db 'Hello, world',13,10,'$'
+=== a ROM with its vectors, org padding between pieces
+        org 0
+        di
+        jp reset
+        org 38h
+isr     ex af,af'
+        exx
+        exx
+        ex af,af'
+        ei
+        reti
+reset   ld sp,0
+        im 1
+        ei
+halt1   halt
+        jr halt1
+=== the location counter
+        org 8000h
+        jr $
+        djnz $+2
+        ld hl,$
+        dw $, $+1
+        jp $+3
+=== the undocumented shift
+        sll b
+        sll (hl)
+        sll (ix+5)
+=== the accumulator left implicit
+        add b
+        adc (hl)
+        sbc 12h
+        add (ix+1)
+=== data directives
+        org 4000h
+        db 1,2,"ab"
+        defb $ff
+        defm "xy"
+        dw 1234h,label
+        defw 1
+        ds 2
+        defs 2,$aa
+label   db 0
+=== undocumented OUT (C),0
+        out (c),0
+=== a macro with positional arguments, repeats and conditionals
+load    macro
+        ld a,\1
+        ld (\2),a
+        endm
+        load 1,$4000
+        load $ff,1234h
+        rept 2
+        nop
+        endr
+        if 0
+        halt
+        else
+        scf
+        endif

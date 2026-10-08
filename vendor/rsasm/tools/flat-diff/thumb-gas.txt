@@ -1,0 +1,53 @@
+Lines before the first snippet are not assembled.
+
+Literal pools, `adr` and interworking in Thumb code, checked against GNU as;
+see arm-gas.txt.
+
+=== literals loaded from a pool at the end of the section
+        .syntax unified
+        .text
+entry:  ldr     r0, =0x12345678
+        ldr     r1, =msg
+        ldr     r8, =msg + 3
+        ldr     r3, =0xff
+        movs    r0, r0
+        bx      lr
+        .data
+msg:    .ascii  "hello"
+
+=== a load that needs 32 bits to reach its pool
+        .syntax unified
+entry:  ldr     r0, =data
+        ldr     r1, =data + 4
+        .space  1020
+        .ltorg
+        bx      lr
+        .data
+        .space  3
+data:   .word   0
+
+=== adr within a section @ 0x9002
+        .syntax unified
+back:   adr     r0, back
+        adr     r1, fwd
+        adr     r2, far
+        .p2align 2, 0
+fwd:    nop
+        .space  0x800
+        .p2align 2, 0
+far:    bx      lr
+
+=== a section a linker places at an odd halfword
+        .syntax unified
+        .text
+        nop
+        .section .text.b, "ax"
+        .thumb_func
+fc:     push    {r4, lr}
+        pop     {r4, pc}
+        adr     r1, fc
+        adr     r2, fwd
+        blx     fwd
+        bx      lr
+        .thumb_func
+fwd:    bx      lr

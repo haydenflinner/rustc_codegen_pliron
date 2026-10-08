@@ -1,0 +1,143 @@
+=== one instruction | -g
+	.text
+	nop
+=== lines apart | -g
+
+	.text
+	nop
+	nop
+
+	# a comment
+	nop
+=== no code | -g
+	.data
+	.byte 1
+=== DWARF 2 | --gdwarf-2
+	.text
+	nop
+	nop
+=== DWARF 3 | --gdwarf-3
+	.text
+	nop
+	nop
+=== DWARF 4 | --gdwarf-4
+	.text
+	nop
+	nop
+=== DWARF 5 | --gdwarf-5
+	.text
+	nop
+	nop
+=== labels | -g
+	.text
+	.globl f
+f:
+	nop
+g:
+	nop
+.Lh:
+	nop
+=== sections | -g
+	.text
+	nop
+	.data
+	.byte 1
+	.section .text.b,"ax",%progbits
+	nop
+	nop
+	.text
+	nop
+=== sections, DWARF 5 | --gdwarf-5
+	.text
+	nop
+	.section .text.b,"ax",%progbits
+g:
+	nop
+	.text
+	nop
+=== code in data | -g
+	.data
+	nop
+	.text
+	nop
+=== starting in data | -g
+	.data
+	.byte 1
+	.text
+	nop
+	nop
+=== a macro | -g
+	.macro twice
+	nop
+	nop
+	.endm
+	.text
+	nop
+	twice
+	nop
+	twice
+=== a repeat | -g
+	.text
+	.rept 3
+	nop
+
+	nop
+	.endr
+	nop
+=== an irp | -g
+	.text
+	.irp x, 1, 2
+	nop
+	nop
+	.endr
+	nop
+=== a numbered file turns it off | -g
+	.text
+	nop
+	.file 1 "a.c"
+	.loc 1 5
+	nop
+=== frames too | -g
+	.text
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	nop
+	.cfi_endproc
+=== line table only
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	nop
+	.data
+	.byte 1
+=== functions | -g
+	.text
+	.globl f
+	.type f, %function
+f:
+	nop
+	nop
+	.size f, .-f
+	.type g, %function
+g:
+	nop
+	.size g, .-g
+	.section .text.b,"ax",%progbits
+	.type h, %function
+h:
+	nop
+	.size h, .-h
+=== functions, DWARF 5 | --gdwarf-5
+	.text
+	.type f, %function
+f:
+	nop
+	.size f, .-f
+	.section .text.b,"ax",%progbits
+	.globl h
+	.type h, %function
+h:
+	nop
+	.size h, .-h

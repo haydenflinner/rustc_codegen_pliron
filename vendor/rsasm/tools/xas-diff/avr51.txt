@@ -1,0 +1,162 @@
+# AVR, checked against avr-elf-as -mmcu=avr51 (GNU binutils 2.47): the forms
+# the default core in avr.txt does not have, which an ATmega128 does — jmp and
+# call, movw, the multiplies, elpm, spm and break — and rjmp and rcall, which no
+# longer wrap at 8K. One statement per line.
+
+# ---- program memory load ---------------------------------------------------
+lpm r0, Z+
+lpm r0, z+
+lpm r5, Z+
+lpm r5, z+
+lpm r16, Z+
+lpm r16, z+
+lpm r31, Z+
+lpm r31, z+
+elpm
+elpm r0, Z
+elpm r0, Z+
+elpm r0, z
+elpm r0, z+
+elpm r5, Z
+elpm r5, Z+
+elpm r5, z
+elpm r5, z+
+elpm r16, Z
+elpm r16, Z+
+elpm r16, z
+elpm r16, z+
+elpm r31, Z
+elpm r31, Z+
+elpm r31, z
+elpm r31, z+
+
+# ---- no operands -----------------------------------------------------------
+break
+
+# ---- self-programming ------------------------------------------------------
+spm
+spm Z
+spm Z+
+spm z
+spm z+
+
+# ---- two registers ---------------------------------------------------------
+mul r0, r5
+mul r1, r5
+mul r7, r5
+mul r15, r5
+mul r16, r5
+mul r17, r5
+mul r23, r5
+mul r24, r5
+mul r25, r5
+mul r26, r5
+mul r29, r5
+mul r30, r5
+mul r31, r5
+mul r5, r0
+mul r5, r1
+mul r5, r7
+mul r5, r15
+mul r5, r16
+mul r5, r17
+mul r5, r23
+mul r5, r24
+mul r5, r25
+mul r5, r26
+mul r5, r29
+mul r5, r30
+mul r5, r31
+mul r31,r31
+mul R16, R17
+mul 3, 4
+mul xl, zh
+
+# ---- absolute jump and call ------------------------------------------------
+call 0
+call 2
+call 0x1234
+call 0x10000
+call 0x3ffffe
+call 0x123456
+jmp 0
+jmp 2
+jmp 0x1234
+jmp 0x10000
+jmp 0x3ffffe
+jmp 0x123456
+
+# ---- movw ------------------------------------------------------------------
+movw r0, r0
+movw r0, r30
+movw r0, x
+movw r2, r0
+movw r2, r30
+movw r2, x
+movw r14, r0
+movw r14, r30
+movw r14, x
+movw r16, r0
+movw r16, r30
+movw r16, x
+movw r24, r0
+movw r24, r30
+movw r24, x
+movw r30, r0
+movw r30, r30
+movw r30, x
+movw x, r0
+movw x, r30
+movw x, x
+movw y, r0
+movw y, r30
+movw y, x
+movw z, r0
+movw z, r30
+movw z, x
+
+# ---- multiplies ------------------------------------------------------------
+muls r16, r16
+muls r16, r31
+muls r17, r16
+muls r17, r31
+muls r24, r16
+muls r24, r31
+muls r31, r16
+muls r31, r31
+mulsu r16, r16
+mulsu r16, r19
+mulsu r16, r23
+mulsu r19, r16
+mulsu r19, r19
+mulsu r19, r23
+mulsu r23, r16
+mulsu r23, r19
+mulsu r23, r23
+fmul r16, r16
+fmul r16, r19
+fmul r16, r23
+fmul r19, r16
+fmul r19, r19
+fmul r19, r23
+fmul r23, r16
+fmul r23, r19
+fmul r23, r23
+fmuls r16, r16
+fmuls r16, r19
+fmuls r16, r23
+fmuls r19, r16
+fmuls r19, r19
+fmuls r19, r23
+fmuls r23, r16
+fmuls r23, r19
+fmuls r23, r23
+fmulsu r16, r16
+fmulsu r16, r19
+fmulsu r16, r23
+fmulsu r19, r16
+fmulsu r19, r19
+fmulsu r19, r23
+fmulsu r23, r16
+fmulsu r23, r19
+fmulsu r23, r23

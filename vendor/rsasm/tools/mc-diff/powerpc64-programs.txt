@@ -1,0 +1,111 @@
+# Snippets that need labels, alignment or directives, where a single line
+# cannot express the case. Branch targets are labels here rather than numbers,
+# because a bare number means a displacement to llvm-mc and an address to
+# rsasm, and only a label means the same thing to both.
+
+=== backward and forward branches
+start:
+	li 3, 0
+loop:
+	addi 3, 3, 1
+	cmpwi 3, 10
+	bne loop
+	b done
+	nop
+done:
+	blr
+
+=== every branch form against one label
+back:
+	b back
+	bl back
+	beq back
+	bne cr7, back
+	bdnz back
+	bc 12, 2, back
+	bcl 4, 2, back
+	bt 5, back
+	bdnzt 0, back
+fwd:
+	b fwd
+
+=== a branch reaching most of the I-form range
+	b far
+	.space 0x1ffff8
+far:
+	blr
+
+=== a conditional branch reaching most of the B-form range
+	beq far
+	.space 0x7ff8
+far:
+	blr
+
+=== word padding stays executable
+	blr
+	.p2align 4
+	blr
+	.p2align 3
+	blr
+
+=== padding after sub-word data completes the partial word
+	blr
+	.byte 1
+	.p2align 2
+	blr
+
+=== a leaf function
+f:
+	mflr 0
+	std 0, 16(1)
+	stdu 1, -32(1)
+	mr 31, 3
+	addi 3, 31, 1
+	addi 1, 1, 32
+	ld 0, 16(1)
+	mtlr 0
+	blr
+
+=== a 64-bit constant built up in halves
+	lis 3, 0x1234
+	ori 3, 3, 0x5678
+	sldi 3, 3, 32
+	oris 3, 3, 0x9abc
+	ori 3, 3, 0xdef0
+
+=== relocations against an external symbol
+	bl ext
+	b ext
+	beq ext
+	lis 3, ext@ha
+	addi 3, 3, ext@l
+	ori 3, 3, ext@h
+	lwz 4, ext@l(3)
+	ld 5, ext@l(3)
+
+=== a byte-swapping load and store pair
+	lwbrx 3, 0, 4
+	stwbrx 3, 0, 5
+	lhbrx 6, 0, 4
+	sthbrx 6, 0, 5
+
+=== an atomic increment loop
+retry:
+	lwarx 3, 0, 4
+	addi 3, 3, 1
+	stwcx. 3, 0, 4
+	bne retry
+	blr
+
+=== halves of a value that resolves while assembling
+# A label difference, and a symbol set after its use, reach layout as fixups
+# rather than constants, and still need @ha arithmetic rather than truncation.
+start:
+	lis 3, (end - start)@ha
+	addi 3, 3, (end - start)@l
+	lis 4, (end - start)@h
+	lis 5, later@ha
+	.space 0x800c
+end:
+	blr
+	.set later, 0x12348000

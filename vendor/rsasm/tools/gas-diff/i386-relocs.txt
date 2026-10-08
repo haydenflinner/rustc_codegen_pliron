@@ -1,0 +1,238 @@
+# i386 objects, compared whole with GNU as's (see run.sh).
+
+=== references to symbols in their own section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+        .hidden lhid
+start:
+        call loc
+        call glob
+        call weak1
+        call hid
+        call prot
+        call intl
+        call whid
+        call lhid
+        call func
+        call late
+        call lweak
+        call lalias
+        call lwalias
+        call galias
+        call walias
+        jmp loc
+        jmp glob
+        jmp weak1
+        jmp lalias
+        jmp walias
+        jz loc
+        jz glob
+        jz weak1
+        jz lalias
+        jz walias
+        call loc@PLT
+        call glob@PLT
+        call weak1@PLT
+        call lalias@PLT
+        call galias@PLT
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+func:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+
+=== references back to symbols in their own section
+        .text
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        call loc
+        call glob
+        call weak1
+        call lalias
+        jmp loc
+        jmp glob
+        jmp weak1
+        jz loc
+        jz glob
+        jz weak1
+
+=== references out of their section, by binding
+        .text
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        call oloc
+        call oglob
+        call oweak
+        call oalias
+        call ext
+        call uweak
+        nop
+        .section .text.other,"ax"
+oloc:   nop
+oglob:  nop
+oweak:  nop
+
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+
+=== default section alignment
+        .text
+        .byte   1
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7
+
+=== calls and jumps to an undefined symbol
+    call ext
+    jmp ext
+    je ext
+    call ext@PLT
+    jmp ext@PLT
+
+=== absolute references at every width
+    movl $ext, %eax
+    movw $ext, %ax
+    movb $ext, %al
+    movl ext, %eax
+    movl ext+4(%ebx), %ecx
+    pushl $ext
+    addl $ext, %edx
+    int $ext
+    .long ext
+    .word ext
+    .byte ext
+    .long ext - .
+
+=== far pointers to symbols
+    ljmp $0x10, $ext
+    lcall $0x10, $ext+8
+    ljmp $ext, $0x1000
+
+=== GOT loads GNU as marks relaxable
+    movl ext@GOT(%ebx), %eax
+    cmpl ext@GOT(%ebx), %ecx
+    addl ext@GOT(%ebx), %edx
+    testl %esi, ext@GOT(%ebx)
+    call *ext@GOT(%ebx)
+    jmp *ext@GOT(%ebx)
+    pushl ext@GOT(%ebx)
+    movl ext@GOT, %eax
+    movl ext@GOT+4(%ebx), %eax
+
+=== GOT references the linker cannot relax
+    movl %eax, ext@GOT(%ebx)
+    leal ext@GOT(%ebx), %eax
+    popl ext@GOT(%ebx)
+    movzbl ext@GOT(%ebx), %eax
+    movl ext@GOT(,%ebx,1), %eax
+    movl $ext@GOT, %eax
+    .long ext@GOT
+
+=== the GOT itself, and offsets from it
+    call 1f
+1:  popl %ebx
+    addl $_GLOBAL_OFFSET_TABLE_+(.-1b), %ebx
+    leal _GLOBAL_OFFSET_TABLE_(%ebx), %eax
+    movl ext@GOTOFF(%ebx), %eax
+    leal ext@GOTOFF+4(%ebx), %ecx
+    movl $ext@GOTOFF, %eax
+    .long ext@GOTOFF
+
+=== thread-local storage models
+    leal ext@TLSGD(,%ebx,1), %eax
+    leal ext@TLSLDM(%ebx), %eax
+    leal ext@DTPOFF(%eax), %eax
+    movl %gs:ext@NTPOFF, %eax
+    movl $ext@TPOFF, %eax
+    movl ext@INDNTPOFF, %eax
+    movl ext@GOTNTPOFF(%ebx), %eax
+    movl ext@GOTTPOFF(%ebx), %eax
+    .long ext@DTPOFF
+
+=== 16-bit code: word relocations
+    .code16
+    call ext
+    jmp ext
+    jne ext
+    movw $ext, %ax
+    movw ext, %bx
+    movw ext+2(%bx,%si), %cx
+    ljmp $0, $ext
+    pushw $ext
+
+=== 16-bit code: byte relocations
+    .code16
+    jcxz ext
+    loop ext
+    movb $ext, %al
+
+=== 16-bit code: 32-bit operands and addresses keep 32-bit relocations
+    .code16
+    movl $ext, %eax
+    movl ext(%eax), %ebx
+    calll ext
+    ljmpl $0x10, $ext
+
+=== code16gcc calls are 32-bit
+    .code16gcc
+    call ext
+    jmp ext
+
+=== local symbols are relocated against their section
+    movl $local, %eax
+    call local
+    movl local+2, %ecx
+    .data
+local:
+    .long 0

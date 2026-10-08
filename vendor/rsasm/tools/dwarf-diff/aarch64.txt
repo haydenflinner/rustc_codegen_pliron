@@ -1,0 +1,57 @@
+=== registers by name
+	.text
+f:
+	.cfi_startproc
+	stp x29, x30, [sp, #-32]!
+	.cfi_def_cfa_offset 32
+	.cfi_offset x29, -32
+	.cfi_offset x30, -24
+	mov x29, sp
+	.cfi_def_cfa w29, 32
+	str x19, [sp, #16]
+	.cfi_offset w19, -16
+	.cfi_offset d8, -8
+	.cfi_offset q9, -40
+	.cfi_offset fp, -48
+	.cfi_offset lr, -56
+	.cfi_register x30, x9
+	.cfi_same_value wzr
+	.cfi_undefined sp
+	ldr x19, [sp, #16]
+	.cfi_restore w19
+	ldp x29, x30, [sp], #32
+	.cfi_def_cfa sp, 0
+	.cfi_restore x29
+	.cfi_restore x30
+	ret
+	.cfi_endproc
+=== return address signing
+	.text
+f:
+	.cfi_startproc
+	hint #25
+	.cfi_negate_ra_state
+	stp x29, x30, [sp, #-16]!
+	.cfi_def_cfa_offset 16
+	.cfi_offset w30, -8
+	.cfi_offset w29, -16
+	ldp x29, x30, [sp], #16
+	.cfi_def_cfa_offset 0
+	hint #29
+	.cfi_negate_ra_state
+	ret
+	.cfi_endproc
+=== a frame in .debug_frame, DWARF 5
+	.cfi_sections .debug_frame
+	.file 0 "/build" "a.c" md5 0x00112233445566778899aabbccddeeff
+	.text
+f:
+	.loc 0 3 0
+	.cfi_startproc
+	sub sp, sp, #16
+	.cfi_def_cfa_offset 16
+	.loc 0 4 5 prologue_end
+	add sp, sp, #16
+	.cfi_def_cfa_offset 0
+	ret
+	.cfi_endproc

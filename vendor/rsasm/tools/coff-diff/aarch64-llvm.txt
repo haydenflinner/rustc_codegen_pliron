@@ -1,0 +1,107 @@
+# ARM64 objects against llvm-mc, the only reference here that writes them.
+=== branches
+        .text
+        bl      foo
+        b       foo
+        b.eq    foo
+        cbz     x0, foo
+        cbnz    w1, foo
+        tbz     x2, #3, foo
+        tbnz    w3, #0, foo
+=== adr and adrp
+        .text
+        adr     x0, foo
+        adrp    x1, foo
+        adrp    x2, foo+0x1234
+        adrp    x3, foo-8
+=== lo12 fields
+        .text
+        add     x0, x0, :lo12:foo
+        add     x1, x1, :lo12:foo+0x1234
+        ldr     x2, [x0, :lo12:foo]
+        ldr     w3, [x0, :lo12:foo+8]
+        ldrb    w4, [x0, :lo12:foo+3]
+        ldrh    w5, [x0, :lo12:foo+6]
+        str     x6, [x0, :lo12:foo+16]
+        ldr     q0, [x0, :lo12:foo+32]
+        ldr     d1, [x0, :lo12:foo+16]
+=== data
+        .data
+        .quad   foo
+        .quad   foo+9
+        .long   foo
+        .long   foo+5
+        .rva    foo
+        .rva    foo+7
+        .secrel32 foo
+        .secidx foo
+        .long   foo@IMGREL
+        .long   foo - .
+        .long   foo + 3 - .
+=== local and global targets
+        .text
+        .globl  f
+f:      nop
+        bl      f
+        b       local
+        adr     x3, f
+        adrp    x0, f
+        add     x0, x0, :lo12:f
+local:  ret
+        .data
+        .quad   f, local
+        .rva    local
+=== cross-section
+        .text
+        .globl  code
+code:
+        adrp    x0, thing
+        ldr     x0, [x0, :lo12:thing]
+        adrp    x1, stuff+8
+        add     x1, x1, :lo12:stuff+8
+        bl      code
+        ret
+        .data
+thing:  .quad   code
+        .section .rdata,"dr"
+stuff:  .long   thing - stuff
+        .quad   0, code
+=== hello
+        .text
+        .globl  main
+main:
+        stp     x29, x30, [sp, #-16]!
+        mov     x29, sp
+        adrp    x0, msg
+        add     x0, x0, :lo12:msg
+        bl      puts
+        mov     w0, #0
+        ldp     x29, x30, [sp], #16
+        ret
+        .section .rdata,"dr"
+msg:    .asciz  "Hello from rsasm!"
+=== sections and alignment
+        .section .mycode,"xr"
+        ret
+        .section .mydata,"dw"
+        .byte   1
+        .balign 8
+        .quad   2
+        .bss
+        .space  16
+=== weak and comdat
+        .text
+        .globl  first
+first:  ret
+        .weak   w
+w:      ret
+        bl      w
+        .section .text$c,"xr",discard,c
+        .globl  c
+c:      ret
+=== function call kept for the linker
+        .text
+        .def    f; .scl 2; .type 32; .endef
+        .globl  f
+f:      ret
+        bl      f

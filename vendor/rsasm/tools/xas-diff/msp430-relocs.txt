@@ -1,0 +1,1134 @@
+# Whole objects, compared by tools/mc-diff/canon.sh: each reference form
+# through each kind of symbol. GNU as relocates every reference from code on
+# this target, even to the label before it, and names a code label itself
+# rather than its section.
+#
+# Three things GNU as does that rsasm does not copy are kept out, none of
+# which changes what a linker makes of the object:
+#
+# - the addend of the last R_MSP430_SYM_DIFF in a section, which GNU as
+#   writes as the subtrahend's negated value where it writes zero for every
+#   other, so a difference is never the last relocation in a section here;
+# - where a `.section .data` directive, which refers to `__crt0_movedata` as
+#   it is read, falls among the undefined symbols, since rsasm orders those
+#   by where they are relocated;
+# - a number `.set` after the code that uses it, which GNU as relocates
+#   against the symbol and rsasm writes into the field.
+=== an undefined symbol
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+
+=== a local label in the same section
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+X:      nop
+
+=== a local label earlier in the section
+        .text
+X:      nop
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+
+=== a local label in another code section
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+        .section .text.other, "ax"
+X:      nop
+
+=== a local label in a data section
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+        .data
+        .word 0
+X:      .word 1
+
+=== a local label in .bss
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+        .bss
+        .space 2
+X:      .space 2
+
+=== a global label in the same section
+        .text
+        .globl  X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+X:      nop
+
+=== a global label in a data section
+        .text
+        .globl  X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+        .data
+X:      .word 1
+
+=== a weak label
+        .text
+        .weak   X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+X:      nop
+
+=== a weak undefined symbol
+        .text
+        .weak   X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+
+=== a hidden global label
+        .text
+        .globl  X
+        .hidden X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+X:      nop
+
+=== a protected global label
+        .text
+        .globl  X
+        .protected X
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+X:      nop
+
+=== a local alias of a global label
+        .text
+        .globl  G
+        .set    X, G
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+G:      nop
+
+=== a global alias of a local label
+        .text
+        .globl  X
+        .set    X, L
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+L:      nop
+
+=== a label made global after use
+        .text
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X
+        jz      X
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+        .byte   X
+        .globl  X
+X:      nop
+
+=== an absolute symbol
+        .text
+        .set    X, 0x1234
+        mov     X, r5
+        mov     &X, r5
+        mov     #X, r5
+        mov     X(r4), r5
+        mov     r5, X
+        mov     r5, &X
+        mov     r5, X(r6)
+        mov.b   X, r5
+        mov.b   &X, r5
+        mov     &X, X
+        mov     @r4, X
+        mov     X, &X
+        add     #X, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        call    #X
+        call    X
+        call    &X
+        br      X
+        br      #X
+        br      &X
+        br      X(r5)
+        push    #X
+        push.b  X
+        clr     X
+        inc     &X
+        tst.b   X(r4)
+        rla     X
+        rlc.b   &X
+        .word   X
+        .long   X
+
+=== a label with an addend
+        .text
+        mov     X+2, r5
+        mov     &X+2, r5
+        mov     #X+2, r5
+        mov     X+2(r4), r5
+        mov     r5, X+2
+        mov     r5, &X+2
+        mov     r5, X+2(r6)
+        mov.b   X+2, r5
+        mov.b   &X+2, r5
+        mov     &X+2, X
+        mov     @r4, X+2
+        mov     X+2, &X
+        add     #X+2, X(r7)
+        mov     #lo(X), r5
+        mov     #hi(X), r5
+        jmp     X+2
+        jz      X+2
+        call    #X+2
+        call    X+2
+        call    &X+2
+        br      X+2
+        br      #X+2
+        br      &X+2
+        br      X+2(r5)
+        push    #X+2
+        push.b  X+2
+        clr     X+2
+        inc     &X+2
+        tst.b   X+2(r4)
+        rla     X+2
+        rlc.b   &X+2
+        .word   X+2
+        .long   X+2
+        .byte   X+2
+X:      nop
+
+=== differences of code labels
+        .text
+a:      nop
+        nop
+b:      nop
+        .word   b - a
+        .long   b - a
+        .byte   b - a
+        .word   a - b + 3
+        .data
+        .word   b - a
+        .long   a - b
+        .text
+        jmp     a
+
+=== LEB128 of differences of code labels
+        .text
+a:      nop
+        mov     #0x1234, r5
+b:      nop
+        .data
+        .uleb128 b - a
+        .uleb128 a - a
+        .sleb128 b - a
+        .word   1
+        .section .debug_foo, "", @progbits
+        .uleb128 b - a
+        .uleb128 b - a + 300
+        .text
+        jmp     a
+
+=== LEB128 of differences of data labels
+        .data
+c:      .word   1
+d:      .word   2
+        .uleb128 d - c
+        .sleb128 c - d
+        .text
+        nop
+
+=== differences of data labels, which GNU as folds
+        .data
+c:      .word   1
+d:      .word   2
+        .word   d - c
+        .long   c - d
+        .text
+        mov     #d - c, r5
+        mov     &d, r5
+
+=== differences across sections
+        .data
+c:      .word   1
+        .text
+a:      nop
+        .word   c - a
+        .long   a - c
+        jmp     a
+
+=== the C runtime references for .data and .bss
+        .text
+        mov     #1, r5
+        .data
+        .word   1
+        .bss
+        .space  2
+
+=== an empty .data and .bss
+        .text
+        nop
+        .data
+        .bss
+
+=== the C runtime references for named sections
+        .section .data.foo, "aw"
+        .word   1
+        .section .bss.foo, "aw", @nobits
+        .space  2
+        .section .lower.data, "aw"
+        .word   2
+        .section .either.bss, "aw", @nobits
+        .space  4
+        .section .upper.data, "aw"
+        .word   3
+        .section .upper.bss, "aw", @nobits
+        .space  4
+        .section .either.data, "aw"
+        .word   4
+
+=== the C runtime references for empty named sections
+        .section .data.empty, "aw"
+        .section .bss.empty, "aw", @nobits
+        .section .rodata
+        .word   1
+
+=== a data section that is not writable
+        .section .rodata
+        .word   1
+        .long   2
+
+=== labels in data sections
+        .data
+d:      .word   1
+        .word   d
+        .long   d + 4
+        .text
+        mov     &d, r5
+        mov     d, r5
+        mov     #d, r5
+        call    #d
+
+=== alignment and section tails
+        .text
+        nop
+        .balign 4
+        mov     #1, r5
+        .p2align 3
+        ret
+        .data
+        .byte   1
+        .balign 8
+        .section .rodata
+        .byte   2
+        .align  2
+
+=== code sections of other names
+        .section .text.a, "ax"
+a:      jmp     b
+        .section .lowtext, "ax"
+b:      call    #a
+        mov     a, r5
+        .section .init, "ax"
+        br      #a
+
+=== refused: mov r5
+        .text
+	mov r5
+
+=== refused: mov
+        .text
+	mov
+
+=== refused: mov r5, #1234
+        .text
+	mov r5, #1234
+
+=== refused: mov r5, #-1
+        .text
+	mov r5, #-1
+
+=== refused: mov r5, @r6+
+        .text
+	mov r5, @r6+
+
+=== refused: mov 2(r2), r5
+        .text
+	mov 2(r2), r5
+
+=== refused: mov r5, 2(r2)
+        .text
+	mov r5, 2(r2)
+
+=== refused: mov #0x10000, r5
+        .text
+	mov #0x10000, r5
+
+=== refused: mov #-32769, r5
+        .text
+	mov #-32769, r5
+
+=== refused: mov &0x10000, r5
+        .text
+	mov &0x10000, r5
+
+=== refused: mov &-32769, r5
+        .text
+	mov &-32769, r5
+
+=== refused: mov 0x10000(r4), r5
+        .text
+	mov 0x10000(r4), r5
+
+=== refused: movx #0x100000, r5
+        .text
+	movx #0x100000, r5
+
+=== refused: movx #-0x80001, r5
+        .text
+	movx #-0x80001, r5
+
+=== refused: movx &0x100000, r5
+        .text
+	movx &0x100000, r5
+
+=== refused: jmp $+1030
+        .text
+	jmp $+1030
+
+=== refused: jmp -1030
+        .text
+	jmp -1030
+
+=== refused: jmp $sym
+        .text
+	jmp $sym
+
+=== refused: rrax r5
+        .text
+	rrax r5
+
+=== refused: mova @r2, r5
+        .text
+	mova @r2, r5
+
+=== refused: mova @r3+, r5
+        .text
+	mova @r3+, r5
+
+=== refused: mova &0x1234, r2
+        .text
+	mova &0x1234, r2
+
+=== refused: mova r5, @r6
+        .text
+	mova r5, @r6
+
+=== refused: mova #1, 2(r5)
+        .text
+	mova #1, 2(r5)
+
+=== refused: pushm #0, r5
+        .text
+	pushm #0, r5
+
+=== refused: pushm #17, r5
+        .text
+	pushm #17, r5
+
+=== refused: popm #5, r3
+        .text
+	popm #5, r3
+
+=== refused: popm #2, r3
+        .text
+	popm #2, r3
+
+=== refused: popm #4, r5
+        .text
+	popm #4, r5
+
+=== refused: rrcm #5, r5
+        .text
+	rrcm #5, r5
+
+=== refused: rrcm #0, r5
+        .text
+	rrcm #0, r5
+
+=== refused: rrcm r5, r6
+        .text
+	rrcm r5, r6
+
+=== refused: rrcm #1, pc
+        .text
+	rrcm #1, pc
+
+=== refused: rpt #17 { rrax r5
+        .text
+	rpt #17 { rrax r5
+
+=== refused: rpt #0 { rrax r5
+        .text
+	rpt #0 { rrax r5
+
+=== refused: rpt pc { rrax r5
+        .text
+	rpt pc { rrax r5
+
+=== refused: rpt sym { rrax r5
+        .text
+	rpt sym { rrax r5
+
+=== refused: rpt #4 { mov r5, r6
+        .text
+	rpt #4 { mov r5, r6
+
+=== refused: rpt #4 { movx &0x200, r6
+        .text
+	rpt #4 { movx &0x200, r6
+
+=== refused: rpt #4 { rrcm #1, r5
+        .text
+	rpt #4 { rrcm #1, r5
+
+=== refused: rpt #4 { adda r5, r6
+        .text
+	rpt #4 { adda r5, r6
+
+=== refused: rpt #4 { mova r5, r6
+        .text
+	rpt #4 { mova r5, r6
+
+=== refused: rpt #4
+        .text
+	rpt #4
+
+=== refused: swpbx.b r5
+        .text
+	swpbx.b r5
+
+=== refused: mov.q r5, r6
+        .text
+	mov.q r5, r6
+
+=== refused: inc.a r5
+        .text
+	inc.a r5
+
+=== refused: foo r5
+        .text
+	foo r5
+
+=== refused: beq 1234
+        .text
+	beq 1234
+
+=== refused: calla
+        .text
+	calla
+
+=== refused: mova r5
+        .text
+	mova r5
+
+=== refused: reta r5
+        .text
+	reta r5
+
+=== refused: adda sym, r5
+        .text
+	adda sym, r5
+
+=== refused: adda #0x100000, r5
+        .text
+	adda #0x100000, r5
+
+=== refused: adda #sym, sym
+        .text
+	adda #sym, sym
+
+=== refused: rla #5
+        .text
+	rla #5
+
+=== refused: .mspabi_attribute 4, 2
+        .text
+	.mspabi_attribute 4, 2
+
+=== refused: .mspabi_attribute 4, 3
+        .text
+	.mspabi_attribute 4, 3
+
+=== refused: .mspabi_attribute 6, 2
+        .text
+	.mspabi_attribute 6, 2
+
+=== refused: .mspabi_attribute 9, 1
+        .text
+	.mspabi_attribute 9, 1
+
+=== refused: .mspabi_attribute 0, 1
+        .text
+	.mspabi_attribute 0, 1
+
+=== refused: mov #hlo(sym), r5
+        .text
+	mov #hlo(sym), r5
+
+=== refused: mov #hhi(sym), r5
+        .text
+	mov #hhi(sym), r5
+
+=== refused: mov (r4), r5
+        .text
+	mov (r4), r5
+
+=== refused: mov @r16, r5
+        .text
+	mov @r16, r5
+
+=== refused: mov 2(r16), r5
+        .text
+	mov 2(r16), r5
+
+=== refused: mov 2(sym), r5
+        .text
+	mov 2(sym), r5
+
+=== refused: jmp #sym
+        .text
+	jmp #sym
+
+=== refused: jmp &sym
+        .text
+	jmp &sym
+
+=== refused: and.a r5, r6
+        .text
+	and.a r5, r6
+
+=== refused: cmp.a r5, pc
+        .text
+	cmp.a r5, pc
+
+=== refused: mova r5, r3
+        .text
+	mova r5, r3
+
+=== refused: mova #0x12345, r3
+        .text
+	mova #0x12345, r3
+
+=== refused: calla #0x100000
+        .text
+	calla #0x100000
+
+=== refused: bra @r2
+        .text
+	bra @r2
+
+=== refused: movx.a #0x12345, 0x54321(r6)
+        .text
+	movx.a #0x12345, 0x54321(r6)
+
+=== refused: sxt.a r5
+        .text
+	sxt.a r5
+
+=== refused: rrux.b r5
+        .text
+	rrux.b r5
+
+=== refused: rrax.b &0x12345
+        .text
+	rrax.b &0x12345
+
+=== refused: mov #'ab', r5
+        .text
+	mov #'ab', r5
+
+=== refused: movx.a r5, r6 { rpt #2 { rlax r7
+        .text
+	movx.a r5, r6 { rpt #2 { rlax r7
+
+=== refused: jmp $-1020 { jmp $-1022
+        .text
+	jmp $-1020 { jmp $-1022
+

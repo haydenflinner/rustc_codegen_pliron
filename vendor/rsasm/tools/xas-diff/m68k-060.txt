@@ -1,0 +1,12 @@
+# Every form of GNU's m68k opcode table that the 68060 has and no CPU
+# before it in tools/fuzz/m68k.py's CORPUS_ORDER does, one line each, with
+# operands that form takes and no earlier form of the mnemonic does.
+# GNU syntax.
+#
+#   tools/fuzz/m68k.py corpus --first --cpu 68060 --syntax gas
+
+halt
+lpstop	#-32768
+plpar	(%a7)
+plpaw	(%a7)
+pulse

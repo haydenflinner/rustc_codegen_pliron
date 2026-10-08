@@ -1,0 +1,896 @@
+nop
+ret
+leave
+hlt
+int3
+ud2
+syscall
+cpuid
+endbr64
+cltq
+cqto
+movq %rbx, %rax
+movl %ebx, %eax
+movw %bx, %ax
+movb %bl, %al
+movq %rax, %r15
+movq %r8, %r9
+movb %sil, %dil
+movb %ah, %al
+movl $1, %eax
+movq $1, %rax
+movq $0x1122334455667788, %rax
+movabsq $0x1122334455667788, %rax
+movq $-1, %rax
+addq $1, %rax
+addq $128, %rax
+addq $-129, %rax
+addl $0x1000, %eax
+addq %rbx, %rax
+addq (%rbx), %rax
+addq %rax, (%rbx)
+subq $8, %rsp
+andl $0xff, %eax
+xorq %rax, %rax
+cmpq $0, %rax
+testq %rax, %rax
+orb $1, (%rax)
+movq 8(%rbx), %rax
+movq -8(%rbx), %rax
+movq (%rbx,%rcx), %rax
+movq (%rbx,%rcx,4), %rax
+movq 16(%rbx,%rcx,8), %rax
+movq (%rsp), %rax
+movq 8(%rsp), %rax
+movq (%rbp), %rax
+movq (%r12), %rax
+movq (%r13), %rax
+movq (%r12,%r13,4), %rax
+movq 0x1000, %rax
+leaq 8(%rbx), %rax
+leaq (%rax,%rax,4), %rax
+pushq %rax
+pushq %r12
+popq %rbx
+pushq $1
+pushq $0x1000
+incq %rax
+decl %eax
+negq %rax
+notq %rax
+mulq %rbx
+idivq %rbx
+imulq %rbx
+imulq %rbx, %rax
+imulq $4, %rbx, %rax
+shlq $1, %rax
+shlq $4, %rax
+shrq %cl, %rax
+sarl $31, %eax
+movzbl %al, %eax
+movzwl %ax, %eax
+movsbl %al, %eax
+movswq %ax, %rax
+movslq %eax, %rax
+setne %al
+sete %bl
+cmovgq %rbx, %rax
+xchgq %rbx, %rax
+lock incq (%rax)
+rep movsb
+repne scasb
+cld
+std
+int $0x80
+fs movq (%rax), %rax
+movq %fs:(%rax), %rax
+movq %gs:8(%rax), %rax
+xchgq %rax, %rax
+xchgl %eax, %eax
+xchgw %ax, %ax
+xchgq %r8, %rax
+xchgl %ebx, %eax
+gs movq (%rax), %rax
+# ---- SIMD -----------------------------------------------------------------
+# The same SIMD cases as tools/mc-diff/x86-64.txt, which lists what is and is
+# not covered. One case is left out: for `vmovq 8(%rax), %xmm17` GNU as picks
+# EVEX `66 W1 6E` where llvm-mc picks `F3 7E`. Both are valid; rsasm follows
+# llvm-mc there, and the mc-diff corpus keeps the case.
+# ---- MMX ----------------------------------------------------------------
+paddb %mm1, %mm2
+paddw (%rax), %mm3
+paddd %mm7, %mm0
+paddq %mm1, %mm2
+psubb %mm1, %mm2
+psubusw %mm1, %mm2
+pmullw %mm1, %mm2
+pmulhw %mm1, %mm2
+pmaddwd %mm1, %mm2
+pand %mm1, %mm2
+pandn %mm1, %mm2
+por %mm1, %mm2
+pxor %mm1, %mm2
+pcmpeqb %mm1, %mm2
+pcmpgtd %mm1, %mm2
+psllw %mm1, %mm2
+psllw $3, %mm2
+psrld $4, %mm5
+psraw $1, %mm0
+psllq $63, %mm7
+packsswb %mm1, %mm2
+packssdw %mm1, %mm2
+packuswb %mm1, %mm2
+punpcklbw %mm1, %mm2
+punpckhdq %mm1, %mm2
+emms
+movd %eax, %mm0
+movd %mm0, %eax
+movd (%rax), %mm0
+movd %mm0, (%rax)
+movq %mm1, %mm2
+movq (%rax), %mm0
+movq %mm0, (%rax)
+movq %rax, %mm0
+movq %mm0, %rax
+pshufw $0x1b, %mm1, %mm2
+pmovmskb %mm1, %eax
+pinsrw $2, %eax, %mm0
+pextrw $2, %mm0, %eax
+movntq %mm0, (%rax)
+maskmovq %mm1, %mm2
+pavgb %mm1, %mm2
+psadbw %mm1, %mm2
+
+# ---- 3DNow! and 3DNow!+ ---------------------------------------------------
+pfadd %mm1, %mm2
+pfadd 8(%rax), %mm2
+pfsub %mm1, %mm2
+pfsubr %mm1, %mm2
+pfmul %mm1, %mm2
+pfrcp %mm1, %mm2
+pfrsqrt %mm1, %mm2
+pfmax %mm1, %mm2
+pfmin %mm1, %mm2
+pfcmpeq %mm1, %mm2
+pfcmpge %mm1, %mm2
+pfcmpgt %mm1, %mm2
+pfacc %mm1, %mm2
+pf2id %mm1, %mm2
+pi2fd %mm1, %mm2
+pavgusb %mm1, %mm2
+pmulhrw %mm1, %mm2
+femms
+prefetch (%rax)
+prefetchw (%rax)
+pf2iw %mm1, %mm2
+pi2fw %mm1, %mm2
+pfnacc %mm1, %mm2
+pfpnacc %mm1, %mm2
+pswapd %mm1, %mm2
+
+# ---- SSE / SSE2 moves -----------------------------------------------------
+movaps %xmm1, %xmm2
+movaps (%rax), %xmm2
+movaps %xmm2, (%rax)
+movups %xmm8, %xmm1
+movups %xmm1, 8(%r9)
+movapd %xmm1, %xmm15
+movupd (%rcx), %xmm3
+movss %xmm1, %xmm2
+movss (%rax), %xmm2
+movss %xmm2, (%rax)
+movsd %xmm1, %xmm2
+movsd (%rax), %xmm2
+movsd %xmm2, 16(%rsp)
+movdqa %xmm1, %xmm2
+movdqa (%rax), %xmm2
+movdqa %xmm2, (%rax)
+movdqu %xmm1, %xmm2
+movdqu %xmm10, (%rax)
+movhlps %xmm1, %xmm2
+movlhps %xmm1, %xmm2
+movlps (%rax), %xmm1
+movlps %xmm1, (%rax)
+movhpd (%rax), %xmm1
+movntps %xmm1, (%rax)
+movntdq %xmm1, (%rax)
+movnti %eax, (%rbx)
+movd %eax, %xmm0
+movd %xmm0, %eax
+movd (%rax), %xmm0
+movq %rax, %xmm0
+movq %xmm0, %rax
+movq %xmm0, %xmm1
+movq (%rax), %xmm1
+movq %xmm1, (%rax)
+movq %r8, %xmm9
+movq2dq %mm1, %xmm2
+movdq2q %xmm1, %mm2
+maskmovdqu %xmm1, %xmm2
+movmskps %xmm1, %eax
+movmskpd %xmm1, %eax
+
+# ---- SSE / SSE2 arithmetic, compares, shuffles ------------------------------
+addps %xmm1, %xmm2
+addpd %xmm1, %xmm2
+addss %xmm1, %xmm2
+addsd %xmm1, %xmm2
+addss (%rax), %xmm2
+subps %xmm1, %xmm2
+mulpd %xmm1, %xmm2
+divss %xmm1, %xmm2
+minsd %xmm1, %xmm2
+maxps %xmm1, %xmm2
+sqrtps %xmm1, %xmm2
+sqrtsd %xmm1, %xmm2
+rsqrtps %xmm1, %xmm2
+rsqrtss %xmm1, %xmm2
+rcpps %xmm1, %xmm2
+rcpss %xmm1, %xmm2
+andps %xmm1, %xmm2
+andnpd %xmm1, %xmm2
+orps %xmm1, %xmm2
+xorpd %xmm1, %xmm2
+cmpps $1, %xmm1, %xmm2
+cmppd $2, %xmm1, %xmm2
+cmpss $3, %xmm1, %xmm2
+cmpsd $7, (%rax), %xmm2
+comiss %xmm1, %xmm2
+comisd %xmm1, %xmm2
+ucomiss (%rax), %xmm2
+ucomisd %xmm1, %xmm2
+unpcklps %xmm1, %xmm2
+unpckhpd %xmm1, %xmm2
+shufps $0x1b, %xmm1, %xmm2
+shufpd $1, %xmm1, %xmm2
+pshufd $0x1b, %xmm1, %xmm2
+pshuflw $0x1b, %xmm1, %xmm2
+pshufhw $0x1b, %xmm1, %xmm2
+
+# ---- SSE / SSE2 conversions -----------------------------------------------
+cvtsi2ss %eax, %xmm1
+cvtsi2ssl %eax, %xmm1
+cvtsi2ssq %rax, %xmm1
+cvtsi2sd %rax, %xmm1
+cvtsi2sdl (%rax), %xmm1
+cvttss2si %xmm1, %eax
+cvttss2si %xmm1, %rax
+cvttsd2si %xmm1, %eax
+cvtss2si %xmm1, %eax
+cvtsd2si %xmm1, %r10
+cvtps2pd %xmm1, %xmm2
+cvtpd2ps %xmm1, %xmm2
+cvtss2sd %xmm1, %xmm2
+cvtsd2ss %xmm1, %xmm2
+cvtdq2ps %xmm1, %xmm2
+cvtps2dq %xmm1, %xmm2
+cvttps2dq %xmm1, %xmm2
+cvtdq2pd %xmm1, %xmm2
+cvtpd2dq %xmm1, %xmm2
+cvttpd2dq %xmm1, %xmm2
+cvtps2pi %xmm1, %mm2
+cvttpd2pi %xmm1, %mm2
+cvtpi2ps %mm1, %xmm2
+cvtpi2pd %mm1, %xmm2
+
+# ---- SSE2 integer ---------------------------------------------------------
+paddb %xmm1, %xmm2
+paddq %xmm11, %xmm12
+psubq %xmm1, %xmm2
+pmuludq %xmm1, %xmm2
+pcmpeqd %xmm1, %xmm2
+pcmpgtw %xmm1, %xmm2
+psllw %xmm1, %xmm2
+psllw $3, %xmm2
+psrlq $4, %xmm10
+psrad $1, %xmm0
+psrldq $4, %xmm1
+pslldq $8, %xmm15
+packssdw %xmm1, %xmm2
+punpcklqdq %xmm1, %xmm2
+punpckhqdq %xmm1, %xmm2
+pavgb %xmm1, %xmm2
+pminub %xmm1, %xmm2
+pmaxsw %xmm1, %xmm2
+psadbw %xmm1, %xmm2
+pmovmskb %xmm1, %eax
+pinsrw $2, %eax, %xmm0
+pextrw $2, %xmm0, %eax
+
+# ---- SSE3 -----------------------------------------------------------------
+addsubps %xmm1, %xmm2
+haddpd %xmm1, %xmm2
+hsubps %xmm1, %xmm2
+movsldup %xmm1, %xmm2
+movshdup %xmm1, %xmm2
+movddup %xmm1, %xmm2
+lddqu (%rax), %xmm1
+
+# ---- SSSE3 ----------------------------------------------------------------
+pshufb %xmm1, %xmm2
+pshufb %mm1, %mm2
+phaddw %xmm1, %xmm2
+pmaddubsw %xmm1, %xmm2
+psignd %xmm1, %xmm2
+pmulhrsw %xmm1, %xmm2
+pabsb %xmm1, %xmm2
+pabsd %mm1, %mm2
+palignr $3, %xmm1, %xmm2
+palignr $3, %mm1, %mm2
+
+# ---- SSE4.1 ---------------------------------------------------------------
+ptest %xmm1, %xmm2
+pmuldq %xmm1, %xmm2
+pcmpeqq %xmm1, %xmm2
+packusdw %xmm1, %xmm2
+pminsb %xmm1, %xmm2
+pmaxud %xmm1, %xmm2
+pmulld %xmm1, %xmm2
+phminposuw %xmm1, %xmm2
+pmovsxbw %xmm1, %xmm2
+pmovzxdq (%rax), %xmm2
+pmovzxbq %xmm1, %xmm2
+pblendvb %xmm1, %xmm2
+pblendvb %xmm0, %xmm1, %xmm2
+blendvps %xmm1, %xmm2
+blendvpd (%rax), %xmm2
+roundps $1, %xmm1, %xmm2
+roundsd $4, %xmm1, %xmm2
+roundss $4, (%rax), %xmm2
+blendps $5, %xmm1, %xmm2
+pblendw $0xaa, %xmm1, %xmm2
+dpps $0xff, %xmm1, %xmm2
+mpsadbw $0, %xmm1, %xmm2
+insertps $0x10, %xmm1, %xmm2
+pextrw $2, %xmm0, (%rax)
+pextrb $1, %xmm0, %eax
+pextrb $1, %xmm0, (%rax)
+pextrd $1, %xmm0, %eax
+pextrq $1, %xmm0, %rax
+extractps $1, %xmm0, %eax
+pinsrb $1, %eax, %xmm0
+pinsrb $1, (%rax), %xmm0
+pinsrd $1, %eax, %xmm0
+pinsrq $1, %rax, %xmm0
+movntdqa (%rax), %xmm1
+
+# ---- SSE4.2, POPCNT, LZCNT, TZCNT -----------------------------------------
+pcmpgtq %xmm1, %xmm2
+pcmpestri $0x0c, %xmm1, %xmm2
+pcmpestrm $0x0c, %xmm1, %xmm2
+pcmpistri $0x0c, %xmm1, %xmm2
+pcmpistrm $0x0c, (%rax), %xmm2
+crc32b %al, %eax
+crc32w %ax, %eax
+crc32l %eax, %eax
+crc32q %rax, %rax
+crc32b %al, %rax
+crc32b (%rax), %ecx
+popcnt %eax, %ebx
+popcntq %rax, %rbx
+popcntw %ax, %bx
+popcnt (%rax), %ecx
+lzcnt %eax, %ebx
+tzcnt %rax, %rbx
+
+# ---- AES-NI, PCLMULQDQ, and the SSE housekeeping ops ------------------------
+aesenc %xmm1, %xmm2
+aesenc (%rax), %xmm9
+aesenclast %xmm1, %xmm2
+aesdec %xmm1, %xmm2
+aesdeclast %xmm1, %xmm2
+aesimc %xmm1, %xmm2
+aeskeygenassist $1, %xmm1, %xmm2
+pclmulqdq $0x11, %xmm1, %xmm2
+sfence
+lfence
+mfence
+prefetchnta (%rax)
+prefetcht0 (%rax)
+ldmxcsr (%rax)
+stmxcsr 4(%rsp)
+
+# ---- AVX: float arithmetic ------------------------------------------------
+vaddps %xmm1, %xmm2, %xmm3
+vaddps %ymm1, %ymm2, %ymm3
+vaddps 8(%rax), %ymm2, %ymm3
+vaddpd %xmm1, %xmm2, %xmm3
+vaddss %xmm1, %xmm2, %xmm3
+vaddsd (%rax), %xmm2, %xmm3
+vsubps %ymm1, %ymm2, %ymm3
+vmulpd %ymm1, %ymm2, %ymm3
+vdivss %xmm1, %xmm2, %xmm3
+vminpd %xmm1, %xmm2, %xmm3
+vmaxsd %xmm1, %xmm2, %xmm3
+vandps %ymm1, %ymm2, %ymm3
+vandnpd %xmm1, %xmm2, %xmm3
+vorps %xmm1, %xmm2, %xmm3
+vxorps %ymm1, %ymm2, %ymm3
+vsqrtps %ymm1, %ymm2
+vsqrtsd %xmm1, %xmm2, %xmm3
+vrsqrtps %xmm1, %xmm2
+vrsqrtss %xmm1, %xmm2, %xmm3
+vrcpps %ymm1, %ymm2
+vcmpps $1, %ymm1, %ymm2, %ymm3
+vcmpsd $0, %xmm1, %xmm2, %xmm3
+vcomiss %xmm1, %xmm2
+vucomisd (%rax), %xmm2
+vhaddpd %ymm1, %ymm2, %ymm3
+vunpcklps %ymm1, %ymm2, %ymm3
+vshufps $0x1b, %ymm1, %ymm2, %ymm3
+vblendps $5, %ymm1, %ymm2, %ymm3
+vdppd $0x31, %xmm1, %xmm2, %xmm3
+vroundps $1, %ymm1, %ymm2
+vroundsd $1, %xmm1, %xmm2, %xmm3
+vblendvps %ymm4, %ymm1, %ymm2, %ymm3
+vpblendvb %xmm4, %xmm1, %xmm2, %xmm3
+vinsertps $0x10, %xmm1, %xmm2, %xmm3
+vextractps $1, %xmm0, %eax
+# Two-byte VEX needs every extension bit in R; the three-byte form is used
+# only when X, B or W is set, or the map is not 0F.
+vaddps %xmm12, %xmm13, %xmm14
+vaddps (%r8,%r9,2), %ymm10, %ymm11
+vaddps %xmm1, %xmm10, %xmm2
+
+# ---- AVX: moves -----------------------------------------------------------
+vmovaps %xmm1, %xmm2
+vmovaps %ymm1, %ymm2
+vmovaps (%rax), %ymm2
+vmovaps %ymm2, (%rax)
+# The store opcode moves an extended source from B to R, where the two-byte
+# prefix can carry it.
+vmovaps %xmm9, %xmm1
+vmovaps %xmm1, %xmm9
+vmovups %ymm12, %ymm0
+vmovdqa %xmm9, %xmm1
+vmovdqu (%rax), %ymm1
+vmovapd %xmm11, %xmm12
+vmovss %xmm1, %xmm2, %xmm3
+vmovss %xmm9, %xmm2, %xmm3
+vmovss (%rax), %xmm1
+vmovss %xmm1, (%rax)
+vmovsd %xmm1, %xmm2, %xmm3
+vmovd %eax, %xmm1
+vmovd %xmm1, %eax
+vmovq %xmm0, %xmm1
+vmovq %xmm9, %xmm1
+vmovq (%rax), %xmm1
+vmovq %xmm1, (%rax)
+vmovq %rax, %xmm1
+vmovq %xmm1, %rax
+vmovhlps %xmm1, %xmm2, %xmm3
+vmovlhps %xmm1, %xmm2, %xmm3
+vmovlps (%rax), %xmm2, %xmm3
+vmovlps %xmm1, (%rax)
+vmovhpd (%rax), %xmm2, %xmm3
+vmovntps %ymm1, (%rax)
+vmovntdq %xmm1, (%rax)
+vmovntdqa (%rax), %ymm1
+vlddqu (%rax), %ymm1
+vmovsldup %ymm1, %ymm2
+vmovddup %xmm1, %xmm2
+vmovddup %ymm1, %ymm2
+vmaskmovdqu %xmm1, %xmm2
+vmovmskps %ymm1, %eax
+vmovmskpd %xmm1, %eax
+vpmovmskb %ymm1, %eax
+
+# ---- AVX: conversions -----------------------------------------------------
+vcvtsi2ss %eax, %xmm1, %xmm2
+vcvtsi2ssq %rax, %xmm1, %xmm2
+vcvtsi2sdl (%rax), %xmm1, %xmm2
+vcvttss2si %xmm1, %eax
+vcvttsd2si %xmm1, %rax
+vcvtss2si %xmm1, %eax
+vcvtsd2si (%rax), %r10
+vcvtss2sd %xmm1, %xmm2, %xmm3
+vcvtsd2ss %xmm1, %xmm2, %xmm3
+vcvtdq2ps %ymm1, %ymm2
+vcvtps2dq %xmm1, %xmm2
+vcvttps2dq %ymm1, %ymm2
+vcvtps2pd %xmm1, %xmm2
+vcvtps2pd %xmm1, %ymm2
+vcvtdq2pd %xmm1, %ymm2
+vcvtpd2ps %xmm1, %xmm2
+vcvtpd2ps %ymm1, %xmm2
+vcvtpd2dq %ymm1, %xmm2
+vcvttpd2dq %ymm1, %xmm2
+
+# ---- AVX / AVX2: integer --------------------------------------------------
+vpaddb %xmm1, %xmm2, %xmm3
+vpaddd %ymm1, %ymm2, %ymm3
+vpaddq (%rax), %ymm2, %ymm3
+vpsubw %xmm1, %xmm2, %xmm3
+vpmullw %ymm1, %ymm2, %ymm3
+vpand %ymm1, %ymm2, %ymm3
+vpxor %xmm1, %xmm2, %xmm3
+vpcmpeqb %ymm1, %ymm2, %ymm3
+vpcmpgtd %xmm1, %xmm2, %xmm3
+vpunpcklqdq %ymm1, %ymm2, %ymm3
+# A shift count register is an xmm even at 256 bits.
+vpsllw %xmm3, %ymm1, %ymm2
+vpsrld %xmm3, %xmm1, %xmm2
+# Shift by immediate: vvvv is the destination, r/m the source.
+vpsllw $3, %ymm1, %ymm2
+vpsrlq $3, %xmm1, %xmm2
+vpsrad $3, %ymm11, %ymm12
+vpsrldq $3, %xmm1, %xmm2
+vpslldq $3, %ymm1, %ymm2
+vpshufd $0x1b, %ymm1, %ymm2
+vpshuflw $0x1b, %xmm1, %xmm2
+vpshufb %ymm1, %ymm2, %ymm3
+vpmaddubsw %xmm1, %xmm2, %xmm3
+vpsignd %ymm1, %ymm2, %ymm3
+vpmuldq %ymm1, %ymm2, %ymm3
+vpcmpeqq %xmm1, %xmm2, %xmm3
+vpcmpgtq %ymm1, %ymm2, %ymm3
+vpminud %ymm1, %ymm2, %ymm3
+vpmulld %xmm1, %xmm2, %xmm3
+vpabsb %ymm1, %ymm2
+vptest %ymm1, %ymm2
+vtestps %xmm1, %xmm2
+vphminposuw %xmm1, %xmm2
+vpmovsxbw %xmm1, %xmm2
+vpmovsxbw %xmm1, %ymm2
+vpmovzxdq (%rax), %ymm2
+vpblendw $0xaa, %ymm1, %ymm2, %ymm3
+vpalignr $3, %xmm1, %xmm2, %xmm3
+vpclmulqdq $0x11, %xmm1, %xmm2, %xmm3
+vpcmpistri $0x0c, %xmm1, %xmm2
+vaeskeygenassist $1, %xmm1, %xmm2
+vaesenc %xmm1, %xmm2, %xmm3
+vaesimc %xmm1, %xmm2
+vpextrb $1, %xmm0, %eax
+vpextrw $1, %xmm0, %eax
+vpextrd $1, %xmm0, %eax
+vpextrq $1, %xmm0, %rax
+vpinsrb $1, %eax, %xmm1, %xmm2
+vpinsrw $1, (%rax), %xmm1, %xmm2
+vpinsrd $1, %eax, %xmm1, %xmm2
+vpinsrq $1, %rax, %xmm1, %xmm2
+
+# ---- AVX / AVX2: broadcasts, lanes, permutes, variable shifts ---------------
+vzeroupper
+vzeroall
+vbroadcastss (%rax), %xmm1
+vbroadcastss (%rax), %ymm1
+vbroadcastss %xmm0, %ymm1
+vbroadcastsd (%rax), %ymm1
+vbroadcastsd %xmm0, %ymm1
+vbroadcastf128 (%rax), %ymm1
+vbroadcasti128 (%rax), %ymm1
+vpbroadcastb %xmm0, %ymm1
+vpbroadcastw (%rax), %xmm1
+vpbroadcastd %xmm0, %ymm1
+vpbroadcastq %xmm0, %xmm1
+vinsertf128 $1, %xmm1, %ymm2, %ymm3
+vinserti128 $1, (%rax), %ymm2, %ymm3
+vextractf128 $1, %ymm1, %xmm2
+vextracti128 $1, %ymm1, (%rax)
+vperm2f128 $0x20, %ymm1, %ymm2, %ymm3
+vperm2i128 $0x31, %ymm1, %ymm2, %ymm3
+vpermilps %ymm1, %ymm2, %ymm3
+vpermilps $0x1b, %ymm1, %ymm2
+vpermilpd $1, %xmm1, %xmm2
+vpermd %ymm1, %ymm2, %ymm3
+vpermps (%rax), %ymm2, %ymm3
+vpermq $0x1b, %ymm1, %ymm2
+vpermpd $0x1b, %ymm1, %ymm2
+vpsllvd %xmm1, %xmm2, %xmm3
+vpsllvq %ymm1, %ymm2, %ymm3
+vpsrlvd %ymm1, %ymm2, %ymm3
+vpsravd %xmm1, %xmm2, %xmm3
+vpblendd $0xf0, %ymm1, %ymm2, %ymm3
+vmaskmovps (%rax), %ymm2, %ymm3
+vmaskmovps %ymm3, %ymm2, (%rax)
+vpmaskmovd (%rax), %xmm2, %xmm3
+vpmaskmovq %ymm3, %ymm2, (%rax)
+
+# ---- AVX2: VSIB gathers ---------------------------------------------------
+vgatherdps %xmm2, (%rax,%xmm1,4), %xmm3
+vgatherdps %ymm2, (%rax,%ymm1,4), %ymm3
+vgatherqps %xmm2, (%rax,%xmm1,4), %xmm3
+# Four qword indices, four dword results: a ymm index into an xmm destination.
+vgatherqps %xmm2, (%rax,%ymm1,4), %xmm3
+vgatherdpd %xmm2, (%rax,%xmm1,8), %xmm3
+vgatherdpd %ymm2, (%rax,%xmm1,8), %ymm3
+vgatherqpd %ymm2, (%rax,%ymm1,8), %ymm3
+vpgatherdd %ymm2, 4(%rax,%ymm9,2), %ymm3
+vpgatherqd %xmm2, (%rax,%ymm1,4), %xmm3
+vpgatherdq %ymm2, (%r12,%xmm1,8), %ymm3
+vpgatherqq %xmm2, (%rax,%xmm13,8), %xmm3
+
+# ---- FMA ------------------------------------------------------------------
+vfmadd132ps %xmm1, %xmm2, %xmm3
+vfmadd213pd %ymm1, %ymm2, %ymm3
+vfmadd231ss %xmm1, %xmm2, %xmm3
+vfmadd231sd (%rax), %xmm2, %xmm3
+vfmsub132ps %ymm1, %ymm2, %ymm3
+vfmsub213sd %xmm1, %xmm2, %xmm3
+vfnmadd231ps %xmm1, %xmm2, %xmm3
+vfnmadd132sd %xmm1, %xmm2, %xmm3
+vfnmsub213pd %ymm1, %ymm2, %ymm3
+vfnmsub231ss %xmm1, %xmm2, %xmm3
+vfmaddsub132ps %xmm1, %xmm2, %xmm3
+vfmsubadd231pd %ymm1, %ymm2, %ymm3
+
+# ---- AVX-512: register extension bits ---------------------------------------
+vaddps %zmm1, %zmm2, %zmm3
+# X is the fifth bit of a register-direct r/m, V' of vvvv, R' of reg.
+vaddps %zmm17, %zmm2, %zmm3
+vaddps %zmm1, %zmm18, %zmm3
+vaddps %zmm1, %zmm2, %zmm19
+vaddps %zmm25, %zmm26, %zmm27
+vaddps %zmm9, %zmm10, %zmm11
+vaddps %xmm16, %xmm1, %xmm2
+vaddps %ymm16, %ymm17, %ymm18
+vaddps (%r9,%r10,2), %zmm2, %zmm3
+vmovaps %xmm17, %xmm1
+vmovdqa32 %zmm17, %zmm2
+vmovdqa32 %zmm9, %zmm2
+
+# ---- AVX-512: writemasks, zeroing, rounding --------------------------------
+vaddps %ymm1, %ymm2, %ymm3 {%k2}
+vaddps %zmm1, %zmm2, %zmm3 {%k1}{z}
+vaddps (%rax), %zmm2, %zmm3 {%k1}{z}
+vmovups %zmm1, %zmm2 {%k1}{z}
+vmovapd (%rax), %zmm1 {%k3}
+vpaddq %zmm1, %zmm2, %zmm3 {%k1}
+vaddps {rn-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rd-sae}, %zmm1, %zmm2, %zmm3
+vaddps {ru-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rz-sae}, %zmm1, %zmm2, %zmm3
+vaddss {rd-sae}, %xmm1, %xmm2, %xmm3
+vsqrtps {rn-sae}, %zmm1, %zmm2
+vcvtdq2ps {rn-sae}, %zmm1, %zmm2
+# {sae} leaves L'L at zero rather than the vector length.
+vmaxps {sae}, %zmm1, %zmm2, %zmm3
+vminpd {sae}, %zmm1, %zmm2, %zmm3 {%k7}
+vcmpps $0, {sae}, %zmm1, %zmm2, %k1
+vcomiss {sae}, %xmm1, %xmm2
+vcvttps2dq {sae}, %zmm1, %zmm2
+
+# ---- AVX-512: broadcast and disp8*N ---------------------------------------
+vaddpd (%rax){1to8}, %zmm2, %zmm3
+vaddps (%rax){1to16}, %zmm2, %zmm3 {%k1}
+vaddps (%rax){1to4}, %xmm2, %xmm3
+vaddps (%rax){1to8}, %ymm2, %ymm3
+vpaddd (%rax){1to16}, %zmm2, %zmm3
+vpaddd (%rax){1to4}, %xmm2, %xmm3
+vpaddq (%rax){1to8}, %zmm2, %zmm3
+vxorpd (%rax){1to8}, %zmm2, %zmm3
+vpternlogq $0x96, (%rax){1to8}, %zmm2, %zmm3
+vpcmpq $1, (%rax){1to8}, %zmm2, %k3
+vcmppd $1, (%rax){1to8}, %zmm2, %k1 {%k2}
+vpsllq $3, (%rax){1to8}, %zmm2
+vcvtdq2pd (%rax){1to8}, %zmm2
+vcvtpd2ps (%rax){1to8}, %ymm2
+# Full vector: N is the register width, or the element under broadcast.
+vmovaps 64(%rax), %zmm0
+vmovaps %zmm0, 64(%rax)
+vaddps 64(%rax), %zmm2, %zmm3
+vaddps 128(%rax), %zmm2, %zmm3
+vaddps -64(%rax), %zmm2, %zmm3
+vaddps -8192(%rax), %zmm2, %zmm3
+vaddps 8128(%rax), %zmm2, %zmm3
+vaddps 32(%rax), %ymm18, %ymm3
+vaddps 16(%rax), %xmm18, %xmm3
+vaddpd 8(%rax){1to8}, %zmm2, %zmm3
+vaddps 4(%rax){1to16}, %zmm2, %zmm3
+vpaddq 8(%rax){1to8}, %zmm2, %zmm3
+# Not a multiple of N, or out of range once divided: back to disp32.
+vaddps 4(%rax), %zmm2, %zmm3
+vaddps -8256(%rax), %zmm2, %zmm3
+vaddps 8192(%rax), %zmm2, %zmm3
+vmovaps 64(%rax), %ymm0
+# RIP-relative displacements are always 32 bits and never scaled.
+vaddps 64(%rip), %zmm1, %zmm2
+# Tuple1 scalar: N is the element, chosen by W.
+vaddss 4(%rax), %xmm18, %xmm3
+vaddsd 8(%rax), %xmm18, %xmm3
+vaddsd 4(%rax), %xmm18, %xmm3
+vcmpsd $1, 8(%rax), %xmm2, %k1
+vmovsd 8(%rax), %xmm1 {%k1}
+vpbroadcastd 4(%rax), %zmm2
+vpbroadcastq 8(%rax), %zmm2
+vpbroadcastw 2(%rax), %zmm2
+vbroadcastss 4(%rax), %zmm1
+vbroadcastsd 8(%rax), %zmm1
+# Full vector memory: never broadcast.
+vmovdqu64 %zmm2, 64(%rax)
+vpaddw 64(%rax), %zmm2, %zmm3
+# Half vector: half the register.
+vcvtps2pd 32(%rax), %zmm2
+# Tuple4: a quarter of 512 bits, sized by W.
+vbroadcastf32x4 16(%rax), %zmm1
+vbroadcasti64x4 32(%rax), %zmm1
+vinserti32x4 $1, 16(%rax), %zmm2, %zmm3
+vinserti64x4 $1, 32(%rax), %zmm1, %zmm2
+vextractf32x4 $1, %zmm1, 16(%rax)
+vextracti64x4 $1, %zmm1, 32(%rax)
+# Half, quarter and eighth memory: the vpmov* narrowings and widenings.
+vpmovqd %zmm1, 32(%rax)
+vpmovdb %zmm1, 16(%rax)
+vpmovqb %zmm1, 8(%rax)
+vpmovzxbd 16(%rax), %zmm2
+vpmovsxwq 16(%rax), %zmm2
+vpmovzxbq 8(%rax), %zmm2
+# movddup reads one double at 128 bits, the whole register above.
+vmovddup 8(%rax), %xmm17
+vmovddup 64(%rax), %zmm1
+vmovddup 32(%rax), %ymm1
+
+# ---- AVX-512F: arithmetic and logic ---------------------------------------
+vsubpd %zmm1, %zmm2, %zmm3
+vmulps 64(%rsp), %zmm2, %zmm3
+vdivpd (%rax){1to8}, %zmm2, %zmm3
+vminps %zmm1, %zmm2, %zmm3
+vmaxpd %ymm17, %ymm2, %ymm3
+vsqrtpd 64(%rax), %zmm2
+vsqrtss %xmm1, %xmm2, %xmm17
+vandps %zmm1, %zmm2, %zmm3
+vunpcklps %zmm1, %zmm2, %zmm3
+vshufps $0x1b, %zmm1, %zmm2, %zmm3
+vcmpps $1, %zmm1, %zmm2, %k1
+vcmpss $1, %xmm1, %xmm2, %k1
+vucomisd %xmm17, %xmm2
+vpaddd %zmm1, %zmm2, %zmm3
+vpsubd %zmm1, %zmm2, %zmm3
+vpandd %zmm1, %zmm2, %zmm3
+vpandq %zmm1, %zmm2, %zmm3
+vpandnq (%rax){1to8}, %zmm2, %zmm3
+vpord %zmm1, %zmm2, %zmm3
+vpxorq %zmm1, %zmm2, %zmm3
+vpminsd %zmm1, %zmm2, %zmm3
+vpmaxuq %zmm1, %zmm2, %zmm3
+vpmulld %zmm1, %zmm2, %zmm3
+vpmullq %zmm1, %zmm2, %zmm3
+vpmuludq %zmm1, %zmm2, %zmm3
+vpmuldq %zmm1, %zmm2, %zmm3
+vpaddb %zmm1, %zmm2, %zmm3
+vpsubb %xmm17, %xmm2, %xmm3
+vpavgb %zmm1, %zmm2, %zmm3
+vpmullw %zmm1, %zmm2, %zmm3
+vpunpckldq %zmm1, %zmm2, %zmm3
+vpunpcklqdq %zmm1, %zmm2, %zmm3
+vpunpckhqdq %zmm1, %zmm2, %zmm3
+vpternlogd $0xff, %zmm1, %zmm2, %zmm3
+vpternlogd $1, %xmm1, %xmm2, %xmm3
+vpabsd %zmm1, %zmm2
+vpabsq %zmm1, %zmm2
+vpshufd $0x1b, %zmm1, %zmm2
+vpslld $3, %zmm1, %zmm2
+vpsrad $3, %zmm1, %zmm2
+vpsraq $3, %zmm1, %zmm2
+vprold $3, %zmm1, %zmm2
+vprorq $3, %zmm1, %zmm2
+vpsrld $3, %xmm17, %xmm2
+vpsllvd %zmm1, %zmm2, %zmm3
+vpsravq %zmm1, %zmm2, %zmm3
+vprolvd %zmm1, %zmm2, %zmm3
+
+# ---- AVX-512F: moves --------------------------------------------------------
+vmovaps %zmm1, %zmm2
+vmovdqa32 %zmm1, %zmm2
+vmovdqa64 %zmm1, (%rax)
+vmovdqu32 %ymm1, %ymm2
+vmovdqu64 (%rax), %zmm2
+vmovdqu8 %zmm1, %zmm2
+vmovdqu16 %xmm1, %xmm2
+vmovntps %zmm1, (%rax)
+vmovntdq %zmm1, (%rax)
+vmovss (%rax), %xmm17
+vmovss %xmm17, 4(%rax)
+vmovss %xmm1, %xmm2, %xmm17
+vmovsldup %zmm1, %zmm2
+vmovd %eax, %xmm17
+vmovq %rax, %xmm17
+vmovq %xmm17, %xmm1
+
+# ---- AVX-512F: permutes, compares into masks, broadcasts, lanes -------------
+vpermd %zmm1, %zmm2, %zmm3
+vpermq %zmm1, %zmm2, %zmm3
+vpermq $1, %zmm1, %zmm2
+vpermpd $1, %zmm1, %zmm2
+vpermps %zmm1, %zmm2, %zmm3
+vpermpd %zmm1, %zmm2, %zmm3
+vpermilps %zmm1, %zmm2, %zmm3
+vpermilps $1, %zmm1, %zmm2
+vpermi2d %zmm1, %zmm2, %zmm3
+vpermt2q %zmm1, %zmm2, %zmm3
+vpermt2ps %zmm1, %zmm2, %zmm3
+vpcmpd $1, %zmm1, %zmm2, %k3
+vpcmpud $1, %zmm1, %zmm2, %k3
+vpcmpeqd %zmm1, %zmm2, %k3
+vpcmpeqd %zmm1, %zmm2, %k3 {%k4}
+vpcmpeqq %zmm1, %zmm2, %k3
+vpcmpgtd %zmm1, %zmm2, %k3
+vpcmpgtq %zmm1, %zmm2, %k3
+vpcmpeqb %zmm1, %zmm2, %k3
+vpcmpeqd %xmm1, %xmm2, %k3
+vptestmd %zmm1, %zmm2, %k3
+vptestnmq %zmm1, %zmm2, %k3
+vpbroadcastd %xmm1, %zmm2
+vpbroadcastd %eax, %zmm2
+vpbroadcastq %rax, %zmm2
+vpbroadcastb %xmm1, %zmm2
+vpbroadcastb %eax, %zmm2
+vpbroadcastw %eax, %zmm2
+vpbroadcastd %xmm1, %xmm17
+vbroadcastss %xmm1, %zmm2
+vbroadcastsd %xmm1, %ymm17
+vinsertf32x4 $1, %xmm1, %zmm2, %zmm3
+vinsertf64x4 $1, %ymm1, %zmm2, %zmm3
+vextractf32x4 $1, %zmm1, %xmm2
+vextracti64x4 $1, %zmm1, %ymm2
+
+# ---- AVX-512F: conversions --------------------------------------------------
+vcvtdq2ps %zmm1, %zmm2
+vcvtps2dq %zmm1, %zmm2
+vcvtdq2pd %ymm1, %zmm2
+vcvtps2pd %ymm1, %zmm2
+vcvtpd2ps %zmm1, %ymm2
+vcvtpd2dq %zmm1, %ymm2
+vcvttpd2dq %zmm1, %ymm2
+vcvtsi2ss %eax, %xmm17, %xmm2
+vcvtsi2sdq %rax, %xmm1, %xmm17
+vcvtss2sd %xmm1, %xmm2, %xmm17
+vpmovqd %zmm1, %ymm2
+vpmovdb %zmm1, %xmm2
+vpmovdw %zmm1, %ymm2
+vpmovqw %zmm1, %xmm2
+vpmovzxbd %xmm1, %zmm2
+vpmovsxdq %ymm1, %zmm2
+
+# ---- AVX-512F: gather and scatter ------------------------------------------
+vgatherdps (%rax,%zmm1,4), %zmm2 {%k1}
+# V' carries the fifth bit of a VSIB index.
+vgatherdps (%rax,%zmm17,4), %zmm2 {%k1}
+vgatherdps 8(%rax,%zmm1,4), %zmm2 {%k1}
+vgatherqps (%rax,%zmm1,4), %ymm2 {%k1}
+vgatherdpd (%rax,%ymm1,8), %zmm2 {%k1}
+vgatherqpd 16(%rax,%zmm1,8), %zmm2 {%k1}
+vpgatherdd (%rax,%zmm1,4), %zmm2 {%k1}
+vpgatherqq (%rax,%zmm1,8), %zmm2 {%k1}
+vgatherdps (%rax,%xmm17,4), %xmm2 {%k1}
+vscatterdps %zmm2, (%rax,%zmm1,4) {%k1}
+vscatterdps %zmm2, 8(%rax,%zmm1,4) {%k1}
+vscatterqpd %zmm2, (%rax,%zmm1,8) {%k1}
+vpscatterdd %zmm2, (%rax,%zmm1,4) {%k1}
+vpscatterqd %ymm2, (%rax,%zmm1,4) {%k1}
+
+# ---- Opmask instructions (VEX) ----------------------------------------------
+kmovw %k1, %k2
+kmovw %eax, %k1
+kmovw %k1, %eax
+kmovw (%rax), %k1
+kmovw %k1, (%rax)
+kmovb %k1, %k2
+kmovb %eax, %k1
+kmovd %k1, %k2
+kmovd %eax, %k1
+kmovd %k1, %eax
+kmovq %k1, %k2
+kmovq %rax, %k2
+kmovq %k2, %rax
+kmovq (%rax), %k2
+kandw %k1, %k2, %k3
+kandb %k1, %k2, %k3
+kandd %k1, %k2, %k3
+kandq %k1, %k2, %k3
+korw %k1, %k2, %k3
+kxnorw %k1, %k2, %k3
+kxorq %k1, %k2, %k3
+kandnw %k1, %k2, %k3
+kaddw %k1, %k2, %k3
+knotw %k1, %k2
+knotq %k1, %k2
+kortestw %k1, %k2
+ktestd %k1, %k2
+kshiftlw $3, %k1, %k2
+kshiftlb $3, %k1, %k2
+kshiftrd $3, %k1, %k2
+kshiftrq $3, %k1, %k2
+kunpckbw %k1, %k2, %k3
+kunpckwd %k1, %k2, %k3
+kunpckdq %k1, %k2, %k3

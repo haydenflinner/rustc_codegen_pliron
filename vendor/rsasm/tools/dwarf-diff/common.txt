@@ -1,0 +1,377 @@
+=== one row
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	nop
+=== rows, columns and advances
+	.file 1 "a.c"
+	.text
+f:
+	.loc 1 1 0
+	nop
+	.loc 1 2 0
+	nop
+	nop
+	.loc 1 3 4
+	nop
+=== a row on the line of the one before
+	.file 1 "a.c"
+	.text
+	.loc 1 3 1
+	nop
+	.loc 1 3 5
+	nop
+	.loc 1 4 1
+	nop
+	.loc 1 4 1
+	nop
+=== line going backwards
+	.file 1 "a.c"
+	.text
+	.loc 1 40
+	nop
+	.loc 1 2
+	nop
+	.loc 1 2000
+	nop
+=== flags and options
+	.file 1 "a.c"
+	.text
+	.loc 1 3 1
+	nop
+	.loc 1 4 3 is_stmt 0
+	nop
+	.loc 1 5 7 discriminator 3
+	nop
+	.loc 1 6 prologue_end
+	nop
+	.loc 1 7 epilogue_begin
+	nop
+	.loc 1 8 basic_block
+	nop
+	.loc 1 9 isa 2
+	nop
+	.loc 1 10 is_stmt 1
+	nop
+	.loc 1 11
+	nop
+=== column and isa carry over, or not
+	.file 1 "a.c"
+	.text
+	.loc 1 5 3 isa 1
+	nop
+	.loc 1 6
+	nop
+	.loc 1 7 0
+	nop
+=== two sequences
+	.file 1 "a.c"
+	.file 2 "b.h"
+	.text
+	.loc 1 1
+	nop
+	.loc 2 20 2
+	nop
+	.section .text.other,"ax"
+	.loc 1 30
+	nop
+	nop
+	.text
+	.loc 1 2
+	nop
+=== consecutive locs and one left over
+	.file 1 "a.c"
+	.text
+	nop
+	.loc 1 5
+	.loc 1 6
+	nop
+	.loc 1 7
+=== what a loc waits for
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	.byte 1, 2, 3, 4
+	.loc 1 2
+	.long 5
+	.loc 1 3
+	.p2align 4
+	nop
+	.loc 1 4
+label:
+	nop
+	.loc 1 11
+	.space 4
+	.loc 1 12
+	.ascii "abcd"
+	.loc 1 13
+	.skip 4, 0
+	.loc 1 14
+	.fill 2, 2, 0
+	.loc 1 15
+	.uleb128 300
+	.loc 1 16
+	nop
+=== a loc across a section switch
+	.file 1 "a.c"
+	.text
+	nop
+	.loc 1 9
+	.data
+	.byte 0, 0, 0, 0
+	.text
+	nop
+	.loc 1 10
+	.pushsection .data
+	.long 1
+	.popsection
+	nop
+=== line zero
+	.file 1 "a.c"
+	.text
+	.loc 1 5
+	nop
+	.loc 1 0
+	nop
+	.loc 1 6
+	nop
+=== large address advances
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	nop
+	.loc 1 2
+	.skip 68
+	nop
+	.loc 1 3
+	.skip 80
+	nop
+	.loc 1 4
+	.skip 300
+	nop
+	.loc 1 5
+	.skip 70000
+	nop
+	.loc 1 6
+	.skip 36
+=== data after the last row
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	nop
+	.skip 40
+=== directories in file names
+	.file 1 "src/a.c"
+	.file 2 "/usr/include/stdio.h"
+	.file 3 "src/b.h"
+	.text
+	.loc 1 1
+	nop
+	.loc 2 2
+	nop
+	.loc 3 3
+	nop
+=== a file table with no rows
+	.file 1 "a.c"
+	.text
+	nop
+=== DWARF 5 with file 0
+	.file 0 "/work/dir" "src/a.c" md5 0x00112233445566778899aabbccddeeff
+	.file 1 "src/b.c" md5 0x0102030405060708090a0b0c0d0e0f10
+	.file 2 "/usr/include/stdio.h" md5 0xffeeddccbbaa99887766554433221100
+	.text
+	.loc 0 1
+	nop
+	.loc 1 2
+	nop
+	.loc 2 3
+	nop
+=== DWARF 5 without checksums
+	.file 0 "/w" "a.c"
+	.file 1 "a1.c"
+	.file 2 "/usr/include" "stdio.h"
+	.file 3 "sub/b.h"
+	.file 4 "/abs/c.h"
+	.file 5 "/w/d.h"
+	.file 6 "/w" "e.h"
+	.file 7 "sub" "f.h"
+	.text
+	.loc 0 1
+	nop
+	.loc 1 2
+	nop
+	.loc 3 3
+	nop
+	.loc 4 4
+	nop
+	.loc 7 5
+	nop
+=== a frame
+	.text
+	.globl f
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	nop
+	.cfi_offset 3, -16
+	nop
+	.cfi_restore 3
+	nop
+	.cfi_endproc
+=== every instruction
+	.text
+	.globl f
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 24
+	.cfi_offset 3, -24
+	.cfi_offset 70, -32
+	.cfi_offset 4, 16
+	.skip 100
+	.cfi_rel_offset 6, 8
+	.cfi_adjust_cfa_offset 8
+	.cfi_def_cfa 6, 16
+	.cfi_def_cfa 5, -8
+	.skip 300
+	.cfi_remember_state
+	.cfi_def_cfa_register 7
+	.cfi_register 3, 4
+	.cfi_same_value 2
+	.cfi_restore 3
+	.cfi_restore 70
+	.cfi_undefined 9
+	.skip 70000
+	.cfi_restore_state
+	.cfi_adjust_cfa_offset -8
+	.cfi_val_offset 3, -16
+	.cfi_val_offset 3, 16
+	.cfi_escape 0x2e, 0x10
+	.cfi_def_cfa_offset -16
+	nop
+	.cfi_endproc
+=== frames that need their own CIEs
+	.text
+f:
+	.cfi_startproc
+	.cfi_undefined 5
+	nop
+	.cfi_endproc
+g:
+	.cfi_startproc
+	.cfi_signal_frame
+	nop
+	.cfi_endproc
+h:
+	.cfi_startproc
+	.cfi_personality 0x9b, pers
+	.cfi_lsda 0x1b, lsda
+	nop
+	.cfi_endproc
+k:
+	.cfi_startproc simple
+	.cfi_return_column 5
+	.cfi_def_cfa 7, 0
+	nop
+	.cfi_endproc
+m:
+	.cfi_startproc
+	nop
+	.cfi_endproc
+	.section .text.other,"ax"
+n:
+	.cfi_startproc
+	.cfi_personality 0x3, pers
+	.cfi_lsda 0x0, lsda
+	nop
+	nop
+	.cfi_endproc
+	.data
+lsda:	.long 0
+=== frames that share a CIE
+	.text
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	nop
+	.cfi_endproc
+g:
+	.cfi_startproc
+	nop
+	.cfi_endproc
+h:
+	.cfi_startproc
+	.cfi_personality 0x9b, pers
+	nop
+	.cfi_endproc
+k:
+	.cfi_startproc
+	.cfi_personality 0x9b, pers
+	nop
+	.cfi_offset 1, -16
+	.cfi_endproc
+=== debug_frame only
+	.cfi_sections .debug_frame
+	.text
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	nop
+	.cfi_endproc
+g:
+	.cfi_startproc
+	.cfi_signal_frame
+	nop
+	.cfi_endproc
+=== both frame sections
+	.cfi_sections .eh_frame, .debug_frame
+	.text
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	nop
+	.cfi_endproc
+g:
+	.cfi_startproc
+	.cfi_personality 0x9b, pers
+	nop
+	.cfi_offset 1, -16
+	.cfi_signal_frame
+	nop
+	.cfi_endproc
+=== remember and restore around an adjustment
+	.text
+f:
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 32
+	.cfi_remember_state
+	nop
+	.cfi_def_cfa_offset 8
+	nop
+	.cfi_restore_state
+	.cfi_adjust_cfa_offset 16
+	.cfi_rel_offset 3, 8
+	nop
+	.cfi_endproc
+=== lines and frames together
+	.file 1 "a.c"
+	.text
+	.globl f
+f:
+	.loc 1 1 0
+	.cfi_startproc
+	nop
+	.cfi_def_cfa_offset 16
+	.loc 1 2 0
+	nop
+	.cfi_offset 3, -16
+	nop
+	.cfi_restore 3
+	.loc 1 3 4
+	nop
+	.cfi_endproc

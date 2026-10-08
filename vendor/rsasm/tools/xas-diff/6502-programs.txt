@@ -1,0 +1,172 @@
+=== zero page for constants and labels known before use, absolute otherwise
+ptr     = $80
+        .org $0200
+start:  lda ptr
+        sta ptr+1
+        lda (ptr),y
+        lda later
+        sta later,x
+        lda start
+        lda a:ptr
+        ldx z:later
+        jmp start
+later   = $40
+later2  = $1234
+=== a label after org is an address, and zero page when it fits
+        .org $0010
+var:    .byte 0
+table:  .byte 1, 2, 3
+code:   lda var
+        ldx table,y
+        sta table,x
+        inc var
+        lda fwd
+fwd:    rts
+=== forward references are absolute even when they turn out small
+        lda zp1
+        sta zp1,x
+        ldy zp2
+        cpx zp2
+zp1     = $10
+zp2     = $20
+=== zero page only forms with a forward reference
+        stx store,y
+        lda (vec,x)
+        lda (vec),y
+store   = $30
+vec     = $fe
+=== byte selectors give zero page addressing
+        .org $1000
+        lda <msg
+        lda >msg,x
+        lda #<msg
+        ldx #>msg
+        .byte <msg, >msg
+        .word msg
+msg:    .byte "hi", 0
+=== branches forward and back at the ends of their range
+        .org $8000
+top:    bne fwd
+        .res 127, $ea
+fwd:    beq top2
+top2:   .res 126, $ea
+        bcc top2
+=== a reset routine laid out at its ROM address
+        .org $f000
+reset:  sei
+        cld
+        ldx #$ff
+        txs
+        lda #0
+        ldx #0
+clear:  sta $00,x
+        sta $0100,x
+        sta $0200,x
+        inx
+        bne clear
+        jsr init
+        jmp main
+init:   lda #<irq
+        sta $fffe
+        lda #>irq
+        sta $ffff
+        rts
+main:   jmp main
+irq:    rti
+=== data directives
+        .org $c000
+        .byte 1, $02, %11, 'a', "bc"
+        .byt 4
+        .word $1234, *
+        .addr main
+        .dbyt $1234
+        .dword $12345678
+        .res 3
+        .res 2, $ff
+        .asciiz "ok"
+        .lobytes $1234, main
+        .hibytes $1234, main
+main:   rts
+=== equates in terms of each other and of labels
+count   = 10
+double  = count * 2
+        .org $0400
+base:   ldx #count
+        ldy #double
+        lda base+count
+        lda #<(base + $100)
+        lda #>(base + $100)
+top     := base
+        jmp top
+=== the location counter
+        .org $0300
+        lda *
+        jmp *
+        .word *, * + 2
+        bne *+4
+        nop
+        nop
+=== instructions in the first column, as ca65 allows
+        .org $0600
+lda #1
+sta $0200
+loop: dex
+bne loop
+rts
+=== comments and case
+        .org $0600      ; origin
+Start:  LDA #$01        ; load
+        STA $0200
+        Lda Value       ; mixed case mnemonic
+        JMP Start
+Value   = $FE
+=== a scrolling message loop
+        .org $0801
+        ldx #0
+next:   lda text,x
+        beq done
+        jsr chrout
+        inx
+        bne next
+done:   rts
+chrout  = $ffd2
+text:   .byte "HELLO, WORLD", 13, 0
+=== a 16-bit add through a zero-page pointer
+lo      = $fb
+hi      = $fc
+        .org $2000
+add16:  clc
+        lda lo
+        adc #<$0123
+        sta lo
+        lda hi
+        adc #>$0123
+        sta hi
+        ldy #0
+        lda (lo),y
+        rts
+=== conditional assembly
+debug   = 1
+        .org $1000
+        .if debug
+        brk
+        .else
+        nop
+        .endif
+        .ifdef debug
+        lda #1
+        .endif
+        .ifndef nodebug
+        lda #2
+        .endif
+        rts
+=== macros with named parameters, and repeats
+        .macro  load val, addr
+        lda #val
+        sta addr
+        .endmacro
+        load 1, $0200
+        load $ff, $10
+        .repeat 3
+        nop
+        .endrep

@@ -1,0 +1,31 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`; GNU as gives SH code that alignment and pads
+the end of the section to it.
+
+=== a literal pool pointing into another section
+        .text
+        .p2align 2
+        mov.l   lit, r0
+        mov.l   @r0, r1
+        rts
+        nop
+        .p2align 2
+lit:    .long   msg
+        .data
+        .p2align 2
+        .space  0x100
+msg:    .long   1
+
+=== data across sections
+        .text
+        .p2align 2
+entry:
+        rts
+        nop
+        .data
+        .p2align 2
+        .long   entry
+        .long   entry - .
+        .long   entry@PLT
+        .long   entry@PCREL

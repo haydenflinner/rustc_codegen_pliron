@@ -1,0 +1,563 @@
+=== bra to the next instruction is bra.b
+	bra next
+next:
+	nop
+=== bra over two bytes is still bra.b
+	bra next
+	nop
+	nop
+next:
+	nop
+=== bra.s reaches three bytes
+	bra next
+	nop
+	nop
+next:
+	rts
+=== bra.s at its longest, ten bytes
+	bra next
+	mov.l #0x12345678, [r1]
+	nop
+	nop
+	nop
+next:
+	rts
+=== bra.b just past bra.s
+	bra next
+	mov.l #0x12345678, [r1]
+	nop
+	nop
+	nop
+	nop
+next:
+	rts
+=== bra backwards is bra.b
+top:
+	nop
+	bra top
+=== bra.b at its forward limit
+	bra next
+	.space 125
+next:
+	rts
+=== bra.w just past bra.b forwards
+	bra next
+	.space 126
+next:
+	rts
+=== bra.b at its backward limit
+top:
+	.space 128
+	bra top
+=== bra.w just past bra.b backwards
+top:
+	.space 129
+	bra top
+=== bra.w at its forward limit
+	bra next
+	.space 32764
+next:
+	rts
+=== bra.a just past bra.w
+	bra next
+	.space 32765
+next:
+	rts
+=== bra.a backwards
+top:
+	.space 40000
+	bra top
+=== explicit branch sizes to a label
+	bra.b next
+	bra.w next
+	bra.a next
+	bsr.w next
+	bsr.a next
+	beq.b next
+	bne.w next
+	bgt.b next
+next:
+	rts
+=== explicit short branches
+	bra.s next
+	beq.s next
+	bne.s next
+	nop
+	nop
+	nop
+next:
+	rts
+=== bsr is at least bsr.w
+	bsr func
+	rts
+func:
+	rts
+=== bsr backwards
+func:
+	rts
+	bsr func
+=== bsr.a past 32K
+	bsr func
+	.space 40000
+func:
+	rts
+=== beq and bne to the next instruction
+	beq a
+a:
+	bne b
+b:
+	rts
+=== beq.s and bne.s
+	beq a
+	nop
+	nop
+a:
+	bne b
+	mov.l #0x12345678, [r1]
+	nop
+	nop
+	nop
+b:
+	rts
+=== beq.w
+	beq far
+	.space 200
+far:
+	rts
+=== bne.w backwards
+far:
+	.space 200
+	bne far
+=== beq past 32K becomes bne.s over bra.a
+	beq far
+	.space 40000
+far:
+	rts
+=== bne past 32K becomes beq.s over bra.a
+	bne far
+	.space 40000
+far:
+	rts
+=== beq backwards past 32K
+far:
+	.space 40000
+	beq far
+=== every condition, near
+	bgeu t
+	bltu t
+	bgtu t
+	bleu t
+	bpz t
+	bn t
+	bge t
+	blt t
+	bgt t
+	ble t
+	bo t
+	bno t
+	bc t
+	bnc t
+	bz t
+	bnz t
+	nop
+	nop
+t:
+	rts
+=== bgt past 127 is an inverted bgt.b over bra.w
+	bgt far
+	.space 200
+far:
+	rts
+=== ble backwards past 128
+far:
+	.space 200
+	ble far
+=== bltu past 32K is an inverted branch over bra.a
+	bltu far
+	.space 40000
+far:
+	rts
+=== bgeu backwards past 32K
+far:
+	.space 40000
+	bgeu far
+=== a relaxation chain: growing one branch pushes another out of range
+	bra b
+	bra c
+	.space 120
+b:
+	.space 3
+c:
+	rts
+=== a loop
+	mov #10, r1
+loop:
+	sub #1, r1
+	bne loop
+	rts
+=== numeric local labels
+1:
+	nop
+	bra 1b
+	bra 2f
+2:
+	rts
+=== a difference of labels already defined folds to the short forms
+s:
+	nop
+	nop
+e:
+	mov #e-s, r1
+=== a folded difference past 15 takes the uimm8 form
+s:
+	.space 20
+e:
+	mov #e-s, r1
+=== a folded difference past 255 takes a 16-bit immediate
+s:
+	.space 300
+e:
+	mov #e-s, r1
+=== a folded difference in cmp
+s:
+	.space 200
+e:
+	cmp #e-s, r1
+	add #e-s, r2
+	sub #e-s, r3
+=== a folded difference in another section
+	.data
+s:
+	.long 1, 2, 3
+e:
+	.text
+	mov #e-s, r1
+	cmp #e-s, r2
+=== a negative folded difference
+s:
+	.space 3
+e:
+	mov #s-e, r1
+=== a forward difference relaxes the general form only
+	mov #e-s, r1
+s:
+	nop
+e:
+	rts
+=== a forward difference of 200
+	mov #e-s, r1
+s:
+	.space 200
+e:
+	rts
+=== a forward difference past 16 bits
+	mov #e-s, r1
+s:
+	.space 70000
+e:
+	rts
+=== a negative forward difference
+	mov #s-e, r1
+s:
+	.space 200
+e:
+	rts
+=== sub of a forward difference is a negated 32-bit add
+	sub #e-s, r1
+s:
+	.space 200
+e:
+	rts
+=== a forward difference in a word store
+	mov.w #e-s, [r1]
+s:
+	.space 200
+e:
+	rts
+=== a set constant takes the short form
+n = 5
+	mov #n, r1
+	cmp #n, r2
+=== a set constant defined later is a 32-bit immediate
+	mov #n, r1
+n = 5
+=== alignment with nops, one to seven bytes
+	nop
+	.align 8
+	nop
+	nop
+	.align 8
+	nop
+	nop
+	nop
+	.align 8
+	nop
+	nop
+	nop
+	nop
+	.align 8
+	nop
+	.align 4
+	nop
+	.align 8
+	rts
+	.align 8
+=== alignment with bra.b over the padding
+	nop
+	nop
+	.align 32
+	rts
+	.align 32
+=== symbols in data
+	.long ext
+	.long ext + 8
+	.word ext
+	.short ext
+	.byte ext
+=== small folded differences in every immediate form
+s:
+	.byte 1, 2, 3, 4, 5
+e:
+	mov.b #e-s, 4[r1]
+	mov.l #e-s, [r1]
+	int #e-s
+	add #e-s, r1, r2
+	mov.w #e-s, 4[r2]
+	cmp #s-e, r3
+	sub #s-e, r4
+	mvtc #e-s, intb
+	mov.b #s-e, 4[r1]
+	and #e-s, r5
+	tst #e-s, r6
+=== larger folded differences in every immediate form
+s:
+	.space 200
+e:
+	mov.b #e-s, 4[r1]
+	mov.l #e-s, 4[r1]
+	mov.l #e-s, [r1]
+	sub #e-s, r1
+	cmp #e-s, r2
+	mul #e-s, r3
+	mov.w #e-s, 4[r2]
+	mvtc #e-s, intb
+=== forward differences in every immediate form
+	mov.b #e-s, 4[r1]
+	mov.l #e-s, [r1]
+	cmp #e-s, r3
+	add #e-s, r1, r2
+	mov.w #e-s, 4[r2]
+	int #e-s
+	mvtc #e-s, intb
+	stz #e-s, r3
+s:
+	.space 5
+e:
+	rts
+=== a branch too close for .s at first shrinks back once the code grows
+	bne 1f
+	bra x
+1:	rts
+=== two branches that both settle on their short forms
+	bne 1f
+	bra 2f
+1:	rts
+2:	rts
+=== bra.s over two bsr that grow to bsr.a
+	bra 1f
+	bsr x
+	bsr x
+1:	rts
+=== a target carried past the branch by earlier growth is not moved
+	bra L1
+	beq L2
+L2:
+	bo L0
+	bsr ext
+	bc L0
+L0:
+	bne L4
+	.balign 4
+L4:
+	rts
+	.space 114
+L1:
+=== the bra.w pair stops three bytes short of its field's reach
+	bgt L0
+	.space 32762
+L0:
+=== one byte further takes the bra.a pair
+	bgt L0
+	.space 32763
+L0:
+=== sizes that flip around an alignment settle as GNU as's do
+	nop
+	bsr ext
+	blt L0
+	bsr ext
+	bno L0
+	bc L0
+	.space 123
+	.balign 4
+L0:
+	bge L0
+	add #1,r3
+	bsr ext
+	mov.l r1,r2
+	bo L0
+	bsr L0
+	bn L0
+	bno L0
+	.space 32760
+	.space 32763
+	bsr ext
+	ble L0
+	bra L0
+	rts
+	.space 1
+	.space 8
+=== a difference across an instruction with a displacement is not folded
+s:
+	add 4[r1], r2
+e:
+	mov #e-s, r1
+=== a difference across a plain [reg] operand is folded
+s:
+	mov.l [r1], r2
+e:
+	mov #e-s, r1
+=== a displacement written as zero still stops folding
+s:
+	mov.l r1, 0[r8]
+e:
+	mov #e-s, r1
+=== a zero displacement the short mov takes does not stop folding
+s:
+	mov.l 0[r1], r2
+e:
+	mov #e-s, r1
+=== the short mov to a displacement does not stop folding
+s:
+	mov.b #1, 4[r1]
+e:
+	cmp #e-s, r1
+=== a difference across an alignment is not folded
+s:
+	nop
+	.balign 4
+e:
+	mov #e-s, r1
+=== constant LEB128 values do not stop folding
+s:
+	.uleb128 300
+	.sleb128 -1000
+e:
+	mov #e-s, r1
+=== a difference across a symbolic immediate is not folded
+s:
+	mov #ext, r1
+e:
+	mov #e-s, r2
+=== a symbol minus itself is folded before it is defined
+	mov #x-x, r1
+	cmp #x-x+20, r2
+x:
+=== a difference from . folds like one from a label
+s:
+	.space 20
+	mov #.-s, r1
+=== a difference of labels as a displacement is 16 bits and not divided
+	mov.l (e-s)[r1], r2
+	mov.b (e-s)[r1], r2
+	add (e-s)[r1].w, r2
+s:
+	.space 200
+e:
+=== a folded difference as a displacement is divided and can be short
+s:
+	.space 8
+e:
+	mov.l (e-s)[r1], r2
+	add (e-s)[r3].w, r4
+=== an immediate and a displacement that are both differences relax together
+	mov.l #e-s, (e-s)[r1]
+s:
+	.space 200
+e:
+=== a byte-sized difference wraps where GNU as's fixup lets it
+	int #s-e
+	mov.b #s-e, 4[r1]
+s:
+	.space 200
+e:
+=== sbb, shift counts and rtsd take folded differences
+s:
+	.space 4
+e:
+	sbb #e-s, r1
+	shlr #e-s, r2
+	rtsd #e-s
+=== a difference with a global label is 32 bits
+	.global g
+	mov #g-s, r1
+s:
+	.space 20
+g:
+=== a difference of labels in another section is 32 bits
+	mov #e-s, r1
+	.data
+s:
+	.long 1, 2
+e:
+=== a difference from . in data resolves in the section
+	.long e - .
+	.short e - .
+	.byte e - .
+	bra e
+e:
+=== a difference straddling a branch is sized once the branch is
+	mov #e-s, r1
+s:
+	bne far
+	.space 125
+e:
+	.space 32768
+far:
+=== a symbolic immediate after a displacement starts at one byte, as GNU as estimates it
+	mov.l #e-s, 12[r3]
+	.space 6
+	bra e
+	.balign 4
+s:
+e:
+=== growth before an immediate is added to a negative difference ahead of it
+	mov.l #a-b, 4[r1]
+	mov #b-c, r1
+b:
+	.balign 2
+a:
+	.space 128
+c:
+=== a symbol set to a folded difference is a constant
+msg:
+	.ascii "hello"
+len = . - msg
+	mov #len, r1
+	cmp #len+1, r2
+=== a symbol set to a difference that does not fold is 32 bits
+s:
+	bra far
+e:
+d = e - s
+	mov #d, r3
+	.space 200
+far:
+=== a symbol set before its labels are defined is 32 bits
+size = e - s
+s:
+	.space 3
+e:
+	mov #size, r1
+=== sub of a symbol set later is a negated 32-bit add
+	sub #n, r3
+n = 300

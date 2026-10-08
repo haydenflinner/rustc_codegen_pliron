@@ -1,0 +1,157 @@
+=== bra to the next instruction
+ bra next
+next: nop
+=== an unsized bra stays at 16 bits in GNU syntax
+back: nop
+ bra back
+ bsr fwd
+ beq back
+ nop
+fwd: rts
+=== jbsr, jra and jbCC relax
+top: nop
+ jeq top
+ jne top
+ jbne top
+ jcc top
+ jmi top
+ jpl top
+ jbsr top
+ jra top
+ jbra top
+ jbls top
+=== explicit branch sizes
+top: nop
+ bras top
+ brab top
+ bra.b top
+ bsrs top
+ bsrw top
+ bsrl top
+ blsw top
+ bhss top
+ beql top
+=== jra relaxes to 16 and 32 bits
+ jra mid
+ jbsr far
+ .space 200
+mid: .space 40000
+far: rts
+=== undefined targets
+ bsr ext
+ jbsr ext
+ jra ext
+ jbeq ext
+ jsr ext
+=== DBcc loops
+ moveq #9,%d0
+1: moveb %a0@+,%a1@+
+ dbra %d0,1b
+ dbhs %d1,1b
+ dbeq %d2,1b
+ rts
+=== local labels forward and back
+1: nop
+ jra 2f
+ jra 1b
+2: rts
+=== PC-relative references to labels
+ lea data(%pc),%a0
+ movew data(%pc),%d0
+ movew %pc@(data),%d0
+ movew data(%pc,%d1:w),%d2
+ movew %pc@(data,%d1:l),%d2
+ pea back(%pc)
+ jsr %pc@(back)
+back: rts
+data: .word 1,2,3
+=== PC-relative references to undefined symbols
+ lea ext(%pc),%a0
+ movew ext(%pc,%d0:w),%d1
+=== constants defined before and after use
+ .set BASE, 0xdff000
+ movew #0x7fff,BASE+0x96
+ lea BASE,%a5
+ movew #0x8200,%a5@(0x96)
+ movew %d0,FWD
+ jsr %a6@(FWD)
+ movew %a0@(FWD,%d0:w),%d1
+ .set FWD, -30
+=== GNU syntax aligns nothing
+ .byte 1
+ rts
+ .byte 2
+ movew %d0,%d1
+=== comments and statement separators
+# a hash comment in the first column
+ movew #1,%d0 | a trailing comment
+ movew #2,%d1 ; movew #3,%d2
+ /* a block comment */ nop
+=== a function with a frame
+f: linkw %fp,#-8
+ moveml %d2-%d3/%a2,%sp@-
+ movel %fp@(8),%d0
+ movel %d0,%fp@(-4)
+ moveml %sp@+,%d2-%d3/%a2
+ unlk %fp
+ rts
+=== code alignment pads with zeroes
+ .byte 1
+ .balign 8
+ rts
+ .balign 8
+=== FPU and MMU branches: fixed sizes, and fj/pb relaxing
+top: fnop
+ fbeq top
+ fbnel top
+ fjgt top
+ fjogl mid
+ pbbs top
+ pbbsw top
+ pbbs mid
+ fdbne %d0,top
+ pdbws %d1,top
+ .space 40000
+mid: rts
+=== fjCC and pbCC to undefined symbols take 32 bits
+ fjeq ext
+ fjne ext
+ pbls ext
+ fbeq ext
+ fdbeq %d7,ext
+=== a DBcc beyond reach becomes dbcc, bra.s and bra.l
+ dbra %d0,far
+ dbeq %d1,near
+near: nop
+ .space 40000
+far: rts
+=== a DBcc to an undefined symbol
+ dbra %d0,ext
+ dbhi %d1,ext
+=== jra, jbsr and jbCC to a number jump absolutely
+ jra 0x1000
+ jbsr 0x12345678
+ jbne 0x8000
+ jbgt 0xfffffffe
+=== memory-indirect displacements of zero are left out
+ movel ([0,%a0],%d1.l,0),%d0
+ movel ([0,%a0]),%d1
+ movel ([4,%a0],0),%d2
+ movel ([%a0],%d3.w,0),%d3
+ faddx ([0,%a1],%d1.l*4,0),%fp0
+=== fsave, frestore and the MMU's save and restore
+ fsave -(%sp)
+ frestore (%sp)+
+ psave -(%sp)
+ prestore (%sp)+
+ fsave %a0@(8)
+ frestore %a1@
+=== an FPU exception handler's register frame
+ fmovem.x %fp0-%fp7,-(%sp)
+ fmovem.l %fpcr/%fpsr/%fpiar,-(%sp)
+ fmove.l %fpsr,%d0
+ andil #0xff00,%d0
+ fmove.l %d0,%fpsr
+ fmovem.l (%sp)+,%fpcr/%fpsr/%fpiar
+ fmovem.x (%sp)+,%fp0-%fp7
+ rte

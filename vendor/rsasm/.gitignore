@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.o
+*.bin
+
+# Claude Code session/worktree state
+.claude/
+
+# Default output of the rsasm binary when no -o is given.
+/a.out
+
+# Python bytecode from the tools.
+__pycache__/
+/Cargo.lock

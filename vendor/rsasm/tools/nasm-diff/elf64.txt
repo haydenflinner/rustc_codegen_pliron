@@ -1,0 +1,116 @@
+=== a hello-world syscall program
+        global _start
+        section .text
+_start:
+        mov     rax, 1
+        mov     rdi, 1
+        lea     rsi, [rel msg]
+        mov     edx, msglen
+        syscall
+        mov     rax, 60
+        xor     rdi, rdi
+        syscall
+        section .rodata
+msg:    db      "Hello, world!", 10
+msglen  equ     $ - msg
+=== data sections and symbols
+        global x, y
+        global f:function
+        global obj:data (obj_end - obj)
+        section .data
+x:      dd      1
+y:      dq      2
+        section .text
+f:      ret
+        section .bss
+obj:    resb    16
+obj_end:
+=== externs and relocations
+        extern printf
+        extern value
+        global main
+        section .text
+main:
+        call    printf
+        mov     eax, [rel value]
+        lea     rdi, [rel value]
+        mov     rax, value
+        ret
+        section .data
+        dq      value
+        dd      main
+=== relative and absolute data
+        global start
+        section .text
+start:  nop
+a:      nop
+b:      nop
+        section .data
+        dd      b - a
+        dd      a - b
+        dq      a
+        dd      start
+tab:    dd      a - tab, b - tab
+=== wrt relocations
+        extern ext
+        global f
+        section .text
+f:
+        call    ext wrt ..plt
+        mov     rax, [rel ext wrt ..got]
+        section .data
+        dq      ext wrt ..got
+        dd      ext wrt ..sym
+        dq      ext wrt ..gotoff
+=== local labels across sections
+        section .text
+        global outer
+outer:
+        jmp     .next
+.next:
+        jmp     .done
+.done:
+        ret
+second:
+.x:     ret
+        dd      outer.next - outer
+=== default rel
+        default rel
+        extern g
+        global f
+        section .text
+f:
+        mov     eax, [g]
+        lea     rsi, [g]
+        mov     rax, [abs g]
+        ret
+=== struc in a data section
+        struc pixel
+        .r: resb 1
+        .g: resb 1
+        .b: resb 1
+        .a: resb 1
+        endstruc
+        section .data
+        global first
+first:  istruc pixel
+        at pixel.r, db 0xff
+        at pixel.g, db 0x80
+        at pixel.a, db 0xff
+        iend
+        dd      pixel_size
+=== a macro library
+%macro syscall3 4
+        mov     rax, %1
+        mov     rdi, %2
+        mov     rsi, %3
+        mov     rdx, %4
+        syscall
+%endmacro
+        global _start
+        section .text
+_start:
+        syscall3 1, 1, buf, 4
+        syscall3 60, 0, 0, 0
+        section .bss
+buf:    resb    4

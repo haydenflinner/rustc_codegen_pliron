@@ -1,0 +1,102 @@
+=== functions | -g
+	.text
+	.globl f
+	.type f, @function
+f:
+	pushq %rbp
+	popq %rbp
+	ret
+	.size f, .-f
+	.type g, @function
+g:
+	ret
+	.size g, .-g
+	.type h, @function
+h:
+	ret
+	.type d, @object
+d:
+	.byte 1
+	.size d, 1
+=== functions in DWARF 5 | --gdwarf-5
+	.text
+	.globl f
+	.type f, @function
+f:
+	ret
+	.size f, .-f
+	.section .text.b,"ax",@progbits
+	.type g, @function
+g:
+	nop
+	ret
+	.size g, .-g
+=== ranges in DWARF 3 | --gdwarf-3
+	.text
+	nop
+	.section .text.b,"ax",@progbits
+	nop
+	.section .text.c,"ax",@progbits
+	ret
+=== ranges in DWARF 4 | --gdwarf-4
+	.text
+	nop
+	.section .text.b,"ax",@progbits
+	nop
+=== a macro in a repeat | -g
+	.macro two a
+	movl $\a, %eax
+	movl $\a, %ebx
+	.endm
+	.text
+	.rept 2
+	two 1
+
+	two 2
+	.endr
+	ret
+=== a repeat in a macro | -g
+	.macro m
+	.rept 2
+	nop
+	pushq %rax
+	.endr
+	.endm
+	.text
+	m
+	ret
+=== instructions of any size | -g
+	.text
+	movabsq $0x1122334455667788, %rax
+	jmp 1f
+	.skip 200
+1:	ret
+=== a source file name | -g
+	.file "hello.c"
+	.text
+	ret
+=== a C file name in DWARF 5 | --gdwarf-5
+	.file "hello.c"
+	.text
+	ret
+=== a unit of its own
+	.file 1 "a.c"
+	.text
+	.loc 1 1
+	ret
+	.section .debug_info,"",@progbits
+	.long 0
+=== data only
+	.data
+	.long 1
+	.section .debug_info,"",@progbits
+	.long 0
+=== sections of data and code | -g
+	.data
+	.long 1
+	.text
+	ret
+	.section .rodata
+	.long 2
+	.text
+	nop

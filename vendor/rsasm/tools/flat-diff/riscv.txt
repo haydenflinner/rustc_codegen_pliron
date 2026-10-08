@@ -1,0 +1,95 @@
+Lines before the first snippet are not assembled.
+
+Sections start with `.p2align 2`, which is the alignment llvm-mc gives RISC-V
+code and not rsasm's default; see mips.txt. Linked with --no-relax.
+
+GNU as and llvm-mc create `.data` before any section the source names, and
+rsasm creates it when it is first used. A snippet with both says `.data`
+first, so the sections come out in the same order.
+
+=== hi and lo of a label in another section
+        .text
+        .p2align 2
+        lui     a0, %hi(msg)
+        addi    a0, a0, %lo(msg)
+        lw      a1, %lo(msg)(a0)
+        sw      a1, %lo(msg + 4)(a0)
+        ret
+        .data
+        .p2align 2
+        .space  0x1800
+msg:    .word   1, 2
+
+=== pcrel_hi and pcrel_lo in the same section
+        .text
+        .p2align 2
+        nop
+1:      auipc   a0, %pcrel_hi(target)
+        addi    a0, a0, %pcrel_lo(1b)
+        lw      a1, %pcrel_lo(1b)(a0)
+        sw      a1, %pcrel_lo(1b)(a0)
+        ret
+        .space  0x900
+target: .word   0
+
+=== pcrel_hi and pcrel_lo into another section
+        .text
+        .p2align 2
+here:   auipc   a0, %pcrel_hi(msg)
+        addi    a0, a0, %pcrel_lo(here)
+        ret
+        .data
+        .p2align 2
+        .space  0x2810
+msg:    .word   1
+
+=== pcrel_lo naming an auipc behind it @ 0x10ffc
+        .text
+        .p2align 2
+back:   auipc   a0, %pcrel_hi(data)
+        nop
+        nop
+        addi    a0, a0, %pcrel_lo(back)
+        ret
+        .data
+        .p2align 2
+data:   .word   1
+
+=== la, call and tail into another section
+        .data
+        .text
+        .p2align 2
+entry:
+        la      a0, msg
+        call    helper
+        tail    helper
+        .section .text.helper, "ax"
+        .p2align 2
+helper:
+        ret
+        .data
+        .p2align 2
+        .space  0x1000
+msg:    .word   1
+
+=== jumps and branches into another section
+        .option norvc
+        .text
+        .p2align 2
+entry:
+        jal     helper
+        j       helper
+        .section .text.helper, "ax"
+        .p2align 2
+helper:
+        j       entry
+
+=== data across sections
+        .text
+        .p2align 2
+entry:
+        ret
+        .data
+        .p2align 2
+        .word   entry
+        .word   entry - .

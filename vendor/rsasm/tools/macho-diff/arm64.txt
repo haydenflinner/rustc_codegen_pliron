@@ -1,0 +1,148 @@
+# One case per line, assembled as a file of its own; `;` separates the
+# statements of a case. See run.sh.
+#
+# ---- nothing but code ----
+nop
+ret
+stp x29, x30, [sp, -16]!;mov x29, sp;ldp x29, x30, [sp], 16;ret
+# ---- branches ----
+bl _ext
+b _ext
+bl _ext+8
+b _ext+0x100
+bl _f;_f: ret
+b _f;_f: ret
+bl Lf;Lf: ret
+b Lf;Lf: ret
+_f: bl _f
+_f: b _f
+_f: bl Lf;Lf: ret
+_f: bl _g;_g: ret
+_f: b _g;_g: ret
+_f: nop;Lb: nop;_g: bl Lb
+.globl _g;_f: bl _g;_g: ret
+.subsections_via_symbols;_f: bl _g;_g: ret
+.subsections_via_symbols;_f: bl Lf;Lf: ret
+.subsections_via_symbols;_f: bl _f
+.subsections_via_symbols;_f: nop;_g: bl _f
+.subsections_via_symbols;.globl _g;_f: b _g;_g: ret
+bl _f+4;_f: nop;ret
+.subsections_via_symbols;bl _f+4;_f: nop;ret
+b.eq _ext
+cbz x0, _ext
+tbz x0, 3, _ext
+adr x0, _ext
+ldr x0, _ext
+b.eq Lf;Lf: ret
+cbz x0, Lf;Lf: ret
+tbnz w1, 7, Lf;Lf: ret
+adr x0, Lf;Lf: ret
+ldr x0, Lf;Lf: .quad 0
+_f: b.eq _g;_g: ret
+.subsections_via_symbols;_f: b.eq _g;_g: ret
+_f: adr x0, _g;_g: ret
+.subsections_via_symbols;_f: adr x0, _g;_g: ret
+b.eq Lf;.section __TEXT,__other,regular,pure_instructions;Lf: ret
+# ---- pages ----
+adrp x0, _ext@PAGE
+add x0, x0, _ext@PAGEOFF
+adrp x0, _ext@PAGE;add x0, x0, _ext@PAGEOFF
+adrp x0, _ext
+adrp x1, _ext+8@PAGE
+adrp x1, (_ext+8)@PAGE
+add x1, x1, (_ext+8)@PAGEOFF
+ldr x0, [x0, _ext@PAGEOFF]
+ldr w0, [x0, _ext@PAGEOFF]
+ldrb w0, [x0, _ext@PAGEOFF]
+ldrh w0, [x0, _ext@PAGEOFF]
+ldrsw x0, [x0, _ext@PAGEOFF]
+str x1, [x0, _ext@PAGEOFF]
+strb w1, [x0, _ext@PAGEOFF]
+ldr d0, [x0, _ext@PAGEOFF]
+ldr q0, [x0, _ext@PAGEOFF]
+ldr s0, [x0, _ext@PAGEOFF]
+adds x0, x0, _ext@PAGEOFF
+sub x0, x0, _ext@PAGEOFF
+_f: adrp x0, _f@PAGE;add x0, x0, _f@PAGEOFF
+adrp x0, _f@PAGE;add x0, x0, _f@PAGEOFF;_f: ret
+adrp x0, Lf@PAGE;add x0, x0, Lf@PAGEOFF;Lf: ret
+_f: adrp x0, Lf@PAGE;add x0, x0, Lf@PAGEOFF;Lf: ret
+_f: nop;nop;Lf: adrp x0, Lf@PAGE;add x0, x0, Lf@PAGEOFF
+adrp x0, (Lf+4)@PAGE;add x0, x0, (Lf+4)@PAGEOFF;Lf: ret
+bl _ext@PAGE
+b _ext@PAGEOFF
+# ---- through the GOT ----
+adrp x0, _ext@GOTPAGE
+ldr x0, [x0, _ext@GOTPAGEOFF]
+adrp x0, _ext@GOTPAGE;ldr x0, [x0, _ext@GOTPAGEOFF]
+ldr w0, [x0, _ext@GOTPAGEOFF]
+adrp x0, (_ext+8)@GOTPAGE
+_f: adrp x0, _f@GOTPAGE;ldr x0, [x0, _f@GOTPAGEOFF]
+add x0, x0, _ext@GOTPAGEOFF
+# ---- data ----
+.quad _ext
+.long _ext
+.short _ext
+.byte _ext
+.quad _ext+8
+.quad _ext-8
+.long _ext+1
+.quad _f;_f: ret
+.quad Lf;Lf: ret
+.quad Lf+3;Lf: ret
+_f: .quad Lf;Lf: ret
+_f: ret;_g: ret;.long _g - _f
+_f: ret;_g: ret;.quad _g - _f
+.long _g - _f;_f: ret;_g: ret
+.quad _g - _f;_f: ret;_g: ret
+.long _f - .;_f: ret
+_f: ret;.long _f - .
+.long Lf - .;Lf: ret
+.long _ext - .
+.long _ext - _f;_f: ret
+.quad _ext@GOT
+.long _ext@GOT
+.long _ext@GOT - .
+# ---- sections ----
+.data;.quad 1
+.data;_d: .quad _d
+.data;.quad Ld;Ld: .quad 0
+.data;_d: .quad 0;.text;adrp x0, _d@PAGE;ldr x0, [x0, _d@PAGEOFF]
+.data;Ld: .quad 0;.text;adrp x0, Ld@PAGE;ldr x0, [x0, Ld@PAGEOFF]
+.data;Ld: .quad 0;.text;adrp x0, (Ld+8)@PAGE
+.data;_d: .quad 0;Ld: .quad 0;.text;adrp x0, Ld@PAGE
+.cstring;Ls: .asciz "hi";.text;adrp x0, Ls@PAGE;add x0, x0, Ls@PAGEOFF
+.cstring;.asciz "a";Ls: .asciz "hi";.text;adrp x0, Ls@PAGE;add x0, x0, Ls@PAGEOFF
+.cstring;Ls: .asciz "hi";.text;adrp x0, (Ls+1)@PAGE
+.cstring;.asciz "a";Ls: .asciz "hi";.data;.quad Ls
+.literal8;L8: .quad 0x3ff0000000000000;.text;adrp x0, L8@PAGE;ldr d0, [x0, L8@PAGEOFF]
+.const;_c: .quad 1;.text;adrp x0, _c@PAGE
+.bss;.space 8
+.bss;_b: .space 8;.text;adrp x0, _b@PAGE
+.section __TEXT,__foo;.byte 1
+.section __DATA,__foo;.quad _ext
+.section __TEXT,__stubs,symbol_stubs,pure_instructions,12;ret
+.mod_init_func;.quad _ext
+.zerofill __DATA,__common,_z,16,4
+.lcomm _l, 8, 3
+.comm _c, 8, 3
+# ---- alignment ----
+.align 3;ret
+.p2align 4;ret
+nop;.align 3;ret
+nop;.p2align 3;ret
+.data;.byte 1;.align 3;.byte 2
+# ---- symbols ----
+.globl _g;_g: ret
+.private_extern _p;_p: ret
+.weak_definition _w;_w: ret
+.weak_reference _u;bl _u
+.alt_entry _a;_f: nop;_a: ret
+.no_dead_strip _f;_f: ret
+_a = 5
+.set _a, 5
+_f: ret;_a = _f + 4
+Lfoo: ret
+.subsections_via_symbols
+.build_version macos, 14, 0
+.build_version ios, 17, 0 sdk_version 17, 2

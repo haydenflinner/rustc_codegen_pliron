@@ -42,3 +42,6 @@ cranelift-codegen = { path = "vendor/cranelift-codegen" }
 # `elf_ie` TLS model setting and the R_X86_64_GOTTPOFF reloc; see vendor/cranelift-codegen/PLIRON_PATCH.md.
 cranelift-codegen-meta = { path = "vendor/cranelift-codegen-meta" }
 cranelift-object = { path = "vendor/cranelift-object" }
+# x86-64 TLS @-modifier relocations (@tpoff/@dtpoff/@gottpoff/@tlsgd/@tlsld);
+# see vendor/rsasm/PLIRON_PATCH.md.
+rsasm = { path = "vendor/rsasm" }

@@ -1,0 +1,620 @@
+=== references to symbols in their own code section, by binding
+        .text
+        .globl  glob, hid, prot, intl, galias, func
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .type   func, %function
+start:
+        rcall   loc
+        rcall   glob
+        rcall   weak1
+        rcall   hid
+        rcall   prot
+        rcall   intl
+        rcall   whid
+        rcall   func
+        rcall   late
+        rcall   lalias
+        rcall   galias
+        rcall   walias
+        rjmp    loc
+        rjmp    glob
+        rjmp    weak1
+        breq    loc
+        brne    glob
+        brcs    weak1
+        brbs    3, lalias
+        brbc    6, walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+func:   ret
+        .globl  late
+late:   nop
+        .set    lalias, loc
+        .set    galias, glob
+        .set    walias, glob
+=== a branch to itself and to its neighbours
+        .text
+        rjmp    .
+        rjmp    . + 2
+        breq    . - 2
+        rcall   1f
+1:      brne    1b
+        rjmp    2f + 4
+2:      nop
+        nop
+        nop
+=== branches to another section and to undefined symbols
+        .section .init0, "ax", @progbits
+        .globl  vec
+vec:    rjmp    main
+        rcall   ext
+        breq    other
+        brne    ext + 2
+        .text
+        .globl  main
+main:   nop
+other:  nop
+=== a branch in a section that is not code is relocated too
+        .section .rodata
+        rjmp    here
+        breq    here
+        rcall   there
+        nop
+here:   nop
+        .globl  there
+there:  nop
+        .weak   w
+        rjmp    w
+w:      nop
+=== absolute jump and call, to every kind of target
+        .arch   avr51
+        .text
+        .globl  g
+        .weak   wk
+        call    loc
+        call    g
+        call    wk
+        call    ext
+        jmp     loc + 4
+        jmp     ext - 2
+        call    0x1234
+        jmp     0x3ffffe
+loc:    nop
+g:      nop
+wk:     nop
+=== every ldi modifier on a symbol
+        .text
+        ldi     r16, sym
+        ldi     r16, lo8(sym)
+        ldi     r17, hi8(sym)
+        ldi     r18, hh8(sym)
+        ldi     r19, hlo8(sym)
+        ldi     r20, hhi8(sym)
+        ldi     r21, pm_lo8(sym)
+        ldi     r22, pm_hi8(sym)
+        ldi     r23, pm_hh8(sym)
+        ldi     r24, lo8(-(sym))
+        ldi     r25, hi8(-(sym))
+        ldi     r26, hh8(-(sym))
+        ldi     r27, hhi8(-(sym))
+        ldi     r28, pm_lo8(-(sym))
+        ldi     r29, pm_hi8(-(sym))
+        ldi     r30, pm_hh8(-(sym))
+        ldi     r31, lo8(pm(sym))
+        ldi     r16, hi8(pm(sym))
+        ldi     r16, hh8(pm(sym))
+        ldi     r16, lo8(gs(sym))
+        ldi     r16, hi8(gs(sym))
+        ldi     r16, hh8(gs(sym))
+        ldi     r16, lo8(-(pm(sym)))
+        ldi     r16, hi8(-(pm(sym)))
+        ldi     r16, hh8(-(pm(sym)))
+        ldi     r16, lo8(-(gs(sym)))
+        ldi     r16, lo8(sym + 3)
+        ldi     r16, hi8(sym - 0x100)
+        ldi     r16, pm_lo8(sym + 2)
+        ldi     r16, lo8(pm(sym + 4))
+=== the other ldi-family instructions carry the same relocations
+        .text
+        andi    r16, lo8(sym)
+        ori     r17, hi8(sym)
+        sbr     r18, lo8(sym)
+        cpi     r19, hh8(sym)
+        sbci    r20, hi8(sym)
+        subi    r21, lo8(-(sym))
+        subi    r22, lo8(sym)
+        cpi     r23, sym
+=== ldi modifiers on local labels, in code and in data
+        .text
+start:  ldi     r30, lo8(pm(func))
+        ldi     r31, hi8(pm(func))
+        ldi     r26, lo8(var)
+        ldi     r27, hi8(var)
+        ldi     r28, lo8(gs(func))
+        ldi     r29, hi8(gs(func))
+        ldi     r16, lo8(start)
+func:   ret
+        .data
+        .byte   0
+var:    .byte   1
+=== ldi modifiers on constants resolve
+        .text
+        .set    k, 0x123456
+        ldi     r16, lo8(k)
+        ldi     r17, hi8(k)
+        ldi     r18, hh8(k)
+        ldi     r19, pm_lo8(k)
+        ldi     r20, lo8(pm(k))
+        ldi     r21, hi8(-(k))
+        ldi     r22, k & 0xff
+=== I/O addresses, bits and small constants on symbols
+        .text
+        in      r0, PINB
+        out     SREG, r1
+        cbi     PORTB, 3
+        sbi     PORTB + 1, 7
+        sbic    PIND, 0
+        sbis    PIND, 1
+        adiw    r24, off
+        sbiw    r28, off + 1
+        ldd     r0, Y+off
+        std     Z+off, r1
+=== direct load and store on symbols
+        .text
+        lds     r0, var
+        sts     var + 1, r31
+        lds     r16, ext
+        sts     ext, r16
+        .data
+var:    .word   0
+=== AVR-tiny direct load and store on symbols
+        .arch   avrtiny
+        .text
+        lds     r16, var
+        sts     var, r17
+        lds     r20, 0x50
+        .data
+var:    .byte   0
+=== differences with a weak or global symbol in the same section
+        .data
+        .weak   w
+        .globl  g
+        .long   w - .
+        .long   g - .
+        .word   w - here
+here:   .byte   0
+w:      .byte   0
+g:      .byte   0
+        .text
+        .weak   tw
+        .long   tw - .
+        .long   tl - .
+tw:     nop
+tl:     nop
+=== data relocations
+        .data
+        .globl  g
+        .byte   ext
+        .word   ext
+        .long   ext
+        .byte   lo8(ext)
+        .byte   hi8(ext)
+        .byte   hlo8(ext)
+        .byte   hh8(ext)
+        .word   pm(ext)
+        .word   gs(ext)
+        .word   pm(ext + 2)
+        .long   ext - .
+        .long   g - .
+        .byte   loc, lo8(loc), hi8(loc)
+        .word   loc, pm(loc)
+        .long   loc
+loc:    .byte   0
+g:      .byte   0
+=== data modifiers on numbers resolve, in either case
+        .data
+        .byte   lo8(0x123456), hi8(0x123456), hlo8(0x123456), hh8(0x123456)
+        .word   pm(0x1234), gs(0x2000)
+        .byte   LO8(0x1234), Hi8(0x1234)
+        .word   PM(0x10)
+=== data referring to code
+        .text
+        .globl  vectors
+vectors:
+        rjmp    reset
+        rjmp    irq
+reset:  nop
+irq:    reti
+        .section .progmem.data, "a", @progbits
+table:  .word   pm(reset), pm(irq), gs(irq)
+        .word   reset, irq
+        .byte   lo8(reset), hi8(irq)
+=== differences of labels
+        .text
+a:      nop
+        nop
+b:      nop
+        .word   b - a
+        .byte   b - a
+        .long   b - a
+        ldi     r16, b - a
+        .data
+c:      .byte   1, 2, 3
+d:      .word   d - c, c - d
+        .long   d - c
+=== symbols with names that look like modifiers
+        .text
+        .globl  pm, lo8
+        ldi     r16, lo8
+        .word   pm
+        .byte   lo8
+pm:     nop
+lo8:    nop
+=== every section kind, with tail padding to the alignment
+        .text
+        nop
+        .data
+        .byte   1
+        .bss
+        .skip   3
+        .section .noinit, "aw", @nobits
+        .skip   5
+        .section .rodata
+        .byte   1, 2, 3
+        .section .init2, "ax", @progbits
+        clr     r1
+=== register numbers and register names in every spelling
+        .text
+        .set    n, 17
+        mov     r0, r31
+        mov     R16, R17
+        mov     n, 3
+        mov     xl, xh
+        mov     YL, YH
+        mov     zl, ZH
+        adiw    X, 1
+        sbiw    Y, 2
+        adiw    z, 3
+        ld      r0, x+
+        st      -Y, r1
+        ldd     r2, z+1
+=== statements separated by a dollar
+        .text
+        nop $ sei $ cli
+        ldi r16, 1$ldi r17, 2
+=== comments
+        .text
+        nop ; a comment
+# a line comment
+        sei     ; ldi r16, 1
+=== .avr.prop: an alignment in code, counted as a power of two
+        .text
+        nop
+        .align  2
+        nop
+=== .avr.prop: alignments with and without a fill, and with a maximum skip
+        .text
+        .balign 4
+        nop
+        .balign 4, 0x55
+        nop
+        .p2align 3
+        nop
+        .balign 8, 0, 3
+        .skip   3
+        .balign 2
+=== .avr.prop: an alignment that pads nothing still counts
+        .text
+        nop
+        nop
+        .balign 4
+        nop
+        .balign 1
+=== .avr.prop: .org with and without a fill, and assignments to the location counter
+        .text
+        nop
+        .org    0x20
+        nop
+        .org    0x28, 0xaa
+        nop
+        . = . + 4
+        nop
+        .org    0x40, 0x7f
+=== .avr.prop: an .org to a label has no constant part and does not count
+        .text
+        nop
+        .org    . + 0
+        nop
+=== .avr.prop: every code section, in order, and none of the others
+        .section .init0, "ax", @progbits
+        nop
+        .balign 4
+        .text
+        nop
+        .p2align 2
+        .section .progmem.data, "a", @progbits
+        .byte   1
+        .balign 4
+        .org    8
+        .data
+        .byte   1
+        .balign 8
+        .section .fini9, "ax", @progbits
+        .org    6, 0xff
+        nop
+=== .avr.prop: code with no alignment writes none
+        .text
+        nop
+        .data
+        .balign 4
+        .byte   1
+=== .avr.prop: an alignment between a branch and its target
+        .text
+        rjmp    1f
+        nop
+        .balign 8
+1:      breq    2f
+        .balign 16, 0xff
+2:      ret
+=== e_flags: the default core
+        .text
+        nop
+=== e_flags: avr1
+        .arch   avr1
+        .text
+        nop
+=== e_flags: avr2
+        .arch   avr2
+        .text
+        movw    r0, r2
+=== e_flags: avr25
+        .arch   avr25
+        .text
+        nop
+=== e_flags: avr3
+        .arch   avr3
+        .text
+        jmp     0
+=== e_flags: avr31
+        .arch   avr31
+        .text
+        elpm
+=== e_flags: avr35
+        .arch   avr35
+        .text
+        movw    r0, r2
+=== e_flags: avr4
+        .arch   avr4
+        .text
+        mul     r0, r1
+=== e_flags: avr5
+        .arch   avr5
+        .text
+        call    0
+=== e_flags: avr51
+        .arch   avr51
+        .text
+        elpm    r0, z+
+=== e_flags: avr6
+        .arch   avr6
+        .text
+        eicall
+=== e_flags: avrxmega1
+        .arch   avrxmega1
+        .text
+        nop
+=== e_flags: avrxmega2
+        .arch   avrxmega2
+        .text
+        spm     z+
+=== e_flags: avrxmega3
+        .arch   avrxmega3
+        .text
+        nop
+=== e_flags: avrxmega4
+        .arch   avrxmega4
+        .text
+        nop
+=== e_flags: avrxmega5
+        .arch   avrxmega5
+        .text
+        nop
+=== e_flags: avrxmega6
+        .arch   avrxmega6
+        .text
+        des     3
+=== e_flags: avrxmega7
+        .arch   avrxmega7
+        .text
+        nop
+=== e_flags: avrtiny
+        .arch   avrtiny
+        .text
+        lds     r16, 0x40
+=== e_flags: a device name
+        .arch   atmega328p
+        .text
+        call    0
+=== e_flags: a device name in capitals
+        .arch   ATtiny85
+        .text
+        movw    r0, r2
+=== e_flags: an object with no code
+        .data
+        .byte   1
+=== refused: jmp on the default core
+        .text
+        jmp     0
+=== refused: call on the default core
+        .text
+        call    0
+=== refused: movw on the default core
+        .text
+        movw    r0, r2
+=== refused: mul on the default core
+        .text
+        mul     r0, r1
+=== refused: break on the default core
+        .text
+        break
+=== refused: lpm with postincrement on the default core
+        .text
+        lpm     r0, z+
+=== spm z+ on avr51, which has spm but not spm z+: GNU as takes the row after a `?` form without checking it
+        .arch   avr51
+        .text
+        spm     z+
+=== lpm r0, z on the default core, which has lpm but not lpm r0, z, by the same rule
+        .text
+        lpm     r0, z
+=== movw with the pair names
+        .arch   avr5
+        .text
+        movw    x, y
+        movw    r30, z
+        movw    Y, X
+=== refused: elpm on avr35
+        .arch   avr35
+        .text
+        elpm
+=== refused: push on avr1
+        .arch   avr1
+        .text
+        push    r0
+=== refused: ld through X on avr1
+        .arch   avr1
+        .text
+        ld      r0, X
+=== refused: ld through Z with postincrement on avr1
+        .arch   avr1
+        .text
+        ld      r0, Z+
+=== refused: r15 on avrtiny
+        .arch   avrtiny
+        .text
+        mov     r15, r16
+=== refused: adiw on avrtiny
+        .arch   avrtiny
+        .text
+        adiw    r24, 1
+=== refused: des on avr6
+        .arch   avr6
+        .text
+        des     1
+=== refused: xch on a plain XMEGA
+        .arch   avrxmega7
+        .text
+        xch     z, r0
+=== refused: rjmp beyond 2K words on a large core
+        .arch   avr5
+        .text
+        rjmp    0x1002
+=== refused: an odd branch target
+        .text
+        rjmp    3
+=== refused: breq beyond 64 words
+        .text
+        breq    130
+=== refused: ldi to a low register
+        .text
+        ldi     r15, 1
+=== refused: ldi above 255
+        .text
+        ldi     r16, 256
+=== refused: adiw on r25
+        .arch   avr5
+        .text
+        adiw    r25, 1
+=== refused: movw with an odd register
+        .arch   avr5
+        .text
+        movw    r1, r2
+=== refused: fmul outside r16-r23
+        .arch   avr5
+        .text
+        fmul    r24, r16
+=== refused: in above 63
+        .text
+        in      r0, 64
+=== refused: cbi above 31
+        .text
+        cbi     32, 0
+=== refused: a bit number above 7
+        .text
+        sbrc    r0, 8
+=== refused: ldd above 63
+        .text
+        ldd     r0, Y+64
+=== refused: ldd without a displacement
+        .text
+        ldd     r0, Y
+=== refused: ldd through X
+        .text
+        ldd     r0, X+1
+=== refused: predecrement and postincrement at once
+        .text
+        ld      r0, -X+
+=== refused: lpm predecrementing
+        .arch   avr5
+        .text
+        lpm     r0, -Z
+=== refused: lpm through Y
+        .arch   avr5
+        .text
+        lpm     r0, Y
+=== refused: a modifier in capitals in an ldi
+        .text
+        ldi     r16, LO8(sym)
+=== refused: pm inside pm_lo8
+        .text
+        ldi     r16, pm_lo8(pm(sym))
+=== refused: pm inside hlo8
+        .text
+        ldi     r16, hlo8(pm(sym))
+=== refused: a modifier with something after it
+        .text
+        ldi     r16, lo8(sym) + 1
+=== refused: pm on a byte
+        .data
+        .byte   pm(sym)
+=== refused: lo8 on a word
+        .data
+        .word   lo8(sym)
+=== refused: lo8 on a long
+        .data
+        .long   lo8(sym)
+=== refused: a register number above 31
+        .text
+        mov     32, r0
+=== refused: a register that is a symbol
+        .text
+        mov     r0, sym
+=== refused: an unknown instruction
+        .text
+        movb    r0, r1
+=== refused: __gcc_isr without -mgcc-isr
+        .text
+        __gcc_isr 1
+=== refused: two operands where one is wanted
+        .text
+        inc     r0, r1
+=== refused: an operand where none is wanted
+        .text
+        nop     r0
+=== refused: a missing operand
+        .text
+        add     r0
+=== refused: an unknown core
+        .arch   avr7
+        .text
+        nop

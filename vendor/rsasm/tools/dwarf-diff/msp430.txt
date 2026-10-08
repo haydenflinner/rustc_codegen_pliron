@@ -1,0 +1,65 @@
+=== a function with lines
+	.file 1 "a.c"
+	.text
+	.globl f
+f:
+	.loc 1 3 0
+	push r10
+	.loc 1 4 5 prologue_end
+	mov #0x1234, r10
+	inc r10
+	.loc 1 5 3 is_stmt 0
+	call #g
+	.loc 1 6 1 epilogue_begin
+	pop r10
+	ret
+=== jumps and data between rows
+	.file 1 "a.c"
+	.text
+f:
+	.loc 1 3 0
+	jmp .L2
+	.skip 100
+.L2:
+	.loc 1 4 0
+	jz .L3
+	.word 1, 2
+.L3:
+	.loc 1 5 0
+	mov &.L2, r15
+	ret
+=== DWARF 5 as a compiler writes it
+	.file 0 "/build" "/src/main.c" md5 0x6ab117db4f2f54234432b36109083dac
+	.file 1 "/src/main.c" md5 0x6ab117db4f2f54234432b36109083dac
+	.text
+f:
+	.loc 1 5 21
+	nop
+	.loc 1 6 3
+	ret
+=== rows in two code sections
+	.file 1 "a.c"
+	.text
+	.loc 1 1 0
+	mov #1, r15
+	.section .text.other, "ax"
+	.loc 1 10 0
+	mov #2, r14
+	.text
+	.loc 1 2 0
+	ret
+=== the whole file with -g | -g
+	.text
+f:	push r10
+	mov r15, r10
+	add #4, r10
+	.balign 2
+	pop r10
+	ret
+=== instructions of every length with -g | -g
+	.text
+	nop
+	mov #0x1234, r5
+	mov &0x200, &0x202
+	jmp f
+f:	ret

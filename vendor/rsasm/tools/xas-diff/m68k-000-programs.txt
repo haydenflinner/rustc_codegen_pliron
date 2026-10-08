@@ -1,0 +1,26 @@
+=== movep, the one 68000 instruction the table encodes
+ movepw %d0,0(%a0)
+ movepl %d1,8(%a1)
+ movepw -2(%a2),%d2
+ movepl 0x7ff0(%a3),%d3
+=== a 68000 DBcc beyond reach becomes dbcc, bra.s and jmp
+ dbra %d0,far
+ dbeq %d1,near
+near: nop
+ .space 40000
+far: rts
+=== a 68000 DBcc to an undefined symbol
+ dbra %d0,ext
+=== a 68000 jra beyond reach becomes jmp
+ jra far
+ jbne far
+ jbsr far
+ .space 40000
+far: rts
+=== the 68881 on a 68000
+ .arch 68000,68881
+ fmovex %fp0,%fp1
+ fmovemx %fp0-%fp3,%sp@-
+ fbne .
+ fjeq ext
+ faddx %a0@(8,%d1:w),%fp2

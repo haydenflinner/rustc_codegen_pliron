@@ -1,0 +1,138 @@
+=== references to symbols in their own section, by binding
+        .text
+        .p2align 2
+        @ GNU as, and rsasm, pad the end of a code section to its alignment
+        @ up to a word; llvm-mc does not. One more halfword ends this one on
+        @ a word, so that the two agree.
+        nop
+        .globl  glob, hid, prot, intl, galias
+        .hidden hid
+        .protected prot
+        .internal intl
+        .weak   weak1, walias, whid
+        .hidden whid
+        .hidden lhid
+start:
+        bl loc
+        bl glob
+        bl weak1
+        bl hid
+        bl prot
+        bl intl
+        bl whid
+        bl lhid
+        bl late
+        bl lweak
+        bl lalias
+        bl lwalias
+        bl galias
+        bl walias
+        b loc
+        b glob
+        b weak1
+        b lalias
+        b walias
+        beq loc
+        beq glob
+        beq weak1
+        beq lalias
+        beq walias
+        nop
+loc:    nop
+glob:   nop
+weak1:  nop
+hid:    nop
+prot:   nop
+intl:   nop
+whid:   nop
+lhid:   nop
+late:   nop
+lweak:  nop
+        .globl  late
+        .weak   lweak
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+=== references back to symbols in their own section
+        .text
+        .p2align 2
+        @ GNU as, and rsasm, pad the end of a code section to its alignment
+        @ up to a word; llvm-mc does not. One more halfword ends this one on
+        @ a word, so that the two agree.
+        nop
+        .globl  glob
+        .weak   weak1
+loc:    nop
+glob:   nop
+weak1:  nop
+        .set    lalias, glob
+        bl loc
+        bl glob
+        bl weak1
+        bl lalias
+        b loc
+        b glob
+        b weak1
+        beq loc
+        beq glob
+        beq weak1
+=== references out of their section, by binding
+        .text
+        .p2align 2
+        @ GNU as, and rsasm, pad the end of a code section to its alignment
+        @ up to a word; llvm-mc does not. One more halfword ends this one on
+        @ a word, so that the two agree.
+        nop
+        .globl  oglob
+        .weak   oweak, uweak
+        .set    oalias, oloc
+        bl oloc
+        bl oglob
+        bl oweak
+        bl oalias
+        bl ext
+        bl uweak
+        nop
+        .section .text.other,"ax"
+        .p2align 2
+oloc:   nop
+oglob:  nop
+oweak:  nop
+        nop
+=== data referring to symbols, by binding
+        .data
+        .globl  glob, galias, hid
+        .weak   weak1, walias
+        .weak   uweak
+        .hidden hid
+        .set    lalias, glob
+        .set    lwalias, weak1
+        .set    galias, loc
+        .set    walias, loc
+base:   .long   loc, glob, weak1, hid, lalias, lwalias, galias, walias, ext
+        .long   loc - ., glob - ., weak1 - ., lalias - ., walias - .
+        .long   glob - base, weak1 - base, base - weak1, lalias - base, walias - base
+        .long   ext - ., uweak - .
+loc:    .long   0
+glob:   .long   0
+weak1:  .long   0
+hid:    .long   0
+=== default section alignment
+        @ llvm-mc aligns `.text` to 4 bytes from the start; GNU as, which
+        @ rsasm follows for ARM, aligns a section only once an instruction
+        @ is assembled into it (tools/xas-diff/thumb-relocs.txt).
+        .data
+        .byte   2
+        .section .rodata
+        .byte   3
+        .bss
+        .space  1
+        .section .text.hot,"ax"
+        .byte   4
+        .section .data.rel,"aw"
+        .byte   5
+        .section .init,"ax"
+        .byte   6
+        .section custom,"a"
+        .byte   7

@@ -1,0 +1,243 @@
+=== hello, as clang writes it
+	.section	__TEXT,__text,regular,pure_instructions
+	.build_version macos, 14, 0	sdk_version 14, 4
+	.globl	_main                           ; -- Begin function main
+	.p2align	2
+_main:                                  ; @main
+	sub	sp, sp, #32
+	stp	x29, x30, [sp, #16]             ; 16-byte Spare
+	add	x29, sp, #16
+	mov	w8, #0                          ; =0x0
+	stur	wzr, [x29, #-4]
+	adrp	x0, l_.str@PAGE
+	add	x0, x0, l_.str@PAGEOFF
+	bl	_printf
+	mov	w0, #0
+	ldp	x29, x30, [sp, #16]             ; 16-byte Spare
+	add	sp, sp, #32
+	ret
+                                        ; -- End function
+	.section	__TEXT,__cstring,cstring_literals
+l_.str:                                 ; @.str
+	.asciz	"Hello, %s!\n"
+
+.subsections_via_symbols
+=== globals through the GOT and by page
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	_get
+	.p2align	2
+_get:
+	adrp	x8, _counter@GOTPAGE
+	ldr	x8, [x8, _counter@GOTPAGEOFF]
+	ldr	w0, [x8]
+	adrp	x9, _local_counter@PAGE
+	ldr	w9, [x9, _local_counter@PAGEOFF]
+	add	w0, w0, w9
+	adrp	x10, _table@PAGE
+	add	x10, x10, _table@PAGEOFF
+	ldr	x10, [x10, #8]
+	ret
+
+	.globl	_set
+	.p2align	2
+_set:
+	adrp	x8, _local_counter@PAGE
+	str	w0, [x8, _local_counter@PAGEOFF]
+	adrp	x8, _environ@GOTPAGE
+	ldr	x8, [x8, _environ@GOTPAGEOFF]
+	b	_get
+
+	.section	__DATA,__data
+	.globl	_table
+	.p2align	3
+_table:
+	.quad	_get
+	.quad	_local_counter
+	.quad	_set+4
+	.quad	_external_thing
+
+	.p2align	2
+_local_counter:
+	.long	7
+
+	.comm	_counter, 4, 2
+.subsections_via_symbols
+=== a switch through a jump table in __TEXT,__const
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	_classify
+	.p2align	2
+_classify:
+	cmp	w0, #3
+	b.hi	LBB_default
+	mov	w8, w0
+	adrp	x9, lJTI0_0@PAGE
+	add	x9, x9, lJTI0_0@PAGEOFF
+	adr	x10, LBB_0
+	ldrsw	x11, [x9, x8, lsl #2]
+	add	x10, x10, x11
+	br	x10
+LBB_0:
+	mov	w0, #10
+	ret
+LBB_1:
+	mov	w0, #20
+	ret
+LBB_2:
+	mov	w0, #30
+	ret
+LBB_default:
+	mov	w0, #-1
+	ret
+	.section	__TEXT,__const
+	.p2align	2
+lJTI0_0:
+	.long	LBB_0-LBB_0
+	.long	LBB_1-LBB_0
+	.long	LBB_2-LBB_0
+	.long	LBB_default-LBB_0
+.subsections_via_symbols
+=== literals by page offset
+	.section	__TEXT,__text,regular,pure_instructions
+	.p2align	2
+_f:
+	adrp	x8, lCPI0_0@PAGE
+	ldr	d0, [x8, lCPI0_0@PAGEOFF]
+	adrp	x8, LCPI0_1@PAGE
+	ldr	s1, [x8, LCPI0_1@PAGEOFF]
+	adrp	x0, l_.str@PAGE
+	add	x0, x0, l_.str@PAGEOFF
+	adrp	x1, L_.str.1@PAGE
+	add	x1, x1, L_.str.1@PAGEOFF
+	ret
+
+	.section	__TEXT,__literal8,8byte_literals
+	.p2align	3
+lCPI0_0:
+	.quad	0x400921fb54442d18
+
+	.section	__TEXT,__literal4,4byte_literals
+	.p2align	2
+LCPI0_1:
+	.long	0x3fc00000
+
+	.section	__TEXT,__cstring,cstring_literals
+l_.str:
+	.asciz	"one"
+L_.str.1:
+	.asciz	"two"
+
+	.section	__DATA,__data
+_strings:
+	.quad	l_.str
+	.quad	L_.str.1
+=== zero-filled storage, and symbols of every kind
+	.text
+	.globl	_bump, _zeta
+	.private_extern _hidden
+	.weak_definition _weak
+	.globl	_weak
+	.weak_reference _maybe
+	.p2align	2
+_bump:
+	adrp	x8, _heap@PAGE
+	ldr	x9, [x8, _heap@PAGEOFF]
+	add	x9, x9, #1
+	str	x9, [x8, _heap@PAGEOFF]
+	bl	_hidden
+	bl	_weak
+	bl	_maybe
+	bl	_undefined
+	b	_zeta
+_hidden:
+	ret
+_weak:
+	ret
+_zeta:
+	ret
+	.alt_entry _zeta_inside
+_zeta_inside:
+	ret
+
+	.lcomm	_small, 4, 2
+	.zerofill __DATA,__common,_big,64,5
+	.zerofill __DATA,__bss,_heap,8,3
+	.comm	_scratch, 256, 4
+_constant = 42
+	.set	_flags, 0x10
+	.globl	_flags
+.subsections_via_symbols
+=== differences within and across sections
+	.text
+	.p2align	2
+_a:
+	nop
+	nop
+_b:
+	ret
+_c:
+	ret
+Lend:
+
+	.const
+_sizes:
+	.long	_b - _a
+	.long	Lend - _c
+	.quad	_sizes - _a
+	.long	_c - Lend
+
+	.data
+_offsets:
+	.long	_a - _offsets
+	.long	_d - _offsets
+	.quad	_b - _a
+_d:
+	.quad	0
+	.long	_later - _d
+_later:
+	.long	0
+	.long	_personality@GOT - .
+	.quad	_personality@GOT
+=== branches within the section, with and without atoms of their own
+	.text
+	.p2align	2
+_f:
+	bl	_g
+	b	Lnear
+	b.eq	Lnear
+	cbz	x0, Lnear
+	tbnz	w1, #3, Lnear
+	adr	x2, Lnear
+	ldr	x3, Lpool
+Lnear:
+	bl	_f
+	ret
+_g:
+	b	_f
+Lpool:
+	.quad	0x1122334455667788
+=== sections of every kind
+	.section	__TEXT,__text,regular,pure_instructions
+	.p2align	2
+_main:
+	ret
+	.section	__TEXT,__const
+_c1:
+	.quad	_main
+	.section	__DATA,__const
+_c2:
+	.quad	_main
+	.section	__DATA,__mod_init_func,mod_init_funcs
+	.p2align	3
+	.quad	_main
+	.section	__TEXT,__text2,regular,pure_instructions
+	.p2align	2
+_other:
+	bl	_main
+	.section	__DATA,__thread_bss,thread_local_zerofill
+	.space	8
+	.section	__DATA,__objc_data,regular,no_dead_strip
+	.quad	_c1
+	.data
+	.quad	_c2
+	.section	__TEXT,__text,regular,pure_instructions
+	b	_other
