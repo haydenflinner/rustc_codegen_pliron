@@ -540,6 +540,15 @@ pub fn lower_to_object(
             {
                 panic!("loopvec broke `{n}`: {e}\n{}", clctx.func.display());
             }
+            // loopvec emits `base + iv*esize` addressing fresh each iteration;
+            // a second indvars round turns them into stepped pointers.
+            if k > 0
+                && st.indvars
+                && crate::pass_enabled("PLIRON_INDUCT2")
+                && crate::bisect("indvars2")
+            {
+                crate::indvars::run(&mut clctx.func);
+            }
         }
         if st.slp && crate::bisect("slp") {
             let simd = matches!(
@@ -2080,6 +2089,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     }
                 };
                 return self.set1(op, cmp);
+            }
+            if self.b.func.dfg.value_type(a) == clt::F16 {
+                // Cranelift has no f16 compare either; promote both sides to
+                // f32 (lossless, preserves every predicate incl. NaN cases)
+                // via compiler-builtins and compare there.
+                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
+                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let r = self.b.ins().fcmp(cc, a, b);
+                return self.set1(op, r);
             }
             let r = self.b.ins().fcmp(cc, a, b);
             self.set1(op, r);
