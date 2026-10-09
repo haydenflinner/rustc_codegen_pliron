@@ -28,7 +28,15 @@ _sibling = os.path.join(ROOT, "..", "rust")
 _default = _sibling if os.path.isdir(os.path.join(_sibling, "tests/ui")) else os.path.expanduser("~/work/rust")
 RUST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("RUST_CHECKOUT", _default)
 FILTER = sys.argv[2] if len(sys.argv) > 2 else ""
-OUT = os.path.join(ROOT, "target/ui")
+# Cross target mode (UI_TARGET=wasm32-wasip1): pliron side needs a pliron-built
+# sysroot (UI_WSYS, provisioned by harness/run.py) because our objects only
+# link with pliron-wasm-ld; stock side just adds --target. Runs go through
+# node+wasi instead of execve.
+TGT = os.environ.get("UI_TARGET")
+WSYS = os.environ.get("UI_WSYS")
+WLD = os.path.join(ROOT, "tools/pliron-wasm-ld/target/release/pliron-wasm-ld")
+WSRUN = os.path.join(ROOT, "tests/wasm/run_wasi_cfg.mjs")
+OUT = os.path.join(ROOT, "target/ui" + (f"-{TGT}" if TGT else ""))
 # Directives that change what a test needs in ways we don't emulate.
 SKIP = re.compile(r"^//@\s*(aux-|revisions|ignore-|only-|needs-|known-bug|proc-macro|build-aux|incremental|min-|should-fail|run-rustfix|ferrocene-|check-cfg)", re.M)
 # Tests run with cwd = their own dir, so pin the toolchain explicitly.
@@ -50,11 +58,22 @@ TID = re.compile(r"thread '([^']+)' \(\d+\) panicked")
 # hex digits; longer hex runs are more likely real data than addresses.
 ADDR = re.compile(r"0x[0-9a-fA-F]+|(?<![0-9a-zA-Z_.])[0-9a-f]{9,12}(?![0-9a-zA-Z_.])")
 LIBTEST = re.compile(r"^running \d+ tests$|^test result:", re.M)
+# JS-side noise on wasm run failures: module hashes, function indices and node
+# internals differ across backends and aren't part of the program's behavior.
+WASM_NOISE = re.compile(
+    r"^.*(wasm://wasm/|RuntimeError|node:internal|Node\.js v|ExperimentalWarning"
+    r"|trace-warnings|panic at wasm|\(Use `node).*$", re.M)
+
+
+def wasm_norm(s):
+    return "\n".join(l for l in WASM_NOISE.sub("", s).splitlines() if l.strip())
 
 
 def norm_out(s):
     """Applied to both sides at compare time so the stock cache stays valid."""
     s = ADDR.sub("PTR", s)
+    if TGT:
+        s = wasm_norm(s)
     if LIBTEST.search(s):
         # libtest runs tests in arbitrary order.
         s = "\n".join(sorted(s.splitlines()))
@@ -139,9 +158,15 @@ def build_and_run(path, sp, exe, backend):
     if not any(f == "--edition" or f.startswith("--edition=") for f in sp["cflags"]):
         cmd += ["--edition", sp["edition"]]
     if backend:
-        cmd += [BE] + WILD + EXTRA
+        cmd += [BE] + (WILD if not TGT else []) + EXTRA
+        if TGT:
+            cmd += ["--target", TGT, f"--sysroot={WSYS}",
+                    f"-Clinker={WLD}", "-Clink-self-contained=no",
+                    f"-Lnative={os.path.join(WSYS, 'lib/rustlib', TGT, 'lib')}"]
     else:
         cmd += EXTRA
+        if TGT:
+            cmd += ["--target", TGT]
     # check-fail/-pass and undirected files stop at codegen; build-pass links
     # but like compiletest does not run the artifact.
     emit = ["-o", exe] if sp["kind"] in ("run-pass", "run-fail", "build-pass") else ["--emit=obj", "-o", exe]
@@ -165,6 +190,22 @@ def build_and_run(path, sp, exe, backend):
 
 
 def exec_bin(path, sp, exe):
+    if TGT:
+        d = os.path.dirname(path)
+        cfg = {"args": [exe] + sp["rflags"],
+               "env": dict(sp["env"]),
+               "preopens": {d: d, ".": d, "/tmp": os.environ.get("TMPDIR", "/tmp")}}
+        e = dict(os.environ, WASI_RUN_CFG=json.dumps(cfg))
+        try:
+            r = subprocess.run(["node", "--no-warnings", WSRUN, exe],
+                               capture_output=True, text=True, timeout=60, env=e)
+        except subprocess.TimeoutExpired:
+            return "run-timeout", "", None
+        except OSError as ex:
+            return "run-error", str(ex), None
+        out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
+        err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
+        return "ran", "", (r.returncode, out, err)
     try:
         r = subprocess.run([exe] + sp["rflags"], capture_output=True, text=True,
                            timeout=60, cwd=os.path.dirname(path), env=run_env(sp))
@@ -188,7 +229,7 @@ def stock_result(path, sp):
     key = hashlib.sha256(
         open(path, "rb").read()
         + json.dumps([STOCK_CACHE_VERSION, sp["kind"], sp["edition"], sp["cflags"], sp["rflags"],
-                      sp["env"], sp["unset"], EXTRA]
+                      sp["env"], sp["unset"], EXTRA, TGT, 2 if TGT else None]
                      + ([sp["cenv"], sp["cunset"]] if sp["cenv"] or sp["cunset"] else []),
                      sort_keys=True).encode()
     ).hexdigest()[:32]

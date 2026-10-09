@@ -17,7 +17,7 @@ Entry point: `harness/run.py` (see `harness/run.py --help`).
 | 5 | abi-cafe cross-backend ABI tests | todo |
 | 6 | mixed-backend (per-CGU / per-function) bisection tool | todo |
 | 7 | self-host fixpoint (stage2 vs stage3 output identical) | todo; determinism of single compiles is done in step 1 |
-| 8 | target matrix (x86_64-linux, aarch64-darwin, wasm32 via node, qemu/docker) | partial: expectations are keyed by host triple |
+| 8 | target matrix (x86_64-linux, aarch64-darwin, wasm32 via node, qemu/docker) | partial: expectations keyed by host; `ui-wasm` suite runs the UI corpus under wasm32-wasip1 (node WASI) differentially vs stock |
 | 9 | crate corpus (`compatibility.md` rows) as a harness suite | todo |
 
 ## What existed before
@@ -253,9 +253,45 @@ there instead of in the cwd.
   than the result. Wide sources still `ireduce`; narrow sources now
   `sextend` (a -1 mask stays all-ones, 0/1 flags stay 0/1).
 - Self-host status: stage1 completes end-to-end; the pliron-built stage1
-  rustc compiles stage2 cleanly except for one remaining `licm`-only
-  miscompile (stage2 rustc SIGSEGVs inside
-  `rustc_ast_passes::ast_validation` reading a null `Attribute` field —
-  under bisection with `PLIRON_OPT_BISECT`, licm gates counted per
-  function). `PLIRON_LICM_PROMOTE=0` does not fix it, so the culprit is
-  the hoist or store-sink path.
+  rustc builds the whole stage2 compiler with `PLIRON_VERIFY=1` clean.
+  The stage2 rustc still SIGSEGVs/SIGBUSes compiling `core` — corrupted
+  `ThinVec`/`Attribute` data inside AST walks (`rustc_ast_passes`,
+  `rustc_expand`, `rustc_lint`; also seen as `thin_vec::capacity_overflow`
+  and unbounded recursion in `flat_map_in_place`). The bug is outside the
+  pass pipeline: `PLIRON_LICM=0`, every `PLIRON_*` pass toggle, and
+  `PLIRON_OPT_BISECT=0` (all gated passes off) all still crash. Suspects
+  left: pliron-IR-level passes (inline/sroa/etc.), lowering itself, or
+  cranelift's internal egraph/regalloc.
+- Wasm: `src/wasm.rs` promoted-alloca SSA work (a8b7f93) landed after a
+  transient intermediate miscompiled wasip1 std (`call_indirect`
+  signature mismatches, `memchr` slice-index traps, dlmalloc asserts);
+  all `tests/wasm/run.sh` legs pass at HEAD. New suite `ui-wasm`
+  (`harness/run.py --suite ui-wasm`): the UI corpus compiled for
+  `wasm32-wasip1` by both backends — pliron objects link via
+  `pliron-wasm-ld` against a provisioned pliron std sysroot
+  (`target/ui-wsys`, rebuilt when the dylib hash changes), stock rustc
+  uses the installed target std; both run under `node`'s WASI and are
+  diffed on exit code + stdout + stderr with wasm-module noise
+  normalized. Note rustlantis programs aren't wasm-portable (64-bit
+  `isize`→`i64` transmutes), so wasm fuzzing needs the UI corpus or a
+  32-bit-safe generator.
+- ui-wasm first full run (21,482 files): 16,466 pass, 4,881 directive
+  skips, 34 env-compile-error, 25 env-link, 17 env-ice — all
+  environmental. Real divergences found and fixed: f16/f128 `fneg`
+  emitted `f32.neg`/`f64.neg` on integer raw-bits reps (f16 = i16 bits
+  in i32, f128 = i64 pair) → invalid wasm rejected at instantiate; now
+  sign-bit xor. Remaining knowns: 11 simd run-fails (v128 memory ops
+  unimplemented → honest `unreachable` stubs), 2 output-mismatches
+  (raw pointer prints — wasm addresses are <9 hex digits, below the
+  ADDR normalizer's floor), 1 stderr-mismatch (`hygiene/panic-location`
+  embeds the local std build path), 1 `accepted`
+  (`explicit-tail-calls` — pliron emits tail calls stock can't), ~44
+  `can't find crate for test` fixed by adding `test` to the sysroot
+  build-std set. f16/f128 arith/cmp/cvt now panic→stub (wasm has no
+  hf/tf ops and the sysroot lacks `__*hf*`/`__*tf*` builtins) instead
+  of emitting invalid wasm.
+- wasm `wloop_opt` (in-flight loopopt: `mk_pre`/`loop_licm`/
+  `loop_indvars`/`wdce`) briefly hung `sum_squares` — stale
+  `cfg.def_block` after inst motion; a live `defb` map fixed it.
+  Debug: `PLIRON_WASM_WLOOP=0` gates the pass, `PLIRON_WASM_LOOPS=<pat>`
+  dumps pre/post bodies for functions whose name contains <pat>.

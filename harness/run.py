@@ -10,6 +10,9 @@ Suites:
   determinism  the smoke programs compiled to objects twice must be byte-identical
   ui           tests/ui_run_pass.py (rustc run-pass/run-fail UI tests, built by
                stock rustc too and diffed on exit code + stdout + stderr)
+  ui-wasm      same UI corpus for wasm32-wasip1: pliron objects link via
+               pliron-wasm-ld + a pliron-built wasip1 sysroot; runs under
+               node+wasi, diffed against stock rustc's wasm target
   fuzz         rustlantis-generated programs (--fuzz-seeds START:END, default 0:32),
                each built+run under stock rustc and pliron at -O0 and -O and diffed
 
@@ -20,7 +23,7 @@ Expectations live in harness/expectations/<suite>.<host>[.O].json; the run fails
 test that was expected to pass and no longer does, or on a new test that fails.
 --accept rewrites the expectations from this run. See test-harness.md.
 """
-import argparse, collections, concurrent.futures as cf, json, os, platform, re, shutil, subprocess, sys
+import argparse, collections, concurrent.futures as cf, hashlib, json, os, platform, re, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target/harness")
@@ -221,6 +224,108 @@ def default_rust():
     return sib if os.path.isdir(os.path.join(sib, "tests/ui")) else os.path.expanduser("~/work/rust")
 
 
+# --------------------------------------------------------------- ui-wasm
+#
+# wasm32-wasip1 differential: pliron objects only link with pliron-wasm-ld, so
+# the suite provisions a pliron-built wasip1 sysroot under target/ui-wsys
+# (rebuilt when the backend dylib changes). Runs execute under node+wasi.
+
+def ui_wasm_sysroot(args):
+    """Build/assemble the pliron wasip1 sysroot; returns its lib dir or None."""
+    tgt = "wasm32-wasip1"
+    wsys = os.path.join(ROOT, "target/ui-wsys")
+    libdir = os.path.join(wsys, "lib/rustlib", tgt, "lib")
+    build = os.path.join(ROOT, "target/ui-wsys-build")
+    stamp = os.path.join(wsys, "stamp")
+    key = hashlib.sha256(open(BACKEND, "rb").read()).hexdigest()
+    if os.path.exists(stamp) and open(stamp).read() == key:
+        return libdir
+    print("ui-wasm: provisioning pliron wasip1 sysroot (one-off, ~minutes)")
+    # pliron-wasm-ld
+    r = sh(["cargo", "build", "-q", "--release",
+            "--manifest-path", os.path.join(ROOT, "tools/pliron-wasm-ld/Cargo.toml")], 600)
+    if r is None or r.returncode != 0:
+        print("ui-wasm: pliron-wasm-ld build failed"); return None
+    be = f"-Zcodegen-backend={BACKEND}"
+    ld = os.path.join(ROOT, "tools/pliron-wasm-ld/target/release/pliron-wasm-ld")
+    # wasi-libc (pure Rust, pliron-compiled)
+    env = dict(os.environ, RUSTFLAGS=f"{be} -Clinker={ld}",
+               CARGO_TARGET_DIR=os.path.join(build, "wasi-libc"))
+    r = sh(["cargo", "build", "-q", "--release", "--target", tgt,
+            "-Zbuild-std=core,panic_abort"], 900,
+           cwd=os.path.join(ROOT, "tools/pliron-wasi-libc"), env=env)
+    if r is None or r.returncode != 0:
+        print(f"ui-wasm: wasi-libc build failed\n{r.stderr[-2000:] if r else 'timeout'}"); return None
+    wasi_libc = os.path.join(build, "wasi-libc", tgt, "release")
+    lnc = os.path.join(wasi_libc, "libc.a")
+    if os.path.lexists(lnc):
+        os.remove(lnc)
+    os.symlink("libpliron_wasi_libc.a", lnc)
+    with open(os.path.join(wasi_libc, "libunwind.a"), "w") as f:
+        f.write("!<arch>\n")
+    # dummy crate → forces -Zbuild-std to emit std rlibs/rmeta we can harvest
+    srcdir = os.path.join(build, "src")
+    os.makedirs(srcdir, exist_ok=True)
+    with open(os.path.join(build, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "wsys"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n')
+    with open(os.path.join(srcdir, "main.rs"), "w") as f:
+        f.write("fn main() {}\n")
+    env = dict(os.environ,
+               RUSTFLAGS=f"{be} -Clinker={ld} -Clink-self-contained=no -Lnative={wasi_libc}",
+               CARGO_TARGET_DIR=os.path.join(build, "app"))
+    r = sh(["cargo", "build", "-q", "--release", "--target", tgt,
+            "-Zbuild-std=std,panic_abort,panic_unwind,test"], 1200, cwd=build, env=env)
+    if r is None or r.returncode != 0:
+        print(f"ui-wasm: build-std failed\n{r.stderr[-2000:] if r else 'timeout'}"); return None
+    os.makedirs(libdir, exist_ok=True)
+    for old in os.listdir(libdir):
+        os.remove(os.path.join(libdir, old))
+    out = os.path.join(build, "app", tgt, "release/build")
+    n = 0
+    for pkg in os.listdir(out):
+        od = os.path.join(out, pkg)
+        for h in os.listdir(od):
+            d = os.path.join(od, h, "out")
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                if f.endswith((".rlib", ".rmeta")):
+                    shutil.copy2(os.path.join(d, f), libdir)
+                    n += 1
+    for f in os.listdir(wasi_libc):
+        if f.endswith(".a"):
+            shutil.copy2(os.path.join(wasi_libc, f), libdir)
+    print(f"ui-wasm: sysroot assembled ({n} rlibs/rmeta)")
+    with open(stamp, "w") as f:
+        f.write(key)
+    return libdir
+
+
+def suite_ui_wasm(args):
+    tgt = "wasm32-wasip1"
+    # stock reference needs the installed target std; pliron needs our sysroot.
+    v = sh(["rustc", "--print", "sysroot"], 30)
+    stock_lib = os.path.join(v.stdout.strip(), "lib/rustlib", tgt) if v else ""
+    if not os.path.isdir(stock_lib):
+        print(f"ui-wasm: stock rustc has no {tgt} std (rustup target add {tgt})")
+        return {}
+    if shutil.which("node") is None:
+        print("ui-wasm: node not found"); return {}
+    libdir = ui_wasm_sysroot(args)
+    if libdir is None:
+        return {}
+    wsys = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(libdir))))
+    cmd = [sys.executable, os.path.join(ROOT, "tests/ui_run_pass.py")]
+    if args.rust or args.filter:
+        cmd += [args.rust or os.environ.get("RUST_CHECKOUT") or default_rust(), args.filter]
+    env = dict(os.environ, UI_FLAGS=" ".join(["-O"] if args.opt else []),
+               UI_TARGET=tgt, UI_WSYS=wsys)
+    r = subprocess.run(cmd, env=env)
+    if r.returncode != 0:
+        sys.exit(f"ui-wasm: tests/ui_run_pass.py exited with {r.returncode}")
+    return json.load(open(os.path.join(ROOT, f"target/ui-{tgt}/results.json")))
+
+
 # ------------------------------------------------------------------ fuzz
 
 # rustlantis `generate` binary; built outside this repo. Programs are
@@ -313,10 +418,11 @@ def suite_fuzz(args):
 
 # --------------------------------------------------------- expectations
 
-SUITES = {"smoke": suite_smoke, "determinism": suite_determinism, "ui": suite_ui, "fuzz": suite_fuzz}
+SUITES = {"smoke": suite_smoke, "determinism": suite_determinism, "ui": suite_ui,
+          "ui-wasm": suite_ui_wasm, "fuzz": suite_fuzz}
 TIERS = {0: ["smoke", "determinism"], 1: ["smoke", "determinism", "ui"]}
 # Suites whose test set depends on --opt (the others cover both opt levels themselves).
-OPT_VARIANT = {"ui"}
+OPT_VARIANT = {"ui", "ui-wasm"}
 
 
 def host():

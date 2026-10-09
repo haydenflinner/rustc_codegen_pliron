@@ -304,6 +304,7 @@ pub fn lower_to_wasm(
         let sig = o.funcs[i].sig;
         let body = match guarded(|| {
             let mut fl = FL::new(&mut o, sig);
+            fl.name = n.clone();
             fl.lower(f.op);
             fl.finish()
         }) {
@@ -595,6 +596,7 @@ struct FL<'o, 'a, 'tcx> {
     rets: Vec<WT>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<WV>,
+    name: String,
 }
 
 impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
@@ -623,6 +625,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             frame: 0,
             frame_align: 16,
             va_buf: None,
+            name: String::new(),
         };
         let sp = fl.o.sp;
         fl.sp0 = fl.op(O::GlobalGet { global_index: sp }, &[], WT::I32);
@@ -644,6 +647,19 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             if let ValueDef::Operator(op, ..) = &mut self.b.values[v] {
                 *op = O::I32Const { value: c };
             }
+        }
+        self.b.optimize(&waffle::OptOptions::default());
+        let dbg = std::env::var("PLIRON_WASM_LOOPS")
+            .map(|f| f.is_empty() || self.name.contains(&f))
+            .unwrap_or(false);
+        if dbg {
+            eprintln!("==== pre-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
+        }
+        if std::env::var("PLIRON_WASM_WLOOP").map_or(true, |v| v != "0") {
+            wloop_opt(&mut self.b, self.o.sp);
+        }
+        if dbg {
+            eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
         }
         self.b.optimize(&waffle::OptOptions::default());
         self.b
@@ -1434,8 +1450,19 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 self.set(op, r);
             }};
         }
+        // f16 arrives as raw i16 bits and f128 as an i64 pair: neither can go
+        // through scalar wasm float ops, and this sysroot has no hf/tf
+        // builtins to call. Panic here becomes an `unreachable` stub.
+        let int_float_ty = |t: TypeHandle| {
+            wleaves(ctx, t)
+                .iter()
+                .any(|l| !matches!(l.1, clt::F32 | clt::F64))
+        };
         macro_rules! fop {
             ($o32:expr, $o64:expr) => {{
+                if int_float_ty(opnds[0].get_type(ctx)) {
+                    panic!("f16/f128 arithmetic on wasm");
+                }
                 let a = self.get(opnds[0]);
                 let b = self.get(opnds[1]);
                 let r = a
@@ -1494,6 +1521,9 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             };
             self.set(op, r);
         } else if is!(FCmpOp) {
+            if int_float_ty(opnds[0].get_type(ctx)) {
+                panic!("f16/f128 compare on wasm");
+            }
             let pred = Operation::get_op::<FCmpOp>(op, ctx).unwrap().predicate(ctx);
             let a = self.get(opnds[0]);
             let b = self.get(opnds[1]);
@@ -1538,6 +1568,9 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         } else if is!(FDivOp) {
             fop!(O::F32Div, O::F64Div)
         } else if is!(FRemOp) {
+            if int_float_ty(opnds[0].get_type(ctx)) {
+                panic!("f16/f128 rem on wasm");
+            }
             let a = self.get1(opnds[0]);
             let b = self.get1(opnds[1]);
             let t = self.ty_of(a);
@@ -1550,13 +1583,23 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             self.set1(op, r);
         } else if is!(FNegOp) {
             let a = self.get(opnds[0]);
-            let r = a
-                .into_iter()
-                .map(|x| {
-                    let t = self.ty_of(x);
-                    self.op(if t == WT::F64 { O::F64Neg } else { O::F32Neg }, &[x], t)
-                })
-                .collect();
+            let ls = wleaves(ctx, opnds[0].get_type(ctx));
+            let r = if ls.len() == 2 {
+                // f128 (lo, hi) i64 pair: flip the sign bit in hi.
+                let s = self.i64c(1u64 << 63);
+                smallvec![a[0], self.op(O::I64Xor, &[a[1], s], WT::I64)]
+            } else if ls[0].1 == clt::I16 {
+                // f16: raw bits zero-extended in an i32; flip bit 15.
+                let s = self.i32c(1 << 15);
+                smallvec![self.op(O::I32Xor, &[a[0], s], WT::I32)]
+            } else {
+                a.into_iter()
+                    .map(|x| {
+                        let t = self.ty_of(x);
+                        self.op(if t == WT::F64 { O::F64Neg } else { O::F32Neg }, &[x], t)
+                    })
+                    .collect()
+            };
             self.set(op, r);
         } else if is!(TruncOp) || is!(ZExtOp) || is!(SExtOp) || is!(PtrToIntOp) || is!(IntToPtrOp) {
             let sw = self.width(opnds[0].get_type(ctx));
@@ -1601,6 +1644,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             let r: Vals = match (f, t) {
                 ("df", "sf") => smallvec![self.op(O::F32DemoteF64, &[x[0]], WT::F32)],
                 ("sf", "df") => smallvec![self.op(O::F64PromoteF32, &[x[0]], WT::F64)],
+                // hf/tf conversions call __extend*/__trunc* builtins that this
+                // sysroot lacks; a stub traps only when actually invoked.
+                ("hf", _) | (_, "hf") | ("tf", _) | (_, "tf") => {
+                    panic!("f16/f128 conversion on wasm")
+                }
                 _ => {
                     let name = format!(
                         "__{}{f}{t}2",
@@ -1613,11 +1661,17 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             };
             self.set(op, r);
         } else if is!(FPToUIOp) || is!(FPToSIOp) {
+            if int_float_ty(opnds[0].get_type(ctx)) {
+                panic!("f16/f128 to int on wasm");
+            }
             let x = self.get1(opnds[0]);
             let w = self.width(self.res_ty(op));
             let r = self.fcvt_sat(is!(FPToSIOp), w, x);
             self.set(op, r);
         } else if is!(UIToFPOp) || is!(SIToFPOp) {
+            if int_float_ty(self.res_ty(op)) {
+                panic!("int to f16/f128 on wasm");
+            }
             let xs = self.get(opnds[0]);
             let w = self.width(opnds[0].get_type(ctx));
             let signed = is!(SIToFPOp);
@@ -2712,6 +2766,369 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 let of = self.op(O::I64Ne, &[hi, z], WT::I32);
                 (smallvec![lo], of)
             }
+        }
+    }
+}
+
+/// Natural loops of the body: (header, member-blocks) pairs.
+fn wloops(b: &FunctionBody, cfg: &waffle::cfg::CFGInfo) -> Vec<(WBlock, FxHashSet<WBlock>)> {
+    let mut out = Vec::new();
+    for h in b.blocks.iter() {
+        let latch: Vec<WBlock> = b.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&p| p == h || cfg.dominates(h, p))
+            .collect();
+        if latch.is_empty() {
+            continue;
+        }
+        // Blocks reaching a latch without crossing the header.
+        let mut body_set: FxHashSet<WBlock> = [h].into_iter().collect();
+        let mut wl = latch;
+        while let Some(x) = wl.pop() {
+            if body_set.insert(x) {
+                wl.extend(b.blocks[x].preds.iter().copied());
+            }
+        }
+        out.push((h, body_set));
+    }
+    out
+}
+
+/// Edges into `h` from outside the loop: (pred, target-index) pairs.
+fn outside_edges(b: &FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> Vec<(WBlock, usize)> {
+    b.blocks[h]
+        .preds
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !inloop.contains(p))
+        .map(|(j, _)| (b.blocks[h].preds[j], b.blocks[h].pos_in_pred_succ[j]))
+        .collect()
+}
+
+/// A loop header with several entry edges gets a forwarding preheader:
+/// `pre` params mirror `h`'s, its terminator forwards them, and all
+/// outside edges are retargeted to `pre`.
+fn mk_pre(b: &mut FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> WBlock {
+    // Collect outside edges before pre's own edge exists.
+    let edges = outside_edges(b, h, inloop);
+    let pre = b.add_block();
+    let fwd: Vec<WV> = b.blocks[h]
+        .params
+        .clone()
+        .into_iter()
+        .map(|(t, _)| b.add_blockparam(pre, t))
+        .collect();
+    for (pr, tidx) in edges {
+        b.blocks[pr].terminator.update_target(tidx, |t| t.block = pre);
+    }
+    b.set_terminator(
+        pre,
+        Terminator::Br {
+            target: BlockTarget { block: h, args: fwd },
+        },
+    );
+    b.recompute_edges();
+    pre
+}
+
+/// Loop optimizations on a finished waffle body: hoists speculatable
+/// loop-invariant ops (and immutable-global reads) to each loop's
+/// preheader, and strength-reduces `base + iv*K` addressing into
+/// induction-variable block params. The wasm path bypasses the CLIF
+/// pipeline, so this fills in for licm/indvars there.
+fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
+    // Merge multi-entry loop headers so every loop has a preheader.
+    {
+        let cfg = waffle::cfg::CFGInfo::new(b);
+        for (h, inloop) in wloops(b, &cfg) {
+            let mut preds: Vec<WBlock> = outside_edges(b, h, &inloop)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            preds.sort();
+            preds.dedup();
+            if preds.len() > 1 {
+                mk_pre(b, h, &inloop);
+            }
+        }
+    }
+    let cfg = waffle::cfg::CFGInfo::new(b);
+    // LICM/indvars move and create insts, so track defining blocks in a
+    // live map rather than the (stale) CFGInfo.
+    let mut defb = cfg.def_block.clone();
+    for (h, inloop) in wloops(b, &cfg) {
+        let outside = outside_edges(b, h, &inloop);
+        if outside.is_empty() {
+            continue;
+        }
+        let mut preds: Vec<WBlock> = outside.iter().map(|&(p, _)| p).collect();
+        preds.sort();
+        preds.dedup();
+        if let [pre] = preds[..] {
+            loop_licm(b, &cfg, &mut defb, &inloop, pre, sp);
+        }
+        loop_indvars(b, &mut defb, &inloop, h);
+    }
+    wdce(b);
+}
+
+/// Move pure ops and non-SP global reads with all-invariant args to `pre`.
+fn loop_licm(
+    b: &mut FunctionBody,
+    cfg: &waffle::cfg::CFGInfo,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    pre: WBlock,
+    sp: waffle::Global,
+) {
+    // Process in RPO order so defs hoist before their users.
+    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
+    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
+    loop {
+        let mut moved = false;
+        for &lb in &order {
+            let mut i = 0;
+            while i < b.blocks[lb].insts.len() {
+                let v = b.blocks[lb].insts[i];
+                let hoist = match b.values[v] {
+                    ValueDef::Operator(op, args, _) => {
+                        let safe = match op {
+                            O::GlobalGet { global_index } => global_index != sp,
+                            _ => op.is_pure(),
+                        };
+                        safe && b.arg_pool[args].iter().all(|&a| {
+                            !inloop.contains(&defb[b.resolve_alias(a)])
+                        })
+                    }
+                    _ => false,
+                };
+                if hoist {
+                    b.blocks[lb].insts.remove(i);
+                    b.blocks[pre].insts.push(v);
+                    defb[v] = pre;
+                    moved = true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// Constant value of `v`, if it is an int-const op.
+fn wconst(b: &FunctionBody, v: WV) -> Option<i64> {
+    match b.values[b.resolve_alias(v)] {
+        ValueDef::Operator(O::I32Const { value }, ..) => Some(value as i32 as i64),
+        ValueDef::Operator(O::I64Const { value }, ..) => Some(value as i64),
+        _ => None,
+    }
+}
+
+/// Is `v` defined outside the loop (or a constant, whose position is free)?
+fn winv(
+    b: &FunctionBody,
+    defb: &waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    v: WV,
+) -> bool {
+    let v = b.resolve_alias(v);
+    match b.values[v] {
+        ValueDef::Operator(
+            O::I32Const { .. } | O::I64Const { .. } | O::F32Const { .. } | O::F64Const { .. },
+            ..,
+        ) => true,
+        _ => !inloop.contains(&defb[v]),
+    }
+}
+
+/// The value arriving for param `pidx` of `h` on edge `tidx` of `pred`.
+fn edge_arg(b: &mut FunctionBody, pred: WBlock, tidx: usize, pidx: usize) -> WV {
+    b.blocks[pred].terminator.visit_target(tidx, |t| t.args[pidx])
+}
+
+/// Push `v` as an extra block-arg on the `tidx`-th target of `pred`.
+fn edge_push(b: &mut FunctionBody, pred: WBlock, tidx: usize, v: WV) {
+    b.blocks[pred].terminator.update_target(tidx, |t| t.args.push(v));
+}
+
+/// Turn `add(base, iv*K)` addresses into `p += step*K` induction params.
+fn loop_indvars(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    h: WBlock,
+) {
+    let params = b.blocks[h].params.clone();
+    for (pidx, &(pty, pv)) in params.iter().enumerate() {
+        if pty != WT::I32 {
+            continue;
+        }
+        // Incoming edges into h: (pred, target-index, arg for pidx).
+        let mut edges = Vec::new();
+        let preds = b.blocks[h].preds.clone();
+        for (j, &pr) in preds.iter().enumerate() {
+            let tidx = b.blocks[h].pos_in_pred_succ[j];
+            let arg = edge_arg(b, pr, tidx, pidx);
+            let arg = b.resolve_alias(arg);
+            edges.push((pr, tidx, arg));
+        }
+        // Each in-loop edge must feed `pv + c` (or pv itself: step 0).
+        let mut steps: Vec<Option<WV>> = Vec::new();
+        let mut ok = true;
+        for &(pr, _, arg) in &edges {
+            if !inloop.contains(&pr) {
+                steps.push(None);
+                continue;
+            }
+            if arg == pv {
+                steps.push(Some(WV::invalid()));
+                continue;
+            }
+            let c = match b.values[arg] {
+                ValueDef::Operator(O::I32Add, aa, _) => {
+                    let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                        ok = false;
+                        break;
+                    };
+                    let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
+                    if x == pv && winv(b, defb, inloop, y) {
+                        Some(y)
+                    } else if y == pv && winv(b, defb, inloop, x) {
+                        Some(x)
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            steps.push(c);
+        }
+        if !ok {
+            continue;
+        }
+        // Addressing sites: `mul(pv, K)` / `mul(K, pv)` feeding `add(base, m)`.
+        let mut sites: Vec<(WV, WV, WV)> = Vec::new(); // (add-value, base, K)
+        for &lb in inloop.iter() {
+            for &inst in &b.blocks[lb].insts {
+                if let ValueDef::Operator(O::I32Add, aa, _) = b.values[inst] {
+                    let &[x, y, ..] = &b.arg_pool[aa][..] else { continue };
+                    for (m, base) in [(x, y), (y, x)] {
+                        let m = b.resolve_alias(m);
+                        let base = b.resolve_alias(base);
+                        if !winv(b, defb, inloop, base) {
+                            continue;
+                        }
+                        if let ValueDef::Operator(O::I32Mul, mm, _) = b.values[m] {
+                            let &[u, k, ..] = &b.arg_pool[mm][..] else { continue };
+                            let (u, k) = (b.resolve_alias(u), b.resolve_alias(k));
+                            if (u == pv && winv(b, defb, inloop, k))
+                                || (k == pv && winv(b, defb, inloop, u))
+                            {
+                                let k = if u == pv { k } else { u };
+                                sites.push((inst, base, k));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (add_v, base, k) in sites {
+            let p = b.add_blockparam(h, WT::I32);
+            defb[p] = h;
+            for (i, &(pr, tidx, arg)) in edges.iter().enumerate() {
+                if !inloop.contains(&pr) {
+                    // Preheader edge: p = base + arg*K.
+                    let m = b.add_op(pr, O::I32Mul, &[arg, k], &[WT::I32]);
+                    let init = b.add_op(pr, O::I32Add, &[base, m], &[WT::I32]);
+                    defb[m] = pr;
+                    defb[init] = pr;
+                    edge_push(b, pr, tidx, init);
+                } else {
+                    // Latch edge: p += c*K (p itself when the step is 0).
+                    let next = match steps[i] {
+                        None => unreachable!(),
+                        Some(c) if !c.is_valid() => p,
+                        Some(c) => {
+                            let inc = match (wconst(b, c), wconst(b, k)) {
+                                (Some(c), Some(k)) => b.add_op(
+                                    pr,
+                                    O::I32Const {
+                                        value: (c * k) as u32,
+                                    },
+                                    &[],
+                                    &[WT::I32],
+                                ),
+                                _ => b.add_op(pr, O::I32Mul, &[c, k], &[WT::I32]),
+                            };
+                            let next = b.add_op(pr, O::I32Add, &[p, inc], &[WT::I32]);
+                            defb[inc] = pr;
+                            defb[next] = pr;
+                            next
+                        }
+                    };
+                    edge_push(b, pr, tidx, next);
+                }
+            }
+            b.set_alias(add_v, p);
+        }
+    }
+}
+
+/// Drop now-dead speculatable insts (left behind by strength reduction).
+fn wdce(b: &mut FunctionBody) {
+    loop {
+        let mut uses: FxHashMap<WV, u32> = FxHashMap::default();
+        for blk in b.blocks.iter() {
+            for &v in &b.blocks[blk].insts {
+                match b.values[v] {
+                    ValueDef::Operator(_, args, _) => {
+                        for i in 0..args.len() {
+                            let a = b.resolve_alias(b.arg_pool[args][i]);
+                            *uses.entry(a).or_default() += 1;
+                        }
+                    }
+                    ValueDef::PickOutput(src, ..) => {
+                        let src = b.resolve_alias(src);
+                        *uses.entry(src).or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+            b.blocks[blk]
+                .terminator
+                .visit_uses(|v| *uses.entry(b.resolve_alias(v)).or_default() += 1);
+        }
+        let mut removed = false;
+        for blk in b.blocks.iter() {
+            let insts = std::mem::take(&mut b.blocks[blk].insts);
+            let keep: Vec<WV> = insts
+                .into_iter()
+                .filter(|&v| {
+                    let dead = uses.get(&v).copied().unwrap_or(0) == 0
+                        && match b.values[v] {
+                            ValueDef::Operator(op, ..) => {
+                                op.is_pure() || matches!(op, O::GlobalGet { .. })
+                            }
+                            ValueDef::Alias(_) | ValueDef::PickOutput(..) => true,
+                            _ => false,
+                        };
+                    removed |= dead;
+                    !dead
+                })
+                .collect();
+            b.blocks[blk].insts = keep;
+        }
+        if !removed {
+            break;
         }
     }
 }
