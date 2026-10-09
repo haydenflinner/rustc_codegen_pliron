@@ -341,7 +341,42 @@ pub(crate) enum Ins {
     Div(Box<Ins>, Box<Ins>),
 }
 
+/// `e` evaluates to a known constant (constants and `iconst` values folded
+/// through the tree). `None` on any non-constant input or `Div` by zero —
+/// the ops here all wrap like the emitted code does.
+fn ins_eval(pos: &FuncCursor, e: &Ins) -> Option<i64> {
+    Some(match e {
+        Ins::K(k) => *k,
+        Ins::Val(v) => iconst(pos.func, *v)?,
+        Ins::Add(a, b) => ins_eval(pos, a)?.wrapping_add(ins_eval(pos, b)?),
+        Ins::Sub(a, b) => ins_eval(pos, a)?.wrapping_sub(ins_eval(pos, b)?),
+        Ins::SatSub(a, b) => ins_eval(pos, a)?.saturating_sub(ins_eval(pos, b)?),
+        Ins::Mul(a, b) => ins_eval(pos, a)?.wrapping_mul(ins_eval(pos, b)?),
+        Ins::And(a, b) => ins_eval(pos, a)? & ins_eval(pos, b)?,
+        Ins::Div(a, b) => (ins_eval(pos, a)? as u64)
+            .checked_div(ins_eval(pos, b)? as u64)? as i64,
+    })
+}
+
 pub(crate) fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
+    // Cheap folds for shapes stream/address exprs produce (e.g. `iv0=0`
+    // turns `base + iv0*K` into `base + 0*K`).
+    match e {
+        Ins::Add(a, b) if ins_eval(pos, a) == Some(0) => return emit(pos, ty, b),
+        Ins::Add(a, b) | Ins::Sub(a, b) if ins_eval(pos, b) == Some(0) => {
+            return emit(pos, ty, a);
+        }
+        Ins::Mul(a, b) | Ins::And(a, b)
+            if ins_eval(pos, a) == Some(0) || ins_eval(pos, b) == Some(0) =>
+        {
+            return emit(pos, ty, &Ins::K(0));
+        }
+        Ins::Mul(a, b) if ins_eval(pos, a) == Some(1) => return emit(pos, ty, b),
+        Ins::Mul(a, b) | Ins::Div(a, b) if ins_eval(pos, b) == Some(1) => {
+            return emit(pos, ty, a);
+        }
+        _ => {}
+    }
     match e {
         Ins::Val(v) => {
             let v = *v;
