@@ -2867,7 +2867,7 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
             }
         }
     }
-    let cfg = waffle::cfg::CFGInfo::new(b);
+    let mut cfg = waffle::cfg::CFGInfo::new(b);
     // LICM/indvars move and create insts, so track defining blocks in a
     // live map rather than the (stale) CFGInfo.
     let mut defb = cfg.def_block.clone();
@@ -2885,12 +2885,24 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
         }
         loop_indvars(b, &mut defb, inloop, *h);
     }
+    // Version loops on provably-passing bounds checks; the fast clones
+    // join the unroll worklist.
+    let mut extra: Vec<(WBlock, FxHashSet<WBlock>)> = Vec::new();
+    for (h, inloop) in &loops {
+        if let Some(cl) = wbcheck(b, &mut defb, &cfg, inloop, *h) {
+            extra.push(cl);
+        }
+    }
+    // wbcheck adds blocks; refresh CFG so clones have rpo/dominance info.
+    if !extra.is_empty() {
+        cfg = waffle::cfg::CFGInfo::new(b);
+    }
     // Unroll innermost loops (bodies containing no other loop header).
     let unr = std::env::var("PLIRON_WASM_UNROLL")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-    for (h, inloop) in &loops {
+        .unwrap_or(8);
+    for (h, inloop) in loops.iter().chain(extra.iter()) {
         let innermost = loops
             .iter()
             .all(|(h2, _)| h2 == h || !inloop.contains(h2));
@@ -3224,209 +3236,27 @@ fn wunroll(
     copies: usize,
 ) {
     let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
-    // Size limits: unrolling is a tradeoff, not a free win.
+    // Size limits: unrolling is a tradeoff, not a free win. Scale the
+    // copy count down for larger bodies — a 64-inst loop gets 2 copies,
+    // a tiny one gets the full 8.
     let insts: usize = inloop.iter().map(|&lb| b.blocks[lb].insts.len()).sum();
+    let copies = copies.min((256 / insts.max(1)).max(2));
     if copies < 2 || inloop.len() > 16 || insts > 64 {
         if verbose {
             eprintln!("wunroll: {h} skipped size blocks={} insts={insts}", inloop.len());
         }
         return;
     }
-    // Only clone ordinary ops; anything exotic (picks, traces, unresolved
-    // placeholders) makes the copy unsafe.
-    for &lb in inloop {
-        for &inst in &b.blocks[lb].insts {
-            if !matches!(
-                b.values[inst],
-                ValueDef::Operator(..) | ValueDef::Alias(_)
-            ) {
-                if verbose {
-                    eprintln!("wunroll: {h} skipped exotic inst {inst}");
-                }
-                return;
-            }
-        }
-        if matches!(
-            b.blocks[lb].terminator,
-            Terminator::None | Terminator::Return { .. } | Terminator::Unreachable
-        ) {
-            if verbose {
-                eprintln!("wunroll: {h} skipped terminator in {lb}");
-            }
-            return;
-        }
-    }
-    // Exit-edge targets keep their original block when cloned, so a value
-    // defined in the loop but used *inside* an outside block would lose
-    // dominance along the new clone paths. Bail on any such leak in a
-    // reachable block (dead blocks may carry dangling args).
-    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
-    {
-        let mut wl = vec![WBlock::new(0)];
-        while let Some(x) = wl.pop() {
-            b.blocks[x].terminator.visit_targets(|t| {
-                if reach.insert(t.block) {
-                    wl.push(t.block);
-                }
-            });
-        }
-    }
-    let cloneable_sink = |b: &FunctionBody, blk: WBlock| {
-        matches!(b.blocks[blk].terminator, Terminator::Unreachable)
-            && b.blocks[blk]
-                .insts
-                .iter()
-                .all(|&v| matches!(b.values[v], ValueDef::Operator(..) | ValueDef::Alias(_)))
-    };
-    for blk in b.blocks.iter() {
-        if inloop.contains(&blk) || !reach.contains(&blk) {
-            continue;
-        }
-        // Blocks that end in `unreachable` and contain only ordinary ops
-        // are pure sinks: clones get their own copy, so leaks into them
-        // are fine.
-        let sink = cloneable_sink(b, blk);
-        for &v in &b.blocks[blk].insts {
-            match b.values[v] {
-                ValueDef::Operator(_, aa, _) if !sink => {
-                    if b.arg_pool[aa]
-                        .iter()
-                        .any(|&a| inloop.contains(&defb[b.resolve_alias(a)]))
-                    {
-                        if verbose {
-                            eprintln!("wunroll: {h} skipped leak {v} in {blk}");
-                        }
-                        return;
-                    }
-                }
-                ValueDef::PickOutput(src, ..) if !sink => {
-                    if inloop.contains(&defb[b.resolve_alias(src)]) {
-                        if verbose {
-                            eprintln!("wunroll: {h} skipped leak pick {v} in {blk}");
-                        }
-                        return;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !sink {
-            let mut leak = false;
-            b.blocks[blk].terminator.visit_uses(|a| {
-                leak |= inloop.contains(&defb[b.resolve_alias(a)]);
-            });
-            if leak {
-                if verbose {
-                    eprintln!("wunroll: {h} skipped leak via terminator in {blk}");
-                }
-                return;
-            }
-        }
+    if !loop_cloneable(b, defb, inloop, h) {
+        return;
     }
     let mut order: Vec<WBlock> = inloop.iter().copied().collect();
     order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
-    fn remap_v(b: &FunctionBody, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
-        let r = b.resolve_alias(v);
-        vmap.get(&r).copied().unwrap_or(r)
-    }
     // Build the copies.
     let mut heads = vec![h];
     let mut copies_blocks: Vec<Vec<WBlock>> = Vec::new();
     for _ in 1..copies {
-        let mut bmap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
-        let mut vmap: FxHashMap<WV, WV> = FxHashMap::default();
-        for &lb in &order {
-            let nb = b.add_block();
-            bmap.insert(lb, nb);
-            for &(ty, pv) in b.blocks[lb].params.clone().iter() {
-                let np = b.add_blockparam(nb, ty);
-                defb[np] = nb;
-                vmap.insert(pv, np);
-            }
-        }
-        let mut aliases = Vec::new();
-        for &lb in &order {
-            let nb = bmap[&lb];
-            let insts = b.blocks[lb].insts.clone();
-            for inst in insts {
-                match b.values[inst] {
-                    ValueDef::Operator(op, aa, tt) => {
-                        let args: Vec<WV> = b.arg_pool[aa]
-                            .iter()
-                            .map(|&a| remap_v(b, &vmap, a))
-                            .collect();
-                        let tys: Vec<WT> = b.type_pool[tt].to_vec();
-                        let nv = b.add_op(nb, op, &args, &tys);
-                        defb[nv] = nb;
-                        vmap.insert(inst, nv);
-                    }
-                    ValueDef::Alias(_) => aliases.push(inst),
-                    _ => {}
-                }
-            }
-        }
-        // Aliases may point at insts cloned in any order; remap them now
-        // that every operator has a clone.
-        for inst in aliases {
-            if let ValueDef::Alias(a) = b.values[inst] {
-                let nv = remap_v(b, &vmap, a);
-                vmap.insert(inst, nv);
-            }
-        }
-        // Clone terminators: in-loop targets map into the copy; exits stay,
-        // except cloneable `unreachable` sinks (panic paths etc.) which are
-        // copied per copy so their leaked args stay dominated.
-        let mut smap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
-        for &lb in &order {
-            let nb = bmap[&lb];
-            let term = b.blocks[lb].terminator.clone();
-            let mut remap_t = |b: &mut FunctionBody, t: &BlockTarget| {
-                let blk = if let Some(&c) = bmap.get(&t.block) {
-                    c
-                } else if cloneable_sink(b, t.block) {
-                    *smap.entry(t.block).or_insert_with_key(|&tb| {
-                        clone_sink(b, defb, &vmap, tb)
-                    })
-                } else {
-                    t.block
-                };
-                BlockTarget {
-                    block: blk,
-                    args: t.args.iter().map(|&a| remap_v(b, &vmap, a)).collect(),
-                }
-            };
-            let nt = match term {
-                Terminator::Br { target } => Terminator::Br {
-                    target: remap_t(b, &target),
-                },
-                Terminator::CondBr {
-                    cond,
-                    if_true,
-                    if_false,
-                } => Terminator::CondBr {
-                    cond: remap_v(b, &vmap, cond),
-                    if_true: remap_t(b, &if_true),
-                    if_false: remap_t(b, &if_false),
-                },
-                Terminator::Select {
-                    value,
-                    targets,
-                    default,
-                } => {
-                    let value = remap_v(b, &vmap, value);
-                    let targets: Vec<_> =
-                        targets.iter().map(|t| remap_t(b, t)).collect();
-                    let default = remap_t(b, &default);
-                    Terminator::Select {
-                        value,
-                        targets,
-                        default,
-                    }
-                }
-                _ => Terminator::Unreachable,
-            };
-            b.set_terminator(nb, nt);
-        }
+        let (bmap, _) = clone_loop(b, defb, &order);
         heads.push(bmap[&h]);
         copies_blocks.push(order.iter().map(|lb| bmap[lb]).collect());
     }
@@ -3448,6 +3278,478 @@ fn wunroll(
         }
     }
     b.recompute_edges();
+}
+
+/// `unreachable`-terminated blocks of ordinary ops are pure sinks (panic
+/// paths): a loop clone may point at its own copy of the sink, so values
+/// leaking into them stay dominated.
+fn cloneable_sink(b: &FunctionBody, blk: WBlock) -> bool {
+    matches!(b.blocks[blk].terminator, Terminator::Unreachable)
+        && b.blocks[blk]
+            .insts
+            .iter()
+            .all(|&v| matches!(b.values[v], ValueDef::Operator(..) | ValueDef::Alias(_)))
+}
+
+/// Can this loop's blocks be safely cloned? Requires ordinary insts only,
+/// supported terminators, and no loop-defined value used *inside* a
+/// reachable non-sink outside block (edge args get remapped per copy;
+/// dead blocks may carry dangling args and don't count).
+fn loop_cloneable(
+    b: &FunctionBody,
+    defb: &waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    h: WBlock,
+) -> bool {
+    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    for &lb in inloop {
+        for &inst in &b.blocks[lb].insts {
+            if !matches!(
+                b.values[inst],
+                ValueDef::Operator(..) | ValueDef::Alias(_)
+            ) {
+                if verbose {
+                    eprintln!("wloop: {h} skipped exotic inst {inst}");
+                }
+                return false;
+            }
+        }
+        if !matches!(
+            b.blocks[lb].terminator,
+            Terminator::Br { .. } | Terminator::CondBr { .. } | Terminator::Select { .. }
+        ) {
+            if verbose {
+                eprintln!("wloop: {h} skipped terminator in {lb}");
+            }
+            return false;
+        }
+    }
+    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
+    {
+        let mut wl = vec![WBlock::new(0)];
+        while let Some(x) = wl.pop() {
+            b.blocks[x].terminator.visit_targets(|t| {
+                if reach.insert(t.block) {
+                    wl.push(t.block);
+                }
+            });
+        }
+    }
+    for blk in b.blocks.iter() {
+        if inloop.contains(&blk) || !reach.contains(&blk) {
+            continue;
+        }
+        let sink = cloneable_sink(b, blk);
+        if !sink {
+            for &v in &b.blocks[blk].insts {
+                match b.values[v] {
+                    ValueDef::Operator(_, aa, _) => {
+                        if b.arg_pool[aa]
+                            .iter()
+                            .any(|&a| inloop.contains(&defb[b.resolve_alias(a)]))
+                        {
+                            if verbose {
+                                eprintln!("wloop: {h} skipped leak {v} in {blk}");
+                            }
+                            return false;
+                        }
+                    }
+                    ValueDef::PickOutput(src, ..) => {
+                        if inloop.contains(&defb[b.resolve_alias(src)]) {
+                            if verbose {
+                                eprintln!("wloop: {h} skipped leak pick {v} in {blk}");
+                            }
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut leak = false;
+            b.blocks[blk].terminator.visit_uses(|a| {
+                leak |= inloop.contains(&defb[b.resolve_alias(a)]);
+            });
+            if leak {
+                if verbose {
+                    eprintln!("wloop: {h} skipped leak via terminator in {blk}");
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn remap_v(b: &FunctionBody, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
+    let r = b.resolve_alias(v);
+    vmap.get(&r).copied().unwrap_or(r)
+}
+
+/// Clone the blocks in `order` once: params, operator/alias insts, and
+/// terminators are remapped into the copy; in-loop targets point at the
+/// copy, exits keep their block, and cloneable sinks are cloned so their
+/// leaked args stay dominated.
+fn clone_loop(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    order: &[WBlock],
+) -> (FxHashMap<WBlock, WBlock>, FxHashMap<WV, WV>) {
+    let mut bmap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
+    let mut vmap: FxHashMap<WV, WV> = FxHashMap::default();
+    for &lb in order {
+        let nb = b.add_block();
+        bmap.insert(lb, nb);
+        for &(ty, pv) in b.blocks[lb].params.clone().iter() {
+            let np = b.add_blockparam(nb, ty);
+            defb[np] = nb;
+            vmap.insert(pv, np);
+        }
+    }
+    let mut aliases = Vec::new();
+    for &lb in order {
+        let nb = bmap[&lb];
+        let insts = b.blocks[lb].insts.clone();
+        for inst in insts {
+            match b.values[inst] {
+                ValueDef::Operator(op, aa, tt) => {
+                    let args: Vec<WV> = b.arg_pool[aa]
+                        .iter()
+                        .map(|&a| remap_v(b, &vmap, a))
+                        .collect();
+                    let tys: Vec<WT> = b.type_pool[tt].to_vec();
+                    let nv = b.add_op(nb, op, &args, &tys);
+                    defb[nv] = nb;
+                    vmap.insert(inst, nv);
+                }
+                ValueDef::Alias(_) => aliases.push(inst),
+                _ => {}
+            }
+        }
+    }
+    // Aliases may point at insts cloned in any order; remap them now that
+    // every operator has a clone.
+    for inst in aliases {
+        if let ValueDef::Alias(a) = b.values[inst] {
+            let nv = remap_v(b, &vmap, a);
+            vmap.insert(inst, nv);
+        }
+    }
+    let mut smap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
+    for &lb in order {
+        let nb = bmap[&lb];
+        let term = b.blocks[lb].terminator.clone();
+        let mut remap_t = |b: &mut FunctionBody, t: &BlockTarget| {
+            let blk = if let Some(&c) = bmap.get(&t.block) {
+                c
+            } else if cloneable_sink(b, t.block) {
+                *smap
+                    .entry(t.block)
+                    .or_insert_with_key(|&tb| clone_sink(b, defb, &vmap, tb))
+            } else {
+                t.block
+            };
+            BlockTarget {
+                block: blk,
+                args: t.args.iter().map(|&a| remap_v(b, &vmap, a)).collect(),
+            }
+        };
+        let nt = match term {
+            Terminator::Br { target } => Terminator::Br {
+                target: remap_t(b, &target),
+            },
+            Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } => Terminator::CondBr {
+                cond: remap_v(b, &vmap, cond),
+                if_true: remap_t(b, &if_true),
+                if_false: remap_t(b, &if_false),
+            },
+            Terminator::Select {
+                value,
+                targets,
+                default,
+            } => {
+                let value = remap_v(b, &vmap, value);
+                let targets: Vec<_> = targets.iter().map(|t| remap_t(b, t)).collect();
+                let default = remap_t(b, &default);
+                Terminator::Select {
+                    value,
+                    targets,
+                    default,
+                }
+            }
+            _ => Terminator::Unreachable,
+        };
+        b.set_terminator(nb, nt);
+    }
+    (bmap, vmap)
+}
+
+/// Loop versioning for in-loop unsigned bounds checks. Given a canonical
+/// induction variable `i` bounded by a dominating `i <u n` exit test, an
+/// in-loop check `idx <u len` (`idx = i + d`) always passes when the last
+/// iteration's index is in bounds. The preheader computes
+/// `hi = i0 + (n - i0 - 1) * step + d` in u64 (exact: it fits, since
+/// `(n - i0 - 1) * step < 2^64` and wraps make `hi >= 2^32 > len` bail to
+/// the slow path) and branches to a check-free clone when `i0 >=u n`
+/// (zero trips) or `hi <u len`. The original loop stays as the slow path.
+fn wbcheck(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    cfg: &waffle::cfg::CFGInfo,
+    inloop: &FxHashSet<WBlock>,
+    h: WBlock,
+) -> Option<(WBlock, FxHashSet<WBlock>)> {
+    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    macro_rules! bail {
+        ($($a:tt)*) => {{
+            if verbose {
+                eprintln!("wbcheck: {h} {}", format_args!($($a)*));
+            }
+            return None;
+        }};
+    }
+    // Single preheader that just forwards to h.
+    let edges = outside_edges(b, h, inloop);
+    let mut preds: Vec<WBlock> = edges.iter().map(|&(p, _)| p).collect();
+    preds.sort();
+    preds.dedup();
+    let [pre] = preds[..] else { bail!("outside preds {preds:?}") };
+    let pre_tidx = edges.iter().find(|&&(p, _)| p == pre)?.1;
+    let Terminator::Br { target: pre_t } = &b.blocks[pre].terminator else {
+        bail!("pre {pre} not a forwarder");
+    };
+    if pre_t.block != h {
+        bail!("pre {pre} targets {}", pre_t.block);
+    }
+    // Latches: in-loop preds of h.
+    let latches: Vec<(WBlock, usize)> = b.blocks[h]
+        .preds
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| inloop.contains(p))
+        .map(|(j, &p)| (p, b.blocks[h].pos_in_pred_succ[j]))
+        .collect();
+    if latches.is_empty() {
+        bail!("no latches");
+    }
+    // Normalize a CondBr `cond` into (idx, bound, pass-is-true) for
+    // `idx <u bound` / `idx >=u bound` shapes.
+    let as_check = |b: &FunctionBody, cond: WV| -> Option<(WV, WV, bool)> {
+        match b.values[b.resolve_alias(cond)] {
+            ValueDef::Operator(O::I32LtU, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                Some((b.resolve_alias(x), b.resolve_alias(y), true))
+            }
+            ValueDef::Operator(O::I32GeU, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                Some((b.resolve_alias(x), b.resolve_alias(y), false))
+            }
+            _ => None,
+        }
+    };
+    // Exit-test candidates: `iv <u n`, one arm leaves the loop, the block
+    // dominates every latch so each iteration is gated by it. Several
+    // blocks can match (a bounds check has the same shape); pick per
+    // candidate the checks it dominates and use the first that yields
+    // any — ordered by RPO so a dominating test wins.
+    let mut cands: Vec<(WBlock, usize, WV)> = Vec::new();
+    'cand: for &lb in inloop.iter() {
+        let Terminator::CondBr {
+            cond,
+            if_true,
+            if_false,
+        } = &b.blocks[lb].terminator
+        else {
+            continue;
+        };
+        let Some((x, n, pass_true)) = as_check(b, *cond) else {
+            continue;
+        };
+        let pass = if pass_true { if_true } else { if_false };
+        let fail = if pass_true { if_false } else { if_true };
+        if !inloop.contains(&pass.block) || inloop.contains(&fail.block) {
+            continue;
+        }
+        let ValueDef::BlockParam(blk, pidx, _) = b.values[x] else {
+            continue;
+        };
+        if blk != h || !winv(b, defb, inloop, n) {
+            continue;
+        }
+        for &(la, _) in &latches {
+            if !cfg.dominates(lb, la) {
+                continue 'cand;
+            }
+        }
+        cands.push((lb, pidx as usize, n));
+    }
+    cands.sort_by_key(|&(lb, _, _)| cfg.rpo_pos[lb]);
+    let mut picked = None;
+    for &(tb, pidx, n) in &cands {
+        let pv = b.blocks[h].params[pidx].1;
+        // Check sites: `idx <u len`, dominated by the exit test, idx
+        // affine in pv with unit stride. The "pass" arm may stay in or
+        // leave the loop — removing a proven-true edge is sound either
+        // way.
+        let mut checks: Vec<(WBlock, WV, Option<WV>, bool)> = Vec::new();
+        for &lb in inloop.iter() {
+            if lb == tb || !cfg.dominates(tb, lb) {
+                continue;
+            }
+            let Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } = &b.blocks[lb].terminator
+            else {
+                continue;
+            };
+            let Some((x, len, pass_true)) = as_check(b, *cond) else {
+                continue;
+            };
+            let pass = if pass_true { if_true } else { if_false };
+            if !inloop.contains(&pass.block) || !winv(b, defb, inloop, len) {
+                continue;
+            }
+            let d = if x == pv {
+                None
+            } else {
+                match b.values[x] {
+                    ValueDef::Operator(O::I32Add, aa, _) => {
+                        let &[u, v, ..] = &b.arg_pool[aa][..] else { continue };
+                        let (u, v) = (b.resolve_alias(u), b.resolve_alias(v));
+                        if u == pv && winv(b, defb, inloop, v) {
+                            Some(v)
+                        } else if v == pv && winv(b, defb, inloop, u) {
+                            Some(u)
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                }
+            };
+            checks.push((lb, len, d, pass_true));
+        }
+        if !checks.is_empty() {
+            picked = Some((tb, pidx, n, checks));
+            break;
+        }
+    }
+    let Some((_, pidx, n, checks)) = picked else {
+        bail!("no exit test with checks ({} candidates)", cands.len());
+    };
+    let pv = b.blocks[h].params[pidx].1;
+    if checks.len() > 8 {
+        bail!("too many checks");
+    }
+    // pv must be affine on every latch edge with one common invariant
+    // step (a latch feeding pv unchanged is step 0).
+    let mut c: Option<WV> = None;
+    for &(la, tidx) in &latches {
+        let arg = edge_arg(b, la, tidx, pidx);
+        let arg = b.resolve_alias(arg);
+        if arg == pv {
+            continue;
+        }
+        let step = match b.values[arg] {
+            ValueDef::Operator(O::I32Add, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
+                if x == pv && winv(b, defb, inloop, y) {
+                    y
+                } else if y == pv && winv(b, defb, inloop, x) {
+                    x
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        match c {
+            None => c = Some(step),
+            Some(c) if c == step => {}
+            _ => return None,
+        }
+    }
+    let i0 = edge_arg(b, pre, pre_tidx, pidx);
+    let i0 = b.resolve_alias(i0);
+    if !loop_cloneable(b, defb, inloop, h) {
+        bail!("not cloneable");
+    }
+    // Guard in the preheader, in u64: hi = i0 + (n - i0 - 1)*c + d.
+    let mut pop = |b: &mut FunctionBody, op: O, args: &[WV], tys: &[WT]| {
+        let v = b.add_op(pre, op, args, tys);
+        defb[v] = pre;
+        v
+    };
+    let i064 = pop(b, O::I64ExtendI32U, &[i0], &[WT::I64]);
+    let n64 = pop(b, O::I64ExtendI32U, &[n], &[WT::I64]);
+    let c64 = match c {
+        Some(c) => pop(b, O::I64ExtendI32U, &[c], &[WT::I64]),
+        None => pop(b, O::I64Const { value: 0 }, &[], &[WT::I64]),
+    };
+    let one = pop(b, O::I64Const { value: 1 }, &[], &[WT::I64]);
+    let trip = pop(b, O::I64Sub, &[n64, i064], &[WT::I64]);
+    let tm1 = pop(b, O::I64Sub, &[trip, one], &[WT::I64]);
+    let span = pop(b, O::I64Mul, &[tm1, c64], &[WT::I64]);
+    let last = pop(b, O::I64Add, &[i064, span], &[WT::I64]);
+    let mut acc: Option<WV> = None;
+    for &(_, len, d, _) in &checks {
+        let len64 = pop(b, O::I64ExtendI32U, &[len], &[WT::I64]);
+        let hi = match d {
+            Some(d) => {
+                let d64 = pop(b, O::I64ExtendI32U, &[d], &[WT::I64]);
+                pop(b, O::I64Add, &[last, d64], &[WT::I64])
+            }
+            None => last,
+        };
+        let ok = pop(b, O::I64LtU, &[hi, len64], &[WT::I32]);
+        acc = Some(match acc {
+            None => ok,
+            Some(a) => pop(b, O::I32And, &[a, ok], &[WT::I32]),
+        });
+    }
+    let acc = acc.unwrap();
+    let zt = pop(b, O::I32GeU, &[i0, n], &[WT::I32]);
+    let guard = pop(b, O::I32Or, &[zt, acc], &[WT::I32]);
+    // Fast copy: clone the loop, drop each proven check's branch.
+    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
+    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
+    let (bmap, _) = clone_loop(b, defb, &order);
+    for &(cb, _, _, pass_true) in &checks {
+        let nb = bmap[&cb];
+        let Terminator::CondBr {
+            if_true, if_false, ..
+        } = b.blocks[nb].terminator.clone()
+        else {
+            continue;
+        };
+        let pass = if pass_true { if_true } else { if_false };
+        b.blocks[nb].terminator = Terminator::Br { target: pass };
+    }
+    // Route the preheader edge: guard -> fast clone, else original.
+    let args = match &b.blocks[pre].terminator {
+        Terminator::Br { target } => target.args.clone(),
+        _ => unreachable!(),
+    };
+    let fh = bmap[&h];
+    b.blocks[pre].terminator = Terminator::CondBr {
+        cond: guard,
+        if_true: BlockTarget {
+            block: fh,
+            args: args.clone(),
+        },
+        if_false: BlockTarget { block: h, args },
+    };
+    b.recompute_edges();
+    if verbose {
+        eprintln!("wbcheck: {h} versioned {} checks -> {fh}", checks.len());
+    }
+    Some((fh, order.iter().map(|lb| bmap[lb]).collect()))
 }
 
 /// Clone an `unreachable`-terminated sink block (panic path) for a loop
