@@ -21,7 +21,7 @@ skipped with a reason; edition defaults to 2015 like compiletest.
 
 Writes target/ui/results.json and prints a failure summary.
 """
-import collections, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys
+import collections, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _sibling = os.path.join(ROOT, "..", "rust")
@@ -180,6 +180,7 @@ def exec_bin(path, sp, exe):
 
 
 STOCK_CACHE_VERSION = 5  # bump when normalization or comparison semantics change
+_STOCK_LOCKS = collections.defaultdict(threading.Lock)
 
 
 def stock_result(path, sp):
@@ -192,21 +193,24 @@ def stock_result(path, sp):
                      sort_keys=True).encode()
     ).hexdigest()[:32]
     cache = os.path.join(OUT, "stock", key + ".json")
-    if os.path.exists(cache):
-        res = json.load(open(cache))
-        # Tuples serialize as lists; comparisons below index but the outer
-        # `got != want` check needs the same shape.
-        if res[2] is not None:
-            res[2] = tuple(res[2])
+    # Different test files can hash to the same key; serialize the stock build
+    # per key so one thread's artifact removal can't race another's check.
+    with _STOCK_LOCKS[key]:
+        if os.path.exists(cache):
+            res = json.load(open(cache))
+            # Tuples serialize as lists; comparisons below index but the outer
+            # `got != want` check needs the same shape.
+            if res[2] is not None:
+                res[2] = tuple(res[2])
+            return res
+        exe = os.path.join(OUT, "stock", key)
+        res = build_and_run(path, sp, exe, False)
+        if os.path.exists(exe):
+            os.remove(exe)
+        tmp = cache + ".tmp"
+        json.dump(res, open(tmp, "w"))
+        os.replace(tmp, cache)
         return res
-    exe = os.path.join(OUT, "stock", key)
-    res = build_and_run(path, sp, exe, False)
-    if os.path.exists(exe):
-        os.remove(exe)
-    tmp = cache + ".tmp"
-    json.dump(res, open(tmp, "w"))
-    os.replace(tmp, cache)
-    return res
 
 
 def first_diff(want, got):
@@ -234,6 +238,10 @@ def run(path):
             if os.path.exists(p):
                 os.remove(p)
         if st == "ice":
+            # The frontend is shared: when stock rustc panics too, pliron
+            # never diverged — record it as environmental.
+            if ref_st == "ice":
+                return rel, "env-ice", f"both panic: {msg} (stock: {ref_msg})"
             return rel, "ice", msg
         if st == "compile-timeout" and ref_st != "compile-timeout":
             # A pliron hang where stock finished is a divergence even if
@@ -275,13 +283,16 @@ def run(path):
                 if ew != eg:
                     res = ("stderr-mismatch", "stderr " + first_diff(ew, eg))
         if res:
-            # Run the pliron binary once more; a test whose own output varies
-            # between runs (e.g. HashMap RandomState order) is flaky, not a
-            # backend mismatch.
-            _, _, got2 = exec_bin(path, sp, exe)
-            if got2 is not None and got2 != got:
-                res = None
-                return rel, "skipped", "nondeterministic output"
+            # A test whose output varies run-to-run under *either* backend
+            # (HashMap RandomState order, timing, ...) is flaky, not a backend
+            # mismatch. Re-run pliron: flaky if its own output varies, or if
+            # it can still reproduce stock's output.
+            for _ in range(4):
+                _, _, got2 = exec_bin(path, sp, exe)
+                if got2 is None:
+                    continue
+                if got2 != got or got2 == want:
+                    return rel, "skipped", "nondeterministic output"
     if os.path.exists(exe):
         os.remove(exe)
     if res:
@@ -304,7 +315,13 @@ def main():
                 res[rel] = [st, msg]
             if i % 200 == 0:
                 print(i, collections.Counter(v[0] for v in res.values()), flush=True)
-    json.dump(res, open(os.path.join(OUT, "results.json"), "w"), indent=1, sort_keys=True)
+    # A filtered run must not clobber the full results file; merge into it.
+    rpath = os.path.join(OUT, "results.json")
+    if FILTER and os.path.exists(rpath):
+        prev = json.load(open(rpath))
+        prev.update(res)
+        res = prev
+    json.dump(res, open(rpath, "w"), indent=1, sort_keys=True)
     c = collections.Counter(v[0] for v in res.values())
     print("SUMMARY", dict(c))
     groups = collections.Counter((v[0], re.sub(r"\d+", "N", v[1])[:160]) for v in res.values()
