@@ -1248,6 +1248,47 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
     }
 
+    /// f16/f128 have no native `fabs`; clear the top bit of the bit pattern.
+    fn fabs_wide(&mut self, x: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let mf = MemFlagsData::new();
+        if t == clt::F16 {
+            let i = self.b.ins().bitcast(clt::I16, mf, x);
+            let r = self.b.ins().band_imm_u(i, 0x7fff);
+            self.b.ins().bitcast(t, mf, r)
+        } else {
+            let i = self.b.ins().bitcast(clt::I128, mf, x);
+            let (lo, hi) = self.b.ins().isplit(i);
+            let hi = self.b.ins().band_imm_s(hi, i64::MAX);
+            let r = self.b.ins().iconcat(lo, hi);
+            self.b.ins().bitcast(t, mf, r)
+        }
+    }
+
+    /// f16/f128 have no native `fcopysign`; move `b`'s sign bit onto `a`.
+    fn fcopysign_wide(&mut self, a: ir::Value, b: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(a);
+        let mf = MemFlagsData::new();
+        if t == clt::F16 {
+            let i = self.b.ins().bitcast(clt::I16, mf, a);
+            let j = self.b.ins().bitcast(clt::I16, mf, b);
+            let v = self.b.ins().band_imm_u(i, 0x7fff);
+            let s = self.b.ins().band_imm_u(j, 0x8000);
+            let r = self.b.ins().bor(v, s);
+            self.b.ins().bitcast(t, mf, r)
+        } else {
+            let i = self.b.ins().bitcast(clt::I128, mf, a);
+            let (lo, hi) = self.b.ins().isplit(i);
+            let hi = self.b.ins().band_imm_s(hi, i64::MAX);
+            let j = self.b.ins().bitcast(clt::I128, mf, b);
+            let (_, jhi) = self.b.ins().isplit(j);
+            let jhi = self.b.ins().band_imm_s(jhi, i64::MIN);
+            let hi = self.b.ins().bor(hi, jhi);
+            let r = self.b.ins().iconcat(lo, hi);
+            self.b.ins().bitcast(t, mf, r)
+        }
+    }
+
     fn ty_leaves(&self, t: TypeHandle) -> Vec<(u64, ClType)> {
         leaves(self.ctx, t)
     }
@@ -1841,6 +1882,32 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 self.set(op, r);
             }};
         }
+        macro_rules! float_binop {
+            ($m:ident, $tf:expr) => {{
+                let a = self.get(opnds[0]);
+                let b = self.get(opnds[1]);
+                let mut r = Vals::new();
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let t = self.b.func.dfg.value_type(*x);
+                    // Cranelift can't do f16/f128 arithmetic, and the
+                    // compiler-builtins f16 set is incomplete (`__divhf3` is
+                    // missing), so f16 promotes to f32 — exact in, single
+                    // rounding out — while f128 uses the quad helpers.
+                    let v = if t == clt::F16 {
+                        let x = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*x])[0];
+                        let y = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*y])[0];
+                        let v = self.b.ins().$m(x, y);
+                        self.libcall("__truncsfhf2", &[clt::F32], &[t], &[v])[0]
+                    } else if t == clt::F128 {
+                        self.libcall($tf, &[t, t], &[t], &[*x, *y])[0]
+                    } else {
+                        self.b.ins().$m(*x, *y)
+                    };
+                    r.push(v);
+                }
+                self.set(op, r);
+            }};
+        }
 
         if is!(ReturnOp) {
             let vs = match opnds.first() {
@@ -2128,19 +2195,29 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(SRemOp) {
             divop!(srem, "__modti3")
         } else if is!(FAddOp) {
-            binop!(fadd)
+            float_binop!(fadd, "__addtf3")
         } else if is!(FSubOp) {
-            binop!(fsub)
+            float_binop!(fsub, "__subtf3")
         } else if is!(FMulOp) {
-            binop!(fmul)
+            float_binop!(fmul, "__multf3")
         } else if is!(FDivOp) {
-            binop!(fdiv)
+            float_binop!(fdiv, "__divtf3")
         } else if is!(FRemOp) {
             let a = self.get1(opnds[0]);
             let b = self.get1(opnds[1]);
             let t = self.b.func.dfg.value_type(a);
-            let name = if t == clt::F32 { "fmodf" } else { "fmod" };
-            let r = self.libcall(name, &[t, t], &[t], &[a, b])[0];
+            let r = if t == clt::F16 {
+                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
+                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let m = self.libcall("fmodf", &[clt::F32, clt::F32], &[clt::F32], &[a, b])[0];
+                self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[m])[0]
+            } else if t == clt::F128 {
+                // compiler-builtins' libm port exports `fmodf128`.
+                self.libcall("fmodf128", &[t, t], &[t], &[a, b])[0]
+            } else {
+                let name = if t == clt::F32 { "fmodf" } else { "fmod" };
+                self.libcall(name, &[t, t], &[t], &[a, b])[0]
+            };
             self.set1(op, r);
         } else if is!(FNegOp) {
             let a = self.get(opnds[0]);
@@ -2202,7 +2279,33 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let t = self.ty_leaves(self.res_ty(op))[0].1;
             let signed = is!(SIToFPOp);
             let ft = self.b.func.dfg.value_type(x);
-            let r = if ft == clt::I128 {
+            let x = if ft.bits() < 32 {
+                self.resize(x, clt::I32, signed)
+            } else {
+                x
+            };
+            let it = self.b.func.dfg.value_type(x);
+            let r = if t == clt::F16 {
+                // compiler-builtins doesn't ship `__float*hf`; go via f32.
+                let f32v = if it == clt::I128 {
+                    let name = if signed { "__floattisf" } else { "__floatuntisf" };
+                    self.libcall(name, &[clt::I128], &[clt::F32], &[x])[0]
+                } else if signed {
+                    self.b.ins().fcvt_from_sint(clt::F32, x)
+                } else {
+                    self.b.ins().fcvt_from_uint(clt::F32, x)
+                };
+                self.libcall("__truncsfhf2", &[clt::F32], &[t], &[f32v])[0]
+            } else if t == clt::F128 {
+                // No cranelift int->f128 conversion either; compiler-builtins.
+                let isx = match it.bits() {
+                    128 => "t",
+                    64 => "d",
+                    _ => "s",
+                };
+                let name = format!("__float{}{}itf", if signed { "" } else { "un" }, isx);
+                self.libcall(&name, &[it], &[t], &[x])[0]
+            } else if ft == clt::I128 {
                 let name = match (signed, t == clt::F32) {
                     (true, true) => "__floattisf",
                     (true, false) => "__floattidf",
@@ -2643,16 +2746,52 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn fcvt_sat(&mut self, signed: bool, t: ClType, x: ir::Value) -> ir::Value {
-        if t == clt::I128 {
-            // Cranelift x64 can't convert floats to i128; compiler-builtins' helpers saturate.
-            let ft = self.b.func.dfg.value_type(x);
-            let name = match (signed, ft == clt::F32) {
-                (true, true) => "__fixsfti",
-                (true, false) => "__fixdfti",
-                (false, true) => "__fixunssfti",
-                (false, false) => "__fixunsdfti",
+        let ft = self.b.func.dfg.value_type(x);
+        if ft == clt::F16 {
+            // compiler-builtins doesn't ship `__fix*hf*`; f16->f32 is exact,
+            // so extending first preserves the saturating result.
+            let x = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0];
+            return self.fcvt_sat(signed, t, x);
+        }
+        if t == clt::I128 || ft == clt::F128 {
+            // Cranelift can't convert floats to i128 nor anything to/from
+            // f128; compiler-builtins' helpers saturate.
+            let sfx = match ft {
+                clt::F32 => "sf",
+                clt::F64 => "df",
+                _ => "tf",
             };
-            return self.libcall(name, &[ft], &[clt::I128], &[x])[0];
+            let (isx, it) = if t == clt::I128 {
+                ("ti", clt::I128)
+            } else if t.bits() > 32 {
+                ("di", clt::I64)
+            } else {
+                ("si", clt::I32)
+            };
+            let name = format!("__fix{}{}{}", if signed { "" } else { "uns" }, sfx, isx);
+            let r = self.libcall(&name, &[ft], &[it], &[x])[0];
+            if it == t {
+                return r;
+            }
+            // Saturate to the narrow range before reducing.
+            let (lo, hi) = if signed {
+                (-(1i64 << (t.bits() - 1)), (1i64 << (t.bits() - 1)) - 1)
+            } else {
+                (0, (1i64 << t.bits()) - 1)
+            };
+            let lo = self.b.ins().iconst(clt::I32, lo);
+            let hi = self.b.ins().iconst(clt::I32, hi);
+            let r = if signed {
+                self.b.ins().smax(r, lo)
+            } else {
+                self.b.ins().umax(r, lo)
+            };
+            let r = if signed {
+                self.b.ins().smin(r, hi)
+            } else {
+                self.b.ins().umin(r, hi)
+            };
+            return self.b.ins().ireduce(t, r);
         }
         let it = if t.bits() < 32 { clt::I32 } else { t };
         let r = if signed {
@@ -3251,17 +3390,58 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let rt = self.ty_leaves(self.res_ty(op))[0].1;
                 self.vec_op(n, &a, rt)
             }
-            "llvm.sqrt" => self.b.ins().sqrt(a[0]),
-            "llvm.fabs" => self.b.ins().fabs(a[0]),
-            "llvm.floor" => self.b.ins().floor(a[0]),
-            "llvm.ceil" => self.b.ins().ceil(a[0]),
-            "llvm.trunc" => self.b.ins().trunc(a[0]),
-            "llvm.roundeven" => self.b.ins().nearest(a[0]),
-            "llvm.copysign" => self.b.ins().fcopysign(a[0], a[1]),
-            "llvm.fma" => self.b.ins().fma(a[0], a[1], a[2]),
-            "llvm.minimum" => self.b.ins().fmin(a[0], a[1]),
-            "llvm.maximum" => self.b.ins().fmax(a[0], a[1]),
-            "llvm.fmuladd" => self.b.ins().fma(a[0], a[1], a[2]),
+            "llvm.fabs" => {
+                let t = self.b.func.dfg.value_type(a[0]);
+                if t == clt::F16 || t == clt::F128 {
+                    self.fabs_wide(a[0])
+                } else {
+                    self.b.ins().fabs(a[0])
+                }
+            }
+            "llvm.copysign" => {
+                let t = self.b.func.dfg.value_type(a[0]);
+                if t == clt::F16 || t == clt::F128 {
+                    self.fcopysign_wide(a[0], a[1])
+                } else {
+                    self.b.ins().fcopysign(a[0], a[1])
+                }
+            }
+            n @ ("llvm.sqrt" | "llvm.floor" | "llvm.ceil" | "llvm.trunc"
+            | "llvm.roundeven" | "llvm.fma" | "llvm.fmuladd" | "llvm.minimum"
+            | "llvm.maximum") => {
+                let t = self.b.func.dfg.value_type(a[0]);
+                if t == clt::F16 || t == clt::F128 {
+                    // No Cranelift lowering; compiler-builtins' libm port
+                    // exports e.g. sqrtf16 / fmaf128.
+                    let base = match n {
+                        "llvm.sqrt" => "sqrt",
+                        "llvm.floor" => "floor",
+                        "llvm.ceil" => "ceil",
+                        "llvm.trunc" => "trunc",
+                        "llvm.roundeven" => "roundeven",
+                        "llvm.minimum" => "fminimum",
+                        "llvm.maximum" => "fmaximum",
+                        _ => "fma",
+                    };
+                    let f = format!(
+                        "{base}f{}",
+                        if t == clt::F16 { "16" } else { "128" }
+                    );
+                    let ps = vec![t; a.len()];
+                    self.libcall(&f, &ps, &[t], &a)[0]
+                } else {
+                    match n {
+                        "llvm.sqrt" => self.b.ins().sqrt(a[0]),
+                        "llvm.floor" => self.b.ins().floor(a[0]),
+                        "llvm.ceil" => self.b.ins().ceil(a[0]),
+                        "llvm.trunc" => self.b.ins().trunc(a[0]),
+                        "llvm.roundeven" => self.b.ins().nearest(a[0]),
+                        "llvm.minimum" => self.b.ins().fmin(a[0], a[1]),
+                        "llvm.maximum" => self.b.ins().fmax(a[0], a[1]),
+                        _ => self.b.ins().fma(a[0], a[1], a[2]),
+                    }
+                }
+            }
             n if matches!(
                 n,
                 "llvm.round"
@@ -3281,6 +3461,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 let f = match t {
                     clt::F32 => format!("{base}f"),
                     clt::F64 => base.to_string(),
+                    clt::F16 | clt::F128 if n == "llvm.round" => format!(
+                        "{base}f{}",
+                        if t == clt::F16 { "16" } else { "128" }
+                    ),
                     _ => panic!("pliron->cranelift: unsupported intrinsic {n} on {t}"),
                 };
                 let ps = vec![t; a.len()];

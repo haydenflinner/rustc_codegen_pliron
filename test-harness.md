@@ -13,7 +13,7 @@ Entry point: `harness/run.py` (see `harness/run.py --help`).
 | 1 | Unified runner, tiers, checked-in expectations, ICE collection | **done** (smoke, determinism, ui, fuzz suites) |
 | 2 | Differential output vs stock LLVM rustc | **done** for smoke + ui: both compare exit code, stdout and stderr; the ui suite honors `run-fail`, `compile-flags` (allowlist), `edition`, `exec-env`, `unset-exec-env`, `rustc-env`, `unset-rustc-env`, `run-flags`, caches stock results in `target/ui/stock`, normalizes exe paths / panic thread ids / raw pointers / libtest ordering, records directive-unsupported tests as `skipped`, and covers `check-pass`/`build-pass`/`check-fail`/`compile-fail`/directive-free files as compile-agreement tests (both must agree on compile outcome; `accepted` = pliron compiles what stock rejects) |
 | 3 | rustlantis fuzzing (differential, -O0 and -O) | **done**: suite `fuzz` (`--fuzz-seeds A:B`, generator from sibling `rustlantis` checkout built with `nightly-2025-08-01` since `box_patterns` was removed upstream; generated programs compile under the pinned nightly); seeds 0–512 all pass, baseline accepted (`fuzz.*.json`) |
-| 4 | `-O` pass matrix, `PLIRON_OPT_BISECT=N`, `PLIRON_VERIFY=1` in CI | partial: `-O` ui baseline accepted (`ui.*.O.json`, 2886 pass, no real failures; harness runs set `PLIRON_VERIFY=1`); `PLIRON_OPT_BISECT=N` gates every optimization-pass application globally (`PLIRON_OPT_BISECT_DEBUG=1` logs `bisect <n> <pass> run|skip`); per-pass matrix todo |
+| 4 | `-O` pass matrix, `PLIRON_OPT_BISECT=N`, `PLIRON_VERIFY=1` in CI | mostly done: widened `-O` ui baseline accepted (`ui.*.O.json`, 16,518 pass / 21,482 files, no real failures; harness runs set `PLIRON_VERIFY=1`); `PLIRON_OPT_BISECT=N` gates every optimization-pass application globally (`PLIRON_OPT_BISECT_DEBUG=1` logs `bisect <n> <pass> run|skip`); fuzz suite `--matrix` reruns each seed with every `PLIRON_<PASS>=0` and requires identical output (status `matrix-<PASS>` on divergence) |
 | 5 | abi-cafe cross-backend ABI tests | todo |
 | 6 | mixed-backend (per-CGU / per-function) bisection tool | todo |
 | 7 | self-host fixpoint (stage2 vs stage3 output identical) | todo; determinism of single compiles is done in step 1 |
@@ -173,3 +173,42 @@ there instead of in the cwd.
   unprefixed asm label inside the object. pliron accepts a program that LLVM
   rejects. It is recorded as `noref` until either the test or the symbol
   resolution changes.
+- `src/lower.rs` f16/f128 (`scalar_size` has no f16/f128 rules on aarch64 —
+  raw `fcmp`/`fadd`/`fsub`/`fmul`/`fdiv`/convs ICE'd; found by
+  `ui/consts/const_in_pattern/f16-f128-const-reassign.rs` plus a reproducer):
+  - `fcmp.f16` promotes both operands via `__extendhfsf2` and compares as
+    f32; f128 already used the `__*tf2` ordered/unordered helpers.
+  - f16 arithmetic (`fadd`/`fsub`/`fmul`/`fdiv`) promotes to f32 and
+    truncates back — compiler-builtins' hf set is incomplete on this
+    toolchain (`__divhf3`, `__fix*hf*`, `__float*hf` all missing); f128 uses
+    `__addtf3`/`__subtf3`/`__multf3`/`__divtf3` (all present).
+  - `frem`: f16 promotes to f32 -> `fmodf` -> `__truncsfhf2`; f128 calls
+    `fmodf128` (compiler-builtins' libm port exports it).
+  - `fcvt_sat`: f16 sources extend to f32 and reuse that path; f128 and
+    i128 targets use the `__fix{,uns}{sf,df,tf}{si,di,ti}` matrix (the old
+    code called `__fixdfti` for *any* non-f32 float -> i128 — a silent ABI
+    bug for f128).
+  - int -> float: f16 goes int -> f32 -> `__truncsfhf2` (`__float*hf` don't
+    exist); f128 uses `__float{un,}{s,d,t}itf` selected by the *resized*
+    operand type.
+  - `llvm.fabs`/`llvm.copysign` on f16/f128 are bitwise (sign-bit
+    `band`/`bxor`), like the existing `fneg` path.
+  - `llvm.{sqrt,floor,ceil,trunc,roundeven,fma,fmuladd,minimum,maximum}` on
+    f16/f128 call compiler-builtins' libm port (`sqrtf16`, `fmaf128`,
+    `fminimumf128`, ...). `llvm.round` gets `roundf16`/`roundf128`.
+- `src/intrinsic.rs`: `sqrtf128`-style intrinsics ICE'd at
+  `must be overridden by codegen backend` — the `float`/`libm` name maps
+  only knew f32/f64. Added f16/f128 entries; `powif128` -> `__powitf2`,
+  `minimum_number_nsz_f*` -> `fminimum_numf*`, `powf16`/`powif16` promote
+  through f32 (`powf`/`__powisf2` + `__truncsfhf2` via `fpext`/`fptrunc`,
+  matching LLVM's soft-f16 promotion). `powf128` emits `powf128` — no such
+  symbol exists in compiler-builtins or libm.dylib, so it is a link error
+  on macOS (honest failure; glibc ships it).
+- Upstream divergences where pliron is *more* correct than stock on
+  aarch64-apple-darwin (LLVM lowers f128 to `long double` libcalls —
+  `fmodl`/`sqrtl`/`floorl`/... — but arm64 macOS `long double` is f64, so
+  the ABI silently truncates and stock returns wrong values; e.g.
+  `7.5f128 % 2.0` prints `0` under stock, `1.5` under pliron). Stock also
+  emits `__floatuntihf` for u128 -> f16, which isn't in any library, so the
+  link fails; pliron goes via f32. f16/f128 tests in the UI corpus may show
+  `env-link`/`output-mismatch` only when they exercise these paths.

@@ -49,9 +49,10 @@ def backend_flags():
     return flags
 
 
-def sh(cmd, timeout, cwd=None):
+def sh(cmd, timeout, cwd=None, env=None):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                              env=dict(os.environ, **env) if env else None)
     except subprocess.TimeoutExpired:
         return None
 
@@ -231,10 +232,10 @@ GENERATE = os.environ.get(
 )
 
 
-def fuzz_build_run(src, exe, opt, backend):
+def fuzz_build_run(src, exe, opt, backend, env=None):
     """Compile+run one generated program; returns (status, msg, (rc, out))."""
     flags = ["-Zmir-opt-level=0", "-Ccodegen-units=1"] + OPTS[opt]
-    c = sh(["rustc", src, "-o", exe] + flags + (backend_flags() if backend else []), 300)
+    c = sh(["rustc", src, "-o", exe] + flags + (backend_flags() if backend else []), 300, env=env)
     if c is None:
         return "compile-timeout", "", None
     if c.returncode != 0:
@@ -245,7 +246,17 @@ def fuzz_build_run(src, exe, opt, backend):
     return "ran", "", (r.returncode, r.stdout.replace(exe, "EXE"))
 
 
-def fuzz_one(seed):
+# -O pass toggles (`PLIRON_<NAME>=0` disables); --matrix reruns each seed
+# with each pass disabled and requires identical output.
+MATRIX_PASSES = [
+    "JUMPTHREAD", "UNROLL", "UNROLL_CLEANUP", "LOADFWD", "EGRAPH", "INDUCT",
+    "LICM", "VEC", "SLP", "BCHECK", "LOOPDEL", "LOOPROT", "CONSTBR",
+    "SWITCHMAP", "IDIOM", "PEEP", "TAILMERGE", "TAILDUP", "UNREACH",
+    "SLOT_DSE", "DEAD_LOADS", "DEAD_PURE", "DOMCOND", "MEMFAST",
+]
+
+
+def fuzz_one(seed, matrix=False):
     name = f"seed{seed}"
     d = os.path.join(OUT, "fuzz", str(seed))
     os.makedirs(d, exist_ok=True)
@@ -274,6 +285,16 @@ def fuzz_one(seed):
             return name, "run-fail", f"{tag}: rc={got[2][0]}, stock rc={ref[2][0]} [{d}]"
         if got[2][1] != ref[2][1]:
             return name, "output-mismatch", f"{tag}: " + first_diff(ref[2][1], got[2][1]) + f" [{d}]"
+    if matrix:
+        for p in MATRIX_PASSES:
+            got = fuzz_build_run(src, os.path.join(d, f"p.no_{p}"), "O", True,
+                                 env={f"PLIRON_{p}": "0"})
+            if got[2] is None:
+                return name, got[0], f"-O PLIRON_{p}=0: {got[1]} [{d}]"
+            if got[2] != sO[2]:
+                return name, f"matrix-{p}", (first_diff(sO[2][1], got[2][1])
+                                             if got[2][0] == sO[2][0]
+                                             else f"rc={got[2][0]} vs {sO[2][0]}") + f" [{d}]"
     return name, "pass", ""
 
 
@@ -284,8 +305,10 @@ def suite_fuzz(args):
     a, _, b = args.fuzz_seeds.partition(":")
     seeds = range(int(a), int(b or int(a) + 32))
     seeds = [s for s in seeds if args.filter in f"seed{s}"]
+    import functools
+    one = functools.partial(fuzz_one, matrix=args.matrix)
     with cf.ThreadPoolExecutor(min(8, os.cpu_count())) as ex:
-        return {n: [st, msg] for n, st, msg in ex.map(fuzz_one, seeds)}
+        return {n: [st, msg] for n, st, msg in ex.map(one, seeds)}
 
 
 # --------------------------------------------------------- expectations
@@ -364,6 +387,8 @@ def main():
     ap.add_argument("--accept", action="store_true", help="write this run's results as the expectations")
     ap.add_argument("--opt", action="store_true", help="run the ui suite at -O (separate expectations)")
     ap.add_argument("--filter", default="", help="only tests whose name contains this")
+    ap.add_argument("--matrix", action="store_true",
+                    help="fuzz: also rerun each seed with every -O pass disabled")
     ap.add_argument("--fuzz-seeds", default="0:32", metavar="START:END",
                     help="seed range for the fuzz suite (default 0:32)")
     ap.add_argument("--rust", help="rust checkout for the ui suite (default: ../rust or ~/work/rust)")

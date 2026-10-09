@@ -28,23 +28,29 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let imm = |v: Value| IntrinsicResult::Operand(OperandValue::Immediate(v));
         let float = |s: &str| -> Option<&'static str> {
             Some(match s {
-                "sqrtf32" | "sqrtf64" => "llvm.sqrt",
-                "fabsf32" | "fabsf64" => "llvm.fabs",
-                "floorf32" | "floorf64" => "llvm.floor",
-                "ceilf32" | "ceilf64" => "llvm.ceil",
-                "truncf32" | "truncf64" => "llvm.trunc",
-                "round_ties_even_f32" | "round_ties_even_f64" => "llvm.roundeven",
-                "copysignf32" | "copysignf64" => "llvm.copysign",
-                "fmaf32" | "fmaf64" | "fmuladdf32" | "fmuladdf64" => "llvm.fma",
-                "minimumf32" | "minimumf64" => "llvm.minimum",
-                "maximumf32" | "maximumf64" => "llvm.maximum",
+                "sqrtf16" | "sqrtf32" | "sqrtf64" | "sqrtf128" => "llvm.sqrt",
+                "fabsf16" | "fabsf32" | "fabsf64" | "fabsf128" => "llvm.fabs",
+                "floorf16" | "floorf32" | "floorf64" | "floorf128" => "llvm.floor",
+                "ceilf16" | "ceilf32" | "ceilf64" | "ceilf128" => "llvm.ceil",
+                "truncf16" | "truncf32" | "truncf64" | "truncf128" => "llvm.trunc",
+                "round_ties_even_f16" | "round_ties_even_f32" | "round_ties_even_f64"
+                | "round_ties_even_f128" => "llvm.roundeven",
+                "copysignf16" | "copysignf32" | "copysignf64" | "copysignf128" => {
+                    "llvm.copysign"
+                }
+                "fmaf16" | "fmaf32" | "fmaf64" | "fmaf128" | "fmuladdf16"
+                | "fmuladdf32" | "fmuladdf64" | "fmuladdf128" => "llvm.fma",
+                "minimumf16" | "minimumf32" | "minimumf64" | "minimumf128" => "llvm.minimum",
+                "maximumf16" | "maximumf32" | "maximumf64" | "maximumf128" => "llvm.maximum",
                 _ => return None,
             })
         };
         let libm = |s: &str| -> Option<&'static str> {
             Some(match s {
+                "roundf16" => "roundf16",
                 "roundf32" => "roundf",
                 "roundf64" => "round",
+                "roundf128" => "roundf128",
                 "sinf32" => "sinf",
                 "sinf64" => "sin",
                 "cosf32" => "cosf",
@@ -63,12 +69,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 "log10f64" => "log10",
                 "powf32" => "powf",
                 "powf64" => "pow",
-                "powif32" => "__powisf2",
+                // `powf128` is the glibc/IEEE name; not in compiler-builtins
+                // or libm.dylib, so it may not link on this target.
+                "powf128" => "powf128",
                 "powif64" => "__powidf2",
+                "powif128" => "__powitf2",
+                "powif32" => "__powisf2",
                 "minnumf32" => "fminf",
                 "minnumf64" => "fmin",
                 "maxnumf32" => "fmaxf",
                 "maxnumf64" => "fmax",
+                "minimum_number_nsz_f16" => "fminimum_numf16",
+                "minimum_number_nsz_f128" => "fminimum_numf128",
+                "maximum_number_nsz_f16" => "fmaximum_numf16",
+                "maximum_number_nsz_f128" => "fmaximum_numf128",
                 _ => return None,
             })
         };
@@ -84,6 +98,19 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         if let Some(i) = float(n) {
             let vs: Vec<_> = (0..args.len()).map(a).collect();
             return imm(self.intrinsic(i, ret, &vs));
+        }
+        if n == "powf16" || n == "powif16" {
+            // No f16 pow builtins; promote to f32 like LLVM's soft-f16 path.
+            let f32t = self.type_f32();
+            let vs: Vec<_> = (0..args.len())
+                .map(|i| {
+                    let v = a(i);
+                    if i == 0 { self.fpext(v, f32t) } else { v }
+                })
+                .collect();
+            let f = if n == "powf16" { "powf" } else { "__powisf2" };
+            let r = self.call_sym(f, f32t, &vs);
+            return imm(self.fptrunc(r, ret));
         }
         if let Some(f) = libm(n) {
             let vs: Vec<_> = (0..args.len()).map(a).collect();
