@@ -694,24 +694,54 @@ fn plan(
         else {
             why!(fname; "no body mem op {:?}", info.h);
         };
-    let mut early: Vec<(Value, bool)> = Vec::new();
-    let Some((_exit, cnt, extra)) = info.exits.iter().find_map(|&e| {
-        let c = count(func, dt, &info, &kinds, e, body_mem)?;
+    // A count exit is usable when every other exit is provably dead, folds
+    // to a runtime pred, or is a lane-wise early-exit test. Prefer the
+    // first attempt needing no early exits — a bounds-check exit that
+    // `early_cond` accepts may still fold to a pred under a different
+    // count choice (and early exits rule out stores/reductions anyway).
+    let mut fully_guarded = None;
+    let mut with_early = None;
+    for &e in &info.exits {
+        let Some(c) = count(func, dt, &info, &kinds, e, body_mem) else {
+            continue;
+        };
         let mut ps = Vec::new();
+        let mut es = Vec::new();
+        let mut ok = true;
         for &e2 in &info.exits {
-            if e2 == e {
+            if e2 == e || guard_dead(func, &c, e2) {
                 continue;
             }
-            if !guard_dead(func, &c, e2) {
-                match guard_pred(func, &info, &kinds, &c, e2) {
-                    Some(pr) => ps.push(pr),
-                    // Otherwise a lane-wise early-exit test is still OK for
-                    // pure search loops (validated after the body scan).
-                    None => early.push(early_cond(func, &info, e2)?),
-                }
+            match guard_pred(func, &info, &kinds, &c, e2) {
+                Some(pr) => ps.push(pr),
+                None => match early_cond(func, &info, e2) {
+                    Some(ec) => es.push(ec),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                },
             }
         }
-        Some((e, c, ps))
+        if !ok {
+            continue;
+        }
+        if es.is_empty() {
+            fully_guarded = Some((e, c, ps));
+            break;
+        }
+        if with_early.is_none() {
+            with_early = Some((e, c, ps, es));
+        }
+    }
+    let mut early: Vec<(Value, bool)> = Vec::new();
+    let Some((_exit, cnt, extra)) = (match (fully_guarded, with_early) {
+        (Some((e, c, ps)), _) => Some((e, c, ps)),
+        (None, Some((e, c, ps, es))) => {
+            early = es;
+            Some((e, c, ps))
+        }
+        (None, None) => None,
     }) else {
         why!(fname; "no counting exit {:?}", info.h);
     };
