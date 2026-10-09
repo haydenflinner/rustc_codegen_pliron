@@ -115,6 +115,10 @@ struct Reduc {
     /// Extra inst allowed to read `acc` (the min/max icmp, or the
     /// conditional update's `acc ⊕ d`).
     aux: Option<Inst>,
+    /// `op` can't reorder lanes (float `fadd`/`fmul` — no `reassoc`):
+    /// loads and the delta are still vectorized, but lanes fold into a
+    /// scalar `acc` in iteration order via `extractlane`.
+    ordered: bool,
 }
 
 /// A conditional-update predicate, planned to evaluate per lane: `insts` are
@@ -160,6 +164,9 @@ impl Reduc {
     /// many accs — each `uaddw`-style add gets its own register so the
     /// dependency chain stays depth-1 instead of serial per group.
     fn split(&self) -> usize {
+        if self.ordered {
+            return 1;
+        }
         match &self.widen {
             Some(Widen::Add { mask: None, .. }) => 2,
             Some(Widen::Mul { chain: true, .. }) => 4,
@@ -520,7 +527,10 @@ fn plan(
         // conditional form.
         let upd_of = |i: Inst| -> Option<(Opcode, Value, Option<Inst>, Option<(Value, bool)>)> {
             match func.dfg.insts[i] {
-                InstructionData::Binary { opcode, args } if reduc_ok(opcode) => {
+                InstructionData::Binary { opcode, args }
+                    if reduc_ok(opcode)
+                        || matches!(opcode, Opcode::Fadd | Opcode::Fmul) =>
+                {
                     let (x, y) = (
                         func.dfg.resolve_aliases(args[0]),
                         func.dfg.resolve_aliases(args[1]),
@@ -765,6 +775,14 @@ fn plan(
             other_ok = false;
             continue;
         }
+        let ordered = matches!(op, Opcode::Fadd | Opcode::Fmul);
+        if ordered && cnd.is_some() {
+            // A conditional ordered update can't be masked lane-wise —
+            // `select` per lane would still serialize correctly but the
+            // plumbing isn't worth it.
+            other_ok = false;
+            continue;
+        }
         reducs.push(Reduc {
             idx: j,
             op,
@@ -779,6 +797,7 @@ fn plan(
             }),
             upd: ui,
             aux,
+            ordered,
         });
     }
     if !other_ok {
@@ -1189,6 +1208,11 @@ fn plan(
             extra_vec.extend(cd.insts.iter().copied());
         }
         if r.aty != elem {
+            if r.ordered {
+                // Ordered lanes fold scalarly at `aty`; a widened delta
+                // would need the acc chain at a different type.
+                why!(fname; "ordered reduction at wrong lane type {:?}", info.h);
+            }
             if !widen_delta(
                 func,
                 &info,
@@ -1203,7 +1227,7 @@ fn plan(
             }
             continue;
         }
-        if !vec_op_ok(r.op, elem) {
+        if !r.ordered && !vec_op_ok(r.op, elem) {
             why!(fname; "reduction type/op {:?}", info.h);
         }
         let d = func.dfg.resolve_aliases(r.delta);
@@ -2244,6 +2268,8 @@ fn red_emit(pos: &mut FuncCursor, op: Opcode, a: Value, b: Value) -> Value {
         Opcode::Smax => pos.ins().smax(a, b),
         Opcode::Umin => pos.ins().umin(a, b),
         Opcode::Umax => pos.ins().umax(a, b),
+        Opcode::Fadd => pos.ins().fadd(a, b),
+        Opcode::Fmul => pos.ins().fmul(a, b),
         _ => unreachable!(),
     }
 }
@@ -2503,10 +2529,17 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let splits: Vec<usize> = p.reducs.iter().map(|r| r.split()).collect();
     let mut v_arg_vals = vec![p.iv0, end, nmv];
     for (r, &sp) in p.reducs.iter().zip(&splits) {
-        for _ in 0..UNROLL * sp {
-            let id = pos.ins().iconst(r.aty, red_identity(r.op, r.aty));
-            let v = pos.ins().splat(r.vty(), id);
-            v_arg_vals.push(v);
+        let n = if r.ordered { 1 } else { UNROLL * sp };
+        for _ in 0..n {
+            if r.ordered {
+                // The scalar acc enters the vector loop directly — lanes
+                // fold into it in order.
+                v_arg_vals.push(p.entry_args[r.idx]);
+            } else {
+                let id = pos.ins().iconst(r.aty, red_identity(r.op, r.aty));
+                let v = pos.ins().splat(r.vty(), id);
+                v_arg_vals.push(v);
+            }
         }
     }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
@@ -2519,8 +2552,13 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         .iter()
         .zip(&splits)
         .map(|(r, &sp)| {
-            (0..UNROLL * sp)
-                .map(|_| pos.func.dfg.append_block_param(vh, r.vty()))
+            let n = if r.ordered { 1 } else { UNROLL * sp };
+            (0..n)
+                .map(|_| {
+                    pos.func
+                        .dfg
+                        .append_block_param(vh, if r.ordered { r.aty } else { r.vty() })
+                })
                 .collect()
         })
         .collect();
@@ -2538,6 +2576,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
             continue;
         }
         if let Some((k, r)) = p.reducs.iter().enumerate().find(|(_, r)| r.idx == j) {
+            if r.ordered {
+                // Lanes already folded scalarly in order inside the loop.
+                epi.push(vaccs[k][0]);
+                continue;
+            }
             // Fold each unroll group's accumulator to a scalar, then combine
             // (reassociation is exact for the whitelisted ops).
             let mut acc = p.entry_args[j];
@@ -2590,6 +2633,13 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
     let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
     let mut back_accs: Vec<Vec<Value>> = p.reducs.iter().map(|_| Vec::new()).collect();
+    // Ordered reductions thread one scalar acc through all groups in order.
+    let mut ord_accs: Vec<Value> = p
+        .reducs
+        .iter()
+        .enumerate()
+        .map(|(k, _)| vaccs[k][0])
+        .collect();
     let gb = i64::from(p.elem.bytes()) * p.vf;
     // Loads that precede the group's first store hoist into a shared
     // pass: batching `ldr`s across groups lets the CPU overlap their
@@ -2746,6 +2796,21 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         // vacc = vacc ⊕ delta per group; deltas come after the group's
         // memory ops so their loads are already in `vmap`.
         for (k, r) in p.reducs.iter().enumerate() {
+            if r.ordered {
+                // `fadd`/`fmul` can't reassociate: keep the scalar acc and
+                // fold each lane in iteration order. Loads and the delta
+                // still vectorize; only the combine serializes.
+                let vd = emit_val(
+                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                );
+                let mut acc = ord_accs[k];
+                for l in 0..p.vf {
+                    let lane = pos.ins().extractlane(vd, l as u8);
+                    acc = red_emit(&mut pos, r.op, acc, lane);
+                }
+                ord_accs[k] = acc;
+                continue;
+            }
             // A conditional update masks its delta: `d & mask`, applied at
             // element lanes — before any widening (`widen(d & m)` sums the
             // kept lanes; `(a & m) * b` zeroes the dropped products).
@@ -2821,6 +2886,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
     let iv2 = pos.ins().iadd(ivv, k);
     let mut back: Vec<Value> = vec![iv2, endv, nm];
+    for (i, accs) in back_accs.iter_mut().enumerate() {
+        if p.reducs[i].ordered {
+            accs.push(ord_accs[i]);
+        }
+    }
     for accs in &back_accs {
         back.extend(accs);
     }
