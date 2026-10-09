@@ -136,6 +136,15 @@ there instead of in the cwd.
   54, 57, 58 — 11 verifier ICEs): the `s == 0` constant path emitted
   `ireduce.i64` on a value already `i64`; `ireduce` must produce a strictly
   narrower type. Now `uextend` for >64, passthrough for ==64, `ireduce` for <64.
+- `optimize_and_codegen_fat_lto`/`run_thin_lto` panicked with `unimplemented!`
+  instead of reporting a clean error (`tests/ui/lto` corpus). Now a
+  `dcx().fatal`.
+- `mir/issue-109004-drop-large-array.rs`: a function exceeding cranelift's
+  entity-capacity limits (`ImplLimitExceeded`) produced an ICE that also
+  dumped the multi-MB function into the panic message. `define_function`
+  failures for `ImplLimitExceeded`/`CodeTooLarge` now report
+  `function too large` via `dcx().fatal` — recorded in the baseline as a
+  known `compile-error` limitation (stock rustc accepts it).
 - `src/lower.rs` switch lowering: MIR `switchInt` on a `u128` value (e.g.
   `zext` of a negative `i64` enum discriminant) went through
   `cranelift_frontend::Switch::emit`, which subtracts the case-cluster

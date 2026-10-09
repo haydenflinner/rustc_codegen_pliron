@@ -183,6 +183,7 @@ pub fn lower_to_object(
     st: &State<'_>,
     isa: Arc<dyn TargetIsa>,
     name: &str,
+    sess: &rustc_session::Session,
 ) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     // Mach-O symbols index sections with a u8 (max 255): per-symbol sections
@@ -640,6 +641,15 @@ pub fn lower_to_object(
             }
         }
         if let Err(e) = m.define_function(id, &mut clctx) {
+            // Known capacity limits are a backend limitation, not a bug: report
+            // cleanly instead of dumping a multi-MB function into an ICE.
+            if let cranelift_module::ModuleError::Compilation(
+                cranelift_codegen::CodegenError::ImplLimitExceeded
+                | cranelift_codegen::CodegenError::CodeTooLarge,
+            ) = e
+            {
+                sess.dcx().fatal(format!("function `{n}` too large: {e}"));
+            }
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
         }
         eh.add_function(&mut m, id, &clctx);

@@ -418,6 +418,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         &cx.st.borrow(),
         isa,
         name,
+        cx.tcx.sess,
     );
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }
@@ -748,7 +749,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 
     fn optimize_and_codegen_fat_lto(
-        _sess: &Session,
+        sess: &Session,
         _cgcx: &CodegenContext,
         _shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
@@ -756,18 +757,18 @@ impl WriteBackendMethods for PlironCodegenBackend {
         _each_linked_rlib_for_lto: &[PathBuf],
         _modules: Vec<FatLtoInput<Self>>,
     ) -> CompiledModule {
-        unimplemented!("LTO is not supported by the pliron backend")
+        sess.dcx().fatal("LTO is not supported by the pliron backend")
     }
 
     fn run_thin_lto(
         _cgcx: &CodegenContext,
         _prof: &SelfProfilerRef,
-        _dcx: DiagCtxtHandle<'_>,
+        dcx: DiagCtxtHandle<'_>,
         _exported_symbols_for_lto: &[String],
         _each_linked_rlib_for_lto: &[PathBuf],
         _modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
-        unimplemented!("LTO is not supported by the pliron backend")
+        dcx.fatal("LTO is not supported by the pliron backend")
     }
 
     fn optimize(
