@@ -37,6 +37,8 @@ fn main() {
             primary_window: Some(Window {
                 title: "pliron bevy".into(),
                 resolution: (W as u32, H as u32).into(),
+                // Uncapped presentation so frame time reflects CPU cost.
+                present_mode: bevy::window::PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
@@ -134,10 +136,26 @@ fn show_score(score: Res<Score>, mut q: Query<&mut Text2d, With<ScoreText>>) {
     }
 }
 
-fn frame_limit(mut l: ResMut<FrameLimit>, score: Res<Score>, stars: Query<&Star>, mut exit: MessageWriter<AppExit>) {
+fn frame_limit(
+    mut l: ResMut<FrameLimit>,
+    score: Res<Score>,
+    stars: Query<&Star>,
+    mut exit: MessageWriter<AppExit>,
+    mut start: Local<Option<std::time::Instant>>,
+) {
     l.1 += 1;
+    // Start timing after a warmup frame so startup/compile hitches don't count.
+    if l.1 == 2 {
+        *start = Some(std::time::Instant::now());
+    }
     if Some(l.1) == l.0 {
-        println!("frames={} score={} stars_alive={}", l.1, score.0, stars.iter().count());
+        let ms = start.map(|t| t.elapsed().as_secs_f64() * 1e3 / f64::from(l.1 - 2));
+        println!(
+            "frames={} score={} stars_alive={} ms_per_frame={ms:?}",
+            l.1,
+            score.0,
+            stars.iter().count()
+        );
         exit.write(AppExit::Success);
     }
 }

@@ -73,6 +73,44 @@ Net at the current defaults: 5.08B / 11.52B instructions (−66% / −64% vs bas
 Correctness at the current defaults: `./test.sh`, `./test.sh --sysroot`, -O std/asm/unwind,
 and `UI_FLAGS=-O tests/ui_run_pass.py`: 2537 pass, the remaining 57 fail identically on stock LLVM.
 
+## CLIF loop optimization pipeline (aarch64/macOS session)
+
+New passes at `-O` in `lower.rs`, all off-switchable (`PLIRON_*=0`), verified
+with `PLIRON_VERIFY=1`:
+
+| pass | file | notes |
+|---|---|---|
+| LICM | `src/licm.rs` | hoists speculatable insts + unclobberable `notrap` loads to the preheader, sinks invariant stores to exit edges, and promotes isolated loop memory to registers (scalar promotion) using `noalias`/`dereferenceable` attrs plumbed from rustc param attributes |
+| indvars | `src/indvars.rs` | `iv*K` strength reduction to a recurrence block param. Narrow-IV widening deliberately not done: wrapping `i += 1` is observable and CLIF carries no nowrap flags, so it is unsound in general |
+| loop idiom | `src/loopidiom.rs` | zeroing/copy loops → `memset`/`memcpy` under runtime fast-path guards (order, bounds-check implication, overlap versioning); the scalar loop stays as fallback |
+| loopvec | `src/loopvec.rs` | elementwise loops → 128-bit vector loop + scalar epilogue. Contiguous affine streams, lane-wise op whitelist (vector shifts take a scalar amount — no per-lane shifts), `icmp` masks + `bitselect` for selects, transitive invariance re-materialization, runtime disjointness predicates, SIMD targets only |
+
+Also: load PRE (`PLIRON_LOADPRE`) is composed before normal load forwarding and
+now defaults on; inliner callsites get a 4× size bonus for const args that
+devirtualize a call and 2× for const args that fold a callee branch
+(`PLIRON_INLINE_DEVIRT`/`PLIRON_INLINE_FOLD`); `PLIRON_MEMCPYOPT` and
+`PLIRON_LOOPROT` flipped to default-on.
+
+Notable traps found:
+
+- `PLIRON_NOUNWIND` default-on **miscompiles wasm emulated EH** — the
+  `llvm.wasm.throw`/`__pliron_eh` unwinding path goes through ordinary calls
+  the body scan can't see, so `invoke → call` conversion is unsound there.
+  Reverted to opt-in (`PLIRON_NOUNWIND=1`).
+- Vectorizer correctness bugs caught by the Cranelift verifier + the bevy
+  build: vector shift amount must be scalar; invariant insts defined outside
+  the loop must be used directly, not cloned; same-stream `store; load`
+  program order is observable and must be preserved (mems emitted in layout
+  order).
+- `switchmap::resolve` could jump through a forwarder block whose inst
+  results were still used downstream, orphaning their defs (pre-existing;
+  fixed with a `confined` check).
+
+Bevy demo (`examples/bevy-game`, 600 frames, Apple M3 Max, Metal, release):
+stock rustc 18.07 ms/frame, this backend 18.08 ms/frame — identical; the
+workload is presentation/driver-bound so the codegen wins don't show here.
+(A single earlier "3 ms" reading was a macOS throttling artifact.)
+
 ## Microbenchmarks (vs stock LLVM rustc -O)
 
 `perf stat -e instructions:u`, best of 3 (runs agree to <0.001%). md5: RustCrypto `md-5` hashing a buffer in a loop,
@@ -130,3 +168,53 @@ captured `cc` line, best of 5, idle 8-core VM. Both outputs run (300 autoplay fr
 |---|---:|---|
 | Wild 0.10.0 | 0.22s | pure Rust |
 | mold 3.0.0 (Rust rewrite, release) | 0.30s | links C `zstd-sys` (required) and `mold-mimalloc-sys` (off with `system-allocator`) |
+
+## aarch64 codegen push (later session, same box)
+
+More passes at `-O`, all `PLIRON_*`-switchable:
+
+| pass | file | notes |
+|---|---|---|
+| if-conversion | `src/ifconv.rs` | select-diamond and partial-diamond `brif` CFGs → straight-line `select`/`bitselect`. Arm blocks may carry cloneable pure insts. An `edge_ok` check rejects conversions whose new edge would bypass a def used in the merge subtree (the `objc2-encode` verifier bug: a collapsed block-param alias left hanging when a same-target `brif` became a `jump` past its defining arm) |
+| SLP | `src/slp.rs` | adjacent scalar stores `base + i*esz` (8/16-byte groups) with isomorphic lane trees → one vector tree + `str q`. Packs adjacent loads, splats, equal consts, isomorphic ops; refuses mixed opcodes and any writer in the span. 22 hits in the bevy dep tree (mostly `Default` struct zeroing) |
+| spec | `src/spec.rs` | IPSCCP-lite: a `Local` fn whose address never escapes and whose every callsite passes the same `ConstVal` for a param adopts it — param uses are replaced by a fresh orphan `UndefOp` const, so downstream constprop does the rest |
+| indvars `Mul::V` | `src/indvars.rs` | `iv * invariant` (and `base + iv * invariant`) → stepped param (`b_idx += n` in matmul's `b[k*n+j]`). `Mul::K(1)` deliberately skipped: `base + iv` is already one cheap add, and a stepped param buys only regalloc parallel-copy movs |
+
+aarch64 lowering additions in vendored cranelift (`vendor/cranelift-codegen/PLIRON_PATCH.md`):
+`udot`/`usdot`/`smlal`/`umlal`/`mls` instructions + ISLE folds for the
+`iadd_pairwise`/`iadd(imul(swiden…))` trees `loopvec`'s widening dot products
+emit, scalar `smaddl`/`umaddl` from `iadd(c, [su]extend(a) * [su]extend(b))`,
+and `mla` from `iadd(acc, imul a, b)`.
+
+`target_config` now uses `internal_target_features` so `-Ctarget-cpu` /
+`-Ctarget-feature` are parsed, validated, and expanded (spec features + a
+cpu table + native detection); `build_isa` maps them onto Cranelift ISA flags
+(`dotprod`→`has_dotprod`, `i8mm`→`has_i8mm`, `lse`, `fp16`, `bti`, x86
+sse/avx/fma/bmi/lzcnt/popc/lse-equiv).
+
+The upstream Cranelift **egraph pass already runs inside `compile`** at
+`opt_level != none` (after our passes, before machinst lowering): GVN +
+ISLE cprop/remat + redundant-load elimination. `PLIRON_EGRAPH=1` adds an
+extra run before `switchmap`/`loopdel`/`looprot` (aliases resolved first —
+the egraph indexes `Value`s directly and doesn't follow them; `try_call`
+fns are skipped since upstream egraph predates EH). No measured gain so
+far — opt-in.
+
+CPU kernels vs stock `-O -Ctarget-cpu=apple-m1` (`/tmp/cpubench`, M3 Max):
+axpy 0.313/0.315, vadd 0.465/0.462, clamp8 0.063/0.075 (faster),
+dot_i32 0.075/0.075, sum_u8 **0.105/0.196 (1.9× faster — `uaddlp` chain
+beats LLVM's `tbl` widening)**, dot_i8 0.075/0.074 (`sdot` ×4 unrolled,
+same as LLVM), matmul 11.9/11.2 (residual: LLVM propagates `n=256` *and*
+`len=65536` into the internal fn; `black_box` keeps `len` opaque to us —
+with runtime `n` it's ~1%). The bevy release build compiles clean with
+everything on and the game runs on Metal.
+
+`PLIRON_JT_CHECK=1` verifies CLIF after each `jumpthread` fixpoint step —
+that's how the ifconv dominance bug was isolated.
+
+Also fixed this session: C-variadic calls on `aarch64-apple-darwin` now
+support `f32`/`f64` varargs (fill the v0-v7 bank with dummy `F64`s so real
+varargs land on the stack where Darwin wants them — previously ICE'd), and
+sub-64-bit varargs are promoted to their 8-byte slot form (`uextend` to
+i64, `fpromote` f32→f64) since Darwin stack varargs stride at 8 bytes —
+an `i32` in a 4-byte slot shifted every later `va_arg` read.

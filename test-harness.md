@@ -10,10 +10,10 @@ Entry point: `harness/run.py` (see `harness/run.py --help`).
 
 | # | step | status |
 |---|---|---|
-| 1 | Unified runner, tiers, checked-in expectations, ICE collection | **done** (smoke, determinism, ui suites) |
-| 2 | Differential output vs stock LLVM rustc | **done** for smoke + ui: both compare exit code, stdout and stderr; the ui suite honors `run-fail`, `compile-flags` (allowlist), `edition`, `exec-env`, `unset-exec-env`, `rustc-env`, `unset-rustc-env`, `run-flags`, caches stock results in `target/ui/stock`, normalizes exe paths / panic thread ids / raw pointers / libtest ordering, and records directive-unsupported tests as `skipped` |
-| 3 | rustlantis fuzzing (differential, -O0 and -O) | todo |
-| 4 | `-O` pass matrix, `PLIRON_OPT_BISECT=N`, `PLIRON_VERIFY=1` in CI | partial: `-O` ui baseline accepted (`ui.*.O.json`, 2886 pass, no real failures; harness runs set `PLIRON_VERIFY=1`); pass-matrix bisection todo |
+| 1 | Unified runner, tiers, checked-in expectations, ICE collection | **done** (smoke, determinism, ui, fuzz suites) |
+| 2 | Differential output vs stock LLVM rustc | **done** for smoke + ui: both compare exit code, stdout and stderr; the ui suite honors `run-fail`, `compile-flags` (allowlist), `edition`, `exec-env`, `unset-exec-env`, `rustc-env`, `unset-rustc-env`, `run-flags`, caches stock results in `target/ui/stock`, normalizes exe paths / panic thread ids / raw pointers / libtest ordering, records directive-unsupported tests as `skipped`, and covers `check-pass`/`build-pass`/`check-fail`/`compile-fail`/directive-free files as compile-agreement tests (both must agree on compile outcome; `accepted` = pliron compiles what stock rejects) |
+| 3 | rustlantis fuzzing (differential, -O0 and -O) | **done**: suite `fuzz` (`--fuzz-seeds A:B`, generator from sibling `rustlantis` checkout built with `nightly-2025-08-01` since `box_patterns` was removed upstream; generated programs compile under the pinned nightly); seeds 0–512 all pass, baseline accepted (`fuzz.*.json`) |
+| 4 | `-O` pass matrix, `PLIRON_OPT_BISECT=N`, `PLIRON_VERIFY=1` in CI | partial: `-O` ui baseline accepted (`ui.*.O.json`, 2886 pass, no real failures; harness runs set `PLIRON_VERIFY=1`); `PLIRON_OPT_BISECT=N` gates every optimization-pass application globally (`PLIRON_OPT_BISECT_DEBUG=1` logs `bisect <n> <pass> run|skip`); per-pass matrix todo |
 | 5 | abi-cafe cross-backend ABI tests | todo |
 | 6 | mixed-backend (per-CGU / per-function) bisection tool | todo |
 | 7 | self-host fixpoint (stage2 vs stage3 output identical) | todo; determinism of single compiles is done in step 1 |
@@ -126,6 +126,16 @@ there instead of in the cwd.
   dropping the platform mangling prefix instead.
 - `src/indvars.rs`: `iconst` immediates must fit the type's unsigned range;
   `K*step` now gets masked (wrapping semantics unchanged).
+- `iconst.i128` (found by rustlantis seed 6, verifier ICE): `iconst`'s result
+  typevar only admits ints up to 64 bits, so materializing a wide constant
+  needs `iconst.i64` + `uextend`/`sextend`/`iconcat`. Fixed in `indvars`
+  (`emit_add`/`emit_lin`), `unroll` (folded results on >64-bit types bail),
+  `jumpthread` (`Arg::K` limited to ≤64-bit types), `switchmap` (`Lin::Map`
+  zero-extends the i64 offset) and `loopidiom` (`Ins::K` sign-extends).
+- `src/switchmap.rs` (found by rustlantis seeds 4, 9, 12, 14, 20, 24, 31, 49,
+  54, 57, 58 — 11 verifier ICEs): the `s == 0` constant path emitted
+  `ireduce.i64` on a value already `i64`; `ireduce` must produce a strictly
+  narrower type. Now `uextend` for >64, passthrough for ==64, `ireduce` for <64.
 - `src/lower.rs` switch lowering: MIR `switchInt` on a `u128` value (e.g.
   `zext` of a negative `i64` enum discriminant) went through
   `cranelift_frontend::Switch::emit`, which subtracts the case-cluster
