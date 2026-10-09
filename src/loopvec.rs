@@ -128,9 +128,10 @@ struct Cond {
 }
 
 enum Widen {
-    /// `delta = x as acc_ty` — `delta` holds the extend's operand (or the
-    /// extending-load result itself).
-    Add { signed: bool },
+    /// `delta = (x as acc_ty) & mask` — `delta` holds the extend's operand
+    /// (or the extending-load result itself); `mask` is an optional
+    /// post-widen `band` constant, kept lane-wise (`(x as w) & k`).
+    Add { signed: bool, mask: Option<i64> },
     /// `delta = (a as acc_ty) * (b as acc_ty)` — a widening dot product,
     /// which aarch64 folds to `sdot`/`usdot` through the pairwise-add tree.
     /// `a`/`b` are the elem-typed lane values being extended.
@@ -1088,6 +1089,19 @@ fn plan(
                     (can_vec.contains(&x) || is_splat(func, &info, &kinds, &mut splat_cache, x))
                         && is_splat(func, &info, &kinds, &mut splat_cache, s)
                 }
+                // Mask-valued bitwise ops stay masks (e.g. the `bor` chain
+                // ifconv's br_table conversion builds).
+                InstructionData::Binary {
+                    opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
+                    args,
+                } if args
+                    .iter()
+                    .all(|&a| masks.contains(&func.dfg.resolve_aliases(a))) =>
+                {
+                    masks.insert(rv);
+                    grew = true;
+                    continue;
+                }
                 InstructionData::Binary { args, .. } => args.iter().all(|&a| {
                     let a = func.dfg.resolve_aliases(a);
                     can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
@@ -1168,7 +1182,7 @@ fn plan(
                 r,
                 &extra_ok,
             ) {
-                why!(fname; "reduction type/op {:?}", info.h);
+                why!(fname; "reduction type/op {} delta {}", info.h, func.dfg.display_inst(r.upd));
             }
             continue;
         }
@@ -1768,10 +1782,57 @@ fn widen_delta(
             true
         }
         _ => {
+            let mut mask = None;
+            let mut d = d;
+            // `band(extend(x), k)` masks the widened lanes — identical
+            // lane-wise under either extension. `k` may hide behind a
+            // widening cast of a narrow constant.
+            if let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } = func.dfg.insts[di]
+            {
+                let cst = |v: Value| -> Option<i64> {
+                    let v = func.dfg.resolve_aliases(v);
+                    if let Some(k) = iconst(func, v) {
+                        return Some(k);
+                    }
+                    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+                        return None;
+                    };
+                    let InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg,
+                    } = func.dfg.insts[i]
+                    else {
+                        return None;
+                    };
+                    let k = iconst(func, arg)?;
+                    let nb = func.dfg.value_type(func.dfg.resolve_aliases(arg)).bits();
+                    if nb >= 64 { return None }
+                    Some(k & ((1i64 << nb) - 1))
+                };
+                let (k, nn) = if let Some(k) = cst(args[1]) {
+                    (k, args[0])
+                } else if let Some(k) = cst(args[0]) {
+                    (k, args[1])
+                } else {
+                    return false;
+                };
+                mask = Some(k);
+                d = func.dfg.resolve_aliases(nn);
+            }
+            let dbg = std::env::var_os("PLIRON_VEC_DEBUG").is_some();
             let Some((x, signed)) = ext_of(func, d, &mut ext_insts) else {
+                if dbg {
+                    eprintln!("widen_delta: no ext in {d:?}");
+                }
                 return false;
             };
             if !can_vec.contains(&x) {
+                if dbg {
+                    eprintln!("widen_delta: {:?} not can_vec", x);
+                }
                 return false;
             }
             let mut ok = vec![r.upd];
@@ -1782,11 +1843,14 @@ fn widen_delta(
             for &i in &ext_insts {
                 let v = func.dfg.resolve_aliases(func.dfg.first_result(i));
                 if !uses_ok(func, v, &ok) {
+                    if dbg {
+                        eprintln!("widen_delta: extra use of {}", func.dfg.display_inst(i));
+                    }
                     return false;
                 }
             }
             r.delta = x;
-            r.widen = Some(Widen::Add { signed });
+            r.widen = Some(Widen::Add { signed, mask });
             true
         }
     }
@@ -2557,7 +2621,16 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                     );
                     v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                     match &r.widen {
-                        Some(Widen::Add { signed }) => widen_vec(&mut pos, *signed, v, r.aty),
+                        Some(Widen::Add { signed, mask }) => {
+                            let v = widen_vec(&mut pos, *signed, v, r.aty);
+                            if let Some(k) = mask {
+                                let kk = pos.ins().iconst(r.aty, *k);
+                                let sp = pos.ins().splat(r.vty(), kk);
+                                pos.ins().band(v, sp)
+                            } else {
+                                v
+                            }
+                        }
                         _ => v,
                     }
                 }

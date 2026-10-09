@@ -17,7 +17,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Value, ValueDef, types,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
+    ValueDef, types,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -179,6 +180,211 @@ fn term_block(func: &Function, term: Inst) -> Block {
     func.layout.inst_block(term).unwrap()
 }
 
+/// `br_table` if-conversion: every target resolving (through pure
+/// forwarders) to one merge `M` with per-arm args collapses to cloned side
+/// computations plus `select(hit, arm_val, sel)` chains in `b`. The mask for
+/// an arm is `or(icmp eq idx, k)` over its table indices — index sets are
+/// disjoint, so select order doesn't matter. Keeps switch-idiom loops
+/// (`matches!` filters) flat enough for loopvec.
+fn conv_table(
+    func: &mut Function,
+    cfg: &mut ControlFlowGraph,
+    domtree: &mut DominatorTree,
+    mset_cache: &mut FxHashMap<Block, FxHashSet<Block>>,
+    dirty: &mut bool,
+    b: Block,
+    term: Inst,
+) -> bool {
+    let InstructionData::BranchTable { arg, table, .. } = func.dfg.insts[term] else {
+        return false;
+    };
+    let idx = func.dfg.resolve_aliases(arg);
+    let ity0 = func.dfg.value_type(idx);
+    if !ity0.is_int() || ity0.is_vector() {
+        return false;
+    }
+    // `all_branches` lists the default first; entry i is index i+1.
+    let dests: Vec<BlockCall> = func
+        .dfg
+        .jump_tables
+        .get(table)
+        .unwrap()
+        .all_branches()
+        .to_vec();
+    let nidx = dests.len() - 1;
+    // Compare at the pre-extension width: `extend(x) == k` for
+    // `0 <= k < 2^(bits-1)` is bit-exact, and narrow compares vectorize.
+    let (idx, ity) = match func.dfg.value_def(idx) {
+        ValueDef::Result(i, _)
+            if nidx < 128
+                && let InstructionData::Unary {
+                    opcode: Opcode::Uextend | Opcode::Sextend,
+                    arg,
+                } = func.dfg.insts[i] =>
+        {
+            (func.dfg.resolve_aliases(arg), func.dfg.value_type(func.dfg.resolve_aliases(arg)))
+        }
+        _ => (idx, ity0),
+    };
+    let mut arms: Vec<Arm> = Vec::new();
+    let mut arm_of: Vec<usize> = Vec::with_capacity(dests.len());
+    'dests: for bc in &dests {
+        let tgt = bc.block(&func.dfg.value_lists);
+        if tgt == b {
+            return false;
+        }
+        let edge: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+        let Some(a) = resolve_arm(func, tgt, &edge) else {
+            return false;
+        };
+        if a.m == b {
+            return false;
+        }
+        for (ai, prev) in arms.iter().enumerate() {
+            if prev.m == a.m && prev.side == a.side && prev.args == a.args {
+                arm_of.push(ai);
+                continue 'dests;
+            }
+        }
+        arm_of.push(arms.len());
+        arms.push(a);
+    }
+    let m = arms[0].m;
+    if arms.iter().any(|a| a.m != m || a.side == Some(m)) {
+        return false;
+    }
+    let np = func.dfg.num_block_params(m);
+    if arms.iter().any(|a| a.args.len() != np) {
+        return false;
+    }
+    // Bounds before mutating: few arms, few total covered indices.
+    if arms.len() > 8 || nidx > 64 {
+        return false;
+    }
+    let dflt = arm_of[0];
+    let covered = |ai: usize| -> Vec<usize> {
+        (0..nidx).filter(|&i| arm_of[1 + i] == ai).collect()
+    };
+    let total_hits: usize = (0..arms.len())
+        .filter(|&ai| ai != dflt)
+        .map(|ai| covered(ai).len())
+        .sum();
+    if total_hits > 12 {
+        return false;
+    }
+    // Per-param select types: every differing override must be selectable
+    // against the default arm's value.
+    for j in 0..np {
+        let dv = arms[dflt].args[j];
+        for ai in 0..arms.len() {
+            if ai == dflt || covered(ai).is_empty() {
+                continue;
+            }
+            let v = arms[ai].args[j];
+            if v != dv && !select_ok(func, v, dv) {
+                return false;
+            }
+        }
+    }
+    if *dirty {
+        cfg.compute(func);
+        domtree.compute(func, &cfg);
+        mset_cache.clear();
+        *dirty = false;
+    }
+    // The synthesized values live in `b`; every path into `m` must come
+    // from this table.
+    let sides: FxHashSet<Block> = arms.iter().filter_map(|a| a.side).collect();
+    let ok = cfg.pred_iter(m).all(|p| {
+        let pb = func.layout.inst_block(p.inst).unwrap_or(m);
+        pb == b || sides.contains(&pb)
+    });
+    if !ok {
+        return false;
+    }
+    let mset = mset_cache.entry(m).or_insert_with(|| {
+        func.layout
+            .blocks()
+            .filter(|&x| domtree.block_dominates(m, x))
+            .collect()
+    });
+    if !edge_ok(func, domtree, m, mset, term) {
+        return false;
+    }
+    // Arm args that aren't cloned side results or side params must dominate
+    // `b`'s terminator — a value legal inside a side block need not be if
+    // the side is reachable without `b`.
+    for a in &arms {
+        let Some(s) = a.side else { continue };
+        let local: FxHashSet<Value> = func
+            .dfg
+            .block_params(s)
+            .iter()
+            .copied()
+            .chain(
+                func.layout
+                    .block_insts(s)
+                    .flat_map(|i| func.dfg.inst_results(i).iter().copied()),
+            )
+            .collect();
+        for &v in &a.args {
+            let v = func.dfg.resolve_aliases(v);
+            if local.contains(&v) {
+                continue;
+            }
+            let dom = match func.dfg.value_def(v) {
+                ValueDef::Result(di, _) => domtree.dominates(di, term, &func.layout),
+                ValueDef::Param(db, _) => domtree.block_dominates(db, b),
+                _ => false,
+            };
+            if !dom {
+                return false;
+            }
+        }
+    }
+    *dirty = true;
+    let avals: Vec<Vec<Value>> = arms.iter().map(|a| emit_arm(func, term, a)).collect();
+    let mut sargs: Vec<BlockArg> = Vec::with_capacity(np);
+    for j in 0..np {
+        let mut sel = avals[dflt][j];
+        for ai in 0..arms.len() {
+            if ai == dflt {
+                continue;
+            }
+            let v = avals[ai][j];
+            if v == sel {
+                continue;
+            }
+            let s = covered(ai);
+            if s.is_empty() {
+                continue;
+            }
+            let mut pos = FuncCursor::new(func).at_inst(term);
+            let mut hit = {
+                let k = pos.ins().iconst(ity, s[0] as i64);
+                pos.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k)
+            };
+            for &k in &s[1..] {
+                let k = pos.ins().iconst(ity, k as i64);
+                let c = pos.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k);
+                hit = pos.ins().bor(hit, c);
+            }
+            sel = pos.ins().select(hit, v, sel);
+        }
+        sargs.push(BlockArg::Value(sel));
+    }
+    let dfg = &mut func.dfg;
+    let bc = BlockCall::new(m, sargs.iter().copied(), &mut dfg.value_lists);
+    dfg.insts[term] = InstructionData::Jump {
+        opcode: Opcode::Jump,
+        destination: bc,
+    };
+    if std::env::var_os("PLIRON_IFCONV_DEBUG").is_some() {
+        eprintln!("ifconv {b} br_table -> jump {m} (arms {})", arms.len());
+    }
+    true
+}
+
 pub fn run(func: &mut Function) -> usize {
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
@@ -190,6 +396,11 @@ pub fn run(func: &mut Function) -> usize {
             continue;
         };
         let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
+            if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
+                && conv_table(func, &mut cfg, &mut domtree, &mut mset_cache, &mut dirty, b, term)
+            {
+                n += 1;
+            }
             continue;
         };
         let dests = func.dfg.insts[term]
