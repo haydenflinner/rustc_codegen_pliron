@@ -649,6 +649,9 @@ pub fn lower_to_object(
                 );
             }
         }
+        // Scalar min/max wider than a register (i128) has no Cranelift
+        // lowering on any target; several passes can emit it.
+        crate::clifpeep::wide_minmax(&mut clctx.func);
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.

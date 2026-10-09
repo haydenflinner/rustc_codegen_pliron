@@ -116,7 +116,31 @@ macro_rules! isle_lower_prelude_methods {
 
         #[inline]
         fn put_in_reg(&mut self, val: Value) -> Reg {
-            self.put_in_regs(val).only_reg().unwrap()
+            let regs = self.put_in_regs(val);
+            regs.only_reg().unwrap_or_else(|| {
+                let f = self.lower_ctx.f;
+                let mut users = alloc::string::String::new();
+                for b in f.layout.blocks() {
+                    for i in f.layout.block_insts(b) {
+                        if f.dfg
+                            .inst_args(i)
+                            .iter()
+                            .any(|&a| f.dfg.resolve_aliases(a) == val)
+                        {
+                            users += &format!("  {} in {:?}\n", f.dfg.display_inst(i), b);
+                        }
+                    }
+                }
+                panic!(
+                    "put_in_reg: {:?} (ty {:?}, def {:?}) has {} regs in {}\nusers:\n{}",
+                    val,
+                    self.lower_ctx.value_ty(val),
+                    f.dfg.value_def(val),
+                    regs.len(),
+                    f.name,
+                    users
+                )
+            })
         }
 
         #[inline]

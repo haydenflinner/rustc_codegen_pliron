@@ -23,24 +23,26 @@
     (bmask ty cmp))
 
 ;; Transform select-of-icmp into {u,s}{min,max} instructions where possible.
-(rule (simplify (select ty (sgt _ x y) x y)) (smax ty x y))
-(rule (simplify (select ty (sge _ x y) x y)) (smax ty x y))
-(rule (simplify (select ty (ugt _ x y) x y)) (umax ty x y))
-(rule (simplify (select ty (uge _ x y) x y)) (umax ty x y))
-(rule (simplify (select ty (slt _ x y) x y)) (smin ty x y))
-(rule (simplify (select ty (sle _ x y) x y)) (smin ty x y))
-(rule (simplify (select ty (ult _ x y) x y)) (umin ty x y))
-(rule (simplify (select ty (ule _ x y) x y)) (umin ty x y))
+;; Restricted to register-width ints: scalar min/max has no lowering for
+;; wider types (i128) on any target, while `icmp`/`select` do.
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sgt _ x y) x y)) (smax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sge _ x y) x y)) (smax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ugt _ x y) x y)) (umax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (uge _ x y) x y)) (umax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (slt _ x y) x y)) (smin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sle _ x y) x y)) (smin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ult _ x y) x y)) (umin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ule _ x y) x y)) (umin ty x y))
 
 ;; These are the same rules as above, but when the operands for select are swapped
-(rule (simplify (select ty (slt _ x y) y x)) (smax ty x y))
-(rule (simplify (select ty (sle _ x y) y x)) (smax ty x y))
-(rule (simplify (select ty (ult _ x y) y x)) (umax ty x y))
-(rule (simplify (select ty (ule _ x y) y x)) (umax ty x y))
-(rule (simplify (select ty (sgt _ x y) y x)) (smin ty x y))
-(rule (simplify (select ty (sge _ x y) y x)) (smin ty x y))
-(rule (simplify (select ty (ugt _ x y) y x)) (umin ty x y))
-(rule (simplify (select ty (uge _ x y) y x)) (umin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (slt _ x y) y x)) (smax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sle _ x y) y x)) (smax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ult _ x y) y x)) (umax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ule _ x y) y x)) (umax ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sgt _ x y) y x)) (smin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (sge _ x y) y x)) (smin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (ugt _ x y) y x)) (umin ty x y))
+(rule (simplify (select (and (fits_in_64 ty) (ty_int _)) (uge _ x y) y x)) (umin ty x y))
 
 ;; Transform bitselect-of-icmp into {u,s}{min,max} instructions where possible.
 (rule (simplify (bitselect ty @ (multi_lane _ _) (sgt _ x y) x y)) (smax ty x y))

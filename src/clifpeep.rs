@@ -489,6 +489,28 @@ pub fn run(func: &mut Function) -> usize {
                 }
                 continue;
             }
+            // `urem x, 2^k` = `x & (2^k - 1)`: scalar urem is a libcall-ish
+            // divide, and the mask form reaches loopvec's cond trees.
+            if let InstructionData::Binary {
+                opcode: Opcode::Urem,
+                args,
+            } = pos.func.dfg.insts[inst]
+            {
+                let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                if let Some(k) = iconst(pos.func, args[1])
+                    && ty.is_int()
+                    && !ty.is_vector()
+                    && ty.bits() <= 64
+                    && k > 0
+                    && (k as u64).is_power_of_two()
+                    && (ty.bits() == 64 || k < (1i64 << ty.bits()))
+                {
+                    let m = pos.ins().iconst(ty, k - 1);
+                    pos.func.replace(inst).band(args[0], m);
+                    n += 1;
+                }
+                continue;
+            }
             if matches!(
                 pos.func.dfg.insts[inst].opcode(),
                 Opcode::Select | Opcode::Bitselect
@@ -541,6 +563,39 @@ pub fn run(func: &mut Function) -> usize {
             let b = pos.ins().band(sh, one);
             let zero = pos.ins().iconst(types::I64, 0);
             pos.func.replace(inst).icmp(cond, b, zero);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `umin`/`umax`/`smin`/`smax` on scalar ints wider than a register (i128):
+/// no Cranelift target lowers them — the egraph's `select(icmp)->min` rules
+/// don't restrict by width, and loopvec's scalar reduction epilogue emits
+/// `umin` for `u128` accumulators — so split them back into `icmp` + `select`
+/// (which do lower on i128: cmp/sbcs + a pair of csel).
+pub fn wide_minmax(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::Binary { opcode, args } = pos.func.dfg.insts[inst] else {
+                continue;
+            };
+            let cc = match opcode {
+                Opcode::Umin => IntCC::UnsignedLessThan,
+                Opcode::Umax => IntCC::UnsignedGreaterThan,
+                Opcode::Smin => IntCC::SignedLessThan,
+                Opcode::Smax => IntCC::SignedGreaterThan,
+                _ => continue,
+            };
+            let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+            if ty.is_vector() || !ty.is_int() || ty.bits() <= 64 {
+                continue;
+            }
+            let [x, y] = args;
+            let c = pos.ins().icmp(cc, x, y);
+            pos.func.replace(inst).select(c, x, y);
             n += 1;
         }
     }

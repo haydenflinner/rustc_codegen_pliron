@@ -204,6 +204,18 @@ there instead of in the cwd.
   matching LLVM's soft-f16 promotion). `powf128` emits `powf128` — no such
   symbol exists in compiler-builtins or libm.dylib, so it is a link error
   on macOS (honest failure; glibc ships it).
+- `umin.i128`/`smin.i128`/etc. ICE'd aarch64 lowering (`put_in_reg` unwrap in
+  `isle.rs`, found self-hosting `rustc_apfloat`'s `from_decimal_string`, then
+  by a `u128::min` reduction loop). Two sources: our passes can emit scalar
+  min/max on i128 accumulators (loopvec's reduction epilogue), and
+  cranelift's own egraph — run inside `define_function` because
+  `opt_level=speed_and_size` — canonicalizes `select(icmp)` -> `umin`
+  unconditionally (`vendor/cranelift-codegen/src/opts/selects.isle`), a
+  rule set with no width guard while no target lowers scalar min/max >64
+  bits. Fixed both ends: the vendored select->min/max rules now require
+  `fits_in_64` + `ty_int`, and `clifpeep::wide_minmax` rewrites any
+  `min/max.i128` left in the function into `icmp` + `select` (both lowerable
+  on i128) just before `define_function`.
 - Upstream divergences where pliron is *more* correct than stock on
   aarch64-apple-darwin (LLVM lowers f128 to `long double` libcalls —
   `fmodl`/`sqrtl`/`floorl`/... — but arm64 macOS `long double` is f64, so
