@@ -1,2 +1,4 @@
 target/
 rustc-ice-*.txt
+__pycache__/
+examples/bevy-game/target-*/
