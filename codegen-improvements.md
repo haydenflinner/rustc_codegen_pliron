@@ -180,6 +180,13 @@ More passes at `-O`, all `PLIRON_*`-switchable:
 | spec | `src/spec.rs` | IPSCCP-lite: a `Local` fn whose address never escapes and whose every callsite passes the same `ConstVal` for a param adopts it — param uses are replaced by a fresh orphan `UndefOp` const, so downstream constprop does the rest |
 | bcheck | `src/bcheck.rs` | Loop-versioning bounds-check elimination (LLVM `LoopPredication`): for a `+1` counting loop, compute `m*last_i + b < len` once in a merged guard block `g`, clone the loop with all panic edges already taken, keep the original as the exact-panic slow path. Handles latch-tested *and* header-tested (while-form) exits, affine index terms `m*i + Σ b`, widened (i128) guard math, multi-entry loops (all entry edges retarget to `g`, whose params are the canonical entry values), and pulls cold trap blocks + private exits into the clone region (they're not `LoopAnalysis` members but use body values freely) |
 | indvars `Mul::V` | `src/indvars.rs` | `iv * invariant` (and `base + iv * invariant`) → stepped param (`b_idx += n` in matmul's `b[k*n+j]`). `Mul::K(1)` deliberately skipped: `base + iv` is already one cheap add, and a stepped param buys only regalloc parallel-copy movs |
+| minmax | `src/clifpeep.rs` | `select|bitselect (icmp cc x, y)` → `{u,s}{min,max}`, incl. the nested clamp idiom `x < lo ? lo : min(x, hi)` (needs a `lo <= hi` constant proof the vendored egraph can't do). Running before `loopvec` makes `u8::clamp`-style loops emit `umin`/`umax` lanes — `clamp_u8_4M` 0.063 → 0.055 ms/iter (stock 0.056) |
+| indvars post-vec | `src/lower.rs` | a second `indvars` run right after `loopvec` strength-reduces the fresh `base + iv*esize` addressing into stepped pointer params (`PLIRON_INDUCT2`); axpy_f32_4M reaches stock parity |
+
+Note: an `iconcat(hi, lo)` operand-order bug in `bcheck`'s widened constants
+made every guard fail, silently pinning execution to the slow path — caught
+by a gather/hist microbenchmark (0.76/0.73 → 0.47/0.28 ms/iter after the
+fix, beating stock's 0.60/0.41).
 
 aarch64 lowering additions in vendored cranelift (`vendor/cranelift-codegen/PLIRON_PATCH.md`):
 `udot`/`usdot`/`smlal`/`umlal`/`mls` instructions + ISLE folds for the
