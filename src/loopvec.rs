@@ -2653,15 +2653,29 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         }
         // Lane-wise early-exit checks: on a hit, resume the scalar loop at
         // this group's first lane — it re-finds the exact lane and takes
-        // the real exit edge with its original args.
-        for &(cv, exits_true) in &p.early {
+        // the real exit edge with its original args. Each check ends its
+        // block; several checks in one group chain through fresh blocks.
+        let nchecks = p.early.len();
+        let mut cur = vbs[g.min(vbs.len() - 1)];
+        for (i, &(cv, exits_true)) in p.early.iter().enumerate() {
             let m = emit_val(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, cv, 0);
+            let nxt = if i + 1 == nchecks {
+                vbs[g + 1]
+            } else {
+                let nb = pos.func.dfg.make_block();
+                pos.func.layout.insert_block_after(nb, cur);
+                nb
+            };
             if exits_true {
                 let hit = pos.ins().vany_true(m);
-                pos.ins().brif(hit, resumes[g], &[], vbs[g + 1], &[]);
+                pos.ins().brif(hit, resumes[g], &[], nxt, &[]);
             } else {
                 let all = pos.ins().vall_true(m);
-                pos.ins().brif(all, vbs[g + 1], &[], resumes[g], &[]);
+                pos.ins().brif(all, nxt, &[], resumes[g], &[]);
+            }
+            if i + 1 != nchecks {
+                pos = FuncCursor::new(pos.func).at_bottom(nxt);
+                cur = nxt;
             }
         }
         // vacc = vacc ⊕ delta per group; deltas come after the group's
