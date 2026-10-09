@@ -1471,11 +1471,16 @@ fn emit_val(
         let sv = emit_scalar(pos, p, smemo, v, 0);
         // Cond-tree operands may sit wider than the lanes (e.g. `icmp.i64
         // ult byte, 128`): truncate — `mask_node`'s signedness checks proved
-        // the masked bits reproduce the operand.
-        let sv = if pos.func.dfg.value_type(sv) == lane {
+        // the masked bits reproduce the operand. Narrower operands (an i8
+        // flag splat across i32 lanes) sign-extend so a -1 mask stays all
+        // ones; only the masked low bits are consumed either way.
+        let st = pos.func.dfg.value_type(sv);
+        let sv = if st == lane {
             sv
-        } else {
+        } else if st.bits() > lane.bits() {
             pos.ins().ireduce(lane, sv)
+        } else {
+            pos.ins().sextend(lane, sv)
         };
         let s = pos.ins().splat(vt, sv);
         splats.insert(v, s);
