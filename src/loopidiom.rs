@@ -663,6 +663,51 @@ pub(crate) fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
     if let Some(k) = iconst(func, c) {
         return e.slot == usize::from(k != 0);
     }
+    // A descending-index bounds check `ult(bound-1-iv, bound)` never fires:
+    // a unit-step stay condition keeps `iv <= bound-1`, so the index stays
+    // in `[0, bound-1]` (no wrap) on every iteration. The index must read
+    // the *current* iv — `iv+step` wraps on the last iteration.
+    if let ValueDef::Result(ci, _) = func.dfg.value_def(c)
+        && let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: IntCC::UnsignedLessThan,
+            args: [x, y],
+        } = func.dfg.insts[ci]
+        && e.slot == 1
+        && func.dfg.resolve_aliases(y) == cnt.bound
+        && cnt.step == 1
+        && matches!(cnt.stay, IntCC::UnsignedLessThan | IntCC::NotEqual)
+    {
+        let xv = func.dfg.resolve_aliases(x);
+        if let ValueDef::Result(xi, _) = func.dfg.value_def(xv)
+            && let InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args: [a, b],
+            } = func.dfg.insts[xi]
+            && func.dfg.resolve_aliases(b) == cnt.iv
+            && let ValueDef::Result(ai, _) =
+                func.dfg.value_def(func.dfg.resolve_aliases(a))
+        {
+            let km1 = match func.dfg.insts[ai] {
+                InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args: [t, k],
+                } => {
+                    func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(1)
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [t, k],
+                } => {
+                    func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(-1)
+                }
+                _ => false,
+            };
+            if km1 {
+                return true;
+            }
+        }
+    }
     // An `icmp` guard is implied by the stay test only when the test runs
     // before the body each iteration.
     if cnt.post_tested {

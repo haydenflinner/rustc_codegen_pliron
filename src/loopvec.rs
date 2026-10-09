@@ -22,8 +22,8 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, MemFlagsData,
-    Opcode, Type, Value, ValueDef, types,
+    Block, BlockArg, BlockCall, ConstantData, Endianness, Function, Inst, InstBuilder,
+    InstructionData, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -31,7 +31,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
     Count, Edge, Info, Ins, Param, Pred, count, deadend, edge_args, emit, gather, guard_dead,
-    guard_pred, iconst, outv, param_kinds, scaled_addr, trips_idx, trips_ptr,
+    guard_pred, iconst, outv, param_kinds, trips_idx, trips_ptr,
 };
 
 const MAX_LOOPS: usize = 16;
@@ -76,19 +76,24 @@ fn vec_op_ok(op: Opcode, elem: Type) -> bool {
 
 /// One affine memory stream: `addr = base + iv*rate` in iv units (`base`
 /// contains `Val(iv)`), or the iv itself (`direct`, pointer-iv loops stepping
-/// one element per iteration).
+/// one element per iteration). `neg` marks a descending stream (`rate < 0`,
+/// e.g. `src[n-1-i]`): the vector body loads the contiguous block whose
+/// lanes run opposite to iteration order and reverses them.
 struct Stream {
     base: Ins,
     /// Entry-side base value for alias-root analysis.
     root_val: Value,
     direct: bool,
+    neg: bool,
 }
 
 enum VPred {
     Cmp(IntCC, Ins, Ins),
     Aligned(Ins, i64),
-    /// `[a, a+len)` and `[b, b+len)` don't overlap and neither wraps.
-    Pair(Ins, Ins),
+    /// `[a, a+len)` and `[b, b+len)` don't overlap and neither wraps. The
+    /// bools mark descending streams: their touched range ends at `a(iv0)`
+    /// rather than starting there.
+    Pair(Ins, bool, Ins, bool),
 }
 
 /// One scalar reduction lifted to a vector accumulator: header param `idx`,
@@ -185,8 +190,136 @@ struct Plan {
     extra_vec: FxHashSet<Inst>,
 }
 
+/// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
+/// visible outside the loop (pure in-body arithmetic is re-expressed, e.g.
+/// `isub(bound-1, iv)` → coeff -1). `None` when `v` isn't affine in `iv` or
+/// the invariant part isn't liftable.
+fn affine(
+    func: &Function,
+    info: &Info,
+    kinds: &[Param],
+    iv: Value,
+    v: Value,
+    depth: u8,
+) -> Option<(i64, Ins)> {
+    if depth > 8 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if v == iv {
+        return Some((1, Ins::K(0)));
+    }
+    if let Some(k) = iconst(func, v) {
+        return Some((0, Ins::K(k)));
+    }
+    if let Some(o) = outv(func, info, kinds, v) {
+        return Some((0, Ins::Val(o)));
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    if !func.layout.inst_block(i).is_some_and(|b| info.body.contains(&b)) {
+        return None;
+    }
+    let d = depth + 1;
+    let (ca, cb, mk) = match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [a, b],
+        } => {
+            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            (ca, cb, Ins::Add(Box::new(oa), Box::new(ob)))
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: [a, b],
+        } => {
+            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            (ca, cb.wrapping_neg(), Ins::Sub(Box::new(oa), Box::new(ob)))
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args: [a, b],
+        } => {
+            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            if ca != 0 && cb != 0 {
+                return None;
+            }
+            if ca == 0 && cb == 0 {
+                (0, 0, Ins::Mul(Box::new(oa), Box::new(ob)))
+            } else if ca != 0 {
+                let m = ins_k(&ob)?;
+                (ca.wrapping_mul(m), 0, Ins::Mul(Box::new(oa), Box::new(Ins::K(m))))
+            } else {
+                let m = ins_k(&oa)?;
+                (0, cb.wrapping_mul(m), Ins::Mul(Box::new(ob), Box::new(Ins::K(m))))
+            }
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, b],
+        } => {
+            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
+            let s = iconst(func, b)?;
+            if !(0..64).contains(&s) {
+                return None;
+            }
+            let m = 1i64 << s;
+            (
+                ca.wrapping_mul(m),
+                0,
+                Ins::Mul(Box::new(oa), Box::new(Ins::K(m))),
+            )
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Ineg,
+            arg,
+        } => {
+            let (ca, oa) = affine(func, info, kinds, iv, arg, d)?;
+            (
+                0,
+                ca.wrapping_neg(),
+                Ins::Sub(Box::new(Ins::K(0)), Box::new(oa)),
+            )
+        }
+        // Pointer-width extension of an index expr: read at target width.
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => return affine(func, info, kinds, iv, arg, d),
+        _ => return None,
+    };
+    Some((ca.wrapping_add(cb), mk))
+}
+
+/// `e` evaluates to a literal constant.
+fn ins_k(e: &Ins) -> Option<i64> {
+    match e {
+        Ins::K(k) => Some(*k),
+        _ => None,
+    }
+}
+
+/// Leftmost non-iv leaf of `e` — the stream's base value for alias analysis.
+fn root_leaf(e: &Ins, iv: Value) -> Option<Value> {
+    match e {
+        Ins::Val(v) if *v != iv => Some(*v),
+        Ins::Add(a, b)
+        | Ins::Sub(a, b)
+        | Ins::SatSub(a, b)
+        | Ins::Mul(a, b)
+        | Ins::And(a, b)
+        | Ins::Div(a, b) => root_leaf(a, iv).or_else(|| root_leaf(b, iv)),
+        _ => None,
+    }
+}
+
 /// `addr` as a stream: (base expr mentioning `Val(cnt.iv)`, entry-side root
-/// value, direct-iv flag). `None` if not affine-contiguous at `ebytes`/iter.
+/// value, direct-iv flag, descending flag). `None` if not affine-contiguous
+/// at `ebytes`/iter.
 fn stream_base(
     func: &Function,
     info: &Info,
@@ -194,10 +327,10 @@ fn stream_base(
     cnt: &Count,
     addr: Value,
     ebytes: i64,
-) -> Option<(Ins, Value, bool)> {
+) -> Option<(Ins, Value, bool, bool)> {
     let a = func.dfg.resolve_aliases(addr);
     if a == cnt.iv {
-        return (cnt.step == ebytes).then_some((Ins::Val(cnt.iv), cnt.iv0, true));
+        return (cnt.step == ebytes).then_some((Ins::Val(cnt.iv), cnt.iv0, true, false));
     }
     let params = func.dfg.block_params(info.h).to_vec();
     for (j, &p) in params.iter().enumerate() {
@@ -207,10 +340,14 @@ fn stream_base(
             let Param::Step(s) = kinds[j] else {
                 return None;
             };
-            if s != ebytes || s % cnt.step != 0 {
+            if s != ebytes && s != -ebytes {
+                return None;
+            }
+            if s % cnt.step != 0 {
                 return None;
             }
             let rate = s / cnt.step;
+            let neg = rate < 0;
             let c = Ins::Sub(
                 Box::new(Ins::Val(info.entry_args[j])),
                 Box::new(Ins::Mul(
@@ -225,22 +362,22 @@ fn stream_base(
                     Box::new(Ins::Val(cnt.iv)),
                 )),
             );
-            return Some((expr, info.entry_args[j], false));
+            return Some((expr, info.entry_args[j], false, neg));
         }
     }
-    let (base, k) = scaled_addr(func, cnt.iv, a)?;
-    if k * cnt.step != ebytes {
+    let (k, off) = affine(func, info, kinds, cnt.iv, a, 0)?;
+    if k * cnt.step != ebytes && k * cnt.step != -ebytes {
         return None;
     }
-    let b = outv(func, info, kinds, base)?;
+    let neg = k * cnt.step < 0;
     let expr = Ins::Add(
-        Box::new(Ins::Val(b)),
+        Box::new(off.clone()),
         Box::new(Ins::Mul(
             Box::new(Ins::Val(cnt.iv)),
             Box::new(Ins::K(k)),
         )),
     );
-    Some((expr, b, false))
+    Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg))
 }
 
 /// `v` is a splattable loop-invariant operand: defined outside the loop, an
@@ -653,7 +790,7 @@ fn plan(
         let idx = match by_addr.get(&a) {
             Some(&j) => j,
             None => {
-                let Some((base, rootv, direct)) =
+                let Some((base, rootv, direct, neg)) =
                     stream_base(func, &info, &kinds, &cnt, a, ebytes)
                 else {
                     why!(fname; "addr {}", func.dfg.display_inst(i));
@@ -662,6 +799,7 @@ fn plan(
                     base,
                     root_val: rootv,
                     direct,
+                    neg,
                 });
                 by_addr.insert(a, streams.len() - 1);
                 streams.len() - 1
@@ -915,7 +1053,12 @@ fn plan(
         ));
     }
     for (a, b) in pairs {
-        preds.push(VPred::Pair(streams[a].base.clone(), streams[b].base.clone()));
+        preds.push(VPred::Pair(
+            streams[a].base.clone(),
+            streams[a].neg,
+            streams[b].base.clone(),
+            streams[b].neg,
+        ));
     }
     let iv_idx = func
         .dfg
@@ -1108,8 +1251,14 @@ fn emit_val(
     let out = match data {
                 InstructionData::Load { .. } => {
                     let j = p.loads.iter().find(|&&(l, _)| l == i).unwrap().1;
-                    pos.ins()
-                        .load(vt, MemFlagsData::new().with_notrap(), addrs[j], 0)
+                    let v = pos
+                        .ins()
+                        .load(vt, MemFlagsData::new().with_notrap(), addrs[j], 0);
+                    if p.streams[j].neg {
+                        vreverse(pos, vt, v)
+                    } else {
+                        v
+                    }
                 }
                 InstructionData::Binary { opcode, args } => {
                     let a = m!(args[0]);
@@ -1195,6 +1344,30 @@ fn emit_val(
         };
     vmap.insert(v, out);
     out
+}
+
+/// Reverse `v`'s element lanes (a descending stream's contiguous block runs
+/// opposite to iteration order). On aarch64 this is one `tbl`.
+fn vreverse(pos: &mut FuncCursor, vt: Type, v: Value) -> Value {
+    let e = vt.lane_type().bytes() as usize;
+    let n = vt.bytes() as usize;
+    let mut mask = vec![0u8; n];
+    for i in 0..n {
+        mask[i] = ((n - e - i / e * e) + i % e) as u8;
+    }
+    let imm = pos
+        .func
+        .dfg
+        .immediates
+        .push(ConstantData::from(mask.as_slice()));
+    // `shuffle` is typed i8x16x2 in this Cranelift; bitcast in and out.
+    // The lane-count change needs an explicit endianness: `little` keeps
+    // byte i of the i8x16 view equal to byte i of each lane, so the mask
+    // permutes lanes while preserving intra-element byte order.
+    let le = MemFlagsData::new().with_endianness(Endianness::Little);
+    let b = pos.ins().bitcast(types::I8X16, le, v);
+    let b = pos.ins().shuffle(b, b, imm);
+    pos.ins().bitcast(vt, le, b)
 }
 
 /// Emit a conditional-update predicate's lane mask: `icmp ne v, 0` when the
@@ -1921,7 +2094,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 let z = pos.ins().iconst(pty, 0);
                 pos.ins().icmp(IntCC::Equal, r, z)
             }
-            VPred::Pair(a, b) => {
+            VPred::Pair(a, a_neg, b, b_neg) => {
                 let lenb = emit(
                     &mut pos,
                     pty,
@@ -1930,11 +2103,35 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                         Box::new(Ins::K(i64::from(p.elem.bytes()))),
                     ),
                 );
-                // Range starts at iteration 0: substitute the entry value.
-                let alo = emit(&mut pos, pty, &subst(a, p.iv, p.iv0));
-                let blo = emit(&mut pos, pty, &subst(b, p.iv, p.iv0));
-                let ahi = pos.ins().iadd(alo, lenb);
-                let bhi = pos.ins().iadd(blo, lenb);
+                // A descending stream touches `[a(iv_last), a(iv0)+e)`:
+                // evaluate its base at the last iteration's iv instead.
+                let last = Ins::Add(
+                    Box::new(Ins::Val(p.iv0)),
+                    Box::new(Ins::Mul(
+                        Box::new(Ins::Sub(
+                            Box::new(p.iters.clone()),
+                            Box::new(Ins::K(1)),
+                        )),
+                        Box::new(Ins::K(p.step)),
+                    )),
+                );
+                let ivl = emit(&mut pos, iv_ty, &last);
+                let lo = |e: &Ins, neg: bool, pos: &mut FuncCursor| {
+                    emit(pos, pty, &subst(e, p.iv, if neg { ivl } else { p.iv0 }))
+                };
+                let (alo, blo) = (lo(a, *a_neg, &mut pos), lo(b, *b_neg, &mut pos));
+                let hi = |e: &Ins, neg: bool, lo: Value, pos: &mut FuncCursor| {
+                    if neg {
+                        // Top of the range is one element past `e(iv0)`.
+                        let t = emit(pos, pty, &subst(e, p.iv, p.iv0));
+                        let eb = pos.ins().iconst(pty, i64::from(p.elem.bytes()));
+                        pos.ins().iadd(t, eb)
+                    } else {
+                        pos.ins().iadd(lo, lenb)
+                    }
+                };
+                let ahi = hi(a, *a_neg, alo, &mut pos);
+                let bhi = hi(b, *b_neg, blo, &mut pos);
                 let nwa = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, alo, ahi);
                 let nwb = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, blo, bhi);
                 let x = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, ahi, blo);
@@ -2037,16 +2234,35 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         let mut addrs = Vec::new();
         for s in &p.streams {
             let a = if s.direct {
-                ivv
+                if s.neg {
+                    // Descending pointer iv: the contiguous block ends at
+                    // `ivv - g*vf*e`, so load at its lowest address.
+                    let off = pos
+                        .ins()
+                        .iconst(iv_ty, -(((g as i64) + 1) * p.vf - 1) * i64::from(p.elem.bytes()));
+                    pos.ins().iadd(ivv, off)
+                } else if g == 0 {
+                    ivv
+                } else {
+                    let off = pos.ins().iconst(pty, gb * g as i64);
+                    pos.ins().iadd(ivv, off)
+                }
             } else {
-                emit(&mut pos, pty, &subst(&s.base, p.iv, ivv))
-            };
-            let a = if g == 0 {
-                a
-            } else {
-                // `direct` streams step `ebytes` per scalar iteration too.
-                let off = pos.ins().iconst(pty, gb * g as i64);
-                pos.ins().iadd(a, off)
+                // Substitute the iv whose address is the block's lowest
+                // byte: the group's first lane ascending, its last
+                // descending.
+                let adj = if s.neg {
+                    (((g as i64) + 1) * p.vf - 1) * p.step
+                } else {
+                    (g as i64) * p.vf * p.step
+                };
+                let w = if adj == 0 {
+                    ivv
+                } else {
+                    let c = pos.ins().iconst(iv_ty, adj);
+                    pos.ins().iadd(ivv, c)
+                };
+                emit(&mut pos, pty, &subst(&s.base, p.iv, w))
             };
             addrs.push(a);
         }
@@ -2059,16 +2275,22 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 InstructionData::Load { .. } => {
                     let r = pos.func.dfg.resolve_aliases(pos.func.dfg.first_result(i));
                     if p.can_vec.contains(&r) && !vmap.contains_key(&r) {
-                        let vl =
+                        let mut vl =
                             pos.ins()
                                 .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j], 0);
+                        if p.streams[j].neg {
+                            vl = vreverse(&mut pos, p.vt, vl);
+                        }
                         vmap.insert(r, vl);
                     }
                 }
                 InstructionData::Store { args, .. } => {
-                    let vv = emit_val(
+                    let mut vv = emit_val(
                         &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, args[0], 0,
                     );
+                    if p.streams[j].neg {
+                        vv = vreverse(&mut pos, p.vt, vv);
+                    }
                     pos.ins()
                         .store(MemFlagsData::new().with_notrap(), vv, addrs[j], 0);
                 }
