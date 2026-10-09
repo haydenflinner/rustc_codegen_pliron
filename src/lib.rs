@@ -195,6 +195,27 @@ pub(crate) fn pass_enabled(var: &str) -> bool {
     std::env::var(var).map_or(true, |v| v != "0")
 }
 
+/// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
+/// applications (across all passes and functions), like LLVM's
+/// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
+/// the budget is unlimited. `PLIRON_OPT_BISECT_DEBUG=1` logs each gate.
+pub(crate) fn bisect(name: &str) -> bool {
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LIMIT: LazyLock<Option<u64>> = LazyLock::new(|| {
+        std::env::var("PLIRON_OPT_BISECT").ok().and_then(|v| v.parse().ok())
+    });
+    static DEBUG: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("PLIRON_OPT_BISECT_DEBUG").is_ok_and(|v| v == "1"));
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(limit) = *LIMIT else { return true };
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let ok = n < limit;
+    if *DEBUG {
+        eprintln!("bisect {} {name} {}", n + 1, if ok { "run" } else { "skip" });
+    }
+    ok
+}
 fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let emit_ir = cx
         .tcx

@@ -344,7 +344,7 @@ pub fn lower_to_object(
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
-        if st.jumpthread {
+        if st.jumpthread && crate::bisect("jumpthread") {
             let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
             threaded += n;
             dead_params += dead;
@@ -361,7 +361,7 @@ pub fn lower_to_object(
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") {
+        if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") && crate::bisect("unroll") {
             let k = crate::unroll::run(&mut clctx.func, &nonnull, &derived);
             // The skipped loop is now unreachable, and its trip count still
             // flows into dead params/branches; dropping them frees the slot
@@ -394,7 +394,7 @@ pub fn lower_to_object(
                 panic!("unroll broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.unreach {
+        if st.unreach && crate::bisect("unreach") {
             unreached += crate::unreach::run(&mut clctx.func);
             if std::env::var_os("PLIRON_VERIFY").is_some()
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
@@ -402,10 +402,10 @@ pub fn lower_to_object(
                 panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.peep {
+        if st.peep && crate::bisect("clifpeep") {
             peeped += crate::clifpeep::run(&mut clctx.func);
         }
-        if st.tailmerge {
+        if st.tailmerge && crate::bisect("tailmerge") {
             merged += crate::tailmerge::run(&mut clctx.func);
             if std::env::var_os("PLIRON_VERIFY").is_some()
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
@@ -413,7 +413,7 @@ pub fn lower_to_object(
                 panic!("tailmerge broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.taildup {
+        if st.taildup && crate::bisect("taildup") {
             dupd += crate::taildup::run(&mut clctx.func);
             if std::env::var_os("PLIRON_VERIFY").is_some()
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
@@ -421,7 +421,7 @@ pub fn lower_to_object(
                 panic!("taildup broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.loadfwd {
+        if st.loadfwd && crate::bisect("loadfwd") {
             forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
             if st.slot_dse {
                 // A load whose only user was a removed dead store keeps its own
@@ -447,7 +447,7 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if crate::pass_enabled("PLIRON_SWITCHMAP") {
+        if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
             let k = crate::switchmap::run(&mut clctx.func);
             // The new bounds tests are often implied by a dominating check.
             let f = if k > 0
@@ -473,7 +473,7 @@ pub fn lower_to_object(
                 panic!("switchmap broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if std::env::var("PLIRON_CONSTBR").is_ok_and(|v| v == "1") {
+        if std::env::var("PLIRON_CONSTBR").is_ok_and(|v| v == "1") && crate::bisect("constbr") {
             let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_CONSTBR_DEBUG").is_some() {
                 eprintln!("constbr {k} {n}");
@@ -484,7 +484,7 @@ pub fn lower_to_object(
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if st.jumpthread && crate::pass_enabled("PLIRON_LOOPDEL") {
+        if st.jumpthread && crate::pass_enabled("PLIRON_LOOPDEL") && crate::bisect("loopdel") {
             let k = crate::loopdel::run(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopdel {k} {n}");
