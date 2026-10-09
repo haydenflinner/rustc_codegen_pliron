@@ -29,7 +29,7 @@ use pliron::value::Value;
 use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
 use pliron_llvm::ops::*;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use waffle::entity::EntityRef;
 use waffle::{
@@ -549,6 +549,28 @@ fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
     out
 }
 
+/// SSA tracking for `st.promoted` allocas. Waffle IR has no mutable locals,
+/// so each promoted alloca leaf is a virtual variable whose block-param
+/// wiring is built lazily — the same algorithm waffle's own wasm frontend
+/// uses for locals (`frontend.rs::LocalTracker`), keyed on our leaf indices.
+#[derive(Default)]
+struct Promo {
+    /// Alloca result -> (first leaf index, leaf count).
+    slots: FxHashMap<Value, (u32, u32)>,
+    /// Wasm type per leaf slot.
+    tys: Vec<WT>,
+    /// Live-out leaf values of a block (or current in-block values).
+    map: FxHashMap<WBlock, FxHashMap<u32, WV>>,
+    /// Blocks whose predecessor set is final.
+    sealed: FxHashSet<WBlock>,
+    /// Waffle blocks that map to a pliron block (vs. internal continuations).
+    mapped: FxHashSet<WBlock>,
+    /// Waffle blocks with their terminator set.
+    finished: FxHashSet<WBlock>,
+    /// Phi placeholders awaiting the block's seal.
+    incomplete: FxHashMap<WBlock, Vec<(u32, WV)>>,
+}
+
 struct FL<'o, 'a, 'tcx> {
     o: &'o mut Obj<'a, 'tcx>,
     ctx: &'a Context,
@@ -558,6 +580,7 @@ struct FL<'o, 'a, 'tcx> {
     vals: FxHashMap<Value, Vals>,
     cconst: FxHashMap<Value, Vals>,
     blocks: FxHashMap<Ptr<BasicBlock>, WBlock>,
+    promo: Promo,
     terminated: bool,
     sp0: WV,
     fp: WV,
@@ -589,6 +612,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             vals: FxHashMap::default(),
             cconst: FxHashMap::default(),
             blocks: FxHashMap::default(),
+            promo: Promo::default(),
             terminated: false,
             epi: None,
             rets,
@@ -611,6 +635,9 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     }
 
     fn finish(mut self) -> FunctionBody {
+        // Patch the frame placeholders before optimizing: GVN would otherwise
+        // alias same-valued consts onto frame_c/mask_c, and the rewrite below
+        // would corrupt them.
         let frame = crate::types::align_to(self.frame, self.frame_align) as u32;
         let mask = !(self.frame_align as u32 - 1);
         for (v, c) in [(self.frame_c, frame), (self.mask_c, mask)] {
@@ -618,6 +645,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 *op = O::I32Const { value: c };
             }
         }
+        self.b.optimize(&waffle::OptOptions::default());
         self.b
     }
 
@@ -932,6 +960,135 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         )
     }
 
+    /// Read a promoted-alloca leaf in the current block.
+    fn pget(&mut self, loc: u32) -> WV {
+        let at = self.cur;
+        self.pget_in(at, loc)
+    }
+
+    /// Write a promoted-alloca leaf in the current block.
+    fn pset(&mut self, loc: u32, v: WV) {
+        self.promo.map.entry(self.cur).or_default().insert(loc, v);
+    }
+
+    /// The leaf's value at `at`: the in-block map for an open block, the
+    /// recorded end map once it is done, else a phi resolved at seal time.
+    fn pget_in(&mut self, at: WBlock, loc: u32) -> WV {
+        if (at == self.cur || self.promo.sealed.contains(&at))
+            && let Some(&v) = self.promo.map.get(&at).and_then(|m| m.get(&loc))
+        {
+            return v;
+        }
+        let ty = self.promo.tys[loc as usize];
+        if self.promo.sealed.contains(&at) {
+            if self.b.blocks[at].preds.is_empty() {
+                return self.pzero(at, ty);
+            }
+            let ph = self.b.add_placeholder(ty);
+            self.promo.map.entry(at).or_default().insert(loc, ph);
+            self.phi(at, loc, ph);
+            return ph;
+        }
+        if let Some(&v) = self.promo.map.get(&at).and_then(|m| m.get(&loc)) {
+            return v;
+        }
+        let ph = self.b.add_placeholder(ty);
+        self.promo.map.entry(at).or_default().insert(loc, ph);
+        self.promo.incomplete.entry(at).or_default().push((loc, ph));
+        ph
+    }
+
+    /// A default (uninitialized) leaf value emitted into a pred-less block.
+    fn pzero(&mut self, at: WBlock, ty: WT) -> WV {
+        let o = match ty {
+            WT::I32 => O::I32Const { value: 0 },
+            WT::I64 => O::I64Const { value: 0 },
+            WT::F32 => O::F32Const { value: 0 },
+            WT::F64 => O::F64Const { value: 0 },
+            WT::V128 => O::V128Const { value: 0 },
+            t => panic!("promoted leaf type {t:?}"),
+        };
+        self.b.add_op(at, o, &[], &[ty])
+    }
+
+    /// `wb`'s predecessor set is final: resolve its phi placeholders.
+    fn pseal(&mut self, wb: WBlock) {
+        if !self.promo.sealed.insert(wb) {
+            return;
+        }
+        for (loc, ph) in self.promo.incomplete.remove(&wb).unwrap_or_default() {
+            self.phi(wb, loc, ph);
+        }
+    }
+
+    /// Fill leaf phi `ph` in `wb` from each pred's live-out value, or fold it
+    /// to an alias when all preds agree.
+    fn phi(&mut self, wb: WBlock, loc: u32, ph: WV) {
+        let preds = self.b.blocks[wb].preds.clone();
+        let mut results = Vec::with_capacity(preds.len());
+        for pred in preds {
+            results.push(self.pget_in(pred, loc));
+        }
+        let mut non_self = results.iter().filter(|&&v| v != ph);
+        let alias = match non_self.next() {
+            None => None,
+            Some(&first)
+                if non_self.all(|&v| v == first) && self.b.resolve_alias(first) != ph =>
+            {
+                Some(first)
+            }
+            Some(_) => None,
+        };
+        if let Some(v) = alias {
+            self.b.set_alias(ph, v);
+        } else {
+            self.b.replace_placeholder_with_blockparam(wb, ph);
+            for (i, result) in results.into_iter().enumerate() {
+                let pred = self.b.blocks[wb].preds[i];
+                let index = self.b.blocks[wb].pos_in_pred_succ[i];
+                self.b.blocks[pred].terminator.update_target(index, |t| {
+                    t.args.push(result);
+                });
+            }
+        }
+    }
+
+    /// Seal an internal (non-pliron) waffle block once its preds — which are
+    /// final as soon as they exist — have all been emitted.
+    fn maybe_seal(&mut self, wb: WBlock) {
+        if self.promo.sealed.contains(&wb)
+            || self.promo.mapped.contains(&wb)
+            || Some(wb) == self.epi
+        {
+            return;
+        }
+        if self
+            .b
+            .blocks[wb]
+            .preds
+            .iter()
+            .all(|p| self.promo.finished.contains(p))
+        {
+            self.pseal(wb);
+        }
+    }
+
+    /// Reinterpret `v` as another same-width wasm container type.
+    fn reinterp(&mut self, v: WV, to: WT) -> WV {
+        let from = self.ty_of(v);
+        if from == to {
+            return v;
+        }
+        let o = match (from, to) {
+            (WT::I32, WT::F32) => O::F32ReinterpretI32,
+            (WT::F32, WT::I32) => O::I32ReinterpretF32,
+            (WT::I64, WT::F64) => O::F64ReinterpretI64,
+            (WT::F64, WT::I64) => O::I64ReinterpretF64,
+            (a, b) => panic!("reinterp {a:?} -> {b:?}"),
+        };
+        self.op(o, &[v], to)
+    }
+
     fn lower(&mut self, f: Ptr<Operation>) {
         let ctx = self.ctx;
         let region = f.deref(ctx).get_region(0);
@@ -962,14 +1119,51 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             // Variadic functions carry one extra hidden param (see wsig).
             self.va_buf = Some(params[i]);
         }
+        for op in crate::sroa::allocas(ctx, f) {
+            let a = op.deref(ctx).get_result(0);
+            if let Some(&ty) = self.st.promoted.get(&a) {
+                let base = self.promo.tys.len() as u32;
+                let n = wleaves(ctx, ty).len() as u32;
+                self.promo.tys.extend(wleaves(ctx, ty).iter().map(|&(_, t)| wty(t)));
+                self.promo.slots.insert(a, (base, n));
+            }
+        }
+        self.promo.mapped = self.blocks.values().copied().collect();
+        // Pliron-level predecessors: a mapped block's waffle `preds` is only
+        // complete once every pliron predecessor has finished emitting.
+        let succ = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
+            b.deref(ctx)
+                .iter(ctx)
+                .flat_map(|op| {
+                    let mut v: Vec<_> = op.deref(ctx).successors().collect();
+                    v.extend(self.st.invokes.get(&op).map(|&(l, _)| l));
+                    v
+                })
+                .collect()
+        };
+        let mut ppred: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+        for &pb in &pblocks {
+            for sb in succ(pb) {
+                ppred.entry(sb).or_default().push(pb);
+            }
+        }
+        let mut pdone: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
         for pb in rpo(ctx, self.st, &pblocks) {
             self.cur = self.blocks[&pb];
             self.cconst.clear();
             self.terminated = false;
+            if ppred
+                .get(&pb)
+                .is_none_or(|ps| ps.iter().all(|p| pdone.contains(p)))
+            {
+                self.pseal(self.cur);
+            }
             let ops: Vec<Ptr<Operation>> = pb.deref(ctx).iter(ctx).collect();
             for op in ops {
                 if self.terminated {
-                    self.cur = self.b.add_block();
+                    let wb = self.b.add_block();
+                    self.cur = wb;
+                    self.maybe_seal(wb);
                     self.cconst.clear();
                     self.terminated = false;
                 }
@@ -978,7 +1172,21 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             if !self.terminated {
                 let c = self.cur;
                 self.b.set_terminator(c, Terminator::Unreachable);
+                self.promo.finished.insert(c);
             }
+            pdone.insert(pb);
+            for sb in succ(pb) {
+                if let Some(&wb) = self.blocks.get(&sb)
+                    && ppred[&sb].iter().all(|p| pdone.contains(p))
+                {
+                    self.pseal(wb);
+                }
+            }
+        }
+        // Unsealed leftovers (e.g. the unwind epilogue, which gathers preds
+        // over the whole function): all preds exist now.
+        while let Some(&wb) = self.promo.incomplete.keys().next() {
+            self.pseal(wb);
         }
     }
 
@@ -993,6 +1201,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     fn term(&mut self, t: Terminator) {
         let c = self.cur;
         self.b.set_terminator(c, t);
+        self.promo.finished.insert(c);
         self.terminated = true;
     }
 
@@ -1036,6 +1245,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
         let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
         self.b.set_terminator(b, Terminator::Return { values });
+        self.promo.finished.insert(b);
         self.cur = save;
         self.epi = Some(b);
         b
@@ -1071,7 +1281,9 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 },
             },
         );
+        self.promo.finished.insert(c);
         self.cur = cont;
+        self.maybe_seal(cont);
     }
 
     fn icmp(&mut self, pred: ICmpPredicateAttr, a: &[WV], b: &[WV], w: u32) -> WV {
@@ -1460,9 +1672,30 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             self.set(op, r);
         } else if is!(AllocaOp) {
             let res = op.deref(ctx).get_result(0);
-            let (size, align) = self.st.allocas[&res];
-            let p = self.slot(size, align);
-            self.set1(op, p);
+            if !self.promo.slots.contains_key(&res) {
+                let (size, align) = self.st.allocas[&res];
+                let p = self.slot(size, align);
+                self.set1(op, p);
+            }
+        } else if is!(LoadOp) && self.promo.slots.contains_key(&opnds[0]) {
+            let (base, _) = self.promo.slots[&opnds[0]];
+            let r: Vals = wleaves(ctx, self.res_ty(op))
+                .iter()
+                .enumerate()
+                .map(|(k, &(_, t))| {
+                    let v = self.pget(base + k as u32);
+                    self.reinterp(v, wty(t))
+                })
+                .collect();
+            self.set(op, r);
+        } else if is!(StoreOp) && self.promo.slots.contains_key(&opnds[1]) {
+            let (base, _) = self.promo.slots[&opnds[1]];
+            let vs = self.get(opnds[0]);
+            for (k, x) in vs.into_iter().enumerate() {
+                let slot = base + k as u32;
+                let x = self.reinterp(x, self.promo.tys[slot as usize]);
+                self.pset(slot, x);
+            }
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
             let r = wleaves(ctx, self.res_ty(op))
