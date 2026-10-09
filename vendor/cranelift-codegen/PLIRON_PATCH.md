@@ -79,9 +79,22 @@ once proven out on the stage2 benchmark, then drop this copy.
     inst is squashed to `Nop0`, keeping inst indices stable for srclocs and
     regalloc edits; its operands are pre-applied so the fused inst carries
     physical registers. Loads require distinct destination regs (`ldp` with
-    `rt == rt2` is unpredictable). Store pairs rarely fire because lowering
-    is demand-driven: pure ALU ops are pulled to their consuming store, so
-    stores are rarely adjacent in vcode — closing that needs scheduling.
+    `rt == rt2` is unpredictable).
+
+11. aarch64 pair fusion across pure-ALU gaps: a second
+    `MachInstEmit::pair_fusion_crossable` hook whitelists pure
+    register-dataflow insts (no memory, control flow, traps, calls or hidden
+    state). `VCode::emit` scans up to 8 insts ahead for a fusable partner
+    (regalloc edits still stop the scan). Post-alloc use/def regs are
+    recorded per inst during allocation application — `get_operands` skips
+    already-physical regs, so they cannot be collected after the fact. The
+    fused pair emits at one of two slots: early (partner moves up — unsafe
+    when a gap inst writes a reg the partner touches or reads one it
+    defines, or when the partner reads this inst's defs since pair uses
+    precede defs) or late (this inst moves down — symmetric hazard set on
+    this inst's regs). The `fmul; str` interleave produced by
+    demand-driven lowering fuses via the late placement, yielding
+    `ldp/fmul/stp` blocks for vectorized map loops.
 
 ## x64 PIC calls use PLT32
 

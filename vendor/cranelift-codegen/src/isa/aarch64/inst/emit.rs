@@ -3815,6 +3815,70 @@ impl MachInstEmit for Inst {
             _ => None,
         }
     }
+
+    fn pair_fusion_crossable(&self) -> bool {
+        // Pure register dataflow: no memory access, no flag reads or
+        // writes that ordering with a store could disturb, no control
+        // flow, traps or calls. (Flag-computing ALU ops like `subs`
+        // still commute with stores — stores don't touch NZCV — and
+        // the caller's hazard check covers data registers.)
+        matches!(
+            self,
+            Inst::AluRRR { .. }
+                | Inst::AluRRRR { .. }
+                | Inst::AluRRImm12 { .. }
+                | Inst::AluRRImmLogic { .. }
+                | Inst::AluRRImmShift { .. }
+                | Inst::AluRRRShift { .. }
+                | Inst::AluRRRExtend { .. }
+                | Inst::BitRR { .. }
+                | Inst::Mov { .. }
+                | Inst::MovWide { .. }
+                | Inst::MovK { .. }
+                | Inst::Extend { .. }
+                | Inst::FpuMove32 { .. }
+                | Inst::FpuMove64 { .. }
+                | Inst::FpuMove128 { .. }
+                | Inst::FpuMoveFromVec { .. }
+                | Inst::FpuExtend { .. }
+                | Inst::FpuRR { .. }
+                | Inst::FpuRRR { .. }
+                | Inst::FpuRRI { .. }
+                | Inst::FpuRRIMod { .. }
+                | Inst::FpuRRRR { .. }
+                | Inst::FpuToInt { .. }
+                | Inst::IntToFpu { .. }
+                | Inst::FpuRound { .. }
+                | Inst::MovToFpu { .. }
+                | Inst::FpuMoveFPImm { .. }
+                | Inst::MovToVec { .. }
+                | Inst::MovFromVec { .. }
+                | Inst::MovFromVecSigned { .. }
+                | Inst::VecDup { .. }
+                | Inst::VecDupFromFpu { .. }
+                | Inst::VecDupFPImm { .. }
+                | Inst::VecDupImm { .. }
+                | Inst::VecExtend { .. }
+                | Inst::VecMovElement { .. }
+                | Inst::VecRRLong { .. }
+                | Inst::VecRRNarrowLow { .. }
+                | Inst::VecRRNarrowHigh { .. }
+                | Inst::VecRRPair { .. }
+                | Inst::VecRRRLong { .. }
+                | Inst::VecRRRLongMod { .. }
+                | Inst::VecRRPairLong { .. }
+                | Inst::VecRRR { .. }
+                | Inst::VecRRRMod { .. }
+                | Inst::VecFmlaElem { .. }
+                | Inst::VecMisc { .. }
+                | Inst::VecLanes { .. }
+                | Inst::VecShiftImm { .. }
+                | Inst::VecShiftImmMod { .. }
+                | Inst::VecExtract { .. }
+                | Inst::VecTbl { .. }
+                | Inst::VecTblExt { .. }
+        )
+    }
 }
 
 fn emit_return_call_common_sequence<T>(

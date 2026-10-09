@@ -903,12 +903,23 @@ impl<I: VCodeInst> VCode<I> {
                 do_emit(&block_start, &mut disasm, &mut buffer, &mut state);
             }
 
-            let apply_allocs = |insts: &mut Vec<I>, iix: InsnIndex| {
+            // Post-alloc use/def registers per inst, recorded by
+            // `apply_allocs` below: `get_operands` skips operands that
+            // are already physical regs, so they can't be collected
+            // after the fact. Needed by pair-fusion hazard checks.
+            let mut preg_ops: Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)> =
+                vec![(smallvec![], smallvec![]); self.insts.len()];
+
+            let apply_allocs = |insts: &mut Vec<I>,
+                                preg_ops: &mut Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)>,
+                                iix: InsnIndex| {
                 // Update the operands for this inst using the
                 // allocations from the regalloc result.
                 let mut allocs = regalloc.inst_allocs(iix).iter();
+                let (mut uses, mut defs): (SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>) =
+                    (smallvec![], smallvec![]);
                 insts[iix.index()].get_operands(
-                    &mut |reg: &mut Reg, constraint, _kind, _pos| {
+                    &mut |reg: &mut Reg, constraint, kind, _pos| {
                         let alloc =
                             allocs.next().expect("enough allocations for all operands");
 
@@ -922,17 +933,25 @@ impl<I: VCodeInst> VCode<I> {
                             let alloc: Reg = alloc.into();
                             *reg = alloc;
                         }
+                        match kind {
+                            OperandKind::Def => defs.push(*reg),
+                            OperandKind::Use => uses.push(*reg),
+                        }
                     },
                 );
+                preg_ops[iix.index()] = (uses, defs);
                 debug_assert!(allocs.next().is_none());
             };
 
-            let mut it = regalloc.block_insts_and_edits(&self, block).peekable();
-            while let Some(inst_or_edit) = it.next() {
-                match inst_or_edit {
+            let items: SmallVec<[InstOrEdit; 64]> =
+                regalloc.block_insts_and_edits(&self, block).collect();
+            let mut k = 0usize;
+            while k < items.len() {
+                match items[k].clone() {
                     InstOrEdit::Inst(iix) => {
                         // Squashed by a pair fusion (e.g. `ldp`) below.
                         if squashed[iix.index()] {
+                            k += 1;
                             continue;
                         }
                         if !self.debug_value_labels.is_empty() {
@@ -1039,26 +1058,93 @@ impl<I: VCodeInst> VCode<I> {
                             }
                         } else {
                             if !applied[iix.index()] {
-                                apply_allocs(&mut self.insts, iix);
+                                apply_allocs(&mut self.insts, &mut preg_ops, iix);
                                 applied[iix.index()] = true;
                             }
 
-                            // Pair fusion (e.g. `ldp`/`stp`): only when
-                            // the next item is the next instruction — a
-                            // regalloc move edit between them could
-                            // clobber either inst's registers, so
-                            // strict adjacency is required.
-                            if let Some(&InstOrEdit::Inst(nix)) = it.peek() {
-                                if !squashed[nix.index()] && !applied[nix.index()] {
-                                    apply_allocs(&mut self.insts, nix);
+                            // Pair fusion (e.g. `ldp`/`stp`): the
+                            // partner must follow with no regalloc
+                            // edit between them — a move there could
+                            // clobber either inst's registers. A gap
+                            // of pure-ALU insts is also fine: the fused
+                            // inst emits at this slot, so no gap inst
+                            // may write a register the pair touches,
+                            // nor read one the pair defines.
+                            let mut j = k + 1;
+                            let mut gap: SmallVec<[InsnIndex; 8]> = smallvec![];
+                            'fuse: loop {
+                                let Some(InstOrEdit::Inst(nix)) = items.get(j).cloned()
+                                else {
+                                    break;
+                                };
+                                if squashed[nix.index()] {
+                                    break;
+                                }
+                                if !applied[nix.index()] {
+                                    apply_allocs(&mut self.insts, &mut preg_ops, nix);
                                     applied[nix.index()] = true;
                                 }
                                 if let Some(fused) = self.insts[iix.index()]
                                     .fuse_with_next(&self.insts[nix.index()])
                                 {
-                                    self.insts[iix.index()] = fused;
-                                    self.insts[nix.index()] = I::gen_nop(0);
-                                    squashed[nix.index()] = true;
+                                    if gap.is_empty() {
+                                        self.insts[iix.index()] = fused;
+                                        self.insts[nix.index()] = I::gen_nop(0);
+                                        squashed[nix.index()] = true;
+                                        break 'fuse;
+                                    }
+                                    // Two placements: the pair can emit
+                                    // early at iix's slot (partner moves
+                                    // up) or late at nix's slot (this
+                                    // inst moves down). The typical
+                                    // demand-lowered order `fmul; str`
+                                    // needs the down placement — the
+                                    // partner's producers sit in the
+                                    // gap.
+                                    let (pu, pd) = &preg_ops[iix.index()];
+                                    let (pu2, pd2) = &preg_ops[nix.index()];
+                                    // Partner up: no gap inst may write
+                                    // a reg the partner touches, nor
+                                    // read one the partner defines. The
+                                    // partner also can't read this
+                                    // inst's defs — pair operands are
+                                    // read before either def lands.
+                                    let ok_up = !pu2.iter().any(|r| pd.contains(r))
+                                        && gap.iter().all(|&b| {
+                                            let (bu, bd) = &preg_ops[b.index()];
+                                            !bd.iter().any(|r| {
+                                                pu2.contains(r) || pd2.contains(r)
+                                            }) && !bu.iter().any(|r| pd2.contains(r))
+                                        });
+                                    // This inst down: no gap inst may
+                                    // write a reg this inst touches,
+                                    // nor read one this inst defines —
+                                    // and the partner may not read this
+                                    // inst's defs either.
+                                    let ok_down = !pu2.iter().any(|r| pd.contains(r))
+                                        && gap.iter().all(|&b| {
+                                            let (bu, bd) = &preg_ops[b.index()];
+                                            !bd.iter().any(|r| {
+                                                pu.contains(r) || pd.contains(r)
+                                            }) && !bu.iter().any(|r| pd.contains(r))
+                                        });
+                                    if ok_down {
+                                        self.insts[iix.index()] = I::gen_nop(0);
+                                        self.insts[nix.index()] = fused;
+                                    } else if ok_up {
+                                        self.insts[iix.index()] = fused;
+                                        self.insts[nix.index()] = I::gen_nop(0);
+                                        squashed[nix.index()] = true;
+                                    }
+                                    break 'fuse;
+                                }
+                                if !self.insts[nix.index()].pair_fusion_crossable() {
+                                    break;
+                                }
+                                gap.push(nix);
+                                j += 1;
+                                if gap.len() > 8 {
+                                    break;
                                 }
                             }
 
@@ -1120,6 +1206,7 @@ impl<I: VCodeInst> VCode<I> {
                         }
                     }
                 }
+                k += 1;
             }
 
             if cur_srcloc.is_some() {
