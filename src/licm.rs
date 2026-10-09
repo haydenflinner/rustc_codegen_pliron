@@ -206,8 +206,29 @@ fn run_loop(
         .blocks()
         .filter(|&b| la.is_in_loop(b, lp))
         .collect();
+    // Moving an inst to just before `pinst` is sound iff every operand
+    // dominates `pinst` and `pinst`'s block dominates every loop block (so
+    // hoisted results still dominate their uses). `pinst`'s block must
+    // dominate the header (it does when the single edge found above is the
+    // only external entry — but cfg is stale across loops after edge splits,
+    // so check rather than assume) and the header must dominate the whole
+    // body — not a given: LoopAnalysis admits irreducible bodies with
+    // external entries bypassing it.
+    let pb = func.layout.inst_block(pinst).unwrap();
+    if !dt.dominates(pb, h, &func.layout)
+        || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
+    {
+        return 0;
+    }
     let inv = |func: &Function, v: Value| {
-        def_block(func, v).is_some_and(|b| !body.contains(&b))
+        if body.contains(&def_block(func, v).unwrap_or(h)) {
+            return false;
+        }
+        match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.dominates(b, pinst, &func.layout),
+            _ => false,
+        }
     };
     // The loop's memory-writing instructions, for load-hoist checks.
     let writers: Vec<Inst> = body
