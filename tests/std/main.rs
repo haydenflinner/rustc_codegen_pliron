@@ -15,4 +15,26 @@ fn main() {
     println!("{s}");
     let r = std::panic::catch_unwind(|| 1 + 1);
     println!("catch_unwind ok = {:?}", r.is_ok());
+    #[cfg(unix)]
+    {
+        // Foreign C-variadic call: float and sub-64-bit args go on the
+        // stack on aarch64-darwin (8-byte slots), in regs/stack on SysV.
+        unsafe extern "C" {
+            fn snprintf(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
+        }
+        let mut buf = [0u8; 64];
+        unsafe {
+            snprintf(
+                buf.as_mut_ptr(),
+                buf.len(),
+                b"%d|%f|%c|%ld\0".as_ptr(),
+                42i32,
+                2.5f64,
+                65u8 as i32,
+                -7i64,
+            );
+        }
+        let s = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap();
+        println!("snprintf = {}", s.to_str().unwrap());
+    }
 }

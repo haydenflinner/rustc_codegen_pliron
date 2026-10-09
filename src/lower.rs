@@ -2768,30 +2768,55 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             if foreign {
                 sig.params.pop();
                 let fixed = sig.params.len();
-                for &v in &cargs[fixed..] {
-                    sig.params
-                        .push(AbiParam::new(self.b.func.dfg.value_type(v)));
+                for i in fixed..cargs.len() {
+                    // Darwin variadic stack slots are 8 bytes minimum; a
+                    // narrower param would pack at its natural size and
+                    // misalign every later va_arg. Promote like C does:
+                    // sub-64-bit ints zero-extend (the callee reads the
+                    // low bits anyway) and f32 promotes to f64.
+                    let v = cargs[i];
+                    let t = self.b.func.dfg.value_type(v);
+                    let (v, t) = if t.is_int() && t.bits() < 64 {
+                        (self.b.ins().uextend(clt::I64, v), clt::I64)
+                    } else if t == clt::F32 {
+                        (self.b.ins().fpromote(clt::F64, v), clt::F64)
+                    } else {
+                        (v, t)
+                    };
+                    cargs[i] = v;
+                    sig.params.push(AbiParam::new(t));
                 }
                 if cc == CallConv::AppleAarch64 && sig.params.len() > fixed {
                     // Darwin puts every variadic argument on the stack, but
                     // Cranelift does not distinguish variadic params: pad the
-                    // argument list with dummy integers so the real variadic
-                    // arguments land past x7. Non-integer parameters are not
-                    // representable this way (same restriction as cg_clif).
+                    // argument list with dummies so the real variadic
+                    // arguments land past x7/v7. AAPCS64 allocates the
+                    // integer and FP banks independently, so both are
+                    // filled; variadic scalars beyond that are unsupported
+                    // (e.g. vector or f128 varargs).
                     assert!(
-                        sig.params.iter().all(|p| p.value_type.is_int()),
-                        "non-integer argument in C-variadic call on aarch64-apple-darwin"
+                        sig.params[fixed..].iter().all(|p| p.value_type.is_int()
+                            || matches!(p.value_type, clt::F32 | clt::F64)),
+                        "unsupported argument type in C-variadic call on aarch64-apple-darwin"
                     );
                     let sret = usize::from(
                         matches!(sig.params[0].purpose, ArgumentPurpose::StructReturn),
                     );
-                    let used: usize = sig.params[sret..fixed]
-                        .iter()
-                        .map(|p| if p.value_type.bits() == 128 { 2 } else { 1 })
-                        .sum();
-                    for _ in used..8 {
+                    let (mut xi, mut vi) = (0usize, 0usize);
+                    for p in &sig.params[sret..fixed] {
+                        if p.value_type.is_int() {
+                            xi += if p.value_type.bits() == 128 { 2 } else { 1 };
+                        } else {
+                            vi += 1;
+                        }
+                    }
+                    for _ in xi..8 {
                         sig.params.insert(fixed, AbiParam::new(clt::I64));
                         cargs.insert(fixed, self.b.ins().iconst(clt::I64, 0));
+                    }
+                    for _ in vi..8 {
+                        sig.params.insert(fixed, AbiParam::new(clt::F64));
+                        cargs.insert(fixed, self.b.ins().f64const(Ieee64::with_bits(0)));
                     }
                 }
             } else {
