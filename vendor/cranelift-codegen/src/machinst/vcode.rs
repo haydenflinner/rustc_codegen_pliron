@@ -792,6 +792,11 @@ impl<I: VCodeInst> VCode<I> {
         let mut state = I::State::new(&self.abi, core::mem::take(ctrl_plane));
 
         let mut disasm = String::new();
+        // Inst indices replaced by a zero-size nop via pair fusion;
+        // `applied` tracks insts whose regalloc results were already
+        // written back by lookahead.
+        let mut squashed = vec![false; self.insts.len()];
+        let mut applied = vec![false; self.insts.len()];
 
         if !self.debug_value_labels.is_empty() {
             inst_offsets.resize(self.insts.len(), NO_INST_OFFSET);
@@ -898,9 +903,38 @@ impl<I: VCodeInst> VCode<I> {
                 do_emit(&block_start, &mut disasm, &mut buffer, &mut state);
             }
 
-            for inst_or_edit in regalloc.block_insts_and_edits(&self, block) {
+            let apply_allocs = |insts: &mut Vec<I>, iix: InsnIndex| {
+                // Update the operands for this inst using the
+                // allocations from the regalloc result.
+                let mut allocs = regalloc.inst_allocs(iix).iter();
+                insts[iix.index()].get_operands(
+                    &mut |reg: &mut Reg, constraint, _kind, _pos| {
+                        let alloc =
+                            allocs.next().expect("enough allocations for all operands");
+
+                        if let Some(alloc) = alloc.as_reg() {
+                            let alloc: Reg = alloc.into();
+                            if let OperandConstraint::FixedReg(rreg) = constraint {
+                                debug_assert_eq!(Reg::from(rreg), alloc);
+                            }
+                            *reg = alloc;
+                        } else if let Some(alloc) = alloc.as_stack() {
+                            let alloc: Reg = alloc.into();
+                            *reg = alloc;
+                        }
+                    },
+                );
+                debug_assert!(allocs.next().is_none());
+            };
+
+            let mut it = regalloc.block_insts_and_edits(&self, block).peekable();
+            while let Some(inst_or_edit) = it.next() {
                 match inst_or_edit {
                     InstOrEdit::Inst(iix) => {
+                        // Squashed by a pair fusion (e.g. `ldp`) below.
+                        if squashed[iix.index()] {
+                            continue;
+                        }
                         if !self.debug_value_labels.is_empty() {
                             // If we need to produce debug info,
                             // record the offset of each instruction
@@ -1004,27 +1038,29 @@ impl<I: VCodeInst> VCode<I> {
                                 do_emit(&inst, &mut disasm, &mut buffer, &mut state);
                             }
                         } else {
-                            // Update the operands for this inst using the
-                            // allocations from the regalloc result.
-                            let mut allocs = regalloc.inst_allocs(iix).iter();
-                            self.insts[iix.index()].get_operands(
-                                &mut |reg: &mut Reg, constraint, _kind, _pos| {
-                                    let alloc =
-                                        allocs.next().expect("enough allocations for all operands");
+                            if !applied[iix.index()] {
+                                apply_allocs(&mut self.insts, iix);
+                                applied[iix.index()] = true;
+                            }
 
-                                    if let Some(alloc) = alloc.as_reg() {
-                                        let alloc: Reg = alloc.into();
-                                        if let OperandConstraint::FixedReg(rreg) = constraint {
-                                            debug_assert_eq!(Reg::from(rreg), alloc);
-                                        }
-                                        *reg = alloc;
-                                    } else if let Some(alloc) = alloc.as_stack() {
-                                        let alloc: Reg = alloc.into();
-                                        *reg = alloc;
-                                    }
-                                },
-                            );
-                            debug_assert!(allocs.next().is_none());
+                            // Pair fusion (e.g. `ldp`/`stp`): only when
+                            // the next item is the next instruction — a
+                            // regalloc move edit between them could
+                            // clobber either inst's registers, so
+                            // strict adjacency is required.
+                            if let Some(&InstOrEdit::Inst(nix)) = it.peek() {
+                                if !squashed[nix.index()] && !applied[nix.index()] {
+                                    apply_allocs(&mut self.insts, nix);
+                                    applied[nix.index()] = true;
+                                }
+                                if let Some(fused) = self.insts[iix.index()]
+                                    .fuse_with_next(&self.insts[nix.index()])
+                                {
+                                    self.insts[iix.index()] = fused;
+                                    self.insts[nix.index()] = I::gen_nop(0);
+                                    squashed[nix.index()] = true;
+                                }
+                            }
 
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
 

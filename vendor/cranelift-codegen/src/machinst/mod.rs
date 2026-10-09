@@ -546,6 +546,16 @@ pub trait MachInstEmit: MachInst {
 
     /// Pretty-print the instruction.
     fn pretty_print_inst(&self, state: &mut Self::State) -> String;
+
+    /// Attempt to fuse this instruction with the immediately following
+    /// instruction into a single instruction (e.g., an `ldp`/`stp`
+    /// register pair). Called during emission with one instruction of
+    /// lookahead; both instructions carry allocated registers at that
+    /// point. On `Some`, the caller replaces this instruction with the
+    /// result and squashes the next instruction to a zero-size nop.
+    fn fuse_with_next(&self, _next: &Self) -> Option<Self> {
+        None
+    }
 }
 
 /// A trait describing the emission state carried between MachInsts when

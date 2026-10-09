@@ -3685,6 +3685,136 @@ impl MachInstEmit for Inst {
     fn pretty_print_inst(&self, state: &mut Self::State) -> String {
         self.print_with_state(state)
     }
+
+    fn fuse_with_next(&self, next: &Self) -> Option<Self> {
+        // A load/store's unsigned-offset byte displacement, if it uses
+        // the simple `[rn + uimm]` form.
+        fn uoff(mem: &AMode) -> Option<(Reg, i64)> {
+            match *mem {
+                AMode::UnsignedOffset { rn, uimm12 } => Some((rn, i64::from(uimm12.value()))),
+                _ => None,
+            }
+        }
+        // Two accesses on adjacent `scale`-byte slots of the same base
+        // make an ldp/stp pair; `swap` says the second inst addressed
+        // the lower slot, so its register goes first.
+        fn pair_amode(m1: &AMode, m2: &AMode, scale_ty: Type) -> Option<(PairAMode, bool)> {
+            let (r1, o1) = uoff(m1)?;
+            let (r2, o2) = uoff(m2)?;
+            if r1 != r2 {
+                return None;
+            }
+            let size = i64::from(scale_ty.bytes());
+            let (base, swap) = if o2 == o1 + size {
+                (o1, false)
+            } else if o1 == o2 + size {
+                (o2, true)
+            } else {
+                return None;
+            };
+            let simm7 = SImm7Scaled::maybe_from_i64(base, scale_ty)?;
+            Some((PairAMode::SignedOffset { reg: r1, simm7 }, swap))
+        }
+        match (self, next) {
+            (
+                &Inst::FpuLoad128 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuLoad128 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I8X16)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuLoadP128 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuLoad64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuLoad64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, F64)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuLoadP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::ULoad64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::ULoad64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I64)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::LoadP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuStore128 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuStore128 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I8X16)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuStoreP128 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuStore64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuStore64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, F64)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuStoreP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::Store64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::Store64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I64)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::StoreP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 fn emit_return_call_common_sequence<T>(

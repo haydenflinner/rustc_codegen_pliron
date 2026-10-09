@@ -68,6 +68,21 @@ once proven out on the stage2 benchmark, then drop this copy.
    acc-chained `iadd(acc, widen half)` trees into per-half accumulators —
    the exact shape LLVM produces for `sum += (x as u64)*(x as u64)`.
 
+10. aarch64 `ldp`/`stp` fusion at emission: new `MachInstEmit::fuse_with_next`
+    hook (default `None`), called from `VCode::emit` when the next block item
+    is the next instruction — no intervening regalloc edit, whose moves could
+    clobber either inst's registers. The AArch64 impl folds two adjacent
+    `UnsignedOffset` loads/stores of equal size and flags on the same base
+    register into `LoadP64`/`StoreP64`/`FpuLoadP64`/`FpuStoreP64`/
+    `FpuLoadP128`/`FpuStoreP128` with a `PairAMode::SignedOffset` amode
+    (offsets may be in either order; `rt` takes the lower slot). The second
+    inst is squashed to `Nop0`, keeping inst indices stable for srclocs and
+    regalloc edits; its operands are pre-applied so the fused inst carries
+    physical registers. Loads require distinct destination regs (`ldp` with
+    `rt == rt2` is unpredictable). Store pairs rarely fire because lowering
+    is demand-driven: pure ALU ops are pulled to their consuming store, so
+    stores are rarely adjacent in vcode — closing that needs scheduling.
+
 ## x64 PIC calls use PLT32
 
 `CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`
