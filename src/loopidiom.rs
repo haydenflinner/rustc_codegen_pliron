@@ -17,7 +17,7 @@ use cranelift_codegen::ir::{
     InstBuilder, InstructionData, LibCall, Opcode, Signature, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 
@@ -644,6 +644,18 @@ pub(crate) fn deadend(func: &Function, b: Block) -> bool {
     func.layout
         .last_inst(b)
         .is_some_and(|t| func.dfg.insts[t].opcode() == Opcode::Trap)
+}
+
+/// Exit edge `e` is never taken because its `brif` arg is a constant
+/// selecting the in-loop destination (a folded-away interior test).
+fn never_taken(func: &Function, e: Edge) -> bool {
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
+        return false;
+    };
+    match iconst(func, func.dfg.resolve_aliases(arg)) {
+        Some(k) => e.slot == usize::from(k != 0),
+        None => false,
+    }
 }
 
 /// Exit edge `e` is a provably-dead bounds-check-style guard: its target is a
@@ -1293,6 +1305,338 @@ pub(crate) fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa:
     emit_call(&mut pos);
 }
 
+/// A counted loop whose body is pure computation: every inst is removable
+/// (no memory, calls, traps, or other side effects) and every exit is
+/// either the provable count exit or an already-dead guard edge. Skipping
+/// the loop is then just computing the exit values from the trip count —
+/// route the entry through a check block that verifies the trips' preds
+/// and jumps to the exit with them, else falls back to the loop.
+struct DeadPlan {
+    entry: Edge,
+    h: Block,
+    entry_args: Vec<Value>,
+    exit_dest: Block,
+    exit_args: Vec<Ins>,
+    preds: Vec<Pred>,
+}
+
+/// Exit-edge arg `v` as an `Ins` over the entry args and `itb` — the trip
+/// count less one for post-tested loops, since a header param `i` reads
+/// `entry_i + itb*step_i` in the exiting iteration (pre-tested exits
+/// evaluate params after the last update, so `itb` is `iters` there).
+/// Anything else must be a loop-invariant value or foldable arithmetic.
+fn arg_ins(
+    func: &Function,
+    info: &Info,
+    kinds: &[Param],
+    itb: &Ins,
+    fwd: &FxHashMap<Value, Ins>,
+    v: Value,
+    depth: u32,
+) -> Option<Ins> {
+    if depth > 8 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(ins) = fwd.get(&v) {
+        return Some(ins.clone());
+    }
+    if let ValueDef::Param(b, i) = func.dfg.value_def(v) {
+        return if b == info.h {
+            match kinds[i] {
+                Param::Inv => Some(Ins::Val(info.entry_args[i])),
+                Param::Step(s) => Some(Ins::Add(
+                    Box::new(Ins::Val(info.entry_args[i])),
+                    Box::new(Ins::Mul(Box::new(itb.clone()), Box::new(Ins::K(s)))),
+                )),
+                Param::Other => None,
+            }
+        } else {
+            Some(Ins::Val(v))
+        };
+    }
+    if let Some(k) = iconst(func, v) {
+        return Some(Ins::K(k));
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    if !func
+        .layout
+        .inst_block(i)
+        .is_some_and(|b| info.body.contains(&b))
+    {
+        return Some(Ins::Val(v));
+    }
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    let (a, b) = (
+        arg_ins(func, info, kinds, itb, fwd, args[0], depth + 1)?,
+        arg_ins(func, info, kinds, itb, fwd, args[1], depth + 1)?,
+    );
+    Some(match opcode {
+        Opcode::Iadd => Ins::Add(Box::new(a), Box::new(b)),
+        Opcode::Isub => Ins::Sub(Box::new(a), Box::new(b)),
+        Opcode::Imul => Ins::Mul(Box::new(a), Box::new(b)),
+        Opcode::Band => Ins::And(Box::new(a), Box::new(b)),
+        _ => return None,
+    })
+}
+
+/// Plan the dead-loop rewrite for `lp`, or None if the body has effects,
+/// the count isn't provable, or an exit edge arg can't be recomputed.
+fn plan_dead(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: Loop,
+) -> Option<DeadPlan> {
+    let Some(info) = gather(func, cfg, dt, la, lp) else {
+        why!("dead: gather {:?}", la.loop_header(lp));
+    };
+    let kinds = param_kinds(func, &info);
+    if kinds.iter().any(|k| matches!(k, Param::Other)) {
+        why!("dead: non-affine param {:?}", info.h);
+    }
+    for &b in &info.body {
+        if deadend(func, b) {
+            continue;
+        }
+        for i in func.layout.block_insts(b) {
+            let op = func.dfg.insts[i].opcode();
+            if op.is_terminator() {
+                match op {
+                    Opcode::Jump => {}
+                    Opcode::Brif if info.exits.iter().any(|e| e.inst == i) => {}
+                    _ => why!("dead: term {:?} {b:?}", op),
+                }
+                continue;
+            }
+            if op.can_load()
+                || op.can_store()
+                || op.can_trap()
+                || op.is_call()
+                || op.other_side_effects()
+            {
+                why!("dead: inst {:?} {b:?}", op);
+            }
+        }
+    }
+    'exits: for &e in &info.exits {
+        // The iv update inst stands in for `count`'s `store` argument: its
+        // dominance over the exit is exactly "the body ran before the
+        // test", which is what `post_tested` means for a pure counter.
+        let upd = (|| {
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
+                return None;
+            };
+            let c = func.dfg.resolve_aliases(arg);
+            let ValueDef::Result(ci, _) = func.dfg.value_def(c) else {
+                return None;
+            };
+            let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                args: [x, y],
+                ..
+            } = func.dfg.insts[ci]
+            else {
+                return None;
+            };
+            let (idx, _) = iv_side(func, &info, &kinds, x)
+                .or_else(|| iv_side(func, &info, &kinds, y))?;
+            info.latches.iter().find_map(|&l| {
+                let a = func.dfg.resolve_aliases(edge_args(func, l)[idx]);
+                match func.dfg.value_def(a) {
+                    ValueDef::Result(i, _) => Some(i),
+                    _ => None,
+                }
+            })
+        })();
+        let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
+            if std::env::var_os("PLIRON_IDIOM_DEBUG").is_some() {
+                eprintln!("dead: no count {:?} exit {:?}", info.h, e.inst);
+            }
+            continue;
+        };
+        if !info
+            .exits
+            .iter()
+            .all(|&e2| e2 == e || never_taken(func, e2) || guard_dead(func, &cnt, e2))
+        {
+            continue;
+        }
+        // Trip count: `trips_idx` already divides by the step for `ult`;
+        // the pointer form returns a byte distance, scaled back to
+        // iterations by `step`.
+        let (iters, preds) = if let Some(t) = trips_idx(&cnt) {
+            t
+        } else {
+            let Some((len, ps)) = trips_ptr(&cnt, cnt.step) else {
+                why!("dead: trips {:?}", info.h);
+            };
+            (Ins::Div(Box::new(len), Box::new(Ins::K(cnt.step))), ps)
+        };
+        let itb = if cnt.post_tested {
+            Ins::Sub(Box::new(iters), Box::new(Ins::K(1)))
+        } else {
+            iters
+        };
+        // Resolve the exit edge's args, then walk trivial forwarder blocks
+        // (a lone `jump next(args)`): their bodies may read the deleted
+        // loop's header params directly, which the new edge would leave
+        // undefined, so the params get bound to the resolved args instead.
+        let mut fwd: FxHashMap<Value, Ins> = FxHashMap::default();
+        let mut dest = edge_dest(func, e);
+        let mut args = edge_args(func, e);
+        let mut exit_args = Vec::new();
+        for _ in 0..8 {
+            if func.dfg.block_params(dest).len() != args.len() {
+                continue 'exits;
+            }
+            exit_args.clear();
+            for &v in &args {
+                let Some(a) = arg_ins(func, &info, &kinds, &itb, &fwd, v, 0) else {
+                    continue 'exits;
+                };
+                exit_args.push(a);
+            }
+            let mut it = func.layout.block_insts(dest);
+            let Some(t) = it.next() else { break };
+            if it.next().is_some() {
+                break;
+            }
+            if !matches!(func.dfg.insts[t], InstructionData::Jump { .. }) {
+                break;
+            }
+            for (p, a) in func
+                .dfg
+                .block_params(dest)
+                .iter()
+                .copied()
+                .zip(exit_args.iter().cloned())
+            {
+                fwd.insert(p, a);
+            }
+            let ne = Edge { inst: t, slot: 0 };
+            dest = edge_dest(func, ne);
+            args = edge_args(func, ne);
+        }
+        // No inst reachable from the new edge's dest — without re-entering
+        // the loop — may read a loop-internal value: the deleted body no
+        // longer dominates those uses. Values used elsewhere keep their
+        // original (still loop-dominated) paths.
+        let loop_val = |v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            ValueDef::Param(b, _) => b == info.h,
+            ValueDef::Result(i, _) => func
+                .layout
+                .inst_block(i)
+                .is_some_and(|b| info.body.contains(&b)),
+            _ => false,
+        };
+        let mut seen = info.body.clone();
+        let mut wl = vec![dest];
+        while let Some(b) = wl.pop() {
+            if !seen.insert(b) {
+                continue;
+            }
+            for i in func.layout.block_insts(b) {
+                if func.dfg.inst_args(i).iter().any(|&a| loop_val(a)) {
+                    why!("dead: {b:?} reads loop values");
+                }
+                for bc in func
+                    .dfg
+                    .insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a
+                            && loop_val(v)
+                        {
+                            why!("dead: {b:?} reads loop values");
+                        }
+                    }
+                    wl.push(bc.block(&func.dfg.value_lists));
+                }
+            }
+        }
+        return Some(DeadPlan {
+            entry: info.entry,
+            h: info.h,
+            entry_args: info.entry_args,
+            exit_dest: dest,
+            exit_args,
+            preds,
+        });
+    }
+    None
+}
+
+/// Rewrite `p`: the entry edge goes to a check block that verifies the
+/// preds and jumps to the exit with the recomputed args, or enters the
+/// loop unchanged.
+fn apply_dead(
+    func: &mut Function,
+    p: &DeadPlan,
+    tcfg: cranelift_codegen::isa::TargetFrontendConfig,
+) {
+    let pblock = func.layout.inst_block(p.entry.inst).unwrap();
+    let nb = func.dfg.make_block();
+    func.layout.insert_block_after(nb, pblock);
+    {
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[p.entry.inst].branch_destination_mut(
+            &mut dfg.jump_tables,
+            &mut dfg.exception_tables,
+        )[p.entry.slot];
+        *bc = BlockCall::new(nb, core::iter::empty(), &mut dfg.value_lists);
+    }
+    let pty = tcfg.pointer_type();
+    let dst_params: Vec<Value> = func.dfg.block_params(p.exit_dest).to_vec();
+    let mut pos = FuncCursor::new(func).at_bottom(nb);
+    let mut ok: Option<Value> = None;
+    for pr in &p.preds {
+        let c = match pr {
+            Pred::Cmp(cc, a, b) => {
+                let (a, b) = (emit(&mut pos, pty, a), emit(&mut pos, pty, b));
+                pos.ins().icmp(*cc, a, b)
+            }
+            Pred::Aligned(a, size) => {
+                let m = emit(&mut pos, pty, a);
+                let k = pos.ins().iconst(pty, size - 1);
+                let r = pos.ins().band(m, k);
+                let z = pos.ins().iconst(pty, 0);
+                pos.ins().icmp(IntCC::Equal, r, z)
+            }
+            Pred::Disjoint => unreachable!(),
+        };
+        ok = Some(match ok {
+            None => c,
+            Some(o) => pos.ins().band(o, c),
+        });
+    }
+    let mut exit_args: Vec<BlockArg> = Vec::with_capacity(p.exit_args.len());
+    for (j, ins) in p.exit_args.iter().enumerate() {
+        let ty = pos.func.dfg.value_type(dst_params[j]);
+        let v = emit(&mut pos, ty, ins);
+        exit_args.push(BlockArg::Value(v));
+    }
+    let h_args: Vec<BlockArg> = p
+        .entry_args
+        .iter()
+        .map(|&v| BlockArg::Value(v))
+        .collect();
+    match ok {
+        Some(ok) => {
+            pos.ins().brif(ok, p.exit_dest, &exit_args, p.h, &h_args);
+        }
+        None => {
+            pos.ins().jump(p.exit_dest, &exit_args);
+        }
+    }
+}
+
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
@@ -1320,14 +1664,21 @@ pub fn run(
             if done.contains(&la.loop_header(lp)) {
                 continue;
             }
-            let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias) else {
+            if let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias) {
+                if debug {
+                    eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
+                }
+                apply(func, &p, tcfg);
+                done.insert(p.h);
+            } else if let Some(d) = plan_dead(func, &cfg, &dt, &la, lp) {
+                if debug {
+                    eprintln!("idiom {fname}: dead loop {:?} eliminated", d.h);
+                }
+                apply_dead(func, &d, tcfg);
+                done.insert(d.h);
+            } else {
                 continue;
-            };
-            if debug {
-                eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
             }
-            apply(func, &p, tcfg);
-            done.insert(p.h);
             n += 1;
             if n >= MAX_CONV {
                 break 'outer;

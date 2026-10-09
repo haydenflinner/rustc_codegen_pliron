@@ -528,6 +528,40 @@ pub fn run(func: &mut Function) -> usize {
             else {
                 continue;
             };
+            // `icmp cc x, bound` folds to a flag constant when `bound` is the
+            // operand type's extreme in `cc`'s direction (`x >u MAX`,
+            // `x <s MIN`, `x <=u MAX`, ...). MIR emits these from range
+            // comparisons like `x > u64::MAX`.
+            let ty = pos.func.dfg.value_type(args[0]);
+            if ty.is_int() && !ty.is_vector() && ty.bits() <= 64 {
+                let (mut cc, mut k) = (cond, args[1]);
+                if iconst(pos.func, args[0]).is_some() {
+                    cc = cc.swap_args();
+                    k = args[0];
+                }
+                if let Some(k) = iconst(pos.func, k) {
+                    let bits = ty.bits() as u32;
+                    let umax = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let smin = (-1i128 << (bits - 1)) as i64;
+                    let smax = ((1i128 << (bits - 1)) - 1) as i64;
+                    let ku = k as u64 & umax;
+                    let c = match cc {
+                        IntCC::UnsignedGreaterThan if ku == umax => Some(0),
+                        IntCC::UnsignedLessThanOrEqual if ku == umax => Some(1),
+                        IntCC::UnsignedLessThan if ku == 0 => Some(0),
+                        IntCC::UnsignedGreaterThanOrEqual if ku == 0 => Some(1),
+                        IntCC::SignedGreaterThan if k == smax => Some(0),
+                        IntCC::SignedLessThanOrEqual if k == smax => Some(1),
+                        IntCC::SignedLessThan if k == smin => Some(0),
+                        IntCC::SignedGreaterThanOrEqual if k == smin => Some(1),
+                        _ => None,
+                    };
+                    if let Some(c) = c {
+                        pos.func.replace(inst).iconst(types::I8, c);
+                        n += 1;
+                    }
+                }
+            }
             if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
                 || pos.func.dfg.value_type(args[0]) != types::I128
             {
