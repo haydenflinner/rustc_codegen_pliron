@@ -2858,8 +2858,9 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
     // LICM/indvars move and create insts, so track defining blocks in a
     // live map rather than the (stale) CFGInfo.
     let mut defb = cfg.def_block.clone();
-    for (h, inloop) in wloops(b, &cfg) {
-        let outside = outside_edges(b, h, &inloop);
+    let loops = wloops(b, &cfg);
+    for (h, inloop) in &loops {
+        let outside = outside_edges(b, *h, inloop);
         if outside.is_empty() {
             continue;
         }
@@ -2867,9 +2868,22 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
         preds.sort();
         preds.dedup();
         if let [pre] = preds[..] {
-            loop_licm(b, &cfg, &mut defb, &inloop, pre, sp);
+            loop_licm(b, &cfg, &mut defb, inloop, pre, sp);
         }
-        loop_indvars(b, &mut defb, &inloop, h);
+        loop_indvars(b, &mut defb, inloop, *h);
+    }
+    // Unroll innermost loops (bodies containing no other loop header).
+    let unr = std::env::var("PLIRON_WASM_UNROLL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    for (h, inloop) in &loops {
+        let innermost = loops
+            .iter()
+            .all(|(h2, _)| h2 == h || !inloop.contains(h2));
+        if innermost {
+            wunroll(b, &mut defb, &cfg, inloop, *h, unr);
+        }
     }
     wdce(b);
 }
@@ -3131,4 +3145,298 @@ fn wdce(b: &mut FunctionBody) {
             break;
         }
     }
+}
+
+/// Unroll a loop `copies` times by cloning all of its blocks `copies-1`
+/// times and chaining the copies through their (cloned) headers. Because
+/// the loop header — including its exit test — is cloned, each copy
+/// re-checks the condition and no epilogue is needed:
+/// `body → h₁ → body₁ → h₂ → … → h`. Runs after licm/indvars so the
+/// cloned body is already lean.
+fn wunroll(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    cfg: &waffle::cfg::CFGInfo,
+    inloop: &FxHashSet<WBlock>,
+    h: WBlock,
+    copies: usize,
+) {
+    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    // Size limits: unrolling is a tradeoff, not a free win.
+    let insts: usize = inloop.iter().map(|&lb| b.blocks[lb].insts.len()).sum();
+    if copies < 2 || inloop.len() > 16 || insts > 64 {
+        if verbose {
+            eprintln!("wunroll: {h} skipped size blocks={} insts={insts}", inloop.len());
+        }
+        return;
+    }
+    // Only clone ordinary ops; anything exotic (picks, traces, unresolved
+    // placeholders) makes the copy unsafe.
+    for &lb in inloop {
+        for &inst in &b.blocks[lb].insts {
+            if !matches!(
+                b.values[inst],
+                ValueDef::Operator(..) | ValueDef::Alias(_)
+            ) {
+                if verbose {
+                    eprintln!("wunroll: {h} skipped exotic inst {inst}");
+                }
+                return;
+            }
+        }
+        if matches!(
+            b.blocks[lb].terminator,
+            Terminator::None | Terminator::Return { .. } | Terminator::Unreachable
+        ) {
+            if verbose {
+                eprintln!("wunroll: {h} skipped terminator in {lb}");
+            }
+            return;
+        }
+    }
+    // Exit-edge targets keep their original block when cloned, so a value
+    // defined in the loop but used *inside* an outside block would lose
+    // dominance along the new clone paths. Bail on any such leak in a
+    // reachable block (dead blocks may carry dangling args).
+    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
+    {
+        let mut wl = vec![WBlock::new(0)];
+        while let Some(x) = wl.pop() {
+            b.blocks[x].terminator.visit_targets(|t| {
+                if reach.insert(t.block) {
+                    wl.push(t.block);
+                }
+            });
+        }
+    }
+    let cloneable_sink = |b: &FunctionBody, blk: WBlock| {
+        matches!(b.blocks[blk].terminator, Terminator::Unreachable)
+            && b.blocks[blk]
+                .insts
+                .iter()
+                .all(|&v| matches!(b.values[v], ValueDef::Operator(..) | ValueDef::Alias(_)))
+    };
+    for blk in b.blocks.iter() {
+        if inloop.contains(&blk) || !reach.contains(&blk) {
+            continue;
+        }
+        // Blocks that end in `unreachable` and contain only ordinary ops
+        // are pure sinks: clones get their own copy, so leaks into them
+        // are fine.
+        let sink = cloneable_sink(b, blk);
+        for &v in &b.blocks[blk].insts {
+            match b.values[v] {
+                ValueDef::Operator(_, aa, _) if !sink => {
+                    if b.arg_pool[aa]
+                        .iter()
+                        .any(|&a| inloop.contains(&defb[b.resolve_alias(a)]))
+                    {
+                        if verbose {
+                            eprintln!("wunroll: {h} skipped leak {v} in {blk}");
+                        }
+                        return;
+                    }
+                }
+                ValueDef::PickOutput(src, ..) if !sink => {
+                    if inloop.contains(&defb[b.resolve_alias(src)]) {
+                        if verbose {
+                            eprintln!("wunroll: {h} skipped leak pick {v} in {blk}");
+                        }
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !sink {
+            let mut leak = false;
+            b.blocks[blk].terminator.visit_uses(|a| {
+                leak |= inloop.contains(&defb[b.resolve_alias(a)]);
+            });
+            if leak {
+                if verbose {
+                    eprintln!("wunroll: {h} skipped leak via terminator in {blk}");
+                }
+                return;
+            }
+        }
+    }
+    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
+    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
+    fn remap_v(b: &FunctionBody, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
+        let r = b.resolve_alias(v);
+        vmap.get(&r).copied().unwrap_or(r)
+    }
+    // Build the copies.
+    let mut heads = vec![h];
+    let mut copies_blocks: Vec<Vec<WBlock>> = Vec::new();
+    for _ in 1..copies {
+        let mut bmap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
+        let mut vmap: FxHashMap<WV, WV> = FxHashMap::default();
+        for &lb in &order {
+            let nb = b.add_block();
+            bmap.insert(lb, nb);
+            for &(ty, pv) in b.blocks[lb].params.clone().iter() {
+                let np = b.add_blockparam(nb, ty);
+                defb[np] = nb;
+                vmap.insert(pv, np);
+            }
+        }
+        let mut aliases = Vec::new();
+        for &lb in &order {
+            let nb = bmap[&lb];
+            let insts = b.blocks[lb].insts.clone();
+            for inst in insts {
+                match b.values[inst] {
+                    ValueDef::Operator(op, aa, tt) => {
+                        let args: Vec<WV> = b.arg_pool[aa]
+                            .iter()
+                            .map(|&a| remap_v(b, &vmap, a))
+                            .collect();
+                        let tys: Vec<WT> = b.type_pool[tt].to_vec();
+                        let nv = b.add_op(nb, op, &args, &tys);
+                        defb[nv] = nb;
+                        vmap.insert(inst, nv);
+                    }
+                    ValueDef::Alias(_) => aliases.push(inst),
+                    _ => {}
+                }
+            }
+        }
+        // Aliases may point at insts cloned in any order; remap them now
+        // that every operator has a clone.
+        for inst in aliases {
+            if let ValueDef::Alias(a) = b.values[inst] {
+                let nv = remap_v(b, &vmap, a);
+                vmap.insert(inst, nv);
+            }
+        }
+        // Clone terminators: in-loop targets map into the copy; exits stay,
+        // except cloneable `unreachable` sinks (panic paths etc.) which are
+        // copied per copy so their leaked args stay dominated.
+        let mut smap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
+        for &lb in &order {
+            let nb = bmap[&lb];
+            let term = b.blocks[lb].terminator.clone();
+            let mut remap_t = |b: &mut FunctionBody, t: &BlockTarget| {
+                let blk = if let Some(&c) = bmap.get(&t.block) {
+                    c
+                } else if cloneable_sink(b, t.block) {
+                    *smap.entry(t.block).or_insert_with_key(|&tb| {
+                        clone_sink(b, defb, &vmap, tb)
+                    })
+                } else {
+                    t.block
+                };
+                BlockTarget {
+                    block: blk,
+                    args: t.args.iter().map(|&a| remap_v(b, &vmap, a)).collect(),
+                }
+            };
+            let nt = match term {
+                Terminator::Br { target } => Terminator::Br {
+                    target: remap_t(b, &target),
+                },
+                Terminator::CondBr {
+                    cond,
+                    if_true,
+                    if_false,
+                } => Terminator::CondBr {
+                    cond: remap_v(b, &vmap, cond),
+                    if_true: remap_t(b, &if_true),
+                    if_false: remap_t(b, &if_false),
+                },
+                Terminator::Select {
+                    value,
+                    targets,
+                    default,
+                } => {
+                    let value = remap_v(b, &vmap, value);
+                    let targets: Vec<_> =
+                        targets.iter().map(|t| remap_t(b, t)).collect();
+                    let default = remap_t(b, &default);
+                    Terminator::Select {
+                        value,
+                        targets,
+                        default,
+                    }
+                }
+                _ => Terminator::Unreachable,
+            };
+            b.set_terminator(nb, nt);
+        }
+        heads.push(bmap[&h]);
+        copies_blocks.push(order.iter().map(|lb| bmap[lb]).collect());
+    }
+    // Chain: copy k's back-edges to its own header go to copy k+1's header
+    // (the last copy's go back to the original h).
+    for k in 0..copies {
+        let srcs: &[WBlock] = if k == 0 {
+            &order
+        } else {
+            &copies_blocks[k - 1]
+        };
+        let next = heads[(k + 1) % copies];
+        for &lb in srcs {
+            b.blocks[lb].terminator.update_targets(|t| {
+                if t.block == heads[k] {
+                    t.block = next;
+                }
+            });
+        }
+    }
+    b.recompute_edges();
+}
+
+/// Clone an `unreachable`-terminated sink block (panic path) for a loop
+/// copy, remapping loop values through `vmap` and its own params/insts
+/// locally.
+fn clone_sink(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    vmap: &FxHashMap<WV, WV>,
+    blk: WBlock,
+) -> WBlock {
+    fn mapv(
+        b: &FunctionBody,
+        lmap: &FxHashMap<WV, WV>,
+        vmap: &FxHashMap<WV, WV>,
+        v: WV,
+    ) -> WV {
+        let r = b.resolve_alias(v);
+        lmap.get(&r).or_else(|| vmap.get(&r)).copied().unwrap_or(r)
+    }
+    let nb = b.add_block();
+    let mut lmap: FxHashMap<WV, WV> = FxHashMap::default();
+    for &(ty, pv) in b.blocks[blk].params.clone().iter() {
+        let np = b.add_blockparam(nb, ty);
+        defb[np] = nb;
+        lmap.insert(pv, np);
+    }
+    let insts = b.blocks[blk].insts.clone();
+    let mut aliases = Vec::new();
+    for inst in insts {
+        match b.values[inst] {
+            ValueDef::Operator(op, aa, tt) => {
+                let args: Vec<WV> = b.arg_pool[aa]
+                    .iter()
+                    .map(|&a| mapv(b, &lmap, vmap, a))
+                    .collect();
+                let tys: Vec<WT> = b.type_pool[tt].to_vec();
+                let nv = b.add_op(nb, op, &args, &tys);
+                defb[nv] = nb;
+                lmap.insert(inst, nv);
+            }
+            ValueDef::Alias(_) => aliases.push(inst),
+            _ => {}
+        }
+    }
+    for inst in aliases {
+        if let ValueDef::Alias(a) = b.values[inst] {
+            let nv = mapv(b, &lmap, vmap, a);
+            lmap.insert(inst, nv);
+        }
+    }
+    b.set_terminator(nb, Terminator::Unreachable);
+    nb
 }
