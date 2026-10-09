@@ -965,7 +965,14 @@ impl<I: VCodeInst> VCode<I> {
             // the gap as long as no gap inst touches a register the
             // pair touches, reads one it defines, or (partner-up) is
             // read by the partner after this inst's defs land.
+            static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let no_fuse = *NO_FUSE.get_or_init(|| {
+                std::env::var("PLIRON_NO_PAIRSTFUSE").map_or(false, |v| v == "1")
+            });
             for k in 0..items.len() {
+                if no_fuse {
+                    break;
+                }
                 let InstOrEdit::Inst(iix) = items[k] else {
                     continue;
                 };
@@ -1070,6 +1077,9 @@ impl<I: VCodeInst> VCode<I> {
             // be read by chain pairs (their offsets anchor the write-
             // back chain) and written by the add itself.
             for i in 0..items.len() {
+                if no_fuse {
+                    break;
+                }
                 let InstOrEdit::Inst(iix) = items[i] else {
                     continue;
                 };
