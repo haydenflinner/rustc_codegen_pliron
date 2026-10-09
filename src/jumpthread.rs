@@ -257,7 +257,7 @@ fn kfold(func: &Function, env: &FxHashMap<Value, u64>, kenv: &KBits, i: Inst) ->
     (z | o == full).then_some(o)
 }
 
-fn pure_op(func: &Function, inst: Inst) -> bool {
+pub(crate) fn pure_op(func: &Function, inst: Inst) -> bool {
     use Opcode::*;
     matches!(
         func.dfg.insts[inst].opcode(),
@@ -640,8 +640,12 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                         out.push(Arg::V(pv));
                     } else if body_vals.contains(&v) {
                         match env.get(&v) {
-                            Some(&k) => out.push(Arg::K(k, func.dfg.value_type(v))),
-                            None => return false,
+                            // `env` tracks 64 bits; it can't describe a wider
+                            // param (and `iconst` tops out at i64).
+                            Some(&k) if func.dfg.value_type(v).bits() <= 64 => {
+                                out.push(Arg::K(k, func.dfg.value_type(v)))
+                            }
+                            _ => return false,
                         }
                     } else {
                         out.push(Arg::V(v));
@@ -1506,6 +1510,11 @@ pub fn remove_trivial_params(func: &mut Function) -> usize {
         ValueDef::Param(b, _) => Some(b),
         _ => None,
     };
+    // `v` must dominate `b`: an edge passing the param itself (e.g. a loop
+    // latch) does not constrain `v`'s position, so without this check the
+    // alias can put `v` in scopes its def doesn't dominate.
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
     let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
     for (&b, st) in &inc {
         if Some(b) == entry {
@@ -1514,7 +1523,9 @@ pub fn remove_trivial_params(func: &mut Function) -> usize {
         let ps = func.dfg.block_params(b);
         for (i, s) in st.iter().enumerate() {
             if let In::One(v) = *s
-                && def_block(func, v) != Some(b)
+                && let Some(d) = def_block(func, v)
+                && d != b
+                && dt.dominates(d, b, &func.layout)
             {
                 rm.push((b, i, ps[i], v));
             }
@@ -1847,12 +1858,27 @@ pub fn run(
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
     let deadp = crate::pass_enabled("PLIRON_DEADPARAM");
+    let ifconv = crate::pass_enabled("PLIRON_IFCONV");
     let mut total = 0;
     let mut dead_params = 0;
     let mut dominated_folds = 0;
+    let chk = std::env::var_os("PLIRON_JT_CHECK").is_some();
+    let check = |func: &Function, tag: &str| {
+        if chk
+            && let Err(e) = cranelift_codegen::verify_function(
+                func,
+                &cranelift_codegen::settings::Flags::new(
+                    cranelift_codegen::settings::builder(),
+                ),
+            )
+        {
+            panic!("jt step {tag}: {e}\n{}", func.display());
+        }
+    };
     for _ in 0..8 {
         if trivp {
             remove_trivial_params(func);
+            check(func, "trivp");
         }
         if deadp {
             let removed = remove_dead_params(func);
@@ -1860,6 +1886,7 @@ pub fn run(
             if removed != 0 {
                 remove_unused_notrap_loads(func);
             }
+            check(func, "deadp");
         }
         let nn = NonNull::new(func, loads, derived);
         let dc = if domcond {
@@ -1868,7 +1895,21 @@ pub fn run(
             0
         };
         dominated_folds += dc;
-        let n = dc + bypass_forwarders(func) + round(func, &nn, domcond);
+        check(func, "domcond");
+        // Select-diamond if-conversion feeds back: folded forwarders expose
+        // new diamonds and bypass_forwarders collapses the residue. The dead
+        // side blocks keep phantom CFG edges (skewing dominance checks), so
+        // sweep them once unreachable.
+        let ic = if ifconv { crate::ifconv::run(func) } else { 0 };
+        check(func, "ifconv");
+        if ic > 0 {
+            remove_unreachable_blocks(func);
+        }
+        check(func, "unreach");
+        let n = dc + ic + bypass_forwarders(func);
+        check(func, "bypass");
+        let n = n + round(func, &nn, domcond);
+        check(func, "round");
         total += n;
         if n == 0 {
             break;

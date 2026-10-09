@@ -31,6 +31,7 @@ mod context;
 mod domcheck;
 mod eh;
 mod hot;
+mod ifconv;
 mod inline;
 mod instcombine;
 mod intrinsic;
