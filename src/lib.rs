@@ -51,6 +51,7 @@ mod nowrite;
 mod objmerge;
 mod phisimp;
 mod simd;
+mod slp;
 mod sroa;
 mod switchmap;
 mod taildup;
@@ -331,6 +332,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.indvars = pass_enabled("PLIRON_INDUCT");
         st.loopidiom = pass_enabled("PLIRON_IDIOM");
         st.loopvec = pass_enabled("PLIRON_VEC");
+        st.slp = pass_enabled("PLIRON_SLP");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
