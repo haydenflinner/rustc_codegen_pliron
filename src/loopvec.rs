@@ -30,8 +30,8 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
-    Count, Edge, Info, Ins, Param, Pred, count, deadend, edge_args, emit, gather, guard_dead,
-    guard_pred, iconst, outv, param_kinds, trips_idx, trips_ptr,
+    Count, Edge, Info, Ins, Param, Pred, count, deadend, def_block, edge_args, emit, gather,
+    guard_dead, guard_pred, iconst, outv, param_kinds, trips_idx, trips_ptr,
 };
 
 const MAX_LOOPS: usize = 16;
@@ -188,6 +188,12 @@ struct Plan {
     /// Cond-tree insts a conditional reduction may vectorize past the
     /// `can_vec` gate (`emit_val` drops their widening casts).
     extra_vec: FxHashSet<Inst>,
+    /// Lane-wise early-exit tests: `brif` on a body-local condition. The
+    /// vector body checks `vany_true`/`vall_true` per group and on a hit
+    /// resumes the scalar loop at the group's first lane — the scalar body
+    /// then re-finds the exact lane and takes the real exit edge with its
+    /// original args.
+    early: Vec<(Value, bool)>,
 }
 
 /// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
@@ -378,6 +384,20 @@ fn stream_base(
         )),
     );
     Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg))
+}
+
+/// `e` is an early-exit test usable lane-wise: a `brif` on a body-local
+/// scalar condition (icmp/fcmp replicability is checked against `masks`
+/// once the body scan finishes). Returns (cond value, exits-when-true).
+fn early_cond(func: &Function, info: &Info, e: Edge) -> Option<(Value, bool)> {
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
+        return None;
+    };
+    let c = func.dfg.resolve_aliases(arg);
+    if !def_block(func, c).is_some_and(|b| info.body.contains(&b)) {
+        return None;
+    }
+    Some((c, e.slot == 0))
 }
 
 /// `v` is a splattable loop-invariant operand: defined outside the loop, an
@@ -674,6 +694,7 @@ fn plan(
         else {
             why!(fname; "no body mem op {:?}", info.h);
         };
+    let mut early: Vec<(Value, bool)> = Vec::new();
     let Some((_exit, cnt, extra)) = info.exits.iter().find_map(|&e| {
         let c = count(func, dt, &info, &kinds, e, body_mem)?;
         let mut ps = Vec::new();
@@ -682,7 +703,12 @@ fn plan(
                 continue;
             }
             if !guard_dead(func, &c, e2) {
-                ps.push(guard_pred(func, &info, &kinds, &c, e2)?);
+                match guard_pred(func, &info, &kinds, &c, e2) {
+                    Some(pr) => ps.push(pr),
+                    // Otherwise a lane-wise early-exit test is still OK for
+                    // pure search loops (validated after the body scan).
+                    None => early.push(early_cond(func, &info, e2)?),
+                }
             }
         }
         Some((e, c, ps))
@@ -811,7 +837,7 @@ fn plan(
         mems2.push((i, idx));
         (if is_store { &mut stores } else { &mut loads }).push((i, idx));
     }
-    if stores.is_empty() && reducs.is_empty() {
+    if stores.is_empty() && reducs.is_empty() && early.is_empty() {
         why!(fname; "no stores");
     }
     // Disjointness: for every (load,store) and (store,store) pair on distinct
@@ -1004,6 +1030,20 @@ fn plan(
             why!(fname; "reduction delta {:?}", info.h);
         }
     }
+    // Early exits are only safe for pure search loops: a store would write
+    // lanes past the hit, a reduction can't resume mid-sum, and a non-unit
+    // step makes the resume position expensive to reconstruct.
+    if !early.is_empty()
+        && (!stores.is_empty() || !reducs.is_empty() || cnt.step != 1)
+    {
+        why!(fname; "early exit needs step=1, no stores, no reducs {:?}", info.h);
+    }
+    for &(cv, _) in &early {
+        let cv = func.dfg.resolve_aliases(cv);
+        if !masks.contains(&cv) && !can_vec.contains(&cv) {
+            why!(fname; "early cond not lane-wise {:?}", info.h);
+        }
+    }
     // Every stored value must be replicable or a splattable invariant.
     for &(s, _) in &stores {
         let InstructionData::Store { args, .. } = func.dfg.insts[s] else {
@@ -1089,6 +1129,7 @@ fn plan(
         can_vec,
         masks,
         extra_vec,
+        early,
     })
 }
 
@@ -2225,12 +2266,29 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     // group, and groups advance together (a cross-group read-back hazard
     // would need a store->load distance < VF*UNROLL, which can't exist:
     // same-stream addresses differ by whole iterations).
-    let mut pos = FuncCursor::new(pos.func).at_bottom(vb);
+    //
+    // Early-exit loops put each group in its own block — a lane check can
+    // branch out mid-body — with an extra tail block for the backedge and
+    // a `resumes[g]` block per group that re-enters the scalar loop at the
+    // group's first lane.
+    let mut vbs = vec![vb];
+    let mut resumes = Vec::new();
+    if !p.early.is_empty() {
+        for _ in 0..UNROLL {
+            let b = pos.func.dfg.make_block();
+            pos.func.layout.insert_block_after(b, *vbs.last().unwrap());
+            let r = pos.func.dfg.make_block();
+            pos.func.layout.insert_block_after(r, b);
+            vbs.push(b);
+            resumes.push(r);
+        }
+    }
     let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
     let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
     let mut back_accs: Vec<Vec<Value>> = p.reducs.iter().map(|_| Vec::new()).collect();
     let gb = i64::from(p.elem.bytes()) * p.vf;
     for g in 0..UNROLL {
+        let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
         let mut addrs = Vec::new();
         for s in &p.streams {
             let a = if s.direct {
@@ -2297,6 +2355,19 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 _ => unreachable!(),
             }
         }
+        // Lane-wise early-exit checks: on a hit, resume the scalar loop at
+        // this group's first lane — it re-finds the exact lane and takes
+        // the real exit edge with its original args.
+        for &(cv, exits_true) in &p.early {
+            let m = emit_val(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, cv, 0);
+            if exits_true {
+                let hit = pos.ins().vany_true(m);
+                pos.ins().brif(hit, resumes[g], &[], vbs[g + 1], &[]);
+            } else {
+                let all = pos.ins().vall_true(m);
+                pos.ins().brif(all, vbs[g + 1], &[], resumes[g], &[]);
+            }
+        }
         // vacc = vacc ⊕ delta per group; deltas come after the group's
         // memory ops so their loads are already in `vmap`.
         for (k, r) in p.reducs.iter().enumerate() {
@@ -2346,6 +2417,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
             });
         }
     }
+    let mut pos = FuncCursor::new(pos.func).at_bottom(*vbs.last().unwrap());
     let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
     let iv2 = pos.ins().iadd(ivv, k);
     let mut back: Vec<Value> = vec![iv2, endv, nm];
@@ -2354,6 +2426,37 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     }
     let bargs: Vec<BlockArg> = back.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().jump(vh, &bargs);
+    // Resume blocks: re-enter the scalar loop at group g's first lane,
+    // `ivv + g*vf*step`. `Step` params advance s per elapsed iteration
+    // (step==1 was required, so elapsed = wg - iv0).
+    for (g, &r) in resumes.iter().enumerate() {
+        let mut pos = FuncCursor::new(pos.func).at_bottom(r);
+        let wg = if g == 0 {
+            ivv
+        } else {
+            let c = pos.ins().iconst(iv_ty, g as i64 * p.vf * p.step);
+            pos.ins().iadd(ivv, c)
+        };
+        let mut args: Vec<Value> = Vec::new();
+        for (j, _) in params.iter().enumerate() {
+            if j == p.iv_idx {
+                args.push(wg);
+                continue;
+            }
+            match p.kinds[j] {
+                Param::Inv => args.push(p.entry_args[j]),
+                Param::Step(s) => {
+                    let d = pos.ins().isub(wg, p.iv0);
+                    let sk = pos.ins().iconst(iv_ty, s);
+                    let m = pos.ins().imul(d, sk);
+                    args.push(pos.ins().iadd(p.entry_args[j], m));
+                }
+                Param::Other => unreachable!(),
+            }
+        }
+        let bargs: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
+        pos.ins().jump(p.h, &bargs);
+    }
 }
 
 pub fn run(
