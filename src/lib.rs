@@ -23,6 +23,7 @@ extern crate rustc_target;
 
 mod abi;
 mod asm;
+mod bcheck;
 mod builder;
 mod clifpeep;
 mod constload;
@@ -381,6 +382,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.loopidiom = pass_enabled("PLIRON_IDIOM");
         st.loopvec = pass_enabled("PLIRON_VEC");
         st.slp = pass_enabled("PLIRON_SLP");
+        st.bcheck = pass_enabled("PLIRON_BCHECK");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }

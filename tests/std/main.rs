@@ -37,4 +37,53 @@ fn main() {
         let s = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap();
         println!("snprintf = {}", s.to_str().unwrap());
     }
+
+    // Loop-versioning bounds-check hoisting: in-bounds fast paths must be
+    // correct, and the slow path must panic at the exact OOB index.
+    {
+        #[inline(never)]
+        fn copy1(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..n {
+                dst[i] = a[i] + 1;
+            }
+        }
+        #[inline(never)]
+        fn incl(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..=n {
+                dst[i] = a[i];
+            }
+        }
+        #[inline(never)]
+        fn strided(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..n {
+                dst[i * 2] = a[i];
+            }
+        }
+        let a = vec![7u32; 100];
+        let mut d = vec![0u32; 100];
+        copy1(&a, &mut d, 50);
+        assert_eq!(d[49], 8);
+        assert_eq!(d[60], 0);
+        copy1(&a, &mut d, 0);
+        copy1(&a, &mut d, 100);
+        assert_eq!(d[99], 8);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy1(&a, &mut d, 200)
+        }));
+        assert!(r.is_err());
+        incl(&a, &mut d, 99);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            incl(&a, &mut d, 100)
+        }));
+        assert!(r.is_err());
+        let mut d2 = vec![0u32; 100];
+        strided(&a, &mut d2, 50);
+        assert_eq!(d2[98], 7);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut d3 = vec![0u32; 100];
+            strided(&a, &mut d3, 60)
+        }));
+        assert!(r.is_err());
+        println!("bcheck ok");
+    }
 }

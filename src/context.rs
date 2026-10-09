@@ -194,6 +194,8 @@ pub struct State<'tcx> {
     pub loopvec: bool,
     /// Store-group SLP vectorizer (`-O`, `PLIRON_SLP`; SIMD targets only).
     pub slp: bool,
+    /// Loop versioning to hoist provable bounds checks (`-O`, `PLIRON_BCHECK`).
+    pub bcheck: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).

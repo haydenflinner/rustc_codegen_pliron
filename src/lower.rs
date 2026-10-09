@@ -556,6 +556,20 @@ pub fn lower_to_object(
                 panic!("slp broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.bcheck && crate::bisect("bcheck") {
+            let k = crate::bcheck::run(&mut clctx.func, n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("bcheck {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("bcheck broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+            if dump {
+                eprintln!("==== clif {n} after bcheck ====\n{}", clctx.func.display());
+            }
+        }
         if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
             let k = crate::switchmap::run(&mut clctx.func);
             // The new bounds tests are often implied by a dominating check.
