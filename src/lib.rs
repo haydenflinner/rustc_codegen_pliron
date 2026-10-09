@@ -40,6 +40,7 @@ mod jumpthread;
 mod licm;
 mod loadfwd;
 mod loopdel;
+mod loopidiom;
 mod looprot;
 mod unroll;
 mod lower;
@@ -327,6 +328,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.taildup = pass_enabled("PLIRON_TAILDUP");
         st.licm = pass_enabled("PLIRON_LICM");
         st.indvars = pass_enabled("PLIRON_INDUCT");
+        st.loopidiom = pass_enabled("PLIRON_IDIOM");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }

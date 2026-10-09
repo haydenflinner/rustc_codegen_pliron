@@ -512,6 +512,18 @@ pub fn lower_to_object(
                 panic!("licm broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.loopidiom && crate::bisect("loopidiom") {
+            let k =
+                crate::loopidiom::run(&mut clctx.func, &noalias, m.target_config(), n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("idiom {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("loopidiom broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
             let k = crate::switchmap::run(&mut clctx.func);
             // The new bounds tests are often implied by a dominating check.
