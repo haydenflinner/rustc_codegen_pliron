@@ -386,6 +386,33 @@ fn stream_base(
     Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg))
 }
 
+/// `v` is the loop param `p` unchanged on a latch: `p` itself, or a block
+/// param every in-edge of whose block supplies `p` at its position.
+fn acc_thru(func: &Function, cfg: &ControlFlowGraph, v: Value, p: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if v == p {
+        return true;
+    }
+    let ValueDef::Param(b, j) = func.dfg.value_def(v) else {
+        return false;
+    };
+    let mut hits = 0;
+    let ok = cfg.pred_iter(b).all(|pred| {
+        func.dfg.insts[pred.inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .iter()
+            .filter(|bc| bc.block(&func.dfg.value_lists) == b)
+            .all(|bc| {
+                hits += 1;
+                matches!(
+                    bc.args(&func.dfg.value_lists).nth(j),
+                    Some(BlockArg::Value(vv)) if func.dfg.resolve_aliases(vv) == p
+                )
+            })
+    });
+    ok && hits > 0
+}
+
 /// `e` is an early-exit test usable lane-wise: a `brif` on a body-local
 /// scalar condition (icmp/fcmp replicability is checked against `masks`
 /// once the body scan finishes). Returns (cond value, exits-when-true).
@@ -574,8 +601,20 @@ fn plan(
             }
         };
         let mut upd: Option<(Inst, Opcode, Value, Option<Inst>, Option<(Value, bool)>)> = None;
+        // (latch block, passes acc through unchanged). A `filter`-style
+        // conditional update often keeps its diamond in the CFG: one latch
+        // feeds back `acc ⊕ d`, a sibling latch feeds back `acc` itself —
+        // the body brif that picked the latch is the update's condition.
+        let mut arms: Vec<(Block, bool)> = Vec::new();
+        let mut pass_insts: FxHashSet<Inst> = FxHashSet::default();
         let ok = info.latches.iter().all(|&e| {
             let a = func.dfg.resolve_aliases(edge_args(func, e)[j]);
+            let src = func.layout.inst_block(e.inst).unwrap_or(info.h);
+            if acc_thru(func, cfg, a, p) {
+                arms.push((src, true));
+                pass_insts.insert(e.inst);
+                return true;
+            }
             let ValueDef::Result(i, _) = func.dfg.value_def(a) else {
                 return false;
             };
@@ -585,12 +624,15 @@ fn plan(
             match upd {
                 None => {
                     upd = Some((i, op, d, aux, cnd));
-                    true
                 }
                 Some((pi, po, pd, paux, pc)) => {
-                    pi == i && po == op && pd == d && paux == aux && pc == cnd
+                    if !(pi == i && po == op && pd == d && paux == aux && pc == cnd) {
+                        return false;
+                    }
                 }
             }
+            arms.push((src, false));
+            true
         });
         if !ok {
             if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
@@ -599,7 +641,53 @@ fn plan(
             other_ok = false;
             continue;
         }
-        let (ui, op, delta, aux, cnd) = upd.unwrap();
+        let Some((ui, op, delta, aux, mut cnd)) = upd else {
+            // Every latch passed `acc` through (e.g. behind a block
+            // param) — effectively invariant, just not recognized.
+            other_ok = false;
+            continue;
+        };
+        if arms.iter().any(|&(_, pass)| pass) {
+            // The add/pass split must be decided by one brif whose arms
+            // dominate the respective latches.
+            if cnd.is_some() {
+                other_ok = false;
+                continue;
+            }
+            let gc = func.layout.last_inst(info.h).and_then(|t| {
+                let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
+                    return None;
+                };
+                let dests = func
+                    .dfg
+                    .insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                let [tb, eb] = dests[..] else { return None };
+                let tb = tb.block(&func.dfg.value_lists);
+                let eb = eb.block(&func.dfg.value_lists);
+                let gated = |a: Block, p: Block| {
+                    arms.iter().all(|&(s, pass)| {
+                        dt.block_dominates(if pass { p } else { a }, s)
+                    })
+                };
+                let gc = func.dfg.resolve_aliases(arg);
+                if gated(tb, eb) {
+                    Some((gc, false))
+                } else if gated(eb, tb) {
+                    Some((gc, true))
+                } else {
+                    None
+                }
+            });
+            let Some(gc) = gc else {
+                if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+                    eprintln!("vec reduc?: param {j} CFG diamond has no gating brif");
+                }
+                other_ok = false;
+                continue;
+            };
+            cnd = Some(gc);
+        }
         // `acc` may not be read anywhere else in the loop (e.g. an exit
         // test on the accumulator would need the lane-wise partial sums);
         // the select's icmp and the conditional update's inner op are
@@ -610,7 +698,11 @@ fn plan(
                 used.extend(func.dfg.inst_args(i).iter().map(|&a| func.dfg.resolve_aliases(a)));
             }
         }
-        let allowed: FxHashSet<Inst> = [ui].into_iter().chain(aux).collect();
+        let allowed: FxHashSet<Inst> = [ui]
+            .into_iter()
+            .chain(aux)
+            .chain(pass_insts.iter().copied())
+            .collect();
         // A pure inst whose results are all dead can read `acc` harmlessly
         // (dead insts aren't emitted in the vector body); anything else makes
         // the loop non-vectorizable.
@@ -674,13 +766,25 @@ fn plan(
     if !other_ok {
         why!(fname; "non-linear param {:?}", info.h);
     }
-    // Interior-block params would need threading through the vector loop.
-    if info
-        .body
-        .iter()
-        .any(|&b| b != info.h && !func.dfg.block_params(b).is_empty())
-    {
-        why!(fname; "interior block params {:?}", info.h);
+    // Interior-block params would need threading through the vector loop —
+    // unless every use is a branch arg (CFG diamonds thread the acc through
+    // a passthrough block this way; the flat vector body never reads them).
+    for &b in &info.body {
+        if b == info.h {
+            continue;
+        }
+        for &pv in func.dfg.block_params(b) {
+            let bad = info.body.iter().flat_map(|&bb| func.layout.block_insts(bb)).any(|i| {
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .any(|&a| func.dfg.resolve_aliases(a) == pv)
+                    && !func.dfg.insts[i].opcode().is_terminator()
+            });
+            if bad {
+                why!(fname; "interior block params {:?}", info.h);
+            }
+        }
     }
     // The count exit: pre-tested only, so the epilogue may run 0 iterations.
     // `count`'s `store` arg is a body inst used for post-tested detection —
@@ -710,6 +814,19 @@ fn plan(
         let mut ok = true;
         for &e2 in &info.exits {
             if e2 == e || guard_dead(func, &c, e2) {
+                continue;
+            }
+            // A duplicate count test on a sibling latch (`filter`-shape
+            // loops test the trip bound on every backedge) is covered by
+            // the vector loop's group check.
+            if count(func, dt, &info, &kinds, e2, body_mem).is_some_and(|c2| {
+                c2.iv == c.iv
+                    && c2.bound == c.bound
+                    && c2.step == c.step
+                    && c2.stay == c.stay
+                    && c2.on_next == c.on_next
+                    && c2.post_tested == c.post_tested
+            }) {
                 continue;
             }
             match guard_pred(func, &info, &kinds, &c, e2) {
@@ -764,6 +881,9 @@ fn plan(
                 match op {
                     Opcode::Jump => {}
                     Opcode::Brif if info.exits.iter().any(|e| e.inst == i) => {}
+                    // A non-exit brif may gate a CFG-diamond conditional
+                    // reduction; checked against `reducs[].cond` below.
+                    Opcode::Brif => other.push(i),
                     _ => why!(fname; "terminator {}", func.dfg.display_inst(i)),
                 }
                 continue;
@@ -811,7 +931,7 @@ fn plan(
             match elem {
                 None => elem = Some(t),
                 Some(e) if e == t => {}
-                _ => why!(fname; "mixed elem types"),
+                _ => why!(fname; "mixed elem types {}", func.dfg.display_inst(i)),
             }
             mems.push(i);
         }
@@ -1061,12 +1181,9 @@ fn plan(
         }
     }
     // Early exits are only safe for pure search loops: a store would write
-    // lanes past the hit, a reduction can't resume mid-sum, and a non-unit
-    // step makes the resume position expensive to reconstruct.
-    if !early.is_empty()
-        && (!stores.is_empty() || !reducs.is_empty() || cnt.step != 1)
-    {
-        why!(fname; "early exit needs step=1, no stores, no reducs {:?}", info.h);
+    // lanes past the hit and a reduction can't resume mid-sum.
+    if !early.is_empty() && (!stores.is_empty() || !reducs.is_empty()) {
+        why!(fname; "early exit needs no stores, no reducs {:?}", info.h);
     }
     for &(cv, _) in &early {
         let cv = func.dfg.resolve_aliases(cv);
@@ -1085,9 +1202,27 @@ fn plan(
         }
     }
     // Remaining `other` insts stay in the scalar epilogue — only side effects
-    // (calls, traps, extra memory ops) make an iteration non-skippable.
+    // (calls, traps, extra memory ops) make an iteration non-skippable. An
+    // interior `brif` is dropped from the vector body — sound only when it
+    // is the gate of a conditional reduction (its per-lane condition becomes
+    // the update mask).
     for &i in &other {
         let op = func.dfg.insts[i].opcode();
+        if op == Opcode::Brif {
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[i] else {
+                unreachable!()
+            };
+            let c = func.dfg.resolve_aliases(arg);
+            let gated = reducs.iter().any(|r| {
+                r.cond
+                    .as_ref()
+                    .is_some_and(|cd| func.dfg.resolve_aliases(cd.c) == c)
+            });
+            if !gated {
+                why!(fname; "interior brif {}", func.dfg.display_inst(i));
+            }
+            continue;
+        }
         if op.can_trap() || op.can_load() || op.can_store() || op.is_call()
             || op.other_side_effects()
         {
@@ -2457,8 +2592,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let bargs: Vec<BlockArg> = back.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().jump(vh, &bargs);
     // Resume blocks: re-enter the scalar loop at group g's first lane,
-    // `ivv + g*vf*step`. `Step` params advance s per elapsed iteration
-    // (step==1 was required, so elapsed = wg - iv0).
+    // `ivv + g*vf*step`. `Step` params advance s per elapsed iteration —
+    // `iters = (wg - iv0) / step` (`wg` is in iv units; for a pointer iv
+    // `step` is the per-iteration byte advance).
     for (g, &r) in resumes.iter().enumerate() {
         let mut pos = FuncCursor::new(pos.func).at_bottom(r);
         let wg = if g == 0 {
@@ -2477,8 +2613,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 Param::Inv => args.push(p.entry_args[j]),
                 Param::Step(s) => {
                     let d = pos.ins().isub(wg, p.iv0);
+                    let it = if p.step == 1 {
+                        d
+                    } else {
+                        let sk = pos.ins().iconst(iv_ty, p.step);
+                        pos.ins().udiv(d, sk)
+                    };
                     let sk = pos.ins().iconst(iv_ty, s);
-                    let m = pos.ins().imul(d, sk);
+                    let m = pos.ins().imul(it, sk);
                     args.push(pos.ins().iadd(p.entry_args[j], m));
                 }
                 Param::Other => unreachable!(),
