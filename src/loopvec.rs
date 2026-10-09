@@ -2586,6 +2586,19 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
     let mut back_accs: Vec<Vec<Value>> = p.reducs.iter().map(|_| Vec::new()).collect();
     let gb = i64::from(p.elem.bytes()) * p.vf;
+    // Loads that precede the group's first store hoist into a shared
+    // pass: batching `ldr`s across groups lets the CPU overlap their
+    // latency (and pairs them for ldp fusion). A load behind a store on
+    // the same stream reads back the stored vector — keep its position.
+    let first_store = p
+        .mems
+        .iter()
+        .position(|&(i, _)| {
+            matches!(pos.func.dfg.insts[i], InstructionData::Store { .. })
+        })
+        .unwrap_or(p.mems.len());
+    let hoist = p.early.is_empty();
+    let mut groups: Vec<(Vec<(Value, i64)>, FxHashMap<Value, Value>)> = Vec::new();
     for g in 0..UNROLL {
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
         // Per-stream (base, byte-offset): the base is emitted once per
@@ -2620,10 +2633,49 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
             };
             addrs.push((a, off));
         }
-        // Emit loads eagerly in program order: on a given stream a
-        // `store; load` pair reads back the stored vector, so ordering is
-        // observable.
         let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+        if hoist {
+            for &(i, j) in &p.mems[..first_store] {
+                if let InstructionData::Load { .. } = pos.func.dfg.insts[i] {
+                    let r = pos.func.dfg.resolve_aliases(pos.func.dfg.first_result(i));
+                    if p.can_vec.contains(&r) && !vmap.contains_key(&r) {
+                        let mut vl =
+                            pos.ins()
+                                .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
+                        if p.streams[j].neg {
+                            vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
+                        }
+                        vmap.insert(r, vl);
+                    }
+                }
+            }
+        }
+        groups.push((addrs, vmap));
+    }
+    // When every load precedes the first store, store values are pure
+    // computation on the hoisted loads — compute them all, then issue the
+    // stores consecutively in the tail so `str` pairs stay adjacent
+    // (stp-fusible) across all unrolled groups.
+    let batch_stores = hoist
+        && !p.mems[first_store..]
+            .iter()
+            .any(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Load { .. }));
+    let mut pending_stores: Vec<(Value, Value, i64)> = Vec::new();
+    if std::env::var_os("PLIRON_LOOPVEC_DEBUG").is_some() {
+        eprintln!(
+            "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
+            pos.func.name,
+            p.mems
+                .iter()
+                .map(|&(i, j)| (pos.func.dfg.insts[i].opcode(), j))
+                .collect::<Vec<_>>()
+        );
+    }
+    for g in 0..UNROLL {
+        let (addrs, mut vmap) = core::mem::take(&mut groups[g]);
+        let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
+        // Loads eagerly in program order: a `store; load` pair on one
+        // stream reads back the stored vector, so ordering is observable.
         for &(i, j) in &p.mems {
             match pos.func.dfg.insts[i] {
                 InstructionData::Load { .. } => {
@@ -2645,8 +2697,16 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                     if p.streams[j].neg {
                         vv = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vv);
                     }
-                    pos.ins()
-                        .store(MemFlagsData::new().with_notrap(), vv, addrs[j].0, addrs[j].1 as i32);
+                    if batch_stores {
+                        pending_stores.push((vv, addrs[j].0, addrs[j].1));
+                    } else {
+                        pos.ins().store(
+                            MemFlagsData::new().with_notrap(),
+                            vv,
+                            addrs[j].0,
+                            addrs[j].1 as i32,
+                        );
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -2749,6 +2809,10 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         }
     }
     let mut pos = FuncCursor::new(pos.func).at_bottom(*vbs.last().unwrap());
+    for (vv, a, off) in pending_stores {
+        pos.ins()
+            .store(MemFlagsData::new().with_notrap(), vv, a, off as i32);
+    }
     let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
     let iv2 = pos.ins().iadd(ivv, k);
     let mut back: Vec<Value> = vec![iv2, endv, nm];
