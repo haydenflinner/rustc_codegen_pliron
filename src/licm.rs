@@ -438,7 +438,7 @@ fn run_loop(
     if std::env::var_os("PLIRON_LICM_PROMOTE").is_some_and(|v| v == "0") {
         return n;
     }
-    n + promote(func, cfg, la, lp, iso, deref, debug)
+    n + promote(func, cfg, dt, la, lp, iso, deref, debug)
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the
@@ -448,6 +448,7 @@ fn run_loop(
 fn promote(
     func: &mut Function,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
@@ -582,7 +583,7 @@ fn promote(
                 continue;
             }
         }
-        n += promote_loc(func, cfg, la, lp, &body, h, (r, o, ty), off, debug);
+        n += promote_loc(func, cfg, dt, la, lp, &body, h, (r, o, ty), off, debug);
     }
     n
 }
@@ -594,6 +595,7 @@ fn promote(
 fn promote_loc(
     func: &mut Function,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
     body: &FxHashSet<Block>,
@@ -655,7 +657,24 @@ fn promote_loc(
             entry = Some((pb, pi, s));
         }
     }
-    let Some((_, pinst, pslot)) = entry else { return 0 };
+    let Some((pb, pinst, pslot)) = entry else { return 0 };
+
+    // A `Root::V` address is used by the synthesized entry load and by the
+    // store-back on every exit/return edge. "Defined outside the loop"
+    // doesn't suffice: on irreducible CFGs the def may not dominate the
+    // entry edge (same trap as hoisting). Everything the new accesses touch
+    // is dominated by `pinst`, so requiring the def to dominate `pinst`
+    // covers all of them.
+    if let Root::V(v) = loc.0 {
+        let ok = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.dominates(b, pb, &func.layout),
+            _ => false,
+        };
+        if !ok {
+            return 0;
+        }
+    }
 
     // The address reused for synthesized accesses: the invariant root
     // itself for V roots; a fresh `stack_addr` for slots (its type is taken
