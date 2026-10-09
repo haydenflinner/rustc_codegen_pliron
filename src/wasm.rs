@@ -145,6 +145,8 @@ struct Obj<'a, 'tcx> {
     mem: Memory,
     /// panic=unwind: emulated EH (see `FL::eh_check`).
     unwind: bool,
+    /// `PLIRON_WASM_TRIP` shared loop-trip counter (created lazily).
+    trip: waffle::Global,
 }
 
 impl<'a, 'tcx> Obj<'a, 'tcx> {
@@ -275,6 +277,7 @@ pub fn lower_to_wasm(
         table,
         mem,
         unwind,
+        trip: waffle::Global::invalid(),
     };
     o.sp = o.import_global("env", "__stack_pointer", true);
 
@@ -662,6 +665,16 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
         }
         self.b.optimize(&waffle::OptOptions::default());
+        if let Some(lim) = std::env::var("PLIRON_WASM_TRIP")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if self.o.trip == waffle::Global::invalid() {
+                // Resolved by the linker to one shared mutable global.
+                self.o.trip = self.o.import_global("env", "__pliron_trip", true);
+            }
+            wtrip_guard(&mut self.b, self.o.trip, lim);
+        }
         self.b
     }
 
@@ -2886,6 +2899,55 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
         }
     }
     wdce(b);
+}
+
+/// `PLIRON_WASM_TRIP=n`: splice a shared i32 counter check onto every
+/// latch edge. A loop spinning past `n` back-edges traps `unreachable`
+/// instead of hanging, and the trap names the function.
+fn wtrip_guard(b: &mut FunctionBody, g: waffle::Global, limit: u64) {
+    let cfg = waffle::cfg::CFGInfo::new(b);
+    let mut edges = Vec::new();
+    for (h, inloop) in wloops(b, &cfg) {
+        for (j, &p) in b.blocks[h].preds.iter().enumerate() {
+            if inloop.contains(&p) {
+                edges.push((h, p, b.blocks[h].pos_in_pred_succ[j]));
+            }
+        }
+    }
+    let mut trap = None;
+    for (h, p, tidx) in edges {
+        let chk = b.add_block();
+        let fwd: Vec<WV> = b.blocks[h]
+            .params
+            .clone()
+            .into_iter()
+            .map(|(t, _)| b.add_blockparam(chk, t))
+            .collect();
+        let c = b.add_op(chk, O::GlobalGet { global_index: g }, &[], &[WT::I32]);
+        let one = b.add_op(chk, O::I32Const { value: 1 }, &[], &[WT::I32]);
+        let c2 = b.add_op(chk, O::I32Add, &[c, one], &[WT::I32]);
+        b.add_op(chk, O::GlobalSet { global_index: g }, &[c2], &[]);
+        let lim = b.add_op(chk, O::I32Const { value: limit as u32 }, &[], &[WT::I32]);
+        let over = b.add_op(chk, O::I32GeU, &[c, lim], &[WT::I32]);
+        let t = *trap.get_or_insert_with(|| {
+            let t = b.add_block();
+            b.set_terminator(t, Terminator::Unreachable);
+            t
+        });
+        b.set_terminator(
+            chk,
+            Terminator::CondBr {
+                cond: over,
+                if_true: BlockTarget {
+                    block: t,
+                    args: vec![],
+                },
+                if_false: BlockTarget { block: h, args: fwd },
+            },
+        );
+        b.blocks[p].terminator.update_target(tidx, |t| t.block = chk);
+    }
+    b.recompute_edges();
 }
 
 /// Move pure ops and non-SP global reads with all-invariant args to `pre`.

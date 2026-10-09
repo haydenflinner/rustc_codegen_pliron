@@ -519,7 +519,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         };
 
-    // Globals: 0 is the stack pointer; each GOT import becomes a constant.
+    // Globals: 0 is the stack pointer; synthetic mutable globals (e.g.
+    // PLIRON_WASM_TRIP's counter) come next, then each GOT import's
+    // constant. GOT base depends on how many synthetics exist.
+    let trip = included
+        .iter()
+        .flat_map(|&oi| &objs[oi].gimports)
+        .any(|(m, n)| m == "env" && n == "__pliron_trip");
+    let n_synth = trip as u32;
     let mut gvals: Vec<u32> = Vec::new();
     let mut gmaps: HashMap<usize, Vec<u32>> = HashMap::new();
     for &oi in &included {
@@ -527,10 +534,11 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         for (module, n) in &objs[oi].gimports {
             m.push(match (module.as_str(), n.as_str()) {
                 ("env", "__stack_pointer") => 0,
+                ("env", "__pliron_trip") => 1,
                 ("GOT.mem", s) | ("GOT.func", s) => {
                     let v = value_of(oi, s, module == "GOT.func", &mut table)?;
                     gvals.push(v);
-                    gvals.len() as u32
+                    n_synth + gvals.len() as u32
                 }
                 (m, s) => return Err(format!("{}: unknown global import {m}.{s}", objs[oi].name)),
             });
@@ -685,6 +693,16 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         },
         &we::ConstExpr::i32_const((1024 + stack()) as i32),
     );
+    if trip {
+        gs.global(
+            we::GlobalType {
+                val_type: we::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &we::ConstExpr::i32_const(0),
+        );
+    }
     for v in &gvals {
         gs.global(
             we::GlobalType {
