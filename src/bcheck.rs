@@ -117,7 +117,7 @@ fn iconst_masked(pos: &mut FuncCursor, t: Type, k: i64) -> Value {
     if t == types::I128 {
         let lo = pos.ins().iconst(types::I64, k);
         let hi = pos.ins().iconst(types::I64, k >> 63);
-        return pos.ins().iconcat(hi, lo);
+        return pos.ins().iconcat(lo, hi);
     }
     let mask = if t.bits() < 64 {
         (1i64 << t.bits()) - 1
