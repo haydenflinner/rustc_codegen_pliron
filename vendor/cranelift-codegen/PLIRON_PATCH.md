@@ -21,6 +21,28 @@ once proven out on the stage2 benchmark, then drop this copy.
    `R_X86_64_GOTTPOFF` in `vendor/cranelift-object`; both of those crates are
    vendored only for this.
 
+4. aarch64 `udot` (FEAT_DotProd): new `VecALUModOp::Udot` variant (same
+   encoding as `sdot` plus the unsigned bit), `udot` helper in
+   `isa/aarch64/inst.isle`, and a `lower.isle` rule folding the
+   `iadd_pairwise(uwiden* lo) + iadd_pairwise(uwiden* hi) + acc` tree —
+   the shape our loopvec emits for `u8 * u8 → i32` widening dot products.
+5. aarch64 `mla`/`mls`: new `VecALUModOp::{Mla,Mls}` variants (same
+   `vec_rrr_mod` encoding shape as `sdot` but with element-size bits; `.2d`
+   excluded — integer `mla`/`mls` have no i64-lane form), `mla`/`mls` helpers
+   in `inst.isle`, and `lower.isle` rules folding vector `iadd(acc, imul a, b)`
+   in either operand order plus `isub(acc, imul a, b)` (non-commutative, one
+   order only). The two `iadd` orders sit at distinct priorities (10/11) so
+   the ISLE overlap checker can prove them disjoint from each other and from
+   the scalar `madd`/`dot` folds; `iadd(imul, imul)` matches only the first,
+   leaving the second product as the accumulator operand.
+6. aarch64 `smlal`/`umlal` widening MAC: new `VecRRRLongModOp::{Smlal8,16,32}`
+   variants (`umlal` already existed for 8/16/32), helpers, and `lower.isle`
+   rules folding `iadd(acc, iadd(imul(widen_lo a, widen_lo b),
+   imul(widen_hi a, widen_hi b)))` into `smlal`+`smlal2` at priorities
+   12-15. Lane-exact because the inner `iadd` is elementwise; loopvec emits
+   this shape for widening dot products at i8→i16/i16→i32/i32→i64, i.e. the
+   widths with no `sdot`-family instruction.
+
 ## x64 PIC calls use PLT32
 
 `CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`

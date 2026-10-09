@@ -2289,7 +2289,10 @@ impl Inst {
                     VecALUModOp::Fmls => ("fmls", size),
                     // Note: the real operand arrangement is .4s, .16b, .16b;
                     // this debug print renders all lanes as .4s.
+                    VecALUModOp::Mla => ("mla", size),
+                    VecALUModOp::Mls => ("mls", size),
                     VecALUModOp::Sdot => ("sdot", VectorSize::Size32x4),
+                    VecALUModOp::Udot => ("udot", VectorSize::Size32x4),
                     VecALUModOp::Usdot => ("usdot", VectorSize::Size32x4),
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), size);
@@ -2394,6 +2397,24 @@ impl Inst {
                     }
                     (VecRRRLongModOp::Umlal32, true) => {
                         ("umlal2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongModOp::Smlal8, false) => {
+                        ("smlal", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongModOp::Smlal8, true) => {
+                        ("smlal2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongModOp::Smlal16, false) => {
+                        ("smlal", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongModOp::Smlal16, true) => {
+                        ("smlal2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongModOp::Smlal32, false) => {
+                        ("smlal", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongModOp::Smlal32, true) => {
+                        ("smlal2", VectorSize::Size64x2, VectorSize::Size32x4)
                     }
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), dest_size);

@@ -132,7 +132,31 @@
 (rule isub_imul (lower (isub (ty_int_ref_scalar_64_extract ty) x (imul _ y z)))
       (msub ty y z x))
 
+;; Fold `iadd` of a 64-bit product of widened 32-bit operands into
+;; `umaddl`/`smaddl`. Higher priority than the generic `madd` rules so the
+;; widen instructions are consumed; distinct priorities per operand order so
+;; the overlap checker can prove the symmetric rules disjoint.
+(rule 16 (lower (iadd $I64 (imul _ (uextend _ a @ (value_type $I32))
+                                  (uextend _ b @ (value_type $I32))) c))
+      (umaddl a b c))
+(rule 17 (lower (iadd $I64 c (imul _ (uextend _ a @ (value_type $I32))
+                                     (uextend _ b @ (value_type $I32)))))
+      (umaddl a b c))
+(rule 18 (lower (iadd $I64 (imul _ (sextend _ a @ (value_type $I32))
+                                  (sextend _ b @ (value_type $I32))) c))
+      (smaddl a b c))
+(rule 19 (lower (iadd $I64 c (imul _ (sextend _ a @ (value_type $I32))
+                                     (sextend _ b @ (value_type $I32)))))
+      (smaddl a b c))
+
 ;; vectors
+
+;; Fold a vector `iadd`/`imul` pair into `mla`; integer vectors only, and
+;; `mla` has no .2d form so i64x2 falls through to `mul`+`add`.
+(rule 10 (lower (iadd ty @ (and (multi_lane _ _) (not_i64x2)) (imul _ a b) c))
+      (mla ty c a b))
+(rule 11 (lower (iadd ty @ (and (multi_lane _ _) (not_i64x2)) c (imul _ a b)))
+      (mla ty c a b))
 
 (rule -2 (lower (iadd ty @ (multi_lane _ _) x y))
       (add_vec x y (vector_size ty)))
@@ -412,6 +436,21 @@
                         c))))
       (sdot c a b))
 
+;; Same tree with both operands widened unsigned: `udot` (also FEAT_DotProd).
+;; The u8*u8 products are unsigned, so they widen with `uwiden` too.
+(rule 8 (lower (and (use_dotprod)
+                    (has_type $I32X4
+                      (iadd _
+                        (iadd_pairwise _
+                          (iadd_pairwise _
+                            (uwiden_low _ lo @ (imul _ (uwiden_low _ a) (uwiden_low _ b)))
+                            (uwiden_high _ lo))
+                          (iadd_pairwise _
+                            (uwiden_low _ hi @ (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                            (uwiden_high _ hi)))
+                        c))))
+      (udot c a b))
+
 ;; With FEAT_I8MM, fold the same tree in its mixed unsigned-by-signed form
 ;; into a single `usdot`. This is the shape quantized inference produces —
 ;; unsigned activations against signed weights — and it differs from the
@@ -428,6 +467,51 @@
                             (swiden_high _ hi)))
                         c))))
       (usdot c a b))
+
+;; Widening multiply-accumulate (`smlal`/`umlal`) folds. Our loopvec emits
+;; `iadd(iadd_pairwise(imul(widen_lo a, widen_lo b), imul(widen_hi a, widen_hi b)),
+;;       acc)` for a widening dot product at widths where no dot instruction
+;; exists (i8→i16, i16→i32, i32→i64). Both halves accumulate into `acc`,
+;; which is exactly `smlal` + `smlal2`. At i64 lanes the pairwise merge is a
+;; plain `iadd` instead (`iadd_pairwise` is undefined there). Priority 12
+;; stays above the `sdot`-family and `mla` folds whose nested-opcode patterns
+;; the overlap checker cannot prove disjoint.
+(rule 12 (lower (has_type $I16X8
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal8 (smlal8 c a b false) a b true))
+(rule 13 (lower (has_type $I16X8
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal8 (umlal8 c a b false) a b true))
+(rule 12 (lower (has_type $I32X4
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal16 (smlal16 c a b false) a b true))
+(rule 14 (lower (has_type $I32X4
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal16 (umlal16 c a b false) a b true))
+(rule 12 (lower (has_type $I64X2
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal32 (smlal32 c a b false) a b true))
+(rule 15 (lower (has_type $I64X2
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal32 (umlal32 c a b false) a b true))
 
 ;;;; Rules for `iabs` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -823,6 +907,12 @@
       (sub_shift ty x y amt))
 
 ;; vectors
+
+;; Fold vector `isub`/`imul` into `mls`; `isub` is not commutative so only
+;; the product-as-subtrahend form folds. No .2d form (i64x2 falls through).
+(rule 10 (lower (isub ty @ (and (multi_lane _ _) (not_i64x2)) c (imul _ a b)))
+      (mls ty c a b))
+
 (rule -2 (lower (isub ty @ (multi_lane _ _) x y))
       (sub_vec x y (vector_size ty)))
 

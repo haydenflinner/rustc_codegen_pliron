@@ -2616,6 +2616,9 @@ impl MachInstEmit for Inst {
                     VecRRRLongModOp::Umlal8 => (0b1, 0b00, 0b0),
                     VecRRRLongModOp::Umlal16 => (0b1, 0b01, 0b0),
                     VecRRRLongModOp::Umlal32 => (0b1, 0b10, 0b0),
+                    VecRRRLongModOp::Smlal8 => (0b0, 0b00, 0b0),
+                    VecRRRLongModOp::Smlal16 => (0b0, 0b01, 0b0),
+                    VecRRRLongModOp::Smlal32 => (0b0, 0b10, 0b0),
                 };
                 sink.put4(enc_vec_rrr_long(
                     high_half as u32,
@@ -2754,7 +2757,7 @@ impl MachInstEmit for Inst {
                 size,
             } => {
                 debug_assert_eq!(rd.to_reg(), ri);
-                let (q, _enc_size) = size.enc_size();
+                let (q, enc_size) = size.enc_size();
 
                 let (top11, bit15_10) = match alu_op {
                     VecALUModOp::Bsl => (0b001_01110_01_1, 0b000111),
@@ -2769,9 +2772,24 @@ impl MachInstEmit for Inst {
                     // so it is baked into top11; only Q (from `size`) is variable.
                     // top11 (Q=0) | q<<9 with bit15_10 yields 0x4E809400 for .4S/.16B.
                     VecALUModOp::Sdot => (0b000_01110_10_0, 0b100101),
+                    // UDOT Vd.4S, Vn.16B, Vm.16B (FEAT_DotProd). Same as SDOT
+                    // but with the unsigned bit (bit 29) set — top11 +0b100000000.
+                    VecALUModOp::Udot => (0b001_01110_10_0, 0b100101),
                     // USDOT Vd.4S, Vn.16B, Vm.16B (FEAT_I8MM). Same shape as
                     // SDOT; only the opcode field differs.
                     VecALUModOp::Usdot => (0b000_01110_10_0, 0b100111),
+                    // MLA Vd.<T>, Vn.<T>, Vm.<T> — integer multiply-accumulate,
+                    // element size in bits 23:22 like `mul` (no .2d).
+                    VecALUModOp::Mla => {
+                        debug_assert_ne!(size, VectorSize::Size64x2);
+                        (0b000_01110_00_1 | enc_size << 1, 0b100101)
+                    }
+                    // MLS Vd.<T>, Vn.<T>, Vm.<T> — same as MLA but with the
+                    // unsigned bit (bit 29) set — top11 +0b100000000.
+                    VecALUModOp::Mls => {
+                        debug_assert_ne!(size, VectorSize::Size64x2);
+                        (0b001_01110_00_1 | enc_size << 1, 0b100101)
+                    }
                 };
                 sink.put4(enc_vec_rrr(top11 | q << 9, rm, bit15_10, rn, rd));
             }

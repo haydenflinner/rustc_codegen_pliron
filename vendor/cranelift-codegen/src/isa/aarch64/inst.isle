@@ -1851,8 +1851,14 @@
     (Fmla)
     ;; Floating-point fused multiply-subtract vectors
     (Fmls)
+    ;; Integer multiply-accumulate vectors
+    (Mla)
+    ;; Integer multiply-subtract vectors
+    (Mls)
     ;; Signed integer dot product (FEAT_DotProd)
     (Sdot)
+    ;; Unsigned integer dot product (FEAT_DotProd)
+    (Udot)
     ;; Unsigned-by-signed integer dot product (FEAT_I8MM)
     (Usdot)
 ))
@@ -1966,6 +1972,10 @@
     (Umlal8)
     (Umlal16)
     (Umlal32)
+    ;; Signed multiply add long
+    (Smlal8)
+    (Smlal16)
+    (Smlal32)
 ))
 
 ;; A vector operation on a pair of elements with one register.
@@ -3285,6 +3295,19 @@
 (decl umlal32 (Reg Reg Reg bool) Reg)
 (rule (umlal32 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal32) x y z high_half))
 
+;; Helpers for the remaining `smlal`/`umlal` widening multiply-accumulate
+;; forms (`x` is the accumulator as well as the destination).
+(decl smlal8 (Reg Reg Reg bool) Reg)
+(rule (smlal8 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal8) x y z high_half))
+(decl smlal16 (Reg Reg Reg bool) Reg)
+(rule (smlal16 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal16) x y z high_half))
+(decl smlal32 (Reg Reg Reg bool) Reg)
+(rule (smlal32 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal32) x y z high_half))
+(decl umlal8 (Reg Reg Reg bool) Reg)
+(rule (umlal8 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal8) x y z high_half))
+(decl umlal16 (Reg Reg Reg bool) Reg)
+(rule (umlal16 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal16) x y z high_half))
+
 ;; Helper for generating `smull8` instructions.
 (decl smull8 (Reg Reg bool) Reg)
 (rule (smull8 x y high_half) (vec_rrr_long (VecRRRLongOp.Smull8) x y high_half))
@@ -3508,6 +3531,24 @@
 (decl sdot (Reg Reg Reg) Reg)
 (rule (sdot acc a b)
       (vec_rrr_mod (VecALUModOp.Sdot) acc a b (VectorSize.Size32x4)))
+
+;; MLA Vd.<T>, Vn.<T>, Vm.<T> -- integer multiply-accumulate vectors;
+;; `acc` is both source and destination. Not available at .2d.
+(decl mla (Type Reg Reg Reg) Reg)
+(rule (mla ty acc a b)
+      (vec_rrr_mod (VecALUModOp.Mla) acc a b (vector_size ty)))
+
+;; MLS Vd.<T>, Vn.<T>, Vm.<T> -- integer multiply-subtract vectors;
+;; `acc` is both source and destination. Not available at .2d.
+(decl mls (Type Reg Reg Reg) Reg)
+(rule (mls ty acc a b)
+      (vec_rrr_mod (VecALUModOp.Mls) acc a b (vector_size ty)))
+
+;; UDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but both sources are read as
+;; unsigned bytes. `acc` is both source and destination; `a`/`b` are i8x16.
+(decl udot (Reg Reg Reg) Reg)
+(rule (udot acc a b)
+      (vec_rrr_mod (VecALUModOp.Udot) acc a b (VectorSize.Size32x4)))
 
 ;; USDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but the first source is read as
 ;; unsigned bytes and the second as signed. `acc` is both source and
