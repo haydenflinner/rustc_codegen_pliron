@@ -252,6 +252,38 @@ fn run_loop(
     }
     let mut ph_inst: Option<Inst> = None; // nb's jump terminator
 
+    // Constants are pure and rematerializable; leaving one in the body pins
+    // its dependents there via the `inv` operand check below.
+    let consts: Vec<Inst> = body
+        .iter()
+        .flat_map(|&b| func.layout.block_insts(b))
+        .filter(|&i| {
+            matches!(
+                func.dfg.insts[i].opcode(),
+                Opcode::Iconst | Opcode::F32const | Opcode::F64const | Opcode::Vconst
+            )
+        })
+        .collect();
+    for i in consts {
+        if n >= MAX_MOVES {
+            break;
+        }
+        if anchor.is_none() && ph_inst.is_none() {
+            // No plain-jump entry edge to hoist to; `try_call`
+            // edges can't take a normal trampoline.
+            let Some(nb) = split_edge(func, pinst, slot) else {
+                break;
+            };
+            ph_inst = func.layout.last_inst(nb);
+        }
+        if debug {
+            eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
+        }
+        func.layout.remove_inst(i);
+        func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
+        n += 1;
+    }
+
     // Two rounds: results of moved instructions are themselves outside the
     // loop, so a second scan exposes dependents (e.g. `a+b` after `a`).
     for _ in 0..2 {
