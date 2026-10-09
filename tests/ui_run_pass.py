@@ -134,12 +134,16 @@ def run_env(sp):
 def build_and_run(path, sp, exe, backend):
     """Returns (status, msg, run) where run is (rc, stdout, stderr) or None.
     Compile-only kinds emit an object (`--emit=obj`) and don't run it."""
-    cmd = ["rustc", os.path.abspath(path), "--edition", sp["edition"], "-Awarnings", "-Ccodegen-units=1"]
+    cmd = ["rustc", os.path.abspath(path), "-Awarnings", "-Ccodegen-units=1"]
+    # A `--edition` in compile-flags wins; rustc rejects duplicates.
+    if not any(f == "--edition" or f.startswith("--edition=") for f in sp["cflags"]):
+        cmd += ["--edition", sp["edition"]]
     if backend:
         cmd += [BE] + WILD + EXTRA
     else:
         cmd += EXTRA
-    # check-fail/-pass and undirected files stop at codegen; build-pass links.
+    # check-fail/-pass and undirected files stop at codegen; build-pass links
+    # but like compiletest does not run the artifact.
     emit = ["-o", exe] if sp["kind"] in ("run-pass", "run-fail", "build-pass") else ["--emit=obj", "-o", exe]
     cmd += sp["cflags"] + emit
     cenv = dict(os.environ)
@@ -155,7 +159,7 @@ def build_and_run(path, sp, exe, backend):
         return (*classify_compile(c.stderr), None)
     if not os.path.exists(exe):
         return "skipped", "no output produced", None
-    if "--emit=obj" in emit:
+    if sp["kind"] not in ("run-pass", "run-fail"):
         return "compiled", "", (0, "", "")
     return exec_bin(path, sp, exe)
 
@@ -166,6 +170,8 @@ def exec_bin(path, sp, exe):
                            timeout=60, cwd=os.path.dirname(path), env=run_env(sp))
     except subprocess.TimeoutExpired:
         return "run-timeout", "", None
+    except OSError as e:
+        return "run-error", str(e), None
     # Normalize the invoked path and panic thread ids so argv[0]/current_exe
     # prints and panic lines compare equal.
     out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
@@ -173,7 +179,7 @@ def exec_bin(path, sp, exe):
     return "ran", "", (r.returncode, out, err)
 
 
-STOCK_CACHE_VERSION = 3  # bump when normalization or comparison semantics change
+STOCK_CACHE_VERSION = 5  # bump when normalization or comparison semantics change
 
 
 def stock_result(path, sp):
