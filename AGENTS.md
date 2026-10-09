@@ -42,6 +42,13 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   unsupported by cranelift-aarch64, but rustc never emits on-stack indirect
   args for AAPCS64.
 - The asm test covers x86-64 and aarch64; PLIRON_HOT is x86-64/ELF only.
+- Cross-target codegen: cranelift-codegen is built `host-arch`-only
+  (Cargo.toml), so the dylib can't emit other architectures —
+  `error: cranelift: Support for this target is disabled`. Flip to
+  `all-arch` to cross-compile (x86_64-apple-darwin links via ld64 and runs
+  under Rosetta; x86_64-macho `__eh_frame` uses SUBTRACTOR+UNSIGNED pairs,
+  see src/eh/mod.rs). Still needs the target std component and a target
+  linker (mold for ELF).
 - Self-hosting: `selfhost/setup.sh [RUST_CHECKOUT] [WORKTREE]` creates a
   worktree at the pinned nightly commit, applies `bootstrap.patch`, and
   rsyncs this repo into `compiler/rustc_codegen_pliron`. Defaults: sibling
