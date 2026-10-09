@@ -28,6 +28,9 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   sibling `mold` checkout built with `cargo build --release`) and runs it
   under docker/qemu when available — the pure-Rust link path, since mold is
   ELF-only (no Mach-O)
+- `harness/run.py [--tier 0|1] [--accept]` — runs suites (smoke with
+  stock-rustc output diff, object determinism, ui) and fails on regressions
+  against `harness/expectations/`; plan and status in `test-harness.md`
 - `tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]` — runs directive-free
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)

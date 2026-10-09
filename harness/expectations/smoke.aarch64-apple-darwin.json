@@ -1,0 +1,13 @@
+{
+"asm@O": "noref",
+"asm@O0": "noref",
+"nostd@O": "pass",
+"nostd@O0": "pass",
+"proc_macro": "pass",
+"std@O": "pass",
+"std@O0": "pass",
+"unroll@O": "pass",
+"unroll@O0": "pass",
+"unwind@O": "pass",
+"unwind@O0": "pass"
+}
