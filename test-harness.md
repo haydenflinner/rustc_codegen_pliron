@@ -291,7 +291,20 @@ there instead of in the cwd.
   hf/tf ops and the sysroot lacks `__*hf*`/`__*tf*` builtins) instead
   of emitting invalid wasm.
 - wasm `wloop_opt` (in-flight loopopt: `mk_pre`/`loop_licm`/
-  `loop_indvars`/`wdce`) briefly hung `sum_squares` — stale
+  `loop_indvars`/`wunroll`/`wdce`) briefly hung `sum_squares` — stale
   `cfg.def_block` after inst motion; a live `defb` map fixed it.
   Debug: `PLIRON_WASM_WLOOP=0` gates the pass, `PLIRON_WASM_LOOPS=<pat>`
-  dumps pre/post bodies for functions whose name contains <pat>.
+  dumps pre/post bodies for functions whose name contains <pat>,
+  `PLIRON_WASM_UNROLL=<n>` sets the innermost-loop unroll factor
+  (default 4), and `PLIRON_WASM_TRIP=<n>` splices a shared
+  `env.__pliron_trip` counter check onto every latch edge — a loop
+  spinning past `n` back-edges traps `unreachable` and the RuntimeError
+  names the function (pliron-wasm-ld synthesizes the import into one
+  module-wide mutable global).
+- ui-wasm second full run (21,482 files, HEAD incl. `wunroll`):
+  16,508 pass, 4,882 skipped, and **zero run-timeouts** — the 20
+  libtest `#[test]`-binary hangs from run 1 came from a sysroot built
+  mid-wloop-development; a HEAD rebuild runs them clean. Remaining divergences are all classified: 12 simd
+  run-fails (v128 gap), 2 output-mismatch (pointer prints), 1
+  stderr-mismatch (panic path), 1 accepted (tail-call). Baseline
+  committed at `harness/expectations/ui-wasm.aarch64-apple-darwin.json`.
