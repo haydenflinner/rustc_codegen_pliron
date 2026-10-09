@@ -14,7 +14,7 @@
 //! use, so otherwise it re-extends the already-`movzx`ed register.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -232,6 +232,207 @@ fn is01(func: &Function, v: Value, depth: u32) -> bool {
                 .is_some_and(|(x, k)| k == 1 && is01(func, x, depth - 1)))
 }
 
+/// `v` as a constant lane: `iconst` or `splat (iconst)`, sign-extended.
+fn lane_const(func: &Function, v: Value) -> Option<i64> {
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.insts[func.dfg.value_def(v).inst()?] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => Some(imm.bits()),
+        InstructionData::Unary {
+            opcode: Opcode::Splat,
+            arg,
+        } => iconst(func, arg),
+        _ => None,
+    }
+}
+
+/// Same value, or same constant bit-pattern in `w` bits.
+fn same_lane(func: &Function, a: Value, b: Value, w: u32) -> bool {
+    let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+    if a == b {
+        return true;
+    }
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    match (lane_const(func, a), lane_const(func, b)) {
+        (Some(x), Some(y)) => (x as u64 & mask) == (y as u64 & mask),
+        _ => false,
+    }
+}
+
+/// `v` as `min_or_max(x, k)` → `(op, x, k)` with the constant second.
+fn minmax_k(func: &Function, v: Value) -> Option<(Opcode, Value, i64)> {
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    if !matches!(
+        opcode,
+        Opcode::Umin | Opcode::Umax | Opcode::Smin | Opcode::Smax
+    ) {
+        return None;
+    }
+    let (a, b) = (args[0], args[1]);
+    if let Some(k) = lane_const(func, b) {
+        Some((opcode, a, k))
+    } else {
+        lane_const(func, a).map(|k| (opcode, b, k))
+    }
+}
+
+/// `select|bitselect (icmp cc x, y) t, f` folds to integer min/max — the
+/// vendored egraph knows the one-level forms but not the nested clamp idiom
+/// `x < lo ? lo : min(x, hi)` (needs a `lo <= hi` proof), and folding here
+/// lets loopvec emit `umin`/`umax` directly instead of `icmp`+`bitselect`.
+fn minmax(pos: &mut FuncCursor, inst: Inst) -> bool {
+    let f = &*pos.func;
+    let InstructionData::Ternary { opcode, args } = f.dfg.insts[inst] else {
+        return false;
+    };
+    if !matches!(opcode, Opcode::Select | Opcode::Bitselect) {
+        return false;
+    }
+    let ty = f.dfg.value_type(f.dfg.first_result(inst));
+    let w = if ty.is_vector() {
+        ty.lane_bits()
+    } else {
+        ty.bits()
+    };
+    if !ty.lane_type().is_int() || w > 64 {
+        return false;
+    }
+    let [c, t, fv] = args;
+    let Some(ci) = f.dfg.value_def(f.dfg.resolve_aliases(c)).inst() else {
+        return false;
+    };
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond: cc,
+        args: [a, b],
+    } = f.dfg.insts[ci]
+    else {
+        return false;
+    };
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let ku = |k: i64| k as u64 & mask;
+    let ks = |k: i64| ((k as u64 & mask) << (64 - w) as i64) >> (64 - w);
+
+    // select(icmp cc a b, t, f): try both arm orders — swapping arms and
+    // complementing cc is the same function.
+    for (tt, ff, cc) in [(t, fv, cc), (fv, t, cc.complement())] {
+        // select(x < y ? x : y) = min etc.
+        let direct = if same_lane(f, tt, a, w) && same_lane(f, ff, b, w) {
+            Some(match cc {
+                IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => Opcode::Umin,
+                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => {
+                    Opcode::Umax
+                }
+                IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual => Opcode::Smin,
+                IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual => {
+                    Opcode::Smax
+                }
+                _ => continue,
+            })
+        } else {
+            None
+        };
+        if let Some(op) = direct {
+            let (a, b) = (a, b);
+            let r = pos.func.replace(inst);
+            match op {
+                Opcode::Umin => r.umin(a, b),
+                Opcode::Umax => r.umax(a, b),
+                Opcode::Smin => r.smin(a, b),
+                _ => r.smax(a, b),
+            };
+            return true;
+        }
+    }
+
+    // Nested clamp: select(icmp cc x, K1) K1, minmax(x, K2).
+    // Normalize so the icmp's constant is the rhs.
+    let (mut x, mut k1v, mut cc) = (a, b, cc);
+    if lane_const(f, x).is_some() && lane_const(f, k1v).is_none() {
+        (x, k1v) = (k1v, x);
+        cc = cc.swap_args();
+    }
+    let Some(k1) = lane_const(f, k1v) else {
+        return false;
+    };
+    for (tt, ff, cc) in [(t, fv, cc), (fv, t, cc.complement())] {
+        if lane_const(f, tt).map_or(true, |k| ku(k) != ku(k1)) {
+            continue;
+        }
+        let Some((mop, mx, k2)) = minmax_k(f, ff) else {
+            continue;
+        };
+        if f.dfg.resolve_aliases(mx) != f.dfg.resolve_aliases(x) {
+            continue;
+        }
+        // `x < K1 ? K1 : min(x, K2)` = max(min(x,K2), K1) iff K1 <= K2, etc.
+        // The inner min/max must share the icmp's signedness — a mixed
+        // signedness changes the result for negative or high-bit lanes.
+        let signed = matches!(
+            cc,
+            IntCC::SignedLessThan
+                | IntCC::SignedLessThanOrEqual
+                | IntCC::SignedGreaterThan
+                | IntCC::SignedGreaterThanOrEqual
+        );
+        if signed != matches!(mop, Opcode::Smin | Opcode::Smax) {
+            continue;
+        }
+        let less = match cc {
+            IntCC::UnsignedLessThan
+            | IntCC::UnsignedLessThanOrEqual
+            | IntCC::SignedLessThan
+            | IntCC::SignedLessThanOrEqual => true,
+            IntCC::UnsignedGreaterThan
+            | IntCC::UnsignedGreaterThanOrEqual
+            | IntCC::SignedGreaterThan
+            | IntCC::SignedGreaterThanOrEqual => false,
+            _ => continue,
+        };
+        let (le12, ge12) = if signed {
+            (ks(k1) <= ks(k2), ks(k1) >= ks(k2))
+        } else {
+            (ku(k1) <= ku(k2), ku(k1) >= ku(k2))
+        };
+        let (min_op, max_op) = if signed {
+            (Opcode::Smin, Opcode::Smax)
+        } else {
+            (Opcode::Umin, Opcode::Umax)
+        };
+        let want_min = mop == min_op;
+        // x<K ? K : min(x,K2) -> max(inner,K)   [K<=K2]
+        // x>K ? K : min(x,K2) -> min(x,K)      [K<=K2]
+        // x<K ? K : max(x,K2) -> max(x,K)      [K>=K2]
+        // x>K ? K : max(x,K2) -> min(inner,K)  [K>=K2]
+        let new = if less && want_min && le12 {
+            Some((max_op, ff, tt))
+        } else if !less && want_min && le12 {
+            Some((min_op, x, tt))
+        } else if less && !want_min && ge12 {
+            Some((max_op, x, tt))
+        } else if !less && !want_min && ge12 {
+            Some((min_op, ff, tt))
+        } else {
+            None
+        };
+        let Some((op, a1, a2)) = new else { continue };
+        let r = pos.func.replace(inst);
+        match op {
+            Opcode::Umin => r.umin(a1, a2),
+            Opcode::Umax => r.umax(a1, a2),
+            Opcode::Smin => r.smin(a1, a2),
+            _ => r.smax(a1, a2),
+        };
+        return true;
+    }
+    false
+}
+
 /// `brif (bxor (band c, 1), 1), a, b` (rustc's `!bool` after `i1`
 /// normalization) becomes `brif c, b, a`.
 fn brif_not(func: &mut Function, inst: Inst) -> bool {
@@ -284,6 +485,15 @@ pub fn run(func: &mut Function) -> usize {
             } = pos.func.dfg.insts[inst]
             {
                 if widen_on() && widen(&mut pos, inst, arg) {
+                    n += 1;
+                }
+                continue;
+            }
+            if matches!(
+                pos.func.dfg.insts[inst].opcode(),
+                Opcode::Select | Opcode::Bitselect
+            ) {
+                if crate::pass_enabled("PLIRON_MINMAX") && minmax(&mut pos, inst) {
                     n += 1;
                 }
                 continue;
