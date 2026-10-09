@@ -300,6 +300,7 @@ pub fn lower_to_object(
         let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
+        let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
         let nowrite: FxHashMap<FuncRef, bool>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
@@ -327,6 +328,7 @@ pub fn lower_to_object(
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
+                deref: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
                 va_buf: None,
                 va_fids: FxHashMap::default(),
@@ -338,6 +340,7 @@ pub fn lower_to_object(
             derived = std::mem::take(&mut fl.derived);
             frozen = std::mem::take(&mut fl.frozen);
             noalias = std::mem::take(&mut fl.noalias);
+            deref = std::mem::take(&mut fl.deref);
             nowrite = std::mem::take(&mut fl.nowrite);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
@@ -968,6 +971,8 @@ struct FnLower<'a, 'b, 'tcx> {
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
     /// Entry params rustc marks `noalias`.
     noalias: FxHashSet<cranelift_codegen::ir::Value>,
+    /// `noalias` params' (dereferenceable bytes, writable) — 0 bytes = unknown.
+    deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>,
     /// FuncRefs of calls to write-free functions (nowrite.rs).
     nowrite: FxHashMap<FuncRef, bool>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
@@ -1036,8 +1041,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             {
                 self.frozen.insert(params[i], s);
             }
-            if n == 1 && self.st.noalias.contains(&arg) {
+            // `noalias` applies to the pointee; for wide refs (`&mut [T]`,
+            // `&mut dyn`) the first leaf is the data pointer.
+            if n >= 1
+                && let Some(&(d, w)) = self.st.noalias.get(&arg)
+            {
                 self.noalias.insert(params[i]);
+                self.deref.insert(params[i], (d, w));
             }
             self.vals.insert(arg, params[i..i + n].into());
             i += n;

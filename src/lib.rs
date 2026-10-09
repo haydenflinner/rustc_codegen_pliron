@@ -249,7 +249,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             st.frozen = context::frozen_values(ctx, st).into_iter().collect();
         }
         if pass_enabled("PLIRON_NOALIAS_FWD") {
-            st.noalias = context::noalias_values(ctx, st).into_iter().collect();
+            st.noalias = context::noalias_values(ctx, st)
+                .into_iter()
+                .map(|(v, d, w)| (v, (d, w)))
+                .collect();
         }
         inline::run(ctx, st, small, None, false);
         domcheck::run(ctx, st, "inline");

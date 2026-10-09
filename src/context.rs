@@ -36,7 +36,7 @@ use rustc_target::spec::{HasTargetSpec, Target};
 
 use crate::types::{TyK, classify};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConstVal {
     /// Raw little-endian bits of a scalar of the value's type.
     Bits(u128),
@@ -87,8 +87,9 @@ pub struct FuncInfo {
     /// (param index, dereferenceable bytes), valid when the function has
     /// `nparams` params.
     pub frozen: Vec<(usize, u64)>,
-    /// Params rustc marks `noalias`, by the same backend index as `frozen`.
-    pub noalias: Vec<usize>,
+    /// Params rustc marks `noalias`, by the same backend index as `frozen`:
+    /// (param index, pointee size when rustc knows it, not `readonly`).
+    pub noalias: Vec<(usize, u64, bool)>,
     pub nparams: usize,
 }
 
@@ -153,8 +154,9 @@ pub struct State<'tcx> {
     /// Entry params of local functions that point at frozen memory, with
     /// their dereferenceable size (see `FuncInfo::frozen`).
     pub frozen: FxHashMap<Value, u64>,
-    /// Entry params of local functions that rustc marks `noalias`.
-    pub noalias: rustc_data_structures::fx::FxHashSet<Value>,
+    /// Entry params of local functions that rustc marks `noalias`:
+    /// (dereferenceable bytes when known, writable when not `readonly`).
+    pub noalias: rustc_data_structures::fx::FxHashMap<Value, (u64, bool)>,
     /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
     pub nowrite: rustc_data_structures::fx::FxHashMap<String, bool>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
@@ -182,6 +184,16 @@ pub struct State<'tcx> {
     pub unreach: bool,
     /// Run `taildup` on each lowered Cranelift function (`PLIRON_TAILDUP=0` disables).
     pub taildup: bool,
+    /// LICM on each lowered Cranelift function (`-O`, `PLIRON_LICM`).
+    pub licm: bool,
+    /// IV strength reduction (`-O`, `PLIRON_INDUCT`).
+    pub indvars: bool,
+    /// Loop -> memset/memcpy idiom (`-O`, `PLIRON_IDIOM`).
+    pub loopidiom: bool,
+    /// Elementwise loop vectorizer (`-O`, `PLIRON_VEC`; SIMD targets only).
+    pub loopvec: bool,
+    /// Store-group SLP vectorizer (`-O`, `PLIRON_SLP`; SIMD targets only).
+    pub slp: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
@@ -767,7 +779,7 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
 
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of
 /// `fn_decl_backend_type`), and the backend param count.
-fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<usize>, usize) {
+fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<(usize, u64, bool)>, usize) {
     use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
     let size = |a: &ArgAttributes| {
         let n = a.pointee_size.bytes();
@@ -800,8 +812,12 @@ fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<usize>, 
         if let Some(s) = a.and_then(size) {
             v.push((i, s));
         }
-        if a.is_some_and(|a| a.regular.contains(A::NoAlias)) {
-            na.push(i);
+        if let Some(a) = a.filter(|a| a.regular.contains(A::NoAlias)) {
+            na.push((
+                i,
+                a.pointee_size.bytes(),
+                !a.regular.contains(A::ReadOnly),
+            ));
         }
         i += n;
     }
@@ -809,7 +825,23 @@ fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<usize>, 
 }
 
 /// Entry-block params of bodies in this module that rustc marks `noalias`.
-pub fn noalias_values(ctx: &Context, st: &State<'_>) -> Vec<Value> {
+/// Entry-block params of bodies in this module that rustc marks `noalias`.
+/// `f.noalias`/`f.frozen` hold per-leaf indices into the flattened
+/// signature while a fat pliron arg covers several leaves; map each leaf
+/// index to its pliron arg. `None` if the leaf counts disagree.
+fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<Value> {
+    let mut off = 0usize;
+    for a in e.deref(ctx).arguments() {
+        let n = crate::types::leaves(ctx, a.get_type(ctx)).len();
+        if leaf >= off && leaf < off + n {
+            return Some(a);
+        }
+        off += n;
+    }
+    None
+}
+
+pub fn noalias_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64, bool)> {
     let mut out = Vec::new();
     for f in st.funcs.values() {
         if f.noalias.is_empty() {
@@ -819,11 +851,11 @@ pub fn noalias_values(ctx: &Context, st: &State<'_>) -> Vec<Value> {
         else {
             continue;
         };
-        let args: Vec<Value> = e.deref(ctx).arguments().collect();
-        if args.len() != f.nparams {
-            continue;
-        }
-        out.extend(f.noalias.iter().map(|&i| args[i]));
+        out.extend(
+            f.noalias
+                .iter()
+                .filter_map(|&(i, d, w)| leaf_arg(ctx, e, i).map(|a| (a, d, w))),
+        );
     }
     out
 }
@@ -839,11 +871,11 @@ pub fn frozen_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64)> {
         else {
             continue;
         };
-        let args: Vec<Value> = e.deref(ctx).arguments().collect();
-        if args.len() != f.nparams {
-            continue;
-        }
-        out.extend(f.frozen.iter().map(|&(i, s)| (args[i], s)));
+        out.extend(
+            f.frozen
+                .iter()
+                .filter_map(|&(i, s)| leaf_arg(ctx, e, i).map(|a| (a, s))),
+        );
     }
     out
 }
