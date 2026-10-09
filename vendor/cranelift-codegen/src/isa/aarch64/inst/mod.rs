@@ -349,6 +349,9 @@ fn pairmemarg_operands(pairmemarg: &mut PairAMode, collector: &mut impl OperandV
         PairAMode::SignedOffset { reg, .. } => {
             collector.reg_use(reg);
         }
+        PairAMode::PostIndex { reg, .. } => {
+            collector.reg_use(reg);
+        }
         PairAMode::SPPreIndexed { .. } | PairAMode::SPPostIndexed { .. } => {}
     }
 }

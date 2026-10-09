@@ -420,6 +420,11 @@ impl PrettyPrint for PairAMode {
                     format!("[{reg}]")
                 }
             }
+            &PairAMode::PostIndex { reg, simm7 } => {
+                let reg = pretty_print_reg(reg);
+                let simm7 = simm7.pretty_print(8);
+                format!("[{reg}], {simm7}")
+            }
             &PairAMode::SPPreIndexed { simm7 } => {
                 let simm7 = simm7.pretty_print(8);
                 format!("[sp, {simm7}]!")

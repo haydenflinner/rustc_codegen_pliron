@@ -1511,6 +1511,14 @@
     (reg Reg)
     (simm7 SImm7Scaled))
 
+  ;; Post-increment a general register after address computation.
+  ;; Only created post-allocation (by emit-time rewriting), so the
+  ;; writeback carries no regalloc metadata; the def is implied to be
+  ;; the same reg as the use.
+  (PostIndex
+    (reg Reg)
+    (simm7 SImm7Scaled))
+
   ;; Pre-increment register before address computation.
   (SPPreIndexed (simm7 SImm7Scaled))
 

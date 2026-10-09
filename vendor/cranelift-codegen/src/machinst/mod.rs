@@ -564,6 +564,24 @@ pub trait MachInstEmit: MachInst {
     fn pair_fusion_crossable(&self) -> bool {
         false
     }
+
+    /// If this is a load/store-pair on a signed-offset register base,
+    /// return `(base, byte_offset, scale_ty)`: the writeback immediate
+    /// for a post-indexed form must be a multiple of `scale_ty`'s size.
+    fn pair_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+        None
+    }
+
+    /// Rewrite this instruction to access `[base]` and write back
+    /// `base + wb` bytes (post-indexed addressing). `wb` must have been
+    /// validated by the caller.
+    fn set_post_index(&mut self, _wb: i64) {}
+
+    /// If this instruction is `add rd, rn, #imm` with `rd == rn`,
+    /// return `(rn, imm)`.
+    fn self_add_imm(&self) -> Option<(Reg, i64)> {
+        None
+    }
 }
 
 /// A trait describing the emission state carried between MachInsts when

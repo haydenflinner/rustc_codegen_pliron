@@ -1224,6 +1224,10 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_pair(0b1010100010, simm7, reg, rt, rt2));
                     }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I64);
+                        sink.put4(enc_ldst_pair(0b1010100010, simm7, reg, rt, rt2));
+                    }
                 }
             }
             &Inst::LoadP64 {
@@ -1253,6 +1257,10 @@ impl MachInstEmit for Inst {
                     &PairAMode::SPPostIndexed { simm7 } => {
                         assert_eq!(simm7.scale_ty, I64);
                         let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b1010100011, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I64);
                         sink.put4(enc_ldst_pair(0b1010100011, simm7, reg, rt, rt2));
                     }
                 }
@@ -1299,6 +1307,10 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_vec_pair(opc, 0b01, true, simm7, reg, rt, rt2));
                     }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert!(simm7.scale_ty == F64 || simm7.scale_ty == I8X16);
+                        sink.put4(enc_ldst_vec_pair(opc, 0b01, true, simm7, reg, rt, rt2));
+                    }
                 }
             }
             &Inst::FpuStoreP64 {
@@ -1339,6 +1351,10 @@ impl MachInstEmit for Inst {
                     &PairAMode::SPPostIndexed { simm7 } => {
                         assert!(simm7.scale_ty == F64 || simm7.scale_ty == I8X16);
                         let reg = stack_reg();
+                        sink.put4(enc_ldst_vec_pair(opc, 0b01, false, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert!(simm7.scale_ty == F64 || simm7.scale_ty == I8X16);
                         sink.put4(enc_ldst_vec_pair(opc, 0b01, false, simm7, reg, rt, rt2));
                     }
                 }
@@ -3878,6 +3894,57 @@ impl MachInstEmit for Inst {
                 | Inst::VecTbl { .. }
                 | Inst::VecTblExt { .. }
         )
+    }
+
+    fn pair_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+        // A pair inst on a plain signed-offset amode: (base reg, byte
+        // offset, scale type for writeback immediates).
+        let (mem, ty) = match self {
+            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => (mem, I64),
+            Inst::FpuLoadP64 { mem, .. } | Inst::FpuStoreP64 { mem, .. } => (mem, F64),
+            Inst::FpuLoadP128 { mem, .. } | Inst::FpuStoreP128 { mem, .. } => (mem, I8X16),
+            _ => return None,
+        };
+        match mem {
+            &PairAMode::SignedOffset { reg, simm7 } => {
+                Some((reg, i64::from(simm7.value), ty))
+            }
+            _ => None,
+        }
+    }
+
+    fn set_post_index(&mut self, wb: i64) {
+        let mem = match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => mem,
+            _ => return,
+        };
+        if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+            let simm7 = SImm7Scaled::maybe_from_i64(wb, simm7.scale_ty)
+                .expect("post-index writeback out of range");
+            *mem = PairAMode::PostIndex { reg, simm7 };
+        }
+    }
+
+    fn self_add_imm(&self) -> Option<(Reg, i64)> {
+        match self {
+            Inst::AluRRImm12 {
+                alu_op,
+                rd,
+                rn,
+                imm12,
+                ..
+            } if rd.to_reg() == *rn => match alu_op {
+                ALUOp::Add => Some((*rn, i64::from(imm12.value()))),
+                ALUOp::Sub => Some((*rn, -i64::from(imm12.value()))),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 

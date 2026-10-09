@@ -27,7 +27,7 @@ use crate::{LabelValueLoc, ValueLocRange};
 use crate::{machinst::*, trace_log_enabled};
 use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstPosition, InstRange, Operand,
-    OperandConstraint, OperandKind, PRegSet, ProgPoint, RegClass,
+    OperandConstraint, OperandKind, PReg, PRegSet, ProgPoint, RegClass,
 };
 
 use crate::HashMap;
@@ -945,6 +945,215 @@ impl<I: VCodeInst> VCode<I> {
 
             let items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
+
+            // Apply allocations eagerly: the peepholes below inspect
+            // physical registers, and `preg_ops` must be fully
+            // populated before their hazard checks run.
+            for it in &items {
+                if let &InstOrEdit::Inst(iix) = it {
+                    if !applied[iix.index()] {
+                        apply_allocs(&mut self.insts, &mut preg_ops, iix);
+                        applied[iix.index()] = true;
+                    }
+                }
+            }
+
+            // Pair fusion (e.g. `ldp`/`stp`): the partner must follow
+            // with no regalloc edit between them — a move there could
+            // clobber either inst's registers. A gap of pure-ALU insts
+            // is also fine: the fused inst can emit at either end of
+            // the gap as long as no gap inst touches a register the
+            // pair touches, reads one it defines, or (partner-up) is
+            // read by the partner after this inst's defs land.
+            for k in 0..items.len() {
+                let InstOrEdit::Inst(iix) = items[k] else {
+                    continue;
+                };
+                if squashed[iix.index()] {
+                    continue;
+                }
+                let mut j = k + 1;
+                let mut gap: SmallVec<[InsnIndex; 8]> = smallvec![];
+                'fuse: loop {
+                    let Some(&InstOrEdit::Inst(nix)) = items.get(j) else {
+                        break;
+                    };
+                    if squashed[nix.index()] {
+                        break;
+                    }
+                    if let Some(fused) = self.insts[iix.index()]
+                        .fuse_with_next(&self.insts[nix.index()])
+                    {
+                        if gap.is_empty() {
+                            self.insts[iix.index()] = fused;
+                            self.insts[nix.index()] = I::gen_nop(0);
+                            squashed[nix.index()] = true;
+                            break 'fuse;
+                        }
+                        // Two placements: the pair can emit early at
+                        // iix's slot (partner moves up) or late at
+                        // nix's slot (this inst moves down). The
+                        // typical demand-lowered order `fmul; str`
+                        // needs the down placement — the partner's
+                        // producers sit in the gap.
+                        let (pu, pd) = &preg_ops[iix.index()];
+                        let (pu2, pd2) = &preg_ops[nix.index()];
+                        // Partner up: no gap inst may write a reg the
+                        // partner touches, nor read one the partner
+                        // defines. The partner also can't read this
+                        // inst's defs — pair operands are read before
+                        // either def lands.
+                        let ok_up = !pu2.iter().any(|r| pd.contains(r))
+                            && gap.iter().all(|&b| {
+                                let (bu, bd) = &preg_ops[b.index()];
+                                !bd.iter().any(|r| {
+                                    pu2.contains(r) || pd2.contains(r)
+                                }) && !bu.iter().any(|r| pd2.contains(r))
+                            });
+                        // This inst down: no gap inst may write a reg
+                        // this inst touches, nor read one this inst
+                        // defines — and the partner may not read this
+                        // inst's defs either.
+                        let ok_down = !pu2.iter().any(|r| pd.contains(r))
+                            && gap.iter().all(|&b| {
+                                let (bu, bd) = &preg_ops[b.index()];
+                                !bd.iter().any(|r| {
+                                    pu.contains(r) || pd.contains(r)
+                                }) && !bu.iter().any(|r| pd.contains(r))
+                            });
+                        if ok_down {
+                            // Union operand sets onto the surviving
+                            // slot so the post-index sweep sees the
+                            // pair's full register footprint.
+                            let (u, d) = preg_ops[iix.index()].clone();
+                            let (u2, d2) = &mut preg_ops[nix.index()];
+                            for r in u.iter().chain(d.iter()) {
+                                if !u2.contains(r) && !d2.contains(r) {
+                                    u2.push(*r);
+                                }
+                            }
+                            self.insts[iix.index()] = I::gen_nop(0);
+                            self.insts[nix.index()] = fused;
+                            squashed[iix.index()] = true;
+                        } else if ok_up {
+                            let (u2, d2) = preg_ops[nix.index()].clone();
+                            let (u, d) = &mut preg_ops[iix.index()];
+                            for r in u2.iter().chain(d2.iter()) {
+                                if !u.contains(r) && !d.contains(r) {
+                                    u.push(*r);
+                                }
+                            }
+                            self.insts[iix.index()] = fused;
+                            self.insts[nix.index()] = I::gen_nop(0);
+                            squashed[nix.index()] = true;
+                        }
+                        break 'fuse;
+                    }
+                    if !self.insts[nix.index()].pair_fusion_crossable() {
+                        break;
+                    }
+                    gap.push(nix);
+                    j += 1;
+                    if gap.len() > 8 {
+                        break;
+                    }
+                }
+            }
+
+            // Post-index rewrite: a run of load/store pairs on one
+            // base at successive offsets, followed by
+            // `add base, base, #C`, folds the pointer bump into
+            // post-indexed pair writebacks — each pair keeps its
+            // access address since `wb_i = o_{i+1} - o_i` telescopes,
+            // the last taking `C - o_n` — and the add is deleted.
+            // Between the first pair and the add, the base may only
+            // be read by chain pairs (their offsets anchor the write-
+            // back chain) and written by the add itself.
+            for i in 0..items.len() {
+                let InstOrEdit::Inst(iix) = items[i] else {
+                    continue;
+                };
+                if squashed[iix.index()] {
+                    continue;
+                }
+                let Some((base, off, ty)) = self.insts[iix.index()].pair_signed_offset()
+                else {
+                    continue;
+                };
+                // Post-indexed access is always `[base]` — the chain
+                // must start at offset 0.
+                if off != 0 {
+                    continue;
+                }
+                let mut chain: SmallVec<[(InsnIndex, i64, Type); 8]> =
+                    smallvec![(iix, off, ty)];
+                let mut add_ix = None;
+                let mut j = i + 1;
+                let mut budget = 64;
+                while j < items.len() && budget > 0 {
+                    match items[j] {
+                        InstOrEdit::Edit(Edit::Move { from, to }) => {
+                            let base_p = base.to_real_reg().map(PReg::from);
+                            if from.as_reg() == base_p || to.as_reg() == base_p {
+                                break;
+                            }
+                        }
+                        InstOrEdit::Inst(jix) => {
+                            if squashed[jix.index()] {
+                                j += 1;
+                                continue;
+                            }
+                            let (uses, defs) = &preg_ops[jix.index()];
+                            if defs.iter().any(|r| *r == base) {
+                                if let Some((r, _)) =
+                                    self.insts[jix.index()].self_add_imm()
+                                    && r == base
+                                {
+                                    add_ix = Some(jix);
+                                }
+                                break;
+                            }
+                            if uses.iter().any(|r| *r == base) {
+                                match self.insts[jix.index()].pair_signed_offset() {
+                                    Some((r, o, ty)) if r == base => {
+                                        chain.push((jix, o, ty));
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+                    j += 1;
+                    budget -= 1;
+                }
+                let Some(add_ix) = add_ix else { continue };
+                let Some((_, c)) = self.insts[add_ix.index()].self_add_imm()
+                else {
+                    continue;
+                };
+                let n = chain.len();
+                let mut wbs: SmallVec<[i64; 8]> = SmallVec::new();
+                for m in 0..n {
+                    let next = if m + 1 < n { chain[m + 1].1 } else { c };
+                    let wb = next - chain[m].1;
+                    let s = i64::from(chain[m].2.bytes());
+                    if wb % s != 0 || !(-64 * s..=63 * s).contains(&wb) {
+                        wbs.clear();
+                        break;
+                    }
+                    wbs.push(wb);
+                }
+                if wbs.len() != n {
+                    continue;
+                }
+                for (m, &(ix, _, _)) in chain.iter().enumerate() {
+                    self.insts[ix.index()].set_post_index(wbs[m]);
+                    preg_ops[ix.index()].1.push(base);
+                }
+                self.insts[add_ix.index()] = I::gen_nop(0);
+                squashed[add_ix.index()] = true;
+            }
+
             let mut k = 0usize;
             while k < items.len() {
                 match items[k].clone() {
@@ -1060,92 +1269,6 @@ impl<I: VCodeInst> VCode<I> {
                             if !applied[iix.index()] {
                                 apply_allocs(&mut self.insts, &mut preg_ops, iix);
                                 applied[iix.index()] = true;
-                            }
-
-                            // Pair fusion (e.g. `ldp`/`stp`): the
-                            // partner must follow with no regalloc
-                            // edit between them — a move there could
-                            // clobber either inst's registers. A gap
-                            // of pure-ALU insts is also fine: the fused
-                            // inst emits at this slot, so no gap inst
-                            // may write a register the pair touches,
-                            // nor read one the pair defines.
-                            let mut j = k + 1;
-                            let mut gap: SmallVec<[InsnIndex; 8]> = smallvec![];
-                            'fuse: loop {
-                                let Some(InstOrEdit::Inst(nix)) = items.get(j).cloned()
-                                else {
-                                    break;
-                                };
-                                if squashed[nix.index()] {
-                                    break;
-                                }
-                                if !applied[nix.index()] {
-                                    apply_allocs(&mut self.insts, &mut preg_ops, nix);
-                                    applied[nix.index()] = true;
-                                }
-                                if let Some(fused) = self.insts[iix.index()]
-                                    .fuse_with_next(&self.insts[nix.index()])
-                                {
-                                    if gap.is_empty() {
-                                        self.insts[iix.index()] = fused;
-                                        self.insts[nix.index()] = I::gen_nop(0);
-                                        squashed[nix.index()] = true;
-                                        break 'fuse;
-                                    }
-                                    // Two placements: the pair can emit
-                                    // early at iix's slot (partner moves
-                                    // up) or late at nix's slot (this
-                                    // inst moves down). The typical
-                                    // demand-lowered order `fmul; str`
-                                    // needs the down placement — the
-                                    // partner's producers sit in the
-                                    // gap.
-                                    let (pu, pd) = &preg_ops[iix.index()];
-                                    let (pu2, pd2) = &preg_ops[nix.index()];
-                                    // Partner up: no gap inst may write
-                                    // a reg the partner touches, nor
-                                    // read one the partner defines. The
-                                    // partner also can't read this
-                                    // inst's defs — pair operands are
-                                    // read before either def lands.
-                                    let ok_up = !pu2.iter().any(|r| pd.contains(r))
-                                        && gap.iter().all(|&b| {
-                                            let (bu, bd) = &preg_ops[b.index()];
-                                            !bd.iter().any(|r| {
-                                                pu2.contains(r) || pd2.contains(r)
-                                            }) && !bu.iter().any(|r| pd2.contains(r))
-                                        });
-                                    // This inst down: no gap inst may
-                                    // write a reg this inst touches,
-                                    // nor read one this inst defines —
-                                    // and the partner may not read this
-                                    // inst's defs either.
-                                    let ok_down = !pu2.iter().any(|r| pd.contains(r))
-                                        && gap.iter().all(|&b| {
-                                            let (bu, bd) = &preg_ops[b.index()];
-                                            !bd.iter().any(|r| {
-                                                pu.contains(r) || pd.contains(r)
-                                            }) && !bu.iter().any(|r| pd.contains(r))
-                                        });
-                                    if ok_down {
-                                        self.insts[iix.index()] = I::gen_nop(0);
-                                        self.insts[nix.index()] = fused;
-                                    } else if ok_up {
-                                        self.insts[iix.index()] = fused;
-                                        self.insts[nix.index()] = I::gen_nop(0);
-                                        squashed[nix.index()] = true;
-                                    }
-                                    break 'fuse;
-                                }
-                                if !self.insts[nix.index()].pair_fusion_crossable() {
-                                    break;
-                                }
-                                gap.push(nix);
-                                j += 1;
-                                if gap.len() > 8 {
-                                    break;
-                                }
                             }
 
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
