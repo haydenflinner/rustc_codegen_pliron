@@ -22,7 +22,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, ConstantData, Endianness, Function, Inst, InstBuilder,
+    Block, BlockArg, BlockCall, ConstantData, Endianness, Function, Immediate, Inst, InstBuilder,
     InstructionData, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
@@ -195,6 +195,9 @@ struct Plan {
     /// then re-finds the exact lane and takes the real exit edge with its
     /// original args.
     early: Vec<(Value, bool)>,
+    /// Shared lane-reversal immediate for descending streams (one pool
+    /// entry, not one per emitted shuffle).
+    rev_imm: Option<Immediate>,
 }
 
 /// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
@@ -457,7 +460,7 @@ fn is_const(func: &Function, v: Value) -> bool {
 }
 
 fn plan(
-    func: &Function,
+    func: &mut Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1284,6 +1287,10 @@ fn plan(
         .block_params(info.h)
         .iter()
         .position(|&p| p == cnt.iv)?;
+    let rev_imm = streams
+        .iter()
+        .any(|s| s.neg)
+        .then(|| func.dfg.immediates.push(rev_mask(vt)));
     Some(Plan {
         entry: info.entry,
         h: info.h,
@@ -1309,6 +1316,7 @@ fn plan(
         masks,
         extra_vec,
         early,
+        rev_imm,
     })
 }
 
@@ -1393,7 +1401,7 @@ fn emit_val(
     vmap: &mut FxHashMap<Value, Value>,
     splats: &mut FxHashMap<Value, Value>,
     smemo: &mut FxHashMap<Value, Value>,
-    addrs: &[Value],
+    addrs: &[(Value, i64)],
     v: Value,
     depth: usize,
 ) -> Value {
@@ -1473,9 +1481,9 @@ fn emit_val(
                     let j = p.loads.iter().find(|&&(l, _)| l == i).unwrap().1;
                     let v = pos
                         .ins()
-                        .load(vt, MemFlagsData::new().with_notrap(), addrs[j], 0);
+                        .load(vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
                     if p.streams[j].neg {
-                        vreverse(pos, vt, v)
+                        vreverse(pos, vt, p.rev_imm.unwrap(), v)
                     } else {
                         v
                     }
@@ -1567,19 +1575,19 @@ fn emit_val(
 }
 
 /// Reverse `v`'s element lanes (a descending stream's contiguous block runs
-/// opposite to iteration order). On aarch64 this is one `tbl`.
-fn vreverse(pos: &mut FuncCursor, vt: Type, v: Value) -> Value {
+/// opposite to iteration order). On aarch64 a full reversal lowers to
+/// `revXX`+`ext`, no `tbl`.
+fn rev_mask(vt: Type) -> ConstantData {
     let e = vt.lane_type().bytes() as usize;
     let n = vt.bytes() as usize;
     let mut mask = vec![0u8; n];
     for i in 0..n {
         mask[i] = ((n - e - i / e * e) + i % e) as u8;
     }
-    let imm = pos
-        .func
-        .dfg
-        .immediates
-        .push(ConstantData::from(mask.as_slice()));
+    ConstantData::from(mask.as_slice())
+}
+
+fn vreverse(pos: &mut FuncCursor, vt: Type, imm: Immediate, v: Value) -> Value {
     // `shuffle` is typed i8x16x2 in this Cranelift; bitcast in and out.
     // The lane-count change needs an explicit endianness: `little` keeps
     // byte i of the i8x16 view equal to byte i of each lane, so the mask
@@ -1598,7 +1606,7 @@ fn emit_mask(
     vmap: &mut FxHashMap<Value, Value>,
     splats: &mut FxHashMap<Value, Value>,
     smemo: &mut FxHashMap<Value, Value>,
-    addrs: &[Value],
+    addrs: &[(Value, i64)],
     cd: &Cond,
 ) -> Value {
     let mut m = emit_val(pos, p, vmap, splats, smemo, addrs, cd.c, 0);
@@ -2518,40 +2526,37 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let gb = i64::from(p.elem.bytes()) * p.vf;
     for g in 0..UNROLL {
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
+        // Per-stream (base, byte-offset): the base is emitted once per
+        // iteration (sharing `iv*rate` across groups), the group shift
+        // rides the load/store's immediate operand.
         let mut addrs = Vec::new();
         for s in &p.streams {
-            let a = if s.direct {
+            let e = i64::from(p.elem.bytes());
+            let (a, off) = if s.direct {
                 if s.neg {
                     // Descending pointer iv: the contiguous block ends at
                     // `ivv - g*vf*e`, so load at its lowest address.
-                    let off = pos
-                        .ins()
-                        .iconst(iv_ty, -(((g as i64) + 1) * p.vf - 1) * i64::from(p.elem.bytes()));
-                    pos.ins().iadd(ivv, off)
-                } else if g == 0 {
-                    ivv
+                    let c = pos.ins().iconst(iv_ty, -(p.vf - 1) * e);
+                    (pos.ins().iadd(ivv, c), -(g as i64) * p.vf * e)
                 } else {
-                    let off = pos.ins().iconst(pty, gb * g as i64);
-                    pos.ins().iadd(ivv, off)
+                    (ivv, gb * g as i64)
                 }
             } else {
                 // Substitute the iv whose address is the block's lowest
                 // byte: the group's first lane ascending, its last
                 // descending.
-                let adj = if s.neg {
-                    (((g as i64) + 1) * p.vf - 1) * p.step
-                } else {
-                    (g as i64) * p.vf * p.step
-                };
+                let adj = if s.neg { (p.vf - 1) * p.step } else { 0 };
                 let w = if adj == 0 {
                     ivv
                 } else {
                     let c = pos.ins().iconst(iv_ty, adj);
                     pos.ins().iadd(ivv, c)
                 };
-                emit(&mut pos, pty, &subst(&s.base, p.iv, w))
+                let a0 = emit(&mut pos, pty, &subst(&s.base, p.iv, w));
+                let d = (g as i64) * p.vf * e;
+                (a0, if s.neg { -d } else { d })
             };
-            addrs.push(a);
+            addrs.push((a, off));
         }
         // Emit loads eagerly in program order: on a given stream a
         // `store; load` pair reads back the stored vector, so ordering is
@@ -2564,9 +2569,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                     if p.can_vec.contains(&r) && !vmap.contains_key(&r) {
                         let mut vl =
                             pos.ins()
-                                .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j], 0);
+                                .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
                         if p.streams[j].neg {
-                            vl = vreverse(&mut pos, p.vt, vl);
+                            vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
                         }
                         vmap.insert(r, vl);
                     }
@@ -2576,10 +2581,10 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                         &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, args[0], 0,
                     );
                     if p.streams[j].neg {
-                        vv = vreverse(&mut pos, p.vt, vv);
+                        vv = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vv);
                     }
                     pos.ins()
-                        .store(MemFlagsData::new().with_notrap(), vv, addrs[j], 0);
+                        .store(MemFlagsData::new().with_notrap(), vv, addrs[j].0, addrs[j].1 as i32);
                 }
                 _ => unreachable!(),
             }
@@ -2607,7 +2612,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                         vmap: &mut FxHashMap<Value, Value>,
                         splats: &mut FxHashMap<Value, Value>,
                         smemo: &mut FxHashMap<Value, Value>,
-                        addrs: &[Value],
+                        addrs: &[(Value, i64)],
                         v: Value|
              -> Value {
                 let Some(cd) = &r.cond else { return v };

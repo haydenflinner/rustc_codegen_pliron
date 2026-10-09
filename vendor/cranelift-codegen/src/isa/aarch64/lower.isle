@@ -230,6 +230,28 @@
 (decl vec_rotate_imm4_from_immediate (u8) Immediate)
 (extern extractor vec_rotate_imm4_from_immediate vec_rotate_imm4_from_immediate)
 
+;; Full lane reversals of a single vector decompose into `revXX` +
+;; `ext #8` — no `tbl` and no literal-pool mask. All indices < 16 so `b`
+;; is irrelevant.
+;;
+;; Byte reverse of i8x16: `rev64.16b` flips each 8-byte group, `ext #8`
+;; swaps the halves — [b15..b0].
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0001_0203_0405_0607_0809_0a0b_0c0d_0e0f)))
+      (let ((r Reg (rev64 a (VectorSize.Size8x16))))
+        (vec_extract r r 8)))
+
+;; Lane reverse of i32x4: `rev64.4s` swaps the s lanes in each d —
+;; [b,a,d,c] — `ext #8` swaps the halves — [d,c,b,a].
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0302_0100_0706_0504_0b0a_0908_0f0e_0d0c)))
+      (let ((r Reg (rev64 a (VectorSize.Size32x4))))
+        (vec_extract r r 8)))
+
+;; Lane reverse of i16x8: `rev64.8h` flips h lanes per d —
+;; [d,c,b,a|h,g,f,e] — `ext #8` swaps the halves.
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0100_0302_0504_0706_0908_0b0a_0d0c_0f0e)))
+      (let ((r Reg (rev64 a (VectorSize.Size16x8))))
+        (vec_extract r r 8)))
+
 ;; Rules for the `uzp1` and `uzp2` instructions which gather even-numbered lanes
 ;; or odd-numbered lanes
 (rule 1 (lower (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200)))

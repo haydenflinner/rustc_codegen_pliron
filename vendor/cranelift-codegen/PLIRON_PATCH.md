@@ -49,6 +49,12 @@ once proven out on the stage2 benchmark, then drop this copy.
    < 16 so the second operand is never referenced. Turns the loopvec
    descending-stream lane reversal for two-lane vectors (e.g. `u64x2`) into
    one instruction instead of a mask load + `tbl`.
+8. aarch64 `shuffle` full lane reversal → `rev64`+`ext`: `lower.isle` rules
+   (priority 8) for the i8x16/i16x8/i32x4 reversal masks. `rev64` flips the
+   element order within each 64-bit group and `ext #8` swaps the halves —
+   two instructions, no literal-pool mask and no `tbl` table register
+   dependency. Used by loopvec's descending streams; identical to what LLVM
+   emits for `shufflevector` reversals.
 
 ## x64 PIC calls use PLT32
 
