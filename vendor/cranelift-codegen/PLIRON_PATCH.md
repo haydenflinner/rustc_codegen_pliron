@@ -55,6 +55,18 @@ once proven out on the stage2 benchmark, then drop this copy.
    two instructions, no literal-pool mask and no `tbl` table register
    dependency. Used by loopvec's descending streams; identical to what LLVM
    emits for `shufflevector` reversals.
+9. aarch64 widening adds: new `VecRRRLongOp::{Saddw,Uaddw,Saddl,Uaddl}8/16/32`
+   variants (`enc_vec_rrr_long` generalized from a `bit14` flag to the full
+   six-bit opcode field — `uaddw`/`uaddl` live at opcodes `0b000100`/`0b000000`,
+   next to `umlal`/`umull`). `lower.isle` rules fold `iadd(acc, widen(x))` →
+   `uaddw`/`saddw` (+`2` for the high half) in both operand orders,
+   `iadd(widen a, widen b)` of equal halves → `uaddl`/`saddl`, and
+   `iadd(acc, iadd(widen_lo x, widen_hi x))` → `uaddw`+`uaddw2` chained on
+   `acc`, at priorities 20-24 (above the `smlal`/`umlal` block; each operand
+   order needs its own priority since the orders overlap on
+   `iadd(uwiden,uwiden)`). loopvec's widening reductions emit
+   acc-chained `iadd(acc, widen half)` trees into per-half accumulators —
+   the exact shape LLVM produces for `sum += (x as u64)*(x as u64)`.
 
 ## x64 PIC calls use PLT32
 

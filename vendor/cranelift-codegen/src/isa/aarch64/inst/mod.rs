@@ -2365,9 +2365,92 @@ impl Inst {
                     (VecRRRLongOp::Umull32, true) => {
                         ("umull2", VectorSize::Size64x2, VectorSize::Size32x4)
                     }
+                    (VecRRRLongOp::Saddw8, false) => {
+                        ("saddw", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Saddw8, true) => {
+                        ("saddw2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Saddw16, false) => {
+                        ("saddw", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Saddw16, true) => {
+                        ("saddw2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Saddw32, false) => {
+                        ("saddw", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Saddw32, true) => {
+                        ("saddw2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Uaddw8, false) => {
+                        ("uaddw", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Uaddw8, true) => {
+                        ("uaddw2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Uaddw16, false) => {
+                        ("uaddw", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Uaddw16, true) => {
+                        ("uaddw2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Uaddw32, false) => {
+                        ("uaddw", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Uaddw32, true) => {
+                        ("uaddw2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Saddl8, false) => {
+                        ("saddl", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Saddl8, true) => {
+                        ("saddl2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Saddl16, false) => {
+                        ("saddl", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Saddl16, true) => {
+                        ("saddl2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Saddl32, false) => {
+                        ("saddl", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Saddl32, true) => {
+                        ("saddl2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Uaddl8, false) => {
+                        ("uaddl", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Uaddl8, true) => {
+                        ("uaddl2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Uaddl16, false) => {
+                        ("uaddl", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Uaddl16, true) => {
+                        ("uaddl2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Uaddl32, false) => {
+                        ("uaddl", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Uaddl32, true) => {
+                        ("uaddl2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                };
+                // Widening adds (`saddw`/`uaddw`) take the wide accumulator
+                // as `Vn`; the multiplies' `Vn` is narrow like `Vm`.
+                let rn_size = match alu_op {
+                    VecRRRLongOp::Saddw8
+                    | VecRRRLongOp::Saddw16
+                    | VecRRRLongOp::Saddw32
+                    | VecRRRLongOp::Uaddw8
+                    | VecRRRLongOp::Uaddw16
+                    | VecRRRLongOp::Uaddw32 => dest_size,
+                    _ => src_size,
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), dest_size);
-                let rn = pretty_print_vreg_vector(rn, src_size);
+                let rn = pretty_print_vreg_vector(rn, rn_size);
                 let rm = pretty_print_vreg_vector(rm, src_size);
                 format!("{op} {rd}, {rn}, {rm}")
             }

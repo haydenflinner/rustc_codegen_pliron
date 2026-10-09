@@ -543,6 +543,165 @@
                         c)))
       (umlal32 (umlal32 c a b false) a b true))
 
+;; PLIRON: Widening-add folds (`uaddw`/`saddw`): `iadd(acc, uwiden(x))` adds
+;; the extended lanes of `x` straight into the wide accumulator, skipping the
+;; `ushll` materialization — the widening-reduction shape loopvec emits.
+;; Priorities: 20/21 for the single-widen form in each operand order, 22 for
+;; `widen+widen` (`uaddl`/`saddl` — overlaps the single form on
+;; `iadd(uwiden,uwiden)`), 23/24 for the lo+hi pair into an accumulator in
+;; each operand order. Repeated `x` bindings are equality-checked, so the
+;; pair form only matches when both halves widen the same vector.
+(rule 20 (lower (has_type $I16X8 (iadd _ a (uwiden_low _ x))))
+      (uaddw8 a x false))
+(rule 21 (lower (has_type $I16X8 (iadd _ (uwiden_low _ x) a)))
+      (uaddw8 a x false))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (uwiden_high _ x))))
+      (uaddw8 a x true))
+(rule 21 (lower (has_type $I16X8 (iadd _ (uwiden_high _ x) a)))
+      (uaddw8 a x true))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (uwiden_low _ x))))
+      (uaddw16 a x false))
+(rule 21 (lower (has_type $I32X4 (iadd _ (uwiden_low _ x) a)))
+      (uaddw16 a x false))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (uwiden_high _ x))))
+      (uaddw16 a x true))
+(rule 21 (lower (has_type $I32X4 (iadd _ (uwiden_high _ x) a)))
+      (uaddw16 a x true))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (uwiden_low _ x))))
+      (uaddw32 a x false))
+(rule 21 (lower (has_type $I64X2 (iadd _ (uwiden_low _ x) a)))
+      (uaddw32 a x false))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (uwiden_high _ x))))
+      (uaddw32 a x true))
+(rule 21 (lower (has_type $I64X2 (iadd _ (uwiden_high _ x) a)))
+      (uaddw32 a x true))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (swiden_low _ x))))
+      (saddw8 a x false))
+(rule 21 (lower (has_type $I16X8 (iadd _ (swiden_low _ x) a)))
+      (saddw8 a x false))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (swiden_high _ x))))
+      (saddw8 a x true))
+(rule 21 (lower (has_type $I16X8 (iadd _ (swiden_high _ x) a)))
+      (saddw8 a x true))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (swiden_low _ x))))
+      (saddw16 a x false))
+(rule 21 (lower (has_type $I32X4 (iadd _ (swiden_low _ x) a)))
+      (saddw16 a x false))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (swiden_high _ x))))
+      (saddw16 a x true))
+(rule 21 (lower (has_type $I32X4 (iadd _ (swiden_high _ x) a)))
+      (saddw16 a x true))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (swiden_low _ x))))
+      (saddw32 a x false))
+(rule 21 (lower (has_type $I64X2 (iadd _ (swiden_low _ x) a)))
+      (saddw32 a x false))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (swiden_high _ x))))
+      (saddw32 a x true))
+(rule 21 (lower (has_type $I64X2 (iadd _ (swiden_high _ x) a)))
+      (saddw32 a x true))
+
+;; `iadd(uwiden_low a, uwiden_low b)` is `uaddl` — one instruction for two
+;; narrow operands widened and added.
+(rule 22 (lower (has_type $I16X8 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl8 x y false))
+(rule 22 (lower (has_type $I16X8 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl8 x y true))
+(rule 22 (lower (has_type $I32X4 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl16 x y false))
+(rule 22 (lower (has_type $I32X4 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl16 x y true))
+(rule 22 (lower (has_type $I64X2 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl32 x y false))
+(rule 22 (lower (has_type $I64X2 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl32 x y true))
+(rule 22 (lower (has_type $I16X8 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl8 x y false))
+(rule 22 (lower (has_type $I16X8 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl8 x y true))
+(rule 22 (lower (has_type $I32X4 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl16 x y false))
+(rule 22 (lower (has_type $I32X4 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl16 x y true))
+(rule 22 (lower (has_type $I64X2 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl32 x y false))
+(rule 22 (lower (has_type $I64X2 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl32 x y true))
+
+;; `iadd(acc, iadd(widen_lo x, widen_hi x))` — a whole vector widening into
+;; an accumulator — chains `uaddw`+`uaddw2` straight through `acc`.
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw8 (saddw8 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw8 (saddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw8 (saddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw8 (saddw8 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw16 (saddw16 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw16 (saddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw16 (saddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw16 (saddw16 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw32 (saddw32 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw32 (saddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw32 (saddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw32 (saddw32 a x false) x true))
+
 ;;;; Rules for `iabs` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule -1 (lower (iabs ty @ (multi_lane _ _) x))

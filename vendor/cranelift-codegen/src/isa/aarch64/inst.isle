@@ -1964,6 +1964,22 @@
     (Umull8)
     (Umull16)
     (Umull32)
+    ;; Signed add long (widen the narrow operand, add to the wide one).
+    (Saddw8)
+    (Saddw16)
+    (Saddw32)
+    ;; Unsigned add long.
+    (Uaddw8)
+    (Uaddw16)
+    (Uaddw32)
+    ;; Signed add long of two narrow operands.
+    (Saddl8)
+    (Saddl16)
+    (Saddl32)
+    ;; Unsigned add long of two narrow operands.
+    (Uaddl8)
+    (Uaddl16)
+    (Uaddl32)
 ))
 
 (type VecRRRLongModOp
@@ -3331,6 +3347,36 @@
 ;; Helper for generating `umull32` instructions.
 (decl umull32 (Reg Reg bool) Reg)
 (rule (umull32 x y high_half) (vec_rrr_long (VecRRRLongOp.Umull32) x y high_half))
+
+;; Helpers for `saddw`/`uaddw` widening adds: `rd = rn + widen(rm half)`,
+;; where `rn`/`rd` are the wide arrangement and `rm` the narrow one.
+(decl saddw8 (Reg Reg bool) Reg)
+(rule (saddw8 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw8) x y high_half))
+(decl saddw16 (Reg Reg bool) Reg)
+(rule (saddw16 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw16) x y high_half))
+(decl saddw32 (Reg Reg bool) Reg)
+(rule (saddw32 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw32) x y high_half))
+(decl uaddw8 (Reg Reg bool) Reg)
+(rule (uaddw8 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw8) x y high_half))
+(decl uaddw16 (Reg Reg bool) Reg)
+(rule (uaddw16 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw16) x y high_half))
+(decl uaddw32 (Reg Reg bool) Reg)
+(rule (uaddw32 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw32) x y high_half))
+
+;; Helpers for `saddl`/`uaddl`: `rd = widen(rn half) + widen(rm half)` —
+;; both operands narrow.
+(decl saddl8 (Reg Reg bool) Reg)
+(rule (saddl8 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl8) x y high_half))
+(decl saddl16 (Reg Reg bool) Reg)
+(rule (saddl16 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl16) x y high_half))
+(decl saddl32 (Reg Reg bool) Reg)
+(rule (saddl32 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl32) x y high_half))
+(decl uaddl8 (Reg Reg bool) Reg)
+(rule (uaddl8 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl8) x y high_half))
+(decl uaddl16 (Reg Reg bool) Reg)
+(rule (uaddl16 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl16) x y high_half))
+(decl uaddl32 (Reg Reg bool) Reg)
+(rule (uaddl32 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl32) x y high_half))
 
 ;; Helper for generating `asr` instructions.
 (attr asr (veri chain))

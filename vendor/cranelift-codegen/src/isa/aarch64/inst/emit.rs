@@ -328,7 +328,7 @@ fn enc_vec_rrr_long(
     q: u32,
     u: u32,
     size: u32,
-    bit14: u32,
+    opc: u32,
     rm: Reg,
     rn: Reg,
     rd: Writable<Reg>,
@@ -336,13 +336,13 @@ fn enc_vec_rrr_long(
     debug_assert_eq!(q & 0b1, q);
     debug_assert_eq!(u & 0b1, u);
     debug_assert_eq!(size & 0b11, size);
-    debug_assert_eq!(bit14 & 0b1, bit14);
+    debug_assert_eq!(opc & 0b111111, opc);
 
-    0b0_0_0_01110_00_1_00000_100000_00000_00000
+    0b0_0_0_01110_00_1_00000_000000_00000_00000
         | q << 30
         | u << 29
         | size << 22
-        | bit14 << 14
+        | opc << 10
         | (machreg_to_vec(rm) << 16)
         | (machreg_to_vec(rn) << 5)
         | machreg_to_vec(rd.to_reg())
@@ -2585,19 +2585,33 @@ impl MachInstEmit for Inst {
                 alu_op,
                 high_half,
             } => {
-                let (u, size, bit14) = match alu_op {
-                    VecRRRLongOp::Smull8 => (0b0, 0b00, 0b1),
-                    VecRRRLongOp::Smull16 => (0b0, 0b01, 0b1),
-                    VecRRRLongOp::Smull32 => (0b0, 0b10, 0b1),
-                    VecRRRLongOp::Umull8 => (0b1, 0b00, 0b1),
-                    VecRRRLongOp::Umull16 => (0b1, 0b01, 0b1),
-                    VecRRRLongOp::Umull32 => (0b1, 0b10, 0b1),
+                let (u, size, opc) = match alu_op {
+                    VecRRRLongOp::Smull8 => (0b0, 0b00, 0b110000),
+                    VecRRRLongOp::Smull16 => (0b0, 0b01, 0b110000),
+                    VecRRRLongOp::Smull32 => (0b0, 0b10, 0b110000),
+                    VecRRRLongOp::Umull8 => (0b1, 0b00, 0b110000),
+                    VecRRRLongOp::Umull16 => (0b1, 0b01, 0b110000),
+                    VecRRRLongOp::Umull32 => (0b1, 0b10, 0b110000),
+                    // PLIRON: widening add — `Vd = Vn + widen(Vm half)`.
+                    VecRRRLongOp::Saddw8 => (0b0, 0b00, 0b000100),
+                    VecRRRLongOp::Saddw16 => (0b0, 0b01, 0b000100),
+                    VecRRRLongOp::Saddw32 => (0b0, 0b10, 0b000100),
+                    VecRRRLongOp::Uaddw8 => (0b1, 0b00, 0b000100),
+                    VecRRRLongOp::Uaddw16 => (0b1, 0b01, 0b000100),
+                    VecRRRLongOp::Uaddw32 => (0b1, 0b10, 0b000100),
+                    // PLIRON: widening add of two narrow operands.
+                    VecRRRLongOp::Saddl8 => (0b0, 0b00, 0b000000),
+                    VecRRRLongOp::Saddl16 => (0b0, 0b01, 0b000000),
+                    VecRRRLongOp::Saddl32 => (0b0, 0b10, 0b000000),
+                    VecRRRLongOp::Uaddl8 => (0b1, 0b00, 0b000000),
+                    VecRRRLongOp::Uaddl16 => (0b1, 0b01, 0b000000),
+                    VecRRRLongOp::Uaddl32 => (0b1, 0b10, 0b000000),
                 };
                 sink.put4(enc_vec_rrr_long(
                     high_half as u32,
                     u,
                     size,
-                    bit14,
+                    opc,
                     rm,
                     rn,
                     rd,
@@ -2612,19 +2626,19 @@ impl MachInstEmit for Inst {
                 high_half,
             } => {
                 debug_assert_eq!(rd.to_reg(), ri);
-                let (u, size, bit14) = match alu_op {
-                    VecRRRLongModOp::Umlal8 => (0b1, 0b00, 0b0),
-                    VecRRRLongModOp::Umlal16 => (0b1, 0b01, 0b0),
-                    VecRRRLongModOp::Umlal32 => (0b1, 0b10, 0b0),
-                    VecRRRLongModOp::Smlal8 => (0b0, 0b00, 0b0),
-                    VecRRRLongModOp::Smlal16 => (0b0, 0b01, 0b0),
-                    VecRRRLongModOp::Smlal32 => (0b0, 0b10, 0b0),
+                let (u, size) = match alu_op {
+                    VecRRRLongModOp::Umlal8 => (0b1, 0b00),
+                    VecRRRLongModOp::Umlal16 => (0b1, 0b01),
+                    VecRRRLongModOp::Umlal32 => (0b1, 0b10),
+                    VecRRRLongModOp::Smlal8 => (0b0, 0b00),
+                    VecRRRLongModOp::Smlal16 => (0b0, 0b01),
+                    VecRRRLongModOp::Smlal32 => (0b0, 0b10),
                 };
                 sink.put4(enc_vec_rrr_long(
                     high_half as u32,
                     u,
                     size,
-                    bit14,
+                    0b100000,
                     rm,
                     rn,
                     rd,

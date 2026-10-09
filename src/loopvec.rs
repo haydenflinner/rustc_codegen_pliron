@@ -140,6 +140,9 @@ enum Widen {
         sb: bool,
         a: Value,
         b: Value,
+        /// Products pass through a `2*w == 64` level: the last-level adds
+        /// chain onto per-half accumulators (the `uaddw`/`saddw` fold).
+        chain: bool,
     },
 }
 
@@ -151,6 +154,17 @@ impl Reduc {
     /// Lanes in the accumulator vector.
     fn lanes(&self) -> i64 {
         128 / self.aty.bits() as i64
+    }
+    /// Vector accumulators per unroll group. Widening reductions whose
+    /// last-level adds chain onto the accumulator split them across this
+    /// many accs — each `uaddw`-style add gets its own register so the
+    /// dependency chain stays depth-1 instead of serial per group.
+    fn split(&self) -> usize {
+        match &self.widen {
+            Some(Widen::Add { mask: None, .. }) => 2,
+            Some(Widen::Mul { chain: true, .. }) => 4,
+            _ => 1,
+        }
     }
 }
 
@@ -1786,7 +1800,13 @@ fn widen_delta(
                     return false;
                 }
             }
-            r.widen = Some(Widen::Mul { sa, sb, a, b });
+            r.widen = Some(Widen::Mul {
+                sa,
+                sb,
+                a,
+                b,
+                chain: 2 * elem.bits() <= 32 && r.aty.bits() == 64,
+            });
             true
         }
         _ => {
@@ -2258,10 +2278,36 @@ fn widen_vec(pos: &mut FuncCursor, signed: bool, mut v: Value, aty: Type) -> Val
     }
 }
 
-/// Widening dot product `vacc += (a as T) * (b as T)` where `a`/`b` are
+/// `widen_vec` chained onto the accumulator pair: the last level emits
+/// `iadd(accs[0], wl)` / `iadd(accs[1], wh)` so each add folds to a widening
+/// add (`uaddw`/`saddw` + `*2`) with the acc as its wide operand, and the two
+/// halves land on separate accumulators to keep the dependency chain short.
+/// The intermediate levels still pairwise-sum.
+fn widen_vec_into(
+    pos: &mut FuncCursor,
+    signed: bool,
+    mut v: Value,
+    aty: Type,
+    accs: &[Value; 2],
+) -> (Value, Value) {
+    let abits = aty.bits();
+    loop {
+        let lb = lane_bits(pos, v);
+        debug_assert!(lb < abits);
+        let (wl, wh) = widen_halves(pos, signed, v);
+        if 2 * lb == abits {
+            return (pos.ins().iadd(accs[0], wl), pos.ins().iadd(accs[1], wh));
+        }
+        v = pos.ins().iadd_pairwise(wl, wh);
+    }
+}
+
+/// Widening dot product `acc += (a as T) * (b as T)` where `a`/`b` are
 /// elem-width vectors: products of the widened halves (exact at 2*elem bits),
-/// then pairwise-summed down to `aty` lanes. At the i8→i32 width this emits
-/// exactly the tree aarch64's `sdot`/`usdot` ISLE rules match.
+/// then pairwise-summed down to `aty` lanes. The emitted `iadd` tree keeps the
+/// shapes the aarch64 folds match: detached `iadd(pair, acc)` for the
+/// `sdot`/`umlal`-family rules, and — when products sit one widen below i64
+/// lanes — halves chained onto `acc` so each folds to `uaddw`/`uaddw2`.
 fn widen_mul(
     pos: &mut FuncCursor,
     sa: bool,
@@ -2269,7 +2315,8 @@ fn widen_mul(
     av: Value,
     bv: Value,
     aty: Type,
-) -> Value {
+    accs: &[Value],
+) -> Vec<Value> {
     let abits = aty.bits();
     let (al, ah) = widen_halves(pos, sa, av);
     let (bl, bh) = widen_halves(pos, sb, bv);
@@ -2296,7 +2343,20 @@ fn widen_mul(
             for p in it {
                 acc_v = pos.ins().iadd(acc_v, p);
             }
-            return acc_v;
+            return vec![pos.ins().iadd(acc_v, accs[0])];
+        }
+        if 2 * w == abits && abits == 64 {
+            debug_assert_eq!(accs.len(), 2 * parts.len());
+            // Products one widen below i64 lanes: each widened half lands on
+            // its own accumulator so every add folds to `uaddw`/`saddw`
+            // (+`2`) with a depth-1 dependency chain.
+            let mut accs = accs.to_vec();
+            for (i, p) in parts.iter().enumerate() {
+                let (l, h) = widen_halves(pos, ps, *p);
+                accs[2 * i] = pos.ins().iadd(accs[2 * i], l);
+                accs[2 * i + 1] = pos.ins().iadd(accs[2 * i + 1], h);
+            }
+            return accs;
         }
         let mut next = Vec::with_capacity(parts.len());
         for p in parts {
@@ -2435,9 +2495,10 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let ok = ok.unwrap();
     // Vector accumulators (one per unroll group per reduction) start at the
     // op's identity splatted to all lanes; acc0 is folded in on exit.
+    let splits: Vec<usize> = p.reducs.iter().map(|r| r.split()).collect();
     let mut v_arg_vals = vec![p.iv0, end, nmv];
-    for r in &p.reducs {
-        for _ in 0..UNROLL {
+    for (r, &sp) in p.reducs.iter().zip(&splits) {
+        for _ in 0..UNROLL * sp {
             let id = pos.ins().iconst(r.aty, red_identity(r.op, r.aty));
             let v = pos.ins().splat(r.vty(), id);
             v_arg_vals.push(v);
@@ -2451,8 +2512,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let vaccs: Vec<Vec<Value>> = p
         .reducs
         .iter()
-        .map(|r| {
-            (0..UNROLL)
+        .zip(&splits)
+        .map(|(r, &sp)| {
+            (0..UNROLL * sp)
                 .map(|_| pos.func.dfg.append_block_param(vh, r.vty()))
                 .collect()
         })
@@ -2619,6 +2681,34 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 let m = emit_mask(pos, p, vmap, splats, smemo, addrs, cd);
                 pos.ins().band(v, m)
             };
+            let sp = splits[k];
+            let accs = &vaccs[k][g * sp..(g + 1) * sp];
+            // An unmasked widening iadd reduction chains the widened halves
+            // onto the accs directly (`uaddw`/`saddw` fold); a masked delta
+            // must be summed before `band`, so it keeps the detached form.
+            if let Some(Widen::Add { signed, mask: None }) = &r.widen {
+                let mut v = emit_val(
+                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                );
+                v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
+                let (lo, hi) =
+                    widen_vec_into(&mut pos, *signed, v, r.aty, accs.try_into().unwrap());
+                back_accs[k].push(lo);
+                back_accs[k].push(hi);
+                continue;
+            }
+            if let Some(Widen::Mul { sa, sb, a, b, .. }) = &r.widen {
+                let mut av = emit_val(
+                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *a, 0,
+                );
+                av = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, av);
+                let bv = emit_val(
+                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *b, 0,
+                );
+                back_accs[k].extend(widen_mul(&mut pos, *sa, *sb, av, bv, r.aty, accs));
+                continue;
+            }
+            let acc = accs[0];
             let vd = match &r.widen {
                 None | Some(Widen::Add { .. }) => {
                     let mut v = emit_val(
@@ -2639,25 +2729,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                         _ => v,
                     }
                 }
-                Some(Widen::Mul { sa, sb, a, b }) => {
-                    let mut av = emit_val(
-                        &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *a, 0,
-                    );
-                    av = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, av);
-                    let bv = emit_val(
-                        &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *b, 0,
-                    );
-                    widen_mul(&mut pos, *sa, *sb, av, bv, r.aty)
-                }
+                Some(Widen::Mul { .. }) => unreachable!(),
             };
-            // `sdot`/`usdot` lowering patterns match `iadd(dot_tree, acc)`
-            // positionally; emit the delta first so the fold can fire.
-            let acc = vaccs[k][g];
-            back_accs[k].push(if matches!(r.widen, Some(Widen::Mul { .. })) {
-                red_emit(&mut pos, r.op, vd, acc)
-            } else {
-                red_emit(&mut pos, r.op, acc, vd)
-            });
+            back_accs[k].push(red_emit(&mut pos, r.op, acc, vd));
         }
     }
     let mut pos = FuncCursor::new(pos.func).at_bottom(*vbs.last().unwrap());
