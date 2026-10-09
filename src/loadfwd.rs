@@ -18,16 +18,16 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 const MAX_ENTRIES: usize = 64;
 const MAX_ITERS: usize = 32;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Root {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Root {
     V(Value),
     S(StackSlot),
 }
 
-type Loc = (Root, i64, Type);
+pub(crate) type Loc = (Root, i64, Type);
 type Avail = FxHashMap<Loc, Value>;
 
-fn root(func: &Function, v: Value) -> (Root, i64) {
+pub(crate) fn root(func: &Function, v: Value) -> (Root, i64) {
     let mut v = func.dfg.resolve_aliases(v);
     let mut off = 0i64;
     for _ in 0..8 {
@@ -74,13 +74,13 @@ fn root(func: &Function, v: Value) -> (Root, i64) {
     (Root::V(v), off)
 }
 
-fn notrap(func: &Function, i: Inst) -> bool {
+pub(crate) fn notrap(func: &Function, i: Inst) -> bool {
     func.dfg.insts[i].memflags().is_some()
         && func.dfg.insts[i].memflags_trap_code(&func.dfg).is_none()
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
-fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
+pub(crate) fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
     let n = i64::from(ty.bytes());
     av.retain(|&(r2, o2, t2), _| match (r, r2) {
         _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
@@ -92,7 +92,12 @@ fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
 /// A direct call to a function that writes no memory before returning
 /// normally; across `try_call` it must not write at all unless `eh`, where
 /// [`unwind_edge`] clears the exception edges instead (nowrite.rs).
-fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>, eh: bool) -> bool {
+pub(crate) fn write_free(
+    func: &Function,
+    i: Inst,
+    nw: &FxHashMap<FuncRef, bool>,
+    eh: bool,
+) -> bool {
     match func.dfg.insts[i] {
         InstructionData::Call { func_ref, .. } => nw.contains_key(&func_ref),
         InstructionData::TryCall { func_ref, .. } => {
@@ -126,7 +131,7 @@ fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bo
 /// (`PLIRON_NOALIAS_FWD`) that never escape. Every use of a value with such
 /// a root must be a load/store address or a const `iadd` that `root` still
 /// resolves to it, so calls and stores through other roots can't touch it.
-fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet<Root> {
+pub(crate) fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet<Root> {
     let mut iso: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
     if crate::pass_enabled("PLIRON_FWD_SLOTS") {
         iso.extend(func.sized_stack_slots.keys().map(Root::S));
@@ -239,30 +244,38 @@ pub fn run(
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
-    let cfg = ControlFlowGraph::with_function(func);
-    // Reverse postorder.
-    let mut post = Vec::new();
-    let mut seen: FxHashSet<Block> = FxHashSet::default();
-    let mut stack = vec![(entry, false)];
-    while let Some((b, done)) = stack.pop() {
-        if done {
-            post.push(b);
-            continue;
-        }
-        if !seen.insert(b) {
-            continue;
-        }
-        stack.push((b, true));
-        for s in cfg.succ_iter(b) {
-            if !seen.contains(&s) {
-                stack.push((s, false));
+    let rpo_of = |cfg: &ControlFlowGraph| {
+        // Reverse postorder.
+        let mut post = Vec::new();
+        let mut seen: FxHashSet<Block> = FxHashSet::default();
+        let mut stack = vec![(entry, false)];
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                post.push(b);
+                continue;
+            }
+            if !seen.insert(b) {
+                continue;
+            }
+            stack.push((b, true));
+            for s in cfg.succ_iter(b) {
+                if !seen.contains(&s) {
+                    stack.push((s, false));
+                }
             }
         }
-    }
-    post.reverse();
-    let rpo = post;
-    if std::env::var("PLIRON_LOADPRE").is_ok_and(|v| v == "1") {
-        return pre(func, &cfg, &rpo, entry);
+        post.reverse();
+        post
+    };
+    let mut cfg = ControlFlowGraph::with_function(func);
+    let mut rpo = rpo_of(&cfg);
+    let mut n = 0;
+    if crate::pass_enabled("PLIRON_LOADPRE") {
+        n += pre(func, &cfg, &rpo, entry);
+        if n > 0 {
+            cfg = ControlFlowGraph::with_function(func);
+            rpo = rpo_of(&cfg);
+        }
     }
     let iso = isolated(func, noalias);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
@@ -318,7 +331,7 @@ pub fn run(
         func.dfg.clear_results(i);
         func.dfg.change_to_alias(r, v);
     }
-    fwd.len()
+    n + fwd.len()
 }
 
 /// A location's state inside a block: a known value, or whatever it held on

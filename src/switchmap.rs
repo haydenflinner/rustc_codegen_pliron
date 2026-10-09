@@ -11,7 +11,7 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, TrapCode,
-    Type, Value, ValueDef,
+    Type, Value, ValueDef, types,
 };
 use rustc_data_structures::fx::FxHashMap;
 
@@ -94,6 +94,7 @@ fn resolve(
     if direct.is_empty()
         && func.dfg.num_block_params(t) == 0
         && cfg.pred_iter(t).all(|p| p.block == src)
+        && confined(func, t)
     {
         let mut local = FxHashMap::default();
         for i in func.layout.block_insts(t) {
@@ -131,6 +132,49 @@ fn resolve(
         Target::Block(t),
         direct.into_iter().map(|v| arg(v, &none)).collect(),
     )))
+}
+
+/// True when every value defined by `b`'s insts is used only inside `b`.
+/// Required before resolving through `b`: edges retargeted past it must not
+/// orphan uses that relied on `b` dominating them.
+fn confined(func: &Function, b: Block) -> bool {
+    let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+    let mut def = FxHashMap::default();
+    for &i in &insts {
+        for &r in func.dfg.inst_results(i) {
+            def.insert(func.dfg.resolve_aliases(r), i);
+        }
+    }
+    if def.is_empty() {
+        return true;
+    }
+    for bb in func.layout.blocks() {
+        for i in func.layout.block_insts(bb) {
+            if def.values().any(|&t| t == i) {
+                continue;
+            }
+            let mut escaped = false;
+            let mut note = |v: Value| {
+                if def.contains_key(&func.dfg.resolve_aliases(v)) {
+                    escaped = true;
+                }
+            };
+            func.dfg.inst_args(i).iter().for_each(|&v| note(v));
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        note(v);
+                    }
+                }
+            }
+            if escaped {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn plan(
@@ -223,7 +267,16 @@ fn rewrite(
             Lin::Same(v) => v,
             Lin::Map { s, b } => {
                 if s == 0 {
-                    pos.ins().iconst(ty, b as i64)
+                    // `iconst` tops out at i64; zero-extend the u64 offset
+                    // for a wider target type.
+                    let k = pos.ins().iconst(types::I64, b as i64);
+                    if ty.bits() > 64 {
+                        pos.ins().uextend(ty, k)
+                    } else if ty.bits() == 64 {
+                        k
+                    } else {
+                        pos.ins().ireduce(ty, k)
+                    }
                 } else {
                     let x = if ity.bits() < ty.bits() {
                         pos.ins().uextend(ty, idx)
