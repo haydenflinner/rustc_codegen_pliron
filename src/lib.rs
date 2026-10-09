@@ -37,6 +37,7 @@ mod inline;
 mod instcombine;
 mod intrinsic;
 mod jumpthread;
+mod licm;
 mod loadfwd;
 mod loopdel;
 mod looprot;
@@ -324,6 +325,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
         st.unreach = pass_enabled("PLIRON_UNREACH");
         st.taildup = pass_enabled("PLIRON_TAILDUP");
+        st.licm = pass_enabled("PLIRON_LICM");
         st.indvars = pass_enabled("PLIRON_INDUCT");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
