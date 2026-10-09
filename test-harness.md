@@ -145,6 +145,16 @@ there instead of in the cwd.
   failures for `ImplLimitExceeded`/`CodeTooLarge` now report
   `function too large` via `dcx().fatal` — recorded in the baseline as a
   known `compile-error` limitation (stock rustc accepts it).
+- `src/bcheck.rs` produced invalid IR on
+  `ui/allocator/alloc-shrink-oob-read.rs` (`try_call ... uses value arg from
+  non-dominating block528` verifier ICE): the clone region kept a block
+  shared whenever it had any pred outside the region, but the cloned edge
+  into that shared block adds a path that bypasses the region entirely — so
+  any use of a region value in the shared block's downstream cone (here
+  `try_call` args threaded from a cloned preheader's params) loses its
+  dominator. The region closure now also absorbs a boundary target when a
+  region value is used anywhere reachable from it without re-entering the
+  region; cones larger than `MAX_REGION_EXTRA` decline to version.
 - `src/lower.rs` switch lowering: MIR `switchInt` on a `u128` value (e.g.
   `zext` of a negative `i64` enum discriminant) went through
   `cranelift_frontend::Switch::emit`, which subtracts the case-cluster

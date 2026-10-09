@@ -203,11 +203,14 @@ def stock_result(path, sp):
             if res[2] is not None:
                 res[2] = tuple(res[2])
             return res
-        exe = os.path.join(OUT, "stock", key)
+        # Pid-unique artifact names: a concurrent runner (e.g. a leftover
+        # invocation) shares this cache dir, and identical source+flags hash
+        # to the same key — per-key locks only serialize within a process.
+        exe = os.path.join(OUT, "stock", f"{key}.{os.getpid()}")
         res = build_and_run(path, sp, exe, False)
         if os.path.exists(exe):
             os.remove(exe)
-        tmp = cache + ".tmp"
+        tmp = f"{cache}.{os.getpid()}.tmp"
         json.dump(res, open(tmp, "w"))
         os.replace(tmp, cache)
         return res
