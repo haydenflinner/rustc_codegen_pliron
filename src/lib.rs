@@ -32,6 +32,7 @@ mod domcheck;
 mod eh;
 mod hot;
 mod ifconv;
+mod indvars;
 mod inline;
 mod instcombine;
 mod intrinsic;
@@ -323,6 +324,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
         st.unreach = pass_enabled("PLIRON_UNREACH");
         st.taildup = pass_enabled("PLIRON_TAILDUP");
+        st.indvars = pass_enabled("PLIRON_INDUCT");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
