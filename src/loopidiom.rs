@@ -961,6 +961,16 @@ pub(crate) fn plan(
     let Some((val, addr, size)) = store_parts(func, s) else {
         why!("store shape: {:?}", la.loop_header(lp));
     };
+    // The store must run on every iteration: it must dominate every latch,
+    // otherwise a conditionally-executed store becomes a full-range
+    // memset/memcpy. A load feeding the store transitively dominates the
+    // latches too; a load that does not is unobservable once the loop is
+    // replaced.
+    for &l in &info.latches {
+        if !dt.dominates(s, l.inst, &func.layout) {
+            why!("conditional store: {:?}", la.loop_header(lp));
+        }
+    }
     // Find the exit edge that gives a usable count; every other exit must be
     // a provably-dead guard or yield a runtime bound check for the fast path.
     let (exit, cnt, extra) = info
@@ -1296,25 +1306,35 @@ pub fn run(
     {
         return 0;
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
-    let loops: Vec<Loop> = la.loops().collect();
     let debug = std::env::var_os("PLIRON_IDIOM_DEBUG").is_some();
     let mut n = 0;
-    for lp in loops.into_iter().take(MAX_LOOPS) {
-        let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias) else {
-            continue;
-        };
-        if debug {
-            eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
+    // `apply` rewires the CFG, so recompute the analyses before each
+    // conversion rather than letting `plan` see stale dominance/latches.
+    let mut done = FxHashSet::default();
+    'outer: for _ in 0..MAX_LOOPS {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dt = DominatorTree::with_function(func, &cfg);
+        let mut la = LoopAnalysis::new();
+        la.compute(func, &cfg, &dt);
+        for lp in la.loops() {
+            if done.contains(&la.loop_header(lp)) {
+                continue;
+            }
+            let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias) else {
+                continue;
+            };
+            if debug {
+                eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
+            }
+            apply(func, &p, tcfg);
+            done.insert(p.h);
+            n += 1;
+            if n >= MAX_CONV {
+                break 'outer;
+            }
+            continue 'outer;
         }
-        apply(func, &p, tcfg);
-        n += 1;
-        if n >= MAX_CONV {
-            break;
-        }
+        break;
     }
     n
 }
