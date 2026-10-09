@@ -42,6 +42,13 @@ once proven out on the stage2 benchmark, then drop this copy.
    12-15. Lane-exact because the inner `iadd` is elementwise; loopvec emits
    this shape for widening dot products at i8→i16/i16→i32/i32→i64, i.e. the
    widths with no `sdot`-family instruction.
+7. aarch64 `shuffle` rotation → `ext`: `lower.isle` rule (priority 7) plus
+   the `vec_rotate_imm4_from_immediate` extractor in
+   `isa/aarch64/lower/isle.rs` — a mask `bytes[i] = (n+i) mod 16` rotates a
+   single vector by `n` bytes, which is `ext a, a, n`. All mask bytes are
+   < 16 so the second operand is never referenced. Turns the loopvec
+   descending-stream lane reversal for two-lane vectors (e.g. `u64x2`) into
+   one instruction instead of a mask load + `tbl`.
 
 ## x64 PIC calls use PLT32
 

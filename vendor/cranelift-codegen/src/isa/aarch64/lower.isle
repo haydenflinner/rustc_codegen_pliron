@@ -222,6 +222,14 @@
 (decl vec_extract_imm4_from_immediate (u8) Immediate)
 (extern extractor vec_extract_imm4_from_immediate vec_extract_imm4_from_immediate)
 
+;; A rotation of a single vector by `n` bytes — `mask[i] = (n+i) mod 16` —
+;; is `ext a, a, n` (e.g. the lane swap of a two-lane vector).
+(rule 7 (lower (shuffle _ a _ (vec_rotate_imm4_from_immediate n)))
+      (vec_extract a a n))
+
+(decl vec_rotate_imm4_from_immediate (u8) Immediate)
+(extern extractor vec_rotate_imm4_from_immediate vec_rotate_imm4_from_immediate)
+
 ;; Rules for the `uzp1` and `uzp2` instructions which gather even-numbered lanes
 ;; or odd-numbered lanes
 (rule 1 (lower (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200)))

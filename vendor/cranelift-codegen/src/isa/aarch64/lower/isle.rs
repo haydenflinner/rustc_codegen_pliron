@@ -765,6 +765,21 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
     }
 
+    fn vec_rotate_imm4_from_immediate(&mut self, imm: Immediate) -> Option<u8> {
+        let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
+        let n = bytes[0];
+        if n < 16
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (n.wrapping_add(i as u8)) % 16)
+        {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     fn shuffle_dup8_from_imm(&mut self, imm: Immediate) -> Option<u8> {
         let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
         if bytes.iter().all(|b| *b == bytes[0]) && bytes[0] < 16 {
