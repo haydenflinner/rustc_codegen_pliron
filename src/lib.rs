@@ -186,8 +186,48 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         fb.set("probestack_strategy", "inline").unwrap();
     }
     let flags = settings::Flags::new(fb);
-    let isa = cranelift_codegen::isa::lookup(triple)
+    let mut isa = cranelift_codegen::isa::lookup(triple.clone())
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
+    // Target features → ISA flags. `sess.internal_target_features` holds the
+    // effective set (spec baseline + `-Ctarget-cpu` + `-Ctarget-feature`).
+    let tf = |rust: &str| sess.internal_target_features.contains(&Symbol::intern(rust));
+    let isa_feats: &[(&str, &str)] = match triple.architecture {
+        target_lexicon::Architecture::Aarch64(_) => &[
+            ("lse", "has_lse"),
+            ("dotprod", "has_dotprod"),
+            ("i8mm", "has_i8mm"),
+            ("fp16", "has_fp16"),
+            ("bti", "use_bti"),
+        ],
+        target_lexicon::Architecture::X86_64 => &[
+            ("sse3", "has_sse3"),
+            ("ssse3", "has_ssse3"),
+            ("sse4.1", "has_sse41"),
+            ("sse4.2", "has_sse42"),
+            ("avx", "has_avx"),
+            ("avx2", "has_avx2"),
+            ("fma", "has_fma"),
+            ("popcnt", "has_popcnt"),
+            ("bmi1", "has_bmi1"),
+            ("bmi2", "has_bmi2"),
+            ("lzcnt", "has_lzcnt"),
+            ("cmpxchg16b", "has_cmpxchg16b"),
+            ("avx512f", "has_avx512f"),
+            ("avx512vl", "has_avx512vl"),
+            ("avx512dq", "has_avx512dq"),
+            ("avx512bitalg", "has_avx512bitalg"),
+            ("avx512vbmi", "has_avx512vbmi"),
+            ("avx512vnni", "has_avx512vnni"),
+            ("avxvnni", "has_avx_vnni"),
+        ],
+        _ => &[],
+    };
+    for &(rust, flag) in isa_feats {
+        if tf(rust) {
+            isa.enable(flag)
+                .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
+        }
+    }
     isa.finish(flags)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
 }
@@ -381,6 +421,96 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     PlironModule { obj, ir, asm }
 }
 
+/// Whether a rustc target feature is enabled in the *base* target machine:
+/// the arch baseline, the spec's `features` string, or the spec/`-C` cpu.
+fn base_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool {
+    // The spec `features` string is a comma-separated "+x"/"-y" list; a later
+    // entry wins. An explicit `-feat` suppresses even a cpu-implied feature.
+    let mut spec = None;
+    for f in sess.target.features.split(',') {
+        let n = f.strip_prefix('+').or_else(|| f.strip_prefix('-'));
+        if n == Some(feature) {
+            spec = Some(f.starts_with('+'));
+        }
+    }
+    if let Some(v) = spec {
+        return v;
+    }
+    let baseline: &[&str] = match sess.target.arch {
+        // x86_64 mandates SSE2; rustc requires fxsr/x87 on top.
+        rustc_target::spec::Arch::X86_64 => &["fxsr", "sse", "sse2", "x87"],
+        // Every aarch64 platform chip has NEON.
+        rustc_target::spec::Arch::AArch64 => &["neon"],
+        _ => &[],
+    };
+    if baseline.contains(&feature) {
+        return true;
+    }
+    let cpu = sess.opts.cg.target_cpu.as_deref().unwrap_or(&sess.target.cpu);
+    if cpu == "native" {
+        return native_has_feature(sess, feature);
+    }
+    cpu_features(cpu).contains(&feature)
+}
+/// `-Ctarget-cpu=native`: LLVM would expand the host cpu name; we probe the
+/// host directly. Only meaningful when compiling for the host arch.
+fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool {
+    use rustc_target::spec::Arch;
+    match sess.target.arch {
+        #[cfg(target_arch = "aarch64")]
+        Arch::AArch64 => match feature {
+            "aes" => std::arch::is_aarch64_feature_detected!("aes"),
+            "dotprod" => std::arch::is_aarch64_feature_detected!("dotprod"),
+            "fcma" => std::arch::is_aarch64_feature_detected!("fcma"),
+            "fp16" => std::arch::is_aarch64_feature_detected!("fp16"),
+            "i8mm" => std::arch::is_aarch64_feature_detected!("i8mm"),
+            "lse" => std::arch::is_aarch64_feature_detected!("lse"),
+            "neon" => true,
+            "rcpc" => std::arch::is_aarch64_feature_detected!("rcpc"),
+            "sha2" => std::arch::is_aarch64_feature_detected!("sha2"),
+            "sha3" => std::arch::is_aarch64_feature_detected!("sha3"),
+            _ => false,
+        },
+        #[cfg(target_arch = "x86_64")]
+        Arch::X86_64 => match feature {
+            "sse3" => std::arch::is_x86_feature_detected!("sse3"),
+            "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
+            "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+            "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
+            "avx" => std::arch::is_x86_feature_detected!("avx"),
+            "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            "popcnt" => std::arch::is_x86_feature_detected!("popcnt"),
+            "bmi1" => std::arch::is_x86_feature_detected!("bmi1"),
+            "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+            "lzcnt" => std::arch::is_x86_feature_detected!("lzcnt"),
+            "cmpxchg16b" => std::arch::is_x86_feature_detected!("cmpxchg16b"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+/// rustc `-Ctarget-cpu` names → feature sets, for the cpus whose properties
+/// feed cranelift lowering. Only entries we can state confidently go here;
+/// anything else falls back to the spec baseline.
+fn cpu_features(cpu: &str) -> &'static [&'static str] {
+    match cpu {
+        // Apple A12-generation and later: v8.3/v8.4+ — dotprod, lse, fp16.
+        "apple-a12" | "apple-s4" | "apple-s5" => {
+            &["aes", "sha2", "dotprod", "lse", "fp16"]
+        }
+        // FEAT_SHA3 arrived with A13; all Apple Silicon Macs (M1+) have it.
+        "apple-a13" | "apple-a14" | "apple-s6" | "apple-s7" | "apple-s8" | "apple-m1" => {
+            &["aes", "sha2", "sha3", "dotprod", "lse", "fp16"]
+        }
+        // FEAT_I8MM arrived with the A15/M2 generation.
+        "apple-a15" | "apple-a16" | "apple-a17" | "apple-a18" | "apple-s9" | "apple-s10"
+        | "apple-s11" | "apple-m2" | "apple-m3" | "apple-m4" | "apple-latest" => {
+            &["aes", "sha2", "sha3", "dotprod", "lse", "fp16", "i8mm"]
+        }
+        _ => &[],
+    }
+}
 impl CodegenBackend for PlironCodegenBackend {
     fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
         types::PTR32.store(
@@ -388,20 +518,25 @@ impl CodegenBackend for PlironCodegenBackend {
             std::sync::atomic::Ordering::Relaxed,
         );
         use rustc_target::spec::{Arch, Os};
-        let feats: Vec<Symbol> = match sess.target.arch {
-            Arch::X86_64 if sess.target.os != Os::None => ["fxsr", "sse", "sse2", "x87"]
-                .iter()
-                .map(|f| Symbol::intern(f))
-                .collect(),
-            Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
+        // Base-target features: the arch baseline, plus whatever the spec's
+        // `features` string / `cpu` name imply, plus `-Ctarget-feature` (parsed
+        // and validated by the helper against rustc's feature names).
+        let feats = match sess.target.arch {
+            Arch::X86_64 | Arch::AArch64 if sess.target.os != Os::None => {
+                rustc_codegen_ssa::target_features::internal_target_features::<0>(
+                    sess,
+                    |_| Default::default(),
+                    |feature| base_has_feature(sess, feature),
+                )
+            }
             Arch::Wasm32 => wasm::target_features(&sess.target, &sess.opts)
                 .iter()
                 .map(|f| Symbol::intern(f))
                 .collect(),
-            _ => vec![],
+            _ => Default::default(),
         };
         TargetConfig {
-            internal_target_features: rustc_data_structures::unord::UnordSet::from_iter(feats),
+            internal_target_features: feats,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f16b: false,
