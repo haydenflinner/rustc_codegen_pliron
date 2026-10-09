@@ -604,7 +604,7 @@ pub fn lower_to_object(
                 panic!("loopdel broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if std::env::var("PLIRON_LOOPROT").is_ok_and(|v| v == "1") {
+        if crate::pass_enabled("PLIRON_LOOPROT") && crate::bisect("looprot") {
             crate::looprot::run(&mut clctx.func);
             if dump {
                 eprintln!("==== clif {n} after looprot ====\n{}", clctx.func.display());
@@ -718,19 +718,21 @@ pub fn lower_to_object(
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
     let mut product = m.finish();
-    // `\x01name` is LLVM's no-mangle marker: emit the rest verbatim, without
-    // the platform prefix (e.g. `_`) that add_symbol already prepended.
+    // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
+    // declaration, so the stored name is `name` or `_name` — drop the
+    // platform prefix (e.g. `_`) that add_symbol prepended.
+    let prefix = product.object.mangling().global_prefix();
     for n in &verbatim_syms {
         let sid = product
             .object
-            .symbol_id(n.as_bytes())
+            .symbol_id(crate::obj_sym(n).as_bytes())
             .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
         let name = &mut product.object.symbol_mut(sid).name;
-        *name = name
-            .strip_prefix(b"_\x01")
-            .or_else(|| name.strip_prefix(b"\x01"))
-            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"))
-            .to_vec();
+        if let Some(p) = prefix
+            && name.starts_with(&[p])
+        {
+            name.remove(0);
+        }
     }
     if !custom_secs.is_empty() {
         emit_merged_custom_sections(&mut product.object, custom_secs);
@@ -1843,11 +1845,46 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .next()
                 .is_some_and(|o| Operation::is_op::<UnreachableOp>(o, ctx));
             if !self.dense_switch(x, &vals, d, dead_default) {
-                let mut s = cranelift_frontend::Switch::new();
-                for &(v, b) in &vals {
-                    s.set_entry(v, b);
+                if self.b.func.dfg.value_type(x) == clt::I128 {
+                    // `Switch::emit` subtracts a case cluster's minimum via
+                    // `iadd_imm_s(val, (min as i64).wrapping_neg())`, which is
+                    // only valid mod 2^64 — wrong for i128 indices. Split into
+                    // a switch on the high half whose cases each switch on the
+                    // low half.
+                    let (lo, hi) = self.b.ins().isplit(x);
+                    let mut by_hi: std::collections::BTreeMap<u64, Vec<(u64, ir::Block)>> =
+                        Default::default();
+                    for &(v, b) in &vals {
+                        by_hi.entry((v >> 64) as u64).or_default().push((v as u64, b));
+                    }
+                    let mut hi_switch = cranelift_frontend::Switch::new();
+                    let groups: Vec<(ir::Block, Vec<(u64, ir::Block)>)> = by_hi
+                        .values()
+                        .map(|g| {
+                            let blk = self.b.create_block();
+                            (blk, g.clone())
+                        })
+                        .collect();
+                    for (&h, &(blk, _)) in by_hi.keys().zip(groups.iter()) {
+                        hi_switch.set_entry(h as u128, blk);
+                    }
+                    hi_switch.emit(&mut self.b, hi, d);
+                    for (blk, group) in groups {
+                        self.b.switch_to_block(blk);
+                        let mut lo_switch = cranelift_frontend::Switch::new();
+                        for (v, b) in group {
+                            lo_switch.set_entry(v as u128, b);
+                        }
+                        lo_switch.emit(&mut self.b, lo, d);
+                        self.b.seal_block(blk);
+                    }
+                } else {
+                    let mut s = cranelift_frontend::Switch::new();
+                    for &(v, b) in &vals {
+                        s.set_entry(v, b);
+                    }
+                    s.emit(&mut self.b, x, d);
                 }
-                s.emit(&mut self.b, x, d);
             }
             self.terminated = true;
         } else if is!(CondBrOp) {

@@ -283,8 +283,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             instcombine::run(ctx, st);
             domcheck::run(ctx, st, "instcombine");
         }
-        if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
+        if pass_enabled("PLIRON_MEMCPYOPT") {
             memcpyopt::run(ctx, st);
+            domcheck::run(ctx, st, "memcpyopt");
         }
         if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
             sroa::forward(ctx, st);

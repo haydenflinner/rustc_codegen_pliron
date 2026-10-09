@@ -417,8 +417,14 @@ fn trip(
             if let Some(c) = c {
                 env.insert(rs[0], c);
                 let v = match nb {
+                    // `env` only tracks 64 bits; folding a wider result would
+                    // fabricate the high half (and `iconst` tops out at i64).
                     Some(nb) => {
                         let ty = func.dfg.value_type(rs[0]);
+                        if ty.bits() > 64 {
+                            map.insert(rs[0], rs[0]);
+                            continue;
+                        }
                         FuncCursor::new(func)
                             .at_bottom(nb)
                             .ins()
