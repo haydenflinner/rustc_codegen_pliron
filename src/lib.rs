@@ -52,6 +52,7 @@ mod objmerge;
 mod phisimp;
 mod simd;
 mod slp;
+mod spec;
 mod sroa;
 mod switchmap;
 mod taildup;
@@ -262,6 +263,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         inline::run(ctx, st, small, None, false);
         domcheck::run(ctx, st, "inline");
+        if pass_enabled("PLIRON_SPEC") {
+            spec::run(ctx, st);
+            domcheck::run(ctx, st, "spec");
+        }
+        // Opt-in: unsound on wasm emulated EH, which unwinds through ordinary
+        // calls (llvm.wasm.throw / __pliron_eh) the body scan can't see.
         if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
             nounwind::run(ctx, st);
         }
