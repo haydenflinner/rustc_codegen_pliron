@@ -224,3 +224,38 @@ there instead of in the cwd.
   emits `__floatuntihf` for u128 -> f16, which isn't in any library, so the
   link fails; pliron goes via f32. f16/f128 tests in the UI corpus may show
   `env-link`/`output-mismatch` only when they exercise these paths.
+- `src/licm.rs` (found by fuzz-matrix seed 7 with `PLIRON_TAILDUP=0`, 8
+  verifier ICEs of the form `licm broke <fn>: ireduce uses value from
+  non-dominating inst`): the invariance test treated "operand defined
+  outside the loop" as sufficient, but on irreducible CFGs the preheader
+  can be reachable from inside the loop, so an outside def need not
+  dominate the insertion point — and a def inside the body can supply a
+  use without dominating the header. Now: operands must dominate the
+  insertion point, the insertion block must dominate the header, and the
+  header must dominate every body block (bails otherwise).
+- `src/loopidiom.rs` (found via stage2 `rustc` emitting invalid MIR —
+  `rustc_mir_transform::ssa::compute_copy_classes`'s masked-store loop
+  `for h in copies.iter_mut() { if *h == head { *h = RETURN } }` became a
+  `memset`): a loop whose store sits behind an in-loop `brif` was
+  converted to an unconditional `memset`. Fixed by requiring the store to
+  dominate every latch; `cfg`/`domtree`/`loop_analysis` are recomputed
+  after each rewrite and converted headers are skipped on rescan.
+- `src/loopvec.rs` (found by `PLIRON_VERIFY=1` while self-hosting —
+  `aho_corasick` `RareBytesThree::find_in` and `regex_automata`
+  `find_fwd`): multiple lane-wise early exits emitted several `brif`
+  terminators into one block ("terminator before end of block").
+  Each check now terminates a fresh block, chaining to the next check.
+- `src/loopvec.rs` (found by `PLIRON_VERIFY=1` while self-hosting
+  `rustc_trait_selection`'s
+  `extend_cause_with_original_assoc_item_obligation`): splatting a
+  cond-tree operand *narrower* than the lanes (an i8 flag across i32
+  lanes) emitted `ireduce.i32 v_i8`, which requires the arg to be wider
+  than the result. Wide sources still `ireduce`; narrow sources now
+  `sextend` (a -1 mask stays all-ones, 0/1 flags stay 0/1).
+- Self-host status: stage1 completes end-to-end; the pliron-built stage1
+  rustc compiles stage2 cleanly except for one remaining `licm`-only
+  miscompile (stage2 rustc SIGSEGVs inside
+  `rustc_ast_passes::ast_validation` reading a null `Attribute` field —
+  under bisection with `PLIRON_OPT_BISECT`, licm gates counted per
+  function). `PLIRON_LICM_PROMOTE=0` does not fix it, so the culprit is
+  the hoist or store-sink path.
