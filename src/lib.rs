@@ -42,6 +42,7 @@ mod loadfwd;
 mod loopdel;
 mod loopidiom;
 mod looprot;
+mod loopvec;
 mod unroll;
 mod lower;
 mod memcpyopt;
@@ -329,6 +330,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.licm = pass_enabled("PLIRON_LICM");
         st.indvars = pass_enabled("PLIRON_INDUCT");
         st.loopidiom = pass_enabled("PLIRON_IDIOM");
+        st.loopvec = pass_enabled("PLIRON_VEC");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }

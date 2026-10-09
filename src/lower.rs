@@ -524,6 +524,22 @@ pub fn lower_to_object(
                 panic!("loopidiom broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.loopvec && crate::bisect("loopvec") {
+            let simd = matches!(
+                isa.triple().architecture,
+                target_lexicon::Architecture::Aarch64(_)
+                    | target_lexicon::Architecture::X86_64
+            );
+            let k = crate::loopvec::run(&mut clctx.func, n, &noalias, m.target_config(), simd);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("loopvec {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("loopvec broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
             let k = crate::switchmap::run(&mut clctx.func);
             // The new bounds tests are often implied by a dominating check.
