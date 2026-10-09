@@ -42,6 +42,7 @@ pub struct UnwindContext {
     /// POINTER_TO_GOT reloc instead of a DW.ref slot.
     personality_fn: Option<u32>,
     macho: bool,
+    x86_macho: bool,
 }
 
 impl UnwindContext {
@@ -54,6 +55,8 @@ impl UnwindContext {
         let mut frame_table = FrameTable::default();
         let macho =
             module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+        let x86_macho = macho
+            && module.isa().triple().architecture == target_lexicon::Architecture::X86_64;
         let mut personality_fn = None;
         let cie_id = module.isa().create_systemv_cie().map(|mut cie| {
             let ptr_enc = if pic {
@@ -128,6 +131,7 @@ impl UnwindContext {
             lsda: unwind,
             personality_fn,
             macho,
+            x86_macho,
         }
     }
 
@@ -231,7 +235,17 @@ impl UnwindContext {
             .object
             .section_mut(sec)
             .set_data(w.writer.into_vec(), 8);
-        for r in &w.relocs {
+        // x86_64-macho: ld64's eh_frame parser accepts only UNSIGNED,
+        // SUBTRACTOR and GOT relocs — a pcrel field needs a SUBTRACTOR
+        // (field label) + UNSIGNED (target) pair, like the assembler's
+        // `.long target - Lfield`. object::write reverses a reloc list that
+        // is ascending by offset (ld64 wants descending), so emit ours
+        // descending to keep each SUBTRACTOR immediately before its UNSIGNED.
+        let mut relocs: Vec<&DebugReloc> = w.relocs.iter().collect();
+        if self.x86_macho {
+            relocs.sort_by_key(|r| std::cmp::Reverse(r.offset));
+        }
+        for r in relocs {
             let (symbol, off) = match r.name {
                 DebugRelocName::Section(_) => (product.object.section_symbol(sec), 0),
                 DebugRelocName::Symbol(id) => {
@@ -254,30 +268,79 @@ impl UnwindContext {
                     }
                 }
             };
-            let (flags, addend) = if self.macho
+            if self.macho
                 && matches!(r.name, DebugRelocName::Symbol(id) if self.personality_fn == Some(id as u32))
                 && u64::from(r.offset) < cie_end
             {
                 // CIE personality: ld64 stores the symbol index in the field
                 // and turns it into a GOT pcrel fixup in the linked image.
-                (
-                    RelocationFlags::MachO {
-                        r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
-                        r_pcrel: true,
-                        r_length: 2,
-                    },
-                    0,
-                )
-            } else {
-                (
-                    RelocationFlags::Generic {
-                        kind: r.kind,
-                        encoding: RelocationEncoding::Generic,
-                        size: r.size * 8,
-                    },
-                    off as i64 + r.addend,
-                )
-            };
+                let r_type = if self.x86_macho {
+                    object::macho::X86_64_RELOC_GOT
+                } else {
+                    object::macho::ARM64_RELOC_POINTER_TO_GOT
+                };
+                // r_pcrel must stay clear on x86_64: the writer would fold a
+                // +4 pcrel correction into the field, and ld64 adds the field
+                // to the symbol index it stores there.
+                product
+                    .object
+                    .add_relocation(
+                        sec,
+                        Relocation {
+                            offset: u64::from(r.offset),
+                            symbol,
+                            flags: RelocationFlags::MachO {
+                                r_type,
+                                r_pcrel: !self.x86_macho,
+                                r_length: 2,
+                            },
+                            addend: 0,
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
+            if self.x86_macho {
+                // A local symbol at the relocated field itself, so the
+                // SUBTRACTOR computes target - field.
+                let lbl = product.object.add_symbol(object::write::Symbol {
+                    name: format!("Leh_field_{:x}", r.offset).into_bytes(),
+                    value: u64::from(r.offset),
+                    size: 0,
+                    kind: object::SymbolKind::Unknown,
+                    scope: object::SymbolScope::Compilation,
+                    weak: false,
+                    section: object::write::SymbolSection::Section(sec),
+                    flags: object::SymbolFlags::None,
+                });
+                let r_length = match r.size {
+                    4 => 2,
+                    8 => 3,
+                    _ => unreachable!("eh_frame reloc size {}", r.size),
+                };
+                for (r_type, sym) in [
+                    (object::macho::X86_64_RELOC_SUBTRACTOR, lbl),
+                    (object::macho::X86_64_RELOC_UNSIGNED, symbol),
+                ] {
+                    product
+                        .object
+                        .add_relocation(
+                            sec,
+                            Relocation {
+                                offset: u64::from(r.offset),
+                                symbol: sym,
+                                flags: RelocationFlags::MachO {
+                                    r_type,
+                                    r_pcrel: false,
+                                    r_length,
+                                },
+                                addend: off as i64 + r.addend,
+                            },
+                        )
+                        .unwrap();
+                }
+                continue;
+            }
             product
                 .object
                 .add_relocation(
@@ -285,8 +348,12 @@ impl UnwindContext {
                     Relocation {
                         offset: u64::from(r.offset),
                         symbol,
-                        flags,
-                        addend,
+                        flags: RelocationFlags::Generic {
+                            kind: r.kind,
+                            encoding: RelocationEncoding::Generic,
+                            size: r.size * 8,
+                        },
+                        addend: off as i64 + r.addend,
                     },
                 )
                 .unwrap();
