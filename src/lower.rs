@@ -450,6 +450,43 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Upstream Cranelift's egraph pass: GVN + ISLE cprop/remat rules +
+        // redundant-load elimination + egraph LICM. Opt-in while its cost and
+        // wins vs. our own passes are measured.
+        // Upstream's egraph doesn't know `try_call` (it predates EH), so
+        // functions with invokes are skipped entirely.
+        if std::env::var("PLIRON_EGRAPH").is_ok_and(|v| v == "1")
+            && crate::bisect("egraph")
+            && !clctx
+                .func
+                .layout
+                .blocks()
+                .flat_map(|b| clctx.func.layout.block_insts(b))
+                .any(|i| {
+                    clctx.func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::TryCall
+                })
+        {
+            let mut cp = cranelift_codegen::control::ControlPlane::default();
+            // The egraph indexes values directly; our passes leave
+            // `Value` aliases it doesn't resolve.
+            clctx.func.dfg.resolve_all_aliases();
+            clctx.compute_cfg();
+            clctx.compute_domtree();
+            clctx
+                .egraph_pass(&*isa, &mut cp)
+                .unwrap_or_else(|e| panic!("egraph broke `{n}`: {e}\n{}", clctx.func.display()));
+            // The egraph populated cfg/domtree; later passes don't maintain
+            // them, so drop them rather than leave stale-but-"valid" state
+            // that `compile`'s initial verify would check.
+            clctx.cfg.clear();
+            clctx.domtree.clear();
+            if dump {
+                eprintln!(
+                    "==== clif {n} after egraph ====\n{}",
+                    clctx.func.display()
+                );
+            }
+        }
         if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
             let k = crate::switchmap::run(&mut clctx.func);
             // The new bounds tests are often implied by a dominating check.
