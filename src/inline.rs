@@ -18,7 +18,7 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{Typed, TypedHandle};
 use pliron::value::Value;
-use pliron_llvm::ops::{BrOp, CallOp, GetElementPtrOp, LoadOp, ReturnOp};
+use pliron_llvm::ops::{BrOp, CallOp, CondBrOp, GetElementPtrOp, LoadOp, ReturnOp};
 use pliron_llvm::types::FuncType;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -121,6 +121,50 @@ fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
                         p = d.deref(ctx).get_operand(0);
                     }
                     _ => break,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parameter indices of `f` that reach a conditional branch's condition
+/// through a short def chain: a scalar-constant argument there folds the
+/// branch in the inlined clone, so the callsite gets a size-limit bonus.
+fn cond_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else {
+        return Vec::new();
+    };
+    let params: Vec<Value> = entry.deref(ctx).arguments().collect();
+    let mut out = Vec::new();
+    for &b in &bs {
+        for op in ops(ctx, b) {
+            if !Operation::is_op::<CondBrOp>(op, ctx) {
+                continue;
+            }
+            let mut work = vec![op.deref(ctx).get_operand(0)];
+            let mut seen: FxHashSet<Value> = FxHashSet::default();
+            let mut budget = 32;
+            while let Some(v) = work.pop() {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                if let Some(i) = params.iter().position(|&a| a == v) {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                    continue;
+                }
+                if !seen.insert(v) {
+                    continue;
+                }
+                let Some(d) = v.defining_op() else {
+                    continue;
+                };
+                for oi in 0..d.deref(ctx).get_num_operands() {
+                    work.push(d.deref(ctx).get_operand(oi));
                 }
             }
         }
@@ -266,16 +310,34 @@ pub fn run(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 4 });
+    // Similarly, callees up to `fold`x the limit whose param reaches a branch
+    // condition are inlined where that argument is a scalar constant, which
+    // folds the branch in the clone (`PLIRON_INLINE_FOLD=<x>`).
+    let fold: usize = std::env::var("PLIRON_INLINE_FOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 2 });
     let mut ok: FxHashMap<String, (Ptr<Operation>, bool, usize)> = FxHashMap::default();
-    let mut dv: FxHashMap<String, (Ptr<Operation>, bool, usize, Vec<usize>)> = FxHashMap::default();
+    let mut dv: FxHashMap<String, (Ptr<Operation>, bool, usize, Vec<usize>, Vec<usize>)> =
+        FxHashMap::default();
     let devirt_ok = |ctx: &Context, st: &State<'_>, sym: &str, dv: &mut FxHashMap<_, _>| {
-        if bonus <= 1 {
+        let max = limit * bonus.max(fold);
+        if max <= limit {
             return;
         }
-        if let Some((eh, n)) = eligible(ctx, st, sym, limit * bonus, false) {
-            let ps = devirt_params(ctx, st.funcs[sym].op);
-            if !ps.is_empty() {
-                dv.insert(sym.to_string(), (st.funcs[sym].op, eh, n, ps));
+        if let Some((eh, n)) = eligible(ctx, st, sym, max, false) {
+            let ps = if bonus > 1 {
+                devirt_params(ctx, st.funcs[sym].op)
+            } else {
+                Vec::new()
+            };
+            let qs = if fold > 1 {
+                cond_params(ctx, st.funcs[sym].op)
+            } else {
+                Vec::new()
+            };
+            if !ps.is_empty() || !qs.is_empty() {
+                dv.insert(sym.to_string(), (st.funcs[sym].op, eh, n, ps, qs));
             }
         }
     };
@@ -315,15 +377,26 @@ pub fn run(
                     continue;
                 };
                 let Some((callee, eh, n)) = ok.get(cs).copied().or_else(|| {
-                    let (f, eh, n, ps) = dv.get(cs)?;
+                    let (f, eh, n, ps, qs) = dv.get(cs)?;
                     let args = Operation::get_op::<CallOp>(op, ctx)?.args(ctx);
-                    ps.iter()
-                        .any(|&i| {
+                    let dvirt = *n <= limit * bonus
+                        && ps.iter().any(|&i| {
                             args.get(i).is_some_and(|a| {
                                 matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
                             })
-                        })
-                        .then_some((*f, *eh, *n))
+                        });
+                    let foldable = *n <= limit * fold
+                        && qs.iter().any(|&i| {
+                            args.get(i).is_some_and(|a| {
+                                matches!(
+                                    st.consts.get(a),
+                                    Some(
+                                        ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. }
+                                    )
+                                )
+                            })
+                        });
+                    (dvirt || foldable).then_some((*f, *eh, *n))
                 }) else {
                     continue;
                 };
