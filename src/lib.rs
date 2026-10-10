@@ -546,6 +546,10 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         | "apple-s11" | "apple-m2" | "apple-m3" | "apple-m4" | "apple-latest" => {
             &["aes", "sha2", "sha3", "dotprod", "lse", "fp16", "i8mm"]
         }
+        // SSSE3-era (Core 2, original Atom): no SSE4.
+        "core2" | "bonnell" | "saltwell" => &["cmpxchg16b", "lahfsahf", "ssse3"],
+        // SSE4.1-era (Penryn; also the x86_64-apple-darwin spec default).
+        "penryn" => &["cmpxchg16b", "lahfsahf", "sse4.1"],
         // SSE4.2-era Intel (v2): Nehalem/Westmere and friends.
         "x86-64-v2" | "nehalem" | "corei7" | "westmere" | "silvermont" | "slm"
         | "goldmont" | "goldmont-plus" | "tremont" => X64_V2,
