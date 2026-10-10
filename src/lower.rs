@@ -3529,7 +3529,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.b.ins().brif(c, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let (se, de) = (self.b.ins().iadd(src, m), self.b.ins().iadd(dst, m));
-        let f = MemFlagsData::new();
+        // Same UB-on-invalid rule as `plain_mf`: a copy to/from invalid
+        // memory is UB, so at -O the expanded accesses need no trap record.
+        let f = if self.st.notrap {
+            MemFlagsData::new().with_notrap()
+        } else {
+            MemFlagsData::new()
+        };
         let v0 = self.b.ins().load(t, f, src, 0);
         let v1 = self.b.ins().load(t, f, se, 0);
         self.b.ins().store(f, v0, dst, 0);
@@ -3573,12 +3579,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     .filter(|n| (0..=SMALL_MEM).contains(n))
                 {
                     // Load everything before storing, so this is also a valid memmove.
+                    let mf = self.plain_mf(op);
                     let vals: Vec<_> = mem_chunks(n as u64)
                         .into_iter()
-                        .map(|(o, t)| (o, self.b.ins().load(t, MemFlagsData::new(), a[1], o)))
+                        .map(|(o, t)| (o, self.b.ins().load(t, mf, a[1], o)))
                         .collect();
                     for (o, v) in vals {
-                        self.b.ins().store(MemFlagsData::new(), v, a[0], o);
+                        self.b.ins().store(mf, v, a[0], o);
                     }
                     return;
                 }
@@ -3603,6 +3610,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     .filter(|n| (0..=SMALL_MEM).contains(n));
                 if let (Some(n), Some(c)) = (n, self.const_int(opnds[1])) {
                     let byte = c as u8 as u64;
+                    let mf = self.plain_mf(op);
                     let mut splat = None;
                     for (o, t) in mem_chunks(n as u64) {
                         let v = if t.is_vector() {
@@ -3615,7 +3623,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                                 & (u64::MAX >> (64 - t.bits()));
                             self.b.ins().iconst(t, pat as i64)
                         };
-                        self.b.ins().store(MemFlagsData::new(), v, a[0], o);
+                        self.b.ins().store(mf, v, a[0], o);
                     }
                     return;
                 }

@@ -656,11 +656,46 @@ pub(crate) fn count(
     })
 }
 
-/// `b` is a diverging dead end: it ends in `trap` and has no successors.
+/// `b` is a diverging dead end: it ends in `trap` and has no successors, or
+/// it ends in a `try_call` (unwinding panic/abort stub) whose fall-through
+/// edge reaches a dead end — rustc points a `-> !` callee's impossible
+/// "normal return" at `trap`, possibly through cold forwarding blocks. The
+/// exception edge unwinds out of the frame, so it can't resume the loop
+/// either. A few hops suffice; a cycle isn't a dead end.
 pub(crate) fn deadend(func: &Function, b: Block) -> bool {
-    func.layout
-        .last_inst(b)
-        .is_some_and(|t| func.dfg.insts[t].opcode() == Opcode::Trap)
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut cur = b;
+    loop {
+        if !seen.insert(cur) {
+            return false;
+        }
+        let Some(t) = func.layout.last_inst(cur) else {
+            return false;
+        };
+        match func.dfg.insts[t].opcode() {
+            Opcode::Trap => return true,
+            Opcode::TryCall => {
+                // The exception table lists the handler targets first and
+                // the normal-return continuation last; an unwinding callee
+                // leaves the frame, so only the normal edge could resume
+                // the loop. A `-> !` callee's continuation is `trap`.
+                let Some(bc) = func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .last()
+                else {
+                    return false;
+                };
+                cur = bc.block(&func.dfg.value_lists);
+            }
+            Opcode::Jump => {
+                let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
+                    return false;
+                };
+                cur = destination.block(&func.dfg.value_lists);
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Exit edge `e` is never taken because its `brif` arg is a constant

@@ -667,3 +667,23 @@ Track as x64 agent follow-up.
   reversal vs our scalar) — mirror-swap vectorization.
 - wasm remaining: multi-callsite mid-size callee inlining needs
   callgraph-aware cost model; dot_i32 +2.4% noise.
+
+## wt/native-opt: mirror-swap vectorization — slice::reverse 11x → parity
+- src/lower.rs: constant-size `llvm.memcpy`/`memmove`/`memset` inline
+  expansions + `small_copy_or_call` fast path now use `plain_mf(op)`
+  (`notrap` at -O). Without it, `ptr::swap`-expanded memops bailed
+  loopvec as side-effecting `other` insts.
+- src/loopidiom.rs: `deadend` follows `try_call` normal-return edges
+  (last exception-table target) and cold `jump` chains to `trap` —
+  unwinding panic paths in functions with cleanup are diverging dead
+  ends for guard proving (guard_dead/guard_pred callers).
+- No loopvec changes needed: `neg`-stream load/store `vreverse`
+  machinery already handles the crossed two-sided swap.
+- slice::reverse u8 0.244→0.022 (stock 0.022, was 11x), u64 0.156→
+  0.092 (0.091, was 1.7x). rev_inplace u8 0.221→0.022 (stock scalar
+  0.213 — now ~10x faster than stock), u64 0.128→0.092 (0.127).
+- Side effect: any loop over small-copy/memset-expanded memory is now
+  vectorizer-eligible (notrap on the expanded ops).
+- Verified: build clean; PLIRON_VERIFY=1 ./test.sh green; exhaustive
+  reverse correctness (sizes 0..=300 + boundary straddles, u8..u64);
+  drev/drev2/bc/rmw/dse/pairfuse/edgespec fixtures pass.

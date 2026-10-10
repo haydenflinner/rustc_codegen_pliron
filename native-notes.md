@@ -887,3 +887,49 @@ edgespec test; harness tier-0 smoke 11/11 + determinism 10/10;
 rmw_check/dse_check/bc_check/drev/drev2 match stock; swtest/swtest2/
 tok2/tok3 outputs identical to stock; wsmin 9000 with bittab 1 +
 edgespec 5 fired.
+
+### mirror-swap vectorization (slice::reverse + rev_inplace parity/beats)
+
+`slice::reverse` and `s.swap(i, n-1-i)` reach loopvec as a two-stream
+in-place mirror swap: an ascending stream `a[i]` and a descending
+stream `b[n-1-i]` with crossed stores (`store back→front`,
+`store front→back`). loopvec's existing `neg`-stream machinery already
+does the whole transform — loads on the descending stream get
+`vreverse` (byte-level `shuffle` → `rev64.16b`+`ext.16b` on aarch64,
+`ext.16b` alone for 2-lane vectors), and so do store values written
+to a `neg` address. Two latent gates, not the vectorizer, blocked it:
+
+- `lower.rs`: `ptr::swap` → `copy_nonoverlapping` → `llvm.memcpy` of 1
+  element expands inline (≤SMALL_MEM) with `MemFlagsData::new()` — no
+  `notrap` — so the back-half load and crossed store landed in
+  loopvec's `other` bucket ("side effects"). Now the constant-size
+  memcpy/memmove expansion, `small_copy_or_call`, and the inline
+  memset expansion all use `plain_mf(op)` — `notrap` at -O like every
+  other plain access (UB-on-invalid is the same argument). This also
+  unblocks vectorization of any other loop touching small-copy/
+  memset-expanded memory.
+- `loopidiom.rs::deadend`: cold bounds-check exits in functions with
+  unwind cleanup end in `try_call` (panic path) instead of
+  `call; trap`, so `deadend` (and with it `guard_dead`/`guard_pred`)
+  refused to prove the guards dead. `deadend` now follows a
+  `try_call`'s normal-return continuation (the LAST exception-table
+  target — handler targets come first) and cold `jump` chains; a
+  `-> !` callee's continuation is `trap`. With that, the const-folded
+  front gate (`brif 1`) and the descending-index check
+  `ult(bound-1-i, bound)` both fold dead and the loop vectorizes.
+
+rev bench (1M u8 / 500k u64, aarch64): slice::reverse u8 0.244 →
+0.022 vs stock 0.022 — 11x gap CLOSED to parity; u64 0.156 → 0.092
+vs 0.091 — 1.7x gap closed. rev_inplace u8 0.221 → 0.022 vs stock
+0.213 — 10x FASTER than stock (LLVM doesn't vectorize the manual
+swap either; it was scalar on both sides); u64 0.128 → 0.092 vs
+0.127. Vector loop: `ldp` batch loads, `rev64.16b`+`ext.16b` per
+vector, crossed `str` stores, `cbnz` countdown latch, 64B/iter
+(UNROLL=4 × 16B) — same shape as LLVM's.
+
+Validated: cargo build; PLIRON_VERIFY=1 ./test.sh green;
+rev_correct.rs exhaustive sizes 0..=300 + boundary straddles
+(511/512/513/1023/1024/4095/4096/65537) × u8/u16/u32/u64 + manual
+swap + double-reverse identity all match stock; drev/drev2
+(reverse-copy) intact; bc_check/bc_sem/rmw_check/dse_check/pairfuse/
+edgespec pass; earch/early2/dtest2/dtest3 pass.
