@@ -333,6 +333,12 @@ pub fn lower_to_wasm(
         o.funcs[i].body = Some(body);
     }
 
+    // Waffle-IR inlining: splice small / single-callsite callees into
+    // callers while `Call` targets still index `o.funcs`. Callees whose
+    // last call edge disappears are dropped by wasm-ld's GC — this is
+    // the main lever on the 4x function-count gap vs stock.
+    winline(&mut o.funcs, verbose);
+
     // Only import functions that are actually called; GOT.func globals
     // name their targets, so they don't need an import.
     let mut called = vec![false; o.funcs.len()];
@@ -1412,6 +1418,336 @@ fn wpeep(bytes: &mut Vec<u8>) {
         p = e;
     }
     *bytes = out;
+}
+
+/// Rebuild `succs`/`preds`/`pos_in_succ_pred`/`pos_in_pred_succ` from
+/// terminators. Needed after `inline_site` rewrites the CFG; waffle's
+/// later passes (CFGInfo, stackify) rely on them.
+fn fixup_edges(b: &mut FunctionBody) {
+    let mut succ: Vec<Vec<WBlock>> = vec![Vec::new(); b.blocks.len()];
+    for blk in b.blocks.iter() {
+        b.blocks[blk]
+            .terminator
+            .visit_targets(|t| succ[blk.index()].push(t.block));
+    }
+    for blk in b.blocks.iter() {
+        b.blocks[blk].succs.clear();
+        b.blocks[blk].preds.clear();
+        b.blocks[blk].pos_in_succ_pred.clear();
+        b.blocks[blk].pos_in_pred_succ.clear();
+    }
+    for (from, tos) in succ.iter().enumerate() {
+        for &to in tos {
+            let fb = WBlock::new(from);
+            let pi = b.blocks[to].preds.len();
+            let si = b.blocks[fb].succs.len();
+            b.blocks[fb].succs.push(to);
+            b.blocks[fb].pos_in_succ_pred.push(pi);
+            b.blocks[to].preds.push(fb);
+            b.blocks[to].pos_in_pred_succ.push(si);
+        }
+    }
+}
+
+/// Splice `callee` into `body` in place of the call `call_v` at
+/// `blk.insts[pos]`. The block is split at the call: `blk` keeps the
+/// prefix and merges the callee entry block (whose params alias the
+/// call args), callee `return`s branch to a fresh join block carrying
+/// the results as blockparams, and the join branches to the tail.
+/// SSA stays valid: everything `after` uses was defined in `blk`'s
+/// prefix or reaches it through the join, and `blk` still dominates
+/// everything it dominated before. Callers must run `fixup_edges`
+/// and re-optimize afterwards.
+fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, callee: &FunctionBody) {
+    let (cargs, tys): (Vec<WV>, Vec<WT>) = match &body.values[call_v] {
+        ValueDef::Operator(_, args, tys) => (
+            body.arg_pool[*args].iter().copied().collect(),
+            body.type_pool[*tys].iter().copied().collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+
+    // Block map: callee entry folds into `blk`; everything else is a
+    // fresh caller block. `after` holds the post-call tail; `join`
+    // collects callee returns and forwards to `after`.
+    let after = body.blocks.push(Default::default());
+    let join = body.blocks.push(Default::default());
+    let mut bmap: Vec<WBlock> = Vec::with_capacity(callee.blocks.len());
+    for cb in callee.blocks.iter() {
+        bmap.push(if cb == callee.entry {
+            blk
+        } else {
+            body.blocks.push(Default::default())
+        });
+    }
+
+    // Value map: callee entry blockparams alias the call args; every
+    // other callee value gets a fresh caller value (defined below).
+    let mut src: Vec<WV> = Vec::with_capacity(callee.values.len());
+    for cv in callee.values.iter() {
+        let eparam = callee.blocks[callee.entry]
+            .params
+            .iter()
+            .position(|&(_, pv)| pv == cv);
+        src.push(match eparam {
+            Some(i) => cargs[i],
+            None => body.values.push(ValueDef::None),
+        });
+    }
+
+    let rt = |t: &BlockTarget, bmap: &[WBlock], src: &[WV]| BlockTarget {
+        block: bmap[t.block.index()],
+        args: t.args.iter().map(|a| src[a.index()]).collect(),
+    };
+    let remap_term = |t: &Terminator, bmap: &[WBlock], src: &[WV]| -> Terminator {
+        match t {
+            Terminator::Br { target } => Terminator::Br {
+                target: rt(target, bmap, src),
+            },
+            Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } => Terminator::CondBr {
+                cond: src[cond.index()],
+                if_true: rt(if_true, bmap, src),
+                if_false: rt(if_false, bmap, src),
+            },
+            Terminator::Select {
+                value,
+                targets,
+                default,
+            } => Terminator::Select {
+                value: src[value.index()],
+                targets: targets.iter().map(|t| rt(t, bmap, src)).collect(),
+                default: rt(default, bmap, src),
+            },
+            // Callee returns become branches to the join block.
+            Terminator::Return { values } => Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: values.iter().map(|a| src[a.index()]).collect(),
+                },
+            },
+            t => t.clone(),
+        }
+    };
+
+    // Copy callee value defs (entry params were aliased to call args).
+    for cv in callee.values.iter() {
+        let nv = src[cv.index()];
+        if callee.blocks[callee.entry]
+            .params
+            .iter()
+            .any(|&(_, pv)| pv == cv)
+        {
+            continue;
+        }
+        let def = match &callee.values[cv] {
+            ValueDef::BlockParam(b2, i, ty) => ValueDef::BlockParam(bmap[b2.index()], *i, *ty),
+            ValueDef::Operator(op, args, tys) => {
+                let na: Vec<WV> = callee.arg_pool[*args]
+                    .iter()
+                    .map(|a| src[a.index()])
+                    .collect();
+                let nt: Vec<WT> = callee.type_pool[*tys].iter().copied().collect();
+                let nal = if na.is_empty() {
+                    Default::default()
+                } else {
+                    body.arg_pool.from_iter(na.iter().copied())
+                };
+                let ntl = match nt.len() {
+                    0 => Default::default(),
+                    1 => body.single_type_list(nt[0]),
+                    _ => body.type_pool.from_iter(nt.iter().copied()),
+                };
+                ValueDef::Operator(op.clone(), nal, ntl)
+            }
+            ValueDef::PickOutput(v, i, ty) => ValueDef::PickOutput(src[v.index()], *i, *ty),
+            ValueDef::Alias(v) => ValueDef::Alias(src[v.index()]),
+            d => d.clone(),
+        };
+        body.values[nv] = def;
+        let ob = callee.value_blocks[cv];
+        if ob.is_valid() {
+            body.value_blocks[nv] = bmap[ob.index()];
+        }
+        body.source_locs[nv] = callee.source_locs[cv];
+    }
+
+    // Split `blk`: prefix stays, tail moves to `after`.
+    let tail: Vec<WV> = body.blocks[blk].insts.split_off(pos + 1);
+    body.blocks[blk].insts.pop(); // drop the call itself
+    body.blocks[after].insts = tail;
+    body.blocks[after].terminator =
+        std::mem::replace(&mut body.blocks[blk].terminator, Terminator::None);
+    for &v in &body.blocks[after].insts {
+        body.value_blocks[v] = after;
+    }
+
+    // Join block: blockparams carry the callee's results.
+    let mut jparams: Vec<WV> = Vec::with_capacity(tys.len());
+    for (i, &ty) in tys.iter().enumerate() {
+        let v = body.values.push(ValueDef::BlockParam(join, i as u32, ty));
+        body.value_blocks[v] = join;
+        body.blocks[join].params.push((ty, v));
+        jparams.push(v);
+    }
+    body.blocks[join].terminator = Terminator::Br {
+        target: BlockTarget {
+            block: after,
+            args: Vec::new(),
+        },
+    };
+
+    // Copy callee blocks: entry insts append to `blk` (its terminator
+    // replaces the placeholder set during the split); the rest land in
+    // their mapped blocks.
+    for cb in callee.blocks.iter() {
+        let nb = bmap[cb.index()];
+        let insts: Vec<WV> = callee.blocks[cb]
+            .insts
+            .iter()
+            .map(|v| src[v.index()])
+            .collect();
+        if cb == callee.entry {
+            body.blocks[blk].insts.extend(insts);
+        } else {
+            body.blocks[nb].insts = insts;
+            body.blocks[nb].params = callee.blocks[cb]
+                .params
+                .iter()
+                .map(|&(t, v)| (t, src[v.index()]))
+                .collect();
+            body.blocks[nb].desc = callee.blocks[cb].desc.clone();
+        }
+        body.blocks[nb].terminator = remap_term(&callee.blocks[cb].terminator, &bmap, &src);
+    }
+
+    // Retire the call value: route its uses to the join blockparams.
+    match jparams.len() {
+        0 => {}
+        1 => body.values[call_v] = ValueDef::Alias(jparams[0]),
+        _ => {
+            for v in body.values.iter() {
+                let i = match body.values[v] {
+                    ValueDef::PickOutput(s, i, _) if s == call_v => i as usize,
+                    _ => continue,
+                };
+                if i < jparams.len() {
+                    body.values[v] = ValueDef::Alias(jparams[i]);
+                }
+            }
+        }
+    }
+}
+
+/// Conservative waffle-IR inliner, run after all bodies are lowered
+/// and before the emit remap renumbers `Call` targets. Two rules:
+/// always inline a callee at most `TINY` insts, and inline a
+/// single-callsite callee at most `SOLO` insts. Once a callee's last
+/// call edge is gone the linker's mark-sweep GC drops its standalone
+/// body, which is where the code-size win lands.
+fn winline(funcs: &mut [FDecl], verbose: bool) {
+    const TINY: usize = 12;
+    const SOLO: usize = 300;
+    const ROUNDS: usize = 8;
+    let body_size = |b: &FunctionBody| -> usize {
+        b.blocks.values().map(|d| d.insts.len()).sum()
+    };
+    let mut inlined = 0usize;
+    for _round in 0..ROUNDS {
+        // callsite count per callee; ref.func keeps the standalone
+        // body alive, so inlining one only duplicates code.
+        let mut calls = vec![0u32; funcs.len()];
+        let mut refs = vec![0u32; funcs.len()];
+        for f in funcs.iter() {
+            for v in f.body.iter().flat_map(|b| b.values.values()) {
+                match v {
+                    ValueDef::Operator(O::Call { function_index }, ..) => {
+                        calls[function_index.index()] += 1;
+                    }
+                    ValueDef::Operator(O::RefFunc { func_index }, ..) => {
+                        refs[func_index.index()] += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut did = false;
+        for ci in 0..funcs.len() {
+            if funcs[ci].body.is_none() {
+                continue;
+            }
+            // One scan per caller: collect all eligible call values.
+            // Positions are resolved per-site at splice time (the tail
+            // split keeps every other call's identity valid).
+            let sites: Vec<(WV, usize)> = {
+                let b = funcs[ci].body.as_ref().unwrap();
+                let mut sites = Vec::new();
+                for blk in b.blocks.iter() {
+                    for &iv in &b.blocks[blk].insts {
+                        if let ValueDef::Operator(O::Call { function_index }, args, _) =
+                            &b.values[iv]
+                        {
+                            let fi = function_index.index();
+                            // no self-inlining; callee must exist
+                            if fi == ci {
+                                continue;
+                            }
+                            let Some(cb) = funcs[fi].body.as_ref() else {
+                                continue;
+                            };
+                            // Entry with preds can't merge (its
+                            // blockparams would need the back-edge args
+                            // too); locals beyond params would need
+                            // remapping — our bodies have none; arity
+                            // must match (the args become the params).
+                            if !cb.blocks[cb.entry].preds.is_empty()
+                                || cb.locals.len() != cb.n_params
+                                || cb.blocks[cb.entry].params.len()
+                                    != b.arg_pool[*args].len()
+                            {
+                                continue;
+                            }
+                            let n = body_size(cb);
+                            if n <= TINY
+                                || (calls[fi] == 1 && refs[fi] == 0 && n <= SOLO)
+                            {
+                                sites.push((iv, fi));
+                            }
+                        }
+                    }
+                }
+                sites
+            };
+            if !sites.is_empty() {
+                did = true;
+                for &(iv, fi) in &sites {
+                    let callee = funcs[fi].body.clone().unwrap();
+                    let b = funcs[ci].body.as_mut().unwrap();
+                    let blk = b.value_blocks[iv];
+                    if !blk.is_valid() {
+                        continue;
+                    }
+                    if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv)
+                    {
+                        inline_site(b, blk, pos, iv, &callee);
+                        inlined += 1;
+                    }
+                }
+                let b = funcs[ci].body.as_mut().unwrap();
+                fixup_edges(b);
+                b.optimize(&waffle::OptOptions::default());
+            }
+        }
+        if !did {
+            break;
+        }
+    }
+    if verbose {
+        eprintln!("pliron-wasm: inlined {inlined} callsites");
+    }
 }
 
 fn leb(out: &mut Vec<u8>, mut v: u32) {
