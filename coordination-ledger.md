@@ -153,3 +153,29 @@ Two cooperating changes close the last wide.rs gap (sum2d was -6%):
   rev_copy32 keeps post-index ldp/stp shape (0.32-vs-0.315 was box noise,
   stock moved identically), all wide kernels parity or wins.
 - Remaining x64 gap: scatter (multi-exit unroll), noted.
+
+## x64: punroll mid-chain side exits (wt/x64-codegen)
+gather/hist were the last x64 deficit: rotated bounds-check loops carry a
+mid-chain `brif` to a cold panic block, and the old chain walk treated any
+`brif` as the latch — "extra body blocks" bail, loop stayed scalar.
+
+- **Chain walk**: a mid-chain `brif` with exactly one fresh in-body dest
+  is a *side exit*; the chain continues through it. Latch is the `brif`
+  with a dest back to `h`. Still bails on diamonds, double exits,
+  re-entry, cold chain blocks, try_call/br_table cones.
+- **Emission**: a side exit splits the copy into segments (`usegs[kk][j]`)
+  — the fused single block is kept only when there are no side exits
+  (sum2d's `addss (mem)` form unaffected). Copies link by `jump`; each
+  copy keeps its own data-dependent side tests, exactly like LLVM.
+- **Exit cones**: a side exit whose dominance cone references loop values
+  gets ONE shared clone per unique target — the clone root takes the used
+  loop values as appended block params, so every copy's `brif` carries its
+  own bindings on the edge (LLVM's one-cold-panic-block shape). Cone-free
+  exits just retarget the original block. Budgets: <=8 exits, <=8
+  blocks/48 insts per cone, <=96 cloned insts total.
+- Verified: scatter gather 0.485 vs stock 0.491 (parity; was 0.563/-12%),
+  hist ~0.467 vs 0.436 (-7%, was -6%; hist times are bimodal ~0.46/~0.82
+  on BOTH binaries — Rosetta system noise, use the low mode). Deterministic
+  n=0..4096 hash test identical to stock; bc_sem panics identically through
+  catch_unwind; PLIRON_VERIFY clean on scatter/main/wide; host test.sh
+  green; x64 nostd/std/unwind/asm/unroll/licm pass under Rosetta.
