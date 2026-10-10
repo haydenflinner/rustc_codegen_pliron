@@ -31,6 +31,7 @@ mod consts;
 mod context;
 mod domcheck;
 mod dse;
+mod edgefwd;
 mod eh;
 mod hot;
 mod ifconv;

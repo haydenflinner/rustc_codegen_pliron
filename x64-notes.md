@@ -177,3 +177,72 @@ Findings:
   `PLIRON_PREVCODE=<pat>` dumps pre-regalloc VCode and
   `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves in
   vendor/cranelift-codegen/src/machinst/compile.rs.
+
+### regex-syntax unconditional-branch audit + `edgefwd` pass (src/edgefwd.rs)
+
+Task: explain ~9.7k `b` vs stock ~2.2k in regex-syntax aarch64 output.
+
+Taxonomy of the 9,819 unconditional `b` (aarch64, `llvm-objdump -d`):
+
+| category | pliron | stock |
+|---|---|---|
+| backward loop branches | 1,568 | 571 |
+| diamond-merge jumps | 3,752 | 588 |
+| after-cond forward jumps | 227 | 260 |
+| jump-to-next-block (missed fallthrough) | 2 | 16 |
+| other forward jumps | 4,270 | ~812 |
+
+Blocks: ~22,751 vs ~10,418 stock; small (≤3-inst) `b`-terminated
+trampolines ~3,929 vs ~704. So the gap is **block-count driven**, not
+layout: missed fallthrough (2) and jump-to-jump chains (~0) are noise.
+
+Root causes found:
+
+1. MIR `bbN: { _x = const k; goto -> T }` blocks lower verbatim to
+   `iconst; jump T(iconst, ...)` forwarders — the dominant residual after
+   earlier passes (all remaining small tramps in `visit_post` were this
+   or `call; jump`).
+2. `try_call` normal/exception edges to forwarder and trap blocks — the
+   earlier `jumpthread::bypass_forwarders` whitelists jump/brif/br_table
+   preds, so `try_call` edges never got retargeted.
+3. `call; jump T` forwarders can't be edge-forwarded (the call result
+   lives in the block) — residual.
+4. `fusechains` only merges single-pred targets; most tramp targets are
+   multi-pred → doesn't reach this shape.
+5. `bl; b shared_udf` machine-level pairs are mostly `try_call`
+   normal-edge artifacts (~162 crate-wide), not ordinary jumps — the
+   trap-tail inline only nets ~3 `b`.
+
+What landed: `src/edgefwd.rs` (new, `PLIRON_EDGEFWD`, default on,
+`PLIRON_BISECT=edgefwd`-able), run in lower.rs after fusechains, before
+`define_function`. Three pieces:
+
+- `bypass_round` — bypass_forwarders generalized to ALL predecessor
+  terminators incl. `try_call`/`try_call_indirect`; non-Value edge args
+  (TryCallRet/TryCallExn pseudo-values) forward verbatim on the same
+  edge. Criteria otherwise identical (empty or pure locally-consumed
+  body, `jump` tail, non-escaping params, args must dominate pred edge).
+- `remat_round` — `iconst; jump T(iconst,...)` forwarders whose args
+  don't dominate the preds: substitute a provably-equal value already
+  valid on the edge (same-typed `iconst` among other targs / pargs /
+  pred-block iconsts), else clone the ≤4-inst pure body into the pred
+  before its terminator and retarget.
+- `inline_trap_tails` — `jump trap_only_blk` → `trap` in place (minor).
+
+Results (regex-syntax rlib, aarch64 disasm): `b` 9,819 → 9,147 (-6.8%),
+total insts 105,033 → 105,540 (+0.5% — the cloned constants are
+materializations LLVM emits per-edge anyway). Per-function: `visit_post`
+(hir) 502→432, `Translator::visit_post` (ast) 630→587, `alternation`
+376→356, `extract` 170→147, `translate` 214→201; a few funcs moved the
+other way on block-order reshuffles (`Display::fmt` 193→221,
+`concat` 248→259). Remaining small tramps in visit_post are all
+`call; jump` (can't forward past a call). Still ~4x stock's `b` count —
+the residual is dominated by diamond-merge/other forward jumps from the
+~2x CLIF block count vs LLVM's CFG.
+
+Correctness: `PLIRON_VERIFY=1` clean on the whole regex-syntax crate;
+test.sh all green (nostd/std/unwind/asm/licm/unroll/proc-macro/wasm);
+Rosetta x86_64-apple-darwin std+unwind pass; scatter kernel output
+correct (hist 0.660 ms/iter vs stock 0.797). x64 regex-syntax compile
+itself is blocked by a pre-existing `splat.i32x2` x64 lowering gap —
+identical with `PLIRON_EDGEFWD=0`, unrelated.
