@@ -35,3 +35,13 @@ ALU gap; no decrementing-pointer addressing. LLVM: 2x ldp + 2x stp(post-idx),
 scaled index in vector loop, (b) ldp/stp fusion crossing pure-ALU gaps in
 both directions (f0efcec/cfe150f may only cover same-direction or forward
 order), (c) post-index addressing for the store stream.
+
+## Merged: psadbw (x64) — commit 23446fa
+Vendors cranelift-assembler-x64{,-meta} under [patch.crates-io] (same
+pattern as regalloc2/rsasm). New x86_psadbw CLIF op + x64 ISLE rules;
+loopvec emits it for u8->u64 unmasked sums on x64 only (aarch64 keeps
+uaddlp tree). sum_u8 x64: 0.384->0.135 vs stock 0.693 = ~5x vs LLVM
+(was 1.8x). Verified: agent ran PLIRON_VERIFY + edge sizes + host test.sh;
+coordinator re-verified std diff-clean + unwind on merged tree.
+Host builds unaffected (host-arch retained; assembler crates only compile
+for x64 feature anyway).
