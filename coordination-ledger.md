@@ -287,3 +287,26 @@ Track as x64 agent follow-up.
 - Block-count reduction: diamond-merge trampolines ~3.9k vs ~704.
 - sum2d -5% x64 residual.
 - cold-cone remat direction for remaining hist copies.
+
+## clifpeep: foldf multi-pred forwarder fold + coldedges/edgefwd reorder (wt/native-opt)
+- MERGE CONFLICT FOUND: edgefwd::bypass_round (no is_cold check) ran
+  after coldedges and retargeted straight through the cold adapters —
+  movs regressed 19570->20351 on regex-syntax. coldedges now runs LAST
+  in the CLIF pipeline (after edgefwd+foldf); adapters survive, mov
+  back to 20028 (+640 cold adapter blocks, intended).
+- New clifpeep::foldforwarders (PLIRON_FOLDF): multi-pred param
+  forwarders — jump retarget incl. escaping params (hazard =
+  escape-use in Reach(target\{b}), BFS-checked) and brif-only
+  forwarder absorb into jump preds. Edge-indexed writes, fixpoint
+  to 8, unreachable cleanup via jumpthread::remove_unreachable_blocks.
+  0 hits on regex-syntax post-edgefwd (edgefwd covers the jump
+  shapes; brif forwarders don't survive jumpthread's selects); fires
+  364x/85 fns with PLIRON_EDGEFWD=0, verify-clean — coverage pass.
+- Block anatomy (jump-table data excluded — ~3.1k udf words are
+  br_table contents, not insts): real blocks 13,489 vs stock 4,714.
+  Dominant residual: ~3.6k small edge-split mov;b copy blocks on
+  arg-carrying conditional edges (jumpthread/shape problem);
+  186 udf trap stubs; 640 cold adapters; 241 b-tramps (stock 204).
+- Verified: cargo build, FULL ./test.sh green, PLIRON_VERIFY on
+  regex-syntax rlib + scatter; scatter/hist timings unchanged.
+  punroll/edgefwd/wasm/regalloc2 untouched.
