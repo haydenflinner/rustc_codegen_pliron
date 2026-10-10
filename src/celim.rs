@@ -12,15 +12,23 @@
 //!   block-param mapping, so a dominating `x < n` still matches a query on
 //!   `n`'s block-param name.
 //! - `brif v` on a non-icmp value seeds `v != 0` / `v == 0` facts; `br_table`
-//!   seeds `idx == k` facts.
+//!   seeds `idx == k` facts. A `band` of icmps on a taken edge seeds each
+//!   leaf (e.g. punroll's `i+1 < n && n-(i+1) > k` trip guard gives both
+//!   bounds); a `bor` on the not-taken edge seeds each leaf's complement.
 //! - Operand offsets: `x + 1 <= y` is implied by `x < y`, `x - 1 >= y` by
 //!   `x > y`, `x <= y` by a dominating `x - 1 < y` (the wrap case would make
 //!   the fact false, so it can't occur on the edge), likewise signed.
-//! - Facts `x - 1 < k` / `x + 1 > k` tighten the unsigned range of `x`
-//!   (likewise the signed range), feeding range-decided queries.
+//!   General offsets `x + c` vs `x + d` decide same-base bounds when every
+//!   add is provably nowrap (CLIF carries no `nuw`; proven via the ranges).
+//! - Facts `x - e < k` / `x + e > k` tighten the unsigned range of `x`
+//!   (likewise the signed range), feeding range-decided queries; unsafe
+//!   directions still restate when nowrap is provable.
+//! - `uload8`/`sload8` etc. bound their result by the load width.
 //! - One transitivity hop: `x <= y` and `y <= z` decide `x <= z`.
 //! - Signed facts narrow a signed interval; a range confined to one sign
 //!   half transfers to the other domain (`x s< 0` gives `x u>= 2^63`, etc).
+//! - `band(x < C, C - x > k)` trip guards fold to one compare (`x <= C-k-1`),
+//!   avoiding setcc flags in unrolled-loop dispatch.
 //!
 //! Soundness: a fold only replaces the icmp with the constant the query
 //! provably evaluates to, so observable behavior — including which panic
@@ -72,8 +80,9 @@ fn known(func: &Function, v: Value) -> Option<u64> {
     }
 }
 
-/// An icmp operand: `base + off` with |off| <= 1 (from `iadd`/`isub` with a
-/// constant), or a plain constant.
+/// An icmp operand: `base + off` (from `iadd`/`isub` with a constant), or
+/// a plain constant. The offset is canonicalized to the signed residue
+/// class of the operand's width (`x + 255` on `i8` is `x - 1`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Op {
     V(Value, i64),
@@ -82,8 +91,9 @@ enum Op {
 
 type Cmp = (IntCC, Op, Op);
 
-/// Decompose `v` into `base + off` for |off| <= 1, else `base + 0`; an
-/// `iconst` becomes `K`.
+/// Decompose `v` into `base + off`, else `base + 0`; an `iconst` becomes
+/// `K`. Offsets beyond +/-1 only fold through the nowrap-gated rules in
+/// `decide`, so emitting them is safe.
 fn decomp(func: &Function, v: Value) -> Op {
     let v = func.dfg.resolve_aliases(v);
     if let Some(k) = known(func, v) {
@@ -99,20 +109,25 @@ fn decomp(func: &Function, v: Value) -> Op {
             func.dfg.resolve_aliases(args[0]),
             func.dfg.resolve_aliases(args[1]),
         );
+        let w = bits(func, v).unwrap_or(64);
         if let Some(k) = known(func, b) {
             let off = if opcode == Opcode::Isub {
-                (k as i64).wrapping_neg()
+                sext(k, w).wrapping_neg()
             } else {
-                k as i64
+                sext(k, w)
             };
-            if (-1..=1).contains(&off) {
+            // `i64::MIN` is ambiguous (x - MIN == x + MIN mod 2^64) and
+            // would break `-d` arithmetic; leave it unpeeled.
+            if off != i64::MIN {
                 return Op::V(a, off);
             }
         } else if opcode == Opcode::Iadd
             && let Some(k) = known(func, a)
-            && (-1..=1).contains(&(k as i64))
         {
-            return Op::V(b, k as i64);
+            let off = sext(k, w);
+            if off != i64::MIN {
+                return Op::V(b, off);
+            }
         }
     }
     Op::V(v, 0)
@@ -169,41 +184,37 @@ fn norm_icmp(func: &Function, i: Inst, peel: bool) -> Option<(Cmp, (Value, Value
     Some(((cond, x, y), raw))
 }
 
-/// The icmp a `brif`/`br_table` condition tests, through `band 1` and
-/// extends of its 0/1 result.
-fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
-    let mut v = func.dfg.resolve_aliases(v);
-    for _ in 0..6 {
-        let i = func.dfg.value_def(v).inst()?;
-        match func.dfg.insts[i] {
-            InstructionData::IntCompare {
-                opcode: Opcode::Icmp,
-                ..
-            } => return Some(i),
-            InstructionData::Unary {
-                opcode: Opcode::Uextend | Opcode::Ireduce,
-                arg,
-            } => v = func.dfg.resolve_aliases(arg),
-            InstructionData::Binary {
-                opcode: Opcode::Band,
-                args,
-            } => {
-                let (a, b) = (
-                    func.dfg.resolve_aliases(args[0]),
-                    func.dfg.resolve_aliases(args[1]),
-                );
-                if known(func, b) == Some(1) {
-                    v = a;
-                } else if known(func, a) == Some(1) {
-                    v = b;
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
+/// Collect every icmp leaf under a `band` tree (resp. `bor` tree). When a
+/// `band` result is nonzero every icmp leaf must be 1 (leaves are 0/1, so
+/// the whole tree's value is the leaves' bit-0 AND) — this turns
+/// `brif (band (icmp ..) (icmp ..))`, the shape punroll's trip-bound
+/// guards take, into both component facts on the taken edge. Symmetrically
+/// a `bor` result of zero forces every leaf false on the not-taken edge.
+/// The other direction of each connective is a disjunction and seeds
+/// nothing per-leaf.
+fn tree_icmps(func: &Function, v: Value, op: Opcode, out: &mut Vec<Inst>, depth: u32) {
+    if depth > 6 {
+        return;
     }
-    None
+    let v = func.dfg.resolve_aliases(v);
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            ..
+        } => out.push(i),
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce,
+            arg,
+        } => tree_icmps(func, arg, op, out, depth + 1),
+        InstructionData::Binary { opcode, args } if opcode == op => {
+            tree_icmps(func, args[0], op, out, depth + 1);
+            tree_icmps(func, args[1], op, out, depth + 1);
+        }
+        _ => {}
+    }
 }
 
 /// Does every path into `s`'s dominance region enter through the `p -> s`
@@ -313,7 +324,13 @@ fn edge_facts(
                     continue;
                 }
                 let arg = func.dfg.resolve_aliases(arg);
-                let icmp = cond_icmp(func, arg).and_then(|i| norm_icmp(func, i, true).map(|q| q.0));
+                // icmp leaves under the connective: `band` on the taken
+                // edge (all leaves true), `bor` on the not-taken edge (all
+                // leaves false). A bare icmp is the single-leaf case.
+                let mut icmps = Vec::new();
+                tree_icmps(func, arg, Opcode::Band, &mut icmps, 0);
+                let mut n_icmps = Vec::new();
+                tree_icmps(func, arg, Opcode::Bor, &mut n_icmps, 0);
                 for &(s, take) in &[(tb, true), (eb, false)] {
                     if !edge_dominates(func, domtree, cfg, b, s) {
                         continue;
@@ -327,9 +344,11 @@ fn edge_facts(
                         IntCC::Equal
                     };
                     fs.push((vc, sub_op(&m, plain(func, arg)), Op::K(0)));
-                    if let Some((cc, x, y)) = icmp {
-                        let cc = if take { cc } else { cc.complement() };
-                        fs.push((cc, sub_op(&m, x), sub_op(&m, y)));
+                    for &i in if take { &icmps } else { &n_icmps } {
+                        if let Some(((cc, x, y), _)) = norm_icmp(func, i, true) {
+                            let cc = if take { cc } else { cc.complement() };
+                            fs.push((cc, sub_op(&m, x), sub_op(&m, y)));
+                        }
                     }
                 }
             }
@@ -464,27 +483,50 @@ fn implied(f: Cmp, q: Cmp) -> Option<bool> {
 }
 
 /// A const fact `x + d cc k` restated as `x cc k'` when the offset's
-/// direction keeps the bound sound: `x - 1 u< k` means `x < k + 1` (the
-/// `x = 0` wrap case would make the fact false), and `x + 1 u> k` means
-/// `x > k - 1` (the `x = max` wrap case can't hold). Other directions can't
-/// merge the wrapped and unwrapped cases into one bound. Signed likewise.
-fn shift_k(cc: IntCC, k: u64, d: i64) -> Option<u64> {
-    match (cc, d) {
-        (IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual, -1) => {
-            k.checked_add(1)
+/// direction keeps the bound sound. `x - e u< k` means `x < k + e` (any
+/// wrapped `x - e` lands near `full`, and when `k + e <= full` no wrapped
+/// value can satisfy the fact, so the unwrapped bound stands alone);
+/// `x + e u> k` means `x > k - e` (wrapped `x + e` values are small, so a
+/// wrapped `x` also satisfies `x > k - e` whenever it satisfies the fact).
+/// `x + e u< k` and `x - e u> k` can't merge their wrapped and unwrapped
+/// satisfying sets into one bound, so they restate nothing. `==`/`!=`
+/// shift exactly. Signed likewise. Whenever a shift succeeds the opposite
+/// extreme is excluded too: the caller adds `x >= e` / `x <= full - e`.
+fn shift_k(cc: IntCC, k: u64, d: i64, full: u64) -> Option<u64> {
+    match cc {
+        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual if d < 0 => {
+            k.checked_add(d.unsigned_abs()).filter(|&k2| k2 <= full)
         }
-        (IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual, 1) => {
-            k.checked_sub(1)
+        IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual if d > 0 => {
+            k.checked_sub(d as u64)
+        }
+        IntCC::Equal | IntCC::NotEqual if d != 0 => {
+            Some(k.wrapping_sub(d as u64) & full)
         }
         _ if d == 0 => Some(k),
         _ => None,
     }
 }
 
-fn shift_ks(cc: IntCC, k: i64, d: i64) -> Option<i64> {
-    match (cc, d) {
-        (IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual, -1) => k.checked_add(1),
-        (IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual, 1) => k.checked_sub(1),
+fn shift_ks(cc: IntCC, k: i64, d: i64, smin: i64, smax: i64) -> Option<i64> {
+    match cc {
+        IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual if d < 0 => {
+            k.checked_add(d.unsigned_abs() as i64).filter(|&k2| k2 <= smax)
+        }
+        IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual if d > 0 => {
+            k.checked_sub(d).filter(|&k2| k2 >= smin)
+        }
+        IntCC::Equal | IntCC::NotEqual if d != 0 => {
+            let w = if smax == i64::MAX && smin == i64::MIN {
+                64
+            } else {
+                smax.count_ones() + 1
+            };
+            Some(sext(
+                ((k as u64).wrapping_sub(d as u64)) & mask(u64::MAX, w),
+                w,
+            ))
+        }
         _ if d == 0 => Some(k),
         _ => None,
     }
@@ -500,23 +542,27 @@ fn urange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(u64, u6
     let (mut lo, mut hi) = (0u64, full);
     for &&(cc, a, b) in fs {
         let (cc, k, d) = match (a, b) {
-            (Op::V(x, d), Op::K(k)) if x == v => (cc, shift_k(cc, k, d), d),
+            (Op::V(x, d), Op::K(k)) if x == v => (cc, shift_k(cc, k, d, full), d),
             (Op::K(k), Op::V(y, d)) if y == v => {
                 let cc = cc.swap_args();
-                (cc, shift_k(cc, k, d), d)
+                (cc, shift_k(cc, k, d, full), d)
             }
             _ => continue,
         };
-        // `x - 1 < k`/`x + 1 > k` also rule out the extremes of `x`, even
-        // when the shifted bound itself isn't expressible.
-        match (cc, d) {
-            (IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual, -1) => {
-                lo = lo.max(1);
+        // A successful `x - e < k` shift means no wrapped value satisfied
+        // the fact, so `x >= e`; likewise `x + e > k` gives `x <= full-e`.
+        if k.is_some() {
+            match cc {
+                IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual if d < 0 => {
+                    lo = lo.max(d.unsigned_abs());
+                }
+                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual
+                    if d > 0 =>
+                {
+                    hi = hi.min(full.wrapping_sub(d as u64));
+                }
+                _ => {}
             }
-            (IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual, 1) => {
-                hi = hi.min(full - 1);
-            }
-            _ => {}
         }
         let Some(k) = k else { continue };
         match cc {
@@ -627,6 +673,21 @@ fn urange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(u64, u6
                     hi = hi.min(k - l);
                 }
             }
+            InstructionData::Load { opcode, .. } => {
+                // Zero-extending loads bound the result by the load width —
+                // `uload8` on `i64` gives `x < 256`, which is what folds
+                // `cnt[v]` for a `v` loaded from `&[u8]` when `cnt.len`
+                // dominates.
+                let m = match opcode {
+                    Opcode::Uload8 => Some(0xff),
+                    Opcode::Uload16 => Some(0xffff),
+                    Opcode::Uload32 => Some(0xffff_ffff),
+                    _ => None,
+                };
+                if let Some(m) = m {
+                    hi = hi.min(m & full);
+                }
+            }
             InstructionData::Binary {
                 opcode: Opcode::Band,
                 args,
@@ -652,6 +713,44 @@ fn urange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(u64, u6
             _ => {}
         }
     }
+    // Second pass: an offset fact `x + d cc k` in a wrap-unsafe direction
+    // still restates exactly (`x cc k - d`) when `x + d` provably can't
+    // wrap given the bounds gathered so far (e.g. `x + 3 < 100` with
+    // `x <= 0xffff_ffff` from a `uextend` gives `x < 97`).
+    for &&(cc, a, b) in fs {
+        let (cc, k, d) = match (a, b) {
+            (Op::V(x, d), Op::K(k)) if x == v && d != 0 => (cc, k, d),
+            (Op::K(k), Op::V(x, d)) if x == v && d != 0 => (cc.swap_args(), k, d),
+            _ => continue,
+        };
+        if shift_k(cc, k, d, full).is_some() {
+            continue;
+        }
+        let nw = if d > 0 {
+            (hi as u128) + (d as u128) <= full as u128
+        } else {
+            (lo as u128) >= d.unsigned_abs() as u128
+        };
+        if !nw {
+            continue;
+        }
+        let k2 = k as i128 - d as i128;
+        match cc {
+            IntCC::UnsignedLessThan if k2 > 0 && k2 <= full as i128 => {
+                hi = hi.min(k2 as u64 - 1);
+            }
+            IntCC::UnsignedLessThanOrEqual if k2 >= 0 && k2 <= full as i128 => {
+                hi = hi.min(k2 as u64);
+            }
+            IntCC::UnsignedGreaterThan if k2 >= 0 && k2 < full as i128 => {
+                lo = lo.max(k2 as u64 + 1);
+            }
+            IntCC::UnsignedGreaterThanOrEqual if k2 > 0 && k2 <= full as i128 => {
+                lo = lo.max(k2 as u64);
+            }
+            _ => {}
+        }
+    }
     (lo <= hi && (lo, hi) != (0, full)).then_some((lo, hi))
 }
 
@@ -668,22 +767,27 @@ fn srange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(i64, i6
     let (mut lo, mut hi) = (smin, smax);
     for &&(cc, a, b) in fs {
         let (cc, k, d) = match (a, b) {
-            (Op::V(x, d), Op::K(k)) if x == v => (cc, shift_ks(cc, sext(k, w), d), d),
+            (Op::V(x, d), Op::K(k)) if x == v => {
+                (cc, shift_ks(cc, sext(k, w), d, smin, smax), d)
+            }
             (Op::K(k), Op::V(y, d)) if y == v => {
                 let cc = cc.swap_args();
-                (cc, shift_ks(cc, sext(k, w), d), d)
+                (cc, shift_ks(cc, sext(k, w), d, smin, smax), d)
             }
             _ => continue,
         };
-        // `x - 1 s< k`/`x + 1 s> k` rule out the signed extremes of `x`.
-        match (cc, d) {
-            (IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual, -1) => {
-                lo = lo.max(smin + 1);
+        // Same forced-nowrap exclusions as the unsigned side: a shiftable
+        // `x - e s< k` rules out `x < smin + e`, etc.
+        if k.is_some() {
+            match cc {
+                IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual if d < 0 => {
+                    lo = lo.max(smin.saturating_add(d.unsigned_abs() as i64));
+                }
+                IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual if d > 0 => {
+                    hi = hi.min(smax.saturating_sub(d));
+                }
+                _ => {}
             }
-            (IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual, 1) => {
-                hi = hi.min(smax - 1);
-            }
-            _ => {}
         }
         let Some(k) = k else { continue };
         match cc {
@@ -737,6 +841,19 @@ fn srange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(i64, i6
                     }
                 }
             }
+            InstructionData::Load { opcode, .. } => {
+                // Sign-extending loads bound the result by the load width.
+                let b = match opcode {
+                    Opcode::Sload8 => Some(8),
+                    Opcode::Sload16 => Some(16),
+                    Opcode::Sload32 => Some(32),
+                    _ => None,
+                };
+                if let Some(b) = b {
+                    lo = lo.max(-(1i64 << (b - 1)));
+                    hi = hi.min((1i64 << (b - 1)) - 1);
+                }
+            }
             _ => {}
         }
     }
@@ -750,6 +867,46 @@ fn srange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(i64, i6
             let conv = |x: u64| (x as i64).wrapping_sub(if w < 64 { 1i64 << w } else { 0 });
             lo = lo.max(conv(ul));
             hi = hi.min(conv(uh));
+        }
+    }
+    // Second pass (signed mirror of the unsigned one): a wrap-unsafe
+    // `x + d scc k` restates exactly when the add can't signed-wrap.
+    for &&(cc, a, b) in fs {
+        let (cc, k, d) = match (a, b) {
+            (Op::V(x, d), Op::K(k)) if x == v && d != 0 => {
+                (cc, sext(k, w), d)
+            }
+            (Op::K(k), Op::V(x, d)) if x == v && d != 0 => {
+                (cc.swap_args(), sext(k, w), d)
+            }
+            _ => continue,
+        };
+        if shift_ks(cc, k, d, smin, smax).is_some() {
+            continue;
+        }
+        let nw = if d > 0 {
+            (hi as i128) + (d as i128) <= smax as i128
+        } else {
+            (lo as i128) - (d as i128) >= smin as i128
+        };
+        if !nw {
+            continue;
+        }
+        let k2 = k as i128 - d as i128;
+        match cc {
+            IntCC::SignedLessThan if k2 > smin as i128 && k2 <= smax as i128 => {
+                hi = hi.min(k2 as i64 - 1);
+            }
+            IntCC::SignedLessThanOrEqual if k2 >= smin as i128 && k2 <= smax as i128 => {
+                hi = hi.min(k2 as i64);
+            }
+            IntCC::SignedGreaterThan if k2 >= smin as i128 && k2 < smax as i128 => {
+                lo = lo.max(k2 as i64 + 1);
+            }
+            IntCC::SignedGreaterThanOrEqual if k2 > smin as i128 && k2 <= smax as i128 => {
+                lo = lo.max(k2 as i64);
+            }
+            _ => {}
         }
     }
     (lo <= hi && (lo, hi) != (smin, smax)).then_some((lo, hi))
@@ -920,6 +1077,188 @@ fn transit(r1: IntCC, r2: IntCC) -> Option<IntCC> {
     (d1 == d2).then(|| cc(d1, s1 || s2))
 }
 
+/// `v + d` can't wrap mod 2^w under the dominating facts — every `x + d`
+/// on both sides of a fact/query pair must hold this before offset
+/// arithmetic may be treated as exact integer math (CLIF `iadd` carries
+/// no nowrap flags; LLVM would use `nuw`/`nsw` here).
+fn unowrap(func: &Function, fs: &[&Cmp], v: Value, d: i64) -> bool {
+    if d == 0 {
+        return true;
+    }
+    let Some(w) = bits(func, v) else {
+        return false;
+    };
+    let full = mask(u64::MAX, w);
+    let (l, h) = urange(func, fs, v, 0).unwrap_or((0, full));
+    if d > 0 {
+        (h as u128) + (d as u128) <= full as u128
+    } else {
+        (l as u128) >= d.unsigned_abs() as u128
+    }
+}
+
+fn snnowrap(func: &Function, fs: &[&Cmp], v: Value, d: i64) -> bool {
+    if d == 0 {
+        return true;
+    }
+    let Some(w) = bits(func, v) else {
+        return false;
+    };
+    let (smin, smax) = if w >= 64 {
+        (i64::MIN, i64::MAX)
+    } else {
+        (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+    };
+    let (l, h) = srange(func, fs, v, 0).unwrap_or((smin, smax));
+    if d > 0 {
+        (h as i128) + (d as i128) <= smax as i128
+    } else {
+        (l as i128) - (d as i128) >= smin as i128
+    }
+}
+
+fn ucc(cc: IntCC) -> bool {
+    matches!(
+        cc,
+        IntCC::UnsignedLessThan
+            | IntCC::UnsignedLessThanOrEqual
+            | IntCC::UnsignedGreaterThan
+            | IntCC::UnsignedGreaterThanOrEqual
+    )
+}
+
+fn scc(cc: IntCC) -> bool {
+    matches!(
+        cc,
+        IntCC::SignedLessThan
+            | IntCC::SignedLessThanOrEqual
+            | IntCC::SignedGreaterThan
+            | IntCC::SignedGreaterThanOrEqual
+    )
+}
+
+/// `(x + fd1) fc (y + fd2)` deciding `(x + qd1) qc (y + qd2)` as exact
+/// integer math — caller guarantees none of the four adds wraps. Restated
+/// `x fc y + F` vs `x qc y + Q` with `F = fd2 - fd1`, `Q = qd2 - qd1`,
+/// decided by comparing the net shifts. `u`/`s` families share the table;
+/// the caller only calls it when fact and query families match (or the
+/// fact/query is an equality test, which is domain-free once nowrap).
+fn delta_implied(fc: IntCC, f: i128, q: i128, qc: IntCC) -> Option<bool> {
+    use IntCC::*;
+    if fc == Equal {
+        // `x = y + F` substitutes into the query outright.
+        return Some(match qc {
+            Equal => f == q,
+            NotEqual => f != q,
+            UnsignedLessThan | SignedLessThan => f < q,
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => f <= q,
+            UnsignedGreaterThan | SignedGreaterThan => f > q,
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => f >= q,
+        });
+    }
+    match fc {
+        // x <= y + F - 1
+        UnsignedLessThan | SignedLessThan => match qc {
+            UnsignedLessThan | SignedLessThan => (f <= q).then_some(true),
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f <= q + 1).then_some(true),
+            UnsignedGreaterThan | SignedGreaterThan => (f <= q + 1).then_some(false),
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
+                (f <= q).then_some(false)
+            }
+            Equal => (f <= q).then_some(false),
+            NotEqual => (f <= q).then_some(true),
+        },
+        // x <= y + F
+        UnsignedLessThanOrEqual | SignedLessThanOrEqual => match qc {
+            UnsignedLessThan | SignedLessThan => (f < q).then_some(true),
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f <= q).then_some(true),
+            UnsignedGreaterThan | SignedGreaterThan => (f <= q).then_some(false),
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
+                (f < q).then_some(false)
+            }
+            Equal => (f < q).then_some(false),
+            NotEqual => (f < q).then_some(true),
+        },
+        // x >= y + F + 1
+        UnsignedGreaterThan | SignedGreaterThan => match qc {
+            UnsignedGreaterThan | SignedGreaterThan => (f >= q).then_some(true),
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
+                (f + 1 >= q).then_some(true)
+            }
+            UnsignedLessThan | SignedLessThan => (f + 1 >= q).then_some(false),
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f >= q).then_some(false),
+            Equal => (q <= f).then_some(false),
+            NotEqual => (q <= f).then_some(true),
+        },
+        // x >= y + F
+        UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => match qc {
+            UnsignedGreaterThan | SignedGreaterThan => (f > q).then_some(true),
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
+                (f >= q).then_some(true)
+            }
+            UnsignedLessThan | SignedLessThan => (f >= q).then_some(false),
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => {
+                (f > q).then_some(false)
+            }
+            Equal => (q < f).then_some(false),
+            NotEqual => (q < f).then_some(true),
+        },
+        Equal => unreachable!(),
+        NotEqual => None,
+    }
+}
+
+/// Both offset-decomposed sides of `f`/`q` share base operands `x`, `y`;
+/// restate the fact in the query's frame and check every add's nowrap in
+/// one consistent domain before applying `delta_implied`.
+fn offset_decide(func: &Function, fs: &[&Cmp], f: Cmp, q: Cmp) -> Option<bool> {
+    let (Op::V(fx, fd1), Op::V(fy, fd2)) = (f.1, f.2) else {
+        return None;
+    };
+    let (Op::V(qx, qd1), Op::V(qy, qd2)) = (q.1, q.2) else {
+        return None;
+    };
+    // Put the fact on the query's operand order: `y + b fc x + a` becomes
+    // `x + a (fc swapped) y + b`.
+    let (fc, fa, fb) = if (fx, fy) == (qx, qy) {
+        (f.0, fd1, fd2)
+    } else if (fx, fy) == (qy, qx) {
+        (f.0.swap_args(), fd2, fd1)
+    } else {
+        return None;
+    };
+    let qc = q.0;
+    let fsh = fb as i128 - fa as i128;
+    let qsh = qd2 as i128 - qd1 as i128;
+    if fsh == 0 && qsh == 0 {
+        return None;
+    }
+    // Pick one integer domain for all four adds. An inequality fact only
+    // transfers to same-family inequality queries and to equality tests
+    // (which it decides in the fact's own domain); an equality fact
+    // transfers to any query in the query's domain.
+    let signed = match (fc, qc) {
+        (IntCC::Equal, _) => scc(qc),
+        (IntCC::NotEqual, _) => return None,
+        (f, q) if scc(f) && scc(q) => true,
+        (f, q) if ucc(f) && ucc(q) => false,
+        (f, IntCC::Equal | IntCC::NotEqual) => scc(f),
+        _ => return None,
+    };
+    let nw = |v: Value, d: i64| {
+        if signed {
+            snnowrap(func, fs, v, d)
+        } else {
+            unowrap(func, fs, v, d)
+        }
+    };
+    // `qx`/`qy` are the same bases as `fx`/`fy`; check each add once.
+    if !nw(qx, fa) || !nw(qy, fb) || !nw(qx, qd1) || !nw(qy, qd2) {
+        return None;
+    }
+    delta_implied(fc, fsh, qsh, qc)
+}
+
 /// Decide the query `q` from the dominating facts `fs`.
 fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<bool> {
     // `x == y` facts let the query match on either name.
@@ -970,6 +1309,11 @@ fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<b
                         return Some(r);
                     }
                 }
+            }
+            // General same-base offsets (`x + c` vs `x + d` bounds),
+            // sound only when every add is provably nowrap.
+            if let Some(r) = offset_decide(func, fs, f, q) {
+                return Some(r);
             }
         }
         // Transitivity: `x R1 m` and `m R2 z` decide `x R3 z` (z may be a
@@ -1059,34 +1403,152 @@ fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<b
     }
 }
 
-/// Fold `icmp`s decided by dominating branch conditions; returns the folds.
-pub fn run(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
-    let fact = edge_facts(func, &cfg, &domtree);
-    if fact.is_empty() {
-        return 0;
+/// Normalize an icmp to `v cc k` (V on the left).
+fn vk_cmp(func: &Function, i: Inst) -> Option<(IntCC, Value, u64)> {
+    let ((cc, a, b), _) = norm_icmp(func, i, false)?;
+    match (a, b) {
+        (Op::V(x, 0), Op::K(k)) => Some((cc, x, k)),
+        (Op::K(k), Op::V(x, 0)) => Some((cc.swap_args(), x, k)),
+        _ => None,
     }
-    let mut folds: Vec<(Inst, bool)> = Vec::new();
-    for b in func.layout.blocks() {
-        let fs = facts_at(&domtree, &fact, b);
-        if fs.is_empty() {
-            continue;
-        }
-        for i in func.layout.block_insts(b) {
-            let Some((q, raw)) = norm_icmp(func, i, true) else {
+}
+
+/// `(x < C) && (C - x > k)` — the counted-loop "enough room" guard punroll
+/// emits — is `x <= min(C - 1, C - k - 1)`: once `x < C` holds, `C - x`
+/// can't wrap, so the band collapses to a single compare instead of
+/// materializing two setcc flags and a test. For `x > C` the first half
+/// already makes the band false and the folded bound is below `C`, so the
+/// rewrite is exact. Variants: `<=`/`>=`, `k < C - x`, either band order.
+fn fold_guard_bands(func: &mut Function) -> usize {
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } = func.dfg.insts[i]
+            else {
                 continue;
             };
-            if let Some(k) = decide(func, &fs, q, raw) {
-                folds.push((i, k));
+            let (a, c) = (
+                func.dfg.resolve_aliases(args[0]),
+                func.dfg.resolve_aliases(args[1]),
+            );
+            for (l, r) in [(a, c), (c, a)] {
+                let Some(i1) = func.dfg.value_def(l).inst() else {
+                    continue;
+                };
+                let Some((cc1, x, cap)) = vk_cmp(func, i1) else {
+                    continue;
+                };
+                if !matches!(
+                    cc1,
+                    IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual
+                ) {
+                    continue;
+                }
+                let Some(i2) = func.dfg.value_def(r).inst() else {
+                    continue;
+                };
+                let Some((cc2, v2, k)) = vk_cmp(func, i2) else {
+                    continue;
+                };
+                if !matches!(
+                    cc2,
+                    IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual
+                ) {
+                    continue;
+                }
+                // `v2` must be `cap - x` (same cap, same x, same width).
+                let Some(d) = func.dfg.value_def(v2).inst() else {
+                    continue;
+                };
+                let InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args: s,
+                } = func.dfg.insts[d]
+                else {
+                    continue;
+                };
+                if func.dfg.value_type(v2) != func.dfg.value_type(x) {
+                    continue;
+                }
+                let Some(cap2) = known(func, s[0]) else {
+                    continue;
+                };
+                if cap2 != cap || func.dfg.resolve_aliases(s[1]) != x {
+                    continue;
+                }
+                let (c, kk) = (cap as i128, k as i128);
+                let b1 = if cc1 == IntCC::UnsignedLessThan {
+                    c - 1
+                } else {
+                    c
+                };
+                let b2 = if cc2 == IntCC::UnsignedGreaterThan {
+                    c - kk - 1
+                } else {
+                    c - kk
+                };
+                let bnd = b1.min(b2);
+                n += 1;
+                if bnd < 0 {
+                    let ty = func.dfg.value_type(func.dfg.first_result(i));
+                    func.replace(i).iconst(ty, 0);
+                } else {
+                    func.replace(i).icmp_imm_u(
+                        IntCC::UnsignedLessThanOrEqual,
+                        x,
+                        bnd as i64,
+                    );
+                }
+                break;
             }
         }
     }
-    for &(i, k) in &folds {
-        let ty = func.dfg.value_type(func.dfg.first_result(i));
-        func.replace(i).iconst(ty, i64::from(k));
+    n
+}
+
+/// Fold `icmp`s decided by dominating branch conditions; returns the folds.
+/// Counts guard-band collapses separately under `PLIRON_STATS`.
+pub fn run(func: &mut Function) -> usize {
+    let guards = fold_guard_bands(func);
+    if guards > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("celim-guard {guards}");
     }
-    if !folds.is_empty() {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let fact = edge_facts(func, &cfg, &domtree);
+    let mut folds: Vec<(Inst, bool)> = Vec::new();
+    if !fact.is_empty() {
+        for b in func.layout.blocks() {
+            let fs = facts_at(&domtree, &fact, b);
+            if fs.is_empty() {
+                continue;
+            }
+            for i in func.layout.block_insts(b) {
+                let Some((q, raw)) = norm_icmp(func, i, true) else {
+                    continue;
+                };
+                let mut r = decide(func, &fs, q, raw);
+                if r.is_none()
+                    && let Some((qp, _)) = norm_icmp(func, i, false)
+                    && qp != q
+                {
+                    // `v != 0`-style facts are stated on the unpeeled node.
+                    r = decide(func, &fs, qp, raw);
+                }
+                if let Some(k) = r {
+                    folds.push((i, k));
+                }
+            }
+        }
+        for &(i, k) in &folds {
+            let ty = func.dfg.value_type(func.dfg.first_result(i));
+            func.replace(i).iconst(ty, i64::from(k));
+        }
+    }
+    if !folds.is_empty() || guards > 0 {
         // A folded check leaves a constant `brif`; retarget it so the dead
         // successor's edge args drop away for the remaining passes.
         crate::jumpthread::fold_const_branches(func);
