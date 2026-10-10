@@ -8,10 +8,13 @@
 //! operands, so `uextend (load.i8)` folds into one `movzx` instead of a byte
 //! op followed by another `movzx` (UTF-8 decoding, `u8` flag tests).
 //!
-//! A `load.i8`/`load.i16` that is also `uextend`ed becomes one zero-extending
-//! `uload` to i64; the narrow value and the extensions become `ireduce`s,
-//! which are free. x64 only folds `uextend (load)` when the load has a single
-//! use, so otherwise it re-extends the already-`movzx`ed register.
+//! A `load.i8`/`load.i16`/`load.i32` that is also `uextend`ed becomes one
+//! zero-extending `uload` to i64; the narrow value and the extensions
+//! become `ireduce`s, which are free. x64 only folds `uextend (load)`
+//! when the load has a single use, so otherwise it re-extends the
+//! already-`movzx`ed register (`movl` already zeroes the upper bits, so
+//! `uload32` and `load.i32` emit the same insn — this just drops the
+//! extra vreg regalloc had to coalesce).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
@@ -266,6 +269,60 @@ fn uloads(func: &mut Function) -> usize {
             } else {
                 pos.func.replace(u).ireduce(to, wide);
             }
+        }
+    }
+    n
+}
+
+/// Late `uload32` fold: `uextend.i64 (load.i32)` becomes one `uload32`
+/// to i64, the i32 uses become an `ireduce` — x64 emits `movl` either
+/// way, so this only drops the extra vreg regalloc must coalesce (the
+/// `movq` it sometimes inserts between the load's reg and the extended
+/// value's reg). Runs in the final-CLIF chain only: early passes
+/// (licm/loadfwd/dse/bcheck/celim) match `Opcode::Load` and would lose
+/// sight of the load if it were rewritten sooner.
+pub fn uloads32(func: &mut Function) -> usize {
+    let mut users: rustc_data_structures::fx::FxHashMap<Value, Vec<Inst>> = Default::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } = func.dfg.insts[i]
+                && func.dfg.value_type(func.dfg.first_result(i)) == types::I64
+            {
+                let a = func.dfg.resolve_aliases(arg);
+                if let Some(d) = func.dfg.value_def(a).inst()
+                    && let InstructionData::Load {
+                        opcode: Opcode::Load,
+                        ..
+                    } = func.dfg.insts[d]
+                    && func.dfg.value_type(a) == types::I32
+                {
+                    users.entry(a).or_default().push(i);
+                }
+            }
+        }
+    }
+    let n = users.len();
+    let mut pos = FuncCursor::new(func);
+    for (r, exts) in users {
+        let l = pos.func.dfg.value_def(r).inst().unwrap();
+        let InstructionData::Load {
+            flags, arg, offset, ..
+        } = pos.func.dfg.insts[l]
+        else {
+            unreachable!()
+        };
+        let flags = pos.func.dfg.mem_flags[flags].clone();
+        pos.goto_inst(l);
+        let wide = pos.ins().uload32(flags, arg, offset);
+        pos.func.replace(l).ireduce(types::I32, wide);
+        for u in exts {
+            let res = pos.func.dfg.first_result(u);
+            pos.func.dfg.clear_results(u);
+            pos.func.layout.remove_inst(u);
+            pos.func.dfg.change_to_alias(res, wide);
         }
     }
     n

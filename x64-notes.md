@@ -531,3 +531,114 @@ merging loaded values into the anchor's register. The residual
 "copies" in the hot loops are the loop-rotation counter shuffle
 (param↔working reg, 2 movq/iter — present in both forms) plus
 the uextend movq — not redundant cursor carries.
+
+### Shared-HEAD re-measure: bcheck versioning + deadrec + uload32
+
+Re-measured the anomaly kernels on shared HEAD (native's bcheck
+affine versioning merged) with new `deadrec` + late `uload32`
+passes, `/tmp/bigbench.rs` (1M elems, haswell, Rosetta,
+best-of-10, same binary for both):
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| gather | 0.511  | 0.510 | **1.00x — parity** |
+| scatter| 0.656  | 0.521 | 1.26x |
+| hist   | 0.462  | 0.320 | 1.44x |
+| prefix | 0.470  | 0.467 | parity |
+| chars  | 0.605  | 0.444 | 1.36x |
+| tokenize | 7.910 | 1.577 | **5.0x** |
+
+**Gather — now at parity.** bcheck's affine versioning splits the
+loop: a checked fallback (~15 insns, keeps both bounds checks +
+rotation copies) and a **9-insn check-free fast loop** — exactly
+stock's instruction count:
+
+```asm
+movl  (%rdi), %edx          ; a[i]
+cmpq  %rcx, %rdx            ; idx < tab.len — data-dependent, stays
+jae   panic
+movl  (%rax,%rdx,4), %edx   ; tab[idx]
+movl  %edx, (%r8)           ; out[i]
+addq  $1, %r9
+addq  $4, %rdi
+addq  $4, %r8
+cmpq  %rsi, %r9
+jb    loop
+```
+
+- The `i < out.len` bound is versioned away (prologue computes a
+  mulxq-based 128-bit trip bound; falls back to the checked loop
+  when it fails). The `i < n` loop-exit test remains — that IS
+  the loop condition, not a removable check. The gather index
+  check `idx < tab.len` is data-dependent and correctly remains.
+- The `uextend.i64 (load.i32)` `movq` is gone: late `uloads32`
+  (PLIRON_ULOAD32, runs after coldedges, right before codegen —
+  earlier passes match `Opcode::Load` so i32 widening must be
+  late) folds to `uload32.i64`; the `movl` zero-extends in one
+  vreg. `deadrec` (PLIRON_DEADREC) drops the leftover `p → iadd
+  p,4 → backedge` cursor recurrence that forward liveness can't
+  see (circular self-use).
+- Residual vs stock: we still use 3 adds (src cursor, dst cursor,
+  index) vs stock's single index + indexed amodes, and stock
+  4x-unrolls with IPSCCP'd constant lens (`cmpq $0xfff`). Even
+  cost under Rosetta, parity measured.
+
+**Scatter — 1.26x residual.** Loop is ~14 insns: `movl (%rax),
+%r10d` (val[i]), `movl (%rdi), %edx` (idx[i]), two cmp/jae pairs
+(`i < val.len` affine — NOT versioned here, and `idx < out.len`
+data-dependent), `movl %r10d, (%r8,%rdx,4)`, 3 cursor adds, exit
+cmp/jb — plus `movq %r11,%rdx`/`movq %rdx,%r11` rotation copies
+on the carried index (deadrec removed one slot but regalloc still
+maps the i-param through a working reg). Stock: ~7-8 insns/iter,
+4x-unrolled, both checks constant-folded via IPSCCP. The affine
+`i < val.len` check not getting the versioning gather got is the
+main remaining gap.
+
+**Tokenize — 5.0x reproduced, shape documented** (native is
+investigating on aarch64; not fixed here). `tokenize =
+s.split_whitespace().map(len).sum()`. Stock inlines the whole
+iterator: per ASCII char ~6-8 insns — byte load, `testb js` UTF-8
+ASCII fast path, and `is_whitespace` as a single **bitmap test**
+(`cmpl $0x20; btq %rax, %r8` with `r8 = 0x100003e00`), unicode
+ranges + WHITESPACE_MAP table only off the cold path. Pliron's
+loop instead has, per char/iteration:
+- a **linear branch chain** for is_whitespace (~10-15 insns:
+  `cmpl $0x20/je`, `cmpl $0x9/jb`, `cmpl $0xd/jbe`, `cmpl $0x84`,
+  shr $8 range checks) — no bitmap fusion;
+- a **jump-table dispatch** (`movslq (%rax,%r11,4); jmpq *%rax`)
+  for the SplitWhitespace state machine each iteration;
+- **stack spill/reload** of ~5 loop-carried iterator values
+  (`front offset`, `done flag`, `word start`, counters parked at
+  `0x8(%rsp)`..`0x30(%rsp)`).
+≈25-35 insns/char vs stock's ~8 → the observed 5x. The UTF-8
+decode itself is already inlined fine; the gap is the state-
+machine dispatch + the non-bitmapped whitespace test + carried-
+state spills.
+
+**revnorm exit-edge fix (correctness, shared HEAD).** The Rosetta
+std test was segfaulting ~50% of runs (HashMap→`kv.sort()`;
+HashMap order randomizes which layout trips it). Bisected to
+`revnorm` on `smallsort::insert_tail`: Phase B rewrote descending-
+iv uses only in `info.body`, so the exit block's use of the iv
+param (the hole pointer = iv's final value, via `v177 -> v84`)
+kept reading the new ascending byte count `j` — `store` at address
+`j` ≈ NULL page → `insertion_sort_shift_left` SIGSEGV at 0x0.
+Fixed by scanning all blocks (param uses are dominance-confined
+anyway) and rewriting via `inst_values`/`map_inst_values`, which
+also covers exception contexts and call args the old
+fixed-args+terminator-only scan missed. After: 0/20 aarch64 +
+0/15 x64-Rosetta failures, std/unwind 5/5 green.
+
+**deadrec verify-fix.** First version scanned
+`dfg.inst_fixed_args`, which returns only
+`num_fixed_value_arguments` — for calls/try_calls ALL args are
+variable-length, so a live `umulhi→iadd→try_call` use of the
+param's alias was invisible and the param got removed anyway
+(dangling `v1421 -> v2887`). Now scans `inst_args` (all non-edge
+args) and skips params/intermediates that are alias targets
+(`alias_targets` set — a `va -> p` alias would strand on removal).
+
+Validation: cargo build clean; test.sh green (nostd/std/unwind/
+asm/unroll/licm/proc-macro/wasm); Rosetta x86_64-apple-darwin
+std+unwind 5/5; PLIRON_VERIFY=1 clean on bigbench + the HashMap
+repro + scat_bench.
