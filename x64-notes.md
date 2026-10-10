@@ -410,3 +410,67 @@ per-element `a[i]`+`cnt[v]` checks aren't dominated by anything, the
 residual stays cold-edge adapter copies); gather 0.452 vs stock
 0.491; wide kernels unchanged. The win is check removal on real
 code paths (bounds-check-dense Rust), not the hist hot loop.
+
+### CELIM v2 + hist re-audit after native umulhi coldargs (Rosetta)
+
+Synced to a224f39 which carries native's coldargs upgrade
+(`umulhi(arg, 0)` disguised-zero instead of `sadd_overflow` rebinding
+for non-i128 ints). Hist re-audit: the `r11->rdi->r9->rdi` pin-chain
+is GONE — the input pointer stays in `rax` for the whole unrolled
+body; no clifpeep change needed. The hot loop is now structurally
+close to stock (4-way unrolled, per-element `i+k < len` +
+`cnt[v] < cnt.len` checks, `addl $1`), so no clifpeep fix this round.
+
+Remaining hist gap is structural, not register-pinning: stock LLVM
+merges the `a[i]` bounds check into the loop exit (`cmpq %r8,%rsi /
+je`) — rustc's MIR gives the loop a const trip `i < 0x100000` while
+the `a[i]` check tests `i < a.len` (a param), so LLVM's
+loop-predication/check-exit fusion can't be matched by folding; it
+needs a min(n, len) exit rewrite. celim can't fold `i < rsi` from
+`i < 0x100000` facts either (different bases). Documented as the
+next candidate pass ("check-exit fusion").
+
+CELIM v2 (all nowrap-gated, CLIF has no nuw/nsw):
+- general offsets: `x +/- c` decompose to `V(base, off)`; same-base
+  compare pairs decide via net shifts `x fc y+F` vs `x qc y+Q`
+  (delta_implied tables verified for lt/le/gt/ge/eq both domains);
+  domain chosen consistently (signed fact -> signed nowrap checks),
+  equality facts decide any-domain queries.
+- `x + d cc k` facts restate as `x cc k-d` when `x + d` provably
+  can't wrap in the inferred range (second pass after range
+  gathering). Headline case verified: `i + 3 < len` dominating
+  `a[i..i+4]` with `i = uextend(u32)` folds all four checks —
+  `narrow4` fast path is check-free like LLVM's constraint-elim.
+- band/bor icmp-leaf seeding on taken/not-taken edges (punroll
+  trip-bound guards decompose into component bounds).
+- load-width facts: `uload8` => `< 256`, uload16/32, sload*
+  signed mirrors — seeds the `cnt[v]` hist fold when `cnt.len`
+  dominates 256 (dynamic-len hist still keeps the check, as
+  expected: nothing proves `cnt.len >= 256`).
+- guard-band collapse: `band(x < C, C - x > k)` ->
+  `x <= min(C-1, C-k-1)` (or false when the bound is < 0). Fires in
+  the hist 4-way dispatch (`celim-guard 1`), removes the setcc/test
+  pair. 0 hits in regex-syntax.
+- unpeeled retry: plain `v != 0` facts are stated on the add node;
+  peeled queries `x+3 == 0` retry unpeeled so they still match.
+
+Measured (PLIRON_STATS, regex-syntax -O): celim **310 folds in 101
+fns** (v1: 243/77); `celim-guard 0` there, 1 in the hist micro.
+Correctness: adversarial wrap/len tests match stock incl. panic
+indices (`i64::MIN` offsets rejected; unsigned_abs used); narrow4 /
+wide4 probe — usize wrapping_add correctly keeps its checks.
+Verify: cargo build, test.sh green (incl. wasm), Rosetta std+unwind
+pass, PLIRON_VERIFY=1 clean on x64 regex-syntax.
+
+Bench (best-of-10, Rosetta, 4M/1M-element workloads):
+hist 2.02 vs stock 0.89 (2.3x — check-exit fusion above),
+gather 1.16 vs 0.33 (3.5x — see below), scatter 0.87 vs 0.29,
+chars 0.87 vs 0.39, tokenize 1.26 vs 0.38, dot_u32 0.35 vs 0.07
+(stock SIMD), matmul 0.38 vs 0.15, prefix 0.87 vs 0.44;
+pliron wins sum_u8 0.032 vs 0.148 (loopvec) and strlen.
+
+New gap found — multi-pointer loop param shuffle: gather/scatter
+bodies carry ~5 movq/lea copies per iter as the rotation merge
+re-maps advancing pointers/indices through block params (regalloc2
+copies, not coldargs). Stock keeps them straight-line unrolled.
+Same family as the old pin-chain but structural to loop params.
