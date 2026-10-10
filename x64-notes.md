@@ -330,3 +330,204 @@ x64 regex-syntax; Rosetta x86_64-apple-darwin std+unwind pass.
 sum2d residual check (x64, Rosetta): pliron 0.788–0.795 ms vs stock
 0.766–0.777 — ~2%, inside earlier-run noise; the ledger's "-5%"
 residual is stale. Accepted as parity.
+
+### Dual-128 loopvec probe + hist re-audit (x64-v3, Rosetta)
+
+Dual-128 turns out to be already implemented: loopvec's vector body
+unrolls by `UNROLL` (`src/loopvec.rs:2419`), currently **4×128-bit
+groups per iteration** — quad-128, not dual. Probe of `unroll=8` on
+x64 (reverted): no kernel improved, several regressed — even_sum
+−21% (0.607→0.733), dot_i8 −10%, dot_u8/sum_sq −5%; the extra
+accumulator regs + epilogue cost lose to port pressure. **4×128 is
+the saturation point; keep UNROLL=4.** A per-arch tunable is
+possible (`apply` already takes `x64`) but measurement says don't
+bother.
+
+Wide-kernel results, `-Ctarget-cpu=x86-64-v3` under Rosetta
+(pliron / stock ms/iter): axpy 0.364/0.593, vadd_u32 0.525/0.653,
+clamp_u8 0.090/0.142, dot_i32 0.088/0.130, sum_u8 0.128/0.694
+(psadbw), dot_i8 0.300/0.430, matmul_256 4.832/12.062, has_val
+0.382/1.491, max_u 0.194/0.353, min_i 0.191/0.227, sum_sq
+0.882/1.057, dot_u8 0.461/1.445, scaled 0.727/0.941, rev_copy32
+0.362/0.636, cnt_vowel 0.666/1.562, even_sum 0.607/1.844, xor_fold
+0.365/0.422, find_off 0.084/1.198, fillzero parity, sum2d
+0.780/0.750 (-4%, ordered fadd — accepted). **Every vectorizable
+kernel beats LLVM's ymm codegen** — dual-128-in-spirit is already
+winning; a real ymm regclass is not on the critical path.
+
+scatter/hist re-audit on shared HEAD (coldedges + coldargs + edgefwd
++ foldf + vmax all merged): gather 0.455 vs stock 0.495 — now a
+**win** (+8%). hist 0.619 vs 0.444 — 1.5x -> 1.39x residual, not
+closed. Per-element in the 4x-unrolled hot loop: movzbq + cmpq + jae
++ addl RMW (4 core insts, same as stock's movzbl/cmpq/jbe/incl) plus
+**~3 cold-edge ABI-pinning copies**: `movq %r11,%rdi` (iv -> panic
+arg reg), `movq %rdi,%r9` / `movq %r9,%rdi` (a[i] save/restore around
+the `jae` to `panic_bounds_check(index=rdi,len=rsi)`). ~8.5 vs ~5.7
+insts/element. The residual lives in coldedge adapter/ABI-pinning
+copies (native agent's coldedges work, 87909ba) — not edgefwd's
+domain. A deeper fix would hoist the per-element `a[i] < len` check:
+a[i] is u8 and cnt.len()=256 makes it statically provable —
+constraint-elimination territory (LLVM doesn't do it either; we'd
+*beat* stock if we did).
+
+Verify: cargo build, test.sh green, Rosetta std+unwind pass at
+0b88590.
+
+### Constraint elimination (src/celim.rs, PLIRON_CELIM)
+
+General dominating-condition compare elimination on final CLIF — a
+superset of jumpthread's `fold_dominated_conds` (PLIRON_DOMCOND),
+run late (after foldf, before sameargs/coldedge) so it sees checks
+materialized by switchmap/bcheck/loopvec/punroll/ifconv and so a
+folded check's dead panic edge never gets a cold adapter.
+
+Beyond domcond it handles: multi-predecessor successors when every
+other pred is dominated by the dest (loop headers — entry via the
+guard edge is the only way into the region); fact operands restated
+through edge-arg -> block-param maps (only for slots every edge
+passes identically — the uniform_slot check keeps loop re-entry
+sound); `brif v` non-icmp facts (`v != 0`); +-1 operand offsets both
+directions (`x<y` => `x+1<=y`, `x-1<y` fact => `x<=y`; wrap cases are
+excluded by the fact holding); `x-1<k`/`x+1>k` range tightening; one
+transitivity hop; signed<->unsigned range transfer (`x s<0` =>
+`x u>= half`).
+
+Measured (PLIRON_STATS, regex-syntax -O): domcond folds 2,360
+icmps; celim adds **+243 in 77 fns** (~10%) — translate/visitor,
+IntervalSet::difference, literal extract, Display fmt, `Pattern::
+is_contained_in`, allocator reserve/spec paths. Also fires in
+cpubench mains + `find_byte_off`. Verification: `func.replace` keeps
+the iconst type; folded `brif` retargeted via fold_const_branches.
+`PLIRON_VERIFY=1` clean on x64 regex-syntax; test.sh green; Rosetta
+std+unwind pass; targeted checks (`a[i]` folded, `a[i+1]` kept under
+`i<len`; `i<len && j<len` elides both) disasm-verified. Soundness
+fixes en route: block-param substitution only on uniform slots, and
+the `(x-y)==0` norm reports sub operands as range raw (was comparing
+`x-y`'s range against `y`'s const — wrong predicate).
+
+Perf: neutral on micros — hist 0.596-0.600 (same as baseline; its
+per-element `a[i]`+`cnt[v]` checks aren't dominated by anything, the
+residual stays cold-edge adapter copies); gather 0.452 vs stock
+0.491; wide kernels unchanged. The win is check removal on real
+code paths (bounds-check-dense Rust), not the hist hot loop.
+
+### CELIM v2 + hist re-audit after native umulhi coldargs (Rosetta)
+
+Synced to a224f39 which carries native's coldargs upgrade
+(`umulhi(arg, 0)` disguised-zero instead of `sadd_overflow` rebinding
+for non-i128 ints). Hist re-audit: the `r11->rdi->r9->rdi` pin-chain
+is GONE — the input pointer stays in `rax` for the whole unrolled
+body; no clifpeep change needed. The hot loop is now structurally
+close to stock (4-way unrolled, per-element `i+k < len` +
+`cnt[v] < cnt.len` checks, `addl $1`), so no clifpeep fix this round.
+
+Remaining hist gap is structural, not register-pinning: stock LLVM
+merges the `a[i]` bounds check into the loop exit (`cmpq %r8,%rsi /
+je`) — rustc's MIR gives the loop a const trip `i < 0x100000` while
+the `a[i]` check tests `i < a.len` (a param), so LLVM's
+loop-predication/check-exit fusion can't be matched by folding; it
+needs a min(n, len) exit rewrite. celim can't fold `i < rsi` from
+`i < 0x100000` facts either (different bases). Documented as the
+next candidate pass ("check-exit fusion").
+
+CELIM v2 (all nowrap-gated, CLIF has no nuw/nsw):
+- general offsets: `x +/- c` decompose to `V(base, off)`; same-base
+  compare pairs decide via net shifts `x fc y+F` vs `x qc y+Q`
+  (delta_implied tables verified for lt/le/gt/ge/eq both domains);
+  domain chosen consistently (signed fact -> signed nowrap checks),
+  equality facts decide any-domain queries.
+- `x + d cc k` facts restate as `x cc k-d` when `x + d` provably
+  can't wrap in the inferred range (second pass after range
+  gathering). Headline case verified: `i + 3 < len` dominating
+  `a[i..i+4]` with `i = uextend(u32)` folds all four checks —
+  `narrow4` fast path is check-free like LLVM's constraint-elim.
+- band/bor icmp-leaf seeding on taken/not-taken edges (punroll
+  trip-bound guards decompose into component bounds).
+- load-width facts: `uload8` => `< 256`, uload16/32, sload*
+  signed mirrors — seeds the `cnt[v]` hist fold when `cnt.len`
+  dominates 256 (dynamic-len hist still keeps the check, as
+  expected: nothing proves `cnt.len >= 256`).
+- guard-band collapse: `band(x < C, C - x > k)` ->
+  `x <= min(C-1, C-k-1)` (or false when the bound is < 0). Fires in
+  the hist 4-way dispatch (`celim-guard 1`), removes the setcc/test
+  pair. 0 hits in regex-syntax.
+- unpeeled retry: plain `v != 0` facts are stated on the add node;
+  peeled queries `x+3 == 0` retry unpeeled so they still match.
+
+Measured (PLIRON_STATS, regex-syntax -O): celim **310 folds in 101
+fns** (v1: 243/77); `celim-guard 0` there, 1 in the hist micro.
+Correctness: adversarial wrap/len tests match stock incl. panic
+indices (`i64::MIN` offsets rejected; unsigned_abs used); narrow4 /
+wide4 probe — usize wrapping_add correctly keeps its checks.
+Verify: cargo build, test.sh green (incl. wasm), Rosetta std+unwind
+pass, PLIRON_VERIFY=1 clean on x64 regex-syntax.
+
+Bench (best-of-10, Rosetta, 4M/1M-element workloads):
+hist 2.02 vs stock 0.89 (2.3x — check-exit fusion above),
+gather 1.16 vs 0.33 (3.5x — see below), scatter 0.87 vs 0.29,
+chars 0.87 vs 0.39, tokenize 1.26 vs 0.38, dot_u32 0.35 vs 0.07
+(stock SIMD), matmul 0.38 vs 0.15, prefix 0.87 vs 0.44;
+pliron wins sum_u8 0.032 vs 0.148 (loopvec) and strlen.
+
+New gap found — multi-pointer loop param shuffle: gather/scatter
+bodies carry ~5 movq/lea copies per iter as the rotation merge
+re-maps advancing pointers/indices through block params (regalloc2
+copies, not coldargs). Stock keeps them straight-line unrolled.
+Same family as the old pin-chain but structural to loop params.
+
+### Anomaly-table reconciliation + ivrefold (src/ivrefold.rs, opt-in)
+
+Reconciled the table above against the earlier "all-wins" suite:
+that suite (wide.rs, `-Ctarget-cpu=x86-64-v3`, 4M elems) benched
+axpy/vadd_u32/clamp_u8/dot_i32/sum_u8/dot_i8/matmul_256/has_val/
+max_u/min_i/sum_sq/dot_u8/scaled/rev_copy32/cnt_vowel/even_sum/
+xor_fold/find_off/fillzero/sum2d. Verdicts:
+
+- `chars`, `tokenize`, `prefix`, `dot_u32`, `cnt_aff`, `strlen`:
+  **new kernels** — not in any earlier table; not regressions vs
+  previously-measured baselines. dot_u32's 0.35/0.07 ratio is
+  stock's ymm SIMD on a 1M-dot; apples-to-apples requires matching
+  loopvec coverage, and on v3-flagged kernels we already win
+  (dot_i32 0.088/0.130).
+- `matmul` (0.38/0.15): **different workload** — 64x64 elementwise
+  constant matrices in the temp harness vs `matmul_256`'s 256x256
+  (4.83/12.06 win). Not comparable; no regression shown.
+- `hist`/`gather`/`scatter`: **real gaps but overstated** — the
+  2.3x/3.5x/3.0x numbers came from a one-off harness that no longer
+  reproduces. Re-measured on a clean reconstruction (1M elems,
+  haswell, Rosetta, best-of-10): hist 0.32/0.23 (1.4x — the known
+  check-exit-fusion gap), gather 0.59/0.37 (1.6x), scatter
+  0.48/0.40 (1.2x). The 3.5x gather residual decomposes into the
+  counter/param rotation copies + 2 bounds-check pairs/iter vs
+  stock's 9-insn tight loop — the earlier harness likely also
+  included cold-edge pin copies now removed.
+
+Copy-chain fix attempt — `ivrefold` (PLIRON_IVREFOLD, default OFF):
+refolds loop-carried affine params (`p' = p + s` on every back
+edge) onto one anchor IV: `p` uses become `bp + r*i` with
+`bp = p0 - r*i0` materialized on the entry edge (ring-exact, no
+nowrap needed), params stripped from all edges. Verified:
+eliminates 3 params in gather/scatter (loop body 17→13 insns,
+all three cursors become `(%base,%idx,4)` amodes, single `addq $1`),
+780 slots in 114 fns on regex-syntax, PLIRON_VERIFY=1 clean.
+
+Measured (x64 Rosetta, isolated best-of-10): gather 0.50→0.59,
+scatter **0.48→0.78 (-60%)**, prefix 0.47→0.36 (+25%), hist
+0.335→0.32; aarch64 native gather flat, scatter 0.43→0.46.
+Root cause of the regression: with the cursors gone, every memory
+op's address keys off the one anchor register — regalloc2 then
+splits the anchor param's live range and parks loaded values in
+the freed register, emitting save/restore copies (`idx[i]` lands
+in the counter's home reg, needs `movq %rdx,%rbx`/`%rbx,%r11`)
+that SERIALIZE what were independent cursor recurrences. OoO
+machines (and Rosetta especially) exploited the parallel chains;
+LLVM's regalloc handles the refolded form better than regalloc2.
+Prefix wins because its real recurrence is the scalar accumulator,
+not the address chains.
+
+**Verdict: transform implemented + verified, kept opt-in**
+(`PLIRON_IVREFOLD=1`); not a default win until regalloc2 stops
+merging loaded values into the anchor's register. The residual
+"copies" in the hot loops are the loop-rotation counter shuffle
+(param↔working reg, 2 movq/iter — present in both forms) plus
+the uextend movq — not redundant cursor carries.

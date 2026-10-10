@@ -527,6 +527,19 @@ pub fn lower_to_object(
                 panic!("licm broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Rebase descending counted ivs (`(0..n).rev()`) to ascending so
+        // loopidiom/loopvec see the canonical `0..bound` count shape.
+        if crate::pass_enabled("PLIRON_REVNORM") && crate::bisect("revnorm") {
+            let k = crate::revnorm::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("revnorm {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("revnorm broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.loopidiom && crate::bisect("loopidiom") {
             let k =
                 crate::loopidiom::run(&mut clctx.func, &noalias, m.target_config(), n);
@@ -756,6 +769,71 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Fold compares decided by dominating branch conditions (bounds
+        // checks implied by earlier checks) before the cold-edge split:
+        // a folded check's dead panic edge then never gets an adapter.
+        if crate::pass_enabled("PLIRON_CELIM") && crate::bisect("celim") {
+            let k = crate::celim::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("celim {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after celim ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("celim broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Refold loop-carried affine params (i' = i+s on every back
+        // edge) onto one anchor IV: `p` becomes `bp + r*i` computed in
+        // the loop body instead of a regalloc parallel copy plus an
+        // increment on the back edge. Runs after celim (icmp folds can
+        // change which param is the counter) and before sameargs so
+        // newly-uniform params are still picked up.
+        //
+        // OPT-IN: the transform is exact and produces LLVM-shaped code,
+        // but measurement (x64 Rosetta, gather/scatter/prefix) shows it
+        // loses today — regalloc2 allocates load results into the freed
+        // param registers, emitting save/restore copies that serialize
+        // the previously-independent cursor recurrences. Re-evaluate
+        // after regalloc changes; prefix does win (+25%).
+        if std::env::var("PLIRON_IVREFOLD").is_ok_and(|v| v == "1")
+            && crate::bisect("ivrefold")
+        {
+            let k = crate::ivrefold::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("ivrefold {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after ivrefold ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("ivrefold broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Drop block params that receive the same value on every
+        // incoming edge (and merge duplicate params): each surviving
+        // param costs a regalloc parallel copy per conditional pred —
+        // the `mov;b` edge-split blocks that dominate the block count.
+        // Runs before coldedges so adapters inherit smaller arg lists.
+        if crate::pass_enabled("PLIRON_SAMEARG") && crate::bisect("sameargs") {
+            let k = crate::clifpeep::sameargs(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("sameargs {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after sameargs ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         // Move hot->cold block-param edge copies into cold adapter blocks

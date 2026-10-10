@@ -28,7 +28,7 @@ folds at lowering time (covers a slice of instcombine/dce for free).
 | `instsimplify` | Simplifies instructions without creating new ones | part (clifpeep + egraph) | low | S |
 | `sccp` | Sparse conditional constant propagation | part (`unroll.rs` const-props through loops; `jumpthread` folds) | low-med | M |
 | `correlated-propagation` | Uses value ranges and branch facts to simplify code | — | med-high (Rust is bounds-check dense) | L |
-| `constraint-elimination` | Removes compares proven by dominating conditions | part (`jumpthread::fold_dominated_conds` folds dominating same/implied/range facts; offset-form `i+k<=n` measured ~0 candidates on the bc_* sweep — see native-notes) | low residual | L |
+| `constraint-elimination` | Removes compares proven by dominating conditions | done (`celim.rs`: dominating-fact RPO stack — edge facts, block-param translation w/ `uniform_slot`, ±c offset decomposition, transitivity, signed↔unsigned transfer; 310 folds/101 fns on regex-syntax) | landed | M |
 | `jump-threading` | Threads branches whose outcome is known on some paths | done (`jumpthread.rs`) | landed | — |
 | `dfa-jump-threading` | Jump threading for state-machine-style switch loops | — | low | M |
 | `simplifycfg` | Merges, removes, and folds basic blocks and branches | part (`unreach`, `tailmerge`, `taildup`, `switchmap`, `fusechains`, `phisimp`) | med (block merging still open) | M |

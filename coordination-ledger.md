@@ -388,3 +388,185 @@ Track as x64 agent follow-up.
 - KNOWN LIMITATION (all workstreams closed): wasm matmul gap is a
   waffle-level unroll problem; native/x64 remaining gaps are regalloc2
   critical-edge splits intrinsic to block-param style.
+
+## wt/native-opt — sameargs param reduction + ra2 split-invariant audit (uncommitted->committing)
+- `sameargs` (clifpeep, post-foldf/pre-coldedges): drops params fed by
+  the same value on every edge; merges duplicate params; TryCallRet/Exn
+  pseudo-args kept distinct after a real miscompile (fused call rets).
+  regex-syntax: 13,896 blocks (−11), 19,987 movs (−41), 1,665 mov-led
+  splits (−16), 103,607 insts (−209).
+- Dead end DOCUMENTED in native-notes: skipping arg-free critical-edge
+  splits in blockorder is unsound — ra2 `inter_block_dests` boundary
+  moves need insertion points even with zero CLIF edge args.
+  Vendor changes reverted; no vendor diff remains.
+- Verified: cargo build, test.sh green, PLIRON_VERIFY=1 clean on
+  regex-syntax, bc_check/bc_sem/dse_check/rmw_check green. gather
+  neutral (0.35); hist-const is layout-noise-dominated (identical loop
+  code flips 0.54<->2.03 across builds).
+
+## Merged: sameargs (b0feedc) + x64 notes (45a00ba) + wasm fwd fix blob
+- sameargs (clifpeep): drops same-value block params, merges duplicate
+  arg vectors to fixpoint. -37 movs/-10 blocks on regex-syntax — small;
+  PROVES the ~1.6k remaining splits are intrinsic to ra2's
+  critical-edge-free CFG (no backend patch possible — boundary moves
+  still need sites for live-in vregs). Option-3 regalloc patch audited
+  as unsound, reverted.
+- Fixed: try_call TryCallRet(0)/(1) arg-fusion bug caught by std segfault.
+- x64: UNROLL=4 in loopvec already = quad-128-bit groups; UNROLL=8 probe
+  LOSES (port pressure). All wide x64 kernels beat LLVM ymm codegen —
+  a real ymm regclass confirmed NOT on the critical path.
+- x64 hist residual: 1.39x, = ~3 cold-edge ABI-pinning copies
+  (r11->rdi->r9->rdi) around each jae per checked element. Fix domain:
+  coldargs pin-direct. Stock keeps per-element checks too.
+- wasm: BIG uncommitted blob reviewed + committed — wpeep fwd coverage
+  fix (conditional defs don't cover, back-edge readers, stale decode
+  ctx), wunroll_flat, bound_u64/as_check, fused memargs. All env-gated
+  default-on. Full test.sh green on merged HEAD.
+- TODO next round: coldarg pin-chain elimination (native), general
+  constraint-elimination (x64), matmul check-diamond flattening (wasm).
+
+## wt/native-opt — coldargs umulhi disguised-zero (uncommitted->committing)
+- `clifpeep::coldargs` rebind upgraded: `sadd_overflow(x,0)` ->
+  shared `umulhi(x,0)` zero per int type per cold block + plain
+  `iadd x, z` per arg. No egraph fold for umulhi*0, so the disguise
+  survives; flagless `add` replaces `adds`+dead `cset`. i128 keeps
+  sadd_overflow (no scalar umulhi lowering).
+- regex-syntax: cset 3,206->748, adds 2,465->7, umulh 160->1,746,
+  real insts ~103.6k->102,477.
+- REJECTED: isle `umulhi(x,0) -> umulh x,xzr` — ra2 reuses the
+  materialized zero-vreg elsewhere; removing it cascaded to +218
+  insts/+524 blocks despite -392 movs. Vendor diff reverted; no
+  vendor change remains.
+- Verified: cargo build, PLIRON_VERIFY=1 whole-crate clean,
+  ./test.sh green, bc_check/dse_check/rmw_check/bc_sem pass.
+
+## Merged: coldargs umulhi (a981fc4) + celim (ab4fb59) + wasm innermost-first wbcheck (3daf617)
+- coldargs: shared umulhi(x,0) disguised-zero per cold block + flagless
+  iadd — regex-syntax cset 3206->748, adds 2465->7, umulh 160->1746;
+  102,477 real insts (was ~103.6k). Speculative umulhi(x,0)->umulh x,xzr
+  ISLE measured WORSE (ra2 loses reusable zero vreg), reverted.
+- celim (NEW src/celim.rs ~1100 lines): dominating-condition icmp
+  elimination — +243 folds on regex-syntax beyond domcond's 2360, sees
+  checks materialized late (switchmap/bcheck/loopvec/punroll/ifconv).
+  Facts: brif/br_table edge facts, block-param translation w/
+  uniform_slot, +-1 tightening, transitivity, signed<->unsigned. 4
+  soundness bugs self-audited pre-commit. Micro-bench: neutral (hist's
+  checks aren't dominated — expected). Value is real-world density.
+- wasm: wbcheck innermost-first + wunroll loop recollection —
+  matmul_256 12.1->10.33ms = ~8% FASTER than stock (was 7% behind).
+  wunroll_flat fires; new hot path: static guards -> k<249 group test ->
+  flat x8 pure f32 loads/mul/add.
+- Wasm remaining: sum_u8 +5%, dot_i32 +2% (V8-normalization noise).
+- Native deferred items logged: strength-reduce non-direct stream
+  bases, two-phase reverse, residual loopvec epilogue work.
+
+## wt/native-opt — offset-affine bounds-check guards (committing)
+- `guard_dead`/`guard_pred` generalize to `iv ± k` and `c - iv`
+  compared index exprs (`iv_add_k` destructuring in loopidiom).
+  neg_off 0.459 -> 0.078 ms/iter (5.9x, stock 0.058); pos_off/
+  off_read parity. guard_pred now appends multiple preds via
+  `&mut Vec<Pred>` (no-wrap `iv0 >=u |k|` + `satsub` bound covers
+  + post-tested first-iter covers); loopidiom::plan updated.
+- Host-side overflow hygiene: checked_add/checked_neg on the
+  i64 proofs (iv0/k can be MIN-shaped consts).
+- hist re-audit post-umulhi: hot unrolled loop is mov-free — no
+  pin bounce around b.hs bounds checks; all rebind work lives in
+  cold blocks. hist-rand 0.373 vs 0.436 (+17% vs stock).
+  hist-const / same-address-hist variance (0.8-2.0 both compilers)
+  is microarchitectural store-forwarding noise, not codegen.
+- celim on aarch64 regex-syntax: 105,545 -> 102,857 insts
+  (-2,592), blocks -569; PLIRON_VERIFY clean — helps here too.
+- Verified: cargo build, test.sh green (incl wasm), PLIRON_VERIFY
+  on probes + panic/wrap tests; wide suite all >= stock.
+- Still scalar (next candidates): desc_sum `(0..n).rev()` —
+  descending counted iv needs step<0 in count() or a rev-norm
+  pre-pass; stride2 non-unit step; rev_inplace half-trip.
+
+## wt/native-opt — revnorm descending-iv rebasing (committing)
+- NEW src/revnorm.rs (PLIRON_REVNORM, after licm, before loopidiom):
+  rebase `iv: hi→lo` desc counted loops to `j: 0→hi-lo` with iv=hi-j.
+  Exact for `eq`/`ne` stay tests any step; `ugt 0` for unit decrement.
+  `iv±k`/`k-iv` defs become `(hi±k)-j` with preheader constants; bare uses
+  get per-block `isub(hi,j)`; icmp single-use check before operand rewrite.
+- desc_sum 0.304 -> 0.074 ms/iter (4.1x; stock 0.073) — full neg-stream
+  NEON path (descending ldp + rev64/ext lane fixup + uaddw accum).
+  step_by(2) normalizes too but stays correctly scalar (strided load).
+- Bug caught+fixed by test: keep icmp RAW polarity (body-on-false brifs
+  mean the cond is the exit test) — inverted exits returned empty sums.
+- Verified: cargo build, PLIRON_VERIFY=1 ./test.sh green incl wasm,
+  rev probes (rsum/rcopy/rrange/rwhile/ridx/panic) match stock exactly
+  (incl panic index), stride2 2550 both, r42 rustlantis 6k-line clean.
+- Remaining: stride2-class non-unit-step vectorization, rev_inplace
+  (half-trip swap, 0.21 vs 0.17 stock), shuffle-tree epilogue.
+
+## Merged: revnorm+affine-guards (5805a7f,0e5dc33) + celim v2 (3b647d0) + wasm flat-unroll cursors (0b6614b)
+- revnorm.rs (NEW): descending counted ivs rebased to ascending via
+  iv=hi-j bijection — desc_sum 0.304->0.074 (parity). loopidiom/loopvec
+  affine iv+-k guard proofs — neg_off 0.459->0.078.
+- hist PIN-CHAIN ELIMINATED (umulhi coldargs worked): unrolled hist loop
+  mov-free; hist-rand 0.373 vs stock 0.436 = +17% WIN. hist-const
+  0.8-2.0ms flips are Apple memory-renaming noise (same-addr RMW chain).
+- celim v2: 310 folds/101 fns on regex-syntax; also verified on aarch64
+  (-2592 insts, -569 blocks). Guard-band collapse fired in hist.
+- wasm: sum_u8->parity, max_u32 -38% WIN, matmul -11% WIN (9.97 vs 11.21).
+  Only deficit: dot_i32 +2.5% (noise; stock doesn't unroll it at all).
+- v128 SIMD verdict (wasm): NOT cheaply wireable — wasm path bypasses
+  CLIF entirely (pliron-dialect -> waffle -> bytecode); vectors
+  scalarized via wleaves. A waffle-level vectorizer is a multi-day
+  project. Documented as deferred.
+- NEW x64 gap identified: check-exit fusion — LLVM exits loops on
+  i==len doubling as bounds check; we keep per-iter i<len checks.
+  Fix = bcheck preheader versioning (hoist i<len for all i<n to a
+  single n<=len preheader test). Also multi-pointer loop copy chains
+  (~5 movq/lea per iter on gather/scatter via rotation merge params).
+- CAUTION: x64 agent's "larger workloads" table showed anomalies vs
+  earlier runs (matmul 2.5x slower at that size, new kernels chars/
+  tokenize/prefix/dot_u32 slower). Different sizes/harness — needs
+  reconciliation before treating as regressions.
+
+## bcheck affine coverage (wt/native-opt, uncommitted)
+- Follow-up to the x64 "check-exit fusion" finding. bcheck already
+  versioned fully-affine loops (gather, sum2d); this round extended
+  the affine analysis: `isub` both directions (`a[i-k]`, `a[c-i]`),
+  invariant consts as sign-extended K terms (was zext'd V — every
+  `a[i-k]` guard silently failed), dead `brif iconst` cold brifs no
+  longer counted as residual checks, and min/max guards for
+  decreasing sequences (`sum_b u< len && hi sge 0`, min-check elided
+  for provably non-negative affines).
+- New fires: rev_copy32, scaled (both now fully check-free fast
+  loops), plus neg_idx/off_idx/shift_cp/gather_chk probes. Outputs
+  and panic indices match stock incl. n>len and wraparound edges.
+- Partial (subset-covered) versioning deliberately stays gated for
+  single-foldable-check loops with non-affine stores: it wins 28%
+  on random-key hist but costs 44% on same-key hist via same-addr
+  store-forward replays — the removed branch's issue slots are
+  load-bearing spacing. Affine-store (`dst[i]`) and load-only
+  partial loops DO version now. PLIRON_BCHECK_PARTIAL=1 overrides.
+- regex-syntax -O: same 7 versionings, +17 insts net, cond-branch
+  count unchanged. test.sh PLIRON_VERIFY=1 green.
+
+## Merged: bcheck affine versioning (9db2ec2) + ivrefold-optin (7c52988) + wasm GC+fusion (abe6e62,942cb56)
+- bcheck: affine() now handles a[i-k] (isub) and a[c-i] (negated terms,
+  Lin::N runtime slopes); consts sign-extend into Lin::K — prior
+  zext'd-const failures SILENTLY killed every i-k guard. Min/max guards
+  for decreasing sequences + dead-const residual accounting. Fires on
+  rev_copy32, scaled, gather_chk, shift_cp — check-free fast clones.
+  PLIRON_BCHECK_PARTIAL=1 folds RMW-store checks too but regresses
+  same-address RMW +44% (issue slots feed store->load forwarding;
+  stock keeps a per-iter check on that shape too). Default keeps it.
+- ivrefold.rs (NEW, PLIRON_IVREFOLD=1 opt-in): refolds loop-carried
+  affine params onto one anchor IV — works mechanically (780 slots
+  gone, LLVM-shaped amodes) but NET-NEGATIVE (ra2 serializes
+  recurrences; gather/scatter lose). Correct pass, wrong regime.
+- Benchmark anomaly RECONCILED: chars/tokenize/prefix/dot_u32 are NEW
+  kernels; matmul anomaly was a 64x64 size not the 256 win. Real x64
+  residuals: hist 1.4x, gather 1.6x, scatter 1.2x — and NEW: tokenize
+  (split_whitespace) ~5x — UTF-8/iterator codegen, cross-target
+  candidate.
+- wasm-ld GC: mark-sweep dead-function/data/GOT/table collection —
+  wmini 1.41MB->204KB (was 30x stock, now 4.3x; residual = per-function
+  codegen volume: locals, SP traffic, GOT indirect addressing).
+- wload fusion: load+ext -> i64.load{8,16,32}_{s,u}; dot_i32 emits
+  stock shape. Bulk-memory ops (memory.copy/fill) already emitted.
+- Next: tokenize 5x (native/x64), gather 1.6x (x64), wasm code-density
+  4.3x (wasm), rev_inplace/stride2 (native).

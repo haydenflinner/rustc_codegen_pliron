@@ -866,15 +866,14 @@ fn plan(
             }) {
                 continue;
             }
-            match guard_pred(func, &info, &kinds, &c, e2) {
-                Some(pr) => ps.push(pr),
-                None => match early_cond(func, &info, e2) {
+            if !guard_pred(func, &info, &kinds, &c, e2, &mut ps) {
+                match early_cond(func, &info, e2) {
                     Some(ec) => es.push(ec),
                     None => {
                         ok = false;
                         break;
                     }
-                },
+                }
             }
         }
         if !ok {

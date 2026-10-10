@@ -85,6 +85,39 @@ rev/neg-store/neg-load/dot/early-exit kernels across edge lengths
   marginal (only scalar epilogue paths benefit); the paired streams
   already telescope to post-index writebacks.
 
+## This round (bcheck affine coverage: `c-i`/`i-k` indices, guard tightening)
+
+- `bcheck::affine` now handles `isub`: `aff - inv` adds a negative b term
+  (`a[i-k]`), and `inv - aff` negates m + every b term (`a[c-i]`). Invariant
+  constants are stored as `Lin::K` so they sign-extend into the widened
+  guard domain — previously `a[i-1]` carried `2^64-1` as a zext'd V term
+  and every guard failed.
+- Decreasing index sequences (m<0) bound the *entry* value instead of the
+  last: guard is `sum_b u< len && hi sge 0` (hi = last-iter value is the
+  min). Increasing sequences keep `hi u< len`, plus `sum_b sge 0` only
+  when a term can actually go negative (`a[i-k]` with small iv0 wraps and
+  must stay on the slow path). Pure-positive affines emit the same
+  single-compare guard as before.
+- New fires: `rev_copy32` (`n-1-i`), `scaled` (dst check; the src check
+  was already a `brif iconst` — dead-const cold brifs no longer count as
+  residual checks), `neg_idx`/`off_idx`/`shift_cp`/`gather_chk` probes.
+  regex-syntax: same 7 versionings as before, +17 insts (min-guard on
+  affine-offset loops only).
+- Partial versioning experiment: lifting the single-foldable-check bail
+  puts `i < a.len` in a `n <= a.len` preheader version guard — hist-rand
+  0.373 -> 0.267 (-28%), but same-key hist 0.9 -> 1.3 (+44%): the removed
+  branch's issue slots were keeping same-address store->load forwarding
+  from replaying (mechanism confirmed by punroll-off: 0.49 checked vs
+  1.14 folded; stock LLVM *keeps* a per-iter `cmp x1,x9 / b.eq` on this
+  shape and hits 0.44). Shipped gated: single-foldable partial
+  versioning only when every store address is strictly iv-affine —
+  `dst[i]` streams can't self-replay, `cnt[a[i]]` RMW keeps its checks.
+  PLIRON_BCHECK_PARTIAL=1 forces it unconditionally.
+- Measured: hist-rand 0.369 vs stock 0.436; gather 0.304 vs 0.61;
+  scatter-hist 0.86 unchanged; wide suite unchanged (rev_copy32/scaled
+  parity). Panic-index fixtures incl. `a[n-1-i]` with n>len and
+  `a[i-lo]` wraparounds match stock exactly.
+
 ## This round (scatter/hist, countdown iv, cold-edge RA effects)
 
 - `bcheck`: skip loop versioning when fewer than 2 checks fold and
@@ -515,3 +548,202 @@ ldrb; ldr; add; str; add; add; cmp; b.ne — zero copies, no check).
   cleanliness/unroll shape (punroll domain), not bcheck/indvars.
 - `gather` residual (0.34-0.35 vs ~0.34 stock): `idx[i] & 1023`
   mask check already gone; at parity.
+
+## This round (sameargs: block-param reduction + ra2 split-invariant audit)
+
+### sameargs (clifpeep, after foldf / before coldedges)
+
+Drops a block param when **every** incoming edge passes the same
+`BlockArg::Value(v)` (`v` then dominates the block, so its uses
+rewrite to `v` and the arg slot is stripped from each edge), and
+merges a param whose arg vector duplicates an earlier param's on
+every edge. Iterates to fixpoint (8 rounds), rewriting all uses
+globally through `InstructionData::map_values` (covers jump-table
+and exception-table `BlockCall` args). Gated by PLIRON_SAMEARG.
+
+regex-syntax rlib (PLIRON_SAMEARG=0 → on):
+
+| metric          | off     | on      | delta |
+|-----------------|--------:|--------:|-------|
+| real insts      | 103,816 | 103,607 | −209  |
+| real blocks     | 13,907  | 13,896  | −11   |
+| movs            | 20,028  | 19,987  | −41   |
+| mov-led splits  | 1,681   | 1,665   | −16   |
+
+Modest but real. **Correctness trap found + fixed**: `try_call`
+normal-return dests carry `TryCallRet(i)` pseudo-args; an early
+version collapsed all non-`Value` args to one marker, so
+`block(ret0, ret1)` looked like a duplicate pair and the merge
+fused a call's first and second results (`fn4(v14, v14)`) —
+verifier-clean but semantically wrong (caught by test.sh's std
+segfault). Fix: keep raw `BlockArg`s and compare them directly;
+`TryCallRet(0) != TryCallRet(1)` now blocks the merge, while
+`TryCallRet(0) == TryCallRet(0)` across all edges still merges
+legitimately.
+
+Bench: gather 0.35 vs 0.36 ms/iter (neutral; stock 0.60). The
+`hist` const-input benchmark flips 0.54↔2.03 ms/iter across
+binaries/runs with **byte-identical loop code** — it's a serial
+same-cache-line RMW whose timing depends on where code+data land;
+hist-randomized is identical (0.375 vs 0.383). No systematic
+sameargs regression.
+
+### Dead end documented: skipping arg-free critical-edge splits
+
+Tried teaching cranelift blockorder to not lower arg-free
+critical edges, relaxing ra2's `CritEdge` check accordingly.
+**Unsound**: ra2's `inter_block_dests` boundary moves fire for
+any vreg live-in at the target (including transparent
+flow-through values), not just blockparam transfers — an arg-free
+CLIF edge can still need a move insertion point, and
+`choose_move_location` panics on unsplit critical edges
+(ion/moves.rs). A correct gate needs "no live-in vregs at the
+target," which is an RA-time property invisible at blockorder;
+even an optimistic CLIF proxy leaves only ~4.3k of ~16.7k
+arg-free edges, and the true count after full liveness is far
+smaller. Reverted; the ~1.6k residual `mov;b` splits are the
+price of ra2's critical-edge-free CFG requirement.
+
+### coldargs: `umulhi` disguised-zero (replaces sadd_overflow)
+
+The `sadd_overflow(x, 0)` rebind paid a dead flag materialization
+per arg: `adds` sets condition codes and the unused overflow flag
+still lowered to `cset`/`seto` before DCE could see through it.
+`umulhi(x, 0)` has no `simplify`/`simplify_skeleton` rule, so it
+survives the egraph as an unprovable runtime zero — one `umulh`
+per int type per cold block (shared across every call in the
+block), with each arg rebound as a plain flagless `iadd x, z`.
+i128 keeps the `sadd_overflow` fallback (no scalar `umulhi`
+lowering).
+
+regex-syntax rlib (sadd_overflow → umulhi scheme):
+
+| metric     | before | after  | delta    |
+|------------|-------:|-------:|----------|
+| cset       | 3,206  | 748    | −2,458   |
+| adds       | 2,465  | 7      | −2,458   |
+| umulh      | 160    | 1,746  | +1,586   |
+| real insts | ~103.6k| 102,477| ~−1.1k   |
+
+**Tried and reverted**: an isle rule lowering
+`umulhi(x, 0)` directly to `umulh x, xzr` (skipping the
+`mov w8,#0`). Counterintuitively a net loss — ra2 reuses the
+materialized zero-vreg for other zero-init moves, so removing it
+cascaded into different split/coalesce decisions: +218 insts,
++524 blocks, +486 uncond `b` vs the iconst form (−392 movs, but
+net negative). Kept the plain `iconst`+`umulhi` CLIF.
+
+Verified: PLIRON_VERIFY=1 whole-crate, ./test.sh green,
+bc_check/dse_check/rmw_check/bc_sem microtests pass.
+
+### Offset-index bounds checks: `guard_dead`/`guard_pred` go affine
+
+Versioned loops with `a[i ± k]` bounds checks used to bail — the
+check's compared value isn't the raw iv, so neither the "same test
+as the stay" dead rule nor the plain `ult(iv, lim)` pred fired.
+`neg_off` (`for i in 4..n { d[i] = a[i-4] }`) was the worst
+remaining loopvec gap: 0.459 ms/iter vs stock 0.080 (5.7x).
+
+New machinery (src/loopidiom.rs):
+
+- `iv_add_k(func, iv, x)` — destructure `x` as `iv`, `iv + C`, or
+  `iv - C` (returns `k`; `isub(iv,c)` reports `-c`).
+- `guard_dead` recognizes `ult(iv - k, bound)` as dead when the
+  loop is pre-tested, step > 0, and `iv0 >= k` is statically
+  provable — the stay condition keeps iv < bound and the
+  subtraction can't wrap, so `iv - k` stays in `[0, bound)`.
+- `guard_pred` now appends a *set* of predicates (`&mut Vec<Pred>`)
+  instead of returning one:
+  - `iv + k`: `bound <=u satsub(lim, k)` (largest checked index
+    `bound-1+k < lim`; the sat keeps `lim < k` honest), plus
+    `iv0 + k < lim` for post-tested first iterations.
+  - `iv - |k|`: `iv0 >=u |k|` (no-wrap) unless `iv0` proves it,
+    `satsub(bound, |k|) <=u lim`, and the post-tested first-iter
+    `iv0 - |k| < lim`.
+  - `c - iv` (descending index like `a[m-i]`): largest index is
+    `c - iv0`, so `c - iv0 <u lim`, plus `satsub(bound,1) <=u c`
+    so the subtraction can't wrap mid-loop.
+  Both host-side arithmetic proofs use `checked_add`/`checked_neg`
+  — `iv0`/`k` can be `i64::MIN`-shaped constants.
+- The loopidiom `plan` caller gained the same multi-pred contract.
+
+Results (1M u32): neg_off 0.459 -> ~0.078 ms/iter (stock 0.058),
+pos_off ~0.078 (stock 0.056), off_read 0.043 (stock 0.042).
+`neg_off` disasm now shows the full NEON `ldp q/stp q` unrolled
+loop + `cbnz` countdown; versioning prologue carries the pair
+overlap + bound preds. Correctness: short-dst still panics at
+index 20, and `a[i.wrapping_sub(2)]` from `0..n` panics on the
+wrapped `usize::MAX-1` (the `iv0 >= k` pred correctly refuses the
+fast path). PLIRON_VERIFY=1 clean, test.sh green.
+
+Known remaining gaps in the same probe family: `desc_sum`
+(`for i in (0..n).rev()`) and `stride2` still scalar — the count
+model only accepts `step > 0` / non-unit strides. Next candidate
+is a descending-iv normalization (rewrite `i: n->0` as ascending
+`j` with `i = iv0 - j` so the existing neg-stream machinery sees
+it) or threading `step < 0` through count/trips/emit.
+
+### hist re-audit post-umulhi (a224f39)
+
+The ~3-move ABI-pinning chain around each bounds-check `b.hs` is
+gone. The 4x-unrolled hist hot loop is mov-free:
+
+```
+cmp x6, x1 / b.hs cold      ; i < n
+ldrb w4, [x0, x6]           ; a[i]
+cmp x4, x3 / b.hs cold      ; a[i] < cnt.len
+ldr w7, [x2, x4, lsl#2]
+add/str ... x4 lanes ...
+add x6, x6, #4; cmp; b.lo
+```
+
+The cold panic blocks keep the whole rebind internally:
+`mov x0,#0; umulh x2, x6, x0; add x0, x6, x2; add x1, x1, x2;
+call panic_bounds_check`. The index still arrives as an edge arg
+(the `mov x6, x5` lane-merge stubs), but the pin chain is confined
+to cold code — no materialize-in-pinned-slot workaround needed.
+
+Benchmarks (1M): hist-rand 0.373 vs stock 0.436 ms/iter (+17%);
+hist-const swings 0.83-2.03 across processes for BOTH compilers —
+it's the serial same-address RMW store chain, layout-sensitive,
+not a codegen deficit. scatter's all-same-index hist shows the
+same pathology (0.77 vs 0.44); gather is a 1.76x win (0.34 vs
+0.60). Wide suite: everything at parity or better (has_val 2x,
+dot_u8 2x, cnt_vowel 3.7x, find_off 14x; even_sum within 2%).
+
+celim on aarch64 (regex-syntax): -2,592 real insts, -569 blocks,
+-186 mov-led splits vs PLIRON_CELIM=0; PLIRON_VERIFY clean. The
+x64-motivated pass is a straight win here too.
+
+### revnorm: descending counted-iv rebasing (new pass)
+
+`for i in (0..n).rev()` arrives as `iv: n → 0` step -1 — invisible to the
+count model (step>0 only) and to stream analysis. New pass `src/revnorm.rs`
+(runs after licm, before loopidiom; `PLIRON_REVNORM=0` off) rebases the iv
+to ascending `j: 0 → hi-lo` via the exact mod-2^64 bijection `iv = hi - j`:
+
+- stay tests: `iv == lo` / `iv != lo` → `j ==/!= hi-lo` (exact for any
+  step — the icmp keeps its RAW polarity since the brif's edges don't
+  move); `iv > 0` → `j < hi` (unit-decrement only — needs to hit the floor
+  exactly). Other floor inequalities are not residue-preserving when
+  `hi < lo` or the step can skip the bound — not normalized.
+- `iv ± k` / `k - iv` defs rebase to `(hi ± k) - j` / `(k - hi) + j` with
+  the constant side materialized in the preheader — preserving the
+  canonical `C - iv` shape the affine guard analysis reads (same check the
+  new `c - iv` guard_pred arm covers).
+- all other in-body uses get `isub(hi, j)` emitted per-block; entry edge
+  passes `iconst 0`, latches pass `j + |s|`; the count icmp must have no
+  other uses.
+
+desc_sum `(0..n).rev() { s += a[i] }`: scalar 0.304 → 0.074 ms/iter —
+full NEON `ldp [x3], #-0x40` descending loads + `rev64`/`ext` lane fixups +
+8 `uaddw` accumulators — at stock parity (0.073). `step_by(2)`'s internal
+descending `remaining` count normalizes too (stays correctly scalar —
+strided loads aren't vectorizable). Verified: verify_function clean,
+rwhile/range/short-dst panic semantics all match stock (panic index 63
+first-visited in rev order, identical to stock).
+
+One subtlety that matters: `brif c, exit, body` (body on the FALSE edge)
+means the icmp computes the EXIT condition — rewriting it to the stay
+condition inverts the loop entirely (returned 0). The icmp must preserve
+the raw condition's truth value translated to j.
