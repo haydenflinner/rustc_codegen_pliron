@@ -738,6 +738,24 @@ pub fn lower_to_object(
                 panic!("fuse broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Retarget edges past `jump`-only forwarder blocks, including
+        // try_call landing-pad and normal-return edges that the earlier
+        // jumpthread bypass cannot touch; each surviving forwarder emits a
+        // `b` in the final stream.
+        if crate::pass_enabled("PLIRON_EDGEFWD") && crate::bisect("edgefwd") {
+            let k = crate::edgefwd::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("edgefwd {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after edgefwd ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("edgefwd broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.
