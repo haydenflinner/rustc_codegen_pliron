@@ -1651,6 +1651,9 @@ fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, cal
 fn winline(funcs: &mut [FDecl], verbose: bool) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
+    // Loop-body callsites execute the call every iteration, so a
+    // moderately-sized callee is worth duplicating there.
+    const HOT: usize = 15;
     const ROUNDS: usize = 8;
     let body_size = |b: &FunctionBody| -> usize {
         b.blocks.values().map(|d| d.insts.len()).sum()
@@ -1678,6 +1681,15 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
         for ci in 0..funcs.len() {
             if funcs[ci].body.is_none() {
                 continue;
+            }
+            // Loop-member blocks of this caller, for the hot rule.
+            let mut inloop: FxHashSet<WBlock> = FxHashSet::default();
+            {
+                let b = funcs[ci].body.as_ref().unwrap();
+                let cfg = waffle::cfg::CFGInfo::new(b);
+                for (_, s) in wloops(b, &cfg) {
+                    inloop.extend(s.iter().copied());
+                }
             }
             // One scan per caller: collect all eligible call values.
             // Positions are resolved per-site at splice time (the tail
@@ -1711,8 +1723,19 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
                                 continue;
                             }
                             let n = body_size(cb);
+                            let k = calls[fi] as usize;
+                            // GC-completion: inlining all K sites
+                            // copies n*(K-1) insts but frees the
+                            // callee body + call ops + func entry
+                            // (~10B); roughly break-even inside this
+                            // budget in inst units.
+                            let gc_done = refs[fi] == 0
+                                && k >= 2
+                                && n * (k - 1) <= 5 + 2 * k;
                             if n <= TINY
-                                || (calls[fi] == 1 && refs[fi] == 0 && n <= SOLO)
+                                || (k == 1 && refs[fi] == 0 && n <= SOLO)
+                                || gc_done
+                                || (inloop.contains(&blk) && n <= HOT)
                             {
                                 sites.push((iv, fi));
                             }
