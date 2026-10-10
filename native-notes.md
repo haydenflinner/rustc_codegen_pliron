@@ -832,3 +832,58 @@ cargo build clean; PLIRON_VERIFY=1 ./test.sh green incl wasm + new
 pairfuse test; wide suite all ≥ stock (has_val/dot_u8 2x, cnt_vowel
 3.7x, find_off 14x); bc_sem/rmw_check/dse_check outputs match stock;
 rev_copy32/dot_u8 ldp-stp stream pairs intact after the vcode fix.
+
+### edgespec + bittab (sentinel threading + set-membership bitmask)
+
+`src/edgespec.rs` (new): threads a predecessor edge through pure
+`brif`/`br_table`/`jump` dispatch blocks when the supplied block-param
+args decide the outcome. Evaluates `iconst`/`ireduce`/`uextend`/
+`sextend`/`bnot`/`band`/`bor`/`bxor`/`icmp`/`select` symbolically
+(const or `c?k1:k0` shapes); constant conds become `jump`, a
+`select`-derived cond becomes a `brif` on the underlying flag.
+
+`src/bittab.rs` (new): folds a sparse `icmp`/`brif` membership tree
+(accepted set ⊆ a 64-value window, pure interior, single-pred,
+two-outcome) into `isub` + `icmp ult d,64` + `select mask/0` +
+`ushr` + `icmp ne 0` + `brif` — one guarded bitmask test. AArch64
+emits `mov/movk`+`cmp`+`csel`+`lsr`+`cbnz`; x64 would use `btq`.
+On `char::is_whitespace` inside `SplitWhitespace::next` it produced
+mask `0x0001_0000_3e00` (bits 9..=13, 32) in one shot.
+
+Soundness bug found and fixed in edgespec: threading `p` past a
+walked block B skips B's param *rebinding* — in
+`SplitWhitespace::next` the `x <= 132` arm went through a block
+whose params carry the advanced cursor; landing after it left the
+loop-carried `v914` bound to the previous iteration's value and the
+scan spun forever (verifier-clean — the def still dominated the use;
+the binding was just stale). Fix: `resolve` accumulates the set of
+skipped blocks per path; `cone_ok`/`fin_edge`/`avail_a` reject any
+use or arg whose def lives in a skipped block unless the def-site
+re-dominates the use inside the landed cone. Added
+`tests/edgespec/main.rs` (wired into test.sh) — iterates a 4.4MB
+split_whitespace string; the buggy build hangs on it.
+
+`PLIRON_EDGESPEC=0` / `PLIRON_BITTAB=0` disable; a
+`PLIRON_EDGESPEC_LIMIT=n` env bisects rewrites within a function
+(was how the bad fold was isolated — rewrite #7 of 10 on `next`).
+
+tokenize 4.4MB (this build vs stock):
+`count` 13.0 vs 6.7 (1.95x), `collect` 15.5 vs 9.1 (1.7x),
+`chars().filter(is_alphabetic)` 6.7 vs 2.96 (2.3x — was 8.6,
+edgespec -22%), `bytes().filter(is_ascii_alphabetic)` 4.3 vs 0.95
+(4.5x — stock NEON-vectorizes the byte predicate; unrelated to the
+folds). `x <= 132` arm threading is now REFUSED (the stale-binding
+case above); the sentinel/discriminant plumbing around `Option<char>`
+is partially but not fully threaded — residual gap stands.
+
+rev_inplace re-measured: `swap(i, n-1-i)` u8 0.221 vs 0.215,
+u64 0.128 vs 0.127 — parity (memory-bound scalar both sides).
+`slice::reverse` u8 0.244 vs 0.022 (11x — stock does SIMD byte
+reversal), u64 0.156 vs 0.091 (1.7x — mirror-swap vectorization
+remains the real gap).
+
+Validated: cargo build; PLIRON_VERIFY=1 ./test.sh green incl the new
+edgespec test; harness tier-0 smoke 11/11 + determinism 10/10;
+rmw_check/dse_check/bc_check/drev/drev2 match stock; swtest/swtest2/
+tok2/tok3 outputs identical to stock; wsmin 9000 with bittab 1 +
+edgespec 5 fired.

@@ -621,3 +621,29 @@ Track as x64 agent follow-up.
 - Next: bittab (set-membership bitmask) + Option-sentinel fold
   (native), scatter non-versioned-check investigation + tokenize
   re-verify (x64), function-count inlining (wasm).
+
+## wt/native-opt — edgespec + bittab for tokenize (committing)
+- src/edgespec.rs (NEW): threads pred edges through pure
+  brif/br_table/jump dispatch blocks decided by supplied block-param
+  args (Option/enum sentinel plumbing); symbolic eval of
+  const/select/ireduce/icmp/band chains; PLIRON_EDGESPEC=0 off,
+  PLIRON_EDGESPEC_LIMIT=n bisects rewrites per function.
+- src/bittab.rs (NEW): sparse icmp/brif membership trees (accepted
+  set ⊆ 64-window, pure interior, 2-outcome) → guarded bitmask
+  isub+icmp.ult.64+select+ushr+icmp.ne+brif. char::is_whitespace in
+  SplitWhitespace::next → mask 0x1_0000_3e00. PLIRON_BITTAB=0 off.
+- MISCOMPILE FIXED: edgespec threaded past a dispatch block whose
+  params carry the advanced iterator cursor — the rebind was skipped,
+  cursor went stale, split_whitespace spun forever (verifier-clean).
+  Fix: per-path skipped-block set; uses/args/conds of skipped defs
+  rejected unless the def re-dominates the use in the landed cone.
+  Regression: tests/edgespec/main.rs (in test.sh).
+- tokenize 4.4MB vs stock: count 13.0/6.7 (1.95x), collect 15.5/9.1
+  (1.7x), chars-filter 6.7/2.96 (2.3x, was 8.6 → -22% from edgespec),
+  bytes-filter 4.3/0.95 (4.5x — stock NEON-vectorizes predicate).
+- rev_inplace u8/u64 parity (0.221/0.215, 0.128/0.127; memory-bound).
+  slice::reverse u8 0.244 vs 0.022 (11x — SIMD byte reversal gap),
+  u64 0.156 vs 0.091.
+- Verified: build clean; PLIRON_VERIFY=1 ./test.sh green (incl new
+  edgespec test); harness tier-0 smoke+determinism OK; cpubench
+  rmw/dse/bc/drev outputs match stock.

@@ -855,6 +855,42 @@ pub fn lower_to_object(
                 panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Thread edges through `brif` dispatch blocks decided by the supplied
+        // args (Option/enum sentinel selects, constant discriminants): the
+        // `select`/`ireduce`/`icmp eq k` cascades collapse to a `brif` on the
+        // flag or a direct edge. Runs before coldedges so any hot->cold edge
+        // it creates still gets an adapter.
+        if crate::pass_enabled("PLIRON_EDGESPEC") && crate::bisect("edgespec") {
+            let k = crate::edgespec::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("edgespec {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after edgespec ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("edgespec broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Sparse small-domain membership trees (is_whitespace/is_ascii_*
+        // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
+        // the accepted set fits a 64-bit window.
+        if crate::pass_enabled("PLIRON_BITTAB") && crate::bisect("bittab") {
+            let k = crate::bittab::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("bittab {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after bittab ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("bittab broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Move hot->cold block-param edge copies into cold adapter blocks
         // so the moves only execute when the cold edge is actually taken.
         // Runs after edgefwd: its bypass has no cold check and would

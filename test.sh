@@ -33,6 +33,10 @@ rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm && $out/licm
 # Post-alloc pair fusion must not pair a load with a load that uses its
 # result as an address (pointer-chase + closure-env dependent loads).
 rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse && $out/pairfuse
+# edgespec must not thread an edge past a dispatch block whose params it
+# leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
+# iterator spun forever.
+rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec && $out/edgespec
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user
