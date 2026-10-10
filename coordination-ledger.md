@@ -92,3 +92,15 @@ Residual: rev_copy32 latch still ~3 insts of regalloc mov ping-pong
 vs LLVM's sub+cbnz count-down; guaranteed store-pairing across
 producer gaps needs source order (done) or a scheduler — assessed
 only; general-reg AMode::PostIndex not pursued (marginal).
+
+## Merged: native fixes (82ba7c8, ff to shared HEAD)
+- scaled regression ROOT CAUSE: punroll was partial-unrolling the new
+  smaller SIMD loops. punroll now bails on vector-typed loops (21-line
+  eligibility check in src/punroll.rs — x64 agent's file, coordinated).
+  Verified merged: scaled 0.561 (parity), rev_copy32 0.241 win retained.
+- Trip-bound remat killed via isub(band) trick — latch now LLVM-parity.
+- NEW: `deflag` pass in clifpeep.rs (PLIRON_DEFLAG, default on) rewrites
+  dead-flag CheckedBinaryOp results to wrapping ops — `.iter().zip()`
+  chains now VECTORIZE (big real-world win; dead overflow flags had
+  defeated loopvec op matching). zip_sum at parity vs stock.
+- Verified: cargo build, std diff-clean, unwind, wide suite.
