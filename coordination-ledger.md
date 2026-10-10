@@ -783,3 +783,21 @@ Track as x64 agent follow-up.
   ne_params self-edge/unreachable-pred soundness.
 - Verified: cargo build; PLIRON_VERIFY=1 ./test.sh green; chars/contains
   correctness incl. empty/mixed-width/char::MAX edges.
+
+## Merged: niche decoding (d7fed94) + punroll brif-latch (1783829) + wasm stale-param fix (1a634e2)
+- jumpthread NonNull lattice (ne_const/ne_params fixpoint), sentinel
+  select-fold, param-null fold, const_sweep, sel_regions edge-arg
+  folding, nonnull fn-arg attrs. chars_ascii 2.4->1.6x, chars_alpha
+  3.4->2.9x, chars_count PARITY.
+- punroll: entry-block-param bounds accepted; rotated jump-latch loops
+  supported; full-unroll 12->16 (K=8 on versioned checked loops).
+  hist ~PARITY both arches (0.24 vs 0.23); gather/scatter now WIN.
+- wasm: stale ValueDef::BlockParam miscompile FIXED (waffle params
+  shrink, defs stale -> wbcheck indexed past edge args -> OOB stub).
+  Ownership checks x4 sites; wbig 0 stubs; PLIRON_WASM_PANIC debug.
+- REGRESSION FLAGGED (x64): ifconv cap 4->8 hurts chars().count() ~2x
+  on x64 (predictable branches -> selects). Needs profitability guard.
+- Remaining: chars multibyte 1.6-2.9x (UTF-8 select chains / SIMD
+  decode), tokenize ~2-2.6x, contains 2.2x (needs u32 2-compare range
+  reduction — Widen::Cnt extension), spilled-hi stack-slot forwarding,
+  matmul-64 (gather/interchange), wasm real-crate runtime ~1.32x.
