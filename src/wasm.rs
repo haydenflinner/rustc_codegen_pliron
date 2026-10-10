@@ -1299,21 +1299,29 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         // adjacent after scheduling fuse here into the single wide
         // load (`i64.load{8,16,32}_{s,u}`); memarg bytes carry over.
         if let (WPeek::Other, Some(&(WPeek::Other, s2, _, _))) = (k, ins.get(wi + 1)) {
-            let mop = match (b[s], b[s2]) {
-                (0x28, 0xac) => Some(0x34), // i64.load32_s
-                (0x28, 0xad) => Some(0x35), // i64.load32_u
-                (0x2c, 0xac) => Some(0x30), // i64.load8_s
-                (0x2d, 0xad) => Some(0x31), // i64.load8_u
-                (0x2e, 0xac) => Some(0x32), // i64.load16_s
-                (0x2f, 0xad) => Some(0x33), // i64.load16_u
-                (0x29, 0xc2) => Some(0x30), // i64.load + extend8_s
-                (0x29, 0xc3) => Some(0x32), // i64.load + extend16_s
-                (0x29, 0xc4) => Some(0x34), // i64.load + extend32_s
+            // (fused opcode, operand bytes kept from the first instr).
+            // `i32.load*; i64.extend_i32_{s,u}` pairs that only became
+            // adjacent after scheduling fuse here into the single wide
+            // load (`i64.load{8,16,32}_{s,u}`); memarg bytes carry over.
+            // `i32.const 0; i32.eq` -> `i32.eqz` (and the i64 pair): the
+            // const operand must be the canonical encoding of 0.
+            let mop: Option<(u8, &[u8])> = match (b[s], b[s2]) {
+                (0x28, 0xac) => Some((0x34, &b[s + 1..e])),
+                (0x28, 0xad) => Some((0x35, &b[s + 1..e])),
+                (0x2c, 0xac) => Some((0x30, &b[s + 1..e])),
+                (0x2d, 0xad) => Some((0x31, &b[s + 1..e])),
+                (0x2e, 0xac) => Some((0x32, &b[s + 1..e])),
+                (0x2f, 0xad) => Some((0x33, &b[s + 1..e])),
+                (0x29, 0xc2) => Some((0x30, &b[s + 1..e])),
+                (0x29, 0xc3) => Some((0x32, &b[s + 1..e])),
+                (0x29, 0xc4) => Some((0x34, &b[s + 1..e])),
+                (0x41, 0x46) if b[s + 1..e] == [0x00] => Some((0x45, &b[e..e])),
+                (0x42, 0x51) if b[s + 1..e] == [0x00] => Some((0x50, &b[e..e])),
                 _ => None,
             };
-            if let Some(mop) = mop {
+            if let Some((mop, tail)) = mop {
                 nb.push(mop);
-                nb.extend_from_slice(&b[s + 1..e]);
+                nb.extend_from_slice(tail);
                 wi += 2;
                 continue;
             }
@@ -1597,6 +1605,61 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         for (v, c) in [(self.frame_c, frame), (self.mask_c, mask)] {
             if let ValueDef::Operator(op, ..) = &mut self.b.values[v] {
                 *op = O::I32Const { value: c };
+            }
+        }
+        if self.frame == 0 {
+            // No stack slots were ever allocated: the save/align/restore
+            // dance around __stack_pointer is pure overhead. Drop every
+            // global.set of it (entry adjust, return/unwind/rethrow
+            // restores) plus the now-dead fp/mask producer chain — the
+            // callee's own SP is never touched, so nothing needs
+            // restoring. A stray consumer of the dead values cancels
+            // the whole rewrite (defensive).
+            let sp = self.o.sp;
+            let mut dead: FxHashSet<WV> =
+                [self.sp0, self.fp, self.frame_c, self.mask_c]
+                    .into_iter()
+                    .collect();
+            let mut wl: Vec<WV> = dead.iter().copied().collect();
+            while let Some(v) = wl.pop() {
+                if let ValueDef::Operator(_, args, _) = &self.b.values[v] {
+                    for i in 0..self.b.arg_pool[*args].len() {
+                        let a = self.b.arg_pool[*args][i];
+                        if dead.insert(a) {
+                            wl.push(a);
+                        }
+                    }
+                }
+            }
+            let mut kill = dead.clone();
+            for blk in self.b.blocks.iter() {
+                for &i in &self.b.blocks[blk].insts {
+                    if let ValueDef::Operator(O::GlobalSet { global_index: g }, ..) =
+                        &self.b.values[i]
+                        && *g == sp
+                    {
+                        kill.insert(i);
+                    }
+                }
+            }
+            let mut bad = false;
+            for blk in self.b.blocks.iter() {
+                for &i in &self.b.blocks[blk].insts {
+                    if kill.contains(&i) {
+                        continue;
+                    }
+                    self.b.values[i].visit_uses(&self.b.arg_pool, |u| {
+                        bad |= dead.contains(&u)
+                    });
+                }
+                self.b.blocks[blk]
+                    .terminator
+                    .visit_uses(|u| bad |= dead.contains(&u));
+            }
+            if !bad {
+                for blk in self.b.blocks.iter() {
+                    self.b.blocks[blk].insts.retain(|i| !kill.contains(i));
+                }
             }
         }
         self.b.optimize(&waffle::OptOptions::default());
