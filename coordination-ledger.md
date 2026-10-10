@@ -345,3 +345,16 @@ Track as x64 agent follow-up.
 - Verified: cargo build, ./test.sh green, PLIRON_VERIFY on
   scatter/hist/bc_check/bc_sem (panics still fire), regex-syntax
   block counts unchanged. punroll/edgefwd/wasm/regalloc2 untouched.
+
+## Merged: vmax fold (adccc15, FF) + try_call trap materialization (0e36154)
+- clifpeep vmax: tight unsigned ceiling through uextend/band/ushr/urem/
+  iconst folds out-of-range icmps -> hist loop 8 insts, 0 checks, 0 movs.
+- hist residual resolved: stock LLVM keeps both per-element checks too;
+  remaining gap is unroll cleanliness. gather ~parity.
+- vendored TryCallInfo.continuation_trap: `call;jmp ud2` -> inline
+  `call;ud2` (x64 jmp -11%, a64 b -9.5%, __text -912B). Verified merged:
+  build clean, unwind test passes (site registration untouched).
+- Edge-block root cause PROVEN: regalloc2 critical-edge splits on
+  arg-carrying conditional edges — intrinsic to block-param style, no
+  single safe fix. jumpthread is largest source but net-positive.
+- sum2d x64 residual: ~2% = noise. Closed/accepted.
