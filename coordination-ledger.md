@@ -192,3 +192,16 @@ Remaining: scatter hist ~7% x64 / ~1.4x aarch64 (regalloc edge-coalescing
 artifact, bigger blast radius — ranked #1 residual in native-notes.md);
 matmul deeper tiling; RMW tight-loop store-forward replay; punroll
 multi-exit for hist_unchecked.
+
+## Merged: native 03cd4db + x64 notes (fd6ea2d, 728c534)
+- loopidiom: same-address RMW loops closed to load;init±delta*iters;store.
+  Escape params + invariant-guard predication + trips_idx. Verified merged:
+  rmw_add/idx/two 0.024us = stock parity (closed-form both sides),
+  rmw_dep 1.19 vs 1.73 WIN, rmw_check output bit-identical incl. panics.
+- x64 hist study: 4 cold-transfer mechanisms measured, all neutral-or-worse;
+  committed shape locally optimal. Next direction: cold-cone remat.
+  PLIRON_PREVCODE=<pat> + PLIRON_RA2_EDITS=1 debug dumps now in vendored
+  compile.rs (env-gated).
+- matmul register tiling: assessed NOT loopvec-expressible (needs
+  unroll-and-jam + multi-acc chains + f-reassoc). Documented handoff.
+- Not perf-validated: some sub-1.5x deltas on loaded box (native-notes.md).
