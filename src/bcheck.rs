@@ -831,38 +831,58 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     }
     // A single foldable check that leaves other checks behind isn't always
     // worth a loop clone: the fast copy still pays a cold branch per
-    // iteration, and the tighter loop can actually be slower — in a
-    // scatter/RMW loop the removed branch's issue slots keep same-address
-    // store->load forwarding from replaying (hist same-key: ~0.9ms
-    // unversioned vs ~1.3ms with the check removed, though random-key hist
-    // improves ~28%). Only safe when no store can revisit an address: every
-    // store address must be strictly affine in the counter (`dst[i]`).
+    // iteration, and the tighter loop can actually be slower — in an RMW
+    // loop the removed branch's issue slots keep same-address store->load
+    // forwarding from replaying (hist same-key: ~0.9ms unversioned vs
+    // ~1.3ms with the check removed, though random-key hist improves
+    // ~28%). The hazard needs a load that can re-read a slot a store
+    // wrote, so it's only a risk when the body has BOTH a non-affine store
+    // AND a non-affine load (hist's `cnt[idx]` on both sides). A scatter
+    // (`out[idx[i]] = val[i]`) has a non-affine store but only affine
+    // loads — in safe-Rust aliasing terms no iteration can read back a
+    // scattered slot — so versioning it is safe. This is a perf heuristic,
+    // not a correctness gate: PLIRON_BCHECK_PARTIAL overrides entirely.
+    // (x64 wt note: widened the original all-stores-affine rule to this
+    // store+load test — merge-flag for native's bcheck.rs.)
     if checks.len() < total_checks
         && checks.len() < 2
         && std::env::var_os("PLIRON_BCHECK_PARTIAL").is_none()
     {
-        let mut store_affine = true;
-        'scan: for &b in &body {
+        let mut dyn_store = false;
+        let mut dyn_load = false;
+        for &b in &body {
             for i in func.layout.block_insts(b) {
                 match func.dfg.insts[i] {
                     InstructionData::Store { args, .. } => {
                         let ok = affine(func, &info, &body, MAX_AFFINE_DEPTH, args[1])
                             .is_some_and(|af| !matches!(af.m, Lin::K(0)));
                         if !ok {
-                            store_affine = false;
-                            break 'scan;
+                            dyn_store = true;
                         }
                     }
-                    _ if func.dfg.insts[i].opcode().can_store() => {
-                        store_affine = false;
-                        break 'scan;
+                    InstructionData::Load { arg, .. } => {
+                        let ok = affine(func, &info, &body, MAX_AFFINE_DEPTH, arg)
+                            .is_some_and(|af| !matches!(af.m, Lin::K(0)));
+                        if !ok {
+                            dyn_load = true;
+                        }
                     }
-                    _ => {}
+                    _ => {
+                        let op = func.dfg.insts[i].opcode();
+                        // Atomics/memcpy/etc.: treat any exotic memory op as
+                        // both sides of a potential forwarding chain.
+                        if op.can_store() {
+                            dyn_store = true;
+                        }
+                        if op.can_load() {
+                            dyn_load = true;
+                        }
+                    }
                 }
             }
         }
-        if !store_affine {
-            bail!("single partial check with non-affine store");
+        if dyn_store && dyn_load {
+            bail!("single partial check with possible same-addr store->load chain");
         }
     }
 
