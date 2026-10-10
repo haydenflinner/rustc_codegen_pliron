@@ -788,6 +788,35 @@ pub fn lower_to_object(
                 panic!("celim broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Refold loop-carried affine params (i' = i+s on every back
+        // edge) onto one anchor IV: `p` becomes `bp + r*i` computed in
+        // the loop body instead of a regalloc parallel copy plus an
+        // increment on the back edge. Runs after celim (icmp folds can
+        // change which param is the counter) and before sameargs so
+        // newly-uniform params are still picked up.
+        //
+        // OPT-IN: the transform is exact and produces LLVM-shaped code,
+        // but measurement (x64 Rosetta, gather/scatter/prefix) shows it
+        // loses today — regalloc2 allocates load results into the freed
+        // param registers, emitting save/restore copies that serialize
+        // the previously-independent cursor recurrences. Re-evaluate
+        // after regalloc changes; prefix does win (+25%).
+        if std::env::var("PLIRON_IVREFOLD").is_ok_and(|v| v == "1")
+            && crate::bisect("ivrefold")
+        {
+            let k = crate::ivrefold::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("ivrefold {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after ivrefold ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("ivrefold broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Drop block params that receive the same value on every
         // incoming edge (and merge duplicate params): each surviving
         // param costs a regalloc parallel copy per conditional pred —
