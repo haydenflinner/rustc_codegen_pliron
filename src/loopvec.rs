@@ -2320,8 +2320,19 @@ fn widen_vec_into(
     mut v: Value,
     aty: Type,
     accs: &[Value; 2],
+    x64: bool,
 ) -> (Value, Value) {
     let abits = aty.bits();
+    // u8→u64 byte sums: `x86_psadbw(v, 0)` + `paddq` replaces the whole
+    // 3-level widen tree (~10 ops → 2). One accumulator per group; the
+    // second one is carried unchanged.
+    if x64 && !signed && lane_bits(pos, v) == 8 && abits == 64 {
+        let vty = pos.func.dfg.value_type(v);
+        let z = pos.ins().iconst(types::I8, 0);
+        let zv = pos.ins().splat(vty, z);
+        let sad = pos.ins().x86_psadbw(v, zv);
+        return (pos.ins().iadd(accs[0], sad), accs[1]);
+    }
     loop {
         let lb = lane_bits(pos, v);
         debug_assert!(lb < abits);
@@ -2407,7 +2418,7 @@ fn widen_mul(
 /// latency and halve loop overhead, matching part of LLVM's default unroll.
 const UNROLL: usize = 4;
 
-fn apply(func: &mut Function, p: &Plan, pty: Type) {
+fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let pb = func.layout.inst_block(p.entry.inst).unwrap();
     let (cb, vh, vb, ve) = (
         func.dfg.make_block(),
@@ -2836,7 +2847,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 );
                 v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                 let (lo, hi) =
-                    widen_vec_into(&mut pos, *signed, v, r.aty, accs.try_into().unwrap());
+                    widen_vec_into(&mut pos, *signed, v, r.aty, accs.try_into().unwrap(), x64);
                 back_accs[k].push(lo);
                 back_accs[k].push(hi);
                 continue;
@@ -2942,6 +2953,7 @@ pub fn run(
     noalias: &FxHashSet<Value>,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
     simd: bool,
+    x64: bool,
 ) -> usize {
     if !simd {
         return 0;
@@ -2968,7 +2980,7 @@ pub fn run(
         if debug {
             eprintln!("vec {:?}: {}x{}", p.h, p.vf, p.elem);
         }
-        apply(func, &p, pty);
+        apply(func, &p, pty, x64);
         n += 1;
         if n >= MAX_CONV {
             break;

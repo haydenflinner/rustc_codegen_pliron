@@ -2660,6 +2660,17 @@
       (if-let true (has_ssse3))
       (x64_pmaddubsw y x))
 
+;; Rules for `x86_psadbw` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; PLIRON: byte-sum reduction `y` = splat(0) — use a pxor zero rather than
+;; materializing the splat.
+(rule 1 (lower (x86_psadbw $I64X2 x (splat _ (iconst _ (u64_from_imm64 0)))))
+      (x64_psadbw (put_in_xmm x) (xmm_to_xmm_mem_128 (xmm_zero $I8X16))))
+
+;; PLIRON: generic `psadbw` (sum of absolute byte differences per group).
+(rule (lower (x86_psadbw $I64X2 x y))
+      (x64_psadbw (put_in_xmm x) (put_in_xmm_mem_128 y)))
+
 ;; Rules for `fadd` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (fadd $F32 x y))

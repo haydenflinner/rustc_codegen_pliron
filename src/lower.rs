@@ -531,7 +531,15 @@ pub fn lower_to_object(
                 target_lexicon::Architecture::Aarch64(_)
                     | target_lexicon::Architecture::X86_64
             );
-            let k = crate::loopvec::run(&mut clctx.func, n, &noalias, m.target_config(), simd);
+            let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+            let k = crate::loopvec::run(
+                &mut clctx.func,
+                n,
+                &noalias,
+                m.target_config(),
+                simd,
+                x64,
+            );
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopvec {k} {n}");
             }

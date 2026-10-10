@@ -96,6 +96,16 @@ once proven out on the stage2 benchmark, then drop this copy.
     demand-driven lowering fuses via the late placement, yielding
     `ldp/fmul/stp` blocks for vectorized map loops.
 
+12. x64 `psadbw`: new CLIF op `x86_psadbw` (`i8x16,i8x16 -> i64x2`, added in
+    `vendor/cranelift-codegen-meta/src/shared/instructions.rs`), plus
+    `x64_psadbw` in `isa/x64/inst.isle` and a `lower.isle` rule (the splat-0
+    operand folds to `xmm_zero`). The encoding itself is added in vendored
+    `cranelift-assembler-x64-meta` (`instructions/avg.rs`); codegen-meta's
+    assembler.isle generator emits `x64_psadbw_a_or_avx` automatically.
+    loopvec emits `iadd(acc, x86_psadbw(chunk, splat 0))` for unsigned
+    u8→u64 widening sums — one instruction per 16 bytes instead of a
+    14-unpack widen tree.
+
 ## x64 PIC calls use PLT32
 
 `CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`
