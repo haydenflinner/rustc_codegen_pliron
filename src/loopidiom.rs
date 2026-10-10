@@ -14,7 +14,8 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, BlockCall, ExternalName, ExtFuncData, FuncRef, Function, Inst,
-    InstBuilder, InstructionData, LibCall, Opcode, Signature, Type, Value, ValueDef, types,
+    InstBuilder, InstructionData, LibCall, MemFlagsData, Opcode, Signature, StackSlot, Type, Value,
+    ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -344,35 +345,51 @@ pub(crate) enum Ins {
 /// `e` evaluates to a known constant (constants and `iconst` values folded
 /// through the tree). `None` on any non-constant input or `Div` by zero —
 /// the ops here all wrap like the emitted code does.
-fn ins_eval(pos: &FuncCursor, e: &Ins) -> Option<i64> {
+fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
     Some(match e {
         Ins::K(k) => *k,
-        Ins::Val(v) => iconst(pos.func, *v)?,
-        Ins::Add(a, b) => ins_eval(pos, a)?.wrapping_add(ins_eval(pos, b)?),
-        Ins::Sub(a, b) => ins_eval(pos, a)?.wrapping_sub(ins_eval(pos, b)?),
-        Ins::SatSub(a, b) => ins_eval(pos, a)?.saturating_sub(ins_eval(pos, b)?),
-        Ins::Mul(a, b) => ins_eval(pos, a)?.wrapping_mul(ins_eval(pos, b)?),
-        Ins::And(a, b) => ins_eval(pos, a)? & ins_eval(pos, b)?,
-        Ins::Div(a, b) => (ins_eval(pos, a)? as u64)
-            .checked_div(ins_eval(pos, b)? as u64)? as i64,
+        Ins::Val(v) => iconst(func, *v)?,
+        Ins::Add(a, b) => ins_eval(func, a)?.wrapping_add(ins_eval(func, b)?),
+        Ins::Sub(a, b) => ins_eval(func, a)?.wrapping_sub(ins_eval(func, b)?),
+        Ins::SatSub(a, b) => ins_eval(func, a)?.saturating_sub(ins_eval(func, b)?),
+        Ins::Mul(a, b) => ins_eval(func, a)?.wrapping_mul(ins_eval(func, b)?),
+        Ins::And(a, b) => ins_eval(func, a)? & ins_eval(func, b)?,
+        Ins::Div(a, b) => (ins_eval(func, a)? as u64)
+            .checked_div(ins_eval(func, b)? as u64)? as i64,
     })
+}
+
+/// `icmp cc x, y` on evaluated operands.
+fn cmp_cc(cc: IntCC, x: i64, y: i64) -> bool {
+    match cc {
+        IntCC::Equal => x == y,
+        IntCC::NotEqual => x != y,
+        IntCC::SignedLessThan => x < y,
+        IntCC::SignedLessThanOrEqual => x <= y,
+        IntCC::SignedGreaterThan => x > y,
+        IntCC::SignedGreaterThanOrEqual => x >= y,
+        IntCC::UnsignedLessThan => (x as u64) < (y as u64),
+        IntCC::UnsignedLessThanOrEqual => (x as u64) <= (y as u64),
+        IntCC::UnsignedGreaterThan => (x as u64) > (y as u64),
+        IntCC::UnsignedGreaterThanOrEqual => (x as u64) >= (y as u64),
+    }
 }
 
 pub(crate) fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
     // Cheap folds for shapes stream/address exprs produce (e.g. `iv0=0`
     // turns `base + iv0*K` into `base + 0*K`).
     match e {
-        Ins::Add(a, b) if ins_eval(pos, a) == Some(0) => return emit(pos, ty, b),
-        Ins::Add(a, b) | Ins::Sub(a, b) if ins_eval(pos, b) == Some(0) => {
+        Ins::Add(a, b) if ins_eval(pos.func, a) == Some(0) => return emit(pos, ty, b),
+        Ins::Add(a, b) | Ins::Sub(a, b) if ins_eval(pos.func, b) == Some(0) => {
             return emit(pos, ty, a);
         }
         Ins::Mul(a, b) | Ins::And(a, b)
-            if ins_eval(pos, a) == Some(0) || ins_eval(pos, b) == Some(0) =>
+            if ins_eval(pos.func, a) == Some(0) || ins_eval(pos.func, b) == Some(0) =>
         {
             return emit(pos, ty, &Ins::K(0));
         }
-        Ins::Mul(a, b) if ins_eval(pos, a) == Some(1) => return emit(pos, ty, b),
-        Ins::Mul(a, b) | Ins::Div(a, b) if ins_eval(pos, b) == Some(1) => {
+        Ins::Mul(a, b) if ins_eval(pos.func, a) == Some(1) => return emit(pos, ty, b),
+        Ins::Mul(a, b) | Ins::Div(a, b) if ins_eval(pos.func, b) == Some(1) => {
             return emit(pos, ty, a);
         }
         _ => {}
@@ -816,6 +833,30 @@ pub(crate) fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
                 )
             };
             Some((count, Vec::new()))
+        }
+        // do-while `iv+step < n`: count = ceil((n - iv0)/step), guarded
+        // `iv0 < n` (the body runs at least once even when it isn't).
+        (IntCC::UnsignedLessThan, true, true) => {
+            let diff = Ins::Sub(Box::new(n()), Box::new(iv0()));
+            let count = if cnt.step == 1 {
+                diff
+            } else {
+                Ins::Div(
+                    Box::new(Ins::Add(
+                        Box::new(diff),
+                        Box::new(Ins::K(cnt.step - 1)),
+                    )),
+                    Box::new(Ins::K(cnt.step)),
+                )
+            };
+            Some((
+                count,
+                vec![Pred::Cmp(
+                    IntCC::UnsignedLessThan,
+                    Ins::Val(cnt.iv0),
+                    Ins::Val(cnt.bound),
+                )],
+            ))
         }
         // `while iv != n`: count = n - iv0, guarded `iv0 <= n` (pre).
         (IntCC::NotEqual, false, false) if cnt.step == 1 => Some((
@@ -1317,7 +1358,46 @@ struct DeadPlan {
     entry_args: Vec<Value>,
     exit_dest: Block,
     exit_args: Vec<Ins>,
+    /// Loop-defined values read by `exit_dest` directly (SSA uses rather
+    /// than edge args): each becomes an appended `exit_dest` param that
+    /// loop-side edges bind to the original value and the fast edge binds
+    /// to the closed form. This is how a licm-promoted loop's exit store
+    /// (`store acc` just past the loop) survives deletion.
+    escapes: Vec<(Value, Ins)>,
+    /// Same-address RMW chains (`*p += K` per iteration) the loop performs:
+    /// the fast path emits one load, the closed form, one store per loc.
+    /// Emitted only when `iters` provably ≥ 1 (post-tested counts).
+    iters: Ins,
+    rmw: Vec<RmwLoc>,
     preds: Vec<Pred>,
+}
+
+/// How a stored value relates to the location's current contents.
+pub(crate) enum RmwDelta {
+    /// `st(ld)` — contents unchanged.
+    Keep,
+    /// `st(ld + d)` or `st(d + ld)`: final = `init + d * iters`.
+    Add(Ins),
+    /// `st(ld - d)`: final = `init - d * iters`.
+    Sub(Ins),
+    /// `st(v)`, `v` invariant: final = `v`.
+    Set(Ins),
+}
+
+/// One invariant-address location the loop RMWs every iteration.
+struct RmwLoc {
+    ty: Type,
+    /// Address root: an emitted expression, or a stack slot.
+    addr: RmwAddr,
+    offset: i32,
+    load_flags: MemFlagsData,
+    store_flags: MemFlagsData,
+    delta: RmwDelta,
+}
+
+enum RmwAddr {
+    V(Ins),
+    S(StackSlot),
 }
 
 /// Exit-edge arg `v` as an `Ins` over the entry args and `itb` — the trip
@@ -1384,6 +1464,194 @@ fn arg_ins(
     })
 }
 
+/// Exit edge `e` is never taken when its `brif` condition is loop-invariant
+/// and the fast path requires the value that keeps control in the loop.
+/// This is a one-branch slice of loop unswitching: an invariant guard such
+/// as rustc's `0 < len` bounds check is the same test on every iteration,
+/// so requiring it once up front makes the edge provably dead.
+fn inv_guard_pred(func: &Function, info: &Info, kinds: &[Param], e: Edge) -> Option<Pred> {
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
+        return None;
+    };
+    let c = outv(func, info, kinds, func.dfg.resolve_aliases(arg))?;
+    // `brif c, then, else`: the exit edge fires on `slot==0` iff `c != 0`,
+    // on `slot==1` iff `c == 0`. Staying in the loop needs the complement.
+    let cc = if e.slot == 1 {
+        IntCC::NotEqual
+    } else {
+        IntCC::Equal
+    };
+    Some(Pred::Cmp(cc, Ins::Val(c), Ins::K(0)))
+}
+
+/// Classify `loads`/`stores` as per-location same-address RMW chains:
+/// every access touches an invariant address, each location has at most
+/// one store, byte ranges on a shared root don't overlap, distinct roots
+/// are only stack slots (a param root may alias another param's pointee),
+/// and each store's value is `ld`, `ld ± inv`, or an invariant. Returns
+/// None when the shape doesn't fit — the loop stays undeleted.
+fn rmw_locs(
+    func: &Function,
+    dt: &DominatorTree,
+    info: &Info,
+    kinds: &[Param],
+    loads: &[Inst],
+    stores: &[Inst],
+) -> Option<Vec<RmwLoc>> {
+    // (root, byte offset) -> (ty, byte width, load insts, store inst)
+    let mut groups: FxHashMap<(Root, i64), (Type, i64, Vec<Inst>, Option<Inst>)> =
+        FxHashMap::default();
+    for &i in loads {
+        let InstructionData::Load { arg, offset, .. } = func.dfg.insts[i] else {
+            return None;
+        };
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        let (r, o) = loadfwd::root(func, arg);
+        let o = o.wrapping_add(i64::from(i32::from(offset)));
+        let e = groups
+            .entry((r, o))
+            .or_insert((ty, i64::from(ty.bytes()), Vec::new(), None));
+        if e.0 != ty {
+            return None;
+        }
+        e.2.push(i);
+    }
+    for &i in stores {
+        let InstructionData::Store { args, offset, .. } = func.dfg.insts[i] else {
+            return None;
+        };
+        let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
+        let (r, o) = loadfwd::root(func, args[1]);
+        let o = o.wrapping_add(i64::from(i32::from(offset)));
+        let e = groups
+            .entry((r, o))
+            .or_insert((ty, i64::from(ty.bytes()), Vec::new(), None));
+        if e.0 != ty || e.3.is_some() {
+            return None;
+        }
+        e.1 = e.1.max(i64::from(ty.bytes()));
+        e.3 = Some(i);
+    }
+    // At most one non-stack root, and its locations must not overlap.
+    let mut vroot: Option<(Root, Vec<(i64, i64)>)> = None;
+    for (&(r, o), &(_, w, _, _)) in &groups {
+        if let Root::S(_) = r {
+            continue;
+        }
+        match &mut vroot {
+            None => vroot = Some((r, vec![(o, w)])),
+            Some((vr, ranges)) if *vr == r => {
+                for &(o2, w2) in ranges.iter() {
+                    if o < o2 + w2 && o2 < o + w {
+                        return None;
+                    }
+                }
+                ranges.push((o, w));
+            }
+            Some(_) => return None,
+        }
+    }
+    let mut out = Vec::new();
+    for (&(r, o), &(ty, _, ref ls, st)) in &groups {
+        // Invariant address: stack slots qualify; a value root must be
+        // defined outside the loop.
+        if let Root::V(v) = r
+            && def_block(func, v).is_some_and(|b| info.body.contains(&b))
+        {
+            return None;
+        }
+        let Some(st) = st else {
+            // Loads without a matching store have no effect to preserve:
+            // they can be dropped with the loop as long as their results
+            // don't escape (checked by the caller's escape analysis, which
+            // can't express a `load` and will bail).
+            continue;
+        };
+        // The store runs on every iteration.
+        if !info
+            .latches
+            .iter()
+            .all(|&l| dt.dominates(st, l.inst, &func.layout))
+        {
+            return None;
+        }
+        // Each load reads the pre-store value.
+        if !ls.iter().all(|&l| dt.dominates(l, st, &func.layout)) {
+            return None;
+        }
+        let sval = func.dfg.resolve_aliases(match func.dfg.insts[st] {
+            InstructionData::Store { args, .. } => args[0],
+            _ => return None,
+        });
+        let is_ld = |v: Value| {
+            func.dfg
+                .value_def(func.dfg.resolve_aliases(v))
+                .inst()
+                .is_some_and(|d| ls.contains(&d))
+        };
+        let delta = if is_ld(sval) {
+            RmwDelta::Keep
+        } else {
+            match func.dfg.value_def(sval) {
+                ValueDef::Result(i, _) => match func.dfg.insts[i] {
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        args: [a, b],
+                    } => {
+                        let d = if is_ld(a) {
+                            b
+                        } else if is_ld(b) {
+                            a
+                        } else {
+                            return None;
+                        };
+                        RmwDelta::Add(Ins::Val(outv(func, info, kinds, d)?))
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Isub,
+                        args: [a, b],
+                    } if is_ld(a) => {
+                        RmwDelta::Sub(Ins::Val(outv(func, info, kinds, b)?))
+                    }
+                    _ => return None,
+                },
+                _ => {
+                    if let Some(k) = iconst(func, sval) {
+                        RmwDelta::Set(Ins::K(k))
+                    } else {
+                        let v = outv(func, info, kinds, sval)?;
+                        RmwDelta::Set(Ins::Val(v))
+                    }
+                }
+            }
+        };
+        let (load_flags, store_flags) = (
+            ls.first()
+                .and_then(|&l| func.dfg.insts[l].memflags_data(&func.dfg))
+                .unwrap_or_else(MemFlagsData::new),
+            match func.dfg.insts[st].memflags_data(&func.dfg) {
+                Some(f) => f,
+                None => return None,
+            },
+        );
+        // The peeled root carries the address; `o` already folds any `+k`
+        // in the address expression plus the inst offset.
+        let addr = match r {
+            Root::V(v) => RmwAddr::V(Ins::Val(outv(func, info, kinds, v)?)),
+            Root::S(ss) => RmwAddr::S(ss),
+        };
+        out.push(RmwLoc {
+            ty,
+            addr,
+            offset: i32::try_from(o).ok()?,
+            load_flags,
+            store_flags,
+            delta,
+        });
+    }
+    Some(out)
+}
+
 /// Plan the dead-loop rewrite for `lp`, or None if the body has effects,
 /// the count isn't provable, or an exit edge arg can't be recomputed.
 fn plan_dead(
@@ -1400,6 +1668,8 @@ fn plan_dead(
     if kinds.iter().any(|k| matches!(k, Param::Other)) {
         why!("dead: non-affine param {:?}", info.h);
     }
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
     for &b in &info.body {
         if deadend(func, b) {
             continue;
@@ -1414,16 +1684,35 @@ fn plan_dead(
                 }
                 continue;
             }
-            if op.can_load()
-                || op.can_store()
-                || op.can_trap()
-                || op.is_call()
-                || op.other_side_effects()
-            {
+            if op.can_load() || op.can_store() {
+                match func.dfg.insts[i] {
+                    InstructionData::Load {
+                        opcode: Opcode::Load,
+                        ..
+                    } => loads.push(i),
+                    InstructionData::Store {
+                        opcode: Opcode::Store,
+                        ..
+                    } => stores.push(i),
+                    _ => why!("dead: mem inst {:?} {b:?}", op),
+                }
+                continue;
+            }
+            if op.can_trap() || op.is_call() || op.other_side_effects() {
                 why!("dead: inst {:?} {b:?}", op);
             }
         }
     }
+    // Memory work confined to disjoint invariant-address `ld`/`st` pairs
+    // folds into a same-address RMW chain closed-form on the fast path.
+    let rmw = if loads.is_empty() && stores.is_empty() {
+        Vec::new()
+    } else {
+        let Some(r) = rmw_locs(func, dt, &info, &kinds, &loads, &stores) else {
+            why!("dead: rmw shape {:?}", info.h);
+        };
+        r
+    };
     'exits: for &e in &info.exits {
         // The iv update inst stands in for `count`'s `store` argument: its
         // dominance over the exit is exactly "the body ran before the
@@ -1444,15 +1733,35 @@ fn plan_dead(
             else {
                 return None;
             };
-            let (idx, _) = iv_side(func, &info, &kinds, x)
+            let (x, y) = (
+                func.dfg.resolve_aliases(x),
+                func.dfg.resolve_aliases(y),
+            );
+            let (idx, on_next) = iv_side(func, &info, &kinds, x)
                 .or_else(|| iv_side(func, &info, &kinds, y))?;
-            info.latches.iter().find_map(|&l| {
-                let a = func.dfg.resolve_aliases(edge_args(func, l)[idx]);
+            let upd = info.latches.iter().find_map(|&l| {
+                let a = func.dfg.resolve_aliases(*edge_args(func, l).get(idx)?);
                 match func.dfg.value_def(a) {
                     ValueDef::Result(i, _) => Some(i),
                     _ => None,
                 }
-            })
+            })?;
+            // When the test reads the next value (`iv+step < n`), it must
+            // be the very value this brif's latch edge passes back —
+            // `iv_side` accepts any `iv+k`, and a different `k` would
+            // miscount the closed-form trip count.
+            if on_next {
+                let side = if iv_side(func, &info, &kinds, x).is_some() {
+                    x
+                } else {
+                    y
+                };
+                let l = info.latches.iter().find(|l| l.inst == e.inst)?;
+                let a = func.dfg.resolve_aliases(*edge_args(func, *l).get(idx)?);
+                (a == side).then_some(upd)
+            } else {
+                Some(upd)
+            }
         })();
         let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
             if std::env::var_os("PLIRON_IDIOM_DEBUG").is_some() {
@@ -1460,11 +1769,22 @@ fn plan_dead(
             }
             continue;
         };
-        if !info
-            .exits
-            .iter()
-            .all(|&e2| e2 == e || never_taken(func, e2) || guard_dead(func, &cnt, e2))
-        {
+        // A store folded into the RMW form only runs when the loop body
+        // executes at least once — post-tested counts guarantee that.
+        if !rmw.is_empty() && !cnt.post_tested {
+            continue;
+        }
+        let mut inv_preds = Vec::new();
+        if !info.exits.iter().all(|&e2| {
+            e2 == e
+                || never_taken(func, e2)
+                || guard_dead(func, &cnt, e2)
+                || inv_guard_pred(func, &info, &kinds, e2)
+                    .is_some_and(|p| {
+                        inv_preds.push(p);
+                        true
+                    })
+        }) {
             continue;
         }
         // Trip count: `trips_idx` already divides by the step for `ult`;
@@ -1479,10 +1799,31 @@ fn plan_dead(
             (Ins::Div(Box::new(len), Box::new(Ins::K(cnt.step))), ps)
         };
         let itb = if cnt.post_tested {
-            Ins::Sub(Box::new(iters), Box::new(Ins::K(1)))
+            Ins::Sub(Box::new(iters.clone()), Box::new(Ins::K(1)))
         } else {
-            iters
+            iters.clone()
         };
+        // Fold statically-known preds (e.g. `iv0 < bound` with both
+        // constant); a statically-false one means the fast path can never
+        // run, so skip the transform entirely.
+        let raw_preds: Vec<Pred> = preds.into_iter().chain(inv_preds).collect();
+        let mut preds: Vec<Pred> = Vec::with_capacity(raw_preds.len());
+        for pr in raw_preds {
+            let known = match &pr {
+                Pred::Cmp(cc, a, b) => ins_eval(func, a)
+                    .zip(ins_eval(func, b))
+                    .map(|(x, y)| cmp_cc(*cc, x, y)),
+                Pred::Aligned(a, size) => {
+                    ins_eval(func, a).map(|x| *size > 0 && x % size == 0)
+                }
+                Pred::Disjoint => None,
+            };
+            match known {
+                Some(true) => {}
+                Some(false) => continue 'exits,
+                None => preds.push(pr),
+            }
+        }
         // Resolve the exit edge's args, then walk trivial forwarder blocks
         // (a lone `jump next(args)`): their bodies may read the deleted
         // loop's header params directly, which the new edge would leave
@@ -1525,8 +1866,12 @@ fn plan_dead(
         }
         // No inst reachable from the new edge's dest — without re-entering
         // the loop — may read a loop-internal value: the deleted body no
-        // longer dominates those uses. Values used elsewhere keep their
-        // original (still loop-dominated) paths.
+        // longer dominates those uses. The exception is `dest` itself: a
+        // loop value it reads directly (e.g. the promoted accumulator in a
+        // `store acc` just past the loop) becomes an appended block param,
+        // bound to the original value on the loop-side edges — it dominated
+        // `dest`, hence every pred edge — and to the closed form on the
+        // fast edge.
         let loop_val = |v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
             ValueDef::Param(b, _) => b == info.h,
             ValueDef::Result(i, _) => func
@@ -1535,6 +1880,7 @@ fn plan_dead(
                 .is_some_and(|b| info.body.contains(&b)),
             _ => false,
         };
+        let mut escapes: Vec<(Value, Ins)> = Vec::new();
         let mut seen = info.body.clone();
         let mut wl = vec![dest];
         while let Some(b) = wl.pop() {
@@ -1542,8 +1888,20 @@ fn plan_dead(
                 continue;
             }
             for i in func.layout.block_insts(b) {
-                if func.dfg.inst_args(i).iter().any(|&a| loop_val(a)) {
-                    why!("dead: {b:?} reads loop values");
+                for &a in func.dfg.inst_args(i) {
+                    if !loop_val(a) {
+                        continue;
+                    }
+                    if b != dest {
+                        why!("dead: {b:?} reads loop values");
+                    }
+                    if !escapes.iter().any(|&(v, _)| v == a) {
+                        let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, a, 0)
+                        else {
+                            continue 'exits;
+                        };
+                        escapes.push((a, ins));
+                    }
                 }
                 for bc in func
                     .dfg
@@ -1551,10 +1909,22 @@ fn plan_dead(
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     for a in bc.args(&func.dfg.value_lists) {
-                        if let BlockArg::Value(v) = a
-                            && loop_val(v)
-                        {
+                        let BlockArg::Value(v) = a else {
+                            continue;
+                        };
+                        if !loop_val(v) {
+                            continue;
+                        }
+                        if b != dest {
                             why!("dead: {b:?} reads loop values");
+                        }
+                        if !escapes.iter().any(|&(e, _)| e == v) {
+                            let Some(ins) =
+                                arg_ins(func, &info, &kinds, &itb, &fwd, v, 0)
+                            else {
+                                continue 'exits;
+                            };
+                            escapes.push((v, ins));
                         }
                     }
                     wl.push(bc.block(&func.dfg.value_lists));
@@ -1567,6 +1937,9 @@ fn plan_dead(
             entry_args: info.entry_args,
             exit_dest: dest,
             exit_args,
+            escapes,
+            iters,
+            rmw,
             preds,
         });
     }
@@ -1594,6 +1967,77 @@ fn apply_dead(
     }
     let pty = tcfg.pointer_type();
     let dst_params: Vec<Value> = func.dfg.block_params(p.exit_dest).to_vec();
+    // Escaped loop values: `exit_dest` gains one param each. Every existing
+    // edge into it passes the original value (it dominated `exit_dest`, so
+    // it's in scope on all preds); the new fast edge passes the closed form.
+    let new_params: Vec<Value> = p
+        .escapes
+        .iter()
+        .map(|&(v, _)| {
+            let ty = func.dfg.value_type(v);
+            func.dfg.append_block_param(p.exit_dest, ty)
+        })
+        .collect();
+    if !new_params.is_empty() {
+        // Edges into `exit_dest`, before the fast edge exists.
+        let mut edges: Vec<(Inst, usize)> = Vec::new();
+        for b in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(b) else {
+                continue;
+            };
+            for (slot, bc) in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                if bc.block(&func.dfg.value_lists) == p.exit_dest {
+                    edges.push((t, slot));
+                }
+            }
+        }
+        for (inst, slot) in edges {
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[inst].branch_destination_mut(
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+            )[slot];
+            for &(v, _) in &p.escapes {
+                bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+            }
+        }
+        // Rewrite the escaping uses in `exit_dest` to the new params. Key
+        // both the escape's raw spelling and its resolved form — uses can
+        // appear under either.
+        let remap: FxHashMap<Value, Value> = p
+            .escapes
+            .iter()
+            .zip(&new_params)
+            .flat_map(|(&(v, _), &np)| {
+                [(v, np), (func.dfg.resolve_aliases(v), np)]
+            })
+            .collect();
+        let insts: Vec<Inst> = func.layout.block_insts(p.exit_dest).collect();
+        for i in insts {
+            for a in func.dfg.inst_args_mut(i) {
+                if let Some(&np) = remap.get(&*a) {
+                    *a = np;
+                }
+            }
+            let dfg = &mut func.dfg;
+            for bc in dfg.insts[i].branch_destination_mut(
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+            ) {
+                bc.update_args(&mut dfg.value_lists, |a| match a {
+                    BlockArg::Value(v) => remap
+                        .get(&v)
+                        .map(|&np| BlockArg::Value(np))
+                        .unwrap_or(a),
+                    a => a,
+                });
+            }
+        }
+    }
     let mut pos = FuncCursor::new(func).at_bottom(nb);
     let mut ok: Option<Value> = None;
     for pr in &p.preds {
@@ -1616,9 +2060,15 @@ fn apply_dead(
             Some(o) => pos.ins().band(o, c),
         });
     }
-    let mut exit_args: Vec<BlockArg> = Vec::with_capacity(p.exit_args.len());
+    let mut exit_args: Vec<BlockArg> =
+        Vec::with_capacity(p.exit_args.len() + p.escapes.len());
     for (j, ins) in p.exit_args.iter().enumerate() {
         let ty = pos.func.dfg.value_type(dst_params[j]);
+        let v = emit(&mut pos, ty, ins);
+        exit_args.push(BlockArg::Value(v));
+    }
+    for (&np, (_, ins)) in new_params.iter().zip(&p.escapes) {
+        let ty = pos.func.dfg.value_type(np);
         let v = emit(&mut pos, ty, ins);
         exit_args.push(BlockArg::Value(v));
     }
@@ -1627,6 +2077,47 @@ fn apply_dead(
         .iter()
         .map(|&v| BlockArg::Value(v))
         .collect();
+    if !p.rmw.is_empty() {
+        // The folded RMW load/stores are side effects: they may only run
+        // on the fast path, so they go in a block past the preds check.
+        let mb = pos.func.dfg.make_block();
+        pos.func.layout.insert_block_after(mb, nb);
+        match ok {
+            Some(ok) => {
+                pos.ins().brif(ok, mb, &[], p.h, &h_args);
+            }
+            None => {
+                pos.ins().jump(mb, &[]);
+            }
+        }
+        let mut pos = FuncCursor::new(func).at_bottom(mb);
+        for r in &p.rmw {
+            let a = match &r.addr {
+                RmwAddr::V(e) => emit(&mut pos, pty, e),
+                RmwAddr::S(ss) => pos.ins().stack_addr(pty, *ss, 0),
+            };
+            let init = pos.ins().load(r.ty, r.load_flags, a, r.offset);
+            let fin = match &r.delta {
+                RmwDelta::Keep => init,
+                RmwDelta::Add(d) => {
+                    let d = emit(&mut pos, r.ty, d);
+                    let n = emit(&mut pos, r.ty, &p.iters);
+                    let m = pos.ins().imul(d, n);
+                    pos.ins().iadd(init, m)
+                }
+                RmwDelta::Sub(d) => {
+                    let d = emit(&mut pos, r.ty, d);
+                    let n = emit(&mut pos, r.ty, &p.iters);
+                    let m = pos.ins().imul(d, n);
+                    pos.ins().isub(init, m)
+                }
+                RmwDelta::Set(v) => emit(&mut pos, r.ty, v),
+            };
+            pos.ins().store(r.store_flags, fin, a, r.offset);
+        }
+        pos.ins().jump(p.exit_dest, &exit_args);
+        return;
+    }
     match ok {
         Some(ok) => {
             pos.ins().brif(ok, p.exit_dest, &exit_args, p.h, &h_args);
