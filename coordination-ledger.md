@@ -937,7 +937,7 @@ miscompiled, not just one path.
   (current HEAD incl. mask01 + noalias-LICM merges). Bad stage2 driver
   snapshotted to /tmp/stage2-bad/ for bisect if needed.
 
-## wasm: inline-site frame folding (wt/wasm-perf, uncommitted→commit pending)
+## wasm: inline-site frame folding (wt/wasm-perf, 4402b11 — NOT merged)
 
 Root cause pursued: spliced callees re-ran the full SP frame dance
 (`global.get sp; sub; and; set` + restores) at every callsite — a hot
