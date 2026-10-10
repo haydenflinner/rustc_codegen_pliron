@@ -848,3 +848,49 @@ unwind 3/3; PLIRON_VERIFY=1 clean on hist_alt, bigbench, std,
 unwind; UBOUND=0/1 A/B confirmed on both arches; suite otherwise
 unchanged (gather/scatter/dot_u32/sum_u8 wins hold, checksums
 match stock).
+
+## unroll landed: bound-param fix + rotated loops (x64 wt)
+
+The flagged blocker turned out to be *not* the chain shape —
+`looprot` already canonicalizes bcheck clones to brif-latch
+do-while before punroll runs. The real bail was the counting
+test's bound check: `a.len`/`cnt.len` arrive as entry-block
+params (`ValueDef::Param`, not an inst, not an h-param), and
+the bound had to be an inst dominating the entries or an
+unchanged header param. Extended to accept a param of any
+block that dominates `h` (an in-body block can't dominate the
+header, so loop-carried values still reject).
+
+Rotated (jump-latch) support went in anyway as belt-and-
+suspenders: `h: brif test -> body | exit` with a `jump h`
+latch reuses the same guard math verbatim (entry test of copy
+kk is `a0 + kk*s` = the `(k-2)*s` budget), copies 0..K-2 drop
+the test, the last copy keeps it (`brif -> copy-body | exit`),
+the latch jump becomes `jump hu`, h stays scalar remainder.
+Verified by building with PLIRON_LOOPROT=0 — hist stays
+0.235 with identical checksum.
+
+Also: small-body full-unroll cut raised 12 -> 16 insts so the
+bcheck clone's 13-inst `movz; addl (mem)` body gets K=8 like
+stock's loop instead of K=4.
+
+Result (x64/Rosetta): hist 0.41 -> **0.24** (stock 0.23,
+~1.04x — parity), gather 0.48 -> **0.32** (stock 0.40, win),
+scatter 0.45 -> **0.27** (stock 0.39, win). aarch64 hist
+0.230 vs stock 0.225 — parity there too (a64 stock build
+here is faster than the old comparison binary).
+matmul-64 0.24 (unrolled clone) vs 0.07 stock — still the
+strided-vectorization gap, unchanged diagnosis.
+
+**heads-up for native**: the merged ifconv inst cap 4->8
+(count-if work) regresses `chars().count()` ~2x on x64
+(0.44 -> 0.83; `PLIRON_IFCONV=0` restores it — the UTF-8
+width-dispatch tree gets if-converted to selects where the
+branch predicted well). aarch64 hit is milder (0.74 vs 0.65
+stock). Probably wants a profitability guard on the wider
+cap (e.g. only when the diamond feeds a count/reduction the
+vectorizer can use). Not reverted — native's file, their
+tradeoff; flagging.
+
+PLIRON_VERIFY=1 clean with and without LOOPROT; test.sh
+green; Rosetta std + unwind pass; checksums match stock.

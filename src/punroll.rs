@@ -29,6 +29,13 @@
 //!     latch k==K-1: brif c' -> hu(cont args) | exit(exit args)
 //! ```
 //!
+//! Rotated while-loops (`bcheck` fast clones: `h: brif (a cc bound) ->
+//! body | exit; body..: jump h`) unroll the same way — h's own brif is
+//! the counting test, so the guard covers copies 0..K-2's entry tests
+//! verbatim (entry test of copy kk is `a0 + kk*s`, the same budget the
+//! do-while guard proves); the last copy keeps the test (`brif c' ->
+//! copy-body | exit`) and the chain's `jump h` becomes `jump hu`.
+//!
 //! The original loop is untouched: it handles the `< K` tail, plus the
 //! a0-fails entry with the same one-iteration semantics the rotation had.
 //! Copy order is preserved, so ordered accumulators (`fadd` chains, memory
@@ -387,6 +394,11 @@ fn run_loop(
     let mut chain = vec![h];
     let mut mid_exits: Vec<SideExit> = Vec::new();
     let latch;
+    // Rotated while-loop: the latch is a plain `jump h` and h's own `brif`
+    // (the test at the top) is the loop's exit edge — it lands in
+    // `mid_exits` at pos 0 during the walk. Latch-tested do-while loops
+    // end on a `brif -> h | exit` instead.
+    let mut rotated = false;
     loop {
         let cur = *chain.last().unwrap();
         if func.layout.is_cold(cur) {
@@ -396,7 +408,12 @@ fn run_loop(
         match func.dfg.insts[t] {
             InstructionData::Jump { destination, .. } => {
                 let nb = destination.block(&func.dfg.value_lists);
-                if nb == h || !body.contains(&nb) || chain.contains(&nb) {
+                if nb == h {
+                    latch = cur;
+                    rotated = true;
+                    break;
+                }
+                if !body.contains(&nb) || chain.contains(&nb) {
                     bail!("nonlinear chain");
                 }
                 chain.push(nb);
@@ -472,7 +489,10 @@ fn run_loop(
         .iter()
         .map(|&b| func.layout.block_insts(b).count() - 1)
         .sum();
-    let k = if n_insts <= 12 {
+    // 12 insts is the small-body cut for full unroll; 16 covers the
+    // load+check+store RMW shape bcheck clones leave (`movz; addl (mem)`
+    // bodies where stock still unrolls 8).
+    let k = if n_insts <= 16 {
         UNROLL
     } else if n_insts <= MAX_BODY {
         UNROLL_BIG
@@ -493,23 +513,51 @@ fn run_loop(
         }
     }
 
-    let lt = func.layout.last_inst(latch).unwrap();
-    let dests: Vec<BlockCall> = func.dfg.insts[lt]
-        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-        .to_vec();
-    let Some(cpos) = dests
-        .iter()
-        .position(|bc| bc.block(&func.dfg.value_lists) == h)
-    else {
-        bail!("no backedge dest");
+    // Rotated: h's `brif test -> body | exit` is the counting test — pop
+    // it out of `mid_exits` (it plays the do-while latch's role, not a
+    // side exit's). The chain's `jump h` is the backedge: its args re-bind
+    // h's params for the next iteration, exactly like the do-while
+    // latch's `cont` edge.
+    let top_test = if rotated {
+        if mid_exits.first().map(|e| e.pos) != Some(0) {
+            bail!("rotated loop without top test");
+        }
+        Some(mid_exits.remove(0))
+    } else {
+        None
     };
-    let cont_bc = dests[cpos];
-    let exit_bc = dests[1 - cpos];
+
+    let lt = func.layout.last_inst(latch).unwrap();
+    // `test_i`/`texit_bc`/`tcpos`: the counting-test brif and its edges —
+    // the latch brif for do-while loops, h's own brif for rotated ones
+    // (tcpos = position of the continue dest). `back_bc`: the call whose
+    // args re-bind h's params on the backedge — the latch `cont` edge, or
+    // the rotated `jump h` call.
+    let (test_i, texit_bc, tcpos, back_bc) = if rotated {
+        let tt = top_test.as_ref().unwrap();
+        let ti = func.layout.last_inst(h).unwrap();
+        let bcs: Vec<BlockCall> = func.dfg.insts[lt]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .to_vec();
+        (ti, tt.exit_bc, 1 - tt.epos, bcs[0])
+    } else {
+        let dests: Vec<BlockCall> = func.dfg.insts[lt]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .to_vec();
+        let Some(cpos) = dests
+            .iter()
+            .position(|bc| bc.block(&func.dfg.value_lists) == h)
+        else {
+            bail!("no backedge dest");
+        };
+        (lt, dests[1 - cpos], cpos, dests[cpos])
+    };
+    let exit_bc = texit_bc;
     if body.contains(&exit_bc.block(&func.dfg.value_lists)) {
         bail!("exit inside loop");
     }
-    let InstructionData::Brif { arg: c, .. } = func.dfg.insts[lt] else {
-        unreachable!()
+    let InstructionData::Brif { arg: c, .. } = func.dfg.insts[test_i] else {
+        bail!("cond not a brif")
     };
     let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
         bail!("cond not an icmp");
@@ -522,10 +570,10 @@ fn run_loop(
     else {
         bail!("cond not an icmp");
     };
-    let cond = if cpos == 0 { cond } else { cond.complement() };
+    let cond = if tcpos == 0 { cond } else { cond.complement() };
 
     let hparams = func.dfg.block_params(h).to_vec();
-    let cont_args: Vec<Value> = cont_bc
+    let cont_args: Vec<Value> = back_bc
         .args(&func.dfg.value_lists)
         .filter_map(|a| match a {
             BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
@@ -592,8 +640,21 @@ fn run_loop(
                 continue;
             }
         } else {
-            match param_idx(func, h, b) {
-                Some(q) if cont_args[q] == b => bpidx = Some(q),
+            match func.dfg.value_def(b) {
+                // Bound is a header param passed back unchanged on the
+                // backedge (usable at hu as hu's own param).
+                cranelift_codegen::ir::ValueDef::Param(bb, q)
+                    if bb == h && cont_args[q] == b =>
+                {
+                    bpidx = Some(q);
+                }
+                // A param of any other block dominating h — e.g. a slice
+                // `len` arriving as an entry-block param — is likewise
+                // loop-invariant and usable at hu. (An in-body block can
+                // never dominate the header, so loop-carried values are
+                // still rejected.)
+                cranelift_codegen::ir::ValueDef::Param(bb, _)
+                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
                 _ => continue,
             }
         }
@@ -781,12 +842,16 @@ fn run_loop(
     let nseg = mid_exits.len() + 1;
     let mut usegs: Vec<Vec<Block>> = Vec::with_capacity(k as usize);
     for kk in 0..k as usize {
-        if mid_exits.is_empty() && kk > 0 {
+        // Rotated: the last copy keeps the top test — its chain[0] ends in
+        // the test brif, so it needs one extra segment over the mid-exit
+        // count. Earlier copies drop the test and stay fused.
+        let extra = (rotated && kk + 1 == k as usize) as usize;
+        if mid_exits.is_empty() && kk > 0 && extra == 0 {
             usegs.push(Vec::new());
             continue;
         }
-        let mut row = Vec::with_capacity(nseg);
-        for _ in 0..nseg {
+        let mut row = Vec::with_capacity(nseg + extra);
+        for _ in 0..nseg + extra {
             let nb = func.dfg.make_block();
             func.layout.insert_block(nb, h);
             row.push(nb);
@@ -994,7 +1059,7 @@ fn run_loop(
                 }
             };
             match tdata {
-                InstructionData::Jump { .. } => {
+                InstructionData::Jump { .. } if i + 1 < chain.len() => {
                     // Fallthrough: bind the next chain block's params from
                     // this jump's args.
                     let bc = tdata
@@ -1002,6 +1067,65 @@ fn run_loop(
                     let sps = func.dfg.block_params(chain[i + 1]).to_vec();
                     for (j, a) in bc.args(&func.dfg.value_lists).enumerate() {
                         carry.insert(sps[j], mvv(func, a));
+                    }
+                }
+                InstructionData::Jump { .. } => {
+                    // Rotated backedge (`jump h`): copies 0..K-2 bind
+                    // chain[0]'s params for the next copy and move to its
+                    // first segment when it has one (empty row ⇒ fused
+                    // fallthrough). The last copy becomes `jump hu` —
+                    // back to the guard, like the do-while `brif -> hu`.
+                    let bc = tdata
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[0];
+                    if kk + 1 < k as usize {
+                        let sps = func.dfg.block_params(chain[0]).to_vec();
+                        for (j, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                            carry.insert(sps[j], mvv(func, a));
+                        }
+                        if !usegs[kk + 1].is_empty() {
+                            let mut pos = FuncCursor::new(func).at_bottom(curseg);
+                            pos.ins().jump(usegs[kk + 1][0], &[]);
+                            curseg = usegs[kk + 1][0];
+                        }
+                    } else {
+                        let cont: Vec<BlockArg> = bc
+                            .args(&func.dfg.value_lists)
+                            .map(|a| mv(func, a))
+                            .collect();
+                        let mut pos = FuncCursor::new(func).at_bottom(curseg);
+                        pos.ins().jump(hu, &cont);
+                    }
+                }
+                InstructionData::Brif { arg: c, .. } if rotated && i == 0 => {
+                    // The top test. Copies 0..K-2's entry tests are
+                    // implied by the guard: drop the brif and fall into
+                    // the body, binding chain[1]'s params from the cont
+                    // edge. The last copy keeps the test — its continue
+                    // edge opens a fresh segment holding its own body —
+                    // and exits on the original exit edge (clone `eu`
+                    // when the exit cone references loop values).
+                    let tt = top_test.as_ref().unwrap();
+                    let c = func.dfg.resolve_aliases(c);
+                    let carg = *vmap.get(&c).unwrap_or(&c);
+                    let sps = func.dfg.block_params(chain[1]).to_vec();
+                    for (j, a) in tt.cont_bc.args(&func.dfg.value_lists).enumerate() {
+                        carry.insert(sps[j], mvv(func, a));
+                    }
+                    if kk + 1 == k as usize {
+                        let eargs: Vec<BlockArg> = tt
+                            .exit_bc
+                            .args(&func.dfg.value_lists)
+                            .map(|a| mv(func, a))
+                            .collect();
+                        let nxt = usegs[kk][seg_i + 1];
+                        let mut pos = FuncCursor::new(func).at_bottom(curseg);
+                        if tt.epos == 0 {
+                            pos.ins().brif(carg, eu, &eargs, nxt, &[]);
+                        } else {
+                            pos.ins().brif(carg, nxt, &[], eu, &eargs);
+                        }
+                        curseg = nxt;
+                        seg_i += 1;
                     }
                 }
                 InstructionData::Brif { arg: c, .. } if mpos.contains_key(&i) => {
@@ -1050,7 +1174,7 @@ fn run_loop(
                         // next copy is a new segment and needs a jump; in
                         // the fused-block shape the fallthrough suffices.
                         let sps = func.dfg.block_params(chain[0]).to_vec();
-                        for (j, a) in cont_bc.args(&func.dfg.value_lists).enumerate() {
+                        for (j, a) in back_bc.args(&func.dfg.value_lists).enumerate() {
                             carry.insert(sps[j], mvv(func, a));
                         }
                         if !mid_exits.is_empty() {
@@ -1059,7 +1183,7 @@ fn run_loop(
                             curseg = usegs[kk + 1][0];
                         }
                     } else {
-                        let cont: Vec<BlockArg> = cont_bc
+                        let cont: Vec<BlockArg> = back_bc
                             .args(&func.dfg.value_lists)
                             .map(|a| mv(func, a))
                             .collect();
@@ -1068,7 +1192,7 @@ fn run_loop(
                             .map(|a| mv(func, a))
                             .collect();
                         let mut pos = FuncCursor::new(func).at_bottom(curseg);
-                        if cpos == 0 {
+                        if tcpos == 0 {
                             pos.ins().brif(carg, hu, &cont, eu, &exit);
                         } else {
                             pos.ins().brif(carg, eu, &exit, hu, &cont);
