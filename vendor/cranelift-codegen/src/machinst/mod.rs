@@ -552,8 +552,10 @@ pub trait MachInstEmit: MachInst {
     /// Called during emission with lookahead; both instructions carry
     /// allocated registers at that point. On `Some`, the caller replaces
     /// this instruction with the result and squashes the partner to a
-    /// zero-size nop.
-    fn fuse_with_next(&self, _next: &Self) -> Option<Self> {
+    /// zero-size nop. `state` gives access to the finalized frame
+    /// layout so virtual stack addressing modes can be resolved to
+    /// concrete `[sp/fp + imm]` offsets.
+    fn fuse_with_next(&self, _next: &Self, _state: &Self::State) -> Option<Self> {
         None
     }
 

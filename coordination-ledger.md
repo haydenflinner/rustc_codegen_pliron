@@ -206,6 +206,23 @@ multi-exit for hist_unchecked.
   unroll-and-jam + multi-acc chains + f-reassoc). Documented handoff.
 - Not perf-validated: some sub-1.5x deltas on loaded box (native-notes.md).
 
+## Native: pair fusion virtual/stack amodes (wt/native-opt, pending)
+- vendored aarch64 emit: `fuse_with_next` gains `&Self::State`
+  (trait default unchanged; aarch64 is the only implementer — no x64
+  file touched). `uoff` now resolves `RegOffset`/`SPOffset`/`FPOffset`/
+  `IncomingArg`/`SlotOffset` exactly as `mem_finalize` does at emit
+  (frame layout is final there), so stack-slot and far-offset accesses
+  can pair-fuse. `UnsignedOffset`/`Unscaled` path unchanged.
+- regex-syntax rlib: 102,875 insts (was 103,041); vs no-fuse build of
+  the same code `str [sp]` 2894 vs 3010, `stp [sp]` 1174 vs 1066.
+  Overall fusion effect in-crate: str 6190 vs 10986, ldr 12315 vs
+  16123. Gap remains: mov 20.5k / b 9.7k / udf 4k — layout+edge-copy
+  problem, not addressing.
+- Verified: cargo build, FULL ./test.sh green, harness tier 0 clean.
+- Shared-file note: vendor/cranelift-codegen/src/machinst/mod.rs +
+  vcode.rs touched (trait sig + call site) — flagging for x64 agent
+  since machinst is common ground.
+
 ## Merged: native dse 1435a5e + x64 jam aaefc3b (-> f4c30bd)
 - src/dse.rs new: backward may-read fixpoint, kills stores overwritten
   before any read (top_non_iso vs top_non_stack demand split; atomics/

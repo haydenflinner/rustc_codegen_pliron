@@ -989,7 +989,7 @@ impl<I: VCodeInst> VCode<I> {
                         break;
                     }
                     if let Some(fused) = self.insts[iix.index()]
-                        .fuse_with_next(&self.insts[nix.index()])
+                        .fuse_with_next(&self.insts[nix.index()], &state)
                     {
                         if gap.is_empty() {
                             self.insts[iix.index()] = fused;

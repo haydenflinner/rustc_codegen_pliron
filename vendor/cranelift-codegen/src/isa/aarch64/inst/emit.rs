@@ -3702,23 +3702,52 @@ impl MachInstEmit for Inst {
         self.print_with_state(state)
     }
 
-    fn fuse_with_next(&self, next: &Self) -> Option<Self> {
+    fn fuse_with_next(&self, next: &Self, state: &Self::State) -> Option<Self> {
         // A load/store's byte displacement, if it uses a simple
         // `[rn + imm]` form — unsigned scaled or unscaled-signed, since
-        // pair offsets are signed anyway.
-        fn uoff(mem: &AMode) -> Option<(Reg, i64)> {
+        // pair offsets are signed anyway. The virtual stack-relative
+        // modes (`SlotOffset`, `SPOffset`, `FPOffset`, `IncomingArg`)
+        // and `RegOffset` are resolved exactly as `mem_finalize` will
+        // later do during this inst's own emission: the frame layout is
+        // final by emit time, so `adj`/`basereg` match. (Out-of-range
+        // resolved offsets simply fail the simm7 check below, same as
+        // a far register offset.)
+        fn uoff(mem: &AMode, state: &EmitState) -> Option<(Reg, i64)> {
             match *mem {
                 AMode::UnsignedOffset { rn, uimm12 } => Some((rn, i64::from(uimm12.value()))),
                 AMode::Unscaled { rn, simm9 } => Some((rn, i64::from(simm9.value()))),
+                AMode::RegOffset { rn, off } => Some((rn, off)),
+                AMode::SPOffset { off } => Some((stack_reg(), off)),
+                AMode::FPOffset { off } => Some((fp_reg(), off)),
+                AMode::IncomingArg { off } => {
+                    let frame_layout = state.frame_layout();
+                    let resolved = i64::from(
+                        frame_layout.setup_area_size
+                            + frame_layout.tail_args_size
+                            + frame_layout.clobber_size
+                            + frame_layout.fixed_frame_storage_size
+                            + frame_layout.outgoing_args_size,
+                    ) - off;
+                    Some((stack_reg(), resolved))
+                }
+                AMode::SlotOffset { off } => {
+                    let adj = i64::from(state.frame_layout().outgoing_args_size);
+                    Some((stack_reg(), off + adj))
+                }
                 _ => None,
             }
         }
         // Two accesses on adjacent `scale`-byte slots of the same base
         // make an ldp/stp pair; `swap` says the second inst addressed
         // the lower slot, so its register goes first.
-        fn pair_amode(m1: &AMode, m2: &AMode, scale_ty: Type) -> Option<(PairAMode, bool)> {
-            let (r1, o1) = uoff(m1)?;
-            let (r2, o2) = uoff(m2)?;
+        fn pair_amode(
+            m1: &AMode,
+            m2: &AMode,
+            scale_ty: Type,
+            state: &EmitState,
+        ) -> Option<(PairAMode, bool)> {
+            let (r1, o1) = uoff(m1, state)?;
+            let (r2, o2) = uoff(m2, state)?;
             if r1 != r2 {
                 return None;
             }
@@ -3741,7 +3770,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 || r1.to_reg() == r2.to_reg() {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, I8X16)?;
+                let (mem, swap) = pair_amode(m1, m2, I8X16, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::FpuLoadP128 {
                     rt,
@@ -3757,7 +3786,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 || r1.to_reg() == r2.to_reg() {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, F64)?;
+                let (mem, swap) = pair_amode(m1, m2, F64, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::FpuLoadP64 {
                     rt,
@@ -3773,7 +3802,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 || r1.to_reg() == r2.to_reg() {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, I64)?;
+                let (mem, swap) = pair_amode(m1, m2, I64, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::LoadP64 {
                     rt,
@@ -3789,7 +3818,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, I8X16)?;
+                let (mem, swap) = pair_amode(m1, m2, I8X16, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::FpuStoreP128 {
                     rt,
@@ -3805,7 +3834,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, F64)?;
+                let (mem, swap) = pair_amode(m1, m2, F64, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::FpuStoreP64 {
                     rt,
@@ -3821,7 +3850,7 @@ impl MachInstEmit for Inst {
                 if f1 != f2 {
                     return None;
                 }
-                let (mem, swap) = pair_amode(m1, m2, I64)?;
+                let (mem, swap) = pair_amode(m1, m2, I64, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::StoreP64 {
                     rt,

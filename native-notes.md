@@ -292,6 +292,47 @@ overlap, call barriers, diamond one-path-read, escaped slot, volatile
 `PLIRON_DSE=0`, bisect consumes `dse` in pipeline order
 (`bisect 8 dse skip`). Volatile fn emits both stores fenced.
 
+## This round (pair-fusion: virtual stack amodes — regex-syntax study)
+
+### pair_amode extended to virtual/stack amodes — landed
+
+Investigation started from the regex-syntax stage2 instruction-count
+gap (pliron ~103k vs stock ~46k). `str …, [sp, #imm]` runs were not
+pairing: pair fusion runs during emission, before `mem_finalize`
+resolves virtual amodes, and `uoff` only recognized the concrete
+`UnsignedOffset`/`Unscaled` forms — while `stack_addr`-derived accesses
+carry `AMode::SlotOffset` until per-inst emit. `SPOffset`, `FPOffset`,
+`IncomingArg`, and `RegOffset` (reg + out-of-range imm) were equally
+invisible.
+
+Fix: `fuse_with_next` now takes `&Self::State` (machinst trait default
+unchanged for other ISAs — aarch64 is the only implementer), and
+`uoff` resolves all offset amodes with exactly `mem_finalize`'s rules:
+`RegOffset{rn,off}` → (rn, off), `SPOffset`/`SlotOffset`/`IncomingArg`
+→ (stack_reg(), adjusted off) using `frame_layout().outgoing_args_size`
+etc., `FPOffset` → (fp_reg(), off). Resolution happens when the layout
+is final, and out-of-range resolved offsets fail the simm7 check like
+any other far offset. No `VirtualSPOffsetAdj` inst exists on aarch64,
+so the `off + outgoing_args_size` adjust is complete.
+
+regex-syntax rlib (opt 3, cgu=1): total insts 102,875 vs 103,041
+before. vs `PLIRON_NO_PAIRSTFUSE=1` on the new build: `str [sp]` 2894
+vs 3010, `stp [sp]` 1174 vs 1066, `ldr [sp]` 5308 vs 5382, `ldp [sp]`
+3214 vs 3156 — slot pairs fuse where they previously could not.
+Overall fusion effect on this crate (all amodes, new build): str
+6190 vs 10986, ldr 12315 vs 16123 → total 102,875 vs 107,261 insts.
+
+The remaining regex-syntax gap is dominated by `mov` (~20.5k),
+`b` (~9.7k), `udf` (~4k padding) and block structure — a
+layout/edge-copy problem, not an amode one.
+
+### Validated this round
+
+cargo build clean; ./test.sh green end-to-end; harness tier 0 clean
+(smoke 9/2noref, determinism 10/10); pair_slots fixture correct;
+regex-syntax disasm shows `stp xN, xM, [sp, #off]` pairs that were
+`str` chains before.
+
 ## Remaining opportunities (ranked)
 
 1. hist residual (~1.19x post-merge): per-iteration regalloc edge
@@ -305,8 +346,11 @@ overlap, call barriers, diamond one-path-read, escaped slot, volatile
    close-form; gains would need dependence-aware spacing of the
    str->ldr replay (scheduler knob, unexplored). We already win
    this vs LLVM 1.19 vs 1.72.
-4. Store pairing across producer gaps: assessed — vcode's fuse pass
-   already crosses ≤8 `pair_fusion_crossable` insts with up/down
-   placements + preg hazard checks. NOT guaranteed (window bound,
-   non-crossable producers, hazard failures); guaranteeing it needs
-   a real scheduler.
+4. Store pairing across producer gaps: amode coverage now complete
+   (virtual stack modes + RegOffset resolve pre-fusion). What remains
+   is ordering — e.g. `str` runs interleaved with value-producing
+   `add`s can't fuse when the gap inst defines the stored reg; that
+   needs a real scheduler, not a bigger fusion window.
+5. regex-syntax block/mov bloat: ~20.5k `mov` + ~9.7k `b` + ~4k `udf`
+   vs stock — edge copies, block layout, and jump-table padding;
+   the largest single instruction-count lever left.
