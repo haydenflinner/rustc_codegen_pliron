@@ -595,3 +595,29 @@ Track as x64 agent follow-up.
   0.091 is the real gap — mirror-swap vectorization (loopvec stream).
 - Verified: cargo build, PLIRON_VERIFY=1 ./test.sh green + pairfuse,
   wide all ≥ stock, bc_sem/rmw_check/dse_check match stock outputs.
+
+## Merged: brchain+licm+pairfuse (b69a68c) + uloads32/revnorm-fix (43330d0) + wasm density (f8adc73)
+- REAL MISCOMPILE x2 fixed: (a) dependent-load pair fusion — ldp
+  x0,x20,[x0] with base redefined; hazard check now applies on the
+  adjacent-instruction path; tests/pairfuse wired into test.sh.
+  (b) revnorm exit-edge — Phase B skipped iv uses in exit blocks;
+  descending loops read ascending j; segfaulted insertion_sort (x64
+  ~50% std fail rate; latent on aarch64). Rewrites all blocks.
+- ivrefold deadrec fix: inst_fixed_args missed call/try_call varargs.
+- brchain.rs (NEW): <=4-entry br_tables -> icmp+brif chains; tokenize
+  split_whitespace -36% (20.6->13.2ms native). licm MAX_MOVES now
+  per-loop (was per-function, one loop starved the rest).
+- uloads32: uextend.i64(load.i32)->uload32.i64+ireduce.i32 kills a
+  stray movq; x64 gather now PARITY (9-insn check-free fast loop).
+- tokenize residual ~2.6x native / ~5x x64(pre-brchain): Option<char>
+  sentinel plumbing (select->ireduce->icmp), branchy is_whitespace vs
+  stock's lsr+tbnz constant bitmask, ~5 spilled loop-carried values.
+- wasm density: GOT->const fold (334->22 globals), local decl merging —
+  residual 4x vs stock is FUNCTION COUNT (390 vs 99, inlining depth);
+  per-function density ~parity (345 vs 336 B).
+- NOTE: a merge commit accidentally carried conflict markers into
+  lower.rs — caught and repaired via amend; resolution keeps uloads32
+  then brchain order.
+- Next: bittab (set-membership bitmask) + Option-sentinel fold
+  (native), scatter non-versioned-check investigation + tokenize
+  re-verify (x64), function-count inlining (wasm).
