@@ -3387,13 +3387,16 @@ fn loop_cloneable(
             // All terminator uses count as leaks: cond/select/return are
             // direct operands, and edge args on this block's outgoing
             // edges must be dominated here too.
-            let mut leak = false;
+            let mut leak = None;
             b.blocks[blk].terminator.visit_uses(|a| {
-                leak |= inloop.contains(&defb[b.resolve_alias(a)]);
+                let a = b.resolve_alias(a);
+                if inloop.contains(&defb[a]) {
+                    leak = Some(a);
+                }
             });
-            if leak {
+            if let Some(a) = leak {
                 if verbose {
-                    eprintln!("wloop: {h} skipped leak via terminator in {blk}");
+                    eprintln!("wloop: {h} skipped leak via terminator {a} in {blk}");
                 }
                 return false;
             }
@@ -3428,7 +3431,10 @@ fn wseal_exits(
         // Leaked values: loop defs used by this block's insts or its
         // terminator's non-edge operands (edge args are edge uses).
         let mut leaks: FxHashSet<WV> = FxHashSet::default();
-        let mut exotic = false;
+        // PickOutput sources can't become params (they must stay
+        // multi-result defs); instead each pred recomputes the pick and
+        // passes its result.
+        let mut picks: Vec<(WV, WV, u32, WT)> = Vec::new();
         for &v in &b.blocks[blk].insts {
             match b.values[v] {
                 ValueDef::Operator(_, aa, _) => {
@@ -3445,11 +3451,10 @@ fn wseal_exits(
                         leaks.insert(a);
                     }
                 }
-                // PickOutput's source must stay a multi-result def; a
-                // blockparam can't replace it, so such a leak can't seal.
-                ValueDef::PickOutput(from, ..) => {
-                    if inloop.contains(&defb[b.resolve_alias(from)]) {
-                        exotic = true;
+                ValueDef::PickOutput(from, idx, ty) => {
+                    let f = b.resolve_alias(from);
+                    if inloop.contains(&defb[f]) {
+                        picks.push((v, f, idx, ty));
                     }
                 }
                 _ => {}
@@ -3488,11 +3493,26 @@ fn wseal_exits(
                 }
             }
         });
-        if leaks.is_empty() {
+        if leaks.is_empty() && picks.is_empty() {
             continue;
         }
-        if exotic {
-            continue;
+        if std::env::var_os("PLIRON_WASM_VERBOSE").is_some() {
+            eprintln!("wseal: {blk} leaks={leaks:?} picks={picks:?}");
+        }
+        // PickOutput leaks: give blk a param of the pick's result type
+        // and have each pred compute `from.idx` just before its edge.
+        for &(inst, from, idx, ty) in &picks {
+            let np = b.add_blockparam(blk, ty);
+            defb[np] = blk;
+            let preds = b.blocks[blk].preds.clone();
+            let poss = b.blocks[blk].pos_in_pred_succ.clone();
+            for (j, pr) in preds.iter().enumerate() {
+                let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
+                defb[pv] = *pr;
+                b.blocks[*pr].insts.push(pv);
+                edge_push(b, *pr, poss[j], pv);
+            }
+            b.values[inst] = ValueDef::Alias(np);
         }
         let mut leaks: Vec<WV> = leaks.into_iter().collect();
         leaks.sort();
