@@ -45,3 +45,16 @@ uaddlp tree). sum_u8 x64: 0.384->0.135 vs stock 0.693 = ~5x vs LLVM
 coordinator re-verified std diff-clean + unwind on merged tree.
 Host builds unaffected (host-arch retained; assembler crates only compile
 for x64 feature anyway).
+
+## Fresh x64 table (Rosetta, v3, all x64 work landed): ALL WIN/PARITY
+kernel: pliron/stock (ms) — has_val 0.355/1.519 (4.3x), max_u 0.211/0.231,
+min_i 0.212/0.235, sum_sq 0.889/1.067, dot_u8 0.464/1.443 (3.1x),
+fillzero 0.666/0.679, scaled 0.727/0.938, rev_copy32 0.370/0.643 (1.7x),
+cnt_vowel 0.671/1.579 (2.4x), even_sum 0.621/1.833 (3x), xor_fold
+0.424/0.465, find_off 0.085/1.208 (14x), sum2d 0.793/0.745 (-6%),
+axpy 0.367/0.588 (1.6x), vadd 0.520/0.641, clamp 0.090/0.142 (1.6x),
+dot_i32 0.089/0.132 (1.5x — was 2.3x SLOWER pre-ISA-flags),
+sum_u8 0.141/0.694 (4.9x, psadbw), dot_i8 0.312/0.446 (1.4x),
+matmul 11.82/12.42 (~parity).
+KEY: earlier x64 regressions were baseline-SSE2 codegen; the
+-Ctarget-cpu ISA mapping (97e3f0b) fixed them, not lowering changes.
