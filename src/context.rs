@@ -77,6 +77,8 @@ pub struct FuncInfo {
     pub exts: Exts,
     pub no_inline: bool,
     pub always_inline: bool,
+    /// Plain `#[inline]` (LLVM `inlinehint`): bigger inlining budget.
+    pub inline_hint: bool,
     /// `#[cold]`: blocks calling it are laid out out of line.
     pub cold: bool,
     /// Declared or inferred unable to unwind (see nounwind.rs).
@@ -340,6 +342,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 exts,
                 no_inline: false,
                 always_inline: false,
+                inline_hint: false,
                 cold: false,
                 nounwind: false,
                 sret_ty: None,
@@ -690,6 +693,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(symbol_name) {
             f.no_inline = matches!(inline, InlineAttr::Never);
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
+            f.inline_hint = matches!(inline, InlineAttr::Hint);
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
         let attrs = self.tcx.codegen_instance_attrs(instance.def);
