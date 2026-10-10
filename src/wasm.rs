@@ -2537,7 +2537,14 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                     deref.entry(vs[0]).or_insert(s);
                 }
             }
-            wloop_opt(&mut self.b, self.o.sp, &frozen, &deref);
+            wloop_opt(
+                &mut self.b,
+                self.o.sp,
+                &frozen,
+                &deref,
+                &self.o.funcs,
+                &self.st.nowrite,
+            );
         }
         if dbg {
             eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
@@ -4820,6 +4827,8 @@ fn wloop_opt(
     sp: waffle::Global,
     frozen: &FxHashMap<WV, u64>,
     deref: &FxHashMap<WV, u64>,
+    funcs: &[FDecl],
+    nowrite: &FxHashMap<String, bool>,
 ) {
     // Merge multi-entry loop headers so every loop has a preheader.
     {
@@ -4850,7 +4859,7 @@ fn wloop_opt(
         preds.sort();
         preds.dedup();
         if let [pre] = preds[..] {
-            loop_licm(b, &cfg, &mut defb, inloop, pre, sp, frozen);
+            loop_licm(b, &cfg, &mut defb, inloop, pre, sp, frozen, deref, funcs, nowrite);
         }
         // Indvars to a fixed point: each new param may itself be the
         // `pv` of a `mul(pv, K)` addressing site (e.g. `idx*4` where
@@ -4991,6 +5000,249 @@ fn load_bytes(op: &O) -> Option<u64> {
     })
 }
 
+/// Bytes written by a store op, `None` for non-stores.
+fn store_bytes(op: &O) -> Option<u64> {
+    Some(match op {
+        O::I32Store { .. } | O::F32Store { .. } | O::I64Store32 { .. } => 4,
+        O::I64Store { .. } | O::F64Store { .. } => 8,
+        O::I32Store8 { .. } | O::I64Store8 { .. } => 1,
+        O::I32Store16 { .. } | O::I64Store16 { .. } => 2,
+        O::V128Store { .. } => 16,
+        _ => return None,
+    })
+}
+
+/// Does `v` derive from the entry-level pointer `base`? `None` = no;
+/// `Some(None)` = derived at an unmeasurable offset; `Some(Some(k))` =
+/// exactly `base + k`. rustc's `noalias` means only `base`-derived
+/// pointers may touch `base`'s pointee inside the function, so `None`
+/// proves disjointness: a store through an unrelated pointer (a loaded
+/// pointer, a global, another param) cannot reach the pointee legally.
+fn derive_off(b: &FunctionBody, base: WV, v: WV, depth: u32) -> Option<Option<i64>> {
+    if depth > 8 {
+        return Some(None);
+    }
+    let v = b.resolve_alias(v);
+    if v == base {
+        return Some(Some(0));
+    }
+    match b.values[v] {
+        ValueDef::Operator(op @ (O::I32Add | O::I64Add | O::I32Sub | O::I64Sub), aa, _) => {
+            let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                return Some(None);
+            };
+            let sub = matches!(op, O::I32Sub | O::I64Sub);
+            if let Some(k) = wconst(b, y) {
+                let k = if sub { -k } else { k };
+                derive_off(b, base, x, depth + 1).map(|o| o.map(|e| e.wrapping_add(k)))
+            } else if let Some(k) = wconst(b, x).filter(|_| !sub) {
+                derive_off(b, base, y, depth + 1).map(|o| o.map(|e| e.wrapping_add(k)))
+            } else if derive_off(b, base, x, depth + 1).is_some()
+                || derive_off(b, base, y, depth + 1).is_some()
+            {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        ValueDef::Operator(op, aa, _) if op.is_pure() => b.arg_pool[aa]
+            .iter()
+            .any(|&a| derive_off(b, base, a, depth + 1).is_some())
+            .then_some(None),
+        // A block arg or pick can carry `base` through; can't prove
+        // disjointness locally. An entry param other than `base` is a
+        // sibling pointer — disjoint under noalias.
+        ValueDef::BlockParam(blk, ..) => (blk != b.entry).then_some(None),
+        ValueDef::PickOutput(..) => Some(None),
+        _ => None,
+    }
+}
+
+/// A loop-internal write: a direct store, an in-module direct call whose
+/// callee's per-param write set can be resolved, or `Bail` for opaque
+/// effects (indirect/foreign calls, bulk-memory ops).
+enum Writer {
+    Store { base: WV, off: i64, sz: u64 },
+    Call { fi: usize, args: Vec<WV> },
+    Bail,
+}
+
+/// Everything in the loop that might write memory, collected once so
+/// several candidate loads share the scan.
+fn loop_writers(
+    b: &FunctionBody,
+    inloop: &FxHashSet<WBlock>,
+    funcs: &[FDecl],
+    nowrite: &FxHashMap<String, bool>,
+) -> Vec<Writer> {
+    let mut ws = Vec::new();
+    for &lb in inloop {
+        for &iv in &b.blocks[lb].insts {
+            let ValueDef::Operator(op, aa, _) = &b.values[iv] else {
+                continue;
+            };
+            if let (Some(sz), Some(m)) = (store_bytes(op), memarg_of(op)) {
+                if let Some(&base) = b.arg_pool[*aa].first() {
+                    ws.push(Writer::Store {
+                        base: b.resolve_alias(base),
+                        off: m.offset as i64,
+                        sz,
+                    });
+                }
+            } else if let O::Call { function_index } = op {
+                let fi = function_index.index();
+                // Write-free callees (possibly except noreturn paths,
+                // which a normal return never observes) can't clobber.
+                if nowrite.contains_key(&funcs[fi].name) {
+                    continue;
+                }
+                ws.push(Writer::Call {
+                    fi,
+                    args: b.arg_pool[*aa].to_vec(),
+                });
+            } else if !op.is_pure()
+                && load_bytes(op).is_none()
+                && !matches!(
+                    op,
+                    O::GlobalSet { .. } | O::TableSet { .. } | O::MemorySize { .. } | O::Nop
+                )
+            {
+                // Indirect calls, bulk-memory ops, atomics, anything
+                // else that might write unattributably.
+                ws.push(Writer::Bail);
+            }
+        }
+    }
+    ws
+}
+
+/// `v` chains back to `GlobalGet(sp)` through pure ops: the callee's own
+/// stack frame, which can't overlap a caller's noalias pointee.
+fn frame_based(cb: &FunctionBody, v: WV, sp: waffle::Global, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match cb.values[cb.resolve_alias(v)] {
+        ValueDef::Operator(O::GlobalGet { global_index }, ..) => global_index == sp,
+        ValueDef::Operator(op, aa, _) if op.is_pure() => {
+            cb.arg_pool[aa].iter().any(|&a| frame_based(cb, a, sp, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// Trace `v` to (entry param index, const byte offset) in the callee —
+/// aliases and constant add/sub only.
+fn param_off(cb: &FunctionBody, v: WV, depth: u32) -> Option<(u32, i64)> {
+    if depth > 8 {
+        return None;
+    }
+    match cb.values[cb.resolve_alias(v)] {
+        ValueDef::BlockParam(blk, i, _) if blk == cb.entry => Some((i, 0)),
+        ValueDef::Operator(op @ (O::I32Add | O::I64Add | O::I32Sub | O::I64Sub), aa, _) => {
+            let &[x, y, ..] = &cb.arg_pool[aa][..] else {
+                return None;
+            };
+            let sub = matches!(op, O::I32Sub | O::I64Sub);
+            let (bv, k) = if let Some(k) = wconst(cb, y) {
+                (x, if sub { -k } else { k })
+            } else if let Some(k) = wconst(cb, x).filter(|_| !sub) {
+                (y, k)
+            } else {
+                return None;
+            };
+            let (i, o) = param_off(cb, bv, depth + 1)?;
+            Some((i, o.wrapping_add(k)))
+        }
+        _ => None,
+    }
+}
+
+/// Byte ranges the callee writes through its own params, as (param
+/// index, start offset, size). `None` = an unattributable write exists:
+/// a call, a bulk-memory op, or a store whose base is neither
+/// frame-local nor traceable to an entry param.
+fn callee_writes(cb: &FunctionBody, sp: waffle::Global) -> Option<Vec<(u32, i64, u64)>> {
+    let mut out = Vec::new();
+    for blk in cb.blocks.iter() {
+        for &iv in &cb.blocks[blk].insts {
+            let ValueDef::Operator(op, aa, _) = &cb.values[iv] else {
+                continue;
+            };
+            if let Some(sz) = store_bytes(op) {
+                let (Some(m), Some(&base)) =
+                    (memarg_of(op), cb.arg_pool[*aa].first())
+                else {
+                    return None;
+                };
+                if frame_based(cb, base, sp, 0) {
+                    continue;
+                }
+                let (pi, off) = param_off(cb, base, 0)?;
+                out.push((pi, off.wrapping_add(m.offset as i64), sz));
+            } else if !op.is_pure()
+                && load_bytes(op).is_none()
+                && !matches!(
+                    op,
+                    O::GlobalSet { .. } | O::TableSet { .. } | O::MemorySize { .. }
+                )
+            {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Does anything inside the loop write `[vb+lo, vb+hi)`? `vb` is a
+/// noalias param pointer, so only `vb`-derived addresses can legally
+/// reach the pointee; everything else is disjoint.
+fn clobbered(
+    b: &FunctionBody,
+    funcs: &[FDecl],
+    writers: &[Writer],
+    wcache: &mut FxHashMap<usize, Option<Vec<(u32, i64, u64)>>>,
+    sp: waffle::Global,
+    vb: WV,
+    lo: u64,
+    hi: u64,
+) -> bool {
+    let hits = |d: i64, off: i64, sz: u64| {
+        let s = d as i128 + off as i128;
+        s + sz as i128 > lo as i128 && s < hi as i128
+    };
+    for w in writers {
+        match w {
+            Writer::Bail => return true,
+            Writer::Store { base, off, sz } => match derive_off(b, vb, *base, 0) {
+                Some(None) => return true,
+                Some(Some(d)) if hits(d, *off, *sz) => return true,
+                _ => {}
+            },
+            Writer::Call { fi, args } => {
+                let Some(cb) = funcs[*fi].body.as_ref() else {
+                    return true;
+                };
+                let ws = match wcache.entry(*fi).or_insert_with(|| callee_writes(cb, sp)) {
+                    Some(ws) => ws,
+                    None => return true,
+                };
+                for &(pi, off, sz) in ws.iter() {
+                    let Some(&a) = args.get(pi as usize) else {
+                        return true;
+                    };
+                    match derive_off(b, vb, b.resolve_alias(a), 0) {
+                        Some(None) => return true,
+                        Some(Some(d)) if hits(d, off, sz) => return true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn loop_licm(
     b: &mut FunctionBody,
     cfg: &waffle::cfg::CFGInfo,
@@ -4999,7 +5251,15 @@ fn loop_licm(
     pre: WBlock,
     sp: waffle::Global,
     frozen: &FxHashMap<WV, u64>,
+    deref: &FxHashMap<WV, u64>,
+    funcs: &[FDecl],
+    nowrite: &FxHashMap<String, bool>,
 ) {
+    // Loop-internal writers + per-callee write sets, computed lazily on
+    // the first writable-noalias load that could hoist.
+    let mut writers: Option<Vec<Writer>> = None;
+    let mut wcache: FxHashMap<usize, Option<Vec<(u32, i64, u64)>>> = FxHashMap::default();
+    let mut n_deref = 0u32;
     // Process in RPO order so defs hoist before their users.
     let mut order: Vec<WBlock> = inloop.iter().copied().collect();
     order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
@@ -5024,15 +5284,40 @@ fn loop_licm(
                                     // memory can't change — hoisting is
                                     // always safe. This is what LLVM's
                                     // param attrs buy it on this loop.
+                                    // Writable noalias params hoist too
+                                    // when nothing in the loop can
+                                    // write the loaded bytes.
                                     load_bytes(&op)
                                         .and_then(|sz| {
                                             let m = memarg_of(&op)?;
                                             let a = b.resolve_alias(
                                                 *b.arg_pool[args].first()?,
                                             );
-                                            let bound = *frozen.get(&a)?;
-                                            (m.offset as u64 + sz <= bound)
-                                                .then_some(())
+                                            let lo = m.offset as u64;
+                                            if let Some(&bound) = frozen.get(&a) {
+                                                return (lo + sz <= bound).then_some(());
+                                            }
+                                            let bound = *deref.get(&a)?;
+                                            if lo + sz > bound {
+                                                return None;
+                                            }
+                                            if writers.is_none() {
+                                                writers = Some(loop_writers(
+                                                    b, inloop, funcs, nowrite,
+                                                ));
+                                            }
+                                            let ok = !clobbered(
+                                                b,
+                                                funcs,
+                                                writers.as_ref().unwrap(),
+                                                &mut wcache,
+                                                sp,
+                                                a,
+                                                lo,
+                                                lo + sz,
+                                            );
+                                            n_deref += ok as u32;
+                                            ok.then_some(())
                                         })
                                         .is_some()
                                 }
@@ -5057,6 +5342,9 @@ fn loop_licm(
         if !moved {
             break;
         }
+    }
+    if n_deref > 0 && std::env::var_os("PLIRON_WASM_LICM").is_some() {
+        eprintln!("loop_licm: {n_deref} noalias-param loads hoisted past writers");
     }
 }
 
