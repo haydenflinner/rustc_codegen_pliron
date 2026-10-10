@@ -141,3 +141,15 @@ Two cooperating changes close the last wide.rs gap (sum2d was -6%):
   multi-exit gather loop, punroll bails on its exit cone.
   Everything else ≥ parity: axpy 0.37/0.59, memchr 0.08/1.21,
   itersum 1.18/2.89, strsum 0.23/0.90.
+
+## Merged: x64 round 3 (e6876bf -> e6976bd)
+- punroll: unrolled copies fuse into ONE block with carry map — enables
+  load+fadd adjacency sinking (was color-boundary blocked).
+- vendored machinst/lower.rs: value_direct_uses + guarded UniqueUse sink
+  (direct_uses==1 && cur_inst direct user && lowered_uses==0). ISA-GENERIC.
+- x64 results: sum2d parity, matmul ~7% win; scatter gather -12%/hist -6%
+  remains (multi-exit punroll budget — documented).
+- aarch64 re-verify on merged tree: std diff-clean, unwind pass,
+  rev_copy32 keeps post-index ldp/stp shape (0.32-vs-0.315 was box noise,
+  stock moved identically), all wide kernels parity or wins.
+- Remaining x64 gap: scatter (multi-exit unroll), noted.
