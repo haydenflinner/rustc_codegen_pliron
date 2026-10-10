@@ -15,6 +15,10 @@ if [[ ! -d "$WT" ]]; then
     git -C "$RUST" cat-file -e "$COMMIT" 2>/dev/null || git -C "$RUST" fetch --depth=1 origin "$COMMIT"
     git -C "$RUST" worktree add --detach "$WT" "$COMMIT"
     git -C "$WT" apply "$B/selfhost/bootstrap.patch"
+    # rustc-side hooks the backend needs (Session::fat_lto_supported,
+    # compiletest backend name). Lives on the rust fork's main as a commit;
+    # mirrored here as a patch so fresh worktrees don't need it.
+    git -C "$WT" apply "$B/selfhost/rustc-session.patch"
     cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
     # cc for crt/libc paths; wild does the linking. Mach-O links fine with the system ld.
     if [[ "$(uname -sm)" == "Linux x86_64" ]]; then

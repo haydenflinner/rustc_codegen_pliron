@@ -913,3 +913,26 @@ Track as x64 agent follow-up.
 - Remaining: chars ~2.2x (carried select chains — needs post-inc
   load idiom or a wider UTF-8 batch decode, not IR polish),
   tokenize ~2.4x, matmul-64 strided-vec.
+
+## Stage2 self-host crash — diagnosis so far (Oct 10 PM)
+
+Reproduced directly: `rust-sh/build/.../stage2/bin/rustc` (pliron-built
+stage2) panics compiling `core` — `thin_vec::drop_non_singleton` capacity
+overflow inside `rustc_lint::levels::add` during pre-expansion lint. On a
+trivial `fn main` it SIGBUSes after E0463. So the stage2 *binary* is
+miscompiled, not just one path.
+
+- The embedded backend in rust-sh was **very stale** (Oct 9 rsync): missing
+  revnorm/edgefwd/celim/bittab/dse/ivrefold — predates ~15 merges and five
+  known miscompile fixes (punroll SSA dominance, edgespec skipped-block,
+  wpeep coverage, volatile-store fencing, dependent-load pair-fusion).
+- Rebuild hit a second latent issue: `fat_lto_supported` is
+  `#[cfg(rustc_in_tree)]` and requires Hayden's rustc-side patch
+  `cf54c772450` which never reached rust-sh (worktree was created before
+  the patch existed; backend was never rebuilt in-tree since). Applied the
+  cherry-pick to rust-sh (detached `4211e93`) and mirrored it as
+  `selfhost/rustc-session.patch` + wired into `selfhost/setup.sh` so fresh
+  worktrees get it.
+- stage1-std + stage2 rebuild in progress against backend `06cdcc6`
+  (current HEAD incl. mask01 + noalias-LICM merges). Bad stage2 driver
+  snapshotted to /tmp/stage2-bad/ for bisect if needed.
