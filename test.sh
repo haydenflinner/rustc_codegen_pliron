@@ -49,6 +49,9 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim
 # values through un-cloned shared continuations (sequential loops with
 # converging exits — Lint::parse_rust_version hit the verifier/EntryLivein).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/punroll && $out/punroll
+# coldargs' i128 arg rebind must build the zero via iconcat — iconst has
+# no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs && $out/coldargs
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user

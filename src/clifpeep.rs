@@ -845,8 +845,11 @@ pub fn coldargs(func: &mut Function) -> usize {
                         pos.ins().iadd(a, z)
                     } else {
                         // i128: no scalar `umulhi` lowering — keep the
-                        // adds+dead-flag rebind.
-                        let z = pos.ins().iconst(ty, 0);
+                        // adds+dead-flag rebind. `iconst` has no i128
+                        // form; a zero is `iconcat` of two i64 zeros.
+                        let lo = pos.ins().iconst(types::I64, 0);
+                        let hi = pos.ins().iconst(types::I64, 0);
+                        let z = pos.ins().iconcat(lo, hi);
                         pos.ins().sadd_overflow(a, z).0
                     };
                     pairs.push((a, nv));
