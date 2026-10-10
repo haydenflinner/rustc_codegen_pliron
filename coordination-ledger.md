@@ -523,3 +523,24 @@ Track as x64 agent follow-up.
   earlier runs (matmul 2.5x slower at that size, new kernels chars/
   tokenize/prefix/dot_u32 slower). Different sizes/harness — needs
   reconciliation before treating as regressions.
+
+## bcheck affine coverage (wt/native-opt, uncommitted)
+- Follow-up to the x64 "check-exit fusion" finding. bcheck already
+  versioned fully-affine loops (gather, sum2d); this round extended
+  the affine analysis: `isub` both directions (`a[i-k]`, `a[c-i]`),
+  invariant consts as sign-extended K terms (was zext'd V — every
+  `a[i-k]` guard silently failed), dead `brif iconst` cold brifs no
+  longer counted as residual checks, and min/max guards for
+  decreasing sequences (`sum_b u< len && hi sge 0`, min-check elided
+  for provably non-negative affines).
+- New fires: rev_copy32, scaled (both now fully check-free fast
+  loops), plus neg_idx/off_idx/shift_cp/gather_chk probes. Outputs
+  and panic indices match stock incl. n>len and wraparound edges.
+- Partial (subset-covered) versioning deliberately stays gated for
+  single-foldable-check loops with non-affine stores: it wins 28%
+  on random-key hist but costs 44% on same-key hist via same-addr
+  store-forward replays — the removed branch's issue slots are
+  load-bearing spacing. Affine-store (`dst[i]`) and load-only
+  partial loops DO version now. PLIRON_BCHECK_PARTIAL=1 overrides.
+- regex-syntax -O: same 7 versionings, +17 insts net, cond-branch
+  count unchanged. test.sh PLIRON_VERIFY=1 green.

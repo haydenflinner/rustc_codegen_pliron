@@ -85,6 +85,39 @@ rev/neg-store/neg-load/dot/early-exit kernels across edge lengths
   marginal (only scalar epilogue paths benefit); the paired streams
   already telescope to post-index writebacks.
 
+## This round (bcheck affine coverage: `c-i`/`i-k` indices, guard tightening)
+
+- `bcheck::affine` now handles `isub`: `aff - inv` adds a negative b term
+  (`a[i-k]`), and `inv - aff` negates m + every b term (`a[c-i]`). Invariant
+  constants are stored as `Lin::K` so they sign-extend into the widened
+  guard domain — previously `a[i-1]` carried `2^64-1` as a zext'd V term
+  and every guard failed.
+- Decreasing index sequences (m<0) bound the *entry* value instead of the
+  last: guard is `sum_b u< len && hi sge 0` (hi = last-iter value is the
+  min). Increasing sequences keep `hi u< len`, plus `sum_b sge 0` only
+  when a term can actually go negative (`a[i-k]` with small iv0 wraps and
+  must stay on the slow path). Pure-positive affines emit the same
+  single-compare guard as before.
+- New fires: `rev_copy32` (`n-1-i`), `scaled` (dst check; the src check
+  was already a `brif iconst` — dead-const cold brifs no longer count as
+  residual checks), `neg_idx`/`off_idx`/`shift_cp`/`gather_chk` probes.
+  regex-syntax: same 7 versionings as before, +17 insts (min-guard on
+  affine-offset loops only).
+- Partial versioning experiment: lifting the single-foldable-check bail
+  puts `i < a.len` in a `n <= a.len` preheader version guard — hist-rand
+  0.373 -> 0.267 (-28%), but same-key hist 0.9 -> 1.3 (+44%): the removed
+  branch's issue slots were keeping same-address store->load forwarding
+  from replaying (mechanism confirmed by punroll-off: 0.49 checked vs
+  1.14 folded; stock LLVM *keeps* a per-iter `cmp x1,x9 / b.eq` on this
+  shape and hits 0.44). Shipped gated: single-foldable partial
+  versioning only when every store address is strictly iv-affine —
+  `dst[i]` streams can't self-replay, `cnt[a[i]]` RMW keeps its checks.
+  PLIRON_BCHECK_PARTIAL=1 forces it unconditionally.
+- Measured: hist-rand 0.369 vs stock 0.436; gather 0.304 vs 0.61;
+  scatter-hist 0.86 unchanged; wide suite unchanged (rev_copy32/scaled
+  parity). Panic-index fixtures incl. `a[n-1-i]` with n>len and
+  `a[i-lo]` wraparounds match stock exactly.
+
 ## This round (scatter/hist, countdown iv, cold-edge RA effects)
 
 - `bcheck`: skip loop versioning when fewer than 2 checks fold and

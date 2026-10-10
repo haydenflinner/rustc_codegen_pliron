@@ -51,6 +51,8 @@ enum Lin {
     V(Value),
     /// Entry value of header param N (the guard block's param N).
     P(usize),
+    /// `-(v)` widened: only produced when an `isub` negates an affine expr.
+    N(Value),
 }
 
 /// `idx = m * i + sum(b)` over true integers (`i` = counter value).
@@ -260,12 +262,55 @@ fn affine(
                 if let Some(mut af) = affine(func, info, body, depth - 1, x)
                     && invariant(func, info, body, y)
                 {
-                    af.b.push(Term {
-                        v: Lin::V(y),
-                        k: 1,
-                    });
+                    // Constants sign-extend into the wide domain; a `V` term
+                    // would zext `-k` into `2^64-k` and sink every guard.
+                    let v = match iconst(func, y) {
+                        Some(k) => Lin::K(k),
+                        None => Lin::V(y),
+                    };
+                    af.b.push(Term { v, k: 1 });
                     return Some(af);
                 }
+            }
+            None
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: [a, b],
+        } => {
+            let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+            // `affine - invariant`: subtract one b term.
+            if let Some(mut af) = affine(func, info, body, depth - 1, a)
+                && invariant(func, info, body, b)
+            {
+                let (v, k) = match iconst(func, b) {
+                    Some(k) => (Lin::K(k), -1),
+                    None => (Lin::V(b), -1),
+                };
+                af.b.push(Term { v, k });
+                return Some(af);
+            }
+            // `invariant - affine` (e.g. `n - 1 - i`): negate m and every
+            // b term, then add the invariant. The index sequence decreases,
+            // so the guard bounds the entry value instead of the last one.
+            if invariant(func, info, body, a)
+                && let Some(mut af) = affine(func, info, body, depth - 1, b)
+            {
+                af.m = match af.m {
+                    Lin::K(k) => Lin::K(k.checked_neg()?),
+                    Lin::V(s) => Lin::N(s),
+                    Lin::N(s) => Lin::V(s),
+                    Lin::P(_) => return None,
+                };
+                for t in af.b.iter_mut() {
+                    t.k = t.k.checked_neg()?;
+                }
+                let v = match iconst(func, a) {
+                    Some(k) => Lin::K(k),
+                    None => Lin::V(a),
+                };
+                af.b.push(Term { v, k: 1 });
+                return Some(af);
             }
             None
         }
@@ -721,12 +766,18 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             .iter()
             .any(|bc| func.layout.is_cold(bc.block(&func.dfg.value_lists)));
-        if to_cold {
-            total_checks += 1;
-        }
         let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
+            if to_cold {
+                total_checks += 1;
+            }
             continue;
         };
+        // A `brif iconst` to cold is already folded (e.g. by celim after the
+        // count test proves the check); it costs nothing in the clone, so it
+        // doesn't count as a residual check for partial versioning.
+        if to_cold && iconst(func, c).is_none() {
+            total_checks += 1;
+        }
         let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
             continue;
         };
@@ -778,13 +829,41 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     if checks.is_empty() {
         bail!("no foldable checks");
     }
-    // A single foldable check that leaves other checks behind isn't worth
-    // a loop clone: the fast copy still pays a cold branch per iteration,
-    // and the tighter loop can actually be slower — in a scatter/RMW loop
-    // the shrunken store->load window hits memory-order replays (hist:
-    // ~0.61ms unversioned vs ~1.12ms with a check removed).
-    if checks.len() < total_checks && checks.len() < 2 {
-        bail!("single partial check not worth a clone");
+    // A single foldable check that leaves other checks behind isn't always
+    // worth a loop clone: the fast copy still pays a cold branch per
+    // iteration, and the tighter loop can actually be slower — in a
+    // scatter/RMW loop the removed branch's issue slots keep same-address
+    // store->load forwarding from replaying (hist same-key: ~0.9ms
+    // unversioned vs ~1.3ms with the check removed, though random-key hist
+    // improves ~28%). Only safe when no store can revisit an address: every
+    // store address must be strictly affine in the counter (`dst[i]`).
+    if checks.len() < total_checks
+        && checks.len() < 2
+        && std::env::var_os("PLIRON_BCHECK_PARTIAL").is_none()
+    {
+        let mut store_affine = true;
+        'scan: for &b in &body {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i] {
+                    InstructionData::Store { args, .. } => {
+                        let ok = affine(func, &info, &body, MAX_AFFINE_DEPTH, args[1])
+                            .is_some_and(|af| !matches!(af.m, Lin::K(0)));
+                        if !ok {
+                            store_affine = false;
+                            break 'scan;
+                        }
+                    }
+                    _ if func.dfg.insts[i].opcode().can_store() => {
+                        store_affine = false;
+                        break 'scan;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !store_affine {
+            bail!("single partial check with non-affine store");
+        }
     }
 
     // Guard/preheader block g takes h's params verbatim; every entry edge
@@ -848,23 +927,44 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         }
     };
     let tw = zext(&mut pos, t);
+    let zero = iconst_masked(&mut pos, wty, 0);
     let mut ok: Option<Value> = None;
     for c in &checks {
+        let dec = match c.aff.m {
+            // idx(i) = m*i + sum_b over true ints. m < 0 (K<0 or N) makes the
+            // sequence decrease: the max is the entry value sum_b and the min
+            // is the last-iteration hi. Otherwise the max is hi and the min
+            // is sum_b.
+            Lin::K(k) => k < 0,
+            Lin::N(_) => true,
+            Lin::V(_) | Lin::P(_) => false,
+        };
         let m = match c.aff.m {
             Lin::K(k) => iconst_masked(&mut pos, wty, k),
-            Lin::V(v) => {
+            Lin::V(v) | Lin::N(v) => {
                 let v = gval(&info, &gp, &mut pos, v);
-                zext(&mut pos, v)
+                let v = zext(&mut pos, v);
+                if let Lin::N(_) = c.aff.m {
+                    pos.ins().ineg(v)
+                } else {
+                    v
+                }
             }
             Lin::P(i) => zext(&mut pos, gp[i]),
         };
         let mut hi = pos.ins().imul(m, tw);
+        let mut sum_b = zero;
         for tm in &c.aff.b {
             let v = match tm.v {
                 Lin::K(k) => iconst_masked(&mut pos, wty, k),
-                Lin::V(v) => {
+                Lin::V(v) | Lin::N(v) => {
                     let v = gval(&info, &gp, &mut pos, v);
-                    zext(&mut pos, v)
+                    let v = zext(&mut pos, v);
+                    if let Lin::N(_) = tm.v {
+                        pos.ins().ineg(v)
+                    } else {
+                        v
+                    }
                 }
                 Lin::P(i) => zext(&mut pos, gp[i]),
             };
@@ -874,8 +974,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 let k = iconst_masked(&mut pos, wty, tm.k);
                 pos.ins().imul(v, k)
             };
-            hi = pos.ins().iadd(hi, term);
+            sum_b = pos.ins().iadd(sum_b, term);
         }
+        hi = pos.ins().iadd(hi, sum_b);
         let lenv = gval(&info, &gp, &mut pos, c.len);
         let lenw = zext(&mut pos, lenv);
         let cc = if c.le {
@@ -883,10 +984,27 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         } else {
             IntCC::UnsignedLessThan
         };
-        let g1 = pos.ins().icmp(cc, hi, lenw);
+        let (minv, maxv) = if dec { (hi, sum_b) } else { (sum_b, hi) };
+        // The max over the trip range must be < len; the min must be >= 0
+        // (a dip below 0 wraps to a huge machine value that would panic).
+        // Skip the min test when no term can go negative — the common
+        // `i < len` guard stays a single compare.
+        let may_neg = dec
+            || c.aff.b.iter().any(|t| match t.v {
+                Lin::V(_) | Lin::P(_) => t.k < 0,
+                Lin::N(_) => t.k > 0,
+                Lin::K(kv) => kv.checked_mul(t.k).is_none_or(|p| p < 0),
+            });
+        let g1 = pos.ins().icmp(cc, maxv, lenw);
+        let g = if may_neg {
+            let g2 = pos.ins().icmp(IntCC::SignedGreaterThanOrEqual, minv, zero);
+            pos.ins().band(g1, g2)
+        } else {
+            g1
+        };
         ok = Some(match ok {
-            None => g1,
-            Some(o) => pos.ins().band(o, g1),
+            None => g,
+            Some(o) => pos.ins().band(o, g),
         });
     }
     let ok = ok.unwrap();
