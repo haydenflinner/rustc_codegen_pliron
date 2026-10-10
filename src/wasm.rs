@@ -950,6 +950,15 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
         }
         self.b.optimize(&waffle::OptOptions::default());
+        // Fold `v == K1 || v == K2` CondBr chains into br_table Selects
+        // (LLVM does the same at ISel for small eq-chains).
+        if std::env::var("PLIRON_WASM_TAB").map_or(true, |v| v != "0") {
+            for _ in 0..4 {
+                if !wtab(&mut self.b) {
+                    break;
+                }
+            }
+        }
         let dbg = std::env::var("PLIRON_WASM_LOOPS")
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false);
@@ -3330,6 +3339,178 @@ fn wconst(b: &FunctionBody, v: WV) -> Option<i64> {
         ValueDef::Operator(O::I64Const { value }, ..) => Some(value as i64),
         _ => None,
     }
+}
+
+/// If `c` resolves to `v == K` (or its `eqz` negation `v != K`),
+/// return `(v, K, eq_on_true)` — `eq_on_true` says whether `v == K`
+/// takes the CondBr's if_true edge.
+fn eq_of(b: &FunctionBody, c: WV) -> Option<(WV, i64, bool)> {
+    let c = b.resolve_alias(c);
+    let (aa, pol) = match b.values[c] {
+        ValueDef::Operator(O::I32Eq, aa, _) => (aa, true),
+        ValueDef::Operator(O::I32Eqz, aa, _) => {
+            let a = b.resolve_alias(*b.arg_pool[aa].first()?);
+            match b.values[a] {
+                ValueDef::Operator(O::I32Eq, aa, _) => (aa, false),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let &[x, y, ..] = &b.arg_pool[aa][..] else {
+        return None;
+    };
+    let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
+    if let Some(k) = wconst(b, y) {
+        return Some((x, k, pol));
+    }
+    if let Some(k) = wconst(b, x) {
+        return Some((y, k, pol));
+    }
+    None
+}
+
+/// Fold `v == K1 || v == K2` two-block CondBr chains into a br_table
+/// (waffle `Select`) on `v - min(K1,K2)` — the same lowering LLVM's
+/// wasm backend gives small equality chains. `blk` must end in
+/// `CondBr(eq, hit, nxt)` where `nxt` is reached *only* from `blk`,
+/// has no params, holds only pure insts (the second `eq` plus whatever
+/// feeds it, e.g. its const), and ends in `CondBr(eq, hit, miss)`
+/// sharing the hit block. Per-index targets
+/// keep their original edge args (hit and miss args differ on the two
+/// original edges), so the only requirement is that the chain block's
+/// edge args aren't defined inside it. Returns whether it folded.
+fn wtab(b: &mut FunctionBody) -> bool {
+    // Use sites per value, keyed by the block each use lives in. A
+    // folded-away chain block keeps its insts but becomes unreachable, so
+    // any value it defines that is used elsewhere (e.g. a GVN-deduped
+    // constant feeding another block's edge args) would lose its
+    // dominating def. Reject the fold unless every nxt def is used only
+    // inside nxt.
+    let mut uses: FxHashMap<WV, FxHashSet<WBlock>> = FxHashMap::default();
+    for blk in b.blocks.iter() {
+        for &i in &b.blocks[blk].insts {
+            b.values[i].visit_uses(&b.arg_pool, |u| {
+                uses.entry(b.resolve_alias(u)).or_default().insert(blk);
+            });
+        }
+        b.blocks[blk].terminator.visit_uses(|u| {
+            uses.entry(b.resolve_alias(u)).or_default().insert(blk);
+        });
+    }
+    let mut edits: Vec<(WBlock, WV, i64, i64, BlockTarget, BlockTarget, BlockTarget)> =
+        Vec::new();
+    for blk in b.blocks.iter() {
+        let Terminator::CondBr {
+            cond: c1,
+            if_true: t1,
+            if_false: f1,
+        } = &b.blocks[blk].terminator
+        else {
+            continue;
+        };
+        let Some((v1, k1, pol1)) = eq_of(b, *c1) else {
+            continue;
+        };
+        // The edge taken when v == k1 is the "hit" (if_true for eq,
+        // if_false for ne); the chain block sits on the other edge.
+        let (hit1, nxt_t) = if pol1 { (t1, f1) } else { (f1, t1) };
+        let nxt = nxt_t.block;
+        if nxt == blk || b.blocks[nxt].preds.as_slice() != [blk] {
+            continue;
+        }
+        if !b.blocks[nxt].params.is_empty() {
+            continue;
+        }
+        let Terminator::CondBr {
+            cond: c2,
+            if_true: t2,
+            if_false: f2,
+        } = &b.blocks[nxt].terminator
+        else {
+            continue;
+        };
+        let c2v = b.resolve_alias(*c2);
+        if !b.blocks[nxt].insts.contains(&c2v) {
+            continue;
+        }
+        // Everything else nxt computes must be pure — folding skips its
+        // execution entirely.
+        if b.blocks[nxt].insts.iter().any(|&i| {
+            i != c2v
+                && !matches!(b.values[i], ValueDef::Alias(_))
+                && !matches!(b.values[i], ValueDef::Operator(op, ..) if op.is_pure())
+        }) {
+            continue;
+        }
+        let Some((v2, k2, pol2)) = eq_of(b, c2v) else {
+            continue;
+        };
+        let (hit2, miss) = if pol2 { (t2, f2) } else { (f2, t2) };
+        if v2 != v1 || hit2.block != hit1.block {
+            continue;
+        }
+        // Edge args evaluated in nxt's frame must exist in blk's: no
+        // arg may be a nxt-local value.
+        if hit2
+            .args
+            .iter()
+            .chain(&miss.args)
+            .map(|&a| b.resolve_alias(a))
+            .any(|a| b.blocks[nxt].insts.contains(&a))
+        {
+            continue;
+        }
+        // No value defined in nxt may be used outside it: folding skips
+        // nxt's execution, so an escaping def would stop dominating its
+        // use.
+        if b.blocks[nxt].insts.iter().any(|&i| {
+            uses.get(&b.resolve_alias(i))
+                .is_some_and(|bs| bs.iter().any(|&ub| ub != nxt))
+        }) {
+            continue;
+        }
+        let (lo, hi) = (k1.min(k2), k1.max(k2));
+        if hi - lo + 1 > 16 {
+            continue;
+        }
+        edits.push((blk, v1, k1, k2, hit1.clone(), hit2.clone(), miss.clone()));
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    for (blk, v, k1, k2, hit1, hit2, miss) in edits {
+        if verbose {
+            eprintln!("wtab: {blk} {v}=={k1}|{k2} -> {hit1:?} {hit2:?} miss={miss:?}");
+        }
+        let lo = k1.min(k2);
+        let idx = if lo == 0 {
+            v
+        } else {
+            let lc = b.add_op(blk, O::I32Const { value: lo as u32 }, &[], &[WT::I32]);
+            b.add_op(blk, O::I32Sub, &[v, lc], &[WT::I32])
+        };
+        let span = (k1.max(k2) - lo + 1) as usize;
+        let mut targets = Vec::with_capacity(span);
+        for i in 0..span as i64 {
+            let k = lo + i;
+            targets.push(if k == k1 {
+                hit1.clone()
+            } else if k == k2 {
+                hit2.clone()
+            } else {
+                miss.clone()
+            });
+        }
+        b.blocks[blk].terminator = Terminator::Select {
+            value: idx,
+            targets,
+            default: miss,
+        };
+    }
+    b.recompute_edges();
+    true
 }
 
 /// Is `v` loop-invariant: defined outside the loop, a constant, or a
