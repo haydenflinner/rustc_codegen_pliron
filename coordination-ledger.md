@@ -373,3 +373,18 @@ Track as x64 agent follow-up.
   /sum_u8 marginally slower.
 - Verified on shared HEAD: build clean, tests/wasm/run.sh green incl.
   wasi std + unknown-EH.
+
+## Merged: wt/wasm-perf round 2 (eafe6f9) — wpeep forwarding fixpoint + wbcheck Chk::Ind
+- wpeep store-forwarding fixpoint: copy-cluster producers retarget onto
+  destination locals (structured-context tracking); matmul back-edge
+  shuffle gone. wbcheck Chk::Ind: k*n+j affine-IV checks proven via
+  uniform latch step.
+- matmul_256 wasm residual ~7% DOCUMENTED, not fixable in runway: V8
+  TurboFan normalizes both sides to near-identical native code; wunroll
+  refuses loops containing check diamonds/panic sinks (>16 blocks) —
+  needs waffle-level unroll across unreachable sinks.
+- NOT perf-validated timing-wise beyond the agent's /tmp/wbench runs.
+- Verified on shared HEAD: build clean, tests/wasm/run.sh fully green.
+- KNOWN LIMITATION (all workstreams closed): wasm matmul gap is a
+  waffle-level unroll problem; native/x64 remaining gaps are regalloc2
+  critical-edge splits intrinsic to block-param style.
