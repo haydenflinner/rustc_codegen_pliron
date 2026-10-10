@@ -58,3 +58,13 @@ sum_u8 0.141/0.694 (4.9x, psadbw), dot_i8 0.312/0.446 (1.4x),
 matmul 11.82/12.42 (~parity).
 KEY: earlier x64 regressions were baseline-SSE2 codegen; the
 -Ctarget-cpu ISA mapping (97e3f0b) fixed them, not lowering changes.
+
+## Merged: native loopvec (d6fe695 -> 4ede697)
+Strength-reduced stream bases (block-param pointers, ±vf*UNROLL steps),
+inst-major hoisted loads, ldp/stp fusion for Unscaled amodes, shuffle-tree
+reduction epilogue, vendor aarch64 emit.rs fuse_with_next Unscaled.
+Verified on merged tree: rev_copy32 now WINS (0.255 vs 0.315, was -11%);
+max_u/min_i parity; dot_u8 2x; cnt_vowel 3.7x; find_off 14x; sum2d parity.
+POSSIBLE REGRESSION: scaled (f64) 0.65->0.72 (~10%, stable across runs;
+new dual-loop runtime dispatch + remat'd trip bound). Follow up with
+native agent — either gate the split or drop the remat.
