@@ -502,6 +502,12 @@ enum WPeek {
     Get(u32),
     Set(u32),
     Tee(u32),
+    /// Control-flow instruction: anything that can change which
+    /// instruction executes next (or how the operand stack's shape is
+    /// interpreted at structured boundaries).
+    Ctl,
+    /// Deleted by the rewrite passes; emits no bytes.
+    Del,
     Other,
 }
 
@@ -531,7 +537,13 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     let locals_end = p;
     // Instruction stream: (kind, byte range). `depth` tracks structured
     // constructs so the scan stops on the `end` that closes the body.
-    let mut ins: Vec<(WPeek, usize, usize)> = Vec::new();
+    // `stack` additionally records each instruction's structured
+    // context — the enclosing (construct, arm) pairs — so the rewrite
+    // pass can tell when a use/def lives on a different `if` arm than
+    // the producer (and can therefore never observe its value).
+    let mut ins: Vec<(WPeek, usize, usize, usize)> = Vec::new();
+    let mut ctx: Vec<Vec<(u32, u8)>> = Vec::new();
+    let mut stack: Vec<(u32, u8)> = Vec::new();
     let mut depth = 0i32;
     loop {
         if p >= b.len() {
@@ -541,21 +553,46 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         let op = b[p];
         p += 1;
         let k = match op {
-            0x00 | 0x01 | 0x05 | 0x0f | 0x1a | 0x1b | 0xd1 => WPeek::Other,
+            0x01 | 0x1a | 0x1b | 0xd1 => WPeek::Other,
+            0x00 | 0x0f => WPeek::Ctl,
+            0x05 => {
+                // else: belongs to the `if` at the top of the stack;
+                // after it, that arm is the else-arm.
+                ctx.push(stack.clone());
+                if let Some(top) = stack.last_mut() {
+                    top.1 = 1;
+                }
+                ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
+                continue;
+            }
             0x02 | 0x03 | 0x04 => {
                 depth += 1;
                 sleb_skip(b, &mut p)?; // blocktype: valtype or type index
-                WPeek::Other
+                ctx.push(stack.clone());
+                stack.push((ins.len() as u32, 0));
+                ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
+                continue;
             }
             0x0b => {
                 depth -= 1;
-                ins.push((WPeek::Other, s, p));
+                ctx.push(stack.clone());
+                ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
+                stack.pop();
                 if depth < 0 {
                     break; // `end` closing the function body itself
                 }
                 continue;
             }
-            0x0c | 0x0d | 0x10 | 0x12 | 0x25 | 0x26 | 0x3f | 0x40 | 0xd2 => {
+            0x0c | 0x0d | 0x10 | 0x12 | 0x14 => {
+                urd(b, &mut p)?;
+                WPeek::Ctl
+            }
+            0x11 | 0x13 => {
+                urd(b, &mut p)?;
+                urd(b, &mut p)?;
+                WPeek::Ctl
+            }
+            0x25 | 0x26 | 0x3f | 0x40 | 0xd2 => {
                 urd(b, &mut p)?;
                 WPeek::Other
             }
@@ -565,12 +602,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 for _ in 0..=n {
                     urd(b, &mut p)?;
                 }
-                WPeek::Other
-            }
-            0x11 | 0x13 => {
-                urd(b, &mut p)?;
-                urd(b, &mut p)?;
-                WPeek::Other
+                WPeek::Ctl
             }
             0x1c => {
                 // select t: vec of valtypes. Multi-byte valtypes (typed
@@ -631,14 +663,15 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             _ => return None, // 0xfb GC, 0xfd SIMD, 0xfe atomics, EH ops
         };
-        ins.push((k, s, p));
+        ctx.push(stack.clone());
+        ins.push((k, s, p, ctx.len() - 1));
     }
     if p != b.len() {
         return None; // trailing bytes after the body `end`
     }
     // Coalesce adjacent pairs until none rewrite.
     loop {
-        let mut out: Vec<(WPeek, usize, usize)> = Vec::with_capacity(ins.len());
+        let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
         let mut changed = false;
         let mut i = 0;
         while i < ins.len() {
@@ -650,13 +683,13 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                     continue;
                 }
                 (WPeek::Set(a), Some(WPeek::Get(c))) if a == c => {
-                    out.push((WPeek::Tee(a), ins[i].1, ins[i].2));
+                    out.push((WPeek::Tee(a), ins[i].1, ins[i].2, ins[i].3));
                     changed = true;
                     i += 2;
                     continue;
                 }
                 (WPeek::Tee(a), Some(WPeek::Set(c))) if a == c => {
-                    out.push((WPeek::Set(a), ins[i].1, ins[i].2));
+                    out.push((WPeek::Set(a), ins[i].1, ins[i].2, ins[i].3));
                     changed = true;
                     i += 2;
                     continue;
@@ -671,9 +704,259 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             break;
         }
     }
+    // Store-forward parallel copies: waffle lowers `br blk(v1..vn)` by
+    // computing the vi into scratch locals and then copying them onto
+    // the block-param locals, e.g.
+    //   local.get t1 .. local.get tn; local.set xn .. local.set x1
+    // When ti is written exactly once and read only by that copy, the
+    // producer can write xi directly and the copy pair disappears
+    // (saves two instructions per copied param on every loop edge).
+    // Pairing is by operand-stack order within a run of pure local ops:
+    // the j-th `local.set` from the end pops the j-th `local.get`.
+    //
+    // The general case is a rotation: the "scratch" slots are often
+    // other params' locals (`get 15;+4;set 14 | get 16;+256;set 15 |
+    // get 17;+1024;set 16` then copies `15<-14,16<-15,17<-16`), so
+    // pairwise retargeting can clobber a param another producer still
+    // needs. Solve as a greatest fixpoint over the copy group: a pair
+    // is retargetable iff every access to its destination local within
+    // (producer, copy-set) is itself an instruction being rewritten,
+    // and the temp has no other defs after its producer and no reads
+    // after it other than the deleted copy-get.
+    for _ in 0..4 {
+        let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        let mut defs: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (i, &(k, _, _, _)) in ins.iter().enumerate() {
+            match k {
+                WPeek::Get(l) => uses.entry(l).or_default().push(i),
+                WPeek::Set(l) => defs.entry(l).or_default().push(i),
+                WPeek::Tee(l) => {
+                    uses.entry(l).or_default().push(i);
+                    defs.entry(l).or_default().push(i);
+                }
+                _ => {}
+            }
+        }
+        let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+        // Stack-order matching inside runs of pure local ops.
+        let mut pairs: Vec<(usize, usize)> = Vec::new(); // (get idx, set idx)
+        let mut pending: Vec<usize> = Vec::new();
+        for (i, &(k, _, _, _)) in ins.iter().enumerate() {
+            match k {
+                WPeek::Get(_) | WPeek::Tee(_) => pending.push(i),
+                WPeek::Set(_) => {
+                    if let Some(g) = pending.pop() {
+                        pairs.push((g, i));
+                    }
+                }
+                _ => pending.clear(),
+            }
+        }
+        // Candidate rewrites: (producer idx, copy-get idx, copy-set idx,
+        // temp local, dest local). A producer is the last set/tee of the
+        // temp before the copy-get.
+        let mut cand: Vec<(usize, usize, usize, u32, u32)> = Vec::new();
+        for &(gi, si) in &pairs {
+            let (WPeek::Get(t), WPeek::Set(x)) = (ins[gi].0, ins[si].0) else {
+                continue;
+            };
+            if t == x {
+                continue; // get x ... set x: stack-neutral no-op, leave it
+            }
+            let Some(&p1) = defs
+                .get(&t)
+                .and_then(|v| v.iter().rev().find(|&&d| d < gi))
+            else {
+                continue;
+            };
+            cand.push((p1, gi, si, t, x));
+        }
+        // Greatest fixpoint: drop candidates whose side conditions fail
+        // with respect to the currently-surviving set.
+        //
+        // `arm_diverged(a, b)` is true when instructions a and b sit in
+        // different arms of the same `if`, so b can never observe a's
+        // writes (or vice versa): walking their enclosing-construct
+        // lists outward, the first difference is an arm difference.
+        // Any other first difference (different constructs, or one list
+        // a prefix of the other) means sequential-or-nested control
+        // flow, which we conservatively treat as reachable.
+        let arm_div = |a: usize, b: usize| -> bool {
+            let (a, b) = (&ctx[ins[a].3], &ctx[ins[b].3]);
+            for k in 0..a.len().min(b.len()) {
+                if a[k].0 != b[k].0 {
+                    return false;
+                }
+                if a[k].1 != b[k].1 {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut live: Vec<bool> = vec![true; cand.len()];
+        loop {
+            // Instruction indices the surviving candidates rewrite or
+            // delete; accesses to a destination local are only allowed
+            // through these.
+            let mut mset: FxHashMap<usize, ()> = FxHashMap::default();
+            for (ci, &(p1, gi, si, _, _)) in cand.iter().enumerate() {
+                if live[ci] {
+                    mset.insert(p1, ());
+                    mset.insert(gi, ());
+                    mset.insert(si, ());
+                }
+            }
+            let mut dropped = false;
+            for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
+                if !live[ci] {
+                    continue;
+                }
+                let mut ok = true;
+                let mut why = 0;
+                // The copy-get must actually read the producer's value:
+                // it has to be reachable from the producer (not on a
+                // sibling arm) with no reachable def of t in between.
+                if arm_div(p1, gi) {
+                    ok = false;
+                    why = 1;
+                }
+                if ok {
+                    for &d in defs.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        if d > p1 && d < gi && !arm_div(p1, d) {
+                            ok = false;
+                            why = 2;
+                            break;
+                        }
+                    }
+                }
+                // Every other use of the temp that can observe the
+                // producer's value must not exist: a use is safe only
+                // when it is unreachable from the producer (different
+                // arm) or shadowed by a later def in its own region.
+                if ok {
+                    for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        if u <= p1 || u == gi {
+                            continue;
+                        }
+                        if arm_div(p1, u) {
+                            continue; // sibling arm: never sees p1's def
+                        }
+                        let shadowed = defs
+                            .get(&t)
+                            .map(|v| {
+                                v.iter().any(|&d| {
+                                    d > p1
+                                        && d < u
+                                        && !mset.contains_key(&d)
+                                        && ctx[ins[d].3] == ctx[ins[u].3]
+                                })
+                            })
+                            .unwrap_or(false);
+                        if !shadowed {
+                            ok = false;
+                            why = 3;
+                            if verbose {
+                                eprintln!(
+                                    "  fail3 t={} use@{} uctx={:?} pctx={:?}",
+                                    t,
+                                    ins[u].1,
+                                    ctx[ins[u].3],
+                                    ctx[ins[p1].3]
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Straight-line producer->copy window; the destination
+                // local is only touched by instructions being rewritten.
+                if ok {
+                    for (i, &(k, _, _, _)) in ins[p1 + 1..si].iter().enumerate() {
+                        let i = i + p1 + 1;
+                        match k {
+                            WPeek::Ctl => {
+                                ok = false;
+                                why = 4;
+                                break;
+                            }
+                            WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l)
+                                if l == x =>
+                            {
+                                if !mset.contains_key(&i) {
+                                    ok = false;
+                                    why = 5;
+                                    if verbose {
+                                        eprintln!("  fail5 x={} i@{}", x, ins[i].1);
+                                    }
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // p1 must be ours alone (not another pair's get/set —
+                // those get deleted, not retargeted), and temp/dest
+                // must be unique among live candidates. Sharing a temp
+                // or a dest clobbers the other rewrite, so only the
+                // earlier candidate wins; dead candidates don't count.
+                if ok {
+                    for (cj, &(_pq, qg, qs, qt, qx)) in cand.iter().enumerate() {
+                        if cj == ci {
+                            continue;
+                        }
+                        if qg == p1
+                            || qs == p1
+                            || ((qx == x || qt == t) && live[cj] && cj < ci)
+                        {
+                            ok = false;
+                            why = 6;
+                            break;
+                        }
+                    }
+                }
+                if verbose && !ok {
+                    eprintln!("wpeep: drop t={t} x={x} why={why}");
+                }
+                if !ok {
+                    live[ci] = false;
+                    dropped = true;
+                }
+            }
+            if verbose {
+                for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
+                    eprintln!(
+                        "wpeep cand p1={} gi={} si={} t={} x={} live={}",
+                        ins[p1].1, ins[gi].1, ins[si].1, t, x, live[ci]
+                    );
+                }
+            }
+            if !dropped {
+                break;
+            }
+        }
+        let mut changed = false;
+        for (ci, &(p1, gi, si, _, x)) in cand.iter().enumerate() {
+            if !live[ci] {
+                continue;
+            }
+            match ins[p1].0 {
+                WPeek::Set(_) => ins[p1] = (WPeek::Set(x), ins[p1].1, ins[p1].2, ins[p1].3),
+                WPeek::Tee(_) => ins[p1] = (WPeek::Tee(x), ins[p1].1, ins[p1].2, ins[p1].3),
+                _ => continue,
+            }
+            ins[gi].0 = WPeek::Del;
+            ins[si].0 = WPeek::Del;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+        ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+    }
     let mut nb = Vec::with_capacity(p);
     nb.extend_from_slice(&b[..locals_end]);
-    for &(k, s, e) in &ins {
+    for &(k, s, e, _) in &ins {
         match k {
             WPeek::Get(n) => {
                 nb.push(0x20);
@@ -687,7 +970,8 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 nb.push(0x22);
                 leb(&mut nb, n);
             }
-            WPeek::Other => nb.extend_from_slice(&b[s..e]),
+            WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
+            WPeek::Del => {}
         }
     }
     Some(nb)
@@ -4485,14 +4769,23 @@ fn wbcheck(
         cands.push((lb, pidx as usize, n));
     }
     cands.sort_by_key(|&(lb, _, _)| cfg.rpo_pos[lb]);
+    // How a provable check index relates to the counted exit test:
+    // `Same(d)` is `pv` itself or `pv + d`; `Ind(pidx, x0, step)` is a
+    // different header blockparam that is itself an affine IV (start
+    // `x0`, constant non-negative `step` on every latch) — e.g. a
+    // strength-reduced second induction like `k*256 + j`.
+    enum Chk {
+        Same(Option<WV>),
+        Ind(WV, i64),
+    }
     let mut picked = None;
     for &(tb, pidx, n) in &cands {
         let pv = b.blocks[h].params[pidx].1;
         // Check sites: `idx <u len`, dominated by the exit test, idx
-        // affine in pv with unit stride. The "pass" arm may stay in or
-        // leave the loop — removing a proven-true edge is sound either
-        // way.
-        let mut checks: Vec<(WBlock, WV, Option<WV>, bool)> = Vec::new();
+        // affine in pv or in another uniform-step induction param. The
+        // "pass" arm may stay in or leave the loop — removing a
+        // proven-true edge is sound either way.
+        let mut checks: Vec<(WBlock, WV, Chk, bool)> = Vec::new();
         for &lb in inloop.iter() {
             if lb == tb || !cfg.dominates(tb, lb) {
                 continue;
@@ -4513,22 +4806,70 @@ fn wbcheck(
                 continue;
             }
             let d = if x == pv {
-                None
-            } else {
-                match b.values[x] {
-                    ValueDef::Operator(O::I32Add, aa, _) => {
-                        let &[u, v, ..] = &b.arg_pool[aa][..] else { continue };
-                        let (u, v) = (b.resolve_alias(u), b.resolve_alias(v));
-                        if u == pv && winv(b, defb, inloop, v) {
-                            Some(v)
-                        } else if v == pv && winv(b, defb, inloop, u) {
-                            Some(u)
-                        } else {
-                            continue;
+                Chk::Same(None)
+            } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[x] {
+                let &[u, v, ..] = &b.arg_pool[aa][..] else { continue };
+                let (u, v) = (b.resolve_alias(u), b.resolve_alias(v));
+                if u == pv && winv(b, defb, inloop, v) {
+                    Chk::Same(Some(v))
+                } else if v == pv && winv(b, defb, inloop, u) {
+                    Chk::Same(Some(u))
+                } else {
+                    continue;
+                }
+            } else if let ValueDef::BlockParam(hb, p2, _) = b.values[x] {
+                if hb != h || p2 as usize == pidx {
+                    continue;
+                }
+                // Uniform non-negative constant step across latches (an
+                // unchanged feed is a step-0 latch, skipped like pv's).
+                let mut step: Option<i64> = None;
+                let mut ok = true;
+                for &(la, tidx) in &latches {
+                    let arg = edge_arg(b, la, tidx, p2 as usize);
+                    let arg = b.resolve_alias(arg);
+                    if arg == x {
+                        continue;
+                    }
+                    let s = match b.values[arg] {
+                        ValueDef::Operator(O::I32Add, aa, _) => {
+                            let u = b.resolve_alias(b.arg_pool[aa][0]);
+                            let v = b.resolve_alias(b.arg_pool[aa][1]);
+                            if u == x {
+                                wconst(b, v)
+                            } else if v == x {
+                                wconst(b, u)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(s) = s else {
+                        ok = false;
+                        break;
+                    };
+                    if s < 0 {
+                        ok = false;
+                        break;
+                    }
+                    match step {
+                        None => step = Some(s),
+                        Some(st) if st == s => {}
+                        _ => {
+                            ok = false;
+                            break;
                         }
                     }
-                    _ => continue,
                 }
+                if !ok {
+                    continue;
+                }
+                let x0 = edge_arg(b, pre, pre_tidx, p2 as usize);
+                let x0 = b.resolve_alias(x0);
+                Chk::Ind(x0, step.unwrap_or(0))
+            } else {
+                continue;
             };
             checks.push((lb, len, d, pass_true));
         }
@@ -4596,14 +4937,21 @@ fn wbcheck(
     let span = pop(b, O::I64Mul, &[tm1, c64], &[WT::I64]);
     let last = pop(b, O::I64Add, &[i064, span], &[WT::I64]);
     let mut acc: Option<WV> = None;
-    for &(_, len, d, _) in &checks {
+    for &(_, len, ref d, _) in &checks {
         let len64 = pop(b, O::I64ExtendI32U, &[len], &[WT::I64]);
         let hi = match d {
-            Some(d) => {
-                let d64 = pop(b, O::I64ExtendI32U, &[d], &[WT::I64]);
+            Chk::Same(Some(d)) => {
+                let d64 = pop(b, O::I64ExtendI32U, &[*d], &[WT::I64]);
                 pop(b, O::I64Add, &[last, d64], &[WT::I64])
             }
-            None => last,
+            Chk::Same(None) => last,
+            // Other affine param: hi = x0 + (trip-1)*step, step >= 0.
+            Chk::Ind(x0, k) => {
+                let x064 = pop(b, O::I64ExtendI32U, &[*x0], &[WT::I64]);
+                let k64 = pop(b, O::I64Const { value: *k as u64 }, &[], &[WT::I64]);
+                let sp = pop(b, O::I64Mul, &[tm1, k64], &[WT::I64]);
+                pop(b, O::I64Add, &[x064, sp], &[WT::I64])
+            }
         };
         let ok = pop(b, O::I64LtU, &[hi, len64], &[WT::I32]);
         acc = Some(match acc {
