@@ -4580,7 +4580,7 @@ fn wunroll_flat(
     copies: usize,
     order: &[WBlock],
 ) -> bool {
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = std::env::var("PLIRON_WASM_VERBOSE").is_ok();
     let Terminator::CondBr {
         cond,
         if_true,
@@ -4589,7 +4589,31 @@ fn wunroll_flat(
     else {
         return false;
     };
-    let Some((iv, n, pass_true)) = as_check(b, *cond) else {
+    // Canonical counted test: `iv <u n`/`iv >=u n` via as_check, plus
+    // `iv != n`/`iv == n` — pointer-bump loops (`for &x in a`) compare
+    // the cursor against the end pointer for equality. With a uniform
+    // positive step, the group test `iv <s n-(copies-1)*step` still
+    // puts every copy strictly below n, so none can equal it, and
+    // non-terminating cases (iv > n, or n-iv not a multiple of step)
+    // fall through to the unchanged `!=` remainder with identical
+    // behavior.
+    let Some((iv, n, pass_true)) = (|cond: WV| -> Option<(WV, WV, bool)> {
+        if let Some(ck) = as_check(b, cond) {
+            return Some(ck);
+        }
+        match b.values[b.resolve_alias(cond)] {
+            ValueDef::Operator(O::I32Eq, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                Some((b.resolve_alias(x), b.resolve_alias(y), false))
+            }
+            ValueDef::Operator(O::I32Ne, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                Some((b.resolve_alias(x), b.resolve_alias(y), true))
+            }
+            _ => None,
+        }
+    })(*cond)
+    else {
         return false;
     };
     let (pass, _) = if pass_true {
