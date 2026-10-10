@@ -639,6 +639,22 @@ pub fn lower_to_object(
                 panic!("looprot broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Scalar unroll of linear counted loops (e.g. ordered float
+        // reductions that can't vectorize): K bodies per branch.
+        if st.jumpthread && crate::pass_enabled("PLIRON_PUNROLL") && crate::bisect("punroll") {
+            let k = crate::punroll::run(&mut clctx.func, n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("punroll {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after punroll ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("punroll broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if !frozen.is_empty() {
             let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
             if dump {

@@ -51,6 +51,7 @@ mod nounwind;
 mod nowrite;
 mod objmerge;
 mod phisimp;
+mod punroll;
 mod simd;
 mod slp;
 mod spec;
