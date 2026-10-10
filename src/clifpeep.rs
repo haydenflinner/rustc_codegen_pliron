@@ -15,7 +15,10 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::{Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
+use cranelift_codegen::ir::{
+    BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, types,
+};
+use rustc_data_structures::fx::FxHashSet;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
@@ -464,9 +467,75 @@ fn brif_not(func: &mut Function, inst: Inst) -> bool {
     true
 }
 
+/// rustc lowers `CheckedBinaryOp` (integer ops under `overflow-checks`) to
+/// two-result `*overflow` CLIF ops; when the `Assert` on the flag is later
+/// optimized away the flag result stays dead, but the checked op still
+/// defeats op-level matching (loopvec reductions, idioms) and pays for the
+/// flag test in scalar code. Rewrite dead-flag overflow ops to the plain
+/// wrapping op — identical first-result semantics.
+fn deflag(func: &mut Function) -> usize {
+    // A value is used iff it appears in some inst's args or in a branch
+    // destination's args (block-call args aren't part of `inst_args`).
+    let mut used: FxHashSet<Value> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                used.insert(func.dfg.resolve_aliases(a));
+            }
+            for a in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .flat_map(|bc| bc.args(&func.dfg.value_lists))
+            {
+                if let BlockArg::Value(v) = a {
+                    used.insert(func.dfg.resolve_aliases(v));
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let plain = match func.dfg.insts[i].opcode() {
+                Opcode::SaddOverflow | Opcode::UaddOverflow => Opcode::Iadd,
+                Opcode::SsubOverflow | Opcode::UsubOverflow => Opcode::Isub,
+                Opcode::SmulOverflow | Opcode::UmulOverflow => Opcode::Imul,
+                _ => continue,
+            };
+            let res = func.dfg.inst_results(i).to_vec();
+            let InstructionData::Binary { args, .. } = func.dfg.insts[i] else {
+                continue;
+            };
+            if res.len() != 2 || used.contains(&func.dfg.resolve_aliases(res[1])) {
+                continue;
+            }
+            let fty = func.dfg.value_type(res[1]);
+            let mut pos = FuncCursor::new(func).at_inst(i);
+            let nv = match plain {
+                Opcode::Iadd => pos.ins().iadd(args[0], args[1]),
+                Opcode::Isub => pos.ins().isub(args[0], args[1]),
+                _ => pos.ins().imul(args[0], args[1]),
+            };
+            // Detach the old results before aliasing (`change_to_alias`
+            // requires unattached values); point the dead flag at a zero
+            // const so it isn't left dangling on a removed inst.
+            let z = pos.ins().iconst(fty, 0);
+            pos.func.dfg.clear_results(i);
+            pos.func.dfg.change_to_alias(res[0], nv);
+            pos.func.dfg.change_to_alias(res[1], z);
+            pos.func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
+    if crate::pass_enabled("PLIRON_DEFLAG") {
+        n += deflag(func);
+    }
     if crate::pass_enabled("PLIRON_ULOAD") {
         n += uloads(func);
     }

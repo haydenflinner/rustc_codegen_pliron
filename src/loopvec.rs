@@ -2449,12 +2449,18 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // `iters-1` down instead and leave ≥1 scalar iteration (preds give
     // `iters ≥ 1` on this path).
     let iters = emit(&mut pos, iv_ty, &p.iters);
-    let mk = pos.ins().iconst(iv_ty, -p.vf * UNROLL as i64);
-    let nmv = if p.post_tested {
-        let im1 = pos.ins().iadd_imm_s(iters, -1);
-        pos.ins().band(im1, mk)
-    } else {
-        pos.ins().band(iters, mk)
+    // `base - (base & (K-1))` == `base & -K`, but unlike `band x, iconst`
+    // the result isn't in the egraph's remat set, so the trip bound stays
+    // hoisted instead of being re-executed on every vector-loop backedge.
+    let mk = pos.ins().iconst(iv_ty, p.vf * UNROLL as i64 - 1);
+    let nmv = {
+        let base = if p.post_tested {
+            pos.ins().iadd_imm_s(iters, -1)
+        } else {
+            iters
+        };
+        let r = pos.ins().band(base, mk);
+        pos.ins().isub(base, r)
     };
     let sk = pos.ins().iconst(iv_ty, p.step);
     let off = pos.ins().imul(nmv, sk);

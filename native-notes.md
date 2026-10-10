@@ -48,13 +48,39 @@ Validated: ./test.sh green; targeted correctness tests for
 rev/neg-store/neg-load/dot/early-exit kernels across edge lengths
 (0..1000 incl. non-multiples of VF*UNROLL).
 
-## Remaining gaps / next items
+## Follow-up (post-merge fixes)
 
-- Post-index addressing for *single* (non-paired) ldr/str would need a
-  general-reg `AMode::PostIndex` — only SP-scoped variants exist today;
-  the emit-site amode match arms would all need a new case. Deferred.
-- `nm`/trip bound remat inside the vector loop (`and x, len, mask`)
-  — cheap but a wasted slot; an anti-remat hint could help.
-- Store pairing across producer gaps is opportunistic (depends on
-  regalloc not reusing the data reg); a guaranteed path needs CLIF or
-  scheduling support.
+- `scaled` regression (0.65→0.72): NOT loopvec's dispatch — the x64
+  punroll pass partial-unrolls the now-small vector body (strength-
+  reduction pushed it under MAX_BODY=24), adding a per-group guard
+  dispatch `(iv+8<bound) && (bound-iv-8>16)` plus an immediate-offset
+  4x clone. Fix: `punroll::run_loop` bails on loops containing
+  vector-typed values (block params, inst args/results) — SIMD loops
+  are already vf*UNROLL-wide, cloning just pays a fresh guard.
+  Back to single post-index ldp/stp loop; 0.61 vs 0.61 stock.
+- Trip-bound `and` remat: egraph remats `band x, iconst` (remat.isle)
+  into every use block, so `nm` was re-executed per backedge. loopvec
+  now emits `nmv = isub(base, band(base, K-1))` — identical value,
+  not remat-eligible (no resimplification rule in opts). Latch is
+  `add; cmp; b.lo` — matches LLVM's 3-inst control.
+- `.iter().zip().map().sum()` stayed scalar: rustc lowers
+  `CheckedBinaryOp` to two-result `sadd_overflow`/`smul_overflow`;
+  MIR drops the `Assert`, leaving DEAD flags that defeat loopvec's
+  op matching. New clifpeep `deflag` (PLIRON_DEFLAG, default on)
+  rewrites dead-flag `*overflow` ops to the plain wrapping op —
+  zip_sum now vectorizes to the same ldp+mla loop as the indexing
+  form (0.327 vs stock 0.323, was ~scalar). MIR shape aside, nothing
+  MIR-level is needed — the iterator loop is a normal pre-tested
+  affine-counted loop once flags are dead.
+- rev_copy32 residual: ~4% vs LLVM comes from backedge mov ping-pong
+  (`mov x0,x8; add x0,#16; mov x8,x0` = 3 insts for iv+=16, regalloc
+  arg-copy artifact) — LLVM counts down (`sub; cbnz`, 2 insts). A
+  count-down iv would need direct-stream addressing rework; left.
+- Store pairing across producer gaps: assessed — vcode's fuse pass
+  already crosses ≤8 `pair_fusion_crossable` insts with up/down
+  placements + preg hazard checks. NOT guaranteed (window bound,
+  non-crossable producers, hazard failures); guaranteeing it needs
+  source-order emission (done: inst-major hoist) or a real scheduler.
+- General-reg AMode::PostIndex for single ldr/str: not pursued —
+  marginal (only scalar epilogue paths benefit); the paired streams
+  already telescope to post-index writebacks.

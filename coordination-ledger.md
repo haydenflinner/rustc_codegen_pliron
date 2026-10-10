@@ -68,3 +68,27 @@ max_u/min_i parity; dot_u8 2x; cnt_vowel 3.7x; find_off 14x; sum2d parity.
 POSSIBLE REGRESSION: scaled (f64) 0.65->0.72 (~10%, stable across runs;
 new dual-loop runtime dispatch + remat'd trip bound). Follow up with
 native agent — either gate the split or drop the remat.
+
+## Native follow-up: scaled regression FIXED + zip() vectorization
+wt/native-opt (ff to 9991f2b + fixes). Root cause: NOT loopvec — x64
+punroll unrolls the now-sub-MAX_BODY vector body, adding per-group
+guard dispatch + a 4x immediate-offset clone (wide_p3 disasm). Fixes:
+- punroll: bail on vector-typed loops (params/args/results is_vector)
+  — cloning SIMD loops just pays a fresh guard per K*vf*UNROLL elems.
+- loopvec: trip bound `nmv = isub(base, base & (K-1))` — numerically
+  identical to `band base, -K` but NOT egraph-remat-eligible; latch
+  is now `add;cmp;b.lo` (LLVM-parity control, no remat'd `and`).
+- clifpeep deflag (PLIRON_DEFLAG, on): rewrite dead-flag
+  sadd/ssub/smul/uadd/usub/umul_overflow -> plain wrapping op. rustc
+  keeps CheckedBinaryOp in iterator chains (e.g. .iter().zip().map()
+  .sum()) with the Assert MIR-opt'd away — dead flags defeated
+  loopvec matching. zip_sum now vectorizes identically to the
+  indexing form.
+Native box numbers (quieter; pliron vs stock): scaled 0.60-0.61 vs
+0.59-0.62 PARITY (regression gone); rev_copy32 0.25 vs 0.24-0.28;
+sum_sq 0.221 vs 0.222; zip_sum 0.327 vs 0.323 (was scalar+punrolled);
+dot_u8 0.148 vs 0.295. ./test.sh green.
+Residual: rev_copy32 latch still ~3 insts of regalloc mov ping-pong
+vs LLVM's sub+cbnz count-down; guaranteed store-pairing across
+producer gaps needs source order (done) or a scheduler — assessed
+only; general-reg AMode::PostIndex not pursued (marginal).

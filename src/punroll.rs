@@ -276,6 +276,27 @@ fn run_loop(
     if body.len() != chain.len() {
         bail!("extra body blocks");
     }
+    // Loops already doing vector work (loopvec output, SIMD intrinsics) are
+    // vf*UNROLL-wide in the element domain; cloning the body again pays a
+    // fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
+    // mizes addressing (post-index forms get cloned into reg+imm offsets).
+    for &b in &chain {
+        let vec_param = func
+            .dfg
+            .block_params(b)
+            .iter()
+            .any(|&v| func.dfg.value_type(v).is_vector());
+        let vec_inst = func.layout.block_insts(b).any(|i| {
+            func.dfg
+                .inst_args(i)
+                .iter()
+                .chain(func.dfg.inst_results(i))
+                .any(|&v| func.dfg.value_type(v).is_vector())
+        });
+        if vec_param || vec_inst {
+            bail!("vector-typed loop");
+        }
+    }
     let n_insts: usize = chain
         .iter()
         .map(|&b| func.layout.block_insts(b).count() - 1)
