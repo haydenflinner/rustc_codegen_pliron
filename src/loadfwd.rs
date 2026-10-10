@@ -11,12 +11,22 @@ use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
-    Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value,
+    Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_ENTRIES: usize = 64;
 const MAX_ITERS: usize = 32;
+
+/// A forwarded load's replacement: an available value, or a select of the
+/// two arms' forwarded values for `load (select c, pa, pb)` — niche
+/// dispatch materialises field addresses this way (RangeInclusive's
+/// `select exhausted, &start, &end`). Splitting is only emitted when both
+/// arm locations forward, so no speculative load is introduced.
+enum Fwd {
+    V(Value),
+    Sel { c: Value, t: Value, e: Value },
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Root {
@@ -166,11 +176,43 @@ pub(crate) fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet
 }
 
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
+/// `load (select c, pa, pb)` with both arms forwarding: the result is
+/// `select c, aval(pa), aval(pb)`. Keeps the select to scalar types the
+/// targets legalize (aarch64 can't pick an i128 or a vector lane-wise).
+fn sel_split(func: &Function, av: &Avail, arg: Value, off: i64, ty: Type) -> Option<Fwd> {
+    if !(ty.is_int() && ty.bits() <= 64 || matches!(ty, cranelift_codegen::ir::types::F32 | cranelift_codegen::ir::types::F64)) {
+        return None;
+    }
+    let (r, _) = root(func, arg);
+    let Root::V(rv) = r else {
+        return None;
+    };
+    let ValueDef::Result(si, _) = func.dfg.value_def(rv) else {
+        return None;
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = func.dfg.insts[si]
+    else {
+        return None;
+    };
+    let (ra, oa) = root(func, args[1]);
+    let (rb, ob) = root(func, args[2]);
+    let t = *av.get(&(ra, oa.wrapping_add(off), ty))?;
+    let e = *av.get(&(rb, ob.wrapping_add(off), ty))?;
+    Some(Fwd::Sel {
+        c: func.dfg.resolve_aliases(args[0]),
+        t,
+        e,
+    })
+}
+
 fn transfer(
     func: &Function,
     b: Block,
     av: &mut Avail,
-    rw: Option<&mut Vec<(Inst, Value)>>,
+    rw: Option<&mut Vec<(Inst, Fwd)>>,
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     eh: bool,
@@ -188,11 +230,16 @@ fn transfer(
                 let res = func.dfg.first_result(i);
                 let ty = func.dfg.value_type(res);
                 let (r, o) = root(func, arg);
-                let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
+                let off = o.wrapping_add(i64::from(i32::from(offset)));
+                let loc = (r, off, ty);
                 if let Some(&v) = av.get(&loc) {
                     if let Some(rw) = rw.as_deref_mut() {
-                        rw.push((i, v));
+                        rw.push((i, Fwd::V(v)));
                     }
+                } else if let Some(s) =
+                    rw.is_some().then(|| sel_split(func, av, arg, off, ty)).flatten()
+                {
+                    rw.as_deref_mut().unwrap().push((i, s));
                 } else if av.len() < MAX_ENTRIES {
                     av.insert(loc, res);
                 }
@@ -208,6 +255,21 @@ fn transfer(
                 let (r, o) = root(func, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
                 kill(av, r, o, ty, iso);
+                // A store through `select c, pa, pb` may write either
+                // arm's location — kill both so kept locs don't forward
+                // stale values (the select's own root is opaque `V`).
+                if let Root::V(rv) = r
+                    && let ValueDef::Result(si, _) = func.dfg.value_def(rv)
+                    && let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: sargs,
+                    } = func.dfg.insts[si]
+                {
+                    for &a in &sargs[1..] {
+                        let (ra, oa) = root(func, a);
+                        kill(av, ra, oa.wrapping_add(o), ty, iso);
+                    }
+                }
                 if av.len() < MAX_ENTRIES {
                     av.insert((r, o, ty), val);
                 }
@@ -319,19 +381,33 @@ pub fn run(
     if !stable {
         return 0;
     }
-    let mut fwd = Vec::new();
+    let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
             transfer(func, b, &mut av, Some(&mut fwd), &iso, nw, eh);
         }
     }
-    for &(i, v) in &fwd {
+    let fwd_cnt = fwd.len();
+    for (i, f) in fwd {
         let r = func.dfg.first_result(i);
+        let v = match f {
+            Fwd::V(v) => v,
+            Fwd::Sel { c, t, e } => {
+                let ty = func.dfg.value_type(r);
+                let sel = func.dfg.make_inst(InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: [c, t, e],
+                });
+                func.dfg.make_inst_results(sel, ty);
+                func.layout.insert_inst(sel, i);
+                func.dfg.first_result(sel)
+            }
+        };
         func.layout.remove_inst(i);
         func.dfg.clear_results(i);
         func.dfg.change_to_alias(r, v);
     }
-    n + fwd.len()
+    n + fwd_cnt
 }
 
 /// A location's state inside a block: a known value, or whatever it held on

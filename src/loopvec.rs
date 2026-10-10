@@ -112,9 +112,9 @@ struct Reduc {
     cond: Option<Cond>,
     /// The `acc = acc ⊕ delta` inst (bounds the load's legal uses).
     upd: Inst,
-    /// Extra inst allowed to read `acc` (the min/max icmp, or the
-    /// conditional update's `acc ⊕ d`).
-    aux: Option<Inst>,
+    /// Extra insts allowed to read `acc` (the min/max icmp, or the
+    /// conditional update's `acc ⊕ d` plus any nested selects).
+    aux: Vec<Inst>,
     /// `op` can't reorder lanes (float `fadd`/`fmul` — no `reassoc`):
     /// loads and the delta are still vectorized, but lanes fold into a
     /// scalar `acc` in iteration order via `extractlane`.
@@ -123,12 +123,20 @@ struct Reduc {
 
 /// A conditional-update predicate, planned to evaluate per lane: `insts` are
 /// the in-body insts of the mask/data tree to re-emit at element lanes.
+/// The delta applies where every `cs` term holds (nested `select` levels
+/// AND — `lo <= i && i <= hi` range checks).
 struct Cond {
+    cs: Vec<CondTerm>,
+    insts: FxHashSet<Inst>,
+}
+
+/// One term of a `Cond`: the lane mask is `band`ed across terms.
+struct CondTerm {
     c: Value,
+    /// `c` sat on the select's false arm — `bnot` its lane value.
     invert: bool,
     /// `c` is a plain flag, not a mask — wrap its lane value in `icmp ne 0`.
     needs_ne: bool,
-    insts: FxHashSet<Inst>,
 }
 
 enum Widen {
@@ -229,6 +237,9 @@ struct Plan {
     /// Shared lane-reversal immediate for descending streams (one pool
     /// entry, not one per emitted shuffle).
     rev_imm: Option<Immediate>,
+    /// No memory streams: the iv itself is the lane stream. Each group's
+    /// `vmap` seeds `iv` with `splat(base) + iota*step`.
+    iv_stream: bool,
 }
 
 /// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
@@ -490,6 +501,136 @@ fn is_const(func: &Function, v: Value) -> bool {
     }
 }
 
+/// Decompose the inst feeding a latch-carried acc arg into
+/// `(op, delta, aux, conds)`:
+/// - `acc ⊕ d` for a whitelisted associative binary (or `fadd`/`fmul`),
+///   unconditional (`conds` empty);
+/// - `select(icmp acc cc d, ...)` — the ifconv-flattened min/max, whose
+///   compare joins `aux` (insts allowed to read `acc`);
+/// - `select(c, acc ⊕ d, acc)` — a conditional update, masked lane-wise.
+///   The update arm may itself be a conditional select of the same acc:
+///   `select(c1, select(c2, acc+d, acc), acc)` counts only lanes passing
+///   BOTH tests (the `lo <= i && i <= hi` range-check `ifconv` produces
+///   from `RangeInclusive::contains`), so `conds` accumulates one
+///   `(cond, invert)` term per level, ANDed.
+fn upd_decomp(
+    func: &Function,
+    p: Value,
+    i: Inst,
+    depth: usize,
+) -> Option<(Opcode, Value, Vec<Inst>, Vec<(Value, bool)>)> {
+    // Bound the select nesting — each level speculates another mask.
+    if depth > 4 {
+        return None;
+    }
+    let reduc_ok = |op: Opcode| {
+        matches!(
+            op,
+            Opcode::Iadd
+                | Opcode::Imul
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Bxor
+                | Opcode::Smin
+                | Opcode::Smax
+                | Opcode::Umin
+                | Opcode::Umax
+        )
+    };
+    match func.dfg.insts[i] {
+        InstructionData::Binary { opcode, args }
+            if reduc_ok(opcode) || matches!(opcode, Opcode::Fadd | Opcode::Fmul) =>
+        {
+            let (x, y) = (
+                func.dfg.resolve_aliases(args[0]),
+                func.dfg.resolve_aliases(args[1]),
+            );
+            let d = if x == p { y } else if y == p { x } else {
+                return None;
+            };
+            Some((opcode, d, vec![], vec![]))
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => {
+            let c = func.dfg.resolve_aliases(args[0]);
+            let (x, y) = (
+                func.dfg.resolve_aliases(args[1]),
+                func.dfg.resolve_aliases(args[2]),
+            );
+            if let ValueDef::Result(ci, _) = func.dfg.value_def(c)
+                && let InstructionData::IntCompare { cond, args: cargs, .. } =
+                    func.dfg.insts[ci]
+            {
+                let (a, b) = (
+                    func.dfg.resolve_aliases(cargs[0]),
+                    func.dfg.resolve_aliases(cargs[1]),
+                );
+                // Both the icmp and the select pair `acc` with the
+                // same single delta value.
+                let (da, dx) = (
+                    if a == p { b } else { a },
+                    if x == p { y } else { x },
+                );
+                if (a == p) != (b == p) && (x == p) != (y == p) && da == dx && da != p {
+                    let d = da;
+                    // `select(a cc b, x, y)`: picking the same operand
+                    // the comparison favors is min, the other is max.
+                    use cranelift_codegen::ir::condcodes::IntCC as CC;
+                    let x_is_a = x == a;
+                    let op = match (cond, x_is_a) {
+                        (CC::UnsignedLessThan | CC::UnsignedLessThanOrEqual, true)
+                        | (CC::UnsignedGreaterThanOrEqual | CC::UnsignedGreaterThan, false) => {
+                            Opcode::Umin
+                        }
+                        (CC::UnsignedGreaterThanOrEqual | CC::UnsignedGreaterThan, true)
+                        | (CC::UnsignedLessThan | CC::UnsignedLessThanOrEqual, false) => {
+                            Opcode::Umax
+                        }
+                        (CC::SignedLessThan | CC::SignedLessThanOrEqual, true)
+                        | (CC::SignedGreaterThanOrEqual | CC::SignedGreaterThan, false) => {
+                            Opcode::Smin
+                        }
+                        (CC::SignedGreaterThanOrEqual | CC::SignedGreaterThan, true)
+                        | (CC::SignedLessThan | CC::SignedLessThanOrEqual, false) => Opcode::Smax,
+                        _ => return None,
+                    };
+                    return Some((op, d, vec![ci], vec![]));
+                }
+            }
+            // `select(c, acc ⊕ d, acc)`: `acc ⊕ (d & mask(c))` per
+            // lane. Only zero-identity ops compose this way. `c` may
+            // not read `acc` (checked in `cond_tree`). The update arm
+            // may nest another conditional select — the delta then
+            // needs every level's mask (see `upd_decomp`'s doc).
+            let (inner, invert) = if y == p && x != p {
+                (x, false)
+            } else if x == p && y != p {
+                (y, true)
+            } else {
+                return None;
+            };
+            let ValueDef::Result(ii, _) = func.dfg.value_def(inner) else {
+                return None;
+            };
+            let (op, d, mut aux, mut conds) = upd_decomp(func, p, ii, depth + 1)?;
+            // Only zero-identity ops mask this way — a nested min/max
+            // or fadd select can't be a conditional update's inner.
+            if !matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor)
+                || d == p
+                || c == p
+            {
+                return None;
+            }
+            aux.push(ii);
+            conds.push((c, invert));
+            Some((op, d, aux, conds))
+        }
+        _ => None,
+    }
+}
+
 fn plan(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -508,20 +649,6 @@ fn plan(
     // latch must pass back the *same* update inst (a multi-latch loop with
     // different deltas can't be a single-block vector body), and `acc`'s
     // only in-body use must be that update.
-    let reduc_ok = |op: Opcode| {
-        matches!(
-            op,
-            Opcode::Iadd
-                | Opcode::Imul
-                | Opcode::Band
-                | Opcode::Bor
-                | Opcode::Bxor
-                | Opcode::Smin
-                | Opcode::Smax
-                | Opcode::Umin
-                | Opcode::Umax
-        )
-    };
     let mut reducs: Vec<Reduc> = Vec::new();
     let mut other_ok = true;
     for (j, &k) in kinds.iter().enumerate() {
@@ -535,110 +662,8 @@ fn plan(
         // — `filter`-style folds, masked lane-wise). `aux` is an extra inst
         // allowed to read `acc`; `cond` carries (predicate, invert) for the
         // conditional form.
-        let upd_of = |i: Inst| -> Option<(Opcode, Value, Option<Inst>, Option<(Value, bool)>)> {
-            match func.dfg.insts[i] {
-                InstructionData::Binary { opcode, args }
-                    if reduc_ok(opcode)
-                        || matches!(opcode, Opcode::Fadd | Opcode::Fmul) =>
-                {
-                    let (x, y) = (
-                        func.dfg.resolve_aliases(args[0]),
-                        func.dfg.resolve_aliases(args[1]),
-                    );
-                    let d = if x == p { y } else if y == p { x } else {
-                        return None;
-                    };
-                    Some((opcode, d, None, None))
-                }
-                InstructionData::Ternary {
-                    opcode: Opcode::Select,
-                    args,
-                } => {
-                    let c = func.dfg.resolve_aliases(args[0]);
-                    let (x, y) = (
-                        func.dfg.resolve_aliases(args[1]),
-                        func.dfg.resolve_aliases(args[2]),
-                    );
-                    if let ValueDef::Result(ci, _) = func.dfg.value_def(c)
-                        && let InstructionData::IntCompare { cond, args: cargs, .. } =
-                            func.dfg.insts[ci]
-                    {
-                        let (a, b) = (
-                            func.dfg.resolve_aliases(cargs[0]),
-                            func.dfg.resolve_aliases(cargs[1]),
-                        );
-                        // Both the icmp and the select pair `acc` with the
-                        // same single delta value.
-                        let (da, dx) = (
-                            if a == p { b } else { a },
-                            if x == p { y } else { x },
-                        );
-                        if (a == p) != (b == p) && (x == p) != (y == p) && da == dx && da != p {
-                            let d = da;
-                            // `select(a cc b, x, y)`: picking the same operand
-                            // the comparison favors is min, the other is max.
-                            use cranelift_codegen::ir::condcodes::IntCC as CC;
-                            let x_is_a = x == a;
-                            let op = match (cond, x_is_a) {
-                                (CC::UnsignedLessThan | CC::UnsignedLessThanOrEqual, true)
-                                | (
-                                    CC::UnsignedGreaterThanOrEqual | CC::UnsignedGreaterThan,
-                                    false,
-                                ) => Opcode::Umin,
-                                (CC::UnsignedGreaterThanOrEqual | CC::UnsignedGreaterThan, true)
-                                | (CC::UnsignedLessThan | CC::UnsignedLessThanOrEqual, false) => {
-                                    Opcode::Umax
-                                }
-                                (CC::SignedLessThan | CC::SignedLessThanOrEqual, true)
-                                | (CC::SignedGreaterThanOrEqual | CC::SignedGreaterThan, false) => {
-                                    Opcode::Smin
-                                }
-                                (CC::SignedGreaterThanOrEqual | CC::SignedGreaterThan, true)
-                                | (CC::SignedLessThan | CC::SignedLessThanOrEqual, false) => {
-                                    Opcode::Smax
-                                }
-                                _ => return None,
-                            };
-                            return Some((op, d, Some(ci), None));
-                        }
-                    }
-                    // `select(c, acc ⊕ d, acc)`: `acc ⊕ (d & mask(c))` per
-                    // lane. Only zero-identity ops compose this way. `c` may
-                    // not read `acc` (checked in `cond_tree`).
-                    let (inner, invert) = if y == p && x != p {
-                        (x, false)
-                    } else if x == p && y != p {
-                        (y, true)
-                    } else {
-                        return None;
-                    };
-                    let ValueDef::Result(ii, _) = func.dfg.value_def(inner) else {
-                        return None;
-                    };
-                    let InstructionData::Binary {
-                        opcode:
-                            op @ (Opcode::Iadd | Opcode::Bor | Opcode::Bxor),
-                        args: iargs,
-                    } = func.dfg.insts[ii]
-                    else {
-                        return None;
-                    };
-                    let (ia, ib) = (
-                        func.dfg.resolve_aliases(iargs[0]),
-                        func.dfg.resolve_aliases(iargs[1]),
-                    );
-                    let d = if ia == p { ib } else if ib == p { ia } else {
-                        return None;
-                    };
-                    if d == p || c == p {
-                        return None;
-                    }
-                    Some((op, d, Some(ii), Some((c, invert))))
-                }
-                _ => None,
-            }
-        };
-        let mut upd: Option<(Inst, Opcode, Value, Option<Inst>, Option<(Value, bool)>)> = None;
+        let upd_of = |i: Inst| upd_decomp(func, p, i, 0);
+        let mut upd: Option<(Inst, Opcode, Value, Vec<Inst>, Vec<(Value, bool)>)> = None;
         // (latch block, passes acc through unchanged). A `filter`-style
         // conditional update often keeps its diamond in the CFG: one latch
         // feeds back `acc ⊕ d`, a sibling latch feeds back `acc` itself —
@@ -659,15 +684,12 @@ fn plan(
             let Some((op, d, aux, cnd)) = upd_of(i) else {
                 return false;
             };
-            match upd {
-                None => {
-                    upd = Some((i, op, d, aux, cnd));
+            if let Some((pi, po, pd, paux, pc)) = &upd {
+                if !(*pi == i && *po == op && *pd == d && *paux == aux && *pc == cnd) {
+                    return false;
                 }
-                Some((pi, po, pd, paux, pc)) => {
-                    if !(pi == i && po == op && pd == d && paux == aux && pc == cnd) {
-                        return false;
-                    }
-                }
+            } else {
+                upd = Some((i, op, d, aux, cnd));
             }
             arms.push((src, false));
             true
@@ -688,7 +710,7 @@ fn plan(
         if arms.iter().any(|&(_, pass)| pass) {
             // The add/pass split must be decided by one brif whose arms
             // dominate the respective latches.
-            if cnd.is_some() {
+            if !cnd.is_empty() {
                 other_ok = false;
                 continue;
             }
@@ -724,7 +746,7 @@ fn plan(
                 other_ok = false;
                 continue;
             };
-            cnd = Some(gc);
+            cnd = vec![gc];
         }
         // `acc` may not be read anywhere else in the loop (e.g. an exit
         // test on the accumulator would need the lane-wise partial sums);
@@ -738,7 +760,7 @@ fn plan(
         }
         let allowed: FxHashSet<Inst> = [ui]
             .into_iter()
-            .chain(aux)
+            .chain(aux.iter().copied())
             .chain(pass_insts.iter().copied())
             .collect();
         // A pure inst whose results are all dead can read `acc` harmlessly
@@ -786,7 +808,7 @@ fn plan(
             continue;
         }
         let ordered = matches!(op, Opcode::Fadd | Opcode::Fmul);
-        if ordered && cnd.is_some() {
+        if ordered && !cnd.is_empty() {
             // A conditional ordered update can't be masked lane-wise —
             // `select` per lane would still serialize correctly but the
             // plumbing isn't worth it.
@@ -799,10 +821,15 @@ fn plan(
             delta,
             aty: func.dfg.value_type(p),
             widen: None,
-            cond: cnd.map(|(c, invert)| Cond {
-                c,
-                invert,
-                needs_ne: false,
+            cond: (!cnd.is_empty()).then(|| Cond {
+                cs: cnd
+                    .into_iter()
+                    .map(|(c, invert)| CondTerm {
+                        c,
+                        invert,
+                        needs_ne: false,
+                    })
+                    .collect(),
                 insts: FxHashSet::default(),
             }),
             upd: ui,
@@ -837,14 +864,22 @@ fn plan(
     // `count`'s `store` arg is a body inst used for post-tested detection —
     // pass a real memory op, not the latch terminator (which never dominates
     // its own edge).
-    let Some(body_mem) = info
+    let body_mem = match info
         .body
         .iter()
         .flat_map(|&b| func.layout.block_insts(b))
         .find(|&i| func.dfg.insts[i].opcode().can_load() || func.dfg.insts[i].opcode().can_store())
-        else {
-            why!(fname; "no body mem op {:?}", info.h);
-        };
+    {
+        Some(i) => i,
+        // IV-driven loops (`(lo..=hi).contains(&i)` counts) have no
+        // memory op — the lane stream is the iv itself. Any in-body
+        // inst serves the post-test dominance probe; the update inst
+        // is guaranteed inside the body.
+        None => match reducs.first() {
+            Some(r) => r.upd,
+            None => why!(fname; "no body mem op {:?}", info.h),
+        },
+    };
     // A count exit is usable when every other exit is provably dead, folds
     // to a runtime pred, or is a lane-wise early-exit test. Prefer the
     // first attempt needing no early exits — a bounds-check exit that
@@ -985,7 +1020,13 @@ fn plan(
             mems.push(i);
         }
     }
-    let Some(elem) = elem else {
+    let iv_ty = func.dfg.value_type(cnt.iv);
+    let Some(elem) = elem.or_else(|| {
+        // IV-as-stream: `count(lo <= i && i <= hi)`-style loops need no
+        // loads — lane k of the stream is `iv + k*step`. Lane type = iv
+        // type; only loops with a lane-typed iv and a reduction qualify.
+        (!reducs.is_empty() && vf_of(iv_ty).is_some()).then_some(iv_ty)
+    }) else {
         why!(fname; "no mem ops");
     };
     let ebytes = i64::from(elem.bytes());
@@ -1110,6 +1151,13 @@ fn plan(
     for &(l, _) in &loads {
         can_vec.insert(func.dfg.resolve_aliases(func.dfg.first_result(l)));
     }
+    // IV-as-stream loops: lane k of the iv is `iv + k*step`, emitted per
+    // group as a base splat plus an iota `vconst` (`apply` pre-seeds each
+    // group's `vmap` with it).
+    let iv_stream = mems.is_empty();
+    if iv_stream {
+        can_vec.insert(cnt.iv);
+    }
     loop {
         let mut grew = false;
         for &i in &other {
@@ -1229,8 +1277,10 @@ fn plan(
                     opcode: Opcode::Select,
                     args,
                 } => {
-                    masks.contains(&func.dfg.resolve_aliases(args[0]))
-                        && args[1..].iter().all(|&a| ib(a))
+                    // A bool (0/1) condition works too: `bitselect` on a
+                    // {0,1} lane cond picks `x`'s low bit or `y` — mod-2
+                    // identical to the scalar select over bool arms.
+                    ib(args[0]) && args[1..].iter().all(|&a| ib(a))
                 }
                 InstructionData::Unary {
                     opcode: Opcode::Ireduce | Opcode::Uextend | Opcode::Sextend,
@@ -1254,7 +1304,7 @@ fn plan(
     // applied at a wider lane type without changing the result.
     let mut extra_vec: FxHashSet<Inst> = FxHashSet::default();
     for r in &mut reducs {
-        let mut extra_ok: FxHashSet<Inst> = r.aux.into_iter().collect();
+        let mut extra_ok: FxHashSet<Inst> = r.aux.iter().copied().collect();
         if let Some(cd) = &mut r.cond {
             let p = func.dfg.block_params(info.h)[r.idx];
             if !cond_mask(
@@ -1262,6 +1312,7 @@ fn plan(
                 &info,
                 &kinds,
                 &can_vec,
+                &bools,
                 &mut splat_cache,
                 elem,
                 p,
@@ -1335,9 +1386,11 @@ fn plan(
             };
             let c = func.dfg.resolve_aliases(arg);
             let gated = reducs.iter().any(|r| {
-                r.cond
-                    .as_ref()
-                    .is_some_and(|cd| func.dfg.resolve_aliases(cd.c) == c)
+                r.cond.as_ref().is_some_and(|cd| {
+                    cd.cs
+                        .iter()
+                        .any(|t| func.dfg.resolve_aliases(t.c) == c)
+                })
             });
             if !gated {
                 why!(fname; "interior brif {}", func.dfg.display_inst(i));
@@ -1422,6 +1475,7 @@ fn plan(
         extra_vec,
         early,
         rev_imm,
+        iv_stream,
     })
 }
 
@@ -1719,14 +1773,30 @@ fn emit_mask(
     addrs: &[(Value, i64)],
     cd: &Cond,
 ) -> Value {
-    let mut m = emit_val(pos, p, vmap, splats, smemo, addrs, cd.c, 0);
-    if cd.needs_ne {
+    let mut terms = cd.cs.iter();
+    let Some(t0) = terms.next() else {
+        unreachable!("Cond without terms");
+    };
+    let mut m = emit_val(pos, p, vmap, splats, smemo, addrs, t0.c, 0);
+    if t0.needs_ne {
         let z = pos.ins().iconst(p.elem, 0);
         let z = pos.ins().splat(p.vt, z);
         m = pos.ins().icmp(IntCC::NotEqual, m, z);
     }
-    if cd.invert {
+    if t0.invert {
         m = pos.ins().bnot(m);
+    }
+    for t in terms {
+        let mut m2 = emit_val(pos, p, vmap, splats, smemo, addrs, t.c, 0);
+        if t.needs_ne {
+            let z = pos.ins().iconst(p.elem, 0);
+            let z = pos.ins().splat(p.vt, z);
+            m2 = pos.ins().icmp(IntCC::NotEqual, m2, z);
+        }
+        if t.invert {
+            m2 = pos.ins().bnot(m2);
+        }
+        m = pos.ins().band(m, m2);
     }
     m
 }
@@ -1887,7 +1957,7 @@ fn widen_delta(
                 return false;
             }
             let mut ok = vec![r.upd];
-            ok.extend(r.aux);
+            ok.extend(r.aux.iter().copied());
             ok.extend(chain.iter().copied());
             ok.extend(ext_insts.iter().copied());
             ok.extend(extra_ok.iter().copied());
@@ -1967,7 +2037,7 @@ fn widen_delta(
                 }
             };
             let mut ok = vec![r.upd];
-            ok.extend(r.aux);
+            ok.extend(r.aux.iter().copied());
             ok.extend(chain.iter().copied());
             ok.extend(ext_insts.iter().copied());
             ok.extend(extra_ok.iter().copied());
@@ -2372,19 +2442,75 @@ fn cond_mask(
     info: &Info,
     kinds: &[Param],
     can_vec: &FxHashSet<Value>,
+    bools: &FxHashSet<Value>,
     splat_cache: &mut FxHashMap<Value, bool>,
     elem: Type,
     acc: Value,
     cd: &mut Cond,
 ) -> bool {
-    if mask_node(func, info, kinds, can_vec, splat_cache, elem, acc, cd.c, &mut cd.insts, 0) {
+    cd.cs.iter_mut().all(|t| {
+        cond_term(
+            func, info, kinds, can_vec, bools, splat_cache, elem, acc, t, &mut cd.insts,
+        )
+    })
+}
+
+/// One `Cond` term (see `cond_mask`): same validation, applied to `t.c`
+/// with needs-`ne` recorded on the term.
+fn cond_term(
+    func: &Function,
+    info: &Info,
+    kinds: &[Param],
+    can_vec: &FxHashSet<Value>,
+    bools: &FxHashSet<Value>,
+    splat_cache: &mut FxHashMap<Value, bool>,
+    elem: Type,
+    acc: Value,
+    t: &mut CondTerm,
+    insts: &mut FxHashSet<Inst>,
+) -> bool {
+    // A lane bool (mod-2 0/1 tree over masks — e.g. the ifconv-flattened
+    // `select(band(cmp,1), cmp, 0)` range-check) emits through `emit_val`
+    // as 0/1 lanes; the `icmp ne` wrap makes it a proper mask. Record the
+    // tree's insts so the use-check treats them as emitted, and reject a
+    // tree reading `acc` (lanes hold partial sums, not the scalar acc).
+    let cv = func.dfg.resolve_aliases(t.c);
+    if bools.contains(&cv) && ubits(func, cv).is_some_and(|w| w <= elem.bits()) {
+        let mut todo = vec![cv];
+        let mut ok = true;
+        while let Some(v) = todo.pop() {
+            let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+                continue;
+            };
+            if !info
+                .body
+                .contains(&func.layout.inst_block(i).unwrap_or(info.h))
+            {
+                continue;
+            }
+            insts.insert(i);
+            for &a in func.dfg.inst_args(i) {
+                let a = func.dfg.resolve_aliases(a);
+                if a == acc {
+                    ok = false;
+                } else if bools.contains(&a) {
+                    todo.push(a);
+                }
+            }
+        }
+        if ok {
+            t.needs_ne = true;
+            return true;
+        }
+    }
+    if mask_node(func, info, kinds, can_vec, splat_cache, elem, acc, t.c, insts, 0) {
         return true;
     }
-    if !ubits(func, cd.c).is_some_and(|w| w <= elem.bits()) {
+    if !ubits(func, t.c).is_some_and(|w| w <= elem.bits()) {
         return false;
     }
-    cd.needs_ne = true;
-    cond_data(func, info, kinds, can_vec, splat_cache, elem, acc, cd.c, &mut cd.insts, 0)
+    t.needs_ne = true;
+    cond_data(func, info, kinds, can_vec, splat_cache, elem, acc, t.c, insts, 0)
 }
 
 /// The identity element for a reduction op at lane type `elem`.
@@ -2594,8 +2720,12 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // `rem = end_v - iv` instead of `iv` and test `rem != 0` on the guard.
     // The latch then lowers to `sub` + `cbnz`/`b.ne` like LLVM, one
     // instruction cheaper than `add` + `cmp` + `b.lo`; the epilogue resume
-    // index is just `end_v` since rem hits 0 exactly on exit.
-    let countdown = p.step > 0 && p.early.is_empty() && p.streams.iter().all(|s| !s.direct);
+    // index is just `end_v` since rem hits 0 exactly on exit. iv-stream
+    // loops read `ivv` for the lane base, so they keep the count-up form.
+    let countdown = p.step > 0
+        && !p.iv_stream
+        && p.early.is_empty()
+        && p.streams.iter().all(|s| !s.direct);
     let mut pos = FuncCursor::new(func).at_bottom(cb);
     // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
@@ -2618,6 +2748,23 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let sk = pos.ins().iconst(iv_ty, p.step);
     let off = pos.ins().imul(nmv, sk);
     let end = pos.ins().iadd(p.iv0, off);
+    // iv-stream lane offsets `{0..vf} * step` as an elem-typed vconst;
+    // each group adds it to the splatted group base.
+    let iota = p.iv_stream.then(|| {
+        let eb = p.elem.bytes() as usize;
+        let lane_mask = if eb == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (eb * 8)) - 1
+        };
+        let mut bytes = Vec::with_capacity(p.vt.bytes() as usize);
+        for k in 0..p.vf {
+            let lane = ((k * p.step) as u64) & lane_mask;
+            bytes.extend_from_slice(&lane.to_le_bytes()[..eb]);
+        }
+        let c = pos.func.dfg.constants.insert(bytes.into());
+        pos.ins().vconst(p.vt, c)
+    });
     // Predicates; all must hold to take the fast path.
     let mut ok: Option<Value> = None;
     for pr in &p.preds {
@@ -2986,6 +3133,18 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     for g in 0..UNROLL {
         let (addrs, mut vmap) = core::mem::take(&mut groups[g]);
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
+        // iv-stream lanes: the group's first scalar iv is `ivv +
+        // g*vf*step`; lane k adds `k*step` via the iota vconst.
+        if let Some(iota) = iota {
+            let wg = if g == 0 {
+                ivv
+            } else {
+                let c = pos.ins().iconst(iv_ty, g as i64 * p.vf * p.step);
+                pos.ins().iadd(ivv, c)
+            };
+            let sp = pos.ins().splat(p.vt, wg);
+            vmap.insert(p.iv, pos.ins().iadd(sp, iota));
+        }
         // Loads eagerly in program order: a `store; load` pair on one
         // stream reads back the stored vector, so ordering is observable.
         for &(i, j) in &p.mems {

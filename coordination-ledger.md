@@ -801,3 +801,45 @@ Track as x64 agent follow-up.
   decode), tokenize ~2-2.6x, contains 2.2x (needs u32 2-compare range
   reduction — Widen::Cnt extension), spilled-hi stack-slot forwarding,
   matmul-64 (gather/interchange), wasm real-crate runtime ~1.32x.
+
+## WIP: IV-only range-count vectorization + ifconv2 chain/profitability rework (wt/native-opt)
+- `(lo..=hi).contains(&i)` count loops now vectorize: 0.588 -> 0.278 ms
+  aarch64 (stock LLVM 0.257 — parity), ~2.1x vs shared baseline.
+- cparm (clifpeep): narrow const-param fold ahead of ifconv2 — drops a
+  block param only when every non-self edge feeds the same iconst,
+  chasing through uniform interior params (RangeInclusive's
+  latch-carried flag reaches the header via block20 <- block18 <-
+  block1). Replaces the early full-`sameargs` call that regressed
+  chars_alpha_ascii ~70% (1.466 -> 0.880): V-param merges/dup-param
+  merges stay out of the early round. The materialized const also
+  rewrites chased interior params so `select flag` arms fold;
+  const_sweep then kills the br_table dispatch.
+- ifconv: resolve_arm walks pure forwarder chains (<=8 hops) for brif
+  and br_table conversions; per-hop param substs remap via `thru`.
+  Chained arms gate on `flat_loop` (convert only when the enclosing
+  loop ends branch-free — the vectorizer-bound shape); wide
+  single-hop arms keep `bool_merge`, so the predictable UTF-8 width
+  dispatch stays branchy.
+- loopvec: `upd_decomp` recurses nested conditional selects —
+  `select(c1, select(c2, acc+d, acc), acc)` = `acc + d & (c1 && c2)` —
+  into `Cond.cs` terms; emit_mask bands them; `aux` covers the nested
+  selects + `acc ⊕ d` insts. IV-only loops (no body mem op) use the
+  reduction update inst as the post-test probe.
+- lower: cparm call + `remove_dead_insts` after it — dead iconsts in
+  folded arm chains would otherwise eat the SPEC_WIDE budget.
+- Tombstone guards: emit_arm's derived-map lookup skips reserved alias
+  dests (`value_alias_dest_for_serialization`), same ICE class as the
+  earlier sameargs_round crash (deadrecs was already guarded).
+- hi-spill: resolved — lo/hi materialize as `movi.4s` splat constants
+  in the vector loop; only stack traffic is the frame prologue.
+- Generated (contains_rng): dup.4s iv splat + add.4s lane IVs,
+  cmhs.4s x2 (lo/hi u32 compares), and.16b mask-AND + &1 normalize,
+  uaddw.2d/uaddw2.2d onto i64x2 accs, punroll'd 4x (16 elem/iter).
+- Measured aarch64 vs c31afff: chars_count 0.037 (=), alpha 1.11-1.17
+  (was 1.447), alpha_ascii 0.83-0.88 (was 0.873 — regression fixed),
+  mixed_utf8 1.61-1.70 (was 2.194), tokenize 2.38-2.52 (was 2.595),
+  contains 0.263-0.278 (was 0.588).
+- Validated: cargo build; PLIRON_VERIFY=1 ./test.sh green; contains
+  edge cases (x=0, lo=hi, u32::MAX bound) == scalar ref; filt_edge
+  mixed-width boundary lens 0..129; filt_probe/filt2/panic_bcheck/
+  charcheck outputs identical to stock. x64 not measured (aarch64 host).

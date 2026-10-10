@@ -17,6 +17,7 @@
 //! extra vreg regalloc had to coalesce).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
@@ -1327,6 +1328,276 @@ pub fn sameargs(func: &mut Function) -> usize {
     n
 }
 
+/// Narrow const-param fold ahead of the second ifconv round: drop a
+/// block param only when every non-self predecessor edge feeds it the
+/// same `iconst` (`RangeInclusive`'s latch-carried exhausted flag).
+/// Constant `br_table`/`brif` dispatch then folds via `const_sweep`,
+/// exposing the count-if merge `ifconv` flattens. Deliberately skips
+/// `sameargs`'s uniform-value and duplicate-param merges — running
+/// those this early rewrites `chars_alpha_ascii`'s decoder dispatch
+/// (~70% regression) before the branches it depends on have settled.
+/// Uniform interior params (`block20`'s fed `block18`'s fed the loop
+/// header's) are resolved transitively for the constness check and
+/// rewritten to the constant, but keep their edge args — no arity
+/// changes outside the folded headers.
+pub fn cparm(func: &mut Function) -> usize {
+    let mut n = 0;
+    for _ in 0..8 {
+        let k = cparm_round(func);
+        n += k;
+        if k == 0 {
+            break;
+        }
+        if crate::pass_enabled("PLIRON_CSWEEP") {
+            n += const_sweep(func);
+        }
+    }
+    n
+}
+
+/// One `cparm` round (see `cparm`).
+fn cparm_round(func: &mut Function) -> usize {
+    // Every edge target -> [(inst, dest index)] (see `sameargs_round`).
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                edges
+                    .entry(bc.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push((i, d));
+            }
+        }
+    }
+    // Resolved edge args per block (skip malformed arity).
+    let mut eargs: FxHashMap<Block, Vec<Vec<Value>>> = FxHashMap::default();
+    for (&b, es) in &edges {
+        let np = func.dfg.block_params(b).len();
+        let mut rows = Vec::with_capacity(es.len());
+        let mut ok = true;
+        for &(i, d) in es {
+            let bc = &func.dfg.insts[i].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            )[d];
+            let args: Vec<Value> = bc
+                .args(&func.dfg.value_lists)
+                .map(|a| match a {
+                    BlockArg::Value(v) => func.dfg.resolve_aliases(v),
+                    _ => {
+                        ok = false;
+                        Value::reserved_value()
+                    }
+                })
+                .collect();
+            if args.len() != np {
+                ok = false;
+            }
+            if !ok {
+                break;
+            }
+            rows.push(args);
+        }
+        if ok {
+            eargs.insert(b, rows);
+        }
+    }
+    // param -> the single value every incoming edge feeds it, modulo
+    // self-passthrough edges (the `sameargs` invariant). The flag param
+    // reaches the header through a chain of these (`block20`'s fed
+    // `block18`'s fed the header's), so constness chases through them.
+    let mut uni: FxHashMap<Value, Value> = FxHashMap::default();
+    for (&b, rows) in &eargs {
+        let ps = func.dfg.block_params(b);
+        for (ix, &p) in ps.iter().enumerate() {
+            let mut u = None;
+            let mut ok = false;
+            for r in rows {
+                let a = r[ix];
+                if a == p {
+                    continue;
+                }
+                match u {
+                    None => {
+                        u = Some(a);
+                        ok = true;
+                    }
+                    Some(x) if x == a => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                uni.insert(p, u.unwrap());
+            }
+        }
+    }
+    let iconst_of = |func: &Function, v: Value| -> Option<(Type, i64)> {
+        match func.dfg.value_def(v) {
+            ValueDef::Result(i, _)
+                if let InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm,
+                } = func.dfg.insts[i] =>
+            {
+                Some((func.dfg.value_type(v), imm.bits()))
+            }
+            _ => None,
+        }
+    };
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
+    let mut param_drops: Vec<Value> = vec![];
+    for (&b, rows) in &eargs {
+        let ps = func.dfg.block_params(b).to_vec();
+        let mut news: Vec<(Type, i64, Value)> = vec![];
+        let mut repl: Vec<(usize, Value)> = vec![];
+        for (ix, &p) in ps.iter().enumerate() {
+            let mut k: Option<(Type, i64)> = None;
+            let mut mids: Vec<Value> = vec![];
+            let mut differs = false;
+            for r in rows {
+                let mut v = r[ix];
+                // Params chased through on the way to the leaf get the
+                // folded constant too — their uses (e.g. `select flag`
+                // in an interior arm block) must rewrite.
+                let mut path: Vec<Value> = vec![];
+                let mut seen: FxHashSet<Value> = FxHashSet::default();
+                while v != p
+                    && let Some(&u) = uni.get(&v)
+                    && seen.insert(v)
+                {
+                    path.push(v);
+                    v = u;
+                }
+                if v == p {
+                    // Self-passthrough edge — preserves the carried
+                    // constant.
+                    continue;
+                }
+                match iconst_of(func, v) {
+                    Some(tk) => {
+                        mids.extend(path);
+                        match k {
+                            None => k = Some(tk),
+                            Some(x) if x == tk => {}
+                            _ => {
+                                differs = true;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        differs = true;
+                        break;
+                    }
+                }
+            }
+            if differs {
+                continue;
+            }
+            if let Some((ty, imm)) = k {
+                let v = match news.iter().find(|&&(t, kk, _)| t == ty && kk == imm) {
+                    Some(&(_, _, v)) => v,
+                    None => {
+                        let v = FuncCursor::new(&mut *func)
+                            .at_first_insertion_point(b)
+                            .ins()
+                            .iconst(ty, imm);
+                        news.push((ty, imm, v));
+                        v
+                    }
+                };
+                repl.push((ix, v));
+                for m in mids {
+                    pmap.insert(m, v);
+                }
+            }
+        }
+        if repl.is_empty() {
+            continue;
+        }
+        let mut ixs: Vec<usize> = repl.iter().map(|(ix, _)| *ix).collect();
+        ixs.sort_unstable_by(|x, y| y.cmp(x));
+        for &(i, d) in &edges[&b] {
+            arg_drops.push((i, d, ixs.clone()));
+        }
+        for (ix, v) in repl {
+            pmap.insert(ps[ix], v);
+            param_drops.push(ps[ix]);
+        }
+    }
+    if param_drops.is_empty() {
+        return 0;
+    }
+    apply_param_drops(func, pmap, arg_drops, param_drops)
+}
+
+/// Shared commit for `sameargs_round`/`cparm_round`: flatten aliases,
+/// chase replacements to survivors, rewrite all uses, strip the dropped
+/// arg slots off every edge, drop the params.
+fn apply_param_drops(
+    func: &mut Function,
+    mut pmap: FxHashMap<Value, Value>,
+    arg_drops: Vec<(Inst, usize, Vec<usize>)>,
+    param_drops: Vec<Value>,
+) -> usize {
+    // Flatten alias chains into inst data first: a `change_to_alias`'d
+    // value (coldargs' `sadd_overflow` rebinds, deflag results) can point
+    // at a param we're about to detach — uses through it wouldn't be
+    // rewritten and the alias would dangle.
+    func.dfg.resolve_all_aliases();
+    // Replacements may themselves be dropped params: chase to a survivor.
+    let keys: Vec<Value> = pmap.keys().copied().collect();
+    for p in keys {
+        let mut w = pmap[&p];
+        let mut seen: FxHashSet<Value> = FxHashSet::default();
+        while let Some(&u) = pmap.get(&w) {
+            if !seen.insert(w) {
+                break;
+            }
+            w = u;
+        }
+        pmap.insert(p, w);
+    }
+    // One global use rewrite (inst args and every BlockCall's args).
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let dfg = &mut func.dfg;
+            let mut data = dfg.insts[i];
+            data.map_values(
+                &mut dfg.value_lists,
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+                |x| pmap.get(&x).copied().unwrap_or(x),
+            );
+            dfg.insts[i] = data;
+        }
+    }
+    // Strip the dropped arg slots from every pred edge (descending so
+    // earlier indices stay valid), then drop the params themselves.
+    for (i, d, ixs) in arg_drops {
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[i].branch_destination_mut(
+            &mut dfg.jump_tables,
+            &mut dfg.exception_tables,
+        )[d];
+        for &ix in &ixs {
+            bc.remove(ix, &mut dfg.value_lists);
+        }
+    }
+    for p in &param_drops {
+        func.dfg.remove_block_param(*p);
+    }
+    param_drops.len()
+}
+
 /// Fold pure insts whose inputs evaluate to constants — the const-param
 /// materialization in `sameargs_round` leaves `uextend`/`band`/`select`
 /// chains on literal tags (`Chars`'s `Option<char>` flag), and `eval`
@@ -1464,6 +1735,15 @@ fn sameargs_round(func: &mut Function) -> usize {
             let mut differs = false;
             for a in &edge_args {
                 let k = a[ix];
+                // A self-edge passes the param back unchanged — it
+                // preserves whatever value the other edges supplied, so
+                // it can't break uniformity. (`RangeInclusive`'s niche
+                // flag is such a latch-carried constant.)
+                if let AKey::V(v) = k
+                    && v == ps[ix]
+                {
+                    continue;
+                }
                 if same.is_none() {
                     same = Some(k);
                 } else if same != Some(k) {
@@ -1472,8 +1752,8 @@ fn sameargs_round(func: &mut Function) -> usize {
                 }
             }
             let mut found = false;
-            if !differs {
-                match same.unwrap() {
+            if !differs && let Some(same_k) = same {
+                match same_k {
                     AKey::V(v) => {
                         // `v` dominates `b` unless it's defined in `b`
                         // itself (a self-edge passing an in-block
@@ -1486,6 +1766,9 @@ fn sameargs_round(func: &mut Function) -> usize {
                             _ => true,
                         };
                         if !in_b {
+                            if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+                                eprintln!("sa V {b} param[{ix}] -> {v}");
+                            }
                             repl.push((ix, v));
                             found = true;
                         }
@@ -1504,6 +1787,9 @@ fn sameargs_round(func: &mut Function) -> usize {
                                 v
                             }
                         };
+                        if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+                            eprintln!("sa K {b} param[{ix}] -> {ty} {imm}");
+                        }
                         repl.push((ix, v));
                         found = true;
                     }
@@ -1542,54 +1828,10 @@ fn sameargs_round(func: &mut Function) -> usize {
     if param_drops.is_empty() {
         return 0;
     }
-    // Flatten alias chains into inst data first: a `change_to_alias`'d
-    // value (coldargs' `sadd_overflow` rebinds, deflag results) can point
-    // at a param we're about to detach — uses through it wouldn't be
-    // rewritten and the alias would dangle.
-    func.dfg.resolve_all_aliases();
-    // Replacements may themselves be dropped params: chase to a survivor.
-    let keys: Vec<Value> = pmap.keys().copied().collect();
-    for p in keys {
-        let mut w = pmap[&p];
-        let mut seen: FxHashSet<Value> = FxHashSet::default();
-        while let Some(&u) = pmap.get(&w) {
-            if !seen.insert(w) {
-                break;
-            }
-            w = u;
-        }
-        pmap.insert(p, w);
+    if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+        eprintln!("sameargs drops {} params", param_drops.len());
     }
-    // One global use rewrite (inst args and every BlockCall's args).
-    for b in func.layout.blocks().collect::<Vec<_>>() {
-        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
-            let dfg = &mut func.dfg;
-            let mut data = dfg.insts[i];
-            data.map_values(
-                &mut dfg.value_lists,
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-                |x| pmap.get(&x).copied().unwrap_or(x),
-            );
-            dfg.insts[i] = data;
-        }
-    }
-    // Strip the dropped arg slots from every pred edge (descending so
-    // earlier indices stay valid), then drop the params themselves.
-    for (i, d, ixs) in arg_drops {
-        let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[i].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[d];
-        for &ix in &ixs {
-            bc.remove(ix, &mut dfg.value_lists);
-        }
-    }
-    for p in &param_drops {
-        func.dfg.remove_block_param(*p);
-    }
-    param_drops.len()
+    apply_param_drops(func, pmap, arg_drops, param_drops)
 }
 
 /// `select c, a, b` whose every use sits in the region where `c`'s truth

@@ -1062,3 +1062,31 @@ correctness n=0..300 x 7 filter fns (alpha/digit/alnum/gt/eq/sum_if/
 filter-map-count/fold) all match; exhaustive 0..=255 byte domain;
 bc_check/bc_sem/rmw_check/dse_check match stock incl. panic paths;
 drev/drev2/condred/early2 pass; cpubench main suite no regressions.
+
+## Range-count (contains) pipeline notes
+
+`(lo..=hi).contains(&i)` count loops arrive as a flag-dispatched
+RangeInclusive iterator: a latch-carried i8/i32 flag param picks the
+lo/hi comparison via nested `br_table`s, then a brif gates the
+conditional `acc+1`. The flat count-if shape needs four steps in
+order: (1) `cparm` folds the flag — the param is self-carried on the
+latch and fed `iconst` at entry, but the arg reaches the header only
+through uniform interior params (`block20` param <- `block18` param <-
+header param), so the constness check chases `uni` links and rewrites
+the chased params to the folded const; (2) `const_sweep` folds the
+flag-driven `br_table`s; (3) `remove_dead_insts` clears the dead
+iconsts left in the folded arm chains (they count against
+`resolve_arm`'s SPEC_WIDE budget otherwise); (4) `ifconv` walks the
+pure forwarder chain `block18->33->37->21->20` to the header merge —
+multi-hop arms are gated by `flat_loop`, not `bool_merge`, because the
+merged value is the accumulator select, not a bool tree.
+
+`loopvec` then sees `latch acc = select(c1, select(c2, acc+1, acc), acc)`
+— `upd_decomp` recurses it to `acc + 1 & (c1 && c2)`, `Cond.cs` holds a
+term per level, `emit_mask` bands the lane masks, `Widen::Cnt`
+normalizes with `band 1` and widens via uaddw onto i64x2 accs. IV-only
+loops have no body mem op — the reduction update inst substitutes as
+the `count` post-test probe.
+
+aarch64 emits `dup.4s`+`add.4s` lane IVs, `cmhs.4s` x2 for the two u32
+range comparisons, `and.16b` mask AND + `and`(1), `uaddw.2d`/`uaddw2.2d`.

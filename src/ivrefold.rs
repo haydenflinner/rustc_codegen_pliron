@@ -18,6 +18,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
@@ -428,10 +429,18 @@ pub fn deadrecs(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let edges = edges_to(func);
-    // Values that are alias targets: removing them would strand the alias.
+    // Values that are alias targets: removing them would strand the
+    // alias. `Alias{INVALID, reserved}` tombstones read as aliases but
+    // panic `resolve_aliases` — skip them by their immediate dest.
     let alias_targets: FxHashSet<Value> = (0..func.dfg.num_values())
         .map(Value::new)
-        .filter(|&v| func.dfg.value_is_alias(v))
+        .filter(|&v| {
+            func.dfg.value_is_alias(v)
+                && func
+                    .dfg
+                    .value_alias_dest_for_serialization(v)
+                    .is_some_and(|o| o != Value::reserved_value())
+        })
         .map(|v| func.dfg.resolve_aliases(v))
         .collect();
     let mut n = 0;

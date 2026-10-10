@@ -561,6 +561,22 @@ pub fn lower_to_object(
             && crate::pass_enabled("PLIRON_IFCONV2")
             && crate::bisect("ifconv2")
         {
+            // Carried-constant params (`RangeInclusive`'s exhausted flag
+            // — a self-edge param fed a literal at entry) fold here so
+            // the dispatch arms they drive die before flattening
+            // (`PLIRON_CPARM`).
+            if crate::pass_enabled("PLIRON_CPARM") {
+                let k = crate::clifpeep::cparm(&mut clctx.func);
+                if k > 0 {
+                    // Const folds leave dead `iconst`s inside the arm
+                    // chains; `resolve_arm`'s speculation cap counts
+                    // them and the diamond then looks too wide.
+                    crate::jumpthread::remove_dead_insts(&mut clctx.func, true);
+                }
+                if dump {
+                    eprintln!("==== clif {n} after cparm ({k}) ====\n{}", clctx.func.display());
+                }
+            }
             // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
             // leaf-up: repeat to fixpoint (bounded by diamond depth).
             let mut k = 0;

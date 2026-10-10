@@ -14,92 +14,214 @@
 //! `PLIRON_IFCONV=0` disables it.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
     ValueDef, types,
 };
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 /// One branch arm resolved against a candidate merge point.
 struct Arm {
-    /// Merge target the arm's jump reaches (`side`'s jump dest), or the
-    /// side block itself for a direct edge.
+    /// Merge target the arm's final jump reaches (`side`'s jump dest), or
+    /// the target itself for a direct edge.
     m: Block,
     /// Values to feed `M`'s params, using pre-clone side-local results.
     args: Vec<Value>,
-    /// The arm's block, `None` for a direct edge to `M`.
+    /// The block that edges into `M` — the last forwarder hop; `None` for
+    /// a direct `b -> M` edge.
     side: Option<Block>,
-    /// Pure insts in `side` (program order) to speculate into `b`.
+    /// Every forwarder hop traversed, in order (empty for a direct arm).
+    chain: Vec<Block>,
+    /// Pure insts across the whole chain (program order) to speculate
+    /// into `b`.
     clone: Vec<Inst>,
-    /// `side` param -> `b`'s edge arg.
+    /// Chain param -> incoming edge arg (per hop, in order).
     psub: Vec<(Value, Value)>,
+    /// `chain` went beyond one hop — gated by `flat_loop`: folding a
+    /// chain inside a loop is only profitable when the loop ends up
+    /// branch-free (vectorizer-bound); inside a still-branchy loop it
+    /// turns predictable branches into always-paid selects.
+    chained: bool,
 }
 
-/// `tgt` reached over `edge`: a pure-compute forwarder `jump M`, or `tgt`
-/// itself when `edge` is the (already-final) argument list into it.
-fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
-    let insts: Vec<Inst> = func.layout.block_insts(tgt).collect();
-    if let Some((&jmp, body)) = insts.split_last()
-        && let InstructionData::Jump { destination, .. } = func.dfg.insts[jmp]
+/// Speculation caps for a pure arm body. The narrow cap is the
+/// historical bound; the wide cap exists for nested range-check
+/// predicate diamonds (`is_ascii_alphanumeric` &co clone ~3 compares
+/// per level) and is only profitable when the diamond merges a
+/// *bool* — see `bool_merge` below.
+const SPEC_NARROW: usize = 4;
+const SPEC_WIDE: usize = 8;
+
+/// `iconst` value bits, if `v` is one.
+fn iconst_bits(func: &Function, v: Value) -> Option<i64> {
+    let v = func.dfg.resolve_aliases(v);
+    if let ValueDef::Result(i, _) = func.dfg.value_def(v)
+        && let InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = func.dfg.insts[i]
     {
-        let m = destination.block(&func.dfg.value_lists);
-        let params = func.dfg.block_params(tgt);
-        // The inst cap bounds speculation; nested range-check predicates
-        // (`is_ascii_alphanumeric` &co) clone a few compares per level.
-        if body.len() <= 8 && edge.len() == params.len() {
-            // All body insts must be speculatable; operands may be side
-            // params, earlier side results, or values dominating `tgt`
-            // (which then dominate `b`'s terminator — see file docs).
-            let mut psub = Vec::with_capacity(params.len());
-            let mut ok = edge.iter().all(|a| matches!(a, BlockArg::Value(_)));
-            for (j, &p) in params.iter().enumerate() {
-                if !ok {
-                    break;
-                }
-                if let BlockArg::Value(v) = edge[j] {
-                    psub.push((p, func.dfg.resolve_aliases(v)));
-                }
-            }
-            for &i in body {
-                ok &= crate::jumpthread::pure_op(func, i);
-            }
-            if ok {
-                let mut args = Vec::new();
-                for a in destination.args(&func.dfg.value_lists) {
-                    let BlockArg::Value(v) = a else {
-                        return None;
-                    };
-                    args.push(func.dfg.resolve_aliases(v));
-                }
-                return Some(Arm {
-                    m,
-                    args,
-                    side: Some(tgt),
-                    clone: body.to_vec(),
-                    psub,
-                });
-            }
-        }
-    }
-    // Direct edge into the merge block.
-    if edge.iter().all(|a| matches!(a, BlockArg::Value(_))) {
-        return Some(Arm {
-            m: tgt,
-            args: edge
-                .iter()
-                .map(|a| match a {
-                    BlockArg::Value(v) => func.dfg.resolve_aliases(*v),
-                    _ => unreachable!(),
-                })
-                .collect(),
-            side: None,
-            clone: Vec::new(),
-            psub: Vec::new(),
-        });
+        return Some(imm.bits());
     }
     None
+}
+
+/// A value carrying a 0/1 (mod-2) result: integer/float compares, bool
+/// constants, and bitwise/select/extend trees over them — the
+/// `filter(pred)` predicate shape loopvec vectorizes. `nonconst` is set
+/// when a real compare (not just constants) sits in the tree: the UTF-8
+/// `Option<char>` dispatch also merges a 0/1 discriminant alongside its
+/// pointer/char args, and speculating its decode arm to feed selects
+/// loses to the (predictable) width branch.
+fn bool_tree(func: &Function, v: Value, depth: usize, nonconst: &mut bool) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if depth == 0 {
+        return false;
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => {
+            *nonconst = true;
+            true
+        }
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => matches!(imm.bits(), 0 | 1),
+        InstructionData::Binary {
+            opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            args.iter().all(|&a| bool_tree(func, a, depth - 1, nonconst))
+                // `band x, 1` is a bool for any `x`.
+                || func.dfg.insts[i].opcode() == Opcode::Band
+                    && args.iter().any(|&a| iconst_bits(func, a) == Some(1))
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => args[1..]
+            .iter()
+            .all(|&a| bool_tree(func, a, depth - 1, nonconst)),
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce | Opcode::Uextend | Opcode::Sextend,
+            arg,
+        } => bool_tree(func, arg, depth - 1, nonconst),
+        _ => false,
+    }
+}
+
+/// Does the diamond's merge carry a *differing* bool param — at least
+/// one arm's arg a real compare/bool tree? Then speculating a wide arm
+/// plausibly feeds a count/conditional reduction the vectorizer wants
+/// flat; otherwise (data merges like the UTF-8 dispatch) a >`SPEC_NARROW`
+/// arm would convert a predictable branch into always-paid work.
+fn bool_merge(func: &Function, arms: &[&Arm]) -> bool {
+    let Some(first) = arms.first() else {
+        return false;
+    };
+    for j in 0..first.args.len() {
+        let mut nc = false;
+        let mut ok = true;
+        let mut diff = false;
+        for a in arms {
+            if !bool_tree(func, a.args[j], 8, &mut nc) {
+                ok = false;
+                break;
+            }
+            diff |= a.args[j] != first.args[j];
+        }
+        if ok && diff && nc {
+            return true;
+        }
+    }
+    false
+}
+
+/// `tgt` reached over `edge`: a chain of pure-compute forwarders ending
+/// in `jump M` (a single-pred flag-fold leaves several hop blocks per
+/// arm), or `tgt` itself when `edge` is the (already-final) argument
+/// list into it. Each hop's pure body joins `clone` and its params join
+/// `psub`; intermediate results remap through `emit_arm`'s value map.
+fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
+    let mut cur = tgt;
+    let mut cur_edge: Vec<BlockArg> = edge.to_vec();
+    let mut chain = Vec::new();
+    let mut clone = Vec::new();
+    let mut psub = Vec::new();
+    while chain.len() < 8 {
+        let insts: Vec<Inst> = func.layout.block_insts(cur).collect();
+        let Some((&jmp, body)) = insts.split_last() else {
+            break;
+        };
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[jmp] else {
+            break;
+        };
+        let params = func.dfg.block_params(cur);
+        // The inst cap bounds total speculation across the chain; arms
+        // deeper than SPEC_NARROW additionally need `bool_merge` at the
+        // conversion site.
+        if cur_edge.len() != params.len()
+            || clone.len() + body.len() > SPEC_WIDE
+            || !cur_edge.iter().all(|a| matches!(a, BlockArg::Value(_)))
+            || !body.iter().all(|&i| crate::jumpthread::pure_op(func, i))
+        {
+            break;
+        }
+        for (j, &p) in params.iter().enumerate() {
+            let BlockArg::Value(v) = cur_edge[j] else {
+                unreachable!()
+            };
+            psub.push((p, func.dfg.resolve_aliases(v)));
+        }
+        clone.extend_from_slice(body);
+        chain.push(cur);
+        cur_edge = destination.args(&func.dfg.value_lists).collect();
+        cur = destination.block(&func.dfg.value_lists);
+    }
+    if chain.is_empty() {
+        // Direct edge into the merge block.
+        if edge.iter().all(|a| matches!(a, BlockArg::Value(_))) {
+            return Some(Arm {
+                m: tgt,
+                args: edge
+                    .iter()
+                    .map(|a| match a {
+                        BlockArg::Value(v) => func.dfg.resolve_aliases(*v),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                side: None,
+                chain,
+                clone,
+                psub,
+                chained: false,
+            });
+        }
+        return None;
+    }
+    let mut args = Vec::new();
+    for a in &cur_edge {
+        let BlockArg::Value(v) = a else {
+            return None;
+        };
+        args.push(func.dfg.resolve_aliases(*v));
+    }
+    Some(Arm {
+        m: cur,
+        args,
+        side: chain.last().copied(),
+        chained: chain.len() > 1,
+        chain,
+        clone,
+        psub,
+    })
 }
 
 /// `select` lowers on our targets only for ≤64-bit scalars (aarch64 can't
@@ -110,6 +232,18 @@ fn select_ok(func: &Function, a: Value, b: Value) -> bool {
     ta == tb
         && ta.lane_count() == 1
         && (ta.is_int() && ta.bits() <= 64 || matches!(ta, types::F32 | types::F64))
+}
+
+/// Chase `v` through the clone/psub map: a later hop's param can map to
+/// an earlier hop's result, which itself renames when cloned.
+fn thru(map: &FxHashMap<Value, Value>, mut v: Value) -> Value {
+    for _ in 0..16 {
+        match map.get(&v) {
+            Some(&w) if w != v => v = w,
+            _ => return v,
+        }
+    }
+    v
 }
 
 /// Clone `arm`'s insts into `b` before `term`, remapping side params and
@@ -132,7 +266,7 @@ fn emit_arm(
                 .iter()
                 .map(|&a| {
                     let a = pos.func.dfg.resolve_aliases(a);
-                    map.get(&a).copied().unwrap_or(a)
+                    thru(&map, a)
                 })
                 .collect();
             pos.func.dfg.overwrite_inst_values(ni, vals.into_iter());
@@ -144,7 +278,16 @@ fn emit_arm(
                 map.insert(o, nr);
                 // A clone of an `inbounds` offset is still inbounds on the
                 // renamed base — keep the fact so `NonNull` can see it.
-                if let Some(&b) = derived.get(&o) {
+                // `derived` may hold a stale alias tombstone (`Alias` whose
+                // dest is the reserved value) — `resolve_aliases` on it
+                // indexes the reserved slot, so leave it unpropagated.
+                if let Some(&b) = derived.get(&o)
+                    && pos
+                        .func
+                        .dfg
+                        .value_alias_dest_for_serialization(b)
+                        .is_none_or(|d| d != Value::reserved_value())
+                {
                     let b = map.get(&pos.func.dfg.resolve_aliases(b))
                         .copied()
                         .unwrap_or(b);
@@ -153,10 +296,7 @@ fn emit_arm(
             }
         }
     }
-    arm.args
-        .iter()
-        .map(|&v| map.get(&v).copied().unwrap_or(v))
-        .collect()
+    arm.args.iter().map(|&v| thru(&map, v)).collect()
 }
 
 /// The `b -> m` edge skips whatever the arms routed through. A use inside
@@ -192,6 +332,53 @@ fn term_block(func: &Function, term: Inst) -> Block {
     func.layout.inst_block(term).unwrap()
 }
 
+/// Blocks reachable from the entry over the current CFG (orphans left by
+/// earlier folds aren't).
+fn reachable(func: &Function, cfg: &ControlFlowGraph) -> FxHashSet<Block> {
+    let mut r = FxHashSet::default();
+    let mut st = vec![func.layout.entry_block().unwrap()];
+    while let Some(b) = st.pop() {
+        if r.insert(b) {
+            st.extend(cfg.succ_iter(b));
+        }
+    }
+    r
+}
+
+/// Would converting `b`'s diamond leave the enclosing loop branch-free?
+/// That's the shape loopvec can take — a flat count/conditional-update
+/// kernel. Inside a loop that keeps other interior branches (the UTF-8
+/// width decode) speculation only buys always-paid selects. Blocks with
+/// no reachable path (dead dispatch arms like `RangeInclusive`'s
+/// exhausted-flag branch) don't count.
+fn flat_loop(
+    func: &Function,
+    la: &LoopAnalysis,
+    reach: &FxHashSet<Block>,
+    b: Block,
+) -> bool {
+    let Some(lp) = la.innermost_loop(b) else {
+        return true;
+    };
+    func.layout.blocks().all(|x| {
+        if x == b || !reach.contains(&x) || !la.is_in_loop(x, lp) {
+            return true;
+        }
+        func.layout.block_insts(x).all(|i| {
+            let InstructionData::Brif { .. } = func.dfg.insts[i] else {
+                return true;
+            };
+            // An interior brif keeps both destinations in the loop.
+            !func
+                .dfg
+                .insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .all(|bc| la.is_in_loop(bc.block(&func.dfg.value_lists), lp))
+        })
+    })
+}
+
 /// `br_table` if-conversion: every target resolving (through pure
 /// forwarders) to one merge `M` with per-arm args collapses to cloned side
 /// computations plus `select(hit, arm_val, sel)` chains in `b`. The mask for
@@ -202,6 +389,8 @@ fn conv_table(
     func: &mut Function,
     cfg: &mut ControlFlowGraph,
     domtree: &mut DominatorTree,
+    la: &mut LoopAnalysis,
+    reach: &mut FxHashSet<Block>,
     mset_cache: &mut FxHashMap<Block, FxHashSet<Block>>,
     dirty: &mut bool,
     b: Block,
@@ -285,6 +474,15 @@ fn conv_table(
     if total_hits > 12 {
         return false;
     }
+    // Wide arms are only profitable for bool merges (see `bool_merge`);
+    // a data dispatch like the UTF-8 width table keeps its predictable
+    // branches. Chained arms are gated by `flat_loop` below instead.
+    if arms.iter().all(|a| !a.chained)
+        && arms.iter().any(|a| a.clone.len() > SPEC_NARROW)
+        && !bool_merge(func, &arms.iter().collect::<Vec<_>>())
+    {
+        return false;
+    }
     // Per-param select types: every differing override must be selectable
     // against the default arm's value.
     for j in 0..np {
@@ -305,6 +503,15 @@ fn conv_table(
         mset_cache.clear();
         *dirty = false;
     }
+    // Multi-hop arms only pay off when the fold leaves its loop
+    // branch-free (see `flat_loop`).
+    if arms.iter().any(|a| a.chained) {
+        la.compute(func, cfg, domtree);
+        *reach = reachable(func, cfg);
+        if !flat_loop(func, la, reach, b) {
+            return false;
+        }
+    }
     // The synthesized values live in `b`; every path into `m` must come
     // from this table.
     let sides: FxHashSet<Block> = arms.iter().filter_map(|a| a.side).collect();
@@ -324,21 +531,24 @@ fn conv_table(
     if !edge_ok(func, domtree, m, mset, term) {
         return false;
     }
-    // Arm args that aren't cloned side results or side params must dominate
-    // `b`'s terminator — a value legal inside a side block need not be if
-    // the side is reachable without `b`.
+    // Arm args that aren't cloned chain results or chain params must
+    // dominate `b`'s terminator — a value legal inside a hop block need
+    // not be if the hop is reachable without `b`.
     for a in &arms {
-        let Some(s) = a.side else { continue };
-        let local: FxHashSet<Value> = func
-            .dfg
-            .block_params(s)
+        if a.side.is_none() {
+            continue;
+        }
+        let local: FxHashSet<Value> = a
+            .chain
             .iter()
-            .copied()
-            .chain(
-                func.layout
-                    .block_insts(s)
-                    .flat_map(|i| func.dfg.inst_results(i).iter().copied()),
-            )
+            .flat_map(|&s| {
+                func.dfg.block_params(s).iter().copied().chain(
+                    func.layout
+                        .block_insts(s)
+                        .flat_map(|i| func.dfg.inst_results(i).iter().copied())
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect();
         for &v in &a.args {
             let v = func.dfg.resolve_aliases(v);
@@ -401,6 +611,8 @@ fn conv_table(
 pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize {
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    let mut reach: FxHashSet<Block> = FxHashSet::default();
     let mut mset_cache: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
     let mut dirty = false;
     let mut n = 0;
@@ -410,7 +622,18 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         };
         let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
             if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
-                && conv_table(func, &mut cfg, &mut domtree, &mut mset_cache, &mut dirty, b, term, derived)
+                && conv_table(
+                    func,
+                    &mut cfg,
+                    &mut domtree,
+                    &mut la,
+                    &mut reach,
+                    &mut mset_cache,
+                    &mut dirty,
+                    b,
+                    term,
+                    derived,
+                )
             {
                 n += 1;
             }
@@ -440,8 +663,9 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         if ta.m != ea.m || ta.m == b {
             continue;
         }
-        // A side can't be its own merge (self-loop forwarder).
-        if ta.m == t && ta.side == Some(t) || ta.m == e && ea.side == Some(e) {
+        // The merge can't sit inside an arm's forwarder chain (a self
+        // loop routed through hops).
+        if ta.chain.contains(&ta.m) || ea.chain.contains(&ea.m) {
             continue;
         }
         let m = ta.m;
@@ -462,11 +686,35 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         {
             continue;
         }
+        // A >`SPEC_NARROW` arm pays its speculation every iteration; only
+        // fold it when the merge carries a real predicate bool (the
+        // `filter(pred)` diamonds loopvec wants flat). The UTF-8 width
+        // dispatch merges const flags + pointers instead — its branches
+        // are predictable and must stay branches (x64: ~2x chars hit).
+        // A multi-hop arm is instead gated by `flat_loop`: folding is
+        // only profitable when the loop ends up branch-free (the
+        // count-if accumulator merges a select, not a bool tree).
+        if !ta.chained
+            && !ea.chained
+            && (ta.clone.len() > SPEC_NARROW || ea.clone.len() > SPEC_NARROW)
+            && !bool_merge(func, &[&ta, &ea])
+        {
+            continue;
+        }
         if dirty {
             cfg.compute(func);
             domtree.compute(func, &cfg);
             mset_cache.clear();
             dirty = false;
+        }
+        // Multi-hop arms only pay off when the fold leaves its loop
+        // branch-free (see `flat_loop`).
+        if ta.chained || ea.chained {
+            la.compute(func, &cfg, &domtree);
+            reach = reachable(func, &cfg);
+            if !flat_loop(func, &la, &reach, b) {
+                continue;
+            }
         }
         let mset = mset_cache.entry(m).or_insert_with(|| {
             func.layout
