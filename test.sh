@@ -41,6 +41,10 @@ rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec && $out/edge
 # home block — one const in the join block leaves non-dominating uses on
 # sibling arms (Vec::into_boxed_slice / try_call edges hit the verifier).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/cparm/main.rs -o $out/cparm && $out/cparm
+# celim's unpeeled retry must range the retry's own operands — a stale
+# peeled base turned `depth != 0` into `depth-1 != 0` and broke
+# BTreeMap's drop walk (build-script SIGSEGV compiling blake3).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim && $out/celim
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user

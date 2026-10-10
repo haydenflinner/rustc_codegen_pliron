@@ -83,7 +83,7 @@ fn known(func: &Function, v: Value) -> Option<u64> {
 /// An icmp operand: `base + off` (from `iadd`/`isub` with a constant), or
 /// a plain constant. The offset is canonicalized to the signed residue
 /// class of the operand's width (`x + 255` on `i8` is `x - 1`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
     V(Value, i64),
     K(u64),
@@ -1532,11 +1532,15 @@ pub fn run(func: &mut Function) -> usize {
                 };
                 let mut r = decide(func, &fs, q, raw);
                 if r.is_none()
-                    && let Some((qp, _)) = norm_icmp(func, i, false)
+                    && let Some((qp, qraw)) = norm_icmp(func, i, false)
                     && qp != q
                 {
                     // `v != 0`-style facts are stated on the unpeeled node.
-                    r = decide(func, &fs, qp, raw);
+                    // `qraw` must be this normalization's own operands:
+                    // pairing `qp`'s base values with the peeled `raw`
+                    // ranges the wrong value (`x-1 != 0` got decided from
+                    // `x != 0`, breaking BTreeMap's leaf-edge walk).
+                    r = decide(func, &fs, qp, qraw);
                 }
                 if let Some(k) = r {
                     folds.push((i, k));

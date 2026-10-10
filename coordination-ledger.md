@@ -975,3 +975,31 @@ miscompiled, not just one path.
 - Remaining: chars ~1.8x x64, tokenize ~2.3-2.6x, nth2_u64 a64
   1.8x (early-exit gate, pre-existing), hist ~parity, matmul-64
   x64 1.39x residual.
+
+## Self-host / cparm dominance fix (3b20008)
+
+- The reported "stage2 crashes compiling core" was a STALE stage2
+  binary: its embedded backend predated ~15 merges incl. five
+  miscompile fixes. After rsyncing current HEAD, `core` compiled
+  cleanly; the failure moved to `alloc`.
+- `alloc` ICE root-caused to `cparm_round` (clifpeep): it folded a
+  join param to ONE `iconst` in the join block and rewrote mid-chain
+  (self-passthrough) params in OTHER blocks to it. A param's uses
+  live under its own home block, which the join need not dominate →
+  non-dominating SSA. Symptom depended on which pass hit it first:
+  egraph `payload < (1 << 30)` (Vec::<u8>::into_boxed_slice),
+  verifier `uses value from non-dominating inst` (try_call edges),
+  and the 13 fuzz `ifconv2 broke` ICEs the x64 agent flagged.
+- Fix (3b20008): each carrier's replacement const is materialized at
+  its OWN home block's first insertion point (dominates all its uses
+  by SSA). Fuzz seeds 0:24 went 13-ICE -> 24/24 clean; new
+  tests/cparm/main.rs covers the shape.
+- rust-sh needs Hayden's rustc-side `fat_lto_supported` commit
+  (cf54c772450) — applied locally as 4211e9357e1 and added to
+  selfhost/setup.sh as rustc-session.patch for fresh worktrees.
+- STILL OPEN: (a) stage1 std `alloc`+ rebuild in progress post-fix;
+  (b) cparm also causes a matmul-64 2x scalar regression (0.16 vs
+  0.08 — flagged by x64 agent, unrelated to dominance; investigate);
+  (c) old-log Mach-O `__linkme*,regular,no_dead_strip` section-name
+  ICE was from the STALE backend (Oct 8) — re-verify on the new
+  build if it resurfaces.
