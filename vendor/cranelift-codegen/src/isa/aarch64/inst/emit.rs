@@ -3703,11 +3703,13 @@ impl MachInstEmit for Inst {
     }
 
     fn fuse_with_next(&self, next: &Self) -> Option<Self> {
-        // A load/store's unsigned-offset byte displacement, if it uses
-        // the simple `[rn + uimm]` form.
+        // A load/store's byte displacement, if it uses a simple
+        // `[rn + imm]` form — unsigned scaled or unscaled-signed, since
+        // pair offsets are signed anyway.
         fn uoff(mem: &AMode) -> Option<(Reg, i64)> {
             match *mem {
                 AMode::UnsignedOffset { rn, uimm12 } => Some((rn, i64::from(uimm12.value()))),
+                AMode::Unscaled { rn, simm9 } => Some((rn, i64::from(simm9.value()))),
                 _ => None,
             }
         }
