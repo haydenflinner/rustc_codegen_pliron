@@ -758,6 +758,23 @@ pub fn lower_to_object(
                 panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Fold compares decided by dominating branch conditions (bounds
+        // checks implied by earlier checks) before the cold-edge split:
+        // a folded check's dead panic edge then never gets an adapter.
+        if crate::pass_enabled("PLIRON_CELIM") && crate::bisect("celim") {
+            let k = crate::celim::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("celim {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after celim ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("celim broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Drop block params that receive the same value on every
         // incoming edge (and merge duplicate params): each surviving
         // param costs a regalloc parallel copy per conditional pred —
