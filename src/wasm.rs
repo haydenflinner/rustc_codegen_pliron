@@ -3858,31 +3858,52 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
             wseal_exits(b, &mut defb, &cfg, inloop, *h);
         }
     }
-    // Version loops on provably-passing bounds checks; the fast clones
-    // join the unroll worklist.
-    let mut extra: Vec<(WBlock, FxHashSet<WBlock>)> = Vec::new();
-    for (h, inloop) in &loops {
-        if std::env::var_os("PLIRON_WASM_BCHECK")
-            .map(|v| v == "0")
-            .unwrap_or(false)
-        {
-            continue;
+    // Version loops on provably-passing bounds checks, innermost-first:
+    // an outer loop's clone must capture the already-versioned inner
+    // structure (guard + both clones) or its fast copy keeps running the
+    // checked inner loop. Membership recorded before a round's clone is
+    // stale for enclosing loops, so defer them to the next recollection.
+    let bcheck_off = std::env::var_os("PLIRON_WASM_BCHECK")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+    if !bcheck_off {
+        let mut done: FxHashSet<WBlock> = FxHashSet::default();
+        for _ in 0..8 {
+            let mut work = wloops(b, &cfg);
+            work.sort_by_key(|(_, s)| s.len());
+            let mut this_round: Vec<WBlock> = Vec::new();
+            let mut any = false;
+            for (h, inloop) in &work {
+                if done.contains(h) {
+                    continue;
+                }
+                if this_round.iter().any(|&v| inloop.contains(&v)) {
+                    continue;
+                }
+                done.insert(*h);
+                if wbcheck(b, &mut defb, &cfg, inloop, *h, &work).is_some() {
+                    this_round.push(*h);
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+            cfg = waffle::cfg::CFGInfo::new(b);
         }
-        if let Some(cl) = wbcheck(b, &mut defb, &cfg, inloop, *h, &loops) {
-            extra.push(cl);
-        }
-    }
-    // wbcheck adds blocks; refresh CFG so clones have rpo/dominance info.
-    if !extra.is_empty() {
-        cfg = waffle::cfg::CFGInfo::new(b);
     }
     // Unroll innermost loops (bodies containing no other loop header).
+    // Recollect: wbcheck's fast clones introduce loop headers `loops`
+    // doesn't know — without this, a versioned outer loop looks
+    // innermost and unrolls *around* its still-checked inner loop
+    // instead of letting the clean inner loop unroll.
     let unr = std::env::var("PLIRON_WASM_UNROLL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
-    for (h, inloop) in loops.iter().chain(extra.iter()) {
-        let innermost = loops
+    let uloops = wloops(b, &cfg);
+    for (h, inloop) in &uloops {
+        let innermost = uloops
             .iter()
             .all(|(h2, _)| h2 == h || !inloop.contains(h2));
         if innermost {
