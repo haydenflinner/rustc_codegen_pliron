@@ -936,3 +936,42 @@ miscompiled, not just one path.
 - stage1-std + stage2 rebuild in progress against backend `06cdcc6`
   (current HEAD incl. mask01 + noalias-LICM merges). Bad stage2 driver
   snapshotted to /tmp/stage2-bad/ for bisect if needed.
+
+## Strided lane-gather vectorization — matmul-64 closed on both arches (wt/x64-codegen, a730090)
+- src/loopvec.rs: `Stream.stride` + `emit_vload` — strided loads
+  (whole-element byte multiple >= 2*ebytes, `MAX_GATHER=2048`)
+  emit per-lane `load.elem` + `splat`/`insertlane` (LLVM's
+  movd/pinsrd column idiom). Loads only; strided stores still
+  bail. `VPred::Pair` and strength-reduced steps scale by stride.
+- `upgrade_lagged` + `param_coeffs`: `Param::Other` whose latches
+  all pass one affine combination of `Step` params upgrades to a
+  deferred `Step` — unblocks rustc's lagged bounds-check/ptr
+  params (matmul k-loop header was all-"?").
+- `exit_bare`: arg-free counting-exit target cloned into the
+  vector epilogue; `rem==0` jumps to the clone so post-tested
+  loops take the full `iters & -K` count. loopidiom trips gained
+  the do-while `ult` arm (`SatSub`/`Div`, `ins_eval` now
+  pub(crate)).
+- Const-trip gate: strided streams with `iters < vf*UNROLL` bail
+  (dead vector clone otherwise).
+- MEASURED (best-of-10): matmul-64 0.161->0.123 x64-Rosetta
+  (stock 0.088; 1.83x->1.39x), 0.162->**0.074** aarch64 (stock
+  0.070 — PARITY). matmul-256 10.40->9.97 / 10.25->9.95 (~stock
+  parity both arches). colsum256/sdot/nth2/nth4 neutral-or-win.
+  All checksums match stock.
+- TRAP: `PLIRON_VEC=0` also disables ifconv2+cparm — matmul-64
+  "novec" 0.095 was a confounded baseline; real shipped scalar is
+  ~0.16 on both arches. Use `PLIRON_VEC_SKIP=` for per-fn A/B.
+- PRE-EXISTING BUG FLAGGED (native wt, cparm): fuzz seeds 0:24 →
+  13 `ifconv2 broke` ICEs (non-dominating value); identical at
+  919ba07 and 140eb02, `PLIRON_CPARM=0` clears. cparm also causes
+  the matmul-64 2x scalar regression noted above (0.16 vs 0.08).
+- Merged shared HEAD 06cdcc6/140eb02 first — fast-forward, no
+  conflicts (delta didn't touch loopvec/loopidiom). Cargo.toml/
+  lock stay dirty locally (all-arch) — not committed.
+- Validated: PLIRON_VERIFY=1 test.sh green, harness tier-0 green,
+  gather_mm/gather_check strided correctness (N=1..256, strides
+  1..128, u32/u64, do-while) ALL OK both arches + Rosetta.
+- Remaining: chars ~1.8x x64, tokenize ~2.3-2.6x, nth2_u64 a64
+  1.8x (early-exit gate, pre-existing), hist ~parity, matmul-64
+  x64 1.39x residual.
