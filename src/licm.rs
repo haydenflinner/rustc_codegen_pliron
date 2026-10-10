@@ -215,12 +215,18 @@ fn run_loop(
                 continue;
             }
             if entry.is_some() {
+                if debug {
+                    eprintln!("licm: skip {h:?} of {}: multi-entry", func.name);
+                }
                 return 0;
             }
             entry = Some((p.inst, slot));
         }
     }
     let Some((pinst, slot)) = entry else {
+        if debug {
+            eprintln!("licm: skip {h:?} of {}: no entry", func.name);
+        }
         return 0;
     };
     let body: FxHashSet<Block> = func
@@ -240,6 +246,9 @@ fn run_loop(
     if !dt.dominates(pb, h, &func.layout)
         || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
     {
+        if debug {
+            eprintln!("licm: skip {h:?} of {}: dom", func.name);
+        }
         return 0;
     }
     let inv = |func: &Function, v: Value| {
@@ -990,10 +999,15 @@ pub fn run(
                 .unwrap_or(0),
         )
     });
+    // `run_loop` already caps its own moves at MAX_MOVES; a shared budget
+    // starves every later loop once one loop's rematerialized constants
+    // consume it (e.g. `SplitWhitespace::next`: ~90 iconsts hoisted from an
+    // early loop left zero moves for the hot char loop's loads). Keep a
+    // looser function-level bound only as a compile-time guard.
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
         n += run_loop(func, &cfg, &dt, &la, lp, &iso, deref, nw, debug);
-        if n >= MAX_MOVES {
+        if n >= MAX_MOVES * MAX_LOOPS {
             break;
         }
     }

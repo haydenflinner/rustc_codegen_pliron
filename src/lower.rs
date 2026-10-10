@@ -855,6 +855,26 @@ pub fn lower_to_object(
                 panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Small `br_table`s become `icmp eq`+`brif` chains: the table
+        // dispatch is ~8 instructions plus an indirect-branch prediction
+        // per execution, which dominates iterator state machines (e.g.
+        // `SplitWhitespace::next`'s per-char discriminant dispatch).
+        // Runs last so nothing un-does the chains and adapters/edge
+        // forwarding have already collapsed the surrounding shape.
+        if crate::pass_enabled("PLIRON_BRCHAIN") && crate::bisect("brchain") {
+            let k = crate::brchain::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("brchain {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after brchain ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("brchain broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.

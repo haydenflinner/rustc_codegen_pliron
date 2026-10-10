@@ -992,9 +992,21 @@ impl<I: VCodeInst> VCode<I> {
                         .fuse_with_next(&self.insts[nix.index()], &state)
                     {
                         if gap.is_empty() {
-                            self.insts[iix.index()] = fused;
-                            self.insts[nix.index()] = I::gen_nop(0);
-                            squashed[nix.index()] = true;
+                            // The partner still can't read this inst's
+                            // defs: the fused pair samples every operand
+                            // before either def lands. Two distinct vregs
+                            // may share the partner's base preg with this
+                            // inst's dest (e.g. `ldr x0,[x0]` then
+                            // `ldr x1,[x0+8]` after regalloc reuses x0) —
+                            // `ldp x0,x1,[x0]` would read the pre-load
+                            // value for the second address.
+                            let (_, pd) = &preg_ops[iix.index()];
+                            let (pu2, _) = &preg_ops[nix.index()];
+                            if !pu2.iter().any(|r| pd.contains(r)) {
+                                self.insts[iix.index()] = fused;
+                                self.insts[nix.index()] = I::gen_nop(0);
+                                squashed[nix.index()] = true;
+                            }
                             break 'fuse;
                         }
                         // Two placements: the pair can emit early at

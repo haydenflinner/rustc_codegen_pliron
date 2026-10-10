@@ -24,6 +24,7 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod bcheck;
+mod brchain;
 mod builder;
 mod celim;
 mod clifpeep;

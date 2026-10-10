@@ -570,3 +570,28 @@ Track as x64 agent follow-up.
   stock shape. Bulk-memory ops (memory.copy/fill) already emitted.
 - Next: tokenize 5x (native/x64), gather 1.6x (x64), wasm code-density
   4.3x (wasm), rev_inplace/stride2 (native).
+
+## wt/native-opt — tokenize crash+perf, rev_inplace (committing)
+- FIX (correctness): vcode pair fusion could merge `ldr x0,[x0]` with a
+  dependent `ldr xN,[x0+8]` — two vregs sharing one preg across disjoint
+  live ranges makes the amode base test pass while the second load's
+  address semantically uses the FIRST load's result. Emitted
+  `ldp x0,x20,[x0]` → EXC_BAD_ACCESS in chars().filter().count(). The
+  adjacent-inst fast path skipped the partner-uses-vs-defs hazard check
+  the gap>0 paths apply; now applied there too. tests/pairfuse covers it.
+- NEW src/brchain.rs (PLIRON_BRCHAIN, last pre-define_function): br_table
+  with ≤4 live entries → icmp eq+brif chain (default-identical entries
+  skipped). split_whitespace count 20.6→13.2 ms (-36%). Cross-target —
+  same transform should lift most of x64's 5x split_whitespace gap.
+- licm: MAX_MOVES was a global per-fn budget — one loop's iconsts starved
+  all later loops (SplitWhitespace end-ptr reload per char). Now per-loop
+  cap only, global guard 96*32. Added skip reasons under LICM_DEBUG.
+- tokenize residual ~2.6x documented in native-notes: Option<char>
+  sentinel plumbing + branchy is_whitespace boolean + param movs —
+  ~28 insts/char vs ~11; chars/bytes filter same class (bytes filter:
+  stock NEON-vectorizes, we don't).
+- rev_inplace a.swap(i,n-1-i): 0.227 vs 0.224 = PARITY (old 0.212/0.173
+  was stale; memory-bound scalar both sides). slice::reverse 0.228 vs
+  0.091 is the real gap — mirror-swap vectorization (loopvec stream).
+- Verified: cargo build, PLIRON_VERIFY=1 ./test.sh green + pairfuse,
+  wide all ≥ stock, bc_sem/rmw_check/dse_check match stock outputs.

@@ -747,3 +747,88 @@ One subtlety that matters: `brif c, exit, body` (body on the FALSE edge)
 means the icmp computes the EXIT condition — rewriting it to the stay
 condition inverts the loop entirely (returned 0). The icmp must preserve
 the raw condition's truth value translated to j.
+
+## This round (pair-fusion dependent-load fix, brchain, licm cap)
+
+### vcode pair fusion: dependent loads must not pair — miscompile fix
+
+Found via `chars().filter().count()`/`split_whitespace().collect()`
+bus-faulting (`EXC_BAD_ACCESS` at an `ldrb`) in a benchmark closure.
+Post-alloc pair fusion saw `ldr x0, [x0]`; `ldr x20, [x0, #8]` — two
+different vregs sharing preg x0 across disjoint live ranges — and
+emitted `ldp x0, x20, [x0]`, which reads the PRE-load base for the
+second slot instead of the loaded pointer. The adjacent-insts fast path
+(`gap.is_empty()`) skipped the `pu2 ∩ pd` hazard check the gap>0 paths
+apply. Fix: apply the same check (partner's uses may not include this
+inst's defs) on the empty-gap path too. `tests/pairfuse` covers the
+pointer-chase + closure-env dependent-load shapes (crashed before the
+fix, passes after). Legit fusions unaffected: rev_copy32 still emits
+the `ldp q`/`stp q` stream pairs; wide suite unchanged.
+
+### brchain: small `br_table` → icmp/brif chains (new pass)
+
+`SplitWhitespace::next`'s per-char discriminant dispatch was a
+3-entry `br_table` → `adr; ldrsw; add; br xN` (~8 insts + an
+indirect-branch prediction per char). New `src/brchain.rs`
+(`PLIRON_BRCHAIN=0` off, runs last before `define_function`) converts
+tables with ≤4 live entries to ordered `icmp eq`+`brif` chains;
+indices ≥ n keep the default edge by falling through, and entries
+identical to the default are skipped. Exact for all index values;
+cross-target (CLIF-level — same transform helps x64's 5x gap).
+
+split_whitespace 4.4MB `count()`: 20.6 → 13.2 ms/iter (-36%);
+`collect` 22.6 → 15.3. Stock 5.0/9.1 — residual ~2.6x.
+
+### licm: MAX_MOVES was a shared per-function budget
+
+`run()` broke out of the loop list once `n >= MAX_MOVES` (96) across
+ALL loops — one loop's rematerialized iconsts starved every later
+loop. `run_loop` already caps per-loop at 96; the global cap is now a
+looser compile-time guard (96*MAX_LOOPS). Immediately hoisted the
+`SplitWhitespace::next` inner loop's invariant end-pointer load
+(was a per-char `ldr [x19, #0x28]` reload; ~1 inst of ~28 saved).
+Added `licm: skip <h>:` reasons under PLIRON_LICM_DEBUG.
+
+### tokenize residual (documented gap)
+
+`split_whitespace().count()` 13.2 vs 5.0 stock (~2.6x), same class as
+x64's 5x. The hot loop is ~28 insts/char vs stock ~11; the remaining
+fat is iterator state plumbing, not bounds checks or table dispatch:
+
+- Option<char> sentinel plumbing: a `decode-ok` flag + `-1` sentinel
+  compare + `select(0,1)` → `ireduce` → `icmp` — ~7 insts materializing
+  what stock folds into the decode path's branch.
+- `char::is_whitespace` as a `mov w10,#0/1` + cmp-chain producing a
+  boolean, then `and/tst/csel` → discriminant; stock uses
+  `cmp c,#0x20; b.ls → lsr mask>>c; tbnz` (one const bitmask, ~4 insts).
+- block-param `mov` shuffles per iteration.
+- `chars().filter().count()` (10.2 vs 3.0) and `bytes().filter().count()`
+  (5.6 vs 0.95 — stock NEON-vectorizes the byte predicate) share the
+  same shape: adapter-chain state plumbing + branchy predicate
+  materialization. This is the general class — a `select`+`icmp`
+  cross-block fold or predicate-controlled branch threading would be
+  the next lever; neither is cheap at CLIF level (the flag threads
+  through block params).
+- sibling-loop note: hoisting the end-ptr load out of the inner loop
+  lands it in the enclosing scan loop's body — sibling char loops
+  share blocks in layout, so invariants leak one level at a time.
+
+### rev_inplace
+
+`a.swap(i, n-1-i)` u32 1M: 0.227 vs 0.224 stock — parity (the earlier
+0.212/0.173 deficit doesn't reproduce; LLVM doesn't vectorize the
+manual swap either — both are memory-bound ~70GB/s scalar). bcheck
+versions it (wide guard) and punroll×4 emits clean checked-free
+swaps. ldp/stp pairing is unreachable: the unrolled body interleaves
+`ldr low; ldr high; str; str` and stores aren't fusion-crossable —
+pairing needs load-batched scheduling at the punroll/loopvec level
+(other stream's). `slice::reverse()` (std's chunked swap_nonoverlapping)
+0.228 vs 0.091 — stock vectorizes the generic mirror-swap; that is the
+real remaining gap (interleave-aware mirror vectorization).
+
+### Validated this round
+
+cargo build clean; PLIRON_VERIFY=1 ./test.sh green incl wasm + new
+pairfuse test; wide suite all ≥ stock (has_val/dot_u8 2x, cnt_vowel
+3.7x, find_off 14x); bc_sem/rmw_check/dse_check outputs match stock;
+rev_copy32/dot_u8 ldp-stp stream pairs intact after the vcode fix.

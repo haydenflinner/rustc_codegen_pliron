@@ -30,6 +30,9 @@ for t in $tests; do rustc $BE --edition 2024 tests/$t/main.rs -o $out/$t && $out
 rustc $BE --edition 2021 -O tests/unroll/main.rs -o $out/unroll && $out/unroll | diff - tests/unroll/expected.out
 # LICM must not speculate enum-payload derefs past the discriminant guard.
 rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm && $out/licm
+# Post-alloc pair fusion must not pair a load with a load that uses its
+# result as an address (pointer-chase + closure-env dependent loads).
+rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse && $out/pairfuse
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user
