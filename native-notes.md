@@ -209,6 +209,89 @@ still firing on the slow path) — pliron and stock byte-identical
 behavior. Perf numbers above are from a loaded box — label
 "not perf validated" for <1.5x deltas.
 
+## This round (DSE pass + volatile fences + constraint-elimination audit)
+
+### dse.rs — landed
+
+CLIF-level dead-store elimination, wired after `loadfwd` in `lower.rs`
+(`PLIRON_DSE`, `bisect("dse")`, verify + stats like the other CLIF
+passes). Backward may-read fixpoint per function:
+
+- `Demands` = two top flags + precise locations. `top_non_iso` covers
+  any reachable (non-isolated) memory for barrier insts (calls,
+  atomics, fences, other side effects); `top_non_stack` at `return`
+  covers every `Root::V` — including isolated noalias params, whose
+  pointee is caller memory — but not `Root::S` slots, which die with
+  the frame. Isolated roots only ever collect explicit per-loc
+  demands, so a barrier can never make an unread slot store live.
+- Candidates: `InstructionData::Store` with a `notrap` store opcode
+  (`Store`/`Istore8/16/32`) — atomics use other formats, volatile ops
+  carry empty flags → both structurally excluded. Killed only when no
+  live read demands any byte of its range; partial-overlap demands
+  (e.g. u32 inside a u64 range) keep the store.
+- A dead store passes demands through so store-store chains collapse.
+- Eliminated counts: 1–2 per test binary (`store_before_panic` and
+  stack-slot paths); most source-level dead stores are already handled
+  by SROA/`slot_dse` before CLIF.
+
+### volatile correctness fix (pre-existing latent bug)
+
+`llvm.store volatile` reached CLIF as a flag-less `store` — cranelift
+has no volatile bit in `MemFlags`. Its egraph alias analysis treats
+no-region stores as `last_fence` chains and dead-store-eliminates "the
+first of two adjacent stores" — so `write_volatile(p,1);
+write_volatile(p,2)` emitted only `str #2`. Fixed two ways:
+
+1. `intrinsic.rs`: `volatile_store` path now calls
+   `OperandValue::volatile_store` (threads `MemFlags::VOLATILE` → op
+   lands in `st.volatile` → `plain_mf` gives empty flags, not
+   `notrap`); `volatile_load` marks all emitted ops via
+   `mark_ops_volatile`.
+2. `lower.rs`: volatile loads/stores emit bracketed by `fence` insts.
+   A `Fence` is `has_memory_fence_semantics` → it shadows the access
+   behind an unkillable `last_fence` version, prevents load folding,
+   and orders the ops. aarch64: `dmb ish` per volatile access — rare
+   enough to be free.
+
+### constraint-elimination — investigated, skipped
+
+Dumped final-stage CLIF for the bounds-check-dense binaries
+(bc_sem/scatter/red/mix/drev2): ~1,800 `icmp`s total. `icmp` on an
+`iadd(x,k)` result (the `i+1 <= n` after `i < n` form): **0**. Duplicate
+normalized (cc, a, b) conditions: 2–6 per binary, and nearly all are the
+checked fallback loops `bcheck` versioning deliberately keeps
+per-iteration checks in — those must stay duplicated. Same-check folds
+in dominating branches are already done by
+`jumpthread::fold_dominated_conds` (identical/implied/equality/range
+facts). Residual opportunity is ≈0 — not implemented.
+
+vector-combine not pursued (requires both prior items done and
+worthwhile; constraint-elimination wasn't).
+
+### Bench sweep this round (loaded box; ratios only — small deltas not perf validated)
+
+- main.rs: axpy 0.334 vs 0.403 (1.2x), vadd 0.509 vs 0.604 (1.2x),
+  sum_u8 0.076 vs 0.226 (3x), matmul 10.74 vs 12.66 (1.18x — holds);
+  clamp/dot_i8 parity.
+- mixed.rs: memchr 0.084 vs 1.186 (14x), strsum 0.112 vs 0.248,
+  itersum 0.455 vs 0.737, chaindep 0.439 vs 0.609; fnv/copyrev parity.
+- rmw: add/idx/two 0.024 parity; rmw_dep 1.227 vs 2.225 (1.8x — holds).
+- scatter: gather 0.393 vs 0.616 (1.6x); hist bimodal — pl 0.53/2.06/2.05
+  vs st 1.67/2.06/2.05 across runs (identical binaries degrade together;
+  known loaded-box behavior — not perf validated).
+- wide.rs: has_val 0.333 vs 0.771, cnt_vowel 0.318 vs 1.188, dot_u8
+  0.149 vs 0.295; scaled 0.688 vs 0.679 parity; rev_copy32 0.333 vs
+  0.334 parity (holds); minmax/sum_sq/even_sum parity.
+
+### Validated this round
+
+cargo build clean, ./test.sh green end-to-end, dse_check.rs suite
+(same/cross-block overwrite, read-between, partial-width u32-in-u64
+overlap, call barriers, diamond one-path-read, escaped slot, volatile
+×2, atomic ×2, panic path) — pass under `PLIRON_VERIFY=1`, pass with
+`PLIRON_DSE=0`, bisect consumes `dse` in pipeline order
+(`bisect 8 dse skip`). Volatile fn emits both stores fenced.
+
 ## Remaining opportunities (ranked)
 
 1. hist residual (~1.19x post-merge): per-iteration regalloc edge

@@ -28,12 +28,12 @@ folds at lowering time (covers a slice of instcombine/dce for free).
 | `instsimplify` | Simplifies instructions without creating new ones | part (clifpeep + egraph) | low | S |
 | `sccp` | Sparse conditional constant propagation | part (`unroll.rs` const-props through loops; `jumpthread` folds) | low-med | M |
 | `correlated-propagation` | Uses value ranges and branch facts to simplify code | — | med-high (Rust is bounds-check dense) | L |
-| `constraint-elimination` | Removes compares proven by dominating conditions | — | med-high (same reason) | L |
+| `constraint-elimination` | Removes compares proven by dominating conditions | part (`jumpthread::fold_dominated_conds` folds dominating same/implied/range facts; offset-form `i+k<=n` measured ~0 candidates on the bc_* sweep — see native-notes) | low residual | L |
 | `jump-threading` | Threads branches whose outcome is known on some paths | done (`jumpthread.rs`) | landed | — |
 | `dfa-jump-threading` | Jump threading for state-machine-style switch loops | — | low | M |
 | `simplifycfg` | Merges, removes, and folds basic blocks and branches | part (`unreach`, `tailmerge`, `taildup`, `switchmap`, `fusechains`, `phisimp`) | med (block merging still open) | M |
 | `dce` / `adce` / `bdce` | Dead code elimination: basic, aggressive, and bit-tracking | part (egraph DCE + `unreach`; no ADCE/bdce) | low | S |
-| `dse` | Dead store elimination | — | med | M |
+| `dse` | Dead store elimination | done (`dse.rs`: backward may-read fixpoint over `loadfwd` roots; covers same-loc overwrite + unread non-escaping slots; atomics/fences/volatile barred) | landed | — |
 | `memcpyopt` | Optimizes memcpy/memset; forms them from loads and stores | part (`memcpyopt.rs` = call-slot forwarding only) | low-med | M |
 | `mldst-motion` | Merges loads and stores in diamond-shaped CFGs | — (`loadfwd` is closest) | low-med | M |
 | `reassociate` | Reorders commutative expressions to expose folding | part (egraph reassociates; `deflag` unblocks loopvec) | med (reduction chains, fma) | M |

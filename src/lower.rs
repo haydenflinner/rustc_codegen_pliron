@@ -451,6 +451,20 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.dse && crate::bisect("dse") {
+            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("dse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after dse ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("dse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Upstream Cranelift's egraph pass: GVN + ISLE cprop/remat rules +
         // redundant-load elimination + egraph LICM. Opt-in while its cost and
         // wins vs. our own passes are measured.
@@ -2466,7 +2480,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
             let atomic = is!(AtomicLoadOp);
+            // Volatile accesses stay plain loads/stores bracketed by fences:
+            // cranelift MemFlags has no volatile bit, and without a barrier
+            // its alias analysis can fold a volatile load to an earlier
+            // value or dead-store-eliminate a volatile store. The fences put
+            // each volatile access behind an unkillable memory version.
+            let vol = !atomic && self.st.volatile.contains(&op);
             let mf = self.plain_mf(op);
+            if vol {
+                self.b.ins().fence();
+            }
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
                 .into_iter()
@@ -2480,6 +2503,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     }
                 })
                 .collect();
+            if vol {
+                self.b.ins().fence();
+            }
             if r.len() == 1 && self.st.nonnull.contains(&op) {
                 self.nonnull.insert(r[0]);
             }
@@ -2492,6 +2518,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let p = self.get1(opnds[1]);
             let lv = self.ty_leaves(opnds[0].get_type(ctx));
             let mf = self.plain_mf(op);
+            // Volatile store: bracket with fences so cranelift's alias
+            // analysis can never dead-store-eliminate or reorder it (see
+            // the LoadOp branch above).
+            let vol = !is!(AtomicStoreOp) && self.st.volatile.contains(&op);
+            if vol {
+                self.b.ins().fence();
+            }
             for (v, (o, t)) in vs.into_iter().zip(lv) {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
@@ -2500,6 +2533,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
                 }
+            }
+            if vol {
+                self.b.ins().fence();
             }
         } else if is!(AtomicRmwOp) {
             use cranelift_codegen::ir::AtomicRmwOp as R;
