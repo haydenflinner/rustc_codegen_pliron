@@ -330,3 +330,45 @@ x64 regex-syntax; Rosetta x86_64-apple-darwin std+unwind pass.
 sum2d residual check (x64, Rosetta): pliron 0.788–0.795 ms vs stock
 0.766–0.777 — ~2%, inside earlier-run noise; the ledger's "-5%"
 residual is stale. Accepted as parity.
+
+### Dual-128 loopvec probe + hist re-audit (x64-v3, Rosetta)
+
+Dual-128 turns out to be already implemented: loopvec's vector body
+unrolls by `UNROLL` (`src/loopvec.rs:2419`), currently **4×128-bit
+groups per iteration** — quad-128, not dual. Probe of `unroll=8` on
+x64 (reverted): no kernel improved, several regressed — even_sum
+−21% (0.607→0.733), dot_i8 −10%, dot_u8/sum_sq −5%; the extra
+accumulator regs + epilogue cost lose to port pressure. **4×128 is
+the saturation point; keep UNROLL=4.** A per-arch tunable is
+possible (`apply` already takes `x64`) but measurement says don't
+bother.
+
+Wide-kernel results, `-Ctarget-cpu=x86-64-v3` under Rosetta
+(pliron / stock ms/iter): axpy 0.364/0.593, vadd_u32 0.525/0.653,
+clamp_u8 0.090/0.142, dot_i32 0.088/0.130, sum_u8 0.128/0.694
+(psadbw), dot_i8 0.300/0.430, matmul_256 4.832/12.062, has_val
+0.382/1.491, max_u 0.194/0.353, min_i 0.191/0.227, sum_sq
+0.882/1.057, dot_u8 0.461/1.445, scaled 0.727/0.941, rev_copy32
+0.362/0.636, cnt_vowel 0.666/1.562, even_sum 0.607/1.844, xor_fold
+0.365/0.422, find_off 0.084/1.198, fillzero parity, sum2d
+0.780/0.750 (-4%, ordered fadd — accepted). **Every vectorizable
+kernel beats LLVM's ymm codegen** — dual-128-in-spirit is already
+winning; a real ymm regclass is not on the critical path.
+
+scatter/hist re-audit on shared HEAD (coldedges + coldargs + edgefwd
++ foldf + vmax all merged): gather 0.455 vs stock 0.495 — now a
+**win** (+8%). hist 0.619 vs 0.444 — 1.5x -> 1.39x residual, not
+closed. Per-element in the 4x-unrolled hot loop: movzbq + cmpq + jae
++ addl RMW (4 core insts, same as stock's movzbl/cmpq/jbe/incl) plus
+**~3 cold-edge ABI-pinning copies**: `movq %r11,%rdi` (iv -> panic
+arg reg), `movq %rdi,%r9` / `movq %r9,%rdi` (a[i] save/restore around
+the `jae` to `panic_bounds_check(index=rdi,len=rsi)`). ~8.5 vs ~5.7
+insts/element. The residual lives in coldedge adapter/ABI-pinning
+copies (native agent's coldedges work, 87909ba) — not edgefwd's
+domain. A deeper fix would hoist the per-element `a[i] < len` check:
+a[i] is u8 and cnt.len()=256 makes it statically provable —
+constraint-elimination territory (LLVM doesn't do it either; we'd
+*beat* stock if we did).
+
+Verify: cargo build, test.sh green, Rosetta std+unwind pass at
+0b88590.
