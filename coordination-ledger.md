@@ -205,3 +205,15 @@ multi-exit for hist_unchecked.
 - matmul register tiling: assessed NOT loopvec-expressible (needs
   unroll-and-jam + multi-acc chains + f-reassoc). Documented handoff.
 - Not perf-validated: some sub-1.5x deltas on loaded box (native-notes.md).
+
+## Merged: native dse 1435a5e + x64 jam aaefc3b (-> f4c30bd)
+- src/dse.rs new: backward may-read fixpoint, kills stores overwritten
+  before any read (top_non_iso vs top_non_stack demand split; atomics/
+  volatile/calls structurally excluded). PLIRON_DSE=0, bisect-gated.
+- LATENT BUG FIXED: adjacent volatile stores were egraph-DSE'd (CLIF
+  MemFlags has no volatile bit); now fence-bracketed via intrinsic.rs.
+- constraint-elimination investigated -> ~0 residual (jumpthread already
+  folds dominated conds; bcheck fallbacks are deliberate). Skipped.
+- punroll unroll-and-jam (PLIRON_JAM, DEFAULT ON — agent mislabeled it
+  "opt-in"; verified enabled): matmul_f32_256 4.17 vs 12.21 stock =
+  2.93x on merged aarch64 build. x64 ~2.5x. Identical outputs n=0..256.
