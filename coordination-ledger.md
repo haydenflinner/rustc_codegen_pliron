@@ -687,3 +687,26 @@ Track as x64 agent follow-up.
 - Verified: build clean; PLIRON_VERIFY=1 ./test.sh green; exhaustive
   reverse correctness (sizes 0..=300 + boundary straddles, u8..u64);
   drev/drev2/bc/rmw/dse/pairfuse/edgespec fixtures pass.
+
+## Merged: mirror-swap unblock (a77cb71) + scatter gate (d63f87a) + winline cost model (cf8ac5f)
+- slice::reverse CLOSED via two latent gates, zero loopvec changes:
+  (1) inline memcpy/memmove/memset lacked `notrap` — loopvec bailed on
+  "side effects"; now plain_mf at -O (any loop over small-copy memory
+  becomes vec-eligible). (2) loopidiom deadend couldn't see through
+  try_call normal-return continuations.
+- slice_reverse u8 11x->PARITY (0.022), u64 1.7x->parity; rev_inplace
+  ~10x FASTER than stock (LLVM doesn't vectorize manual swap either).
+- scatter gate refined: bail only on non-affine store AND non-affine
+  load together. scatter versions by default -> x64 WIN (0.452 vs
+  0.512). RMW correctly stays gated.
+- winline cost model: gc_done/loop-hot/ref.func rules — neutral on
+  wmini (residual is structural mid-size multi-callsite callees;
+  needs bottom-up inline ordering).
+- Fresh x64 table: gather WIN, scatter WIN, sum_u8 5.4x, dot_u32 1.5x;
+  residuals: hist 1.44x, chars 1.36x, matmul-64 2.6x, tokenize 2.59x.
+- Native residuals: tokenize ~1.95x (11-live-param state machine —
+  same gap on aarch64 with ~1 spill -> NOT regalloc), chars().filter
+  2.3x, bytes().filter 4.5x (stock NEON-vectorizes byte predicates —
+  predicate-count SIMD idiom missing).
+- Next: bytes().filter vectorization (native), hist residual decomp +
+  matmul-64 (x64), whole-crate wasm (wasm).
