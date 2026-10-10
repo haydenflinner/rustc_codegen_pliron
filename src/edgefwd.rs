@@ -566,5 +566,11 @@ pub fn run(func: &mut Function) -> usize {
             break;
         }
     }
+    // Note: privatising `try_call` normal edges to shared trap blocks
+    // (`try_call f, ret=shared_trap, [pad]` -> a per-site `trap` block
+    // after the call) was tried and rejected: `Function::is_effectively_cold`
+    // marks every trap-terminated block cold, so the private traps always
+    // sink and the `callq; jmp ud2` stays — the transform only added ~1.2k
+    // `ud2` instructions in regex-syntax for ~187 removed jumps.
     total
 }

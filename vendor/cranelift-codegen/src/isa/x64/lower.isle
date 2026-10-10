@@ -4954,6 +4954,32 @@
         (if-let true (has_sse3))
         (x64_movddup addr))
 
+;; PLIRON: splats to sub-128-bit vector types (i8x2/i8x4/i8x8, i16x2/i16x4,
+;; i32x2, f16x2, f32x2). All vector types live in xmm registers and
+;; consumers of a narrower vector read only its low lanes, so broadcasting
+;; the lane across the full 128-bit register is correct — this reuses the
+;; same sequences as the 128-bit splats above. The wildcard lane count is
+;; why these rules sit at a lower priority than the concrete 128-bit
+;; rules: they only fire when no typed rule matched, i.e. for sub-128
+;; vectors.
+;;
+;; Integer-lane sources arrive in a gpr (movd first); float-lane sources
+;; are already in an xmm register. The `is_xmm_type` guard keeps the
+;; wildcard lane-count from ever matching a >128-bit vector type.
+(rule -1 (lower (splat (is_xmm_type (multi_lane 8 _)) src @ (value_type $I8)))
+        (let ((src Gpr src)
+              (src Xmm (x64_movd_to_xmm src)))
+          (x64_pshufd (x64_pshuflw (x64_punpcklbw src src) 0) 0)))
+(rule -1 (lower (splat (is_xmm_type (multi_lane 16 _)) src @ (value_type $I16)))
+        (x64_pshufd (x64_pshuflw (bitcast_gpr_to_xmm 32 src) 0) 0))
+(rule -1 (lower (splat (is_xmm_type (multi_lane 32 _)) src @ (value_type $I32)))
+        (x64_pshufd (bitcast_gpr_to_xmm 32 src) 0))
+(rule -1 (lower (splat (is_xmm_type (multi_lane 16 _)) src @ (value_type $F16)))
+        (x64_pshufd (x64_pshuflw (put_in_xmm src) 0) 0))
+(rule -1 (lower (splat (is_xmm_type (multi_lane 32 _)) src @ (value_type $F32)))
+        (let ((tmp Xmm src))
+          (x64_shufps tmp tmp 0)))
+
 ;; Rules for `vany_true` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (vany_true _ val)) (lower_cond_bool (is_vany_true val)))

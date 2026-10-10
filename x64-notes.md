@@ -244,5 +244,46 @@ Correctness: `PLIRON_VERIFY=1` clean on the whole regex-syntax crate;
 test.sh all green (nostd/std/unwind/asm/licm/unroll/proc-macro/wasm);
 Rosetta x86_64-apple-darwin std+unwind pass; scatter kernel output
 correct (hist 0.660 ms/iter vs stock 0.797). x64 regex-syntax compile
-itself is blocked by a pre-existing `splat.i32x2` x64 lowering gap —
-identical with `PLIRON_EDGEFWD=0`, unrelated.
+was initially blocked by a pre-existing `splat.i32x2` x64 lowering gap —
+identical with `PLIRON_EDGEFWD=0`, unrelated; fixed by the sub-128 splat
+rules documented below.
+
+### x64 sub-128 vector splat lowering (`vendor/.../x64/lower.isle`)
+
+x64 whole-crate builds failed in `Hir::alternation` with
+`Compilation(Unsupported("should be implemented in ISLE: inst = v21083 =
+splat.i32x2 v4529"))` — identical with `PLIRON_EDGEFWD=0`. Origin: pliron's
+own SLP pass (`src/slp.rs`, `Pack::Splat`) packs two adjacent i32 stores of
+one scalar into `splat.i32x2` + an 8-byte vector store (regex-syntax's
+`extend_trusted`/`map_fold` `(u32,u32)` pair fill). x64 only had splat
+rules for the six 128-bit vector types.
+
+Fix: five wildcard rules at priority -1 keyed on
+`(is_xmm_type (multi_lane <bits> _))` + the scalar source's `value_type`,
+covering i8x{2,4,8}, i16x{2,4}, i32x2, f16x2, f32x2. Sub-128 vectors live
+in xmm registers and consumers read only the low lanes, so broadcasting
+across all 128 bits is correct — the rules reuse the same sequences as
+the 128-bit splats (movd/bitcast + punpcklbw/pshuflw/pshufd/shufps). The
+`is_xmm_type` guard keeps the wildcard lane-count from matching a >128-bit
+type if Cranelift ever legalizes one. Priority -1 puts them below the
+concrete 128-bit rules so nothing existing is shadowed.
+
+Validation:
+- minimal repro: `fn fill2(x:u32, out:&mut [u32;2]) { for i in 0..2 {
+  out[i]=x; } }` — SLP emits `splat.i32x2` + `store.i32x2`; disasm
+  `movd %edi,%xmm3; pshufd $0,%xmm3,%xmm5; movsd %xmm5,(%rsi)`; plus
+  i8x8/i16x4/f32x2 variants (punpcklbw+pshuflw+pshufd / pshuflw+pshufd /
+  shufps), all runtime-verified under Rosetta (`splat ok`).
+- Full x86_64-apple-darwin regex-syntax rlib now compiles end-to-end
+  (previously hard-failed); `PLIRON_VERIFY=1` clean.
+- x64 disasm `jmp` count: pliron 10,534 vs stock 2,491 — same ~4x
+  block-count-driven gap as aarch64 (9,147 vs 2,247).
+- test.sh green; Rosetta std+unwind pass.
+
+Rejected experiment (edgefwd): privatising `try_call` normal edges to
+shared trap-only blocks — per-site `try_call f, ret=private_trap, [pad]`
+with the private trap placed after the call — aimed at `callq; ud2`
+fallthrough instead of `callq; jmp shared_ud2` (~1.3k sites crate-wide).
+`Function::is_effectively_cold` marks every trap-terminated block cold,
+so the private traps always sink to the cold section and the jmp stays:
++1,193 `ud2` for only -187 `jmp`. Reverted; kept as a code comment.
