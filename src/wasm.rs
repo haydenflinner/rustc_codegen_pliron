@@ -109,7 +109,7 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     HOOK.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |i| {
-            if !QUIET.with(|q| q.get()) {
+            if !QUIET.with(|q| q.get()) || std::env::var("PLIRON_WASM_PANIC").is_ok() {
                 prev(i)
             }
         }));
@@ -5234,7 +5234,11 @@ fn wunroll_flat(
     let ValueDef::BlockParam(hb, pidx, WT::I32) = b.values[iv] else {
         return false;
     };
-    if hb != h {
+    // A stale BlockParam can outlive its slot if optimize dropped the
+    // param; `iv` must still own index `pidx` before edge args are read.
+    if hb != h
+        || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == iv)
+    {
         return false;
     }
     // Uniform positive constant step on iv across all latches (an
@@ -5972,8 +5976,13 @@ fn bound_u64(
                 return None;
             }
             // Uniform non-negative constant step on that param across
-            // oh's latches (an unchanged feed contributes 0).
-            let pv = b.blocks[oh].params[opidx as usize].1;
+            // oh's latches (an unchanged feed contributes 0). `v` must
+            // still own slot `opidx` — a stale BlockParam may index a
+            // removed slot after optimize drops an unused param.
+            if !matches!(b.blocks[oh].params.get(opidx as usize), Some(&(_, pv)) if pv == v) {
+                return None;
+            }
+            let pv = v;
             let mut st: Option<i64> = None;
             for (j, &p) in b.blocks[oh].preds.iter().enumerate() {
                 if !il2.contains(&p) {
@@ -6103,7 +6112,13 @@ fn wbcheck(
         let ValueDef::BlockParam(blk, pidx, _) = b.values[x] else {
             continue;
         };
-        if blk != h || !winv(b, defb, inloop, n) {
+        // A stale BlockParam can outlive its slot: optimize may drop
+        // an unused param without rewriting the (dead) ValueDef that
+        // indexed it, leaving `x` pointing at a removed index.
+        if blk != h
+            || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == x)
+            || !winv(b, defb, inloop, n)
+        {
             continue;
         }
         for &(la, _) in &latches {
@@ -6163,7 +6178,11 @@ fn wbcheck(
                     continue;
                 }
             } else if let ValueDef::BlockParam(hb, p2, _) = b.values[x] {
-                if hb != h || p2 as usize == pidx {
+                // Same stale-param guard: `x` must still own slot p2.
+                if hb != h
+                    || p2 as usize == pidx
+                    || !matches!(b.blocks[h].params.get(p2 as usize), Some(&(_, v)) if v == x)
+                {
                     continue;
                 }
                 // Uniform non-negative constant step across latches (an
