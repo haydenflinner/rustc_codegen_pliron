@@ -2884,6 +2884,14 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
             loop_licm(b, &cfg, &mut defb, inloop, pre, sp);
         }
         loop_indvars(b, &mut defb, inloop, *h);
+        // Loop-closed exits: funnel leaked loop values through exit
+        // block params so cloning (wbcheck/unroll) is legal.
+        if std::env::var_os("PLIRON_WASM_SEAL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            wseal_exits(b, &mut defb, inloop);
+        }
     }
     // Version loops on provably-passing bounds checks; the fast clones
     // join the unroll worklist.
@@ -3288,7 +3296,12 @@ fn cloneable_sink(b: &FunctionBody, blk: WBlock) -> bool {
         && b.blocks[blk]
             .insts
             .iter()
-            .all(|&v| matches!(b.values[v], ValueDef::Operator(..) | ValueDef::Alias(_)))
+            .all(|&v| {
+                matches!(
+                    b.values[v],
+                    ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
+                )
+            })
 }
 
 /// Can this loop's blocks be safely cloned? Requires ordinary insts only,
@@ -3306,10 +3319,16 @@ fn loop_cloneable(
         for &inst in &b.blocks[lb].insts {
             if !matches!(
                 b.values[inst],
-                ValueDef::Operator(..) | ValueDef::Alias(_)
+                ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
             ) {
                 if verbose {
-                    eprintln!("wloop: {h} skipped exotic inst {inst}");
+                    let k = match b.values[inst] {
+                        ValueDef::PickOutput(..) => "pickoutput",
+                        ValueDef::Placeholder(..) => "placeholder",
+                        ValueDef::BlockParam(..) => "blockparam",
+                        _ => "other",
+                    };
+                    eprintln!("wloop: {h} skipped exotic inst {inst} {k}");
                 }
                 return false;
             }
@@ -3365,6 +3384,9 @@ fn loop_cloneable(
                     _ => {}
                 }
             }
+            // All terminator uses count as leaks: cond/select/return are
+            // direct operands, and edge args on this block's outgoing
+            // edges must be dominated here too.
             let mut leak = false;
             b.blocks[blk].terminator.visit_uses(|a| {
                 leak |= inloop.contains(&defb[b.resolve_alias(a)]);
@@ -3378,6 +3400,165 @@ fn loop_cloneable(
         }
     }
     true
+}
+
+/// Loop-closed exits: any in-loop value used inside a reachable outside
+/// block is funneled through a new block param, with the value pushed on
+/// every incoming edge. The def dominates its use, hence every pred of
+/// the use block, so it is always available on the edge. Cloned loop
+/// copies remap the edge args and stay dominated.
+fn wseal_exits(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+) {
+    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
+    let mut wl = vec![WBlock::new(0)];
+    while let Some(x) = wl.pop() {
+        b.blocks[x].terminator.visit_targets(|t| {
+            if reach.insert(t.block) {
+                wl.push(t.block);
+            }
+        });
+    }
+    for blk in b.blocks.iter() {
+        if inloop.contains(&blk) || !reach.contains(&blk) {
+            continue;
+        }
+        // Leaked values: loop defs used by this block's insts or its
+        // terminator's non-edge operands (edge args are edge uses).
+        let mut leaks: FxHashSet<WV> = FxHashSet::default();
+        let mut exotic = false;
+        for &v in &b.blocks[blk].insts {
+            match b.values[v] {
+                ValueDef::Operator(_, aa, _) => {
+                    for &a in b.arg_pool[aa].iter() {
+                        let a = b.resolve_alias(a);
+                        if inloop.contains(&defb[a]) {
+                            leaks.insert(a);
+                        }
+                    }
+                }
+                ValueDef::Alias(a) => {
+                    let a = b.resolve_alias(a);
+                    if inloop.contains(&defb[a]) {
+                        leaks.insert(a);
+                    }
+                }
+                // PickOutput's source must stay a multi-result def; a
+                // blockparam can't replace it, so such a leak can't seal.
+                ValueDef::PickOutput(from, ..) => {
+                    if inloop.contains(&defb[b.resolve_alias(from)]) {
+                        exotic = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &b.blocks[blk].terminator {
+            Terminator::CondBr { cond, .. } => {
+                let c = b.resolve_alias(*cond);
+                if inloop.contains(&defb[c]) {
+                    leaks.insert(c);
+                }
+            }
+            Terminator::Select { value, .. } => {
+                let v = b.resolve_alias(*value);
+                if inloop.contains(&defb[v]) {
+                    leaks.insert(v);
+                }
+            }
+            Terminator::Return { values } => {
+                for &a in values {
+                    let a = b.resolve_alias(a);
+                    if inloop.contains(&defb[a]) {
+                        leaks.insert(a);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Target args are also uses of this block (they evaluate in its
+        // frame) — a loop value there leaks the same way.
+        b.blocks[blk].terminator.visit_targets(|t| {
+            for &a in &t.args {
+                let a = b.resolve_alias(a);
+                if inloop.contains(&defb[a]) {
+                    leaks.insert(a);
+                }
+            }
+        });
+        if leaks.is_empty() {
+            continue;
+        }
+        if exotic {
+            continue;
+        }
+        let mut leaks: Vec<WV> = leaks.into_iter().collect();
+        leaks.sort();
+        for &v in &leaks {
+            let ty = match b.values[v].ty(&b.type_pool) {
+                Some(t) => t,
+                None => break,
+            };
+            let np = b.add_blockparam(blk, ty);
+            defb[np] = blk;
+            // Rewrite this block's own uses: inst args, alias targets,
+            // terminator cond/select/return and edge args.
+            let insts = b.blocks[blk].insts.clone();
+            for inst in insts {
+                match b.values[inst] {
+                    ValueDef::Operator(_, aa, _) => {
+                        for ai in 0..b.arg_pool[aa].len() {
+                            let a = b.arg_pool[aa][ai];
+                            if b.resolve_alias(a) == v {
+                                b.arg_pool[aa][ai] = np;
+                            }
+                        }
+                    }
+                    ValueDef::Alias(a) if b.resolve_alias(a) == v => {
+                        b.values[inst] = ValueDef::Alias(np);
+                    }
+                    _ => {}
+                }
+            }
+            let mut term = b.blocks[blk].terminator.clone();
+            match &mut term {
+                Terminator::CondBr { cond, .. } => {
+                    if b.resolve_alias(*cond) == v {
+                        *cond = np;
+                    }
+                }
+                Terminator::Select { value, .. } => {
+                    if b.resolve_alias(*value) == v {
+                        *value = np;
+                    }
+                }
+                Terminator::Return { values } => {
+                    for a in values.iter_mut() {
+                        if b.resolve_alias(*a) == v {
+                            *a = np;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            term.update_targets(|t| {
+                for a in t.args.iter_mut() {
+                    if b.resolve_alias(*a) == v {
+                        *a = np;
+                    }
+                }
+            });
+            b.blocks[blk].terminator = term;
+            // Pass v on every incoming edge.
+            let preds = b.blocks[blk].preds.clone();
+            let poss = b.blocks[blk].pos_in_pred_succ.clone();
+            for (j, pr) in preds.iter().enumerate() {
+                edge_push(b, *pr, poss[j], v);
+            }
+        }
+    }
 }
 
 fn remap_v(b: &FunctionBody, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
@@ -3418,6 +3599,12 @@ fn clone_loop(
                         .collect();
                     let tys: Vec<WT> = b.type_pool[tt].to_vec();
                     let nv = b.add_op(nb, op, &args, &tys);
+                    defb[nv] = nb;
+                    vmap.insert(inst, nv);
+                }
+                ValueDef::PickOutput(from, idx, ty) => {
+                    let nv = b.add_value(ValueDef::PickOutput(remap_v(b, &vmap, from), idx, ty));
+                    b.blocks[nb].insts.push(nv);
                     defb[nv] = nb;
                     vmap.insert(inst, nv);
                 }
@@ -3788,6 +3975,16 @@ fn clone_sink(
                     .collect();
                 let tys: Vec<WT> = b.type_pool[tt].to_vec();
                 let nv = b.add_op(nb, op, &args, &tys);
+                defb[nv] = nb;
+                lmap.insert(inst, nv);
+            }
+            ValueDef::PickOutput(from, idx, ty) => {
+                let nv = b.add_value(ValueDef::PickOutput(
+                    mapv(b, &lmap, vmap, from),
+                    idx,
+                    ty,
+                ));
+                b.blocks[nb].insts.push(nv);
                 defb[nv] = nb;
                 lmap.insert(inst, nv);
             }

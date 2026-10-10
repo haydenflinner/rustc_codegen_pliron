@@ -296,7 +296,10 @@ there instead of in the cwd.
   Debug: `PLIRON_WASM_WLOOP=0` gates the pass, `PLIRON_WASM_LOOPS=<pat>`
   dumps pre/post bodies for functions whose name contains <pat>,
   `PLIRON_WASM_UNROLL=<n>` sets the innermost-loop unroll factor
-  (default 4), and `PLIRON_WASM_TRIP=<n>` splices a shared
+  (default 8 for small bodies, fewer as size grows), `PLIRON_WASM_SEAL=0`
+  disables loop-closed exit sealing (leaked loop values become exit
+  block params, enabling wbcheck/unroll clones), and
+  `PLIRON_WASM_TRIP=<n>` splices a shared
   `env.__pliron_trip` counter check onto every latch edge — a loop
   spinning past `n` back-edges traps `unreachable` and the RuntimeError
   names the function (pliron-wasm-ld synthesizes the import into one
