@@ -21,3 +21,8 @@
 - x64 min/max/dot_i32 "gaps" largely explained by missing ISA flags
   (baseline SSE2); psadbw for sum_u8 blocked on vendoring
   cranelift-assembler-x64 — documented in x64-notes.md.
+
+## Follow-ups
+- rev_copy32 aarch64: stable ~11% deficit vs stock (0.26 vs 0.234, 3 runs).
+  NOT punroll (same with PLIRON_PUNROLL=0). Assign to native agent: check
+  store-pair/lane-reversal interaction in loopvec output.
