@@ -58,3 +58,28 @@ Running log of work + learnings. Bench: `/tmp/cpubench/{main,wide}.rs`,
 x64 smoke status (Rosetta): std/unwind/unroll/licm/asm all compile+run;
 std & unroll outputs identical to expectations (stock x64 can't link
 tests/asm — the test's global_asm is ELF-styled, no Mach-O underscore).
+
+### Scalar partial unrolling (src/punroll.rs, `PLIRON_PUNROLL`, default on)
+
+- sum2d was the last wide.rs regression: LLVM doesn't vectorize the
+  ordered fadd reduction but scalar-unrolls the inner loop 8x. Existing
+  `unroll.rs` only handles constant-trip full unrolls.
+- `punroll::run` (after loop rotation, before lowering) detects a
+  latch-tested linear counted loop (`a cc bound`, single-entry chain of
+  jump/brif blocks, body <= 24 insts), then emits a guarded K-copy chain:
+  `hu` checks `bound - a0` covers the group (widened, no wrap), then K
+  clones run; only the last copy re-tests the count and exits, so all
+  intermediate entry tests are implied. Scalar remainder keeps the
+  original loop (tail iterations + re-entry on non-multiple trips).
+- SSA: the exit block's dominance cone may use loop values directly
+  (e.g. `return acc`). If so the whole cone is cloned (<= 16 blocks /
+  128 insts, no try_call/br_table) and the unrolled exit targets the
+  clone; cone-internal edges retarget via a block map. Verified with
+  `PLIRON_VERIFY=1`; earlier verifier error "uses value v76 from
+  non-dominating inst63" was this exact pattern.
+- Result (Rosetta, v3): sum2d 0.79 vs stock 0.75 — parity; the serial
+  addss dependency chain is the bound, unrolling only removes the
+  per-iteration loop overhead. asm confirms 8 consecutive addss in the
+  fast path (K=8 for bodies <= 16 insts).
+- Host `./test.sh` passes; x86 target std/unwind/asm/unroll/licm all
+  run correctly under Rosetta.
