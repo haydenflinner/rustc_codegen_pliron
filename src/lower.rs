@@ -23,7 +23,9 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
-use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
+use pliron_llvm::attributes::{
+    FCmpPredicateAttr, GepNoWrapFlags, ICmpPredicateAttr,
+};
 use pliron_llvm::ops::*;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -908,6 +910,24 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization
+        // residue around `icmp`/`uextend`/`select` booleans) — one `and`
+        // per element in scalar count_if loops. After sameargs: the merged
+        // predicate param is only alias-visible once it has dropped.
+        if crate::pass_enabled("PLIRON_MASK01") && crate::bisect("mask01") {
+            let k = crate::clifpeep::mask01(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("mask01 {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after mask01 ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("mask01 broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         // Thread edges through `brif` dispatch blocks decided by the supplied
@@ -3273,7 +3293,25 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 _ => unreachable!(),
             }
         }
-        if addr != base_v && self.st.inbounds.contains(&op) {
+        // `getelementptr inbounds` from rustc (`ptr.add` cursor bumps,
+        // `slice::Iter` advances) carries the no-wrap flag on the op itself;
+        // `st.inbounds` covers our own `inbounds_gep` emissions. Either one
+        // keeps the derived base non-null so jumpthread's null-guard folds
+        // can collapse the `Option<NonNull>` safe-load selects iterators
+        // emit. The rustc-flag path is off by default: folding the extra
+        // guards reshapes the `split_whitespace` dispatch badly enough to
+        // cost ~8% on tokenize while the chars loop it was aimed at gains
+        // nothing (see `chars_alpha` in coordination-ledger.md).
+        static IBNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PLIRON_INBOUNDSNN").is_ok_and(|v| v == "1")
+        });
+        if addr != base_v
+            && (self.st.inbounds.contains(&op)
+                || (*IBNN
+                    && gep
+                        .no_wrap_flags(ctx)
+                        .contains(GepNoWrapFlags::INBOUNDS)))
+        {
             self.derived.insert(addr, base_v);
         }
         self.set1(op, addr);

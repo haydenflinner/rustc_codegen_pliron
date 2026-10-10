@@ -1834,6 +1834,51 @@ fn sameargs_round(func: &mut Function) -> usize {
     apply_param_drops(func, pmap, arg_drops, param_drops)
 }
 
+/// `band v, 1` where `v` is already 0/1 (rustc's i1 normalization residue:
+/// `icmp` results, `uextend`/`ireduce`/`select` of 0/1 values) costs one
+/// `and` per element in scalar `count_if` loops the vectorizer leaves
+/// behind — e.g. `add acc, (uextend (select lo<=x, x<=hi, 0)) & 1` where
+/// the select's arms are already boolean. Runs after sameargs: that's
+/// when the merged predicate param has been aliased to its select def and
+/// `is01` can see through it. Scalar-only — a vector `icmp`'s all-ones
+/// lanes are masks, not 0/1, so `band` on them is a real operation.
+pub fn mask01(func: &mut Function) -> usize {
+    let mut hits = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let res = func.dfg.first_result(i);
+            let ty = func.dfg.value_type(res);
+            if !ty.is_int() || ty.is_vector() {
+                continue;
+            }
+            let x = if iconst(func, args[1]) == Some(1) {
+                args[0]
+            } else if iconst(func, args[0]) == Some(1) {
+                args[1]
+            } else {
+                continue;
+            };
+            if is01(func, x, 4) {
+                hits.push((i, res, func.dfg.resolve_aliases(x)));
+            }
+        }
+    }
+    let n = hits.len();
+    for (i, res, x) in hits {
+        func.dfg.clear_results(i);
+        func.layout.remove_inst(i);
+        func.dfg.change_to_alias(res, x);
+    }
+    n
+}
+
 /// `select c, a, b` whose every use sits in the region where `c`'s truth
 /// is already decided collapses to that arm — the `Option<NonNull>`
 /// niche selects (`select end?, 0, ptr`) ifconv materialises: the load

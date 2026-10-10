@@ -1090,3 +1090,59 @@ the `count` post-test probe.
 
 aarch64 emits `dup.4s`+`add.4s` lane IVs, `cmhs.4s` x2 for the two u32
 range comparisons, `and.16b` mask AND + `and`(1), `uaddw.2d`/`uaddw2.2d`.
+
+## chars() residual decomposition + mask01
+
+### Stock LLVM vs pliron `chars_alpha` inner loop
+
+Stock (`is_alphabetic` filter over `chars()`): a branch-oriented
+UTF-8 decoder — `ldrsb w9, [x8], #1` post-incremented first-byte
+load, direct width dispatch (ASCII fast path bumps the cursor +1;
+multibyte paths load fixed offsets and bump +2/+3/+4), predicate
+checks on the decoded scalar, count via the loop back-edge. No
+safe-load selects, no sentinel merge in the hot path.
+
+Pliron's loop carries per-byte `icmp cursor == end` +
+`select end?, 0, ptr` safe-address selects feeding the loads, a
+flag/payload niche merge (`select flag, payload, -1` for
+`Option<char>`), then `icmp decoded == -1` before the alphabetic
+predicate. ~2x stock's per-iter inst count — the residual is this
+iterator/niche dispatch structure, not the decode arithmetic.
+
+### What was tried
+
+- `PLIRON_INBOUNDSNN=1` (kept, default off): rustc's
+  `getelementptr inbounds` no-wrap flag seeds `self.derived`
+  alongside our own `inbounds_gep`s, so jumpthread's null-guard
+  folds collapse the safe-load selects. Produces cleaner CLIF
+  (`uload8` direct cursor loads, `brif` dispatch, no address
+  selects) — but the emitted hot loop is byte-identical and
+  chars gains nothing; the extra folds reshaped the
+  split_whitespace dispatch enough to cost ~8% on tokenize.
+  Default-off experiment knob.
+- edgespec return-clone (`PLIRON_RETCLONE`, REVERTED): `Edge::Ret`
+  walked dispatch chains to a `return` and inlined it at the pred;
+  cloned returns appended at the layout tail. Cleaner IR again
+  (bare `jump block40` forwarder, direct cursor bumps) — zero chars
+  gain, tokenize cost, and a verifier bug on regex-syntax
+  (non-dominating store use surfacing at the bittab verify).
+  Reverted wholesale; documented here only.
+
+The remaining chars gap is *not* IR polish: it needs either a
+post-increment load idiom (Cranelift aarch64 has `Amode` reg+imm
+but the cursor loop keeps the bump as a separate `iadd` feeding
+multiple loads — folding it into post-index addressing requires
+amode/IV co-design) or a batched UTF-8 decode (memchr-style ASCII
+skip). Neither is a small safe change.
+
+### mask01 (clifpeep) — shipped
+
+`band v, 1` where `v` is provably 0/1 (via `is01`: icmp/fcmp,
+uextend/ireduce/select of 0/1, nested `band(_,1)`, `bxor(01,1)`)
+is rustc's i1-normalization residue — costs one `and` per element
+in scalar `count_if` loops the vectorizer leaves behind. Runs
+after sameargs (merged predicate param alias'd to its select def
+by then). Scalar-only — vector `icmp` lanes are all-ones masks,
+`band` there is real work. Scalar countif inner loop:
+`uxtb; and #1; add` → `add x0, x0, w3, uxtb` (−2 insts/iter).
+118 hits on regex-syntax, verify-clean.

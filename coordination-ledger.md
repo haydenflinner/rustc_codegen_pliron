@@ -865,3 +865,51 @@ Track as x64 agent follow-up.
 - Remaining: chars ~2.2x native (UTF-8 select chains — post-inc idiom
   or SIMD decode), tokenize ~2.4x, matmul-64 strided-vec, wasm
   transition-ptr reload (unhoistable through clobber-unknown call).
+
+## WIP→merge: chars residual decomp + mask01 (wt/native-opt)
+- **chars decomposition (chars_alpha hot loop)**: stock LLVM emits a
+  branch-oriented UTF-8 decoder — `ldrsb w9, [x8], #1` post-incremented
+  first-byte load, direct width dispatch (1/2/3/4-byte cursor bumps),
+  no safe-load selects, no sentinel merge. Pliron's loop carries
+  `icmp cursor==end` + `select` safe-address chains per byte load and
+  a flag/payload niche merge (`select flag, payload, -1`) — ~2x the
+  per-iter instruction count of stock; that, not decode math, is the
+  residual. chars_alpha 1.11-1.17 vs stock 0.51 (still ~2.2x).
+- **inbounds-derived nonnull** (`PLIRON_INBOUNDSNN=1`, default OFF):
+  rustc's `getelementptr inbounds` flag now also seeds `derived`
+  (our own `inbounds_gep` already did), letting jumpthread's
+  null-guard folds collapse the safe-load selects — produces visibly
+  cleaner CLIF (direct `uload8` cursor loads, `brif` dispatch) but
+  emitted asm is byte-identical in the hot loop and chars gains
+  nothing; the extra folds reshape the split_whitespace dispatch
+  (~8% tokenize regression). Kept as an experiment knob only.
+- **edgespec return-clone** (`PLIRON_RETCLONE`, investigated then
+  REVERTED): inlined trivial `return` tails from dispatch blocks —
+  cleaner IR (bare `jump` forwarder, direct cursor bumps) but zero
+  chars gain, ~8% tokenize cost from clone placement, AND a real
+  verifier bug on regex-syntax (non-dominating use surfacing at the
+  bittab verify). Reverted to HEAD entirely.
+- **mask01 (clifpeep, default ON)**: `band v, 1` where `v` is provably
+  0/1 (is01: icmp/fcmp result, uextend/ireduce/select of 0/1) is
+  rustc's i1-normalization residue — one `and` per element in scalar
+  count_if loops. Runs after sameargs (when the merged predicate
+  param has been alias'd to its select def). Scalar-only (vector icmp
+  lanes are all-ones masks). 118 hits crate-wide on regex-syntax;
+  scalar countif inner loop drops `uxtb + and #0x1` → a single
+  `add x0, x0, w3, uxtb` (−2 insts/iter).
+- **Fresh regex-syntax rlib counts** (`-O -C cgu=1`, llvm-objdump,
+  countbb.py): vs the numbers last recorded ~10 merges ago:
+  total insts 102,875 → 99,518 (stock 46,195 — 2.15x); real blocks
+  13,489 → 12,102 (stock 4,714 — 2.57x); mov 20,519 → 18,621
+  (stock 7,816); uncond `b` 8,753 → 6,583 (stock 2,224, −25%);
+  mov-led ≤3-inst b-splits 1,799 → 1,266; pure-b trampolines
+  241 → 506 (stock 204); udf data-words still ~2.6k pseudo-blocks.
+- Bench (final build): chars_count 0.037 (=), alpha 1.173,
+  alpha_ascii 0.880, mixed 1.70, tokenize 2.42-2.52, contains 0.278.
+- Validated: cargo build; PLIRON_VERIFY=1 ./test.sh green; filt_edge
+  (UTF-8 widths, lens 0..129), contains_test, charcheck, scalar
+  countif all pass; gated paths (INBOUNDSNN) verify-clean on
+  regex-syntax. x64 not measured (aarch64 host).
+- Remaining: chars ~2.2x (carried select chains — needs post-inc
+  load idiom or a wider UTF-8 batch decode, not IR polish),
+  tokenize ~2.4x, matmul-64 strided-vec.
