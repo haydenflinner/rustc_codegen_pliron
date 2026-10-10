@@ -2883,7 +2883,16 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
         if let [pre] = preds[..] {
             loop_licm(b, &cfg, &mut defb, inloop, pre, sp);
         }
-        loop_indvars(b, &mut defb, inloop, *h);
+        // Indvars to a fixed point: each new param may itself be the
+        // `pv` of a `mul(pv, K)` addressing site (e.g. `idx*4` where
+        // idx already strides), needing another pass to strength-reduce.
+        for _ in 0..4 {
+            let n0 = b.blocks[*h].params.len();
+            loop_indvars(b, &mut defb, inloop, *h);
+            if b.blocks[*h].params.len() == n0 {
+                break;
+            }
+        }
         // Loop-closed exits: funnel leaked loop values through exit
         // block params so cloning (wbcheck/unroll) is legal.
         if std::env::var_os("PLIRON_WASM_SEAL")
@@ -3025,7 +3034,10 @@ fn wconst(b: &FunctionBody, v: WV) -> Option<i64> {
     }
 }
 
-/// Is `v` defined outside the loop (or a constant, whose position is free)?
+/// Is `v` loop-invariant: defined outside the loop, a constant, or a
+/// pure op whose operands all are? In-loop defs of pure ops (e.g. a
+/// `mul` of two invariants left on a latch edge by strength reduction)
+/// count too — the value is still identical every iteration.
 fn winv(
     b: &FunctionBody,
     defb: &waffle::entity::PerEntity<WV, WBlock>,
@@ -3038,8 +3050,43 @@ fn winv(
             O::I32Const { .. } | O::I64Const { .. } | O::F32Const { .. } | O::F64Const { .. },
             ..,
         ) => true,
+        ValueDef::Operator(op, aa, _) => {
+            !inloop.contains(&defb[v])
+                || (op.is_pure()
+                    && b.arg_pool[aa]
+                        .iter()
+                        .all(|&a| winv(b, defb, inloop, a)))
+        }
         _ => !inloop.contains(&defb[v]),
     }
+}
+
+/// Materialize a `winv`-invariant value inside `blk`: outside defs are
+/// used as-is; an in-loop pure op is re-emitted with recursively
+/// materialized args so the result is dominated where it's used.
+fn mat_inv(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    blk: WBlock,
+    v: WV,
+) -> WV {
+    let v = b.resolve_alias(v);
+    let (op, aa, tt) = match b.values[v] {
+        ValueDef::Operator(op, aa, tt) if inloop.contains(&defb[v]) && op.is_pure() => {
+            (op, aa, tt)
+        }
+        _ => return v,
+    };
+    let mut args: Vec<WV> = Vec::with_capacity(b.arg_pool[aa].len());
+    for i in 0..b.arg_pool[aa].len() {
+        let a = b.arg_pool[aa][i];
+        args.push(mat_inv(b, defb, inloop, blk, a));
+    }
+    let tys: Vec<WT> = b.type_pool[tt].to_vec();
+    let nv = b.add_op(blk, op, &args, &tys);
+    defb[nv] = blk;
+    nv
 }
 
 /// The value arriving for param `pidx` of `h` on edge `tidx` of `pred`.
@@ -3111,8 +3158,28 @@ fn loop_indvars(
         if !ok {
             continue;
         }
-        // Addressing sites: `mul(pv, K)` / `mul(K, pv)` feeding `add(base, m)`.
-        let mut sites: Vec<(WV, WV, WV)> = Vec::new(); // (add-value, base, K)
+        // Addressing sites: `mul(<affine pv>, K)` feeding `add(base, m)`,
+        // where <affine pv> is `pv` itself or `pv + off` for invariant
+        // off (`base + (pv+off)*K` still strides by K per step of pv).
+        let mut sites: Vec<(WV, WV, WV, Option<WV>)> = Vec::new(); // (add, base, K, off)
+        let affine_pv = |b: &FunctionBody, x: WV, pv: WV| -> Option<Option<WV>> {
+            if x == pv {
+                return Some(None);
+            }
+            if let ValueDef::Operator(O::I32Add, xa, _) = b.values[x] {
+                let &[p, q, ..] = &b.arg_pool[xa][..] else {
+                    return None;
+                };
+                let (p, q) = (b.resolve_alias(p), b.resolve_alias(q));
+                if p == pv && winv(b, defb, inloop, q) {
+                    return Some(Some(q));
+                }
+                if q == pv && winv(b, defb, inloop, p) {
+                    return Some(Some(p));
+                }
+            }
+            None
+        };
         for &lb in inloop.iter() {
             for &inst in &b.blocks[lb].insts {
                 if let ValueDef::Operator(O::I32Add, aa, _) = b.values[inst] {
@@ -3126,23 +3193,36 @@ fn loop_indvars(
                         if let ValueDef::Operator(O::I32Mul, mm, _) = b.values[m] {
                             let &[u, k, ..] = &b.arg_pool[mm][..] else { continue };
                             let (u, k) = (b.resolve_alias(u), b.resolve_alias(k));
-                            if (u == pv && winv(b, defb, inloop, k))
-                                || (k == pv && winv(b, defb, inloop, u))
-                            {
-                                let k = if u == pv { k } else { u };
-                                sites.push((inst, base, k));
+                            for (x, kk) in [(u, k), (k, u)] {
+                                if let Some(off) = affine_pv(b, x, pv) {
+                                    if winv(b, defb, inloop, kk) {
+                                        sites.push((inst, base, kk, off));
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        for (add_v, base, k) in sites {
+        for (add_v, base, k, off) in sites {
             let p = b.add_blockparam(h, WT::I32);
             defb[p] = h;
             for (i, &(pr, tidx, arg)) in edges.iter().enumerate() {
                 if !inloop.contains(&pr) {
-                    // Preheader edge: p = base + arg*K.
+                    // Preheader edge: p = base + (arg + off)*K.
+                    let arg = match off {
+                        Some(off) => {
+                            let off = mat_inv(b, defb, inloop, pr, off);
+                            let t = b.add_op(pr, O::I32Add, &[arg, off], &[WT::I32]);
+                            defb[t] = pr;
+                            t
+                        }
+                        None => arg,
+                    };
+                    let k = mat_inv(b, defb, inloop, pr, k);
+                    let base = mat_inv(b, defb, inloop, pr, base);
                     let m = b.add_op(pr, O::I32Mul, &[arg, k], &[WT::I32]);
                     let init = b.add_op(pr, O::I32Add, &[base, m], &[WT::I32]);
                     defb[m] = pr;
@@ -3154,6 +3234,8 @@ fn loop_indvars(
                         None => unreachable!(),
                         Some(c) if !c.is_valid() => p,
                         Some(c) => {
+                            let c = mat_inv(b, defb, inloop, pr, c);
+                            let k = mat_inv(b, defb, inloop, pr, k);
                             let inc = match (wconst(b, c), wconst(b, k)) {
                                 (Some(c), Some(k)) => b.add_op(
                                     pr,
