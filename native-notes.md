@@ -602,3 +602,82 @@ net negative). Kept the plain `iconst`+`umulhi` CLIF.
 
 Verified: PLIRON_VERIFY=1 whole-crate, ./test.sh green,
 bc_check/dse_check/rmw_check/bc_sem microtests pass.
+
+### Offset-index bounds checks: `guard_dead`/`guard_pred` go affine
+
+Versioned loops with `a[i ± k]` bounds checks used to bail — the
+check's compared value isn't the raw iv, so neither the "same test
+as the stay" dead rule nor the plain `ult(iv, lim)` pred fired.
+`neg_off` (`for i in 4..n { d[i] = a[i-4] }`) was the worst
+remaining loopvec gap: 0.459 ms/iter vs stock 0.080 (5.7x).
+
+New machinery (src/loopidiom.rs):
+
+- `iv_add_k(func, iv, x)` — destructure `x` as `iv`, `iv + C`, or
+  `iv - C` (returns `k`; `isub(iv,c)` reports `-c`).
+- `guard_dead` recognizes `ult(iv - k, bound)` as dead when the
+  loop is pre-tested, step > 0, and `iv0 >= k` is statically
+  provable — the stay condition keeps iv < bound and the
+  subtraction can't wrap, so `iv - k` stays in `[0, bound)`.
+- `guard_pred` now appends a *set* of predicates (`&mut Vec<Pred>`)
+  instead of returning one:
+  - `iv + k`: `bound <=u satsub(lim, k)` (largest checked index
+    `bound-1+k < lim`; the sat keeps `lim < k` honest), plus
+    `iv0 + k < lim` for post-tested first iterations.
+  - `iv - |k|`: `iv0 >=u |k|` (no-wrap) unless `iv0` proves it,
+    `satsub(bound, |k|) <=u lim`, and the post-tested first-iter
+    `iv0 - |k| < lim`.
+  - `c - iv` (descending index like `a[m-i]`): largest index is
+    `c - iv0`, so `c - iv0 <u lim`, plus `satsub(bound,1) <=u c`
+    so the subtraction can't wrap mid-loop.
+  Both host-side arithmetic proofs use `checked_add`/`checked_neg`
+  — `iv0`/`k` can be `i64::MIN`-shaped constants.
+- The loopidiom `plan` caller gained the same multi-pred contract.
+
+Results (1M u32): neg_off 0.459 -> ~0.078 ms/iter (stock 0.058),
+pos_off ~0.078 (stock 0.056), off_read 0.043 (stock 0.042).
+`neg_off` disasm now shows the full NEON `ldp q/stp q` unrolled
+loop + `cbnz` countdown; versioning prologue carries the pair
+overlap + bound preds. Correctness: short-dst still panics at
+index 20, and `a[i.wrapping_sub(2)]` from `0..n` panics on the
+wrapped `usize::MAX-1` (the `iv0 >= k` pred correctly refuses the
+fast path). PLIRON_VERIFY=1 clean, test.sh green.
+
+Known remaining gaps in the same probe family: `desc_sum`
+(`for i in (0..n).rev()`) and `stride2` still scalar — the count
+model only accepts `step > 0` / non-unit strides. Next candidate
+is a descending-iv normalization (rewrite `i: n->0` as ascending
+`j` with `i = iv0 - j` so the existing neg-stream machinery sees
+it) or threading `step < 0` through count/trips/emit.
+
+### hist re-audit post-umulhi (a224f39)
+
+The ~3-move ABI-pinning chain around each bounds-check `b.hs` is
+gone. The 4x-unrolled hist hot loop is mov-free:
+
+```
+cmp x6, x1 / b.hs cold      ; i < n
+ldrb w4, [x0, x6]           ; a[i]
+cmp x4, x3 / b.hs cold      ; a[i] < cnt.len
+ldr w7, [x2, x4, lsl#2]
+add/str ... x4 lanes ...
+add x6, x6, #4; cmp; b.lo
+```
+
+The cold panic blocks keep the whole rebind internally:
+`mov x0,#0; umulh x2, x6, x0; add x0, x6, x2; add x1, x1, x2;
+call panic_bounds_check`. The index still arrives as an edge arg
+(the `mov x6, x5` lane-merge stubs), but the pin chain is confined
+to cold code — no materialize-in-pinned-slot workaround needed.
+
+Benchmarks (1M): hist-rand 0.373 vs stock 0.436 ms/iter (+17%);
+hist-const swings 0.83-2.03 across processes for BOTH compilers —
+it's the serial same-address RMW store chain, layout-sensitive,
+not a codegen deficit. scatter's all-same-index hist shows the
+same pathology (0.77 vs 0.44); gather is a 1.76x win (0.34 vs
+0.60). Wide suite: everything at parity or better (has_val 2x,
+dot_u8 2x, cnt_vowel 3.7x, find_off 14x; even_sum within 2%).
+
+celim on aarch64 (regex-syntax): -2,592 real insts, -569 blocks,
+-186 mov-led splits vs PLIRON_CELIM=0; PLIRON_VERIFY clean. The
+x64-motivated pass is a straight win here too.

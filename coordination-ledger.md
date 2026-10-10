@@ -459,3 +459,25 @@ Track as x64 agent follow-up.
 - Wasm remaining: sum_u8 +5%, dot_i32 +2% (V8-normalization noise).
 - Native deferred items logged: strength-reduce non-direct stream
   bases, two-phase reverse, residual loopvec epilogue work.
+
+## wt/native-opt — offset-affine bounds-check guards (committing)
+- `guard_dead`/`guard_pred` generalize to `iv ± k` and `c - iv`
+  compared index exprs (`iv_add_k` destructuring in loopidiom).
+  neg_off 0.459 -> 0.078 ms/iter (5.9x, stock 0.058); pos_off/
+  off_read parity. guard_pred now appends multiple preds via
+  `&mut Vec<Pred>` (no-wrap `iv0 >=u |k|` + `satsub` bound covers
+  + post-tested first-iter covers); loopidiom::plan updated.
+- Host-side overflow hygiene: checked_add/checked_neg on the
+  i64 proofs (iv0/k can be MIN-shaped consts).
+- hist re-audit post-umulhi: hot unrolled loop is mov-free — no
+  pin bounce around b.hs bounds checks; all rebind work lives in
+  cold blocks. hist-rand 0.373 vs 0.436 (+17% vs stock).
+  hist-const / same-address-hist variance (0.8-2.0 both compilers)
+  is microarchitectural store-forwarding noise, not codegen.
+- celim on aarch64 regex-syntax: 105,545 -> 102,857 insts
+  (-2,592), blocks -569; PLIRON_VERIFY clean — helps here too.
+- Verified: cargo build, test.sh green (incl wasm), PLIRON_VERIFY
+  on probes + panic/wrap tests; wide suite all >= stock.
+- Still scalar (next candidates): desc_sum `(0..n).rev()` —
+  descending counted iv needs step<0 in count() or a rev-norm
+  pre-pass; stride2 non-unit step; rev_inplace half-trip.

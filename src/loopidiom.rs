@@ -675,6 +675,39 @@ fn never_taken(func: &Function, e: Edge) -> bool {
     }
 }
 
+/// `x` as `iv + k` for the counted iv: the iv itself (`k = 0`), or an
+/// `iadd`/`isub` by a constant. `isub(iv, c)` reports `-c`.
+fn iv_add_k(func: &Function, iv: Value, x: Value) -> Option<i64> {
+    let x = func.dfg.resolve_aliases(x);
+    if x == iv {
+        return Some(0);
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(x) else {
+        return None;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [a, b],
+        } => {
+            if func.dfg.resolve_aliases(a) == iv {
+                iconst(func, b)
+            } else if func.dfg.resolve_aliases(b) == iv {
+                iconst(func, a)
+            } else {
+                None
+            }
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: [a, b],
+        } if func.dfg.resolve_aliases(a) == iv => {
+            iconst(func, b).and_then(|k| k.checked_neg())
+        }
+        _ => None,
+    }
+}
+
 /// Exit edge `e` is a provably-dead bounds-check-style guard: its target is a
 /// deadend block reached through a `brif` on the same `icmp` as the loop's
 /// stay test, going the failing way. Only sound pre-test (`!post_tested`):
@@ -737,6 +770,35 @@ pub(crate) fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
             }
         }
     }
+    // `ult(iv - k, bound)` — an offset-index bounds check (e.g. `a[i-4]`).
+    // The pre-tested stay condition keeps every in-body iv below `bound`;
+    // when `iv0 >= k` is provable the subtraction can't wrap, so
+    // `iv - k` stays in `[0, bound)` and the check never fires. (The
+    // `iv + k` mirror is NOT dead — it can exceed `bound`.)
+    if !cnt.post_tested
+        && cnt.step > 0
+        && matches!(
+            cnt.stay,
+            IntCC::UnsignedLessThan
+                | IntCC::UnsignedLessThanOrEqual
+                | IntCC::NotEqual
+        )
+        && let ValueDef::Result(ci, _) = func.dfg.value_def(c)
+        && let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: IntCC::UnsignedLessThan,
+            args: [x, y],
+        } = func.dfg.insts[ci]
+        && e.slot == 1
+        && func.dfg.resolve_aliases(y) == cnt.bound
+        && let Some(k) = iv_add_k(func, cnt.iv, x)
+        && k < 0
+        && iconst(func, cnt.iv0).is_some_and(|v0| {
+            v0.checked_add(k).is_some_and(|s| s >= 0)
+        })
+    {
+        return true;
+    }
     // An `icmp` guard is implied by the stay test only when the test runs
     // before the body each iteration.
     if cnt.post_tested {
@@ -768,16 +830,30 @@ pub(crate) fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
 /// still admit the fast path under the runtime check `bound <=u lim`: the iv
 /// rises monotonically and every stored index stays below `bound`, hence below
 /// `lim`. Works for any bound relationship (e.g. rustc's `min` trip counts).
-pub(crate) fn guard_pred(func: &Function, info: &Info, kinds: &[Param], cnt: &Count, e: Edge) -> Option<Pred> {
+///
+/// Affine index expressions generalize this: `ult(iv + k, lim)` needs
+/// `bound + k <=u lim`, `ult(iv - k, lim)` additionally needs `iv0 >=u k`
+/// so the offset can't wrap, and a descending `ult(c - iv, lim)` needs the
+/// entry-side value `c - iv0 <u lim` plus `bound - 1 <=u c` so it can't
+/// wrap mid-loop. Returns `false` when the guard isn't an affine `ult`
+/// against an invariant limit; otherwise pushes the runtime predicates.
+pub(crate) fn guard_pred(
+    func: &Function,
+    info: &Info,
+    kinds: &[Param],
+    cnt: &Count,
+    e: Edge,
+    out: &mut Vec<Pred>,
+) -> bool {
     if !deadend(func, edge_dest(func, e)) {
-        return None;
+        return false;
     }
     let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
-        return None;
+        return false;
     };
     let c = func.dfg.resolve_aliases(arg);
     let ValueDef::Result(ci, _) = func.dfg.value_def(c) else {
-        return None;
+        return false;
     };
     let InstructionData::IntCompare {
         opcode: Opcode::Icmp,
@@ -785,20 +861,112 @@ pub(crate) fn guard_pred(func: &Function, info: &Info, kinds: &[Param], cnt: &Co
         args: [x, y],
     } = func.dfg.insts[ci]
     else {
-        return None;
+        return false;
     };
-    if cond != IntCC::UnsignedLessThan
-        || func.dfg.resolve_aliases(x) != cnt.x
-        || e.slot != 1
-    {
-        return None;
+    if cond != IntCC::UnsignedLessThan || e.slot != 1 {
+        return false;
     }
-    let lim = outv(func, info, kinds, y)?;
-    Some(Pred::Cmp(
-        IntCC::UnsignedLessThanOrEqual,
-        Ins::Val(cnt.bound),
-        Ins::Val(lim),
-    ))
+    let Some(lim) = outv(func, info, kinds, y) else {
+        return false;
+    };
+    let xr = func.dfg.resolve_aliases(x);
+    if xr == cnt.x {
+        out.push(Pred::Cmp(
+            IntCC::UnsignedLessThanOrEqual,
+            Ins::Val(cnt.bound),
+            Ins::Val(lim),
+        ));
+        return true;
+    }
+    if cnt.step <= 0 {
+        return false;
+    }
+    // `iv + k` / `iv - k` against an invariant limit.
+    if let Some(k) = iv_add_k(func, cnt.iv, x) {
+        if k == 0 {
+            // The same index as the stay test, compared at a different
+            // bound: `bound <=u lim`.
+            out.push(Pred::Cmp(
+                IntCC::UnsignedLessThanOrEqual,
+                Ins::Val(cnt.bound),
+                Ins::Val(lim),
+            ));
+        } else if k > 0 {
+            // Largest checked index is `bound-1+k`; `lim - k` saturates to
+            // keep the compare honest when `lim < k`.
+            out.push(Pred::Cmp(
+                IntCC::UnsignedLessThanOrEqual,
+                Ins::Val(cnt.bound),
+                Ins::SatSub(Box::new(Ins::Val(lim)), Box::new(Ins::K(k))),
+            ));
+            // A post-tested loop runs its body once with `iv0` before any
+            // stay test — cover that check too.
+            if cnt.post_tested {
+                out.push(Pred::Cmp(
+                    IntCC::UnsignedLessThan,
+                    Ins::Add(Box::new(Ins::Val(cnt.iv0)), Box::new(Ins::K(k))),
+                    Ins::Val(lim),
+                ));
+            }
+        } else {
+            // `iv - |k|`: largest is `bound-1-|k|`, so `satsub(bound,|k|)
+            // <= lim` covers the range; the sub itself must not wrap, so
+            // `iv >= |k|` on every iteration — i.e. `iv0 >= |k|` (step > 0).
+            let Some(nk) = k.checked_neg() else {
+                return false;
+            };
+            if iconst(func, cnt.iv0)
+                .is_none_or(|v0| v0.checked_add(k).is_none_or(|s| s < 0))
+            {
+                out.push(Pred::Cmp(
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    Ins::Val(cnt.iv0),
+                    Ins::K(nk),
+                ));
+            }
+            out.push(Pred::Cmp(
+                IntCC::UnsignedLessThanOrEqual,
+                Ins::SatSub(Box::new(Ins::Val(cnt.bound)), Box::new(Ins::K(nk))),
+                Ins::Val(lim),
+            ));
+            // Same post-tested first-iteration cover as above; the iv0 >=
+            // |k| pred already emitted (or statically true) rules out wrap.
+            if cnt.post_tested {
+                out.push(Pred::Cmp(
+                    IntCC::UnsignedLessThan,
+                    Ins::Sub(Box::new(Ins::Val(cnt.iv0)), Box::new(Ins::K(nk))),
+                    Ins::Val(lim),
+                ));
+            }
+        }
+        return true;
+    }
+    // `c - iv` against an invariant limit (descending index, e.g.
+    // `a[m - i]`): the largest index is `c - iv0`; no wrap needs every
+    // in-body `iv <= c`, implied by `bound - 1 <=u c` (saturated).
+    let ValueDef::Result(xi, _) = func.dfg.value_def(x) else {
+        return false;
+    };
+    if let InstructionData::Binary {
+        opcode: Opcode::Isub,
+        args: [a, b],
+    } = func.dfg.insts[xi]
+        && func.dfg.resolve_aliases(b) == cnt.iv
+        && let Some(cv) = outv(func, info, kinds, a)
+    {
+        out.push(Pred::Cmp(
+            IntCC::UnsignedLessThanOrEqual,
+            Ins::SatSub(Box::new(Ins::Val(cnt.bound)), Box::new(Ins::K(1))),
+            Ins::Val(cv),
+        ));
+        out.push(Pred::Cmp(
+            IntCC::UnsignedLessThan,
+            Ins::Sub(Box::new(Ins::Val(cv)), Box::new(Ins::Val(cnt.iv0))),
+            Ins::Val(lim),
+        ));
+        return true;
+    }
+    false
 }
 
 /// `base + iv0*K` as a plan expression.
@@ -1036,8 +1204,10 @@ pub(crate) fn plan(
                 if e2 == e {
                     continue;
                 }
-                if !guard_dead(func, &c, e2) {
-                    ps.push(guard_pred(func, &info, &kinds, &c, e2)?);
+                if !guard_dead(func, &c, e2)
+                    && !guard_pred(func, &info, &kinds, &c, e2, &mut ps)
+                {
+                    return None;
                 }
             }
             Some((e, c, ps))
