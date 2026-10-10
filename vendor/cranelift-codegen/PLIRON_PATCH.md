@@ -96,6 +96,34 @@ once proven out on the stage2 benchmark, then drop this copy.
     demand-driven lowering fuses via the late placement, yielding
     `ldp/fmul/stp` blocks for vectorized map loops.
 
+12. x64 `psadbw`: new CLIF op `x86_psadbw` (`i8x16,i8x16 -> i64x2`, added in
+    `vendor/cranelift-codegen-meta/src/shared/instructions.rs`), plus
+    `x64_psadbw` in `isa/x64/inst.isle` and a `lower.isle` rule (the splat-0
+    operand folds to `xmm_zero`). The encoding itself is added in vendored
+    `cranelift-assembler-x64-meta` (`instructions/avg.rs`); codegen-meta's
+    assembler.isle generator emits `x64_psadbw_a_or_avx` automatically.
+    loopvec emits `iadd(acc, x86_psadbw(chunk, splat 0))` for unsigned
+    u8→u64 widening sums — one instruction per 16 bytes instead of a
+    14-unpack widen tree.
+
+13. direct-use side-effect sinking (`src/machinst/lower.rs`):
+    `compute_use_states` additionally returns `value_direct_uses` — raw
+    argument-position use counts, *not* coarsened by the transitive
+    `Multiple` propagation. The side-effect branch of
+    `get_value_as_source_or_const` accepts a def as `UniqueUse` when either
+    upstream's `value_ir_uses == Once` holds, or the value has exactly one
+    direct use, that use is `cur_inst` itself, and nothing has already
+    materialized the value (`value_lowered_uses == 0`). Upstream's `Once`
+    is poisoned to `Multiple` whenever a consumer's result fans out (e.g.
+    a scalar `fadd` accumulator feeding both backedge and exit args), so
+    `load; fadd` could never fuse into `addss (mem), %xmm` in a reduction
+    loop. The two extra tests are load-bearing: `cur_inst`-is-user rejects
+    probes that reach the value through a still-live pure sub-pattern
+    (`(store (iadd (load l) k) addr)` matching `l`), and the
+    `lowered_uses` test rejects sinking after an earlier-lowered inst
+    legitimately put the value in a register — fusing then would leave
+    that register's definition unemitted.
+
 ## x64 PIC calls use PLT32
 
 `CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`

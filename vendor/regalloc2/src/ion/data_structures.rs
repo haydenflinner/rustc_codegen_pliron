@@ -545,7 +545,7 @@ pub struct Ctx {
 
     // For debug output only: a list of textual annotations at every
     // ProgPoint to insert into the final allocated program listing.
-    pub(crate) debug_annotations: FxHashMap<ProgPoint, Vec<String>>,
+    pub debug_annotations: FxHashMap<ProgPoint, Vec<String>>,
     pub(crate) annotations_enabled: bool,
 
     // Cached allocation for `try_to_allocate_bundle_to_reg` to avoid allocating

@@ -30,6 +30,8 @@ mod constload;
 mod consts;
 mod context;
 mod domcheck;
+mod dse;
+mod edgefwd;
 mod eh;
 mod hot;
 mod ifconv;
@@ -51,6 +53,7 @@ mod nounwind;
 mod nowrite;
 mod objmerge;
 mod phisimp;
+mod punroll;
 mod simd;
 mod slp;
 mod spec;
@@ -167,7 +170,9 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
     fb.set(
         "opt_level",
-        if sess.opts.optimize == OptLevel::No {
+        if sess.opts.optimize == OptLevel::No
+            || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH")
+        {
             "none"
         } else {
             "speed_and_size"
@@ -200,26 +205,22 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
             ("fp16", "has_fp16"),
             ("bti", "use_bti"),
         ],
+        // The VEX families (avx/avx2/fma/avx512*) are deliberately not
+        // mapped: this Cranelift has no ymm register class, so the flags
+        // only buy VEX-128 encodings — which translate ~2x slower than
+        // legacy SSE under Rosetta, and on real hardware offer only the
+        // 3-operand form. `PLIRON_X64_VEX=1` opts back in for real-HW runs.
+        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
             ("ssse3", "has_ssse3"),
             ("sse4.1", "has_sse41"),
             ("sse4.2", "has_sse42"),
-            ("avx", "has_avx"),
-            ("avx2", "has_avx2"),
-            ("fma", "has_fma"),
             ("popcnt", "has_popcnt"),
             ("bmi1", "has_bmi1"),
             ("bmi2", "has_bmi2"),
             ("lzcnt", "has_lzcnt"),
             ("cmpxchg16b", "has_cmpxchg16b"),
-            ("avx512f", "has_avx512f"),
-            ("avx512vl", "has_avx512vl"),
-            ("avx512dq", "has_avx512dq"),
-            ("avx512bitalg", "has_avx512bitalg"),
-            ("avx512vbmi", "has_avx512vbmi"),
-            ("avx512vnni", "has_avx512vnni"),
-            ("avxvnni", "has_avx_vnni"),
         ],
         _ => &[],
     };
@@ -227,6 +228,28 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         if tf(rust) {
             isa.enable(flag)
                 .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
+        }
+    }
+    // Opt-in VEX encodings on x64 (see the comment on the flag table above).
+    if triple.architecture == target_lexicon::Architecture::X86_64
+        && std::env::var("PLIRON_X64_VEX").is_ok_and(|v| v == "1")
+    {
+        for &(rust, flag) in &[
+            ("avx", "has_avx"),
+            ("avx2", "has_avx2"),
+            ("fma", "has_fma"),
+            ("avx512f", "has_avx512f"),
+            ("avx512vl", "has_avx512vl"),
+            ("avx512dq", "has_avx512dq"),
+            ("avx512bitalg", "has_avx512bitalg"),
+            ("avx512vbmi", "has_avx512vbmi"),
+            ("avx512vnni", "has_avx512vnni"),
+            ("avxvnni", "has_avx_vnni"),
+        ] {
+            if tf(rust) {
+                isa.enable(flag)
+                    .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
+            }
         }
     }
     isa.finish(flags)
@@ -373,6 +396,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
         st.loadfwd = pass_enabled("PLIRON_LOADFWD");
         st.slot_dse = pass_enabled("PLIRON_SLOT_DSE");
+        st.dse = pass_enabled("PLIRON_DSE");
         st.peep = pass_enabled("PLIRON_PEEP");
         st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
         st.unreach = pass_enabled("PLIRON_UNREACH");
@@ -497,6 +521,23 @@ fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool
 /// feed cranelift lowering. Only entries we can state confidently go here;
 /// anything else falls back to the spec baseline.
 fn cpu_features(cpu: &str) -> &'static [&'static str] {
+    // x86-64 psABI levels: each arm lists entry-point features only —
+    // `internal_target_features` expands the implied closure
+    // (avx2 → avx → sse4.2 → … → sse2), so the v2 non-SIMD extras are the
+    // only ones repeated per tier.
+    const X64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse4.2"];
+    const X64_AVX: &[&str] = &["avx", "cmpxchg16b", "lahfsahf", "popcnt"];
+    const X64_V3: &[&str] = &[
+        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
+    ];
+    const X64_V4: &[&str] = &[
+        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
+        "avx512bw", "avx512cd", "avx512dq", "avx512vl",
+    ];
+    const X64_V4_EXT: &[&str] = &[
+        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
+        "avx512bw", "avx512cd", "avx512dq", "avx512vl", "avx512bitalg", "avx512vbmi", "avx512vnni",
+    ];
     match cpu {
         // Apple A12-generation and later: v8.3/v8.4+ — dotprod, lse, fp16.
         "apple-a12" | "apple-s4" | "apple-s5" => {
@@ -511,6 +552,29 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         | "apple-s11" | "apple-m2" | "apple-m3" | "apple-m4" | "apple-latest" => {
             &["aes", "sha2", "sha3", "dotprod", "lse", "fp16", "i8mm"]
         }
+        // SSSE3-era (Core 2, original Atom): no SSE4.
+        "core2" | "bonnell" | "saltwell" => &["cmpxchg16b", "lahfsahf", "ssse3"],
+        // SSE4.1-era (Penryn; also the x86_64-apple-darwin spec default).
+        "penryn" => &["cmpxchg16b", "lahfsahf", "sse4.1"],
+        // SSE4.2-era Intel (v2): Nehalem/Westmere and friends.
+        "x86-64-v2" | "nehalem" | "corei7" | "westmere" | "silvermont" | "slm"
+        | "goldmont" | "goldmont-plus" | "tremont" => X64_V2,
+        // AVX without AVX2: Sandy Bridge/Ivy Bridge and the matching AMD.
+        "sandybridge" | "corei7-avx" | "ivybridge" | "core-avx-i" | "bdver1" | "bdver2"
+        | "btver2" => X64_AVX,
+        // AVX2-class (v3): Haswell onward, Zen 1–3, recent E-cores.
+        "x86-64-v3" | "haswell" | "core-avx2" | "broadwell" | "skylake" | "kabylake"
+        | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake"
+        | "raptorlake" | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake"
+        | "pantherlake" | "sierraforest" | "grandridge" | "clearwaterforest" | "gracemont"
+        | "bdver4" | "znver1" | "znver2" | "znver3" => X64_V3,
+        // AVX-512 F/BW/CD/DQ/VL (v4): Skylake-SP through Cascade/Cooper Lake.
+        "x86-64-v4" | "skylake-avx512" | "cascadelake" | "cooperlake" => X64_V4,
+        // v4 plus the VNNI/VBMI/BITALG extensions Cranelift has flags for
+        // (Ice Lake onward, Zen 4/5).
+        "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" | "sapphirerapids"
+        | "emeraldrapids" | "graniterapids" | "graniterapids-d" | "diamondrapids" | "znver4"
+        | "znver5" => X64_V4_EXT,
         _ => &[],
     }
 }

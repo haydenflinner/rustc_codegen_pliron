@@ -132,11 +132,41 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
-    fn mark_volatile(&mut self, volatile: bool) {
+    pub(crate) fn mark_volatile(&mut self, volatile: bool) {
         if volatile {
             use pliron::linked_list::ContainsLinkedList;
             let tail = self.block.deref(&self.cx.pctx.borrow()).get_tail().unwrap();
             self.st.borrow_mut().volatile.insert(tail);
+        }
+    }
+
+    /// The current block's tail op, if any.
+    pub(crate) fn tail_op(&mut self) -> Option<Ptr<Operation>> {
+        use pliron::linked_list::ContainsLinkedList;
+        self.block.deref(&self.cx.pctx.borrow()).get_tail()
+    }
+
+    /// Mark every op appended to the current block after `prev` (`None`
+    /// marks all of them) volatile. Shared helpers like
+    /// `OperandValue::store` emit several ops without threading the flag
+    /// through, so the tail-only `mark_volatile` is not enough.
+    pub(crate) fn mark_ops_volatile(&mut self, prev: Option<Ptr<Operation>>) {
+        use pliron::linked_list::ContainsLinkedList;
+        let cx = self.cx.pctx.borrow();
+        let mut mark = prev.is_none();
+        let mut ops = Vec::new();
+        for op in self.block.deref(&*cx).iter(&*cx) {
+            if mark {
+                ops.push(op);
+            }
+            if Some(op) == prev {
+                mark = true;
+            }
+        }
+        drop(cx);
+        let mut st = self.st.borrow_mut();
+        for op in ops {
+            st.volatile.insert(op);
         }
     }
 

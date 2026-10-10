@@ -213,11 +213,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::black_box => return IntrinsicResult::Operand(args[0].val),
             sym::volatile_load | sym::unaligned_volatile_load => {
                 let place = PlaceRef::new_sized(a(0), result_layout);
-                return IntrinsicResult::Operand(self.load_operand(place).val);
+                // `load_operand` goes through plain `load`: mark every op it
+                // emits so they keep volatile semantics (no `notrap`, never
+                // removable or reorderable by the memory passes).
+                let prev = self.tail_op();
+                let v = self.load_operand(place).val;
+                self.mark_ops_volatile(prev);
+                return IntrinsicResult::Operand(v);
             }
             sym::volatile_store | sym::unaligned_volatile_store => {
                 let dst = PlaceRef::new_sized(a(0), args[1].layout);
-                args[1].val.store(self, dst);
+                // `volatile_store` threads MemFlags::VOLATILE through every
+                // emitted store/copy; plain `.store` dropped the flag, so
+                // volatile writes got `notrap` at -O and were removable.
+                args[1].val.volatile_store(self, dst);
                 return IntrinsicResult::Operand(OperandValue::ZeroSized);
             }
             sym::catch_unwind => {

@@ -451,6 +451,20 @@ pub fn lower_to_object(
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        if st.dse && crate::bisect("dse") {
+            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("dse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after dse ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("dse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Upstream Cranelift's egraph pass: GVN + ISLE cprop/remat rules +
         // redundant-load elimination + egraph LICM. Opt-in while its cost and
         // wins vs. our own passes are measured.
@@ -531,7 +545,15 @@ pub fn lower_to_object(
                 target_lexicon::Architecture::Aarch64(_)
                     | target_lexicon::Architecture::X86_64
             );
-            let k = crate::loopvec::run(&mut clctx.func, n, &noalias, m.target_config(), simd);
+            let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+            let k = crate::loopvec::run(
+                &mut clctx.func,
+                n,
+                &noalias,
+                m.target_config(),
+                simd,
+                x64,
+            );
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopvec {k} {n}");
             }
@@ -639,6 +661,22 @@ pub fn lower_to_object(
                 panic!("looprot broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Scalar unroll of linear counted loops (e.g. ordered float
+        // reductions that can't vectorize): K bodies per branch.
+        if st.jumpthread && crate::pass_enabled("PLIRON_PUNROLL") && crate::bisect("punroll") {
+            let k = crate::punroll::run(&mut clctx.func, n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("punroll {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after punroll ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("punroll broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if !frozen.is_empty() {
             let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
             if dump {
@@ -652,6 +690,93 @@ pub fn lower_to_object(
         // Scalar min/max wider than a register (i128) has no Cranelift
         // lowering on any target; several passes can emit it.
         crate::clifpeep::wide_minmax(&mut clctx.func);
+        if std::env::var("PLIRON_VCODE").is_ok_and(|f| n.contains(f.as_str())) {
+            clctx.set_disasm(true);
+        }
+        // Rebind cold-call args defined in hot code so their ABI register
+        // pinning lands at the cold call site instead of constraining the
+        // whole hot loop's register allocation.
+        if crate::pass_enabled("PLIRON_COLDARG") && crate::bisect("coldarg") {
+            let k = crate::clifpeep::coldargs(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldarg {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldargs ====\n{}", clctx.func.display());
+            }
+        }
+        // Splice single-predecessor successors into their predecessor so
+        // hot loops broken into several blocks by cold-edge branches lose
+        // the per-edge register-allocation copy shuffle.
+        if crate::pass_enabled("PLIRON_FUSE") && crate::bisect("fuse") {
+            let k = crate::clifpeep::fusechains(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("fuse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after fuse ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("fuse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Retarget edges past `jump`-only forwarder blocks, including
+        // try_call landing-pad and normal-return edges that the earlier
+        // jumpthread bypass cannot touch; each surviving forwarder emits a
+        // `b` in the final stream.
+        if crate::pass_enabled("PLIRON_EDGEFWD") && crate::bisect("edgefwd") {
+            let k = crate::edgefwd::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("edgefwd {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after edgefwd ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("edgefwd broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Fold multi-pred forwarders edgefwd leaves: `brif`-only blocks
+        // absorbed into `jump` preds, and `jump` forwarders with
+        // escaping params. Must run before coldedges so any hot->cold
+        // edges it creates still get cold adapters.
+        if crate::pass_enabled("PLIRON_FOLDF") && crate::bisect("foldf") {
+            let k = crate::clifpeep::foldforwarders(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("foldf {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after foldf ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Move hot->cold block-param edge copies into cold adapter blocks
+        // so the moves only execute when the cold edge is actually taken.
+        // Runs after edgefwd: its bypass has no cold check and would
+        // retarget straight through the adapters, putting the parallel
+        // copy back in the hot predecessor tail.
+        if crate::pass_enabled("PLIRON_COLDEDGE") && crate::bisect("coldedge") {
+            let k = crate::clifpeep::coldedges(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldedge {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.
@@ -663,6 +788,11 @@ pub fn lower_to_object(
                 sess.dcx().fatal(format!("function `{n}` too large: {e}"));
             }
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
+        }
+        if let Some(cc) = clctx.compiled_code()
+            && let Some(v) = &cc.vcode
+        {
+            eprintln!("==== vcode {n} ====\n{v}");
         }
         eh.add_function(&mut m, id, &clctx);
         m.clear_context(&mut clctx);
@@ -1062,21 +1192,33 @@ thread_local! {
 }
 
 /// `%al=8` + tail-`jmp` stub so foreign variadic callees dump all xmm regs.
-fn va_tramp_asm(sym: &str) -> String {
+fn va_tramp_asm(sym: &str, macho: bool) -> String {
     let sym = crate::obj_sym(sym);
     let t = format!("__pliron_va8.{sym}");
-    format!(
-        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
-    )
+    if macho {
+        format!(
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp {sym}\n.text\n"
+        )
+    } else {
+        format!(
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
+        )
+    }
 }
 
 /// `%al=8` + `jmp *<reg>` stub for calls through variadic function pointers:
 /// the fp is appended as a hidden last argument, landing in `reg`.
-fn va_tramp_ind_asm(reg: &str) -> String {
+fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     let t = format!("__pliron_va8_ind_{reg}");
-    format!(
-        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
-    )
+    if macho {
+        format!(
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp *%{reg}\n.text\n"
+        )
+    } else {
+        format!(
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
+        )
+    }
 }
 
 struct FnLower<'a, 'b, 'tcx> {
@@ -1621,7 +1763,8 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .unwrap();
             self.va_fids.insert(t.clone(), id);
         }
-        VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_asm(sym)));
+        let macho = self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+        VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_asm(sym, macho)));
         t
     }
 
@@ -2392,7 +2535,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
             let atomic = is!(AtomicLoadOp);
+            // Volatile accesses stay plain loads/stores bracketed by fences:
+            // cranelift MemFlags has no volatile bit, and without a barrier
+            // its alias analysis can fold a volatile load to an earlier
+            // value or dead-store-eliminate a volatile store. The fences put
+            // each volatile access behind an unkillable memory version.
+            let vol = !atomic && self.st.volatile.contains(&op);
             let mf = self.plain_mf(op);
+            if vol {
+                self.b.ins().fence();
+            }
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
                 .into_iter()
@@ -2406,6 +2558,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     }
                 })
                 .collect();
+            if vol {
+                self.b.ins().fence();
+            }
             if r.len() == 1 && self.st.nonnull.contains(&op) {
                 self.nonnull.insert(r[0]);
             }
@@ -2418,6 +2573,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             let p = self.get1(opnds[1]);
             let lv = self.ty_leaves(opnds[0].get_type(ctx));
             let mf = self.plain_mf(op);
+            // Volatile store: bracket with fences so cranelift's alias
+            // analysis can never dead-store-eliminate or reorder it (see
+            // the LoadOp branch above).
+            let vol = !is!(AtomicStoreOp) && self.st.volatile.contains(&op);
+            if vol {
+                self.b.ins().fence();
+            }
             for (v, (o, t)) in vs.into_iter().zip(lv) {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
@@ -2426,6 +2588,9 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
                 }
+            }
+            if vol {
+                self.b.ins().fence();
             }
         } else if is!(AtomicRmwOp) {
             use cranelift_codegen::ir::AtomicRmwOp as R;
@@ -3123,8 +3288,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                                     .unwrap();
                                 self.va_fids.insert(t.clone(), id);
                             }
+                            let macho = self.m.isa().triple().binary_format
+                                == target_lexicon::BinaryFormat::Macho;
                             VA_TRAMPS
-                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg)));
+                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg, macho)));
                             Ok(self.call_fref(self.va_fids[&t]))
                         }
                         // fp lands on the stack (rare): call it directly; %al

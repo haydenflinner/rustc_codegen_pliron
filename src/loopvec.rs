@@ -2320,8 +2320,19 @@ fn widen_vec_into(
     mut v: Value,
     aty: Type,
     accs: &[Value; 2],
+    x64: bool,
 ) -> (Value, Value) {
     let abits = aty.bits();
+    // u8→u64 byte sums: `x86_psadbw(v, 0)` + `paddq` replaces the whole
+    // 3-level widen tree (~10 ops → 2). One accumulator per group; the
+    // second one is carried unchanged.
+    if x64 && !signed && lane_bits(pos, v) == 8 && abits == 64 {
+        let vty = pos.func.dfg.value_type(v);
+        let z = pos.ins().iconst(types::I8, 0);
+        let zv = pos.ins().splat(vty, z);
+        let sad = pos.ins().x86_psadbw(v, zv);
+        return (pos.ins().iadd(accs[0], sad), accs[1]);
+    }
     loop {
         let lb = lane_bits(pos, v);
         debug_assert!(lb < abits);
@@ -2407,7 +2418,7 @@ fn widen_mul(
 /// latency and halve loop overhead, matching part of LLVM's default unroll.
 const UNROLL: usize = 4;
 
-fn apply(func: &mut Function, p: &Plan, pty: Type) {
+fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let pb = func.layout.inst_block(p.entry.inst).unwrap();
     let (cb, vh, vb, ve) = (
         func.dfg.make_block(),
@@ -2432,18 +2443,32 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let ivv = func.dfg.append_block_param(vh, iv_ty);
     let endv = func.dfg.append_block_param(vh, iv_ty);
     let nm = func.dfg.append_block_param(vh, iv_ty);
+    // Count-down induction: when nothing inside the vector body reads the
+    // scalar iv (every stream base was strength-reduced to a carried
+    // pointer and no lane early-exit resume needs the index), carry
+    // `rem = end_v - iv` instead of `iv` and test `rem != 0` on the guard.
+    // The latch then lowers to `sub` + `cbnz`/`b.ne` like LLVM, one
+    // instruction cheaper than `add` + `cmp` + `b.lo`; the epilogue resume
+    // index is just `end_v` since rem hits 0 exactly on exit.
+    let countdown = p.step > 0 && p.early.is_empty() && p.streams.iter().all(|s| !s.direct);
     let mut pos = FuncCursor::new(func).at_bottom(cb);
     // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
     // `iters-1` down instead and leave ≥1 scalar iteration (preds give
     // `iters ≥ 1` on this path).
     let iters = emit(&mut pos, iv_ty, &p.iters);
-    let mk = pos.ins().iconst(iv_ty, -p.vf * UNROLL as i64);
-    let nmv = if p.post_tested {
-        let im1 = pos.ins().iadd_imm_s(iters, -1);
-        pos.ins().band(im1, mk)
-    } else {
-        pos.ins().band(iters, mk)
+    // `base - (base & (K-1))` == `base & -K`, but unlike `band x, iconst`
+    // the result isn't in the egraph's remat set, so the trip bound stays
+    // hoisted instead of being re-executed on every vector-loop backedge.
+    let mk = pos.ins().iconst(iv_ty, p.vf * UNROLL as i64 - 1);
+    let nmv = {
+        let base = if p.post_tested {
+            pos.ins().iadd_imm_s(iters, -1)
+        } else {
+            iters
+        };
+        let r = pos.ins().band(base, mk);
+        pos.ins().isub(base, r)
     };
     let sk = pos.ins().iconst(iv_ty, p.step);
     let off = pos.ins().imul(nmv, sk);
@@ -2527,7 +2552,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     // Vector accumulators (one per unroll group per reduction) start at the
     // op's identity splatted to all lanes; acc0 is folded in on exit.
     let splits: Vec<usize> = p.reducs.iter().map(|r| r.split()).collect();
-    let mut v_arg_vals = vec![p.iv0, end, nmv];
+    // The carried counter: count-up iv (iv0 -> end), or remaining count
+    // (end - iv0 = nm*step -> 0) for the countdown latch.
+    let mut v_arg_vals = vec![if countdown { off } else { p.iv0 }, end, nmv];
     for (r, &sp) in p.reducs.iter().zip(&splits) {
         let n = if r.ordered { 1 } else { UNROLL * sp };
         for _ in 0..n {
@@ -2541,6 +2568,37 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 v_arg_vals.push(v);
             }
         }
+    }
+    // Strength-reduced stream bases: a `base + iv*rate` address would
+    // otherwise recompute a scaled-index `mul`/`iadd` tree every
+    // iteration; carry the per-iteration base as a vector-loop
+    // parameter stepped ±vf*UNROLL elements per backedge instead.
+    // Descending streams anchor at the UNROLL block's lowest byte so
+    // every group's load/store offset is a non-negative displacement —
+    // the unsigned amode form the emit-time ldp/stp fusion requires.
+    let mut sr_steps: Vec<i64> = Vec::new();
+    for s in &p.streams {
+        if s.direct {
+            sr_steps.push(0);
+            continue;
+        }
+        let e = i64::from(p.elem.bytes());
+        // Evaluate the stream base at the iv whose address is group 0's
+        // lowest byte — for a descending stream its last lane.
+        let adj = if s.neg { (p.vf - 1) * p.step } else { 0 };
+        let w0 = if adj == 0 {
+            p.iv0
+        } else {
+            let c = pos.ins().iconst(iv_ty, adj);
+            pos.ins().iadd(p.iv0, c)
+        };
+        let mut base = emit(&mut pos, pty, &subst(&s.base, p.iv, w0));
+        if s.neg {
+            let c = pos.ins().iconst(pty, -(UNROLL as i64 - 1) * p.vf * e);
+            base = pos.ins().iadd(base, c);
+        }
+        v_arg_vals.push(base);
+        sr_steps.push(if s.neg { -e } else { e } * p.vf * UNROLL as i64);
     }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
     let v_args: Vec<BlockArg> = v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
@@ -2562,8 +2620,20 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 .collect()
         })
         .collect();
+    // Carried stream bases (strength-reduced above) follow the accumulators
+    // in `vh`'s parameter list.
+    let sr_ptrs: Vec<Option<Value>> = p
+        .streams
+        .iter()
+        .map(|s| (!s.direct).then(|| pos.func.dfg.append_block_param(vh, pty)))
+        .collect();
     let mut pos = FuncCursor::new(pos.func).at_bottom(vh);
-    let c = pos.ins().icmp(IntCC::UnsignedLessThan, ivv, endv);
+    let c = if countdown {
+        let z = pos.ins().iconst(iv_ty, 0);
+        pos.ins().icmp(IntCC::NotEqual, ivv, z)
+    } else {
+        pos.ins().icmp(IntCC::UnsignedLessThan, ivv, endv)
+    };
     pos.ins().brif(c, vb, &[], ve, &[]);
     // ve: scalar epilogue entry — resume at iv_v with stepping params advanced
     // by s*nm and each reduction acc = acc0 ⊕ fold(vacc).
@@ -2572,7 +2642,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     let mut epi: Vec<Value> = Vec::new();
     for (j, _) in params.iter().enumerate() {
         if j == p.iv_idx {
-            epi.push(ivv);
+            // Countdown loops exit with rem == 0, i.e. iv == end_v.
+            epi.push(if countdown { endv } else { ivv });
             continue;
         }
         if let Some((k, r)) = p.reducs.iter().enumerate().find(|(_, r)| r.idx == j) {
@@ -2581,17 +2652,36 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 epi.push(vaccs[k][0]);
                 continue;
             }
-            // Fold each unroll group's accumulator to a scalar, then combine
-            // (reassociation is exact for the whitelisted ops).
+            // Combine the group accumulators lane-wise, then fold the
+            // single vector to a scalar through a log2(lanes)
+            // shuffle+op tree — extractlane-per-element is linear and
+            // serializes on the scalar ALU. (Reassociation is exact for
+            // the whitelisted ops.)
             let mut acc = p.entry_args[j];
-            for &vacc in &vaccs[k] {
-                let mut s = pos.ins().extractlane(vacc, 0);
-                for l in 1..r.lanes() {
-                    let lane = pos.ins().extractlane(vacc, l as u8);
-                    s = red_emit(&mut pos, r.op, s, lane);
-                }
-                acc = red_emit(&mut pos, r.op, acc, s);
+            let mut v = vaccs[k][0];
+            for &a in &vaccs[k][1..] {
+                v = red_emit(&mut pos, r.op, v, a);
             }
+            let mut lanes = r.lanes();
+            while lanes > 1 {
+                // Rotate the vector by half its live width so the upper
+                // half lands in the low lanes, then combine lane-wise;
+                // only the low half stays meaningful after each step.
+                let half = (lanes as usize * r.aty.bytes() as usize) / 2;
+                let mut m = [0u8; 16];
+                for b in 0..16 {
+                    m[b] = ((b + half) % 16) as u8;
+                }
+                let imm = pos.func.dfg.immediates.push(ConstantData::from(&m[..]));
+                let le = MemFlagsData::new().with_endianness(Endianness::Little);
+                let b8 = pos.ins().bitcast(types::I8X16, le, v);
+                let sh = pos.ins().shuffle(b8, b8, imm);
+                let hi = pos.ins().bitcast(r.vty(), le, sh);
+                v = red_emit(&mut pos, r.op, v, hi);
+                lanes /= 2;
+            }
+            let s = pos.ins().extractlane(v, 0);
+            acc = red_emit(&mut pos, r.op, acc, s);
             epi.push(acc);
             continue;
         }
@@ -2660,7 +2750,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
         // iteration (sharing `iv*rate` across groups), the group shift
         // rides the load/store's immediate operand.
         let mut addrs = Vec::new();
-        for s in &p.streams {
+        for (j, s) in p.streams.iter().enumerate() {
             let e = i64::from(p.elem.bytes());
             let (a, off) = if s.direct {
                 if s.neg {
@@ -2672,40 +2762,62 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                     (ivv, gb * g as i64)
                 }
             } else {
-                // Substitute the iv whose address is the block's lowest
-                // byte: the group's first lane ascending, its last
-                // descending.
-                let adj = if s.neg { (p.vf - 1) * p.step } else { 0 };
-                let w = if adj == 0 {
-                    ivv
+                // Strength-reduced carried base: the group shift rides
+                // the load/store's immediate operand. Descending bases
+                // are anchored at the UNROLL block's lowest byte, so
+                // group offsets count up from there.
+                let a = sr_ptrs[j].unwrap();
+                let off = if s.neg {
+                    (UNROLL as i64 - 1 - g as i64) * p.vf * e
                 } else {
-                    let c = pos.ins().iconst(iv_ty, adj);
-                    pos.ins().iadd(ivv, c)
+                    (g as i64) * p.vf * e
                 };
-                let a0 = emit(&mut pos, pty, &subst(&s.base, p.iv, w));
-                let d = (g as i64) * p.vf * e;
-                (a0, if s.neg { -d } else { d })
+                (a, off)
             };
             addrs.push((a, off));
         }
-        let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
-        if hoist {
-            for &(i, j) in &p.mems[..first_store] {
-                if let InstructionData::Load { .. } = pos.func.dfg.insts[i] {
-                    let r = pos.func.dfg.resolve_aliases(pos.func.dfg.first_result(i));
-                    if p.can_vec.contains(&r) && !vmap.contains_key(&r) {
-                        let mut vl =
-                            pos.ins()
-                                .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
-                        if p.streams[j].neg {
-                            vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
-                        }
-                        vmap.insert(r, vl);
+        groups.push((addrs, FxHashMap::default()));
+    }
+    if hoist {
+        // Loads inst-major: all unroll groups of one memory inst emit
+        // consecutively, so a stream's group loads land on adjacent
+        // addresses next to each other (`ldr [b+k], ldr [b+k+sz]`),
+        // which the emit-time `ldp` fusion and post-index writeback
+        // sweep can pick up. Lane reversals go in a second pass so a
+        // `rev`/`ext` chain doesn't split the load run. All loads here
+        // precede `first_store`, and loads commute with each other, so
+        // the reorder is unobservable. (`hoist` implies
+        // `early.is_empty()`, so `vbs == [vb]`.)
+        let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[0]);
+        for &(i, j) in &p.mems[..first_store] {
+            if let InstructionData::Load { .. } = pos.func.dfg.insts[i] {
+                let r = pos.func.dfg.resolve_aliases(pos.func.dfg.first_result(i));
+                if !p.can_vec.contains(&r) {
+                    continue;
+                }
+                let mut raws: Vec<(usize, Value)> = Vec::with_capacity(UNROLL);
+                for g in 0..UNROLL {
+                    let (addrs, vmap) = &mut groups[g];
+                    if vmap.contains_key(&r) {
+                        continue;
                     }
+                    let vl = pos.ins().load(
+                        p.vt,
+                        MemFlagsData::new().with_notrap(),
+                        addrs[j].0,
+                        addrs[j].1 as i32,
+                    );
+                    raws.push((g, vl));
+                }
+                for (g, vl) in raws {
+                    let mut vl = vl;
+                    if p.streams[j].neg {
+                        vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
+                    }
+                    groups[g].1.insert(r, vl);
                 }
             }
         }
-        groups.push((addrs, vmap));
     }
     // When every load precedes the first store, store values are pure
     // computation on the hoisted loads — compute them all, then issue the
@@ -2836,7 +2948,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
                 );
                 v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                 let (lo, hi) =
-                    widen_vec_into(&mut pos, *signed, v, r.aty, accs.try_into().unwrap());
+                    widen_vec_into(&mut pos, *signed, v, r.aty, accs.try_into().unwrap(), x64);
                 back_accs[k].push(lo);
                 back_accs[k].push(hi);
                 continue;
@@ -2884,7 +2996,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
             .store(MemFlagsData::new().with_notrap(), vv, a, off as i32);
     }
     let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
-    let iv2 = pos.ins().iadd(ivv, k);
+    let iv2 = if countdown {
+        pos.ins().isub(ivv, k)
+    } else {
+        pos.ins().iadd(ivv, k)
+    };
     let mut back: Vec<Value> = vec![iv2, endv, nm];
     for (i, accs) in back_accs.iter_mut().enumerate() {
         if p.reducs[i].ordered {
@@ -2893,6 +3009,15 @@ fn apply(func: &mut Function, p: &Plan, pty: Type) {
     }
     for accs in &back_accs {
         back.extend(accs);
+    }
+    // Step the strength-reduced stream bases: ±vf*UNROLL elements per
+    // vector iteration.
+    for (j, s) in p.streams.iter().enumerate() {
+        if s.direct {
+            continue;
+        }
+        let c = pos.ins().iconst(pty, sr_steps[j]);
+        back.push(pos.ins().iadd(sr_ptrs[j].unwrap(), c));
     }
     let bargs: Vec<BlockArg> = back.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().jump(vh, &bargs);
@@ -2942,6 +3067,7 @@ pub fn run(
     noalias: &FxHashSet<Value>,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
     simd: bool,
+    x64: bool,
 ) -> usize {
     if !simd {
         return 0;
@@ -2968,7 +3094,7 @@ pub fn run(
         if debug {
             eprintln!("vec {:?}: {}x{}", p.h, p.vf, p.elem);
         }
-        apply(func, &p, pty);
+        apply(func, &p, pty, x64);
         n += 1;
         if n >= MAX_CONV {
             break;
