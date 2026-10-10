@@ -982,14 +982,17 @@ Filter+fusion shapes that now vectorize:
 
 Residuals:
 - `chars().filter()`: the `Chars` iterator is a UTF-8 decode FSM —
-  data-dependent byte stride (1..4), 3+ non-linear header params
-  (ptr/state/acc), continuation-byte shift/mask assembly. lane-wise
-  loopvec can't express it; would need a dedicated SIMD decode idiom
-  (lead-byte classification). ~2.4x residual, documented.
-- `(a..b).contains(&x)` predicates lower through
-  `RangeInclusive::contains`'s `br_table` dispatch — a different CFG
-  shape (conv_table can't fold multi-leaf dispatch). Niche; `is_ascii_*`
-  covers the common predicates.
+  data-dependent byte stride (1..4), continuation-byte shift/mask
+  assembly. The `Option<char>`/`Option<NonNull>` niche overhead is now
+  folded (see "niche decoding" below), but each multibyte arm still
+  carries `select(ptr==end, 0, ptr)` safe-load selects for continuation
+  bytes — the loop is dep-bound on the carried `cmp`+`csel` chain where
+  stock does post-increment loads. ~1.6-2.9x residual (was 2.4-3.4x).
+- `(a..b).contains(&x)`: not a `br_table` in the hot loop — two cmps +
+  `and` per element. Stock *vectorizes* the `count(lo<=i && i<=hi)`
+  reduction (8x u32 `cmhs` lanes); ours is scalar (2.2x). Same family as
+  count-if; would need a wider-lane range-check reduction in loopvec.
+  Also a spilled `hi` reload inside the loop (missed stack fwd).
 
 Bench (1MiB u8, aarch64, ms/iter):
   bytes_alpha  0.157 -> 0.056  (stock 0.157 — 2.8x FASTER)
@@ -998,8 +1001,57 @@ Bench (1MiB u8, aarch64, ms/iter):
   cnt_gt(>127) 0.059 -> 0.027  (stock 0.059 — 2.2x)
   cnt_eq(==32) 0.143 -> 0.027  (stock 0.142 — 5.3x)
   sum_if       0.068 -> 0.032  (stock 0.069 — 2.2x)
-  chars_alpha  1.577           (stock 0.457 — 3.4x behind, decode)
-  chars_ascii  1.131           (stock 0.471 — 2.4x behind, decode)
+  chars_count  0.037           (stock 0.037 — parity)
+  chars_alpha  1.42            (stock 0.49 — 2.9x behind, was 3.4x)
+  chars_ascii  0.85-0.87       (stock 0.52 — 1.6x behind, was 2.4x)
+  chars_mixed  2.09-2.12       (stock 1.10 — 1.9x behind)
+  tokenize     2.57            (stock 1.10 — 2.3x behind, was ~2.6x)
+  contains_rng 0.56-0.58       (stock 0.26 — 2.2x, stock vectorizes)
+
+### Niche decoding (`Option`/`char` sentinels) — this round
+
+rustc niche-encodes `Option<NonNull>`/`Option<char>`: `Chars::next`
+materialises `select(end?, 0, ptr)` (null niche) and
+`select(flag, char, -1)` (char niche `-1`), plus a `select(c, ptr, ptr+1)`
+"null-safe" next pointer. Stock LLVM never materialises these — it
+branches on the guard directly. Folds added:
+
+- `context.rs`: `FuncInfo::nonnull` — rustc `nonnull` arg attrs
+  (`&T`/`&str` data ptrs, `Box`, `NonNull`) by leaf index;
+  `nonnull_values()` maps them to entry args; `lower.rs` seeds them into
+  the `nonnull` fact set (`PLIRON_NNARGS`).
+- `jumpthread::fold_null_tests`: `icmp eq/ne (select c, 0, X), 0` →
+  `c`/`!c` when `X` is nonnull (`NonNull` lattice: nonnull loads, args,
+  `inbounds` offsets, select arms, block-param greatest fixpoint); the
+  block-param variant folds `p == 0` to the guarding `brif` condition
+  when all of `p`'s edges funnel through it (`PLIRON_PARAMNULL`).
+- Sentinel generalisation (`PLIRON_SENTINEL`): `icmp eq/ne
+  (select c, X, K), K` → `!c`/`c` for `X` provably `!= K` — `ne_params`
+  computes a greatest fixpoint of params `!= K` (constants, `uloadN`
+  widths, `kbits`, select arms; skips self edges and unreachable preds)
+  — folds `Option<char>`'s `-1` test to the "produced char" flag.
+- `clifpeep::sel_regions` (`PLIRON_SELREGION`): a `select c, a, b` whose
+  uses all sit under one decided arm of `brif c` (or `brif (icmp eq/ne
+  c,0)`) collapses to that arm; edge args fold in place first, which is
+  what frees `Chars`' loop-carried `select(end?, ptr, ptr+1)` into a
+  plain `iadd`.
+- `sameargs` const-key: uniform args keyed by `(ty, imm)` so per-edge
+  `iconst` materialisations merge; `const_sweep` (`PLIRON_CSWEEP`) then
+  const-folds the residue via `eval` (iconsts masked + sign-extended —
+  narrow `imm`s must be canonicalised on insert).
+- `jumpthread` body budget (`PLIRON_BODYK`): `iconst`s no longer count
+  against `MAX_BODY` — long niche-merge bodies (flag test + sentinel
+  compare) now thread.
+
+ASCII `chars_alpha` hot path is now `ldrb`+`add`+`cmp`+`b`+`tbnz` —
+the `Option` selects are gone; remaining gap is the multibyte safe-load
+selects and the flag materialisation (`mov w13,#1`/`tbnz`).
+
+Correctness landmines hit and fixed this round: `AKey::Other` must keep
+the raw `BlockArg` (`TryCallRet(0)` vs `(1)` — merging them crashed the
+unwind test); `const_sweep` must mask+sext `eval` results; the
+param-null "all edges nonnull" case fired vacuously on entry params
+(needs `saw_x`); `k != 0` icmps must not fall into the `x == 0` paths.
 
 Generated (bytes_alpha): ldp-paired 16B loads (64B/iter, UNROLL=4),
 `cmhs.16b` range compares, `bsl.16b` select-tree mask, `and.16b`(1),

@@ -118,6 +118,7 @@ fn emit_arm(
     func: &mut Function,
     term: Inst,
     arm: &Arm,
+    derived: &mut FxHashMap<Value, Value>,
 ) -> Vec<Value> {
     let mut map: FxHashMap<Value, Value> = arm.psub.iter().copied().collect();
     {
@@ -139,7 +140,16 @@ fn emit_arm(
             let old: Vec<Value> = pos.func.dfg.inst_results(i).to_vec();
             let new: Vec<Value> = pos.func.dfg.inst_results(ni).to_vec();
             for (o, nr) in old.into_iter().zip(new) {
-                map.insert(pos.func.dfg.resolve_aliases(o), nr);
+                let o = pos.func.dfg.resolve_aliases(o);
+                map.insert(o, nr);
+                // A clone of an `inbounds` offset is still inbounds on the
+                // renamed base — keep the fact so `NonNull` can see it.
+                if let Some(&b) = derived.get(&o) {
+                    let b = map.get(&pos.func.dfg.resolve_aliases(b))
+                        .copied()
+                        .unwrap_or(b);
+                    derived.insert(nr, b);
+                }
             }
         }
     }
@@ -196,6 +206,7 @@ fn conv_table(
     dirty: &mut bool,
     b: Block,
     term: Inst,
+    derived: &mut FxHashMap<Value, Value>,
 ) -> bool {
     let InstructionData::BranchTable { arg, table, .. } = func.dfg.insts[term] else {
         return false;
@@ -345,7 +356,7 @@ fn conv_table(
         }
     }
     *dirty = true;
-    let avals: Vec<Vec<Value>> = arms.iter().map(|a| emit_arm(func, term, a)).collect();
+    let avals: Vec<Vec<Value>> = arms.iter().map(|a| emit_arm(func, term, a, derived)).collect();
     let mut sargs: Vec<BlockArg> = Vec::with_capacity(np);
     for j in 0..np {
         let mut sel = avals[dflt][j];
@@ -387,7 +398,7 @@ fn conv_table(
     true
 }
 
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize {
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
     let mut mset_cache: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
@@ -399,7 +410,7 @@ pub fn run(func: &mut Function) -> usize {
         };
         let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
             if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
-                && conv_table(func, &mut cfg, &mut domtree, &mut mset_cache, &mut dirty, b, term)
+                && conv_table(func, &mut cfg, &mut domtree, &mut mset_cache, &mut dirty, b, term, derived)
             {
                 n += 1;
             }
@@ -467,8 +478,8 @@ pub fn run(func: &mut Function) -> usize {
             continue;
         }
         dirty = true;
-        let targs = emit_arm(func, term, &ta);
-        let eargs = emit_arm(func, term, &ea);
+        let targs = emit_arm(func, term, &ta, derived);
+        let eargs = emit_arm(func, term, &ea, derived);
         let cond = func.dfg.resolve_aliases(cond);
         let mut sargs: Vec<BlockArg> = Vec::with_capacity(targs.len());
         for (x, y) in targs.into_iter().zip(eargs) {

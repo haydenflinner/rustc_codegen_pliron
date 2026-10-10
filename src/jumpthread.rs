@@ -17,7 +17,7 @@ use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
-    Opcode, Type, Value, ValueDef,
+    Opcode, ProgramPoint, Type, Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -377,17 +377,43 @@ impl<'a> NonNull<'a> {
     }
 
     pub(crate) fn is(&self, func: &Function, v: Value) -> bool {
-        let mut v = func.dfg.resolve_aliases(v);
-        for _ in 0..8 {
-            if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {
-                return true;
+        // `select c, a, b` is non-null iff both arms are; every term on
+        // the worklist must justify itself (a `!nonnull` load, a param
+        // the fixpoint kept, a symbol/stack address, or an `inbounds`
+        // offset of a non-null base).
+        let mut work = vec![func.dfg.resolve_aliases(v)];
+        let mut seen: FxHashSet<Value> = FxHashSet::default();
+        'terms: while let Some(mut v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
             }
-            match self.derived.get(&v) {
-                Some(&b) => v = func.dfg.resolve_aliases(b),
-                None => return false,
+            for _ in 0..8 {
+                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v)
+                {
+                    continue 'terms;
+                }
+                if let Some(i) = func.dfg.value_def(v).inst()
+                    && let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args,
+                    } = func.dfg.insts[i]
+                {
+                    work.push(func.dfg.resolve_aliases(args[1]));
+                    work.push(func.dfg.resolve_aliases(args[2]));
+                    continue 'terms;
+                }
+                match self.derived.get(&v) {
+                    Some(&b) => {
+                        v = func.dfg.resolve_aliases(b);
+                        continue;
+                    }
+                    None => return false,
+                }
             }
+            // Derived chain too deep to prove.
+            return false;
         }
-        false
+        true
     }
 }
 
@@ -401,10 +427,226 @@ fn addr_of_symbol(func: &Function, v: Value) -> bool {
     })
 }
 
-/// `icmp eq/ne x, 0` with `x` known non-null → constant.
+/// Trace the `src → dst` edge at destination index `di` back through
+/// single-predecessor `jump` chains to the `brif` whose arm selects it.
+/// Returns `(guard_block, condition, taken_when_true)`.
+fn edge_guard(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    mut src: Block,
+    mut di: usize,
+) -> Option<(Block, Value, bool)> {
+    for _ in 0..64 {
+        let t = func.layout.last_inst(src)?;
+        match func.dfg.insts[t] {
+            InstructionData::Brif { arg: c, .. } => return Some((src, c, di == 0)),
+            InstructionData::Jump { .. } => {
+                // `src` falls through unconditionally; its single
+                // predecessor's terminator holds the guard.
+                let mut preds = cfg.pred_iter(src);
+                let p = preds.next()?;
+                if preds.next().is_some() {
+                    return None;
+                }
+                let dests = func.dfg.insts[p.inst].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                );
+                // If `src` is reachable on more than one arm the edge
+                // carries no arm information.
+                let mut hit = dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == src)
+                    .map(|(i, _)| i);
+                di = hit.next()?;
+                if hit.next().is_some() {
+                    return None;
+                }
+                src = p.block;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `v` is provably `!= k` (`k` masked to `v`'s width): constants,
+/// zero-extend loads, known bits (`band`/`bor`/shifts), selects whose
+/// arms both qualify, or a block param in `cand` (the greatest-fixpoint
+/// set `ne_params` computes — iterator decode pipelines route values
+/// through cycles of params like `Chars`' forwarder merges, which a
+/// plain recursion can't prove).
+fn ne_const(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    cand: &FxHashSet<Value>,
+    v: Value,
+    k: u64,
+    depth: u32,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    let Some(w) = bits(func, v) else {
+        return false;
+    };
+    let k = mask(k, w);
+    if let Some(c) = known(func, env, v) {
+        return c != k;
+    }
+    match func.dfg.value_def(v) {
+        ValueDef::Param(..) => cand.contains(&v),
+        ValueDef::Result(i, _) => match func.dfg.insts[i].opcode() {
+            // Zero-extend loads clear every bit above the load width.
+            Opcode::Uload8 => k >> 8 != 0,
+            Opcode::Uload16 => k >> 16 != 0,
+            Opcode::Uload32 => k >> 32 != 0,
+            Opcode::Select => {
+                let InstructionData::Ternary { args: sa, .. } = func.dfg.insts[i] else {
+                    return false;
+                };
+                ne_const(func, env, cand, sa[1], k, depth + 1)
+                    && ne_const(func, env, cand, sa[2], k, depth + 1)
+            }
+            _ => {
+                let kenv = FxHashMap::default();
+                let (z, o) = kbits(func, env, &kenv, v, 0);
+                ((o & !k) | (z & k)) != 0
+            }
+        },
+        _ => false,
+    }
+}
+
+/// Greatest fixpoint: block params whose every value is provably `!= k`
+/// (`k` masked per param width). Every param starts a candidate; one is
+/// dropped when a non-self incoming arg can't be shown `!= k` (self edges
+/// preserve the value, adding no candidates — cycles of provable params
+/// survive the fixpoint).
+fn ne_params(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    env: &FxHashMap<Value, u64>,
+    k: u64,
+) -> FxHashSet<Value> {
+    // Edges out of unreachable blocks contribute no runtime values; the
+    // pass runs before dead-block sweeps, so count only reachable preds.
+    let mut reach: FxHashSet<Block> = FxHashSet::default();
+    let mut work = Vec::new();
+    if let Some(e) = func.layout.entry_block() {
+        reach.insert(e);
+        work.push(e);
+    }
+    while let Some(b) = work.pop() {
+        for s in cfg.succ_iter(b) {
+            if reach.insert(s) {
+                work.push(s);
+            }
+        }
+    }
+    let mut args_of: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut cand: FxHashSet<Value> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        if !reach.contains(&b) {
+            continue;
+        }
+        for (pidx, &p) in func.dfg.block_params(b).iter().enumerate() {
+            if bits(func, p).is_none() {
+                continue;
+            }
+            let mut args = Vec::new();
+            let mut ok = true;
+            for pred in cfg.pred_iter(b) {
+                if !reach.contains(&pred.block) {
+                    continue;
+                }
+                let dests = func.dfg.insts[pred.inst].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                );
+                for bc in dests {
+                    if bc.block(&func.dfg.value_lists) != b {
+                        continue;
+                    }
+                    match bc.args(&func.dfg.value_lists).nth(pidx) {
+                        Some(BlockArg::Value(a)) => {
+                            let a = func.dfg.resolve_aliases(a);
+                            if a != p {
+                                args.push(a);
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            // No non-self args (entry params, pure self-loops): nothing
+            // proves `!= k`.
+            if ok && !args.is_empty() {
+                args_of.insert(p, args);
+                cand.insert(p);
+            }
+        }
+    }
+    loop {
+        let mut drop = Vec::new();
+        for (&p, args) in &args_of {
+            if cand.contains(&p)
+                && args
+                    .iter()
+                    .any(|&a| !ne_const(func, env, &cand, a, k, 0))
+            {
+                drop.push(p);
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        for p in drop {
+            cand.remove(&p);
+        }
+    }
+    cand
+}
+
+/// `icmp eq/ne x, 0` with `x` known non-null → constant. Also the
+/// `Option<NonNull>`-niche tests `icmp eq/ne (select c, 0, X), 0` (a
+/// select is null exactly when `c` picks the zero arm) and the block-param
+/// equivalent (a param is null exactly on zero-arg edges; when all edges
+/// funnel through one `brif`, the test reduces to that condition) — the
+/// shapes `slice::Iter::next()`/`Chars` leave after Option lowering.
+/// The same select shape with a non-zero sentinel (`icmp eq/ne
+/// (select c, X, K), K` with `X` provably `!= K`, e.g. `Option<char>`'s
+/// `-1`) reduces to `!c`.
 fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
     let none = FxHashMap::default();
+    enum Fold {
+        Const(i64),
+        Alias(Value),
+        Neg(Value),
+        NN(Value),
+    }
+    // `brif`/`select` conditions are only guaranteed nonzero-vs-zero;
+    // an `icmp` result is canonically 0/1, so aliasing `c` directly is
+    // only safe when `c` itself is a canonical boolean.
+    let booly = |func: &Function, v: Value| {
+        func.dfg
+            .value_def(v)
+            .inst()
+            .is_some_and(|i| matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp))
+    };
     let mut hits = Vec::new();
+    let mut cfg_lazy: Option<ControlFlowGraph> = None;
+    let mut dt_lazy: Option<DominatorTree> = None;
+    // `ne_params` sets per sentinel constant, built on first use.
+    let mut ne_sets: FxHashMap<u64, FxHashSet<Value>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for inst in func.layout.block_insts(b) {
             let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
@@ -415,21 +657,233 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             {
                 continue;
             }
-            let x = match (known(func, &none, args[0]), known(func, &none, args[1])) {
-                (Some(0), None) => args[1],
-                (None, Some(0)) => args[0],
+            let ne = cond == IntCC::NotEqual;
+            let (x, k) = match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (Some(k), None) => (args[1], k),
+                (None, Some(k)) => (args[0], k),
                 _ => continue,
             };
+            let Some(w) = bits(func, x) else {
+                continue;
+            };
+            let k = mask(k, w);
+            if k != 0 {
+                if !crate::pass_enabled("PLIRON_SENTINEL") {
+                    continue;
+                }
+                // `select c, X, K == K` iff `!c` when `X != K`;
+                // `select c, K, X` mirrors. The sentinel test of a
+                // niche-encoded enum (`Option<char>`'s `-1`).
+                let x = func.dfg.resolve_aliases(x);
+                let Some(d) = func.dfg.value_def(x).inst() else {
+                    continue;
+                };
+                let InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: sa,
+                } = func.dfg.insts[d]
+                else {
+                    continue;
+                };
+                let cfg =
+                    cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                let cand = ne_sets
+                    .entry(k)
+                    .or_insert_with(|| ne_params(func, cfg, &none, k));
+                let eq_is_c = if known(func, &none, sa[2]) == Some(k)
+                    && ne_const(func, &none, cand, sa[1], k, 0)
+                {
+                    false
+                } else if known(func, &none, sa[1]) == Some(k)
+                    && ne_const(func, &none, cand, sa[2], k, 0)
+                {
+                    true
+                } else {
+                    continue;
+                };
+                let c = sa[0];
+                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst))
+                {
+                    continue;
+                }
+                // `x == K` ⇔ `eq_is_c ? c : !c`; `ne` inverts.
+                let f = match (ne, eq_is_c) {
+                    (false, true) | (true, false) if booly(func, c) => Fold::Alias(c),
+                    (false, true) | (true, false) => Fold::NN(c),
+                    _ => Fold::Neg(c),
+                };
+                hits.push((inst, f));
+                continue;
+            }
             if nn.is(func, x) {
-                hits.push((inst, (cond == IntCC::NotEqual) as i64));
+                hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
+                continue;
+            }
+            let x = func.dfg.resolve_aliases(x);
+            // A block param is the other form Rust's niche layout takes
+            // after SROA: `p` merges the `Some` pointer with the `None`
+            // zero. `p == 0` iff a zero edge was taken; when every edge
+            // funnels through the same `brif c`, the test is that
+            // condition itself.
+            if crate::pass_enabled("PLIRON_PARAMNULL")
+                && let ValueDef::Param(d, pidx) = func.dfg.value_def(x)
+            {
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                let mut edges: Vec<(bool, bool)> = Vec::new();
+                let mut guard: Option<(Block, Value)> = None;
+                let mut ok = true;
+                for pred in cfg.pred_iter(d) {
+                    let dests = func.dfg.insts[pred.inst].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    );
+                    for (di, bc) in dests.iter().enumerate() {
+                        if bc.block(&func.dfg.value_lists) != d {
+                            continue;
+                        }
+                        let Some(BlockArg::Value(arg)) =
+                            bc.args(&func.dfg.value_lists).nth(pidx)
+                        else {
+                            ok = false;
+                            break;
+                        };
+                        let Some((gb, c, arm)) = edge_guard(func, cfg, pred.block, di)
+                        else {
+                            ok = false;
+                            break;
+                        };
+                        match guard {
+                            None => guard = Some((gb, c)),
+                            Some((pb, pc)) if pb == gb && pc == c => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        let arg = func.dfg.resolve_aliases(arg);
+                        match known(func, &none, arg) {
+                            Some(0) => edges.push((arm, true)),
+                            Some(_) => edges.push((arm, false)),
+                            None if nn.is(func, arg) => edges.push((arm, false)),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let (mut zarm, mut saw_x) = (None, false);
+                for &(arm, is_z) in &edges {
+                    if is_z {
+                        match zarm {
+                            None => zarm = Some(arm),
+                            Some(z) if z == arm => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        saw_x = true;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let Some(az) = zarm else {
+                    // Every edge passes a non-null value — only meaningful
+                    // with at least one edge (an entry param has none and
+                    // would fold vacuously).
+                    if !saw_x {
+                        continue;
+                    }
+                    hits.push((inst, Fold::Const(ne as i64)));
+                    continue;
+                };
+                if !saw_x || edges.iter().any(|&(a, z)| !z && a == az) {
+                    continue;
+                }
+                let Some((_, c)) = guard else {
+                    continue;
+                };
+                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst)) {
+                    continue;
+                }
+                // `c` must dominate the test: every path to the merge
+                // block passes the guard, so it does — except a guard
+                // inside the merge block itself (self-edge), where the
+                // compare could precede `c`'s def.
+                let dt = dt_lazy.get_or_insert_with(|| {
+                    DominatorTree::with_function(func, cfg)
+                });
+                let pp = match func.dfg.value_def(c) {
+                    ValueDef::Result(ci, _) => ProgramPoint::Inst(ci),
+                    ValueDef::Param(cb, _) => ProgramPoint::Block(cb),
+                    _ => continue,
+                };
+                if !dt.dominates(pp, inst, &func.layout) {
+                    continue;
+                }
+                // `p == 0` ⇔ arm `az` taken ⇔ (az ? c : !c); `ne` inverts.
+                let f = match (ne, az) {
+                    (false, true) | (true, false) if booly(func, c) => Fold::Alias(c),
+                    (false, true) | (true, false) => Fold::NN(c),
+                    _ => Fold::Neg(c),
+                };
+                hits.push((inst, f));
+                continue;
+            }
+            let Some(d) = func.dfg.value_def(x).inst() else {
+                continue;
+            };
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: sa,
+            } = func.dfg.insts[d]
+            else {
+                continue;
+            };
+            // `select c, 0, X == 0` iff `c` (X ≠ 0); `select c, X, 0` mirrors.
+            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is(func, sa[2]);
+            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is(func, sa[1]);
+            let c = sa[0];
+            let f = match (t0, t1, ne) {
+                (true, _, false) | (false, true, true) if booly(func, c) => Fold::Alias(c),
+                (true, _, false) | (false, true, true) => Fold::NN(c),
+                (true, _, true) | (false, true, false) => Fold::Neg(c),
+                _ => continue,
+            };
+            hits.push((inst, f));
+        }
+    }
+    let n = hits.len();
+    for (inst, f) in hits {
+        match f {
+            Fold::Const(k) => {
+                let ty = func.dfg.value_type(func.dfg.first_result(inst));
+                func.replace(inst).iconst(ty, k);
+            }
+            Fold::Alias(c) => {
+                let res = func.dfg.first_result(inst);
+                func.dfg.clear_results(inst);
+                func.layout.remove_inst(inst);
+                func.dfg.change_to_alias(res, c);
+            }
+            Fold::Neg(c) => {
+                func.replace(inst).icmp_imm_s(IntCC::Equal, c, 0);
+            }
+            Fold::NN(c) => {
+                func.replace(inst).icmp_imm_s(IntCC::NotEqual, c, 0);
             }
         }
     }
-    for &(inst, k) in &hits {
-        let ty = func.dfg.value_type(func.dfg.first_result(inst));
-        func.replace(inst).iconst(ty, k);
-    }
-    hits.len()
+    n
 }
 
 enum Arg {
@@ -497,7 +951,25 @@ fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
         let Some((&term, body)) = insts.split_last() else {
             continue;
         };
-        if body.len() > MAX_BODY || !body.iter().all(|&i| pure_op(func, i)) {
+        // `iconst`s cost nothing to evaluate through the env map; budget
+        // the real ops only (long niche-merge chains — `Option<char>`
+        // flag test + sentinel compare — otherwise exceed MAX_BODY).
+        let real = if crate::pass_enabled("PLIRON_BODYK") {
+            body.iter()
+                .filter(|&&i| {
+                    !matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        } else {
+            body.len()
+        };
+        if real > MAX_BODY || !body.iter().all(|&i| pure_op(func, i)) {
             continue;
         }
         let InstructionData::Brif {
@@ -1852,7 +2324,7 @@ pub(crate) fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
 pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
-    derived: &FxHashMap<Value, Value>,
+    derived: &mut FxHashMap<Value, Value>,
 ) -> (usize, usize, usize) {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
@@ -1888,7 +2360,6 @@ pub fn run(
             }
             check(func, "deadp");
         }
-        let nn = NonNull::new(func, loads, derived);
         let dc = if domcond {
             fold_dominated_conds(func)
         } else {
@@ -1900,7 +2371,7 @@ pub fn run(
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
         // sweep them once unreachable.
-        let ic = if ifconv { crate::ifconv::run(func) } else { 0 };
+        let ic = if ifconv { crate::ifconv::run(func, derived) } else { 0 };
         check(func, "ifconv");
         if ic > 0 {
             remove_unreachable_blocks(func);
@@ -1908,6 +2379,8 @@ pub fn run(
         check(func, "unreach");
         let n = dc + ic + bypass_forwarders(func);
         check(func, "bypass");
+        // Rebuild after `ifconv` so cloned `inbounds` offsets are seen.
+        let nn = NonNull::new(func, loads, derived);
         let n = n + round(func, &nn, domcond);
         check(func, "round");
         total += n;

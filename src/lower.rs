@@ -298,7 +298,7 @@ pub fn lower_to_object(
         let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
-        let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
+        let mut derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
         let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
@@ -349,7 +349,7 @@ pub fn lower_to_object(
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         if st.jumpthread && crate::bisect("jumpthread") {
-            let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &derived);
+            let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &mut derived);
             threaded += n;
             dead_params += dead;
             dominated_folds += folds;
@@ -565,7 +565,7 @@ pub fn lower_to_object(
             // leaf-up: repeat to fixpoint (bounded by diamond depth).
             let mut k = 0;
             for _ in 0..8 {
-                let n2 = crate::ifconv::run(&mut clctx.func);
+                let n2 = crate::ifconv::run(&mut clctx.func, &mut derived);
                 k += n2;
                 if n2 == 0 {
                     break;
@@ -1545,6 +1545,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             {
                 self.noalias.insert(params[i]);
                 self.deref.insert(params[i], (d, w));
+            }
+            // `nonnull` arg leaves (`&str`/`&T` data ptrs, `Box`, `NonNull`):
+            // seed them like `!nonnull` load results so jumpthread's
+            // lattice folds the `Option<ptr>` niche selects iterator
+            // adapters emit (`Chars`, `slice::Iter`).
+            if let Some(&mask) = self.st.nnargs.get(&arg) {
+                for (k, &p) in params[i..i + n].iter().enumerate() {
+                    if mask & (1 << k) != 0 {
+                        self.nonnull.insert(p);
+                    }
+                }
             }
             self.vals.insert(arg, params[i..i + n].into());
             i += n;
