@@ -168,7 +168,9 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
     fb.set(
         "opt_level",
-        if sess.opts.optimize == OptLevel::No {
+        if sess.opts.optimize == OptLevel::No
+            || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH")
+        {
             "none"
         } else {
             "speed_and_size"

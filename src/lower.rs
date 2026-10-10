@@ -676,6 +676,9 @@ pub fn lower_to_object(
         // Scalar min/max wider than a register (i128) has no Cranelift
         // lowering on any target; several passes can emit it.
         crate::clifpeep::wide_minmax(&mut clctx.func);
+        if std::env::var("PLIRON_VCODE").is_ok_and(|f| n.contains(f.as_str())) {
+            clctx.set_disasm(true);
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.
@@ -687,6 +690,11 @@ pub fn lower_to_object(
                 sess.dcx().fatal(format!("function `{n}` too large: {e}"));
             }
             panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
+        }
+        if let Some(cc) = clctx.compiled_code()
+            && let Some(v) = &cc.vcode
+        {
+            eprintln!("==== vcode {n} ====\n{v}");
         }
         eh.add_function(&mut m, id, &clctx);
         m.clear_context(&mut clctx);

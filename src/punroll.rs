@@ -507,8 +507,14 @@ fn run_loop(
         bail!("exit cone too big");
     }
 
-    // hu (unrolled header/guard) plus K clones of the chain, all placed just
-    // before h so the scalar remainder keeps its position.
+    // hu (unrolled header/guard) plus ONE fused block holding all K copies
+    // of the chain, placed just before h so the scalar remainder keeps its
+    // position. Chaining copies through jumps (one block per copy) lets the
+    // compile-time egraph park every pure combine — e.g. an ordered `fadd`
+    // reduction chain — in the last block, splitting each producing `load`
+    // from its consumer across a block boundary and defeating the backend's
+    // load-sinking (`addss (mem), %xmm` never forms). A single straight-line
+    // block keeps each load adjacent to its user.
     let hu = func.dfg.make_block();
     for &p in &hparams {
         let ty = func.dfg.value_type(p);
@@ -516,20 +522,13 @@ fn run_loop(
     }
     func.layout.insert_block(hu, h);
     let huparams = func.dfg.block_params(hu).to_vec();
-    let mut ub: Vec<Vec<Block>> = Vec::new();
-    for _ in 0..k {
-        let mut row = Vec::new();
-        for &b in &chain {
-            let nb = func.dfg.make_block();
-            for &p in func.dfg.block_params(b).to_vec().iter() {
-                let ty = func.dfg.value_type(p);
-                func.dfg.append_block_param(nb, ty);
-            }
-            func.layout.insert_block(nb, h);
-            row.push(nb);
-        }
-        ub.push(row);
+    let uf = func.dfg.make_block();
+    for &p in func.dfg.block_params(chain[0]).to_vec().iter() {
+        let ty = func.dfg.value_type(p);
+        func.dfg.append_block_param(uf, ty);
     }
+    func.layout.insert_block(uf, h);
+    let ufparams = func.dfg.block_params(uf).to_vec();
 
     // Guard: iteration budget `bound - a0` must cover copies 0..K-2's entry
     // tests (i.e. a_{K-2} cc bound), evaluated wide so it can't wrap.
@@ -578,7 +577,7 @@ fn run_loop(
         );
         let ok = pos.ins().band(ok1, ok2);
         let args: Vec<BlockArg> = huparams.iter().map(|&v| v.into()).collect();
-        pos.ins().brif(ok, ub[0][0], &args, h, &args);
+        pos.ins().brif(ok, uf, &args, h, &args);
     }
 
     // When the exit cone references loop values, the unrolled loop's exit
@@ -625,16 +624,22 @@ fn run_loop(
     }
     let eu = cmap.get(&eblk).copied().unwrap_or(eblk);
 
-    // Clone K copies of the chain. A clone block's params bind the original
-    // params in vmap; jump args carry the mapped operand values.
+    // Clone K copies of the chain into the single fused block. Block params
+    // bind through `carry`: copy kk>0's header params come from copy kk-1's
+    // latch `cont` args, mid-chain params from the preceding block's jump
+    // args — all keyed by the source param value, no blocks needed.
     let nobmap: FxHashMap<Block, Block> = FxHashMap::default();
-    let mut lastmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut carry: FxHashMap<Value, Value> = FxHashMap::default();
     for kk in 0..k as usize {
-        let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
         for (i, &b) in chain.iter().enumerate() {
-            let nb = ub[kk][i];
             for (j, &sp) in func.dfg.block_params(b).to_vec().iter().enumerate() {
-                vmap.insert(sp, func.dfg.block_params(nb)[j]);
+                let nv = if kk == 0 && i == 0 {
+                    ufparams[j]
+                } else {
+                    carry[&sp]
+                };
+                vmap.insert(sp, nv);
             }
             let insts: Vec<Inst> = func.layout.block_insts(b).collect();
             for &ii in &insts[..insts.len() - 1] {
@@ -650,7 +655,7 @@ fn run_loop(
                 let ni = func.dfg.make_inst(data);
                 let ctv = func.dfg.ctrl_typevar(ii);
                 func.dfg.make_inst_results(ni, ctv);
-                func.layout.append_inst(ni, nb);
+                func.layout.append_inst(ni, uf);
                 for (&o, &nv) in func
                     .dfg
                     .inst_results(ii)
@@ -671,46 +676,56 @@ fn run_loop(
                     a => a,
                 }
             };
+            let mvv = |func: &Function, a: BlockArg| -> Value {
+                match mv(func, a) {
+                    BlockArg::Value(v) => v,
+                    _ => unreachable!("punroll: non-value branch arg"),
+                }
+            };
             match tdata {
                 InstructionData::Jump { .. } => {
+                    // Fallthrough: bind the next chain block's params from
+                    // this jump's args.
                     let bc = tdata
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[0];
-                    let args: Vec<BlockArg> = bc
-                        .args(&func.dfg.value_lists)
-                        .map(|a| mv(func, a))
-                        .collect();
-                    let mut pos = FuncCursor::new(func).at_bottom(nb);
-                    pos.ins().jump(ub[kk][i + 1], &args);
+                    let sps = func.dfg.block_params(chain[i + 1]).to_vec();
+                    for (j, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                        carry.insert(sps[j], mvv(func, a));
+                    }
                 }
                 InstructionData::Brif { arg: c, .. } => {
                     let c = func.dfg.resolve_aliases(c);
                     let carg = *vmap.get(&c).unwrap_or(&c);
-                    let cont: Vec<BlockArg> = cont_bc
-                        .args(&func.dfg.value_lists)
-                        .map(|a| mv(func, a))
-                        .collect();
-                    let exit: Vec<BlockArg> = exit_bc
-                        .args(&func.dfg.value_lists)
-                        .map(|a| mv(func, a))
-                        .collect();
-                    let mut pos = FuncCursor::new(func).at_bottom(nb);
                     if kk + 1 < k as usize {
                         // Iteration kk+1's entry test is implied by the
-                        // guard; chain straight into the next copy.
-                        pos.ins().jump(ub[kk + 1][0], &cont);
-                    } else if cpos == 0 {
-                        pos.ins().brif(carg, hu, &cont, eu, &exit);
+                        // guard; thread `cont` args into the next copy's
+                        // header params and fall through.
+                        let sps = func.dfg.block_params(chain[0]).to_vec();
+                        for (j, a) in cont_bc.args(&func.dfg.value_lists).enumerate() {
+                            carry.insert(sps[j], mvv(func, a));
+                        }
                     } else {
-                        pos.ins().brif(carg, eu, &exit, hu, &cont);
+                        let cont: Vec<BlockArg> = cont_bc
+                            .args(&func.dfg.value_lists)
+                            .map(|a| mv(func, a))
+                            .collect();
+                        let exit: Vec<BlockArg> = exit_bc
+                            .args(&func.dfg.value_lists)
+                            .map(|a| mv(func, a))
+                            .collect();
+                        let mut pos = FuncCursor::new(func).at_bottom(uf);
+                        if cpos == 0 {
+                            pos.ins().brif(carg, hu, &cont, eu, &exit);
+                        } else {
+                            pos.ins().brif(carg, eu, &exit, hu, &cont);
+                        }
                     }
                 }
                 _ => unreachable!(),
             }
         }
-        if kk + 1 == k as usize {
-            lastmap = vmap;
-        }
     }
+    let mut lastmap: FxHashMap<Value, Value> = vmap;
 
     // Emit the cloned exit cone, if needed: verbatim copies seen through the
     // last unrolled copy's value map (loop-external values pass through

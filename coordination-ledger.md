@@ -104,3 +104,40 @@ only; general-reg AMode::PostIndex not pursued (marginal).
   chains now VECTORIZE (big real-world win; dead overflow flags had
   defeated loopvec op matching). zip_sum at parity vs stock.
 - Verified: cargo build, std diff-clean, unwind, wide suite.
+
+## Merged: x64 load-sink relaxation + punroll single-block (wt/x64-codegen)
+Two cooperating changes close the last wide.rs gap (sum2d was -6%):
+
+- **punroll single fused block** (src/punroll.rs): the K unrolled copies
+  now go into ONE straight-line block (`uf`) instead of one block per
+  copy; block params thread through a `carry` map keyed by source param.
+  Rationale: Cranelift's `optimize()` egraph parks pure `fadd` combines
+  in the last block when copies are chained by jumps, separating each
+  `load` from its consumer by a block boundary — colors are never
+  adjacent, so no load-sinking form can ever apply. Same-block copies
+  keep `load; fadd` adjacent through elaboration.
+- **direct-use load sinking** (vendor cranelift machinst/lower.rs):
+  `get_value_as_source_or_const`'s side-effect path additionally accepts
+  `value_direct_uses[val]==1` *when `cur_inst` itself is that use and
+  `value_lowered_uses[val]==0`, alongside upstream `Once`. The `Once`
+  state is transitively coarsened to `Multiple` whenever a consumer
+  fans out (e.g. an `fadd` accumulator feeding backedge AND exit args),
+  so upstream could never fuse `addss (mem), %xmm` in a reduction loop.
+  Two safety conditions learned the hard way (both previously ICE'd):
+  * `cur_inst` must be a direct user — rejects `(store (iadd (load) k)
+    addr)`-style probes where a multi-used pure node still needs the
+    value;
+  * `value_lowered_uses==0` — an earlier-lowered inst may already have
+    materialized the value in a register after its own probe rejected
+    sinking; fusing then would leave that register undefined.
+- Kept as opt-in diagnostics: `PLIRON_VCODE=<substr>` prints Cranelift
+  VCode for matching functions (lower.rs set_disasm), and
+  `PLIRON_COMPILE_EGRAPH=0` ablates the whole egraph pass (lib.rs).
+- Verification: host ./test.sh green; x86_64-apple-darwin
+  nostd/std/unwind/asm/unroll/licm all pass under Rosetta.
+- Perf (Rosetta, v3, pliron/stock ms): sum2d 0.74/0.74 PARITY (was
+  0.79/0.75); matmul 11.3/12.2 (+7%); scatter gather 0.56/0.50 (-12%),
+  hist 0.47/0.44 (-6%) — only remaining x64 gap; LLVM 4x-unrolls the
+  multi-exit gather loop, punroll bails on its exit cone.
+  Everything else ≥ parity: axpy 0.37/0.59, memchr 0.08/1.21,
+  itersum 1.18/2.89, strsum 0.23/0.90.

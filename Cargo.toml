@@ -12,7 +12,7 @@ rsasm = { version = "0.1.3", default-features = false, features = ["x86", "aarch
 gimli = { version = "0.33", default-features = false, features = ["std", "write"] }
 pliron = { path = "vendor/pliron", default-features = false, features = ["std"] }
 pliron-llvm = { path = "vendor/pliron/pliron-llvm", default-features = false, features = ["std"] }
-cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std", "unwind", "host-arch"] }
+cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std", "unwind", "all-arch"] }
 cranelift-frontend = "0.135.5"
 cranelift-module = "0.135.5"
 cranelift-object = "0.135.5"

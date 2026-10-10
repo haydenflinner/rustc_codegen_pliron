@@ -199,6 +199,15 @@ pub struct Lower<'func, I: VCodeInst> {
     /// See doc comment on `ValueUseState` for more details.
     value_ir_uses: SecondaryMap<Value, ValueUseState>,
 
+    /// PLIRON: direct use-counts per SSA value (0, 1, or 2+ saturated), as
+    /// counted in the input IR. Unlike `value_ir_uses`, this is *not*
+    /// coarsened by the transitive `Multiple` propagation: a value with
+    /// exactly one direct use stays `1` here even if a transitive consumer
+    /// is multi-used. The side-effect sinking path uses this: an effectful
+    /// inst with a single direct use can always be fused into that consumer,
+    /// since it is emitted exactly once either way.
+    value_direct_uses: SecondaryMap<Value, u8>,
+
     /// Actual uses of each SSA value so far, incremented while lowering.
     value_lowered_uses: SecondaryMap<Value, u32>,
 
@@ -484,7 +493,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors[bb] = InstColor::new(cur_color);
         }
 
-        let value_ir_uses = compute_use_states(f, sret_param);
+        let (value_ir_uses, value_direct_uses) = compute_use_states(f, sret_param);
 
         Ok(Lower {
             f,
@@ -495,6 +504,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors,
             side_effect_inst_entry_colors,
             value_ir_uses,
+            value_direct_uses,
             value_lowered_uses: SecondaryMap::default(),
             inst_sunk: FxHashSet::default(),
             cur_scan_entry_color: None,
@@ -1235,7 +1245,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 fn compute_use_states(
     f: &Function,
     sret_param: Option<Value>,
-) -> SecondaryMap<Value, ValueUseState> {
+) -> (SecondaryMap<Value, ValueUseState>, SecondaryMap<Value, u8>) {
     // We perform the analysis without recursion, so we don't
     // overflow the stack on long chains of ops in the input.
     //
@@ -1254,11 +1264,13 @@ fn compute_use_states(
     // efficient than a full indirect-use-counting pass.
 
     let mut value_ir_uses = SecondaryMap::with_default(ValueUseState::Unused);
+    let mut value_direct_uses = SecondaryMap::with_default(0u8);
 
     if let Some(sret_param) = sret_param {
         // There's an implicit use of the struct-return parameter in each
         // copy of the function epilogue, which we count here.
         value_ir_uses[sret_param] = ValueUseState::Multiple;
+        value_direct_uses[sret_param] = 2;
     }
 
     // Stack of iterators over Values as we do DFS to mark
@@ -1299,6 +1311,7 @@ fn compute_use_states(
             debug_assert!(f.dfg.value_is_real(arg));
             let old = value_ir_uses[arg];
             value_ir_uses[arg].inc();
+            value_direct_uses[arg] = value_direct_uses[arg].saturating_add(1);
             let new = value_ir_uses[arg];
             trace!("arg {} used, old state {:?}, new {:?}", arg, old, new);
 
@@ -1337,7 +1350,7 @@ fn compute_use_states(
         }
     }
 
-    value_ir_uses
+    (value_ir_uses, value_direct_uses)
 }
 
 /// Definition of a "root" instruction for the calculation of `ValueUseState`.
@@ -1587,14 +1600,37 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 } else {
                     // Side-effect: test whether this is the only use of the
                     // only result of the instruction, and whether colors allow
-                    // the code-motion.
+                    // the code-motion. PLIRON: the upstream
+                    // `value_ir_uses == Once`
+                    // test requires the whole downstream def-DAG to be
+                    // uniquely used; we additionally allow the value to have
+                    // exactly one *direct* use, by `cur_inst` itself: the
+                    // consumer is emitted exactly once, so an inst fused into
+                    // it is too, regardless of how often the consumer's own
+                    // result is used downstream (the classic case: a load
+                    // feeding a single `add`/`fadd` whose result fans out to
+                    // both backedge and exit args). The `cur_inst` test
+                    // rejects probes that reach this value through a pure
+                    // sub-pattern of an inst that does not use it (e.g.
+                    // `(store (iadd (load l) k) addr)` matching `l` while the
+                    // `iadd` still needs it for another use). The
+                    // `value_lowered_uses` test covers the converse: an
+                    // earlier-lowered inst may have legitimately materialized
+                    // this value in a register after a sub-pattern probe
+                    // rejected sinking (the producer then *must* be emitted),
+                    // so fusing now would leave that register undefined.
                     trace!(
                         " -> side-effecting op {} for val {}: use state {:?}",
                         src_inst, val, self.value_ir_uses[val]
                     );
                     if self.cur_scan_entry_color.is_some()
-                        && self.value_ir_uses[val] == ValueUseState::Once
                         && self.num_outputs(src_inst) == 1
+                        && (self.value_ir_uses[val] == ValueUseState::Once
+                            || (self.value_direct_uses[val] == 1
+                                && self.value_lowered_uses[val] == 0
+                                && self.cur_inst.is_some_and(|ci| {
+                                    self.f.dfg.inst_values(ci).any(|a| a == val)
+                                })))
                         && src_entry_color.get() + 1 == self.cur_scan_entry_color.unwrap().get()
                     {
                         InputSourceInst::UniqueUse(src_inst, 0)
