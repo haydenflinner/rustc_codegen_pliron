@@ -707,3 +707,71 @@ matches CLIF's masked `ushr`, so semantics are exact. Verified:
 setb %al` (was `shrq %cl; testq $1; setne`). It does **not**
 fire on tokenize (no `ushr` form there — needs the switch-level
 fold above), but covers hand-rolled bit-table code.
+
+### Scatter gate refined + bittab/edgespec merge (post-everything baseline)
+
+Merged `wt/native-opt@fe62bed` (edgespec sentinel threading +
+bittab set-membership bitmask + wasm winline; the x64 `bt` ISLE
+fold was already merged back). Fresh sweep, `/tmp/bigbench.rs`,
+1M elems, haswell, Rosetta, best-of-3:
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| hist   | 0.463  | 0.321 | 1.44x |
+| gather | 0.473  | 0.508 | **0.93 — wins** |
+| scatter| 0.452  | 0.512 | **0.88 — wins (new)** |
+| sum_u8 | 0.044  | 0.238 | **5.4x win** |
+| cnt_aff| 0.802  | 0.781 | ~parity |
+| dot_u32| 0.155  | 0.230 | **1.5x win** |
+| matmul | 0.320  | 0.122 | 2.6x |
+| prefix | 0.470  | 0.466 | parity |
+| chars  | 0.605  | 0.444 | 1.36x |
+| tokenize| 4.015 | 1.550 | 2.59x |
+
+**bcheck partial-versioning gate — relaxed, landed.** The old
+rule required *every* store affine (`dst[i]`). The actual hazard
+it protects is same-address store->load forwarding replay, which
+needs a load that can re-read a stored slot. New rule: a single
+partial check is allowed unless the body has BOTH a non-affine
+store AND a non-affine load (hist's `cnt[idx]` on both sides →
+still blocked; exotic memory ops count as both). Scatter
+(`out[idx[i]] = val[i]`) has a non-affine store but only affine
+loads — write-only w.r.t. data-dependent slots — so it versions
+by default now: **0.452 vs stock 0.512, beats stock** (was
+0.84-0.91). Paired RMW kernel `cnt[idx[i]] += val[i]` confirmed
+still gated (bcheck doesn't fire). Versioning is semantics-
+preserving regardless; the gate is a perf heuristic only.
+**Merge-flag: this is native's `src/bcheck.rs`** — the widening
+is ~40 lines at the single-partial-check site, marked with an
+`(x64 wt note ...)` comment in the source.
+
+**bittab fired on tokenize** (`bittab 1`, `edgespec 16`): the
+whitespace range-chain is now a guarded bitmap — `cmpl $0x40;
+cmovbq bitmap,%rax; shrxq %r10,%rax,%rax; testq; jne` (~5 insns,
+stock is `cmpl $0x20; ja; bt` ~4). The x64 `bt` ISLE rule can't
+fold further: the const is wrapped in a `select(c<64)` guard
+which is semantically required — a bare `bt` would index mod-64
+for c>=64. Time unchanged (~4.0): classification is no longer
+the bottleneck.
+
+**Tokenize residual — spills are NOT the cause (measured).**
+aarch64 native (31 GPRs vs x64's 15, ~1 spill slot in the whole
+hot loop vs x64's ~10 stack ops/char) shows the *same* ~2.5x
+(4.02 vs 1.55) — so register pressure explains at most a small
+x64-specific tail. The residual is structural: ~2.5x dynamic
+insns/char from the flattened SplitWhitespace state machine —
+11 live block14 params mean per-char select/copy merges +
+per-path cursor recompute, where stock carries ~7 regs and
+sinks state updates into the paths that need them. No cheap
+lever found: ra2's `spill_weight_from_constraint` is a fixed
+formula (loop-depth 4^n + def/constraint bonuses) with no knobs;
+tuning vendored ra2 is shared-infra risky and wouldn't fix
+aarch64 anyway; block-param count is set by MIR's iterator
+layout before our pipeline sees it. Documented as the remaining
+structural item (real fix = iterator state sinking at MIR/LLVM-
+dialect level, or a vectorized whitespace-skip fast path).
+
+Validation: cargo build clean; test.sh green incl. merged
+`edgespec` test; Rosetta std 5/5 + unwind 3/3; PLIRON_VERIFY=1
+clean on rmw_gate (scatter+RMW kernels), bigbench, std, unwind.
+rmw_gate checksums match stock.
