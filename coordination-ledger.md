@@ -647,3 +647,23 @@ Track as x64 agent follow-up.
 - Verified: build clean; PLIRON_VERIFY=1 ./test.sh green (incl new
   edgespec test); harness tier-0 smoke+determinism OK; cpubench
   rmw/dse/bc/drev outputs match stock.
+
+## Merged: bittab+edgespec (4390fd3) + x64 bt fold + winline (7eb7090)
+- bittab.rs (NEW): sparse set-membership -> select(guard,mask,0)+ushr+
+  icmp ne 0 bitmask. is_whitespace fires (mask 0x100003e00). x64 bt ISLE
+  rules fold it to btq+setb.
+- edgespec.rs (NEW): edge specialization threading — CAUGHT real
+  verifier-clean infinite loop (threaded past cursor-rebinding block);
+  skipped-block tracking + PLIRON_EDGESPEC_LIMIT bisect. tests/edgespec
+  wired into test.sh.
+- tokenize: 5.0x->2.56x x64, ~2.6x->1.95x aarch64. Residual = 11 live
+  params -> ~5 spill slots/char (structural regalloc pressure) + mask
+  iconst remat per-iter (ra2 remat vs LLVM hoist).
+- winline (wasm): waffle-IR inliner — callee<=12 always, single-
+  callsite <=300. wmini 194->183KB, 390->294 funcs, 1339->113 calls.
+- scatter: PLIRON_BCHECK_PARTIAL=1 beats stock (0.450 vs 0.52) but
+  default stays off (hist same-addr RMW regression).
+- BIGGEST remaining kernel gap: slice::reverse u8 11x (LLVM SIMD byte
+  reversal vs our scalar) — mirror-swap vectorization.
+- wasm remaining: multi-callsite mid-size callee inlining needs
+  callgraph-aware cost model; dot_i32 +2.4% noise.
