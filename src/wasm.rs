@@ -1543,6 +1543,9 @@ struct FL<'o, 'a, 'tcx> {
     rets: Vec<WT>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<WV>,
+    /// Load results emitted as a wide `i64.load{8,16,32}_{s,u}` because
+    /// their only use is a same-block extend (value -> signed).
+    fused_ext: FxHashMap<Value, bool>,
     name: String,
 }
 
@@ -1572,6 +1575,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             frame: 0,
             frame_align: 16,
             va_buf: None,
+            fused_ext: FxHashMap::default(),
             name: String::new(),
         };
         let sp = fl.o.sp;
@@ -1707,6 +1711,57 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             t => panic!("load {t}"),
         };
         self.op(o, &[p], ty)
+    }
+
+    /// Do `a` and `b` (in that order) lower to the same waffle block?
+    /// Post-terminator ops in one pliron block start a fresh waffle
+    /// block, where a value defined before the terminator does not
+    /// dominate its use.
+    fn same_wb(&self, a: Ptr<Operation>, b: Ptr<Operation>) -> bool {
+        let ctx = self.ctx;
+        let Some(pb) = a.deref(ctx).get_parent_block() else {
+            return false;
+        };
+        if b.deref(ctx).get_parent_block() != Some(pb) {
+            return false;
+        }
+        let mut it = pb.deref(ctx).iter(ctx);
+        for x in it.by_ref() {
+            if x == a {
+                break;
+            }
+        }
+        for x in it.by_ref() {
+            if x == b {
+                return true;
+            }
+            let xid = Operation::get_opid(x, ctx);
+            if x.deref(ctx).successors().next().is_some()
+                || xid == ReturnOp::get_opid_static()
+                || xid == UnreachableOp::get_opid_static()
+                || self.st.invokes.contains_key(&x)
+            {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Narrow integer load fused with a following extension: emits
+    /// `i64.load{8,16,32}_{s,u}`, whose memory access (and alignment
+    /// hint) is the same as the unfused narrow load.
+    fn wload(&mut self, t: ClType, p: WV, off: u64, signed: bool) -> WV {
+        let memory = self.ma(off, t.bytes() as u64);
+        let o = match (t, signed) {
+            (clt::I8, true) => O::I64Load8S { memory },
+            (clt::I8, false) => O::I64Load8U { memory },
+            (clt::I16, true) => O::I64Load16S { memory },
+            (clt::I16, false) => O::I64Load16U { memory },
+            (clt::I32, true) => O::I64Load32S { memory },
+            (clt::I32, false) => O::I64Load32U { memory },
+            t => panic!("wload {t:?}"),
+        };
+        self.op(o, &[p], WT::I64)
     }
 
     fn store(&mut self, t: ClType, v: WV, p: WV, off: u64) {
@@ -2580,7 +2635,12 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             for l in 0..lanes {
                 let x = if sw == 128 { xs[0] } else { xs[l] };
                 let hi_in = if sw == 128 { Some(xs[1]) } else { None };
-                let x = if signed { self.sext(x, sw.min(64)) } else { x };
+                // A fused load+extend operand is already the wide value.
+                let x = if signed && !self.fused_ext.contains_key(&opnds[0]) {
+                    self.sext(x, sw.min(64))
+                } else {
+                    x
+                };
                 if dw == 128 {
                     let lo = self.to_wide(x, true, signed);
                     let hi = match hi_in {
@@ -2721,9 +2781,36 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             }
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
+            // If this load's only use is a same-block sext/zext, emit the
+            // extending `i64.load{8,16,32}_{s,u}` form directly: same
+            // memory access, one instruction instead of load+extend
+            // (what LLVM emits too). The extend's lowering sees the
+            // value is already wide and becomes a no-op.
+            let res = op.deref(ctx).get_result(0);
+            let mut wide: Option<bool> = None;
+            if is!(LoadOp) && wleaves(ctx, res.get_type(ctx)).len() == 1 {
+                if let [u] = res.uses(ctx)[..] {
+                    let uop = u.user_op();
+                    let uid = Operation::get_opid(uop, ctx);
+                    let se = uid == SExtOp::get_opid_static();
+                    if (se || uid == ZExtOp::get_opid_static())
+                        && u.try_find_index(ctx).ok() == Some(0)
+                        && self.width(uop.deref(ctx).get_result(0).get_type(ctx)) > 32
+                        && self.same_wb(op, uop)
+                    {
+                        wide = Some(se);
+                        self.fused_ext.insert(res, se);
+                    }
+                }
+            }
             let r = wleaves(ctx, self.res_ty(op))
                 .into_iter()
-                .map(|(o, t)| self.load(t, p, o))
+                .map(|(o, t)| match wide {
+                    Some(s) if matches!(t, clt::I8 | clt::I16 | clt::I32) => {
+                        self.wload(t, p, o, s)
+                    }
+                    _ => self.load(t, p, o),
+                })
                 .collect();
             self.set(op, r);
         } else if is!(StoreOp) || is!(AtomicStoreOp) {
