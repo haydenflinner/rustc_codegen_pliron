@@ -1309,8 +1309,19 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         leb(&mut nb, c);
         nb.push(t);
     }
+    // A `return` followed only by `end` opcodes (i.e. the last
+    // non-`end` instruction of the body) is dead — the function
+    // falls through with the same stack either way.
+    let drop_ret = ins
+        .iter()
+        .rposition(|&(_, s, _, _)| b[s] != 0x0b)
+        .filter(|&i| b[ins[i].1] == 0x0f);
     let mut wi = 0;
     while wi < ins.len() {
+        if Some(wi) == drop_ret {
+            wi += 1;
+            continue;
+        }
         let &(k, s, e, _) = &ins[wi];
         // `i32.load*; i64.extend_i32_{s,u}` pairs that only became
         // adjacent after scheduling fuse here into the single wide
@@ -1642,6 +1653,70 @@ fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, cal
     }
 }
 
+/// `if (c) { br m(x) } else { br m(y) }` diamonds whose arms are pure
+/// forwarders (no insts, no blockparams) to the same single-param merge
+/// become `select`, deleting two blocks and the branch structure —
+/// LLVM emits `select` for the same shapes. Soundness: x is used at
+/// its arm block, so it dominates that block; `a` is a pred of the
+/// arm, so x dominates `a` too, and arm blocks define nothing else
+/// (no insts, no params — a param could still have uses in blocks the
+/// arm dominates, which is why param'd arms are rejected). Arm blocks
+/// with other preds stay live via those edges and are unaffected.
+fn wsel(b: &mut FunctionBody) -> bool {
+    let mut patch: Vec<(WBlock, WV, WV, WV, WT, WBlock)> = Vec::new();
+    for a in b.blocks.iter() {
+        let (cond, ta, fa) = match &b.blocks[a].terminator {
+            Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } => (*cond, if_true, if_false),
+            _ => continue,
+        };
+        let arm = |t: &BlockTarget| -> Option<(WBlock, WV)> {
+            let tb = t.block;
+            // Arms must be pure forwarders: no insts (side effects) and
+            // no blockparams — a param can have uses in blocks the arm
+            // dominates, and bypassing the arm would drop its def.
+            if tb == a || !b.blocks[tb].insts.is_empty() || !b.blocks[tb].params.is_empty() {
+                return None;
+            }
+            match &b.blocks[tb].terminator {
+                Terminator::Br { target } if target.args.len() == 1 => {
+                    Some((target.block, target.args[0]))
+                }
+                _ => None,
+            }
+        };
+        let Some((mt, x)) = arm(ta) else { continue };
+        let Some((mf, y)) = arm(fa) else { continue };
+        if mt != mf {
+            continue;
+        }
+        // Single-arg edges mean the merge has exactly one param; its
+        // type drives the (untyped) select, which needs a scalar.
+        if b.blocks[mt].params.len() != 1 {
+            continue;
+        }
+        let ty = b.blocks[mt].params[0].0;
+        if !matches!(ty, WT::I32 | WT::I64 | WT::F32 | WT::F64) {
+            continue;
+        }
+        patch.push((a, cond, x, y, ty, mt));
+    }
+    for (a, cond, x, y, ty, m) in &patch {
+        // O::Select args are [if-true, if-false, cond].
+        let sel = b.add_op(*a, O::Select, &[*x, *y, *cond], &[*ty]);
+        b.blocks[*a].terminator = Terminator::Br {
+            target: BlockTarget {
+                block: *m,
+                args: vec![sel],
+            },
+        };
+    }
+    !patch.is_empty()
+}
+
 /// Conservative waffle-IR inliner, run after all bodies are lowered
 /// and before the emit remap renumbers `Call` targets. Two rules:
 /// always inline a callee at most `TINY` insts, and inline a
@@ -1681,6 +1756,15 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
         for ci in 0..funcs.len() {
             if funcs[ci].body.is_none() {
                 continue;
+            }
+            // Fold empty-arm select diamonds (also runs on callers
+            // with no inlinable sites).
+            {
+                let b = funcs[ci].body.as_mut().unwrap();
+                if wsel(b) {
+                    fixup_edges(b);
+                    b.optimize(&waffle::OptOptions::default());
+                }
             }
             // Loop-member blocks of this caller, for the hot rule.
             let mut inloop: FxHashSet<WBlock> = FxHashSet::default();
