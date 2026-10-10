@@ -48,6 +48,18 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     log::debug!("Number of lowered vcode blocks: {}", vcode.num_blocks());
     trace!("vcode from lowering: \n{:?}", vcode);
 
+    // PLIRON: `PLIRON_PREVCODE=<substr>` dumps pre-regalloc VCode for
+    // functions whose CLIF name contains <substr>; `all` matches every
+    // function. (CLIF names are `u0:N` — correlate to symbols with
+    // `PLIRON_CLIF` output.)
+    let prevcode_match = std::env::var("PLIRON_PREVCODE")
+        .ok()
+        .map(|pat| pat == "all" || (!pat.is_empty() && format!("{}", f.name).contains(&pat)))
+        .unwrap_or(false);
+    if prevcode_match {
+        eprintln!("==== prevcode {} ====\n{:?}", f.name, vcode);
+    }
+
     // Perform register allocation.
     {
         let _tt = timing::regalloc();
@@ -75,6 +87,17 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                 err
             })
             .expect("register allocation");
+
+        // PLIRON: `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves
+        // (program point → edit) for the same functions as
+        // `PLIRON_PREVCODE`.
+        if prevcode_match && std::env::var_os("PLIRON_RA2_EDITS").is_some() {
+            eprintln!("==== ra2edits {} ====", f.name);
+            for (pp, edit) in &regalloc_ctx.output.edits {
+                eprintln!("  {:?}: {:?}", pp, edit);
+            }
+            eprintln!("==== ra2edits end ====");
+        }
     }
 
     // Run the regalloc checker, if requested.

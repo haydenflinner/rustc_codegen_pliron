@@ -133,3 +133,47 @@ already there.
   `paddq` per 16-byte group, zero reg hoisted. Correctness checked
   n∈{0,1,7,…,4093,4096,1M} vs scalar reference; host ./test.sh and x86
   std/unwind/asm/unroll/licm all green under Rosetta.
+
+### `scatter::hist` side-exit transfer study (checked histogram, Rosetta)
+
+Investigated the remaining checked-histogram gap: the unrolled loop's
+mid-chain `brif` side exits (index + bounds panics) transfer live values
+(`i`, `a[i]`, `alen`) to shared cold panic blocks via edge args. RA2
+splits each value's bundle at the hot/cold boundary — the cold segment
+has fixed-reg requirements from the panic call — producing per-element
+boundary movs incl. `movq %rdi,%r9` save/restore pairs around each
+bounds check.
+
+Four transfer mechanisms measured (same-address `vec![3;1<<20]` /
+varied input, ms/iter, Rosetta):
+
+| mechanism | same-addr | varied |
+|---|---|---|
+| stock LLVM | ~0.44 | ~0.34 |
+| shared cone + edge params (committed) | ~0.47 | ~0.47 |
+| per-copy cold trampolines binding params | ~0.47 | ~0.47 |
+| stack-slot hand-off (store hot, load cold) | ~0.70 | ~0.44 |
+| per-copy cone clones reading globals | ~1.02 | ~0.41 |
+
+Findings:
+
+- The boundary movs are **structurally unavoidable** with a shared cold
+  target: any value live into a cold block whose use needs a fixed reg
+  gets its bundle split in hot code — via edge args, explicit cold
+  trampolines, or continue-edge rebinding (all equivalent).
+- Eliminating the movs entirely requires LLVM's shape — each check's
+  cold code reads globals directly — i.e. per-copy cone clones. That
+  produced the *cleanest* hot asm (~10 insts/element vs ~12) yet ran
+  ~2.2x **slower** on same-address input. Likely a Rosetta translation
+  artifact of multiplied cold branch targets, not instruction count.
+- Stack slots avoid the register split but the hot-path stores lose
+  more on the store-bound loop than they save.
+- Conclusion: the committed shared-param shape is locally optimal; the
+  residual ~7% same-address gap vs LLVM is the boundary-mov cost, and
+  the larger varied gap is worth more future effort (cold-cone
+  rematerialization — reload `a[i]` inside the cone from already-live
+  `aptr`+`i` — is the most promising remaining transfer reduction).
+- Debug tooling added (uncommitted, env-gated):
+  `PLIRON_PREVCODE=<pat>` dumps pre-regalloc VCode and
+  `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves in
+  vendor/cranelift-codegen/src/machinst/compile.rs.
