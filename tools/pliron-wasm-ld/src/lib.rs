@@ -8,6 +8,7 @@
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
 use wasm_encoder as we;
@@ -403,6 +404,103 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     let resolve = |oi: usize, sym: &str| objs[oi].local(oi, sym).or_else(|| defs.get(sym).copied());
 
+    // Mark-sweep GC at symbol granularity. Roots: the command-line exports
+    // (or every global function of a non-archive object when none are
+    // given, matching the default export list below), `_start`, every
+    // `.init_array` object, and global data of non-archive objects.
+    // Edges: a live function's `call`/`ref.func`/`return_call` operands
+    // (imports resolve by symbol, defined functions by index) and its
+    // `global.get`/`global.set` of GOT.mem/GOT.func imports; a live data
+    // object's relocation targets. Everything unmarked is dropped from
+    // the function/code/data/table sections.
+    let mut live_f: HashSet<(usize, u32)> = HashSet::new();
+    let mut live_d: HashSet<(usize, usize)> = HashSet::new();
+    let mut wl: Vec<Def> = Vec::new();
+    let roots: Vec<String> = if exports.is_empty() {
+        included
+            .iter()
+            .filter(|&&oi| !blobs[oi].2)
+            .flat_map(|&oi| {
+                objs[oi]
+                    .funcs
+                    .iter()
+                    .filter(|f| f.1 & GLOBAL != 0)
+                    .map(|f| f.0.clone())
+            })
+            .collect()
+    } else {
+        exports.clone()
+    };
+    for n in roots.iter().map(|s| &s[..]).chain(entry.then_some("_start")) {
+        if let Some(&d) = defs.get(n) {
+            wl.push(d);
+        }
+    }
+    for &oi in &included {
+        for (di, d) in objs[oi].data.iter().enumerate() {
+            if d.flags & INIT_ARRAY != 0 || (d.flags & GLOBAL != 0 && !blobs[oi].2) {
+                wl.push(Def::Data(oi, di));
+            }
+        }
+    }
+    while let Some(d) = wl.pop() {
+        match d {
+            Def::Func(oi, f) => {
+                let o = &objs[oi];
+                let bi = f - o.fimports.len() as u32;
+                if !live_f.insert((oi, bi)) {
+                    continue;
+                }
+                let ops = o.bodies[bi as usize]
+                    .get_operators_reader()
+                    .map_err(|e| format!("{}: {e:?}", o.name))?;
+                for op in ops {
+                    match op.map_err(|e| format!("{}: {e:?}", o.name))? {
+                        wp::Operator::Call { function_index: i }
+                        | wp::Operator::RefFunc { function_index: i }
+                        | wp::Operator::ReturnCall { function_index: i } => {
+                            if (i as usize) < o.fimports.len() {
+                                let (m, n, _) = &o.fimports[i as usize];
+                                if m == "env"
+                                    && let Some(d) = resolve(oi, n)
+                                {
+                                    wl.push(d);
+                                }
+                            } else {
+                                wl.push(Def::Func(oi, i));
+                            }
+                        }
+                        wp::Operator::GlobalGet { global_index: i }
+                        | wp::Operator::GlobalSet { global_index: i } => {
+                            if let Some((m, n)) = o.gimports.get(i as usize)
+                                && (m == "GOT.mem" || m == "GOT.func")
+                                && let Some(d) = resolve(oi, n)
+                            {
+                                wl.push(d);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Def::Data(oi, di) => {
+                if !live_d.insert((oi, di)) {
+                    continue;
+                }
+                for (_, _, sym, _) in &objs[oi].data[di].relocs {
+                    if let Some(d) = resolve(oi, sym) {
+                        wl.push(d);
+                    }
+                }
+            }
+        }
+    }
+    // Is this definition emitted?
+    let is_live = |d: Def| match d {
+        Def::Func(oi, f) => live_f.contains(&(oi, f - objs[oi].fimports.len() as u32)),
+        Def::Data(oi, di) => live_d.contains(&(oi, di)),
+    };
+
     // Types.
     let mut types: Vec<wp::FuncType> = Vec::new();
     let mut tmaps: HashMap<usize, Vec<u32>> = HashMap::new();
@@ -433,17 +531,29 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
-    let mut base: HashMap<usize, u32> = HashMap::new();
+    // Output function indices: host imports, then each object's live
+    // bodies in link order. Dead functions map to u32::MAX; dead-local
+    // references cannot occur in live bodies, so their slots are unused.
+    let mut fout: HashMap<usize, Vec<u32>> = HashMap::new();
     let mut next = host.len() as u32;
     for &oi in &included {
-        base.insert(oi, next);
-        next += objs[oi].bodies.len() as u32;
+        let mut v = vec![u32::MAX; objs[oi].bodies.len()];
+        for (i, f) in v.iter_mut().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                *f = next;
+                next += 1;
+            }
+        }
+        fout.insert(oi, v);
     }
     // `__wasm_call_ctors` is synthesized after every object's bodies.
     let ctors_fn = next;
     let func_out = |d: Def| -> Option<u32> {
         match d {
-            Def::Func(oi, f) => Some(base[&oi] + f - objs[oi].fimports.len() as u32),
+            Def::Func(oi, f) => match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
+                u32::MAX => None,
+                x => Some(x),
+            },
             Def::Data(..) => None,
         }
     };
@@ -453,22 +563,26 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         let mut m = Vec::new();
         for (md, n, _) in &o.fimports {
             m.push(match resolve(oi, n).filter(|_| md == "env") {
-                Some(d) => func_out(d)
-                    .ok_or_else(|| format!("{}: {n} is data, called as a function", o.name))?,
+                Some(d @ Def::Func(..)) => func_out(d).unwrap_or(0),
+                Some(Def::Data(..)) => {
+                    return Err(format!("{}: {n} is data, called as a function", o.name));
+                }
                 None if md == "env" && n == CALL_CTORS => ctors_fn,
                 None => host.iter().position(|h| &h.0 == md && &h.1 == n).unwrap() as u32,
             });
         }
-        let b = base[&oi];
-        m.extend((0..o.bodies.len() as u32).map(|i| b + i));
+        m.extend(fout[&oi].iter().map(|&f| if f == u32::MAX { 0 } else { f }));
         fmaps.insert(oi, m);
     }
 
-    // Data layout.
+    // Data layout: live objects only.
     let mut addr: HashMap<(usize, usize), u32> = HashMap::new();
     let mut cur = 1024 + stack();
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
+            if !live_d.contains(&(oi, di)) {
+                continue;
+            }
             cur = cur.next_multiple_of(d.align.max(1));
             addr.insert((oi, di), cur);
             cur += d.bytes.len() as u32;
@@ -497,8 +611,15 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let value_of =
         |oi: usize, sym: &str, func: bool, table: &mut Vec<u32>| -> Result<u32, String> {
             match (resolve(oi, sym), sym) {
-                (Some(Def::Data(o, d)), _) if !func => Ok(addr[&(o, d)]),
-                (Some(d @ Def::Func(..)), _) if func => Ok(slot(func_out(d).unwrap(), table)),
+                (Some(Def::Data(o, d)), _) if !func => addr
+                    .get(&(o, d))
+                    .copied()
+                    .ok_or_else(|| format!("{sym}: dead data referenced")),
+                (Some(d @ Def::Func(..)), _) if func => Ok(slot(
+                    func_out(d)
+                        .ok_or_else(|| format!("{sym}: dead function referenced"))?,
+                    table,
+                )),
                 (None, CALL_CTORS) if func => Ok(slot(ctors_fn, table)),
                 (None, "__heap_base") => Ok(heap_base),
                 (None, "__data_end") => Ok(data_end),
@@ -536,9 +657,19 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                 ("env", "__stack_pointer") => 0,
                 ("env", "__pliron_trip") => 1,
                 ("GOT.mem", s) | ("GOT.func", s) => {
-                    let v = value_of(oi, s, module == "GOT.func", &mut table)?;
-                    gvals.push(v);
-                    n_synth + gvals.len() as u32
+                    // A GOT entry only dead functions consult is dropped;
+                    // their bodies are never emitted, so the map slot is
+                    // never read. Symbols without a definition are
+                    // linker-synthesized (__heap_base, __pliron_eh, host
+                    // functions): always keep them.
+                    let live = resolve(oi, s).is_none_or(|d| is_live(d));
+                    if live {
+                        let v = value_of(oi, s, module == "GOT.func", &mut table)?;
+                        gvals.push(v);
+                        n_synth + gvals.len() as u32
+                    } else {
+                        0
+                    }
                 }
                 (m, s) => return Err(format!("{}: unknown global import {m}.{s}", objs[oi].name)),
             });
@@ -550,6 +681,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let mut segs: Vec<(u32, Vec<u8>)> = Vec::new();
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
+            if !live_d.contains(&(oi, di)) {
+                continue;
+            }
             let mut bytes = d.bytes.clone();
             for (off, func, sym, add) in &d.relocs {
                 let v = value_of(oi, sym, *func, &mut table)?.wrapping_add(*add as u32);
@@ -564,7 +698,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // Constructors: every pointer in an `.init_array` entry, in link order.
     let mut ctors: Vec<u32> = Vec::new();
     for &oi in &included {
-        for d in objs[oi].data.iter().filter(|d| d.flags & INIT_ARRAY != 0) {
+        for (di, d) in objs[oi].data.iter().enumerate() {
+            if d.flags & INIT_ARRAY == 0 || !live_d.contains(&(oi, di)) {
+                continue;
+            }
             for (_, func, sym, _) in &d.relocs {
                 let f = resolve(oi, sym)
                     .filter(|_| *func)
@@ -608,23 +745,8 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
 
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
-    let names: Vec<String> = if exports.is_empty() {
-        included
-            .iter()
-            .filter(|&&oi| !blobs[oi].2)
-            .flat_map(|&oi| {
-                objs[oi]
-                    .funcs
-                    .iter()
-                    .filter(|f| f.1 & GLOBAL != 0)
-                    .map(|f| f.0.clone())
-            })
-            .collect()
-    } else {
-        exports
-    };
     let start = (entry && defs.contains_key("_start")).then(|| "_start".to_string());
-    for n in names.into_iter().chain(start) {
+    for n in roots.into_iter().chain(start) {
         if let Some(f) = defs.get(&n).copied().and_then(func_out) {
             if !ex.iter().any(|e| e.0 == n) {
                 ex.push((n, f));
@@ -656,8 +778,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     module.section(&is);
     let mut fs = we::FunctionSection::new();
     for &oi in &included {
-        for t in &objs[oi].ftypes {
-            fs.function(tmaps[&oi][*t as usize]);
+        for (i, t) in objs[oi].ftypes.iter().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                fs.function(tmaps[&oi][*t as usize]);
+            }
         }
     }
     fs.function(void_ty);
@@ -734,7 +858,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             globals: &gmaps[&oi],
             types: &tmaps[&oi],
         };
-        for b in &objs[oi].bodies {
+        for (i, b) in objs[oi].bodies.iter().enumerate() {
+            if !live_f.contains(&(oi, i as u32)) {
+                continue;
+            }
             m.parse_function_body(&mut code, b.clone())
                 .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
         }
@@ -759,7 +886,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         .collect();
     for &oi in &included {
         for (n, &f) in &objs[oi].exports {
-            named.push((base[&oi] + f - objs[oi].fimports.len() as u32, n));
+            match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
+                u32::MAX => {}
+                x => named.push((x, n)),
+            }
         }
     }
     named.push((ctors_fn, CALL_CTORS));
