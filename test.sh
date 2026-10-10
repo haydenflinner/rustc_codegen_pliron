@@ -45,6 +45,10 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/cparm/main.rs -o $out/cparm
 # peeled base turned `depth != 0` into `depth-1 != 0` and broke
 # BTreeMap's drop walk (build-script SIGSEGV compiling blake3).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim && $out/celim
+# punroll's peeled side-exit clones must not reach ambient uses of body
+# values through un-cloned shared continuations (sequential loops with
+# converging exits — Lint::parse_rust_version hit the verifier/EntryLivein).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/punroll && $out/punroll
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user

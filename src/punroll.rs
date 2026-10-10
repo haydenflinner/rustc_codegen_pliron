@@ -1015,27 +1015,24 @@ fn run_loop(
         e.corder = scone;
     }
 
-    // Outside uses of body values must stay inside exit cones: a block that
-    // is dominated by no single exit (e.g. a continuation shared by the
-    // latch exit and a side exit) can be reached from an unrolled copy
-    // without the defining inst ever running, so ambient uses there — most
-    // often aliases pointing back into the body — would violate dominance.
+    // Outside uses of body values must stay inside each exit's own cone.
+    // An unrolled copy's exit clone (the latch's cone clone, or a side
+    // exit's scone clone) binds the loop values used inside it, but its
+    // forward edges land on original blocks: from there the peeled path
+    // travels un-cloned code. Any ambient use of a body value reachable
+    // from an exit target without re-entering the body must therefore be
+    // dominated by that target — otherwise a peeled copy can reach the
+    // use without the defining inst ever running (most often an alias or
+    // live-out value pointing back into the body).
     {
-        let mut coneblks: FxHashSet<Block> = cone.iter().copied().collect();
-        for e in &mid_exits {
-            coneblks.extend(e.corder.iter().copied());
-        }
-        for b in func.layout.blocks() {
-            if body.contains(&b) || coneblks.contains(&b) || !dt.is_reachable(b) {
-                continue;
-            }
+        let mut ambient = |func: &Function, b: Block| -> bool {
             for i in func.layout.block_insts(b) {
                 if func
                     .dfg
                     .inst_values(i)
                     .any(|v| lvals.contains(&func.dfg.resolve_aliases(v)))
                 {
-                    bail!("body value used outside exit cones");
+                    return true;
                 }
                 for bc in func.dfg.insts[i].branch_destination(
                     &func.dfg.jump_tables,
@@ -1044,7 +1041,31 @@ fn run_loop(
                     if bc.args(&func.dfg.value_lists).any(|a| {
                         matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
                     }) {
-                        bail!("body value used outside exit cones");
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        for tgt in std::iter::once(eblk).chain(mid_exits.iter().map(|e| e.seblk)) {
+            let mut seen: FxHashSet<Block> = FxHashSet::default();
+            let mut stack = vec![tgt];
+            while let Some(b) = stack.pop() {
+                if body.contains(&b) || !seen.insert(b) || !dt.is_reachable(b) {
+                    continue;
+                }
+                if seen.len() > 512 {
+                    bail!("exit continuation too big");
+                }
+                if !dt.block_dominates(tgt, b) && ambient(func, b) {
+                    bail!("body value used outside exit cones");
+                }
+                for i in func.layout.block_insts(b) {
+                    for bc in func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    ) {
+                        stack.push(bc.block(&func.dfg.value_lists));
                     }
                 }
             }
