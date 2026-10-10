@@ -1310,6 +1310,11 @@
 (decl pure has_bmi2 () bool)
 (extern constructor has_bmi2 has_bmi2)
 
+;; pliron: gate for the `(bitmap >> x) & 1` -> `bt` fold; env
+;; PLIRON_X64_BITTAB=0 disables (enabled by default).
+(decl pure pliron_bittab () bool)
+(extern constructor pliron_bittab pliron_bittab)
+
 (decl pure use_popcnt () bool)
 (extern constructor use_popcnt use_popcnt)
 
@@ -3921,6 +3926,18 @@
 ;; [1]: https://github.com/bytecodealliance/wasmtime/pull/11128#discussion_r2164888415
 (rule 2 (is_nonzero_band ty a b @ (i32_from_iconst _))
   (CondResult.CC (x64_test ty a b) (CC.NZ)))
+
+;; pliron: bit-table probe — `(bitmap >> x) & 1` with a constant bitmap.
+;; `bt` puts bit `x` of the bitmap operand into CF (the index is taken
+;; mod operand-width, matching CLIF's masked `ushr`), so the whole
+;; movabs+shr+test chain becomes one `bt`. LLVM uses this for
+;; `char::is_whitespace`-style small tables. Gated by pliron_bittab.
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (ushr _ k @ (u64_from_iconst _) x) (u64_from_iconst 1))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (u64_from_iconst 1) (ushr _ k @ (u64_from_iconst _) x))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
 
 ;; Helper to test whether the `u64` input has a single bit set, and if so
 ;; yields the bit position of where that bit is set. Used in the lowering of

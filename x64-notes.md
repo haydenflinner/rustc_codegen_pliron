@@ -642,3 +642,68 @@ Validation: cargo build clean; test.sh green (nostd/std/unwind/
 asm/unroll/licm/proc-macro/wasm); Rosetta x86_64-apple-darwin
 std+unwind 5/5; PLIRON_VERIFY=1 clean on bigbench + the HashMap
 repro + scat_bench.
+
+### Post-brchain re-measure + x64 `bt` fold (gather/scatter/tokenize)
+
+HEAD `b9bc035` + the `bt` ISLE rules below, `/tmp/bigbench.rs`
+(1M elems, haswell, Rosetta, best-of-5):
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| gather | 0.484  | 0.514 | **parity** |
+| scatter| 0.837  | 0.510 | 1.64x (harness noise; ~1.3x isolated) |
+| tokenize | 3.97 | 1.55  | **2.56x** (was 5.0x) |
+
+**Tokenize 5.0x → 2.56x.** `brchain` (src/brchain.rs) replaced
+the per-char `movslq/jmpq *%rax` state-machine dispatch with a
+direct `cmpl/je` chain — the indirect-branch mispredict per
+iteration was the single biggest cost. The remaining 2.56x is
+two pieces, both invasive (documented, not fixed here):
+
+1. **Whitespace check: range-chain vs guarded bitmap.** Stock
+   emits `cmpl $0x20; ja skip; movl %r12d,%eax; btq %rax,%r8`
+   with `r8 = 0x100003e00` hoisted — the `c <= 0x20` guard makes
+   `bt`'s mod-64 index safe; LLVM folds the match-set
+   {9,10,11,12,13,32} into a bitmap at switch level. Our CLIF
+   carries the same test as a *branch* chain (`cmpl $0x20/je`,
+   `cmpl $0x9/jb`, `cmpl $0xd/jbe`, `cmpl $0x84/jbe`, then
+   `shr $8` + WHITESPACE_MAP byte-table for the unicode ranges)
+   — there is no `ushr` in the dataflow for ISLE to see, so
+   closing this needs a range-set→bitmap fold on the branch/
+   switch structure (LLVM's SwitchToLookupTable analogue).
+2. **11 loop-carried params → ~5 spill slots per char.** The
+   block14 state loop carries `(flag, ptr, off0..5, len_sel,
+   accum, sel)` — all verified *live* (SplitWhitespace's
+   front/back offsets, word bounds, char width + the `n` sum;
+   sameargs/deadrec found nothing removable). ~11 carried i64s
+   > usable GPRs → `0x8..0x28(%rsp)` stores+reloads every
+   iteration. Stock SROA/promotion shrinks per-iter state to ~7
+   regs, zero hot-loop stack traffic. This is a carried-state
+   fatness + spill-placement issue, not a pass we can cheaply
+   add — fixing means either MIR-level state reduction or
+   regalloc spill-cost work.
+
+**Gather — parity confirmed on HEAD.** bcheck versions the
+`i < out.len` affine bound; the fast loop is exactly stock's
+9-insn scalar shape (data-dependent `idx < tab.len` preserved).
+The `uextend.i64 (load.i32)` `movq` is gone via late `uloads32`
+— `movl` zero-extends in one vreg.
+
+**Scatter — bcheck skips it by default, deliberately.** Only
+one of scatter's two checks is affine-foldable, and the single-
+partial-check gate requires all stores to have affine addresses;
+`out[idx[i]]` is not, so the `i < val.len` check stays (the gate
+exists to protect histogram/RMW same-address forwarding).
+`PLIRON_BCHECK_PARTIAL=1` overrides: versioned fast loop ~8-9
+insns, isolated scatter **0.450ms vs stock 0.52 — beats stock**.
+Do not flip the default without re-measuring hist/RMW.
+
+**x64 `bt` fold added** (`PLIRON_X64_BITTAB=0` to disable):
+`(bitmap >> x) & 1` with constant bitmap → `x64_bt`, matching
+LLVM's X86 `BT` combine. Complements the existing `x & (1<<b)`
+and `x & single-bit-imm` rules; `bt`'s mod-operand-width index
+matches CLIF's masked `ushr`, so semantics are exact. Verified:
+`movabsq $0x100003e00,%rsi; andq $0x3f,%rdi; btq %rdi,%rsi;
+setb %al` (was `shrq %cl; testq $1; setne`). It does **not**
+fire on tokenize (no `ushr` form there — needs the switch-level
+fold above), but covers hand-rolled bit-table code.
