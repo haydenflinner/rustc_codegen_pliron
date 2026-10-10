@@ -90,6 +90,8 @@ pub struct FuncInfo {
     /// Params rustc marks `noalias`, by the same backend index as `frozen`:
     /// (param index, pointee size when rustc knows it, not `readonly`).
     pub noalias: Vec<(usize, u64, bool)>,
+    /// Params rustc marks `nonnull`, by the same backend index as `frozen`.
+    pub nonnull: Vec<usize>,
     pub nparams: usize,
 }
 
@@ -161,6 +163,10 @@ pub struct State<'tcx> {
     pub nowrite: rustc_data_structures::fx::FxHashMap<String, bool>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
+    /// `NonNull`): a bitmask over the arg's leaf indices (see
+    /// `FuncInfo::nonnull`).
+    pub nnargs: FxHashMap<Value, u64>,
     /// `inbounds` GEPs: null only if their base is.
     pub inbounds: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
@@ -345,6 +351,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 sret_ty: None,
                 frozen: Vec::new(),
                 noalias: Vec::new(),
+                nonnull: Vec::new(),
                 nparams: 0,
             },
         );
@@ -421,7 +428,7 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
-            (f.frozen, f.noalias, f.nparams) = frozen_params(fn_abi);
+            (f.frozen, f.noalias, f.nonnull, f.nparams) = frozen_params(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
             let t = self.backend_type(fn_abi.ret.layout);
@@ -784,14 +791,23 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
 
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of
 /// `fn_decl_backend_type`), and the backend param count.
-fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<(usize, u64, bool)>, usize) {
+fn frozen_params(
+    fn_abi: &FnAbi<'_, Ty<'_>>,
+) -> (
+    Vec<(usize, u64)>,
+    Vec<(usize, u64, bool)>,
+    Vec<usize>,
+    usize,
+) {
     use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
     let size = |a: &ArgAttributes| {
         let n = a.pointee_size.bytes();
         (a.regular.contains(A::NoAlias | A::ReadOnly) && n > 0).then_some(n)
     };
+    let nn = |a: Option<&ArgAttributes>| a.is_some_and(|a| a.regular.contains(A::NonNull));
     let mut v = Vec::new();
     let mut na = Vec::new();
+    let mut null = Vec::new();
     let mut i = usize::from(matches!(fn_abi.ret.mode, PassMode::Indirect { .. }));
     let nargs = if fn_abi.c_variadic {
         fn_abi.fixed_count as usize
@@ -824,22 +840,37 @@ fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, Vec<(usize, 
                 !a.regular.contains(A::ReadOnly),
             ));
         }
+        // `nonnull` leaf attrs: direct/pair element attrs and the
+        // indirect/meta pointers. Cast args are packed; skip them.
+        let ats: [Option<&ArgAttributes>; 2] = match &arg.mode {
+            PassMode::Direct(a) => [Some(a), None],
+            PassMode::Pair(a, b) => [Some(a), Some(b)],
+            PassMode::Indirect {
+                attrs, meta_attrs, ..
+            } => [Some(attrs), meta_attrs.as_ref()],
+            _ => [None, None],
+        };
+        for (k, at) in ats.into_iter().enumerate() {
+            if nn(at) {
+                null.push(i + k);
+            }
+        }
         i += n;
     }
-    (v, na, i)
+    (v, na, null, i)
 }
 
 /// Entry-block params of bodies in this module that rustc marks `noalias`.
-/// Entry-block params of bodies in this module that rustc marks `noalias`.
-/// `f.noalias`/`f.frozen` hold per-leaf indices into the flattened
-/// signature while a fat pliron arg covers several leaves; map each leaf
-/// index to its pliron arg. `None` if the leaf counts disagree.
-fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<Value> {
+/// `f.noalias`/`f.frozen`/`f.nonnull` hold per-leaf indices into the
+/// flattened signature while a fat pliron arg covers several leaves; map
+/// each leaf index to its pliron arg and the leaf offset within it. `None`
+/// if the leaf counts disagree.
+fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<(Value, usize)> {
     let mut off = 0usize;
     for a in e.deref(ctx).arguments() {
         let n = crate::types::leaves(ctx, a.get_type(ctx)).len();
         if leaf >= off && leaf < off + n {
-            return Some(a);
+            return Some((a, leaf - off));
         }
         off += n;
     }
@@ -859,7 +890,7 @@ pub fn noalias_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64, bool)> 
         out.extend(
             f.noalias
                 .iter()
-                .filter_map(|&(i, d, w)| leaf_arg(ctx, e, i).map(|a| (a, d, w))),
+                .filter_map(|&(i, d, w)| leaf_arg(ctx, e, i).map(|(a, _)| (a, d, w))),
         );
     }
     out
@@ -879,8 +910,34 @@ pub fn frozen_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64)> {
         out.extend(
             f.frozen
                 .iter()
-                .filter_map(|&(i, s)| leaf_arg(ctx, e, i).map(|a| (a, s))),
+                .filter_map(|&(i, s)| leaf_arg(ctx, e, i).map(|(a, _)| (a, s))),
         );
+    }
+    out
+}
+
+/// Entry-block params of bodies in this module that rustc marks `nonnull`,
+/// as (arg, bitmask of nonnull leaf offsets within the arg).
+pub fn nonnull_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64)> {
+    let mut out = Vec::new();
+    for f in st.funcs.values() {
+        if f.nonnull.is_empty() {
+            continue;
+        }
+        let Some(e) = Operation::get_op::<FuncOp>(f.op, ctx).and_then(|o| o.get_entry_block(ctx))
+        else {
+            continue;
+        };
+        for &i in &f.nonnull {
+            let Some((a, off)) = leaf_arg(ctx, e, i) else {
+                continue;
+            };
+            let e = out.iter_mut().find(|(x, _)| *x == a);
+            match e {
+                Some((_, m)) => *m |= 1 << off,
+                None => out.push((a, 1 << off)),
+            }
+        }
     }
     out
 }

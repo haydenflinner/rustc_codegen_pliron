@@ -26,10 +26,10 @@ folds at lowering time (covers a slice of instcombine/dce for free).
 | `instcombine` | Large peephole combiner for algebraic simplification | part (`instcombine.rs` egg ints; `clifpeep.rs`; `constload.rs`) | med (fp/vector/memory patterns open) | M |
 | `aggressive-instcombine` | Costlier pattern folds that instcombine skips | — | low-med | M |
 | `instsimplify` | Simplifies instructions without creating new ones | part (clifpeep + egraph) | low | S |
-| `sccp` | Sparse conditional constant propagation | part (`unroll.rs` const-props through loops; `jumpthread` folds) | low-med | M |
-| `correlated-propagation` | Uses value ranges and branch facts to simplify code | — | med-high (Rust is bounds-check dense) | L |
+| `sccp` | Sparse conditional constant propagation | part (`unroll.rs` const-props through loops; `jumpthread` folds + `sameargs` const-key + `const_sweep` eval-based const folding) | low-med | M |
+| `correlated-propagation` | Uses value ranges and branch facts to simplify code | part (`clifpeep::sel_regions` — select arms folded under decided `brif` regions; `jumpthread` param-null fold to guarding brif cond) | med-high (Rust is bounds-check dense) | L |
 | `constraint-elimination` | Removes compares proven by dominating conditions | done (`celim.rs`: dominating-fact RPO stack — edge facts, block-param translation w/ `uniform_slot`, ±c offset decomposition, transitivity, signed↔unsigned transfer; 310 folds/101 fns on regex-syntax) | landed | M |
-| `jump-threading` | Threads branches whose outcome is known on some paths | done (`jumpthread.rs`) | landed | — |
+| `jump-threading` | Threads branches whose outcome is known on some paths | done (`jumpthread.rs`; niche folds — `icmp (select c, X, K), K` w/ `ne_params` greatest fixpoint, `NonNull` lattice seeded from rustc `nonnull` arg attrs) | landed | — |
 | `dfa-jump-threading` | Jump threading for state-machine-style switch loops | — | low | M |
 | `simplifycfg` | Merges, removes, and folds basic blocks and branches | part (`unreach`, `tailmerge`, `taildup`, `switchmap`, `fusechains`, `phisimp`) | med (block merging still open) | M |
 | `dce` / `adce` / `bdce` | Dead code elimination: basic, aggressive, and bit-tracking | part (egraph DCE + `unreach`; no ADCE/bdce) | low | S |

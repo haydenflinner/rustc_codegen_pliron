@@ -19,7 +19,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
+    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
     types,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -361,10 +361,27 @@ fn bin_k(func: &Function, v: Value, op: Opcode) -> Option<(Value, i64)> {
 
 /// Whether `v` is always 0 or 1.
 fn is01(func: &Function, v: Value, depth: u32) -> bool {
-    if let Some(i) = func.dfg.value_def(v).inst()
-        && matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp)
-    {
+    let v = func.dfg.resolve_aliases(v);
+    if iconst(func, v).is_some_and(|k| matches!(k, 0 | 1)) {
         return true;
+    }
+    if let Some(i) = func.dfg.value_def(v).inst() {
+        match func.dfg.insts[i] {
+            _ if matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp) => {
+                return true;
+            }
+            InstructionData::Unary {
+                opcode: Opcode::Uextend | Opcode::Ireduce,
+                arg,
+            } if depth > 0 => return is01(func, arg, depth - 1),
+            InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } if depth > 0 => {
+                return is01(func, args[1], depth - 1) && is01(func, args[2], depth - 1);
+            }
+            _ => {}
+        }
     }
     bin_k(func, v, Opcode::Band).is_some_and(|(_, k)| k == 1)
         || (depth > 0
@@ -587,7 +604,36 @@ fn brif_not(func: &mut Function, inst: Inst) -> bool {
                 v = x;
                 neg = !neg;
             }
-            _ => break,
+            _ => {
+                // `ireduce` of a 0/1 value is free and `select c, 0, 1`
+                // is `!c` while `select c, 1, 0` is `c != 0` — the
+                // `Option`-select residue `brif (zext !c) & 1`.
+                let Some(i) = func.dfg.value_def(v).inst() else {
+                    break;
+                };
+                match func.dfg.insts[i] {
+                    InstructionData::Unary {
+                        opcode: Opcode::Ireduce,
+                        arg: x,
+                    } if is01(func, x, 4) => v = x,
+                    InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args,
+                    } => {
+                        let a = iconst(func, func.dfg.resolve_aliases(args[1]));
+                        let b = iconst(func, func.dfg.resolve_aliases(args[2]));
+                        match (a, b) {
+                            (Some(0), Some(1)) => {
+                                v = args[0];
+                                neg = !neg;
+                            }
+                            (Some(1), Some(0)) => v = args[0],
+                            _ => break,
+                        }
+                    }
+                    _ => break,
+                }
+            }
         }
     }
     if v == func.dfg.resolve_aliases(arg) {
@@ -1275,7 +1321,70 @@ pub fn sameargs(func: &mut Function) -> usize {
             break;
         }
     }
+    if crate::pass_enabled("PLIRON_CSWEEP") {
+        n += const_sweep(func);
+    }
     n
+}
+
+/// Fold pure insts whose inputs evaluate to constants — the const-param
+/// materialization in `sameargs_round` leaves `uextend`/`band`/`select`
+/// chains on literal tags (`Chars`'s `Option<char>` flag), and `eval`
+/// walks them transitively. Constant `brif`s become `jump`s via
+/// `fold_const_branches`, then dead blocks are swept.
+fn const_sweep(func: &mut Function) -> usize {
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut hits = Vec::new();
+    let nz = |_: Value| false;
+    let rg = |_: Value| None;
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let rs = func.dfg.inst_results(i);
+            if rs.len() == 1
+                && let Some(k) = crate::jumpthread::eval(func, &env, &nz, &rg, i)
+            {
+                let ty = func.dfg.value_type(rs[0]);
+                // `eval` returns raw 64 bits; store the value masked to
+                // the result width and emit the iconst sign-extended —
+                // narrow immediates (`iconst.i8 -1`) need both to stay
+                // canonical.
+                let bits = ty.bits();
+                let k = if bits >= 64 { k } else { k & ((1 << bits) - 1) };
+                let s = if bits >= 64 {
+                    k as i64
+                } else {
+                    ((k << (64 - bits)) as i64) >> (64 - bits)
+                };
+                hits.push((i, ty, s));
+                env.insert(rs[0], k);
+            }
+        }
+    }
+    let mut n = hits.len();
+    for (i, ty, k) in hits {
+        func.replace(i).iconst(ty, k);
+    }
+    if n > 0 {
+        // Replacements can expose constant branch conditions.
+        let f = crate::jumpthread::fold_const_branches(func);
+        if f > 0 {
+            crate::unreach::run(func);
+        }
+        n += f;
+    }
+    n
+}
+
+/// Edge-arg key for `sameargs_round`: `V` is an SSA value, `K` a
+/// materializable `iconst` — distinct `iconst` defs of the same
+/// (ty, imm) count as the same incoming arg. Pseudo-args keep their
+/// identity: `TryCallRet(0)` and `TryCallRet(1)` are different incoming
+/// values, so they must never compare equal.
+#[derive(Clone, Copy, PartialEq)]
+enum AKey {
+    V(Value),
+    K(Type, i64),
+    Other(BlockArg),
 }
 
 fn sameargs_round(func: &mut Function) -> usize {
@@ -1301,7 +1410,7 @@ fn sameargs_round(func: &mut Function) -> usize {
     let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
     let mut param_drops: Vec<Value> = vec![];
     for (&b, es) in &edges {
-        let ps = func.dfg.block_params(b);
+        let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() || es.is_empty() {
             continue;
         }
@@ -1309,18 +1418,34 @@ fn sameargs_round(func: &mut Function) -> usize {
         // `TryCallRet(0)` and `TryCallRet(1)` are different incoming
         // values — collapsing them to one "not a Value" marker makes the
         // duplicate-param merge below fuse a call's distinct results.
-        let mut edge_args: Vec<Vec<BlockArg>> = Vec::with_capacity(es.len());
+        // Edge args keyed so distinct `iconst` defs of the same (ty, imm)
+        // compare equal — `Chars`-style decoders pass literal tags
+        // (`iconst 1` for `Some`) materialized per arm.
+        let mut edge_args: Vec<Vec<AKey>> = Vec::with_capacity(es.len());
         let mut uniform = true;
         for &(i, d) in es {
             let bc = &func.dfg.insts[i].branch_destination(
                 &func.dfg.jump_tables,
                 &func.dfg.exception_tables,
             )[d];
-            let args: Vec<BlockArg> = bc
+            let args: Vec<AKey> = bc
                 .args(&func.dfg.value_lists)
                 .map(|a| match a {
-                    BlockArg::Value(v) => BlockArg::Value(func.dfg.resolve_aliases(v)),
-                    _ => a,
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        match func.dfg.value_def(v).inst() {
+                            Some(i)
+                                if let InstructionData::UnaryImm {
+                                    opcode: Opcode::Iconst,
+                                    imm,
+                                } = func.dfg.insts[i] =>
+                            {
+                                AKey::K(func.dfg.value_type(v), imm.bits())
+                            }
+                            _ => AKey::V(v),
+                        }
+                    }
+                    a => AKey::Other(a),
                 })
                 .collect();
             if args.len() != ps.len() {
@@ -1333,38 +1458,56 @@ fn sameargs_round(func: &mut Function) -> usize {
             continue;
         }
         let mut repl: Vec<(usize, Value)> = vec![];
+        let mut news: Vec<(Type, i64, Value)> = vec![];
         for ix in 0..ps.len() {
-            let mut same: Option<Value> = None;
+            let mut same: Option<AKey> = None;
             let mut differs = false;
             for a in &edge_args {
-                match a[ix] {
-                    BlockArg::Value(v) => {
-                        if same.is_none() {
-                            same = Some(v);
-                        } else if same != Some(v) {
-                            differs = true;
-                            break;
-                        }
-                    }
-                    _ => {
-                        differs = true;
-                        break;
-                    }
+                let k = a[ix];
+                if same.is_none() {
+                    same = Some(k);
+                } else if same != Some(k) {
+                    differs = true;
+                    break;
                 }
             }
             let mut found = false;
             if !differs {
-                let v = same.unwrap();
-                // `v` dominates `b` unless it's defined in `b` itself
-                // (a self-edge passing an in-block def/param).
-                let in_b = match func.dfg.value_def(v) {
-                    ValueDef::Result(i, _) => func.layout.inst_block(i) == Some(b),
-                    ValueDef::Param(bb, _) => bb == b,
-                    _ => true,
-                };
-                if !in_b {
-                    repl.push((ix, v));
-                    found = true;
+                match same.unwrap() {
+                    AKey::V(v) => {
+                        // `v` dominates `b` unless it's defined in `b`
+                        // itself (a self-edge passing an in-block
+                        // def/param).
+                        let in_b = match func.dfg.value_def(v) {
+                            ValueDef::Result(i, _) => {
+                                func.layout.inst_block(i) == Some(b)
+                            }
+                            ValueDef::Param(bb, _) => bb == b,
+                            _ => true,
+                        };
+                        if !in_b {
+                            repl.push((ix, v));
+                            found = true;
+                        }
+                    }
+                    AKey::K(ty, imm) => {
+                        // Materialize one canonical const at the top of
+                        // `b` (dominates every use of the dropped param).
+                        let v = match news.iter().find(|&&(t, k, _)| t == ty && k == imm) {
+                            Some(&(_, _, v)) => v,
+                            None => {
+                                let v = FuncCursor::new(&mut *func)
+                                    .at_first_insertion_point(b)
+                                    .ins()
+                                    .iconst(ty, imm);
+                                news.push((ty, imm, v));
+                                v
+                            }
+                        };
+                        repl.push((ix, v));
+                        found = true;
+                    }
+                    AKey::Other(_) => {}
                 }
             }
             if !found {
@@ -1447,6 +1590,219 @@ fn sameargs_round(func: &mut Function) -> usize {
         func.dfg.remove_block_param(*p);
     }
     param_drops.len()
+}
+
+/// `select c, a, b` whose every use sits in the region where `c`'s truth
+/// is already decided collapses to that arm — the `Option<NonNull>`
+/// niche selects (`select end?, 0, ptr`) ifconv materialises: the load
+/// using the `Some` arm only executes on the `!end` edge, so the select
+/// (and its compare feed) is dead weight. A use is "under `c = f`" when
+/// the block of the `brif c` arm proving it dominates the use block and
+/// that arm's target is reachable only through it.
+fn sel_regions(func: &mut Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    // Region roots per condition: `brif c` targets reachable only via
+    // the matching arm.
+    let mut roots: FxHashMap<Value, Vec<(Block, bool)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif {
+            arg: c, blocks, ..
+        } = func.dfg.insts[t]
+        else {
+            continue;
+        };
+        let c = func.dfg.resolve_aliases(c);
+        // `brif (icmp eq/ne x, 0)` decides `x`'s truth on each arm too
+        // (`eq` inverts it) — selects conditioned on `x` fold the same
+        // way once niche tests rewrite the branch to such a compare.
+        let mut conds = vec![(c, false)];
+        if let Some(ci) = func.dfg.value_def(c).inst()
+            && let InstructionData::IntCompare {
+                cond, args: ia, ..
+            } = func.dfg.insts[ci]
+            && matches!(cond, IntCC::Equal | IntCC::NotEqual)
+        {
+            let konst = |v: Value| match func.dfg.value_def(v) {
+                ValueDef::Result(i, 0) => match func.dfg.insts[i] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => Some(imm.bits()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let x = match (konst(ia[0]), konst(ia[1])) {
+                (Some(0), None) => Some(ia[1]),
+                (None, Some(0)) => Some(ia[0]),
+                _ => None,
+            };
+            if let Some(x) = x {
+                conds.push((func.dfg.resolve_aliases(x), cond == IntCC::Equal));
+            }
+        }
+        for (di, want) in [(0usize, true), (1, false)] {
+            let d = blocks[di].block(&func.dfg.value_lists);
+            if blocks[1 - di].block(&func.dfg.value_lists) == d {
+                continue;
+            }
+            // `d` must be entered only through this arm.
+            let ok = cfg.pred_iter(d).all(|p| {
+                p.inst == t
+                    && func.dfg.insts[p.inst]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == d)
+                        .all(|(i, _)| i == di)
+            });
+            if ok {
+                for &(rc, inv) in &conds {
+                    roots.entry(rc).or_default().push((d, want != inv));
+                }
+            }
+        }
+    }
+    if roots.is_empty() {
+        return 0;
+    }
+    // Which arm each block is decided under: `(want == true)` means
+    // `c != 0` is known on entry. Edge args are evaluated in the edge's
+    // source block, so a `select` arg in a decided block folds to its
+    // arm in place — `Chars`' `select(end?, ptr, ptr+1)` carried through
+    // the exit edge is the motivating case: the exit edge keeps `ptr`
+    // (the arm the select yields there anyway), after which the select's
+    // remaining uses all sit under `!end` and the whole select collapses
+    // to `ptr+1` below.
+    let decided = |u: Block, rs: &[(Block, bool)]| -> Option<bool> {
+        for &(r, w) in rs {
+            if domtree.block_dominates(r, u) {
+                return Some(w);
+            }
+        }
+        None
+    };
+    let mut edge_edits: Vec<(Inst, usize, usize, Value)> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (di, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    let BlockArg::Value(v) = a else {
+                        continue;
+                    };
+                    let Some(d) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
+                    else {
+                        continue;
+                    };
+                    let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: sa,
+                    } = func.dfg.insts[d]
+                    else {
+                        continue;
+                    };
+                    let c = func.dfg.resolve_aliases(sa[0]);
+                    let Some(rs) = roots.get(&c) else {
+                        continue;
+                    };
+                    if let Some(w) = decided(b, rs) {
+                        edge_edits.push((i, di, ai, sa[if w { 1 } else { 2 }]));
+                    }
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for (i, di, ai, v) in edge_edits {
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[i].branch_destination_mut(
+            &mut dfg.jump_tables,
+            &mut dfg.exception_tables,
+        )[di];
+        let mut at = 0;
+        bc.update_args(&mut dfg.value_lists, |a| {
+            let r = if at == ai { BlockArg::Value(v) } else { a };
+            at += 1;
+            r
+        });
+        n += 1;
+    }
+    // Use blocks of each select result (inst args and edge args alike:
+    // an edge arg is evaluated where the edge is taken).
+    let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                uses
+                    .entry(func.dfg.resolve_aliases(a))
+                    .or_default()
+                    .insert(b);
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        uses
+                            .entry(func.dfg.resolve_aliases(v))
+                            .or_default()
+                            .insert(b);
+                    }
+                }
+            }
+        }
+    }
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let c = func.dfg.resolve_aliases(args[0]);
+            let Some(rs) = roots.get(&c) else {
+                continue;
+            };
+            let Some(us) = uses.get(&func.dfg.first_result(i)) else {
+                continue;
+            };
+            let (mut want_t, mut want_f) = (0usize, 0usize);
+            for &u in us {
+                match decided(u, rs) {
+                    Some(true) => want_t += 1,
+                    Some(false) => want_f += 1,
+                    None => {
+                        want_t += usize::MAX / 2;
+                        break;
+                    }
+                }
+            }
+            let arm = match (want_t, want_f) {
+                (u, _) if u >= usize::MAX / 2 => continue,
+                (0, f) if f > 0 => args[2],
+                (t, 0) if t > 0 => args[1],
+                _ => continue,
+            };
+            let res = func.dfg.first_result(i);
+            func.dfg.clear_results(i);
+            func.layout.remove_inst(i);
+            func.dfg.change_to_alias(res, arm);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Returns the number of rewrites.
@@ -1614,6 +1970,11 @@ pub fn run(func: &mut Function) -> usize {
             pos.func.replace(inst).icmp(cond, b, zero);
             n += 1;
         }
+    }
+    // Region collapse after `brif_not` has normalised `brif` args to the
+    // underlying conditions.
+    if crate::pass_enabled("PLIRON_SELREGION") {
+        n += sel_regions(func);
     }
     n
 }

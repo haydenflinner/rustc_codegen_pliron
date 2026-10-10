@@ -331,6 +331,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 .map(|(v, d, w)| (v, (d, w)))
                 .collect();
         }
+        if pass_enabled("PLIRON_NNARGS") {
+            st.nnargs = context::nonnull_values(ctx, st).into_iter().collect();
+        }
         inline::run(ctx, st, small, None, false);
         domcheck::run(ctx, st, "inline");
         if pass_enabled("PLIRON_SPEC") {

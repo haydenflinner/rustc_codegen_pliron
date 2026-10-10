@@ -757,3 +757,29 @@ Track as x64 agent follow-up.
 - Residuals: tokenize ~1.95-2.6x (state machine shape), chars 2.4-3.4x
   (UTF-8 decode FSM — needs dedicated SIMD decode), wasm runtime
   ~1.32x on real crate.
+
+## WIP wt/native-opt: niche/nonnull decoding (uncommitted)
+- context.rs/lower.rs: rustc `nonnull` arg attrs by leaf index ->
+  NonNull fact seeding (PLIRON_NNARGS); jumpthread NonNull lattice
+  (nonnull loads, args, inbounds offsets, select arms, param fixpoint).
+- jumpthread: `icmp (select c, X, K), K` -> c/!c via `ne_params`
+  greatest fixpoint (PLIRON_SENTINEL) — folds Option<char> -1 test and
+  Option<NonNull> 0 test to the guard flag; param-null fold to guarding
+  brif cond (PLIRON_PARAMNULL); `sameargs` const-key + `const_sweep`
+  (PLIRON_CSWEEP); iconsts excluded from MAX_BODY (PLIRON_BODYK).
+- clifpeep::sel_regions (PLIRON_SELREGION): select arms folded when all
+  uses sit under a decided brif region — frees Chars' carried
+  select(end?,ptr,ptr+1) to a plain iadd.
+- chars: chars_count parity (0.037); ascii 2.4x->1.6x; mixed ~1.9x;
+  alpha ~2.9x; tokenize ~2.3x. ASCII hot loop = ldrb+add+cmp+b+tbnz;
+  Option selects/sentinels gone. Remaining: multibyte safe-load
+  selects (dep-bound cmp+csel) vs stock post-increment.
+- contains_rng: NOT br_table — scalar count(lo<=i&&i<=hi) 2.2x; stock
+  vectorizes the range reduction (8x u32 cmhs). loopvec gap; also
+  spilled-hi reload in loop.
+- Fixed en route: vacuous param-null fold on entry params (saw_x);
+  k!=0 icmps leaking into x==0 paths; AKey::Other raw BlockArg
+  (TryCallRet(0) vs (1) unwind crash); const_sweep eval mask+sext;
+  ne_params self-edge/unreachable-pred soundness.
+- Verified: cargo build; PLIRON_VERIFY=1 ./test.sh green; chars/contains
+  correctness incl. empty/mixed-width/char::MAX edges.
