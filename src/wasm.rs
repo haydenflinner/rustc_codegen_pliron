@@ -350,7 +350,7 @@ pub fn lower_to_wasm(
     // callers while `Call` targets still index `o.funcs`. Callees whose
     // last call edge disappears are dropped by wasm-ld's GC — this is
     // the main lever on the 4x function-count gap vs stock.
-    winline(&mut o.funcs, verbose);
+    winline(&mut o.funcs, verbose, o.sp);
 
     // Only import functions that are actually called; GOT.func globals
     // name their targets, so they don't need an import.
@@ -1473,6 +1473,110 @@ fn fixup_edges(b: &mut FunctionBody) {
     }
 }
 
+/// Does the pure-op tree feeding `v` mention any value in `set`?
+/// Follows aliases; treats unresolvable/non-pure leaves as clean.
+fn tree_touches(cb: &FunctionBody, v: WV, set: &FxHashSet<WV>, depth: u32) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    let v = cb.resolve_alias(v);
+    if set.contains(&v) {
+        return true;
+    }
+    match cb.values[v] {
+        ValueDef::Operator(op, aa, _) if op.is_pure() => {
+            cb.arg_pool[aa].iter().any(|&a| tree_touches(cb, a, set, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// A folded callee frame: `(fp value, size, align)`. FL emits each
+/// function frame as `s = global.get sp; t = s - SZ; fp = t & -A;
+/// global.set sp = fp` at the head plus `global.set sp = s|fp` restores
+/// on exits. `inline_site` folds every well-formed chain into one
+/// entry-level reservation in the caller so the spliced body doesn't
+/// rerun the adjust/restore dance at the callsite — which for loop-body
+/// callsites costs ~10 ops per iteration.
+fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, u64)> {
+    // users[v] = values whose defs reference v.
+    let mut users: FxHashMap<WV, Vec<WV>> = FxHashMap::default();
+    for cv in cb.values.iter() {
+        let mut push = |u| users.entry(u).or_default().push(cv);
+        match &cb.values[cv] {
+            ValueDef::Operator(_, aa, _) => {
+                for i in 0..cb.arg_pool[*aa].len() {
+                    push(cb.arg_pool[*aa][i]);
+                }
+            }
+            ValueDef::PickOutput(v, ..) | ValueDef::Alias(v) => push(*v),
+            _ => {}
+        }
+    }
+    // Values used by terminators can't be folded away.
+    let mut tused: FxHashSet<WV> = FxHashSet::default();
+    for blk in cb.blocks.iter() {
+        cb.blocks[blk]
+            .terminator
+            .visit_uses(|u| _ = tused.insert(cb.resolve_alias(u)));
+    }
+    let mut out = Vec::new();
+    for cv in cb.values.iter() {
+        let ValueDef::Operator(O::GlobalGet { global_index }, ..) = &cb.values[cv]
+        else {
+            continue;
+        };
+        if *global_index != sp || tused.contains(&cv) {
+            continue;
+        }
+        // Allowed uses of the SP read: exactly one `i32.sub sp0, SZ`
+        // (the frame alloc) plus `global.set sp` restores.
+        let mut sub = None;
+        let mut ok = true;
+        for &u in users.get(&cv).into_iter().flatten() {
+            match &cb.values[u] {
+                ValueDef::Operator(O::I32Sub, aa, _)
+                    if sub.is_none() && cb.arg_pool[*aa].first() == Some(&cv) =>
+                {
+                    sub = Some(u)
+                }
+                ValueDef::Operator(O::GlobalSet { global_index }, ..)
+                    if *global_index == sp => {}
+                _ => ok = false,
+            }
+        }
+        let Some(sub) = sub.filter(|s| ok && !tused.contains(s)) else {
+            continue;
+        };
+        let ValueDef::Operator(_, saa, _) = &cb.values[sub] else {
+            continue;
+        };
+        let Some(size) = wconst(cb, cb.arg_pool[*saa][1]) else {
+            continue;
+        };
+        // The sub feeds exactly the align `and` — the frame pointer.
+        let mut fu = users.get(&sub).into_iter().flatten();
+        let (Some(&fp), None) = (fu.next(), fu.next()) else {
+            continue;
+        };
+        let ValueDef::Operator(O::I32And, aa, _) = &cb.values[fp] else {
+            continue;
+        };
+        if cb.arg_pool[*aa].first() != Some(&sub) {
+            continue;
+        }
+        let Some(mask) = wconst(cb, cb.arg_pool[*aa][1]) else {
+            continue;
+        };
+        let align = (-mask).max(1) as u64;
+        if !align.is_power_of_two() || size <= 0 {
+            continue;
+        }
+        out.push((cv, sub, fp, size as u64, align));
+    }
+    out
+}
+
 /// Splice `callee` into `body` in place of the call `call_v` at
 /// `blk.insts[pos]`. The block is split at the call: `blk` keeps the
 /// prefix and merges the callee entry block (whose params alias the
@@ -1482,7 +1586,335 @@ fn fixup_edges(b: &mut FunctionBody) {
 /// prefix or reaches it through the join, and `blk` still dominates
 /// everything it dominated before. Callers must run `fixup_edges`
 /// and re-optimize afterwards.
-fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, callee: &FunctionBody) {
+fn inline_site(
+    body: &mut FunctionBody,
+    blk: WBlock,
+    mut pos: usize,
+    call_v: WV,
+    callee: &FunctionBody,
+    sp: waffle::Global,
+) {
+    // Fold the callee's stack frames into the caller's frame: FL emits
+    // each function frame as `s = global.get sp; t = s - SZ;
+    // fp = t & -A; global.set sp = fp` at the head plus `global.set sp`
+    // restores on exits, and the splice would re-execute that whole
+    // dance at the callsite — ~10 ops per loop iteration for hot
+    // callsites. Instead the frame is laid out inside the caller's own
+    // reservation (`fp + K_i`, like LLVM's merged inline allocas): the
+    // caller's `SZ` is bumped by the extra space and its mask widened
+    // if a folded frame needs more alignment. A frameless caller gets
+    // a fresh prologue-shaped reservation. `fold_base`: callee fp ->
+    // its remapped base; `fold_drop`: callee insts to skip when copying.
+    let mut fold_base: FxHashMap<WV, WV> = FxHashMap::default();
+    let mut fold_drop: FxHashSet<WV> = FxHashSet::default();
+    let chains = frame_chains(callee, sp);
+    if !chains.is_empty() {
+        let entry = body.entry;
+        // Find the caller's frame chain rooted at entry insts[0]: any
+        // `global.get sp` there starts either the real prologue or an
+        // earlier splice's reservation — growing either is safe, since
+        // every slot is fp-relative. `add` ops are new-frame bases.
+        // (sub, and, gset entry position) of the caller's frame chain.
+        let mut acc: Option<(WV, WV, usize)> = None;
+        if let Some(&first) = body.blocks[entry].insts.first()
+            && let ValueDef::Operator(O::GlobalGet { global_index }, ..) =
+                &body.values[first]
+            && *global_index == sp
+        {
+            let mut sub = None;
+            let mut gpos = None;
+            for (i, &iv) in body.blocks[entry].insts.iter().enumerate() {
+                match body.values[iv] {
+                    ValueDef::Operator(O::I32Sub, aa, _)
+                        if body.arg_pool[aa].first() == Some(&first)
+                            && wconst(body, body.arg_pool[aa][1]).is_some() =>
+                    {
+                        sub = sub.or(Some(iv))
+                    }
+                    ValueDef::Operator(O::GlobalSet { global_index }, ..)
+                        if global_index == sp =>
+                    {
+                        gpos = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // and = the sub's I32And-with-const consumer; the gset must
+            // set SP to it, else this isn't a frame chain — don't touch.
+            if let (Some(s), Some(gpos)) = (sub, gpos) {
+                let and = body.blocks[entry].insts.iter().find(|&&iv| {
+                    matches!(
+                        &body.values[iv],
+                        ValueDef::Operator(O::I32And, aa, _)
+                            if body.arg_pool[*aa].first() == Some(&s)
+                                && wconst(body, body.arg_pool[*aa][1]).is_some()
+                    )
+                });
+                if let Some(&a) = and
+                    && matches!(
+                        body.values[body.blocks[entry].insts[gpos]],
+                        ValueDef::Operator(O::GlobalSet { .. }, aa, _)
+                            if body.arg_pool[aa].first() == Some(&a)
+                    )
+                {
+                    acc = Some((s, a, gpos));
+                }
+            }
+        }
+        // When the callsite itself is in `entry`, emitted insts must
+        // land at or before the call's index — anything later gets
+        // swept into `after` by the split below and stops dominating
+        // the spliced body (SSA breakage, misaligned frames).
+        let call_idx = if blk == entry {
+            body.blocks[entry].insts.iter().position(|&i| i == call_v)
+        } else {
+            None
+        };
+        let pos_of = |b: &FunctionBody, v: WV| {
+            b.blocks[entry]
+                .insts
+                .iter()
+                .position(|&i| i == v)
+                .unwrap_or(0)
+        };
+        // The anchored layout needs room for the new bases: they go
+        // right after the frame's `global.set` (or before the call if
+        // that comes first), but always after `a`'s def.
+        let anchor_ok = match acc {
+            Some((_, a, gpos)) => {
+                (gpos + 1).min(call_idx.unwrap_or(usize::MAX)) > pos_of(body, a)
+            }
+            None => false,
+        };
+        // Lay out the folded frames after whatever space the chain
+        // already reserves (0 for a fresh one).
+        let (mut k, mut maxa, anchor): (u64, u64, Option<(WV, WV, usize)>) =
+            if anchor_ok {
+                let (s, a, gpos) = acc.unwrap();
+                let sa = match &body.values[s] {
+                    ValueDef::Operator(_, aa, _) => *aa,
+                    _ => unreachable!(),
+                };
+                let aa = match &body.values[a] {
+                    ValueDef::Operator(_, aa, _) => *aa,
+                    _ => unreachable!(),
+                };
+                (
+                    wconst(body, body.arg_pool[sa][1]).unwrap_or(0) as u64,
+                    -wconst(body, body.arg_pool[aa][1]).unwrap_or(-16) as u64,
+                    Some((s, a, gpos)),
+                )
+            } else {
+                (0, 16, None)
+            };
+        let mut offs = Vec::with_capacity(chains.len());
+        for &(_, _, _, sz, al) in &chains {
+            k = crate::types::align_to(k, al);
+            offs.push(k);
+            k += sz;
+            maxa = maxa.max(al);
+        }
+        // Each emitted op carries an anchor — the inst it is inserted
+        // before (None = end of entry) — so multiple inserts can't
+        // drift past one another or past the call.
+        let mut chunk: Vec<(WV, Option<WV>)> = Vec::new();
+        if let Some((s, a, gpos)) = anchor {
+            // New frame bases land right after the frame's `global.set`;
+            // capture the anchor before emitting anything (add_op
+            // appends to this same list and would shift the index).
+            let nxt = body.blocks[entry].insts.get(gpos + 1).copied();
+            let sa = match &body.values[s] {
+                ValueDef::Operator(_, aa, _) => *aa,
+                _ => unreachable!(),
+            };
+            let kc = body.add_op(
+                entry,
+                O::I32Const {
+                    value: crate::types::align_to(k, maxa) as u32,
+                },
+                &[],
+                &[WT::I32],
+            );
+            chunk.push((kc, Some(s)));
+            body.arg_pool[sa][1] = kc;
+            let aa = match &body.values[a] {
+                ValueDef::Operator(_, aa, _) => *aa,
+                _ => unreachable!(),
+            };
+            if maxa > -wconst(body, body.arg_pool[aa][1]).unwrap_or(-16) as u64 {
+                let nm = body.add_op(
+                    entry,
+                    O::I32Const {
+                        value: !(maxa as u32 - 1),
+                    },
+                    &[],
+                    &[WT::I32],
+                );
+                chunk.push((nm, Some(a)));
+                body.arg_pool[aa][1] = nm;
+            }
+            for (i, &(_, _, cfp, _, _)) in chains.iter().enumerate() {
+                let kc = body.add_op(
+                    entry,
+                    O::I32Const {
+                        value: offs[i] as u32,
+                    },
+                    &[],
+                    &[WT::I32],
+                );
+                let ad = body.add_op(entry, O::I32Add, &[a, kc], &[WT::I32]);
+                chunk.push((kc, nxt));
+                chunk.push((ad, nxt));
+                fold_base.insert(cfp, ad);
+            }
+        } else {
+            // Fresh reservation: `ibase = align(SP - k); SP = ibase`,
+            // plus per-frame `ibase + K` bases. Insert just past the
+            // first `global.set sp` in entry — every callsite sits
+            // after that point (calls can't precede the prologue, and
+            // earlier splices only leave SP ops before the callsites
+            // they replaced); position 0 when no SP adjust exists.
+            let mut ipos = 0;
+            for (i, &iv) in body.blocks[entry].insts.iter().enumerate() {
+                if matches!(
+                    body.values[iv],
+                    ValueDef::Operator(O::GlobalSet { global_index }, ..)
+                        if global_index == sp
+                ) {
+                    ipos = i + 1;
+                    break;
+                }
+            }
+            let nxt = body.blocks[entry].insts.get(ipos).copied();
+            let mut seq: Vec<WV> = Vec::new();
+            let mut add = |b: &mut FunctionBody, op: O, args: &[WV], tys: &[WT]| {
+                let v = b.add_op(entry, op, args, tys);
+                seq.push(v);
+                v
+            };
+            let gg = add(body, O::GlobalGet { global_index: sp }, &[], &[WT::I32]);
+            let ec = add(body, O::I32Const { value: k as u32 }, &[], &[WT::I32]);
+            let t2 = add(body, O::I32Sub, &[gg, ec], &[WT::I32]);
+            let mc = add(
+                body,
+                O::I32Const {
+                    value: !(maxa as u32 - 1),
+                },
+                &[],
+                &[WT::I32],
+            );
+            let ibase = add(body, O::I32And, &[t2, mc], &[WT::I32]);
+            add(body, O::GlobalSet { global_index: sp }, &[ibase], &[]);
+            for (i, &(_, _, cfp, _, _)) in chains.iter().enumerate() {
+                let base = if offs[i] == 0 {
+                    ibase
+                } else {
+                    let kc = add(
+                        body,
+                        O::I32Const {
+                            value: offs[i] as u32,
+                        },
+                        &[],
+                        &[WT::I32],
+                    );
+                    add(body, O::I32Add, &[ibase, kc], &[WT::I32])
+                };
+                fold_base.insert(cfp, base);
+            }
+            chunk = seq.iter().map(|&v| (v, nxt)).collect();
+            // The caller had no frame of its own, so its return paths
+            // may not restore SP; every Return block must end with a
+            // `global.set sp` back to the pre-adjust value. That's the
+            // earliest SP read in final entry order: `gg` itself when
+            // the reservation lands before the pre-existing read.
+            let mut first_get = None;
+            for (i, &iv) in body.blocks[entry].insts.iter().enumerate() {
+                if let ValueDef::Operator(O::GlobalGet { global_index }, ..) =
+                    &body.values[iv]
+                    && *global_index == sp
+                    && !seq.contains(&iv)
+                {
+                    first_get = Some((iv, i));
+                    break;
+                }
+            }
+            let gg_pos = ipos.min(call_idx.unwrap_or(usize::MAX));
+            let orig = match first_get {
+                Some((g, p)) if gg_pos > p => g,
+                _ => gg,
+            };
+            for rb in body.blocks.iter() {
+                if !matches!(body.blocks[rb].terminator, Terminator::Return { .. }) {
+                    continue;
+                }
+                let restored = body.blocks[rb].insts.last().is_some_and(|&iv| {
+                    matches!(
+                        body.values[iv],
+                        ValueDef::Operator(O::GlobalSet { global_index }, ..)
+                            if global_index == sp
+                    )
+                });
+                if !restored {
+                    body.add_op(rb, O::GlobalSet { global_index: sp }, &[orig], &[]);
+                }
+            }
+        }
+        // Move emitted ops (currently at the end of entry's insts) to
+        // their anchors — inserted just before the anchored inst, and
+        // never past the call when it shares this block.
+        {
+            let insts = &mut body.blocks[entry].insts;
+            for &(v, _) in &chunk {
+                if let Some(p) = insts.iter().position(|&i| i == v) {
+                    insts.remove(p);
+                }
+            }
+            for (v, anchor) in chunk {
+                let mut p = match anchor {
+                    Some(a) => insts
+                        .iter()
+                        .position(|&i| i == a)
+                        .unwrap_or(insts.len()),
+                    None => insts.len(),
+                };
+                if blk == entry
+                    && let Some(cp) = insts.iter().position(|&i| i == call_v)
+                {
+                    p = p.min(cp);
+                }
+                insts.insert(p, v);
+            }
+        }
+        // Emitting shifted inst positions; re-find the call.
+        if let Some(p) = body.blocks[blk].insts.iter().position(|&i| i == call_v) {
+            pos = p;
+        }
+        // The callee's SP ops die with the fold: the get/sub chain
+        // members (fp is remapped through fold_base), plus every
+        // `global.set sp` whose argument computes through folded
+        // values — the entry adjust and the restores. A set whose arg
+        // derives only from unfolded chains stays verbatim.
+        let folded: FxHashSet<WV> = chains
+            .iter()
+            .flat_map(|&(g, s, cfp, _, _)| [g, s, cfp])
+            .collect();
+        for cv in callee.values.iter() {
+            let ValueDef::Operator(O::GlobalSet { global_index }, aa, _) =
+                &callee.values[cv]
+            else {
+                continue;
+            };
+            if *global_index == sp
+                && tree_touches(callee, callee.arg_pool[*aa][0], &folded, 0)
+            {
+                fold_drop.insert(cv);
+            }
+        }
+        for &(g, s, cfp, _, _) in &chains {
+            fold_drop.extend([g, s, cfp]);
+        }
+    }
     let (cargs, tys): (Vec<WV>, Vec<WT>) = match &body.values[call_v] {
         ValueDef::Operator(_, args, tys) => (
             body.arg_pool[*args].iter().copied().collect(),
@@ -1567,6 +1999,15 @@ fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, cal
         {
             continue;
         }
+        // Folded frame pointers alias their reserved base; the rest of
+        // the dropped SP machinery gets no def at all.
+        if let Some(&base) = fold_base.get(&cv) {
+            body.values[nv] = ValueDef::Alias(base);
+            continue;
+        }
+        if fold_drop.contains(&cv) {
+            continue;
+        }
         let def = match &callee.values[cv] {
             ValueDef::BlockParam(b2, i, ty) => ValueDef::BlockParam(bmap[b2.index()], *i, *ty),
             ValueDef::Operator(op, args, tys) => {
@@ -1632,6 +2073,7 @@ fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, cal
         let insts: Vec<WV> = callee.blocks[cb]
             .insts
             .iter()
+            .filter(|v| !fold_drop.contains(v))
             .map(|v| src[v.index()])
             .collect();
         if cb == callee.entry {
@@ -2067,7 +2509,7 @@ fn wsel(b: &mut FunctionBody) -> bool {
 /// single-callsite callee at most `SOLO` insts. Once a callee's last
 /// call edge is gone the linker's mark-sweep GC drops its standalone
 /// body, which is where the code-size win lands.
-fn winline(funcs: &mut [FDecl], verbose: bool) {
+fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
     // Loop-body callsites execute the call every iteration, so a
@@ -2209,7 +2651,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
                     }
                     if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv)
                     {
-                        inline_site(b, blk, pos, iv, &callee);
+                        inline_site(b, blk, pos, iv, &callee, sp);
                         inlined += 1;
                     }
                 }
