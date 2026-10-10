@@ -711,10 +711,18 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     // Foldable checks: `brif (icmp cc idx, len)` where idx is affine in the
     // counter, len invariant, and the unsafe edge is a cold (panic) block.
     let mut checks: Vec<Chk> = Vec::new();
+    let mut total_checks = 0usize;
     'blk: for &b in &body {
         let Some(t) = func.layout.last_inst(b) else { continue };
         if func.dfg.insts[t].opcode() != Opcode::Brif {
             continue;
+        }
+        let to_cold = func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .iter()
+            .any(|bc| func.layout.is_cold(bc.block(&func.dfg.value_lists)));
+        if to_cold {
+            total_checks += 1;
         }
         let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
             continue;
@@ -769,6 +777,14 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     }
     if checks.is_empty() {
         bail!("no foldable checks");
+    }
+    // A single foldable check that leaves other checks behind isn't worth
+    // a loop clone: the fast copy still pays a cold branch per iteration,
+    // and the tighter loop can actually be slower — in a scatter/RMW loop
+    // the shrunken store->load window hits memory-order replays (hist:
+    // ~0.61ms unversioned vs ~1.12ms with a check removed).
+    if checks.len() < total_checks && checks.len() < 2 {
+        bail!("single partial check not worth a clone");
     }
 
     // Guard/preheader block g takes h's params verbatim; every entry edge

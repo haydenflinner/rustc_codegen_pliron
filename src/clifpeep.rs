@@ -16,7 +16,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
-    BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, types,
+    BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef, types,
 };
 use rustc_data_structures::fx::FxHashSet;
 
@@ -525,6 +525,156 @@ fn deflag(func: &mut Function) -> usize {
             pos.func.dfg.change_to_alias(res[1], z);
             pos.func.layout.remove_inst(i);
             n += 1;
+        }
+    }
+    n
+}
+
+/// An integer argument of a call in a cold block that is defined in a hot
+/// block pins its virtual register to a fixed ABI register across the whole
+/// hot region: the register allocator honors the call's operand constraint
+/// at the value's only fixed use, so loop-carried operands like a
+/// bounds-check `idx`/`len` get permanently assigned to x0/x1 and every
+/// other user — and every backedge — pays a move to shuffle them. Rebind
+/// each such arg to a fresh `iadd x, 0` defined inside the cold block: the
+/// copy is still emitted, but at the call site in cold code instead of at
+/// every hot use (LLVM places the same `mov`s in the panic block).
+pub fn coldargs(func: &mut Function) -> usize {
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        if !func.layout.is_cold(b) {
+            continue;
+        }
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            if !func.dfg.insts[i].opcode().is_call() {
+                continue;
+            }
+            let mut reb = vec![];
+            for &a in func.dfg.inst_args(i) {
+                let ty = func.dfg.value_type(a);
+                if !ty.is_int() {
+                    continue;
+                }
+                let hot = match func.dfg.value_def(a) {
+                    ValueDef::Result(di, _) => func
+                        .layout
+                        .inst_block(di)
+                        .is_some_and(|db| !func.layout.is_cold(db)),
+                    ValueDef::Param(pb, _) => !func.layout.is_cold(pb),
+                    _ => false,
+                };
+                if hot {
+                    reb.push((a, ty));
+                }
+            }
+            if reb.is_empty() {
+                continue;
+            }
+            let mut pairs = vec![];
+            {
+                let mut pos = FuncCursor::new(func).at_inst(i);
+                for &(a, ty) in &reb {
+                    let z = pos.ins().iconst(ty, 0);
+                    pairs.push((a, pos.ins().iadd(a, z)));
+                }
+            }
+            for a in func.dfg.inst_args_mut(i) {
+                for &(old, nv) in &pairs {
+                    if *a == old {
+                        *a = nv;
+                    }
+                }
+            }
+            n += pairs.len();
+        }
+    }
+    n
+}
+
+/// Splice a `jump`'s target into its predecessor when the target has no
+/// other predecessors. Cranelift's register allocator splits live ranges
+/// at block boundaries, so straight-line code chopped into blocks (e.g.
+/// bcheck's versioned clones) pays a parallel-copy shuffle on every edge.
+/// A block can only have one terminator, so only unconditional edges can
+/// be merged: move the target's instructions in, alias its params to the
+/// edge args, and the per-edge copies disappear. Repeat to fixpoint: each
+/// fusion can expose the next block of the same chain.
+pub fn fusechains(func: &mut Function) -> usize {
+    use rustc_data_structures::fx::FxHashMap;
+    let mut n = 0;
+    loop {
+        // Incoming-edge count per block (self-edges included).
+        let mut preds: FxHashMap<cranelift_codegen::ir::Block, u32> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            let Some(lt) = func.layout.last_inst(b) else {
+                continue;
+            };
+            for bc in func.dfg.insts[lt].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                *preds.entry(bc.block(&func.dfg.value_lists)).or_default() += 1;
+            }
+        }
+        let mut fused = false;
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            if func.layout.is_cold(b) {
+                continue;
+            }
+            let Some(lt) = func.layout.last_inst(b) else {
+                continue;
+            };
+            if func.dfg.insts[lt].opcode() != Opcode::Jump {
+                continue;
+            }
+            let dests = func.dfg.insts[lt]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .to_vec();
+            let pick = dests.iter().find(|bc| {
+                let t = bc.block(&func.dfg.value_lists);
+                t != b
+                    && !func.layout.is_cold(t)
+                    && preds.get(&t).copied().unwrap_or(0) == 1
+            });
+            let Some(bc) = pick else { continue };
+            let t = bc.block(&func.dfg.value_lists);
+            // Edge args must all be plain values (no try_call exn markers)
+            // so the successor's params can be aliased to them.
+            let params = func.dfg.block_params(t).to_vec();
+            let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+            let mut pairs = Vec::with_capacity(args.len());
+            let mut ok = args.len() == params.len();
+            for (p, a) in params.iter().zip(args) {
+                if let BlockArg::Value(v) = a {
+                    pairs.push((*p, v));
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Detach t's params so they can be aliased to the edge args;
+            // every use of a param (in t or anywhere t dominated) then
+            // resolves to the value the predecessor passed.
+            func.dfg.detach_block_params(t);
+            for (p, v) in pairs {
+                func.dfg.change_to_alias(p, v);
+            }
+            let tinsts: Vec<Inst> = func.layout.block_insts(t).collect();
+            func.layout.remove_inst(lt);
+            for i in tinsts {
+                func.layout.remove_inst(i);
+                func.layout.append_inst(i, b);
+            }
+            func.layout.remove_block(t);
+            n += 1;
+            fused = true;
+            break;
+        }
+        if !fused {
+            break;
         }
     }
     n

@@ -676,6 +676,35 @@ pub fn lower_to_object(
         // Scalar min/max wider than a register (i128) has no Cranelift
         // lowering on any target; several passes can emit it.
         crate::clifpeep::wide_minmax(&mut clctx.func);
+        // Rebind cold-call args defined in hot code so their ABI register
+        // pinning lands at the cold call site instead of constraining the
+        // whole hot loop's register allocation.
+        if crate::pass_enabled("PLIRON_COLDARG") && crate::bisect("coldarg") {
+            let k = crate::clifpeep::coldargs(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldarg {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldargs ====\n{}", clctx.func.display());
+            }
+        }
+        // Splice single-predecessor successors into their predecessor so
+        // hot loops broken into several blocks by cold-edge branches lose
+        // the per-edge register-allocation copy shuffle.
+        if crate::pass_enabled("PLIRON_FUSE") && crate::bisect("fuse") {
+            let k = crate::clifpeep::fusechains(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("fuse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after fuse ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("fuse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if let Err(e) = m.define_function(id, &mut clctx) {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.

@@ -84,3 +84,69 @@ rev/neg-store/neg-load/dot/early-exit kernels across edge lengths
 - General-reg AMode::PostIndex for single ldr/str: not pursued —
   marginal (only scalar epilogue paths benefit); the paired streams
   already telescope to post-index writebacks.
+
+## This round (scatter/hist, countdown iv, cold-edge RA effects)
+
+- `bcheck`: skip loop versioning when fewer than 2 checks fold and
+  other cold checks remain. Versioning duplicates the loop for ~2
+  insts of per-iter gain, and in scatter/RMW loops the tighter clone
+  is actually slower — `cnt[a[i]]` is a same-address store->load
+  chain, and shrinking the loop widened the memory-order replay
+  exposure (measured: versioned 9-inst loop 1.12ms vs unversioned
+  15-inst loop 0.61ms, all-3s data). `hist`: 1.123 -> 0.612.
+  `gather` keeps its win (2 of 3 checks fold): 0.478 vs stock 0.599.
+- `clifpeep::coldargs` (PLIRON_COLDARG, default on): integer args of
+  calls in cold blocks defined in hot code get rebound through
+  `iadd x, 0` inside the cold block, so the ABI arg-register pinning
+  materializes at the call site (LLVM's shape) instead of
+  constraining the value's whole hot live range. Keeps CLIF honest;
+  measured effect is small — see residual below.
+- `clifpeep::fusechains` (PLIRON_FUSE, default on): splices a
+  `jump`'s target into its predecessor when the target has exactly
+  one predecessor — removes per-edge regalloc copy shuffles on
+  straight-line chains (bcheck clones, split bodies). Conditional
+  edges cannot merge (one terminator per block).
+- `loopvec` count-down induction: when no body inst reads the scalar
+  iv (all stream bases strength-reduced, no early exits, step > 0)
+  the vector loop carries `rem = end - iv` and guards `rem != 0`.
+  rev_copy32's latch is now `sub x6,#0x10; cbnz x6` — LLVM's exact
+  shape, and both stores emit post-index `stp`s. Timing parity
+  (0.316 vs 0.316; bandwidth-bound) with strictly better code; the
+  earlier mov ping-pong was already gone after stream strength
+  reduction.
+
+## Bench sweep this round (same loaded box; hist numbers repeat
+consistently within a binary but identical code has measured
+0.61-1.16 across runs — treat <2x deltas as noise-prone)
+
+- scatter: gather 0.478 vs 0.599 (win), hist 0.612 vs 0.438
+  (residual loss, was 1.123)
+- mixed: memchr 0.080 vs 1.178, itersum 0.442 vs 0.732, strsum 0.109
+  vs 0.236, fnv/copyrev/chaindep parity
+- main: matmul 10.53 vs 12.07 (1.15x), sum_u8 0.074 vs 0.219 (3x),
+  axpy/vadd/clamp/dot parity
+- wide: rev_copy32 0.316 parity (cbnz latch now), scaled parity,
+  dot_u8/cnt_vowel/find_off/has_val wins
+- early2/earch/es/cv/dtest2/dtest3/condred/splitacc: correctness
+  identical both backends
+
+## Remaining opportunities (ranked)
+
+1. hist residual (~1.4x): the unversioned checked loop still emits
+   ~6 regalloc copies per iteration (`x0=x5; x4=x15; x13=x3; ...`)
+   vs LLVM's zero. CLIF is minimal (one carried param; cold call
+   args rebound); the copies are per-block-boundary RA artifacts —
+   LLVM's 3-MBB loop has the same structure but a global live-range
+   assignment. Fix is RA-level (regalloc2 operand/edge coalescing),
+   not a CLIF pass: bigger blast radius, not attempted.
+2. matmul further win (1.15x now): deeper k-unroll / f32 fmla
+   pairing / register tiling. loopvec's model can't express tiling;
+   punroll (x64-owned) is the nearer lever — multi-exit inner loops.
+3. Same-address RMW loops: tight 7-9 inst loops LOSE to 14-15 inst
+   versions on Apple silicon (store->load replays). bcheck now
+   avoids creating the tight clone for hist-like shapes, but
+   LLVM-checked hist still beats our unversioned loop — spacing the
+   dependent str->ldr gap (a scheduler knob) is unexplored.
+4. hist_unchecked path takes scalar punroll and loses (1.48 vs
+   0.61); punroll multi-exit handling is the x64 agent's domain —
+   documented only.

@@ -2443,6 +2443,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let ivv = func.dfg.append_block_param(vh, iv_ty);
     let endv = func.dfg.append_block_param(vh, iv_ty);
     let nm = func.dfg.append_block_param(vh, iv_ty);
+    // Count-down induction: when nothing inside the vector body reads the
+    // scalar iv (every stream base was strength-reduced to a carried
+    // pointer and no lane early-exit resume needs the index), carry
+    // `rem = end_v - iv` instead of `iv` and test `rem != 0` on the guard.
+    // The latch then lowers to `sub` + `cbnz`/`b.ne` like LLVM, one
+    // instruction cheaper than `add` + `cmp` + `b.lo`; the epilogue resume
+    // index is just `end_v` since rem hits 0 exactly on exit.
+    let countdown = p.step > 0 && p.early.is_empty() && p.streams.iter().all(|s| !s.direct);
     let mut pos = FuncCursor::new(func).at_bottom(cb);
     // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
@@ -2544,7 +2552,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // Vector accumulators (one per unroll group per reduction) start at the
     // op's identity splatted to all lanes; acc0 is folded in on exit.
     let splits: Vec<usize> = p.reducs.iter().map(|r| r.split()).collect();
-    let mut v_arg_vals = vec![p.iv0, end, nmv];
+    // The carried counter: count-up iv (iv0 -> end), or remaining count
+    // (end - iv0 = nm*step -> 0) for the countdown latch.
+    let mut v_arg_vals = vec![if countdown { off } else { p.iv0 }, end, nmv];
     for (r, &sp) in p.reducs.iter().zip(&splits) {
         let n = if r.ordered { 1 } else { UNROLL * sp };
         for _ in 0..n {
@@ -2618,7 +2628,12 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         .map(|s| (!s.direct).then(|| pos.func.dfg.append_block_param(vh, pty)))
         .collect();
     let mut pos = FuncCursor::new(pos.func).at_bottom(vh);
-    let c = pos.ins().icmp(IntCC::UnsignedLessThan, ivv, endv);
+    let c = if countdown {
+        let z = pos.ins().iconst(iv_ty, 0);
+        pos.ins().icmp(IntCC::NotEqual, ivv, z)
+    } else {
+        pos.ins().icmp(IntCC::UnsignedLessThan, ivv, endv)
+    };
     pos.ins().brif(c, vb, &[], ve, &[]);
     // ve: scalar epilogue entry — resume at iv_v with stepping params advanced
     // by s*nm and each reduction acc = acc0 ⊕ fold(vacc).
@@ -2627,7 +2642,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let mut epi: Vec<Value> = Vec::new();
     for (j, _) in params.iter().enumerate() {
         if j == p.iv_idx {
-            epi.push(ivv);
+            // Countdown loops exit with rem == 0, i.e. iv == end_v.
+            epi.push(if countdown { endv } else { ivv });
             continue;
         }
         if let Some((k, r)) = p.reducs.iter().enumerate().find(|(_, r)| r.idx == j) {
@@ -2980,7 +2996,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             .store(MemFlagsData::new().with_notrap(), vv, a, off as i32);
     }
     let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
-    let iv2 = pos.ins().iadd(ivv, k);
+    let iv2 = if countdown {
+        pos.ins().isub(ivv, k)
+    } else {
+        pos.ins().iadd(ivv, k)
+    };
     let mut back: Vec<Value> = vec![iv2, endv, nm];
     for (i, accs) in back_accs.iter_mut().enumerate() {
         if p.reducs[i].ordered {
