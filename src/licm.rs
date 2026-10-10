@@ -140,6 +140,7 @@ fn hoists(
     writers: &[Inst],
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
+    deref: &FxHashMap<Value, (u64, bool)>,
     i: Inst,
 ) -> bool {
     if !func.dfg.inst_args(i).iter().all(|&a| inv(func, a)) {
@@ -163,7 +164,28 @@ fn hoists(
     let ty = func.dfg.value_type(func.dfg.first_result(i));
     let (r, o) = loadfwd::root(func, arg);
     let loc: Loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
-    writers.iter().all(|&w| !clobbers(func, w, loc, iso, nw))
+    // `notrap` only asserts the load can't trap where it sits — invalid
+    // addresses are UB, so removal/reorder is fine — but hoisting speculates
+    // it onto paths where the address may be garbage (a pointer loaded from
+    // an enum payload is only valid on that variant's arm). Require the
+    // root dereferenceable unconditionally: a stack slot, a symbol or stack
+    // base, or a param rustc marked `dereferenceable` covering the access.
+    let safe = match r {
+        Root::S(_) => true,
+        Root::V(v) => {
+            let proven = deref.get(&v).is_some_and(|&(bytes, _)| {
+                o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64
+            });
+            proven
+                || func.dfg.value_def(v).inst().is_some_and(|d| {
+                    matches!(
+                        func.dfg.insts[d].opcode(),
+                        Opcode::SymbolValue | Opcode::FuncAddr | Opcode::GetStackPointer
+                    )
+                })
+        }
+    };
+    safe && writers.iter().all(|&w| !clobbers(func, w, loc, iso, nw))
 }
 
 fn run_loop(
@@ -294,7 +316,7 @@ fn run_loop(
                 if n >= MAX_MOVES {
                     break;
                 }
-                if hoists(func, &inv, &writers, iso, nw, i) {
+                if hoists(func, &inv, &writers, iso, nw, deref, i) {
                     if debug {
                         eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
                     }
