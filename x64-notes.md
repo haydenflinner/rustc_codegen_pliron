@@ -37,3 +37,24 @@ Running log of work + learnings. Bench: `/tmp/cpubench/{main,wide}.rs`,
   lowering support in vendored Cranelift (upstream never did it; only
   aarch64 has real vector-legalization for >128). loopvec stays 128-bit;
   UNROLL=4 gives 512 bits/iter anyway.
+
+### Mach-O x64 fixes (backend already ran on aarch64; these unblock x86_64-apple-darwin)
+
+- `va_tramp_asm`/`va_tramp_ind_asm` (src/lower.rs) emitted ELF-only stubs:
+  `.section .text.<sym>,"ax",@progbits` + `.type`/`.size`/`.hidden`. On
+  Mach-O rsasm parsed `.text.__pliron_va8.snprintf` as a segment name →
+  >16 chars → "a Mach-O segment name is at most 16 characters" panic in
+  objmerge. Now both take a `macho` flag (from `isa().triple().binary_format`)
+  and emit `__TEXT,__text` + `.private_extern` for Mach-O, ELF path
+  unchanged. Verified: `snprintf = 42|2.500000|A|-7` through the `%al=8`
+  trampoline under Rosetta.
+- `llvm_intrinsic_stub` MachO branch (src/asm.rs) dropped the
+  `.intel_syntax noprefix`/`.att_syntax` wrappers the ELF branch adds, so
+  every Intel-syntax x86 stub body (xgetbv/pclmulqdq/vzeroupper/ud2/…)
+  mis-assembled ("no form of `movq` accepts a memory operand"). Now emits
+  `{syntax}{body}{back}` on both paths. Verified: `pclmulqdq ok` under
+  Rosetta.
+
+x64 smoke status (Rosetta): std/unwind/unroll/licm/asm all compile+run;
+std & unroll outputs identical to expectations (stock x64 can't link
+tests/asm — the test's global_asm is ELF-styled, no Mach-O underscore).

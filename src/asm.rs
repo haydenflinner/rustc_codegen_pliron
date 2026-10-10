@@ -155,7 +155,7 @@ impl<'tcx> CodegenCx<'tcx> {
         if self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::MachO {
             write!(
                 st.asm,
-                ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{body}"
+                ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{syntax}{body}{back}"
             )
             .unwrap();
         } else {

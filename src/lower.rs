@@ -1062,21 +1062,33 @@ thread_local! {
 }
 
 /// `%al=8` + tail-`jmp` stub so foreign variadic callees dump all xmm regs.
-fn va_tramp_asm(sym: &str) -> String {
+fn va_tramp_asm(sym: &str, macho: bool) -> String {
     let sym = crate::obj_sym(sym);
     let t = format!("__pliron_va8.{sym}");
-    format!(
-        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
-    )
+    if macho {
+        format!(
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp {sym}\n.text\n"
+        )
+    } else {
+        format!(
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
+        )
+    }
 }
 
 /// `%al=8` + `jmp *<reg>` stub for calls through variadic function pointers:
 /// the fp is appended as a hidden last argument, landing in `reg`.
-fn va_tramp_ind_asm(reg: &str) -> String {
+fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     let t = format!("__pliron_va8_ind_{reg}");
-    format!(
-        ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
-    )
+    if macho {
+        format!(
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp *%{reg}\n.text\n"
+        )
+    } else {
+        format!(
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
+        )
+    }
 }
 
 struct FnLower<'a, 'b, 'tcx> {
@@ -1621,7 +1633,8 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 .unwrap();
             self.va_fids.insert(t.clone(), id);
         }
-        VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_asm(sym)));
+        let macho = self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+        VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_asm(sym, macho)));
         t
     }
 
@@ -3123,8 +3136,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                                     .unwrap();
                                 self.va_fids.insert(t.clone(), id);
                             }
+                            let macho = self.m.isa().triple().binary_format
+                                == target_lexicon::BinaryFormat::Macho;
                             VA_TRAMPS
-                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg)));
+                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg, macho)));
                             Ok(self.call_fref(self.va_fids[&t]))
                         }
                         // fp lands on the stack (rare): call it directly; %al
