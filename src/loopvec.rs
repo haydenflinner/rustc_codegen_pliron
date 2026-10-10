@@ -30,14 +30,19 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
-    Count, Edge, Info, Ins, Param, Pred, count, deadend, def_block, edge_args, emit, gather,
-    guard_dead, guard_pred, iconst, outv, param_kinds, trips_idx, trips_ptr,
+    Count, Edge, Info, Ins, Param, Pred, count, deadend, def_block, edge_args, edge_dest, emit,
+    gather, guard_dead, guard_pred, iconst, ins_eval, outv, param_kinds, trips_idx, trips_ptr,
 };
 
 const MAX_LOOPS: usize = 16;
 const MAX_CONV: usize = 4;
 /// Sanity bound on insts scanned per loop.
 const MAX_OPS: usize = 64;
+/// Largest byte stride a lane-gather stream may step — `movd`+`pinsrd`
+/// lane inserts cost ~2 insts/lane regardless of distance, so the bound
+/// is a page-locality sanity cap, not a codegen limit (matmul-256's
+/// 1024-byte column stride is the motivating case).
+const MAX_GATHER: i64 = 2048;
 
 macro_rules! why {
     ($f:expr; $($t:tt)*) => {{
@@ -85,6 +90,11 @@ struct Stream {
     root_val: Value,
     direct: bool,
     neg: bool,
+    /// Elements advanced per scalar iteration. `1` (and `neg`'s -1 case)
+    /// is a contiguous vector load; a `stride >= 2` gather emits per-lane
+    /// scalar loads `stride*ebytes` apart joined by `insertlane` — LLVM's
+    /// `movd`+`pinsrd` idiom for column/strided streams (matmul's `b[k][j]`).
+    stride: i64,
 }
 
 enum VPred {
@@ -92,8 +102,9 @@ enum VPred {
     Aligned(Ins, i64),
     /// `[a, a+len)` and `[b, b+len)` don't overlap and neither wraps. The
     /// bools mark descending streams: their touched range ends at `a(iv0)`
-    /// rather than starting there.
-    Pair(Ins, bool, Ins, bool),
+    /// rather than starting there. The i64s carry each stream's element
+    /// stride: a strided (lane-gather) stream's hull is `iters*stride` wide.
+    Pair(Ins, bool, i64, Ins, bool, i64),
 }
 
 /// One scalar reduction lifted to a vector accumulator: header param `idx`,
@@ -240,6 +251,11 @@ struct Plan {
     /// No memory streams: the iv itself is the lane stream. Each group's
     /// `vmap` seeds `iv` with `splat(base) + iota*step`.
     iv_stream: bool,
+    /// The counting exit's target when it takes no args: the epilogue can
+    /// jump straight to it when the vector count consumed every iteration
+    /// (`rem == 0`), letting a post-tested loop use the full `iters & -K`
+    /// vector count instead of leaving a forced scalar group.
+    exit_bare: Option<Block>,
 }
 
 /// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
@@ -250,13 +266,14 @@ fn affine(
     func: &Function,
     info: &Info,
     kinds: &[Param],
-    iv: Value,
+    cnt: &Count,
     v: Value,
     depth: u8,
 ) -> Option<(i64, Ins)> {
     if depth > 8 {
         return None;
     }
+    let iv = cnt.iv;
     let v = func.dfg.resolve_aliases(v);
     if v == iv {
         return Some((1, Ins::K(0)));
@@ -266,6 +283,26 @@ fn affine(
     }
     if let Some(o) = outv(func, info, kinds, v) {
         return Some((0, Ins::Val(o)));
+    }
+    // A `Step` param is affine in the iv: `p(t) = entry + s*t` with `t`
+    // the iteration count, i.e. `p = entry + (s/step)*(iv - iv0)` — this
+    // is the same shape `stream_base`'s direct param check produces.
+    if let ValueDef::Param(b, j) = func.dfg.value_def(v)
+        && b == info.h
+        && let Param::Step(s) = kinds[j]
+        && s % cnt.step == 0
+    {
+        let rate = s / cnt.step;
+        return Some((
+            rate,
+            Ins::Sub(
+                Box::new(Ins::Val(info.entry_args[j])),
+                Box::new(Ins::Mul(
+                    Box::new(Ins::K(rate)),
+                    Box::new(Ins::Val(cnt.iv0)),
+                )),
+            ),
+        ));
     }
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return None;
@@ -279,24 +316,24 @@ fn affine(
             opcode: Opcode::Iadd,
             args: [a, b],
         } => {
-            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
-            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            let (ca, oa) = affine(func, info, kinds, cnt, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, cnt, b, d)?;
             (ca, cb, Ins::Add(Box::new(oa), Box::new(ob)))
         }
         InstructionData::Binary {
             opcode: Opcode::Isub,
             args: [a, b],
         } => {
-            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
-            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            let (ca, oa) = affine(func, info, kinds, cnt, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, cnt, b, d)?;
             (ca, cb.wrapping_neg(), Ins::Sub(Box::new(oa), Box::new(ob)))
         }
         InstructionData::Binary {
             opcode: Opcode::Imul,
             args: [a, b],
         } => {
-            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
-            let (cb, ob) = affine(func, info, kinds, iv, b, d)?;
+            let (ca, oa) = affine(func, info, kinds, cnt, a, d)?;
+            let (cb, ob) = affine(func, info, kinds, cnt, b, d)?;
             if ca != 0 && cb != 0 {
                 return None;
             }
@@ -314,7 +351,7 @@ fn affine(
             opcode: Opcode::Ishl,
             args: [a, b],
         } => {
-            let (ca, oa) = affine(func, info, kinds, iv, a, d)?;
+            let (ca, oa) = affine(func, info, kinds, cnt, a, d)?;
             let s = iconst(func, b)?;
             if !(0..64).contains(&s) {
                 return None;
@@ -330,7 +367,7 @@ fn affine(
             opcode: Opcode::Ineg,
             arg,
         } => {
-            let (ca, oa) = affine(func, info, kinds, iv, arg, d)?;
+            let (ca, oa) = affine(func, info, kinds, cnt, arg, d)?;
             (
                 0,
                 ca.wrapping_neg(),
@@ -341,7 +378,7 @@ fn affine(
         InstructionData::Unary {
             opcode: Opcode::Uextend,
             arg,
-        } => return affine(func, info, kinds, iv, arg, d),
+        } => return affine(func, info, kinds, cnt, arg, d),
         _ => return None,
     };
     Some((ca.wrapping_add(cb), mk))
@@ -370,8 +407,10 @@ fn root_leaf(e: &Ins, iv: Value) -> Option<Value> {
 }
 
 /// `addr` as a stream: (base expr mentioning `Val(cnt.iv)`, entry-side root
-/// value, direct-iv flag, descending flag). `None` if not affine-contiguous
-/// at `ebytes`/iter.
+/// value, direct-iv flag, descending flag, element stride). `None` if not
+/// affine at a multiple of `ebytes`/iter. A stride ≥ 2 stream is only
+/// formed when `gather` is set (loads — a strided store would need
+/// scatter) and `MAX_GATHER` bounds the per-vector span.
 fn stream_base(
     func: &Function,
     info: &Info,
@@ -379,10 +418,11 @@ fn stream_base(
     cnt: &Count,
     addr: Value,
     ebytes: i64,
-) -> Option<(Ins, Value, bool, bool)> {
+    gather: bool,
+) -> Option<(Ins, Value, bool, bool, i64)> {
     let a = func.dfg.resolve_aliases(addr);
     if a == cnt.iv {
-        return (cnt.step == ebytes).then_some((Ins::Val(cnt.iv), cnt.iv0, true, false));
+        return (cnt.step == ebytes).then_some((Ins::Val(cnt.iv), cnt.iv0, true, false, 1));
     }
     let params = func.dfg.block_params(info.h).to_vec();
     for (j, &p) in params.iter().enumerate() {
@@ -392,8 +432,12 @@ fn stream_base(
             let Param::Step(s) = kinds[j] else {
                 return None;
             };
+            let mut stride = 1;
             if s != ebytes && s != -ebytes {
-                return None;
+                if !(gather && s > ebytes && s % ebytes == 0 && s <= MAX_GATHER) {
+                    return None;
+                }
+                stride = s / ebytes;
             }
             if s % cnt.step != 0 {
                 return None;
@@ -414,12 +458,19 @@ fn stream_base(
                     Box::new(Ins::Val(cnt.iv)),
                 )),
             );
-            return Some((expr, info.entry_args[j], false, neg));
+            return Some((expr, info.entry_args[j], false, neg, stride));
         }
     }
-    let (k, off) = affine(func, info, kinds, cnt.iv, a, 0)?;
+    let (k, off) = affine(func, info, kinds, cnt, a, 0)?;
+    let mut stride = 1;
     if k * cnt.step != ebytes && k * cnt.step != -ebytes {
-        return None;
+        // Strided-gather stream: `k*step` bytes/iter, a whole-element
+        // multiple ≥ 2 of the access width (columns, every-nth walks).
+        if !(gather && k * cnt.step > ebytes && (k * cnt.step) % ebytes == 0 && k * cnt.step <= MAX_GATHER)
+        {
+            return None;
+        }
+        stride = k * cnt.step / ebytes;
     }
     let neg = k * cnt.step < 0;
     let expr = Ins::Add(
@@ -429,7 +480,138 @@ fn stream_base(
             Box::new(Ins::K(k)),
         )),
     );
-    Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg))
+    Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg, stride))
+}
+
+/// `v` as `Σ coeff·param + const`: add `mul`·(param coeffs of `v`) into
+/// `out`; invariant terms (constants, out-of-loop values, `Inv` params)
+/// contribute nothing and always succeed. `None` when `v` reads a value
+/// that isn't affine over the loop's params (a load, `Other` param,
+/// interior-block param, non-affine op, …).
+fn param_coeffs(
+    func: &Function,
+    info: &Info,
+    kinds: &[Param],
+    v: Value,
+    mul: i64,
+    out: &mut FxHashMap<usize, i64>,
+    depth: u8,
+) -> Option<()> {
+    if depth > 8 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.value_def(v) {
+        ValueDef::Param(b, j) if b == info.h => match kinds[j] {
+            Param::Step(_) => {
+                *out.entry(j).or_insert(0) += mul;
+                Some(())
+            }
+            Param::Inv => Some(()),
+            Param::Other => None,
+        },
+        // Params of other blocks: invariant when defined outside the loop,
+        // non-affine when carried inside it.
+        ValueDef::Param(b, _) if !info.body.contains(&b) => Some(()),
+        ValueDef::Param(..) => None,
+        ValueDef::Result(i, _)
+            if func
+                .layout
+                .inst_block(i)
+                .is_some_and(|b| info.body.contains(&b)) =>
+        {
+            let d = depth + 1;
+            match func.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode,
+                    args: [a, b],
+                } => match opcode {
+                    Opcode::Iadd => {
+                        param_coeffs(func, info, kinds, a, mul, out, d)?;
+                        param_coeffs(func, info, kinds, b, mul, out, d)
+                    }
+                    Opcode::Isub => {
+                        param_coeffs(func, info, kinds, a, mul, out, d)?;
+                        param_coeffs(func, info, kinds, b, -mul, out, d)
+                    }
+                    Opcode::Imul => {
+                        if let Some(k) = iconst(func, b) {
+                            param_coeffs(func, info, kinds, a, mul.wrapping_mul(k), out, d)
+                        } else if let Some(k) = iconst(func, a) {
+                            param_coeffs(func, info, kinds, b, mul.wrapping_mul(k), out, d)
+                        } else {
+                            None
+                        }
+                    }
+                    Opcode::Ishl => {
+                        let k = iconst(func, b)?;
+                        if !(0..32).contains(&k) {
+                            return None;
+                        }
+                        param_coeffs(func, info, kinds, a, mul.wrapping_shl(k as u32), out, d)
+                    }
+                    _ => None,
+                },
+                InstructionData::Unary { opcode, arg } => match opcode {
+                    Opcode::Ineg => param_coeffs(func, info, kinds, arg, -mul, out, d),
+                    Opcode::Uextend | Opcode::Sextend => {
+                        param_coeffs(func, info, kinds, arg, mul, out, d)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => Some(()),
+    }
+}
+
+/// A `Param::Other` whose latches all pass back the same affine function of
+/// `Step` params is itself a `Step` param one iteration deferred:
+/// `q(t+1) = C + Σ aᵢ·pᵢ(t)` gives `q(t+1) - q(t) = Σ aᵢ·sᵢ` — rustc's
+/// bounds-check index and next-iteration pointer precomputation arrive in
+/// this form (`prev ← cur`, `q ← f(p)` computed a step early, matmul's
+/// k-loop). Upgrade the kind so the loop reads as linear; the epilogue's
+/// `entry + s*done` for `Step` reproduces the deferred value exactly.
+fn upgrade_lagged(func: &Function, info: &Info, kinds: &mut Vec<Param>) {
+    for _ in 0..kinds.len() {
+        let mut changed = false;
+        for j in 0..kinds.len() {
+            if !matches!(kinds[j], Param::Other) {
+                continue;
+            }
+            // All latches must pass back the same value.
+            let mut it = info
+                .latches
+                .iter()
+                .map(|&e| func.dfg.resolve_aliases(*edge_args(func, e).get(j).unwrap_or(&Value::from_u32(0))));
+            let Some(bv) = it.next() else { continue };
+            if !it.all(|v| v == bv) {
+                continue;
+            }
+            let mut cs: FxHashMap<usize, i64> = FxHashMap::default();
+            if param_coeffs(func, info, kinds, bv, 1, &mut cs, 0).is_none() || cs.is_empty() {
+                continue;
+            }
+            let step: i64 = cs
+                .iter()
+                .map(|(&i, &c)| {
+                    c.wrapping_mul(match kinds[i] {
+                        Param::Step(s) => s,
+                        _ => unreachable!(),
+                    })
+                })
+                .sum();
+            if step == 0 {
+                continue;
+            }
+            kinds[j] = Param::Step(step);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// `v` is the loop param `p` unchanged on a latch: `p` itself, or a block
@@ -631,6 +813,35 @@ fn upd_decomp(
     }
 }
 
+/// Can `from` reach `to` along terminator edges without passing through
+/// `avoid`? Bounded — past the visit cap answers true (treat as unsafe).
+fn reaches_avoiding(func: &Function, from: Block, to: Block, avoid: Block) -> bool {
+    if from == avoid {
+        return false;
+    }
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![from];
+    while let Some(b) = stack.pop() {
+        if b == to {
+            return true;
+        }
+        if !seen.insert(b) || b == avoid {
+            continue;
+        }
+        if seen.len() > 4096 {
+            return true;
+        }
+        if let Some(t) = func.layout.last_inst(b) {
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                stack.push(bc.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    false
+}
+
 fn plan(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -643,7 +854,23 @@ fn plan(
     let Some(info) = gather(func, cfg, dt, la, lp) else {
         why!(fname; "gather loop {:?}", lp);
     };
-    let kinds = param_kinds(func, &info);
+    let mut kinds = param_kinds(func, &info);
+    upgrade_lagged(func, &info, &mut kinds);
+    if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+        eprintln!(
+            "vec kinds {} {:?}: {:?}",
+            fname,
+            info.h,
+            kinds
+                .iter()
+                .map(|k| match k {
+                    Param::Step(s) => format!("S{s}"),
+                    Param::Inv => "I".into(),
+                    Param::Other => "?".into(),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
     // A `Param::Other` header param can still be a reduction accumulator:
     // `acc = acc ⊕ delta` for a lane-wise associative+commutative op. Each
     // latch must pass back the *same* update inst (a multi-latch loop with
@@ -936,7 +1163,7 @@ fn plan(
         }
     }
     let mut early: Vec<(Value, bool)> = Vec::new();
-    let Some((_exit, cnt, extra)) = (match (fully_guarded, with_early) {
+    let Some((exit, cnt, extra)) = (match (fully_guarded, with_early) {
         (Some((e, c, ps)), _) => Some((e, c, ps)),
         (None, Some((e, c, ps, es))) => {
             early = es;
@@ -1056,8 +1283,11 @@ fn plan(
         let idx = match by_addr.get(&a) {
             Some(&j) => j,
             None => {
-                let Some((base, rootv, direct, neg)) =
-                    stream_base(func, &info, &kinds, &cnt, a, ebytes)
+                // Lane-gather (strided) streams are loads-only and pay
+                // ~2 insts/lane — only worthwhile at vf ≤ 4 lanes.
+                let gather = !is_store && ebytes >= 4;
+                let Some((base, rootv, direct, neg, stride)) =
+                    stream_base(func, &info, &kinds, &cnt, a, ebytes, gather)
                 else {
                     why!(fname; "addr {}", func.dfg.display_inst(i));
                 };
@@ -1066,6 +1296,7 @@ fn plan(
                     root_val: rootv,
                     direct,
                     neg,
+                    stride,
                 });
                 by_addr.insert(a, streams.len() - 1);
                 streams.len() - 1
@@ -1408,11 +1639,26 @@ fn plan(
     }
     // Trip count in scalar iterations, plus its order/divisibility preds.
     let (iters, it_preds) = if streams.iter().any(|s| s.direct) {
-        let (len, ps) = trips_ptr(&cnt, ebytes)?;
+        let Some((len, ps)) = trips_ptr(&cnt, ebytes) else {
+            why!(fname; "trips_ptr {:?} {} {:?} {}", info.h, cnt.stay, cnt.post_tested, cnt.on_next);
+        };
         (Ins::Div(Box::new(len), Box::new(Ins::K(ebytes))), ps)
     } else {
-        trips_idx(&cnt)?
+        let Some(t) = trips_idx(&cnt) else {
+            why!(fname; "trips_idx {:?} {} {:?} {}", info.h, cnt.stay, cnt.post_tested, cnt.on_next);
+        };
+        t
     };
+    // A provably-short strided trip count (< one vector group) would
+    // emit a versioned vector clone that can never execute — keep the
+    // scalar form alone in that case.
+    if streams.iter().any(|s| s.stride > 1)
+        && let Some(t) = ins_eval(func, &iters)
+        && t >= 0
+        && t < i64::from(vf) * UNROLL as i64
+    {
+        why!(fname; "gather trip {t} below one vector group");
+    }
     let mut preds: Vec<VPred> = extra
         .into_iter()
         .chain(it_preds)
@@ -1435,19 +1681,158 @@ fn plan(
         preds.push(VPred::Pair(
             streams[a].base.clone(),
             streams[a].neg,
+            streams[a].stride,
             streams[b].base.clone(),
             streams[b].neg,
+            streams[b].stride,
         ));
     }
-    let iv_idx = func
+    let Some(iv_idx) = func
         .dfg
         .block_params(info.h)
         .iter()
-        .position(|&p| p == cnt.iv)?;
+        .position(|&p| p == cnt.iv)
+    else {
+        why!(fname; "iv not a header param {:?}", info.h);
+    };
     let rev_imm = streams
         .iter()
         .any(|s| s.neg)
         .then(|| func.dfg.immediates.push(rev_mask(vt)));
+    // The epilogue can clone `xb` for the `rem == 0` exit-skip when `xb`
+    // is arg-free and every in-body value it reads is a header param
+    // (last-iteration value = epi - step) or a backedge arg (post-loop
+    // value = epi); in-body defs can't be reconstructed at the resume
+    // point. `vx` also inherits `xb`'s outgoing edges, so every value used
+    // in `xb`'s forward cone must still dominate its use on the new path:
+    // either its def dominates the loop entry (and therefore `vx`), or no
+    // `xb`-successor can reach the use without passing the def first.
+    let exit_bare = {
+        let xb = edge_dest(func, exit);
+        let mut latch_args: FxHashSet<Value> = FxHashSet::default();
+        for &e in &info.latches {
+            latch_args.extend(
+                edge_args(func, e)
+                    .iter()
+                    .map(|&v| func.dfg.resolve_aliases(v)),
+            );
+        }
+        let ok_arg = |a: Value, entry_blk: Block| {
+            let a = func.dfg.resolve_aliases(a);
+            match func.dfg.value_def(a) {
+                ValueDef::Param(b, j) if b == info.h => !matches!(kinds[j], Param::Other),
+                ValueDef::Param(b, _) => {
+                    !info.body.contains(&b) && dt.block_dominates(b, entry_blk)
+                }
+                ValueDef::Result(di, _) => {
+                    let Some(db) = func.layout.inst_block(di) else {
+                        return false;
+                    };
+                    if info.body.contains(&db) {
+                        latch_args.contains(&a)
+                    } else {
+                        dt.block_dominates(db, entry_blk)
+                    }
+                }
+                ValueDef::Union(..) => false,
+            }
+        };
+        let ok = (|| {
+            let entry_blk = func.layout.inst_block(info.entry.inst)?;
+            if !func.dfg.block_params(xb).is_empty() {
+                return None;
+            }
+            let args_ok = |b: Block| {
+                func.layout.block_insts(b).all(|i| {
+                    func.dfg.inst_args(i).iter().all(|&a| ok_arg(a, entry_blk))
+                        && func
+                            .dfg
+                            .insts[i]
+                            .branch_destination(
+                                &func.dfg.jump_tables,
+                                &func.dfg.exception_tables,
+                            )
+                            .iter()
+                            .all(|bc| {
+                                bc.args(&func.dfg.value_lists).all(|ba| match ba {
+                                    BlockArg::Value(v) => ok_arg(v, entry_blk),
+                                    _ => false,
+                                })
+                            })
+                })
+            };
+            if !args_ok(xb) {
+                return None;
+            }
+            // Forward cone past `xb`: blocks the clone's terminator edges
+            // reach. `ok_arg` substitutes only inside `xb` — deeper uses
+            // keep their original value, so its def must dominate the
+            // entry, or block every successor→use path that skips it.
+            let succs: Vec<Block> = func.layout.last_inst(xb).map_or(Vec::new(), |t| {
+                func.dfg
+                    .insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .map(|bc| bc.block(&func.dfg.value_lists))
+                    .collect()
+            });
+            let mut stack = succs.clone();
+            let mut seen: FxHashSet<Block> = FxHashSet::default();
+            while let Some(t) = stack.pop() {
+                if t == xb || !seen.insert(t) {
+                    continue;
+                }
+                for i in func.layout.block_insts(t) {
+                    for &a in func.dfg.inst_args(i) {
+                        let Some(db) = def_block(func, a) else {
+                            return None;
+                        };
+                        if db == t || dt.block_dominates(db, entry_blk) {
+                            continue;
+                        }
+                        if succs
+                            .iter()
+                            .any(|&s| reaches_avoiding(func, s, t, db))
+                        {
+                            return None;
+                        }
+                    }
+                    for bc in func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    {
+                        for ba in bc.args(&func.dfg.value_lists) {
+                            let BlockArg::Value(v) = ba else {
+                                return None;
+                            };
+                            let v = func.dfg.resolve_aliases(v);
+                            let Some(db) = def_block(func, v) else {
+                                return None;
+                            };
+                            if db == t || dt.block_dominates(db, entry_blk) {
+                                continue;
+                            }
+                            if succs
+                                .iter()
+                                .any(|&s| reaches_avoiding(func, s, t, db))
+                            {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                let Some(t2) = func.layout.last_inst(t) else {
+                    continue;
+                };
+                for bc in func.dfg.insts[t2]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    stack.push(bc.block(&func.dfg.value_lists));
+                }
+            }
+            Some(xb)
+        })();
+        ok
+    };
     Some(Plan {
         entry: info.entry,
         h: info.h,
@@ -1476,6 +1861,7 @@ fn plan(
         early,
         rev_imm,
         iv_stream,
+        exit_bare,
     })
 }
 
@@ -1550,6 +1936,43 @@ fn emit_scalar(
     };
     memo.insert(v, out);
     out
+}
+
+/// Emit stream `j`'s vector load at `(base, off)`: a contiguous `load.vt`
+/// for unit/descending streams, or `vf` scalar `load.elem`s `stride`e`
+/// bytes apart joined by `insertlane` for a lane-gather stream (LLVM's
+/// `movd`+`pinsrd` column idiom — x64 sinks each scalar load into the
+/// `vpinsr*` operand, so a lane costs ~1 fused inst after the splat).
+fn emit_vload(
+    pos: &mut FuncCursor,
+    p: &Plan,
+    j: usize,
+    addrs: &[(Value, i64)],
+    raw: bool,
+) -> Value {
+    let s = &p.streams[j];
+    let (a, off) = addrs[j];
+    let flags = MemFlagsData::new().with_notrap();
+    if s.stride == 1 {
+        let v = pos.ins().load(p.vt, flags, a, off as i32);
+        return if s.neg && !raw {
+            vreverse(pos, p.vt, p.rev_imm.unwrap(), v)
+        } else {
+            v
+        };
+    }
+    let lane_bytes = s.stride * i64::from(p.elem.bytes());
+    let mut v = None;
+    for l in 0..p.vf {
+        let sv = pos
+            .ins()
+            .load(p.elem, flags, a, (off + l * lane_bytes) as i32);
+        v = Some(match v {
+            None => pos.ins().splat(p.vt, sv),
+            Some(v) => pos.ins().insertlane(v, sv, l as u8),
+        });
+    }
+    v.unwrap()
 }
 
 /// Emit `v`'s vector value in `vb`, recursively materializing producers:
@@ -1643,14 +2066,7 @@ fn emit_val(
     let out = match data {
                 InstructionData::Load { .. } => {
                     let j = p.loads.iter().find(|&&(l, _)| l == i).unwrap().1;
-                    let v = pos
-                        .ins()
-                        .load(vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
-                    if p.streams[j].neg {
-                        vreverse(pos, vt, p.rev_imm.unwrap(), v)
-                    } else {
-                        v
-                    }
+                    emit_vload(pos, p, j, addrs, false)
                 }
                 InstructionData::Binary { opcode, args } => {
                     let a = m!(args[0]);
@@ -2736,11 +3152,17 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // the result isn't in the egraph's remat set, so the trip bound stays
     // hoisted instead of being re-executed on every vector-loop backedge.
     let mk = pos.ins().iconst(iv_ty, p.vf * UNROLL as i64 - 1);
+    // A post-tested epilogue can be skipped entirely when the vector count
+    // consumes all `iters` and the exit takes no args, so only then is it
+    // safe to cover the final group (`iters & -K`); otherwise drop the
+    // count by one so ≥1 scalar iteration remains for the body-first
+    // epilogue.
+    let full_floor = !p.post_tested || p.exit_bare.is_some();
     let nmv = {
-        let base = if p.post_tested {
-            pos.ins().iadd_imm_s(iters, -1)
-        } else {
+        let base = if full_floor {
             iters
+        } else {
+            pos.ins().iadd_imm_s(iters, -1)
         };
         let r = pos.ins().band(base, mk);
         pos.ins().isub(base, r)
@@ -2780,14 +3202,16 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 let z = pos.ins().iconst(pty, 0);
                 pos.ins().icmp(IntCC::Equal, r, z)
             }
-            VPred::Pair(a, a_neg, b, b_neg) => {
-                let lenb = emit(
-                    &mut pos,
-                    pty,
-                    &Ins::Mul(
+            VPred::Pair(a, a_neg, a_str, b, b_neg, b_str) => {
+                let len_of = |str_: i64| {
+                    Ins::Mul(
                         Box::new(p.iters.clone()),
-                        Box::new(Ins::K(i64::from(p.elem.bytes()))),
-                    ),
+                        Box::new(Ins::K(i64::from(p.elem.bytes()) * str_)),
+                    )
+                };
+                let (lena, lenb) = (
+                    emit(&mut pos, pty, &len_of(*a_str)),
+                    emit(&mut pos, pty, &len_of(*b_str)),
                 );
                 // A descending stream touches `[a(iv_last), a(iv0)+e)`:
                 // evaluate its base at the last iteration's iv instead.
@@ -2806,18 +3230,18 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                     emit(pos, pty, &subst(e, p.iv, if neg { ivl } else { p.iv0 }))
                 };
                 let (alo, blo) = (lo(a, *a_neg, &mut pos), lo(b, *b_neg, &mut pos));
-                let hi = |e: &Ins, neg: bool, lo: Value, pos: &mut FuncCursor| {
+                let hi = |e: &Ins, neg: bool, lo: Value, len: Value, pos: &mut FuncCursor| {
                     if neg {
                         // Top of the range is one element past `e(iv0)`.
                         let t = emit(pos, pty, &subst(e, p.iv, p.iv0));
                         let eb = pos.ins().iconst(pty, i64::from(p.elem.bytes()));
                         pos.ins().iadd(t, eb)
                     } else {
-                        pos.ins().iadd(lo, lenb)
+                        pos.ins().iadd(lo, len)
                     }
                 };
-                let ahi = hi(a, *a_neg, alo, &mut pos);
-                let bhi = hi(b, *b_neg, blo, &mut pos);
+                let ahi = hi(a, *a_neg, alo, lena, &mut pos);
+                let bhi = hi(b, *b_neg, blo, lenb, &mut pos);
                 let nwa = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, alo, ahi);
                 let nwb = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, blo, bhi);
                 let x = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, ahi, blo);
@@ -2890,7 +3314,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             base = pos.ins().iadd(base, c);
         }
         v_arg_vals.push(base);
-        sr_steps.push(if s.neg { -e } else { e } * p.vf * UNROLL as i64);
+        // A lane-gather stream steps `stride` elements per iteration —
+        // its carried base advances `stride`× the unit-stream rate.
+        sr_steps.push(if s.neg { -e } else { e * s.stride } * p.vf * UNROLL as i64);
     }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
     let v_args: Vec<BlockArg> = v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
@@ -2989,7 +3415,132 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         }
     }
     let eargs: Vec<BlockArg> = epi.iter().map(|&v| BlockArg::Value(v)).collect();
-    pos.ins().jump(p.h, &eargs);
+    let mut jumped = false;
+    if let Some(xb) = p.exit_bare {
+        // `rem = iters - nm` scalar iterations remain. When none do, the
+        // loop is done — branch to `vx`, a clone of the counting exit's
+        // target with in-body values replaced by their at-exit forms,
+        // instead of re-entering the scalar loop (whose post-tested body
+        // would over-run by one iteration, and whose in-body SSA uses in
+        // `xb` a plain jump couldn't dominate anyway).
+        let mut xmap: FxHashMap<Value, Value> = FxHashMap::default();
+        // A header param read at the exit test sees the last iteration's
+        // value — one step back from the resume value `epi` for a
+        // post-tested loop (the exit fires inside the last body), `epi`
+        // itself for a pre-tested one (the failed test runs first).
+        for (j, &pv) in params.iter().enumerate() {
+            match p.kinds[j] {
+                Param::Step(s) => {
+                    let v = if p.post_tested {
+                        pos.ins().iadd_imm_s(epi[j], -s)
+                    } else {
+                        epi[j]
+                    };
+                    xmap.insert(pv, v);
+                }
+                Param::Inv => {
+                    xmap.insert(pv, p.entry_args[j]);
+                }
+                Param::Other => {}
+            }
+        }
+        // Backedge args — the "next" values latch edges pass to `p.h`,
+        // e.g. a reduc's `acc ⊕ delta` or `iv + step` — equal the resume
+        // value `epi` once the loop has run all `iters` iterations.
+        let mut latch_args: Vec<(Value, usize)> = Vec::new();
+        for &b in &p.body {
+            let Some(t) = pos.func.layout.last_inst(b) else {
+                continue;
+            };
+            let dests = pos.func.dfg.insts[t]
+                .branch_destination(
+                    &pos.func.dfg.jump_tables,
+                    &pos.func.dfg.exception_tables,
+                )
+                .to_vec();
+            for bc in dests {
+                if bc.block(&pos.func.dfg.value_lists) != p.h {
+                    continue;
+                }
+                for (j, ba) in bc.args(&pos.func.dfg.value_lists).enumerate() {
+                    if let BlockArg::Value(v) = ba {
+                        latch_args.push((v, j));
+                    }
+                }
+            }
+        }
+        for (v, j) in latch_args {
+            let v = pos.func.dfg.resolve_aliases(v);
+            xmap.insert(v, epi[j]);
+        }
+        // Resolve every `xb` arg once — `map_values` below can't query the
+        // dfg while it mutably borrows the pools.
+        let xb_insts: Vec<Inst> = pos.func.layout.block_insts(xb).collect();
+        let xb_local: FxHashSet<Value> = xb_insts
+            .iter()
+            .flat_map(|&i| pos.func.dfg.inst_results(i).iter().copied())
+            .collect();
+        let mut raw_args: Vec<Value> = Vec::new();
+        for &i in &xb_insts {
+            raw_args.extend(pos.func.dfg.inst_args(i).iter().copied());
+            for bc in pos.func.dfg.insts[i]
+                .branch_destination(&pos.func.dfg.jump_tables, &pos.func.dfg.exception_tables)
+            {
+                for ba in bc.args(&pos.func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = ba {
+                        raw_args.push(v);
+                    }
+                }
+            }
+        }
+        let mut resolved: FxHashMap<Value, Value> = FxHashMap::default();
+        for a in raw_args {
+            let r = pos.func.dfg.resolve_aliases(a);
+            resolved.insert(a, r);
+        }
+        // `plan` already proved every in-body use maps; re-check cheaply
+        // so an unmapped arg falls back to the plain epilogue entry.
+        let ok = resolved.values().all(|&a| {
+            xmap.contains_key(&a)
+                || xb_local.contains(&a)
+                || !def_block(pos.func, a).is_some_and(|b| p.body.contains(&b))
+        });
+        if ok {
+            let vx = pos.func.dfg.make_block();
+            pos.func.layout.insert_block_after(vx, ve);
+            let mut cmap: FxHashMap<Value, Value> = FxHashMap::default();
+            for i in xb_insts {
+                let ni = pos.func.dfg.clone_inst(i);
+                let olds = pos.func.dfg.inst_results(i).to_vec();
+                let news = pos.func.dfg.inst_results(ni).to_vec();
+                for (o, n) in olds.into_iter().zip(news) {
+                    cmap.insert(o, n);
+                }
+                pos.func.layout.append_inst(ni, vx);
+                let mut data = pos.func.dfg.insts[ni];
+                let (cmap_r, xmap_r, resolved_r) = (&cmap, &xmap, &resolved);
+                let dfg = &mut pos.func.dfg;
+                data.map_values(
+                    &mut dfg.value_lists,
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                    |a| {
+                        let a = resolved_r.get(&a).copied().unwrap_or(a);
+                        cmap_r.get(&a).or_else(|| xmap_r.get(&a)).copied().unwrap_or(a)
+                    },
+                );
+                pos.func.dfg.insts[ni] = data;
+            }
+            let rem = pos.ins().isub(iters, nmv);
+            let z = pos.ins().iconst(iv_ty, 0);
+            let c = pos.ins().icmp(IntCC::NotEqual, rem, z);
+            pos.ins().brif(c, p.h, &eargs, vx, &[]);
+            jumped = true;
+        }
+    }
+    if !jumped {
+        pos.ins().jump(p.h, &eargs);
+    }
     // vb: UNROLL groups of the body. Group g's streams are offset g*VF
     // elements ahead; same-stream program order is preserved within each
     // group, and groups advance together (a cross-group read-back hazard
@@ -3057,12 +3608,13 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 // Strength-reduced carried base: the group shift rides
                 // the load/store's immediate operand. Descending bases
                 // are anchored at the UNROLL block's lowest byte, so
-                // group offsets count up from there.
+                // group offsets count up from there. A lane-gather stream
+                // shifts `stride` elements per iteration.
                 let a = sr_ptrs[j].unwrap();
                 let off = if s.neg {
                     (UNROLL as i64 - 1 - g as i64) * p.vf * e
                 } else {
-                    (g as i64) * p.vf * e
+                    (g as i64) * p.vf * e * s.stride
                 };
                 (a, off)
             };
@@ -3093,12 +3645,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                     if vmap.contains_key(&r) {
                         continue;
                     }
-                    let vl = pos.ins().load(
-                        p.vt,
-                        MemFlagsData::new().with_notrap(),
-                        addrs[j].0,
-                        addrs[j].1 as i32,
-                    );
+                    let vl = emit_vload(&mut pos, p, j, addrs, true);
                     raws.push((g, vl));
                 }
                 for (g, vl) in raws {
@@ -3152,12 +3699,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 InstructionData::Load { .. } => {
                     let r = pos.func.dfg.resolve_aliases(pos.func.dfg.first_result(i));
                     if p.can_vec.contains(&r) && !vmap.contains_key(&r) {
-                        let mut vl =
-                            pos.ins()
-                                .load(p.vt, MemFlagsData::new().with_notrap(), addrs[j].0, addrs[j].1 as i32);
-                        if p.streams[j].neg {
-                            vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
-                        }
+                        let vl = emit_vload(&mut pos, p, j, &addrs, false);
                         vmap.insert(r, vl);
                     }
                 }
