@@ -2890,7 +2890,7 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
             .map(|v| v != "0")
             .unwrap_or(true)
         {
-            wseal_exits(b, &mut defb, inloop, *h);
+            wseal_exits(b, &mut defb, &cfg, inloop, *h);
         }
     }
     // Version loops on provably-passing bounds checks; the fast clones
@@ -3437,26 +3437,36 @@ fn rewrite_block_uses(b: &mut FunctionBody, blk: WBlock, v: WV, np: WV) {
     b.blocks[blk].terminator = term;
 }
 
-/// A value equal to `v` usable inside `blk`'s frame. In-loop and
-/// unreachable blocks may use `v` directly (uses there don't block
-/// cloning); other blocks get a *carrier* param fed by every incoming
-/// edge. Feeding a carrier pushes args into the preds' terminators —
-/// for outside preds the arg is the pred's own carrier, created on
-/// demand — so sealing never plants a fresh in-loop use in an outside
-/// block. `v`'s def dominates `blk`, hence every block on the reverse
-/// walk back to the loop, so `v` is always available at the in-loop
-/// edge sources where the recursion bottoms out. Iterative: the carrier
-/// is registered before its edges are fed, so CFG cycles resolve to
-/// each other's params instead of recursing forever.
+/// A value equal to `v` usable inside `blk`'s frame. Unreachable blocks
+/// may use `v` directly (dead uses don't count); reachable blocks get a
+/// *carrier* param fed by every incoming edge — in-loop blocks included.
+/// Feeding a carrier pushes args into the preds' terminators. Only an
+/// in-loop pred `v` dominates (or a dead pred, whose args dangle
+/// harmlessly) may take `v` itself; any other pred gets its own carrier
+/// on demand. Both halves of that condition are load-bearing:
+/// domination keeps the pushed arg valid SSA (`v` dominating `blk` does
+/// *not* imply it dominates `blk`'s preds — `entry→pr→cur→def(v)→blk`
+/// is a legal shape), and the in-loop requirement keeps `loop_cloneable`
+/// happy — an outside block dominated by the loop def is still an
+/// outside block, and pushing `v` there plants a fresh leak. The
+/// carrier is registered before its edges are fed, so CFG cycles
+/// resolve to each other's params instead of recursing forever.
+///
+/// Feasibility is checked before any mutation: the pred-walk must bottom
+/// out at dead blocks or dominated in-loop ones and can never cross the
+/// entry block (its params are the function signature). If the walk
+/// would reach entry, `v` is returned unsealed and cloning simply bails.
 fn seal_value(
     b: &mut FunctionBody,
     defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    cfg: &waffle::cfg::CFGInfo,
     inloop: &FxHashSet<WBlock>,
     reach: &FxHashSet<WBlock>,
     carriers: &mut FxHashMap<(WBlock, WV), WV>,
     blk: WBlock,
     v: WV,
 ) -> WV {
+    let v = b.resolve_alias(v);
     if inloop.contains(&blk) || !reach.contains(&blk) {
         return v;
     }
@@ -3468,6 +3478,28 @@ fn seal_value(
         // cloning still bails, but the rest of the block's leaks seal.
         return v;
     };
+    let dblk = defb[v];
+    // Mirror of the carrier walk below, without mutating: infeasible iff
+    // it would need a carrier on the entry block.
+    {
+        let mut seen: FxHashSet<WBlock> = [blk].into_iter().collect();
+        let mut wl = vec![blk];
+        while let Some(cur) = wl.pop() {
+            for &pr in &b.blocks[cur].preds {
+                if !seen.insert(pr)
+                    || !reach.contains(&pr)
+                    || (inloop.contains(&pr) && cfg.dominates(dblk, pr))
+                    || carriers.contains_key(&(pr, v))
+                {
+                    continue;
+                }
+                if pr == WBlock::new(0) {
+                    return v;
+                }
+                wl.push(pr);
+            }
+        }
+    }
     let np = b.add_blockparam(blk, ty);
     defb[np] = blk;
     carriers.insert((blk, v), np);
@@ -3477,7 +3509,9 @@ fn seal_value(
         let preds = b.blocks[cur].preds.clone();
         let poss = b.blocks[cur].pos_in_pred_succ.clone();
         for (j, pr) in preds.iter().enumerate() {
-            let c = if inloop.contains(pr) || !reach.contains(pr) {
+            let c = if !reach.contains(pr)
+                || (inloop.contains(pr) && cfg.dominates(dblk, *pr))
+            {
                 v
             } else if let Some(&c) = carriers.get(&(*pr, v)) {
                 c
@@ -3496,12 +3530,14 @@ fn seal_value(
 }
 
 /// A value equal to `PickOutput(from, idx)` usable inside `blk`'s frame.
-/// `from` is a multi-result def and can't itself be a param: in-loop and
-/// unreachable blocks recompute the pick; other blocks get a carrier
-/// param fed recursively, same as `seal_value`.
+/// `from` is a multi-result def and can't itself be a param: blocks the
+/// pick may be recomputed in (dead ones, or in-loop ones `from`
+/// dominates — same rule as `seal_value`) get a fresh `PickOutput`;
+/// other blocks get a carrier param fed recursively.
 fn seal_pick(
     b: &mut FunctionBody,
     defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    cfg: &waffle::cfg::CFGInfo,
     inloop: &FxHashSet<WBlock>,
     reach: &FxHashSet<WBlock>,
     carriers: &mut FxHashMap<(WBlock, WV, u32), WV>,
@@ -3510,14 +3546,42 @@ fn seal_pick(
     idx: u32,
     ty: WT,
 ) -> WV {
-    if inloop.contains(&blk) || !reach.contains(&blk) {
+    let from = b.resolve_alias(from);
+    let mkpick = |b: &mut FunctionBody,
+                  defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+                  blk: WBlock| {
         let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
         defb[pv] = blk;
         b.blocks[blk].insts.push(pv);
-        return pv;
+        pv
+    };
+    if inloop.contains(&blk) || !reach.contains(&blk) {
+        return mkpick(b, defb, blk);
     }
     if let Some(&np) = carriers.get(&(blk, from, idx)) {
         return np;
+    }
+    let dblk = defb[from];
+    // Same feasibility pre-check as `seal_value`: the pred-walk must
+    // never need a carrier on the entry block.
+    {
+        let mut seen: FxHashSet<WBlock> = [blk].into_iter().collect();
+        let mut wl = vec![blk];
+        while let Some(cur) = wl.pop() {
+            for &pr in &b.blocks[cur].preds {
+                if !seen.insert(pr)
+                    || !reach.contains(&pr)
+                    || (inloop.contains(&pr) && cfg.dominates(dblk, pr))
+                    || carriers.contains_key(&(pr, from, idx))
+                {
+                    continue;
+                }
+                if pr == WBlock::new(0) {
+                    return mkpick(b, defb, blk);
+                }
+                wl.push(pr);
+            }
+        }
     }
     let np = b.add_blockparam(blk, ty);
     defb[np] = blk;
@@ -3527,11 +3591,10 @@ fn seal_pick(
         let preds = b.blocks[cur].preds.clone();
         let poss = b.blocks[cur].pos_in_pred_succ.clone();
         for (j, pr) in preds.iter().enumerate() {
-            let c = if inloop.contains(pr) || !reach.contains(pr) {
-                let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
-                defb[pv] = *pr;
-                b.blocks[*pr].insts.push(pv);
-                pv
+            let c = if !reach.contains(pr)
+                || (inloop.contains(pr) && cfg.dominates(dblk, *pr))
+            {
+                mkpick(b, defb, *pr)
             } else if let Some(&c) = carriers.get(&(*pr, from, idx)) {
                 c
             } else {
@@ -3558,6 +3621,7 @@ fn seal_pick(
 fn wseal_exits(
     b: &mut FunctionBody,
     defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    cfg: &waffle::cfg::CFGInfo,
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
 ) {
@@ -3624,13 +3688,24 @@ fn wseal_exits(
         let mut leaks: Vec<WV> = leaks.into_iter().collect();
         leaks.sort();
         for &v in &leaks {
-            let np = seal_value(b, defb, inloop, &reach, &mut carriers, blk, v);
+            let np = seal_value(b, defb, cfg, inloop, &reach, &mut carriers, blk, v);
             if np == v && verbose {
                 eprintln!("wseal: {h} {blk} unsealable leak {v} {:?}", b.values[v]);
             }
         }
         for &(inst, from, idx, ty) in &picks {
-            let np = seal_pick(b, defb, inloop, &reach, &mut pick_carriers, blk, from, idx, ty);
+            let np = seal_pick(
+                b,
+                defb,
+                cfg,
+                inloop,
+                &reach,
+                &mut pick_carriers,
+                blk,
+                from,
+                idx,
+                ty,
+            );
             b.values[inst] = ValueDef::Alias(np);
         }
     }
