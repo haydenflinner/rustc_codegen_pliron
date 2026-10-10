@@ -130,23 +130,100 @@ consistently within a binary but identical code has measured
 - early2/earch/es/cv/dtest2/dtest3/condred/splitacc: correctness
   identical both backends
 
+## This round (RMW closed-form loop deletion + post-merge reassessment)
+
+`loopidiom::plan_dead` previously rejected any loop containing a load
+or store. That miss showed up as a ~50x loss on same-address RMW
+loops (`for _ in 0..n { *p += k }`): licm had already promoted the
+location to a loop-carried accumulator and punroll×8'd the body, but
+LLVM deletes the loop entirely (`init + k*n`, one store). Now closed
+too:
+
+- `DeadPlan` gained `escapes`, `iters`, `rmw`. Escaped loop values
+  (e.g. the licm-promoted accumulator read by an exit-block `store`)
+  become appended `exit_dest` params: existing in-edges bind the
+  original value, the fast edge binds the closed form (`arg_ins` over
+  entry args + `iters-1` for post-tested counts). Previously any
+  direct in-dest use of a loop value aborted the transform.
+- `rmw_locs` classifies in-loop plain `load`/`store` access as
+  per-location same-address RMW chains: invariant address roots,
+  one store per location, non-overlapping ranges, store dominates
+  every latch, loads dominate the store, stored value is `ld`,
+  `ld ± inv`, or an invariant. Fast path emits load →
+  `init ± delta*iters` (or invariant set) → store per loc. Only
+  post-tested counts fold (provable ≥1 iteration; zero-trip loops
+  keep the store on the loop path).
+- Exit edges proved dead by a loop-INVARIANT `brif` (rustc's hoisted
+  bounds checks, e.g. `0 < len` in `a[0] += k`) now add a one-shot
+  pre-loop pred instead of blocking deletion — a one-branch slice
+  of unswitching, sound because `outv` only accepts `Param::Inv` /
+  loop-external values.
+- `trips_idx` learned the do-while `iv+step < n` shape
+  (`ceil((n-iv0)/step)`, guarded `iv0 < n`), and the count prover
+  now requires the tested `iv+step` value to be the exact latch
+  arg — a different `iv+k` would miscount.
+- Constant preds are folded at plan time; a statically-false one
+  skips the transform rather than emitting a dead fast path.
+
+`rmw.rs` (new microbench): rmw_add 1.18→0.023us, rmw_idx
+5.15→0.023, rmw_two 5.72→0.024 — all at stock parity (~0.023).
+`rmw_dep` (changing-address chain `a[i] += a[i-1]>>2`, true
+dependence) stays a loop at 1.19us vs stock 1.72 — we win there
+because LLVM can't promote it either.
+
+### matmul assessment (asked: can loopvec do register tiling?)
+
+No, not within the current model. `loopvec`'s `Reduc` abstraction
+lifts ONE scalar loop-carried reduction into a lane-wise vector
+accumulator; float `fadd`/`fmul` reductions are deliberately kept
+scalar (rounding-order changes, no `reassoc` flag). A 2×4/4×4
+register tile needs loop unroll-and-JAM, several independent scalar
+acc chains, and float reassociation policy — none expressible. That
+said, the benchmarked `matmul_f32_256` stock codegen is itself a
+scalar serial `fmul`/`fadd` dependency chain (~54-line fn), not a
+tiled kernel — the gap it leaves is FP latency, not vectorization.
+Pliron already leads 10.69ms vs 12.22 (1.14x). Further gain is a
+punroll-side multi-acc / unroll-and-jam item — x64-owned, noted not
+attempted.
+
+### scatter::hist post-merge (re-measured only, x64 agent owns RA)
+
+Merged punroll side-exit work (bc1faa1) emits the ×2 histogram body.
+hist remains noisy/bimodal: 0.52 typical vs stock 0.44 (~1.19x);
+identical code has measured 0.38–0.73 across runs — treat as
+noise-prone. gather: 0.38 vs stock 0.60 — win. Residual copies are
+the edge-copy/regalloc artifact already scoped to the x64 agent.
+
+### Sweep re-check (same loaded box; ratios only)
+
+wide.rs re-run after the RMW work: no regressions; scaled 0.585 vs
+stock 0.65, rev_copy32 0.272 vs 0.317 (the countdown-iv shape holds).
+
+### Validated this round
+
+cargo build clean, ./test.sh green, PLIRON_VERIFY=1 on the RMW
+kernels, rmw_check.rs (0/1/3/1000 trips, add/sub/set/keep deltas,
+two locations, iv+acc escapes, variable-delta non-fold, conditional
+store non-fold, changing-address chain non-fold, bounds-check traps
+still firing on the slow path) — pliron and stock byte-identical
+behavior. Perf numbers above are from a loaded box — label
+"not perf validated" for <1.5x deltas.
+
 ## Remaining opportunities (ranked)
 
-1. hist residual (~1.4x): the unversioned checked loop still emits
-   ~6 regalloc copies per iteration (`x0=x5; x4=x15; x13=x3; ...`)
-   vs LLVM's zero. CLIF is minimal (one carried param; cold call
-   args rebound); the copies are per-block-boundary RA artifacts —
-   LLVM's 3-MBB loop has the same structure but a global live-range
-   assignment. Fix is RA-level (regalloc2 operand/edge coalescing),
-   not a CLIF pass: bigger blast radius, not attempted.
-2. matmul further win (1.15x now): deeper k-unroll / f32 fmla
-   pairing / register tiling. loopvec's model can't express tiling;
-   punroll (x64-owned) is the nearer lever — multi-exit inner loops.
-3. Same-address RMW loops: tight 7-9 inst loops LOSE to 14-15 inst
-   versions on Apple silicon (store->load replays). bcheck now
-   avoids creating the tight clone for hist-like shapes, but
-   LLVM-checked hist still beats our unversioned loop — spacing the
-   dependent str->ldr gap (a scheduler knob) is unexplored.
-4. hist_unchecked path takes scalar punroll and loses (1.48 vs
-   0.61); punroll multi-exit handling is the x64 agent's domain —
-   documented only.
+1. hist residual (~1.19x post-merge): per-iteration regalloc edge
+   copies in the unversioned checked loop. RA-level fix (regalloc2
+   operand/edge coalescing), scoped to the x64 agent's
+   investigation — re-measure after their next merge.
+2. matmul deeper win: unroll-and-jam with multiple independent f32
+   acc chains needs punroll-side support (multi-exit inner loops)
+   plus a float reassoc policy — outside loopvec's model, x64-owned.
+3. Dependent-address RMW chains (`a[i] += a[i-1]>>2` style): can't
+   close-form; gains would need dependence-aware spacing of the
+   str->ldr replay (scheduler knob, unexplored). We already win
+   this vs LLVM 1.19 vs 1.72.
+4. Store pairing across producer gaps: assessed — vcode's fuse pass
+   already crosses ≤8 `pair_fusion_crossable` insts with up/down
+   placements + preg hazard checks. NOT guaranteed (window bound,
+   non-crossable producers, hazard failures); guaranteeing it needs
+   a real scheduler.
