@@ -570,3 +570,35 @@ even an optimistic CLIF proxy leaves only ~4.3k of ~16.7k
 arg-free edges, and the true count after full liveness is far
 smaller. Reverted; the ~1.6k residual `mov;b` splits are the
 price of ra2's critical-edge-free CFG requirement.
+
+### coldargs: `umulhi` disguised-zero (replaces sadd_overflow)
+
+The `sadd_overflow(x, 0)` rebind paid a dead flag materialization
+per arg: `adds` sets condition codes and the unused overflow flag
+still lowered to `cset`/`seto` before DCE could see through it.
+`umulhi(x, 0)` has no `simplify`/`simplify_skeleton` rule, so it
+survives the egraph as an unprovable runtime zero — one `umulh`
+per int type per cold block (shared across every call in the
+block), with each arg rebound as a plain flagless `iadd x, z`.
+i128 keeps the `sadd_overflow` fallback (no scalar `umulhi`
+lowering).
+
+regex-syntax rlib (sadd_overflow → umulhi scheme):
+
+| metric     | before | after  | delta    |
+|------------|-------:|-------:|----------|
+| cset       | 3,206  | 748    | −2,458   |
+| adds       | 2,465  | 7      | −2,458   |
+| umulh      | 160    | 1,746  | +1,586   |
+| real insts | ~103.6k| 102,477| ~−1.1k   |
+
+**Tried and reverted**: an isle rule lowering
+`umulhi(x, 0)` directly to `umulh x, xzr` (skipping the
+`mov w8,#0`). Counterintuitively a net loss — ra2 reuses the
+materialized zero-vreg for other zero-init moves, so removing it
+cascaded into different split/coalesce decisions: +218 insts,
++524 blocks, +486 uncond `b` vs the iconst form (−392 movs, but
+net negative). Kept the plain `iconst`+`umulhi` CLIF.
+
+Verified: PLIRON_VERIFY=1 whole-crate, ./test.sh green,
+bc_check/dse_check/rmw_check/bc_sem microtests pass.

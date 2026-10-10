@@ -664,16 +664,21 @@ pub fn coldedges(func: &mut Function) -> usize {
 ///
 /// The wrap can't be `iadd x, 0`: cranelift's egraph folds it back to
 /// `x` (`iadd_x_plus_zero`), re-attaching the fixed use to the hot
-/// range. `sadd_overflow x, 0` computes the same value, has no
-/// `simplify`/`simplify_skeleton` rule, and its dead overflow-flag
-/// result is removed by vcode DCE — leaving a single `adds` in the
-/// cold block.
+/// range. Instead each cold block materializes one disguised zero per
+/// int type — `umulhi x, 0` has no `simplify`/`simplify_skeleton` rule
+/// so it survives as an unprovable runtime-0 (`umulh` on aarch64) — and
+/// every arg rebinds as `iadd x, z`, a single flagless `add` where the
+/// old `sadd_overflow` scheme paid `adds` + a dead flag materialization
+/// (`cset`/`seto`) per arg.
 pub fn coldargs(func: &mut Function) -> usize {
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         if !func.layout.is_cold(b) {
             continue;
         }
+        // Lazily-built `umulhi` zero per int type, shared by all calls
+        // in the block.
+        let mut zeros: FxHashMap<cranelift_codegen::ir::Type, Value> = FxHashMap::default();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
             if !func.dfg.insts[i].opcode().is_call() {
                 continue;
@@ -707,11 +712,23 @@ pub fn coldargs(func: &mut Function) -> usize {
             {
                 let mut pos = FuncCursor::new(func).at_inst(i);
                 for &(a, ty) in &reb {
-                    let z = pos.ins().iconst(ty, 0);
-                    // `sadd_overflow` is pure but has no egraph rule, and
-                    // the flag result is dead so vcode DCE leaves one
-                    // `adds` in the cold block.
-                    let nv = pos.ins().sadd_overflow(a, z).0;
+                    let nv = if ty.bits() <= 64 {
+                        let z = match zeros.get(&ty) {
+                            Some(&z) => z,
+                            None => {
+                                let c0 = pos.ins().iconst(ty, 0);
+                                let z = pos.ins().umulhi(a, c0);
+                                zeros.insert(ty, z);
+                                z
+                            }
+                        };
+                        pos.ins().iadd(a, z)
+                    } else {
+                        // i128: no scalar `umulhi` lowering — keep the
+                        // adds+dead-flag rebind.
+                        let z = pos.ins().iconst(ty, 0);
+                        pos.ins().sadd_overflow(a, z).0
+                    };
                     pairs.push((a, nv));
                 }
             }

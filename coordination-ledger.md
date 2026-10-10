@@ -424,3 +424,18 @@ Track as x64 agent follow-up.
   default-on. Full test.sh green on merged HEAD.
 - TODO next round: coldarg pin-chain elimination (native), general
   constraint-elimination (x64), matmul check-diamond flattening (wasm).
+
+## wt/native-opt — coldargs umulhi disguised-zero (uncommitted->committing)
+- `clifpeep::coldargs` rebind upgraded: `sadd_overflow(x,0)` ->
+  shared `umulhi(x,0)` zero per int type per cold block + plain
+  `iadd x, z` per arg. No egraph fold for umulhi*0, so the disguise
+  survives; flagless `add` replaces `adds`+dead `cset`. i128 keeps
+  sadd_overflow (no scalar umulhi lowering).
+- regex-syntax: cset 3,206->748, adds 2,465->7, umulh 160->1,746,
+  real insts ~103.6k->102,477.
+- REJECTED: isle `umulhi(x,0) -> umulh x,xzr` — ra2 reuses the
+  materialized zero-vreg elsewhere; removing it cascaded to +218
+  insts/+524 blocks despite -392 movs. Vendor diff reverted; no
+  vendor change remains.
+- Verified: cargo build, PLIRON_VERIFY=1 whole-crate clean,
+  ./test.sh green, bc_check/dse_check/rmw_check/bc_sem pass.
