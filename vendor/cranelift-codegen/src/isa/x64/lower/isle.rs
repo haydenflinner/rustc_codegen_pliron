@@ -507,6 +507,16 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         self.backend.x64_flags.has_bmi2()
     }
 
+    /// pliron: `PLIRON_X64_BITTAB=0` disables the `(bitmap >> x) & 1`
+    /// -> `bt` fold in `is_nonzero_band`.
+    #[inline]
+    fn pliron_bittab(&mut self) -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PLIRON_X64_BITTAB").map_or(true, |v| v != "0")
+        });
+        *ON
+    }
+
     #[inline]
     fn use_popcnt(&mut self) -> bool {
         self.backend.x64_flags.has_popcnt() && self.backend.x64_flags.has_sse42()
