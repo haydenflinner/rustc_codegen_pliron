@@ -46,7 +46,9 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
     {
         let m = destination.block(&func.dfg.value_lists);
         let params = func.dfg.block_params(tgt);
-        if body.len() <= 4 && edge.len() == params.len() {
+        // The inst cap bounds speculation; nested range-check predicates
+        // (`is_ascii_alphanumeric` &co) clone a few compares per level.
+        if body.len() <= 8 && edge.len() == params.len() {
             // All body insts must be speculatable; operands may be side
             // params, earlier side results, or values dominating `tgt`
             // (which then dominate `b`'s terminator — see file docs).

@@ -148,6 +148,11 @@ enum Widen {
         /// chain onto per-half accumulators (the `uaddw`/`saddw` fold).
         chain: bool,
     },
+    /// `delta = (pred as acc_ty)` where `pred` is a lane bool (an icmp/fcmp
+    /// mask, a 0/1 constant, or a bitwise/select tree over them — `bools`).
+    /// The count is `sum(pred & 1)`: `band 1` normalizes 0/-1 mask lanes to
+    /// 0/1 before the unsigned widening sum (`iter.filter(p).count()`).
+    Cnt,
 }
 
 impl Reduc {
@@ -168,7 +173,7 @@ impl Reduc {
             return 1;
         }
         match &self.widen {
-            Some(Widen::Add { mask: None, .. }) => 2,
+            Some(Widen::Add { mask: None, .. }) | Some(Widen::Cnt) => 2,
             Some(Widen::Mul { chain: true, .. }) => 4,
             _ => 1,
         }
@@ -207,6 +212,11 @@ struct Plan {
     can_vec: FxHashSet<Value>,
     /// Values replicable to all-ones/all-zeros lane masks (icmp/fcmp).
     masks: FxHashSet<Value>,
+    /// Lane bools: values whose vector form is ≡ the scalar form mod 2 —
+    /// masks ({0,-1} lanes), {0,1} constants, and band/bor/bxor/select trees
+    /// over them. Only counted (`band 1` then unsigned-widen), never read
+    /// as data.
+    bools: FxHashSet<Value>,
     /// Cond-tree insts a conditional reduction may vectorize past the
     /// `can_vec` gate (`emit_val` drops their widening casts).
     extra_vec: FxHashSet<Inst>,
@@ -856,13 +866,16 @@ fn plan(
             // A duplicate count test on a sibling latch (`filter`-shape
             // loops test the trip bound on every backedge) is covered by
             // the vector loop's group check.
-            if count(func, dt, &info, &kinds, e2, body_mem).is_some_and(|c2| {
+            // `post_tested` isn't compared: it's per-exit (a memory op in
+            // the sibling's own latch block, not a trip-count property) —
+            // only the chosen exit's value drives the epilogue-entry pred.
+            let c2 = count(func, dt, &info, &kinds, e2, body_mem);
+            if c2.as_ref().is_some_and(|c2| {
                 c2.iv == c.iv
                     && c2.bound == c.bound
                     && c2.step == c.step
                     && c2.stay == c.stay
                     && c2.on_next == c.on_next
-                    && c2.post_tested == c.post_tested
             }) {
                 continue;
             }
@@ -1181,6 +1194,59 @@ fn plan(
             break;
         }
     }
+    // Lane bools for `cnt += (pred as i64)` count-if reductions: masks,
+    // 0/1 constants, and bitwise/select trees over them. `band v, 1` is a
+    // bool for any `v` (both sides take bit 0). Mod-2 equivalence is what
+    // counts: a 0/-1 mask lane reads the same as a 0/1 scalar after `&1`.
+    let mut bools: FxHashSet<Value> = masks.clone();
+    loop {
+        let mut grew = false;
+        for &i in &other {
+            let rs = func.dfg.inst_results(i);
+            if rs.len() != 1 {
+                continue;
+            }
+            let rv = func.dfg.resolve_aliases(rs[0]);
+            if bools.contains(&rv) {
+                continue;
+            }
+            let ib = |a: Value| {
+                let a = func.dfg.resolve_aliases(a);
+                bools.contains(&a) || matches!(iconst(func, a), Some(0 | 1))
+            };
+            let ok = match func.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
+                    args,
+                } => {
+                    args.iter().all(|&a| ib(a))
+                        || (func.dfg.insts[i].opcode() == Opcode::Band
+                            && args.iter().any(|&a| {
+                                iconst(func, func.dfg.resolve_aliases(a)) == Some(1)
+                            }))
+                }
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => {
+                    masks.contains(&func.dfg.resolve_aliases(args[0]))
+                        && args[1..].iter().all(|&a| ib(a))
+                }
+                InstructionData::Unary {
+                    opcode: Opcode::Ireduce | Opcode::Uextend | Opcode::Sextend,
+                    arg,
+                } => ib(arg),
+                _ => false,
+            };
+            if ok {
+                bools.insert(rv);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     // Reductions: the accumulator is element-typed unless the delta widens
     // it (`acc += a[i] as u64` — a pairwise-widen chain reaches the acc lane
     // width), the op must have a vector form, and the delta must be
@@ -1216,6 +1282,7 @@ fn plan(
                 func,
                 &info,
                 &can_vec,
+                &bools,
                 &kinds,
                 &mut splat_cache,
                 elem,
@@ -1351,6 +1418,7 @@ fn plan(
         streams,
         can_vec,
         masks,
+        bools,
         extra_vec,
         early,
         rev_imm,
@@ -1455,7 +1523,7 @@ fn emit_val(
         pos.func.dfg.value_def(v),
         ValueDef::Result(i, _) if p.extra_vec.contains(&i)
     );
-    if !p.can_vec.contains(&v) && !p.masks.contains(&v) && !extra {
+    if !p.can_vec.contains(&v) && !p.masks.contains(&v) && !p.bools.contains(&v) && !extra {
         if let Some(&s) = splats.get(&v) {
             return s;
         }
@@ -1679,6 +1747,7 @@ fn widen_delta(
     func: &Function,
     info: &Info,
     can_vec: &FxHashSet<Value>,
+    bools: &FxHashSet<Value>,
     kinds: &[Param],
     splat_cache: &mut FxHashMap<Value, bool>,
     elem: Type,
@@ -1879,18 +1948,24 @@ fn widen_delta(
                 d = func.dfg.resolve_aliases(nn);
             }
             let dbg = std::env::var_os("PLIRON_VEC_DEBUG").is_some();
-            let Some((x, signed)) = ext_of(func, d, &mut ext_insts) else {
-                if dbg {
-                    eprintln!("widen_delta: no ext in {d:?}");
+            let (x, signed) = match ext_of(func, d, &mut ext_insts) {
+                Some(x) => x,
+                // `cnt += select(pred, 1, 0)` with no widening cast: the
+                // acc-typed value is already a lane bool. A bare `0`/`1`
+                // constant delta under a conditional update is the same
+                // count (`acc += 1` gated by the filter arm).
+                None if bools.contains(&d)
+                    || matches!(iconst(func, d), Some(0 | 1)) =>
+                {
+                    (d, false)
                 }
-                return false;
+                None => {
+                    if dbg {
+                        eprintln!("widen_delta: no ext in {d:?}");
+                    }
+                    return false;
+                }
             };
-            if !can_vec.contains(&x) {
-                if dbg {
-                    eprintln!("widen_delta: {:?} not can_vec", x);
-                }
-                return false;
-            }
             let mut ok = vec![r.upd];
             ok.extend(r.aux);
             ok.extend(chain.iter().copied());
@@ -1904,6 +1979,77 @@ fn widen_delta(
                     }
                     return false;
                 }
+            }
+            if !can_vec.contains(&x) {
+                // `cnt += (pred as i64)`: the extension leaf is a lane bool.
+                // `band 1` normalizes 0/-1 mask lanes to 0/1 counts before
+                // the unsigned widening sum — an outer `band d, k` is only
+                // identity when `k == 1`.
+                let x_bool = bools.contains(&x)
+                    || matches!(iconst(func, x), Some(0 | 1));
+                if !x_bool || !matches!(mask, None | Some(1)) {
+                    if dbg {
+                        eprintln!("widen_delta: {:?} not can_vec/bool", x);
+                    }
+                    return false;
+                }
+                // Bool-tree nodes may have other in-body readers. Collect
+                // the emitted tree (x plus its bool operands); every
+                // reader of a node must be in `ok` or itself produce a
+                // bool — a numeric reader would see a mask lane's -1 as
+                // data (non-emitted readers only see scalars, and a
+                // bool-producing reader propagates the mod-2 invariant).
+                let mut tree: FxHashSet<Value> = [x].into_iter().collect();
+                let mut todo = vec![x];
+                while let Some(v) = todo.pop() {
+                    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+                        continue;
+                    };
+                    for &a in func.dfg.inst_args(i) {
+                        let a = func.dfg.resolve_aliases(a);
+                        if bools.contains(&a) && tree.insert(a) {
+                            todo.push(a);
+                        }
+                    }
+                }
+                let mut bad = false;
+                for &v in &tree {
+                    for i in info
+                        .body
+                        .iter()
+                        .flat_map(|&b| func.layout.block_insts(b))
+                    {
+                        if ok.contains(&i)
+                            || !func
+                                .dfg
+                                .inst_args(i)
+                                .iter()
+                                .any(|&a| func.dfg.resolve_aliases(a) == v)
+                        {
+                            continue;
+                        }
+                        let rs = func.dfg.inst_results(i);
+                        if rs.is_empty()
+                            || !rs.iter().all(|&rr| {
+                                bools.contains(&func.dfg.resolve_aliases(rr))
+                            })
+                        {
+                            if dbg {
+                                eprintln!(
+                                    "widen_delta: bool reader {}",
+                                    func.dfg.display_inst(i)
+                                );
+                            }
+                            bad = true;
+                        }
+                    }
+                }
+                if bad {
+                    return false;
+                }
+                r.delta = x;
+                r.widen = Some(Widen::Cnt);
+                return true;
             }
             r.delta = x;
             r.widen = Some(Widen::Add { signed, mask });
@@ -2952,6 +3098,23 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 back_accs[k].push(hi);
                 continue;
             }
+            // `cnt += (pred as i64)`: `band 1` normalizes 0/-1 mask lanes
+            // to 0/1, then the unsigned widening sum counts them —
+            // aarch64 folds the chain to `cmXX` + `uaddlp`.
+            if matches!(r.widen, Some(Widen::Cnt)) {
+                let mut v = emit_val(
+                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                );
+                v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
+                let one = pos.ins().iconst(p.elem, 1);
+                let ones = pos.ins().splat(p.vt, one);
+                let v = pos.ins().band(v, ones);
+                let (lo, hi) =
+                    widen_vec_into(&mut pos, false, v, r.aty, accs.try_into().unwrap(), x64);
+                back_accs[k].push(lo);
+                back_accs[k].push(hi);
+                continue;
+            }
             if let Some(Widen::Mul { sa, sb, a, b, .. }) = &r.widen {
                 let mut av = emit_val(
                     &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *a, 0,
@@ -2984,7 +3147,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                         _ => v,
                     }
                 }
-                Some(Widen::Mul { .. }) => unreachable!(),
+                Some(Widen::Mul { .. }) | Some(Widen::Cnt) => unreachable!(),
             };
             back_accs[k].push(red_emit(&mut pos, r.op, acc, vd));
         }

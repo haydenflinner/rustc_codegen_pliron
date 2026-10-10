@@ -710,3 +710,27 @@ Track as x64 agent follow-up.
   predicate-count SIMD idiom missing).
 - Next: bytes().filter vectorization (native), hist residual decomp +
   matmul-64 (x64), whole-crate wasm (wasm).
+
+## bytes().filter count-if vectorization (wt/native-opt)
+- src/lower.rs: second `ifconv` round before loopvec (`PLIRON_IFCONV2`,
+  fixpoint ≤8) — loadfwd/egraph had already dedup'd the predicate arm
+  re-loads that made jumpthread's ifconv bail on non-pure side arms.
+  Dead forwarders removed, then `fusechains` splices single-pred latch
+  merges into the header.
+- src/ifconv.rs: side-arm speculation cap 4→8 insts (nested
+  range-check diamonds clone ~3 compares per level).
+- src/loopvec.rs: `Widen::Cnt` — count-if reduction `acc += bool`:
+  `bools` lattice (masks ∪ {0,1} consts ∪ band/bor/bxor/select trees,
+  mod-2-faithful) + `band 1` normalize + unsigned widen-sum
+  (uaddlp/uaddw aarch64, psadbw x64). Readers of bool-tree nodes must
+  produce bools. Also: sibling-latch duplicate-exit check no longer
+  compares `post_tested` (per-block property, not trip agreement) —
+  unblocks `filter().map().sum()` conditional-reduction loops.
+- byte filters now BEAT stock (uaddlp chain > movemask+popcnt):
+  alpha 0.056 vs 0.157 (2.8x), digit 0.037 vs 0.147 (4x),
+  alnum 0.078 vs 0.236 (3x), gt 0.027 vs 0.059 (2.2x),
+  eq 0.027 vs 0.142 (5.3x), sum_if 0.032 vs 0.069 (2.2x).
+- Residuals documented: chars().filter = UTF-8 decode FSM (2.4-3.4x,
+  needs dedicated SIMD decode); (a..b).contains = br_table dispatch.
+- Verified: build; PLIRON_VERIFY=1 test.sh green; n=0..300 x 7 fns
+  correct; bc/rmw/dse/drev/condred/early2 pass; cpubench unchanged.

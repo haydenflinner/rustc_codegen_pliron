@@ -552,6 +552,45 @@ pub fn lower_to_object(
                 panic!("loopidiom broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // A second ifconv round: loadfwd/egraph dedup re-loaded predicate
+        // operands that made jumpthread's arm blocks non-pure, leaving
+        // `filter(pred)` range-check diamonds folded only now that they're
+        // pure forwarders. Flattening them to `select` chains is what lets
+        // loopvec see the count-if/conditional-update shapes.
+        if st.loopvec
+            && crate::pass_enabled("PLIRON_IFCONV2")
+            && crate::bisect("ifconv2")
+        {
+            // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
+            // leaf-up: repeat to fixpoint (bounded by diamond depth).
+            let mut k = 0;
+            for _ in 0..8 {
+                let n2 = crate::ifconv::run(&mut clctx.func);
+                k += n2;
+                if n2 == 0 {
+                    break;
+                }
+            }
+            if k > 0 {
+                // Folded merges leave dead forwarders still edging into
+                // the merge — remove them so the merge is single-pred,
+                // then splice it into the header for a flat single-block
+                // loop.
+                crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
+                crate::clifpeep::fusechains(&mut clctx.func);
+                if std::env::var_os("PLIRON_STATS").is_some() {
+                    eprintln!("ifconv2 {k} {n}");
+                }
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after ifconv2 ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("ifconv2 broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.loopvec && crate::bisect("loopvec") {
             let simd = matches!(
                 isa.triple().architecture,

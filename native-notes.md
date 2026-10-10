@@ -933,3 +933,80 @@ rev_correct.rs exhaustive sizes 0..=300 + boundary straddles
 swap + double-reverse identity all match stock; drev/drev2
 (reverse-copy) intact; bc_check/bc_sem/rmw_check/dse_check/pairfuse/
 edgespec pass; earch/early2/dtest2/dtest3 pass.
+
+## bytes().filter(pred).count() — count-if vectorization (count-if)
+
+The 4.5x-behind `bytes().filter(is_ascii_alphabetic).count()` deficit
+had three independent blockers, not one:
+
+1. **Predicate shape**: `is_ascii_*` predicates lower to a CFG tree of
+   `icmp ule` range checks merged through interior-block params
+   (`band(uextend(param), 1)` delta). jumpthread's ifconv couldn't fold
+   it: each arm block re-loaded the byte (`pure_op` rejects loads).
+   loadfwd/egraph later dedup the loads to aliases, so a **second
+   ifconv round before loopvec** (`PLIRON_IFCONV2`, iterated to
+   fixpoint — nested range trees fold leaf-up) flattens the tree to
+   `select` chains. `fusechains` then splices the single-pred latch
+   merge into the header for a flat single-block loop. The arm
+   speculation cap went 4 → 8 insts (nested diamonds clone a few
+   compares per level).
+2. **Reduction matcher**: `widen_delta` only accepted
+   `uextend/sextend` of `can_vec` lane values — the `icmp` leaf sits in
+   `masks`, not `can_vec`, so `cnt += uextend(icmp)` bailed. New
+   `Widen::Cnt`: the delta is a **lane bool** — `masks` members (0/-1
+   lanes), `{0,1}` constants, and band/bor/bxor/select trees over them
+   (a new `bools` fixpoint in plan(); mod-2-faithful is all a count
+   needs). Emission: `band(v, splat(1))` normalizes lanes to 0/1, then
+   the existing unsigned widening sum (`uaddlp`/`uaddw` on aarch64,
+   `psadbw` on x64) — exactly LLVM's compare+mask+popcount idiom.
+   Safety: every in-body reader of a bool-tree node must itself produce
+   a bool (numeric readers would see mask -1 as data) — checked over
+   the tree's transitive uses.
+   `cnt += select(pred,1,0)` and a bare `0`/`1` constant delta under a
+   conditional update (`acc += 1` on the filter arm) take the same path.
+3. **Sibling-latch trip tests**: `filter` loops put the trip test on
+   BOTH the take-arm latch and the skip latch. The skip latch's count
+   has `post_tested=false` while the add arm's has `true` (a load sits
+   before its test) — the duplicate-exit check compared `post_tested`
+   and failed, so the sibling got classified as an early exit → bail
+   with reductions present. `post_tested` is per-exit block property,
+   not trip-count agreement — dropped from the duplicate check (the
+   chosen exit's own value still drives the epilogue-entry pred).
+
+Filter+fusion shapes that now vectorize:
+- `iter().filter(is_ascii_alphabetic/digit/alphanumeric).count()`
+- `iter().filter(b > k).count()`, `fold(0, |c,b| c + pred as usize)`
+- `iter().filter(pred).map(g).count()` (const-1 gated delta)
+- `iter().filter(pred).map(g).sum()` (conditional `Widen::Add` — the
+  delta masks before widening: `band(load, mask)` → `uaddlp` → `uaddw`)
+
+Residuals:
+- `chars().filter()`: the `Chars` iterator is a UTF-8 decode FSM —
+  data-dependent byte stride (1..4), 3+ non-linear header params
+  (ptr/state/acc), continuation-byte shift/mask assembly. lane-wise
+  loopvec can't express it; would need a dedicated SIMD decode idiom
+  (lead-byte classification). ~2.4x residual, documented.
+- `(a..b).contains(&x)` predicates lower through
+  `RangeInclusive::contains`'s `br_table` dispatch — a different CFG
+  shape (conv_table can't fold multi-leaf dispatch). Niche; `is_ascii_*`
+  covers the common predicates.
+
+Bench (1MiB u8, aarch64, ms/iter):
+  bytes_alpha  0.157 -> 0.056  (stock 0.157 — 2.8x FASTER)
+  bytes_digit  0.147 -> 0.037  (stock 0.147 — 4.0x)
+  bytes_alnum  0.235 -> 0.078  (stock 0.236 — 3.0x)
+  cnt_gt(>127) 0.059 -> 0.027  (stock 0.059 — 2.2x)
+  cnt_eq(==32) 0.143 -> 0.027  (stock 0.142 — 5.3x)
+  sum_if       0.068 -> 0.032  (stock 0.069 — 2.2x)
+  chars_alpha  1.577           (stock 0.457 — 3.4x behind, decode)
+  chars_ascii  1.131           (stock 0.471 — 2.4x behind, decode)
+
+Generated (bytes_alpha): ldp-paired 16B loads (64B/iter, UNROLL=4),
+`cmhs.16b` range compares, `bsl.16b` select-tree mask, `and.16b`(1),
+`uaddlp.8h`+`uaddlp.4s` + `uaddw.2d`/`uaddw2.2d` onto 2 acc regs.
+
+Validated: cargo build; PLIRON_VERIFY=1 ./test.sh green; filt_edge
+correctness n=0..300 x 7 filter fns (alpha/digit/alnum/gt/eq/sum_if/
+filter-map-count/fold) all match; exhaustive 0..=255 byte domain;
+bc_check/bc_sem/rmw_check/dse_check match stock incl. panic paths;
+drev/drev2/condred/early2 pass; cpubench main suite no regressions.
