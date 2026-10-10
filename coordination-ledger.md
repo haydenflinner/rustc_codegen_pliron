@@ -403,3 +403,24 @@ Track as x64 agent follow-up.
   regex-syntax, bc_check/bc_sem/dse_check/rmw_check green. gather
   neutral (0.35); hist-const is layout-noise-dominated (identical loop
   code flips 0.54<->2.03 across builds).
+
+## Merged: sameargs (b0feedc) + x64 notes (45a00ba) + wasm fwd fix blob
+- sameargs (clifpeep): drops same-value block params, merges duplicate
+  arg vectors to fixpoint. -37 movs/-10 blocks on regex-syntax — small;
+  PROVES the ~1.6k remaining splits are intrinsic to ra2's
+  critical-edge-free CFG (no backend patch possible — boundary moves
+  still need sites for live-in vregs). Option-3 regalloc patch audited
+  as unsound, reverted.
+- Fixed: try_call TryCallRet(0)/(1) arg-fusion bug caught by std segfault.
+- x64: UNROLL=4 in loopvec already = quad-128-bit groups; UNROLL=8 probe
+  LOSES (port pressure). All wide x64 kernels beat LLVM ymm codegen —
+  a real ymm regclass confirmed NOT on the critical path.
+- x64 hist residual: 1.39x, = ~3 cold-edge ABI-pinning copies
+  (r11->rdi->r9->rdi) around each jae per checked element. Fix domain:
+  coldargs pin-direct. Stock keeps per-element checks too.
+- wasm: BIG uncommitted blob reviewed + committed — wpeep fwd coverage
+  fix (conditional defs don't cover, back-edge readers, stale decode
+  ctx), wunroll_flat, bound_u64/as_check, fused memargs. All env-gated
+  default-on. Full test.sh green on merged HEAD.
+- TODO next round: coldarg pin-chain elimination (native), general
+  constraint-elimination (x64), matmul check-diamond flattening (wasm).
