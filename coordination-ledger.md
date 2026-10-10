@@ -263,3 +263,27 @@ multi-exit for hist_unchecked.
 - Shared-file note: machinst/compile.rs + regalloc2
   data_structures.rs touched (env-gated debug dumps only) — flagging
   for x64 agent.
+
+## Merged: coldargs/coldedges (87909ba) + edgefwd (6197594 -> aa02e84)
+- Cold-edge mov tax fixed TWO ways: clifpeep::coldargs now rebinds
+  hot-defined cold-call args via sadd_overflow (survives egraph), and new
+  coldedges pass adds per-edge cold adapter blocks for hot->cold param
+  edges. hist checked loop: 17 insts+6 movs -> 11+0; gather 0.607->0.342
+  (~1.3x FASTER than stock). regex-syntax: mov 20.5k->19.6k.
+- New src/edgefwd.rs (PLIRON_EDGEFWD): edge forwarding past forwarder
+  blocks for ALL terminators incl try_call, iconst-forwarder remat,
+  inline trap tails. regex-syntax b 9.8k->9.1k (-6.8%).
+- Combined merge verified: cargo build + FULL test.sh green.
+- Root cause confirmed: block COUNT is the residual gap (~22.7k vs ~10.4k
+  blocks) — diamond-merge jumps dominate, needs block-count reduction.
+
+## BUG FOUND (pre-existing): x64 splat.i32x2 lowering gap
+Blocks x64 regex-syntax builds entirely (identical with EDGEFWD off).
+Track as x64 agent follow-up.
+
+## Still open (ranked)
+- hist residual ~1.5x: per-element bounds check not merged into
+  loop-exit test (constraint-elimination/indvars territory).
+- Block-count reduction: diamond-merge trampolines ~3.9k vs ~704.
+- sum2d -5% x64 residual.
+- cold-cone remat direction for remaining hist copies.
