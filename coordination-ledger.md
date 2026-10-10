@@ -26,3 +26,12 @@
 - rev_copy32 aarch64: stable ~11% deficit vs stock (0.26 vs 0.234, 3 runs).
   NOT punroll (same with PLIRON_PUNROLL=0). Assign to native agent: check
   store-pair/lane-reversal interaction in loopvec output.
+
+## rev_copy32 root cause (for native agent)
+Vector loop emits per-load `mov #-N; add base; ldr q` (3 instrs/load) + a
+`mul` for scaled index; 4 adjacent str never fuse into stp across rev64/ext
+ALU gap; no decrementing-pointer addressing. LLVM: 2x ldp + 2x stp(post-idx),
+~15 instrs/64B vs our ~25. Fixes needed: (a) induction strength-reduction of
+scaled index in vector loop, (b) ldp/stp fusion crossing pure-ALU gaps in
+both directions (f0efcec/cfe150f may only cover same-direction or forward
+order), (c) post-index addressing for the store stream.
