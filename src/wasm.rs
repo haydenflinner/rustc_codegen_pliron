@@ -130,6 +130,13 @@ struct FDecl {
     sig: Signature,
     ty: Option<TypeHandle>,
     body: Option<FunctionBody>,
+    /// `#[inline(always)]`: splice at every callsite regardless of
+    /// size (LLVM's AlwaysInliner parity). `#[inline(never)]` blocks
+    /// inlining entirely.
+    always: bool,
+    /// `#[inline]` hint (LLVM `inlinehint`): raised size budget.
+    hint: bool,
+    no_inline: bool,
 }
 
 struct Obj<'a, 'tcx> {
@@ -197,6 +204,9 @@ impl<'a, 'tcx> Obj<'a, 'tcx> {
             sig,
             ty: None,
             body: None,
+            always: false,
+            hint: false,
+            no_inline: false,
         });
         self.fidx.insert(name.into(), self.funcs.len() - 1);
         self.funcs.len() - 1
@@ -292,6 +302,9 @@ pub fn lower_to_wasm(
             sig,
             ty: Some(f.ty),
             body: None,
+            always: f.always_inline,
+            hint: f.inline_hint,
+            no_inline: f.no_inline,
         });
         o.fidx.insert(n.clone(), o.funcs.len() - 1);
     }
@@ -1662,6 +1675,337 @@ fn inline_site(body: &mut FunctionBody, blk: WBlock, pos: usize, call_v: WV, cal
 /// (no insts, no params — a param could still have uses in blocks the
 /// arm dominates, which is why param'd arms are rejected). Arm blocks
 /// with other preds stay live via those edges and are unaffected.
+/// Range folding: `x <u C` / `x >=u C` where `x`'s unsigned maximum is
+/// provably below `C` folds to a constant. The common case is a table
+/// bounds check `byte <u 256` on an `i32.load8_u` result (LLVM gets the
+/// same from u8 range info); folding the compare lets DCE drop the
+/// never-taken panic arm and the loop carry.
+fn wrange(b: &mut FunctionBody) -> bool {
+    // Static unsigned upper bound for an i32 value.
+    fn ubound(b: &FunctionBody, v: WV, depth: u32) -> Option<u32> {
+        if depth > 8 {
+            return None;
+        }
+        let v = b.resolve_alias(v);
+        match b.values[v] {
+            ValueDef::Operator(O::I32Const { value }, ..) => Some(value as u32),
+            ValueDef::Operator(O::I32Load8U { .. }, ..) => Some(0xff),
+            ValueDef::Operator(O::I32Load16U { .. }, ..) => Some(0xffff),
+            ValueDef::Operator(O::I32And, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                // x & K <= K for a constant mask K.
+                match (wconst(b, x), wconst(b, y)) {
+                    (Some(m), _) => {
+                        Some((m as u32).min(ubound(b, y, depth + 1).unwrap_or(u32::MAX)))
+                    }
+                    (_, Some(m)) => {
+                        Some((m as u32).min(ubound(b, x, depth + 1).unwrap_or(u32::MAX)))
+                    }
+                    _ => None,
+                }
+            }
+            ValueDef::Operator(O::I32ShrU, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                // wasm masks the shift count to 5 bits.
+                let s = (wconst(b, y)? as u32) & 31;
+                Some(ubound(b, x, depth + 1)? >> s)
+            }
+            ValueDef::Operator(O::I32RemU, aa, _) => {
+                let &[_, y, ..] = &b.arg_pool[aa][..] else { return None };
+                // x % K < K (K = 0 traps, never produces a value).
+                let m = wconst(b, y)? as u32;
+                (m != 0).then_some(m - 1)
+            }
+            ValueDef::Operator(O::Select, aa, _) => {
+                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                Some(ubound(b, x, depth + 1)?.max(ubound(b, y, depth + 1)?))
+            }
+            _ => None,
+        }
+    }
+    let mut patch: Vec<(WBlock, WV, i32)> = Vec::new();
+    let mut shls: Vec<(WBlock, WV, WV, u32, bool)> = Vec::new();
+    for blk in b.blocks.iter() {
+        for &iv in &b.blocks[blk].insts {
+            // `x * 2^k` -> `x << k` for a constant power of two. `other`
+            // must be the operand that did *not* supply k: when both
+            // operands are consts, picking it by `wconst(x).is_some()`
+            // shifts the wrong one.
+            if std::env::var_os("PLIRON_WASM_NOSHL").is_none()
+                && let ValueDef::Operator(op @ (O::I32Mul | O::I64Mul), aa, _) =
+                    &b.values[iv]
+            {
+                if let &[x, y, ..] = &b.arg_pool[*aa][..] {
+                    let pow2 = |v| -> Option<u32> {
+                        let k = wconst(b, v).filter(|k| *k > 0)?;
+                        (k as u64)
+                            .is_power_of_two()
+                            .then(|| (k as u64).trailing_zeros())
+                    };
+                    let wide = *op == O::I64Mul;
+                    if let Some((sh, other)) =
+                        pow2(x).map(|s| (s, y)).or_else(|| pow2(y).map(|s| (s, x)))
+                        && sh < if wide { 64 } else { 32 }
+                    {
+                        shls.push((blk, iv, other, sh, wide));
+                    }
+                }
+                continue;
+            }
+            let fold = match &b.values[iv] {
+                ValueDef::Operator(op @ (O::I32LtU | O::I32LeU | O::I32GtU | O::I32GeU | O::I32Eq | O::I32Ne), aa, _) => {
+                    let &[x, y, ..] = &b.arg_pool[*aa][..] else { continue };
+                    let Some(c) = wconst(b, y) else { continue };
+                    let c = c as u32;
+                    match op {
+                        O::I32LtU if c == 0 => Some(0),
+                        O::I32GeU if c == 0 => Some(1),
+                        O::I32LeU if c == u32::MAX => Some(1),
+                        O::I32GtU if c == u32::MAX => Some(0),
+                        _ => match ubound(b, x, 0) {
+                            Some(u) if u < c => match op {
+                                O::I32LtU | O::I32LeU | O::I32Ne => Some(1),
+                                O::I32GtU | O::I32GeU | O::I32Eq => Some(0),
+                                _ => None,
+                            },
+                            Some(u) if u <= c => match op {
+                                O::I32LeU => Some(1),
+                                O::I32GtU => Some(0),
+                                _ => None,
+                            },
+                            _ => None,
+                        },
+                    }
+                }
+                _ => None,
+            };
+            if let Some(k) = fold {
+                patch.push((blk, iv, k));
+            }
+        }
+    }
+    let mut did = !patch.is_empty() || !shls.is_empty();
+    // New ops must land *before* the folded inst's position: a use of iv
+    // in the same block can precede block end, and add_op appends.
+    let add_at = |b: &mut FunctionBody, blk: WBlock, iv: WV| -> usize {
+        b.blocks[blk]
+            .insts
+            .iter()
+            .position(|&i| i == iv)
+            .unwrap_or_else(|| b.blocks[blk].insts.len())
+    };
+    for (blk, iv, k) in patch {
+        let pos = add_at(&mut *b, blk, iv);
+        let nc = b.add_op(blk, O::I32Const { value: k as u32 }, &[], &[WT::I32]);
+        let at = b.blocks[blk].insts.len() - 1;
+        b.blocks[blk].insts.remove(at);
+        b.blocks[blk].insts.insert(pos, nc);
+        b.values[iv] = ValueDef::Alias(nc);
+    }
+    for (blk, iv, x, k, wide) in shls {
+        let pos = add_at(&mut *b, blk, iv);
+        let c = b.add_op(
+            blk,
+            if wide {
+                O::I64Const { value: k as u64 }
+            } else {
+                O::I32Const { value: k }
+            },
+            &[],
+            &[if wide { WT::I64 } else { WT::I32 }],
+        );
+        let shl = b.add_op(
+            blk,
+            if wide { O::I64Shl } else { O::I32Shl },
+            &[x, c],
+            &[if wide { WT::I64 } else { WT::I32 }],
+        );
+        for (j, nv) in [c, shl].into_iter().enumerate() {
+            let at = b.blocks[blk].insts.len() - 1;
+            b.blocks[blk].insts.remove(at);
+            b.blocks[blk].insts.insert(pos + j, nv);
+        }
+        b.values[iv] = ValueDef::Alias(shl);
+    }
+    // Fold CondBr on a constant cond (ours from the patch above, or any
+    // that optimize/GVN produced): waffle's own passes leave a literal
+    // `i32.const k; if` behind.
+    let mut folds: Vec<WBlock> = Vec::new();
+    for blk in b.blocks.iter() {
+        if let Terminator::CondBr { cond, .. } = &b.blocks[blk].terminator
+            && wconst(b, *cond).is_some()
+        {
+            folds.push(blk);
+        }
+    }
+    if !folds.is_empty() {
+        // Skipping a target removes an edge; a param'd block that loses
+        // its last pred crashes waffle's const-meet on unreachable
+        // blocks. preds can be stale after optimize(), so recompute,
+        // then track each dead target's remaining edges as we fold.
+        b.recompute_edges();
+        let mut left: FxHashMap<WBlock, usize> = FxHashMap::default();
+        for blk in folds {
+            let Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } = &b.blocks[blk].terminator
+            else {
+                continue;
+            };
+            let Some(k) = wconst(b, *cond) else { continue };
+            let (keep, dead) = if k != 0 {
+                (if_true, if_false)
+            } else {
+                (if_false, if_true)
+            };
+            if dead.block != keep.block {
+                let rem = left
+                    .entry(dead.block)
+                    .or_insert(b.blocks[dead.block].preds.len());
+                if *rem <= 1 && !b.blocks[dead.block].params.is_empty() {
+                    continue;
+                }
+                *rem = rem.saturating_sub(1);
+            }
+            b.blocks[blk].terminator = Terminator::Br {
+                target: keep.clone(),
+            };
+            did = true;
+        }
+    }
+    did
+}
+
+/// Fold `i32.add(addr, K)`/`i32.sub(addr, K)` address operands into
+/// load/store memarg offsets: `*(p + K)` becomes `load offset=K+off`.
+/// LLVM does the same in wasm ISel; it differs from the wrap-around
+/// u32 add only when the address computation wraps past 4GiB, which a
+/// defined program can't produce.
+fn memarg_of(op: &O) -> Option<waffle::MemoryArg> {
+    Some(*match op {
+            O::I32Load { memory }
+            | O::I64Load { memory }
+            | O::F32Load { memory }
+            | O::F64Load { memory }
+            | O::I32Load8S { memory }
+            | O::I32Load8U { memory }
+            | O::I32Load16S { memory }
+            | O::I32Load16U { memory }
+            | O::I64Load8S { memory }
+            | O::I64Load8U { memory }
+            | O::I64Load16S { memory }
+            | O::I64Load16U { memory }
+            | O::I64Load32S { memory }
+            | O::I64Load32U { memory }
+            | O::I32Store { memory }
+            | O::I64Store { memory }
+            | O::F32Store { memory }
+            | O::F64Store { memory }
+            | O::I32Store8 { memory }
+            | O::I32Store16 { memory }
+            | O::I64Store8 { memory }
+            | O::I64Store16 { memory }
+            | O::I64Store32 { memory } => memory,
+            _ => return None,
+        })
+    }
+    fn memarg_mut(op: &mut O) -> Option<&mut waffle::MemoryArg> {
+        Some(match op {
+            O::I32Load { memory }
+            | O::I64Load { memory }
+            | O::F32Load { memory }
+            | O::F64Load { memory }
+            | O::I32Load8S { memory }
+            | O::I32Load8U { memory }
+            | O::I32Load16S { memory }
+            | O::I32Load16U { memory }
+            | O::I64Load8S { memory }
+            | O::I64Load8U { memory }
+            | O::I64Load16S { memory }
+            | O::I64Load16U { memory }
+            | O::I64Load32S { memory }
+            | O::I64Load32U { memory }
+            | O::I32Store { memory }
+            | O::I64Store { memory }
+            | O::F32Store { memory }
+            | O::F64Store { memory }
+            | O::I32Store8 { memory }
+            | O::I32Store16 { memory }
+            | O::I64Store8 { memory }
+            | O::I64Store16 { memory }
+            | O::I64Store32 { memory } => memory,
+            _ => return None,
+        })
+}
+
+fn waddr(b: &mut FunctionBody) -> bool {
+    // Constant add/sub chains peel one layer per pass.
+    let mut did = false;
+    for _ in 0..8 {
+        if !waddr_once(b) {
+            break;
+        }
+        did = true;
+    }
+    did
+}
+
+fn waddr_once(b: &mut FunctionBody) -> bool {
+    let mut did = false;
+    for blk in b.blocks.iter() {
+        for &iv in &b.blocks[blk].insts {
+            let ValueDef::Operator(op, aa, _) = &b.values[iv] else {
+                continue;
+            };
+            let Some(m) = memarg_of(op) else { continue };
+            let aa = *aa;
+            let Some(&addr0) = b.arg_pool[aa].first() else {
+                continue;
+            };
+            let addr = b.resolve_alias(addr0);
+            let delta = match &b.values[addr] {
+                ValueDef::Operator(O::I32Add, aa2, _) => {
+                    let &[x, y, ..] = &b.arg_pool[*aa2][..] else {
+                        continue;
+                    };
+                    if wconst(b, x).is_some() {
+                        (y, wconst(b, x).unwrap())
+                    } else if wconst(b, y).is_some() {
+                        (x, wconst(b, y).unwrap())
+                    } else {
+                        continue;
+                    }
+                }
+                ValueDef::Operator(O::I32Sub, aa2, _) => {
+                    let &[x, y, ..] = &b.arg_pool[*aa2][..] else {
+                        continue;
+                    };
+                    match wconst(b, y) {
+                        Some(k) => (x, -k),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let noff = m.offset as i64 + delta.1;
+            if !(0..=u32::MAX as i64).contains(&noff) {
+                continue;
+            }
+            let ValueDef::Operator(op2, ..) = &mut b.values[iv] else {
+                continue;
+            };
+            if let Some(mm) = memarg_mut(op2) {
+                mm.offset = noff as u32;
+            }
+            b.arg_pool[aa][0] = delta.0;
+            did = true;
+        }
+    }
+    did
+}
+
 fn wsel(b: &mut FunctionBody) -> bool {
     let mut patch: Vec<(WBlock, WV, WV, WV, WT, WBlock)> = Vec::new();
     for a in b.blocks.iter() {
@@ -1729,12 +2073,26 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
     const HOT: usize = 15;
+    // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
+    // attribute a large budget bonus — mirror that with a raised cap.
+    // Off by default: on a real std workload (regex wbig) it added
+    // ~30% code size for no measurable runtime gain — wasm calls are
+    // cheap and our post-splice optimizer doesn't exploit the merge
+    // the way LLVM's does. `PLIRON_WASM_HINT=n` re-enables.
+    let hint_cap = std::env::var("PLIRON_WASM_HINT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // Even `#[inline(always)]` gets a hard ceiling: a pathological
+    // multi-K-inst callee spliced at every site makes the per-caller
+    // optimize() rounds dominate compile time and triples module size.
+    const ALWAYS_CAP: usize = 300;
     const ROUNDS: usize = 8;
     let body_size = |b: &FunctionBody| -> usize {
         b.blocks.values().map(|d| d.insts.len()).sum()
     };
     let mut inlined = 0usize;
-    for _round in 0..ROUNDS {
+    for round in 0..ROUNDS {
         // callsite count per callee; ref.func keeps the standalone
         // body alive, so inlining one only duplicates code.
         let mut calls = vec![0u32; funcs.len()];
@@ -1791,6 +2149,11 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
                             if fi == ci {
                                 continue;
                             }
+                            // `#[inline(never)]` is a hard no —
+                            // LLVM refuses to inline it too.
+                            if funcs[fi].no_inline {
+                                continue;
+                            }
                             let Some(cb) = funcs[fi].body.as_ref() else {
                                 continue;
                             };
@@ -1816,7 +2179,14 @@ fn winline(funcs: &mut [FDecl], verbose: bool) {
                             let gc_done = refs[fi] == 0
                                 && k >= 2
                                 && n * (k - 1) <= 5 + 2 * k;
-                            if n <= TINY
+                            // Hint sites only in round 0: unrestricted
+                            // re-scanning cascades `#[inline]` chains
+                            // inside fresh splice copies and blows up
+                            // compile time; LLVM inlines bottom-up
+                            // once per site instead.
+                            if (funcs[fi].always && n <= ALWAYS_CAP)
+                                || (round == 0 && funcs[fi].hint && n <= hint_cap)
+                                || n <= TINY
                                 || (k == 1 && refs[fi] == 0 && n <= SOLO)
                                 || gc_done
                                 || (inloop.contains(&blk) && n <= HOT)
@@ -2116,6 +2486,10 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 }
             }
         }
+        // Provable-range folds (`byte <u 256` etc.); the optimize below
+        // drops the dead arms this opens up.
+        wrange(&mut self.b);
+        waddr(&mut self.b);
         self.b.optimize(&waffle::OptOptions::default());
         // Fold `v == K1 || v == K2` CondBr chains into br_table Selects
         // (LLVM does the same at ISel for small eq-chains).
@@ -2132,8 +2506,38 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         if dbg {
             eprintln!("==== pre-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
         }
+        // Second range pass: optimize/wtab can expose new bounded
+        // operands (copy-prop through and/select). DCE immediately so
+        // loop analysis sees the loop without dead panic arms.
+        if wrange(&mut self.b) | waddr(&mut self.b) {
+            self.b.optimize(&waffle::OptOptions::default());
+        }
         if std::env::var("PLIRON_WASM_WLOOP").map_or(true, |v| v != "0") {
-            wloop_opt(&mut self.b, self.o.sp);
+            // `&T` entry params (noalias + readonly + dereferenceable):
+            // loads within the pointee bound are loop-hoistable. Maps
+            // pliron args to their waffle entry-param values.
+            let mut frozen: FxHashMap<WV, u64> = FxHashMap::default();
+            for (&a, &s) in self.st.frozen.iter() {
+                if let Some(vs) = self.vals.get(&a)
+                    && vs.len() == 1
+                {
+                    frozen.insert(vs[0], s);
+                }
+            }
+            // noalias entry params (incl. `&mut T`) are dereferenceable
+            // within `pointee_size` — a dead load there can't trap.
+            let mut deref: FxHashMap<WV, u64> = frozen.clone();
+            for (&a, &(s, _)) in self.st.noalias.iter() {
+                if s == 0 {
+                    continue;
+                }
+                if let Some(vs) = self.vals.get(&a)
+                    && vs.len() == 1
+                {
+                    deref.entry(vs[0]).or_insert(s);
+                }
+            }
+            wloop_opt(&mut self.b, self.o.sp, &frozen, &deref);
         }
         if dbg {
             eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
@@ -4411,7 +4815,12 @@ fn mk_pre(b: &mut FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> WBlock
 /// preheader, and strength-reduces `base + iv*K` addressing into
 /// induction-variable block params. The wasm path bypasses the CLIF
 /// pipeline, so this fills in for licm/indvars there.
-fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
+fn wloop_opt(
+    b: &mut FunctionBody,
+    sp: waffle::Global,
+    frozen: &FxHashMap<WV, u64>,
+    deref: &FxHashMap<WV, u64>,
+) {
     // Merge multi-entry loop headers so every loop has a preheader.
     {
         let cfg = waffle::cfg::CFGInfo::new(b);
@@ -4441,7 +4850,7 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
         preds.sort();
         preds.dedup();
         if let [pre] = preds[..] {
-            loop_licm(b, &cfg, &mut defb, inloop, pre, sp);
+            loop_licm(b, &cfg, &mut defb, inloop, pre, sp, frozen);
         }
         // Indvars to a fixed point: each new param may itself be the
         // `pv` of a `mul(pv, K)` addressing site (e.g. `idx*4` where
@@ -4514,7 +4923,7 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
             wunroll(b, &mut defb, &cfg, inloop, *h, unr);
         }
     }
-    wdce(b);
+    wdce(b, deref);
 }
 
 /// `PLIRON_WASM_TRIP=n`: splice a shared i32 counter check onto every
@@ -4567,6 +4976,21 @@ fn wtrip_guard(b: &mut FunctionBody, g: waffle::Global, limit: u64) {
 }
 
 /// Move pure ops and non-SP global reads with all-invariant args to `pre`.
+/// Access size in bytes for load ops (stores excluded — hoisting a
+/// store is a different question entirely).
+fn load_bytes(op: &O) -> Option<u64> {
+    Some(match op {
+        O::I32Load { .. } | O::I64Load32S { .. } | O::I64Load32U { .. } | O::F32Load { .. } => 4,
+        O::I64Load { .. } | O::F64Load { .. } => 8,
+        O::I32Load8S { .. } | O::I32Load8U { .. } | O::I64Load8S { .. } | O::I64Load8U { .. } => 1,
+        O::I32Load16S { .. }
+        | O::I32Load16U { .. }
+        | O::I64Load16S { .. }
+        | O::I64Load16U { .. } => 2,
+        _ => return None,
+    })
+}
+
 fn loop_licm(
     b: &mut FunctionBody,
     cfg: &waffle::cfg::CFGInfo,
@@ -4574,6 +4998,7 @@ fn loop_licm(
     inloop: &FxHashSet<WBlock>,
     pre: WBlock,
     sp: waffle::Global,
+    frozen: &FxHashMap<WV, u64>,
 ) {
     // Process in RPO order so defs hoist before their users.
     let mut order: Vec<WBlock> = inloop.iter().copied().collect();
@@ -4588,7 +5013,30 @@ fn loop_licm(
                     ValueDef::Operator(op, args, _) => {
                         let safe = match op {
                             O::GlobalGet { global_index } => global_index != sp,
-                            _ => op.is_pure(),
+                            _ => {
+                                if op.is_pure() {
+                                    true
+                                } else {
+                                    // Loads on `frozen` (noalias +
+                                    // readonly + dereferenceable)
+                                    // params: within the pointee bound
+                                    // they can't trap, and frozen
+                                    // memory can't change — hoisting is
+                                    // always safe. This is what LLVM's
+                                    // param attrs buy it on this loop.
+                                    load_bytes(&op)
+                                        .and_then(|sz| {
+                                            let m = memarg_of(&op)?;
+                                            let a = b.resolve_alias(
+                                                *b.arg_pool[args].first()?,
+                                            );
+                                            let bound = *frozen.get(&a)?;
+                                            (m.offset as u64 + sz <= bound)
+                                                .then_some(())
+                                        })
+                                        .is_some()
+                                }
+                            }
                         };
                         safe && b.arg_pool[args].iter().all(|&a| {
                             !inloop.contains(&defb[b.resolve_alias(a)])
@@ -5021,7 +5469,7 @@ fn loop_indvars(
 }
 
 /// Drop now-dead speculatable insts (left behind by strength reduction).
-fn wdce(b: &mut FunctionBody) {
+fn wdce(b: &mut FunctionBody, deref: &FxHashMap<WV, u64>) {
     loop {
         let mut uses: FxHashMap<WV, u32> = FxHashMap::default();
         for blk in b.blocks.iter() {
@@ -5052,8 +5500,26 @@ fn wdce(b: &mut FunctionBody) {
                 .filter(|&v| {
                     let dead = uses.get(&v).copied().unwrap_or(0) == 0
                         && match b.values[v] {
-                            ValueDef::Operator(op, ..) => {
-                                op.is_pure() || matches!(op, O::GlobalGet { .. })
+                            ValueDef::Operator(op, args, _) => {
+                                op.is_pure()
+                                    || matches!(op, O::GlobalGet { .. })
+                                    || (
+                                        // A dead load can't change
+                                        // behavior only when it can't
+                                        // trap: base inside a `noalias`/
+                                        // `frozen` param's deref bound.
+                                        load_bytes(&op)
+                                            .and_then(|sz| {
+                                                let m = memarg_of(&op)?;
+                                                let a = b.resolve_alias(
+                                                    *b.arg_pool[args].first()?,
+                                                );
+                                                let bound = *deref.get(&a)?;
+                                                (m.offset as u64 + sz <= bound)
+                                                    .then_some(())
+                                            })
+                                            .is_some()
+                                    )
                             }
                             ValueDef::Alias(_) | ValueDef::PickOutput(..) => true,
                             _ => false,
