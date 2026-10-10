@@ -544,3 +544,29 @@ Track as x64 agent follow-up.
   partial loops DO version now. PLIRON_BCHECK_PARTIAL=1 overrides.
 - regex-syntax -O: same 7 versionings, +17 insts net, cond-branch
   count unchanged. test.sh PLIRON_VERIFY=1 green.
+
+## Merged: bcheck affine versioning (9db2ec2) + ivrefold-optin (7c52988) + wasm GC+fusion (abe6e62,942cb56)
+- bcheck: affine() now handles a[i-k] (isub) and a[c-i] (negated terms,
+  Lin::N runtime slopes); consts sign-extend into Lin::K — prior
+  zext'd-const failures SILENTLY killed every i-k guard. Min/max guards
+  for decreasing sequences + dead-const residual accounting. Fires on
+  rev_copy32, scaled, gather_chk, shift_cp — check-free fast clones.
+  PLIRON_BCHECK_PARTIAL=1 folds RMW-store checks too but regresses
+  same-address RMW +44% (issue slots feed store->load forwarding;
+  stock keeps a per-iter check on that shape too). Default keeps it.
+- ivrefold.rs (NEW, PLIRON_IVREFOLD=1 opt-in): refolds loop-carried
+  affine params onto one anchor IV — works mechanically (780 slots
+  gone, LLVM-shaped amodes) but NET-NEGATIVE (ra2 serializes
+  recurrences; gather/scatter lose). Correct pass, wrong regime.
+- Benchmark anomaly RECONCILED: chars/tokenize/prefix/dot_u32 are NEW
+  kernels; matmul anomaly was a 64x64 size not the 256 win. Real x64
+  residuals: hist 1.4x, gather 1.6x, scatter 1.2x — and NEW: tokenize
+  (split_whitespace) ~5x — UTF-8/iterator codegen, cross-target
+  candidate.
+- wasm-ld GC: mark-sweep dead-function/data/GOT/table collection —
+  wmini 1.41MB->204KB (was 30x stock, now 4.3x; residual = per-function
+  codegen volume: locals, SP traffic, GOT indirect addressing).
+- wload fusion: load+ext -> i64.load{8,16,32}_{s,u}; dot_i32 emits
+  stock shape. Bulk-memory ops (memory.copy/fill) already emitted.
+- Next: tokenize 5x (native/x64), gather 1.6x (x64), wasm code-density
+  4.3x (wasm), rev_inplace/stride2 (native).
