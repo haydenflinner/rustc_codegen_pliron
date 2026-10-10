@@ -310,3 +310,18 @@ Track as x64 agent follow-up.
 - Verified: cargo build, FULL ./test.sh green, PLIRON_VERIFY on
   regex-syntax rlib + scatter; scatter/hist timings unchanged.
   punroll/edgefwd/wasm/regalloc2 untouched.
+
+## Merged: x64 splat fix (471e2b4) + native ordering fix (e0920af -> c390025)
+- splat.i32x2 + all sub-128 vector splat types now lower on x64 (reuses
+  128-bit broadcast sequences; emitted by OUR slp.rs Pack::Splat for
+  adjacent same-value stores). regex-syntax rlib now compiles x64 e2e.
+- INTERACTION BUG caught by native agent: edgefwd bypass_round had no
+  is_cold check and ran after coldedges, undoing adapters (movs regressed
+  19.5k->20.35k). Fix: coldedges now runs LAST (after edgefwd+foldf).
+  Merged tree verified: coldedges at lower.rs:767, post-edgefwd.
+- foldf (clifpeep): multi-pred forwarder folding; 0-hit on regex-syntax
+  (edgefwd covers) but fires 364 rewrites w/ EDGEFWD=0 — kept as coverage.
+- Real residual identified: ~3,608 small b-terminated edge blocks
+  (1,799 mov-led) = regalloc critical-edge splits on arg-carrying
+  conditional edges — block-param pressure problem, not forwarders.
+- x64 jmp count ~4x stock confirmed same root cause (block count).
