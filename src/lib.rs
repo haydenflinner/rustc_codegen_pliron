@@ -40,6 +40,7 @@ mod indvars;
 mod inline;
 mod instcombine;
 mod intrinsic;
+mod ivrefold;
 mod jumpthread;
 mod licm;
 mod loadfwd;

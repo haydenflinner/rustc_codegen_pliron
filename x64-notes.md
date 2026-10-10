@@ -474,3 +474,60 @@ bodies carry ~5 movq/lea copies per iter as the rotation merge
 re-maps advancing pointers/indices through block params (regalloc2
 copies, not coldargs). Stock keeps them straight-line unrolled.
 Same family as the old pin-chain but structural to loop params.
+
+### Anomaly-table reconciliation + ivrefold (src/ivrefold.rs, opt-in)
+
+Reconciled the table above against the earlier "all-wins" suite:
+that suite (wide.rs, `-Ctarget-cpu=x86-64-v3`, 4M elems) benched
+axpy/vadd_u32/clamp_u8/dot_i32/sum_u8/dot_i8/matmul_256/has_val/
+max_u/min_i/sum_sq/dot_u8/scaled/rev_copy32/cnt_vowel/even_sum/
+xor_fold/find_off/fillzero/sum2d. Verdicts:
+
+- `chars`, `tokenize`, `prefix`, `dot_u32`, `cnt_aff`, `strlen`:
+  **new kernels** — not in any earlier table; not regressions vs
+  previously-measured baselines. dot_u32's 0.35/0.07 ratio is
+  stock's ymm SIMD on a 1M-dot; apples-to-apples requires matching
+  loopvec coverage, and on v3-flagged kernels we already win
+  (dot_i32 0.088/0.130).
+- `matmul` (0.38/0.15): **different workload** — 64x64 elementwise
+  constant matrices in the temp harness vs `matmul_256`'s 256x256
+  (4.83/12.06 win). Not comparable; no regression shown.
+- `hist`/`gather`/`scatter`: **real gaps but overstated** — the
+  2.3x/3.5x/3.0x numbers came from a one-off harness that no longer
+  reproduces. Re-measured on a clean reconstruction (1M elems,
+  haswell, Rosetta, best-of-10): hist 0.32/0.23 (1.4x — the known
+  check-exit-fusion gap), gather 0.59/0.37 (1.6x), scatter
+  0.48/0.40 (1.2x). The 3.5x gather residual decomposes into the
+  counter/param rotation copies + 2 bounds-check pairs/iter vs
+  stock's 9-insn tight loop — the earlier harness likely also
+  included cold-edge pin copies now removed.
+
+Copy-chain fix attempt — `ivrefold` (PLIRON_IVREFOLD, default OFF):
+refolds loop-carried affine params (`p' = p + s` on every back
+edge) onto one anchor IV: `p` uses become `bp + r*i` with
+`bp = p0 - r*i0` materialized on the entry edge (ring-exact, no
+nowrap needed), params stripped from all edges. Verified:
+eliminates 3 params in gather/scatter (loop body 17→13 insns,
+all three cursors become `(%base,%idx,4)` amodes, single `addq $1`),
+780 slots in 114 fns on regex-syntax, PLIRON_VERIFY=1 clean.
+
+Measured (x64 Rosetta, isolated best-of-10): gather 0.50→0.59,
+scatter **0.48→0.78 (-60%)**, prefix 0.47→0.36 (+25%), hist
+0.335→0.32; aarch64 native gather flat, scatter 0.43→0.46.
+Root cause of the regression: with the cursors gone, every memory
+op's address keys off the one anchor register — regalloc2 then
+splits the anchor param's live range and parks loaded values in
+the freed register, emitting save/restore copies (`idx[i]` lands
+in the counter's home reg, needs `movq %rdx,%rbx`/`%rbx,%r11`)
+that SERIALIZE what were independent cursor recurrences. OoO
+machines (and Rosetta especially) exploited the parallel chains;
+LLVM's regalloc handles the refolded form better than regalloc2.
+Prefix wins because its real recurrence is the scalar accumulator,
+not the address chains.
+
+**Verdict: transform implemented + verified, kept opt-in**
+(`PLIRON_IVREFOLD=1`); not a default win until regalloc2 stops
+merging loaded values into the anchor's register. The residual
+"copies" in the hot loops are the loop-rotation counter shuffle
+(param↔working reg, 2 movq/iter — present in both forms) plus
+the uextend movq — not redundant cursor carries.
