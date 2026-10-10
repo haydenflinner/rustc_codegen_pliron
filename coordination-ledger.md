@@ -358,3 +358,18 @@ Track as x64 agent follow-up.
   arg-carrying conditional edges — intrinsic to block-param style, no
   single safe fix. jumpthread is largest source but net-positive.
 - sum2d x64 residual: ~2% = noise. Closed/accepted.
+
+## Merged: wt/wasm-perf (87c4e0e..850517e) — wasm correctness + perf work landed
+- wseal_exits: domination-safe carrier sealing; 0 skipped leaks (was ~122);
+  /tmp/wchk node output byte-identical to stock.
+- wtab eq-chain->Select fold + use-escape check — fixes a REAL miscompile:
+  folded chain-block defs lost dominance -> backend stub -> unreachable
+  trap in WASI create_dir_all. wasi std now green.
+- wpeep bytecode peephole (local-shuffle noise); wasm indvars affine
+  sites + fixed point.
+- Wasm bench vs stock (this build): vadd 1.46 vs 2.05 WIN, axpy 1.53 vs
+  1.75 WIN, cnt_ab 1.43 vs 1.66 WIN (was worst gap), sum_f32 ~parity-win,
+  matmul_256 12.1 vs 11.3 still ~7% behind (improved from ~12.3), dot_i32
+  /sum_u8 marginally slower.
+- Verified on shared HEAD: build clean, tests/wasm/run.sh green incl.
+  wasi std + unknown-EH.
