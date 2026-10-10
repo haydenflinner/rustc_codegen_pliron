@@ -388,3 +388,18 @@ Track as x64 agent follow-up.
 - KNOWN LIMITATION (all workstreams closed): wasm matmul gap is a
   waffle-level unroll problem; native/x64 remaining gaps are regalloc2
   critical-edge splits intrinsic to block-param style.
+
+## wt/native-opt — sameargs param reduction + ra2 split-invariant audit (uncommitted->committing)
+- `sameargs` (clifpeep, post-foldf/pre-coldedges): drops params fed by
+  the same value on every edge; merges duplicate params; TryCallRet/Exn
+  pseudo-args kept distinct after a real miscompile (fused call rets).
+  regex-syntax: 13,896 blocks (−11), 19,987 movs (−41), 1,665 mov-led
+  splits (−16), 103,607 insts (−209).
+- Dead end DOCUMENTED in native-notes: skipping arg-free critical-edge
+  splits in blockorder is unsound — ra2 `inter_block_dests` boundary
+  moves need insertion points even with zero CLIF edge args.
+  Vendor changes reverted; no vendor diff remains.
+- Verified: cargo build, test.sh green, PLIRON_VERIFY=1 clean on
+  regex-syntax, bc_check/bc_sem/dse_check/rmw_check green. gather
+  neutral (0.35); hist-const is layout-noise-dominated (identical loop
+  code flips 0.54<->2.03 across builds).

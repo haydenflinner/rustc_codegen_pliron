@@ -515,3 +515,58 @@ ldrb; ldr; add; str; add; add; cmp; b.ne — zero copies, no check).
   cleanliness/unroll shape (punroll domain), not bcheck/indvars.
 - `gather` residual (0.34-0.35 vs ~0.34 stock): `idx[i] & 1023`
   mask check already gone; at parity.
+
+## This round (sameargs: block-param reduction + ra2 split-invariant audit)
+
+### sameargs (clifpeep, after foldf / before coldedges)
+
+Drops a block param when **every** incoming edge passes the same
+`BlockArg::Value(v)` (`v` then dominates the block, so its uses
+rewrite to `v` and the arg slot is stripped from each edge), and
+merges a param whose arg vector duplicates an earlier param's on
+every edge. Iterates to fixpoint (8 rounds), rewriting all uses
+globally through `InstructionData::map_values` (covers jump-table
+and exception-table `BlockCall` args). Gated by PLIRON_SAMEARG.
+
+regex-syntax rlib (PLIRON_SAMEARG=0 → on):
+
+| metric          | off     | on      | delta |
+|-----------------|--------:|--------:|-------|
+| real insts      | 103,816 | 103,607 | −209  |
+| real blocks     | 13,907  | 13,896  | −11   |
+| movs            | 20,028  | 19,987  | −41   |
+| mov-led splits  | 1,681   | 1,665   | −16   |
+
+Modest but real. **Correctness trap found + fixed**: `try_call`
+normal-return dests carry `TryCallRet(i)` pseudo-args; an early
+version collapsed all non-`Value` args to one marker, so
+`block(ret0, ret1)` looked like a duplicate pair and the merge
+fused a call's first and second results (`fn4(v14, v14)`) —
+verifier-clean but semantically wrong (caught by test.sh's std
+segfault). Fix: keep raw `BlockArg`s and compare them directly;
+`TryCallRet(0) != TryCallRet(1)` now blocks the merge, while
+`TryCallRet(0) == TryCallRet(0)` across all edges still merges
+legitimately.
+
+Bench: gather 0.35 vs 0.36 ms/iter (neutral; stock 0.60). The
+`hist` const-input benchmark flips 0.54↔2.03 ms/iter across
+binaries/runs with **byte-identical loop code** — it's a serial
+same-cache-line RMW whose timing depends on where code+data land;
+hist-randomized is identical (0.375 vs 0.383). No systematic
+sameargs regression.
+
+### Dead end documented: skipping arg-free critical-edge splits
+
+Tried teaching cranelift blockorder to not lower arg-free
+critical edges, relaxing ra2's `CritEdge` check accordingly.
+**Unsound**: ra2's `inter_block_dests` boundary moves fire for
+any vreg live-in at the target (including transparent
+flow-through values), not just blockparam transfers — an arg-free
+CLIF edge can still need a move insertion point, and
+`choose_move_location` panics on unsplit critical edges
+(ion/moves.rs). A correct gate needs "no live-in vregs at the
+target," which is an RA-time property invisible at blockorder;
+even an optimistic CLIF proxy leaves only ~4.3k of ~16.7k
+arg-free edges, and the true count after full liveness is far
+smaller. Reverted; the ~1.6k residual `mov;b` splits are the
+price of ra2's critical-edge-free CFG requirement.

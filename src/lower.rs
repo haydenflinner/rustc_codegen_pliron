@@ -758,6 +758,25 @@ pub fn lower_to_object(
                 panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Drop block params that receive the same value on every
+        // incoming edge (and merge duplicate params): each surviving
+        // param costs a regalloc parallel copy per conditional pred —
+        // the `mov;b` edge-split blocks that dominate the block count.
+        // Runs before coldedges so adapters inherit smaller arg lists.
+        if crate::pass_enabled("PLIRON_SAMEARG") && crate::bisect("sameargs") {
+            let k = crate::clifpeep::sameargs(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("sameargs {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after sameargs ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Move hot->cold block-param edge copies into cold adapter blocks
         // so the moves only execute when the cold edge is actually taken.
         // Runs after edgefwd: its bypass has no cold check and would
