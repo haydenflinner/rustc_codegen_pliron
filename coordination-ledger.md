@@ -439,3 +439,23 @@ Track as x64 agent follow-up.
   vendor change remains.
 - Verified: cargo build, PLIRON_VERIFY=1 whole-crate clean,
   ./test.sh green, bc_check/dse_check/rmw_check/bc_sem pass.
+
+## Merged: coldargs umulhi (a981fc4) + celim (ab4fb59) + wasm innermost-first wbcheck (3daf617)
+- coldargs: shared umulhi(x,0) disguised-zero per cold block + flagless
+  iadd — regex-syntax cset 3206->748, adds 2465->7, umulh 160->1746;
+  102,477 real insts (was ~103.6k). Speculative umulhi(x,0)->umulh x,xzr
+  ISLE measured WORSE (ra2 loses reusable zero vreg), reverted.
+- celim (NEW src/celim.rs ~1100 lines): dominating-condition icmp
+  elimination — +243 folds on regex-syntax beyond domcond's 2360, sees
+  checks materialized late (switchmap/bcheck/loopvec/punroll/ifconv).
+  Facts: brif/br_table edge facts, block-param translation w/
+  uniform_slot, +-1 tightening, transitivity, signed<->unsigned. 4
+  soundness bugs self-audited pre-commit. Micro-bench: neutral (hist's
+  checks aren't dominated — expected). Value is real-world density.
+- wasm: wbcheck innermost-first + wunroll loop recollection —
+  matmul_256 12.1->10.33ms = ~8% FASTER than stock (was 7% behind).
+  wunroll_flat fires; new hot path: static guards -> k<249 group test ->
+  flat x8 pure f32 loads/mul/add.
+- Wasm remaining: sum_u8 +5%, dot_i32 +2% (V8-normalization noise).
+- Native deferred items logged: strength-reduce non-direct stream
+  bases, two-phase reverse, residual loopvec epilogue work.
