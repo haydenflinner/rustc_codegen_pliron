@@ -734,3 +734,26 @@ Track as x64 agent follow-up.
   needs dedicated SIMD decode); (a..b).contains = br_table dispatch.
 - Verified: build; PLIRON_VERIFY=1 test.sh green; n=0..300 x 7 fns
   correct; bc/rmw/dse/drev/condred/early2 pass; cpubench unchanged.
+
+## Merged: count-if vec (5e650ca) + UBOUND (2367df8) + wasm real-crate (c2928dd)
+- loopvec Widen::Cnt: cnt+=uextend(icmp)/select(pred,1,0) -> band(v,1)
+  + uaddlp/uaddw (psadbw x64). bytes().filter().count() 4.5x BEHIND ->
+  2.8-5.3x FASTER than LLVM (uaddlp > movemask+popcnt on M3).
+  + PLIRON_IFCONV2 second ifconv round + fusechains latch merge to
+  flatten filter CFG diamonds.
+- bcheck UBOUND: vmax-proven data-dependent index checks version to
+  tymax<len preheader guard — hist 1.44->1.28x both arches, multi-key
+  hist beats stock. Degenerate single-key ~1.3-1.6x regression
+  (forwarding-replay) accepted, matching LLVM's unconditional
+  versioning.
+- matmul-64 = gather/unit-stride-interchange feature gap (stock does
+  lane-gathers + vpmulld; needs gather support — documented).
+- wasm real-crate (wbig, regex+std): ~2x total size, ~1.32x runtime,
+  identical output hash. Dead-return peep (-1964 opcodes) + wsel
+  diamond->Select.
+- CORRECTNESS FLAG: pre-existing miscompile in
+  symbolic_name_normalize_bytes — stubs with OOB "len is 2, index 2"
+  on cold path. Latent backend bug, needs investigation (wasm wt).
+- Residuals: tokenize ~1.95-2.6x (state machine shape), chars 2.4-3.4x
+  (UTF-8 decode FSM — needs dedicated SIMD decode), wasm runtime
+  ~1.32x on real crate.
