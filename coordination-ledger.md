@@ -325,3 +325,23 @@ Track as x64 agent follow-up.
   (1,799 mov-led) = regalloc critical-edge splits on arg-carrying
   conditional edges — block-param pressure problem, not forwarders.
 - x64 jmp count ~4x stock confirmed same root cause (block count).
+
+## Native: vmax icmp-range fold + edge-split provenance (pending)
+- `vmax(func, v)` in clifpeep: unsigned ceiling through
+  uextend/band/ushr/urem/iconst; the `icmp cc x, imm` fold now fires
+  when imm is outside [0, vmax] (ult/ule->1, ugt/uge->0, eq/ne, and
+  signed ccs when the ceiling is in the signed-positive half).
+  PLIRON_VMAX toggle, default on. Folds `cnt[u8]` checks on
+  fixed-size arrays (hist `&mut [u32; 1<<20]` check eliminated —
+  loop now 8 insts/iter, no check, no copies).
+- Edge-split provenance (crate ablations): 1,799 mov-led splits are
+  ra2 critical-edge blocks on arg-carrying cond edges. jumpthread's
+  param'd merges = +505 net (removing it costs +1.7k blocks);
+  looprot = +75 net but is perf-positive (gather 0.74 vs 0.80);
+  punroll = net 0. No single-pass fix — lowering-shape property.
+- hist residual resolved: stock LLVM keeps BOTH per-element checks
+  (param-len case) — gap is unroll/loop-shape (punroll domain),
+  not a missing guard/latch merge.
+- Verified: cargo build, ./test.sh green, PLIRON_VERIFY on
+  scatter/hist/bc_check/bc_sem (panics still fire), regex-syntax
+  block counts unchanged. punroll/edgefwd/wasm/regalloc2 untouched.

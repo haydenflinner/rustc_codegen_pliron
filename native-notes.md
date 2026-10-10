@@ -447,8 +447,10 @@ emitted hist loop still 9-inst/0-mov.
 
 1. hist residual (~1.19x post-merge): per-iteration regalloc edge
    copies in the unversioned checked loop — **fixed** by coldedges +
-   coldargs above. New residual (~0.53 vs 0.436 stock): per-element
-   bounds check not folded into the exit test.
+   coldargs above. Const-size check (`cnt[b]` on `&mut [u32; N]`)
+   **folded by vmax** (see below). Param-len residual (~0.54 vs
+   0.436 stock): stock keeps both checks too — the gap is loop
+   shape/unroll cleanliness (punroll domain), not the check.
 2. matmul deeper win: unroll-and-jam with multiple independent f32
    acc chains needs punroll-side support (multi-exit inner loops)
    plus a float reassoc policy — outside loopvec's model, x64-owned.
@@ -466,3 +468,50 @@ emitted hist loop still 9-inst/0-mov.
    copy blocks on arg-carrying conditional edges (block-param
    pressure on brif/br_table edges; a lowering-shape problem), not
    forwarders (edgefwd+foldf cover those) or addressing.
+
+### mov-led edge splits — provenance (ablation, regex-syntax)
+
+The ~1,799 `mov`-led small `b` blocks are **regalloc2-inserted
+critical-edge splits** materializing parallel copies on
+arg-carrying conditional edges — not CLIF forwarder blocks (those
+are gone post-edgefwd/foldf; pure-`b` trampolines sit at 241 vs
+stock 204). Per-pass ablation (PLIRON_X=0, whole crate):
+
+| ablation        | real blocks | mov-led splits | verdict |
+|-----------------|------------:|---------------:|---------|
+| baseline        | 13,489      | 1,799          | — |
+| LOOPROT=0       | 13,300      | 1,724          | −75 splits, −1,058 real insts — but looprot is **perf-positive** (gather 0.74 vs 0.80 off) so it stays |
+| PUNROLL=0       | 13,421      | 1,799          | no net split change crate-wide |
+| JUMPTHREAD=0    | 15,248      | 1,294          | −505 splits but +1,760 blocks — jumpthread trades merges for param'd edges; net-positive overall |
+
+Conclusion: splits are the price of the pipeline's block-param
+style — diffuse, no single safe fix. CLIF-side edge splitting would
+just reproduce what ra2 already does; eliminating them requires
+fewer arg-carrying conditional edges (a lowering-shape property),
+not a CFG pass.
+
+### vmax: range-based `icmp` fold (clifpeep)
+
+New `vmax(func, v)` computes a tight unsigned ceiling on a value
+through `uextend` (narrow-typed source), `band` masks, `ushr`,
+`urem`, and `iconst`; the existing `icmp cc x, imm` fold now also
+fires when `imm` lies outside `[0, vmax]` — `ult/ule → 1`,
+`ugt/uge → 0`, `eq → 0`, `ne → 1`, plus signed ccs when the ceiling
+stays in the signed-positive half. Gated by PLIRON_VMAX (default
+on). This kills `arr[u8_index]`-style checks on fixed-size tables
+LLVM removes via known-bits — e.g. `icmp ult (uextend.i64 u8),
+0x100000` in `cnt[b] += 1` on `&mut [u32; 1<<20]` folds to true
+and the cold check block dies (hist loop drops to 8 insts/iter:
+ldrb; ldr; add; str; add; add; cmp; b.ne — zero copies, no check).
+
+### hist residual — final analysis
+
+- `cnt: &mut [u32; N]` (const size): **fixed by vmax** — the
+  `b < N` check is statically provable.
+- `cnt: &mut [u32]` (param len, hist2 shape): stock LLVM keeps
+  **both** per-element checks (`i < a.len` and `b < cnt.len`, both
+  exiting to `panic_bounds_check`) — there is no guard/latch merge
+  to copy; the residual ~0.54 vs ~0.44 gap is scalar-loop
+  cleanliness/unroll shape (punroll domain), not bcheck/indvars.
+- `gather` residual (0.34-0.35 vs ~0.34 stock): `idx[i] & 1023`
+  mask check already gone; at parity.

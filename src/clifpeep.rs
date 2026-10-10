@@ -31,6 +31,69 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+/// Tight unsigned ceiling on `v` — its proven maximum value. Defaults to the
+/// type's max; narrower through `uextend` (a `u8` index extended to i64 is at
+/// most 255), `band` masks, `ushr`, and `urem`. Used to fold `icmp`s whose
+/// constant bound lies outside the operand's range (`x8 < 0x100000`).
+fn vmax(func: &Function, v: Value) -> u64 {
+    let v = func.dfg.resolve_aliases(v);
+    let ty = func.dfg.value_type(v);
+    let ty_umax = if ty.bits() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << ty.bits()) - 1
+    };
+    if !ty.is_int() || ty.is_vector() {
+        return ty_umax;
+    }
+    let mut hi = ty_umax;
+    let Some(d) = func.dfg.value_def(v).inst() else {
+        return hi;
+    };
+    match func.dfg.insts[d] {
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => hi = hi.min(vmax(func, arg)),
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => hi = hi.min(imm.bits() as u64 & ty_umax),
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            for a in args {
+                if let Some(m) = iconst(func, a) {
+                    hi = hi.min(m as u64 & ty_umax);
+                }
+            }
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => {
+            if let Some(s) = iconst(func, args[1]) {
+                // CLIF masks the shift amount to the operand width.
+                let s = (s as u64) % (ty.bits() as u64);
+                hi = hi.min(ty_umax >> s);
+            }
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Urem,
+            args,
+        } => {
+            if let Some(d) = iconst(func, args[1])
+                && d > 0
+            {
+                hi = hi.min(d as u64 - 1);
+            }
+        }
+        _ => {}
+    }
+    hi
+}
+
 fn const128(func: &Function, v: Value) -> Option<(i64, i64)> {
     let v = func.dfg.resolve_aliases(v);
     match func.dfg.insts[func.dfg.value_def(v).inst()?] {
@@ -1170,16 +1233,18 @@ pub fn run(func: &mut Function) -> usize {
             else {
                 continue;
             };
-            // `icmp cc x, bound` folds to a flag constant when `bound` is the
-            // operand type's extreme in `cc`'s direction (`x >u MAX`,
-            // `x <s MIN`, `x <=u MAX`, ...). MIR emits these from range
-            // comparisons like `x > u64::MAX`.
+            // `icmp cc x, bound` folds to a flag constant when `bound` is
+            // outside `x`'s proven range — either the operand type's extreme
+            // (`x >u MAX`, `x <s MIN`, `x <=u MAX`, ...) or a tighter ceiling
+            // from `vmax` (`uextend`/`band`/`ushr`/`urem`-bounded values, like
+            // `x8 <u 0x100000` bounds checks on narrow indexes).
             let ty = pos.func.dfg.value_type(args[0]);
             if ty.is_int() && !ty.is_vector() && ty.bits() <= 64 {
-                let (mut cc, mut k) = (cond, args[1]);
+                let (mut cc, mut k, mut x) = (cond, args[1], args[0]);
                 if iconst(pos.func, args[0]).is_some() {
                     cc = cc.swap_args();
                     k = args[0];
+                    x = args[1];
                 }
                 if let Some(k) = iconst(pos.func, k) {
                     let bits = ty.bits() as u32;
@@ -1187,6 +1252,17 @@ pub fn run(func: &mut Function) -> usize {
                     let smin = (-1i128 << (bits - 1)) as i64;
                     let smax = ((1i128 << (bits - 1)) - 1) as i64;
                     let ku = k as u64 & umax;
+                    // `mx`: proven unsigned ceiling on the non-const operand;
+                    // `nn`: x's range stays in the signed-positive half, so
+                    // signed compares against `k` behave like unsigned ones.
+                    let (mx, nn) = if crate::pass_enabled("PLIRON_VMAX") {
+                        let m = vmax(pos.func, x);
+                        (m, m <= smax as u64)
+                    } else {
+                        // Type max never fits the signed-positive half.
+                        (umax, false)
+                    };
+                    let mx = mx as i64;
                     let c = match cc {
                         IntCC::UnsignedGreaterThan if ku == umax => Some(0),
                         IntCC::UnsignedLessThanOrEqual if ku == umax => Some(1),
@@ -1196,6 +1272,20 @@ pub fn run(func: &mut Function) -> usize {
                         IntCC::SignedLessThanOrEqual if k == smax => Some(1),
                         IntCC::SignedLessThan if k == smin => Some(0),
                         IntCC::SignedGreaterThanOrEqual if k == smin => Some(1),
+                        IntCC::Equal if ku > mx as u64 => Some(0),
+                        IntCC::NotEqual if ku > mx as u64 => Some(1),
+                        IntCC::UnsignedLessThan if ku > mx as u64 => Some(1),
+                        IntCC::UnsignedLessThanOrEqual if ku >= mx as u64 => Some(1),
+                        IntCC::UnsignedGreaterThan if ku >= mx as u64 => Some(0),
+                        IntCC::UnsignedGreaterThanOrEqual if ku > mx as u64 => Some(0),
+                        IntCC::SignedLessThan if nn && k > mx => Some(1),
+                        IntCC::SignedLessThan if nn && k <= 0 => Some(0),
+                        IntCC::SignedLessThanOrEqual if nn && k >= mx => Some(1),
+                        IntCC::SignedLessThanOrEqual if nn && k < 0 => Some(0),
+                        IntCC::SignedGreaterThan if nn && k >= mx => Some(0),
+                        IntCC::SignedGreaterThan if nn && k < 0 => Some(1),
+                        IntCC::SignedGreaterThanOrEqual if nn && k > mx => Some(0),
+                        IntCC::SignedGreaterThanOrEqual if nn && k <= 0 => Some(1),
                         _ => None,
                     };
                     if let Some(c) = c {
