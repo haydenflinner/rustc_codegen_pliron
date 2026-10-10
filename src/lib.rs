@@ -25,6 +25,7 @@ mod abi;
 mod asm;
 mod bcheck;
 mod builder;
+mod celim;
 mod clifpeep;
 mod constload;
 mod consts;

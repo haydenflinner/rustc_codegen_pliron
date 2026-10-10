@@ -372,3 +372,41 @@ constraint-elimination territory (LLVM doesn't do it either; we'd
 
 Verify: cargo build, test.sh green, Rosetta std+unwind pass at
 0b88590.
+
+### Constraint elimination (src/celim.rs, PLIRON_CELIM)
+
+General dominating-condition compare elimination on final CLIF — a
+superset of jumpthread's `fold_dominated_conds` (PLIRON_DOMCOND),
+run late (after foldf, before sameargs/coldedge) so it sees checks
+materialized by switchmap/bcheck/loopvec/punroll/ifconv and so a
+folded check's dead panic edge never gets a cold adapter.
+
+Beyond domcond it handles: multi-predecessor successors when every
+other pred is dominated by the dest (loop headers — entry via the
+guard edge is the only way into the region); fact operands restated
+through edge-arg -> block-param maps (only for slots every edge
+passes identically — the uniform_slot check keeps loop re-entry
+sound); `brif v` non-icmp facts (`v != 0`); +-1 operand offsets both
+directions (`x<y` => `x+1<=y`, `x-1<y` fact => `x<=y`; wrap cases are
+excluded by the fact holding); `x-1<k`/`x+1>k` range tightening; one
+transitivity hop; signed<->unsigned range transfer (`x s<0` =>
+`x u>= half`).
+
+Measured (PLIRON_STATS, regex-syntax -O): domcond folds 2,360
+icmps; celim adds **+243 in 77 fns** (~10%) — translate/visitor,
+IntervalSet::difference, literal extract, Display fmt, `Pattern::
+is_contained_in`, allocator reserve/spec paths. Also fires in
+cpubench mains + `find_byte_off`. Verification: `func.replace` keeps
+the iconst type; folded `brif` retargeted via fold_const_branches.
+`PLIRON_VERIFY=1` clean on x64 regex-syntax; test.sh green; Rosetta
+std+unwind pass; targeted checks (`a[i]` folded, `a[i+1]` kept under
+`i<len`; `i<len && j<len` elides both) disasm-verified. Soundness
+fixes en route: block-param substitution only on uniform slots, and
+the `(x-y)==0` norm reports sub operands as range raw (was comparing
+`x-y`'s range against `y`'s const — wrong predicate).
+
+Perf: neutral on micros — hist 0.596-0.600 (same as baseline; its
+per-element `a[i]`+`cnt[v]` checks aren't dominated by anything, the
+residual stays cold-edge adapter copies); gather 0.452 vs stock
+0.491; wide kernels unchanged. The win is check removal on real
+code paths (bounds-check-dense Rust), not the hist hot loop.
