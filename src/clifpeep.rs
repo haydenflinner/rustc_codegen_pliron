@@ -37,9 +37,14 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 
 /// Tight unsigned ceiling on `v` — its proven maximum value. Defaults to the
 /// type's max; narrower through `uextend` (a `u8` index extended to i64 is at
-/// most 255), `band` masks, `ushr`, and `urem`. Used to fold `icmp`s whose
-/// constant bound lies outside the operand's range (`x8 < 0x100000`).
-fn vmax(func: &Function, v: Value) -> u64 {
+/// most 255), `band` masks, `ushr`, `urem`, and narrow `uload*`. Used to fold
+/// `icmp`s whose constant bound lies outside the operand's range
+/// (`x8 < 0x100000`); `bcheck` also calls it for bounded-index versioning.
+pub(crate) fn vmax(func: &Function, v: Value) -> u64 {
+    vmax_d(func, v, 8)
+}
+
+fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
     let v = func.dfg.resolve_aliases(v);
     let ty = func.dfg.value_type(v);
     let ty_umax = if ty.bits() >= 64 {
@@ -47,7 +52,7 @@ fn vmax(func: &Function, v: Value) -> u64 {
     } else {
         (1u64 << ty.bits()) - 1
     };
-    if !ty.is_int() || ty.is_vector() {
+    if !ty.is_int() || ty.is_vector() || depth == 0 {
         return ty_umax;
     }
     let mut hi = ty_umax;
@@ -58,7 +63,7 @@ fn vmax(func: &Function, v: Value) -> u64 {
         InstructionData::Unary {
             opcode: Opcode::Uextend,
             arg,
-        } => hi = hi.min(vmax(func, arg)),
+        } => hi = hi.min(vmax_d(func, arg, depth - 1)),
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             imm,
@@ -67,10 +72,21 @@ fn vmax(func: &Function, v: Value) -> u64 {
             opcode: Opcode::Band,
             args,
         } => {
+            // `a & b`'s set bits are a subset of each operand's, so the
+            // value is <= each side's own bound — recurse both.
             for a in args {
-                if let Some(m) = iconst(func, a) {
-                    hi = hi.min(m as u64 & ty_umax);
-                }
+                hi = hi.min(vmax_d(func, a, depth - 1));
+            }
+        }
+        InstructionData::Load { opcode, .. } => {
+            let bits = match opcode {
+                Opcode::Uload8 => 8,
+                Opcode::Uload16 => 16,
+                Opcode::Uload32 => 32,
+                _ => 0,
+            };
+            if bits > 0 {
+                hi = hi.min((1u64 << bits) - 1);
             }
         }
         InstructionData::Binary {

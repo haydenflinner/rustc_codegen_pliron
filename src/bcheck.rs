@@ -212,6 +212,35 @@ fn invariant(
     }
 }
 
+/// (x64 wt) Unsigned bound of `v` when `clifpeep::vmax` proves one tighter
+/// than the value's own type — `uload8`/`uload16` loads, `uextend`s, masks.
+/// Used to version data-dependent but range-limited checks (`cnt[a[i]]`
+/// with a u8 `a`): the synthesized "affine" hi is the constant bound, so
+/// the guard is `tymax < len`. Only small-table bounds are worth a clone:
+/// a guard that can never pass (u32-range bound vs a realistic slice len)
+/// is pure bloat.
+fn ubound(func: &Function, v: Value) -> Option<u64> {
+    let ty = func.dfg.value_type(v);
+    if !ty.is_int() || ty.is_vector() {
+        return None;
+    }
+    let ty_umax = if ty.bits() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << ty.bits()) - 1
+    };
+    let k = crate::clifpeep::vmax(func, v);
+    (k < ty_umax && k <= 0xFFFF).then_some(k)
+}
+
+/// `PLIRON_BCHECK_UBOUND=0` disables bounded-index versioning.
+fn ubound_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PLIRON_BCHECK_UBOUND").map_or(true, |v| v != "0")
+    });
+    *ON
+}
+
 /// Decompose `v` as `m*i + sum(b)` over the counting iv. Each `b` term is
 /// `(lin, factor)` so `imul` by a constant scales through.
 fn affine(
@@ -801,8 +830,25 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             if !invariant(func, &info, &body, bb) {
                 continue;
             }
-            let Some(aff) = affine(func, &info, &body, MAX_AFFINE_DEPTH, a) else {
-                continue;
+            let aff = match affine(func, &info, &body, MAX_AFFINE_DEPTH, a) {
+                Some(af) => af,
+                // (x64 wt note) data-dependent but range-limited index:
+                // `cnt[a[i]]` with a u8 `a` is `hi = 255`, not affine. A
+                // `ubound` cap synthesizes a constant Aff so the guard is
+                // `tymax < len` — hist's exact version.
+                None if ubound_on() => match ubound(func, a) {
+                    Some(k) => Aff {
+                        m: Lin::K(0),
+                        b: [Term {
+                            v: Lin::K(k as i64),
+                            k: 1,
+                        }]
+                        .into_iter()
+                        .collect(),
+                    },
+                    None => continue,
+                },
+                None => continue,
             };
             let dests = func.dfg.insts[t].branch_destination(
                 &func.dfg.jump_tables,
