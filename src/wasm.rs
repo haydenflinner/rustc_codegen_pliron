@@ -416,6 +416,12 @@ pub fn lower_to_wasm(
     let mut bytes =
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
+    if std::env::var_os("PLIRON_WASM_PEEP")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        wpeep(&mut bytes);
+    }
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
     let mut tf = Vec::new();
     leb(&mut tf, features.len() as u32);
@@ -449,6 +455,298 @@ fn stub(m: &Module, sig: Signature) -> FunctionBody {
     let e = b.entry;
     b.set_terminator(e, Terminator::Unreachable);
     b
+}
+
+/// Read a u32 LEB128 at `*p`, advancing past it.
+fn urd(b: &[u8], p: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    let mut s = 0u32;
+    loop {
+        let c = *b.get(*p)?;
+        *p += 1;
+        if s < 32 {
+            v |= ((c & 0x7f) as u32) << s;
+        }
+        if c & 0x80 == 0 {
+            return Some(v);
+        }
+        s += 7;
+        if s > 35 {
+            return None;
+        }
+    }
+}
+
+/// Skip a signed LEB128 at `*p`.
+fn sleb_skip(b: &[u8], p: &mut usize) -> Option<()> {
+    loop {
+        let c = *b.get(*p)?;
+        *p += 1;
+        if c & 0x80 == 0 {
+            return Some(());
+        }
+    }
+}
+
+/// Skip `n` bytes at `*p`.
+fn nskip(b: &[u8], p: &mut usize, n: usize) -> Option<()> {
+    if b.len() - *p < n {
+        return None;
+    }
+    *p += n;
+    Some(())
+}
+
+#[derive(Clone, Copy)]
+enum WPeek {
+    Get(u32),
+    Set(u32),
+    Tee(u32),
+    Other,
+}
+
+/// Decode one function body into instructions; rewrite the
+/// local-shuffle noise waffle's SSA->locals lowering leaves behind:
+/// `local.get x; local.set x` is a no-op pair, `local.set x; local.get
+/// x` fuses to `local.tee x`, and `local.tee x; local.set x` is just
+/// `local.set x`. All three edits keep the operand stack and locals
+/// identical and only span adjacent instructions, so structured
+/// control flow is unaffected (branch targets are label depths, not
+/// byte offsets). Returns None — caller keeps the original bytes — on
+/// any opcode it can't decode.
+fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
+    // Locals prefix: vec of (count, valtype); copied verbatim.
+    let mut p = 0usize;
+    let nl = urd(b, &mut p)?;
+    for _ in 0..nl {
+        urd(b, &mut p)?;
+        // Single-byte valtypes only (numeric/v128/funcref/externref);
+        // typed refs (0x63/0x64 + heaptype) need a longer decode — bail.
+        let t = *b.get(p)?;
+        if !matches!(t, 0x6f | 0x70 | 0x78..=0x7f) {
+            return None;
+        }
+        p += 1;
+    }
+    let locals_end = p;
+    // Instruction stream: (kind, byte range). `depth` tracks structured
+    // constructs so the scan stops on the `end` that closes the body.
+    let mut ins: Vec<(WPeek, usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    loop {
+        if p >= b.len() {
+            return None;
+        }
+        let s = p;
+        let op = b[p];
+        p += 1;
+        let k = match op {
+            0x00 | 0x01 | 0x05 | 0x0f | 0x1a | 0x1b | 0xd1 => WPeek::Other,
+            0x02 | 0x03 | 0x04 => {
+                depth += 1;
+                sleb_skip(b, &mut p)?; // blocktype: valtype or type index
+                WPeek::Other
+            }
+            0x0b => {
+                depth -= 1;
+                ins.push((WPeek::Other, s, p));
+                if depth < 0 {
+                    break; // `end` closing the function body itself
+                }
+                continue;
+            }
+            0x0c | 0x0d | 0x10 | 0x12 | 0x25 | 0x26 | 0x3f | 0x40 | 0xd2 => {
+                urd(b, &mut p)?;
+                WPeek::Other
+            }
+            0x0e => {
+                // br_table: n targets + default.
+                let n = urd(b, &mut p)?;
+                for _ in 0..=n {
+                    urd(b, &mut p)?;
+                }
+                WPeek::Other
+            }
+            0x11 | 0x13 => {
+                urd(b, &mut p)?;
+                urd(b, &mut p)?;
+                WPeek::Other
+            }
+            0x1c => {
+                // select t: vec of valtypes. Multi-byte valtypes (typed
+                // refs) aren't emitted here; bail if one shows up.
+                let n = urd(b, &mut p)?;
+                for _ in 0..n {
+                    let t = *b.get(p)?;
+                    if t == 0x63 || t == 0x64 {
+                        return None;
+                    }
+                    p += 1;
+                }
+                WPeek::Other
+            }
+            0x20 => WPeek::Get(urd(b, &mut p)?),
+            0x21 => WPeek::Set(urd(b, &mut p)?),
+            0x22 => WPeek::Tee(urd(b, &mut p)?),
+            0x23 | 0x24 => {
+                urd(b, &mut p)?;
+                WPeek::Other
+            }
+            0x28..=0x3e => {
+                urd(b, &mut p)?; // align
+                urd(b, &mut p)?; // offset
+                WPeek::Other
+            }
+            0x41 | 0x42 => {
+                sleb_skip(b, &mut p)?;
+                WPeek::Other
+            }
+            0x43 => {
+                nskip(b, &mut p, 4)?;
+                WPeek::Other
+            }
+            0x44 => {
+                nskip(b, &mut p, 8)?;
+                WPeek::Other
+            }
+            0x45..=0xc4 => WPeek::Other,
+            0xd0 => {
+                sleb_skip(b, &mut p)?; // ref.null heaptype
+                WPeek::Other
+            }
+            0xfc => {
+                let sub = urd(b, &mut p)?;
+                match sub {
+                    0..=7 => {}
+                    8 | 10 | 12 | 14 => {
+                        urd(b, &mut p)?;
+                        urd(b, &mut p)?;
+                    }
+                    9 | 11 | 13 | 15 | 16 | 17 => {
+                        urd(b, &mut p)?;
+                    }
+                    _ => return None,
+                }
+                WPeek::Other
+            }
+            _ => return None, // 0xfb GC, 0xfd SIMD, 0xfe atomics, EH ops
+        };
+        ins.push((k, s, p));
+    }
+    if p != b.len() {
+        return None; // trailing bytes after the body `end`
+    }
+    // Coalesce adjacent pairs until none rewrite.
+    loop {
+        let mut out: Vec<(WPeek, usize, usize)> = Vec::with_capacity(ins.len());
+        let mut changed = false;
+        let mut i = 0;
+        while i < ins.len() {
+            let pair = (ins[i].0, ins.get(i + 1).map(|x| x.0));
+            match pair {
+                (WPeek::Get(a), Some(WPeek::Set(c))) if a == c => {
+                    changed = true;
+                    i += 2;
+                    continue;
+                }
+                (WPeek::Set(a), Some(WPeek::Get(c))) if a == c => {
+                    out.push((WPeek::Tee(a), ins[i].1, ins[i].2));
+                    changed = true;
+                    i += 2;
+                    continue;
+                }
+                (WPeek::Tee(a), Some(WPeek::Set(c))) if a == c => {
+                    out.push((WPeek::Set(a), ins[i].1, ins[i].2));
+                    changed = true;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(ins[i]);
+            i += 1;
+        }
+        ins = out;
+        if !changed {
+            break;
+        }
+    }
+    let mut nb = Vec::with_capacity(p);
+    nb.extend_from_slice(&b[..locals_end]);
+    for &(k, s, e) in &ins {
+        match k {
+            WPeek::Get(n) => {
+                nb.push(0x20);
+                leb(&mut nb, n);
+            }
+            WPeek::Set(n) => {
+                nb.push(0x21);
+                leb(&mut nb, n);
+            }
+            WPeek::Tee(n) => {
+                nb.push(0x22);
+                leb(&mut nb, n);
+            }
+            WPeek::Other => nb.extend_from_slice(&b[s..e]),
+        }
+    }
+    Some(nb)
+}
+
+/// Module-level driver for `peep_body`: walks sections, rewrites each
+/// code-section function body. Leaves the module untouched on any
+/// malformed section layout.
+fn wpeep(bytes: &mut Vec<u8>) {
+    if bytes.len() < 8 || &bytes[..8] != b"\0asm\x01\0\0\0" {
+        return;
+    }
+    let mut out = bytes[..8].to_vec();
+    let mut p = 8usize;
+    while p < bytes.len() {
+        let id = bytes[p];
+        p += 1;
+        let Some(sz) = urd(bytes, &mut p) else {
+            return;
+        };
+        let (s, e) = (p, p.saturating_add(sz as usize));
+        if e > bytes.len() {
+            return;
+        }
+        out.push(id);
+        if id != 10 {
+            leb(&mut out, sz);
+            out.extend_from_slice(&bytes[s..e]);
+            p = e;
+            continue;
+        }
+        // Code section: vec of (size, body).
+        let mut body_out = Vec::new();
+        let mut q = s;
+        let Some(nf) = urd(bytes, &mut q) else {
+            return;
+        };
+        leb(&mut body_out, nf);
+        for _ in 0..nf {
+            let Some(bsz) = urd(bytes, &mut q) else {
+                return;
+            };
+            let be = q + bsz as usize;
+            if be > e {
+                return;
+            }
+            let nb = peep_body(&bytes[q..be]).unwrap_or_else(|| bytes[q..be].to_vec());
+            leb(&mut body_out, nb.len() as u32);
+            body_out.extend_from_slice(&nb);
+            q = be;
+        }
+        if q != e {
+            return; // trailing bytes inside the code section
+        }
+        leb(&mut out, body_out.len() as u32);
+        out.extend_from_slice(&body_out);
+        p = e;
+    }
+    *bytes = out;
 }
 
 fn leb(out: &mut Vec<u8>, mut v: u32) {
