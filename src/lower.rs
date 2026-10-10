@@ -705,22 +705,6 @@ pub fn lower_to_object(
                 eprintln!("==== clif {n} after coldargs ====\n{}", clctx.func.display());
             }
         }
-        // Move hot->cold block-param edge copies into cold adapter blocks
-        // so the moves only execute when the cold edge is actually taken.
-        if crate::pass_enabled("PLIRON_COLDEDGE") && crate::bisect("coldedge") {
-            let k = crate::clifpeep::coldedges(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("coldedge {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
-            }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
         // Splice single-predecessor successors into their predecessor so
         // hot loops broken into several blocks by cold-edge branches lose
         // the per-edge register-allocation copy shuffle.
@@ -754,6 +738,43 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("edgefwd broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Fold multi-pred forwarders edgefwd leaves: `brif`-only blocks
+        // absorbed into `jump` preds, and `jump` forwarders with
+        // escaping params. Must run before coldedges so any hot->cold
+        // edges it creates still get cold adapters.
+        if crate::pass_enabled("PLIRON_FOLDF") && crate::bisect("foldf") {
+            let k = crate::clifpeep::foldforwarders(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("foldf {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after foldf ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Move hot->cold block-param edge copies into cold adapter blocks
+        // so the moves only execute when the cold edge is actually taken.
+        // Runs after edgefwd: its bypass has no cold check and would
+        // retarget straight through the adapters, putting the parallel
+        // copy back in the hot predecessor tail.
+        if crate::pass_enabled("PLIRON_COLDEDGE") && crate::bisect("coldedge") {
+            let k = crate::clifpeep::coldedges(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldedge {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         if let Err(e) = m.define_function(id, &mut clctx) {

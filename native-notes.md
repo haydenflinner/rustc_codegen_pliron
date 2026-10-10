@@ -392,6 +392,57 @@ Numbers:
 Verified: cargo build, full ./test.sh green, PLIRON_VERIFY clean on
 scatter, hist/gather timings stable, emitted disasm checked.
 
+## edgefwd interaction + foldf + block-count anatomy (post-merge)
+
+After merging the x64 agent's edgefwd (aa02e84), two findings:
+
+- **edgefwd's `bypass_round` has no `is_cold` check and ran AFTER
+  coldedges** — it retargeted straight through the cold adapters
+  (`a: jump C(args)` -> `P->C(args)`), undoing coldedges: hot pred
+  tails carried the cold-edge parallel copies again (mov 19,570 ->
+  20,351 merged). Fix: coldedges now runs LAST (after
+  edgefwd+foldf). Adapters survive to emission; movs back to
+  20,028, at the cost of ~640 cold adapter blocks (+~105 cold `b`s)
+  — the intended trade.
+- **foldf** (clifpeep::foldforwarders, PLIRON_FOLDF=0) folds
+  multi-pred param-forwarders edgefwd leaves: single-inst
+  `b(p): jump T(a)` retargets (escaping params allowed — the real
+  hazard is narrower than edgefwd's blanket skip: unsafe only when
+  an escaping-param use sits in `Reach(T \ {b})`, verified via a
+  b-free successor BFS; caught a live bug where `b21(v280): jump
+  block8` had v280 used *inside* cold block8's body), and
+  `b(p): brif c, T1, T2` absorbs into `jump`-terminated preds.
+  On the merged pipeline it is a **no-op on regex-syntax** (edgefwd
+  already covers jump forwarders incl. pure bodies/try_call/remat;
+  brif-only param forwarders don't survive jumpthread's select
+  formation). With PLIRON_EDGEFWD=0 it fires 364 rewrites/85 fns,
+  verify-clean — kept as coverage, not a regex-syntax win.
+
+### regex-syntax block-count anatomy (llvm-objdump, corrected)
+
+Earlier "~22.7k blocks" included `udf` words that are **jump-table
+data** (~3.1k data words after `br xN`, not instructions — stock
+keeps tables in a data section). Real block count: **13,489**
+vs stock **4,714**. Residual sources:
+
+- ~3,608 small `b`-terminated edge blocks (1,799 `mov`-led):
+  regalloc critical-edge splits materializing parallel copies on
+  arg-carrying conditional edges — the dominant real gap
+  (~3.1k vs stock's ~360). Reducing them means fewer
+  block-param args on brif/br_table edges — a
+  jumpthread/lowering-shape problem, not a forwarder one.
+- ~807 1-inst + 3,040 2-inst blocks overall (stock 578/325).
+- 186 single-`udf` trap stubs (panic `bl; udf` tails), 640 cold
+  coldedges adapters, 241 pure-`b` trampolines (stock 204 — near
+  parity there).
+- movs: 20,028 (was 20,351 pre-reorder; 19,570 pre-edgefwd).
+  Unconditional `b`: 8,497.
+
+Verified: cargo build, FULL ./test.sh green, PLIRON_VERIFY on the
+whole regex-syntax crate (foldf exercised 364x under
+PLIRON_EDGEFWD=0), scatter gather 0.344/hist 0.538 unchanged,
+emitted hist loop still 9-inst/0-mov.
+
 ## Remaining opportunities (ranked)
 
 1. hist residual (~1.19x post-merge): per-iteration regalloc edge
@@ -410,7 +461,8 @@ scatter, hist/gather timings stable, emitted disasm checked.
    is ordering — e.g. `str` runs interleaved with value-producing
    `add`s can't fuse when the gap inst defines the stored reg; that
    needs a real scheduler, not a bigger fusion window.
-5. regex-syntax residual bloat: ~19.6k `mov` + ~8.8k `b` + ~4k `udf`
-   remain after coldedges/coldargs — dominated by high-arity
-   block-arg edges, layout, and jump-table padding rather than any
-   single coalescing gap (see taxonomy above).
+5. regex-syntax residual bloat: ~20.0k `mov` + ~8.5k uncond `b`;
+   13.5k real blocks vs 4.7k stock — dominated by ~3.6k edge-split
+   copy blocks on arg-carrying conditional edges (block-param
+   pressure on brif/br_table edges; a lowering-shape problem), not
+   forwarders (edgefwd+foldf cover those) or addressing.
