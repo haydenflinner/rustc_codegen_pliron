@@ -530,15 +530,80 @@ fn deflag(func: &mut Function) -> usize {
     n
 }
 
+/// A shared cold block with block params makes its incoming edge copies
+/// unconditional: regalloc can't place the parallel copy inside the cold
+/// successor (other preds feed different values), so every hot
+/// predecessor's tail pays the moves — executed even when the cold path
+/// is never taken (e.g. punroll's shared `block21(v46) cold` panic
+/// blocks). Give each hot->cold param edge a cold adapter block
+/// `a: jump C(args)`: the same parallel copy then materializes inside
+/// cold code, while the arg vregs are merely live-in to the adapter and
+/// the hot edge carries no args at all.
+pub fn coldedges(func: &mut Function) -> usize {
+    // Collect (pred terminator, edge index, cold target, edge args)
+    // first: new blocks are appended while rewriting.
+    let mut edges = vec![];
+    for b in func.layout.blocks() {
+        if func.layout.is_cold(b) {
+            continue;
+        }
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        for (di, bc) in func
+            .dfg
+            .insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .iter()
+            .enumerate()
+        {
+            let c = bc.block(&func.dfg.value_lists);
+            if !func.layout.is_cold(c) || func.dfg.block_params(c).is_empty() {
+                continue;
+            }
+            let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+            if args.iter().all(|a| matches!(a, BlockArg::Value(_)))
+                && args.len() == func.dfg.block_params(c).len()
+            {
+                edges.push((t, di, c, args));
+            }
+        }
+    }
+    let mut n = 0;
+    for (t, di, c, args) in edges {
+        let a = func.dfg.make_block();
+        func.layout.set_cold(a);
+        func.layout.insert_block(a, c);
+        FuncCursor::new(func).at_bottom(a).ins().jump(c, &args);
+        let bc = func.dfg.block_call(a, &[]);
+        let dfg = &mut func.dfg;
+        let dests = dfg
+            .insts[t]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+        if let Some(d) = dests.get_mut(di) {
+            *d = bc;
+        }
+        n += 1;
+    }
+    n
+}
+
 /// An integer argument of a call in a cold block that is defined in a hot
 /// block pins its virtual register to a fixed ABI register across the whole
 /// hot region: the register allocator honors the call's operand constraint
 /// at the value's only fixed use, so loop-carried operands like a
 /// bounds-check `idx`/`len` get permanently assigned to x0/x1 and every
 /// other user — and every backedge — pays a move to shuffle them. Rebind
-/// each such arg to a fresh `iadd x, 0` defined inside the cold block: the
-/// copy is still emitted, but at the call site in cold code instead of at
+/// each such arg to a fresh identity def inside the cold block: the copy
+/// is still emitted, but at the call site in cold code instead of at
 /// every hot use (LLVM places the same `mov`s in the panic block).
+///
+/// The wrap can't be `iadd x, 0`: cranelift's egraph folds it back to
+/// `x` (`iadd_x_plus_zero`), re-attaching the fixed use to the hot
+/// range. `sadd_overflow x, 0` computes the same value, has no
+/// `simplify`/`simplify_skeleton` rule, and its dead overflow-flag
+/// result is removed by vcode DCE — leaving a single `adds` in the
+/// cold block.
 pub fn coldargs(func: &mut Function) -> usize {
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
@@ -560,7 +625,11 @@ pub fn coldargs(func: &mut Function) -> usize {
                         .layout
                         .inst_block(di)
                         .is_some_and(|db| !func.layout.is_cold(db)),
-                    ValueDef::Param(pb, _) => !func.layout.is_cold(pb),
+                    // A block param's bundle merges with its incoming
+                    // edge sources (typically hot values), so a
+                    // fixed-reg call use on the param reaches back
+                    // into the hot source bundle and fragments it.
+                    ValueDef::Param(..) => true,
                     _ => false,
                 };
                 if hot {
@@ -575,7 +644,11 @@ pub fn coldargs(func: &mut Function) -> usize {
                 let mut pos = FuncCursor::new(func).at_inst(i);
                 for &(a, ty) in &reb {
                     let z = pos.ins().iconst(ty, 0);
-                    pairs.push((a, pos.ins().iadd(a, z)));
+                    // `sadd_overflow` is pure but has no egraph rule, and
+                    // the flag result is dead so vcode DCE leaves one
+                    // `adds` in the cold block.
+                    let nv = pos.ins().sadd_overflow(a, z).0;
+                    pairs.push((a, nv));
                 }
             }
             for a in func.dfg.inst_args_mut(i) {

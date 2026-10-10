@@ -234,3 +234,32 @@ multi-exit for hist_unchecked.
 - punroll unroll-and-jam (PLIRON_JAM, DEFAULT ON — agent mislabeled it
   "opt-in"; verified enabled): matmul_f32_256 4.17 vs 12.21 stock =
   2.93x on merged aarch64 build. x64 ~2.5x. Identical outputs n=0..256.
+
+## clifpeep: coldedges adapters + coldargs sadd_overflow wrap (wt/native-opt)
+- mov taxonomy via new PLIRON_RA2_EDITS/PLIRON_RA2_VERBOSE dumps
+  (machinst/compile.rs; regalloc2 Ctx::debug_annotations now `pub`):
+  (a) fixed-ABI uses on cold-block call args reach back through hot
+  live ranges -> ion minimal-bundle splits pay a mov per hot use +
+  backedge (hist ~6/iter, both arches); (b) shared param'd cold
+  blocks (punroll `block21(v46) cold`) force incoming parallel copies
+  into hot pred tails; (c) residual high-arity block-arg edges +
+  layout — no safe minimal RA2 tweak, merge_vreg_bundles already
+  covers blockparams/reuse.
+- src/clifpeep.rs::coldargs: hot int args of cold-block calls rebound
+  via `sadd_overflow(x,0)` (survives egraph `iadd_x_plus_zero`; flag
+  result DCE'd -> one `adds` in cold code); extended to
+  ValueDef::Param (bundles merge with hot edge sources).
+- src/clifpeep.rs::coldedges (new, PLIRON_COLDEDGE=0, bisect'd):
+  per-edge cold adapter `a: jump C(args)` for hot->cold param edges;
+  edge-indexed so two-edge terminators/br_table are correct; skips
+  edges carrying TryCallRet/TryCallExn args.
+- Numbers: hist loop 17i+6mov -> 11i+0mov; gather 0.607->0.342
+  (beats stock 0.44); hist 0.66->0.53 (stock 0.436; residual =
+  per-element bounds check not merged into exit test).
+  regex-syntax rlib: mov 20519->19570, uncond b 9676->8753; total
+  +2.7k cold adds/cset (~2740 rewrites/217 fns).
+- Verified: cargo build, FULL ./test.sh green, PLIRON_VERIFY clean,
+  scatter/hist/gather correct + timed. punroll.rs/wasm.rs untouched.
+- Shared-file note: machinst/compile.rs + regalloc2
+  data_structures.rs touched (env-gated debug dumps only) — flagging
+  for x64 agent.

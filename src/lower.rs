@@ -705,6 +705,22 @@ pub fn lower_to_object(
                 eprintln!("==== clif {n} after coldargs ====\n{}", clctx.func.display());
             }
         }
+        // Move hot->cold block-param edge copies into cold adapter blocks
+        // so the moves only execute when the cold edge is actually taken.
+        if crate::pass_enabled("PLIRON_COLDEDGE") && crate::bisect("coldedge") {
+            let k = crate::clifpeep::coldedges(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldedge {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Splice single-predecessor successors into their predecessor so
         // hot loops broken into several blocks by cold-edge branches lose
         // the per-edge register-allocation copy shuffle.

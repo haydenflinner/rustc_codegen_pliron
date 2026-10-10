@@ -333,12 +333,71 @@ cargo build clean; ./test.sh green end-to-end; harness tier 0 clean
 regex-syntax disasm shows `stp xN, xM, [sp, #off]` pairs that were
 `str` chains before.
 
+## mov taxonomy + cold-edge fix (clifpeep::coldedges / coldargs)
+
+Investigated the regex-syntax `mov` ~20.5k + `b` ~9.7k gap and the
+scatter/hist ~6 redundant RA copies/iter. Findings:
+
+- `PLIRON_RA2_EDITS=1` (new instrumentation in
+  vendor/cranelift-codegen/src/machinst/compile.rs, plus
+  `PLIRON_RA2_VERBOSE` annotation dump; regalloc2
+  `Ctx::debug_annotations` made `pub`) shows three move classes:
+  1. **ABI-pinning copies**: an int arg of a `call` in a cold block
+     (bounds-check panic stubs) whose def is hot gets a fixed-reg
+     constraint that reaches back through its live range; ion's
+     minimal-bundle split then pays a move at every hot use AND the
+     backedge. This was the hist ~6 movs/iter on BOTH arches.
+  2. **Hot->cold param edges**: punroll shares param'd cold panic
+     blocks (`block21(v46) cold`); a multi-pred cold successor can't
+     absorb the incoming parallel copy, so every hot predecessor tail
+     materializes arg moves that execute even when the cold edge is
+     never taken.
+  3. **Residual**: genuine high-arity block-arg materialization
+     (regex edges carry ~95 block params in places), mid-block splits,
+     imm materialization — layout/coalescing, not addressing. No
+     minimal regalloc2 tweak safely fixes class 3;
+     `merge_vreg_bundles` already merges blockparams and reuse
+     operands — remaining failures are live-range/fixed-reg
+     interference by construction.
+
+Fixes landed (both gated + bisected, verify under PLIRON_VERIFY):
+
+- `clifpeep::coldargs` now wraps each hot int arg of a cold-block call
+  in `sadd_overflow(x, 0)` (value arm only; flag is dead → DCE'd,
+  leaves one `adds` in cold code). `iadd x,0` was insufficient —
+  egraph `iadd_x_plus_zero` folded it back and re-attached the fixed
+  use to the hot range. Also extended to `ValueDef::Param` args, whose
+  bundles merge with hot edge sources. `sadd_overflow` lowers cleanly
+  on aarch64 for all int widths (overflow_op_small / AddS).
+- `clifpeep::coldedges` (new, PLIRON_COLDEDGE=0 disables): each
+  hot→cold edge into a param'd cold block gets a cold adapter
+  `a: jump C(args)` — the parallel copy materializes inside cold code;
+  the hot edge carries zero args. Edge-indexed (`br_table`/two-edge
+  terminators handled; only all-`BlockArg::Value` edges rewritten, so
+  TryCallRet/TryCallExn edges are skipped).
+
+Numbers:
+
+- hist checked loop: 17 insts + 6 movs/iter → 11 insts, 0 movs
+  (`ldrb; cmp; b.hs(cold); ldr scaled; add; str; add; cmp; b.lo`).
+  gather 0.607 → 0.342 ms/iter (stock 0.44 → now ~1.3x *faster*);
+  hist 0.66 → 0.53 (stock 0.436). Residual hist gap is the
+  per-element input bounds check not merged into the loop-exit test —
+  constraint-elimination/indvars territory, separate issue.
+- regex-syntax rlib (llvm-objdump, aarch64): mov 20,519 → 19,570,
+  `b` (uncond) 9,676 → 8,753; total 102,866 → 105,597 (+2.7k cold
+  `adds`/`cset` from ~2,740 coldarg rewrites across 217 fns — cold
+  code growth traded for hot-path moves).
+
+Verified: cargo build, full ./test.sh green, PLIRON_VERIFY clean on
+scatter, hist/gather timings stable, emitted disasm checked.
+
 ## Remaining opportunities (ranked)
 
 1. hist residual (~1.19x post-merge): per-iteration regalloc edge
-   copies in the unversioned checked loop. RA-level fix (regalloc2
-   operand/edge coalescing), scoped to the x64 agent's
-   investigation — re-measure after their next merge.
+   copies in the unversioned checked loop — **fixed** by coldedges +
+   coldargs above. New residual (~0.53 vs 0.436 stock): per-element
+   bounds check not folded into the exit test.
 2. matmul deeper win: unroll-and-jam with multiple independent f32
    acc chains needs punroll-side support (multi-exit inner loops)
    plus a float reassoc policy — outside loopvec's model, x64-owned.
@@ -351,6 +410,7 @@ regex-syntax disasm shows `stp xN, xM, [sp, #off]` pairs that were
    is ordering — e.g. `str` runs interleaved with value-producing
    `add`s can't fuse when the gap inst defines the stored reg; that
    needs a real scheduler, not a bigger fusion window.
-5. regex-syntax block/mov bloat: ~20.5k `mov` + ~9.7k `b` + ~4k `udf`
-   vs stock — edge copies, block layout, and jump-table padding;
-   the largest single instruction-count lever left.
+5. regex-syntax residual bloat: ~19.6k `mov` + ~8.8k `b` + ~4k `udf`
+   remain after coldedges/coldargs — dominated by high-arity
+   block-arg edges, layout, and jump-table padding rather than any
+   single coalescing gap (see taxonomy above).
