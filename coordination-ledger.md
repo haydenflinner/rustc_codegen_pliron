@@ -498,3 +498,28 @@ Track as x64 agent follow-up.
   (incl panic index), stride2 2550 both, r42 rustlantis 6k-line clean.
 - Remaining: stride2-class non-unit-step vectorization, rev_inplace
   (half-trip swap, 0.21 vs 0.17 stock), shuffle-tree epilogue.
+
+## Merged: revnorm+affine-guards (5805a7f,0e5dc33) + celim v2 (3b647d0) + wasm flat-unroll cursors (0b6614b)
+- revnorm.rs (NEW): descending counted ivs rebased to ascending via
+  iv=hi-j bijection — desc_sum 0.304->0.074 (parity). loopidiom/loopvec
+  affine iv+-k guard proofs — neg_off 0.459->0.078.
+- hist PIN-CHAIN ELIMINATED (umulhi coldargs worked): unrolled hist loop
+  mov-free; hist-rand 0.373 vs stock 0.436 = +17% WIN. hist-const
+  0.8-2.0ms flips are Apple memory-renaming noise (same-addr RMW chain).
+- celim v2: 310 folds/101 fns on regex-syntax; also verified on aarch64
+  (-2592 insts, -569 blocks). Guard-band collapse fired in hist.
+- wasm: sum_u8->parity, max_u32 -38% WIN, matmul -11% WIN (9.97 vs 11.21).
+  Only deficit: dot_i32 +2.5% (noise; stock doesn't unroll it at all).
+- v128 SIMD verdict (wasm): NOT cheaply wireable — wasm path bypasses
+  CLIF entirely (pliron-dialect -> waffle -> bytecode); vectors
+  scalarized via wleaves. A waffle-level vectorizer is a multi-day
+  project. Documented as deferred.
+- NEW x64 gap identified: check-exit fusion — LLVM exits loops on
+  i==len doubling as bounds check; we keep per-iter i<len checks.
+  Fix = bcheck preheader versioning (hoist i<len for all i<n to a
+  single n<=len preheader test). Also multi-pointer loop copy chains
+  (~5 movq/lea per iter on gather/scatter via rotation merge params).
+- CAUTION: x64 agent's "larger workloads" table showed anomalies vs
+  earlier runs (matmul 2.5x slower at that size, new kernels chars/
+  tokenize/prefix/dot_u32 slower). Different sizes/harness — needs
+  reconciliation before treating as regressions.
