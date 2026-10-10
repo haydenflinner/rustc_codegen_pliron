@@ -481,3 +481,20 @@ Track as x64 agent follow-up.
 - Still scalar (next candidates): desc_sum `(0..n).rev()` —
   descending counted iv needs step<0 in count() or a rev-norm
   pre-pass; stride2 non-unit step; rev_inplace half-trip.
+
+## wt/native-opt — revnorm descending-iv rebasing (committing)
+- NEW src/revnorm.rs (PLIRON_REVNORM, after licm, before loopidiom):
+  rebase `iv: hi→lo` desc counted loops to `j: 0→hi-lo` with iv=hi-j.
+  Exact for `eq`/`ne` stay tests any step; `ugt 0` for unit decrement.
+  `iv±k`/`k-iv` defs become `(hi±k)-j` with preheader constants; bare uses
+  get per-block `isub(hi,j)`; icmp single-use check before operand rewrite.
+- desc_sum 0.304 -> 0.074 ms/iter (4.1x; stock 0.073) — full neg-stream
+  NEON path (descending ldp + rev64/ext lane fixup + uaddw accum).
+  step_by(2) normalizes too but stays correctly scalar (strided load).
+- Bug caught+fixed by test: keep icmp RAW polarity (body-on-false brifs
+  mean the cond is the exit test) — inverted exits returned empty sums.
+- Verified: cargo build, PLIRON_VERIFY=1 ./test.sh green incl wasm,
+  rev probes (rsum/rcopy/rrange/rwhile/ridx/panic) match stock exactly
+  (incl panic index), stride2 2550 both, r42 rustlantis 6k-line clean.
+- Remaining: stride2-class non-unit-step vectorization, rev_inplace
+  (half-trip swap, 0.21 vs 0.17 stock), shuffle-tree epilogue.

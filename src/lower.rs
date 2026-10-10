@@ -527,6 +527,19 @@ pub fn lower_to_object(
                 panic!("licm broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Rebase descending counted ivs (`(0..n).rev()`) to ascending so
+        // loopidiom/loopvec see the canonical `0..bound` count shape.
+        if crate::pass_enabled("PLIRON_REVNORM") && crate::bisect("revnorm") {
+            let k = crate::revnorm::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("revnorm {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("revnorm broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.loopidiom && crate::bisect("loopidiom") {
             let k =
                 crate::loopidiom::run(&mut clctx.func, &noalias, m.target_config(), n);

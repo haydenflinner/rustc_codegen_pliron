@@ -55,6 +55,7 @@ mod nowrite;
 mod objmerge;
 mod phisimp;
 mod punroll;
+mod revnorm;
 mod simd;
 mod slp;
 mod spec;

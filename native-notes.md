@@ -681,3 +681,36 @@ dot_u8 2x, cnt_vowel 3.7x, find_off 14x; even_sum within 2%).
 celim on aarch64 (regex-syntax): -2,592 real insts, -569 blocks,
 -186 mov-led splits vs PLIRON_CELIM=0; PLIRON_VERIFY clean. The
 x64-motivated pass is a straight win here too.
+
+### revnorm: descending counted-iv rebasing (new pass)
+
+`for i in (0..n).rev()` arrives as `iv: n → 0` step -1 — invisible to the
+count model (step>0 only) and to stream analysis. New pass `src/revnorm.rs`
+(runs after licm, before loopidiom; `PLIRON_REVNORM=0` off) rebases the iv
+to ascending `j: 0 → hi-lo` via the exact mod-2^64 bijection `iv = hi - j`:
+
+- stay tests: `iv == lo` / `iv != lo` → `j ==/!= hi-lo` (exact for any
+  step — the icmp keeps its RAW polarity since the brif's edges don't
+  move); `iv > 0` → `j < hi` (unit-decrement only — needs to hit the floor
+  exactly). Other floor inequalities are not residue-preserving when
+  `hi < lo` or the step can skip the bound — not normalized.
+- `iv ± k` / `k - iv` defs rebase to `(hi ± k) - j` / `(k - hi) + j` with
+  the constant side materialized in the preheader — preserving the
+  canonical `C - iv` shape the affine guard analysis reads (same check the
+  new `c - iv` guard_pred arm covers).
+- all other in-body uses get `isub(hi, j)` emitted per-block; entry edge
+  passes `iconst 0`, latches pass `j + |s|`; the count icmp must have no
+  other uses.
+
+desc_sum `(0..n).rev() { s += a[i] }`: scalar 0.304 → 0.074 ms/iter —
+full NEON `ldp [x3], #-0x40` descending loads + `rev64`/`ext` lane fixups +
+8 `uaddw` accumulators — at stock parity (0.073). `step_by(2)`'s internal
+descending `remaining` count normalizes too (stays correctly scalar —
+strided loads aren't vectorizable). Verified: verify_function clean,
+rwhile/range/short-dst panic semantics all match stock (panic index 63
+first-visited in rev order, identical to stock).
+
+One subtlety that matters: `brif c, exit, body` (body on the FALSE edge)
+means the icmp computes the EXIT condition — rewriting it to the stay
+condition inverts the loop entirely (returned 0). The icmp must preserve
+the raw condition's truth value translated to j.
