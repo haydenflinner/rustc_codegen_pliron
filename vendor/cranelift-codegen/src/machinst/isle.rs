@@ -690,10 +690,33 @@ macro_rules! isle_lower_prelude_methods {
             let continuation = labels.next().unwrap();
             assert_eq!(labels.next(), None);
 
+            // If the normal-return destination is a block containing only
+            // a single `trap` (and the edge carries no block arguments),
+            // the trap can be emitted inline right after the call rather
+            // than jumping to the block. Trap-only blocks are treated as
+            // cold by the block-ordering pass and always sink, so the jump
+            // would never be elided as a fallthrough.
+            let continuation_trap = {
+                let f = self.lower_ctx.f;
+                let nbc = f.dfg.exception_tables[et].normal_return();
+                let nb = nbc.block(&f.dfg.value_lists);
+                let mut insts = f.layout.block_insts(nb);
+                match (insts.next(), insts.next()) {
+                    (Some(i), None)
+                        if f.dfg.insts[i].opcode() == crate::ir::Opcode::Trap
+                            && nbc.args(&f.dfg.value_lists).next().is_none() =>
+                    {
+                        f.dfg.insts[i].trap_code()
+                    }
+                    _ => None,
+                }
+            };
+
             let exception_handlers = exception_handlers.into_boxed_slice();
 
             Some(TryCallInfo {
                 continuation,
+                continuation_trap,
                 exception_handlers,
             })
         }

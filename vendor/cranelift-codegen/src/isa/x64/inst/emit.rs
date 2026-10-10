@@ -466,10 +466,16 @@ pub(crate) fn emit(
             // If this is a try-call, jump to the continuation
             // (normal-return) block.
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                let jmp = Inst::JmpKnown {
-                    dst: try_call.continuation,
-                };
-                jmp.emit(sink, info, state);
+                if let Some(code) = try_call.continuation_trap {
+                    // The continuation is a lone `trap`: emit it inline
+                    // (`callq; ud2`) instead of jumping to a cold block.
+                    asm::inst::ud2_zo::new(code).emit(sink, info, state);
+                } else {
+                    let jmp = Inst::JmpKnown {
+                        dst: try_call.continuation,
+                    };
+                    jmp.emit(sink, info, state);
+                }
             }
         }
 
@@ -546,10 +552,16 @@ pub(crate) fn emit(
             );
 
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                let jmp = Inst::JmpKnown {
-                    dst: try_call.continuation,
-                };
-                jmp.emit(sink, info, state);
+                if let Some(code) = try_call.continuation_trap {
+                    // The continuation is a lone `trap`: emit it inline
+                    // (`callq; ud2`) instead of jumping to a cold block.
+                    asm::inst::ud2_zo::new(code).emit(sink, info, state);
+                } else {
+                    let jmp = Inst::JmpKnown {
+                        dst: try_call.continuation,
+                    };
+                    jmp.emit(sink, info, state);
+                }
             }
         }
 

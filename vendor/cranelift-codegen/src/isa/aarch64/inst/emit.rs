@@ -3042,10 +3042,18 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    let jmp = Inst::Jump {
-                        dest: BranchTarget::Label(try_call.continuation),
-                    };
-                    jmp.emit(sink, emit_info, state);
+                    if let Some(trap_code) = try_call.continuation_trap {
+                        // The continuation is a lone `trap`: emit it
+                        // inline (`bl; udf`) instead of jumping to a
+                        // cold block.
+                        let trap = Inst::Udf { trap_code };
+                        trap.emit(sink, emit_info, state);
+                    } else {
+                        let jmp = Inst::Jump {
+                            dest: BranchTarget::Label(try_call.continuation),
+                        };
+                        jmp.emit(sink, emit_info, state);
+                    }
                 }
 
                 // We produce an island above if needed, so disable
@@ -3089,10 +3097,18 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    let jmp = Inst::Jump {
-                        dest: BranchTarget::Label(try_call.continuation),
-                    };
-                    jmp.emit(sink, emit_info, state);
+                    if let Some(trap_code) = try_call.continuation_trap {
+                        // The continuation is a lone `trap`: emit it
+                        // inline (`bl; udf`) instead of jumping to a
+                        // cold block.
+                        let trap = Inst::Udf { trap_code };
+                        trap.emit(sink, emit_info, state);
+                    } else {
+                        let jmp = Inst::Jump {
+                            dest: BranchTarget::Label(try_call.continuation),
+                        };
+                        jmp.emit(sink, emit_info, state);
+                    }
                 }
 
                 // We produce an island above if needed, so disable

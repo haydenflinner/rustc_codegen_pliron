@@ -287,3 +287,46 @@ fallthrough instead of `callq; jmp shared_ud2` (~1.3k sites crate-wide).
 `Function::is_effectively_cold` marks every trap-terminated block cold,
 so the private traps always sink to the cold section and the jmp stays:
 +1,193 `ud2` for only -187 `jmp`. Reverted; kept as a code comment.
+
+### try_call → trap continuation inline materialization (vendored emit)
+
+`callq; jmp shared_ud2` after try_call (~850 direct + ~74 via edge-block
+forwarders crate-wide in regex-syntax x64) could not be fixed at CLIF
+level: `Function::is_effectively_cold` marks every trap-terminated block
+cold so shared traps always sink and the jump never becomes fallthrough.
+The CLIF-level private-trap variant was tried and rejected (prior entry).
+
+Fix is in the vendored backend, at emit time:
+
+- `TryCallInfo` gains `continuation_trap: Option<TrapCode>`
+  (machinst/abi.rs).
+- `try_call_info` (machinst/isle.rs) fills it when the exception-table
+  `normal_return()` BlockCall targets a block whose only inst is a
+  `trap` and whose edge carries no args. Detection is on the CLIF block,
+  so critical-edge forwarders to the same trap are bypassed too.
+- x64 emit (inst/emit.rs, `CallKnown` + `CallUnknown`): when set, emit
+  `ud2` in place of the `jmp continuation` — `callq; ud2`, matching
+  LLVM's `call f; unreachable` shape. Trap record is registered via the
+  assembler's `add_trap`; exception-handler edges (add_try_call_site)
+  are unchanged.
+- aarch64 emit gets the same treatment (`bl; udf` via `Inst::Udf`).
+
+Results (regex-syntax rlib):
+
+- x64: `callq;jmp` 2,701 → 1,067; total `jmp` 10,189 → 9,069 (−11%);
+  `callq;ud2` 1,144 → 2,774; `__text` 171,764 → 170,852 B (−912 B).
+- aarch64: `b` 9,161 → 8,287 (−9.5% vs the edgefwd-era build).
+- Stock x64 reference: 534 `callq;jmp` (incl. 141 → ud2) + 71 inline
+  `callq;ud2` — the residual pliron gap is try_call site COUNT (2.7k
+  invoke sites vs ~600 LLVM) and non-trap continuations, i.e. the same
+  block-count inflation, not this pattern.
+
+Correctness: unwind semantics unaffected — the ud2 only executes on a
+normal return into `unreachable`; landing pads come from
+`add_try_call_site` at the call offset, untouched. cargo build clean;
+test.sh green (incl. aarch64 unwind); PLIRON_VERIFY=1 clean on whole
+x64 regex-syntax; Rosetta x86_64-apple-darwin std+unwind pass.
+
+sum2d residual check (x64, Rosetta): pliron 0.788–0.795 ms vs stock
+0.766–0.777 — ~2%, inside earlier-run noise; the ledger's "-5%"
+residual is stale. Accepted as parity.

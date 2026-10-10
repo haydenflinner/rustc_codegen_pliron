@@ -652,6 +652,14 @@ pub struct CallInfo<T> {
 pub struct TryCallInfo {
     /// The target to jump to on a normal returhn.
     pub continuation: MachLabel,
+    /// If the continuation block consists of exactly one `trap`
+    /// instruction (and the edge carries no arguments), the trap code
+    /// to materialize inline after the call instead of jumping to the
+    /// block: `callq; ud2` rather than `callq; jmp shared_ud2`. Shared
+    /// trap blocks are effectively cold and sink in the block order, so
+    /// the jump never becomes a fallthrough; emitting the trap in place
+    /// is both smaller and one fewer branch.
+    pub continuation_trap: Option<crate::ir::TrapCode>,
     /// Exception tags to catch and corresponding destination labels.
     pub exception_handlers: Box<[TryCallHandler]>,
 }
