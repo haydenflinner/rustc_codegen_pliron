@@ -275,6 +275,7 @@ struct Cnt {
 
 pub fn run(func: &mut Function, name: &str) -> usize {
     let mut tried: FxHashSet<Block> = FxHashSet::default();
+    let mut normed: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
     while n < MAX_LOOPS {
         let cfg = ControlFlowGraph::with_function(func);
@@ -283,6 +284,22 @@ pub fn run(func: &mut Function, name: &str) -> usize {
         la.compute(func, &cfg, &dt);
         let mut hit = false;
         let loops: Vec<_> = la.loops().collect();
+        // Canonicalize mid-chain counting exits into the latch: bcheck/
+        // sameargs leave `brif const -> h` dead latches behind the real
+        // trip test sitting mid-chain. Moving the test to the latch
+        // gives jam and unroll the canonical do-while shape — jam's
+        // "inner latch exits elsewhere" check needs exactly this.
+        for lp in loops.iter().copied() {
+            let h = la.loop_header(lp);
+            if normed.contains(&h) {
+                continue;
+            }
+            normed.insert(h);
+            if sink_test(func, &cfg, &dt, &la, lp, h, name) {
+                hit = true;
+                break; // cfg/la stale; rescan
+            }
+        }
         // Unroll-and-jam runs first: an outer loop wrapping a single
         // linear inner chain gets J fused copies before punroll can
         // disturb the inner loop's shape. Jammed loop headers join
@@ -339,70 +356,82 @@ pub fn run(func: &mut Function, name: &str) -> usize {
     n
 }
 
-fn run_loop(
-    func: &mut Function,
-    cfg: &ControlFlowGraph,
+macro_rules! wbail {
+    ($name:expr, $h:expr, $why:expr) => {{
+        if debug() {
+            eprintln!("punroll {} block{}: {}", $name, $h.as_u32(), $why);
+        }
+        return None;
+    }};
+}
+
+/// A mid-chain `brif` in the linear chain: one dest continues the chain,
+/// the other leaves the body (a side exit — bounds-check panic edge, or
+/// the loop's own exit when the counting test sits mid-chain).
+struct SideExit {
+    /// Index in `chain` of the block whose `brif` exits.
+    pos: usize,
+    /// In-body `brif` edge (to `chain[pos+1]`).
+    cont_bc: BlockCall,
+    /// Out-of-body `brif` edge (the side exit).
+    exit_bc: BlockCall,
+    /// `exit_bc` target.
+    seblk: Block,
+    /// Position (0/1) of the exit dest in the original `brif`.
+    epos: usize,
+    /// Loop values used inside `seblk`'s dominance cone, in the order
+    /// they become clone-root params (empty ⇒ edge retargets the
+    /// original block, no clone needed).
+    lvals: Vec<Value>,
+    /// Dominance cone blocks in emission (RPO) order, cone clones, and
+    /// the clone root when `lvals` is non-empty.
+    corder: Vec<Block>,
+    cmap: FxHashMap<Block, Block>,
+    clone_root: Option<Block>,
+}
+
+struct Walk {
+    body: FxHashSet<Block>,
+    chain: Vec<Block>,
+    mid_exits: Vec<SideExit>,
+    latch: Block,
+    /// `jump`-latch rotated loop: the latch is a plain `jump h` and h's
+    /// own `brif` (a pos-0 side exit) is the counting test. `false` for
+    /// brif-latch do-while loops.
+    rotated: bool,
+}
+
+/// Walk the linear chain `h -> .. -> latch`: `jump` steps land on a fresh
+/// in-body block; a mid-chain `brif` is allowed when exactly one dest is
+/// a fresh in-body block (the loop continues) and the other leaves the
+/// body. The `brif` whose dest is `h` is the latch (do-while); a `jump h`
+/// latch marks a rotated while-loop. Anything else, any extra body
+/// block, or a cold block disqualifies.
+fn walk(
+    func: &Function,
+    _cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: cranelift_codegen::loop_analysis::Loop,
     h: Block,
     name: &str,
-) -> Option<()> {
-    macro_rules! bail {
-        ($why:expr) => {{
-            if debug() {
-                eprintln!("punroll {name} block{}: {}", h.as_u32(), $why);
-            }
-            return None;
-        }};
-    }
+) -> Option<Walk> {
     if !dt.is_reachable(h) || func.layout.is_cold(h) {
-        bail!("header unreachable/cold");
+        wbail!(name, h, "header unreachable/cold");
     }
     let body: FxHashSet<Block> = func
         .layout
         .blocks()
         .filter(|&b| la.is_in_loop(b, lp))
         .collect();
-    // Walk the linear chain h -> .. -> latch: `jump` steps land on a fresh
-    // in-body block; a mid-chain `brif` is allowed when exactly one dest is
-    // a fresh in-body block (the loop continues) and the other leaves the
-    // body (a side exit, e.g. a bounds-check panic edge). The `brif` whose
-    // dest is `h` is the latch. Anything else, any extra body block, or a
-    // cold block disqualifies.
-    struct SideExit {
-        /// Index in `chain` of the block whose `brif` exits.
-        pos: usize,
-        /// In-body `brif` edge (to `chain[pos+1]`).
-        cont_bc: BlockCall,
-        /// Out-of-body `brif` edge (the side exit).
-        exit_bc: BlockCall,
-        /// `exit_bc` target.
-        seblk: Block,
-        /// Position (0/1) of the exit dest in the original `brif`.
-        epos: usize,
-        /// Loop values used inside `seblk`'s dominance cone, in the order
-        /// they become clone-root params (empty ⇒ edge retargets the
-        /// original block, no clone needed).
-        lvals: Vec<Value>,
-        /// Dominance cone blocks in emission (RPO) order, cone clones, and
-        /// the clone root when `lvals` is non-empty.
-        corder: Vec<Block>,
-        cmap: FxHashMap<Block, Block>,
-        clone_root: Option<Block>,
-    }
     let mut chain = vec![h];
     let mut mid_exits: Vec<SideExit> = Vec::new();
     let latch;
-    // Rotated while-loop: the latch is a plain `jump h` and h's own `brif`
-    // (the test at the top) is the loop's exit edge — it lands in
-    // `mid_exits` at pos 0 during the walk. Latch-tested do-while loops
-    // end on a `brif -> h | exit` instead.
     let mut rotated = false;
     loop {
         let cur = *chain.last().unwrap();
         if func.layout.is_cold(cur) {
-            bail!("cold block in chain");
+            wbail!(name, h, "cold block in chain");
         }
         let t = func.layout.last_inst(cur)?;
         match func.dfg.insts[t] {
@@ -414,11 +443,11 @@ fn run_loop(
                     break;
                 }
                 if !body.contains(&nb) || chain.contains(&nb) {
-                    bail!("nonlinear chain");
+                    wbail!(name, h, "nonlinear chain");
                 }
                 chain.push(nb);
                 if chain.len() > MAX_CHAIN {
-                    bail!("chain too long");
+                    wbail!(name, h, "chain too long");
                 }
             }
             InstructionData::Brif { .. } => {
@@ -436,11 +465,11 @@ fn run_loop(
                 } else if body.contains(&d1) && !body.contains(&d0) {
                     (dests[1], dests[0], 0)
                 } else {
-                    bail!("nonlinear chain");
+                    wbail!(name, h, "nonlinear chain");
                 };
                 let nb = cont_bc.block(&func.dfg.value_lists);
                 if chain.contains(&nb) {
-                    bail!("nonlinear chain");
+                    wbail!(name, h, "nonlinear chain");
                 }
                 mid_exits.push(SideExit {
                     pos: chain.len() - 1,
@@ -455,15 +484,264 @@ fn run_loop(
                 });
                 chain.push(nb);
                 if chain.len() > MAX_CHAIN {
-                    bail!("chain too long");
+                    wbail!(name, h, "chain too long");
                 }
             }
-            _ => bail!("unhandled terminator"),
+            _ => wbail!(name, h, "unhandled terminator"),
         }
     }
     if body.len() != chain.len() {
-        bail!("extra body blocks");
+        wbail!(name, h, "extra body blocks");
     }
+    Some(Walk {
+        body,
+        chain,
+        mid_exits,
+        latch,
+        rotated,
+    })
+}
+
+/// The counted continue-test search: `a cc bound` where `a` is
+/// `param + d`, `param` stepping `+s` along the backedge (`cont_args`),
+/// `bound` loop-invariant. Shared by the latch test (do-while), h's top
+/// brif (rotated), and mid-chain exits being sunk to the latch.
+fn find_count(
+    func: &Function,
+    h: Block,
+    body: &FxHashSet<Block>,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    x: Value,
+    y: Value,
+    cond: IntCC,
+    hparams: &[Value],
+    cont_args: &[Value],
+) -> Option<Cnt> {
+    for (a, b, cc) in [(x, y, cond), (y, x, cond.swap_args())] {
+        let (le, signed) = match cc {
+            IntCC::UnsignedLessThan => (false, false),
+            IntCC::UnsignedLessThanOrEqual => (true, false),
+            IntCC::SignedLessThan => (false, true),
+            IntCC::SignedLessThanOrEqual => (true, true),
+            _ => continue,
+        };
+        let Some((pidx, d)) = affine_param(func, h, a) else {
+            continue;
+        };
+        let pty = func.dfg.value_type(hparams[pidx]);
+        if !pty.is_int() || pty.bits() < 16 || pty.bits() > 64 {
+            continue;
+        }
+        // Step: p's backedge value must be `p + s`, s a positive const.
+        let Some(bi) = func.dfg.value_def(cont_args[pidx]).inst() else {
+            continue;
+        };
+        let mut step = None;
+        if let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } = func.dfg.insts[bi]
+        {
+            for (px, sc) in [(args[0], args[1]), (args[1], args[0])] {
+                if param_idx(func, h, px) == Some(pidx)
+                    && let Some(s) = iconst(func, sc)
+                    && s > 0
+                {
+                    step = Some(s);
+                }
+            }
+        }
+        let Some(step) = step else { continue };
+        // Bound must be loop-invariant: defined outside the body, or a header
+        // param passed back unchanged (usable at hu as hu's own param).
+        let b = func.dfg.resolve_aliases(b);
+        let mut bpidx = None;
+        if let Some(bi) = func.dfg.value_def(b).inst() {
+            let Some(bb) = func.layout.inst_block(bi) else {
+                continue;
+            };
+            if body.contains(&bb) {
+                continue;
+            }
+            // Its def must dominate every entry edge into the loop.
+            if !cfg
+                .pred_iter(h)
+                .filter(|p| !body.contains(&p.block))
+                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+            {
+                continue;
+            }
+        } else {
+            match func.dfg.value_def(b) {
+                // Bound is a header param passed back unchanged on the
+                // backedge (usable at hu as hu's own param).
+                cranelift_codegen::ir::ValueDef::Param(bb, q)
+                    if bb == h && cont_args[q] == b =>
+                {
+                    bpidx = Some(q);
+                }
+                // A param of any other block dominating h — e.g. a slice
+                // `len` arriving as an entry-block param — is likewise
+                // loop-invariant and usable at hu. (An in-body block can
+                // never dominate the header, so loop-carried values are
+                // still rejected.)
+                cranelift_codegen::ir::ValueDef::Param(bb, _)
+                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                _ => continue,
+            }
+        }
+        return Some(Cnt {
+            pidx,
+            d,
+            step,
+            bound: b,
+            bpidx,
+            le,
+            signed,
+        });
+    }
+    None
+}
+
+/// Canonicalize a mid-chain counting exit into the latch — `bcheck`/
+/// `sameargs` leave a `brif const -> h` dead latch behind the real trip
+/// test sitting mid-chain (`h: check; body; brif iv<n -> next | exit;
+/// next: iv'; brif 1 -> h | cold`). Moving the test to the latch gives
+/// jam and unroll the canonical do-while shape:
+///
+/// ```text
+/// chain[p]:   jump chain[p+1](cont args)          (exit edge drops)
+/// latch:      brif test -> h(back args) | exit(exit args)
+/// ```
+///
+/// Only applies when the latch's taken edge is provably `h` (const cond)
+/// — its other edge is dead and safe to drop — and the trailing blocks
+/// are speculatable (they now run on the iteration the test fails).
+fn sink_test(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: cranelift_codegen::loop_analysis::Loop,
+    h: Block,
+    name: &str,
+) -> bool {
+    let Some(w) = walk(func, cfg, dt, la, lp, h, name) else {
+        return false;
+    };
+    if w.rotated {
+        return false;
+    }
+    let lt = func.layout.last_inst(w.latch).unwrap();
+    let InstructionData::Brif { arg: c_l, .. } = func.dfg.insts[lt] else {
+        return false;
+    };
+    let Some(k) = iconst(func, c_l) else {
+        return false;
+    };
+    let ldests: Vec<BlockCall> = func.dfg.insts[lt]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .to_vec();
+    // `brif k` takes dests[0] when k != 0.
+    let taken = if k != 0 { 0 } else { 1 };
+    if ldests[taken].block(&func.dfg.value_lists) != h {
+        return false;
+    }
+    let back_bc = ldests[taken];
+    let hparams = func.dfg.block_params(h).to_vec();
+    let cont_args: Vec<Value> = back_bc
+        .args(&func.dfg.value_lists)
+        .filter_map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect();
+    if cont_args.len() != hparams.len() {
+        return false;
+    }
+    for e in &w.mid_exits {
+        let te = func.layout.last_inst(w.chain[e.pos]).unwrap();
+        let InstructionData::Brif { arg: c, .. } = func.dfg.insts[te] else {
+            continue;
+        };
+        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+            continue;
+        };
+        let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond,
+            args: [x, y],
+        } = func.dfg.insts[ci]
+        else {
+            continue;
+        };
+        // Normalize cond to "true -> continue" (cont sits at 1 - epos).
+        let cond = if e.epos == 1 { cond } else { cond.complement() };
+        if find_count(func, h, &w.body, cfg, dt, x, y, cond, &hparams, &cont_args).is_none() {
+            continue;
+        }
+        // The trailing chain must be speculatable — it now executes on
+        // the iteration the test fails.
+        let ok = w.chain[e.pos + 1..].iter().all(|&b| {
+            func.layout.block_insts(b).all(|i| {
+                let op = func.dfg.insts[i].opcode();
+                op.is_terminator()
+                    || !(op.can_load()
+                        || op.can_store()
+                        || op.can_trap()
+                        || op.other_side_effects())
+            })
+        });
+        if !ok {
+            return false;
+        }
+        // Splice: chain[e.pos]'s brif becomes a jump over its cont edge;
+        // the latch re-tests `c` — continue to h on the same polarity the
+        // mid-exit used, exit on the moved exit edge.
+        let cargs: Vec<BlockArg> = e.cont_bc.args(&func.dfg.value_lists).collect();
+        let cblk = e.cont_bc.block(&func.dfg.value_lists);
+        func.replace(te).jump(cblk, &cargs);
+        let eargs: Vec<BlockArg> = e.exit_bc.args(&func.dfg.value_lists).collect();
+        let eblk = e.exit_bc.block(&func.dfg.value_lists);
+        let bargs: Vec<BlockArg> = back_bc.args(&func.dfg.value_lists).collect();
+        if e.epos == 0 {
+            func.replace(lt).brif(c, eblk, &eargs, h, &bargs);
+        } else {
+            func.replace(lt).brif(c, h, &bargs, eblk, &eargs);
+        }
+        if debug() {
+            eprintln!("punroll {name} block{}: sunk mid-chain test", h.as_u32());
+        }
+        return true;
+    }
+    false
+}
+
+fn run_loop(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: cranelift_codegen::loop_analysis::Loop,
+    h: Block,
+    name: &str,
+) -> Option<()> {
+    macro_rules! bail {
+        ($why:expr) => {{
+            if debug() {
+                eprintln!("punroll {name} block{}: {}", h.as_u32(), $why);
+            }
+            return None;
+        }};
+    }
+    let Walk {
+        chain,
+        mut mid_exits,
+        latch,
+        rotated,
+        body,
+    } = walk(func, cfg, dt, la, lp, h, name)?;
     // Loops already doing vector work (loopvec output, SIMD intrinsics) are
     // vf*UNROLL-wide in the element domain; cloning the body again pays a
     // fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
@@ -584,92 +862,10 @@ fn run_loop(
         bail!("backedge arity");
     }
 
-    let mut cnt: Option<Cnt> = None;
-    for (a, b, cc) in [(x, y, cond), (y, x, cond.swap_args())] {
-        let (le, signed) = match cc {
-            IntCC::UnsignedLessThan => (false, false),
-            IntCC::UnsignedLessThanOrEqual => (true, false),
-            IntCC::SignedLessThan => (false, true),
-            IntCC::SignedLessThanOrEqual => (true, true),
-            _ => continue,
-        };
-        let Some((pidx, d)) = affine_param(func, h, a) else {
-            continue;
-        };
-        let pty = func.dfg.value_type(hparams[pidx]);
-        if !pty.is_int() || pty.bits() < 16 || pty.bits() > 64 {
-            continue;
-        }
-        // Step: p's backedge value must be `p + s`, s a positive const.
-        let Some(bi) = func.dfg.value_def(cont_args[pidx]).inst() else {
-            continue;
-        };
-        let mut step = None;
-        if let InstructionData::Binary {
-            opcode: Opcode::Iadd,
-            args,
-        } = func.dfg.insts[bi]
-        {
-            for (px, sc) in [(args[0], args[1]), (args[1], args[0])] {
-                if param_idx(func, h, px) == Some(pidx)
-                    && let Some(s) = iconst(func, sc)
-                    && s > 0
-                {
-                    step = Some(s);
-                }
-            }
-        }
-        let Some(step) = step else { continue };
-        // Bound must be loop-invariant: defined outside the body, or a header
-        // param passed back unchanged (usable at hu as hu's own param).
-        let b = func.dfg.resolve_aliases(b);
-        let mut bpidx = None;
-        if let Some(bi) = func.dfg.value_def(b).inst() {
-            let Some(bb) = func.layout.inst_block(bi) else {
-                continue;
-            };
-            if body.contains(&bb) {
-                continue;
-            }
-            // Its def must dominate every entry edge into the loop.
-            if !cfg
-                .pred_iter(h)
-                .filter(|p| !body.contains(&p.block))
-                .all(|p| dt.dominates(bi, p.inst, &func.layout))
-            {
-                continue;
-            }
-        } else {
-            match func.dfg.value_def(b) {
-                // Bound is a header param passed back unchanged on the
-                // backedge (usable at hu as hu's own param).
-                cranelift_codegen::ir::ValueDef::Param(bb, q)
-                    if bb == h && cont_args[q] == b =>
-                {
-                    bpidx = Some(q);
-                }
-                // A param of any other block dominating h — e.g. a slice
-                // `len` arriving as an entry-block param — is likewise
-                // loop-invariant and usable at hu. (An in-body block can
-                // never dominate the header, so loop-carried values are
-                // still rejected.)
-                cranelift_codegen::ir::ValueDef::Param(bb, _)
-                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
-                _ => continue,
-            }
-        }
-        cnt = Some(Cnt {
-            pidx,
-            d,
-            step,
-            bound: b,
-            bpidx,
-            le,
-            signed,
-        });
-        break;
-    }
-    let Some(cnt) = cnt else { bail!("no counting test") };
+    let Some(cnt) = find_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &cont_args)
+    else {
+        bail!("no counting test")
+    };
 
     let ity = func.dfg.value_type(hparams[cnt.pidx]);
     // `bound - a0` must not wrap: <=32-bit counters widen to i64 (signed or
