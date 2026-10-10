@@ -775,3 +775,76 @@ Validation: cargo build clean; test.sh green incl. merged
 `edgespec` test; Rosetta std 5/5 + unwind 3/3; PLIRON_VERIFY=1
 clean on rmw_gate (scatter+RMW kernels), bigbench, std, unwind.
 rmw_gate checksums match stock.
+
+### hist decomp + bounded-index versioning (landed), matmul-64/chars decomp
+
+On `0e3af1a` (mirror-swap + scatter-gate + winline merged).
+
+**hist — precise decomp.** Inner loops, `c[a[i] as usize] += 1`
+(u8 in, 256-entry counts):
+
+- stock x64: 8x unrolled, **no bounds check** — LLVM versions on
+  the u8 type bound (`idx <= 255 < c.len` proven once outside),
+  then `movzbl (%rdi,%rcx),%r8d; incl (%rdx,%r8,4)` x8 ≈ 2.4
+  insns/elem.
+- pliron x64 (pre-fix): scalar `movzbl; cmpq; jae; addl $1;
+  addq; cmpq; jb` ≈ 7-8 insns/elem — the data-dependent check
+  stayed (bcheck only folded *affine* indices) + no unroll.
+- Same shape on aarch64 (pliron scalar+checked ~1.47x, not
+  beating stock in this build).
+
+**Fix landed — bounded-index checks in bcheck**
+(`PLIRON_BCHECK_UBOUND=0` to disable): when `affine()` fails, try
+`clifpeep::vmax` — a data-dependent index with a proven unsigned
+ceiling (`uload8`/`uload16` loads, `uextend`, `band` masks)
+synthesizes a constant `Aff{m:0, hi:bound}` so the guard is
+`tymax < len` — exactly LLVM's versioning. vmax itself gained
+`uload*` bounds and both-operand `band` recursion (depth-capped);
+it's `pub(crate)` for bcheck. Bound filter `<= 0xFFFF` avoids
+dead clones (u32-range bound never passes a real slice len).
+**Merge-flag: touched native's `src/bcheck.rs` again** (~50
+lines: `ubound`/`ubound_on` + the `None if ubound_on()` arm).
+
+Result: hist 0.463 -> **0.410** x64, 0.458 -> **0.408** aarch64
+(1.44x -> 1.28x). Fast loop = `movzbl; addl $1,(cnt,idx,4);
+addq; cmpq; jb` — 5 insns/elem, check gone.
+
+Caveat — degenerate single-key hist regresses ~1.3-1.6x (the
+same store->load forwarding-replay hazard the partial gate
+protects; a single check doesn't pass through that gate).
+Measured `/tmp/hist_alt.rs`: unversioned ~0.72 uniform vs
+versioned alt4 **0.34** / alt2 **0.46** (beats stock ~0.5-0.7!),
+but same-key 1.9-2.5 vs 0.72 — on BOTH arches (not Rosetta
+noise). Multi-key wins are 2x+; kept ungated, matching LLVM's
+own unconditional versioning. Remaining 1.28x vs stock is the
+8x unroll: bcheck's clone is a *rotated* loop (exit test at
+header top, plain `jump` latch back) and punroll's chain model
+needs a `brif`-to-header latch — "nonlinear chain" bail. Rotated-
+loop unroll support is punroll-invasive; flagged for native.
+
+**matmul-64 — root cause: vectorization, not dispatch.**
+`[[u32;64];64]` triple loop; PLIRON_PUNROLL/JAM/LOOPVEC toggles
+all no-ops (0.32 regardless). Stock LLVM vectorizes the
+k-reduction: a[i] row -> ymm0-7 once per i, b-column vectors
+built per j via `vmovd`/`vpinsrd` lane-gathers at 0x100 stride,
+`vpmulld`/`vpaddd` accumulate (~2.4 insn-equiv/element). Ours is
+scalar `imull; leal` per k (~7 insns). The strided (gather)
+reduction is beyond loopvec — needs either gather support or a
+k<->j interchange to the unit-stride outer-product form
+(`c[i][j..8] += a[i][k]*b[k][j..8]`). Both are feature-level
+work; documented, not fixed.
+
+**chars — ~11 vs ~7 insns/char** (`s.chars().count()`). Stock
+ASCII iter: `movzbl; testb; jns` -> `incq ptr; incq cnt; cmpq;
+je` (7), multi-byte advance folded into `sbbq $-0x1`. Ours adds:
+`testq %rdi,%rdi` null test (MIR Option-niche check not folded),
+`leaq 0x1(%rdi),%rsi; movq %rsi,%rdi` cursor copy (SSA param,
+not coalesced), and a rotated-loop jmp-to-top. No `bt`/
+is_whitespace content — pure UTF-8 width dispatch; same family
+as native's bytes-filter work, noted not duplicated.
+
+Validation: build clean; test.sh green; Rosetta std 5/5 +
+unwind 3/3; PLIRON_VERIFY=1 clean on hist_alt, bigbench, std,
+unwind; UBOUND=0/1 A/B confirmed on both arches; suite otherwise
+unchanged (gather/scatter/dot_u32/sum_u8 wins hold, checksums
+match stock).
