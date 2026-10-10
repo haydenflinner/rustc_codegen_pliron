@@ -1454,6 +1454,8 @@ fn cparm_round(func: &mut Function) -> usize {
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
     let mut param_drops: Vec<Value> = vec![];
+    // Per-home-block const cache for carried-chain params (see `mids`).
+    let mut mid_news: FxHashMap<(Block, Type, i64), Value> = FxHashMap::default();
     for (&b, rows) in &eargs {
         let ps = func.dfg.block_params(b).to_vec();
         let mut news: Vec<(Type, i64, Value)> = vec![];
@@ -1516,7 +1518,28 @@ fn cparm_round(func: &mut Function) -> usize {
                 };
                 repl.push((ix, v));
                 for m in mids {
-                    pmap.insert(m, v);
+                    // `m` is a param of some other block on the carried
+                    // chain; its uses live there, not under `b` — the
+                    // replacement const must be materialized in `m`'s own
+                    // home block or uses become non-dominating (alloc's
+                    // `Vec::into_boxed_slice` hit this: an iconst in a
+                    // sibling arm fed edges on two other arms).
+                    let home = match func.dfg.value_def(m) {
+                        ValueDef::Param(bm, _) => bm,
+                        _ => continue,
+                    };
+                    let mv = match mid_news.get(&(home, ty, imm)) {
+                        Some(&mv) => mv,
+                        None => {
+                            let mv = FuncCursor::new(&mut *func)
+                                .at_first_insertion_point(home)
+                                .ins()
+                                .iconst(ty, imm);
+                            mid_news.insert((home, ty, imm), mv);
+                            mv
+                        }
+                    };
+                    pmap.insert(m, mv);
                 }
             }
         }

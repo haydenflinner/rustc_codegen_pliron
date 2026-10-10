@@ -37,6 +37,10 @@ rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse && $out/pair
 # leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
 # iterator spun forever.
 rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec && $out/edgespec
+# cparm must materialize carried-chain constants in each carried param's
+# home block — one const in the join block leaves non-dominating uses on
+# sibling arms (Vec::into_boxed_slice / try_call edges hit the verifier).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/cparm/main.rs -o $out/cparm && $out/cparm
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user
