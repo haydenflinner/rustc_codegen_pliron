@@ -1003,3 +1003,56 @@ miscompiled, not just one path.
   (c) old-log Mach-O `__linkme*,regular,no_dead_strip` section-name
   ICE was from the STALE backend (Oct 8) — re-verify on the new
   build if it resurfaces.
+
+## Self-host / celim retry-operand fix (52c3338) + punroll shared-exit fix (73907a8)
+
+- Stage1 std build completed post-cparm-fix (core/alloc/std/test/
+  proc_macro all clean). Stage2 progressed to compiler deps, then a
+  pliron-compiled `blake3` build-script binary SIGSEGV'd inside
+  `cc`'s env handling — `BTreeMap::IntoIter::dying_next` null-deref.
+- Root cause (52c3338): `celim` normalizes an icmp with peeling; if
+  that decide fails it retries unpeeled, but passed the FIRST
+  normalization's raw operand pair. A `v223 == 0` query was decided
+  against `v492`'s range (`v492-1 != 0` from `v492 != 0` — wrong),
+  folding `depth-1 == 0` false so `dying_next` walked a dead link.
+  Repro: BTreeMap<u32,u32> insert n>=12 then drop -> SIGSEGV
+  (opt-level>=1). tests/celim/main.rs covers it.
+- Next stage2 failure: `miniz_oxide` `deflate::compress_inner` —
+  Cranelift egraph elaborate assert / verifier non-dominating use.
+  Root cause (73907a8): `ifconv2` aliased a live-out value to
+  in-body loads (`v6129 -> v758`); `punroll` then fed the shared
+  exit continuation (a block dominated by no single exit, reached
+  via both latch and side exits) from the peeled copies without the
+  loads ever running — an ambient use outside every cloneable exit
+  cone. `run_loop` never checked for that; `run_jam` already bails
+  on the same shape ("body value used outside"). run_loop now bails
+  too when a resolved body value is used in a reachable non-body
+  block outside `cone ∪ mid_exit.corder`s.
+- Not perf-validated: the bail only affects loops whose ambient
+  live-outs leak past multi-exit merges (observed: none in test.sh;
+  miniz_oxide compress_inner now skips the unroll). An LCSSA-style
+  param-threading recovery is possible follow-up if a hot loop
+  regresses.
+- test.sh: green on 73907a8 (one prior `sleep+instant` 5ms flake,
+  passes on rerun — timing-sensitive WASI test, not a regression).
+- Stage2 compiler rebuild running on 73907a8 backend.
+
+## Self-host / punroll second shared-continuation fix (f6c551d)
+
+- After 73907a8, stage2 hit `register allocation: EntryLivein` on
+  `rustc_lint_defs`; a new catch_unwind in lower.rs (4981375) named it
+  `Lint::parse_rust_version` — three sequential `parse_part` loops
+  whose exits converge on a shared continuation that ambiently uses
+  the third loop's params (`v325` in `block138`).
+- Root cause: the 73907a8 guard asked only that each ambient use sit
+  inside *some* exit's cone. `block138` is inside the latch cone, but
+  the peeled *side-exit* clone (`block181`) jumps to the original
+  shared `block136` — reached without the defining inst running.
+  The cone clone binds values only for the latch path.
+- Fix: per exit target, forward-walk non-body blocks; any ambient
+  body-value use must be dominated by that target (i.e. inside its
+  own cloneable cone) — otherwise bail. Both repros now clean;
+  tests/punroll/main.rs is the regression (ICE'd on 73907a8).
+- Over-bail check: no new bails across test.sh corpus.
+- Not perf-validated beyond test.sh; stage2 rebuild running on
+  f6c551d+4981375.
