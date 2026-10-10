@@ -280,65 +280,34 @@ fn normalize(
     }
 
     // Phase B: every remaining use of a desc param reads `isub(e, j)`.
+    // Scan ALL blocks, not just the loop body: a desc param also escapes
+    // through exit edges — e.g. `insert_tail`'s hole pointer is the iv's
+    // final value, read by the exit block after `brif stay, latch, exit`
+    // (leaving it as `j` turned the hole into a small integer pointer).
+    // Header-param uses are confined to blocks dominated by the header, so
+    // blocks outside can't reference `p` anyway. `inst_values`/`map_inst_values`
+    // cover inst args, branch-call args, and exception contexts uniformly.
     let mut subs: FxHashMap<(Block, Value), Value> = FxHashMap::default();
-    for &b in &info.body {
+    for b in func.layout.blocks().collect::<Vec<_>>() {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for i in insts {
             if i == ci || normed.contains(&i) {
                 continue;
             }
-            let mut repl: Vec<(usize, Value)> = Vec::new();
-            for (ai, &a) in func.dfg.inst_args(i).to_vec().iter().enumerate() {
+            let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
+            let uses: Vec<Value> = func.dfg.inst_values(i).collect();
+            for a in uses {
                 let p = func.dfg.resolve_aliases(a);
                 if desc.contains(&p) {
                     let (_, ev) = param_entry(&params, &info.entry_args, p);
                     let v = iv_sub(func, &mut subs, b, p, ev);
-                    repl.push((ai, v));
+                    repl.insert(a, v);
                 }
             }
             if !repl.is_empty() {
-                let args = func.dfg.inst_args_mut(i);
-                for (ai, v) in repl {
-                    args[ai] = v;
-                }
+                func.dfg
+                    .map_inst_values(i, |x| repl.get(&x).copied().unwrap_or(x));
             }
-        }
-        // Branch-call args on the block's terminators.
-        let t = func.layout.last_inst(b).unwrap();
-        let raw: Vec<(usize, usize, Value)> = func.dfg.insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .iter()
-            .enumerate()
-            .flat_map(|(slot, bc)| {
-                bc.args(&func.dfg.value_lists)
-                    .enumerate()
-                    .filter_map(move |(ai, a)| match a {
-                        BlockArg::Value(v) => Some((slot, ai, v)),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut repl: Vec<(usize, usize, Value)> = Vec::new();
-        for (slot, ai, v) in raw {
-            let p = func.dfg.resolve_aliases(v);
-            if desc.contains(&p) {
-                let (_, ev) = param_entry(&params, &info.entry_args, p);
-                let sv = iv_sub(func, &mut subs, b, p, ev);
-                repl.push((slot, ai, sv));
-            }
-        }
-        for (slot, ai, v) in repl {
-            let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[t]
-                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                [slot];
-            let mut cur = 0usize;
-            bc.update_args(&mut dfg.value_lists, |a| {
-                let r = if cur == ai { BlockArg::Value(v) } else { a };
-                cur += 1;
-                r
-            });
         }
     }
 

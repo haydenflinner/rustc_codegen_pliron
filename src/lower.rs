@@ -817,6 +817,25 @@ pub fn lower_to_object(
                 panic!("ivrefold broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Drop loop params whose only uses feed their own back-edge
+        // arg — dead recurrences (e.g. the i*4 byte-offset cursor
+        // indvars leaves when addressing moved to another param).
+        // Forward liveness can't see these: the param is "used" by
+        // its increment and the increment is "used" by the edge.
+        if crate::pass_enabled("PLIRON_DEADREC") && crate::bisect("deadrec") {
+            let k = crate::ivrefold::deadrecs(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("deadrec {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after deadrec ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("deadrec broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Drop block params that receive the same value on every
         // incoming edge (and merge duplicate params): each surviving
         // param costs a regalloc parallel copy per conditional pred —
@@ -853,6 +872,25 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // `uextend.i64 (load.i32)` -> `uload32.i64` + `ireduce.i32`: x64
+        // emits movl either way, but dropping the extension vreg frees
+        // regalloc from coalescing it (a stray `movq` showed up in
+        // loop bodies). Last transform before codegen — earlier passes
+        // match `Opcode::Load` and must still see the load.
+        if crate::pass_enabled("PLIRON_ULOAD32") && crate::bisect("uload32") {
+            let k = crate::clifpeep::uloads32(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("uload32 {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after uload32 ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("uload32 broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         if let Err(e) = m.define_function(id, &mut clctx) {

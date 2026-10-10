@@ -1790,7 +1790,7 @@ fn nonzero_iconst(func: &Function, v: Value) -> bool {
 /// Can `inst` be deleted when none of its results are used? Always true for
 /// `notrap` loads; with `pure`, also for side-effect-free, non-trapping ops
 /// (plus `udiv`/`urem` by a nonzero constant).
-fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
+pub(crate) fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
     let data = &func.dfg.insts[inst];
     if let InstructionData::Load { flags, .. } = *data {
         return func.dfg.mem_flags[flags].notrap();

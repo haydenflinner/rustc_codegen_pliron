@@ -17,10 +17,12 @@
 //! carried copy) are replaced by their entry value outright.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
+    Block, BlockArg, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData, Opcode,
+    Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -348,6 +350,134 @@ fn refold_header(
     }
     for &ix in &ixs {
         func.dfg.remove_block_param(params[ix]);
+    }
+    n
+}
+
+/// Uses of `v` that are all self-feeding into slot `ix` of header `h`:
+/// a pure-inst chain whose results end up only as the back-edge arg
+/// for `v`'s own slot. Edge-arg uses elsewhere or any impure use
+/// makes it live. Recursive (SSA def-use is a DAG; the only cycle is
+/// through `v`'s own slot, treated as a dead sink).
+fn self_feeding(
+    func: &Function,
+    h: Block,
+    ix: usize,
+    v: Value,
+    alias_targets: &FxHashSet<Value>,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    // Removing `v` (or the dead chain feeding it) must not strand an alias:
+    // `va -> v` survives removal and leaves any user of `va` dangling.
+    if alias_targets.contains(&v) {
+        return false;
+    }
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            // All inst args except branch-destination args (call args are
+            // variable-length, so `inst_fixed_args` would miss them).
+            for &a in func.dfg.inst_args(i) {
+                if func.dfg.resolve_aliases(a) != v {
+                    continue;
+                }
+                if !crate::jumpthread::removable(func, i, true) {
+                    return false;
+                }
+                for &r in func.dfg.inst_results(i) {
+                    if !self_feeding(func, h, ix, r, alias_targets, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            // Edge args: only the self-slot is a dead sink.
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let dst = bc.block(&func.dfg.value_lists);
+                for (s, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let BlockArg::Value(x) = a
+                        && func.dfg.resolve_aliases(x) == v
+                        && !(dst == h && s == ix)
+                    {
+                        return false;
+                    }
+                }
+            }
+            // Exception contexts are always real uses.
+            if let Some(et) = func.dfg.insts[i].exception_table()
+                && func.dfg.exception_tables[et]
+                    .items()
+                    .any(|x| matches!(x, ExceptionTableItem::Context(x) if func.dfg.resolve_aliases(x) == v))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Drop loop-carried params that are dead recurrences: `p`'s only uses
+/// feed the computation of `p`'s own back-edge arg (e.g. the classic
+/// `p -> iadd p,k -> jump h(...)` byte-offset cursor indvars leaves
+/// when the body's addressing moved to another param). Uses outside
+/// that chain keep `p` live. Returns slots eliminated.
+pub fn deadrecs(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let edges = edges_to(func);
+    // Values that are alias targets: removing them would strand the alias.
+    let alias_targets: FxHashSet<Value> = (0..func.dfg.num_values())
+        .map(Value::new)
+        .filter(|&v| func.dfg.value_is_alias(v))
+        .map(|v| func.dfg.resolve_aliases(v))
+        .collect();
+    let mut n = 0;
+    for h in func.layout.blocks().collect::<Vec<_>>() {
+        let params = func.dfg.block_params(h).to_vec();
+        if params.is_empty() {
+            continue;
+        }
+        let Some(es) = edges.get(&h) else {
+            continue;
+        };
+        // Only loops can hide a self-feeding recurrence.
+        if !es.iter().any(|&(i, _)| {
+            func.layout
+                .inst_block(i)
+                .is_some_and(|src| src == h || domtree.dominates(h, src, &func.layout))
+        }) {
+            continue;
+        }
+        let mut ixs = vec![];
+        for (ix, &p) in params.iter().enumerate() {
+            if self_feeding(func, h, ix, p, &alias_targets, 0) {
+                ixs.push(ix);
+            }
+        }
+        if ixs.is_empty() {
+            continue;
+        }
+        ixs.sort_unstable_by(|x, y| y.cmp(x));
+        for &(i, d) in es {
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[i].branch_destination_mut(
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+            )[d];
+            for &ix in &ixs {
+                bc.remove(ix, &mut dfg.value_lists);
+            }
+        }
+        for &ix in &ixs {
+            func.dfg.remove_block_param(params[ix]);
+        }
+        n += ixs.len();
+    }
+    if n > 0 {
+        crate::jumpthread::remove_dead_insts(func, true);
     }
     n
 }
