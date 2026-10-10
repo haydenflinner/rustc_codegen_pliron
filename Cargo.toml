@@ -45,3 +45,7 @@ cranelift-object = { path = "vendor/cranelift-object" }
 # x86-64 TLS @-modifier relocations (@tpoff/@dtpoff/@gottpoff/@tlsgd/@tlsld);
 # see vendor/rsasm/PLIRON_PATCH.md.
 rsasm = { path = "vendor/rsasm" }
+# `psadbw`/`vpsadbw` for the u8x16 byte-sum fold; see
+# vendor/cranelift-assembler-x64-meta/PLIRON_PATCH.md.
+cranelift-assembler-x64 = { path = "vendor/cranelift-assembler-x64" }
+cranelift-assembler-x64-meta = { path = "vendor/cranelift-assembler-x64-meta" }

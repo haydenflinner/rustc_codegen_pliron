@@ -96,19 +96,40 @@ already there.
   `extractlane`×4 + 3 scalar ops per accumulator instead of LLVM's
   psrldq+pminud shuffle tree — but it runs once per call (~30 uops vs
   ~2.5M in the loop), so it cannot explain any measurable gap. A
-  shuffle-tree epilogue would be a loopvec.rs change; not worth it.
+  shuffle-tree epilogue would be a loopvec.rs change; it IS expressible
+  in CLIF today without ISLE work (`shuffle` uimm128 masks already lower
+  to `pshufd`/`palignr` via the rules at lower.isle:4632+), but it's not
+  worth the churn — ~30 uops once per call.
 - `dot_i32` (indexing `a[i]*b[i]` form): `imul.i32x4` + `iadd.i32x4` →
   `pmulld`+`paddd` — optimal for i32 lanes (pmaddwd only applies to
   i16). Note: the `.iter().zip(b)` formulation does NOT vectorize
   (bounds-check shape hides the induction) — only the indexing form.
-- `sum_u8`: per 16 bytes, loopvec emits a 3-level uwiden tree
-  (u8x16→u16x8→u32x4→u64x2 = 6 unpacks) + `iadd.i64x2`. LLVM emits one
-  `psadbw x, zero` + `paddq`. **Structural blocker:** `psadbw` is not
-  bound in vendored cranelift-codegen's x64 ISLE *or* in
-  cranelift-assembler-x64 0.135.5 (crates.io dep) — wiring it means
-  vendoring/patching the assembler crate's meta tables. An ISLE-level
-  `pmaddubsw` fold exists (`x86_pmaddubsw` + `x64_pmaddubsw` are
-  already bound) but i16x8 partial sums still need 2-level widening to
-  i64, saving ~1 op/16B — marginal. The real fix (u32-lane accumulator
-  + periodic spill, or psadbw) is a loopvec restructure, punted.
-  Still measures 0.39 vs 0.70 stock (1.8x faster) under Rosetta.
+- `sum_u8`: **fixed** — see `psadbw` section below.
+
+### `psadbw` byte-sum fold (vendored assembler + new CLIF op)
+
+- `sum_u8` (`a[i] as u64` widening sum) emitted a 3-level `uwiden` tree
+  per u8x16 (6 unpacks + 2 iadd_pairwise + 2 iadd ≈ 10 vec ops) where
+  LLVM emits `psadbw x, zero` + `paddq`. The widen tree's per-byte lane
+  mapping doesn't align with psadbw's group sums, so no ISLE-only fold
+  was possible — the epilogue sums all lanes anyway, so any lane
+  grouping of the accumulator is legal.
+- Vendored `cranelift-assembler-x64` and `cranelift-assembler-x64-meta`
+  (0.135.5, path deps via `[patch.crates-io]`; meta is the assembler's
+  build-dep table crate — the actual encoding addition is one
+  `inst("psadbw", ...)`/`inst("vpsadbw", ...)` pair in
+  `instructions/avg.rs`). `cranelift-codegen-meta`'s assembler.isle
+  generator then emits `x64_psadbw_a_or_avx` for free.
+- New CLIF op `x86_psadbw` (i8x16,i8x16 → i64x2, real |a−b| group-sum
+  semantics) in codegen-meta `shared/instructions.rs`; `x64_psadbw`
+  decl in `isa/x64/inst.isle`; `lower.isle` rules lower it and fold a
+  `splat(iconst 0)` operand to `xmm_zero`.
+- loopvec: `widen_vec_into` emits `iadd(acc, x86_psadbw(chunk, splat0))`
+  for the unsigned u8→u64 unmasked-sum case, gated on a new `x64` flag
+  threaded from `run` (aarch64 keeps the pairwise-widen tree — uaddlp
+  folds already). Diff is ~12 lines plus signatures.
+- Result (Rosetta, x86-64-v3): sum_u8 **0.135 ms vs stock 0.693 ms**
+  (was 0.39 pre-fold; now ~5x stock). Disasm: one `psadbw xmm,zero` +
+  `paddq` per 16-byte group, zero reg hoisted. Correctness checked
+  n∈{0,1,7,…,4093,4096,1M} vs scalar reference; host ./test.sh and x86
+  std/unwind/asm/unroll/licm all green under Rosetta.

@@ -3003,6 +3003,26 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", I16x8)]),
     );
 
+    // PLIRON: SSE2 `psadbw` — with a zero `y` this is the u8x16 byte-sum
+    // reduction (sum_u8 / `a[i] as u64` loops) that otherwise costs a
+    // 3-level `uwiden` tree.
+    ig.push(
+        Inst::new(
+            "x86_psadbw",
+            r#"
+        An instruction with equivalent semantics to `psadbw` on x86.
+
+        Computes the sum of absolute differences of unsigned bytes in each
+        8-byte group: `a[i] = sum(|x[j] - y[j]| for j in group i)`, producing
+        two `i64` lanes from an `i8x16` pair. With `y` all-zero this sums the
+        bytes of `x` per group.
+            "#,
+            &formats.binary,
+        )
+        .operands_in(vec![Operand::new("x", I8x16), Operand::new("y", I8x16)])
+        .operands_out(vec![Operand::new("a", I64x2)]),
+    );
+
     ig.push(
         Inst::new(
             "uextend",
