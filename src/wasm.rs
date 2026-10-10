@@ -521,11 +521,15 @@ enum WPeek {
 /// byte offsets). Returns None — caller keeps the original bytes — on
 /// any opcode it can't decode.
 fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
-    // Locals prefix: vec of (count, valtype); copied verbatim.
+    // Locals prefix: vec of (count, valtype). waffle emits one group per
+    // local; re-emit adjacent same-type runs as a single group. This is
+    // index-preserving (merge only, never reorder), so it needs no other
+    // fixups and costs two bytes per eliminated group.
     let mut p = 0usize;
     let nl = urd(b, &mut p)?;
+    let mut groups: Vec<(u32, u8)> = Vec::new();
     for _ in 0..nl {
-        urd(b, &mut p)?;
+        let c = urd(b, &mut p)?;
         // Single-byte valtypes only (numeric/v128/funcref/externref);
         // typed refs (0x63/0x64 + heaptype) need a longer decode — bail.
         let t = *b.get(p)?;
@@ -533,8 +537,11 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         p += 1;
+        match groups.last_mut() {
+            Some((gc, gt)) if *gt == t => *gc += c,
+            _ => groups.push((c, t)),
+        }
     }
-    let locals_end = p;
     // Instruction stream: (kind, byte range). `depth` tracks structured
     // constructs so the scan stops on the `end` that closes the body.
     // `stack` additionally records each instruction's structured
@@ -1291,7 +1298,11 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
     }
     let mut nb = Vec::with_capacity(p);
-    nb.extend_from_slice(&b[..locals_end]);
+    leb(&mut nb, groups.len() as u32);
+    for &(c, t) in &groups {
+        leb(&mut nb, c);
+        nb.push(t);
+    }
     let mut wi = 0;
     while wi < ins.len() {
         let &(k, s, e, _) = &ins[wi];

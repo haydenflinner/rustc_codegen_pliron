@@ -239,6 +239,10 @@ struct Mapper<'m> {
     funcs: &'m [u32],
     globals: &'m [u32],
     types: &'m [u32],
+    /// Per global-import index: link-time constant for GOT.* imports
+    /// (data addresses and table slots) chosen for folding. Bodies read
+    /// them as `i32.const` instead of `global.get`.
+    gconsts: &'m [Option<i32>],
 }
 
 impl Reencode for Mapper<'_> {
@@ -257,6 +261,32 @@ impl Reencode for Mapper<'_> {
     }
     fn memory_index(&mut self, _: u32) -> Result<u32, ReError<Self::Error>> {
         Ok(0)
+    }
+    fn instruction<'a>(
+        &mut self,
+        arg: wp::Operator<'a>,
+    ) -> Result<we::Instruction<'a>, ReError<Self::Error>> {
+        // GOT globals hold link-time constants (data address, table
+        // slot); fold the read into an immediate like a static address.
+        if let wp::Operator::GlobalGet { global_index } = arg
+            && let Some(Some(v)) = self.gconsts.get(global_index as usize)
+        {
+            return Ok(we::Instruction::I32Const(*v));
+        }
+        wasm_encoder::reencode::utils::instruction(self, arg)
+    }
+}
+
+/// Length in bytes of `v` encoded as a signed LEB128.
+fn sleb_len(mut v: i32) -> u32 {
+    let mut n = 0;
+    loop {
+        n += 1;
+        let sign = v & 0x40 != 0;
+        v >>= 7;
+        if (v == 0 && !sign) || (v == -1 && sign) {
+            return n;
+        }
     }
 }
 
@@ -415,6 +445,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // the function/code/data/table sections.
     let mut live_f: HashSet<(usize, u32)> = HashSet::new();
     let mut live_d: HashSet<(usize, usize)> = HashSet::new();
+    // Per-object GOT global-import use counts in live bodies; the
+    // fold-or-keep decision below compares immediate size against the
+    // cost of keeping a GOT global entry.
+    let mut got_uses: HashMap<(usize, u32), u32> = HashMap::new();
     let mut wl: Vec<Def> = Vec::new();
     let roots: Vec<String> = if exports.is_empty() {
         included
@@ -474,9 +508,11 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                         | wp::Operator::GlobalSet { global_index: i } => {
                             if let Some((m, n)) = o.gimports.get(i as usize)
                                 && (m == "GOT.mem" || m == "GOT.func")
-                                && let Some(d) = resolve(oi, n)
                             {
-                                wl.push(d);
+                                *got_uses.entry((oi, i)).or_insert(0) += 1;
+                                if let Some(d) = resolve(oi, n) {
+                                    wl.push(d);
+                                }
                             }
                         }
                         _ => {}
@@ -650,31 +686,48 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let n_synth = trip as u32;
     let mut gvals: Vec<u32> = Vec::new();
     let mut gmaps: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut gconsts: HashMap<usize, Vec<Option<i32>>> = HashMap::new();
     for &oi in &included {
         let mut m = Vec::new();
-        for (module, n) in &objs[oi].gimports {
-            m.push(match (module.as_str(), n.as_str()) {
-                ("env", "__stack_pointer") => 0,
-                ("env", "__pliron_trip") => 1,
+        let mut gc = Vec::new();
+        for (gi, (module, n)) in objs[oi].gimports.iter().enumerate() {
+            let (g, c) = match (module.as_str(), n.as_str()) {
+                ("env", "__stack_pointer") => (0, None),
+                ("env", "__pliron_trip") => (1, None),
                 ("GOT.mem", s) | ("GOT.func", s) => {
-                    // A GOT entry only dead functions consult is dropped;
-                    // their bodies are never emitted, so the map slot is
-                    // never read. Symbols without a definition are
-                    // linker-synthesized (__heap_base, __pliron_eh, host
-                    // functions): always keep them.
+                    // GOT entries are link-time constants, so bodies can
+                    // read them as i32.const (see Mapper::instruction)
+                    // instead of keeping an immutable GOT global around.
+                    // But a large address encodes wider than a small
+                    // global index: fold only when the immediate form is
+                    // no bigger overall than the global it replaces.
+                    // Dead targets are only consulted by dead bodies.
                     let live = resolve(oi, s).is_none_or(|d| is_live(d));
-                    if live {
-                        let v = value_of(oi, s, module == "GOT.func", &mut table)?;
-                        gvals.push(v);
-                        n_synth + gvals.len() as u32
+                    if !live {
+                        (0, None)
                     } else {
-                        0
+                        let v = value_of(oi, s, module == "GOT.func", &mut table)?;
+                        let uses = got_uses.get(&(oi, gi as u32)).copied().unwrap_or(0);
+                        if uses * (1 + sleb_len(v as i32)) <= 8 + uses * 3 {
+                            (0, Some(v as i32))
+                        } else {
+                            gvals.push(v);
+                            (n_synth + gvals.len() as u32, None)
+                        }
                     }
                 }
-                (m, s) => return Err(format!("{}: unknown global import {m}.{s}", objs[oi].name)),
-            });
+                (m, s) => {
+                    return Err(format!(
+                        "{}: unknown global import {m}.{s}",
+                        objs[oi].name
+                    ));
+                }
+            };
+            m.push(g);
+            gc.push(c);
         }
         gmaps.insert(oi, m);
+        gconsts.insert(oi, gc);
     }
 
     // Data bytes with relocations applied.
@@ -857,6 +910,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             funcs: &fmaps[&oi],
             globals: &gmaps[&oi],
             types: &tmaps[&oi],
+            gconsts: &gconsts[&oi],
         };
         for (i, b) in objs[oi].bodies.iter().enumerate() {
             if !live_f.contains(&(oi, i as u32)) {
