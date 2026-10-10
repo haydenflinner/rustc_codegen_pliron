@@ -179,3 +179,16 @@ mid-chain `brif` to a cold panic block, and the old chain walk treated any
   n=0..4096 hash test identical to stock; bc_sem panics identically through
   catch_unwind; PLIRON_VERIFY clean on scatter/main/wide; host test.sh
   green; x64 nostd/std/unwind/asm/unroll/licm pass under Rosetta.
+
+## Merged: native a247049 + x64 4371c82 (combined -> bc1faa1)
+Native: count-down vector IV (rev_copy32 latch now sub+cbnz LLVM-shape),
+bcheck skips <2-fold versioning (hist 1.12->0.61), clifpeep coldargs +
+fusechains passes (PLIRON_COLDARG/PLIRON_FUSE, default on, bisect-gated).
+x64: punroll mid-chain side exits — segmented emission + shared cold-block
+clones; scatter gather -12% -> parity (0.485 vs 0.491).
+Verified on combined merge: cargo build clean, FULL test.sh green
+(nostd/std/unwind/asm/proc-macro/wasm/wasi/EH all pass).
+Remaining: scatter hist ~7% x64 / ~1.4x aarch64 (regalloc edge-coalescing
+artifact, bigger blast radius — ranked #1 residual in native-notes.md);
+matmul deeper tiling; RMW tight-loop store-forward replay; punroll
+multi-exit for hist_unchecked.
