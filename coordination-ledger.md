@@ -843,3 +843,25 @@ Track as x64 agent follow-up.
   edge cases (x=0, lo=hi, u32::MAX bound) == scalar ref; filt_edge
   mixed-width boundary lens 0..129; filt_probe/filt2/panic_bcheck/
   charcheck outputs identical to stock. x64 not measured (aarch64 host).
+
+## Merged: contains-parity+cparm (0790709) + punroll sink_test (3112404) + wasm wrange fixes (13b866e)
+- contains() at PARITY (0.263-0.278 vs 0.257): Widen::Cnt nested-select
+  decomposition acc+d*(c1&c2); u32 two-compare range reduction emits
+  cmhs.4s x2 + uaddw accumulators, punroll'd x4.
+- cparm: const-fed param drops chasing virtual uniform-param links —
+  replaces early sameargs (chars_alpha_ascii regression). ifconv
+  chained arms gated by flat_loop — keeps count-if gains, no UTF-8
+  branch regression. Fixed resolve_aliases ICE.
+- punroll: rotated jump-latch unrolling + sink_test — matmul-64
+  3.4x->1.45x (residual = strided B-column SIMD vs scalar, loopvec
+  stream_addr can't gather). gather/scatter x64 now WIN.
+- wasm x2 REAL MISCOMPILES: wrange use-before-def (appended values
+  used earlier in block) + mul->shl wrong operand with both-const
+  (dlmalloc OOB). Plus waddr memarg offsets, loop_licm frozen-param
+  hoists, wdce dead-deref loads, inline-attr honoring.
+- wbig: 1.83x size, ~1.29x runtime vs stock.
+- DISK: cleaned /tmp/pliron-head + incremental caches (1.1G->16G free);
+  watch target/ dirs (~190G total across 4 checkouts).
+- Remaining: chars ~2.2x native (UTF-8 select chains — post-inc idiom
+  or SIMD decode), tokenize ~2.4x, matmul-64 strided-vec, wasm
+  transition-ptr reload (unhoistable through clobber-unknown call).
