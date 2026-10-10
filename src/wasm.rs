@@ -543,6 +543,10 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     // the producer (and can therefore never observe its value).
     let mut ins: Vec<(WPeek, usize, usize, usize)> = Vec::new();
     let mut ctx: Vec<Vec<(u32, u8)>> = Vec::new();
+    // Opcode per decode-time ins index: ctx entries record the
+    // construct's decode index, which coalescing below makes stale as
+    // an `ins` index — `dop` keeps it resolvable.
+    let mut dop: Vec<u8> = Vec::new();
     let mut stack: Vec<(u32, u8)> = Vec::new();
     let mut depth = 0i32;
     loop {
@@ -562,6 +566,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 if let Some(top) = stack.last_mut() {
                     top.1 = 1;
                 }
+                dop.push(op);
                 ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
                 continue;
             }
@@ -570,12 +575,14 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 sleb_skip(b, &mut p)?; // blocktype: valtype or type index
                 ctx.push(stack.clone());
                 stack.push((ins.len() as u32, 0));
+                dop.push(op);
                 ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
                 continue;
             }
             0x0b => {
                 depth -= 1;
                 ctx.push(stack.clone());
+                dop.push(op);
                 ins.push((WPeek::Ctl, s, p, ctx.len() - 1));
                 stack.pop();
                 if depth < 0 {
@@ -664,6 +671,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             _ => return None, // 0xfb GC, 0xfd SIMD, 0xfe atomics, EH ops
         };
         ctx.push(stack.clone());
+        dop.push(op);
         ins.push((k, s, p, ctx.len() - 1));
     }
     if p != b.len() {
@@ -702,6 +710,334 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         ins = out;
         if !changed {
             break;
+        }
+    }
+    // Materialization forwarding: waffle's treeify only inlines pure
+    // ops, so every load / non-pure result gets `P; local.set t` then a
+    // later `local.get t` — LLVM instead keeps such values on the
+    // operand stack, which is why its loops are ~40% shorter. When t is
+    // defined exactly once (that set) and read exactly once (a later
+    // `local.get`), we can replay P at the use site and drop both local
+    // ops. P must be a self-contained stack unit — net effect +1 and
+    // never consuming values pushed before it — composed only of
+    // "transparent" instrs: no control flow, no local/global writes,
+    // no stores/calls (loads and pure ops may reorder freely; a load
+    // moving across another load changes only trap order, which is
+    // unobservable). Everything between a forwarded set and its use
+    // must be transparent too — an `else`, a `local.set` of another
+    // local, or a store between them makes the move unsafe (the use
+    // could observe a different local value, or a load could cross a
+    // store). Stack shape is preserved exactly: each producer replayed
+    // at its use contributes the +1 the deleted `local.get` provided.
+    if !std::env::var_os("PLIRON_WASM_FWD")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        // Stack (pops, pushes) for instrs allowed inside producers and
+        // in set->use gaps. None = opaque (barrier).
+        let tr = |i: usize| -> Option<(u32, u32)> {
+            match ins[i].0 {
+                WPeek::Get(_) => Some((0, 1)),
+                WPeek::Other => {
+                    let op = b[ins[i].1];
+                    Some(match op {
+                        0x01 => (0, 0),        // nop
+                        0x1a => (1, 0),        // drop
+                        0x1b | 0x1c => (3, 1), // select
+                        0x23 => (0, 1),        // global.get
+                        0x28..=0x35 => (1, 1), // loads
+                        0x41..=0x44 => (0, 1), // consts
+                        0x45 | 0x50 => (1, 1), // eqz
+                        0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
+                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => (1, 1),
+                        0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => (2, 1),
+                        0xa7..=0xc4 => (1, 1), // conversions
+                        0xd1 | 0xd2 => (0, 1), // ref.null / ref.func
+                        _ => return None,
+                    })
+                }
+                _ => None,
+            }
+        };
+        let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        let mut defs: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (i, &(k, _, _, _)) in ins.iter().enumerate() {
+            match k {
+                WPeek::Get(l) => uses.entry(l).or_default().push(i),
+                WPeek::Set(l) => defs.entry(l).or_default().push(i),
+                WPeek::Tee(l) => {
+                    uses.entry(l).or_default().push(i);
+                    defs.entry(l).or_default().push(i);
+                }
+                _ => {}
+            }
+        }
+        // Forwardable `local.set t` at i: u is the ONLY use of t in the
+        // window (i, next def of t) — so deleting the set cannot leave
+        // a stale read: uses before i read an earlier def, uses after
+        // the next def read a newer one, and we replace u itself with
+        // the producer. Multi-def locals (temps reused across unrolled
+        // copies) forward fine under this rule.
+        // Instruction a and b sit in different arms of the same `if`
+        // when their enclosing-construct lists first differ by arm.
+        let arm_div = |a: usize, b2: usize| -> bool {
+            let (a, b2) = (&ctx[ins[a].3], &ctx[ins[b2].3]);
+            for k in 0..a.len().min(b2.len()) {
+                if a[k].0 != b2[k].0 {
+                    return false;
+                }
+                if a[k].1 != b2[k].1 {
+                    return true;
+                }
+            }
+            false
+        };
+        // A later def d of a local provably rewrites the value before
+        // use u reads it only when d's context encloses u's (same
+        // construct path and arm — it can't be skipped) and no
+        // branch-family instruction between them can hop over d. A def
+        // on a conditional arm never covers: paths that skip it still
+        // observe the earlier value.
+        let covers = |d: usize, u: usize| -> bool {
+            let (cd, cu) = (&ctx[ins[d].3], &ctx[ins[u].3]);
+            cd.len() <= cu.len()
+                && cu[..cd.len()] == cd[..]
+                && !(d + 1..u).any(|k| {
+                    matches!(ins[k].0, WPeek::Ctl) && matches!(b[ins[k].1], 0x0c | 0x0d | 0x0e)
+                })
+        };
+        let fwd = |i: usize, del: &[bool]| -> Option<(u32, usize)> {
+            let WPeek::Set(t) = ins[i].0 else { return None };
+            if del[i] || !defs.get(&t).map(|v| v.contains(&i)).unwrap_or(false) {
+                return None;
+            }
+            // A read positioned before the set can observe its value
+            // through a `loop` back-edge feeding the next iteration —
+            // that makes the set unforwardable outright (the producer
+            // can never be moved backwards to it).
+            if uses
+                .get(&t)
+                .map(|v| {
+                    v.iter().any(|&u| {
+                        u < i
+                            && !del[u]
+                            && !arm_div(i, u)
+                            && ctx[ins[i].3].iter().any(|e| {
+                                dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e)
+                            })
+                    })
+                })
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            // The use must be the *only* later-positioned reader that
+            // can observe this set's value: any use not covered by a
+            // following def (conditional defs don't cover — paths that
+            // skip them still see this value). A read inside a
+            // conditional arm counts as a reader too — it just can't
+            // serve as the splice target below.
+            let w: Vec<usize> = uses
+                .get(&t)
+                .map(|v| {
+                    v.iter()
+                        .copied()
+                        .filter(|&u| {
+                            if del[u] || u <= i || arm_div(i, u) {
+                                return false;
+                            }
+                            !defs
+                                .get(&t)
+                                .map(|v| {
+                                    v.iter().any(|&d| {
+                                        d > i && d < u && !del[d] && covers(d, u)
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let [u] = w.as_slice() else { return None };
+            // Splice-target validity: every path reaching u must pass
+            // through i, and the producer can't gain conditionality —
+            // an `if` construct on either side of the context LCP
+            // means some path observes a different value (or the
+            // producer, possibly trapping, no longer always runs).
+            {
+                let (ci, cu) = (&ctx[ins[i].3], &ctx[ins[*u].3]);
+                let lcp = ci
+                    .iter()
+                    .zip(cu.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if ci[lcp..]
+                    .iter()
+                    .chain(&cu[lcp..])
+                    .any(|e| dop[e.0 as usize] == 0x04)
+                {
+                    return None;
+                }
+            }
+            if !matches!(ins[*u].0, WPeek::Get(_)) {
+                return None;
+            }
+            Some((t, *u))
+        };
+        // Minimal self-contained producer suffix of `slice` (instrs in
+        // [lo, hi)): walk the stack need backwards; the suffix starts
+        // where the need first reaches 0 with no negative dip.
+        let prod_start = |lo: usize, hi: usize| -> Option<usize> {
+            let mut need: i32 = 1;
+            for k in (lo..hi).rev() {
+                let (p, q) = tr(k)?;
+                need -= q as i32;
+                if need < 0 {
+                    return None;
+                }
+                need += p as i32;
+                if need == 0 {
+                    return Some(k);
+                }
+            }
+            if need == 0 {
+                Some(lo)
+            } else {
+                None
+            }
+        };
+        let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+        let mut del = vec![false; ins.len()]; // forwarded sets + moved producers
+        let mut splice: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut i = 0;
+        while i < ins.len() {
+            if fwd(i, &del).is_none() {
+                i += 1;
+                continue;
+            }
+            // Chain: [transparent run][fwd set]+. The transparent run
+            // before each set yields its producer suffix.
+            let mut segsets: Vec<(usize, u32, usize)> = Vec::new(); // (set, t, use)
+            let mut j = i;
+            loop {
+                match fwd(j, &del) {
+                    Some((t, u)) => {
+                        segsets.push((j, t, u));
+                        j += 1;
+                    }
+                    None => break,
+                }
+                // Instrs until the following set must be transparent;
+                // anything else ends the segment.
+                while j < ins.len()
+                    && !matches!(ins[j].0, WPeek::Set(_))
+                    && !del[j]
+                    && tr(j).is_some()
+                {
+                    j += 1;
+                }
+                if j >= ins.len() || !matches!(ins[j].0, WPeek::Set(_)) {
+                    break;
+                }
+            }
+            // Largest prefix of segsets whose uses all land after its
+            // last set inside a transparent tail. A later set whose
+            // producer would swallow earlier uses (e.g. the
+            // loop-carried accumulator's) just truncates the chain.
+            let mut k = segsets.len();
+            let mut pvec: Vec<(usize, usize)> = Vec::new();
+            let mut umax = 0usize;
+            while k > 0 {
+                let last = segsets[k - 1].0;
+                umax = segsets[..k].iter().map(|&(_, _, u)| u).max().unwrap();
+                let tail_ok = segsets[..k].iter().all(|&(_, _, u)| u > last)
+                    && (last + 1..=umax).all(|k2| tr(k2).is_some());
+                if !tail_ok {
+                    k -= 1;
+                    continue;
+                }
+                // Producer slice per set: self-contained suffix of the
+                // transparent run since the previous set (or before
+                // the first). Must not contain a use position or an
+                // already-moved/deleted instr.
+                let mut plo = {
+                    let mut lo = segsets[0].0;
+                    while lo > 0 && tr(lo - 1).is_some() {
+                        lo -= 1;
+                    }
+                    lo
+                };
+                let mut good = true;
+                pvec.clear();
+                // A producer that reads a forwarded temp would observe
+                // its deleted set's value: replaying it at the use site
+                // would see the pre-segment local instead.
+                let temps: FxHashSet<u32> =
+                    segsets[..k].iter().map(|&(_, t, _)| t).collect();
+                for &(s, _, _) in &segsets[..k] {
+                    match prod_start(plo, s) {
+                        Some(ps)
+                            if (ps..s).all(|m| !del[m] && !splice.contains_key(&m))
+                                && !(ps..s).any(|m| {
+                                    matches!(ins[m].0, WPeek::Get(l2) if temps.contains(&l2))
+                                })
+                                // Nor may it read a local whose def was
+                                // already deleted by an earlier
+                                // forwarding — the producer would replay
+                                // against the pre-segment value.
+                                && !(ps..s).any(|m| {
+                                    matches!(ins[m].0, WPeek::Get(l2) | WPeek::Tee(l2)
+                                        if defs.get(&l2).map(|v| {
+                                            v.iter().any(|&d| del[d])
+                                        }).unwrap_or(false))
+                                }) =>
+                        {
+                            pvec.push((ps, s));
+                        }
+                        _ => {
+                            good = false;
+                            break;
+                        }
+                    }
+                    plo = s + 1;
+                }
+                if good {
+                    break;
+                }
+                k -= 1;
+            }
+            if k == 0 {
+                i += 1;
+                continue;
+            }
+            if verbose {
+                eprintln!("wsched: fwd {k} mats at set@{}", ins[segsets[0].0].1);
+            }
+            for (m, &(s, _, u)) in segsets[..k].iter().enumerate() {
+                let (ps, pe) = pvec[m];
+                for m2 in ps..pe {
+                    del[m2] = true;
+                }
+                del[s] = true;
+                splice.insert(u, (ps..pe).collect());
+            }
+            i = umax + 1;
+        }
+        if !splice.is_empty() {
+            let mut ni: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+            for (i, &e) in ins.iter().enumerate() {
+                if del[i] {
+                    continue;
+                }
+                if let Some(pr) = splice.get(&i) {
+                    for &m in pr {
+                        ni.push(ins[m]);
+                    }
+                    continue;
+                }
+                ni.push(e);
+            }
+            ins = ni;
         }
     }
     // Store-forward parallel copies: waffle lowers `br blk(v1..vn)` by
@@ -956,7 +1292,32 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     }
     let mut nb = Vec::with_capacity(p);
     nb.extend_from_slice(&b[..locals_end]);
-    for &(k, s, e, _) in &ins {
+    let mut wi = 0;
+    while wi < ins.len() {
+        let &(k, s, e, _) = &ins[wi];
+        // `i32.load*; i64.extend_i32_{s,u}` pairs that only became
+        // adjacent after scheduling fuse here into the single wide
+        // load (`i64.load{8,16,32}_{s,u}`); memarg bytes carry over.
+        if let (WPeek::Other, Some(&(WPeek::Other, s2, _, _))) = (k, ins.get(wi + 1)) {
+            let mop = match (b[s], b[s2]) {
+                (0x28, 0xac) => Some(0x34), // i64.load32_s
+                (0x28, 0xad) => Some(0x35), // i64.load32_u
+                (0x2c, 0xac) => Some(0x30), // i64.load8_s
+                (0x2d, 0xad) => Some(0x31), // i64.load8_u
+                (0x2e, 0xac) => Some(0x32), // i64.load16_s
+                (0x2f, 0xad) => Some(0x33), // i64.load16_u
+                (0x29, 0xc2) => Some(0x30), // i64.load + extend8_s
+                (0x29, 0xc3) => Some(0x32), // i64.load + extend16_s
+                (0x29, 0xc4) => Some(0x34), // i64.load + extend32_s
+                _ => None,
+            };
+            if let Some(mop) = mop {
+                nb.push(mop);
+                nb.extend_from_slice(&b[s + 1..e]);
+                wi += 2;
+                continue;
+            }
+        }
         match k {
             WPeek::Get(n) => {
                 nb.push(0x20);
@@ -973,6 +1334,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
             WPeek::Del => {}
         }
+        wi += 1;
     }
     Some(nb)
 }
@@ -1322,16 +1684,19 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         }
     }
 
-    fn ma(&self, off: u64) -> MemoryArg {
+    fn ma(&self, off: u64, bytes: u64) -> MemoryArg {
+        // Hint natural alignment like LLVM: the wasm align immediate
+        // is advisory only (misaligned access still works), and a
+        // 1-byte hint can steer engines to conservative codegen.
         MemoryArg {
-            align: 0,
+            align: bytes.trailing_zeros(),
             offset: off as u32,
             memory: self.o.mem,
         }
     }
 
     fn load(&mut self, t: ClType, p: WV, off: u64) -> WV {
-        let memory = self.ma(off);
+        let memory = self.ma(off, t.bytes() as u64);
         let (o, ty) = match t {
             clt::I8 => (O::I32Load8U { memory }, WT::I32),
             clt::I16 => (O::I32Load16U { memory }, WT::I32),
@@ -1345,7 +1710,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
     }
 
     fn store(&mut self, t: ClType, v: WV, p: WV, off: u64) {
-        let memory = self.ma(off);
+        let memory = self.ma(off, t.bytes() as u64);
         let o = match t {
             clt::I8 => O::I32Store8 { memory },
             clt::I16 => O::I32Store16 { memory },
@@ -3497,7 +3862,13 @@ fn wloop_opt(b: &mut FunctionBody, sp: waffle::Global) {
     // join the unroll worklist.
     let mut extra: Vec<(WBlock, FxHashSet<WBlock>)> = Vec::new();
     for (h, inloop) in &loops {
-        if let Some(cl) = wbcheck(b, &mut defb, &cfg, inloop, *h) {
+        if std::env::var_os("PLIRON_WASM_BCHECK")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(cl) = wbcheck(b, &mut defb, &cfg, inloop, *h, &loops) {
             extra.push(cl);
         }
     }
@@ -4091,12 +4462,43 @@ fn wunroll(
     let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
     // Size limits: unrolling is a tradeoff, not a free win. Scale the
     // copy count down for larger bodies — a 64-inst loop gets 2 copies,
-    // a tiny one gets the full 8.
-    let insts: usize = inloop.iter().map(|&lb| b.blocks[lb].insts.len()).sum();
+    // a tiny one gets the full 8. `unreachable` panic sinks are cold:
+    // they inflate the raw CFG shape but not the hot path, so count
+    // them separately when deciding whether the loop is worth cloning.
+    let sink_blocks: usize = inloop
+        .iter()
+        .filter(|&&lb| cloneable_sink(b, lb))
+        .count();
+    let insts: usize = inloop
+        .iter()
+        .filter(|&&lb| !cloneable_sink(b, lb))
+        .map(|&lb| b.blocks[lb].insts.len())
+        .sum();
+    let eff_blocks = inloop.len() - sink_blocks;
     let copies = copies.min((256 / insts.max(1)).max(2));
-    if copies < 2 || inloop.len() > 16 || insts > 64 {
+    if copies < 2 || eff_blocks > 16 || insts > 64 {
         if verbose {
-            eprintln!("wunroll: {h} skipped size blocks={} insts={insts}", inloop.len());
+            eprintln!(
+                "wunroll: {h} skipped size blocks={eff_blocks}+{sink_blocks} insts={insts}"
+            );
+            for &lb in inloop {
+                eprintln!(
+                    "wunroll:   {lb} insts={} term={:?} -> {:?} {}",
+                    b.blocks[lb].insts.len(),
+                    std::mem::discriminant(&b.blocks[lb].terminator),
+                    {
+                        let mut ts = Vec::new();
+                        b.blocks[lb].terminator.visit_targets(|t| ts.push(t.block));
+                        ts
+                    },
+                    match &b.blocks[lb].terminator {
+                        Terminator::CondBr { cond, .. } => {
+                            format!("cond={:?}", b.values[b.resolve_alias(*cond)])
+                        }
+                        _ => String::new(),
+                    }
+                );
+            }
         }
         return;
     }
@@ -4105,6 +4507,12 @@ fn wunroll(
     }
     let mut order: Vec<WBlock> = inloop.iter().copied().collect();
     order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
+    let flat_ok = !std::env::var_os("PLIRON_WASM_FLAT")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+    if flat_ok && wunroll_flat(b, defb, inloop, h, copies, &order) {
+        return;
+    }
     // Build the copies.
     let mut heads = vec![h];
     let mut copies_blocks: Vec<Vec<WBlock>> = Vec::new();
@@ -4131,6 +4539,188 @@ fn wunroll(
         }
     }
     b.recompute_edges();
+}
+
+/// Flat unrolling for canonical counted loops `iv <u n` stepping by a
+/// uniform constant: test once per `copies` iterations rather than once
+/// per cloned body. A new header `hT` tests `iv <s t64` where the
+/// preheader computes `t64 = n - (copies-1)*step` in i64 (no wrap:
+/// negative just means fewer than `copies` iterations remain). Every
+/// clone's header test is replaced by an unconditional branch to its
+/// pass arm — entering a group guarantees all `copies` iterations are
+/// in-trip. The original loop is the remainder: `hT`'s fail edge feeds
+/// it the live params and its per-iteration test finishes the tail.
+/// Returns false when the loop lacks the canonical shape.
+fn wunroll_flat(
+    b: &mut FunctionBody,
+    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
+    inloop: &FxHashSet<WBlock>,
+    h: WBlock,
+    copies: usize,
+    order: &[WBlock],
+) -> bool {
+    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let Terminator::CondBr {
+        cond,
+        if_true,
+        if_false,
+    } = &b.blocks[h].terminator
+    else {
+        return false;
+    };
+    let Some((iv, n, pass_true)) = as_check(b, *cond) else {
+        return false;
+    };
+    let (pass, _) = if pass_true {
+        (if_true, if_false)
+    } else {
+        (if_false, if_true)
+    };
+    if !inloop.contains(&pass.block) || pass.block == h {
+        return false;
+    }
+    if !winv(b, defb, inloop, n) {
+        return false;
+    }
+    let ValueDef::BlockParam(hb, pidx, WT::I32) = b.values[iv] else {
+        return false;
+    };
+    if hb != h {
+        return false;
+    }
+    // Uniform positive constant step on iv across all latches (an
+    // unchanged feed contributes 0 like wbcheck's rule).
+    let latches: Vec<(WBlock, usize)> = b.blocks[h]
+        .preds
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| inloop.contains(p))
+        .map(|(j, &p)| (p, b.blocks[h].pos_in_pred_succ[j]))
+        .collect();
+    if latches.is_empty() {
+        return false;
+    }
+    let mut step: Option<i64> = None;
+    for &(la, tidx) in &latches {
+        let arg = edge_arg(b, la, tidx, pidx as usize);
+        let arg = b.resolve_alias(arg);
+        let s = if arg == iv {
+            0
+        } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
+            let u = b.resolve_alias(b.arg_pool[aa][0]);
+            let v = b.resolve_alias(b.arg_pool[aa][1]);
+            let s = if u == iv {
+                wconst(b, v)
+            } else if v == iv {
+                wconst(b, u)
+            } else {
+                None
+            };
+            match s {
+                Some(s) => s,
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        match step {
+            None => step = Some(s),
+            Some(st) if st == s => {}
+            _ => return false,
+        }
+    }
+    let Some(step) = step else { return false };
+    if step <= 0 {
+        return false;
+    }
+    // Outside edges retarget to the new group header.
+    let edges = outside_edges(b, h, inloop);
+    // `copies` clones of the whole loop; each clone's header keeps its
+    // params but loses the trip test.
+    let mut heads = Vec::new();
+    let mut blocks_of = Vec::new();
+    for _ in 0..copies {
+        let (bmap, _) = clone_loop(b, defb, order);
+        let ch = bmap[&h];
+        let pt = match &b.blocks[ch].terminator {
+            Terminator::CondBr {
+                if_true, if_false, ..
+            } => {
+                if pass_true {
+                    if_true.clone()
+                } else {
+                    if_false.clone()
+                }
+            }
+            _ => return false,
+        };
+        b.blocks[ch].terminator = Terminator::Br { target: pt };
+        heads.push(ch);
+        blocks_of.push(order.iter().map(|lb| bmap[lb]).collect::<Vec<_>>());
+    }
+    // The group header mirrors h's params and tests once per group:
+    // t64 = n - (copies-1)*step in i64 (no wrap: a negative result just
+    // means fewer than `copies` iterations remain, which the signed
+    // compare reports correctly).
+    let h_t = b.add_block();
+    let mut htp = Vec::new();
+    for &(ty, _) in &b.blocks[h].params.clone() {
+        let np = b.add_blockparam(h_t, ty);
+        defb[np] = h_t;
+        htp.push(np);
+    }
+    let nm = mat_inv(b, defb, inloop, h_t, n);
+    let n64 = b.add_op(h_t, O::I64ExtendI32U, &[nm], &[WT::I64]);
+    defb[n64] = h_t;
+    let cc = b.add_op(
+        h_t,
+        O::I64Const {
+            value: ((copies as i64 - 1) * step) as u64,
+        },
+        &[],
+        &[WT::I64],
+    );
+    defb[cc] = h_t;
+    let t64 = b.add_op(h_t, O::I64Sub, &[n64, cc], &[WT::I64]);
+    defb[t64] = h_t;
+    let iv64 = b.add_op(h_t, O::I64ExtendI32U, &[htp[pidx as usize]], &[WT::I64]);
+    defb[iv64] = h_t;
+    let cond_t = b.add_op(h_t, O::I64LtS, &[iv64, t64], &[WT::I32]);
+    defb[cond_t] = h_t;
+    b.set_terminator(
+        h_t,
+        Terminator::CondBr {
+            cond: cond_t,
+            if_true: BlockTarget {
+                block: heads[0],
+                args: htp.clone(),
+            },
+            if_false: BlockTarget {
+                block: h,
+                args: htp,
+            },
+        },
+    );
+    for (pr, tidx) in edges {
+        b.blocks[pr].terminator.update_target(tidx, |t| t.block = h_t);
+    }
+    // Chain the group: copy i's edges to its own header instead enter
+    // copy i+1's; the last copy's loop back to h_t.
+    for i in 0..copies {
+        let next = if i + 1 < copies { heads[i + 1] } else { h_t };
+        for &lb in &blocks_of[i] {
+            b.blocks[lb].terminator.update_targets(|t| {
+                if t.block == heads[i] {
+                    t.block = next;
+                }
+            });
+        }
+    }
+    b.recompute_edges();
+    if verbose {
+        eprintln!("wunroll: {h} flat x{copies} -> {h_t}");
+    }
+    true
 }
 
 /// `unreachable`-terminated blocks of ordinary ops are pure sinks (panic
@@ -4677,12 +5267,131 @@ fn clone_loop(
 /// `(n - i0 - 1) * step < 2^64` and wraps make `hi >= 2^32 > len` bail to
 /// the slow path) and branches to a check-free clone when `i0 >=u n`
 /// (zero trips) or `hi <u len`. The original loop stays as the slow path.
+///
+/// Static upper bound for an i32 value, in u64, derived from constants
+/// and enclosing counted loops: a blockparam of an enclosing loop whose
+/// own header tests `param <u n_out` (constant bound, uniform
+/// non-negative step) is at most `n_out - 1` anywhere inside the loop
+/// nest. Returns None when no bound is provable.
+fn bound_u64(
+    b: &FunctionBody,
+    loops: &[(WBlock, FxHashSet<WBlock>)],
+    h: WBlock,
+    v: WV,
+    depth: u32,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let v = b.resolve_alias(v);
+    match b.values[v] {
+        ValueDef::Operator(O::I32Const { value }, ..) => Some(value as u32 as u64),
+        ValueDef::Operator(O::I32Add, aa, _) => {
+            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            let s = bound_u64(b, loops, h, x, depth + 1)?
+                .checked_add(bound_u64(b, loops, h, y, depth + 1)?)?;
+            (s <= u32::MAX as u64).then_some(s)
+        }
+        ValueDef::Operator(O::I32Mul, aa, _) => {
+            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            let s = bound_u64(b, loops, h, x, depth + 1)?
+                .checked_mul(bound_u64(b, loops, h, y, depth + 1)?)?;
+            (s <= u32::MAX as u64).then_some(s)
+        }
+        ValueDef::BlockParam(oh, opidx, WT::I32) if oh != h => {
+            let (_, il2) = loops.iter().find(|(h2, _)| *h2 == oh)?;
+            if !il2.contains(&h) {
+                return None;
+            }
+            let Terminator::CondBr {
+                cond,
+                if_true,
+                if_false,
+            } = &b.blocks[oh].terminator
+            else {
+                return None;
+            };
+            let (x, n_out, pt) = as_check(b, *cond)?;
+            let pass = if pt { if_true } else { if_false };
+            if !il2.contains(&pass.block) {
+                return None;
+            }
+            let ValueDef::BlockParam(pb, pp, _) = b.values[x] else {
+                return None;
+            };
+            if pb != oh || pp != opidx {
+                return None;
+            }
+            // Uniform non-negative constant step on that param across
+            // oh's latches (an unchanged feed contributes 0).
+            let pv = b.blocks[oh].params[opidx as usize].1;
+            let mut st: Option<i64> = None;
+            for (j, &p) in b.blocks[oh].preds.iter().enumerate() {
+                if !il2.contains(&p) {
+                    continue;
+                }
+                let tidx = b.blocks[oh].pos_in_pred_succ[j];
+                let mut arg = None;
+                b.blocks[p].terminator.visit_target(tidx, |t| arg = t.args.get(opidx as usize).copied());
+                let arg = b.resolve_alias(arg?);
+                let s = if arg == pv {
+                    0
+                } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
+                    let u = b.resolve_alias(b.arg_pool[aa][0]);
+                    let w = b.resolve_alias(b.arg_pool[aa][1]);
+                    let s = if u == pv {
+                        wconst(b, w)
+                    } else if w == pv {
+                        wconst(b, u)
+                    } else {
+                        None
+                    };
+                    match s {
+                        Some(s) => s,
+                        None => return None,
+                    }
+                } else {
+                    return None;
+                };
+                match st {
+                    None => st = Some(s),
+                    Some(t) if t == s => {}
+                    _ => return None,
+                }
+            }
+            if st? < 0 {
+                return None;
+            }
+            let nb = wconst(b, n_out)? as u64;
+            Some(nb.saturating_sub(1))
+        }
+        _ => None,
+    }
+}
+
+/// Normalize a CondBr `cond` into (idx, bound, pass-is-true) for
+/// `idx <u bound` / `idx >=u bound` shapes.
+fn as_check(b: &FunctionBody, cond: WV) -> Option<(WV, WV, bool)> {
+    match b.values[b.resolve_alias(cond)] {
+        ValueDef::Operator(O::I32LtU, aa, _) => {
+            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            Some((b.resolve_alias(x), b.resolve_alias(y), true))
+        }
+        ValueDef::Operator(O::I32GeU, aa, _) => {
+            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            Some((b.resolve_alias(x), b.resolve_alias(y), false))
+        }
+        _ => None,
+    }
+}
+
 fn wbcheck(
     b: &mut FunctionBody,
     defb: &mut waffle::entity::PerEntity<WV, WBlock>,
     cfg: &waffle::cfg::CFGInfo,
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
+    loops: &[(WBlock, FxHashSet<WBlock>)],
 ) -> Option<(WBlock, FxHashSet<WBlock>)> {
     let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
     macro_rules! bail {
@@ -4718,20 +5427,7 @@ fn wbcheck(
         bail!("no latches");
     }
     // Normalize a CondBr `cond` into (idx, bound, pass-is-true) for
-    // `idx <u bound` / `idx >=u bound` shapes.
-    let as_check = |b: &FunctionBody, cond: WV| -> Option<(WV, WV, bool)> {
-        match b.values[b.resolve_alias(cond)] {
-            ValueDef::Operator(O::I32LtU, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
-                Some((b.resolve_alias(x), b.resolve_alias(y), true))
-            }
-            ValueDef::Operator(O::I32GeU, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
-                Some((b.resolve_alias(x), b.resolve_alias(y), false))
-            }
-            _ => None,
-        }
-    };
+    // `idx <u bound` / `idx >=u bound` shapes (`as_check` is the free fn).
     // Exit-test candidates: `iv <u n`, one arm leaves the loop, the block
     // dominates every latch so each iteration is gated by it. Several
     // blocks can match (a bounds check has the same shape); pick per
@@ -4939,19 +5635,60 @@ fn wbcheck(
     let mut acc: Option<WV> = None;
     for &(_, len, ref d, _) in &checks {
         let len64 = pop(b, O::I64ExtendI32U, &[len], &[WT::I64]);
-        let hi = match d {
-            Chk::Same(Some(d)) => {
-                let d64 = pop(b, O::I64ExtendI32U, &[*d], &[WT::I64]);
-                pop(b, O::I64Add, &[last, d64], &[WT::I64])
+        // Static bound: when the affine start is bounded through
+        // enclosing counted loops (e.g. `i*n + k` bounded by the outer
+        // `i`/`j` tests), `hi` collapses to a constant — a
+        // loop-invariant test the engine can hoist out of the whole
+        // nest instead of recomputing per loop entry.
+        let n_c = wconst(b, n).map(|v| v as u64);
+        let hi_static = (|d: &Chk| -> Option<u64> {
+            match d {
+                Chk::Same(d) => {
+                    let db = match d {
+                        Some(d) => bound_u64(b, loops, h, *d, 0)?,
+                        None => 0,
+                    };
+                    n_c.and_then(|nc| nc.checked_sub(1)?.checked_add(db))
+                }
+                Chk::Ind(x0, k) => {
+                    let xb = bound_u64(b, loops, h, *x0, 0)?;
+                    if *k == 0 {
+                        Some(xb)
+                    } else {
+                        // `(iters-1)*step <= n-1` needs `iters <= n`,
+                        // i.e. the counted iv to step at least +1.
+                        let iv_step_ok = c
+                            .and_then(|v| wconst(b, v))
+                            .map(|s| s >= 1)
+                            .unwrap_or(false);
+                        if !iv_step_ok {
+                            return None;
+                        }
+                        n_c.and_then(|nc| {
+                            nc.checked_sub(1)?
+                                .checked_mul(*k as u64)?
+                                .checked_add(xb)
+                        })
+                    }
+                }
             }
-            Chk::Same(None) => last,
-            // Other affine param: hi = x0 + (trip-1)*step, step >= 0.
-            Chk::Ind(x0, k) => {
-                let x064 = pop(b, O::I64ExtendI32U, &[*x0], &[WT::I64]);
-                let k64 = pop(b, O::I64Const { value: *k as u64 }, &[], &[WT::I64]);
-                let sp = pop(b, O::I64Mul, &[tm1, k64], &[WT::I64]);
-                pop(b, O::I64Add, &[x064, sp], &[WT::I64])
-            }
+        })(d);
+        let hi = match hi_static {
+            Some(v) => pop(b, O::I64Const { value: v }, &[], &[WT::I64]),
+            None => match d {
+                Chk::Same(Some(d)) => {
+                    let d64 = pop(b, O::I64ExtendI32U, &[*d], &[WT::I64]);
+                    pop(b, O::I64Add, &[last, d64], &[WT::I64])
+                }
+                Chk::Same(None) => last,
+                // Other affine param: hi = x0 + (trip-1)*step, step >= 0.
+                Chk::Ind(x0, k) => {
+                    let x064 = pop(b, O::I64ExtendI32U, &[*x0], &[WT::I64]);
+                    let k64 = pop(b, O::I64Const { value: *k as u64 }, &[], &[WT::I64]);
+                    let sp = pop(b, O::I64Mul, &[tm1, k64], &[WT::I64]);
+                    pop(b, O::I64Add, &[x064, sp], &[WT::I64])
+                }
+            },
         };
         let ok = pop(b, O::I64LtU, &[hi, len64], &[WT::I32]);
         acc = Some(match acc {
