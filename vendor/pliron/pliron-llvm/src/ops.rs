@@ -3451,7 +3451,7 @@ impl Verify for SExtOp {
 /// | `res` | Signless integer |
 #[pliron_op(
     name = "llvm.zext",
-    format = "`<nneg=` attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> ` $0 ` to ` type($0)",
+    format = "`<nneg=` opt_attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> ` $0 ` to ` type($0)",
     interfaces = [
         CastOpInterface,
         OneResultInterface,
@@ -3483,7 +3483,7 @@ impl Verify for ZExtOp {
 /// | `res` | Floating-point number |
 #[pliron_op(
     name = "llvm.fpext",
-    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
+    format = "opt_attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
     interfaces = [
         CastOpInterface,
         OneResultInterface,
@@ -3580,7 +3580,7 @@ impl Verify for TruncOp {
 /// | `res` | float or vector of float |
 #[pliron_op(
     name = "llvm.fptrunc",
-    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
+    format = "opt_attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` to ` type($0)",
     interfaces = [
         CastOpInterface,
         OneResultInterface,
@@ -3757,7 +3757,7 @@ impl Verify for SIToFPOp {
 /// | `res` | Floating-point number |
 #[pliron_op(
     name = "llvm.uitofp",
-    format = "`<nneg=` attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> `$0 ` to ` type($0)",
+    format = "`<nneg=` opt_attr($llvm_nneg_flag, `pliron::builtin::attributes::BoolAttr`) `> `$0 ` to ` type($0)",
     interfaces = [
         CastOpInterface,
         OneResultInterface,
@@ -4376,7 +4376,7 @@ pub enum SelectOpVerifyErr {
 /// | `res` | float or vector of float |
 #[pliron_op(
     name = "llvm.fneg",
-    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` : ` type($0)",
+    format = "opt_attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` : ` type($0)",
     interfaces = [
         OneResultInterface,
         OneOpdInterface,
@@ -4431,7 +4431,7 @@ macro_rules! new_float_bin_op {
         /// | `res` | float |
         #[pliron_op(
             name = $op_id,
-            format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 `, ` $1 ` : ` type($0)",
+            format = "opt_attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 `, ` $1 ` : ` type($0)",
             interfaces = [
                 OneResultInterface, SameOperandsType, SameResultsType,
                 SameOperandsAndResultType, BinArithOp, FloatBinArithOp,
@@ -4489,7 +4489,7 @@ new_float_bin_op! {
 /// | `res` | i1 or vector of i1 |
 #[pliron_op(
     name = "llvm.fcmp",
-    format = "attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` <` attr($llvm_fcmp_predicate, $FCmpPredicateAttr) `> ` $1 ` : ` type($0)",
+    format = "opt_attr($llvm_fast_math_flags, $FastmathFlagsAttr) ` ` $0 ` <` opt_attr($llvm_fcmp_predicate, $FCmpPredicateAttr) `> ` $1 ` : ` type($0)",
     interfaces = [
         OneResultInterface,
         SameOperandsType,

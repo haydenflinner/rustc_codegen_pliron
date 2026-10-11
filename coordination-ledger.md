@@ -1294,3 +1294,49 @@ REJECTED: mid-size (<=64-inst) <=6-callsite inlining in winline —
 Remaining hot gaps (200-iter profile, pl vs st): find_fwd_imp +79ms,
 ReverseInner::search_half +31, hybrid_try_search_half_fwd +27 /_rev
 +11, aho PrefilterI::find +36.
+
+## nocapture: callee-body capture inference feeding slotmerge
+
+`DeducedParamAttrs::captures_none` only applies to `PassMode::Indirect`
+params — rustc's MIR analysis ignores `*_k` uses and `move`/`copy` of the
+param, which is unsound to reuse for `&`/`&mut` (Direct) params (a callee
+that returns the pointer reports `captures_none`; the rustix build-script
+panic proved it empirically). But the dominant SROA/slotmerge blockers are
+exactly those Direct pointer args (~75 call escapes ≈ 3KB of live frame in
+`parse_item_kind`, plus `llvm.icmp`/`llvm.br` pointer uses).
+
+src/nocapture.rs: LLVM `captures(none)`-style bottom-up inference over the
+pliron bodies of the CGU. Per-param derivation is tracked in two bands —
+`exact` (pointer-typed values) and `fuzzy` (ints that could encode one via
+`ptrtoint`) — propagated through results, block params, and invoke
+exception payloads to a fixpoint; comparisons produce neither so
+`p == q`-returning predicates stay non-capturing. Any store of a derived
+value counts as capture (even into the callee's own frame), so no alias
+tracking is needed; memcpy/memmove capture the src only; unknown
+intrinsics/asm/returns capture everything. Optimistic fixpoint like
+nowrite.rs handles recursion; cross-CGU and indirect callees stay
+conservative.
+
+builder.rs computes `CallInfo.nocap` from `DeducedParamAttrs` restricted
+to `PassMode::Indirect` (rustc's own soundness domain — also correct
+cross-crate); lower.rs unions it with `st.nocapture` per CLIF arg
+(`csrc` maps each lowered arg back to its pliron operand through ABI
+expansion, sret, and the vararg rewrites); slotmerge treats flagged args
+as bounded uses.
+
+Verified on synthetics: `p == q` predicates and load/store helpers stay
+non-capturing, `return p`/`store p` capture. Numbers (rustc_parse
+stage2): +123 merges, −1.6KB total frame; `parse_item_kind` unchanged at
+9.0KB — its remaining escapes are cross-CGU `parse_item_*` callees and
+stores into the caller's sret out-param, both out of scope for this
+analysis. LLVM's 896B is mostly SROA coverage, a separate problem.
+Not perf-measured; small win by construction, correctness-validated by
+./test.sh and stage2 rebuilds.
+
+Also in this change: lifetime markers record the instruction anchored
+just before them (`ipos[anchor]+1` start / `ipos[anchor]` end, block-start
+and drop fallbacks) instead of conservative whole-block ranges;
+`PLIRON_SROA_WHYFN=<substr>` prints per-alloca promotion blockers; the
+`why` diagnostic skips lifetime markers; pliron printer switched the
+optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
+`llvm_fcmp_predicate`) to `opt_attr` so `PLIRON_DUMP_OPT` no longer ICEs.

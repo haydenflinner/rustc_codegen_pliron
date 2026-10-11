@@ -235,7 +235,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.st
             .borrow_mut()
             .calls
-            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false });
+            .insert(
+                p,
+                CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false, nocap: None },
+            );
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -1112,12 +1115,66 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
             _ => (false, None),
         };
+        // Per-operand `captures(none)` deduced from the callee's MIR — the
+        // same `DeducedParamAttrs` data rustc applies to `PassMode::Indirect`
+        // params for LLVM. It is only sound for by-value (Indirect) params:
+        // the analysis ignores `*_k` uses and `move`/`copy` of the param
+        // value, so for `&mut`/`&` (Direct) params a function that returns
+        // or stores the pointer reports `captures_none` anyway. A pointer
+        // the callee can't retain is a bounded use, not a function-end
+        // escape, for slotmerge. Walk `fn_abi.args` in operand order
+        // (Ignore = 0, Pair and unsized-indirect = 2, Cast = pad + 1,
+        // else 1); `full[0]` is the sret pointer when the return is indirect.
+        let deduced: &[rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs] =
+            match instance {
+                Some(i)
+                    if matches!(i.def, ty::InstanceKind::Item(_))
+                        && fn_abi.is_some_and(|a| a.conv.is_rustic_abi()) =>
+                {
+                    self.tcx.deduced_param_attrs(i.def_id())
+                }
+                _ => &[],
+            };
+        let env = ty::TypingEnv::fully_monomorphized();
+        let nocap = fn_abi.and_then(|abi| {
+            let mut v = vec![false; full.len()];
+            let mut j = usize::from(return_slot.is_indirect());
+            let mut any = false;
+            for (ai, a) in abi.args.iter().enumerate() {
+                use rustc_target::callconv::PassMode;
+                let n = match &a.mode {
+                    PassMode::Ignore => 0,
+                    PassMode::Pair(..) => 2,
+                    PassMode::Indirect { meta_attrs, .. } => {
+                        usize::from(meta_attrs.is_some()) + 1
+                    }
+                    PassMode::Cast { pad_i32_count, .. } => {
+                        usize::from(*pad_i32_count) + 1
+                    }
+                    PassMode::Direct(_) => 1,
+                };
+                let cap = matches!(a.mode, PassMode::Indirect { .. })
+                    && deduced
+                        .get(ai + 1)
+                        .is_some_and(|d| d.captures_none(self.tcx, env, a.layout.ty));
+                if cap {
+                    any = true;
+                    let hi = (j + n).min(v.len());
+                    for x in &mut v[j..hi] {
+                        *x = true;
+                    }
+                }
+                j += n;
+            }
+            any.then(|| v.into_boxed_slice())
+        });
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
             let mut st = self.st.borrow_mut();
             let info = st.calls.get_mut(&p).unwrap();
             info.foreign = foreign;
             info.cc = cc;
+            info.nocap = nocap;
         }
         v
     }

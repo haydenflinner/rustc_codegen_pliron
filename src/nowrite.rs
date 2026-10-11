@@ -21,7 +21,7 @@ use crate::lower::has_body;
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];
 
 /// Intrinsic name prefixes that neither write memory nor synchronize.
-const PURE: &[&str] = &[
+pub(crate) const PURE: &[&str] = &[
     "llvm.ctlz.",
     "llvm.cttz.",
     "llvm.ctpop.",

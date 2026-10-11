@@ -325,6 +325,7 @@ pub fn lower_to_object(
         let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
         let nowrite: FxHashMap<FuncRef, bool>;
         let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
+        let nocap: FxHashSet<(ir::Inst, u32)>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -354,6 +355,7 @@ pub fn lower_to_object(
                 deref: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
                 lifetimes: Vec::new(),
+                nocap: FxHashSet::default(),
                 va_buf: None,
                 va_fids: FxHashMap::default(),
                 eh_data,
@@ -382,6 +384,7 @@ pub fn lower_to_object(
                         .map(|v| (v, anchor, b, start))
                 })
                 .collect();
+            nocap = std::mem::take(&mut fl.nocap);
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -1101,11 +1104,11 @@ pub fn lower_to_object(
             let before: u64 = stats
                 .then(|| clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum())
                 .unwrap_or(0);
-            let k = crate::slotmerge::run(&mut clctx.func, &nowrite, &lifetimes);
+            let k = crate::slotmerge::run(&mut clctx.func, &nowrite, &lifetimes, &nocap);
             if stats {
                 let after: u64 =
                     clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum();
-                eprintln!("slotmerge {k} {before}->{after}B {n}");
+                eprintln!("slotmerge {k} {before}->{after}B {} {n}", nocap.len());
             }
             if dump && k > 0 {
                 eprintln!("==== clif {n} after slotmerge ====\n{}", clctx.func.display());
@@ -1620,6 +1623,11 @@ struct FnLower<'a, 'b, 'tcx> {
     /// lower after its marker. slotmerge turns these into use positions
     /// for the slot's live interval (MIR StorageLive/Dead).
     lifetimes: Vec<(Value, Option<ir::Inst>, ir::Block, bool)>,
+    /// (call inst, arg index) pairs whose callee param rustc deduced
+    /// `captures(none)` for — the pointer can't outlive the call, so
+    /// slotmerge bounds the use instead of escaping the slot to
+    /// function end.
+    nocap: FxHashSet<(ir::Inst, u32)>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<ir::Value>,
     /// `__pliron_va8.<sym>` trampoline imports declared for this module.
@@ -3550,7 +3558,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         args: &[ir::Value],
         catch: Ptr<BasicBlock>,
         is_catch: bool,
-    ) -> Vals {
+    ) -> (ir::Inst, Vals) {
         if self.eh_data.is_some() {
             // Emulated EH: call normally, then branch to the funclet block
             // when `__pliron_eh.flag` is set (the pad reads `pliron.eh.exn`).
@@ -3560,7 +3568,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             };
             let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
             self.eh_check(Some(catch));
-            return rs;
+            return (inst, rs);
         }
         use cranelift_codegen::ir::{
             BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
@@ -3599,7 +3607,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     pcall,
                 )],
             ));
-        match target {
+        let inst = match target {
             Ok(fr) => self.b.ins().try_call(fr, args, et),
             Err((addr, _)) => self.b.ins().try_call_indirect(addr, args, et),
         };
@@ -3612,9 +3620,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.b.ins().jump(lp, &[]);
         self.b.switch_to_block(normal);
         self.cconst.clear();
-        rets.into_iter()
+        let rs = rets
+            .into_iter()
             .map(|t| self.b.append_block_param(normal, t))
-            .collect()
+            .collect();
+        (inst, rs)
     }
 
     fn lower_call(&mut self, op: Ptr<Operation>) {
@@ -3638,8 +3648,14 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
-        for a in &args {
-            cargs.extend(self.get(*a));
+        // Which pliron operand each CLIF arg expands from (for `nocap`
+        // lookup); usize::MAX marks entries with no source operand
+        // (variadic buffer pointer, trampoline padding).
+        let mut csrc = Vec::new();
+        for (ai, a) in args.iter().enumerate() {
+            let vs = self.get(*a);
+            csrc.extend(std::iter::repeat_n(ai, vs.len()));
+            cargs.extend(vs);
         }
         // C variadic: fn_ty only has the fixed params. Foreign callees get the
         // real SysV ABI (extra args passed like ordinary arguments); callees
@@ -3711,10 +3727,12 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     for _ in xi..8 {
                         sig.params.insert(fixed, AbiParam::new(clt::I64));
                         cargs.insert(fixed, self.b.ins().iconst(clt::I64, 0));
+                        csrc.insert(fixed, usize::MAX);
                     }
                     for _ in vi..8 {
                         sig.params.insert(fixed, AbiParam::new(clt::F64));
                         cargs.insert(fixed, self.b.ins().f64const(Ieee64::with_bits(0)));
+                        csrc.insert(fixed, usize::MAX);
                     }
                 }
             } else {
@@ -3734,6 +3752,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     seen += self.get(a).len();
                 }
                 cargs.drain(fixed..);
+                csrc.drain(fixed..);
                 let mut off = 0u64;
                 let mut plan = Vec::new();
                 for &a in &args[first..] {
@@ -3751,15 +3770,18 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     }
                 }
                 cargs.push(buf);
+                csrc.push(usize::MAX);
             }
         }
         // Emulated EH: a post-call flag check is only needed when the callee
         // might "throw". Leaf asm stubs/wrappers can never throw; vararg
         // trampolines tail-jump to the callee and can.
         let mut maythrow = true;
+        let mut callee_sym = None;
         let target = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
                 let sym = &self.st.ident_to_sym[&ident.to_string()].clone();
+                callee_sym = Some(sym.clone());
                 maythrow = !self.st.funcs.get(sym).is_some_and(|f| f.nounwind)
                     && !(sym.starts_with("__pliron_asm_")
                         || sym.starts_with("__pliron_llvm_")
@@ -3789,6 +3811,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     // stub sets %al=8 then tail-jumps to it (fp's SysV
                     // register is computed positionally).
                     cargs.push(addr);
+                    csrc.push(usize::MAX);
                     sig.params.push(AbiParam::new(clt::I64));
                     const INT_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                     let n_int = sig.params[..sig.params.len() - 1]
@@ -3872,19 +3895,34 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             self.terminated = true;
             return;
         }
-        let rs: Vals = if let Some(&(catch, is_catch)) = self.st.invokes.get(&op) {
-            self.try_call(target, &cargs, catch, is_catch)
-        } else {
-            let inst = match target {
-                Ok(fr) => self.b.ins().call(fr, &cargs),
-                Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
+        let (inst, rs): (ir::Inst, Vals) =
+            if let Some(&(catch, is_catch)) = self.st.invokes.get(&op) {
+                self.try_call(target, &cargs, catch, is_catch)
+            } else {
+                let inst = match target {
+                    Ok(fr) => self.b.ins().call(fr, &cargs),
+                    Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
+                };
+                let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
+                if self.eh_data.is_some() && maythrow {
+                    self.eh_check(None);
+                }
+                (inst, rs)
             };
-            let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
-            if self.eh_data.is_some() && maythrow {
-                self.eh_check(None);
+        // `info.nocap` carries rustc's `captures(none)` (Indirect params);
+        // `st.nocapture` is our body-level inference, which also covers
+        // `&`/`&mut` (Direct) params. Either flags the CLIF arg a bounded use.
+        let own = callee_sym.and_then(|s| self.st.nocapture.get(&s));
+        if info.nocap.is_some() || own.is_some() {
+            for (k, &s) in csrc.iter().enumerate() {
+                let flagged = s != usize::MAX
+                    && (info.nocap.as_ref().is_some_and(|nc| nc.get(s) == Some(&true))
+                        || own.is_some_and(|o| o.contains(&(s as u32))));
+                if flagged {
+                    self.nocap.insert((inst, k as u32));
+                }
             }
-            rs
-        };
+        }
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
         }

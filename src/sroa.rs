@@ -774,6 +774,21 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                     }
                 }
             }
+            // Per-function breakdown for a name filter: `PLIRON_SROA_WHYFN`.
+            if let Some(filt) = std::env::var("PLIRON_SROA_WHYFN").ok() {
+                for (name, f) in &st.funcs {
+                    if !name.contains(&filt) || !has_body(ctx, f.op) {
+                        continue;
+                    }
+                    for op in allocas(ctx, f.op) {
+                        let a = op.deref(ctx).get_result(0);
+                        if !st.promoted.contains_key(&a) {
+                            let sz = st.allocas.get(&a).map(|x| x.0).unwrap_or(0);
+                            eprintln!("  whyfn {sz:5}B {} {name}", why2(ctx, st, a));
+                        }
+                    }
+                }
+            }
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(20) {
@@ -817,6 +832,11 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 uses.push("load");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
+            } else if matches!(
+                intrinsic(st, op),
+                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+            ) {
+                // Markers are skipped by `accesses` — not the blocker.
             } else if matches!(
                 intrinsic(st, op),
                 Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")

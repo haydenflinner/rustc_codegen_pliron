@@ -33,6 +33,7 @@ pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Value, Option<Inst>, Block, bool)],
+    nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
     if func.sized_stack_slots.len() < 2 {
         return 0;
@@ -323,7 +324,7 @@ pub fn run(
                                     // region's contents into dst, so
                                     // contained pointers flow dst-ward.
                                     use cranelift_codegen::ir::{ExternalName, LibCall};
-                                    let (nocap, copy) = match func.dfg.ext_funcs[fr].name {
+                                    let (nokeep, copy) = match func.dfg.ext_funcs[fr].name {
                                         ExternalName::LibCall(LibCall::Memcpy)
                                         | ExternalName::LibCall(LibCall::Memmove) => (true, true),
                                         ExternalName::LibCall(LibCall::Memset) => (true, false),
@@ -341,17 +342,26 @@ pub fn run(
                                     for (k, &a) in cargs.iter().enumerate() {
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
-                                            if !nw && !nocap && !(sret && k == 0) {
+                                            // rustc's captures(none): the
+                                            // callee can't retain the
+                                            // pointer past the call.
+                                            if !nw
+                                                && !nokeep
+                                                && !(sret && k == 0)
+                                                && !nocap.contains(&(i, k as u32))
+                                            {
                                                 escape!(s, i);
                                             }
                                         }
                                     }
                                 }
                                 CallInfo::Indirect(_, cargs) => {
-                                    for &a in cargs {
+                                    for (k, &a) in cargs.iter().enumerate() {
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
-                                            escape!(s, i);
+                                            if !nocap.contains(&(i, k as u32)) {
+                                                escape!(s, i);
+                                            }
                                         }
                                     }
                                 }

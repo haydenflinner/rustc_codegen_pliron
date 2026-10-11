@@ -54,6 +54,7 @@ mod loopvec;
 mod unroll;
 mod lower;
 mod memcpyopt;
+mod nocapture;
 mod nounwind;
 mod nowrite;
 mod objmerge;
@@ -427,6 +428,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         if pass_enabled("PLIRON_NOWRITE") {
             nowrite::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_NOCAP") {
+            nocapture::run(ctx, st);
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");

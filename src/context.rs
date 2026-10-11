@@ -123,6 +123,11 @@ pub struct CallInfo {
     /// instead of call+ret. Only honored when the caller's own convention is
     /// `CallConv::Tail` (Cranelift requires it).
     pub tail: bool,
+    /// Per-operand `captures(none)` flags (indexed like the call's operand
+    /// list), deduced by rustc from the callee's MIR. A non-captured pointer
+    /// can't outlive the call, so slotmerge treats it as a bounded use
+    /// rather than a function-end escape.
+    pub nocap: Option<Box<[bool]>>,
 }
 
 #[derive(Default)]
@@ -163,6 +168,12 @@ pub struct State<'tcx> {
     pub noalias: rustc_data_structures::fx::FxHashMap<Value, (u64, bool)>,
     /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
     pub nowrite: rustc_data_structures::fx::FxHashMap<String, bool>,
+    /// Per-callee body-level capture analysis: param indices provably not
+    /// retained past the call (nocapture.rs).
+    pub nocapture: rustc_data_structures::fx::FxHashMap<
+        String,
+        rustc_data_structures::fx::FxHashSet<u32>,
+    >,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
