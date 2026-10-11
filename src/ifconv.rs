@@ -308,11 +308,19 @@ fn emit_arm(
 /// `m`'s dominated subtree of a value defined outside it (a removed-param
 /// alias to an arm-local def is the live case) is only safe when the def
 /// still dominates `term`. `m`'s own params are fine: `sargs` supplies them.
+///
+/// A def inside a bypassed `chain` block never qualifies on dominance: the
+/// use isn't remapped — `emit_arm` only rewrites `b`'s edge — and the hop
+/// keeps binding it, now over a *smaller* edge set. A hop param is a phi
+/// over the hop's incoming edges, so dropping `b`'s edge changes the value
+/// the use observes even when the hop still dominates it (the loop-header
+/// flag case: `rustc_lexer::eat_hexadecimal_digits` lost `has_digits`).
 fn edge_ok(
     func: &Function,
     domtree: &DominatorTree,
     m: Block,
     mset: &FxHashSet<Block>,
+    chains: &FxHashSet<Block>,
     term: Inst,
 ) -> bool {
     mset.iter().all(|&x| {
@@ -320,11 +328,16 @@ fn edge_ok(
             func.dfg.inst_values(i).all(|v| {
                 match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
                     ValueDef::Param(d, _) => {
-                        d == m || mset.contains(&d) || domtree.block_dominates(d, term_block(func, term))
+                        !chains.contains(&d)
+                            && (d == m
+                                || mset.contains(&d)
+                                || domtree.block_dominates(d, term_block(func, term)))
                     }
                     ValueDef::Result(di, _) => {
-                        mset.contains(&func.layout.inst_block(di).unwrap_or(m))
-                            || domtree.dominates(di, term, &func.layout)
+                        let db = func.layout.inst_block(di).unwrap_or(m);
+                        !chains.contains(&db)
+                            && (mset.contains(&db)
+                                || domtree.dominates(di, term, &func.layout))
                     }
                     _ => true,
                 }
@@ -527,13 +540,14 @@ fn conv_table(
     if !ok {
         return false;
     }
+    let chains: FxHashSet<Block> = arms.iter().flat_map(|a| a.chain.iter().copied()).collect();
     let mset = mset_cache.entry(m).or_insert_with(|| {
         func.layout
             .blocks()
             .filter(|&x| domtree.block_dominates(m, x))
             .collect()
     });
-    if !edge_ok(func, domtree, m, mset, term) {
+    if !edge_ok(func, domtree, m, mset, &chains, term) {
         return false;
     }
     // Arm args that aren't cloned chain results or chain params must
@@ -721,13 +735,19 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 continue;
             }
         }
+        let chains: FxHashSet<Block> = ta
+            .chain
+            .iter()
+            .chain(ea.chain.iter())
+            .copied()
+            .collect();
         let mset = mset_cache.entry(m).or_insert_with(|| {
             func.layout
                 .blocks()
                 .filter(|&x| domtree.block_dominates(m, x))
                 .collect()
         });
-        if !edge_ok(func, &domtree, m, mset, term) {
+        if !edge_ok(func, &domtree, m, mset, &chains, term) {
             continue;
         }
         dirty = true;
@@ -767,7 +787,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
 mod tests {
     use super::*;
     use cranelift_codegen::ir::condcodes::IntCC;
-    use cranelift_codegen::ir::JumpTableData;
+    use cranelift_codegen::ir::{JumpTableData, MemFlagsData};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// Evaluate `v` (a pure iconst/icmp-eq/bor/select tree over `b`'s first
@@ -880,5 +900,136 @@ mod tests {
         for (i, want) in [(0, 2), (1, 1), (2, 0), (3, -1), (9, -1)] {
             assert_eq!(eval(&func, sel, i, b) as i8, want, "table index {i}");
         }
+    }
+
+    /// Mirrors `rustc_lexer::eat_hexadecimal_digits` (sec6): `hop` is the
+    /// digit-loop header merge that `ifconv` first folds into a pure
+    /// forwarder to `merge`. `hop`'s params and results still have uses
+    /// below `merge` (the `brif cnd` in `merge`, the `has`/`base` args in
+    /// `blk411`'s edge into `hdr`). `latch` — the digit-classify backedge
+    /// that injects `has=1` — sits inside `hop`'s loop, so `hop` dominates
+    /// it and the plain dominance clause in `edge_ok` accepts the escaped
+    /// defs. Folding `latch`'s arms past `hop` bypasses it: `has` becomes
+    /// a phi over only `entry`'s `0` edge, and every hex literal reported
+    /// `no valid digits`.
+    #[test]
+    fn arm_chain_local_escape_blocks_conversion() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (latch, hop_p) = {
+            let mut fb = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = fb.create_block();
+            let hop = fb.create_block();
+            let arm_t = fb.create_block();
+            let arm_e = fb.create_block();
+            let merge = fb.create_block();
+            let blk411 = fb.create_block();
+            let blk410 = fb.create_block();
+            let blk415 = fb.create_block();
+            let blk413 = fb.create_block();
+            let hdr = fb.create_block();
+            let latch = fb.create_block();
+            let ret = fb.create_block();
+            for blk in [entry, latch] {
+                fb.append_block_param(blk, types::I8);
+            }
+            for _ in 0..4 {
+                fb.append_block_param(hop, types::I8);
+            }
+            for _ in 0..4 {
+                fb.append_block_param(merge, types::I8);
+            }
+            for _ in 0..4 {
+                fb.append_block_param(hdr, types::I8);
+            }
+            fb.append_block_param(ret, types::I8);
+
+            // entry -> hop with has=0 (first char), or straight out.
+            // Constants live in entry so every later block may use them.
+            fb.switch_to_block(entry);
+            let c = fb.block_params(entry)[0];
+            let z = fb.ins().iconst(types::I8, 0);
+            let one = fb.ins().iconst(types::I8, 1);
+            let s = fb.ins().iconst(types::I8, 16);
+            fb.ins().brif(
+                c,
+                hop,
+                &[z, z, z, z].map(BlockArg::Value),
+                ret,
+                &[BlockArg::Value(z)],
+            );
+
+            // hop: the loop-header diamond — its `cnd` escapes into
+            // merge's own brif below. Its own fold (to a forwarder) is
+            // legitimate: latch's backedge keeps it reachable.
+            fb.switch_to_block(hop);
+            let hp = fb.block_params(hop).to_vec();
+            let cnd = fb.ins().icmp(IntCC::Equal, hp[2], hp[3]);
+            fb.ins().brif(cnd, arm_t, &[], arm_e, &[]);
+
+            fb.switch_to_block(arm_t);
+            fb.ins().jump(
+                merge,
+                &[z, hp[2], hp[2], hp[3]].map(BlockArg::Value),
+            );
+            fb.switch_to_block(arm_e);
+            fb.ins().jump(
+                merge,
+                &[hp[2], hp[3], hp[2], hp[3]].map(BlockArg::Value),
+            );
+
+            fb.switch_to_block(merge);
+            let mp = fb.block_params(merge).to_vec();
+            // Escaped use: cnd (a hop local) steers merge's own branch.
+            fb.ins().brif(cnd, blk411, &[], blk410, &[]);
+
+            // Escaped uses: hop's params forwarded to hdr via merge kids.
+            fb.switch_to_block(blk411);
+            fb.ins()
+                .jump(hdr, &[z, z, hp[0], hp[1]].map(BlockArg::Value));
+            fb.switch_to_block(blk410);
+            let v = fb.ins().uload8(types::I8, MemFlagsData::new().with_notrap(), mp[0], 0);
+            let f = fb.ins().icmp_imm_u(IntCC::UnsignedLessThan, v, 128);
+            fb.ins().brif(f, blk415, &[], blk413, &[]);
+            fb.switch_to_block(blk415);
+            fb.ins()
+                .jump(hdr, &[one, v, hp[0], hp[1]].map(BlockArg::Value));
+            fb.switch_to_block(blk413);
+            fb.ins()
+                .jump(hdr, &[z, v, hp[0], hp[1]].map(BlockArg::Value));
+
+            // hdr loops back through the digit latch or exits. latch is
+            // dominated by hop — the shape that defeats the plain
+            // dominance clause.
+            fb.switch_to_block(hdr);
+            let dp = fb.block_params(hdr).to_vec();
+            let live = fb.ins().icmp_imm_u(IntCC::Equal, dp[2], 0);
+            fb.ins()
+                .brif(live, latch, &[BlockArg::Value(dp[0])], ret, &[BlockArg::Value(dp[2])]);
+
+            // Digit latch: inject has=1, base=16 into the shared header.
+            fb.switch_to_block(latch);
+            let c = fb.block_params(latch)[0];
+            let args = [one, s, z, z].map(BlockArg::Value);
+            fb.ins().brif(c, hop, &args, hop, &args);
+
+            fb.switch_to_block(ret);
+            let r = fb.block_params(ret)[0];
+            fb.ins().return_(&[r]);
+            fb.seal_all_blocks();
+            (latch, hp[0])
+        };
+
+        let mut derived = FxHashMap::default();
+        let _ = run(&mut func, &mut derived);
+        // hop's own diamond fold is legitimate; the latch's fold must be
+        // rejected — its arms resolve through `hop` while `hop`'s params
+        // and `cnd` still feed blocks below `merge`.
+        let term = func.layout.last_inst(latch).unwrap();
+        assert!(
+            matches!(func.dfg.insts[term], InstructionData::Brif { .. }),
+            "hop bypassed despite escaped param {hop_p}: {}",
+            func.display()
+        );
     }
 }
