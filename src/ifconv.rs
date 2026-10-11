@@ -206,12 +206,17 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
         }
         return None;
     }
+    let map: FxHashMap<Value, Value> = psub.iter().copied().collect();
     let mut args = Vec::new();
     for a in &cur_edge {
         let BlockArg::Value(v) = a else {
             return None;
         };
-        args.push(func.dfg.resolve_aliases(*v));
+        // Resolve through the chain's param substitutions: the final edge
+        // args are the last hop's own params, which are identical for every
+        // arm sharing that hop. Dedup must see what each arm actually feeds
+        // `m` — the value injected at its first hop.
+        args.push(thru(&map, func.dfg.resolve_aliases(*v)));
     }
     Some(Arm {
         m: cur,
@@ -756,4 +761,124 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         n += 1;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::JumpTableData;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// Evaluate `v` (a pure iconst/icmp-eq/bor/select tree over `b`'s first
+    /// param) with the param bound to `idx`.
+    fn eval(func: &Function, v: Value, idx: i64, b: Block) -> i64 {
+        let v = func.dfg.resolve_aliases(v);
+        match func.dfg.value_def(v) {
+            ValueDef::Param(d, _) => {
+                assert_eq!(d, b);
+                idx
+            }
+            ValueDef::Result(i, _) => match func.dfg.insts[i] {
+                InstructionData::UnaryImm { imm, .. } => imm.bits(),
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    args,
+                    cond,
+                } => {
+                    let (x, y) = (eval(func, args[0], idx, b), eval(func, args[1], idx, b));
+                    i64::from(match cond {
+                        IntCC::Equal => x == y,
+                        _ => panic!("unexpected icmp {cond}"),
+                    })
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Bor,
+                    args,
+                } => i64::from(
+                    eval(func, args[0], idx, b) != 0 || eval(func, args[1], idx, b) != 0,
+                ),
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => {
+                    if eval(func, args[0], idx, b) != 0 {
+                        eval(func, args[1], idx, b)
+                    } else {
+                        eval(func, args[2], idx, b)
+                    }
+                }
+                _ => panic!("unexpected {}", func.dfg.display_inst(i)),
+            },
+            _ => panic!("bad value def"),
+        }
+    }
+
+    /// `br_table` whose arms are pure forwarders through a shared last hop:
+    /// each arm injects a different constant at its first hop, but the final
+    /// edge into the merge is `hop`'s param — identical for every arm. Arm
+    /// dedup must compare the resolved (per-arm) values, not the raw edge
+    /// args, or every member of the table returns the first arm's constant.
+    /// (`rustc_hir_analysis::param_default_policy`: every `ItemKind` member
+    /// returned `Forbidden`.)
+    #[test]
+    fn table_arms_dedup_on_resolved_args() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (b, merge) = {
+            let mut fb = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let b = fb.create_block();
+            let dflt = fb.create_block();
+            let a0 = fb.create_block();
+            let a1 = fb.create_block();
+            let a2 = fb.create_block();
+            let hop = fb.create_block();
+            let merge = fb.create_block();
+            fb.append_block_param(b, types::I32);
+            fb.append_block_param(hop, types::I8);
+            fb.append_block_param(merge, types::I8);
+
+            fb.switch_to_block(b);
+            let idx = fb.block_params(b)[0];
+            let pool = &mut fb.func.dfg.value_lists;
+            let dbc = BlockCall::new(dflt, std::iter::empty(), pool);
+            let entries: Vec<BlockCall> = [a0, a1, a2]
+                .into_iter()
+                .map(|t| BlockCall::new(t, std::iter::empty(), pool))
+                .collect();
+            let jt = fb.func.create_jump_table(JumpTableData::new(dbc, &entries));
+            fb.ins().br_table(idx, jt);
+
+            for (blk, k) in [(a0, 2i64), (a1, 1), (a2, 0)] {
+                fb.switch_to_block(blk);
+                let v = fb.ins().iconst(types::I8, k);
+                fb.ins().jump(hop, &[BlockArg::Value(v)]);
+            }
+            fb.switch_to_block(dflt);
+            let v = fb.ins().iconst(types::I8, -1);
+            fb.ins().jump(merge, &[BlockArg::Value(v)]);
+            fb.switch_to_block(hop);
+            let p = fb.block_params(hop)[0];
+            fb.ins().jump(merge, &[BlockArg::Value(p)]);
+            fb.switch_to_block(merge);
+            let r = fb.block_params(merge)[0];
+            fb.ins().return_(&[r]);
+            fb.seal_all_blocks();
+            (b, merge)
+        };
+
+        let mut derived = FxHashMap::default();
+        assert_eq!(run(&mut func, &mut derived), 1);
+        let term = func.layout.last_inst(b).unwrap();
+        let InstructionData::Jump { destination, .. } = &func.dfg.insts[term] else {
+            panic!("table not folded: {}", func.display());
+        };
+        assert_eq!(destination.block(&func.dfg.value_lists), merge);
+        let Some(BlockArg::Value(sel)) = destination.args(&func.dfg.value_lists).next() else {
+            panic!("no merge arg");
+        };
+        for (i, want) in [(0, 2), (1, 1), (2, 0), (3, -1), (9, -1)] {
+            assert_eq!(eval(&func, sel, i, b) as i8, want, "table index {i}");
+        }
+    }
 }
