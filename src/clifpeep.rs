@@ -1227,7 +1227,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
 /// edge args, and the per-edge copies disappear. Repeat to fixpoint: each
 /// fusion can expose the next block of the same chain.
 pub fn fusechains(func: &mut Function) -> usize {
-    use rustc_data_structures::fx::FxHashMap;
+    use rustc_data_structures::fx::{FxHashMap, FxHashSet};
     let mut n = 0;
     loop {
         // Incoming-edge count per block (self-edges included).
@@ -1279,7 +1279,17 @@ pub fn fusechains(func: &mut Function) -> usize {
                     break;
                 }
             }
-            if !ok {
+            // An arg that's one of t's own params means the edge loops back
+            // from a block t dominates (dead t->b->t cycle, or a param
+            // permutation like `jump t(p2, p1)`): aliasing a param to itself
+            // or to a sibling creates an alias cycle, and any use of that
+            // param in b would dangle once t is removed.
+            let pset: FxHashSet<_> = params.iter().copied().collect();
+            if !ok
+                || pairs
+                    .iter()
+                    .any(|&(_, v)| pset.contains(&func.dfg.resolve_aliases(v)))
+            {
                 continue;
             }
             // Detach t's params so they can be aliased to the edge args;
