@@ -1227,4 +1227,3 @@ REJECTED: mid-size (<=64-inst) <=6-callsite inlining in winline —
 Remaining hot gaps (200-iter profile, pl vs st): find_fwd_imp +79ms,
 ReverseInner::search_half +31, hybrid_try_search_half_fwd +27 /_rev
 +11, aho PrefilterI::find +36.
-||||||| d3636f1
