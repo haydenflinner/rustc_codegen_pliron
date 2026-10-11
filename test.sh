@@ -52,6 +52,10 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/pun
 # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
 # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs && $out/coldargs
+# bittab must test bit 0 of the shifted mask — `sh != 0` accepts the whole
+# [lo, max] interval, so sparse sets take the interval's holes (rustc's
+# check_const_closure matched `kw::Fn` against {Move,Static,Use}).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/bittab/main.rs -o $out/bittab && $out/bittab
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
     rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user && $out/pm_user

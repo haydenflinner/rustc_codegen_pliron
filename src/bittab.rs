@@ -19,7 +19,7 @@
 //!     in = icmp ult d, 64           // guards the shift (ushr wraps mod 64)
 //!     mg = select in, mask64, 0     // out-of-window ⇒ shift a zero mask
 //!     sh = ushr mg, uextend(d)      // bit i set <=> lo+i accepted
-//!     c  = icmp ne sh, 0
+//!     c  = icmp ne (band sh, 1), 0  // the tested bit lands at bit 0
 //!     brif c, hit(args), miss(args)
 //! ```
 //!
@@ -589,7 +589,11 @@ pub fn run(func: &mut Function) -> usize {
         let z = cur.ins().iconst(I64, 0);
         let mg = cur.ins().select(ig, m, z);
         let sh = cur.ins().ushr(mg, dx);
-        let c = cur.ins().icmp(IntCC::NotEqual, sh, z);
+        // Bit `d` of the mask lands at bit 0 of `sh`: test it, not the
+        // whole shifted value — `sh != 0` would accept every `x` at or
+        // below the mask's highest set bit, i.e. the interval's holes.
+        let bit = cur.ins().band_imm(sh, 1);
+        let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
         cur.ins().brif(c, pl.hit.0, &ha, pl.miss.0, &ma);
         for &b in &pl.dead {
             while let Some(i) = func.layout.first_inst(b) {
