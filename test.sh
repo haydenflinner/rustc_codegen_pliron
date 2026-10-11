@@ -108,6 +108,13 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/in
     $out/inlinecm$exe > $out/inlinecm.out
 PLIRON_INLINE_MODEL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm_l$exe &&
     $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
+# nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
+# inferred nonnull-return or returned-arg folds these null/equality checks
+# the wrong way.
+PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/retattr/main.rs -o $out/retattr$exe 2> $out/retattr.stats && $out/retattr$exe
+grep -Eq 'nnret .*: [1-9][0-9]* of' $out/retattr.stats || { echo "nnret inferred nothing" >&2; exit 1; }
+grep -Eq 'retarg .*: [1-9][0-9]* returned-arg bodies' $out/retattr.stats || { echo "retarg inferred nothing" >&2; exit 1; }
+grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
