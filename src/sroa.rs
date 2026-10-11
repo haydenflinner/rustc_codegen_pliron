@@ -125,6 +125,50 @@ fn diverging_arg(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
         && crate::pass_enabled("PLIRON_SROA_ESCAPE")
 }
 
+/// `p` is argument `idx` of `op`, a call whose callee can't observe that it
+/// got a fresh copy of the alloca rather than the real slot — either rustc
+/// deduced `captures(none)` on a by-value (Indirect) param (the callee gets
+/// a private copy and can't retain the pointer), or our own inference shows
+/// arg `idx` isn't retained and the callee writes nothing a path returning
+/// to us could see. A panic-path writer is fine for a plain call — unwinding
+/// skips our frame — but not an invoke, whose catch pad must see pre-panic
+/// writes made through a shared pointer.
+fn copyable_arg(ctx: &Context, st: &State<'_>, op: Ptr<Operation>, _p: Value, idx: usize) -> bool {
+    let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+        return false;
+    };
+    let direct = matches!(c.callee(ctx), CallOpCallable::Direct(_));
+    // Operand 0 of an indirect call is the callee, not an argument.
+    if !direct && idx == 0 {
+        return false;
+    }
+    let ai = idx - usize::from(!direct);
+    if st
+        .calls
+        .get(&op)
+        .and_then(|i| i.nocap.as_ref())
+        .is_some_and(|n| n.get(ai) == Some(&true))
+    {
+        return true;
+    }
+    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+        return false;
+    };
+    let Some(sym) = st.ident_to_sym.get(&id.to_string()) else {
+        return false;
+    };
+    let Some(&strict) = st.nowrite.get(sym) else {
+        return false;
+    };
+    if !strict && st.invokes.contains_key(&op) {
+        return false;
+    }
+    st.nocapture
+        .get(sym)
+        .is_some_and(|s| s.contains(&(ai as u32)))
+        && crate::pass_enabled("PLIRON_SROA_ESCAPE")
+}
+
 fn intrinsic<'a>(st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(&op).map(|s| s.as_str())
 }
@@ -212,7 +256,9 @@ fn accesses(
                     off: base as u64,
                     kind,
                 });
-            } else if diverging_arg(ctx, op, p) && in_range(base, 0) {
+            } else if (diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx))
+                && in_range(base, 0)
+            {
                 out.push(Access {
                     op,
                     off: base as u64,
@@ -844,7 +890,7 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 && const_int(ctx, st, op.deref(ctx).get_operand(2)).is_some()
             {
                 uses.push("mem");
-            } else if diverging_arg(ctx, op, p) {
+            } else if diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx) {
                 uses.push("escape");
             } else {
                 let n = st

@@ -396,6 +396,14 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             phisimp::run(ctx, st);
             domcheck::run(ctx, st, "phisimp");
         }
+        // Run ahead of sroa: its `copyable_arg` check consults `st.nowrite`
+        // and `st.nocapture` to decide which call args can take a fresh copy.
+        if pass_enabled("PLIRON_NOWRITE") {
+            nowrite::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_NOCAP") {
+            nocapture::run(ctx, st);
+        }
         if pass_enabled("PLIRON_SROA") {
             sroa::run(ctx, st);
             domcheck::run(ctx, st, "sroa");
@@ -425,12 +433,6 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     }
                 }
             }
-        }
-        if pass_enabled("PLIRON_NOWRITE") {
-            nowrite::run(ctx, st);
-        }
-        if pass_enabled("PLIRON_NOCAP") {
-            nocapture::run(ctx, st);
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
