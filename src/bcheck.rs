@@ -491,17 +491,35 @@ impl InstructionMapper for CloneMap<'_> {
 /// cold yet live, and folding it drops the loop's exit, turning the scan
 /// into an out-of-bounds read (stage2 rustc `parse_cfg`: `s.contains('=')`
 /// spuriously true for every `s`).
-fn dead_end(func: &Function, bad: Block) -> bool {
+/// `throw_ret`: under emulated EH (COFF panic=unwind) a "throw" unwinds by
+/// early-return, so a panic cold-path ends `call panic_*; load tls_flag;
+/// return` instead of trapping. Admit a `return` only when a call and a load
+/// off the `tls_value` flag address precede it — a live cold exit like
+/// `contains`' `call missing; return` never reads the EH slot, so it still
+/// counts as a live edge.
+fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     let mut stack = vec![bad];
     while let Some(b) = stack.pop() {
         if !seen.insert(b) || seen.len() > 16 || !func.layout.is_cold(b) {
             return false;
         }
+        let (mut call, mut flag) = (false, false);
         for i in func.layout.block_insts(b) {
             let d = &func.dfg.insts[i];
-            if d.opcode() == Opcode::Return {
-                return false;
+            match d.opcode() {
+                Opcode::Call | Opcode::CallIndirect => call = true,
+                Opcode::Load => {
+                    if let InstructionData::Load { arg, .. } = *d
+                        && let Some(ai) =
+                            func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+                        && func.dfg.insts[ai].opcode() == Opcode::TlsValue
+                    {
+                        flag = true;
+                    }
+                }
+                Opcode::Return if !(throw_ret && call && flag) => return false,
+                _ => {}
             }
             for bc in d.branch_destination(
                 &func.dfg.jump_tables,
@@ -514,7 +532,7 @@ fn dead_end(func: &Function, bad: Block) -> bool {
     true
 }
 
-fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop, name: &str, seen: &mut FxHashSet<Block>) -> usize {
+fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop, name: &str, throw_ret: bool, seen: &mut FxHashSet<Block>) -> usize {
     let debug = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
     let h = la.loop_header(lp);
     if !seen.insert(h) {
@@ -887,7 +905,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             );
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
-            if !func.layout.is_cold(bad) || !dead_end(func, bad) {
+            if !func.layout.is_cold(bad) || !dead_end(func, bad, throw_ret) {
                 continue;
             }
             checks.push(Chk {
@@ -1236,7 +1254,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     1
 }
 
-pub fn run(func: &mut Function, name: &str) -> usize {
+pub fn run(func: &mut Function, name: &str, throw_ret: bool) -> usize {
     let debug = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
@@ -1249,7 +1267,7 @@ pub fn run(func: &mut Function, name: &str) -> usize {
         la.compute(func, &cfg, &dt);
         let mut did = 0;
         for lp in la.loops().take(MAX_LOOPS) {
-            let k = run_loop(func, &cfg, &dt, &la, lp, name, &mut seen);
+            let k = run_loop(func, &cfg, &dt, &la, lp, name, throw_ret, &mut seen);
             did += k;
             if k > 0 {
                 break; // cfg/dt/la now stale; rescan

@@ -649,7 +649,7 @@ pub fn lower_to_object(
         // bcheck before loopvec: the versioned fast path has no per-iteration
         // bounds branches, so it's vectorizable where the checked loop isn't.
         if st.bcheck && crate::bisect("bcheck") {
-            let k = crate::bcheck::run(&mut clctx.func, n);
+            let k = crate::bcheck::run(&mut clctx.func, n, eh_data.is_some());
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("bcheck {k} {n}");
             }
