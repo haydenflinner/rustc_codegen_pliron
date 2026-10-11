@@ -62,6 +62,7 @@ mod punroll;
 mod revnorm;
 mod simd;
 mod slp;
+mod slotmerge;
 mod spec;
 mod sroa;
 mod switchmap;

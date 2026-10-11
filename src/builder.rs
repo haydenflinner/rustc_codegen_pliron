@@ -1057,8 +1057,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_invariant_load(&mut self, _load: Value) {}
-    fn lifetime_start(&mut self, _ptr: Value, _size: Size) {}
-    fn lifetime_end(&mut self, _ptr: Value, _size: Size) {}
+    // StorageLive/Dead reach us as lifetime markers; slotmerge consumes them
+    // for exact stack-slot intervals (they emit no machine code).
+    fn lifetime_start(&mut self, ptr: Value, size: Size) {
+        let n = self.const_usize(size.bytes());
+        self.intrinsic("llvm.lifetime.start", self.type_void(), &[n, ptr]);
+    }
+    fn lifetime_end(&mut self, ptr: Value, size: Size) {
+        let n = self.const_usize(size.bytes());
+        self.intrinsic("llvm.lifetime.end", self.type_void(), &[n, ptr]);
+    }
 
     fn call(
         &mut self,

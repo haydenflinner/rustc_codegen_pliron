@@ -1218,3 +1218,56 @@ unit test in the offending pass before the fix.
   Test: tests/bcheck (needle placed just past len inside Vec capacity;
   fails pre-fix `true` vs `false`). Not perf-measured; the gate only
   tightens check collection.
+- slotmerge + lifetime markers (uncommitted): stage2 SIGBUS cluster
+  (deep parser/typeck recursion — expr-stack-overflow, match-72933,
+  survive-peano, issue-88747, deep-try-153583) root-caused to giant
+  frames, not stacker: every `alloca` became its own `ExplicitSlot` and
+  Cranelift lays slots out sequentially with no sharing, so
+  `parse_item_kind` paid ~18.3 KB/frame vs LLVM's ~896 B (~20 arms x
+  136 B aggregates). ~3400 recursion levels x ~26 KB/cycle overflows
+  any thread stack. `src/slotmerge.rs` does CLIF-level stack-slot
+  coloring: traces each `stack_addr` through pure ops/block params/
+  call args, builds a live interval over instruction positions in
+  layout order, and greedily best-fit colors disjoint intervals onto
+  one representative (absorbed slots shrink to 0). Escape model:
+  stores to non-frame memory/indirect calls/writing callees/
+  other-side-effect insts extend the interval to function end;
+  `stack_addr` itself, `return`ed pointers, `sret` args, write-free
+  callees (both `nowrite` flavors for plain calls — unwind kills our
+  frame — strict-only for `try_call`, whose landing pads stay
+  in-frame), and libc memset count as point uses. Store-of-pointer
+  into another slot is NOT an escape: a container edge forces the
+  stored slot's interval to contain the container's — a fixpoint with
+  memcpy/memmove copy edges (contained pointers flow dst-ward) — so
+  escapes through in-frame structures stay bounded by their
+  containers. Loads whose results can't hold a scalar pointer
+  (vector/float) don't propagate slot provenance — chunked i8x16
+  aggregate copies no longer pin every copied slot; scalar-int loads
+  still propagate (loaded bytes may be a pointer). Atomic arg orders
+  audited: store/atomic_store (val, addr); atomic_rmw (addr, val);
+  atomic_cas (addr, expected, new). Backward CFG edges smear the span.
+  `llvm.lifetime.start/end` (MIR StorageLive/Dead) are emitted by
+  builder.rs, recorded per-CLIF-block in lower.rs (resolved after
+  lowering — an inlined alloca can postdate its marker), ignored by
+  sroa.rs (not a memory access), and no-op'd in wasm.rs. IMPORTANT:
+  markers contribute use positions ONLY — exempting marked slots from
+  escape/back-edge extension (LLVM's model: dead storage can't be
+  dereferenced) MISCOMPILED stage2 (`lower_to_hir` read a corrupted
+  DefIndex; rustc MIR permits raw-pointer access after StorageDead).
+  Kept behind PLIRON_SLOTMERGE_MARK for experiments; off by default.
+  Synthetic check (tests/slotmerge/big.rs, 20 arms x 2 disjoint
+  136-B aggregates): 40 slots -> 2 regions, frame 9.5 KB -> 272 B
+  (LLVM: 304 B), `slotmerge 38`. Stage2 `parse_item_kind`:
+  18.3 KB -> 9.1 KB (LLVM 896 B — remaining gap is real call-arg
+  escapes into non-nowrite callees + stores through the caller's
+  out-param, which need marker-authoritative bounds to shrink
+  further). Cluster: 1/5 pass under stage2 (match-72933); the deep
+  ~3400-level cases still SIGBUS at ~9 KB/frame — documented gap,
+  needs the contents-tracking or SROA-coverage follow-up.
+  `check_expr_kind` 19.2 -> 11.3 KB, `check_argument_types`
+  7.0 -> 3.6 KB. Tests: tests/slotmerge/main.rs runtime check
+  (disjoint, overlapping, escaped, edge-carried) + big.rs frame-size
+  assert (<1024 B) in test.sh. Not perf-measured (correctness/
+  frame-size fix); container edges added after the last local run —
+  no measurable change on parse_item_kind (its stores go through the
+  caller's sret out-param, not local slots).

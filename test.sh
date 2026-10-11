@@ -57,6 +57,21 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/co
 # turned `s.contains('=')` into an out-of-bounds read (stage2 rustc
 # parse_cfg emitted the wrong --cfg diagnostic).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/bcheck/main.rs -o $out/bcheck && $out/bcheck
+# slotmerge may only share slots with disjoint live ranges — escaped,
+# overlapping, and edge-carried pointers must keep their own memory or
+# live data is aliased (per-arm aggregate allocas are the frame-size win).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotmerge/main.rs -o $out/slotmerge && $out/slotmerge
+# frame-size regression: 20 match arms x 2 disjoint 136-B aggregates must
+# color to ~2 regions (~272 B), not sum to ~5.4 KB — unmerged, this is the
+# shape that made stage2 rustc_parse::parse_item_kind allocate ~18 KB and
+# SIGBUS on deep parser recursion (tests/ui/expr/if/expr-stack-overflow).
+rustc $BE --crate-type rlib --edition 2021 -O -C codegen-units=1 tests/slotmerge/big.rs -o $out/big.rlib
+objdump -d $out/big.rlib > $out/big.dis
+frame=$(awk '/dispatch.*>:/{f=1} f&&/sub/{print; exit}' $out/big.dis |
+    sed -n 's/.*sub[[:space:]]*sp, sp, #\(0x[0-9a-f]*\).*/\1/p; s/.*sub[ql]*[[:space:]]*\$\(0x[0-9a-f]*\),%rsp.*/\1/p')
+if [ -n "$frame" ] && [ "$((frame))" -ge 1024 ]; then
+    echo "slotmerge: dispatch frame is $((frame))B (expected <1024)" >&2; exit 1
+fi
 # bittab must test bit 0 of the shifted mask — `sh != 0` accepts the whole
 # [lo, max] interval, so sparse sets take the interval's holes (rustc's
 # check_const_closure matched `kw::Fn` against {Move,Static,Use}).

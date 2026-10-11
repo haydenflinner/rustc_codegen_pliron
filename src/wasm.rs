@@ -4828,6 +4828,11 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 self.term(Terminator::Unreachable);
                 return;
             }
+            // Storage-liveness markers for slotmerge (native); wasm has no
+            // explicit stack slots to color, so they're a plain no-op.
+            "llvm.lifetime.start" | "llvm.lifetime.end" => {
+                return;
+            }
             // Landing-pad read of the in-flight exception: delivers the
             // exception pointer and clears the unwind flag so the handler's
             // own calls work normally.

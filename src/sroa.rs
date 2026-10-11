@@ -177,6 +177,10 @@ fn accesses(
                     kind: Kind::Store,
                 });
             } else if let Some(name) = intrinsic(st, op) {
+                // Liveness markers touch no bytes — neither an access nor an escape.
+                if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
+                    continue;
+                }
                 let opnds: Vec<Value> = op.deref(ctx).operands().collect();
                 let kind = match name {
                     "llvm.memcpy" | "llvm.memmove" if idx < 2 => {
@@ -610,7 +614,10 @@ fn validate(ctx: &Context, st: &mut State<'_>, a: Value) {
         } else if Operation::is_op::<StoreOp>(op, ctx) {
             idx == 1 && leaf_compatible(ctx, ty, op.deref(ctx).get_operand(0).get_type(ctx))
         } else {
-            false
+            matches!(
+                intrinsic(st, op),
+                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+            )
         }
     });
     if !ok {

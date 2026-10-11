@@ -305,6 +305,7 @@ pub fn lower_to_object(
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
         let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
         let nowrite: FxHashMap<FuncRef, bool>;
+        let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -333,6 +334,7 @@ pub fn lower_to_object(
                 noalias: FxHashSet::default(),
                 deref: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
+                lifetimes: Vec::new(),
                 va_buf: None,
                 va_fids: FxHashMap::default(),
             };
@@ -345,6 +347,19 @@ pub fn lower_to_object(
             noalias = std::mem::take(&mut fl.noalias);
             deref = std::mem::take(&mut fl.deref);
             nowrite = std::mem::take(&mut fl.nowrite);
+            // Resolve each marker's pointer to its CLIF value — safe now
+            // that every def has been lowered. Untranslatable pointers
+            // (promoted allocas, folded ops) just drop the marker.
+            lifetimes = std::mem::take(&mut fl.lifetimes)
+                .into_iter()
+                .filter_map(|(p, anchor, b, start)| {
+                    fl.vals
+                        .get(&p)
+                        .or_else(|| fl.cconst.get(&p))
+                        .and_then(|vs| vs.first().copied())
+                        .map(|v| (v, anchor, b, start))
+                })
+                .collect();
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -1024,6 +1039,28 @@ pub fn lower_to_object(
                 panic!("brchain broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Merge disjoint-lifetime explicit slots — last, so slot references
+        // cloned by earlier passes are all accounted for before sharing.
+        if crate::pass_enabled("PLIRON_SLOTMERGE") && crate::bisect("slotmerge") {
+            let stats = std::env::var_os("PLIRON_STATS").is_some();
+            let before: u64 = stats
+                .then(|| clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum())
+                .unwrap_or(0);
+            let k = crate::slotmerge::run(&mut clctx.func, &nowrite, &lifetimes);
+            if stats {
+                let after: u64 =
+                    clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum();
+                eprintln!("slotmerge {k} {before}->{after}B {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after slotmerge ====\n{}", clctx.func.display());
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("slotmerge broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.
@@ -1522,6 +1559,12 @@ struct FnLower<'a, 'b, 'tcx> {
     deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>,
     /// FuncRefs of calls to write-free functions (nowrite.rs).
     nowrite: FxHashMap<FuncRef, bool>,
+    /// `llvm.lifetime.{start,end}` markers, as (pointer operand, anchor
+    /// instruction, block, is_start); the pointer is a pliron value — its
+    /// CLIF form is resolved after lowering since an inlined alloca may
+    /// lower after its marker. slotmerge turns these into use positions
+    /// for the slot's live interval (MIR StorageLive/Dead).
+    lifetimes: Vec<(Value, Option<ir::Inst>, ir::Block, bool)>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<ir::Value>,
     /// `__pliron_va8.<sym>` trampoline imports declared for this module.
@@ -3681,6 +3724,21 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             if k > 1 {
                 return self.split_vec_op(op, name, opnds, k);
             }
+        }
+        if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
+            // Not code — a storage-liveness marker. Record where it lands:
+            // the instruction just emitted before it is the anchor (the
+            // marker sits between it and whatever comes next), and the
+            // block is the fallback if that instruction doesn't survive
+            // the pass pipeline. The pointer stays a pliron value: an
+            // inlined alloca may not be lowered yet, and materializing it
+            // here would panic.
+            if let Some(b) = self.b.current_block() {
+                let anchor = self.b.func.layout.block_insts(b).last();
+                self.lifetimes
+                    .push((opnds[1], anchor, b, name == "llvm.lifetime.start"));
+            }
+            return;
         }
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
