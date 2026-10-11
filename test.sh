@@ -37,6 +37,10 @@ for t in $tests; do rustc $BE $stockcfg --edition 2024 tests/$t/main.rs -o $out/
 rustc $BE --edition 2021 -O tests/unroll/main.rs -o $out/unroll$exe && $out/unroll$exe | diff --strip-trailing-cr - tests/unroll/expected.out
 # LICM must not speculate enum-payload derefs past the discriminant guard.
 rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm$exe && $out/licm$exe
+# loadpre's edge insertion must feed the post-store/post-call value across
+# join edges — a compensating load on a missing arm reads end-of-pred
+# memory, so an aliasing store or writing call there must not go stale.
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/loadpre/main.rs -o $out/loadpre$exe && $out/loadpre$exe
 # Post-alloc pair fusion must not pair a load with a load that uses its
 # result as an address (pointer-chase + closure-env dependent loads).
 rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse$exe && $out/pairfuse$exe
