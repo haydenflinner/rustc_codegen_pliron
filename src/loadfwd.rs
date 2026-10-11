@@ -7,6 +7,7 @@
 //! everything. Only `notrap` loads/stores (all non-volatile accesses at -O)
 //! are forwarded.
 
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::FuncRef;
@@ -423,6 +424,10 @@ struct Pre<'a> {
     end: FxHashMap<Block, FxHashMap<Loc, St>>,
     start: FxHashMap<(Block, Loc), Value>,
     pending: Vec<(Block, Loc)>,
+    /// Compensating loads inserted at the end of a predecessor that lacked
+    /// the location (partial-availability PRE): `(block, loc, pred)` → the
+    /// inserted load's result, used as the edge arg instead of `end_val`.
+    inserted: FxHashMap<(Block, Loc, Block), Value>,
 }
 
 fn pred_blocks(cfg: &ControlFlowGraph, b: Block) -> Vec<Block> {
@@ -466,6 +471,122 @@ fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type) {
         (Root::S(_), Root::S(_)) => true,
         _ => false,
     });
+}
+
+/// Whether a store footprint `w = (root, offset, type)` may clobber `l` —
+/// the complement of `kill_st`'s keep rule.
+fn may_write(w: Loc, l: Loc) -> bool {
+    let (r, o, ty) = w;
+    let (r2, o2, t2) = l;
+    match (r, r2) {
+        _ if r == r2 => !(o2 >= o + i64::from(ty.bytes()) || o >= o2 + i64::from(t2.bytes())),
+        (Root::S(_), Root::S(_)) => false,
+        _ => true,
+    }
+}
+
+/// Bound on compensating loads `edge_pre` inserts per function.
+const MAX_INSERTS: usize = 64;
+
+/// Partial-availability PRE (LLVM GVN's load PRE on the missing edges): a
+/// `notrap` load in `b` whose `loc` is available at the end of some but not
+/// all predecessors is made fully available by inserting a compensating
+/// copy of the load at the end of each missing predecessor, then merging
+/// all arms' values through a new block param (the same `start`/`pending`
+/// machinery as fully-available locs; `inserted` supplies the edge arg for
+/// the preds that got a fresh load).
+///
+/// Soundness, checked per missing pred `p` before committing: `p`'s
+/// terminator must be a plain branch — a `try_call` edge would need the
+/// post-call state but anything inserted before it reads pre-call memory
+/// — and the load's address operand must dominate it (a pointer computed
+/// in `b` can't be reloaded upstream). Callers guarantee nothing in `b`
+/// before the load may write `loc`, so the value the load sees equals the
+/// memory state at end of every pred. `notrap` loads are speculatable
+/// (invalid memory is UB), so running them on `p`'s sibling edges is safe.
+fn edge_pre(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dom: &mut Option<DominatorTree>,
+    out: &FxHashMap<Block, FxHashSet<Loc>>,
+    reach: &FxHashSet<Block>,
+    pre: &mut Pre,
+    b: Block,
+    i: Inst,
+    loc: Loc,
+) -> Option<Value> {
+    let mut avail = false;
+    let mut missing: Vec<(Block, Inst)> = Vec::new();
+    for p in cfg.pred_iter(b) {
+        if !reach.contains(&p.block) {
+            return None;
+        }
+        if out.get(&p.block).is_some_and(|o| o.contains(&loc)) {
+            avail = true;
+        } else {
+            missing.push((p.block, p.inst));
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    // `missing` empty is the fully-available case (`st` would have hit);
+    // `avail` false is plain hoisting, not redundancy elimination; a self
+    // back-edge among the missing would read memory past the load itself.
+    if !avail || missing.is_empty() || missing.iter().any(|&(p, _)| p == b) {
+        return None;
+    }
+    if pre.inserted.len() + missing.len() > MAX_INSERTS {
+        return None;
+    }
+    let InstructionData::Load {
+        arg, flags, offset, ..
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let arg = func.dfg.resolve_aliases(arg);
+    for &(p, pinst) in &missing {
+        if func.layout.last_inst(p) != Some(pinst)
+            || !matches!(
+                func.dfg.insts[pinst].opcode(),
+                Opcode::Jump | Opcode::Brif | Opcode::BrTable
+            )
+        {
+            return None;
+        }
+        if dom.is_none() {
+            *dom = Some(DominatorTree::with_function(func, cfg));
+        }
+        let ok = match func.dfg.value_def(arg) {
+            ValueDef::Result(di, _) => dom.as_ref().unwrap().dominates(di, pinst, &func.layout),
+            ValueDef::Param(db, _) => dom.as_ref().unwrap().dominates(db, pinst, &func.layout),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+    }
+    let v = match pre.start.get(&(b, loc)) {
+        Some(&v) => v,
+        None => {
+            pre.pending.push((b, loc));
+            let v = func.dfg.append_block_param(b, loc.2);
+            pre.start.insert((b, loc), v);
+            v
+        }
+    };
+    for &(p, pinst) in &missing {
+        let li = func.dfg.make_inst(InstructionData::Load {
+            opcode: Opcode::Load,
+            arg,
+            flags,
+            offset,
+        });
+        func.dfg.make_inst_results(li, loc.2);
+        func.layout.insert_inst(li, pinst);
+        pre.inserted.insert((b, loc, p), func.dfg.first_result(li));
+    }
+    Some(v)
 }
 
 /// Load forwarding with PRE at joins (LLVM GVN's load PRE / LICM scalar
@@ -528,10 +649,18 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
         end: FxHashMap::default(),
         start: FxHashMap::default(),
         pending: Vec::new(),
+        inserted: FxHashMap::default(),
     };
+    let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
     for &b in rpo {
         let mut st: FxHashMap<Loc, St> = ins[&b].iter().map(|&l| (l, St::In)).collect();
+        // May-write footprints since block start plus a cleared-state flag,
+        // so a load miss can tell "never tracked — it still reads
+        // block-start memory" from "clobbered on the way" (edge PRE would
+        // then feed it the stale end-of-pred value).
+        let mut writes: Vec<Loc> = Vec::new();
+        let mut clobbered = false;
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for i in insts {
             let op = func.dfg.insts[i].opcode();
@@ -553,6 +682,13 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                         };
                         fwd.push((i, v));
                         st.insert(loc, St::Local(v));
+                    } else if !clobbered
+                        && writes.iter().all(|&w| !may_write(w, loc))
+                        && let Some(v) =
+                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc)
+                    {
+                        fwd.push((i, v));
+                        st.insert(loc, St::Local(v));
                     } else if st.len() < MAX_ENTRIES {
                         st.insert(loc, St::Local(res));
                     }
@@ -568,6 +704,25 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                     let (r, o) = root(func, args[1]);
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
                     kill_st(&mut st, r, o, ty);
+                    writes.push((r, o, ty));
+                    // A store through `select c, pa, pb` may write either
+                    // arm's location — kill both, mirroring `transfer` (a
+                    // stale `St` here would forward values the store
+                    // overwrote).
+                    if let Root::V(rv) = r
+                        && let ValueDef::Result(si, _) = func.dfg.value_def(rv)
+                        && let InstructionData::Ternary {
+                            opcode: Opcode::Select,
+                            args: sargs,
+                        } = func.dfg.insts[si]
+                    {
+                        for &a in &sargs[1..] {
+                            let (ra, oa) = root(func, a);
+                            let a = (ra, oa.wrapping_add(o), ty);
+                            kill_st(&mut st, a.0, a.1, a.2);
+                            writes.push(a);
+                        }
+                    }
                     if st.len() < MAX_ENTRIES {
                         st.insert((r, o, ty), St::Local(val));
                     }
@@ -578,6 +733,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                     || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
                 {
                     st.clear();
+                    clobbered = true;
                 }
                 _ => {}
             }
@@ -592,7 +748,10 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
         pinsts.sort_unstable();
         pinsts.dedup();
         for (pb, pinst) in pinsts {
-            let v = end_val(func, &mut pre, pb, loc);
+            let v = match pre.inserted.get(&(b, loc, pb)) {
+                Some(&v) => v,
+                None => end_val(func, &mut pre, pb, loc),
+            };
             let dfg = &mut func.dfg;
             for bc in dfg.insts[pinst]
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
