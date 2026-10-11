@@ -1203,3 +1203,18 @@ unit test in the offending pass before the fix.
   diff harness — the "run this regularly" process. Handles the Darwin
   rust-objcopy PATH gap, --force-rerun against fingerprint caching, and
   a watchdog for idle-deadlocked rustc (the demangle symptom above).
+- 0f99954 bcheck: a foldable bound check's unsafe edge only had to be
+  `cold` — but cold *normal* exits are cold too. In `parse_cfg`'s
+  `s.contains('=')` the `position` scan's not-found exit was cold (the
+  surrounding error-reporting fold is a cold call region), so the loop's
+  own `iv < bound` control test was collected as a "bounds check" and
+  its `brif` became an unconditional `jump` in the fast clone — the
+  scan's exit vanished and it read OOB until it found the byte. The
+  `hi < len` guard is vacuous for `idx = i` (`hi = bound-1`), so the
+  broken clone was always taken: every string "contained" '='. Found
+  via the stage1-vs-stage2 ui diff (cfg-arg-invalid-2, path-kw — the
+  "ensure escaping" long diagnostic). Fix: `dead_end` requires every
+  path out of the unsafe edge to stay cold and never reach `return`.
+  Test: tests/bcheck (needle placed just past len inside Vec capacity;
+  fails pre-fix `true` vs `false`). Not perf-measured; the gate only
+  tightens check collection.
