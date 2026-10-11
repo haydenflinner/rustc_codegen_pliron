@@ -68,6 +68,7 @@ mod sroa;
 mod switchmap;
 mod taildup;
 mod tailmerge;
+mod tailrec;
 mod type_of;
 mod types;
 mod unreach;
@@ -428,6 +429,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         st.loopvec = pass_enabled("PLIRON_VEC");
         st.slp = pass_enabled("PLIRON_SLP");
         st.bcheck = pass_enabled("PLIRON_BCHECK");
+        st.tailrec = pass_enabled("PLIRON_TAILREC");
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }

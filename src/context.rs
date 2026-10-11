@@ -207,6 +207,8 @@ pub struct State<'tcx> {
     pub slp: bool,
     /// Loop versioning to hoist provable bounds checks (`-O`, `PLIRON_BCHECK`).
     pub bcheck: bool,
+    /// Accumulator tail-recursion elimination (`-O`, `PLIRON_TAILREC`).
+    pub tailrec: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).

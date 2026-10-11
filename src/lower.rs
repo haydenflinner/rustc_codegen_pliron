@@ -464,6 +464,26 @@ pub fn lower_to_object(
                 panic!("taildup broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // `f(a) + f(b)`-style recursion → accumulate the first call and
+        // loop on the second's args (LLVM TRE); before loadfwd/licm so
+        // they can still hoist out of the new back-edge.
+        if st.tailrec && crate::bisect("tailrec") {
+            let k = crate::tailrec::run(&mut clctx.func, id);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("tailrec {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!(
+                    "==== clif {n} after tailrec ====\n{}",
+                    clctx.func.display()
+                );
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("tailrec broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.loadfwd && crate::bisect("loadfwd") {
             forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
             if st.slot_dse {
