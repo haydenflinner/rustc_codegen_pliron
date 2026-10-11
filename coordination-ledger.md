@@ -1056,3 +1056,43 @@ miscompiled, not just one path.
 - Over-bail check: no new bails across test.sh corpus.
 - Not perf-validated beyond test.sh; stage2 rebuild running on
   f6c551d+4981375.
+
+## wasm: inline-site frame folding (wt/wasm-perf, 4402b11 — merged)
+
+Root cause pursued: spliced callees re-ran the full SP frame dance
+(`global.get sp; sub; and; set` + restores) at every callsite — a hot
+`FindMatches::count` loop paid ~10 extra ops/iteration.
+
+Fix: `inline_site` now folds callee frame chains into the caller's
+reservation — callee fp aliases `caller_fp + K_i` (LLVM-style merged
+inline allocas); the caller's `SZ` is bumped and its align mask widened
+when needed. Frameless callers get a fresh prologue-shaped reservation
+plus `global.set sp` restores on Return blocks that lacked one.
+
+Bugs found via FunctionBody::validate() instrumentation (since removed):
+- Emitted base `i32add`s were swept into `after` when the callsite sat
+  in `entry` before the insert slot (split at `pos+1` takes everything
+  after the call) → "def does not dominate" → misaligned frames →
+  `unreachable` trap in regex `Builder::configure`.
+- `insts.get(gpos+1)` captured *after* `add_op` appended the new consts,
+  so bases anchored before the just-emitted const → same-block
+  def-after-use.
+Fixes: emitted ops insert before *anchor insts* (not absolute indices),
+clamped to the call index when `blk == entry`; the anchored layout is
+used only when there is room after `a`'s def (else falls back to a fresh
+reservation); `orig` for restores picks the earliest SP read in final
+entry order. Post-splice `validate()` now reports 0 failures on wbig
+(was 70 with the broken version).
+
+Measured (wbig, regex+std real crate, node):
+- runtime: 6.60 → 6.52 ms/iter work(20) (~1.3%, consistent over 5 runs);
+  stock 5.12 — remaining gap ~27%.
+- size: 2,427,849 → 2,424,804 (stock 1,328,665 — still ~1.83x).
+- SP ops (global.get/set 0 in disasm): 4,656 → 3,850 (−17%; stock 2,327).
+- functions: 2,872 → 2,871 (stock 1,528).
+- verify hash -9077338054421087601n identical to stock; work outputs
+  byte-identical.
+Validation: bash tests/wasm/run.sh fully green (core/std/WASI/unwind).
+Not validated: V8/d8 hot-profile re-run; other wasm crates.
+Next frontier: function count (~1.9x) and code density in branch-heavy
+regex paths — local.set/if-else/i64-packing traffic per earlier profile.
