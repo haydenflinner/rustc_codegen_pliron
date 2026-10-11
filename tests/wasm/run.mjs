@@ -14,6 +14,7 @@ const checks = [
   ["indirect(4)", () => e.indirect(4), 5],
   ["indirect(5)", () => e.indirect(5), 15],
   ["fmt_len(42)", () => e.fmt_len(42), "x=42 f=6.000".length],
+  ["eq_bytes(7)", () => e.eq_bytes_check(7), 43],
 ];
 let bad = 0;
 for (const [n, f, want] of checks) {

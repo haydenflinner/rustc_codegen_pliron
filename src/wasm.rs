@@ -2512,6 +2512,9 @@ fn wsel(b: &mut FunctionBody) -> bool {
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
+    // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
+    // +2% size on wbig — wasm calls really are cheap and the splice's
+    // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
     const HOT: usize = 15;
