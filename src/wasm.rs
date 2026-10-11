@@ -2989,6 +2989,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 &deref,
                 &self.o.funcs,
                 &self.st.nowrite,
+                &self.name,
             );
         }
         if dbg {
@@ -5274,6 +5275,7 @@ fn wloop_opt(
     deref: &FxHashMap<WV, u64>,
     funcs: &[FDecl],
     nowrite: &FxHashMap<String, bool>,
+    fname: &str,
 ) {
     // Merge multi-entry loop headers so every loop has a preheader.
     {
@@ -5374,7 +5376,7 @@ fn wloop_opt(
             .iter()
             .all(|(h2, _)| h2 == h || !inloop.contains(h2));
         if innermost {
-            wunroll(b, &mut defb, &cfg, inloop, *h, unr);
+            wunroll(b, &mut defb, &cfg, inloop, *h, unr, fname);
         }
     }
     wdce(b, deref);
@@ -6282,6 +6284,7 @@ fn wunroll(
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
     copies: usize,
+    fname: &str,
 ) {
     let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
     // Size limits: unrolling is a tradeoff, not a free win. Scale the
@@ -6303,7 +6306,7 @@ fn wunroll(
     if copies < 2 || eff_blocks > 16 || insts > 64 {
         if verbose {
             eprintln!(
-                "wunroll: {h} skipped size blocks={eff_blocks}+{sink_blocks} insts={insts}"
+                "wunroll: {fname} {h} skipped size blocks={eff_blocks}+{sink_blocks} insts={insts}"
             );
             for &lb in inloop {
                 eprintln!(
@@ -6335,7 +6338,13 @@ fn wunroll(
         .map(|v| v == "0")
         .unwrap_or(false);
     if flat_ok && wunroll_flat(b, defb, inloop, h, copies, &order) {
+        if verbose {
+            eprintln!("wunroll: {fname} {h} flat");
+        }
         return;
+    }
+    if verbose {
+        eprintln!("wunroll: {fname} {h} chain x{copies}");
     }
     // Build the copies.
     let mut heads = vec![h];
@@ -6384,13 +6393,21 @@ fn wunroll_flat(
     order: &[WBlock],
 ) -> bool {
     let verbose = std::env::var("PLIRON_WASM_VERBOSE").is_ok();
+    macro_rules! rej {
+        ($why:expr) => {{
+            if verbose {
+                eprintln!("wunroll_flat: {h} reject: {}", $why);
+            }
+            return false;
+        }};
+    }
     let Terminator::CondBr {
         cond,
         if_true,
         if_false,
     } = &b.blocks[h].terminator
     else {
-        return false;
+        rej!("header not condbr");
     };
     // Canonical counted test: `iv <u n`/`iv >=u n` via as_check, plus
     // `iv != n`/`iv == n` — pointer-bump loops (`for &x in a`) compare
@@ -6417,7 +6434,7 @@ fn wunroll_flat(
         }
     })(*cond)
     else {
-        return false;
+        rej!("cond not a recognized check");
     };
     let (pass, _) = if pass_true {
         (if_true, if_false)
@@ -6425,20 +6442,20 @@ fn wunroll_flat(
         (if_false, if_true)
     };
     if !inloop.contains(&pass.block) || pass.block == h {
-        return false;
+        rej!("pass arm not in loop / is header");
     }
     if !winv(b, defb, inloop, n) {
-        return false;
+        rej!("n not loop-invariant");
     }
     let ValueDef::BlockParam(hb, pidx, WT::I32) = b.values[iv] else {
-        return false;
+        rej!("iv not an i32 header blockparam");
     };
     // A stale BlockParam can outlive its slot if optimize dropped the
     // param; `iv` must still own index `pidx` before edge args are read.
     if hb != h
         || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == iv)
     {
-        return false;
+        rej!("iv blockparam slot stale");
     }
     // Uniform positive constant step on iv across all latches (an
     // unchanged feed contributes 0 like wbcheck's rule).
@@ -6450,38 +6467,42 @@ fn wunroll_flat(
         .map(|(j, &p)| (p, b.blocks[h].pos_in_pred_succ[j]))
         .collect();
     if latches.is_empty() {
-        return false;
+        rej!("no latches");
+    }
+    // The latch arg is `iv + step` as an affine relation — chase add
+    // chains (upstream unrolling leaves `add(add(iv,1),1)…`) rather
+    // than requiring a literal `add(iv, const)`.
+    fn step_of(b: &FunctionBody, iv: WV, arg: WV) -> Option<i64> {
+        let arg = b.resolve_alias(arg);
+        if arg == iv {
+            return Some(0);
+        }
+        if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
+            let u = b.resolve_alias(b.arg_pool[aa][0]);
+            let v = b.resolve_alias(b.arg_pool[aa][1]);
+            if let Some(c) = wconst(b, v) {
+                return step_of(b, iv, u).map(|s| s + c);
+            }
+            if let Some(c) = wconst(b, u) {
+                return step_of(b, iv, v).map(|s| s + c);
+            }
+        }
+        None
     }
     let mut step: Option<i64> = None;
     for &(la, tidx) in &latches {
         let arg = edge_arg(b, la, tidx, pidx as usize);
-        let arg = b.resolve_alias(arg);
-        let s = if arg == iv {
-            0
-        } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
-            let u = b.resolve_alias(b.arg_pool[aa][0]);
-            let v = b.resolve_alias(b.arg_pool[aa][1]);
-            let s = if u == iv {
-                wconst(b, v)
-            } else if v == iv {
-                wconst(b, u)
-            } else {
-                None
-            };
-            match s {
-                Some(s) => s,
-                None => return false,
-            }
-        } else {
-            return false;
+        let s = match step_of(b, iv, arg) {
+            Some(s) => s,
+            None => rej!("latch iv arg not iv+const chain"),
         };
         match step {
             None => step = Some(s),
             Some(st) if st == s => {}
-            _ => return false,
+            _ => rej!("non-uniform step"),
         }
     }
-    let Some(step) = step else { return false };
+    let Some(step) = step else { rej!("step not positive (or none)") };
     if step <= 0 {
         return false;
     }
