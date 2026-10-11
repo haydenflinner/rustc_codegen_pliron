@@ -55,3 +55,9 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   `rust`/`rust-sh` dirs (or `~/work/rust`/`~/work/rust-sh` on the Linux box).
   On Linux it appends a `[target.*] linker = cc-wild` stanza; on macOS the
   system `ld` is used. `selfhost/bench.sh` is Linux-only.
+- `selfhost/verify.sh [WORKTREE] [SUITE]` — run a compiletest suite under
+  the pliron-built stage2 rustc and the LLVM-built stage1 baseline, then
+  diff failures: stage2-only entries are pliron regression candidates.
+  Handles Darwin's `rust-objcopy` PATH requirement and watchdog-kills
+  rustc stuck idle (miscompiled-rustc deadlocks). Run it after optimizer
+  changes that touch stage2 codegen.

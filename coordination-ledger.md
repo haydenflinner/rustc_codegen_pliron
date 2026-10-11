@@ -21,6 +21,20 @@
 - x64 min/max/dot_i32 "gaps" largely explained by missing ISA flags
   (baseline SSE2); psadbw for sum_u8 blocked on vendoring
   cranelift-assembler-x64 — documented in x64-notes.md.
+- ffe20b3 loopvec operand-emitability guards: conservative by design —
+  some count-if conds that previously vectorized may now stay scalar
+  (any `band x,1`/bool-tree operand that is neither lane-replicable nor
+  splattable). Correctness-required (was an ICE / silent-miscompile
+  path), but the perf delta was not measured.
+- 75cb4c6 bittab reanalyze-per-fold: CFG/dom/ublocks are rebuilt after
+  each applied fold — correct-by-construction but measurably more
+  compile-time than the old single-snapshot plans; not measured.
+- b134d48 fusechains/merge_chains self-alias guards: bail rate on
+  param-permutation/dead-cycle chains unmeasured; could theoretically
+  forgo some profitable fusions.
+- 655947a wasm frame-fold merge: perf validated on the wt/wasm-perf
+  worktree only (wbig ~1.3%, SP ops -17%); not re-benchmarked after
+  merging onto the current optimizer stack.
 
 ## Follow-ups
 - rev_copy32 aarch64: stable ~11% deficit vs stock (0.26 vs 0.234, 3 runs).
@@ -937,7 +951,127 @@ miscompiled, not just one path.
   (current HEAD incl. mask01 + noalias-LICM merges). Bad stage2 driver
   snapshotted to /tmp/stage2-bad/ for bisect if needed.
 
-## wasm: inline-site frame folding (wt/wasm-perf, 4402b11 — NOT merged)
+## Strided lane-gather vectorization — matmul-64 closed on both arches (wt/x64-codegen, a730090)
+- src/loopvec.rs: `Stream.stride` + `emit_vload` — strided loads
+  (whole-element byte multiple >= 2*ebytes, `MAX_GATHER=2048`)
+  emit per-lane `load.elem` + `splat`/`insertlane` (LLVM's
+  movd/pinsrd column idiom). Loads only; strided stores still
+  bail. `VPred::Pair` and strength-reduced steps scale by stride.
+- `upgrade_lagged` + `param_coeffs`: `Param::Other` whose latches
+  all pass one affine combination of `Step` params upgrades to a
+  deferred `Step` — unblocks rustc's lagged bounds-check/ptr
+  params (matmul k-loop header was all-"?").
+- `exit_bare`: arg-free counting-exit target cloned into the
+  vector epilogue; `rem==0` jumps to the clone so post-tested
+  loops take the full `iters & -K` count. loopidiom trips gained
+  the do-while `ult` arm (`SatSub`/`Div`, `ins_eval` now
+  pub(crate)).
+- Const-trip gate: strided streams with `iters < vf*UNROLL` bail
+  (dead vector clone otherwise).
+- MEASURED (best-of-10): matmul-64 0.161->0.123 x64-Rosetta
+  (stock 0.088; 1.83x->1.39x), 0.162->**0.074** aarch64 (stock
+  0.070 — PARITY). matmul-256 10.40->9.97 / 10.25->9.95 (~stock
+  parity both arches). colsum256/sdot/nth2/nth4 neutral-or-win.
+  All checksums match stock.
+- TRAP: `PLIRON_VEC=0` also disables ifconv2+cparm — matmul-64
+  "novec" 0.095 was a confounded baseline; real shipped scalar is
+  ~0.16 on both arches. Use `PLIRON_VEC_SKIP=` for per-fn A/B.
+- PRE-EXISTING BUG FLAGGED (native wt, cparm): fuzz seeds 0:24 →
+  13 `ifconv2 broke` ICEs (non-dominating value); identical at
+  919ba07 and 140eb02, `PLIRON_CPARM=0` clears. cparm also causes
+  the matmul-64 2x scalar regression noted above (0.16 vs 0.08).
+- Merged shared HEAD 06cdcc6/140eb02 first — fast-forward, no
+  conflicts (delta didn't touch loopvec/loopidiom). Cargo.toml/
+  lock stay dirty locally (all-arch) — not committed.
+- Validated: PLIRON_VERIFY=1 test.sh green, harness tier-0 green,
+  gather_mm/gather_check strided correctness (N=1..256, strides
+  1..128, u32/u64, do-while) ALL OK both arches + Rosetta.
+- Remaining: chars ~1.8x x64, tokenize ~2.3-2.6x, nth2_u64 a64
+  1.8x (early-exit gate, pre-existing), hist ~parity, matmul-64
+  x64 1.39x residual.
+
+## Self-host / cparm dominance fix (3b20008)
+
+- The reported "stage2 crashes compiling core" was a STALE stage2
+  binary: its embedded backend predated ~15 merges incl. five
+  miscompile fixes. After rsyncing current HEAD, `core` compiled
+  cleanly; the failure moved to `alloc`.
+- `alloc` ICE root-caused to `cparm_round` (clifpeep): it folded a
+  join param to ONE `iconst` in the join block and rewrote mid-chain
+  (self-passthrough) params in OTHER blocks to it. A param's uses
+  live under its own home block, which the join need not dominate →
+  non-dominating SSA. Symptom depended on which pass hit it first:
+  egraph `payload < (1 << 30)` (Vec::<u8>::into_boxed_slice),
+  verifier `uses value from non-dominating inst` (try_call edges),
+  and the 13 fuzz `ifconv2 broke` ICEs the x64 agent flagged.
+- Fix (3b20008): each carrier's replacement const is materialized at
+  its OWN home block's first insertion point (dominates all its uses
+  by SSA). Fuzz seeds 0:24 went 13-ICE -> 24/24 clean; new
+  tests/cparm/main.rs covers the shape.
+- rust-sh needs Hayden's rustc-side `fat_lto_supported` commit
+  (cf54c772450) — applied locally as 4211e9357e1 and added to
+  selfhost/setup.sh as rustc-session.patch for fresh worktrees.
+- STILL OPEN: (a) stage1 std `alloc`+ rebuild in progress post-fix;
+  (b) cparm also causes a matmul-64 2x scalar regression (0.16 vs
+  0.08 — flagged by x64 agent, unrelated to dominance; investigate);
+  (c) old-log Mach-O `__linkme*,regular,no_dead_strip` section-name
+  ICE was from the STALE backend (Oct 8) — re-verify on the new
+  build if it resurfaces.
+
+## Self-host / celim retry-operand fix (52c3338) + punroll shared-exit fix (73907a8)
+
+- Stage1 std build completed post-cparm-fix (core/alloc/std/test/
+  proc_macro all clean). Stage2 progressed to compiler deps, then a
+  pliron-compiled `blake3` build-script binary SIGSEGV'd inside
+  `cc`'s env handling — `BTreeMap::IntoIter::dying_next` null-deref.
+- Root cause (52c3338): `celim` normalizes an icmp with peeling; if
+  that decide fails it retries unpeeled, but passed the FIRST
+  normalization's raw operand pair. A `v223 == 0` query was decided
+  against `v492`'s range (`v492-1 != 0` from `v492 != 0` — wrong),
+  folding `depth-1 == 0` false so `dying_next` walked a dead link.
+  Repro: BTreeMap<u32,u32> insert n>=12 then drop -> SIGSEGV
+  (opt-level>=1). tests/celim/main.rs covers it.
+- Next stage2 failure: `miniz_oxide` `deflate::compress_inner` —
+  Cranelift egraph elaborate assert / verifier non-dominating use.
+  Root cause (73907a8): `ifconv2` aliased a live-out value to
+  in-body loads (`v6129 -> v758`); `punroll` then fed the shared
+  exit continuation (a block dominated by no single exit, reached
+  via both latch and side exits) from the peeled copies without the
+  loads ever running — an ambient use outside every cloneable exit
+  cone. `run_loop` never checked for that; `run_jam` already bails
+  on the same shape ("body value used outside"). run_loop now bails
+  too when a resolved body value is used in a reachable non-body
+  block outside `cone ∪ mid_exit.corder`s.
+- Not perf-validated: the bail only affects loops whose ambient
+  live-outs leak past multi-exit merges (observed: none in test.sh;
+  miniz_oxide compress_inner now skips the unroll). An LCSSA-style
+  param-threading recovery is possible follow-up if a hot loop
+  regresses.
+- test.sh: green on 73907a8 (one prior `sleep+instant` 5ms flake,
+  passes on rerun — timing-sensitive WASI test, not a regression).
+- Stage2 compiler rebuild running on 73907a8 backend.
+
+## Self-host / punroll second shared-continuation fix (f6c551d)
+
+- After 73907a8, stage2 hit `register allocation: EntryLivein` on
+  `rustc_lint_defs`; a new catch_unwind in lower.rs (4981375) named it
+  `Lint::parse_rust_version` — three sequential `parse_part` loops
+  whose exits converge on a shared continuation that ambiently uses
+  the third loop's params (`v325` in `block138`).
+- Root cause: the 73907a8 guard asked only that each ambient use sit
+  inside *some* exit's cone. `block138` is inside the latch cone, but
+  the peeled *side-exit* clone (`block181`) jumps to the original
+  shared `block136` — reached without the defining inst running.
+  The cone clone binds values only for the latch path.
+- Fix: per exit target, forward-walk non-body blocks; any ambient
+  body-value use must be dominated by that target (i.e. inside its
+  own cloneable cone) — otherwise bail. Both repros now clean;
+  tests/punroll/main.rs is the regression (ICE'd on 73907a8).
+- Over-bail check: no new bails across test.sh corpus.
+- Not perf-validated beyond test.sh; stage2 rebuild running on
+  f6c551d+4981375.
+
+## wasm: inline-site frame folding (wt/wasm-perf, 4402b11 — merged)
 
 Root cause pursued: spliced callees re-ran the full SP frame dance
 (`global.get sp; sub; and; set` + restores) at every callsite — a hot
@@ -977,6 +1111,99 @@ Not validated: V8/d8 hot-profile re-run; other wasm crates.
 Next frontier: function count (~1.9x) and code density in branch-heavy
 regex paths — local.set/if-else/i64-packing traffic per earlier profile.
 
+## Stage2 self-host reached (2026-10-10)
+
+The full stage2 compiler (incl. rustc_codegen_pliron itself, compiled by
+the pliron-built stage1 rustc) now builds. Optimizer bugs fixed along
+the way, in hit order:
+
+- 52c3338 celim: unpeeled-retry range query used the peeled call's
+  operand pair — `x-1 == 0` folded from `x != 0`; SIGSEGV'd BTreeMap
+  drop walks (blake3 build script). Test: tests/celim.
+- 73907a8 + f6c551d punroll: peeled exits feeding shared continuations
+  created ambient (non-dominating) uses of body values — egraph
+  elaborate assert / EntryLivein regalloc failure (miniz_oxide,
+  rustc_lint_defs). Test: tests/punroll.
+- 17ddc11 coldargs: `iconst.i128` is unrepresentable — iconcat halves
+  instead (jiff). Test: tests/coldargs.
+- 75cb4c6 bittab: stale analysis snapshot across folds + block-param
+  uses unaccounted → dangling values / reserved_value OOB
+  (rustc_trait_selection).
+- b134d48 fusechains + merge_chains: edge args resolving to the
+  target's own params wrote self-alias cycles (release builds skip
+  change_to_alias's debug_assert) — `Value alias loop detected`
+  (rustc_mir_transform).
+- ffe20b3 loopvec: `band x,1` mod-2 bool arm + cond-tree walk admitted
+  operands that were neither lane-replicable nor splattable →
+  emit_scalar hit an in-body load ("side-effecting inst used as scalar
+  invariant", vendored cranelift-codegen dfg.rs). Unit regression test
+  in src/loopvec.rs builds the shape with FunctionBuilder.
+- 4981375 lower: catch_unwind around define_function names the
+  function + dumps CLIF on backend panics (kept — it made every ICE
+  above reproducible in minutes).
+
+## Stage2 self-host miscompiles (6239c9b, fe3fd90, e8d0fbf)
+
+Post-"stage2 builds" the pliron-built stage2 rustc miscompiled three
+successive passes; each blocked stage2 std until fixed. All diagnosed
+via `PLIRON_CLIF` per-pass dumps on `rustc_*` crate rebuilds plus
+disassembly of the stage2 driver dylib; each got a FunctionBuilder
+unit test in the offending pass before the fix.
+
+- 6239c9b bittab: the sparse-set fold emitted `icmp ne (mask >> d), 0`
+  — nonzero whenever ANY bit >= d is set, so the whole interval
+  `[lo, max]` matched, not just the sparse set. Contiguous ranges hid
+  it; `sym == 12` slipped through {21,28,35} in `uninterpolate`, and
+  stage2 rustc couldn't parse `pub const fn`. Fix: `band (mask>>d), 1`.
+  Test: tests/bittab (fails pre-fix: every x <= max "hits").
+  Bootstrap hazard: rebuild used `PLIRON_BITTAB=0` so the loaded buggy
+  dylib couldn't poison the new one mid-build.
+- fe3fd90 ifconv: `conv_table` deduped `br_table` arms on the RAW
+  final-edge args — identical when arms share a last forwarder hop —
+  collapsing arms that inject different constants earlier in the chain
+  to the representative's value. `param_default_policy` returned
+  `Some(Forbidden)` for every `ItemKind` member; stage2 rustc rejected
+  generic param defaults on `const trait` (and everything else).
+  Fix: resolve final args through `psub` before dedup.
+  Test: `ifconv::tests::table_arms_dedup_on_resolved_args` + tests/polsw
+  e2e. Rebuild used `PLIRON_IFCONV=0` for the same bootstrap hazard.
+- e8d0fbf ifconv: `edge_ok` accepted escaped uses of a bypassed
+  forwarder-hop's own defs whenever the hop dominated `b`'s term —
+  exactly true when `b` is a loop latch inside the loop whose header
+  merge is the hop. The use stays dominated, but the hop param is a
+  phi over the hop's edges: dropping `b`'s edge changes the value the
+  use observes. `rustc_lexer::eat_hexadecimal_digits` (in the ifconv2
+  round): the digit latch's `has=1` edge was bypassed, `has` became a
+  phi over only the entry `0` edge — 3030 `E0768 no valid digits`
+  errors on valid hex literals in stage2 std.
+  Fix: `edge_ok` now takes the union of all arm `chain` blocks; defs
+  inside a bypassed chain never qualify on the dominance clause (both
+  brif and br_table paths). Test:
+  `ifconv::tests::arm_chain_local_escape_blocks_conversion` mirrors the
+  sec6 CFG (dominated latch + escaped hop param/result) and asserts the
+  fold is rejected; hop's own forwarder fold still fires.
+- Perf note: none of the three were perf-measured (correctness fixes);
+  the e8d0fbf rejection additionally skips chained ifconv folds whose
+  hop locals leak below the merge — a real (unquantified) missed-opt
+  class for flag-carrying loop headers.
+- 534d57c celim: `off_implied` folded the *weak* reverse compare on
+  ±1-offset facts — `x < y` does imply `x + 1 <= y`, so `x + 1 > y` is
+  dead, but `x + 1 >= y` is SATISFIABLE at `x = y - 1`; folding it false
+  dropped bounds-check exits. In `str::trim_start_matches("0")` on a
+  1-byte string (the demangler's `0usize` suffix strip), the
+  `ceil_char_boundary` `i >= len` exit was folded away →
+  out-of-bounds panic. Recursive panic while demangling a backtrace
+  deadlocked stage2 rustc at 0% CPU on any ui test that ICE'd under
+  RUST_BACKTRACE — the first stage2 `tests/ui` run stalled mid-suite.
+  Fix: only the strict complement decides false; the equality boundary
+  stays satisfiable (unsigned lt/gt arms + signed mirrors).
+  Test: `tests/celim` boundary pair `x = y - 1` + trim_start_matches
+  cases (fails pre-fix, 0-vs-3 assert). Not perf-measured.
+- 89f2fe7 selfhost/verify.sh: repeatable stage1-vs-stage2 compiletest
+  diff harness — the "run this regularly" process. Handles the Darwin
+  rust-objcopy PATH gap, --force-rerun against fingerprint caching, and
+  a watchdog for idle-deadlocked rustc (the demangle symptom above).
+
 ## wasm: inline small-const byte equality (6a4d672)
 
 cpu-prof (node --cpu-prof, 200 iters) put `memcmp` at 77ms/1335ms — the
@@ -1000,3 +1227,4 @@ REJECTED: mid-size (<=64-inst) <=6-callsite inlining in winline —
 Remaining hot gaps (200-iter profile, pl vs st): find_fwd_imp +79ms,
 ReverseInner::search_half +31, hybrid_try_search_half_fwd +27 /_rev
 +11, aho PrefilterI::find +36.
+||||||| d3636f1

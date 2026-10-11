@@ -845,8 +845,11 @@ pub fn coldargs(func: &mut Function) -> usize {
                         pos.ins().iadd(a, z)
                     } else {
                         // i128: no scalar `umulhi` lowering — keep the
-                        // adds+dead-flag rebind.
-                        let z = pos.ins().iconst(ty, 0);
+                        // adds+dead-flag rebind. `iconst` has no i128
+                        // form; a zero is `iconcat` of two i64 zeros.
+                        let lo = pos.ins().iconst(types::I64, 0);
+                        let hi = pos.ins().iconst(types::I64, 0);
+                        let z = pos.ins().iconcat(lo, hi);
                         pos.ins().sadd_overflow(a, z).0
                     };
                     pairs.push((a, nv));
@@ -1224,7 +1227,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
 /// edge args, and the per-edge copies disappear. Repeat to fixpoint: each
 /// fusion can expose the next block of the same chain.
 pub fn fusechains(func: &mut Function) -> usize {
-    use rustc_data_structures::fx::FxHashMap;
+    use rustc_data_structures::fx::{FxHashMap, FxHashSet};
     let mut n = 0;
     loop {
         // Incoming-edge count per block (self-edges included).
@@ -1276,7 +1279,17 @@ pub fn fusechains(func: &mut Function) -> usize {
                     break;
                 }
             }
-            if !ok {
+            // An arg that's one of t's own params means the edge loops back
+            // from a block t dominates (dead t->b->t cycle, or a param
+            // permutation like `jump t(p2, p1)`): aliasing a param to itself
+            // or to a sibling creates an alias cycle, and any use of that
+            // param in b would dangle once t is removed.
+            let pset: FxHashSet<_> = params.iter().copied().collect();
+            if !ok
+                || pairs
+                    .iter()
+                    .any(|&(_, v)| pset.contains(&func.dfg.resolve_aliases(v)))
+            {
                 continue;
             }
             // Detach t's params so they can be aliased to the edge args;
@@ -1454,6 +1467,8 @@ fn cparm_round(func: &mut Function) -> usize {
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
     let mut param_drops: Vec<Value> = vec![];
+    // Per-home-block const cache for carried-chain params (see `mids`).
+    let mut mid_news: FxHashMap<(Block, Type, i64), Value> = FxHashMap::default();
     for (&b, rows) in &eargs {
         let ps = func.dfg.block_params(b).to_vec();
         let mut news: Vec<(Type, i64, Value)> = vec![];
@@ -1516,7 +1531,28 @@ fn cparm_round(func: &mut Function) -> usize {
                 };
                 repl.push((ix, v));
                 for m in mids {
-                    pmap.insert(m, v);
+                    // `m` is a param of some other block on the carried
+                    // chain; its uses live there, not under `b` — the
+                    // replacement const must be materialized in `m`'s own
+                    // home block or uses become non-dominating (alloc's
+                    // `Vec::into_boxed_slice` hit this: an iconst in a
+                    // sibling arm fed edges on two other arms).
+                    let home = match func.dfg.value_def(m) {
+                        ValueDef::Param(bm, _) => bm,
+                        _ => continue,
+                    };
+                    let mv = match mid_news.get(&(home, ty, imm)) {
+                        Some(&mv) => mv,
+                        None => {
+                            let mv = FuncCursor::new(&mut *func)
+                                .at_first_insertion_point(home)
+                                .ins()
+                                .iconst(ty, imm);
+                            mid_news.insert((home, ty, imm), mv);
+                            mv
+                        }
+                    };
+                    pmap.insert(m, mv);
                 }
             }
         }

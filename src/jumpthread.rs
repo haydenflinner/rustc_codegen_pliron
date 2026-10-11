@@ -1233,6 +1233,16 @@ fn merge_chains(func: &mut Function) {
             if args.len() != func.dfg.num_block_params(y) {
                 break;
             }
+            // An arg that is one of y's own params (a dead y->x->y cycle or
+            // a param permutation) would alias a param to itself or a
+            // sibling; resolve first since existing aliases can mask it.
+            let pset: FxHashSet<Value> = func.dfg.block_params(y).iter().copied().collect();
+            if args
+                .iter()
+                .any(|&a| pset.contains(&func.dfg.resolve_aliases(a)))
+            {
+                break;
+            }
             let params = func.dfg.detach_block_params(y);
             let params: Vec<Value> = params.as_slice(&func.dfg.value_lists).to_vec();
             for (p, a) in params.into_iter().zip(args) {

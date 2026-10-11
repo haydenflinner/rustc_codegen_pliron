@@ -345,7 +345,7 @@ pub(crate) enum Ins {
 /// `e` evaluates to a known constant (constants and `iconst` values folded
 /// through the tree). `None` on any non-constant input or `Div` by zero —
 /// the ops here all wrap like the emitted code does.
-fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
+pub(crate) fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
     Some(match e {
         Ins::K(k) => *k,
         Ins::Val(v) => iconst(func, *v)?,
@@ -1091,6 +1091,25 @@ pub(crate) fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
                 Ins::Val(cnt.bound),
             )],
         )),
+        // do-while `iv < n` on the current iv: the exiting body is the
+        // first with `iv >= n`, so count = ceil(sat(n - iv0)/step) + 1
+        // (saturating keeps iv0 >= n at exactly one iteration — the
+        // post-tested body always runs at least once).
+        (IntCC::UnsignedLessThan, true, false) => {
+            let diff = Ins::SatSub(Box::new(n()), Box::new(iv0()));
+            let count = if cnt.step == 1 {
+                diff
+            } else {
+                Ins::Div(
+                    Box::new(Ins::Add(
+                        Box::new(diff),
+                        Box::new(Ins::K(cnt.step - 1)),
+                    )),
+                    Box::new(Ins::K(cnt.step)),
+                )
+            };
+            Some((Ins::Add(Box::new(count), Box::new(Ins::K(1))), Vec::new()))
+        }
         _ => None,
     }
 }
@@ -1150,6 +1169,21 @@ pub(crate) fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
                 ),
                 Pred::Aligned(diff(), size),
             ],
+        )),
+        // do-while `p < end` on the current ptr: same as the pre-test form
+        // plus one extra step for the body that runs with `p >= end`.
+        (IntCC::UnsignedLessThan, true, false) => Some((
+            Ins::Add(
+                Box::new(Ins::And(
+                    Box::new(Ins::Add(
+                        Box::new(Ins::SatSub(Box::new(end()), Box::new(p0()))),
+                        Box::new(Ins::K(size - 1)),
+                    )),
+                    Box::new(Ins::K(!(size - 1))),
+                )),
+                Box::new(Ins::K(size)),
+            ),
+            Vec::new(),
         )),
         _ => None,
     }

@@ -83,7 +83,7 @@ fn known(func: &Function, v: Value) -> Option<u64> {
 /// An icmp operand: `base + off` (from `iadd`/`isub` with a constant), or
 /// a plain constant. The offset is canonicalized to the signed residue
 /// class of the operand's width (`x + 255` on `i8` is `x - 1`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
     V(Value, i64),
     K(u64),
@@ -969,15 +969,18 @@ fn off_implied(fc: IntCC, qa: i64, qb: i64, qc: IntCC) -> Option<bool> {
     }
     match (fc, qa, qb) {
         // `x < y` gives `x + 1 <= y` and `x <= y - 1` (y >= 1 on the edge).
+        // The weak reverse compare (`x + 1 >= y`) is *satisfiable* — `x` can
+        // be `y - 1` — so only the strict form decides false.
         (UnsignedLessThan, 1, 0) | (UnsignedLessThan, 0, -1) => match qc {
             UnsignedLessThanOrEqual => Some(true),
-            UnsignedGreaterThanOrEqual | UnsignedGreaterThan => Some(false),
+            UnsignedGreaterThan => Some(false),
             _ => None,
         },
-        // `x > y` gives `x - 1 >= y` and `x >= y + 1`.
+        // `x > y` gives `x - 1 >= y` and `x >= y + 1`; `x - 1 <= y` and
+        // `x <= y + 1` stay satisfiable at `x = y + 1`.
         (UnsignedGreaterThan, -1, 0) | (UnsignedGreaterThan, 0, 1) => match qc {
             UnsignedGreaterThanOrEqual => Some(true),
-            UnsignedLessThan | UnsignedLessThanOrEqual => Some(false),
+            UnsignedLessThan => Some(false),
             _ => None,
         },
         // `x == y` decides `x +/- 1` vs `y` and `x` vs `y +/- 1`: if the
@@ -987,15 +990,15 @@ fn off_implied(fc: IntCC, qa: i64, qb: i64, qc: IntCC) -> Option<bool> {
             Equal => Some(false),
             _ => None,
         },
-        // Signed mirrors.
+        // Signed mirrors; the same boundary case applies.
         (SignedLessThan, 1, 0) | (SignedLessThan, 0, -1) => match qc {
             SignedLessThanOrEqual => Some(true),
-            SignedGreaterThanOrEqual | SignedGreaterThan => Some(false),
+            SignedGreaterThan => Some(false),
             _ => None,
         },
         (SignedGreaterThan, -1, 0) | (SignedGreaterThan, 0, 1) => match qc {
             SignedGreaterThanOrEqual => Some(true),
-            SignedLessThan | SignedLessThanOrEqual => Some(false),
+            SignedLessThan => Some(false),
             _ => None,
         },
         _ => None,
@@ -1532,13 +1535,20 @@ pub fn run(func: &mut Function) -> usize {
                 };
                 let mut r = decide(func, &fs, q, raw);
                 if r.is_none()
-                    && let Some((qp, _)) = norm_icmp(func, i, false)
+                    && let Some((qp, qraw)) = norm_icmp(func, i, false)
                     && qp != q
                 {
                     // `v != 0`-style facts are stated on the unpeeled node.
-                    r = decide(func, &fs, qp, raw);
+                    // `qraw` must be this normalization's own operands:
+                    // pairing `qp`'s base values with the peeled `raw`
+                    // ranges the wrong value (`x-1 != 0` got decided from
+                    // `x != 0`, breaking BTreeMap's leaf-edge walk).
+                    r = decide(func, &fs, qp, qraw);
                 }
                 if let Some(k) = r {
+                    if std::env::var_os("PLIRON_CELIM_DEBUG").is_some() {
+                        eprintln!("celim fold {i} -> {k} q={q:?} facts={fs:?}");
+                    }
                     folds.push((i, k));
                 }
             }

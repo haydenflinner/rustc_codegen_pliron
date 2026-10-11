@@ -894,3 +894,89 @@ tradeoff; flagging.
 
 PLIRON_VERIFY=1 clean with and without LOOPROT; test.sh
 green; Rosetta std + unwind pass; checksums match stock.
+
+## Strided lane-gather vectorization landed (matmul-64 gap closed)
+
+The remaining matmul-64 gap was the k-reduction's strided B-column
+load (`b[k][j]` steps 256B/iter at N=64, 1KB at N=256) — loopvec
+only formed unit/descending streams. Three enabling pieces plus the
+gather itself went in on `wt/x64-codegen` (`a730090`, merged over
+shared HEAD 140eb02):
+
+- `upgrade_lagged` — rustc lowers the inner-loop pointers as
+  `Param::Other` one-iteration-lagged values (`q(t+1) = f(p(t))`
+  for affine `f` over `Step` params — bounds-check index and
+  next-iteration pointer precompute). All latches passing the same
+  affine value means `q` is itself a `Step` deferred by one;
+  `param_coeffs` decomposes the backedge value, fixpointed for
+  chains. matmul's k-loop header goes from `["S1","?","?","?"]`
+  (non-linear bail) to all-Step.
+- `Stream.stride` + `emit_vload` — byte strides that are a whole
+  element multiple >= 2*ebytes emit `vf` scalar `load.elem`s
+  `stride*ebytes` apart joined by `splat`+`insertlane` (LLVM's
+  `movd`/`vpinsrd` column idiom; x64 sinks each load into the
+  pinsr operand). Loads only; strided stores still bail.
+  `MAX_GATHER=2048` caps the stride (also bounds per-lane offsets
+  to ~6KB, i32-safe). Non-overlap preds and strength-reduced base
+  steps scale by the element stride. Const trips < `vf*UNROLL`
+  bail (vector clone could never execute).
+- `exit_bare` + do-while trips — post-tested loops previously
+  reserved a forced scalar iteration (`(iters-1) & -K`). When the
+  counting exit's target is arg-free and every in-body value it
+  reads maps to a resume-time value (header param -> last
+  iteration, backedge arg -> resume), the epilogue clones the exit
+  block and brifs `rem != 0` -> scalar / `rem == 0` -> exit clone,
+  allowing the full `iters & -K` count. `trips_idx`/`trips_ptr`
+  gained the `(ult, post_tested, current-iv)` arm:
+  `ceil(sat(bound - x0)/step) + 1` via `Ins::SatSub`/`Ins::Div`
+  (`ins_eval` is now `pub(crate)` for the trip gate).
+
+**Measured** (`/tmp/strided.rs` + `/tmp/bigbench.rs`, best-of-10,
+pliron vs stock `x86-64-v3` under Rosetta / `apple-m1` native;
+branch base 919ba07 = "scalar" column):
+
+| kernel | x64 base | x64 gather | x64 stock | a64 base | a64 gather | a64 stock |
+|--------|----------|------------|-----------|----------|------------|-----------|
+| matmul64 | 0.161 | **0.123** | 0.088 | 0.162 | **0.074** | 0.070 |
+| matmul256 | 10.40 | **9.97** | 10.64 | 10.25 | **9.95** | 9.88 |
+| colsum256 | 0.040 | 0.037 | 0.042 | 0.036 | 0.037 | 0.041 |
+
+matmul-64 x64: 1.83x-behind -> 1.39x; aarch64: 2.3x-behind ->
+**parity**. matmul-256 now ~parity/beats stock on both arches.
+
+**Measurement trap — `PLIRON_VEC=0` is not a scalar baseline.**
+`st.loopvec` also gates `PLIRON_IFCONV2`+`PLIRON_CPARM`, so VEC=0
+silently disables them. matmul-64 with VEC=0 measures 0.095 x64 /
+0.076 a64 ("clean" scalar), but the actual shipped scalar
+(ifconv2+cparm on, e.g. `PLIRON_VEC_SKIP=matmul`) is **0.160** —
+cparm's const-param fold reshapes the k-loop into a form ~2x
+slower scalar on both arches. The gather looked like a regression
+vs the VEC=0 number; vs the real baseline it's a clear win.
+A/B loopvec with `PLIRON_VEC_SKIP=<substr>` (per-function) rather
+than `PLIRON_VEC=0`.
+
+**cparm finding (flag for native wt).** Two independent symptoms:
+(1) the matmul-64 2x scalar regression above — cparm folds a
+const-fed header param in the bounds-check shape and the result
+punrolls/regallocs worse on both arches; (2) `harness/run.py
+--suite fuzz --fuzz-seeds 0:24` hits **13 `ifconv2 broke` ICEs**
+(verify: use of non-dominating value) — identical at 919ba07 and
+merged HEAD, `PLIRON_CPARM=0` clears them. Pre-existing, not from
+this change; needs a look on the native side.
+
+**Other kernels on merged HEAD** (x64 / a64 vs stock): gather
+0.334/0.270 vs 0.369/0.436 win, scatter 0.331/0.244 vs 0.376/0.438
+win, sum_u8 0.032/0.018 vs 0.174/0.054, dot_u32 0.111/0.055 vs
+0.165/0.055, cnt_aff 0.241/0.129 vs 0.434/0.127, prefix
+0.301/0.297 vs 0.327/0.297, hist ~parity, nth2_u64 0.147/0.149 vs
+0.168/0.081 (x64 win, a64 1.8x loss — bails loopvec on the
+early-exit gate, pre-existing), chars 0.579/0.587 vs 0.320/0.643,
+tokenize 2.65/2.48 vs 1.12/1.12.
+
+Validated: `PLIRON_VERIFY=1 ./test.sh` green; harness tier-0
+(smoke 9+2noref, determinism 10/10) green on merged HEAD; strided
+correctness `/tmp/gather_mm.rs` (const-generic mm/colsum/xpose,
+N=1..256 incl. non-multiples of 16 — full-matrix diff vs scalar)
+and `/tmp/gather_check.rs` (strides 1..128, u32/u64, do-while
+steps) ALL OK on both arches; fuzz ICEs are the pre-existing
+cparm set, unchanged by this work.

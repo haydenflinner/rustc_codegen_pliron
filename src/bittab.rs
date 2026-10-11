@@ -19,7 +19,7 @@
 //!     in = icmp ult d, 64           // guards the shift (ushr wraps mod 64)
 //!     mg = select in, mask64, 0     // out-of-window ⇒ shift a zero mask
 //!     sh = ushr mg, uextend(d)      // bit i set <=> lo+i accepted
-//!     c  = icmp ne sh, 0
+//!     c  = icmp ne (band sh, 1), 0  // the tested bit lands at bit 0
 //!     brif c, hit(args), miss(args)
 //! ```
 //!
@@ -40,7 +40,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::types::I64;
+use cranelift_codegen::ir::types::{I64, I128};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
@@ -324,12 +324,21 @@ fn try_tree(
     if region.len() < 3 {
         return None;
     }
-    // No result defined inside a dying block may be used outside the region
-    // (leaf-edge args are re-emitted at the root, so their recorded use is
-    // inside the region).
+    // No value defined inside a dying block may be used outside the region
+    // — results *and* block params (a param's uses can live in any block
+    // the dying block's edges fed, not just inside the tree).
+    // Leaf-edge args are re-emitted at the root, so their recorded use is
+    // inside the region.
     for &c in &region {
         if c == root {
             continue;
+        }
+        for p in func.dfg.block_params(c) {
+            if let Some(us) = ublocks.get(&func.dfg.resolve_aliases(*p))
+                && !us.is_subset(&region)
+            {
+                return None;
+            }
         }
         for i in func.layout.block_insts(c) {
             for r in func.dfg.inst_results(i) {
@@ -491,48 +500,55 @@ fn prep_args(
 }
 
 pub fn run(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
-    // value -> blocks using it
-    let mut ublocks: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for v in func.dfg.inst_values(i) {
-                ublocks
-                    .entry(func.dfg.resolve_aliases(v))
-                    .or_default()
-                    .insert(b);
+    // Fold one tree at a time and re-analyze after each: plans computed
+    // against a stale dominator tree could otherwise keep a tested value
+    // or leaf arg whose defining block an earlier fold just removed,
+    // leaving dangling operands that crash `value_def` downstream.
+    let mut n = 0;
+    loop {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dom = DominatorTree::with_function(func, &cfg);
+        // value -> blocks using it
+        let mut ublocks: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    ublocks
+                        .entry(func.dfg.resolve_aliases(v))
+                        .or_default()
+                        .insert(b);
+                }
             }
         }
-    }
-    let mut plans = Vec::new();
-    for b in func.layout.blocks() {
-        if !dom.is_reachable(b) {
-            continue;
+        let mut plan = None;
+        for b in func.layout.blocks() {
+            if !dom.is_reachable(b) {
+                continue;
+            }
+            if let Some(pl) = try_tree(func, &cfg, &dom, &ublocks, b) {
+                plan = Some(pl);
+                break;
+            }
         }
-        if let Some(pl) = try_tree(func, &cfg, &dom, &ublocks, b) {
-            plans.push(pl);
-        }
-    }
-    let mut n = 0;
-    for pl in plans {
-        // An earlier fold may have removed this tree's blocks.
+        let Some(pl) = plan else {
+            break;
+        };
         if !func.layout.is_block_inserted(pl.root)
             || !func.layout.is_block_inserted(pl.hit.0)
             || !func.layout.is_block_inserted(pl.miss.0)
             || pl.dead.iter().any(|&b| !func.layout.is_block_inserted(b))
         {
-            continue;
+            break;
         }
         let Some(rterm) = func.layout.last_inst(pl.root) else {
-            continue;
+            break;
         };
         let deadset: FxHashSet<Block> = pl.dead.iter().copied().collect();
         let (Some(ha), Some(ma)) = (
             prep_args(func, &dom, pl.root, rterm, &deadset, &pl.hit.1),
             prep_args(func, &dom, pl.root, rterm, &deadset, &pl.miss.1),
         ) else {
-            continue;
+            break;
         };
         let xty = func.dfg.value_type(pl.x);
         func.layout.remove_inst(rterm);
@@ -541,6 +557,13 @@ pub fn run(func: &mut Function) -> usize {
             args.iter()
                 .map(|a| match a {
                     A::V(v) => BlockArg::Value(*v),
+                    A::K(ty, k) if *ty == I128 => {
+                        // `iconst` has no i128 form — rebuild the
+                        // constant from two i64 halves.
+                        let lo = cur.ins().iconst(I64, *k);
+                        let hi = cur.ins().iconst(I64, k >> 63);
+                        BlockArg::Value(cur.ins().iconcat(lo, hi))
+                    }
                     A::K(ty, k) => BlockArg::Value(cur.ins().iconst(*ty, *k)),
                 })
                 .collect()
@@ -566,7 +589,11 @@ pub fn run(func: &mut Function) -> usize {
         let z = cur.ins().iconst(I64, 0);
         let mg = cur.ins().select(ig, m, z);
         let sh = cur.ins().ushr(mg, dx);
-        let c = cur.ins().icmp(IntCC::NotEqual, sh, z);
+        // Bit `d` of the mask lands at bit 0 of `sh`: test it, not the
+        // whole shifted value — `sh != 0` would accept every `x` at or
+        // below the mask's highest set bit, i.e. the interval's holes.
+        let bit = cur.ins().band_imm(sh, 1);
+        let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
         cur.ins().brif(c, pl.hit.0, &ha, pl.miss.0, &ma);
         for &b in &pl.dead {
             while let Some(i) = func.layout.first_inst(b) {

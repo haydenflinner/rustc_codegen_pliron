@@ -1024,7 +1024,21 @@ pub fn lower_to_object(
                 panic!("brchain broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
-        if let Err(e) = m.define_function(id, &mut clctx) {
+        // Panics inside Cranelift (verifier, egraph, regalloc asserts)
+        // bypass the Err path below — catch and rethrow so the message
+        // carries the function name and final CLIF for reproduction.
+        let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.define_function(id, &mut clctx)
+        }));
+        let e = match defr {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(e) => {
+                eprintln!("cranelift panicked in `{n}`\n{}", clctx.func.display());
+                std::panic::resume_unwind(e);
+            }
+        };
+        if let Some(e) = e {
             // Known capacity limits are a backend limitation, not a bug: report
             // cleanly instead of dumping a multi-MB function into an ICE.
             if let cranelift_module::ModuleError::Compilation(
