@@ -21,6 +21,20 @@
 - x64 min/max/dot_i32 "gaps" largely explained by missing ISA flags
   (baseline SSE2); psadbw for sum_u8 blocked on vendoring
   cranelift-assembler-x64 — documented in x64-notes.md.
+- ffe20b3 loopvec operand-emitability guards: conservative by design —
+  some count-if conds that previously vectorized may now stay scalar
+  (any `band x,1`/bool-tree operand that is neither lane-replicable nor
+  splattable). Correctness-required (was an ICE / silent-miscompile
+  path), but the perf delta was not measured.
+- 75cb4c6 bittab reanalyze-per-fold: CFG/dom/ublocks are rebuilt after
+  each applied fold — correct-by-construction but measurably more
+  compile-time than the old single-snapshot plans; not measured.
+- b134d48 fusechains/merge_chains self-alias guards: bail rate on
+  param-permutation/dead-cycle chains unmeasured; could theoretically
+  forgo some profitable fusions.
+- 655947a wasm frame-fold merge: perf validated on the wt/wasm-perf
+  worktree only (wbig ~1.3%, SP ops -17%); not re-benchmarked after
+  merging onto the current optimizer stack.
 
 ## Follow-ups
 - rev_copy32 aarch64: stable ~11% deficit vs stock (0.26 vs 0.234, 3 runs).
@@ -1096,3 +1110,34 @@ Validation: bash tests/wasm/run.sh fully green (core/std/WASI/unwind).
 Not validated: V8/d8 hot-profile re-run; other wasm crates.
 Next frontier: function count (~1.9x) and code density in branch-heavy
 regex paths — local.set/if-else/i64-packing traffic per earlier profile.
+
+## Stage2 self-host reached (2026-10-10)
+
+The full stage2 compiler (incl. rustc_codegen_pliron itself, compiled by
+the pliron-built stage1 rustc) now builds. Optimizer bugs fixed along
+the way, in hit order:
+
+- 52c3338 celim: unpeeled-retry range query used the peeled call's
+  operand pair — `x-1 == 0` folded from `x != 0`; SIGSEGV'd BTreeMap
+  drop walks (blake3 build script). Test: tests/celim.
+- 73907a8 + f6c551d punroll: peeled exits feeding shared continuations
+  created ambient (non-dominating) uses of body values — egraph
+  elaborate assert / EntryLivein regalloc failure (miniz_oxide,
+  rustc_lint_defs). Test: tests/punroll.
+- 17ddc11 coldargs: `iconst.i128` is unrepresentable — iconcat halves
+  instead (jiff). Test: tests/coldargs.
+- 75cb4c6 bittab: stale analysis snapshot across folds + block-param
+  uses unaccounted → dangling values / reserved_value OOB
+  (rustc_trait_selection).
+- b134d48 fusechains + merge_chains: edge args resolving to the
+  target's own params wrote self-alias cycles (release builds skip
+  change_to_alias's debug_assert) — `Value alias loop detected`
+  (rustc_mir_transform).
+- ffe20b3 loopvec: `band x,1` mod-2 bool arm + cond-tree walk admitted
+  operands that were neither lane-replicable nor splattable →
+  emit_scalar hit an in-body load ("side-effecting inst used as scalar
+  invariant", vendored cranelift-codegen dfg.rs). Unit regression test
+  in src/loopvec.rs builds the shape with FunctionBuilder.
+- 4981375 lower: catch_unwind around define_function names the
+  function + dumps CLIF on backend panics (kept — it made every ICE
+  above reproducible in minutes).
