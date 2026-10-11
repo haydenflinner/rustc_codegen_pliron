@@ -91,6 +91,13 @@ rustc $BE --edition 2024 -O tests/polsw/main.rs -o $out/polsw$exe && $out/polsw$
 # back-edge (LLVM TRE for `op(expr, f(args))`) — a re-executed identity or
 # stale param miscomputes; non-commutative ops must be left alone.
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/tailrec/main.rs -o $out/tailrec$exe && $out/tailrec$exe
+# inlinecm: the cost model must accept the constant-mode dispatch the fixed
+# thresholds reject (and reject call-dense bodies they'd take); recursive
+# and oversized callees stay calls under both. Outputs must match.
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm$exe &&
+    $out/inlinecm$exe > $out/inlinecm.out
+PLIRON_INLINE_MODEL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm_l$exe &&
+    $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
