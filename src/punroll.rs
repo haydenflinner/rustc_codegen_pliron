@@ -1025,7 +1025,7 @@ fn run_loop(
     // use without the defining inst ever running (most often an alias or
     // live-out value pointing back into the body).
     {
-        let mut ambient = |func: &Function, b: Block| -> bool {
+        let ambient = |func: &Function, b: Block| -> bool {
             for i in func.layout.block_insts(b) {
                 if func
                     .dfg
