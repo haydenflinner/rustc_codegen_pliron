@@ -50,6 +50,15 @@ enum Kind {
     Escape {
         idx: usize,
     },
+    /// Operand `idx` of a call the callee may legally read/write within
+    /// `n` bytes of this pointer (the arg's pointee extent, recorded in
+    /// `CallInfo::arg_extent`). The slices covering `[off, off+n)` stay
+    /// real stack memory and the operand is retargeted into them — sound
+    /// for any callee, unlike the copy `Escape` makes.
+    Pin {
+        idx: usize,
+        n: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +72,10 @@ struct Slice {
     off: u64,
     size: u64,
     ty: TypeHandle,
+    /// True when a call operand reaches into this slice (a `Pin` access):
+    /// the bytes must stay real memory, so the slice is alloca'd but not
+    /// promoted.
+    pinned: bool,
 }
 
 pub(crate) fn const_int(ctx: &Context, st: &State<'_>, v: Value) -> Option<i128> {
@@ -169,6 +182,34 @@ fn copyable_arg(ctx: &Context, st: &State<'_>, op: Ptr<Operation>, _p: Value, id
         && crate::pass_enabled("PLIRON_SROA_ESCAPE")
 }
 
+/// `p` is operand `idx` of `op`: if `op` is a call whose `idx`-th argument
+/// has a known pointee extent (a ref arg or a sized Indirect param —
+/// `CallInfo::arg_extent`), the callee may legally touch `(size, align)`
+/// bytes from `p`. The slices covering them must stay memory; anything
+/// else in the alloca can still promote.
+fn pin_extent(
+    ctx: &Context,
+    st: &State<'_>,
+    op: Ptr<Operation>,
+    idx: usize,
+) -> Option<(u64, u64)> {
+    if !crate::pass_enabled("PLIRON_SROA_PIN") {
+        return None;
+    }
+    let c = Operation::get_op::<CallOp>(op, ctx)?;
+    if matches!(c.callee(ctx), CallOpCallable::Indirect(_)) && idx == 0 {
+        // Operand 0 of an indirect call is the callee, not an argument.
+        return None;
+    }
+    let ai = idx - usize::from(matches!(c.callee(ctx), CallOpCallable::Indirect(_)));
+    st.calls
+        .get(&op)
+        .and_then(|i| i.arg_extent.as_ref())
+        .and_then(|e| e.get(ai))
+        .copied()
+        .filter(|&e| e.0 > 0)
+}
+
 fn intrinsic<'a>(st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(&op).map(|s| s.as_str())
 }
@@ -264,14 +305,27 @@ fn accesses(
                     off: base as u64,
                     kind: Kind::Escape { idx },
                 });
+            } else if let Some((n, _)) = pin_extent(ctx, st, op, idx)
+                && in_range(base, n)
+            {
+                out.push(Access {
+                    op,
+                    off: base as u64,
+                    kind: Kind::Pin { idx, n },
+                });
             } else {
                 return None;
             }
         }
     }
     // A copy with both ends in this alloca would need overlap handling.
+    // Two pinned or escaping args on one call are fine — each access
+    // retargets its own operand.
     let mut seen = FxHashSet::default();
-    if out.iter().any(|a| !seen.insert(a.op)) {
+    if out
+        .iter()
+        .any(|a| matches!(a.kind, Kind::Copy { .. }) && !seen.insert(a.op))
+    {
         return None;
     }
     Some((out, geps))
@@ -342,25 +396,35 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
                 off: a.off,
                 size,
                 ty,
+                pinned: false,
             }),
         }
     }
     let mut cuts: Vec<u64> = Vec::new();
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for a in acc {
-        if let Kind::Copy { n, .. } | Kind::Set { n, .. } = a.kind {
-            if n == 0 {
-                continue;
+        match a.kind {
+            Kind::Copy { n, .. } | Kind::Set { n, .. } => {
+                if n == 0 {
+                    continue;
+                }
+                let (s, e) = (a.off, a.off + n);
+                if typed
+                    .iter()
+                    .any(|t| (t.off < s && s < t.off + t.size) || (t.off < e && e < t.off + t.size))
+                {
+                    return Err("copy/set cuts a typed slice");
+                }
+                cuts.extend([s, e]);
+                ranges.push((s, e));
             }
-            let (s, e) = (a.off, a.off + n);
-            if typed
-                .iter()
-                .any(|t| (t.off < s && s < t.off + t.size) || (t.off < e && e < t.off + t.size))
-            {
-                return Err("copy/set cuts a typed slice");
+            Kind::Pin { n, .. } if n > 0 => {
+                // Pinned bytes need slice coverage but don't cut existing
+                // slices: whatever the range overlaps stays memory anyway.
+                cuts.extend([a.off, a.off + n]);
+                ranges.push((a.off, a.off + n));
             }
-            cuts.extend([s, e]);
-            ranges.push((s, e));
+            _ => {}
         }
     }
     cuts.extend(typed.iter().flat_map(|t| [t.off, t.off + t.size]));
@@ -385,7 +449,24 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
     }
     for (off, k) in gaps {
         let ty = IntegerType::get(ctx, (k * 8) as u32, Signedness::Signless).into();
-        typed.push(Slice { off, size: k, ty });
+        typed.push(Slice {
+            off,
+            size: k,
+            ty,
+            pinned: false,
+        });
+    }
+    let pins: Vec<(u64, u64)> = acc
+        .iter()
+        .filter_map(|a| match a.kind {
+            Kind::Pin { n, .. } if n > 0 => Some((a.off, a.off + n)),
+            _ => None,
+        })
+        .collect();
+    for s in &mut typed {
+        s.pinned = pins
+            .iter()
+            .any(|&(lo, hi)| lo < s.off + s.size && s.off < hi);
     }
     typed.sort_by_key(|s| s.off);
     if typed.is_empty() {
@@ -502,9 +583,49 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
 
     let count = alloca.deref(ctx).get_operand(0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
+    // All pinned slices share one stack object: a callee handed a pointer
+    // into the pin range may legally roam the whole extent, and per-slice
+    // allocas aren't guaranteed to sit contiguously. The object covers
+    // every pinned slice (a typed slice can extend past its pin range),
+    // not just the ranges themselves.
+    let (mut pin_lo, mut pin_hi, mut pin_al) = (u64::MAX, 0u64, 1u64);
+    for x in &acc {
+        if let Kind::Pin { idx, .. } = x.kind
+            && let Some((_, al)) = pin_extent(ctx, st, x.op, idx)
+        {
+            pin_al = pin_al.max(al);
+        }
+    }
+    for s in &sl {
+        if s.pinned {
+            pin_lo = pin_lo.min(s.off);
+            pin_hi = pin_hi.max(s.off + s.size);
+        }
+    }
+    // A valid `&T` arg means `x.off` was a multiple of `T`'s align in the
+    // original alloca. Rounding `pin_lo` down to the widest pointee align
+    // keeps `x.off - pin_lo` a multiple of it too, so the retargeted
+    // pointer into `pin_a` stays correctly aligned for the callee.
+    pin_lo &= !(pin_al - 1);
+    let pin_a = if pin_lo < pin_hi {
+        let arr = ArrayType::get(ctx, i8t, pin_hi - pin_lo).into();
+        let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
+        op.insert_before(ctx, alloca);
+        let v = op.deref(ctx).get_result(0);
+        st.allocas.insert(v, (pin_hi - pin_lo, align.max(1)));
+        // Its bytes back a live call operand — re-splitting would just
+        // re-pin the same range.
+        st.escape_copies.insert(v);
+        Some(v)
+    } else {
+        None
+    };
     let new: Vec<Value> = sl
         .iter()
         .map(|s| {
+            if s.pinned {
+                return ptr_plus(ctx, st, pin_a.unwrap(), s.off - pin_lo, alloca);
+            }
             let arr = ArrayType::get(ctx, i8t, s.size).into();
             let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
             op.insert_before(ctx, alloca);
@@ -634,6 +755,13 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
                         .insert_before(ctx, x.op);
                 }
                 let p = ptr_plus(ctx, st, tmp, x.off, x.op);
+                Operation::replace_operand(x.op, ctx, idx, p);
+            }
+            Kind::Pin { idx, .. } => {
+                // `new[i]` is a gep into `pin_a`, so the callee sees real
+                // memory exactly covering its pointee extent.
+                let i = find(x.off);
+                let p = ptr_plus(ctx, st, new[i], x.off - sl[i].off, x.op);
                 Operation::replace_operand(x.op, ctx, idx, p);
             }
         }
@@ -892,6 +1020,8 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 uses.push("mem");
             } else if diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx) {
                 uses.push("escape");
+            } else if pin_extent(ctx, st, op, idx).is_some() {
+                uses.push("pin");
             } else {
                 let n = st
                     .intrinsics

@@ -128,6 +128,14 @@ pub struct CallInfo {
     /// can't outlive the call, so slotmerge treats it as a bounded use
     /// rather than a function-end escape.
     pub nocap: Option<Box<[bool]>>,
+    /// Per-operand `(size, align)` for pointer args with a sized pointee —
+    /// `&T`/`&mut T` (Direct) cover `size_of::<T>()` bytes at `T`'s align,
+    /// `Indirect` params cover the arg's own layout. Raw pointers get none:
+    /// `slice.as_mut_ptr()` legally covers the whole buffer. SROA pins
+    /// exactly this range of the underlying alloca when the arg can't be
+    /// proven copyable, letting the rest of the object promote (LLVM's
+    /// partition-pinning equivalent).
+    pub arg_extent: Option<Box<[(u64, u64)]>>,
 }
 
 #[derive(Default)]

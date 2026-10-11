@@ -237,7 +237,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             .calls
             .insert(
                 p,
-                CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false, nocap: None },
+                CallInfo {
+                    fn_ty,
+                    exts,
+                    foreign: false,
+                    cc: None,
+                    tail: false,
+                    nocap: None,
+                    arg_extent: None,
+                },
             );
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
@@ -1136,12 +1144,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 _ => &[],
             };
         let env = ty::TypingEnv::fully_monomorphized();
-        let nocap = fn_abi.and_then(|abi| {
-            let mut v = vec![false; full.len()];
+        let mut nc = vec![false; full.len()];
+        let mut exts = vec![(0u64, 0u64); full.len()];
+        let (mut any_nc, mut any_ex) = (false, false);
+        if let Some(abi) = fn_abi {
+            use rustc_target::callconv::PassMode;
             let mut j = usize::from(return_slot.is_indirect());
-            let mut any = false;
             for (ai, a) in abi.args.iter().enumerate() {
-                use rustc_target::callconv::PassMode;
                 let n = match &a.mode {
                     PassMode::Ignore => 0,
                     PassMode::Pair(..) => 2,
@@ -1157,24 +1166,51 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     && deduced
                         .get(ai + 1)
                         .is_some_and(|d| d.captures_none(self.tcx, env, a.layout.ty));
-                if cap {
-                    any = true;
-                    let hi = (j + n).min(v.len());
-                    for x in &mut v[j..hi] {
-                        *x = true;
+                // The `(size, align)` range the callee may legally reach
+                // through this operand: a ref's pointee layout, or the
+                // whole arg for Indirect. Raw pointers are excluded —
+                // `slice.as_mut_ptr()` legally covers the whole buffer,
+                // not `size_of::<u8>()`. SROA pins just this range of a
+                // caller alloca, keeping the arg pointer's alignment.
+                let ext = match &a.mode {
+                    PassMode::Indirect { meta_attrs, .. } if meta_attrs.is_none() => {
+                        Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
+                    }
+                    PassMode::Direct(_)
+                        if matches!(a.layout.ty.kind(), ty::Ref(..)) =>
+                    {
+                        a.layout.ty.builtin_deref(true).and_then(|t| {
+                            let l = self.cx.layout_of(t);
+                            l.is_sized()
+                                .then(|| (l.size.bytes(), l.align.abi.bytes()))
+                        })
+                    }
+                    _ => None,
+                };
+                for k in 0..n {
+                    if j + k >= full.len() {
+                        break;
+                    }
+                    if cap {
+                        nc[j + k] = true;
+                    }
+                    if let Some(e) = ext {
+                        exts[j + k] = e;
                     }
                 }
+                any_nc |= cap;
+                any_ex |= ext.is_some_and(|e| e.0 > 0);
                 j += n;
             }
-            any.then(|| v.into_boxed_slice())
-        });
+        }
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
             let mut st = self.st.borrow_mut();
             let info = st.calls.get_mut(&p).unwrap();
             info.foreign = foreign;
             info.cc = cc;
-            info.nocap = nocap;
+            info.nocap = any_nc.then(|| nc.into_boxed_slice());
+            info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
         }
         v
     }

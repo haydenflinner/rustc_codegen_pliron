@@ -1,0 +1,126 @@
+// PLIRON_SROA_PIN: a non-copyable call arg (callee writes through it or
+// retains it) with a known pointee extent pins only that byte range of
+// the caller's alloca — the slices covering it share one `pin_a` stack
+// object and every other slice still promotes. The callee's writes and
+// pointers retained past the call must observe the same memory the
+// caller's promoted fields see: a wrong retarget offset or align
+// silently reads/writes the wrong bytes.
+
+use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SAVED: AtomicUsize = AtomicUsize::new(0);
+
+#[repr(C)]
+struct Rec {
+    a: u64,
+    b: u64,
+    c: u64,
+    tag: u8,
+    pad: [u8; 7],
+    d: u64,
+    inner: Inner,
+}
+
+#[repr(C)]
+struct Inner {
+    x: u64,
+    y: u64,
+}
+
+// Writes through the arg: fails nowrite inference -> not copyable -> pin.
+#[inline(never)]
+fn wr(p: &mut u64, v: u64) {
+    *p = v;
+}
+
+// Retains the arg in a global: fails nocapture -> not copyable -> pin.
+#[inline(never)]
+fn keep(p: &mut u64) {
+    SAVED.store(p as *mut u64 as usize, Ordering::SeqCst);
+}
+
+// Reads the whole aggregate by ref: pins its entire extent.
+#[inline(never)]
+fn sum_rec(r: &Rec) -> u64 {
+    r.a + r.b + r.c + r.d + r.inner.x + r.inner.y
+}
+
+#[inline(never)]
+fn caller(x: u64) -> u64 {
+    let mut r = Rec {
+        a: x,
+        b: 1,
+        c: 2,
+        tag: 7,
+        pad: [0; 7],
+        d: 4,
+        inner: Inner { x: 5, y: 6 },
+    };
+    // Pin r.b's slice: the store must reach real memory the caller reads.
+    wr(&mut r.b, 0xBEEF);
+    // Pin r.c's slice and leak its address: a later write *through the
+    // retained pointer* must land where the caller's r.c lives.
+    keep(&mut r.c);
+    // Nested-field gep: pins only inner.y's range.
+    wr(&mut r.inner.y, 0xF00D);
+    unsafe {
+        *(SAVED.load(Ordering::SeqCst) as *mut u64) = 9;
+    }
+    // Whole-struct ref: covers the entire extent; all fields read back.
+    let total = sum_rec(&r);
+    // r.a / r.d / r.tag stay unpinned; reads must be unaffected by the
+    // aliased writes above.
+    r.a.wrapping_add(total).wrapping_add(r.tag as u64)
+}
+
+// Two pinned args on the same call must retarget independently.
+#[inline(never)]
+fn mix(p: &mut u64, q: &mut u64) {
+    *p = *p + 100;
+    *q = *q + 200;
+}
+
+#[inline(never)]
+fn two_pins(x: u64) -> u64 {
+    let mut r = Rec {
+        a: x,
+        b: 10,
+        c: 20,
+        tag: 1,
+        pad: [0; 7],
+        d: 30,
+        inner: Inner { x: 40, y: 50 },
+    };
+    mix(&mut r.b, &mut r.inner.x);
+    r.a + r.b + r.c + r.d + r.inner.x + r.inner.y
+}
+
+// Pinning a single array element must not disturb its neighbors.
+#[inline(never)]
+fn arr_elem(x: u64) -> u64 {
+    let mut a = [x, 1, 2, 3, 4];
+    keep(&mut a[2]);
+    unsafe {
+        *(SAVED.load(Ordering::SeqCst) as *mut u64) = 77;
+    }
+    a.iter().sum()
+}
+
+fn main() {
+    // caller: r.a=x, r.b=0xBEEF, r.c=9 (via SAVED), r.d=4, inner={5,0xF00D},
+    // tag=7. total = x + 0xBEEF + 9 + 4 + 5 + 0xF00D; result adds x + 7.
+    let x = black_box(3);
+    let expect = x + (x + 0xBEEF + 9 + 4 + 5 + 0xF00D) + 7;
+    assert_eq!(caller(x), expect);
+
+    // two_pins: b=10+100=110, inner.x=40+200=240; sum = x+110+20+30+240+50.
+    let x = black_box(2);
+    assert_eq!(two_pins(x), x + 110 + 20 + 30 + 240 + 50);
+
+    // arr_elem: a[2] becomes 77 via the retained pointer.
+    let x = black_box(5);
+    assert_eq!(arr_elem(x), x + 1 + 77 + 3 + 4);
+
+    println!("sroa-pin ok");
+}
