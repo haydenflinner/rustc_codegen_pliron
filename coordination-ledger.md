@@ -1186,3 +1186,20 @@ unit test in the offending pass before the fix.
   the e8d0fbf rejection additionally skips chained ifconv folds whose
   hop locals leak below the merge — a real (unquantified) missed-opt
   class for flag-carrying loop headers.
+- 534d57c celim: `off_implied` folded the *weak* reverse compare on
+  ±1-offset facts — `x < y` does imply `x + 1 <= y`, so `x + 1 > y` is
+  dead, but `x + 1 >= y` is SATISFIABLE at `x = y - 1`; folding it false
+  dropped bounds-check exits. In `str::trim_start_matches("0")` on a
+  1-byte string (the demangler's `0usize` suffix strip), the
+  `ceil_char_boundary` `i >= len` exit was folded away →
+  out-of-bounds panic. Recursive panic while demangling a backtrace
+  deadlocked stage2 rustc at 0% CPU on any ui test that ICE'd under
+  RUST_BACKTRACE — the first stage2 `tests/ui` run stalled mid-suite.
+  Fix: only the strict complement decides false; the equality boundary
+  stays satisfiable (unsigned lt/gt arms + signed mirrors).
+  Test: `tests/celim` boundary pair `x = y - 1` + trim_start_matches
+  cases (fails pre-fix, 0-vs-3 assert). Not perf-measured.
+- 89f2fe7 selfhost/verify.sh: repeatable stage1-vs-stage2 compiletest
+  diff harness — the "run this regularly" process. Handles the Darwin
+  rust-objcopy PATH gap, --force-rerun against fingerprint caching, and
+  a watchdog for idle-deadlocked rustc (the demangle symptom above).
