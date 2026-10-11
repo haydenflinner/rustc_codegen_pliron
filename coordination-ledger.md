@@ -1141,3 +1141,48 @@ the way, in hit order:
 - 4981375 lower: catch_unwind around define_function names the
   function + dumps CLIF on backend panics (kept — it made every ICE
   above reproducible in minutes).
+
+## Stage2 self-host miscompiles (6239c9b, fe3fd90, e8d0fbf)
+
+Post-"stage2 builds" the pliron-built stage2 rustc miscompiled three
+successive passes; each blocked stage2 std until fixed. All diagnosed
+via `PLIRON_CLIF` per-pass dumps on `rustc_*` crate rebuilds plus
+disassembly of the stage2 driver dylib; each got a FunctionBuilder
+unit test in the offending pass before the fix.
+
+- 6239c9b bittab: the sparse-set fold emitted `icmp ne (mask >> d), 0`
+  — nonzero whenever ANY bit >= d is set, so the whole interval
+  `[lo, max]` matched, not just the sparse set. Contiguous ranges hid
+  it; `sym == 12` slipped through {21,28,35} in `uninterpolate`, and
+  stage2 rustc couldn't parse `pub const fn`. Fix: `band (mask>>d), 1`.
+  Test: tests/bittab (fails pre-fix: every x <= max "hits").
+  Bootstrap hazard: rebuild used `PLIRON_BITTAB=0` so the loaded buggy
+  dylib couldn't poison the new one mid-build.
+- fe3fd90 ifconv: `conv_table` deduped `br_table` arms on the RAW
+  final-edge args — identical when arms share a last forwarder hop —
+  collapsing arms that inject different constants earlier in the chain
+  to the representative's value. `param_default_policy` returned
+  `Some(Forbidden)` for every `ItemKind` member; stage2 rustc rejected
+  generic param defaults on `const trait` (and everything else).
+  Fix: resolve final args through `psub` before dedup.
+  Test: `ifconv::tests::table_arms_dedup_on_resolved_args` + tests/polsw
+  e2e. Rebuild used `PLIRON_IFCONV=0` for the same bootstrap hazard.
+- e8d0fbf ifconv: `edge_ok` accepted escaped uses of a bypassed
+  forwarder-hop's own defs whenever the hop dominated `b`'s term —
+  exactly true when `b` is a loop latch inside the loop whose header
+  merge is the hop. The use stays dominated, but the hop param is a
+  phi over the hop's edges: dropping `b`'s edge changes the value the
+  use observes. `rustc_lexer::eat_hexadecimal_digits` (in the ifconv2
+  round): the digit latch's `has=1` edge was bypassed, `has` became a
+  phi over only the entry `0` edge — 3030 `E0768 no valid digits`
+  errors on valid hex literals in stage2 std.
+  Fix: `edge_ok` now takes the union of all arm `chain` blocks; defs
+  inside a bypassed chain never qualify on the dominance clause (both
+  brif and br_table paths). Test:
+  `ifconv::tests::arm_chain_local_escape_blocks_conversion` mirrors the
+  sec6 CFG (dominated latch + escaped hop param/result) and asserts the
+  fold is rejected; hop's own forwarder fold still fires.
+- Perf note: none of the three were perf-measured (correctness fixes);
+  the e8d0fbf rejection additionally skips chained ifconv folds whose
+  hop locals leak below the merge — a real (unquantified) missed-opt
+  class for flag-carrying loop headers.
