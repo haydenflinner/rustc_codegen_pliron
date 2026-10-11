@@ -37,6 +37,21 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 
 ## Platform notes
 
+- windows-msvc (x86_64): `is_pic=false`, Cranelift `tls_model="coff"`.
+  `src/eh/mod.rs` emits `.pdata`/`.xdata` (serialized `UNWIND_INFO` +
+  `RUNTIME_FUNCTION`, `RelocationKind::ImageOffset` → `ADDR32NB`) instead of
+  `.eh_frame`. Unwinding is *emulated* like the wasm backend: TLS `__pliron_eh`
+  state word, flag checks after calls, `pliron.eh.exn`/`rethrow`, and
+  `_CxxThrowException`/`_Unwind_Resume` interception. Catch works when std +
+  panic_unwind are also backend-built (`-Zbuild-std`, run via
+  `test.sh --sysroot`); with stock std, real SEH throws unwind *through* our
+  frames (correct `.pdata`) but our `catch_unwind` can't intercept them —
+  `tests/std/main.rs` gates those asserts on `--cfg pliron_stock_seh`.
+  MSVC i128/f128 libcall ABI: args byval through pointers, return in xmm0 —
+  `libcall()` in lower.rs adapts (`__udivti3`, `__floattisf`, `__rust_i128_*`).
+  rsasm COFF: `.linkonce`, `.seh_*`, `3f@IMGREL` local-label modifiers; LLVM
+  `$$` escapes become `$` (AT&T) or nothing (Intel syntax). Compiler-stub
+  symbols (`__pliron_llvm_*`) get per-CGU-unique names on COFF (no weak syms).
 - aarch64: `CallConv::Tail` can't take sret params; lower.rs keeps sret
   functions on the platform ABI. `ArgumentPurpose::StructArgument` (byval) is
   unsupported by cranelift-aarch64, but rustc never emits on-stack indirect

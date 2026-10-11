@@ -22,7 +22,13 @@ fn main() {
         assert_eq!(m.into_iter().count(), n);
     }
     // The shape the blake3/cc build-script crash took: Command's env map.
-    let mut c = Command::new("/bin/echo");
+    let mut c = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/c", "echo"]);
+        c
+    } else {
+        Command::new("/bin/echo")
+    };
     for j in 0..30 {
         c.env(format!("VAR_{j}"), format!("v{j}"));
     }

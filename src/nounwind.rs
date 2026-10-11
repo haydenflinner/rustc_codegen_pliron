@@ -68,4 +68,11 @@ pub fn run(ctx: &Context, st: &mut State<'_>) {
     for op in dead {
         st.invokes.remove(&op);
     }
+    // Persist the inference: the emulated-EH flag check after calls on COFF
+    // is skipped for callees that can't unwind.
+    for s in &nw {
+        if let Some(f) = st.funcs.get_mut(s) {
+            f.nounwind = true;
+        }
+    }
 }

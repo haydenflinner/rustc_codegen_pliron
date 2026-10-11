@@ -1,7 +1,9 @@
 use std::arch::{asm, global_asm};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", unix))]
 global_asm!(".globl pliron_ga_add\npliron_ga_add:\n    lea rax, [rdi + rsi]\n    ret");
+#[cfg(all(target_arch = "x86_64", windows))]
+global_asm!(".globl pliron_ga_add\npliron_ga_add:\n    lea rax, [rcx + rdx]\n    ret");
 #[cfg(target_arch = "aarch64")]
 global_asm!(".globl pliron_ga_add\npliron_ga_add:\n    add x0, x0, x1\n    ret");
 unsafe extern "C" {

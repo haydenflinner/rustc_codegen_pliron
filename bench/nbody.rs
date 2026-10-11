@@ -1,0 +1,47 @@
+use std::hint::black_box;
+use std::time::Instant;
+
+const N: usize = 5;
+
+struct Body { x: [f64; 3], v: [f64; 3], m: f64 }
+
+#[inline(never)]
+fn advance(bodies: &mut [Body; N], dt: f64) {
+    for i in 0..N {
+        for j in (i + 1)..N {
+            let dx = bodies[i].x[0] - bodies[j].x[0];
+            let dy = bodies[i].x[1] - bodies[j].x[1];
+            let dz = bodies[i].x[2] - bodies[j].x[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let mag = dt / (d2 * d2.sqrt());
+            let (a, b) = (bodies[i].m * mag, bodies[j].m * mag);
+            bodies[i].v[0] -= dx * b;
+            bodies[i].v[1] -= dy * b;
+            bodies[i].v[2] -= dz * b;
+            bodies[j].v[0] += dx * a;
+            bodies[j].v[1] += dy * a;
+            bodies[j].v[2] += dz * a;
+        }
+    }
+    for b in bodies.iter_mut() {
+        for k in 0..3 {
+            b.x[k] += dt * b.v[k];
+        }
+    }
+}
+
+fn main() {
+    let mut bodies = [
+        Body { x: [0.0; 3], v: [0.0; 3], m: 39.478 },
+        Body { x: [4.84, -1.62, -0.09], v: [0.0007, 0.0035, 0.0], m: 0.016 },
+        Body { x: [8.34, 4.12, -0.40], v: [-0.0017, 0.0016, 0.0], m: 0.0037 },
+        Body { x: [12.89, -15.11, -0.22], v: [0.0013, 0.0015, 0.0], m: 0.0008 },
+        Body { x: [15.37, 25.35, -0.22], v: [-0.0024, 0.0004, 0.0], m: 0.00007 },
+    ];
+    let t = Instant::now();
+    for _ in 0..black_box(2_000_000) {
+        advance(&mut bodies, 0.01);
+    }
+    let d = t.elapsed();
+    println!("{:.3} {:.6}", d.as_secs_f64() * 1e3, bodies[0].x[0]);
+}

@@ -43,6 +43,10 @@ pub struct UnwindContext {
     personality_fn: Option<u32>,
     macho: bool,
     x86_macho: bool,
+    /// COFF: per-function (FuncId, .xdata UNWIND_INFO bytes, function size).
+    /// Emitted as `.pdata` RUNTIME_FUNCTION + `.xdata` records.
+    coff: bool,
+    pdata: Vec<(FuncId, Vec<u8>, u64)>,
 }
 
 impl UnwindContext {
@@ -53,12 +57,17 @@ impl UnwindContext {
             Endianness::Big => RunTimeEndian::Big,
         };
         let mut frame_table = FrameTable::default();
-        let macho =
-            module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+        let binary_format = module.isa().triple().binary_format;
+        let macho = binary_format == target_lexicon::BinaryFormat::Macho;
+        let coff = binary_format == target_lexicon::BinaryFormat::Coff;
         let x86_macho = macho
             && module.isa().triple().architecture == target_lexicon::Architecture::X86_64;
         let mut personality_fn = None;
-        let cie_id = module.isa().create_systemv_cie().map(|mut cie| {
+        // No DWARF CIE on COFF: unwind info is .pdata/.xdata per function.
+        let cie_id = if coff {
+            None
+        } else {
+            module.isa().create_systemv_cie().map(|mut cie| {
             let ptr_enc = if pic {
                 gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
             } else {
@@ -123,7 +132,8 @@ impl UnwindContext {
                 }
             }
             frame_table.add_cie(cie)
-        });
+            })
+        };
         UnwindContext {
             endian,
             frame_table,
@@ -132,11 +142,22 @@ impl UnwindContext {
             personality_fn,
             macho,
             x86_macho,
+            coff,
+            pdata: Vec::new(),
         }
     }
 
     pub fn add_function(&mut self, module: &mut ObjectModule, func_id: FuncId, context: &Context) {
         let code = context.compiled_code().unwrap();
+        if self.coff {
+            let info = code.create_unwind_info(module.isa()).unwrap();
+            if let Some(UnwindInfo::WindowsX64(info)) = info {
+                let mut buf = vec![0; info.emit_size()];
+                info.emit(&mut buf);
+                self.pdata.push((func_id, buf, u64::from(code.buffer.total_size())));
+            }
+            return;
+        }
         let Some(UnwindInfo::SystemV(info)) = code.create_unwind_info(module.isa()).unwrap() else {
             return;
         };
@@ -215,7 +236,70 @@ impl UnwindContext {
         self.frame_table.add_fde(self.cie_id.unwrap(), fde);
     }
 
+    /// COFF: `.pdata` RUNTIME_FUNCTION entries + `.xdata` UNWIND_INFO records.
+    /// No exception handler is registered (UNW_FLAG_NHANDLER): real SEH can
+    /// unwind through our frames but cannot catch in them — catching is done
+    /// by the emulated-EH path in lower.rs under panic=unwind.
+    pub fn emit_coff(self, product: &mut ObjectProduct) {
+        if self.pdata.is_empty() {
+            return;
+        }
+        let fsyms: Vec<object::write::SymbolId> = self
+            .pdata
+            .iter()
+            .map(|(id, _, _)| product.function_symbol(*id))
+            .collect();
+        let obj = &mut product.object;
+        let xdata = obj.add_section(
+            Vec::new(),
+            b".xdata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        let pdata = obj.add_section(
+            Vec::new(),
+            b".pdata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        for ((func_id, bytes, size), fsym) in self.pdata.into_iter().zip(fsyms) {
+            let xoff = obj.append_section_data(xdata, &bytes, 4);
+            let xsym = obj.add_symbol(object::write::Symbol {
+                name: format!("$unwind${}", func_id.as_u32()).into_bytes(),
+                value: xoff,
+                size: bytes.len() as u64,
+                kind: object::SymbolKind::Data,
+                scope: object::SymbolScope::Compilation,
+                weak: false,
+                section: object::write::SymbolSection::Section(xdata),
+                flags: object::SymbolFlags::None,
+            });
+            let poff = obj.append_section_data(pdata, &[0; 12], 4);
+            for (off, sym, addend) in [
+                (0u64, fsym, 0i64),
+                (4, fsym, size as i64),
+                (8, xsym, 0),
+            ] {
+                obj.add_relocation(
+                    pdata,
+                    Relocation {
+                        offset: poff + off,
+                        symbol: sym,
+                        flags: RelocationFlags::Generic {
+                            kind: object::RelocationKind::ImageOffset,
+                            encoding: RelocationEncoding::Generic,
+                            size: 32,
+                        },
+                        addend,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
     pub fn emit(self, product: &mut ObjectProduct) {
+        if self.coff {
+            return self.emit_coff(product);
+        }
         let mut eh = EhFrame::from(WriterRelocate::new(self.endian));
         self.frame_table.write_eh_frame(&mut eh).unwrap();
         let w = eh.0;

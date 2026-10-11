@@ -1320,6 +1320,12 @@ fn plan(
             if li == si {
                 continue;
             }
+            // Identical base exprs touch the same address each iteration —
+            // a split load/store pair on one access (`c[i] += x`) — safe as
+            // same-stream even though two SSA addr values made two streams.
+            if streams[li].base == streams[si].base {
+                continue;
+            }
             let (lr, _) = loadfwd::root(func, streams[li].root_val);
             let (sr, _) = loadfwd::root(func, streams[si].root_val);
             let na = |r: Root| matches!(r, Root::V(v) if noalias.contains(&v));

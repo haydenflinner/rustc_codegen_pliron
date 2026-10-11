@@ -90,9 +90,15 @@ impl<'tcx> CodegenCx<'tcx> {
         if intel {
             s.push_str(".intel_syntax noprefix\n");
         }
+        // Templates are LLVM-flavored: `$$` is a literal `$`, which GAS
+        // intel-syntax treats as an immediate sigil rsasm doesn't know —
+        // keep it for AT&T immediates, drop it in intel mode.
+        let imm_sigil = if intel { "" } else { "$" };
         for piece in template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => s.push_str(t),
+                InlineAsmTemplatePiece::String(t) => {
+                    s.push_str(&t.replace("$$", imm_sigil))
+                }
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx, span, ..
                 } => match operands[*operand_idx] {
@@ -119,23 +125,53 @@ impl<'tcx> CodegenCx<'tcx> {
     /// A few are implemented in assembly; the rest become weak stubs that
     /// trap if they're ever executed, so crates still build.
     pub fn llvm_intrinsic_stub(&self, name: &str) -> String {
-        let sym: String = format!(
-            "__pliron_{}",
-            name.chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-        );
         let mut st = self.st.borrow_mut();
+        let san: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        // COFF weak linkage needs COMDAT machinery; a per-module-unique name
+        // dedups the same way since nothing external defines these.
+        let coff = self.tcx.sess.target.options.binary_format
+            == rustc_target::spec::BinaryFormat::Coff;
+        let sym = if coff {
+            st.counter += 1;
+            let cgu: String = st
+                .cgu
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!(
+                "__pliron_{}_{:x}_{cgu}_{}",
+                san,
+                self.tcx
+                    .stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+                    .as_u64(),
+                st.counter
+            )
+        } else {
+            format!("__pliron_{san}")
+        };
         if !st.llvm_stubs.insert(sym.clone()) {
             return sym;
         }
         let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
+        // Win64 integer args: rcx, rdx, r8 (SysV: rdi, rsi, rdx).
+        let win64 = x86
+            && self.tcx.sess.target.options.binary_format
+                == rustc_target::spec::BinaryFormat::Coff;
         let body = match name {
+            "llvm.x86.xgetbv" if x86 && win64 => {
+                "    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n".to_string()
+            }
             "llvm.x86.xgetbv" if x86 => {
                 "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n"
                     .to_string()
             }
             "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n".into(),
+            "pliron.clmul64" if x86 && win64 => {
+                "    movq xmm0, rcx\n    movq xmm1, rdx\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [r8], xmm0\n    ret\n".into()
+            }
             "pliron.clmul64" if x86 => {
                 "    movq xmm0, rdi\n    movq xmm1, rsi\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [rdx], xmm0\n    ret\n".into()
             }
@@ -152,12 +188,15 @@ impl<'tcx> CodegenCx<'tcx> {
         };
         let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
         let back = if x86 { ".att_syntax\n" } else { "" };
-        if self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::MachO {
+        let fmt = self.tcx.sess.target.options.binary_format;
+        if fmt == rustc_target::spec::BinaryFormat::MachO {
             write!(
                 st.asm,
                 ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{syntax}{body}{back}"
             )
             .unwrap();
+        } else if fmt == rustc_target::spec::BinaryFormat::Coff {
+            write!(st.asm, ".text\n.globl {sym}\n{sym}:\n{syntax}{body}{back}").unwrap();
         } else {
             write!(
                 st.asm,
@@ -550,12 +589,15 @@ impl Gen<'_, '_> {
     }
 
     fn wrapper(&self, name: &str) -> String {
-        let macho = self.tcx.sess.target.options.binary_format
-            == rustc_target::spec::BinaryFormat::MachO;
+        let fmt = self.tcx.sess.target.options.binary_format;
+        let macho = fmt == rustc_target::spec::BinaryFormat::MachO;
+        let coff = fmt == rustc_target::spec::BinaryFormat::Coff;
         let mut s = String::new();
         if macho {
             writeln!(s, ".globl {name}\n.private_extern {name}").unwrap();
             writeln!(s, ".section __TEXT,__text,regular,pure_instructions\n{name}:").unwrap();
+        } else if coff {
+            writeln!(s, ".globl {name}\n.text\n{name}:").unwrap();
         } else {
             writeln!(s, ".globl {name}\n.hidden {name}\n.type {name},@function").unwrap();
             writeln!(s, ".section .text.{name},\"ax\",@progbits\n{name}:").unwrap();
@@ -564,7 +606,13 @@ impl Gen<'_, '_> {
         let att = self.options.contains(InlineAsmOptions::ATT_SYNTAX);
         let noreturn = self.options.contains(InlineAsmOptions::NORETURN);
         if x86 {
-            s.push_str(".intel_syntax noprefix\n    push rbp\n    mov rbp,rsp\n    push rbx\n    mov rbx,rdi\n");
+            // The frame arg arrives in the platform's first register.
+            let arg0 = if coff { "rcx" } else { "rdi" };
+            write!(
+                s,
+                ".intel_syntax noprefix\n    push rbp\n    mov rbp,rsp\n    push rbx\n    mov rbx,{arg0}\n"
+            )
+            .unwrap();
         } else {
             s.push_str("    stp fp, lr, [sp, #-32]!\n    mov fp, sp\n    str x19, [sp, #24]\n    mov x19, x0\n");
         }
@@ -586,9 +634,12 @@ impl Gen<'_, '_> {
         if x86 && att {
             s.push_str(".att_syntax\n");
         }
+        let imm_sigil = if att { "$" } else { "" };
         for piece in self.template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => s.push_str(t),
+                InlineAsmTemplatePiece::String(t) => {
+                    s.push_str(&t.replace("$$", imm_sigil))
+                }
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx,
                     modifier,
@@ -637,7 +688,7 @@ impl Gen<'_, '_> {
         if x86 {
             s.push_str(".att_syntax\n");
         }
-        if !macho {
+        if !macho && !coff {
             writeln!(s, ".size {name}, .-{name}\n.text\n").unwrap();
         }
         s

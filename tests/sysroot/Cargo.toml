@@ -11,4 +11,8 @@ path = "../std/main.rs"
 name = "unwind-test"
 path = "../unwind/main.rs"
 
+[[bin]]
+name = "dbg"
+path = "../dbg/main.rs"
+
 [workspace]

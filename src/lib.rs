@@ -126,7 +126,10 @@ impl ModuleBufferMethods for PlironBuffer {
 
 fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
-    fb.set("is_pic", "true").unwrap();
+    // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
+    // symbol's bytes rather than its address.
+    let coff = sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+    fb.set("is_pic", if coff { "false" } else { "true" }).unwrap();
     if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
         fb.set("regalloc_checker", "true").unwrap();
     }
@@ -342,8 +345,16 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             domcheck::run(ctx, st, "spec");
         }
         // Opt-in: unsound on wasm emulated EH, which unwinds through ordinary
-        // calls (llvm.wasm.throw / __pliron_eh) the body scan can't see.
-        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
+        // calls (llvm.wasm.throw / __pliron_eh) the body scan can't see. On
+        // COFF the emulated-EH "throw" is a flag+early-return through plain
+        // calls, so inference is sound — and lets lowering skip the flag
+        // check after calls that can't throw.
+        let coff_eh = cx.tcx.sess.target.options.binary_format
+            == rustc_target::spec::BinaryFormat::Coff
+            && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
+        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1")
+            || (coff_eh && pass_enabled("PLIRON_NOUNWIND"))
+        {
             nounwind::run(ctx, st);
         }
         if pass_enabled("PLIRON_SRET2REG") {
@@ -702,6 +713,30 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             &[],
             None,
         );
+        if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind
+            && tcx.sess.target.options.binary_format
+                == rustc_target::spec::BinaryFormat::Coff
+        {
+            // TLS slot driving emulated EH on COFF: `{ flag: i32, _pad: i32,
+            // exn: ptr, buf: [u8; 32] }` — the buffer holds a copy of
+            // `panic_unwind::seh::Exception` made at the throw site so it
+            // outlives the unwound frame. See `eh_tls`/`eh_check` in lower.rs.
+            let ty = cx.type_array(cx.type_i8(), 48);
+            let init = cx.new_value(ty, context::ConstVal::Bytes(vec![0; 48]));
+            cx.declare_global(
+                "__pliron_eh",
+                context::GlobalInfo {
+                    ty,
+                    init: Some(init),
+                    align: 8,
+                    mutable: true,
+                    tls: true,
+                    linkage: Linkage::Export,
+                    used: false,
+                    section: None,
+                },
+            );
+        }
         finish_module(&cx, module_name)
     }
 

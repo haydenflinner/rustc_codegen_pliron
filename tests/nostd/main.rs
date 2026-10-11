@@ -3,14 +3,25 @@
 
 use core::panic::PanicInfo;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
     fn exit(code: i32) -> !;
 }
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _write(fd: i32, buf: *const u8, n: u32) -> i32;
+    fn _exit(code: i32) -> !;
+}
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    unsafe { exit(101) }
+    unsafe {
+        #[cfg(unix)]
+        exit(101);
+        #[cfg(windows)]
+        _exit(101);
+    }
 }
 
 struct Pair {
@@ -35,7 +46,12 @@ fn sum(xs: &[Pair]) -> u64 {
 }
 
 fn print(s: &[u8]) {
-    unsafe { write(1, s.as_ptr(), s.len()) };
+    unsafe {
+        #[cfg(unix)]
+        write(1, s.as_ptr(), s.len());
+        #[cfg(windows)]
+        _write(1, s.as_ptr(), s.len() as u32);
+    }
 }
 
 fn print_num(mut n: u64) {

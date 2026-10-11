@@ -1012,7 +1012,21 @@ impl<'a> ExprParser<'a> {
             }
             TokKind::LocalRef(n, dir) => {
                 cur.advance();
-                Some(self.arena.alloc(ExprKind::LocalRef(n, dir), tok.span))
+                let mut e = self.arena.alloc(ExprKind::LocalRef(n, dir), tok.span);
+                // A relocation modifier can trail a local-label ref too:
+                // `3f@IMGREL` (panic_unwind's `_ThrowInfo` on Windows).
+                if self.dialect == Dialect::Gas
+                    && let TokKind::Ident(m) = cur.peek().kind
+                    && let Some(mname) = self.interner.get(m).strip_prefix('@')
+                    && split_modifier(&format!("x@{mname}")).is_some()
+                {
+                    let t = cur.advance();
+                    let modifier = self.interner.intern(&mname.to_ascii_lowercase());
+                    e = self
+                        .arena
+                        .alloc(ExprKind::Modifier(modifier, e), tok.span.to(t.span));
+                }
+                Some(e)
             }
             TokKind::Punct(Punct::Dot) => {
                 cur.advance();

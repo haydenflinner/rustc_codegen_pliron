@@ -275,6 +275,25 @@ pub fn lower_to_object(
         ids.insert(n.clone(), Sym::D(id, g.tls));
     }
 
+    // Windows has no landingpad unwinder for us to catch in, so COFF EH is
+    // emulated like the wasm backend: a TLS flag word (`__pliron_eh`,
+    // defined by the allocator module) checked after every call; a "throw"
+    // sets it and unwinds by early-return. Real SEH can still unwind through
+    // our frames via `.pdata`/`.xdata` (see eh/mod.rs).
+    let eh_data = if unwind
+        && isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
+    {
+        match ids.get("__pliron_eh") {
+            Some(&Sym::D(id, _)) => Some(id),
+            _ => Some(
+                m.declare_data("__pliron_eh", Linkage::Import, true, true)
+                    .unwrap(),
+            ),
+        }
+    } else {
+        None
+    };
+
     let mut eh = crate::eh::UnwindContext::new(&mut m, true, unwind);
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
@@ -337,6 +356,9 @@ pub fn lower_to_object(
                 lifetimes: Vec::new(),
                 va_buf: None,
                 va_fids: FxHashMap::default(),
+                eh_data,
+                eh_tls_v: None,
+                eject: None,
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -624,6 +646,22 @@ pub fn lower_to_object(
                 panic!("ifconv2 broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // bcheck before loopvec: the versioned fast path has no per-iteration
+        // bounds branches, so it's vectorizable where the checked loop isn't.
+        if st.bcheck && crate::bisect("bcheck") {
+            let k = crate::bcheck::run(&mut clctx.func, n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("bcheck {k} {n}");
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("bcheck broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+            if dump {
+                eprintln!("==== clif {n} after bcheck ====\n{}", clctx.func.display());
+            }
+        }
         if st.loopvec && crate::bisect("loopvec") {
             let simd = matches!(
                 isa.triple().architecture,
@@ -671,20 +709,6 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("slp broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.bcheck && crate::bisect("bcheck") {
-            let k = crate::bcheck::run(&mut clctx.func, n);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("bcheck {k} {n}");
-            }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("bcheck broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-            if dump {
-                eprintln!("==== clif {n} after bcheck ====\n{}", clctx.func.display());
             }
         }
         if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
@@ -1569,6 +1593,12 @@ struct FnLower<'a, 'b, 'tcx> {
     va_buf: Option<ir::Value>,
     /// `__pliron_va8.<sym>` trampoline imports declared for this module.
     va_fids: FxHashMap<String, FuncId>,
+    /// Emulated EH on COFF: DataId of the `__pliron_eh` TLS slot.
+    eh_data: Option<DataId>,
+    /// Entry-block-hoisted `&__pliron_eh` address; all EH helpers read this.
+    eh_tls_v: Option<ir::Value>,
+    /// Shared early-return block used to propagate a pending "exception".
+    eject: Option<Block>,
 }
 
 impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
@@ -1669,6 +1699,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             if pb == pblocks[0] {
                 let z = self.b.ins().iconst(pt, 0);
                 self.b.def_var(exn, z);
+                if self.eh_data.is_some() {
+                    // Resolve the TLS slot once at entry: `tls_value` isn't
+                    // CSE-able across calls, and every post-call flag check
+                    // would otherwise redo the `_tls_index`/`gs:[0x58]` chain.
+                    let v = self.eh_tls_addr();
+                    self.eh_tls_v = Some(v);
+                }
             }
             self.cconst.clear();
             self.terminated = false;
@@ -1686,7 +1723,67 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 self.b.ins().trap(TrapCode::unwrap_user(1));
             }
         }
+        if let Some(eject) = self.eject {
+            self.b.switch_to_block(eject);
+            self.b.set_cold_block(eject);
+            let tys: Vec<ClType> = self
+                .b
+                .func
+                .signature
+                .returns
+                .iter()
+                .map(|r| r.value_type)
+                .collect();
+            let rets: Vec<ir::Value> =
+                tys.into_iter().map(|t| self.iconst_any(t, 0)).collect();
+            self.b.ins().return_(&rets);
+        }
         self.b.seal_all_blocks();
+    }
+
+    /// Address of `__pliron_eh`, the TLS slot driving emulated EH on COFF:
+    /// `{ flag: i32, _pad: i32, exn: ptr, buf: [u8; 32] }` (defined by the
+    /// allocator module; see `codegen_allocator` in lib.rs).
+    /// Entry-block-only — see `eh_tls_v`; all post-entry users read the
+    /// hoisted address.
+    fn eh_tls_addr(&mut self) -> ir::Value {
+        let id = self.eh_data.expect("emulated EH without __pliron_eh");
+        let gv = *self
+            .gvs
+            .entry(id)
+            .or_insert_with(|| self.m.declare_data_in_func(id, self.b.func));
+        self.b.ins().tls_value(clt::I64, gv)
+    }
+
+    fn eh_tls(&mut self) -> ir::Value {
+        self.eh_tls_v.expect("eh_tls used outside entry block")
+    }
+
+    /// After a possibly-throwing call, `__pliron_eh.flag != 0` means a
+    /// "throw" is in flight: branch to the `catch` funclet block for an
+    /// invoke, or to the shared early-return block to keep propagating.
+    fn eh_check(&mut self, catch: Option<Ptr<BasicBlock>>) {
+        let tls = self.eh_tls();
+        let f = self.b.ins().load(clt::I32, MemFlagsData::new(), tls, 0);
+        let cont = self.b.create_block();
+        let bad = match catch {
+            Some(pb) => self.blocks[&pb],
+            None => *self.eject.get_or_insert_with(|| self.b.create_block()),
+        };
+        self.b.ins().brif(f, bad, &[], cont, &[]);
+        self.b.switch_to_block(cont);
+        self.cconst.clear();
+    }
+
+    /// Emulated throw: set `__pliron_eh.flag` and unwind by early-return.
+    /// Callers that change the exception in flight store to `tls + 8` first.
+    fn eh_raise(&mut self) {
+        let tls = self.eh_tls();
+        let one = self.b.ins().iconst(clt::I32, 1);
+        self.b.ins().store(MemFlagsData::new(), one, tls, 0);
+        let eject = *self.eject.get_or_insert_with(|| self.b.create_block());
+        self.b.ins().jump(eject, &[]);
+        self.terminated = true;
     }
 
     /// Cranelift x64 has no f16/f128 `fneg`; flip the sign bit instead.
@@ -2120,16 +2217,56 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         rets: &[ClType],
         args: &[ir::Value],
     ) -> Vec<ir::Value> {
+        // MSVC has no i128/f128 ABI: LLVM passes them byval through pointers
+        // and returns them in xmm0. Cranelift's ABI doesn't model that, so
+        // spill wide args to stack slots and pass the pointers ourselves, and
+        // read the result back as a vector.
+        let coff =
+            self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Coff;
+        let wideof = |t: ClType| t == clt::I128 || t == clt::F128;
+        let wide = coff && (params.iter().any(|t| wideof(*t)) || rets.iter().any(|t| wideof(*t)));
         let mut sig = Signature::new(self.cc);
-        sig.params.extend(params.iter().map(|t| AbiParam::new(*t)));
-        sig.returns.extend(rets.iter().map(|t| AbiParam::new(*t)));
+        let mut call_args: Vec<ir::Value> = Vec::new();
+        for (t, a) in params.iter().zip(args.iter()) {
+            if wide && wideof(*t) {
+                let s = self.slot(16, 16);
+                self.b.ins().store(MemFlagsData::trusted(), *a, s, 0);
+                sig.params.push(AbiParam::new(clt::I64));
+                call_args.push(s);
+            } else {
+                sig.params.push(AbiParam::new(*t));
+                call_args.push(*a);
+            }
+        }
+        sig.returns.extend(rets.iter().map(|t| {
+            AbiParam::new(if wide && wideof(*t) {
+                clt::I8X16
+            } else {
+                *t
+            })
+        }));
         let id = self
             .m
             .declare_function(crate::obj_sym(name), Linkage::Import, &sig)
             .unwrap();
         let fr = self.call_fref(id);
-        let c = self.b.ins().call(fr, args);
-        self.b.inst_results(c).to_vec()
+        let c = self.b.ins().call(fr, &call_args);
+        let results: Vec<ir::Value> = self.b.inst_results(c).to_vec();
+        results
+            .iter()
+            .zip(rets)
+            .map(|(v, t)| {
+                if wide && wideof(*t) {
+                    // Lane-count-changing bitcasts need a byte order; a
+                    // store+load through a slot is simpler.
+                    let s = self.slot(16, 16);
+                    self.b.ins().store(MemFlagsData::trusted(), *v, s, 0);
+                    self.b.ins().load(*t, MemFlagsData::trusted(), s, 0)
+                } else {
+                    *v
+                }
+            })
+            .collect()
     }
 
     /// Cranelift can't lower 16-byte atomic ops on aarch64: route them through
@@ -3383,6 +3520,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         catch: Ptr<BasicBlock>,
         is_catch: bool,
     ) -> Vals {
+        if self.eh_data.is_some() {
+            // Emulated EH: call normally, then branch to the funclet block
+            // when `__pliron_eh.flag` is set (the pad reads `pliron.eh.exn`).
+            let inst = match target {
+                Ok(fref) => self.b.ins().call(fref, args),
+                Err((addr, sigref)) => self.b.ins().call_indirect(sigref, addr, args),
+            };
+            let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
+            self.eh_check(Some(catch));
+            return rs;
+        }
         use cranelift_codegen::ir::{
             BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
         };
@@ -3574,9 +3722,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 cargs.push(buf);
             }
         }
+        // Emulated EH: a post-call flag check is only needed when the callee
+        // might "throw". Leaf asm stubs/wrappers can never throw; vararg
+        // trampolines tail-jump to the callee and can.
+        let mut maythrow = true;
         let target = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
-                let sym = &self.st.ident_to_sym[&ident.to_string()];
+                let sym = &self.st.ident_to_sym[&ident.to_string()].clone();
+                maythrow = !self.st.funcs.get(sym).is_some_and(|f| f.nounwind)
+                    && !(sym.starts_with("__pliron_asm_")
+                        || sym.starts_with("__pliron_llvm_")
+                        || sym.starts_with("__pliron_a64_"));
                 match self.ids.get(sym).copied() {
                     Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => {
                         let nw = self.st.nowrite.get(sym).copied();
@@ -3636,6 +3792,38 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 }
             }
         };
+        if self.eh_data.is_some()
+            && let CallOpCallable::Direct(ident) = call.callee(ctx)
+        {
+            // Emulated EH: a "throw" records the exception in `__pliron_eh`
+            // and unwinds by early-return instead of raising SEH.
+            let sym = self.st.ident_to_sym[&ident.to_string()].as_str();
+            if sym == "_CxxThrowException" {
+                // `panic_unwind::seh::Exception` = { canary, payload } = 24
+                // bytes; copy it into the TLS buffer so it outlives the
+                // unwound frame.
+                let tls = self.eh_tls();
+                let mf = MemFlagsData::new();
+                let vs: Vec<ir::Value> = (0..3)
+                    .map(|i| self.b.ins().load(clt::I64, mf, cargs[0], i * 8))
+                    .collect();
+                for (i, v) in vs.into_iter().enumerate() {
+                    self.b.ins().store(mf, v, tls, 16 + i as i32 * 8);
+                }
+                let bufp = self.b.ins().iadd_imm_s(tls, 16);
+                self.b.ins().store(mf, bufp, tls, 8);
+                self.eh_raise();
+                return;
+            }
+            if sym == "_Unwind_Resume" {
+                let tls = self.eh_tls();
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), cargs[0], tls, 8);
+                self.eh_raise();
+                return;
+            }
+        }
         if info.tail && self.own_tail {
             // `return_call` produces no results, but the dead Return op after
             // it still reads the call's result operand — bind dummies.
@@ -3660,7 +3848,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 Ok(fr) => self.b.ins().call(fr, &cargs),
                 Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
             };
-            self.b.inst_results(inst).iter().copied().collect()
+            let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
+            if self.eh_data.is_some() && maythrow {
+                self.eh_check(None);
+            }
+            rs
         };
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
@@ -3742,7 +3934,19 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         }
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
-            "pliron.eh.exn" => self.b.use_var(self.exn.unwrap()),
+            "pliron.eh.exn" => {
+                if self.eh_data.is_some() {
+                    // Emulated EH: deliver the in-flight exception and clear
+                    // the flag.
+                    let tls = self.eh_tls();
+                    let exn = self.b.ins().load(clt::I64, MemFlagsData::new(), tls, 8);
+                    let z = self.b.ins().iconst(clt::I32, 0);
+                    self.b.ins().store(MemFlagsData::new(), z, tls, 0);
+                    exn
+                } else {
+                    self.b.use_var(self.exn.unwrap())
+                }
+            }
             "pliron.va.buf" => self.va_buf.unwrap_or_else(|| {
                 panic!(
                     "pliron.va.buf in a non-variadic function {}",
@@ -3995,6 +4199,16 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 };
                 let ps = vec![t; a.len()];
                 self.libcall(&f, &ps, &[t], &a)[0]
+            }
+            "pliron.eh.rethrow" if self.eh_data.is_some() => {
+                // Emulated rethrow (`cleanup_ret` with no unwind dest):
+                // the exception pointer is still in `__pliron_eh`; set the
+                // flag again and keep unwinding by early-return.
+                let pt = self.m.target_config().pointer_type();
+                let z = self.iconst_any(pt, 0);
+                self.set1(op, z);
+                self.eh_raise();
+                return;
             }
             n => panic!("pliron->cranelift: unsupported intrinsic {n}"),
         };

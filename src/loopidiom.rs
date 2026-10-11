@@ -330,7 +330,7 @@ pub(crate) enum Pred {
 }
 
 /// A tiny expression DSL emitted into the check/call blocks.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum Ins {
     Val(Value),
     K(i64),

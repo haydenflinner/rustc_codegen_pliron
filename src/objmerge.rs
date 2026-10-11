@@ -14,11 +14,14 @@ use rustc_data_structures::fx::FxHashMap;
 
 pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     let macho = out.format() == BinaryFormat::MachO;
+    let coff = out.format() == BinaryFormat::Coff;
     let arch = rsasm::arch::lookup(if x86 { "x86-64" } else { "aarch64" }).unwrap();
     let opts = Options::new()
         .with_dialect(Dialect::Gas)
         .with_format(if macho {
             rsasm::output::Format::MachO
+        } else if coff {
+            rsasm::output::Format::Coff
         } else {
             rsasm::output::Format::Elf
         });
@@ -32,11 +35,18 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     }
     let bytes = if macho {
         rsasm::output::macho::build(&a).unwrap()
+    } else if coff {
+        rsasm::output::coff::build(&a).unwrap()
     } else {
         rsasm::output::elf::build(&a).unwrap()
     };
     if macho {
         let f = object::read::macho::MachOFile64::<object::Endianness>::parse(&*bytes).unwrap();
+        splice(&f, out, x86);
+    } else if coff {
+        let f =
+            object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(&*bytes)
+                .unwrap();
         splice(&f, out, x86);
     } else {
         let f = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes).unwrap();
