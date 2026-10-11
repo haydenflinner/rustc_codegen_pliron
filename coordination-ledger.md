@@ -1271,3 +1271,26 @@ unit test in the offending pass before the fix.
   frame-size fix); container edges added after the last local run —
   no measurable change on parse_item_kind (its stores go through the
   caller's sret out-param, not local slots).
+## wasm: inline small-const byte equality (6a4d672)
+
+cpu-prof (node --cpu-prof, 200 iters) put `memcmp` at 77ms/1335ms — the
+hot sites were constant n=32 compares in the regex-automata DFA
+Lazy-cache/state-set path, all libcalls. LLVM expands small-const
+memcmp inline; we didn't.
+
+src/intrinsic.rs: `raw_eq` (const type size) and `compare_bytes`
+(const n arg) <=32B now emit an or-reduced xor over 8/4/2/1-byte word
+chunks (narrow chunks zext to the accumulator width — wasm validate
+caught the mix). compare_bytes keeps exact ordering by branching to
+the libcall only when the inline scan differs (catch_unwind slot
+pattern for the merge).
+
+wbig: 6.5 -> 6.07 ms/iter work(20) (~7%); stock 5.08 — gap 1.28x ->
+~1.19x. Size 2,427,742 -> 2,425,383. verify hash identical; memcmp
+falls off the profile. tests/wasm run.sh green incl. new
+eq_bytes_check (all chunk widths, non-equal slow path, n>32).
+REJECTED: mid-size (<=64-inst) <=6-callsite inlining in winline —
+~1% runtime for +2% size; wasm calls are cheap. Comment left in situ.
+Remaining hot gaps (200-iter profile, pl vs st): find_fwd_imp +79ms,
+ReverseInner::search_half +31, hybrid_try_search_half_fwd +27 /_rev
++11, aho PrefilterI::find +36.

@@ -1,5 +1,6 @@
 //! Rust intrinsics -> pliron ops / `llvm.*` intrinsic calls / libm calls.
 
+use pliron::r#type::TypeHandle;
 use pliron::value::Value;
 use rustc_abi::Align;
 use rustc_codegen_ssa::common::IntPredicate;
@@ -12,6 +13,49 @@ use rustc_middle::ty::{self, Instance};
 use rustc_span::{Span, sym};
 
 use crate::builder::Builder;
+
+/// Or-reduced xor of `pa[0..n]` vs `pb[0..n]` in word chunks — nonzero
+/// iff the byte ranges differ. LLVM expands small constant-size
+/// equality the same way; a libcall sits badly in hot loops (wasm DFA
+/// state-set compares were 32-byte memcmp calls in the search path).
+fn eq_bytes<'a, 'tcx>(
+    b: &mut Builder<'a, 'tcx>,
+    pa: Value,
+    pb: Value,
+    n: u64,
+) -> (Value, TypeHandle) {
+    let i8t = b.type_i8();
+    let mut off = 0u64;
+    let mut acc = None;
+    let mut acc_ty = i8t;
+    for (w, t) in [
+        (8u64, b.type_i64()),
+        (4, b.type_i32()),
+        (2, b.type_i16()),
+        (1, i8t),
+    ] {
+        while off + w <= n {
+            let o = b.const_usize(off);
+            let ga = b.gep(i8t, pa, &[o]);
+            let va = b.load(t, ga, Align::ONE);
+            let gb = b.gep(i8t, pb, &[o]);
+            let vb = b.load(t, gb, Align::ONE);
+            let d = b.xor(va, vb);
+            if acc.is_none() {
+                acc_ty = t;
+            }
+            // Later chunks are narrower than the first: widen to the
+            // accumulator's type before or-ing.
+            let d = if t == acc_ty { d } else { b.zext(d, acc_ty) };
+            acc = Some(match acc {
+                None => d,
+                Some(p) => b.or(p, d),
+            });
+            off += w;
+        }
+    }
+    (acc.unwrap(), acc_ty)
+}
 
 impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_intrinsic_call(
@@ -273,13 +317,48 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::is_val_statically_known => self.const_bool(false),
             sym::compare_bytes => {
                 let i32t = self.type_i32();
-                self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)])
+                let kn = crate::sroa::const_int(
+                    &self.pctx.borrow(),
+                    &self.st.borrow(),
+                    a(2),
+                );
+                match kn {
+                    // Small constant n: the common result is equality,
+                    // so scan inline and only call memcmp for ordering
+                    // when the ranges differ.
+                    Some(n) if (1..=32).contains(&n) => {
+                        let al = Align::from_bytes(4).unwrap();
+                        let slot = self.alloca(rustc_abi::Size::from_bytes(4), al);
+                        let done = self.append_sibling_block("cmpb_done");
+                        let slow = self.append_sibling_block("cmpb_slow");
+                        let join = self.append_sibling_block("cmpb_join");
+                        let (acc, acc_ty) = eq_bytes(self, a(0), a(1), n as u64);
+                        let z = self.const_int(acc_ty, 0);
+                        let eq = self.icmp(IntPredicate::IntEQ, acc, z);
+                        self.cond_br(eq, done, slow);
+                        self.switch_to_block(done);
+                        let z = self.const_i32(0);
+                        self.store(z, slot, al);
+                        self.br(join);
+                        self.switch_to_block(slow);
+                        let c = self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)]);
+                        self.store(c, slot, al);
+                        self.br(join);
+                        self.switch_to_block(join);
+                        self.load(i32t, slot, al)
+                    }
+                    _ => self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)]),
+                }
             }
             sym::raw_eq => {
                 let tp = instance.args.type_at(0);
                 let size = self.layout_of(tp).size.bytes();
                 if size == 0 {
                     self.const_bool(true)
+                } else if size <= 32 {
+                    let (acc, acc_ty) = eq_bytes(self, a(0), a(1), size);
+                    let z = self.const_int(acc_ty, 0);
+                    self.icmp(IntPredicate::IntEQ, acc, z)
                 } else {
                     let i32t = self.type_i32();
                     let n = self.const_usize(size);
