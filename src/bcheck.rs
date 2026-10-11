@@ -483,6 +483,37 @@ impl InstructionMapper for CloneMap<'_> {
     }
 }
 
+/// `bad` must die for the fold to be sound: the clone replaces the check's
+/// unsafe edge with an unconditional jump to the safe successor, so every
+/// path out of `bad` must stay in cold code and never reach a `return`.
+/// A panic/trap chain qualifies; a cold *normal* exit does not — e.g. the
+/// not-found edge of a `position`/`contains` scan under a cold caller is
+/// cold yet live, and folding it drops the loop's exit, turning the scan
+/// into an out-of-bounds read (stage2 rustc `parse_cfg`: `s.contains('=')`
+/// spuriously true for every `s`).
+fn dead_end(func: &Function, bad: Block) -> bool {
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![bad];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) || seen.len() > 16 || !func.layout.is_cold(b) {
+            return false;
+        }
+        for i in func.layout.block_insts(b) {
+            let d = &func.dfg.insts[i];
+            if d.opcode() == Opcode::Return {
+                return false;
+            }
+            for bc in d.branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                stack.push(bc.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    true
+}
+
 fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop, name: &str, seen: &mut FxHashSet<Block>) -> usize {
     let debug = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
     let h = la.loop_header(lp);
@@ -856,7 +887,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             );
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
-            if !func.layout.is_cold(bad) {
+            if !func.layout.is_cold(bad) || !dead_end(func, bad) {
                 continue;
             }
             checks.push(Chk {

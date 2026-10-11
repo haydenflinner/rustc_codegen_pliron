@@ -52,6 +52,11 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/pun
 # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
 # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs && $out/coldargs
+# bcheck may only fold a bound check whose unsafe edge dies — a cold
+# not-found exit is cold yet live; folding the scan loop's own bound test
+# turned `s.contains('=')` into an out-of-bounds read (stage2 rustc
+# parse_cfg emitted the wrong --cfg diagnostic).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/bcheck/main.rs -o $out/bcheck && $out/bcheck
 # bittab must test bit 0 of the shifted mask — `sh != 0` accepts the whole
 # [lo, max] interval, so sparse sets take the interval's holes (rustc's
 # check_const_closure matched `kw::Fn` against {Move,Static,Use}).
