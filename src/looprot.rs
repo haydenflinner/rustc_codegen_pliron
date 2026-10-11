@@ -7,6 +7,7 @@
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, InstructionData, Value};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -193,6 +194,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
         map.insert(prm, a);
     }
     let body: Vec<Inst> = func.layout.block_insts(h).collect();
+    let mut lt = None;
     for i in body {
         let ni = func.dfg.clone_inst(i);
         let dfg = &mut func.dfg;
@@ -215,7 +217,48 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
             .collect();
         map.extend(res);
         func.layout.insert_inst(ni, l.inst);
+        if i == t {
+            lt = Some(ni);
+        }
     }
     func.layout.remove_inst(l.inst);
+    // The cloned test ends each iteration; keep the loop-directed edge on
+    // the taken arm so the exit can fall through — `brif c, exit, loop`
+    // emits `jcc tramp; jmp tramp` where `brif !c, loop, exit` is a single
+    // `jcc` back when the exit lands next in layout.
+    let Some(lt) = lt else { return true };
+    if succ
+        .iter()
+        .position(|s| domtree.block_dominates(*s, l.block))
+        == Some(1)
+        && let InstructionData::Brif { arg, .. } = func.dfg.insts[lt]
+        && uses(func, arg) == 1
+        && let Some(ci) = func
+            .dfg
+            .value_def(func.dfg.resolve_aliases(arg))
+            .inst()
+        && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+    {
+        *cond = cond.complement();
+        let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[lt] else {
+            unreachable!()
+        };
+        blocks.swap(0, 1);
+    }
     true
+}
+
+/// Number of times `v` is used as an operand (inst args + branch args).
+fn uses(func: &Function, v: Value) -> usize {
+    let v = func.dfg.resolve_aliases(v);
+    func.layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .map(|i| {
+            func.dfg
+                .inst_values(i)
+                .filter(|&u| func.dfg.resolve_aliases(u) == v)
+                .count()
+        })
+        .sum()
 }
