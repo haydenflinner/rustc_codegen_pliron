@@ -29,5 +29,24 @@ fn main() {
     c.env("UNSET_ME", "x");
     c.env_remove("UNSET_ME");
     c.output().unwrap();
+
+    // off_implied must not fold the *weak* reverse compare: `x < y` implies
+    // `x + 1 <= y`, so `x + 1 > y` is dead but `x + 1 >= y` is live at
+    // `x = y - 1`. Folding it false dropped ceil_char_boundary's `i >= len`
+    // exit inside trim_start_matches("0"), turning demangle of any
+    // `[T; Nusize]` array type into an out-of-bounds panic — and stage2
+    // rustc hangs on backtrace demangling.
+    let mut hits = 0;
+    for (x, y) in [(0usize, 1usize), (0, 5), (3, 4), (10, 11), (5, 3)] {
+        if x < y && x + 1 >= y {
+            hits += 1;
+        }
+    }
+    assert_eq!(hits, 3);
+    // Same fold on the loop-carried increment path (the searcher shape).
+    assert_eq!("4".trim_start_matches("0"), "4");
+    assert_eq!("4usize".trim_start_matches("0"), "4usize");
+    assert_eq!("000a4".trim_start_matches("0"), "a4");
+    assert_eq!("0".trim_start_matches("0"), "");
     println!("celim ok");
 }

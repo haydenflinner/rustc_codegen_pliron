@@ -969,15 +969,18 @@ fn off_implied(fc: IntCC, qa: i64, qb: i64, qc: IntCC) -> Option<bool> {
     }
     match (fc, qa, qb) {
         // `x < y` gives `x + 1 <= y` and `x <= y - 1` (y >= 1 on the edge).
+        // The weak reverse compare (`x + 1 >= y`) is *satisfiable* — `x` can
+        // be `y - 1` — so only the strict form decides false.
         (UnsignedLessThan, 1, 0) | (UnsignedLessThan, 0, -1) => match qc {
             UnsignedLessThanOrEqual => Some(true),
-            UnsignedGreaterThanOrEqual | UnsignedGreaterThan => Some(false),
+            UnsignedGreaterThan => Some(false),
             _ => None,
         },
-        // `x > y` gives `x - 1 >= y` and `x >= y + 1`.
+        // `x > y` gives `x - 1 >= y` and `x >= y + 1`; `x - 1 <= y` and
+        // `x <= y + 1` stay satisfiable at `x = y + 1`.
         (UnsignedGreaterThan, -1, 0) | (UnsignedGreaterThan, 0, 1) => match qc {
             UnsignedGreaterThanOrEqual => Some(true),
-            UnsignedLessThan | UnsignedLessThanOrEqual => Some(false),
+            UnsignedLessThan => Some(false),
             _ => None,
         },
         // `x == y` decides `x +/- 1` vs `y` and `x` vs `y +/- 1`: if the
@@ -987,15 +990,15 @@ fn off_implied(fc: IntCC, qa: i64, qb: i64, qc: IntCC) -> Option<bool> {
             Equal => Some(false),
             _ => None,
         },
-        // Signed mirrors.
+        // Signed mirrors; the same boundary case applies.
         (SignedLessThan, 1, 0) | (SignedLessThan, 0, -1) => match qc {
             SignedLessThanOrEqual => Some(true),
-            SignedGreaterThanOrEqual | SignedGreaterThan => Some(false),
+            SignedGreaterThan => Some(false),
             _ => None,
         },
         (SignedGreaterThan, -1, 0) | (SignedGreaterThan, 0, 1) => match qc {
             SignedGreaterThanOrEqual => Some(true),
-            SignedLessThan | SignedLessThanOrEqual => Some(false),
+            SignedLessThan => Some(false),
             _ => None,
         },
         _ => None,
@@ -1543,6 +1546,9 @@ pub fn run(func: &mut Function) -> usize {
                     r = decide(func, &fs, qp, qraw);
                 }
                 if let Some(k) = r {
+                    if std::env::var_os("PLIRON_CELIM_DEBUG").is_some() {
+                        eprintln!("celim fold {i} -> {k} q={q:?} facts={fs:?}");
+                    }
                     folds.push((i, k));
                 }
             }
