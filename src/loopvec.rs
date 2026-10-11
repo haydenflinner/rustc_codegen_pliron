@@ -1498,10 +1498,27 @@ fn plan(
                     opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
                     args,
                 } => {
+                    // `band x, 1` keeps only bit 0, so x is exempt from
+                    // the 0/1 rule — but x still has to be emittable:
+                    // emit_val lane-replicates or splats every operand, so
+                    // an in-body value that is neither would miscompile
+                    // (uniform lanes) or hit emit_scalar's in-body check.
                     args.iter().all(|&a| ib(a))
                         || (func.dfg.insts[i].opcode() == Opcode::Band
                             && args.iter().any(|&a| {
                                 iconst(func, func.dfg.resolve_aliases(a)) == Some(1)
+                            })
+                            && args.iter().all(|&a| {
+                                let a = func.dfg.resolve_aliases(a);
+                                ib(a)
+                                    || can_vec.contains(&a)
+                                    || is_splat(
+                                        func,
+                                        &info,
+                                        &kinds,
+                                        &mut splat_cache,
+                                        a,
+                                    )
                             }))
                 }
                 InstructionData::Ternary {
@@ -2893,6 +2910,7 @@ fn cond_term(
     let cv = func.dfg.resolve_aliases(t.c);
     if bools.contains(&cv) && ubits(func, cv).is_some_and(|w| w <= elem.bits()) {
         let mut todo = vec![cv];
+        let mut found: FxHashSet<Inst> = FxHashSet::default();
         let mut ok = true;
         while let Some(v) = todo.pop() {
             let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
@@ -2904,17 +2922,26 @@ fn cond_term(
             {
                 continue;
             }
-            insts.insert(i);
+            found.insert(i);
             for &a in func.dfg.inst_args(i) {
                 let a = func.dfg.resolve_aliases(a);
                 if a == acc {
                     ok = false;
                 } else if bools.contains(&a) {
                     todo.push(a);
+                } else if !can_vec.contains(&a)
+                    && !is_splat(func, info, kinds, splat_cache, a)
+                {
+                    // emit_val must produce every non-bool operand too:
+                    // lane-replicated or splatted. An unemittable in-body
+                    // value would miscompile as a uniform splat (or ICE on
+                    // a side-effecting def).
+                    ok = false;
                 }
             }
         }
         if ok {
+            insts.extend(found);
             t.needs_ne = true;
             return true;
         }
@@ -3964,4 +3991,71 @@ pub fn run(
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use target_lexicon::PointerWidth;
+
+    /// `select(band(popcnt(x), 1), acc+1, acc)` — a count-if whose
+    /// condition is a `band x,1` "mod-2 bool" over a value that is
+    /// neither lane-replicable (`popcnt` isn't in `vec_op_ok`) nor
+    /// splattable. The loop must stay scalar: admitting the cond lets
+    /// `emit_scalar` clone the operand chain down into an in-body load.
+    /// Regression test for the `u0:0` ICE in vendored cranelift-codegen
+    /// during self-host stage2.
+    #[test]
+    fn band1_bool_operand_must_be_emittable() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let body = b.create_block();
+            let exit = b.create_block();
+            b.append_block_param(head, types::I64);
+            b.append_block_param(head, types::I64);
+            b.append_block_param(exit, types::I64);
+
+            b.switch_to_block(entry);
+            let p0 = b.ins().iconst(types::I64, 0);
+            let n = b.ins().iconst(types::I64, 64);
+            let st = b.ins().iconst(types::I64, 8);
+            let nb = b.ins().imul(n, st);
+            let end = b.ins().iadd(p0, nb);
+            let zero = b.ins().iconst(types::I64, 0);
+            b.ins().jump(head, &[p0.into(), zero.into()]);
+
+            b.switch_to_block(head);
+            let (p, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
+            let done = b.ins().icmp(IntCC::Equal, p, end);
+            b.ins().brif(done, exit, &[acc.into()], body, &[]);
+
+            b.switch_to_block(body);
+            let x = b
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), p, 0);
+            let pc = b.ins().popcnt(x);
+            let c = b.ins().band_imm_u(pc, 1);
+            let acc1 = b.ins().iadd(acc, x);
+            let acc2 = b.ins().select(c, acc1, acc);
+            let p1 = b.ins().iadd_imm_s(p, 8);
+            b.ins().jump(head, &[p1.into(), acc2.into()]);
+
+            b.switch_to_block(exit);
+            let r = b.block_params(exit)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        let tcfg = TargetFrontendConfig {
+            default_call_conv: CallConv::SystemV,
+            pointer_width: PointerWidth::U64,
+            page_size_align_log2: 12,
+        };
+        run(&mut func, "band1_cond", &FxHashSet::default(), tcfg, true, false);
+    }
 }
