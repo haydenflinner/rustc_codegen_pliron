@@ -3,6 +3,10 @@
 //! processed bottom-up, so inlined bodies are inlined transitively; at invoke sites
 //! the callee's calls become invokes to the same landing pad.
 //! `PLIRON_INLINE=<max ops>` tunes the size limit; `0` disables it.
+//!
+//! `PLIRON_INLINE_MODEL` (default on; `0` = the old fixed thresholds) weighs
+//! per-callsite cost vs. savings: see [`run`]. `PLIRON_INLINE_VERBOSE=1` logs
+//! every callsite verdict with its score under either model.
 
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
@@ -13,12 +17,15 @@ use pliron::irbuild::inserter::OpInsertionPoint;
 use pliron::irbuild::listener::DummyListener;
 use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron::linked_list::ContainsLinkedList;
-use pliron::operation::OpDbg;
 use pliron::op::Op;
+use pliron::operation::OpDbg;
 use pliron::operation::Operation;
 use pliron::r#type::{Typed, TypedHandle};
 use pliron::value::Value;
-use pliron_llvm::ops::{BrOp, CallOp, CondBrOp, GetElementPtrOp, LoadOp, ReturnOp};
+use pliron_llvm::ops::{
+    AtomicLoadOp, AtomicStoreOp, BitcastOp, BrOp, CallOp, CondBrOp, GetElementPtrOp, IndirectBrOp,
+    LoadOp, ReturnOp, StoreOp, SwitchOp, UnreachableOp,
+};
 use pliron_llvm::types::FuncType;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -27,6 +34,27 @@ use crate::lower::has_body;
 
 const DEFAULT_LIMIT: usize = 320;
 const SMALL_LIMIT: usize = 40;
+
+// Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
+// `cost <= threshold`.
+/// Each call inside the callee costs this much on top of its own op: inlining
+/// moves the call into the caller, it doesn't remove it.
+const CALL_OP_W: usize = 3;
+/// Bonus per use a constant actual can fold (a scalar arg feeding arithmetic,
+/// compares, selects, casts, ...).
+const FOLD_USE: usize = 25;
+/// Bonus per memory op a by-ref arg reaches through GEP/bitcast chains when
+/// the actual is a local slot or a constant address: the inlined loads/stores
+/// become direct (SROA/`loadfwd`/`constload` material).
+const MEM_USE: usize = 20;
+/// `#[cold]` callees pollute the caller's hot layout: cost doubles.
+const COLD_W: usize = 2;
+/// Threshold cap (x the base limit) so the bonus terms can't grow without
+/// bound; a single callsite never budgets more than this.
+const MAX_T: usize = 32;
+/// Default per-caller budget (x the base limit) of non-free inlined ops
+/// (`PLIRON_INLINE_GROWTH`).
+const GROWTH_MULT: usize = 25;
 
 pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     if f.deref(ctx).regions().next().is_none() {
@@ -51,20 +79,16 @@ pub(crate) fn direct_callee<'a>(
     st.ident_to_sym.get(&id.to_string())
 }
 
-/// `Some(has_eh)` if `sym` may be inlined; `has_eh` = it has invokes or reads
-/// the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees outright.
-fn eligible(
-    ctx: &Context,
-    st: &State<'_>,
-    sym: &str,
-    limit: usize,
-    once: bool,
-) -> Option<(bool, usize)> {
+/// Legality only — `Some((has_eh, ops, calls))` if `sym` may be inlined at
+/// all; profitability is judged per callsite. `has_eh` = it has invokes or
+/// reads the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees
+/// outright.
+fn legal(ctx: &Context, st: &State<'_>, sym: &str) -> Option<(bool, usize, usize)> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
         return None;
     }
-    let (mut n, mut eh) = (0, false);
+    let (mut n, mut ncalls, mut eh) = (0, 0, false);
     for b in blocks(ctx, f.op) {
         for op in ops(ctx, b) {
             n += 1;
@@ -75,17 +99,171 @@ fn eligible(
                 return None;
             }
             eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
+            ncalls += usize::from(Operation::is_op::<CallOp>(op, ctx));
         }
     }
     if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
         return None;
     }
-    (n <= if f.always_inline || once {
-        limit * 10
+    Some((eh, n, ncalls))
+}
+
+/// Callee-body facts the callsite score is computed from.
+struct CInfo {
+    op: Ptr<Operation>,
+    eh: bool,
+    /// Op count.
+    n: usize,
+    /// Call ops inside the body (`CALL_OP_W` extra cost each under the model).
+    ncalls: usize,
+    /// Params feeding an indirect call's target (see `devirt_params`).
+    dvirt: Vec<usize>,
+    /// Params reaching a branch condition (see `cond_params`).
+    conds: Vec<usize>,
+    /// Per-param memory-op uses a direct actual makes resolvable.
+    mem: Vec<u32>,
+    /// Per-param other foldable uses.
+    fold: Vec<u32>,
+}
+
+/// `legal` plus the body scans the score needs. The fixed thresholds only
+/// profile callees a devirt/fold multiplier could rescue (as the old `dv` map
+/// did); the model profiles every plausibly inlinable body.
+fn callee_info(
+    ctx: &Context,
+    st: &State<'_>,
+    sym: &str,
+    model: bool,
+    limit: usize,
+    bonus: usize,
+    fold: usize,
+) -> Option<CInfo> {
+    let (eh, n, ncalls) = legal(ctx, st, sym)?;
+    let mut ci = CInfo {
+        op: st.funcs[sym].op,
+        eh,
+        n,
+        ncalls,
+        dvirt: Vec::new(),
+        conds: Vec::new(),
+        mem: Vec::new(),
+        fold: Vec::new(),
+    };
+    let want = if model {
+        n <= limit.saturating_mul(MAX_T)
     } else {
-        limit
-    })
-    .then_some((eh, n))
+        n > limit && n <= limit.saturating_mul(bonus.max(fold))
+    };
+    if !want {
+        return Some(ci);
+    }
+    if model || bonus > 1 {
+        ci.dvirt = devirt_params(ctx, st.funcs[sym].op);
+    }
+    if model || fold > 1 {
+        ci.conds = cond_params(ctx, st.funcs[sym].op, model);
+    }
+    if model {
+        (ci.mem, ci.fold) = param_uses(ctx, st, st.funcs[sym].op);
+    }
+    Some(ci)
+}
+
+/// Per entry-param use shape: `mem` = loads/stores/mem intrinsics reached
+/// through GEP/bitcast chains (a by-ref arg whose actual is a local slot or a
+/// constant becomes direct access the cleanup passes can resolve); `fold` =
+/// other uses a constant actual can fold. Call/branch/return uses earn
+/// neither — calls are priced by `ncalls`, block args don't fold in place.
+fn param_uses(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> (Vec<u32>, Vec<u32>) {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let nparams = entry.deref(ctx).arguments().count();
+    let (mut mem, mut fold) = (vec![0u32; nparams], vec![0u32; nparams]);
+    for (i, p) in entry.deref(ctx).arguments().enumerate() {
+        let (mut work, mut seen, mut budget) = (vec![p], FxHashSet::default(), 64);
+        while let Some(v) = work.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            for u in v.uses(ctx) {
+                let o = u.user_op();
+                let ui = u.find_index(ctx);
+                if (Operation::is_op::<GetElementPtrOp>(o, ctx)
+                    || Operation::is_op::<BitcastOp>(o, ctx))
+                    && ui == 0
+                {
+                    if seen.insert(o.deref(ctx).get_result(0)) {
+                        work.push(o.deref(ctx).get_result(0));
+                    }
+                } else if Operation::is_op::<LoadOp>(o, ctx)
+                    || Operation::is_op::<AtomicLoadOp>(o, ctx)
+                    || ((Operation::is_op::<StoreOp>(o, ctx)
+                        || Operation::is_op::<AtomicStoreOp>(o, ctx))
+                        && ui != 0)
+                    || st
+                        .intrinsics
+                        .get(&o)
+                        .is_some_and(|s| s.starts_with("llvm.mem") && ui <= 1)
+                {
+                    mem[i] += 1;
+                } else if !(Operation::is_op::<CallOp>(o, ctx)
+                    || Operation::is_op::<BrOp>(o, ctx)
+                    || Operation::is_op::<CondBrOp>(o, ctx)
+                    || Operation::is_op::<SwitchOp>(o, ctx)
+                    || Operation::is_op::<IndirectBrOp>(o, ctx)
+                    || Operation::is_op::<ReturnOp>(o, ctx)
+                    || Operation::is_op::<UnreachableOp>(o, ctx))
+                {
+                    fold[i] += 1;
+                }
+            }
+        }
+    }
+    (mem, fold)
+}
+
+/// Whether `v` is a scalar constant the model credits: literal bits, zero, or
+/// a symbol address (vtables and fn pointers fold indirect calls; global
+/// addresses make by-ref memory direct).
+fn const_arg(st: &State<'_>, v: &Value) -> bool {
+    matches!(
+        st.consts.get(v),
+        Some(ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. })
+    )
+}
+
+/// Successor blocks, counting invoke landing-pad edges.
+fn bsuccs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
+    let mut v = Vec::new();
+    for op in ops(ctx, b) {
+        v.extend(op.deref(ctx).successors());
+        v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+    }
+    v
+}
+
+/// Blocks of `f` that can reach themselves: the callsite-context "in a loop"
+/// signal (an inlined body there runs once per iteration, so a little extra
+/// code is worth it).
+fn loop_blocks(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+    let mut out = FxHashSet::default();
+    for b in blocks(ctx, f) {
+        let mut seen = FxHashSet::default();
+        let mut stack = bsuccs(ctx, st, b);
+        while let Some(x) = stack.pop() {
+            if x == b {
+                out.insert(b);
+                break;
+            }
+            if seen.insert(x) {
+                stack.extend(bsuccs(ctx, st, x));
+            }
+        }
+    }
+    out
 }
 
 /// Parameter indices of `f` that (through loads / GEPs) feed an indirect call's
@@ -131,7 +309,8 @@ fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
 /// Parameter indices of `f` that reach a conditional branch's condition
 /// through a short def chain: a scalar-constant argument there folds the
 /// branch in the inlined clone, so the callsite gets a size-limit bonus.
-fn cond_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
+/// `incl_switch` (the cost model) also counts `switch` conditions.
+fn cond_params(ctx: &Context, f: Ptr<Operation>, incl_switch: bool) -> Vec<usize> {
     let bs = blocks(ctx, f);
     let Some(&entry) = bs.first() else {
         return Vec::new();
@@ -140,7 +319,9 @@ fn cond_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
     let mut out = Vec::new();
     for &b in &bs {
         for op in ops(ctx, b) {
-            if !Operation::is_op::<CondBrOp>(op, ctx) {
+            if !Operation::is_op::<CondBrOp>(op, ctx)
+                && !(incl_switch && Operation::is_op::<SwitchOp>(op, ctx))
+            {
                 continue;
             }
             let mut work = vec![op.deref(ctx).get_operand(0)];
@@ -259,6 +440,22 @@ fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
 
 /// `small`: size-sensitive output (wasm, -Copt-level=s/z) keeps the old 40-op limit and no
 /// single-caller inlining; rustc.wasm tripled in code size (past V8's 1 GB module cap) without it.
+///
+/// The cost model (`PLIRON_INLINE_MODEL`, default on; `0` = the fixed
+/// thresholds) inlines a callsite when `cost <= threshold`:
+///
+/// - cost = the callee's op count, plus `CALL_OP_W` per nested call (inlining
+///   moves, doesn't remove, them), times `COLD_W` for `#[cold]` callees.
+/// - threshold = the `PLIRON_INLINE` base, x10 for `#[inline(always)]` or a
+///   local callee with a single callsite (its out-of-line copy then dies),
+///   x`PLIRON_INLINE_DEVIRT` when a constant-address actual feeds an
+///   indirect-call param, x`PLIRON_INLINE_FOLD` when a constant actual feeds
+///   a branch condition, plus `FOLD_USE`/`MEM_USE` per use a constant or
+///   local-slot actual resolves, plus half the base when the callsite sits in
+///   a loop — all capped at `MAX_T`x the base.
+/// - `PLIRON_INLINE_GROWTH` (default `GROWTH_MULT`x the base) caps the
+///   non-free ops one caller may absorb; `PLIRON_INLINE_CALLER_MAX` still
+///   bounds total size. `small` disables every bonus and the budget.
 pub fn run(
     ctx: &mut Context,
     st: &mut State<'_>,
@@ -317,30 +514,25 @@ pub fn run(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 2 });
-    let mut ok: FxHashMap<String, (Ptr<Operation>, bool, usize)> = FxHashMap::default();
-    let mut dv: FxHashMap<String, (Ptr<Operation>, bool, usize, Vec<usize>, Vec<usize>)> =
-        FxHashMap::default();
-    let devirt_ok = |ctx: &Context, st: &State<'_>, sym: &str, dv: &mut FxHashMap<_, _>| {
-        let max = limit * bonus.max(fold);
-        if max <= limit {
-            return;
-        }
-        if let Some((eh, n)) = eligible(ctx, st, sym, max, false) {
-            let ps = if bonus > 1 {
-                devirt_params(ctx, st.funcs[sym].op)
-            } else {
-                Vec::new()
-            };
-            let qs = if fold > 1 {
-                cond_params(ctx, st.funcs[sym].op)
-            } else {
-                Vec::new()
-            };
-            if !ps.is_empty() || !qs.is_empty() {
-                dv.insert(sym.to_string(), (st.funcs[sym].op, eh, n, ps, qs));
+    // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
+    // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
+    // grow code on heuristics tuned for speed.
+    let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    let verbose = std::env::var("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
+    // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
+    // model only). `cap` still bounds the caller's absolute size.
+    let growth: usize = std::env::var("PLIRON_INLINE_GROWTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
+    let mut infos: FxHashMap<String, CInfo> = FxHashMap::default();
+    macro_rules! add_info {
+        ($sym:expr) => {
+            if let Some(ci) = callee_info(ctx, st, $sym, model, limit, bonus, fold) {
+                infos.insert($sym.to_string(), ci);
             }
-        }
-    };
+        };
+    }
     let order: Vec<String> = if bottom_up {
         post_order(ctx, st)
     } else {
@@ -348,11 +540,7 @@ pub fn run(
             if always_only && !st.funcs[sym].always_inline {
                 continue;
             }
-            if let Some((eh, n)) = eligible(ctx, st, sym, limit, single.contains(sym)) {
-                ok.insert(sym.clone(), (st.funcs[sym].op, eh, n));
-            } else {
-                devirt_ok(ctx, st, sym, &mut dv);
-            }
+            add_info!(sym);
         }
         st.funcs
             .iter()
@@ -365,6 +553,8 @@ pub fn run(
         let caller = st.funcs[&sym].op;
         let mut sites = Vec::new();
         let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
+        let mut grown = 0usize;
+        let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
         for b in blocks(ctx, caller) {
             for op in ops(ctx, b) {
                 if !bottom_up && st.invokes.contains_key(&op) {
@@ -376,46 +566,108 @@ pub fn run(
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
-                let Some((callee, eh, n)) = ok.get(cs).copied().or_else(|| {
-                    let (f, eh, n, ps, qs) = dv.get(cs)?;
-                    let args = Operation::get_op::<CallOp>(op, ctx)?.args(ctx);
-                    let dvirt = *n <= limit * bonus
-                        && ps.iter().any(|&i| {
-                            args.get(i).is_some_and(|a| {
-                                matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
-                            })
-                        });
-                    let foldable = *n <= limit * fold
-                        && qs.iter().any(|&i| {
-                            args.get(i).is_some_and(|a| {
-                                matches!(
-                                    st.consts.get(a),
-                                    Some(
-                                        ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. }
-                                    )
-                                )
-                            })
-                        });
-                    (dvirt || foldable).then_some((*f, *eh, *n))
-                }) else {
+                let Some(ci) = infos.get(cs) else {
+                    if verbose {
+                        eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
+                    }
                     continue;
                 };
+                let f = &st.funcs[cs];
+                // Free inlines: the out-of-line copy disappears
+                // (single-callsite locals) or rustc demanded it.
+                let free = f.always_inline || (once && single.contains(cs));
+                let mut t = if free {
+                    limit.saturating_mul(10)
+                } else {
+                    limit
+                };
+                let args = Operation::get_op::<CallOp>(op, ctx)
+                    .map(|c| c.args(ctx))
+                    .unwrap_or_default();
+                // A constant address feeding an indirect-call param lets
+                // `devirt` make the call direct; a scalar constant feeding a
+                // branch condition folds it. (The old `dv` map's bonuses.)
+                if bonus > 1
+                    && ci.dvirt.iter().any(|&i| {
+                        args.get(i)
+                            .is_some_and(|a| matches!(st.consts.get(a), Some(ConstVal::Sym { .. })))
+                    })
+                {
+                    t = t.max(limit.saturating_mul(bonus));
+                }
+                if fold > 1
+                    && ci
+                        .conds
+                        .iter()
+                        .any(|&i| args.get(i).is_some_and(|a| const_arg(st, a)))
+                {
+                    t = t.max(limit.saturating_mul(fold));
+                }
+                let mut cost = ci.n;
+                if model {
+                    cost = ci.n.saturating_add(ci.ncalls.saturating_mul(CALL_OP_W));
+                    let mut save = 0usize;
+                    for (i, a) in args.iter().enumerate() {
+                        if const_arg(st, a) {
+                            save = save.saturating_add(
+                                FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
+                            );
+                        }
+                        if const_arg(st, a) || st.allocas.contains_key(a) {
+                            save = save.saturating_add(
+                                MEM_USE * ci.mem.get(i).copied().unwrap_or(0) as usize,
+                            );
+                        }
+                    }
+                    t = t.saturating_add(save);
+                    if f.cold {
+                        cost = cost.saturating_mul(COLD_W);
+                    }
+                    if loops
+                        .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                        .contains(&b)
+                    {
+                        t = t.saturating_add(limit / 2);
+                    }
+                    t = t.min(limit.saturating_mul(MAX_T));
+                    if free {
+                        // Net global growth is ~0 — the callee's out-of-line
+                        // copy dies — so nested calls and coldness aren't
+                        // charged; `cap` still bounds the caller's size.
+                        cost = ci.n;
+                    }
+                }
                 // A callee with landing pads may go into an invoke whose pad is a
                 // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
                 // into a catch pad: unwinder phase 1 would never see that catch.
-                if eh
+                let eh_block = ci.eh
                     && st
                         .invokes
                         .get(&op)
-                        .is_some_and(|&(_, catch)| catch || !eh_invoke)
-                {
-                    continue;
-                }
-                // Stop growing a caller past the cap: huge generated functions
-                // (cranelift's ISLE lowering) would otherwise blow up memory.
-                if callee != caller && st.calls[&op].fn_ty == st.funcs[cs].ty && size + n <= cap {
-                    size += n;
-                    sites.push((op, callee));
+                        .is_some_and(|&(_, catch)| catch || !eh_invoke);
+                let why = if cost > t {
+                    "reject (score)"
+                } else if eh_block {
+                    "reject (eh)"
+                } else if ci.op == caller || st.calls[&op].fn_ty != f.ty {
+                    "reject (self/fnty)"
+                } else if size + ci.n > cap {
+                    "reject (cap)"
+                } else if model && !free && grown + ci.n > growth {
+                    "reject (growth)"
+                } else {
+                    if model && !free {
+                        grown += ci.n;
+                    }
+                    size += ci.n;
+                    sites.push((op, ci.op));
+                    "accept"
+                };
+                if verbose {
+                    eprintln!(
+                        "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
+                        st.cgu, ci.n, ci.ncalls
+                    );
                 }
             }
         }
@@ -423,15 +675,11 @@ pub fn run(
             inline_call(ctx, st, &mut rw, call, callee);
         }
         if bottom_up {
-            if let Some((eh, n)) = eligible(ctx, st, &sym, limit, single.contains(&sym)) {
-                ok.insert(sym.clone(), (caller, eh, n));
-            } else {
-                devirt_ok(ctx, st, &sym, &mut dv);
-            }
+            add_info!(&sym);
         }
     }
     if std::env::var("PLIRON_STATS").is_ok() {
-        left_stats(ctx, st, &ok);
+        left_stats(ctx, st, &infos);
     }
 }
 
@@ -508,11 +756,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
 }
 
 /// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
-fn left_stats(
-    ctx: &Context,
-    st: &State<'_>,
-    ok: &FxHashMap<String, (Ptr<Operation>, bool, usize)>,
-) {
+fn left_stats(ctx: &Context, st: &State<'_>, infos: &FxHashMap<String, CInfo>) {
     let mut why: FxHashMap<&str, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
         if !has_body(ctx, f.op) {
@@ -532,8 +776,8 @@ fn left_stats(
                     "preemptible"
                 } else if cs == sym {
                     "self"
-                } else if let Some(&(_, eh, _)) = ok.get(cs) {
-                    if eh && st.invokes.contains_key(&op) {
+                } else if let Some(ci) = infos.get(cs) {
+                    if ci.eh && st.invokes.contains_key(&op) {
                         "eh callee at invoke (catch pad / EH_INVOKE=0)"
                     } else if st.calls[&op].fn_ty != g.ty {
                         "fn type mismatch"
