@@ -54,12 +54,14 @@ mod loopvec;
 mod unroll;
 mod lower;
 mod memcpyopt;
+mod nnret;
 mod nocapture;
 mod nounwind;
 mod nowrite;
 mod objmerge;
 mod phisimp;
 mod punroll;
+mod retarg;
 mod revnorm;
 mod simd;
 mod slp;
@@ -433,6 +435,17 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     }
                 }
             }
+        }
+        // IPO return-value attributes, after inlining/devirt so remaining
+        // direct calls are the final set. `nnret` is consumed at lowering
+        // (nonnull call results feed jumpthread); `retarg` folds call
+        // results to the returned argument in place.
+        if pass_enabled("PLIRON_NNRET") {
+            nnret::run(ctx, st);
+        }
+        if pass_enabled("PLIRON_RETARG") {
+            retarg::run(ctx, st);
+            domcheck::run(ctx, st, "retarg");
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");

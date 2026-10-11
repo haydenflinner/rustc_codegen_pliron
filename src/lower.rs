@@ -3909,6 +3909,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 }
                 (inst, rs)
             };
+        // `st.nnret` inference: a nonnull-returning callee's result is a
+        // known-non-null pointer for jumpthread's null-test folds.
+        if rs.len() == 1
+            && callee_sym
+                .as_deref()
+                .is_some_and(|s| self.st.nnret.contains(s))
+        {
+            self.nonnull.insert(rs[0]);
+        }
         // `info.nocap` carries rustc's `captures(none)` (Indirect params);
         // `st.nocapture` is our body-level inference, which also covers
         // `&`/`&mut` (Direct) params. Either flags the CLIF arg a bounded use.

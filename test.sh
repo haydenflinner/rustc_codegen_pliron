@@ -91,6 +91,13 @@ rustc $BE --edition 2024 -O tests/polsw/main.rs -o $out/polsw$exe && $out/polsw$
 # back-edge (LLVM TRE for `op(expr, f(args))`) — a re-executed identity or
 # stale param miscomputes; non-commutative ops must be left alone.
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/tailrec/main.rs -o $out/tailrec$exe && $out/tailrec$exe
+# nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
+# inferred nonnull-return or returned-arg folds these null/equality checks
+# the wrong way.
+PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/retattr/main.rs -o $out/retattr$exe 2> $out/retattr.stats && $out/retattr$exe
+grep -Eq 'nnret .*: [1-9][0-9]* of' $out/retattr.stats || { echo "nnret inferred nothing" >&2; exit 1; }
+grep -Eq 'retarg .*: [1-9][0-9]* returned-arg bodies' $out/retattr.stats || { echo "retarg inferred nothing" >&2; exit 1; }
+grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&

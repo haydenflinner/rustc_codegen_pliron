@@ -174,6 +174,9 @@ pub struct State<'tcx> {
         String,
         rustc_data_structures::fx::FxHashSet<u32>,
     >,
+    /// Bodies inferred to return a non-null pointer (nnret.rs); lowering
+    /// seeds their call results into `FnLower::nonnull` for jumpthread.
+    pub nnret: rustc_data_structures::fx::FxHashSet<String>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
