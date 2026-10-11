@@ -40,9 +40,11 @@ mkdir -p "$OUT"
 cd "$WT"
 
 kill_stragglers() {
-    # etime is MM:SS / HH:MM:SS / D-HH:MM:SS — only idle (<0.5% cpu) rustc.
+    # Only stage1/stage2 test-invoked rustc — the bootstrap driver rustc
+    # and stage codegen rustc legitimately idle while orchestrating.
+    # etime is MM:SS / HH:MM:SS / D-HH:MM:SS; only kill idle (<0.5% cpu).
     ps -eo pid,%cpu,etime,comm | awk -v w="$WT/build" -v m="$WATCHDOG_MIN" '
-        index($0, w) {
+        index($0, w) && $0 ~ /\/stage[12]\/bin\/rustc$/ {
             n = split($3, t, ":")
             mins = (n == 2) ? t[1] : m + 1
             if ($3 ~ /-/ || mins >= m) { if ($2 + 0 < 0.5) print $1 }
@@ -64,7 +66,13 @@ run_stage() {
     # indented "[suite] path" lines.
     awk '/^failures:$/ {f=1; next} f && /^    \[/ {print; next} f {f=0}' \
         "$OUT/stage$st.log" | sort -u > "$OUT/stage$st.failures"
-    echo "stage$st: $(wc -l < "$OUT/stage$st.failures" | tr -d ' ') failures (x exit $rc)"
+    if ! grep -q "^test result:" "$OUT/stage$st.log"; then
+        echo "stage$st: INCOMPLETE — no 'test result:' summary in log (x exit $rc); failure list not trustworthy"
+        touch "$OUT/stage$st.incomplete"
+    else
+        rm -f "$OUT/stage$st.incomplete"
+        echo "stage$st: $(wc -l < "$OUT/stage$st.failures" | tr -d ' ') failures (x exit $rc)"
+    fi
 }
 
 case "$ONLY" in
@@ -73,6 +81,10 @@ case "$ONLY" in
     *)
         run_stage 2
         run_stage 1
+        if [ -e "$OUT/stage1.incomplete" ] || [ -e "$OUT/stage2.incomplete" ]; then
+            echo "== comparison skipped: a stage run did not complete"
+            exit 1
+        fi
         comm -23 "$OUT/stage2.failures" "$OUT/stage1.failures" > "$OUT/regressions"
         comm -13 "$OUT/stage2.failures" "$OUT/stage1.failures" > "$OUT/stage1-only"
         echo "== stage2-only failures (pliron regression candidates): $(wc -l < "$OUT/regressions" | tr -d ' ')"
