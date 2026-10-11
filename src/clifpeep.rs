@@ -2302,6 +2302,40 @@ pub fn run(func: &mut Function) -> usize {
     n
 }
 
+/// `isub x, k` → `iadd x, -k`: x64 lowers scalar iadd as `lea`, which
+/// writes any reg without destroying the input — `sub`'s operand
+/// destruction forces a `mov` when the input stays live (e.g. `n-1` as a
+/// call arg next to loop-carried `n-2`). Runs late so the earlier loop
+/// passes keep seeing canonical `isub` IV updates.
+pub fn sublea(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args,
+            } = pos.func.dfg.insts[inst]
+            else {
+                continue;
+            };
+            let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+            if !ty.is_int()
+                || ty.is_vector()
+                || ty.bits() > 64
+                || iconst(pos.func, args[1]).is_none()
+            {
+                continue;
+            }
+            let k = iconst(pos.func, args[1]).unwrap();
+            let nk = pos.ins().iconst(ty, k.wrapping_neg());
+            pos.func.replace(inst).iadd(args[0], nk);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// `umin`/`umax`/`smin`/`smax` on scalar ints wider than a register (i128):
 /// no Cranelift target lowers them — the egraph's `select(icmp)->min` rules
 /// don't restrict by width, and loopvec's scalar reduction epilogue emits

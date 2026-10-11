@@ -816,6 +816,17 @@ pub fn lower_to_object(
                 );
             }
         }
+        // `isub x, k` → `iadd x, -k` so x64's `lea` lowering can write a
+        // call-arg/phi result non-destructively instead of `mov` + `sub`.
+        if st.peep
+            && crate::pass_enabled("PLIRON_SUBLEA")
+            && crate::bisect("sublea")
+        {
+            let k = crate::clifpeep::sublea(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("sublea {k} {n}");
+            }
+        }
         // Scalar min/max wider than a register (i128) has no Cranelift
         // lowering on any target; several passes can emit it.
         crate::clifpeep::wide_minmax(&mut clctx.func);
