@@ -109,7 +109,9 @@ use crate::settings::ProbestackStrategy;
 use crate::{ir, isa};
 use crate::{machinst::*, trace};
 use alloc::boxed::Box;
+use core::cell::Cell;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use regalloc2::{MachineEnv, PReg, PRegSet};
 use smallvec::smallvec;
 
@@ -1217,6 +1219,19 @@ fn checked_round_up(val: u32, mask: u32) -> Option<u32> {
     Some(val.checked_add(mask)? & !mask)
 }
 
+// PLIRON: per-function frame-pointer bisect. `PLIRON_FN_DUMP=1` prints each
+// function's ordinal and name as its Callee is created; `PLIRON_FP_RANGE=a:b`
+// keeps a frame pointer for ordinals in [a,b); `PLIRON_FP_FNS=x,y` keeps one
+// for functions whose name contains any listed substring.
+static PLIRON_FN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PLIRON_FORCE_FP: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn pliron_force_fp() -> bool {
+    PLIRON_FORCE_FP.with(|c| c.get())
+}
+
 impl<M: ABIMachineSpec> Callee<M> {
     /// Create a new body ABI instance.
     pub fn new(
@@ -1226,6 +1241,25 @@ impl<M: ABIMachineSpec> Callee<M> {
         sigs: &SigSet,
     ) -> CodegenResult<Self> {
         trace!("ABI: func signature {:?}", f.signature);
+
+        {
+            let ord = PLIRON_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = alloc::format!("{}", f.name);
+            if std::env::var_os("PLIRON_FN_DUMP").is_some() {
+                eprintln!("fn {ord}: {name}");
+            }
+            let mut force = std::env::var("PLIRON_FP_FNS").ok().map_or(false, |pats| {
+                pats.split(',').any(|p| !p.is_empty() && name.contains(p))
+            });
+            if let Ok(range) = std::env::var("PLIRON_FP_RANGE") {
+                if let Some((a, b)) = range.split_once(':') {
+                    if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        force |= ord >= a && ord < b;
+                    }
+                }
+            }
+            PLIRON_FORCE_FP.with(|c| c.set(force));
+        }
 
         let flags = isa.flags().clone();
         let sig = sigs.abi_sig_for_signature(&f.signature);

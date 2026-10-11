@@ -144,13 +144,27 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     )
     .unwrap();
     // Frame pointers follow the target default and `-Cforce-frame-pointers`, as in
-    // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
-    // `PLIRON_OMIT_FP=0` keeps them unconditionally.
+    // cg_clif: unwinding uses .eh_frame/.xdata, so rbp is free for the register
+    // allocator. `PLIRON_OMIT_FP=0` keeps them unconditionally.
     let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
-    // Cranelift's x64 `return_call` emission requires frame pointers.
-    let keep_fp = fp != rustc_target::spec::FramePointer::MayOmit
-        || !pass_enabled("PLIRON_OMIT_FP")
-        || tail_calls;
+    // Cranelift's x64 `return_call` emission requires frame pointers, and an
+    // explicit `-Cforce-frame-pointers` wins outright. Otherwise omit fp even
+    // where the spec defaults to `Always` (windows-msvc): unwind is
+    // metadata-driven and LLVM drops it for ordinary functions the same way.
+    let forced = sess.opts.cg.force_frame_pointers != rustc_target::spec::FramePointer::MayOmit;
+    let keep_fp = tail_calls || forced || !pass_enabled("PLIRON_OMIT_FP");
+    if std::env::var("PLIRON_DEBUG_FP").is_ok() {
+        eprintln!(
+            "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
+            sess.target.options.frame_pointer,
+            sess.opts.cg.force_frame_pointers,
+            fp,
+            tail_calls,
+            forced,
+            pass_enabled("PLIRON_OMIT_FP"),
+            keep_fp
+        );
+    }
     fb.set(
         "preserve_frame_pointers",
         if keep_fp { "true" } else { "false" },

@@ -171,13 +171,19 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
 ) -> CodegenResult<UnwindInfo> {
     let mut instructions = vec![];
 
-    let mut cfa_offset = 0;
+    // The CIE defines CFA = RSP + pointer size (return address).
+    let mut cfa_offset = 8;
+    // Whether the prologue established a frame pointer; when it did not,
+    // `StackAlloc`s must keep the CFA offset correct and register saves are
+    // RSP-relative.
+    let mut has_fp = false;
     let mut clobber_offset_to_cfa = 0;
     for &(instruction_offset, ref inst) in insts {
         match inst {
             &UnwindInst::PushFrameRegs {
                 offset_upward_to_caller_sp,
             } => {
+                has_fp = true;
                 // Define CFA in terms of current SP (SP changed and we haven't
                 // set FP yet).
                 instructions.push((
@@ -228,12 +234,15 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
             &UnwindInst::StackAlloc { size } => {
                 // If we do not use a frame pointer, we need to update the
                 // CFA offset whenever the stack pointer changes.
-                if mr.fp().is_none() {
+                if !has_fp {
                     cfa_offset += size;
                     instructions.push((
                         instruction_offset,
                         CallFrameInstruction::CfaOffset(cfa_offset as i32),
                     ));
+                    // Register saves recorded below are RSP-relative; express
+                    // them relative to the updated CFA.
+                    clobber_offset_to_cfa = cfa_offset;
                 }
             }
             &UnwindInst::SaveReg {

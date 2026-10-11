@@ -340,7 +340,12 @@ impl From<SyntheticAmode> for asm::Amode<Gpr> {
         match amode {
             SyntheticAmode::Real(amode) => amode.into(),
             SyntheticAmode::IncomingArg { offset } => asm::Amode::ImmReg {
-                base: Gpr::RBP,
+                // RSP-relative works both with and without a frame pointer:
+                // during the function body FP == RSP + active_size, so the
+                // sink's `incoming_arg_offset` term absorbs the difference.
+                // (PLIRON: RBP was the base when all functions had frames; it
+                // is now an allocatable register and cannot appear here.)
+                base: Gpr::RSP,
                 simm32: asm::AmodeOffsetPlusKnownOffset {
                     simm32: (-i32::try_from(offset).unwrap()).into(),
                     offset: Some(offsets::KEY_INCOMING_ARG),

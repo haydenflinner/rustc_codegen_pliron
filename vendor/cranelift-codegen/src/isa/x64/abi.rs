@@ -719,14 +719,22 @@ impl ABIMachineSpec for X64ABIMachineSpec {
 
         // Adjust the stack pointer downward for clobbers and the function fixed
         // frame (spillslots, storage slots, and argument area).
+        let frameless = frame_layout.setup_area_size == 0;
         let stack_size = frame_layout.fixed_frame_storage_size
             + frame_layout.clobber_size
             + frame_layout.outgoing_args_size;
         if stack_size > 0 {
             let rsp = Writable::from_reg(regs::rsp());
-            let stack_size = i32::try_from(stack_size)
+            let stack_size_i = i32::try_from(stack_size)
                 .expect("`stack_size` is too large to fit in a 32-bit immediate");
-            insts.push(Inst::subq_mi(rsp, stack_size));
+            insts.push(Inst::subq_mi(rsp, stack_size_i));
+            if flags.unwind_info() && frameless {
+                // Without a frame pointer the unwinder must track the
+                // allocation to keep CFA correct.
+                insts.push(Inst::Unwind {
+                    inst: UnwindInst::StackAlloc { size: stack_size },
+                });
+            }
         }
 
         // Store each clobbered register in order at offsets from RSP,
@@ -754,9 +762,14 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             ));
 
             if flags.unwind_info() {
+                // With a frame pointer, save offsets are relative to the frame
+                // base at the bottom of the clobber area (see
+                // `UnwindInst::DefineNewFrame`). Without one they are relative
+                // to post-prologue RSP.
+                let clobber_offset = if frameless { off + clobber_offset } else { off };
                 insts.push(Inst::Unwind {
                     inst: UnwindInst::SaveReg {
-                        clobber_offset: off,
+                        clobber_offset,
                         reg: r_reg,
                     },
                 });
@@ -776,8 +789,14 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // Restore regs by loading from offsets of RSP. We compute the offset from
         // the same base as above in clobber_save, as RSP won't change between the
         // prologue and epilogue.
-        let mut cur_offset =
+        let clobber_offset =
             frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        // PLIRON: accumulate the *relative* offset like `gen_clobber_save`
+        // does, and add `clobber_offset` when addressing. Aligning the
+        // absolute offset instead would disagree with the save side whenever
+        // the clobber-area base isn't itself 16-aligned, silently shifting
+        // vector saves.
+        let mut cur_offset = 0;
         for reg in &frame_layout.clobbered_callee_saves {
             let rreg = reg.to_reg();
             let ty = match rreg.class() {
@@ -791,7 +810,10 @@ impl ABIMachineSpec for X64ABIMachineSpec {
 
             insts.push(Inst::load(
                 ty,
-                Amode::imm_reg(cur_offset.try_into().unwrap(), regs::rsp()),
+                Amode::imm_reg(
+                    (cur_offset + clobber_offset).try_into().unwrap(),
+                    regs::rsp(),
+                ),
                 Writable::from_reg(rreg.into()),
                 ExtKind::None,
             ));
@@ -879,12 +901,27 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     }
 
     fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
-        if flags.enable_pinned_reg() {
-            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true);
-            &MACHINE_ENV
-        } else {
-            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false);
-            &MACHINE_ENV
+        // PLIRON: when frame pointers are omitted, RBP is unused by the frame
+        // and becomes a callee-saved allocatable register like any other.
+        let free_rbp = !flags.preserve_frame_pointers()
+            && std::env::var_os("PLIRON_NO_FREE_RBP").is_none();
+        match (flags.enable_pinned_reg(), free_rbp) {
+            (true, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false);
+                &MACHINE_ENV
+            }
+            (true, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true);
+                &MACHINE_ENV
+            }
+            (false, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false);
+                &MACHINE_ENV
+            }
+            (false, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true);
+                &MACHINE_ENV
+            }
         }
     }
 
@@ -956,18 +993,34 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // Compute clobber size.
         let clobber_size = compute_clobber_size(&regs);
 
-        // Compute setup area size: RBP + return address. PLIRON: leaf functions
-        // with nothing on the stack skip `push rbp; mov rbp, rsp` (as aarch64
-        // already does), unless frame pointers must be preserved.
+        // Compute setup area size: RBP + return address. PLIRON: when frame
+        // pointers are not required, omit `push rbp; mov rbp, rsp` entirely and
+        // address everything RSP-relative (as LLVM does). The only remaining
+        // need for RBP is tail calls with more stack args than incoming args:
+        // gen_clobber_save resizes the incoming arg area through the FP.
+        //
+        // This must cover every function that could run under
+        // `!preserve_frame_pointers`, because get_machine_env frees RBP for
+        // regalloc in that mode -- if any function still built a frame, an
+        // RBP allocation would corrupt its frame base.
         let frameless = !flags.preserve_frame_pointers()
-            && function_calls == FunctionCalls::None
-            && incoming_args_size == 0
-            && tail_args_size == 0
-            && clobber_size == 0
-            && fixed_frame_storage_size == 0
-            && stackslots_size == 0
-            && outgoing_args_size == 0;
+            && tail_args_size == incoming_args_size
+            && !crate::machinst::abi::pliron_force_fp();
         let setup_area_size = if frameless { 0 } else { 16 };
+
+        // With a frame pointer, `push rbp` absorbs the odd 8 bytes of the
+        // pushed return address and `stack_size` is a multiple of 16. Without
+        // one, the frame must carry those 8 bytes itself so RSP is 16-aligned
+        // at call sites (entry RSP is always 8 mod 16). The pad goes at the
+        // *top* of the frame (inside `clobber_size`), not in
+        // `outgoing_args_size`: the clobber area base must stay 16-aligned or
+        // vector saves land on odd offsets that `UWOP_SAVE_XMM128`'s
+        // 16-byte-unit offset can't represent.
+        let mut clobber_size = clobber_size;
+        if frameless && function_calls != FunctionCalls::None {
+            let total = fixed_frame_storage_size + clobber_size + outgoing_args_size;
+            clobber_size += (8u32.wrapping_sub(total)) % 16;
+        }
 
         // Return FrameLayout structure.
         FrameLayout {
@@ -1293,7 +1346,7 @@ const fn all_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM15))
 }
 
-const fn create_reg_env_systemv(enable_pinned_reg: bool) -> MachineEnv {
+const fn create_reg_env_systemv(enable_pinned_reg: bool, free_rbp: bool) -> MachineEnv {
     const fn preg(r: Reg) -> PReg {
         r.to_real_reg().unwrap().preg()
     }
@@ -1354,6 +1407,12 @@ const fn create_reg_env_systemv(enable_pinned_reg: bool) -> MachineEnv {
     if !enable_pinned_reg {
         env.non_preferred_regs_by_class[0] =
             env.non_preferred_regs_by_class[0].with(preg(regs::r15()));
+    }
+    if free_rbp {
+        // RBP is callee-saved under both ABIs; with the frame pointer omitted
+        // it is free for the allocator like R12-R14.
+        env.non_preferred_regs_by_class[0] =
+            env.non_preferred_regs_by_class[0].with(preg(regs::rbp()));
     }
 
     env

@@ -1883,8 +1883,18 @@ pub(crate) fn emit(
                     // necessary to communicate Cranelift's internal offsets to the
                     // assembler; due to when Cranelift determines these offsets, this
                     // happens quite late (i.e., here during emission).
+                    // PLIRON: the base of an IncomingArg amode is RSP, so the
+                    // offset must cover the active frame plus the linkage area
+                    // (pushed FP + return address when framed; just the return
+                    // address when frameless).
                     incoming_arg_offset: i32::try_from(
-                        frame.tail_args_size + frame.setup_area_size,
+                        frame.active_size()
+                            + frame.tail_args_size
+                            + if frame.setup_area_size == 0 {
+                                8
+                            } else {
+                                frame.setup_area_size
+                            },
                     )
                     .unwrap(),
                     slot_offset: i32::try_from(frame.outgoing_args_size).unwrap(),

@@ -91,14 +91,18 @@ impl UnwindCode {
                     )
                 };
                 writer.write_u8(*instruction_offset);
-                let scaled_stack_offset = stack_offset / 16;
+                // The encoded offset is in units of 8 bytes for GPR saves and
+                // 16 bytes for XMM saves (matching LLVM's emission); the small
+                // form holds it in a u16.
+                let scale = if is_xmm { 16 } else { 8 };
+                let scaled_stack_offset = stack_offset / scale;
                 if scaled_stack_offset <= u16::MAX as u32 {
                     writer.write_u8((*reg << 4) | (op_small as u8));
                     writer.write_u16_le(scaled_stack_offset as u16);
                 } else {
                     writer.write_u8((*reg << 4) | (op_large as u8));
-                    writer.write_u16_le(*stack_offset as u16);
-                    writer.write_u16_le((stack_offset >> 16) as u16);
+                    writer.write_u16_le(scaled_stack_offset as u16);
+                    writer.write_u16_le((scaled_stack_offset >> 16) as u16);
                 }
             }
             Self::StackAlloc {
@@ -256,7 +260,13 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<crate::machinst::
                 offset_downward_to_clobbers,
                 ..
             } => {
-                frame_register_offset = ensure_unwind_offset(offset_downward_to_clobbers)?;
+                // The UNWIND_INFO FrameOffset field is scaled by 16 and only
+                // four bits wide.
+                frame_register_offset = ensure_unwind_offset(offset_downward_to_clobbers / 16)?;
+                if frame_register_offset > 15 {
+                    warn!("clobber area too large to describe with a frame register");
+                    return Err(CodegenError::CodeTooLarge);
+                }
                 unwind_codes.push(UnwindCode::SetFPReg { instruction_offset });
             }
             &UnwindInst::StackAlloc { size } => {
@@ -294,10 +304,15 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<crate::machinst::
         max_unwind_offset = instruction_offset;
     }
 
+    // A frame register is present only when the prologue established one:
+    // frameless functions emit no `SetFPReg` and unwind relative to RSP.
+    let has_fp = unwind_codes
+        .iter()
+        .any(|c| matches!(c, UnwindCode::SetFPReg { .. }));
     Ok(UnwindInfo {
         flags: 0,
         prologue_size: max_unwind_offset,
-        frame_register: Some(UNWIND_RBP_REG),
+        frame_register: has_fp.then_some(UNWIND_RBP_REG),
         frame_register_offset,
         unwind_codes,
     })
