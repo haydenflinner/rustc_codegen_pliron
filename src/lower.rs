@@ -3478,7 +3478,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             for j in 0..k {
                 let x = part(j)[0];
                 let x = self.sign_source(x);
-                let m = self.b.ins().vhigh_bits(clt::I32, x);
+                let m = self.vhigh_bits(x);
                 let m = if sh > 0 {
                     let s = self.b.ins().iconst(clt::I32, sh);
                     self.b.ins().ishl(m, s)
@@ -3496,6 +3496,39 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             .map(|j| self.vec_op(name, &part(j), rts[j].1))
             .collect();
         self.set(op, r);
+    }
+
+    /// aarch64's `vhigh_bits` ISLE covers only 128-bit vectors — for a
+    /// 64-bit input, SWAR the sign bits out of a scalar bitcast instead:
+    /// `(x & lane_msbs) * magic >> (64 - lanes)` packs each lane's top
+    /// bit into the low bits, the same movemask multiply NEON targets
+    /// use for `u8x8`.
+    fn vhigh_bits(&mut self, x: ir::Value) -> ir::Value {
+        let ty = self.b.func.dfg.value_type(x);
+        if !ty.is_vector() {
+            // 1-lane vectors flatten to their scalar lane type.
+            let s = self.b.ins().ushr_imm(x, ty.bits() as i64 - 1);
+            return self.resize(s, clt::I32, false);
+        }
+        if ty.bits() != 64 {
+            return self.b.ins().vhigh_bits(clt::I32, x);
+        }
+        let s = self.bitcast_to(clt::I64, x);
+        let l = ty.lane_bits() as u64;
+        let m = if l == 64 {
+            self.b.ins().ushr_imm(s, 63)
+        } else {
+            let msbs = (u64::MAX / ((1u64 << l) - 1)) << (l - 1);
+            let n = 64 / l;
+            // Magic bit j places lane i's sign bit at (64-n)+i.
+            let magic: u64 = (0..n)
+                .map(|i| 1u64 << (65 - l - n - (l - 1) * i))
+                .fold(0, |a, b| a | b);
+            let m = self.b.ins().band_imm_u(s, msbs as i64);
+            let m = self.b.ins().imul_imm(m, magic as i64);
+            self.b.ins().ushr_imm(m, (64 - n) as i64)
+        };
+        self.b.ins().ireduce(clt::I32, m)
     }
 
     /// `vhigh_bits(icmp slt y, 0)` reads the same sign bits as `vhigh_bits(y)`.
@@ -3535,12 +3568,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         match name {
             "pliron.vsplat" => {
                 let t = rt;
-                self.b.ins().splat(t, a[0])
+                // 1-lane vectors flatten to their scalar lane type.
+                if t.is_vector() {
+                    self.b.ins().splat(t, a[0])
+                } else {
+                    self.resize(a[0], t, false)
+                }
             }
             "pliron.vhigh_bits" => {
                 let t = rt;
                 let x = self.sign_source(a[0]);
-                let m = self.b.ins().vhigh_bits(clt::I32, x);
+                let m = self.vhigh_bits(x);
                 self.resize(m, t, false)
             }
             "pliron.vbitselect" => {
