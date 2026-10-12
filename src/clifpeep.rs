@@ -3788,6 +3788,157 @@ pub fn lcse(func: &mut Function) -> usize {
     n
 }
 
+/// A block param whose only uses feed its own edge args is a dead
+/// recurrence — e.g. `j += i` left running when a countdown compare moves
+/// the bound test to a `rem` param. Remove the param, its edge args on
+/// every predecessor, and the now-dead feed insts.
+pub fn selfarg(func: &mut Function) -> usize {
+    // use map: v -> (inst operand uses, branch-arg uses as (inst, slot, arg
+    // index) so `p` passed to `h` at its own index is recognizable).
+    let mut uses: FxHashMap<Value, (Vec<Inst>, Vec<(Inst, usize, usize)>)> =
+        FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                uses.entry(func.dfg.resolve_aliases(a))
+                    .or_default()
+                    .0
+                    .push(i);
+            }
+            for (d, bc) in func.dfg.insts[i].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            )
+            .iter()
+            .enumerate()
+            {
+                let blk = bc.block(&func.dfg.value_lists);
+                for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let BlockArg::Value(v) = a {
+                        uses.entry(func.dfg.resolve_aliases(v))
+                            .or_default()
+                            .1
+                            .push((i, d, ai));
+                    }
+                    let _ = blk;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for h in func.layout.blocks().collect::<Vec<_>>() {
+        // Entry params are signature args, not edge-fed — never drop.
+        if Some(h) == func.layout.entry_block() {
+            continue;
+        }
+        let mut drops: Vec<(usize, Value, FxHashSet<Inst>)> = Vec::new();
+        for (idx, p) in func.dfg.block_params(h).to_vec().into_iter().enumerate() {
+            // Feed closure: insts consuming `p`, and insts consuming feed
+            // insts' results. Every use must stay inside the closure or be
+            // an edge arg to `h` at `idx`. `p` must not appear as an edge
+            // arg anywhere but (h, idx).
+            let mut feed: Vec<Inst> = Vec::new();
+            let mut inset: FxHashSet<Inst> = FxHashSet::default();
+            let mut ok = true;
+            // Feed insts get deleted — they must be pure and non-trapping.
+            let pure = |i: Inst| {
+                let op = func.dfg.insts[i].opcode();
+                !(op.can_load()
+                    || op.can_store()
+                    || op.can_trap()
+                    || op.is_call()
+                    || op.is_branch()
+                    || op.is_terminator()
+                    || op.other_side_effects())
+            };
+            if let Some((ops, edges)) = uses.get(&p) {
+                for &i in ops {
+                    if !pure(i) {
+                        ok = false;
+                    } else if inset.insert(i) {
+                        feed.push(i);
+                    }
+                }
+                for &(i, d, ai) in edges {
+                    let bc = func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    )[d];
+                    if bc.block(&func.dfg.value_lists) != h || ai != idx {
+                        ok = false;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            while ok && let Some(i) = feed.pop() {
+                if func.dfg.insts[i].opcode().is_terminator() {
+                    break;
+                }
+                for &r in func.dfg.inst_results(i) {
+                    let r = func.dfg.resolve_aliases(r);
+                    let Some((ops, edges)) = uses.get(&r) else {
+                        continue;
+                    };
+                    for &u in ops {
+                        if !pure(u) {
+                            ok = false;
+                        } else if inset.insert(u) {
+                            feed.push(u);
+                        }
+                    }
+                    for &(u, d, ai) in edges {
+                        let bc = func.dfg.insts[u].branch_destination(
+                            &func.dfg.jump_tables,
+                            &func.dfg.exception_tables,
+                        )[d];
+                        if bc.block(&func.dfg.value_lists) != h || ai != idx {
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            if ok {
+                drops.push((idx, p, inset));
+            }
+        }
+        // Apply in descending param order so earlier removals don't shift
+        // later indices.
+        drops.sort_by_key(|(idx, _, _)| usize::MAX - idx);
+        for (idx, p, inset) in drops {
+            for b2 in func.layout.blocks().collect::<Vec<_>>() {
+                for i in func.layout.block_insts(b2).collect::<Vec<_>>() {
+                    let ndest = func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                        .len();
+                    for d in 0..ndest {
+                        let dfg = &mut func.dfg;
+                        let bc = &mut dfg.insts[i].branch_destination_mut(
+                            &mut dfg.jump_tables,
+                            &mut dfg.exception_tables,
+                        )[d];
+                        if bc.block(&dfg.value_lists) == h {
+                            bc.remove(idx, &mut dfg.value_lists);
+                        }
+                    }
+                }
+            }
+            func.dfg.remove_block_param(p);
+            for i in inset {
+                // A feed inst can appear in another param's closure too
+                // (e.g. `p += q` where both drop); the first removal wins.
+                if func.layout.inst_block(i).is_some() {
+                    func.layout.remove_inst(i);
+                    func.dfg.clear_results(i);
+                }
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

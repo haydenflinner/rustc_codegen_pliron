@@ -1246,6 +1246,23 @@ pub fn lower_to_object(
                 panic!("boundcmp broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Dead self-feed recurrences — boundcmp's countdown replaces the
+        // bound-tested iv with `rem`, leaving the iv's `+=` update feeding
+        // only its own edge arg. Runs after boundcmp/looprot.
+        if crate::pass_enabled("PLIRON_SELFARG") && crate::bisect("selfarg") {
+            let k = crate::clifpeep::selfarg(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("selfarg {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after selfarg ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("selfarg broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Small `br_table`s become `icmp eq`+`brif` chains: the table
         // dispatch is ~8 instructions plus an indirect-branch prediction
         // per execution, which dominates iterator state machines (e.g.
