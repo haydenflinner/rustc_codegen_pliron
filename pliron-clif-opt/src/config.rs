@@ -101,14 +101,21 @@ pub fn env_get(var: &str) -> Option<&'static str> {
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
 /// the budget is unlimited. `PLIRON_OPT_BISECT_DEBUG=1` logs each gate.
 pub fn bisect(name: &str) -> bool {
-    static LIMIT: LazyLock<Option<u64>> =
-        LazyLock::new(|| env_get("PLIRON_OPT_BISECT").and_then(|v| v.parse().ok()));
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(limit) = *LIMIT else { return true };
+    let Some(limit) = bisect_limit() else { return true };
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     let ok = n < limit;
     if env_is("PLIRON_OPT_BISECT_DEBUG", "1") {
         eprintln!("bisect {} {name} {}", n + 1, if ok { "run" } else { "skip" });
     }
     ok
+}
+
+/// The `PLIRON_OPT_BISECT` budget, parsed once. When `Some`, pass
+/// applications must run in a deterministic order — the counter numbers
+/// each `bisect` call, which is what makes bisection reproducible.
+pub fn bisect_limit() -> Option<u64> {
+    static LIMIT: LazyLock<Option<u64>> =
+        LazyLock::new(|| env_get("PLIRON_OPT_BISECT").and_then(|v| v.parse().ok()));
+    *LIMIT
 }

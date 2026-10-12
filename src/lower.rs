@@ -11,7 +11,8 @@ use cranelift_codegen::ir::{
     self, AbiParam, ArgumentPurpose, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData,
     Signature, StackSlotData, StackSlotKind, TrapCode, Type as ClType, types as clt,
 };
-use cranelift_codegen::isa::{CallConv, TargetIsa};
+use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::isa::{CallConv, TargetFrontendConfig, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -335,6 +336,48 @@ pub fn lower_to_object(
     // actually broke.
     let verify_env = crate::env_set("PLIRON_VERIFY");
     let verify_full_env = crate::env_is("PLIRON_VERIFY", "full");
+    /// A function's pliron→CLIF lower output plus everything the CLIF
+    /// pipeline and cranelift compile need. Jobs are independent: phase
+    /// (B) below runs them on worker threads.
+    struct FnJob<'a> {
+        name: &'a str,
+        id: FuncId,
+        func: ir::Function,
+        nonnull: FxHashSet<ir::Value>,
+        derived: FxHashMap<ir::Value, ir::Value>,
+        frozen: FxHashMap<ir::Value, u64>,
+        noalias: FxHashSet<ir::Value>,
+        deref: FxHashMap<ir::Value, (u64, bool)>,
+        nowrite: FxHashMap<FuncRef, bool>,
+        call_frozen: FxHashMap<FuncRef, u64>,
+        scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
+        invariant: FxHashSet<ir::Inst>,
+        operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+        block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
+        lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>,
+        nocap: FxHashSet<(ir::Inst, u32)>,
+        stubs: rustc_hash::FxHashSet<&'static str>,
+        stats: crate::pipeline::Stats,
+        err: Option<cranelift_codegen::CodegenError>,
+        code: Option<cranelift_codegen::CompiledCode>,
+        dump: bool,
+    }
+    /// Read-only inputs shared by every job in phase (B).
+    struct JobShared<'a> {
+        isa: &'a dyn TargetIsa,
+        tcfg: TargetFrontendConfig,
+        simd: bool,
+        x64: bool,
+        cmp64: bool,
+        has_eh: bool,
+        verify_env: bool,
+        verify_full_env: bool,
+        fn_flags: &'a crate::pipeline::FnFlags,
+        region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    }
+    // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
+    // pliron `Context`, which is RefCell-interned and not shareable.
+    let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -346,7 +389,7 @@ pub fn lower_to_object(
         let id = hot_bodies.get(n).copied().unwrap_or(id);
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
-        let mut derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
+        let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
         let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
         let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
@@ -358,6 +401,7 @@ pub fn lower_to_object(
         let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
         let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
         let nocap: FxHashSet<(ir::Inst, u32)>;
+        let stubs: rustc_hash::FxHashSet<&'static str>;
         {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -440,53 +484,111 @@ pub fn lower_to_object(
                 }
             }
             operand_frozen = ofz;
+            stubs = std::mem::take(&mut fl.stubs);
         }
-        let dump = crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f));
-        if dump {
+        jobs.push(FnJob {
+            name: n,
+            id,
+            func: std::mem::replace(&mut clctx.func, ir::Function::new()),
+            nonnull,
+            derived,
+            frozen,
+            noalias,
+            deref,
+            nowrite,
+            call_frozen,
+            scoped,
+            invariant,
+            operand_frozen,
+            block_region,
+            lifetimes,
+            nocap,
+            stubs,
+            stats: crate::pipeline::Stats::default(),
+            err: None,
+            code: None,
+            dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
+        });
+        m.clear_context(&mut clctx);
+    }
+
+    // Phase (B): CLIF pipeline + cranelift compile per function. Each job
+    // is fully self-contained, so workers can run them in any order;
+    // results are applied in declaration order in phase (C), keeping the
+    // object byte-identical. Serial when `PLIRON_OPT_BISECT` is set (the
+    // bisect counter must number pass applications deterministically) or
+    // `PLIRON_PAR=0` / `PLIRON_PAR=N` overrides the thread count.
+    let shared = JobShared {
+        isa: &*isa,
+        tcfg: cfg,
+        simd,
+        x64,
+        cmp64,
+        has_eh: eh_data.is_some(),
+        verify_env,
+        verify_full_env,
+        fn_flags: &fn_flags,
+        region_parent: &st.region_parent,
+    };
+    fn run_job(
+        j: &mut FnJob,
+        clctx: &mut cranelift_codegen::Context,
+        sh: &JobShared,
+    ) {
+        CUR_FN.with(|c| {
+            let mut c = c.borrow_mut();
+            c.clear();
+            c.push_str(j.name);
+        });
+        clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
+        let n = j.name;
+        if j.dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
-        let mut verify_full = verify_full_env;
-        let snapshot = (verify_env && !verify_full).then(|| clctx.func.clone());
+        let mut verify_full = sh.verify_full_env;
+        let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
         if crate::env_set("PLIRON_FROZEN_DEBUG") {
-            eprintln!("==== {n}: noalias={noalias:?} deref={deref:?}");
+            eprintln!("==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
         }
         'retry: loop {
         {
             let mut pipe = crate::pipeline::Pipe {
-                clctx: &mut clctx,
-                isa: &*isa,
+                clctx,
+                isa: sh.isa,
                 fname: n,
-                func_id: id,
-                nonnull: &nonnull,
-                derived: &mut derived,
-                frozen: &frozen,
-                noalias: &noalias,
-                deref: &deref,
-                nowrite: &nowrite,
-                call_frozen: &call_frozen,
-                scoped: &scoped,
-                invariant: &invariant,
-                operand_frozen: &operand_frozen,
-                block_region: &block_region,
-                region_parent: &st.region_parent,
-                lifetimes: &lifetimes,
-                nocap: &nocap,
-                tcfg: cfg,
-                simd,
-                x64,
-                cmp64,
-                has_eh: eh_data.is_some(),
-                flags: &fn_flags,
-                dump,
+                func_id: j.id,
+                nonnull: &j.nonnull,
+                derived: &mut j.derived,
+                frozen: &j.frozen,
+                noalias: &j.noalias,
+                deref: &j.deref,
+                nowrite: &j.nowrite,
+                call_frozen: &j.call_frozen,
+                scoped: &j.scoped,
+                invariant: &j.invariant,
+                operand_frozen: &j.operand_frozen,
+                block_region: &j.block_region,
+                region_parent: sh.region_parent,
+                lifetimes: &j.lifetimes,
+                nocap: &j.nocap,
+                tcfg: sh.tcfg,
+                simd: sh.simd,
+                x64: sh.x64,
+                cmp64: sh.cmp64,
+                has_eh: sh.has_eh,
+                flags: sh.fn_flags,
+                dump: j.dump,
                 verify_full,
-                stats: &mut stats,
+                stats: &mut j.stats,
             };
             crate::pipeline::run_pipeline(&mut pipe);
         }
         if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
             clctx.set_disasm(true);
         }
-        if verify_env && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+        if sh.verify_env
+            && let Err(e) =
+                cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
         {
             if !verify_full && let Some(snap) = &snapshot {
                 // Which pass broke it is unknown until the per-pass
@@ -499,42 +601,113 @@ pub fn lower_to_object(
         }
         break 'retry;
         }
-        if dump {
+        if j.dump {
             eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
         }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.
         let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            m.define_function(id, &mut clctx)
+            clctx
+                .compile(sh.isa, &mut ControlPlane::default())
+                .map(|_| ())
+                .map_err(|e| e.inner)
         }));
-        let e = match defr {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e),
+        match defr {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => j.err = Some(e),
             Err(e) => {
                 eprintln!("cranelift panicked in `{n}`\n{}", clctx.func.display());
                 std::panic::resume_unwind(e);
             }
-        };
-        if let Some(e) = e {
-            // Known capacity limits are a backend limitation, not a bug: report
-            // cleanly instead of dumping a multi-MB function into an ICE.
-            if let cranelift_module::ModuleError::Compilation(
-                cranelift_codegen::CodegenError::ImplLimitExceeded
-                | cranelift_codegen::CodegenError::CodeTooLarge,
-            ) = e
+        }
+        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+        j.code = clctx.take_compiled_code();
+        // `optimize` leaves cfg/domtree/loop_analysis valid for this
+        // func — drop them like `clear_context` did so the next job's
+        // compile doesn't verify against a stale cfg.
+        clctx.clear();
+    }
+
+    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
+    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
+        1
+    } else {
+        par.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        })
+        .min(jobs.len().max(1))
+        .max(1)
+    };
+    let jobs = if nthreads <= 1 {
+        let mut wcl = cranelift_codegen::Context::new();
+        for j in &mut jobs {
+            run_job(j, &mut wcl, &shared);
+        }
+        jobs
+    } else {
+        let jobs: Vec<std::sync::Mutex<FnJob>> =
+            jobs.into_iter().map(std::sync::Mutex::new).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let shared = &shared;
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                s.spawn(|| {
+                    let mut wcl = cranelift_codegen::Context::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= jobs.len() {
+                            break;
+                        }
+                        let mut j =
+                            jobs[i].lock().unwrap_or_else(|e| e.into_inner());
+                        run_job(&mut j, &mut wcl, shared);
+                    }
+                });
+            }
+        });
+        jobs.into_iter()
+            .map(|m| m.into_inner().unwrap())
+            .collect()
+    };
+
+    // Phase (C): apply compiled code to the object in the original
+    // function order — identical to what `define_function` did after
+    // compiling each function serially.
+    for j in &jobs {
+        stats.merge(&j.stats);
+        asm_stubs.extend(j.stubs.iter().copied());
+        let Some(code) = &j.code else {
+            let n = j.name;
+            // Known capacity limits are a backend limitation, not a bug:
+            // report cleanly instead of dumping a multi-MB function into
+            // an ICE.
+            if let Some(
+                e @ (cranelift_codegen::CodegenError::ImplLimitExceeded
+                | cranelift_codegen::CodegenError::CodeTooLarge),
+            ) = &j.err
             {
                 sess.dcx().fatal(format!("function `{n}` too large: {e}"));
             }
-            panic!("cranelift rejected `{n}`: {e:?}\n{}", clctx.func.display());
+            panic!("cranelift rejected `{n}`: {:?}\n{}", j.err, j.func.display());
+        };
+        if let Some(v) = &code.vcode {
+            eprintln!("==== vcode {} ====\n{v}", j.name);
         }
-        if let Some(cc) = clctx.compiled_code()
-            && let Some(v) = &cc.vcode
-        {
-            eprintln!("==== vcode {n} ====\n{v}");
-        }
-        eh.add_function(&mut m, id, &clctx);
-        m.clear_context(&mut clctx);
+        let relocs: Vec<cranelift_module::ModuleReloc> = code
+            .buffer
+            .relocs()
+            .iter()
+            .map(|r| cranelift_module::ModuleReloc::from_mach_reloc(r, &j.func, j.id))
+            .collect();
+        m.define_function_bytes(
+            j.id,
+            u64::from(code.buffer.alignment),
+            code.buffer.data(),
+            &relocs,
+        )
+        .unwrap_or_else(|e| panic!("define {}: {e}", j.name));
+        eh.add_function(&mut m, j.id, code);
     }
 
     if crate::env_set("PLIRON_STATS") {

@@ -6,7 +6,7 @@ mod gcc_except_table;
 
 use cranelift_codegen::ir::{AbiParam, Endianness, Signature, types};
 use cranelift_codegen::isa::unwind::UnwindInfo;
-use cranelift_codegen::{Context, FinalizedMachExceptionHandler};
+use cranelift_codegen::{CompiledCode, FinalizedMachExceptionHandler};
 use cranelift_module::{DataDescription, DataId, FuncId, FuncOrDataId, Linkage, Module};
 use cranelift_object::{ObjectModule, ObjectProduct};
 use gcc_except_table::*;
@@ -147,8 +147,12 @@ impl UnwindContext {
         }
     }
 
-    pub fn add_function(&mut self, module: &mut ObjectModule, func_id: FuncId, context: &Context) {
-        let code = context.compiled_code().unwrap();
+    pub fn add_function(
+        &mut self,
+        module: &mut ObjectModule,
+        func_id: FuncId,
+        code: &CompiledCode,
+    ) {
         if self.coff {
             let info = code.create_unwind_info(module.isa()).unwrap();
             if let Some(UnwindInfo::WindowsX64(info)) = info {

@@ -95,6 +95,20 @@ pub struct Stats {
     pub slot_dse: usize,
 }
 
+impl Stats {
+    pub fn merge(&mut self, o: &Self) {
+        self.threaded += o.threaded;
+        self.dead_params += o.dead_params;
+        self.dominated_folds += o.dominated_folds;
+        self.unreached += o.unreached;
+        self.peeped += o.peeped;
+        self.merged += o.merged;
+        self.dupd += o.dupd;
+        self.forwarded += o.forwarded;
+        self.slot_dse += o.slot_dse;
+    }
+}
+
 /// Everything a step needs beyond `&mut Function`.
 pub struct Pipe<'a> {
     pub clctx: &'a mut Context,
