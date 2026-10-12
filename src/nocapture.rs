@@ -255,7 +255,7 @@ pub fn run(ctx: &Context, st: &mut State<'_>) {
             break;
         }
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         let (p, t): (usize, usize) = nc.values().fold((0, 0), |(p, t), s| (p + s.len(), t + 1));
         eprintln!("nocapture {}: {p} non-capturing params across {t} bodies", st.cgu);
     }

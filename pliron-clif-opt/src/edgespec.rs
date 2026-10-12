@@ -1074,8 +1074,7 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     let mut n = 0;
-    let lim = std::env::var("PLIRON_EDGESPEC_LIMIT")
-        .ok()
+    let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT")
         .and_then(|s| s.parse::<usize>().ok());
     for (p, t, nt) in plans {
         if let Some(l) = lim

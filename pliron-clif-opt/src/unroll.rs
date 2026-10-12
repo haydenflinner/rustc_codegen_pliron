@@ -31,8 +31,7 @@ const MAX_LOOPS: usize = 8;
 fn max_insts() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("PLIRON_UNROLL_INSTS")
-            .ok()
+        crate::env_get("PLIRON_UNROLL_INSTS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(MAX_INSTS)
     })
@@ -57,7 +56,7 @@ pub fn run(
             let Some((pred, pinst, body, entry, used_out)) = candidate(func, &cfg, &dt, h) else {
                 continue;
             };
-            if std::env::var_os("PLIRON_UNROLL_DEBUG").is_some_and(|v| v == "2") {
+            if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
                 eprintln!("unroll: candidate {h} ({} blocks)", body.len());
             }
             match trip(func, &nn, &body, h, entry.clone(), None) {
@@ -493,7 +492,7 @@ fn trip(
 }
 
 fn why<T>(r: &str) -> Option<T> {
-    if std::env::var_os("PLIRON_UNROLL_DEBUG").is_some_and(|v| v == "2") {
+    if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
         eprintln!("unroll: no: {r}");
     }
     None

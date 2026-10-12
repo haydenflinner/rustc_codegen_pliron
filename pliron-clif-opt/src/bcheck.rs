@@ -302,7 +302,7 @@ fn ubound(func: &Function, v: Value) -> Option<u64> {
 /// `PLIRON_BCHECK_UBOUND=0` disables bounded-index versioning.
 fn ubound_on() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("PLIRON_BCHECK_UBOUND").map_or(true, |v| v != "0")
+        crate::pass_enabled("PLIRON_BCHECK_UBOUND")
     });
     *ON
 }
@@ -580,7 +580,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     // no `throw_ret` gate: leaf throwers (panic_bounds_check callers with no
     // landing pad of their own) end every OOB edge in exactly this shape.
     let mut rethrow = false;
-    let dbg = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_BCHECK_DEBUG");
     while let Some(b) = stack.pop() {
         if !seen.insert(b) {
             continue;
@@ -909,7 +909,7 @@ fn retarget_entries(func: &mut Function, entries: &[Edge], g: Block) {
 }
 
 fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop, name: &str, throw_ret: bool, seen: &mut FxHashSet<Block>) -> usize {
-    let debug = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -1322,7 +1322,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     // store+load test — merge-flag for native's bcheck.rs.)
     if checks.len() < total_checks
         && checks.len() < 2
-        && std::env::var_os("PLIRON_BCHECK_PARTIAL").is_none()
+        && !crate::env_set("PLIRON_BCHECK_PARTIAL")
     {
         let mut dyn_store = false;
         let mut dyn_load = false;
@@ -1714,7 +1714,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
 }
 
 pub fn run(func: &mut Function, name: &str, throw_ret: bool) -> usize {
-    let debug = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
     // find the first loop that versions, then rescan.
@@ -1765,7 +1765,7 @@ fn unswitch_loop(
     name: &str,
     seen: &mut FxHashSet<Block>,
 ) -> usize {
-    let debug = std::env::var_os("PLIRON_UNSWITCH_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_UNSWITCH_DEBUG");
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -1957,7 +1957,7 @@ fn unswitch_loop(
 
 /// `PLIRON_UNSWITCH=0` disables invariant-brif loop unswitching.
 pub fn unswitch(func: &mut Function, name: &str) -> usize {
-    let debug = std::env::var_os("PLIRON_UNSWITCH_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_UNSWITCH_DEBUG");
     let mut n = 0;
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..MAX_VERSIONS {

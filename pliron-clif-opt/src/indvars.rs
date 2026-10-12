@@ -374,7 +374,7 @@ pub fn run(func: &mut Function) -> usize {
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let debug = std::env::var_os("PLIRON_INDUCT_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
     let loops = deepest_first(&la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
@@ -906,7 +906,7 @@ pub fn rotld(func: &mut Function) -> usize {
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let debug = std::env::var_os("PLIRON_LDROT_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_LDROT_DEBUG");
     let loops = deepest_first(&la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
@@ -939,7 +939,7 @@ pub fn boundcmp(func: &mut Function) -> usize {
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let debug = std::env::var_os("PLIRON_INDUCT_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
     let mut n = 0;
     for lp in deepest_first(&la).into_iter().take(MAX_LOOPS) {
         let h = la.loop_header(lp);

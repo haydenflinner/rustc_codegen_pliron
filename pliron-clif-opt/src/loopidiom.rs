@@ -28,7 +28,7 @@ const MAX_CONV: usize = 8;
 /// Debug macro: return None, logging `why` under PLIRON_IDIOM_DEBUG.
 macro_rules! why {
     ($($t:tt)*) => {{
-        if std::env::var_os("PLIRON_IDIOM_DEBUG").is_some() {
+        if crate::env_set("PLIRON_IDIOM_DEBUG") {
             eprintln!("idiom bail: {}", format_args!($($t)*));
         }
         return None;
@@ -1308,7 +1308,7 @@ pub fn plan(
             Some((e, c, ps))
         })
         .or_else(|| {
-            if std::env::var_os("PLIRON_IDIOM_DEBUG").is_some() {
+            if crate::env_set("PLIRON_IDIOM_DEBUG") {
                 eprintln!("idiom bail: count/guards {:?}", la.loop_header(lp));
             }
             None
@@ -2033,7 +2033,7 @@ fn plan_dead(
             }
         })();
         let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
-            if std::env::var_os("PLIRON_IDIOM_DEBUG").is_some() {
+            if crate::env_set("PLIRON_IDIOM_DEBUG") {
                 eprintln!("dead: no count {:?} exit {:?}", info.h, e.inst);
             }
             continue;
@@ -2410,7 +2410,7 @@ pub fn run(
     {
         return 0;
     }
-    let debug = std::env::var_os("PLIRON_IDIOM_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_IDIOM_DEBUG");
     let mut n = 0;
     // `apply` rewires the CFG, so recompute the analyses before each
     // conversion rather than letting `plan` see stale dominance/latches.

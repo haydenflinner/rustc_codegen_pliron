@@ -110,7 +110,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     // symbol's bytes rather than its address.
     let coff = sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
     fb.set("is_pic", if coff { "false" } else { "true" }).unwrap();
-    if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
+    if crate::env_is("PLIRON_RA_CHECK", "1") {
         fb.set("regalloc_checker", "true").unwrap();
     }
     fb.set(
@@ -132,7 +132,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     // metadata-driven and LLVM drops it for ordinary functions the same way.
     let forced = sess.opts.cg.force_frame_pointers != rustc_target::spec::FramePointer::MayOmit;
     let keep_fp = tail_calls || forced || !pass_enabled("PLIRON_OMIT_FP");
-    if std::env::var("PLIRON_DEBUG_FP").is_ok() {
+    if crate::env_set("PLIRON_DEBUG_FP") {
         eprintln!(
             "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
             sess.target.options.frame_pointer,
@@ -236,7 +236,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     }
     // Opt-in VEX encodings on x64 (see the comment on the flag table above).
     if triple.architecture == target_lexicon::Architecture::X86_64
-        && std::env::var("PLIRON_X64_VEX").is_ok_and(|v| v == "1")
+        && crate::env_is("PLIRON_X64_VEX", "1")
     {
         for &(rust, flag) in &[
             ("avx", "has_avx"),
@@ -266,27 +266,6 @@ pub(crate) fn obj_sym(n: &str) -> &str {
     n.strip_prefix('\u{1}').unwrap_or(n)
 }
 
-/// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
-/// applications (across all passes and functions), like LLVM's
-/// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
-/// the budget is unlimited. `PLIRON_OPT_BISECT_DEBUG=1` logs each gate.
-pub(crate) fn bisect(name: &str) -> bool {
-    use std::sync::LazyLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LIMIT: LazyLock<Option<u64>> = LazyLock::new(|| {
-        std::env::var("PLIRON_OPT_BISECT").ok().and_then(|v| v.parse().ok())
-    });
-    static DEBUG: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("PLIRON_OPT_BISECT_DEBUG").is_ok_and(|v| v == "1"));
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(limit) = *LIMIT else { return true };
-    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    let ok = n < limit;
-    if *DEBUG {
-        eprintln!("bisect {} {name} {}", n + 1, if ok { "run" } else { "skip" });
-    }
-    ok
-}
 fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let emit_ir = cx
         .tcx
@@ -294,13 +273,13 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         .opts
         .output_types
         .contains_key(&OutputType::LlvmAssembly)
-        || std::env::var_os("PLIRON_DUMP").is_some();
+        || crate::env_set("PLIRON_DUMP");
     let ir = if emit_ir {
         cx.print_ir()
     } else {
         String::new()
     };
-    if std::env::var_os("PLIRON_DUMP").is_some() {
+    if crate::env_set("PLIRON_DUMP") {
         eprintln!("==== {name} ====\n{ir}");
     }
     if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
@@ -348,7 +327,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let coff_eh = cx.tcx.sess.target.options.binary_format
             == rustc_target::spec::BinaryFormat::Coff
             && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
-        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1")
+        if crate::env_is("PLIRON_NOUNWIND", "1")
             || (coff_eh && pass_enabled("PLIRON_NOUNWIND"))
         {
             nounwind::run(ctx, st);
@@ -357,7 +336,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             abi::run(ctx, st);
             domcheck::run(ctx, st, "abi");
         }
-        if std::env::var("PLIRON_DEADARG").is_ok_and(|v| v == "1") {
+        if crate::env_is("PLIRON_DEADARG", "1") {
             abi::dead_args(ctx, st);
         }
         if pass_enabled("PLIRON_INSTCOMBINE") {
@@ -445,7 +424,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             inline::dead_fns(ctx, st);
         }
     }
-    if std::env::var_os("PLIRON_DUMP_OPT").is_some() {
+    if crate::env_set("PLIRON_DUMP_OPT") {
         eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
@@ -465,10 +444,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let isa = build_isa(
         cx.tcx.sess,
         cx.tcx.features().enabled(rustc_span::sym::explicit_tail_calls)
-            || std::env::var("PLIRON_TAILCALL").is_ok(),
+            || crate::env_set("PLIRON_TAILCALL"),
     );
-    let hot = std::env::var("PLIRON_HOT")
-        .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
+    let hot = crate::env_get("PLIRON_HOT")
+        .is_some_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
     let obj = lower::lower_to_object(
         cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
         hot,
@@ -779,13 +758,13 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
         && !tcx.sess.target.is_like_wasm
-        && std::env::var_os("PLIRON_HOT").is_none()
+        && !crate::env_set("PLIRON_HOT")
     {
         xcgu::copies(tcx, cgu)
     } else {
         Vec::new()
     };
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("xcgu {cgu_name}: {} local copies", extra.len());
     }
     for &inst in &extra {

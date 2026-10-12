@@ -23,7 +23,7 @@ use crate::inline::{blocks, direct_callee, ops};
 use crate::lower::has_body;
 
 pub fn run(ctx: &mut Context, st: &mut State<'_>) {
-    let dbg = std::env::var_os("PLIRON_SPEC_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_SPEC_DEBUG");
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     for f in st.funcs.values() {
@@ -96,7 +96,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             done += 1;
         }
     }
-    if done > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+    if done > 0 && crate::env_set("PLIRON_STATS") {
         eprintln!("spec {}: {done} params", st.cgu);
     }
 }

@@ -851,7 +851,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             validate(ctx, st, a);
         }
     }
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         let total = st
             .funcs
             .values()
@@ -884,7 +884,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             }
             eprintln!("  cond_br {n}: {k} const cond, {kk} cond of all-const operands");
         }
-        if std::env::var_os("PLIRON_STATS_MEMCPY").is_some() {
+        if crate::env_set("PLIRON_STATS_MEMCPY") {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let kind = |v: Value| -> String {
                 let Some(d) = v.defining_op() else {
@@ -932,7 +932,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 eprintln!("  memcpy {c:5} {n}");
             }
         }
-        if std::env::var_os("PLIRON_STATS_WHY").is_some() {
+        if crate::env_set("PLIRON_STATS_WHY") {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let fs: Vec<_> = st
                 .funcs
@@ -949,7 +949,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 }
             }
             // Per-function breakdown for a name filter: `PLIRON_SROA_WHYFN`.
-            if let Some(filt) = std::env::var("PLIRON_SROA_WHYFN").ok() {
+            if let Some(filt) = crate::env_get("PLIRON_SROA_WHYFN") {
                 for (name, f) in &st.funcs {
                     if !name.contains(&filt) || !has_body(ctx, f.op) {
                         continue;
@@ -969,7 +969,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 eprintln!("  why {c:6} {n}");
             }
         }
-        if std::env::var_os("PLIRON_STATS_OPS").is_some() {
+        if crate::env_set("PLIRON_STATS_OPS") {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
                 for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
@@ -1072,7 +1072,7 @@ pub fn forward(ctx: &mut Context, st: &State<'_>) {
         .into_iter()
         .map(|f| forward_single_store(ctx, st, f))
         .sum();
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("sroa-fwd {}: {n} single-store allocas forwarded", st.cgu);
     }
 }

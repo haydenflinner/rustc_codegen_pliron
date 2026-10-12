@@ -153,7 +153,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             n += 1;
         }
     }
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("constload {}: {n} loads folded", st.cgu);
     }
 }

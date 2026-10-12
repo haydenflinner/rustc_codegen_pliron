@@ -388,7 +388,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         nc += c;
         nv += v;
     }
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "instcombine {}: {nc} values folded to constants, {nv} to an operand",
             st.cgu

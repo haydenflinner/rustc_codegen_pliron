@@ -157,7 +157,7 @@ pub fn run(ctx: &Context, st: &mut State<'_>) {
         nw.entry(s.clone()).or_insert(false);
     }
     fixpoint(ctx, st, &bodied, &mut nw, false);
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "nowrite {}: {} of {} bodies write-free, {} more on return",
             st.cgu,

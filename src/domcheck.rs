@@ -11,7 +11,7 @@ use pliron::value::DefiningEntity;
 use rustc_hash::FxHashMap;
 
 pub fn run(ctx: &Context, st: &State<'_>, pass: &str) {
-    if std::env::var_os("PLIRON_CHECK_DOM").is_none() {
+    if !crate::env_set("PLIRON_CHECK_DOM") {
         return;
     }
     for (name, f) in &st.funcs {

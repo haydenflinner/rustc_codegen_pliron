@@ -45,7 +45,7 @@ pub fn run(func: &mut Function) -> usize {
 /// Header `h` with one latch ending in `jump h`, a small call-free body and a
 /// `brif` to two blocks that only `h` reaches.
 fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
-    let dbg = std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_LOOPROT_DEBUG");
     macro_rules! bail {
         ($($t:tt)*) => {{
             if dbg {
@@ -178,7 +178,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
                 continue;
             }
             let Some(side) = side else {
-                if std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some() {
+                if crate::env_set("PLIRON_LOOPROT_DEBUG") {
                     eprintln!("looprot {h}: bail side-none blk{b} used {used:?}");
                 }
                 return false;
@@ -193,7 +193,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
     // supply appended params.
     for side in 0..2 {
         if cfg.pred_iter(succ[side]).count() > 1 && !need[side].is_empty() {
-            if std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some() {
+            if crate::env_set("PLIRON_LOOPROT_DEBUG") {
                 eprintln!(
                     "looprot {h}: bail multipred {:?} need {:?}",
                     succ[side], need[side]

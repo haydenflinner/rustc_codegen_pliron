@@ -193,7 +193,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
         }
         n += live.iter().filter(|&&l| !l).count();
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("deadarg {}: {n} params removed", st.cgu);
     }
 }
@@ -201,7 +201,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
 pub fn run(ctx: &mut Context, st: &mut State<'_>) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         let (mut total, mut dead, mut ro) = (0, 0, 0);
         for s in &internal {
             let f = &st.funcs[s];
@@ -251,7 +251,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         rewrite(ctx, st, sym, sty, &leaves, &calls);
         n += 1;
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("sret2reg {}: {n} functions", st.cgu);
     }
 }

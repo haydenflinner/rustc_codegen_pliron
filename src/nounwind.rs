@@ -57,7 +57,7 @@ pub fn run(ctx: &Context, st: &mut State<'_>) {
         .copied()
         .filter(|&op| direct_callee(ctx, st, op).is_some_and(|c| nw.contains(c)))
         .collect();
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "nounwind {}: {} of {} invokes -> calls",
             st.cgu,

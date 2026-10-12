@@ -2344,7 +2344,7 @@ pub fn run(
     let mut total = 0;
     let mut dead_params = 0;
     let mut dominated_folds = 0;
-    let chk = std::env::var_os("PLIRON_JT_CHECK").is_some();
+    let chk = crate::env_set("PLIRON_JT_CHECK");
     let check = |func: &Function, tag: &str| {
         if chk
             && let Err(e) = cranelift_codegen::verify_function(

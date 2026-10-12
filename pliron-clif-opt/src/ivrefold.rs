@@ -909,7 +909,7 @@ pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let edges = edges_to(func);
-    let debug = std::env::var_os("PLIRON_IVREFOLD_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_IVREFOLD_DEBUG");
     let mut n = 0;
     for h in func.layout.blocks().collect::<Vec<_>>() {
         n += refold_header(func, &domtree, &edges, h, debug);

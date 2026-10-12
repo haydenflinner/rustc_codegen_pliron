@@ -47,7 +47,7 @@ const MAX_GATHER: i64 = 2048;
 
 macro_rules! why {
     ($f:expr; $($t:tt)*) => {{
-        if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+        if crate::env_set("PLIRON_VEC_DEBUG") {
             eprintln!("vec bail {}: {}", $f, format_args!($($t)*));
         }
         return None;
@@ -922,7 +922,7 @@ fn plan(
     };
     let mut kinds = param_kinds(func, &info);
     upgrade_lagged(func, &info, &mut kinds);
-    if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+    if crate::env_set("PLIRON_VEC_DEBUG") {
         eprintln!(
             "vec kinds {} {:?}: {:?}",
             fname,
@@ -949,7 +949,7 @@ fn plan(
             continue;
         }
         let p = func.dfg.block_params(info.h)[j];
-        if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+        if crate::env_set("PLIRON_VEC_DEBUG") {
             eprintln!("vec reduc?: param {j} analyzing, {} latches", info.latches.len());
         }
         // The acc update as a lane op + delta: a whitelisted binary
@@ -991,7 +991,7 @@ fn plan(
             true
         });
         if !ok {
-            if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+            if crate::env_set("PLIRON_VEC_DEBUG") {
                 eprintln!("vec reduc?: param {j} latch args not one update inst");
             }
             other_ok = false;
@@ -1000,7 +1000,7 @@ fn plan(
         let Some((ui, op, delta, aux, mut cnd)) = upd else {
             // Every latch passed `acc` through (e.g. behind a block
             // param) — effectively invariant, just not recognized.
-            if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+            if crate::env_set("PLIRON_VEC_DEBUG") {
                 eprintln!("vec reduc?: param {j} no update inst");
             }
             other_ok = false;
@@ -1070,7 +1070,7 @@ fn plan(
                         .then(|| (func.dfg.resolve_aliases(arg), invert))
                 });
             let Some(gc) = gc else {
-                if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+                if crate::env_set("PLIRON_VEC_DEBUG") {
                     eprintln!("vec reduc?: param {j} CFG diamond has no gating brif");
                 }
                 other_ok = false;
@@ -1122,7 +1122,7 @@ fn plan(
                     .all(|&r| !used.contains(&func.dfg.resolve_aliases(r))))
         });
         if bad_use || reducs.len() >= 2 {
-            if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+            if crate::env_set("PLIRON_VEC_DEBUG") {
                 for &b in &info.body {
                     for i in func.layout.block_insts(b) {
                         if !allowed.contains(&i)
@@ -2577,7 +2577,7 @@ fn widen_delta(
                 mask = Some(k);
                 d = func.dfg.resolve_aliases(nn);
             }
-            let dbg = std::env::var_os("PLIRON_VEC_DEBUG").is_some();
+            let dbg = crate::env_set("PLIRON_VEC_DEBUG");
             let (x, signed) = match ext_of(func, d, &mut ext_insts) {
                 Some(x) => x,
                 // `cnt += select(pred, 1, 0)` with no widening cast: the
@@ -3823,7 +3823,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             .iter()
             .any(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Load { .. }));
     let mut pending_stores: Vec<(Value, Value, i64)> = Vec::new();
-    if std::env::var_os("PLIRON_LOOPVEC_DEBUG").is_some() {
+    if crate::env_set("PLIRON_LOOPVEC_DEBUG") {
         eprintln!(
             "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
             pos.func.name,
@@ -4099,9 +4099,9 @@ pub fn run(
         return 0;
     }
     // Bisection gate: PLIRON_VEC_SKIP=foo,bar skips vectorizing matching fns.
-    if let Some(skip) = std::env::var_os("PLIRON_VEC_SKIP")
+    if let Some(skip) = crate::env_get("PLIRON_VEC_SKIP")
         && !skip.is_empty()
-        && skip.to_string_lossy().split(',').any(|s| fname.contains(&*s))
+        && skip.split(',').any(|s| fname.contains(&*s))
     {
         return 0;
     }
@@ -4112,7 +4112,7 @@ pub fn run(
     // Deepest-first: parent loops always fail `gather`'s innermost check,
     // so iterating them first would just burn the MAX_LOOPS budget.
     let loops = deepest_first(&la);
-    let debug = std::env::var_os("PLIRON_VEC_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_VEC_DEBUG");
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {

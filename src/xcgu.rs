@@ -61,8 +61,7 @@ pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<
 }
 
 fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
-    let limit = std::env::var("PLIRON_XCGU_SIZE")
-        .ok()
+    let limit = crate::env_get("PLIRON_XCGU_SIZE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
     let ours = cgu.items();
@@ -82,8 +81,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     }
     // Callees of accepted copies are candidates too (up to `PLIRON_XCGU_DEPTH`
     // levels), so a small wrapper's own small callee in a third CGU inlines.
-    let depth = std::env::var("PLIRON_XCGU_DEPTH")
-        .ok()
+    let depth = crate::env_get("PLIRON_XCGU_DEPTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
@@ -118,7 +116,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
                 }
             }
         }
-        let why = std::env::var("PLIRON_STATS_XCGU").ok();
+        let why = crate::env_get("PLIRON_STATS_XCGU");
         cands.retain(|c| {
             let ok = refs.get(c).is_some_and(|us| {
                 us.iter().all(|u| {
@@ -130,7 +128,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
             });
             if !ok
                 && let Some(w) = &why
-                && with_no_trimmed_paths!(c.to_string()).contains(w.as_str())
+                && with_no_trimmed_paths!(c.to_string()).contains(*w)
             {
                 let bad: Vec<String> = refs.get(c).map_or(vec!["<no used items>".into()], |us| {
                     us.iter()
@@ -186,12 +184,10 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
 }
 
 fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
-    let limit = std::env::var("PLIRON_XCGU_SIZE")
-        .ok()
+    let limit = crate::env_get("PLIRON_XCGU_SIZE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let depth = std::env::var("PLIRON_XCGU_DEPTH")
-        .ok()
+    let depth = crate::env_get("PLIRON_XCGU_DEPTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
     let ours = cgu.items();
@@ -270,7 +266,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
 
     let mut remaining: FxHashSet<MonoItem<'tcx>> =
         candidates.iter().map(|&c| MonoItem::Fn(c)).collect();
-    let why = std::env::var("PLIRON_STATS_XCGU").ok();
+    let why = crate::env_get("PLIRON_STATS_XCGU");
     loop {
         let removed: Vec<(Instance<'tcx>, Vec<MonoItem<'tcx>>)> = candidates
             .iter()
@@ -296,7 +292,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         for (c, bad) in removed {
             remaining.remove(&MonoItem::Fn(c));
             if let Some(w) = &why
-                && with_no_trimmed_paths!(c.to_string()).contains(w.as_str())
+                && with_no_trimmed_paths!(c.to_string()).contains(*w)
             {
                 let bad: Vec<String> = bad
                     .iter()

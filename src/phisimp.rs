@@ -116,7 +116,7 @@ pub fn run(ctx: &mut Context, st: &State<'_>) {
             }
         }
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("phisimp {}: {n} block args removed", st.cgu);
     }
 }

@@ -67,7 +67,7 @@ const JAM: usize = 4;
 const MAX_JAM_BODY: usize = 16;
 
 fn debug() -> bool {
-    std::env::var_os("PLIRON_PUNROLL_DEBUG").is_some()
+    crate::env_set("PLIRON_PUNROLL_DEBUG")
 }
 
 struct Vm<'a> {

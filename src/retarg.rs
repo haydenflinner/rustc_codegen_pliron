@@ -151,7 +151,7 @@ pub fn run(ctx: &Context, st: &State<'_>) {
             }
         }
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "retarg {}: {} returned-arg bodies, {folded} call results folded",
             st.cgu,

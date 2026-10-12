@@ -456,7 +456,7 @@ fn transfer(
                 let (r, o) = root(func, ps, na, arg);
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
-                if std::env::var_os("PLIRON_LFDEBUG").is_some() {
+                if crate::env_set("PLIRON_LFDEBUG") {
                     eprintln!("load {res} arg {arg} root {r:?} off {off} av={:?}", av.get(&loc));
                 }
                 // `!invariant.load`: the location holds one value for the

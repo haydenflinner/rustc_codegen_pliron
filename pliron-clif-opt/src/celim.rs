@@ -1516,7 +1516,7 @@ fn fold_guard_bands(func: &mut Function) -> usize {
 /// Counts guard-band collapses separately under `PLIRON_STATS`.
 pub fn run(func: &mut Function) -> usize {
     let guards = fold_guard_bands(func);
-    if guards > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+    if guards > 0 && crate::env_set("PLIRON_STATS") {
         eprintln!("celim-guard {guards}");
     }
     let cfg = ControlFlowGraph::with_function(func);
@@ -1546,7 +1546,7 @@ pub fn run(func: &mut Function) -> usize {
                     r = decide(func, &fs, qp, qraw);
                 }
                 if let Some(k) = r {
-                    if std::env::var_os("PLIRON_CELIM_DEBUG").is_some() {
+                    if crate::env_set("PLIRON_CELIM_DEBUG") {
                         eprintln!("celim fold {i} -> {k} q={q:?} facts={fs:?}");
                     }
                     folds.push((i, k));

@@ -155,7 +155,7 @@ fn hoists(
     pb: Block,
     i: Inst,
 ) -> bool {
-    let dbg = std::env::var_os("PLIRON_LICM_DEBUG2").is_some()
+    let dbg = crate::env_set("PLIRON_LICM_DEBUG2")
         && matches!(func.dfg.insts[i], InstructionData::Load { .. });
     if dbg
         && let Some(&reg) = scoped.get(&i)
@@ -613,7 +613,7 @@ fn run_loop(
             }
         }
     }
-    if std::env::var_os("PLIRON_LICM_PROMOTE").is_some_and(|v| v == "0") {
+    if crate::env_get("PLIRON_LICM_PROMOTE") == Some("0") {
         return n + cn;
     }
     cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, escapes, deref, debug)
@@ -1176,7 +1176,7 @@ pub fn run(
     // region check can apply it.
     let mut stop: FxHashSet<Value> = noalias.clone();
     stop.extend(ofz.keys().copied());
-    let debug = std::env::var_os("PLIRON_LICM_DEBUG").is_some();
+    let debug = crate::env_set("PLIRON_LICM_DEBUG");
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
     let mut loops: Vec<Loop> = la.loops().collect();

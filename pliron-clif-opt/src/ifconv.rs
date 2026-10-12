@@ -621,7 +621,7 @@ fn conv_table(
         opcode: Opcode::Jump,
         destination: bc,
     };
-    if std::env::var_os("PLIRON_IFCONV_DEBUG").is_some() {
+    if crate::env_set("PLIRON_IFCONV_DEBUG") {
         eprintln!("ifconv {b} br_table -> jump {m} (arms {})", arms.len());
     }
     true
@@ -775,7 +775,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             opcode: Opcode::Jump,
             destination: bc,
         };
-        if std::env::var_os("PLIRON_IFCONV_DEBUG").is_some() {
+        if crate::env_set("PLIRON_IFCONV_DEBUG") {
             eprintln!("ifconv {b} -> jump {m} (arms {t:?} {e:?})");
         }
         n += 1;

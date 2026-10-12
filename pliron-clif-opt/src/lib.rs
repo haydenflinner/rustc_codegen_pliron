@@ -7,6 +7,7 @@
 
 pub mod bcheck;
 pub mod bittab;
+pub mod config;
 pub mod brchain;
 pub mod celim;
 pub mod clifpeep;
@@ -24,6 +25,7 @@ pub mod loopdel;
 pub mod loopidiom;
 pub mod looprot;
 pub mod loopvec;
+pub mod pipeline;
 pub mod punroll;
 pub mod revnorm;
 pub mod slotmerge;
@@ -35,8 +37,4 @@ pub mod tailrec;
 pub mod unreach;
 pub mod unroll;
 
-/// `PLIRON_<PASS>=0` disables a pass at runtime (default on).
-/// Keep semantics identical to `rustc_codegen_pliron::pass_enabled`.
-pub fn pass_enabled(var: &str) -> bool {
-    std::env::var(var).map_or(true, |v| v != "0")
-}
+pub use config::{bisect, env_get, env_is, env_set, pass_enabled};

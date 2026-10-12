@@ -204,7 +204,7 @@ pub fn run(
     let nslots = func.sized_stack_slots.len();
     let mut iv: Vec<(u32, u32)> = vec![(u32::MAX, 0); nslots];
     let mut uses: Vec<Vec<u32>> = vec![Vec::new(); nslots];
-    let dbg = std::env::var_os("PLIRON_SLOTMERGE_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_SLOTMERGE_DEBUG");
     let mut esc: Vec<(StackSlot, Inst)> = Vec::new();
     // `llvm.lifetime.{start,end}` markers (MIR StorageLive/Dead) pin
     // validity windows in LLVM's model: a pointer into dead storage can't
@@ -215,7 +215,7 @@ pub fn run(
     // use positions. `PLIRON_SLOTMERGE_MARK` re-enables the exemption for
     // experiments.
     let mut marked = vec![false; nslots];
-    if std::env::var_os("PLIRON_SLOTMERGE_MARK").is_some() {
+    if crate::env_set("PLIRON_SLOTMERGE_MARK") {
         for &(v, _, _, _) in lifetimes {
             let ds = &derived[func.dfg.resolve_aliases(v)];
             // A marker operand naming exactly one slot is that storage's

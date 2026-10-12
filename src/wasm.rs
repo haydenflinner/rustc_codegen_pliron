@@ -109,7 +109,7 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     HOOK.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |i| {
-            if !QUIET.with(|q| q.get()) || std::env::var("PLIRON_WASM_PANIC").is_ok() {
+            if !QUIET.with(|q| q.get()) || crate::env_set("PLIRON_WASM_PANIC") {
                 prev(i)
             }
         }));
@@ -308,7 +308,7 @@ pub fn lower_to_wasm(
         });
         o.fidx.insert(n.clone(), o.funcs.len() - 1);
     }
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     let mut stubs = 0;
     let mut defined = 0;
     for (n, f) in &st.funcs {
@@ -327,7 +327,7 @@ pub fn lower_to_wasm(
             Ok(b) => b,
             Err(e) => {
                 stubs += 1;
-                if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                if let Some(f) = crate::env_get("PLIRON_WASM_STUBLOG") {
                     use std::fmt::Write as _;
                     let mut s = String::new();
                     writeln!(s, "stub {n}: {e}").unwrap();
@@ -400,7 +400,7 @@ pub fn lower_to_wasm(
                     Ok(Ok(c)) => c.into_raw_body(),
                     Ok(Err(e)) | Err(e) => {
                         stubs += 1;
-                        if let Ok(f) = std::env::var("PLIRON_WASM_STUBLOG") {
+                        if let Some(f) = crate::env_get("PLIRON_WASM_STUBLOG") {
                             let _ = std::fs::OpenOptions::new()
                                 .create(true)
                                 .append(true)
@@ -435,9 +435,7 @@ pub fn lower_to_wasm(
     let mut bytes =
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
-    if std::env::var_os("PLIRON_WASM_PEEP")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    if crate::pass_enabled("PLIRON_WASM_PEEP")
     {
         wpeep(&mut bytes);
     }
@@ -755,9 +753,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     // could observe a different local value, or a load could cross a
     // store). Stack shape is preserved exactly: each producer replayed
     // at its use contributes the +1 the deleted `local.get` provided.
-    if !std::env::var_os("PLIRON_WASM_FWD")
-        .map(|v| v == "0")
-        .unwrap_or(false)
+    if crate::env_get("PLIRON_WASM_FWD") != Some("0")
     {
         // Stack (pops, pushes) for instrs allowed inside producers and
         // in set->use gaps. None = opaque (barrier).
@@ -932,7 +928,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 None
             }
         };
-        let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+        let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
         let mut del = vec![false; ins.len()]; // forwarded sets + moved producers
         let mut splice: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         let mut i = 0;
@@ -1099,7 +1095,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 _ => {}
             }
         }
-        let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+        let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
         // Stack-order matching inside runs of pure local ops.
         let mut pairs: Vec<(usize, usize)> = Vec::new(); // (get idx, set idx)
         let mut pending: Vec<usize> = Vec::new();
@@ -2173,7 +2169,7 @@ fn wrange(b: &mut FunctionBody) -> bool {
             // must be the operand that did *not* supply k: when both
             // operands are consts, picking it by `wconst(x).is_some()`
             // shifts the wrong one.
-            if std::env::var_os("PLIRON_WASM_NOSHL").is_none()
+            if !crate::env_set("PLIRON_WASM_NOSHL")
                 && let ValueDef::Operator(op @ (O::I32Mul | O::I64Mul), aa, _) =
                     &b.values[iv]
             {
@@ -2524,8 +2520,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // ~30% code size for no measurable runtime gain — wasm calls are
     // cheap and our post-splice optimizer doesn't exploit the merge
     // the way LLVM's does. `PLIRON_WASM_HINT=n` re-enables.
-    let hint_cap = std::env::var("PLIRON_WASM_HINT")
-        .ok()
+    let hint_cap = crate::env_get("PLIRON_WASM_HINT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     // Even `#[inline(always)]` gets a hard ceiling: a pathological
@@ -2938,14 +2933,14 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         self.b.optimize(&waffle::OptOptions::default());
         // Fold `v == K1 || v == K2` CondBr chains into br_table Selects
         // (LLVM does the same at ISel for small eq-chains).
-        if std::env::var("PLIRON_WASM_TAB").map_or(true, |v| v != "0") {
+        if crate::pass_enabled("PLIRON_WASM_TAB") {
             for _ in 0..4 {
                 if !wtab(&mut self.b) {
                     break;
                 }
             }
         }
-        let dbg = std::env::var("PLIRON_WASM_LOOPS")
+        let dbg = crate::env_get("PLIRON_WASM_LOOPS")
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false);
         if dbg {
@@ -2957,7 +2952,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         if wrange(&mut self.b) | waddr(&mut self.b) {
             self.b.optimize(&waffle::OptOptions::default());
         }
-        if std::env::var("PLIRON_WASM_WLOOP").map_or(true, |v| v != "0") {
+        if crate::pass_enabled("PLIRON_WASM_WLOOP") {
             // `&T` entry params (noalias + readonly + dereferenceable):
             // loads within the pointee bound are loop-hoistable. Maps
             // pliron args to their waffle entry-param values.
@@ -2996,8 +2991,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
             eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
         }
         self.b.optimize(&waffle::OptOptions::default());
-        if let Some(lim) = std::env::var("PLIRON_WASM_TRIP")
-            .ok()
+        if let Some(lim) = crate::env_get("PLIRON_WASM_TRIP")
             .and_then(|v| v.parse::<u64>().ok())
         {
             if self.o.trip == waffle::Global::invalid() {
@@ -5325,9 +5319,7 @@ fn wloop_opt(
         }
         // Loop-closed exits: funnel leaked loop values through exit
         // block params so cloning (wbcheck/unroll) is legal.
-        if std::env::var_os("PLIRON_WASM_SEAL")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        if crate::pass_enabled("PLIRON_WASM_SEAL")
         {
             wseal_exits(b, &mut defb, &cfg, inloop, *h);
         }
@@ -5337,9 +5329,7 @@ fn wloop_opt(
     // structure (guard + both clones) or its fast copy keeps running the
     // checked inner loop. Membership recorded before a round's clone is
     // stale for enclosing loops, so defer them to the next recollection.
-    let bcheck_off = std::env::var_os("PLIRON_WASM_BCHECK")
-        .map(|v| v == "0")
-        .unwrap_or(false);
+    let bcheck_off = crate::env_get("PLIRON_WASM_BCHECK") == Some("0");
     if !bcheck_off {
         let mut done: FxHashSet<WBlock> = FxHashSet::default();
         for _ in 0..8 {
@@ -5371,8 +5361,7 @@ fn wloop_opt(
     // doesn't know — without this, a versioned outer loop looks
     // innermost and unrolls *around* its still-checked inner loop
     // instead of letting the clean inner loop unroll.
-    let unr = std::env::var("PLIRON_WASM_UNROLL")
-        .ok()
+    let unr = crate::env_get("PLIRON_WASM_UNROLL")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let uloops = wloops(b, &cfg);
@@ -5795,7 +5784,7 @@ fn loop_licm(
             break;
         }
     }
-    if n_deref > 0 && std::env::var_os("PLIRON_WASM_LICM").is_some() {
+    if n_deref > 0 && crate::env_set("PLIRON_WASM_LICM") {
         eprintln!("loop_licm: {n_deref} noalias-param loads hoisted past writers");
     }
 }
@@ -5947,7 +5936,7 @@ fn wtab(b: &mut FunctionBody) -> bool {
     if edits.is_empty() {
         return false;
     }
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     for (blk, v, k1, k2, hit1, hit2, miss) in edits {
         if verbose {
             eprintln!("wtab: {blk} {v}=={k1}|{k2} -> {hit1:?} {hit2:?} miss={miss:?}");
@@ -6291,7 +6280,7 @@ fn wunroll(
     copies: usize,
     fname: &str,
 ) {
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     // Size limits: unrolling is a tradeoff, not a free win. Scale the
     // copy count down for larger bodies — a 64-inst loop gets 2 copies,
     // a tiny one gets the full 8. `unreachable` panic sinks are cold:
@@ -6339,9 +6328,7 @@ fn wunroll(
     }
     let mut order: Vec<WBlock> = inloop.iter().copied().collect();
     order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
-    let flat_ok = !std::env::var_os("PLIRON_WASM_FLAT")
-        .map(|v| v == "0")
-        .unwrap_or(false);
+    let flat_ok = crate::env_get("PLIRON_WASM_FLAT") != Some("0");
     if flat_ok && wunroll_flat(b, defb, inloop, h, copies, &order) {
         if verbose {
             eprintln!("wunroll: {fname} {h} flat");
@@ -6397,7 +6384,7 @@ fn wunroll_flat(
     copies: usize,
     order: &[WBlock],
 ) -> bool {
-    let verbose = std::env::var("PLIRON_WASM_VERBOSE").is_ok();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     macro_rules! rej {
         ($why:expr) => {{
             if verbose {
@@ -6627,7 +6614,7 @@ fn loop_cloneable(
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
 ) -> bool {
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     for &lb in inloop {
         for &inst in &b.blocks[lb].insts {
             if !matches!(
@@ -6938,7 +6925,7 @@ fn wseal_exits(
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
 ) {
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
     let mut wl = vec![WBlock::new(0)];
     while let Some(x) = wl.pop() {
@@ -7276,7 +7263,7 @@ fn wbcheck(
     h: WBlock,
     loops: &[(WBlock, FxHashSet<WBlock>)],
 ) -> Option<(WBlock, FxHashSet<WBlock>)> {
-    let verbose = std::env::var_os("PLIRON_WASM_VERBOSE").is_some();
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
     macro_rules! bail {
         ($($a:tt)*) => {{
             if verbose {

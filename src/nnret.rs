@@ -194,7 +194,7 @@ pub fn run(ctx: &Context, st: &mut State<'_>) {
             break;
         }
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "nnret {}: {} of {} pointer-returning bodies nonnull",
             st.cgu,

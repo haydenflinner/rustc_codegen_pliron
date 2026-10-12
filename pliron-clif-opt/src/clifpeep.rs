@@ -2103,7 +2103,7 @@ fn sameargs_round(func: &mut Function) -> usize {
                             _ => true,
                         };
                         if !in_b {
-                            if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+                            if crate::env_set("PLIRON_SA_DEBUG") {
                                 eprintln!("sa V {b} param[{ix}] -> {v}");
                             }
                             repl.push((ix, v));
@@ -2124,7 +2124,7 @@ fn sameargs_round(func: &mut Function) -> usize {
                                 v
                             }
                         };
-                        if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+                        if crate::env_set("PLIRON_SA_DEBUG") {
                             eprintln!("sa K {b} param[{ix}] -> {ty} {imm}");
                         }
                         repl.push((ix, v));
@@ -2165,7 +2165,7 @@ fn sameargs_round(func: &mut Function) -> usize {
     if param_drops.is_empty() {
         return 0;
     }
-    if std::env::var_os("PLIRON_SA_DEBUG").is_some() {
+    if crate::env_set("PLIRON_SA_DEBUG") {
         eprintln!("sameargs drops {} params", param_drops.len());
     }
     apply_param_drops(func, pmap, arg_drops, param_drops)
@@ -3540,7 +3540,7 @@ pub fn sublea(func: &mut Function) -> usize {
     // `acc*10+d` chains, which is where it pays.
     if crate::pass_enabled("PLIRON_OVKILL") {
         let k = ovkill(func);
-        if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+        if k > 0 && crate::env_set("PLIRON_STATS") {
             eprintln!("ovkill {k} {}", func.name);
         }
         n += k;
@@ -3650,7 +3650,7 @@ pub fn frozen_loads(
     }
     // Opt-in: on hm.rs it pins the key's fields in callee-saved registers
     // across the probe loop and costs +7% instructions.
-    if !hoist.is_empty() && std::env::var("PLIRON_FROZEN_HOIST").is_ok_and(|v| v == "1") {
+    if !hoist.is_empty() && crate::env_is("PLIRON_FROZEN_HOIST", "1") {
         hoist_frozen(func, hoist);
     }
     n

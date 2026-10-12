@@ -403,7 +403,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
         }
         st.dead_fns.extend(dead);
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "deadfn {}: {} of {} fns not lowered",
             st.cgu,
@@ -472,8 +472,7 @@ pub fn run(
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
 ) {
-    let limit = std::env::var("PLIRON_INLINE")
-        .ok()
+    let limit = crate::env_get("PLIRON_INLINE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { SMALL_LIMIT } else { DEFAULT_LIMIT });
     // -O0 still honours `#[inline(always)]` like LLVM's AlwaysInliner: wasm-bindgen
@@ -484,7 +483,7 @@ pub fn run(
     }
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
-    let once = !always_only && std::env::var("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
     let single: FxHashSet<String> = if once {
         let taken = crate::lower::address_taken(ctx, st);
         let counts = call_counts(ctx, st);
@@ -503,42 +502,37 @@ pub fn run(
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = !always_only && crate::pass_enabled("PLIRON_INLINE_BU");
     // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
-    let eh_invoke = std::env::var("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
-    let cap: usize = std::env::var("PLIRON_INLINE_CALLER_MAX")
-        .ok()
+    let eh_invoke = crate::env_get("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
+    let cap: usize = crate::env_get("PLIRON_INLINE_CALLER_MAX")
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
     // Callees up to `bonus`x the limit whose indirect call target comes from a
     // parameter are inlined where that argument is a constant address
     // (`PLIRON_INLINE_DEVIRT=<x>`; e.g. hashbrown's `find_or_find_insert_index_inner`
     // taking `&mut dyn FnMut`).
-    let bonus: usize = std::env::var("PLIRON_INLINE_DEVIRT")
-        .ok()
+    let bonus: usize = crate::env_get("PLIRON_INLINE_DEVIRT")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 4 });
     // Similarly, callees up to `fold`x the limit whose param reaches a branch
     // condition are inlined where that argument is a scalar constant, which
     // folds the branch in the clone (`PLIRON_INLINE_FOLD=<x>`).
-    let fold: usize = std::env::var("PLIRON_INLINE_FOLD")
-        .ok()
+    let fold: usize = crate::env_get("PLIRON_INLINE_FOLD")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 2 });
     // `#[inline]` callees get up to `hint`x the limit (`PLIRON_INLINE_HINT`):
     // rustc's hint means "small or hot leaf" — std's `hash_one`/iterator
     // adapters sit just over the base limit but must inline to match LLVM.
-    let hint: usize = std::env::var("PLIRON_INLINE_HINT")
-        .ok()
+    let hint: usize = crate::env_get("PLIRON_INLINE_HINT")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 4 });
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
-    let verbose = std::env::var("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
+    let verbose = crate::env_get("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
-    let growth: usize = std::env::var("PLIRON_INLINE_GROWTH")
-        .ok()
+    let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
     let mut infos: FxHashMap<String, CInfo> = FxHashMap::default();
@@ -670,8 +664,7 @@ pub fn run(
                             // every iteration, so a fatter callee is worth it
                             // (hashbrown's `hash_one`: SipHash inlined into the
                             // probe loop wins ~30% on `HashMap::get`).
-                            let lb: usize = std::env::var("PLIRON_INLINE_LOOP")
-                                .ok()
+                            let lb: usize = crate::env_get("PLIRON_INLINE_LOOP")
                                 .and_then(|s| s.parse().ok())
                                 .unwrap_or(8);
                             t = t.saturating_add(limit * lb / 4);
@@ -729,7 +722,7 @@ pub fn run(
             add_info!(&sym);
         }
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if crate::env_set("PLIRON_STATS") {
         left_stats(ctx, st, &infos);
     }
 }
@@ -789,7 +782,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
                 }
                 Operation::erase(c, ctx);
                 out.insert(nc);
-                if std::env::var_os("PLIRON_STATS_DEVIRT").is_some() {
+                if crate::env_set("PLIRON_STATS_DEVIRT") {
                     let caller = st
                         .funcs
                         .iter()
@@ -800,7 +793,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
             }
         }
     }
-    if std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
         eprintln!("devirt {}: {} calls", st.cgu, out.len());
     }
     out
@@ -900,7 +893,7 @@ fn extract_leaf(
     depth: usize,
 ) -> Option<Value> {
     let mut seen = FxHashSet::default();
-    let scan = std::env::var_os("PLIRON_FROZEN_SCAN").is_some();
+    let scan = crate::env_set("PLIRON_FROZEN_SCAN");
     if depth > 24 {
         return None;
     }
@@ -1010,7 +1003,7 @@ fn store_src(
     load: Ptr<Operation>,
     mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<Value> {
-    let scan = std::env::var_os("PLIRON_FROZEN_SCAN").is_some();
+    let scan = crate::env_set("PLIRON_FROZEN_SCAN");
     let fail = |why: &str| -> Option<Value> {
         if scan {
             eprintln!("store_src: {why} for {load:?}");
@@ -1304,7 +1297,7 @@ fn same_ptr(
         norm(ctx, st, preds, v1, &mut mem.clone()),
         norm(ctx, st, preds, v2, &mut mem.clone()),
     );
-    if n1 != n2 && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
+    if n1 != n2 && crate::env_set("PLIRON_FROZEN_SCAN") {
         let d = |v: Value| {
             v.defining_op()
                 .map(|o| OpDbg { op: o, ctx }.to_string())
@@ -1501,7 +1494,7 @@ fn frozen_args(
     if !crate::pass_enabled("PLIRON_FROZEN_INLINE") {
         return;
     }
-    let dbg = std::env::var_os("PLIRON_FROZEN_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_FROZEN_DEBUG");
     let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {
         return;
     };
@@ -1605,7 +1598,7 @@ fn frozen_args(
                 .map(|(_, r)| r)
         });
         let region = inh.unwrap_or(entry);
-        if dbg && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
+        if dbg && crate::env_set("PLIRON_FROZEN_SCAN") {
             eprintln!(
                 "frozen_args: leaf {leaf} sub {sub} entry {entry:?} inh={inh:?} rb={rb:?} cv={cv:?}"
             );
@@ -1670,7 +1663,7 @@ fn frozen_args(
             };
             let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
             else {
-                if dbg && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
+                if dbg && crate::env_set("PLIRON_FROZEN_SCAN") {
                     let bs = base
                         .defining_op()
                         .map(|o| OpDbg { op: o, ctx }.to_string())

@@ -836,14 +836,14 @@ impl X<'_> {
             {
                 return Some(Pack::Vec(va));
             }
-            if std::env::var_os("PLIRON_XPACK_DEBUG").is_some() {
+            if crate::env_set("PLIRON_XPACK_DEBUG") {
                 eprintln!(
                     "    xpack novec d{depth}: {a:?}/{b:?} va={va:?} vb={vb:?} samev={} avail={}",
                     va == vb,
                     self.avail(va)
                 );
             }
-        } else if std::env::var_os("PLIRON_XPACK_DEBUG").is_some()
+        } else if crate::env_set("PLIRON_XPACK_DEBUG")
             && (la.is_some() || lb.is_some())
         {
             eprintln!("    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
@@ -907,7 +907,7 @@ impl X<'_> {
         }
         // Isomorphic ops: pack recursively. A failed attempt rolls back the
         // rows/members it pushed, then the column falls back to a gather.
-        let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+        let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
         if dbg
             && depth <= 6
             && let (da, db) = (self.def(a), self.def(b))
@@ -1202,7 +1202,7 @@ fn plan_pair(
     Vec<(Value, usize, u8)>,
     FxHashSet<Inst>,
 )> {
-    let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
@@ -1280,7 +1280,7 @@ fn finish_plan(
 )> {
     let (func, pos, insts) = (x.func, x.pos, x.insts);
     let (ia, ib) = tag;
-    let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
@@ -1750,7 +1750,7 @@ fn xpack_block(
     let mut total = 0;
     let mut tried = 0usize;
     let mut taken: FxHashSet<Inst> = FxHashSet::default();
-    let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
     loop {
         let insts: Vec<Inst> = func.layout.block_insts(block).collect();
         let pos: FxHashMap<Inst, usize> = insts
@@ -1768,7 +1768,7 @@ fn xpack_block(
                 }
             }
         }
-        if std::env::var_os("PLIRON_XPACK_DEBUG").is_some() && total > 0 {
+        if crate::env_set("PLIRON_XPACK_DEBUG") && total > 0 {
             for (p, &i) in insts.iter().enumerate() {
                 let d = &func.dfg.insts[i];
                 let args: Vec<String> = func

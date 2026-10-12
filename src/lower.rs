@@ -299,22 +299,42 @@ pub fn lower_to_object(
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     let mut asm_stubs = rustc_hash::FxHashSet::default();
-    let mut threaded = 0usize;
-    let mut dead_params = 0usize;
-    let mut dominated_folds = 0usize;
-    let mut merged = 0usize;
-    let mut unreached = 0usize;
-    let mut dupd = 0usize;
-    let mut forwarded = 0usize;
-    let mut slot_dse = 0usize;
-    let mut peeped = 0usize;
+    let mut stats = crate::pipeline::Stats::default();
+    let fn_flags = crate::pipeline::FnFlags {
+        jumpthread: st.jumpthread,
+        unreach: st.unreach,
+        peep: st.peep,
+        tailmerge: st.tailmerge,
+        taildup: st.taildup,
+        tailrec: st.tailrec,
+        loadfwd: st.loadfwd,
+        slot_dse: st.slot_dse,
+        dse: st.dse,
+        indvars: st.indvars,
+        licm: st.licm,
+        loopidiom: st.loopidiom,
+        loopvec: st.loopvec,
+        bcheck: st.bcheck,
+        slp: st.slp,
+    };
+    let simd = matches!(
+        isa.triple().architecture,
+        target_lexicon::Architecture::Aarch64(_) | target_lexicon::Architecture::X86_64
+    );
+    let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+    // 64-bit vector compares are cheap on aarch64 and with sse4.2
+    // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
+    let cmp64 = !x64
+        || sess
+            .internal_target_features
+            .contains(&rustc_span::Symbol::intern("sse4.2"));
     // `PLIRON_VERIFY=full` verifies after every pass. Any other truthy
     // value verifies once after the pipeline: on failure the function is
     // restored from a pre-pipeline snapshot and re-run with per-pass
     // verification, so attribution costs a retry only when something
     // actually broke.
-    let verify_env = std::env::var_os("PLIRON_VERIFY").is_some();
-    let verify_full_env = std::env::var("PLIRON_VERIFY").is_ok_and(|v| v == "full");
+    let verify_env = crate::env_set("PLIRON_VERIFY");
+    let verify_full_env = crate::env_is("PLIRON_VERIFY", "full");
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -421,960 +441,50 @@ pub fn lower_to_object(
             }
             operand_frozen = ofz;
         }
-        let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
+        let dump = crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f));
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
         let mut verify_full = verify_full_env;
         let snapshot = (verify_env && !verify_full).then(|| clctx.func.clone());
+        if crate::env_set("PLIRON_FROZEN_DEBUG") {
+            eprintln!("==== {n}: noalias={noalias:?} deref={deref:?}");
+        }
         'retry: loop {
-        if st.jumpthread && crate::bisect("jumpthread") {
-            let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &mut derived);
-            threaded += n;
-            dead_params += dead;
-            dominated_folds += folds;
-            if dump {
-                eprintln!(
-                    "==== clif {n} after jumpthread ====\n{}",
-                    clctx.func.display()
-                );
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // rustc emits bounds-check `brif`s whose conditions become constants
-        // once jumpthread folds dominated tests; left in place they make a
-        // loop read as a long side-exit chain to unroll/punroll/loopvec.
-        // Fold early so the loop passes see the canonical shape; the late
-        // `PLIRON_CONSTBR=1` run below still catches constants exposed by
-        // later passes.
-        if st.jumpthread && crate::pass_enabled("PLIRON_CONSTBR") && crate::bisect("constbr") {
-            let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
-            if k > 0 {
-                crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
-                if std::env::var_os("PLIRON_STATS").is_some() {
-                    eprintln!("constbr {k} {n}");
-                }
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") && crate::bisect("unroll") {
-            let k = crate::unroll::run(&mut clctx.func, &nonnull, &derived);
-            // The skipped loop is now unreachable, and its trip count still
-            // flows into dead params/branches; dropping them frees the slot
-            // address arithmetic so slot DSE can see the slot doesn't escape.
-            if k > 0 && crate::pass_enabled("PLIRON_UNROLL_CLEANUP") {
-                let ub = crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
-                let (mut dp, mut di) = (0, 0);
-                for _ in 0..4 {
-                    let p = crate::jumpthread::remove_dead_params(&mut clctx.func)
-                        + crate::jumpthread::fold_same_target_brifs(&mut clctx.func);
-                    let i = crate::jumpthread::remove_dead_insts(&mut clctx.func, true);
-                    (dp, di) = (dp + p, di + i);
-                    if p + i == 0 {
-                        break;
-                    }
-                }
-                if std::env::var_os("PLIRON_UNROLL_DEBUG").is_some() {
-                    eprintln!("unroll cleanup {n}: {ub} blocks, {dp} params, {di} insts");
-                }
-            }
-            if k > 0 && std::env::var_os("PLIRON_UNROLL_DEBUG").is_some() {
-                eprintln!("unroll {k} {n}");
-            }
-            if dump {
-                eprintln!("==== clif {n} after unroll ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("unroll broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.unreach && crate::bisect("unreach") {
-            unreached += crate::unreach::run(&mut clctx.func);
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.peep && crate::bisect("clifpeep") {
-            peeped += crate::clifpeep::run(&mut clctx.func);
-        }
-        if st.tailmerge && crate::bisect("tailmerge") {
-            merged += crate::tailmerge::run(&mut clctx.func);
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("tailmerge broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.taildup && crate::bisect("taildup") {
-            dupd += crate::taildup::run(&mut clctx.func);
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("taildup broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // `f(a) + f(b)`-style recursion → accumulate the first call and
-        // loop on the second's args (LLVM TRE); before loadfwd/licm so
-        // they can still hoist out of the new back-edge.
-        if st.tailrec && crate::bisect("tailrec") {
-            let k = crate::tailrec::run(&mut clctx.func, id);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("tailrec {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!(
-                    "==== clif {n} after tailrec ====\n{}",
-                    clctx.func.display()
-                );
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("tailrec broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.loadfwd && crate::bisect("loadfwd") {
-            forwarded += crate::loadfwd::run(
-                &mut clctx.func,
-                &noalias,
-                &invariant,
-                &operand_frozen,
-                &block_region,
-                &st.region_parent,
-                &nowrite,
-                &call_frozen,
-            );
-            if st.slot_dse {
-                // A load whose only user was a removed dead store keeps its own
-                // slot alive, so alternate the two until nothing changes.
-                for _ in 0..4 {
-                    slot_dse += crate::loadfwd::dead_slot_stores(&mut clctx.func);
-                    if !crate::pass_enabled("PLIRON_DEAD_LOADS")
-                        || crate::jumpthread::remove_dead_insts(
-                            &mut clctx.func,
-                            crate::pass_enabled("PLIRON_DEAD_PURE"),
-                        ) == 0
-                    {
-                        break;
-                    }
-                }
-            }
-            if dump {
-                eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.dse && crate::bisect("dse") {
-            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("dse {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after dse ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("dse broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Upstream Cranelift's egraph pass: GVN + ISLE cprop/remat rules +
-        // redundant-load elimination + egraph LICM. Opt-in while its cost and
-        // wins vs. our own passes are measured.
-        // Upstream's egraph doesn't know `try_call` (it predates EH), so
-        // functions with invokes are skipped entirely.
-        if std::env::var("PLIRON_EGRAPH").is_ok_and(|v| v == "1")
-            && crate::bisect("egraph")
-            && !clctx
-                .func
-                .layout
-                .blocks()
-                .flat_map(|b| clctx.func.layout.block_insts(b))
-                .any(|i| {
-                    clctx.func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::TryCall
-                })
         {
-            let mut cp = cranelift_codegen::control::ControlPlane::default();
-            // The egraph indexes values directly; our passes leave
-            // `Value` aliases it doesn't resolve.
-            clctx.func.dfg.resolve_all_aliases();
-            clctx.compute_cfg();
-            clctx.compute_domtree();
-            clctx
-                .egraph_pass(&*isa, &mut cp)
-                .unwrap_or_else(|e| panic!("egraph broke `{n}`: {e}\n{}", clctx.func.display()));
-            // The egraph populated cfg/domtree; later passes don't maintain
-            // them, so drop them rather than leave stale-but-"valid" state
-            // that `compile`'s initial verify would check.
-            clctx.cfg.clear();
-            clctx.domtree.clear();
-            if dump {
-                eprintln!(
-                    "==== clif {n} after egraph ====\n{}",
-                    clctx.func.display()
-                );
-            }
-        }
-        if st.indvars && crate::bisect("indvars") {
-            let k = crate::indvars::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("indvars {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("indvars broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Loop-carried load reuse: sibling to indvars since it grows
-        // stepped header params the same machinery produces.
-        if st.indvars
-            && crate::pass_enabled("PLIRON_LDROT")
-            && crate::bisect("ldrot")
-        {
-            let k = crate::indvars::rotld(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("ldrot {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("ldrot broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.licm && crate::bisect("licm") {
-            let k = crate::licm::run(
-                &mut clctx.func,
-                &noalias,
-                &deref,
-                &nowrite,
-                &call_frozen,
-                &scoped,
-                &block_region,
-                &st.region_parent,
-                &operand_frozen,
-            );
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("licm {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after licm ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("licm broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Rebase descending counted ivs (`(0..n).rev()`) to ascending so
-        // loopidiom/loopvec see the canonical `0..bound` count shape.
-        if crate::pass_enabled("PLIRON_REVNORM") && crate::bisect("revnorm") {
-            let k = crate::revnorm::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("revnorm {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("revnorm broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.loopidiom && crate::bisect("loopidiom") {
-            let k =
-                crate::loopidiom::run(&mut clctx.func, &noalias, m.target_config(), n);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("idiom {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("loopidiom broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // A second ifconv round: loadfwd/egraph dedup re-loaded predicate
-        // operands that made jumpthread's arm blocks non-pure, leaving
-        // `filter(pred)` range-check diamonds folded only now that they're
-        // pure forwarders. Flattening them to `select` chains is what lets
-        // loopvec see the count-if/conditional-update shapes.
-        if st.loopvec
-            && crate::pass_enabled("PLIRON_IFCONV2")
-            && crate::bisect("ifconv2")
-        {
-            // Carried-constant params (`RangeInclusive`'s exhausted flag
-            // — a self-edge param fed a literal at entry) fold here so
-            // the dispatch arms they drive die before flattening
-            // (`PLIRON_CPARM`).
-            if crate::pass_enabled("PLIRON_CPARM") {
-                let k = crate::clifpeep::cparm(&mut clctx.func);
-                if k > 0 {
-                    // Const folds leave dead `iconst`s inside the arm
-                    // chains; `resolve_arm`'s speculation cap counts
-                    // them and the diamond then looks too wide.
-                    crate::jumpthread::remove_dead_insts(&mut clctx.func, true);
-                }
-                if dump {
-                    eprintln!("==== clif {n} after cparm ({k}) ====\n{}", clctx.func.display());
-                }
-            }
-            // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
-            // leaf-up: repeat to fixpoint (bounded by diamond depth).
-            let mut k = 0;
-            for _ in 0..8 {
-                let n2 = crate::ifconv::run(&mut clctx.func, &mut derived);
-                k += n2;
-                if n2 == 0 {
-                    break;
-                }
-            }
-            if k > 0 {
-                // Folded merges leave dead forwarders still edging into
-                // the merge — remove them so the merge is single-pred,
-                // then splice it into the header for a flat single-block
-                // loop.
-                crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
-                crate::clifpeep::fusechains(&mut clctx.func);
-                if std::env::var_os("PLIRON_STATS").is_some() {
-                    eprintln!("ifconv2 {k} {n}");
-                }
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after ifconv2 ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("ifconv2 broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Unswitch invariant brifs before bcheck: the constant-folded
-        // copies (e.g. a `capacity == 0` early-out in HashMap::get) shrink
-        // each version's body and can expose more foldable checks.
-        if crate::pass_enabled("PLIRON_UNSWITCH") && crate::bisect("unswitch") {
-            let k = crate::bcheck::unswitch(&mut clctx.func, n);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("unswitch {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after unswitch ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("unswitch broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // bcheck before loopvec: the versioned fast path has no per-iteration
-        // bounds branches, so it's vectorizable where the checked loop isn't.
-        if st.bcheck && crate::bisect("bcheck") {
-            let k = crate::bcheck::run(&mut clctx.func, n, eh_data.is_some());
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("bcheck {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("bcheck broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-            if dump {
-                eprintln!("==== clif {n} after bcheck ====\n{}", clctx.func.display());
-            }
-        }
-        if st.loopvec && crate::bisect("loopvec") {
-            let simd = matches!(
-                isa.triple().architecture,
-                target_lexicon::Architecture::Aarch64(_)
-                    | target_lexicon::Architecture::X86_64
-            );
-            let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-            // 64-bit vector compares are cheap on aarch64 and with sse4.2
-            // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
-            let cmp64 = !x64
-                || sess
-                    .internal_target_features
-                    .contains(&rustc_span::Symbol::intern("sse4.2"));
-            let k = crate::loopvec::run(
-                &mut clctx.func,
-                n,
-                &noalias,
-                m.target_config(),
+            let mut pipe = crate::pipeline::Pipe {
+                clctx: &mut clctx,
+                isa: &*isa,
+                fname: n,
+                func_id: id,
+                nonnull: &nonnull,
+                derived: &mut derived,
+                frozen: &frozen,
+                noalias: &noalias,
+                deref: &deref,
+                nowrite: &nowrite,
+                call_frozen: &call_frozen,
+                scoped: &scoped,
+                invariant: &invariant,
+                operand_frozen: &operand_frozen,
+                block_region: &block_region,
+                region_parent: &st.region_parent,
+                lifetimes: &lifetimes,
+                nocap: &nocap,
+                tcfg: cfg,
                 simd,
                 x64,
                 cmp64,
-            );
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("loopvec {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("loopvec broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-            // loopvec emits `base + iv*esize` addressing fresh each iteration;
-            // a second indvars round turns them into stepped pointers.
-            if k > 0
-                && st.indvars
-                && crate::pass_enabled("PLIRON_INDUCT2")
-                && crate::bisect("indvars2")
-            {
-                crate::indvars::run(&mut clctx.func);
-            }
-        }
-        if st.slp && crate::bisect("slp") {
-            let simd = matches!(
-                isa.triple().architecture,
-                target_lexicon::Architecture::Aarch64(_)
-                    | target_lexicon::Architecture::X86_64
-            );
-            let k = crate::slp::run(&mut clctx.func, &noalias, simd);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("slp {k} {n}");
-            }
-            if std::env::var_os("PLIRON_XPACK_CLIF").is_some() {
-                eprintln!("==== clif {n} after slp ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("slp broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if crate::pass_enabled("PLIRON_SWITCHMAP") && crate::bisect("switchmap") {
-            let k = crate::switchmap::run(&mut clctx.func);
-            // The new bounds tests are often implied by a dominating check.
-            let f = if k > 0
-                && crate::pass_enabled("PLIRON_DOMCOND")
-                && crate::pass_enabled("PLIRON_SWITCHMAP_FOLD")
-            {
-                let folds = crate::jumpthread::fold_dominated_conds(&mut clctx.func);
-                dominated_folds += folds;
-                if folds > 0 {
-                    crate::jumpthread::fold_const_branches(&mut clctx.func)
-                } else {
-                    0
-                }
-            } else {
-                0
+                has_eh: eh_data.is_some(),
+                flags: &fn_flags,
+                dump,
+                verify_full,
+                stats: &mut stats,
             };
-            if k > 0 && std::env::var_os("PLIRON_SWITCHMAP_DEBUG").is_some() {
-                eprintln!("switchmap {k} fold {f} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("switchmap broke `{n}`: {e}\n{}", clctx.func.display());
-            }
+            crate::pipeline::run_pipeline(&mut pipe);
         }
-        if std::env::var("PLIRON_CONSTBR").is_ok_and(|v| v == "1") && crate::bisect("constbr") {
-            let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_CONSTBR_DEBUG").is_some() {
-                eprintln!("constbr {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if st.jumpthread && crate::pass_enabled("PLIRON_LOOPDEL") && crate::bisect("loopdel") {
-            let k = crate::loopdel::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("loopdel {k} {n}");
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("loopdel broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if crate::pass_enabled("PLIRON_LOOPROT") && crate::bisect("looprot") {
-            crate::looprot::run(&mut clctx.func);
-            if dump {
-                eprintln!("==== clif {n} after looprot ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("looprot broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Scalar unroll of linear counted loops (e.g. ordered float
-        // reductions that can't vectorize): K bodies per branch.
-        if st.jumpthread && crate::pass_enabled("PLIRON_PUNROLL") && crate::bisect("punroll") {
-            let k = crate::punroll::run(&mut clctx.func, n);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("punroll {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after punroll ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("punroll broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
-            eprintln!("==== {n}: noalias={noalias:?} deref={deref:?}");
-        }
-        if !frozen.is_empty() {
-            let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
-            if dump {
-                eprintln!(
-                    "==== clif {n}: {k} frozen loads, params {:?} ====\n{}",
-                    frozen,
-                    clctx.func.display()
-                );
-            }
-        }
-        // `isub x, k` → `iadd x, -k` so x64's `lea` lowering can write a
-        // call-arg/phi result non-destructively instead of `mov` + `sub`.
-        if st.peep
-            && crate::pass_enabled("PLIRON_SUBLEA")
-            && crate::bisect("sublea")
-        {
-            let k = crate::clifpeep::sublea(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("sublea {k} {n}");
-            }
-        }
-        // `op multi_use, one_use` → `op one_use, multi_use` on commutative
-        // binops: the fewer-use operand takes two-address dst, so regalloc
-        // clobbers it in place instead of copying the live one (`movdqa`
-        // splat copies in matmul's `mulpd` loop).
-        if st.peep
-            && crate::pass_enabled("PLIRON_COMMUTE")
-            && crate::bisect("commute")
-        {
-            let k = crate::commute::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("commute {k} {n}");
-            }
-        }
-        // Scalar min/max wider than a register (i128) has no Cranelift
-        // lowering on any target; several passes can emit it.
-        crate::clifpeep::wide_minmax(&mut clctx.func);
-        if std::env::var("PLIRON_VCODE").is_ok_and(|f| n.contains(f.as_str())) {
+        if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
             clctx.set_disasm(true);
-        }
-        // Rebind cold-call args defined in hot code so their ABI register
-        // pinning lands at the cold call site instead of constraining the
-        // whole hot loop's register allocation.
-        if crate::pass_enabled("PLIRON_COLDARG") && crate::bisect("coldarg") {
-            let k = crate::clifpeep::coldargs(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("coldarg {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after coldargs ====\n{}", clctx.func.display());
-            }
-        }
-        // Splice single-predecessor successors into their predecessor so
-        // hot loops broken into several blocks by cold-edge branches lose
-        // the per-edge register-allocation copy shuffle.
-        if crate::pass_enabled("PLIRON_FUSE") && crate::bisect("fuse") {
-            let k = crate::clifpeep::fusechains(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("fuse {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after fuse ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("fuse broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Retarget edges past `jump`-only forwarder blocks, including
-        // try_call landing-pad and normal-return edges that the earlier
-        // jumpthread bypass cannot touch; each surviving forwarder emits a
-        // `b` in the final stream.
-        if crate::pass_enabled("PLIRON_EDGEFWD") && crate::bisect("edgefwd") {
-            let k = crate::edgefwd::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("edgefwd {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after edgefwd ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("edgefwd broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Fold multi-pred forwarders edgefwd leaves: `brif`-only blocks
-        // absorbed into `jump` preds, and `jump` forwarders with
-        // escaping params. Must run before coldedges so any hot->cold
-        // edges it creates still get cold adapters.
-        if crate::pass_enabled("PLIRON_FOLDF") && crate::bisect("foldf") {
-            let k = crate::clifpeep::foldforwarders(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("foldf {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after foldf ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Fold compares decided by dominating branch conditions (bounds
-        // checks implied by earlier checks) before the cold-edge split:
-        // a folded check's dead panic edge then never gets an adapter.
-        if crate::pass_enabled("PLIRON_CELIM") && crate::bisect("celim") {
-            let k = crate::celim::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("celim {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after celim ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("celim broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Refold loop-carried affine params (i' = i+s on every back
-        // edge) onto one anchor IV: `p` becomes `bp + r*i` computed in
-        // the loop body instead of a regalloc parallel copy plus an
-        // increment on the back edge. Runs after celim (icmp folds can
-        // change which param is the counter) and before sameargs so
-        // newly-uniform params are still picked up.
-        //
-        // Load/store uses of dropped params get a fresh `bp + scaled(iv)`
-        // per use that folds into a base+index*scale amode, so no
-        // address math materializes; constant-trip counters fold their
-        // exit test onto the anchor's step value and die with deadrecs.
-        if crate::pass_enabled("PLIRON_IVREFOLD") && crate::bisect("ivrefold") {
-            let k = crate::ivrefold::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("ivrefold {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after ivrefold ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("ivrefold broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Drop loop params whose only uses feed their own back-edge
-        // arg — dead recurrences (e.g. the i*4 byte-offset cursor
-        // indvars leaves when addressing moved to another param).
-        // Forward liveness can't see these: the param is "used" by
-        // its increment and the increment is "used" by the edge.
-        if crate::pass_enabled("PLIRON_DEADREC") && crate::bisect("deadrec") {
-            let k = crate::ivrefold::deadrecs(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("deadrec {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after deadrec ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("deadrec broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Per-block CSE of duplicate pure insts so redundant chains
-        // (the vectorizer's separate load/store address streams,
-        // rustc's repeated index math) collapse to one value before
-        // sameargs merges the now-identical edge args.
-        if crate::pass_enabled("PLIRON_LCSE") && crate::bisect("lcse") {
-            let k = crate::clifpeep::lcse(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("lcse {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after lcse ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("lcse broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Drop block params that receive the same value on every
-        // incoming edge (and merge duplicate params): each surviving
-        // param costs a regalloc parallel copy per conditional pred —
-        // the `mov;b` edge-split blocks that dominate the block count.
-        // Runs before coldedges so adapters inherit smaller arg lists.
-        if crate::pass_enabled("PLIRON_SAMEARG") && crate::bisect("sameargs") {
-            if std::env::var_os("PLIRON_SA_DEBUG").is_some()
-                || std::env::var_os("PLIRON_PHI_DEBUG").is_some()
-            {
-                eprintln!("--- sameargs {n}");
-            }
-            let k = crate::clifpeep::sameargs(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("sameargs {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after sameargs ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization
-        // residue around `icmp`/`uextend`/`select` booleans) — one `and`
-        // per element in scalar count_if loops. After sameargs: the merged
-        // predicate param is only alias-visible once it has dropped.
-        if crate::pass_enabled("PLIRON_MASK01") && crate::bisect("mask01") {
-            let k = crate::clifpeep::mask01(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("mask01 {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after mask01 ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("mask01 broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Thread edges through `brif` dispatch blocks decided by the supplied
-        // args (Option/enum sentinel selects, constant discriminants): the
-        // `select`/`ireduce`/`icmp eq k` cascades collapse to a `brif` on the
-        // flag or a direct edge. Runs before coldedges so any hot->cold edge
-        // it creates still gets an adapter.
-        if crate::pass_enabled("PLIRON_EDGESPEC") && crate::bisect("edgespec") {
-            let k = crate::edgespec::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("edgespec {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after edgespec ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("edgespec broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Sparse small-domain membership trees (is_whitespace/is_ascii_*
-        // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
-        // the accepted set fits a 64-bit window.
-        if crate::pass_enabled("PLIRON_BITTAB") && crate::bisect("bittab") {
-            let k = crate::bittab::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("bittab {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after bittab ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("bittab broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Move hot->cold block-param edge copies into cold adapter blocks
-        // so the moves only execute when the cold edge is actually taken.
-        // Runs after edgefwd: its bypass has no cold check and would
-        // retarget straight through the adapters, putting the parallel
-        // copy back in the hot predecessor tail.
-        if crate::pass_enabled("PLIRON_COLDEDGE") && crate::bisect("coldedge") {
-            let k = crate::clifpeep::coldedges(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("coldedge {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Second DSE: ifconv's store→load forwarding and the late edge
-        // transforms rewrite a slot's last readers to the stored value,
-        // leaving stores the early dse saw live (e.g. the `&key` slot
-        // materialized for `HashMap::get`, dead once `hash_one`'s byte
-        // loads forward from the key value itself).
-        if crate::pass_enabled("PLIRON_DSE2") && crate::bisect("dse2") {
-            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("dse2 {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after dse2 ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("dse2 broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Lane-by-lane constant stores into a stack slot that whole-vector
-        // loads read back (rustc's `Simd` const materialization, e.g.
-        // hashbrown's `u8x8` special-byte checks in `reserve_rehash`) fold
-        // to `iconst`+`bitcast`, and the lane stores go dead.
-        if crate::pass_enabled("PLIRON_VECSLOT") && crate::bisect("vecslot") {
-            let k = crate::clifpeep::vecslot(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("vecslot {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after vecslot ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("vecslot broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Late value numbering: the edge transforms and vecslot leave
-        // identical insts in one block; also drives the mem-offset and
-        // neg folds on late-introduced addressing.
-        if crate::pass_enabled("PLIRON_LCSE") && crate::bisect("lcse") {
-            let k = crate::clifpeep::lcse(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("lcse {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after lcse ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("lcse broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // `uextend.i64 (load.i32)` -> `uload32.i64` + `ireduce.i32`: x64
-        // emits movl either way, but dropping the extension vreg frees
-        // regalloc from coalescing it (a stray `movq` showed up in
-        // loop bodies). Last transform before codegen — earlier passes
-        // match `Opcode::Load` and must still see the load.
-        if crate::pass_enabled("PLIRON_ULOAD32") && crate::bisect("uload32") {
-            let k = crate::clifpeep::uloads32(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("uload32 {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after uload32 ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("uload32 broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Loop count tests against a wide constant rematerialize it per
-        // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
-        // a non-constant preheader value codegen pins in a register. Runs
-        // late (after loop rotation) so latch-copied tests are covered.
-        if crate::pass_enabled("PLIRON_BCMP") && crate::bisect("boundcmp") {
-            let k = crate::indvars::boundcmp(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("boundcmp {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after boundcmp ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("boundcmp broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Dead self-feed recurrences — boundcmp's countdown replaces the
-        // bound-tested iv with `rem`, leaving the iv's `+=` update feeding
-        // only its own edge arg. Runs after boundcmp/looprot.
-        if crate::pass_enabled("PLIRON_SELFARG") && crate::bisect("selfarg") {
-            let k = crate::clifpeep::selfarg(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("selfarg {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after selfarg ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("selfarg broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Small `br_table`s become `icmp eq`+`brif` chains: the table
-        // dispatch is ~8 instructions plus an indirect-branch prediction
-        // per execution, which dominates iterator state machines (e.g.
-        // `SplitWhitespace::next`'s per-char discriminant dispatch).
-        // Runs last so nothing un-does the chains and adapters/edge
-        // forwarding have already collapsed the surrounding shape.
-        if crate::pass_enabled("PLIRON_BRCHAIN") && crate::bisect("brchain") {
-            let k = crate::brchain::run(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("brchain {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after brchain ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("brchain broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Merge disjoint-lifetime explicit slots — last, so slot references
-        // cloned by earlier passes are all accounted for before sharing.
-        if crate::pass_enabled("PLIRON_SLOTMERGE") && crate::bisect("slotmerge") {
-            let stats = std::env::var_os("PLIRON_STATS").is_some();
-            let before: u64 = stats
-                .then(|| clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum())
-                .unwrap_or(0);
-            let k = crate::slotmerge::run(&mut clctx.func, &nowrite, &lifetimes, &nocap);
-            if stats {
-                let after: u64 =
-                    clctx.func.sized_stack_slots.values().map(|d| d.size as u64).sum();
-                eprintln!("slotmerge {k} {before}->{after}B {} {n}", nocap.len());
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after slotmerge ====\n{}", clctx.func.display());
-            }
-            if verify_full
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
-            {
-                panic!("slotmerge broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-        }
-        // Leaf `return` blocks that share a `brif` with a loop header are
-        // colder than the loop: mark them cold so the emitted RPO order puts
-        // them last and the loop arm falls through. Runs last — it's pure
-        // layout metadata, so nothing downstream needs to see it.
-        if crate::pass_enabled("PLIRON_COLDRET") && crate::bisect("coldret") {
-            let k = crate::clifpeep::coldrets(&mut clctx.func);
-            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
-                eprintln!("coldret {k} {n}");
-            }
-            if dump && k > 0 {
-                eprintln!("==== clif {n} after coldrets ====\n{}", clctx.func.display());
-            }
         }
         if verify_env && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
         {
@@ -1427,12 +537,25 @@ pub fn lower_to_object(
         m.clear_context(&mut clctx);
     }
 
-    if st.loadfwd && std::env::var_os("PLIRON_STATS").is_some() {
+    if crate::env_set("PLIRON_STATS") {
+        eprintln!("pipeline {name}: {}", crate::config::config().describe());
+    }
+    if st.loadfwd && crate::env_set("PLIRON_STATS") {
+        let (forwarded, peeped, slot_dse) =
+            (stats.forwarded, stats.peeped, stats.slot_dse);
         eprintln!(
             "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
         );
     }
-    if st.jumpthread && std::env::var_os("PLIRON_STATS").is_some() {
+    if st.jumpthread && crate::env_set("PLIRON_STATS") {
+        let (threaded, dead_params, dominated_folds, merged, unreached, dupd) = (
+            stats.threaded,
+            stats.dead_params,
+            stats.dominated_folds,
+            stats.merged,
+            stats.unreached,
+            stats.dupd,
+        );
         eprintln!(
             "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
         );
@@ -1977,7 +1100,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+                        if crate::env_set("PLIRON_FROZEN_DEBUG") {
                             eprintln!(
                                 "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}"
                             );
@@ -1993,7 +1116,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+                        if crate::env_set("PLIRON_FROZEN_DEBUG") {
                             eprintln!(
                                 "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
                                 *pb,
@@ -2381,7 +1504,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         let op = v.defining_op()?;
         let ctx = self.ctx;
         let id = Operation::get_opid(op, ctx);
-        if std::env::var_os("PLIRON_CONSTDBG").is_some() {
+        if crate::env_set("PLIRON_CONSTDBG") {
             eprintln!("const_bits {}: {}", depth, id);
         }
         let ops: Vec<Value> = op.deref(ctx).operands().collect();
@@ -4257,7 +3380,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         // cost ~8% on tokenize while the chars loop it was aimed at gains
         // nothing (see `chars_alpha` in coordination-ledger.md).
         static IBNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("PLIRON_INBOUNDSNN").is_ok_and(|v| v == "1")
+            crate::env_is("PLIRON_INBOUNDSNN", "1")
         });
         if addr != base_v
             && (self.st.inbounds.contains(&op)
