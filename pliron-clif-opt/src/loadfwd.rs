@@ -216,6 +216,35 @@ pub fn notrap(func: &Function, i: Inst) -> bool {
         && func.dfg.insts[i].memflags_trap_code(&func.dfg).is_none()
 }
 
+/// `root` with no `noalias` scope stops: peel scope names to the concrete
+/// object underneath. Two scope roots are provably distinct objects only
+/// when both peels bottom out somewhere disjoint — today, separate
+/// `stack_addr`s. Returning `(V(v), off)` means "unresolved", not
+/// "different object": callers must keep treating it as may-alias.
+pub fn concrete(func: &Function, ps: &FxHashMap<Value, Value>, v: Value) -> (Root, i64) {
+    root(func, ps, &FxHashSet::default(), v)
+}
+
+/// `root` normalized for disjointness/dereferenceability checks: when a
+/// `V` scope name (`noalias` param, operand-frozen operand) peels to a
+/// `stack_addr`, report the slot itself so two scoped pointers into
+/// different locals compare disjoint like any other slot pair.
+pub fn norm_root(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    v: Value,
+) -> (Root, i64) {
+    let (r, o) = root(func, ps, na, v);
+    match r {
+        Root::V(rv) => match concrete(func, ps, rv) {
+            (Root::S(ss), so) => (Root::S(ss), o.wrapping_add(so)),
+            _ => (r, o),
+        },
+        _ => (r, o),
+    }
+}
+
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
 pub fn kill(
     av: &mut Avail,
@@ -618,14 +647,18 @@ pub fn run(
     // either way the value names its own memory scope. `isolated` keeps
     // the real set so operand values don't get function-wide immunity.
     let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
+    let iso = isolated(func, noalias, &ps, cfrozen);
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        n += pre(func, &ps, &stop, &cfg, &rpo, entry);
+        // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
+        // which retains a loc across a store to a different root only when
+        // one side is isolated — an empty set would drop every loc at the
+        // first unrelated store.
+        n += pre(func, &ps, &stop, &cfg, &rpo, entry, &iso);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
         }
     }
-    let iso = isolated(func, noalias, &ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut invs: FxHashSet<Loc> = FxHashSet::default();
     let mut invreg: FxHashMap<Loc, Vec<Region>> = FxHashMap::default();
@@ -922,8 +955,8 @@ fn pre(
     cfg: &ControlFlowGraph,
     rpo: &[Block],
     entry: Block,
+    iso: &FxHashSet<Root>,
 ) -> usize {
-    let iso: FxHashSet<Root> = FxHashSet::default();
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;
     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
@@ -961,10 +994,12 @@ fn pre(
                 b,
                 &mut av,
                 None,
-                &iso,
+                iso,
                 // `out` must agree with the `st` scan below, which tracks
                 // no invariant immunity — pass empty sets so `transfer`
-                // marks and retains nothing extra here.
+                // marks and retains nothing extra here. `iso` is real:
+                // `kill` needs it to keep locs disjoint from the store's
+                // root, or every unrelated store empties the set.
                 &FxHashSet::default(),
                 &mut FxHashSet::default(),
                 None,

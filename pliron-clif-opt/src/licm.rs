@@ -80,7 +80,7 @@ fn clobbers(
         // use of such an address escapes analysis — and this store IS a use.
         InstructionData::Store { args, offset, .. } => {
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-            let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
+            let (r2, o2) = loadfwd::norm_root(func, ps, na, args[1]);
             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
             !overlap_keeps((r2, o2, ty), loc, iso)
         }
@@ -205,14 +205,18 @@ fn hoists(
             }
         );
     }
-    let loc: Loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
+    // The clobber scan and the `safe` check below want the concrete object
+    // (`norm_root` peels a scope name to its stack slot), while `r` stays
+    // the scope name — the `ofz` region check needs it.
+    let (nr, no) = loadfwd::norm_root(func, ps, na, arg);
+    let loc: Loc = (nr, no.wrapping_add(i64::from(i32::from(offset))), ty);
     // `notrap` only asserts the load can't trap where it sits — invalid
     // addresses are UB, so removal/reorder is fine — but hoisting speculates
     // it onto paths where the address may be garbage (a pointer loaded from
     // an enum payload is only valid on that variant's arm). Require the
     // root dereferenceable unconditionally: a stack slot, a symbol or stack
     // base, or a param rustc marked `dereferenceable` covering the access.
-    let safe = match r {
+    let safe = match loc.0 {
         Root::S(_) => true,
         Root::V(v) => {
             let proven = deref
@@ -519,7 +523,7 @@ fn run_loop(
         };
         let (val, addr) = (func.dfg.resolve_aliases(args[0]), args[1]);
         let store_ty = func.dfg.value_type(val);
-        let (sr, so) = loadfwd::root(func, ps, na, addr);
+        let (sr, so) = loadfwd::norm_root(func, ps, na, addr);
         let sloc: Loc = (sr, so.wrapping_add(i64::from(i32::from(offset))), store_ty);
         let mut ok = loadfwd::notrap(func, s) && inv(func, val) && inv(func, addr);
         if ok {
@@ -556,7 +560,7 @@ fn run_loop(
                             ok = false;
                             break;
                         }
-                        let (r, o) = loadfwd::root(func, ps, na, arg);
+                        let (r, o) = loadfwd::norm_root(func, ps, na, arg);
                         let lloc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                         if !overlap_keeps(sloc, lloc, iso) {
                             ok = false;
@@ -740,7 +744,10 @@ fn promote(
                     continue;
                 }
             };
-            let (r, o) = loadfwd::root(func, ps, na, addr.0);
+            // `norm_root` unifies a scope-named pointer into a slot with
+            // the slot's own accesses; a scope that doesn't resolve stays
+            // `V` — may-alias as far as the group scan is concerned.
+            let (r, o) = loadfwd::norm_root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
             if !iso_l.contains(&r) {
                 // An operand-frozen root is its own name only inside its
@@ -810,7 +817,8 @@ fn promote(
                         InstructionData::Store { opcode: Opcode::Store, args, offset, .. }
                             if loadfwd::notrap(func, i)
                                 && {
-                                    let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
+                                    let (r2, o2) =
+                                        loadfwd::norm_root(func, ps, na, args[1]);
                                     (r2, o2.wrapping_add(i64::from(i32::from(offset)))) == (r, o)
                                 }
                                 && func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
@@ -1018,7 +1026,7 @@ fn promote_loc(
             } = func.dfg.insts[i]
                 && func.dfg.value_type(func.dfg.first_result(i)) == ty
                 && {
-                    let (r, o) = loadfwd::root(func, ps, na, arg);
+                    let (r, o) = loadfwd::norm_root(func, ps, na, arg);
                     (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                 }
             {
@@ -1123,7 +1131,7 @@ fn promote_loc(
                     offset,
                     ..
                 } if func.dfg.value_type(func.dfg.first_result(i)) == ty && {
-                    let (r, o) = loadfwd::root(func, ps, na, arg);
+                    let (r, o) = loadfwd::norm_root(func, ps, na, arg);
                     (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                 } =>
                 {
@@ -1138,7 +1146,7 @@ fn promote_loc(
                     offset,
                     ..
                 } if func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty && {
-                    let (r, o) = loadfwd::root(func, ps, na, args[1]);
+                    let (r, o) = loadfwd::norm_root(func, ps, na, args[1]);
                     (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                 } =>
                 {
