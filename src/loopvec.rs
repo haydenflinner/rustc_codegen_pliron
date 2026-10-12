@@ -673,6 +673,69 @@ fn is_splat(
     r
 }
 
+/// `v` is a `bor` tree over `icmp eq x, k` leaves all on the same operand
+/// with ≥4 distinct constants inside a 64-bit window — the shape
+/// `bittab::flat` folds into a single masked `ushr`/`band` test (~2 insts
+/// per byte in the scalar loop). Vectorizing such a scan only adds the
+/// aligned-window preamble and a fatter per-chunk test: with a ~free scalar
+/// predicate the early-exit resume machinery rarely pays for itself.
+fn eqchain_testable(func: &Function, v: Value) -> bool {
+    fn k_of(func: &Function, v: Value) -> Option<i64> {
+        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = func.dfg.insts[di] {
+            Some(imm.bits())
+        } else {
+            None
+        }
+    }
+    let mut x = None;
+    let mut ks: Vec<u64> = Vec::new();
+    let mut stack = vec![func.dfg.resolve_aliases(v)];
+    while let Some(v) = stack.pop() {
+        let Some(di) = func.dfg.value_def(v).inst() else {
+            return false;
+        };
+        match func.dfg.insts[di] {
+            InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                stack.push(func.dfg.resolve_aliases(args[0]));
+                stack.push(func.dfg.resolve_aliases(args[1]));
+            }
+            InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                let (a, c) = (
+                    func.dfg.resolve_aliases(args[0]),
+                    func.dfg.resolve_aliases(args[1]),
+                );
+                let (xv, k) = match (k_of(func, a), k_of(func, c)) {
+                    (None, Some(k)) => (a, k),
+                    (Some(k), None) => (c, k),
+                    _ => return false,
+                };
+                let bits = func.dfg.value_type(xv).bits();
+                if bits > 64 {
+                    return false;
+                }
+                let kv = if bits == 64 { k as u64 } else { (k as u64) & ((1u64 << bits) - 1) };
+                if kv >= 64 {
+                    return false;
+                }
+                match x {
+                    None => x = Some(xv),
+                    Some(e) if e == xv => {}
+                    _ => return false,
+                }
+                ks.push(kv);
+            }
+            _ => return false,
+        }
+    }
+    if ks.len() < 4 {
+        return false;
+    }
+    ks.sort_unstable();
+    ks.dedup();
+    ks.len() >= 4 && ks.last().unwrap() - ks.first().unwrap() < 64
+}
+
 fn is_const(func: &Function, v: Value) -> bool {
     match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
         ValueDef::Result(i, _) => matches!(
@@ -1615,6 +1678,9 @@ fn plan(
         let cv = func.dfg.resolve_aliases(cv);
         if !masks.contains(&cv) && !can_vec.contains(&cv) {
             why!(fname; "early cond not lane-wise {:?}", info.h);
+        }
+        if eqchain_testable(func, cv) {
+            why!(fname; "early cond is a cheap scalar bit test {:?}", info.h);
         }
     }
     // Every stored value must be replicable or a splattable invariant.

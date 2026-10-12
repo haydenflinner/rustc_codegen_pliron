@@ -499,6 +499,242 @@ fn prep_args(
     Some(out)
 }
 
+/// Range-refolding: `bor` trees of `icmp eq x, k` leaves sharing one
+/// resolved `x` collapse consecutive constants into `icmp ult (x-lo), len`
+/// range checks — `x ∈ {0,1,2,3,4}` becomes one `ult` instead of five
+/// `eq`s and four `bor`s. Works on scalars and vectors: a vectorized
+/// SwitchInt arrives as `vconst`-vs-`vconst` eq chains that otherwise
+/// cost 5+ compares per vector of bytes (e.g. `is_ascii_whitespace`).
+/// Runs of length ≥2 fold; singleton `k`s keep their original `icmp`.
+fn eqrange(func: &mut Function) -> usize {
+    /// Lane-typed constant bits: `iconst` scalar, or a `vconst` that
+    /// splats one lane value (all lanes byte-identical).
+    fn const_of(func: &Function, v: Value) -> Option<u64> {
+        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        match func.dfg.insts[di] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Some(imm.bits() as u64),
+            InstructionData::UnaryConst {
+                opcode: Opcode::Vconst,
+                constant_handle,
+            } => {
+                let ty = func.dfg.value_type(func.dfg.first_result(di));
+                let lb = (ty.lane_bits() / 8) as usize;
+                if lb == 0 || lb > 8 {
+                    return None;
+                }
+                let d = func.dfg.constants.get(constant_handle).as_slice();
+                if d.is_empty() || d.len() % lb != 0 || !d.chunks(lb).all(|c| c == &d[..lb]) {
+                    return None;
+                }
+                let mut k = 0u64;
+                for (j, &b) in d[..lb].iter().enumerate() {
+                    k |= (b as u64) << (8 * j);
+                }
+                Some(k)
+            }
+            _ => None,
+        }
+    }
+    /// `ty`-typed constant `k`: `iconst` scalar or splat `vconst`.
+    fn kconst(
+        cur: &mut FuncCursor,
+        ty: cranelift_codegen::ir::Type,
+        k: u64,
+    ) -> Value {
+        if ty.is_vector() {
+            let lb = (ty.lane_bits() / 8) as usize;
+            let mut bytes = Vec::with_capacity(lb * ty.lane_count() as usize);
+            for _ in 0..ty.lane_count() {
+                bytes.extend_from_slice(&k.to_le_bytes()[..lb]);
+            }
+            let h = cur.func.dfg.constants.insert(bytes.into());
+            cur.ins().vconst(ty, h)
+        } else {
+            cur.ins().iconst(ty, k as i64)
+        }
+    }
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        let interior: FxHashSet<Value> = func
+            .layout
+            .block_insts(b)
+            .flat_map(|i| {
+                if let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i] {
+                    args.to_vec()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            if func.dfg.inst_results(i).len() != 1 {
+                continue;
+            }
+            let out = func.dfg.first_result(i);
+            if interior.contains(&func.dfg.resolve_aliases(out)) {
+                continue;
+            }
+            let ty = func.dfg.value_type(out);
+            if !ty.lane_type().is_int() {
+                continue;
+            }
+            // Gather the tree: interior `bor`s, leaves `icmp eq x, k` all
+            // on the same resolved `x`.
+            let mut x = None;
+            let mut ks: Vec<u64> = Vec::new();
+            let mut stack = vec![args[0], args[1]];
+            let mut ok = true;
+            while let Some(v) = stack.pop() {
+                let v = func.dfg.resolve_aliases(v);
+                let Some(di) = func.dfg.value_def(v).inst() else {
+                    ok = false;
+                    break;
+                };
+                match func.dfg.insts[di] {
+                    InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                        stack.push(args[0]);
+                        stack.push(args[1]);
+                    }
+                    InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                        let (a, c) = (
+                            func.dfg.resolve_aliases(args[0]),
+                            func.dfg.resolve_aliases(args[1]),
+                        );
+                        let (xv, k) = match (const_of(func, a), const_of(func, c)) {
+                            (None, Some(k)) => (a, k),
+                            (Some(k), None) => (c, k),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        match x {
+                            None => x = Some(xv),
+                            Some(e) if e == xv => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ks.push(mask(k, func.dfg.value_type(xv).lane_bits()));
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || ks.len() < 3 {
+                continue;
+            }
+            ks.sort_unstable();
+            ks.dedup();
+            let x = x.unwrap();
+            let xty = func.dfg.value_type(x);
+            // `iconst`/`vconst` can't express a lane wider than 64 bits.
+            if xty.lane_bits() > 64 {
+                continue;
+            }
+            // Maximal consecutive runs; a run folds when it is cheaper than
+            // the eqs it replaces. Scalar `ult` is sub+cmp — beats len≥2.
+            // Vector `ult` lowers to a psubb/pminub/pcmpeqb/pcmpeqd/pxor
+            // sequence (~5 insts + bor share), so it only pays at len≥4.
+            let min_len = if xty.is_vector() { 4 } else { 2 };
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for &k in &ks {
+                match runs.last_mut() {
+                    Some(r) if k == r.1 + 1 => r.1 = k,
+                    _ => runs.push((k, k)),
+                }
+            }
+            let folded: usize = runs
+                .iter()
+                .map(|(lo, hi)| (hi - lo + 1) as usize)
+                .filter(|&l| l >= min_len)
+                .sum();
+            if folded < 2 {
+                continue;
+            }
+            // Rebuild: range checks for runs, original `icmp eq` results
+            // for singletons (k -> leaf value, only singles looked up).
+            let single: FxHashMap<u64, Value> = {
+                let mut m = FxHashMap::default();
+                if runs.iter().any(|&(lo, hi)| hi - lo + 1 < min_len as u64) {
+                    let mut st = vec![args[0], args[1]];
+                    while let Some(v) = st.pop() {
+                        let v = func.dfg.resolve_aliases(v);
+                        let Some(di) = func.dfg.value_def(v).inst() else {
+                            continue;
+                        };
+                        match func.dfg.insts[di] {
+                            InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                                st.push(args[0]);
+                                st.push(args[1]);
+                            }
+                            InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                                let (a, c) = (
+                                    func.dfg.resolve_aliases(args[0]),
+                                    func.dfg.resolve_aliases(args[1]),
+                                );
+                                let k = const_of(func, c).or_else(|| const_of(func, a));
+                                if let Some(k) = k {
+                                    m.insert(mask(k, xty.lane_bits()), v);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                m
+            };
+            let mut cur = FuncCursor::new(func).at_inst(i);
+            let mut parts: Vec<Value> = Vec::new();
+            for (lo, hi) in runs {
+                let len = hi - lo + 1;
+                // `len` must fit the lane type unsigned — a full-domain run
+                // (len = 2^bits) would truncate the bound to 0.
+                let len_fits = xty.lane_bits() == 64 || len < (1u64 << xty.lane_bits());
+                if len >= min_len as u64 && len_fits {
+                    let d = if lo > 0 {
+                        let k = kconst(&mut cur, xty, lo);
+                        cur.ins().isub(x, k)
+                    } else {
+                        x
+                    };
+                    let k = kconst(&mut cur, xty, len);
+                    parts.push(cur.ins().icmp(IntCC::UnsignedLessThan, d, k));
+                } else {
+                    // Below-threshold run: keep each original eq leaf.
+                    for k in lo..=hi {
+                        if let Some(&v) = single.get(&k) {
+                            parts.push(v);
+                        } else {
+                            let k = kconst(&mut cur, xty, k);
+                            parts.push(cur.ins().icmp(IntCC::Equal, x, k));
+                        }
+                    }
+                }
+            }
+            let mut c = parts[0];
+            for &p in &parts[1..] {
+                c = cur.ins().bor(c, p);
+            }
+            func.dfg.clear_results(i);
+            func.dfg.change_to_alias(out, c);
+            func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Flat form: a `bor` tree over `icmp eq x, k` leaves inside one block —
 /// what the branchy tree becomes once ifconv or the vectorizer's scan
 /// expansion collapses it into straight-line data flow. With ≥4 distinct
@@ -641,7 +877,15 @@ pub fn run(func: &mut Function) -> usize {
     // against a stale dominator tree could otherwise keep a tested value
     // or leaf arg whose defining block an earlier fold just removed,
     // leaving dangling operands that crash `value_def` downstream.
+    // `flat` first: a scalar chain dense enough for a masked `ushr`/`bt`
+    // test is strictly cheaper than the range checks `eqrange` would break
+    // it into, and once folded there is no `bor` tree left to range-fold.
+    // `eqrange` then takes the leftovers — vector chains and sparse scalar
+    // sets outside a 64-bit window.
     let mut n = flat(func);
+    if crate::pass_enabled("PLIRON_EQRANGE") {
+        n += eqrange(func);
+    }
     loop {
         let cfg = ControlFlowGraph::with_function(func);
         let dom = DominatorTree::with_function(func, &cfg);
