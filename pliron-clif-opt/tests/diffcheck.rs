@@ -1,8 +1,9 @@
 //! The differential checker must flag real behavior changes and stay quiet
 //! on equivalent rewrites and on runs that hit undefined behavior.
 
-use cranelift_codegen::ir::Function;
+use cranelift_codegen::ir::{Function, Value};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
+use rustc_hash::FxHashSet;
 
 fn parse(src: &str) -> Function {
     cranelift_reader::parse_functions(src).unwrap().remove(0)
@@ -237,4 +238,78 @@ fn zero_size_slot_address_is_valid() {
     );
     let s = check(&a, &b, &Facts::default(), &cfg()).unwrap();
     assert_eq!(s.compared, 32);
+}
+
+#[test]
+fn nonnull_load_fact_is_honored() {
+    // `v1` comes from a `!nonnull` load, so folding `v1 != 0` to true is
+    // allowed; runs where the load yields 0 are undefined, not mismatches.
+    let a = parse(
+        "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = load.i64 notrap v0
+            v2 = iconst.i64 0
+            v3 = icmp ne v1, v2
+            return v3
+        }",
+    );
+    let b = parse(
+        "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = load.i64 notrap v0
+            v3 = iconst.i8 1
+            return v3
+        }",
+    );
+    // Without the fact, a zero in memory exposes the fold.
+    let cfg = Config {
+        trials: 64,
+        ..Config::default()
+    };
+    assert!(check(&a, &b, &Facts::default(), &cfg).is_err());
+    let nn: FxHashSet<Value> = [Value::from_u32(1)].into_iter().collect();
+    let facts = Facts {
+        nonnull: Some(&nn),
+        ..Facts::default()
+    };
+    check(&a, &b, &facts, &cfg).unwrap();
+}
+
+#[test]
+fn noalias_param_memory_is_not_reachable_from_other_memory() {
+    // `v1` is noalias, so a pointer loaded from `v0`'s memory can't point
+    // into it: forwarding `*v1` across a call given that pointer is fine.
+    let src = |reload: bool| {
+        format!(
+            "function %f(i64, i64) -> i64 {{
+                sig0 = (i64)
+                fn0 = %g sig0
+            block0(v0: i64, v1: i64):
+                v2 = load.i64 notrap v1
+                v3 = load.i64 notrap v0
+                call fn0(v3)
+                {}
+                v5 = iadd v2, v4
+                return v5
+            }}",
+            if reload {
+                "v4 = load.i64 notrap v1"
+            } else {
+                "v4 -> v2"
+            }
+        )
+    };
+    let (a, b) = (parse(&src(true)), parse(&src(false)));
+    // The clobber needs the seeded pointer to land on `*v1` exactly: rare.
+    let cfg = Config {
+        trials: 2000,
+        ..Config::default()
+    };
+    assert!(check(&a, &b, &Facts::default(), &cfg).is_err());
+    let na: FxHashSet<Value> = [Value::from_u32(1)].into_iter().collect();
+    let facts = Facts {
+        noalias: Some(&na),
+        ..Facts::default()
+    };
+    check(&a, &b, &facts, &cfg).unwrap();
 }

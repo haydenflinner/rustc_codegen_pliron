@@ -151,7 +151,7 @@ fn with_pipe<R>(
     k: impl FnOnce(&mut Pipe) -> R,
 ) -> R {
     let mut clctx = Context::for_function(func);
-    let mut derived = FxHashMap::default();
+    let mut derived = facts.derived.clone();
     let mut stats = Stats::default();
     let flags = FnFlags {
         jumpthread: true,

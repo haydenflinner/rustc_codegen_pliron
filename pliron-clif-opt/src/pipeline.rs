@@ -397,6 +397,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         nowrite: Some(p.nowrite),
         // `cranelift_module` names a declared function `u0:<FuncId>`.
         self_name: Some(format!("u0:{}", p.func_id.as_u32())),
+        derived: Some(&*p.derived),
     }
 }
 

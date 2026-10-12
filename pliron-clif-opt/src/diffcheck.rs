@@ -56,6 +56,9 @@ pub struct Facts<'a> {
     /// self-recursion is interpreted instead of stubbed. Defaults to the
     /// function's `name`.
     pub self_name: Option<String>,
+    /// Derived pointer → its base, as the pipeline tracks them. Not used by
+    /// the check; saved in repros so `clif-check` replays a step faithfully.
+    pub derived: Option<&'a FxHashMap<Value, Value>>,
 }
 
 pub struct Config {
@@ -300,6 +303,9 @@ struct World {
     regions: BTreeMap<u64, Region>,
     args: Vec<DataValue>,
     seed: u64,
+    /// Values the optimizer may assume nonzero (`!nonnull` loads too): a
+    /// load that yields 0 into one is undefined behavior, so the run stops.
+    nonnull: FxHashSet<Value>,
 }
 
 impl World {
@@ -324,7 +330,11 @@ impl World {
                         stub_writable: !pi.frozen,
                     },
                 );
-                targets.push(base + PTR_SLACK);
+                // A noalias param's memory is reachable only through the
+                // param, so no seeded word may point into it.
+                if !facts.noalias.is_some_and(|s| s.contains(p)) {
+                    targets.push(base + PTR_SLACK);
+                }
             }
         }
         for h in 0..HEAPS {
@@ -357,6 +367,7 @@ impl World {
             regions,
             args,
             seed,
+            nonnull: facts.nonnull.cloned().unwrap_or_default(),
         }
     }
 }
@@ -365,7 +376,9 @@ fn fill(data: &mut [u8], targets: &[u64], rng: &mut Rng) {
     for w in data.chunks_mut(8) {
         let v: u64 = match rng.below(10) {
             0..=4 => targets[rng.below(targets.len() as u64) as usize] + rng.below(8) * 8,
-            5..=8 => rng.below(64),
+            // Zero gets its own share: null pointers and empty lengths.
+            5 => 0,
+            6..=8 => rng.below(64),
             _ => rng.next(),
         };
         let b = v.to_le_bytes();
@@ -551,6 +564,7 @@ struct Sandbox<'a> {
     syms: FxHashMap<String, u64>,
     calls: Vec<(String, Vec<DataValue>)>,
     nowrite: &'a FxHashSet<String>,
+    nonnull: &'a FxHashSet<Value>,
     seed: u64,
     pinned: DataValue,
     /// Last address a load or store fell outside the sandbox at.
@@ -872,6 +886,7 @@ fn run_inner(
         syms: FxHashMap::default(),
         calls: Vec::new(),
         nowrite,
+        nonnull: &world.nonnull,
         seed: world.seed,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
@@ -977,6 +992,13 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
         let cf = step(s, ctx).map_err(|e| Stop::Unsupported(format!("{}: {e}", data.opcode())))?;
         match cf {
             ControlFlow::Assign(vals) => {
+                if data.opcode().can_load()
+                    && let Some(&r) = f.dfg.inst_results(i).first()
+                    && s.nonnull.contains(&r)
+                    && matches!(vals.first(), Some(DataValue::I64(0) | DataValue::I32(0)))
+                {
+                    return Err(Stop::Trap(format!("nonnull load {r} yielded 0")));
+                }
                 s.current_frame_mut()
                     .set_all(f.dfg.inst_results(i), vals.to_vec());
                 inst = f.layout.next_inst(i);
@@ -1313,6 +1335,7 @@ pub struct OwnedFacts {
     pub frozen: FxHashMap<Value, u64>,
     pub nowrite: FxHashMap<FuncRef, bool>,
     pub self_name: Option<String>,
+    pub derived: FxHashMap<Value, Value>,
 }
 
 impl OwnedFacts {
@@ -1324,6 +1347,7 @@ impl OwnedFacts {
             frozen: Some(&self.frozen),
             nowrite: Some(&self.nowrite),
             self_name: self.self_name.clone(),
+            derived: Some(&self.derived),
         }
     }
 
@@ -1365,6 +1389,11 @@ impl OwnedFacts {
                             out.frozen.insert(v, n);
                         }
                     }
+                    "derived" if parts.len() == 2 => {
+                        if let (Some(v), Some(b)) = (val(parts[0]), val(parts[1])) {
+                            out.derived.insert(v, b);
+                        }
+                    }
                     "nowrite" if parts.len() == 2 => {
                         if let Some(r) = fref(parts[0]) {
                             out.nowrite.insert(r, parts[1] == "1");
@@ -1380,8 +1409,8 @@ impl OwnedFacts {
 
 use cranelift_codegen::entity::EntityRef as _;
 
-/// One comment line recording the facts that concern `f`'s entry params
-/// and callees.
+/// One comment line recording the facts a repro needs: nonnull values,
+/// derived pointers, and what concerns `f`'s entry params and callees.
 pub fn facts_header(f: &Function, facts: &Facts) -> String {
     let params: FxHashSet<Value> = f
         .layout
@@ -1403,7 +1432,19 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
         })
         .unwrap_or_default()
     };
-    let nonnull = sorted(set(facts.nonnull));
+    // Every nonnull value, not just params: loads carry it too.
+    let nonnull = sorted(
+        facts
+            .nonnull
+            .map(|s| s.iter().map(|v| v.to_string()).collect())
+            .unwrap_or_default(),
+    );
+    let derived = sorted(
+        facts
+            .derived
+            .map(|m| m.iter().map(|(v, b)| format!("{v}:{b}")).collect())
+            .unwrap_or_default(),
+    );
     let noalias = sorted(set(facts.noalias));
     let deref = sorted(
         facts
@@ -1440,7 +1481,7 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
     );
     let _ = write!(
         s,
-        " nonnull={nonnull} noalias={noalias} deref={deref} frozen={frozen} nowrite={nowrite}"
+        " nonnull={nonnull} noalias={noalias} deref={deref} frozen={frozen} nowrite={nowrite} derived={derived}"
     );
     if let Some(n) = &facts.self_name {
         let _ = write!(s, " self={n}");

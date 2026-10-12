@@ -94,6 +94,22 @@ there instead of in the cwd.
 
 ## Findings
 
+- `PLIRON_DIFFCHECK` over std, alloc, core and regex, hashbrown, smallvec,
+  indexmap, serde_json, memchr, rustc-demangle (about 8,200 functions) found
+  three real miscompiles, all fixed with regression tests:
+  - `src/slp.rs` xpack dropped the immediate offset of a paired store (and
+    of a paired load column), so regex-automata's `backtrack::Cache::new`
+    wrote a `Vec` header 16 bytes low and left its pointer null. A program
+    using `BoundedBacktracker` segfaulted at `-O`; it runs correctly now.
+  - `src/indvars.rs` ldrot seeded a rotated load on the loop entry edge even
+    when the loop can exit before reaching that load, reading through an
+    empty `Vec`'s dangling pointer (regex-syntax `IntervalSet`).
+  - Unrelated to the checker but found running it: the `%al=8` variadic
+    stubs were strong symbols per CGU and failed `-Zbuild-std` links.
+  Also open: `loopvec`'s shuffle-tree reduction emits `shuffle`, which x86-64
+  without SSSE3 lowers to an `__cranelift_x86_pshufb` libcall nobody
+  provides (rustc-demangle fails to link at the default target CPU).
+
 - `src/licm.rs` miscompiled `ui/impl-trait/example-calendar.rs` at `-O`
   (SIGBUS/SIGTRAP, `PLIRON_LICM=0` was clean): `clobbers` only ran the precise
   overlap check on `notrap` stores, so a hoisted load crossed a plain store to
