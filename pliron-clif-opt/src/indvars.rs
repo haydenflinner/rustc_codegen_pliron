@@ -250,6 +250,64 @@ fn edge_value(
     }
 }
 
+/// Every use of `insts`' results only ever forms a machine address:
+/// the value is a load/store address operand directly, or one operand
+/// of an `iadd` whose other operand is loop-invariant and whose result
+/// is itself address-only — `base + iv*scale` two levels deep still
+/// folds into one reg+reg*scale amode.
+fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bool {
+    let mut addr: FxHashSet<Value> = insts
+        .iter()
+        .map(|&i| func.dfg.first_result(i))
+        .collect();
+    loop {
+        let mut grew = false;
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for (k, &a) in func.dfg.inst_args(i).iter().enumerate() {
+                    let a = func.dfg.resolve_aliases(a);
+                    if !addr.contains(&a) {
+                        continue;
+                    }
+                    match func.dfg.insts[i] {
+                        InstructionData::Load { .. } if k == 0 => {}
+                        InstructionData::Store { .. } if k == 1 => {}
+                        InstructionData::Binary {
+                            opcode: Opcode::Iadd,
+                            args: [x, y],
+                        } => {
+                            let other = if func.dfg.resolve_aliases(x) == a { y } else { x };
+                            match def_block(func, other) {
+                                Some(d) if body.contains(&d) => return false,
+                                _ => {}
+                            }
+                            let r = func.dfg.first_result(i);
+                            if addr.insert(r) {
+                                grew = true;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a
+                            && addr.contains(&func.dfg.resolve_aliases(v))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            return true;
+        }
+    }
+}
+
 fn run_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -257,6 +315,7 @@ fn run_loop(
     la: &LoopAnalysis,
     lp: Loop,
     debug: bool,
+    amode_scale: bool,
 ) -> usize {
     let h = la.loop_header(lp);
     if !dt.is_reachable(h) {
@@ -323,6 +382,19 @@ fn run_loop(
             if mul == Mul::K(0) || (mul == Mul::K(1) && bare) {
                 continue;
             }
+            // `base + iv*{1,2,4,8}` feeding only memory addresses folds
+            // into the reg+reg*scale amode for free: a stepped param is a
+            // whole extra IV chain for nothing (iterw kept `i` for the
+            // bound check and paid `lea`+`addq` per element on the
+            // redundant pointer param). Only where the target folds
+            // scaled addressing — wasm/riscv compute addresses
+            // explicitly and genuinely want the stepped pointer.
+            if amode_scale
+                && matches!(mul, Mul::K(1 | 2 | 4 | 8))
+                && mem_addr_only(func, &body, insts)
+            {
+                continue;
+            }
             let ty: Type = base
                 .map(|b| func.dfg.value_type(b))
                 .unwrap_or_else(|| func.dfg.value_type(iv));
@@ -363,13 +435,17 @@ fn run_loop(
     n
 }
 
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    amode_scale: bool,
+) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
     let loops = deepest_first(la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += run_loop(func, cfg, dt, la, lp, debug);
+        n += run_loop(func, cfg, dt, la, lp, debug, amode_scale);
     }
     n
 }
