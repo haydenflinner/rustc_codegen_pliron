@@ -2341,7 +2341,10 @@
 (rule 2 (lower (ctz_nonzero $I32 src))
       (emit_ret_gpr (x64_bsfl_rm_raw (put_in_gpr_mem_32 src))))
 
-(rule 1 (lower (ctz_nonzero (ty_8_or_16 ty) src))
+(rule 2 (lower (ctz_nonzero $I16 src))
+      (emit_ret_gpr (x64_bsfw_rm_raw (put_in_gpr_mem_16 src))))
+
+(rule 1 (lower (ctz_nonzero $I8 src))
       (let ((extended Gpr (extend_to_gpr src $I32 (ExtendKind.Zero))))
         (emit_ret_gpr (x64_bsfl_rm_raw extended))))
 
