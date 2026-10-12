@@ -1746,6 +1746,16 @@
 (rule (lower (insertlane _ vec @ (value_type $F64X2) val (u8_from_uimm8 1)))
       (x64_movlhps vec val))
 
+;; (f64x2.replace_lane 1) with a splat as source for lane 0 -- elide the
+;; splat: `punpcklqdq`/`unpcklpd` builds [lane0, lane1] from the two scalar
+;; registers in one instruction (the i64x2 `pinsrq` special case above is
+;; the integer equivalent). This is the common "gather two f64 scalars into
+;; a vector" pattern produced by SLP/xpack.
+(rule 4 (lower (insertlane _ (splat $F64X2 lane0)
+                           lane1
+                           (u8_from_uimm8 1)))
+        (x64_punpcklqdq (put_in_xmm lane0) (put_in_xmm lane1)))
+
 ;;;; Rules for `smin`, `smax`, `umin`, `umax` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; `i64` and smaller.
