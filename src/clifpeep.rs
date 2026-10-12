@@ -391,6 +391,54 @@ fn is01(func: &Function, v: Value, depth: u32) -> bool {
                 .is_some_and(|(x, k)| k == 1 && is01(func, x, depth - 1)))
 }
 
+/// Bitmask of `v`'s possibly-set bits — `v & cover(v) == v` always.
+/// Tight through `band`/`ushr`/`uextend`/narrow loads; the type's
+/// all-ones otherwise.
+fn cover(func: &Function, v: Value, depth: usize) -> u64 {
+    let v = func.dfg.resolve_aliases(v);
+    let ty = func.dfg.value_type(v);
+    let all = if ty.bits() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << ty.bits()) - 1
+    };
+    if !ty.is_int() || ty.is_vector() || depth == 0 {
+        return all;
+    }
+    let Some(d) = func.dfg.value_def(v).inst() else {
+        return all;
+    };
+    match func.dfg.insts[d] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => imm.bits() as u64 & all,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => cover(func, arg, depth - 1),
+        InstructionData::Binary { opcode: Opcode::Band, args } => {
+            cover(func, args[0], depth - 1) & cover(func, args[1], depth - 1)
+        }
+        InstructionData::Binary { opcode: Opcode::Bor, args } => {
+            (cover(func, args[0], depth - 1) | cover(func, args[1], depth - 1)) & all
+        }
+        InstructionData::Binary { opcode: Opcode::Ushr, args } => {
+            match iconst(func, args[1]) {
+                Some(s) => cover(func, args[0], depth - 1) >> (s as u64 % ty.bits() as u64),
+                None => all,
+            }
+        }
+        InstructionData::Load { opcode, .. } => match opcode {
+            Opcode::Uload8 => 0xff,
+            Opcode::Uload16 => 0xffff,
+            Opcode::Uload32 => 0xffff_ffff,
+            _ => all,
+        },
+        _ => all,
+    }
+}
+
 /// `v` as a constant lane: `iconst` or `splat (iconst)`, sign-extended.
 fn lane_const(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
@@ -2312,14 +2360,16 @@ fn phi_comm(op: Opcode) -> bool {
     )
 }
 
-/// `band v, 1` where `v` is already 0/1 (rustc's i1 normalization residue:
-/// `icmp` results, `uextend`/`ireduce`/`select` of 0/1 values) costs one
-/// `and` per element in scalar `count_if` loops the vectorizer leaves
-/// behind — e.g. `add acc, (uextend (select lo<=x, x<=hi, 0)) & 1` where
-/// the select's arms are already boolean. Runs after sameargs: that's
-/// when the merged predicate param has been aliased to its select def and
-/// `is01` can see through it. Scalar-only — a vector `icmp`'s all-ones
-/// lanes are masks, not 0/1, so `band` on them is a real operation.
+/// `band v, M` where `v`'s bits already fit `M` (rustc's i1 normalization
+/// residue: `icmp` results, `uextend`/`ireduce`/`select` of 0/1 values
+/// costs one `and` per element in scalar `count_if` loops the vectorizer
+/// leaves behind — e.g. `add acc, (uextend (select lo<=x, x<=hi, 0)) & 1`
+/// where the select's arms are already boolean; `ushr`-extracted fields
+/// masked by their width, like `(h >> 57) & 0x7f` in SipHash's h2).
+/// Runs after sameargs: that's when the merged predicate param has been
+/// aliased to its select def and `is01` can see through it. Scalar-only —
+/// a vector `icmp`'s all-ones lanes are masks, not 0/1, so `band` on them
+/// is a real operation.
 pub fn mask01(func: &mut Function) -> usize {
     let mut hits = Vec::new();
     for b in func.layout.blocks() {
@@ -2336,14 +2386,22 @@ pub fn mask01(func: &mut Function) -> usize {
             if !ty.is_int() || ty.is_vector() {
                 continue;
             }
-            let x = if iconst(func, args[1]) == Some(1) {
-                args[0]
-            } else if iconst(func, args[0]) == Some(1) {
-                args[1]
+            let all = if ty.bits() >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << ty.bits()) - 1
+            };
+            let (x, m) = if let Some(m) = iconst(func, args[1]) {
+                (args[0], m as u64 & all)
+            } else if let Some(m) = iconst(func, args[0]) {
+                (args[1], m as u64 & all)
             } else {
                 continue;
             };
-            if is01(func, x, 4) {
+            // The mask is a no-op when `cover` proves every set bit of `x`
+            // is already in `m` (value bound is not enough: 7 <= 8 but
+            // `7 & 8 != 7`); `is01` covers the non-const bit-cover case.
+            if cover(func, x, 4) & !m == 0 || (m == 1 && is01(func, x, 4)) {
                 hits.push((i, res, func.dfg.resolve_aliases(x)));
             }
         }
