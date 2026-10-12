@@ -343,6 +343,16 @@ pub fn run(func: &mut Function, name: &str) -> usize {
                 continue;
             }
             tried.insert(h);
+            if debug() {
+                eprintln!("punroll {name} try block{}", h.as_u32());
+            }
+            if crate::pass_enabled("PLIRON_PEEL")
+                && run_peel(func, &cfg, &dt, &la, lp, h, name).is_some()
+            {
+                n += 1;
+                hit = true;
+                break; // cfg/la stale; rescan
+            }
             if run_loop(func, &cfg, &dt, &la, lp, h, name).is_some() {
                 n += 1;
                 hit = true;
@@ -1489,6 +1499,488 @@ fn run_loop(
         }
     }
     Some(())
+}
+
+// ---------------------------------------------------------------------------
+// Loop peeling (PLIRON_PEEL)
+// ---------------------------------------------------------------------------
+
+/// How one copy binds an original loop value: `Val` is a concrete binding;
+/// `Aff(base, off)` is `base + off` materialized lazily on use — affine
+/// header params become `entry + k·step`, so pointer IVs fold into
+/// addressing modes and counter IVs collapse to one `iadd` feeding the
+/// trip test.
+#[derive(Clone, Copy)]
+enum Seed {
+    Val(Value),
+    Aff(Value, i64),
+}
+
+fn seed_of(func: &Function, smap: &FxHashMap<Value, Seed>, v: Value) -> Seed {
+    let v = func.dfg.resolve_aliases(v);
+    smap.get(&v).copied().unwrap_or(Seed::Val(v))
+}
+
+/// The concrete value for `v` in the current copy, emitting `iadd base, off`
+/// into `nb` when `v` is in affine form (memoized through `smap`).
+fn matv(func: &mut Function, nb: Block, smap: &mut FxHashMap<Value, Seed>, v: Value) -> Value {
+    let v = func.dfg.resolve_aliases(v);
+    match smap.get(&v).copied().unwrap_or(Seed::Val(v)) {
+        Seed::Val(x) => x,
+        Seed::Aff(b, 0) => b,
+        Seed::Aff(b, o) => {
+            let ty = func.dfg.value_type(v);
+            let mut pos = FuncCursor::new(func).at_bottom(nb);
+            let c = pos.ins().iconst(ty, o);
+            let r = pos.ins().iadd(b, c);
+            smap.insert(v, Seed::Val(r));
+            r
+        }
+    }
+}
+
+/// Loop peeling: emit K sequential clones of the chain ahead of the
+/// residual loop — LLVM's bounded-trip unroll shape (`movzbl k(p)`, one
+/// `cmp` per digit, straight-line through `parse` digit loops). Affine
+/// header params are re-expressed as `entry + k·step` per copy rather than
+/// threaded through block params, killing the IV-update chain; every test
+/// is kept verbatim and the last copy's continue edge lands on the
+/// original loop, so the peel is correct for ANY trip count — no bound
+/// proof needed, trips > K simply flow into the residual. The cost is
+/// pure code size, capped by the small-body budget.
+fn run_peel(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: Loop,
+    h: Block,
+    name: &str,
+) -> Option<()> {
+    macro_rules! bail {
+        ($why:expr) => {{
+            if debug() {
+                eprintln!("peel {name} block{}: {}", h.as_u32(), $why);
+            }
+            return None;
+        }};
+    }
+    let Walk {
+        chain,
+        mid_exits,
+        latch,
+        body,
+        rotated: _,
+    } = walk(func, cfg, dt, la, lp, h, name)?;
+    for &b in &chain {
+        let vec_param = func
+            .dfg
+            .block_params(b)
+            .iter()
+            .any(|&v| func.dfg.value_type(v).is_vector());
+        let vec_inst = func.layout.block_insts(b).any(|i| {
+            func.dfg
+                .inst_args(i)
+                .iter()
+                .chain(func.dfg.inst_results(i).iter())
+                .any(|&v| func.dfg.value_type(v).is_vector())
+        });
+        if vec_param || vec_inst {
+            bail!("vector-typed loop");
+        }
+    }
+    let n_insts: usize = chain
+        .iter()
+        .map(|&b| func.layout.block_insts(b).count() - 1)
+        .sum();
+    let kmax = if n_insts <= 12 {
+        8usize
+    } else if n_insts <= MAX_BODY {
+        4
+    } else {
+        bail!("body too big");
+    };
+    // Every copy carries its exits verbatim: mid-chain exits plus the
+    // latch test. Keep the peeled branch-site count bounded — past ~16
+    // sites the straight-line copies predict worse than the rolled loop
+    // they replace (measured on strwork's variable-length parse).
+    let exits = mid_exits.len() + 1;
+    let k = kmax.min(16 / exits.max(1)).max(1);
+    for &b in &chain {
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        for &i in &insts[..insts.len() - 1] {
+            let op = func.dfg.insts[i].opcode();
+            // Calls are correct to clone but never worth it: a small linear
+            // loop wrapping a call (e.g. a tail-recursion turned loop) gets
+            // k call sites for near-zero gain.
+            if op.is_terminator()
+                || op.is_branch()
+                || op.is_call()
+                || matches!(op, Opcode::TryCall | Opcode::TryCallIndirect)
+            {
+                bail!("unclonable inst");
+            }
+        }
+    }
+
+    let hparams = func.dfg.block_params(h).to_vec();
+    // The backedge call whose args re-bind h's params (do-while: the latch
+    // brif's h dest; rotated: the chain's `jump h`), plus the brif latch's
+    // exit edge for do-while loops.
+    let lt = func.layout.last_inst(latch).unwrap();
+    let bcs: Vec<BlockCall> = func.dfg.insts[lt]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .to_vec();
+    let (back_bc, lexit) = match func.dfg.insts[lt] {
+        InstructionData::Jump { .. } => (bcs[0], None),
+        InstructionData::Brif { .. } => {
+            let Some(cp) = bcs
+                .iter()
+                .position(|bc| bc.block(&func.dfg.value_lists) == h)
+            else {
+                bail!("no backedge dest")
+            };
+            (bcs[cp], Some(bcs[1 - cp]))
+        }
+        _ => bail!("bad latch"),
+    };
+    let cont_args: Vec<Value> = back_bc
+        .args(&func.dfg.value_lists)
+        .filter_map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect();
+    if cont_args.len() != hparams.len() {
+        bail!("backedge arity");
+    }
+    // Every edge arg in the chain must be a plain value.
+    for &b in &chain {
+        let t = func.layout.last_inst(b).unwrap();
+        for bc in func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            if bc
+                .args(&func.dfg.value_lists)
+                .any(|a| !matches!(a, BlockArg::Value(_)))
+            {
+                bail!("non-value edge arg");
+            }
+        }
+    }
+
+    // Affine header params: backedge arg `p + s` (`isub` counts as -s) or
+    // `p` itself (s = 0, invariant).
+    let mut steps: Vec<Option<i64>> = Vec::with_capacity(hparams.len());
+    for (j, &p) in hparams.iter().enumerate() {
+        if !func.dfg.value_type(p).is_int() {
+            steps.push(None);
+            continue;
+        }
+        let a = func.dfg.resolve_aliases(cont_args[j]);
+        if a == p {
+            steps.push(Some(0));
+            continue;
+        }
+        let s = func.dfg.value_def(a).inst().and_then(|i| {
+            match func.dfg.insts[i] {
+                InstructionData::Binary { opcode: Opcode::Iadd, args } => {
+                    for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                        if func.dfg.resolve_aliases(x) == p {
+                            return iconst(func, c);
+                        }
+                    }
+                    None
+                }
+                InstructionData::Binary { opcode: Opcode::Isub, args } => {
+                    if func.dfg.resolve_aliases(args[0]) == p {
+                        return iconst(func, args[1]).map(|c| c.wrapping_neg());
+                    }
+                    None
+                }
+                _ => None,
+            }
+        });
+        steps.push(s);
+    }
+
+    // Loop values ambiently used past an exit edge would bind wrongly from a
+    // peeled copy: same check punroll applies — every non-dominated use of a
+    // loop value reachable from an exit target disqualifies.
+    let mut lvals: FxHashSet<Value> = hparams.iter().copied().collect();
+    for &b in &chain {
+        lvals.extend(func.dfg.block_params(b).iter().copied());
+        for i in func.layout.block_insts(b) {
+            lvals.extend(func.dfg.inst_results(i).iter().copied());
+        }
+    }
+    {
+        let ambient = |func: &Function, b: Block| -> bool {
+            for i in func.layout.block_insts(b) {
+                if func
+                    .dfg
+                    .inst_values(i)
+                    .any(|v| lvals.contains(&func.dfg.resolve_aliases(v)))
+                {
+                    return true;
+                }
+                for bc in func.dfg.insts[i].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                ) {
+                    if bc.args(&func.dfg.value_lists).any(|a| {
+                        matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
+                    }) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let mut tgts: Vec<Block> = mid_exits.iter().map(|e| e.seblk).collect();
+        if let Some(ebc) = lexit {
+            tgts.push(ebc.block(&func.dfg.value_lists));
+        }
+        for tgt in tgts {
+            let mut seen: FxHashSet<Block> = FxHashSet::default();
+            let mut stack = vec![tgt];
+            while let Some(b) = stack.pop() {
+                if body.contains(&b) || !seen.insert(b) || !dt.is_reachable(b) {
+                    continue;
+                }
+                if seen.len() > 512 {
+                    bail!("exit continuation too big");
+                }
+                // Any lval operand in the exit region is unsalvageable:
+                // peeled copies branch to `tgt` directly, so a loop value
+                // could never dominate — and semantically it would bind the
+                // residual iteration, not the peeled one. Edge args are
+                // remapped at the peeled edge, so only bare uses disqualify.
+                if ambient(func, b) {
+                    bail!("body value used outside exit edges");
+                }
+                for i in func.layout.block_insts(b) {
+                    for bc in func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    ) {
+                        stack.push(bc.block(&func.dfg.value_lists));
+                    }
+                }
+            }
+        }
+    }
+
+    // `pe` takes h's params verbatim from every entry edge — it is the
+    // uniform affine base (`entry + k·s`) and gives multi-entry loops one
+    // merge point. Copy blocks take no params at all: the chain is
+    // single-pred, so each param binds eagerly from its incoming edge.
+    let pe = func.dfg.make_block();
+    for &p in &hparams {
+        let ty = func.dfg.value_type(p);
+        func.dfg.append_block_param(pe, ty);
+    }
+    func.layout.insert_block(pe, h);
+    let peps = func.dfg.block_params(pe).to_vec();
+    let cblks: Vec<Vec<Block>> = (0..k)
+        .map(|_| {
+            chain
+                .iter()
+                .map(|_| {
+                    let nb = func.dfg.make_block();
+                    func.layout.insert_block(nb, h);
+                    nb
+                })
+                .collect()
+        })
+        .collect();
+    FuncCursor::new(func).at_bottom(pe).ins().jump(cblks[0][0], &[]);
+
+    let mpos: FxHashMap<usize, usize> = mid_exits
+        .iter()
+        .enumerate()
+        .map(|(ei, e)| (e.pos, ei))
+        .collect();
+    // `nxt[j]` is the seed for h's param j at the NEXT copy — affine params
+    // get their `entry + k·s` form regardless of the carried value.
+    let mut nxt: Vec<Seed> = peps.iter().map(|&p| Seed::Val(p)).collect();
+    for kk in 0..k {
+        let mut smap: FxHashMap<Value, Seed> = FxHashMap::default();
+        for (j, &p) in hparams.iter().enumerate() {
+            let s = match steps[j] {
+                Some(s) => Seed::Aff(peps[j], kk as i64 * s),
+                None => nxt[j],
+            };
+            smap.insert(p, s);
+        }
+        // Params of mid-chain blocks, seeded from the pending edge args.
+        let mut pend: Vec<Seed> = Vec::new();
+        for (i, &b) in chain.iter().enumerate() {
+            let nb = cblks[kk][i];
+            if i > 0 {
+                for (j, &sp) in func.dfg.block_params(b).to_vec().iter().enumerate() {
+                    smap.insert(sp, pend.get(j).copied().unwrap_or(Seed::Val(sp)));
+                }
+            }
+            let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+            for &ii in &insts[..insts.len() - 1] {
+                let mut kept = false;
+                if let InstructionData::Binary { opcode, args } = func.dfg.insts[ii]
+                    && matches!(opcode, Opcode::Iadd | Opcode::Isub)
+                {
+                    let fold = match (opcode, args) {
+                        (Opcode::Iadd, [x, c]) | (Opcode::Iadd, [c, x])
+                            if iconst(func, c).is_some() =>
+                        {
+                            match seed_of(func, &smap, x) {
+                                Seed::Aff(bv, o) => Some((bv, o + iconst(func, c).unwrap())),
+                                _ => None,
+                            }
+                        }
+                        (Opcode::Isub, [x, c]) if iconst(func, c).is_some() => {
+                            match seed_of(func, &smap, x) {
+                                Seed::Aff(bv, o) => Some((bv, o - iconst(func, c).unwrap())),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((bv, o)) = fold {
+                        let r = func.dfg.resolve_aliases(func.dfg.first_result(ii));
+                        smap.insert(r, Seed::Aff(bv, o));
+                        kept = true;
+                    }
+                }
+                if kept {
+                    continue;
+                }
+                let ni = func.dfg.clone_inst(ii);
+                let srcs: Vec<Value> = func.dfg.inst_values(ni).collect();
+                let vals: Vec<Value> = srcs
+                    .iter()
+                    .map(|&v| matv(func, nb, &mut smap, v))
+                    .collect();
+                func.dfg.overwrite_inst_values(ni, vals.into_iter());
+                func.layout.append_inst(ni, nb);
+                let orig: Vec<Value> = func.dfg.inst_results(ii).to_vec();
+                let new: Vec<Value> = func.dfg.inst_results(ni).to_vec();
+                for (&o, &n) in orig.iter().zip(new.iter()) {
+                    smap.insert(func.dfg.resolve_aliases(o), Seed::Val(n));
+                }
+            }
+            let t = *insts.last().unwrap();
+            fn eargs(
+                func: &mut Function,
+                nb: Block,
+                smap: &mut FxHashMap<Value, Seed>,
+                bc: BlockCall,
+            ) -> Vec<BlockArg> {
+                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                args.iter()
+                    .map(|a| match a {
+                        BlockArg::Value(v) => BlockArg::Value(matv(func, nb, smap, *v)),
+                        a => *a,
+                    })
+                    .collect()
+            }
+            fn sargs(
+                func: &Function,
+                smap: &FxHashMap<Value, Seed>,
+                bc: BlockCall,
+            ) -> Vec<Seed> {
+                bc.args(&func.dfg.value_lists)
+                    .map(|a| match a {
+                        BlockArg::Value(v) => seed_of(func, smap, v),
+                        _ => unreachable!("peel: non-value edge arg"),
+                    })
+                    .collect()
+            }
+            match func.dfg.insts[t] {
+                InstructionData::Jump { .. } if i + 1 < chain.len() => {
+                    let bc = bcs_of(func, t)[0];
+                    pend = sargs(func, &smap, bc);
+                    FuncCursor::new(func).at_bottom(nb).ins().jump(cblks[kk][i + 1], &[]);
+                }
+                InstructionData::Jump { .. } => {
+                    // Rotated backedge `jump h`.
+                    if kk + 1 < k {
+                        nxt = sargs(func, &smap, back_bc);
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(cblks[kk + 1][0], &[]);
+                    } else {
+                        let cont = eargs(func, nb, &mut smap, back_bc);
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(h, &cont);
+                    }
+                }
+                InstructionData::Brif { arg: c, .. } if mpos.contains_key(&i) => {
+                    let e = &mid_exits[mpos[&i]];
+                    let carg = matv(func, nb, &mut smap, c);
+                    pend = sargs(func, &smap, e.cont_bc);
+                    let ex = eargs(func, nb, &mut smap, e.exit_bc);
+                    let nxtblk = cblks[kk][i + 1];
+                    let mut pos = FuncCursor::new(func).at_bottom(nb);
+                    if e.epos == 0 {
+                        pos.ins().brif(carg, e.seblk, &ex, nxtblk, &[]);
+                    } else {
+                        pos.ins().brif(carg, nxtblk, &[], e.seblk, &ex);
+                    }
+                }
+                InstructionData::Brif { arg: c, .. } => {
+                    // Do-while latch.
+                    let carg = matv(func, nb, &mut smap, c);
+                    let ebc = lexit.unwrap();
+                    let ex = eargs(func, nb, &mut smap, ebc);
+                    let (ctgt, cargs) = if kk + 1 < k {
+                        nxt = sargs(func, &smap, back_bc);
+                        (cblks[kk + 1][0], Vec::new())
+                    } else {
+                        (h, eargs(func, nb, &mut smap, back_bc))
+                    };
+                    let cpos = bcs
+                        .iter()
+                        .position(|bc| bc.block(&func.dfg.value_lists) == h)
+                        .unwrap();
+                    let eblk = ebc.block(&func.dfg.value_lists);
+                    let mut pos = FuncCursor::new(func).at_bottom(nb);
+                    if cpos == 0 {
+                        pos.ins().brif(carg, ctgt, &cargs, eblk, &ex);
+                    } else {
+                        pos.ins().brif(carg, eblk, &ex, ctgt, &cargs);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // Redirect every outside-the-body entry edge from h to pe.
+    let entries: Vec<(Block, Inst)> = cfg
+        .pred_iter(h)
+        .filter(|p| !body.contains(&p.block))
+        .map(|p| (p.block, p.inst))
+        .collect();
+    for (_pb, pi) in entries {
+        let ndest = func.dfg.insts[pi]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .len();
+        for slot in 0..ndest {
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[pi].branch_destination_mut(
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+            )[slot];
+            if bc.block(&dfg.value_lists) == h {
+                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                *bc = BlockCall::new(pe, args.iter().copied(), &mut dfg.value_lists);
+            }
+        }
+    }
+    Some(())
+}
+
+fn bcs_of(func: &Function, i: Inst) -> Vec<BlockCall> {
+    func.dfg.insts[i]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .to_vec()
 }
 
 // ---------------------------------------------------------------------------
