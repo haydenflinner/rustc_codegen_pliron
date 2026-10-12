@@ -121,6 +121,15 @@
       (if-let amt (lshl_from_imm64 ty k))
       (add_shift ty y x amt))
 
+;; Same for a logical right shift by a constant.
+(rule iadd_ushr_right 20 (lower (iadd (ty_int_ref_scalar_64_extract ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let amt (lshr_from_u64 ty k))
+      (add_shift ty x y amt))
+
+(rule iadd_ushr_left 21 (lower (iadd (ty_int_ref_scalar_64_extract ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let amt (lshr_from_u64 ty k))
+      (add_shift ty y x amt))
+
 ;; Fold an `iadd` and `imul` combination into a `madd` instruction.
 (rule iadd_imul_right 7 (lower (iadd (ty_int_ref_scalar_64_extract ty) x (imul _ y z)))
       (madd ty y z x))

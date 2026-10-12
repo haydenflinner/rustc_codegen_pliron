@@ -113,6 +113,11 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
         }
         // `icmp` yields 0/1; `a ^ b` sets no bit clear in both operands.
         InstructionData::IntCompare { .. } => hi = hi.min(1),
+        InstructionData::Unary { opcode, .. }
+            if matches!(opcode, Opcode::Clz | Opcode::Ctz | Opcode::Popcnt) =>
+        {
+            hi = hi.min(u64::from(ty.bits()));
+        }
         InstructionData::Binary {
             opcode: Opcode::Bxor,
             args,
@@ -368,10 +373,41 @@ fn bin_k(func: &Function, v: Value, op: Opcode) -> Option<(Value, i64)> {
     if opcode != op {
         return None;
     }
+    bin_k_data(func, args)
+}
+
+/// `(non_const, imm)` when the `iadd`/`isub`-shaped args hold a constant —
+/// the constant's position doesn't matter to callers.
+fn bin_k_data(func: &Function, args: [Value; 2]) -> Option<(Value, i64)> {
     let a = args.map(|a| func.dfg.resolve_aliases(a));
     iconst(func, a[1])
         .map(|k| (a[0], k))
         .or_else(|| iconst(func, a[0]).map(|k| (a[1], k)))
+}
+
+/// Number of uses of `v` as an inst arg or branch-edge arg.
+fn uses_of(func: &Function, v: Value) -> usize {
+    let mut c = 0;
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            c += func
+                .dfg
+                .inst_args(i)
+                .iter()
+                .filter(|&&a| func.dfg.resolve_aliases(a) == v)
+                .count();
+            for bc in func.dfg.insts[i].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                c += bc
+                    .args(&func.dfg.value_lists)
+                    .filter(|a| matches!(a, BlockArg::Value(x) if func.dfg.resolve_aliases(*x) == v))
+                    .count();
+            }
+        }
+    }
+    c
 }
 
 /// Whether `v` is always 0 or 1.
@@ -3751,18 +3787,265 @@ pub fn lcse(func: &mut Function) -> usize {
             _ => None,
         }
     };
+    type Seen = FxHashMap<K, Value>;
+    // In-place arg mutation (memoff reassociation, `neg`'s imul peel)
+    // changes what `d`'s result computes, but `seen` may already map its old
+    // key to it — a later identical inst would then alias to a value that no
+    // longer matches. Drop the stale entry before mutating.
+    let untrack = |func: &Function, seen: &mut Seen, d: Inst| {
+        let Some(k) = key(func, d) else { return };
+        let res = func.dfg.first_result(d);
+        if seen.get(&k) == Some(&res) {
+            seen.remove(&k);
+        }
+    };
+    // `x*1` / `x+0` / `x|0` / `x^0` / `x&-1` / `x<<0` / `x>>0` -> `x`: these
+    // survive GVN when rustc's `index*elemsize` idiom degenerates to *1.
+    let ident = |func: &Function, data: InstructionData, res_ty: Type| -> Option<Value> {
+        // `uextend (ireduce v)` == `v` when `v` provably fits the reduced
+        // width (`clz`/`ctz`/`popcnt` counts, masked values) — kills the
+        // `mov wN, wN` isel emits to re-zero the top half.
+        if let InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } = data
+        {
+            let a = func.dfg.resolve_aliases(arg);
+            if !crate::pass_enabled("PLIRON_EXTRED") {
+                return None;
+            }
+            if let Some(d) = func.dfg.value_def(a).inst()
+                && let InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    arg: x,
+                } = func.dfg.insts[d]
+            {
+                let x = func.dfg.resolve_aliases(x);
+                let w = func.dfg.value_type(func.dfg.first_result(d)).bits();
+                if func.dfg.value_type(x) == res_ty
+                    && w < 64
+                    && (vmax(func, x) >> w) == 0
+                {
+                    return Some(x);
+                }
+            }
+            return None;
+        }
+        let InstructionData::Binary { opcode, args } = data else {
+            return None;
+        };
+        let [a, b] = args.map(|v| func.dfg.resolve_aliases(v));
+        let (ka, kb) = (iconst(func, a), iconst(func, b));
+        match opcode {
+            Opcode::Imul => {
+                if ka == Some(1) {
+                    Some(b)
+                } else {
+                    (kb == Some(1)).then_some(a)
+                }
+            }
+            Opcode::Iadd | Opcode::Bor | Opcode::Bxor => {
+                if ka == Some(0) {
+                    Some(b)
+                } else {
+                    (kb == Some(0)).then_some(a)
+                }
+            }
+            Opcode::Band => {
+                if ka == Some(-1) {
+                    Some(b)
+                } else {
+                    (kb == Some(-1)).then_some(a)
+                }
+            }
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => (kb == Some(0)).then_some(a),
+            _ => None,
+        }
+    };
+    // `load/store (iadd base, K)` → `load/store base, off+K`: the
+    // constant rides the memory operand's offset field instead of
+    // costing an in-loop add (`hashbrown` slot addressing). Nested
+    // `(a + k) + x` chains: rewrite the outer add's args to
+    // `(a, x)` — in-place, so its operands still dominate it — and
+    // carry `k` into the offset too (outer add must be single-use).
+    let memoff = |func: &mut Function,
+                  v: &mut Value,
+                  off: &mut i64,
+                  seen: &mut Seen|
+     -> usize {
+        if !crate::pass_enabled("PLIRON_MEMOFF") {
+            return 0;
+        }
+        let mut depth = 0;
+        loop {
+            let a = func.dfg.resolve_aliases(*v);
+            if let Some((b, k)) = bin_k(func, a, Opcode::Iadd) {
+                match off.checked_add(k).and_then(|x| i32::try_from(x).ok()) {
+                    Some(no) => {
+                        *off = i64::from(no);
+                        *v = b;
+                        depth += 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let Some(d) = func.dfg.value_def(a).inst() else {
+                break;
+            };
+            let InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } = func.dfg.insts[d]
+            else {
+                break;
+            };
+            if !crate::pass_enabled("PLIRON_MEMOFF_NEST") {
+                break;
+            }
+            let mut inner = None;
+            for (ix, &c) in args.iter().enumerate() {
+                if let Some((b, k)) = bin_k(func, func.dfg.resolve_aliases(c), Opcode::Iadd) {
+                    inner = Some((ix, b, k));
+                    break;
+                }
+            }
+            let Some((ix, b, k)) = inner else {
+                break;
+            };
+            if uses_of(func, a) != 1 {
+                break;
+            }
+            let Some(no) = off.checked_add(k).and_then(|x| i32::try_from(x).ok()) else {
+                break;
+            };
+            *off = i64::from(no);
+            let other = args[1 - ix];
+            untrack(func, seen, d);
+            func.dfg.insts[d] =
+                InstructionData::Binary { opcode: Opcode::Iadd, args: [b, other] };
+            depth += 1;
+        }
+        depth
+    };
     let mut n = 0;
-    let mut seen: FxHashMap<K, Value> = FxHashMap::default();
+    let mut seen: Seen = FxHashMap::default();
     for b in func.layout.blocks().collect::<Vec<_>>() {
         seen.clear();
         let mut dead = Vec::new();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let data = func.dfg.insts[i];
+            match data {
+                InstructionData::Load { arg, offset, .. } => {
+                    let mut a = arg;
+                    let mut off = i64::from(offset);
+                    if memoff(func, &mut a, &mut off, &mut seen) > 0 {
+                        if let InstructionData::Load { arg, offset, .. } = &mut func.dfg.insts[i] {
+                            *arg = a;
+                            *offset = (off as i32).into();
+                        }
+                        n += 1;
+                        continue;
+                    }
+                }
+                InstructionData::Store { args, offset, .. } => {
+                    let mut a = args[1];
+                    let mut off = i64::from(offset);
+                    if memoff(func, &mut a, &mut off, &mut seen) > 0 {
+                        if let InstructionData::Store { args, offset, .. } =
+                            &mut func.dfg.insts[i]
+                        {
+                            args[1] = a;
+                            *offset = (off as i32).into();
+                        }
+                        n += 1;
+                        continue;
+                    }
+                }
+                InstructionData::Binary { opcode: Opcode::Iadd, args }
+                    if crate::pass_enabled("PLIRON_NEGFOLD") =>
+                {
+                    let ra = func.dfg.resolve_aliases(args[0]);
+                    let rb = func.dfg.resolve_aliases(args[1]);
+                    // `iadd (ineg a), b` → `isub b, a` — isel turns the
+                    // subtract into `sub b, a, lsl #s` when `a` is a shift.
+                    // `isub 0, a` is the same negation (that's what
+                    // `isub 0, x` lowers from). `(-a) * k` is `-(a * k)`, so
+                    // a single-use `imul (isub 0, a), k` operand lets the
+                    // neg ride through to `isub b, (a * k)` — an `msub`.
+                    let negdef = |func: &Function, v: Value| {
+                        let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        match func.dfg.insts[i] {
+                            InstructionData::Unary {
+                                opcode: Opcode::Ineg,
+                                arg,
+                            } => Some(func.dfg.resolve_aliases(arg)),
+                            InstructionData::Binary {
+                                opcode: Opcode::Isub,
+                                args: [z, a],
+                            } if iconst(func, func.dfg.resolve_aliases(z)) == Some(0) => {
+                                Some(func.dfg.resolve_aliases(a))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let mut neg = |v: Value, seen: &mut Seen| {
+                        if let Some(x) = negdef(func, v) {
+                            return Some(x);
+                        }
+                        // Peel a single-use `imul (neg a), y` — rewriting
+                        // the mul to `a * y` changes its value, so no other
+                        // use may observe it.
+                        let mi = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        let InstructionData::Binary {
+                            opcode: Opcode::Imul,
+                            args: margs,
+                        } = func.dfg.insts[mi]
+                        else {
+                            return None;
+                        };
+                        let (ix, inner) = margs
+                            .iter()
+                            .enumerate()
+                            .find_map(|(ix, &m)| negdef(func, m).map(|x| (ix, x)))?;
+                        if uses_of(func, func.dfg.first_result(mi)) != 1 {
+                            return None;
+                        }
+                        untrack(func, seen, mi);
+                        if let InstructionData::Binary { args, .. } =
+                            &mut func.dfg.insts[mi]
+                        {
+                            args[ix] = inner;
+                        }
+                        Some(func.dfg.first_result(mi))
+                    };
+                    let sub = if let Some(x) = neg(ra, &mut seen) {
+                        Some([rb, x])
+                    } else {
+                        neg(rb, &mut seen).map(|x| [ra, x])
+                    };
+                    if let Some(args) = sub {
+                        func.dfg.insts[i] =
+                            InstructionData::Binary { opcode: Opcode::Isub, args };
+                        n += 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
             // Single-result insts whose result isn't already an alias.
             if func.dfg.inst_results(i).len() != 1 {
                 continue;
             }
             let res = func.dfg.first_result(i);
             if func.dfg.resolve_aliases(res) != res {
+                continue;
+            }
+            if let Some(x) = ident(func, data, func.dfg.value_type(res)) {
+                func.dfg.clear_results(i);
+                func.dfg.change_to_alias(res, x);
+                dead.push(i);
+                n += 1;
                 continue;
             }
             let Some(k) = key(func, i) else { continue };

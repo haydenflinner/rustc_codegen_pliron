@@ -140,3 +140,13 @@ when `is_pic` is set (`isa/x64/inst/emit.rs`). Together with the backend marking
 direct-call `FuncRef`s colocated (`PLIRON_PLTCALL`), calls to symbols from other
 CGUs become `call rel32` (the linker resolves PLT32 directly when the definition
 is local, else through the PLT) instead of a GOT load plus `call *reg`.
+
+14. aarch64 `add`/`lsr` fusion (`src/isa/aarch64/lower.isle`): `iadd` with
+    a logical-right-shift immediate operand lowers to `add x, y, z, lsr #k`
+    (priorities 20/21, above the `iadd_imul` folds at 7 but below the
+    imm12 rules). Hashbrown's probe-index `off + (hash >> 3)` pattern.
+
+15. `PLIRON_PRECOMPILE` debug hook (`src/context.rs`): dumps each func's
+    CLIF inside `compile_stencil` after `optimize()` — the exact form
+    `compile_function`/isel consumes, unlike the backend-side `PLIRON_CLIF`
+    `final` dump which precedes `remove_constant_phis`/egraph.

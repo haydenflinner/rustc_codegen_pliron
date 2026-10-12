@@ -140,6 +140,10 @@ impl Context {
 
             self.verify_if(isa)?;
             self.optimize(isa, ctrl_plane)?;
+            // PLIRON: debug hook — dump the CLIF in its final pre-isel form.
+            if std::env::var_os("PLIRON_PRECOMPILE").is_some() {
+                eprintln!("==== clif {} precompile ====\n{}", self.func.name, self.func.display());
+            }
             result = isa.compile_function(
                 &self.func,
                 &self.domtree,

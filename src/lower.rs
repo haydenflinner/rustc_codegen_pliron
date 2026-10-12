@@ -1331,6 +1331,9 @@ pub fn lower_to_object(
         }
         break 'retry;
         }
+        if dump {
+            eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
+        }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.
