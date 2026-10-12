@@ -692,6 +692,10 @@ fn promote(
     // neighbors must all be poisoned even though the group itself is
     // non-uniform and unpromotable.
     let mut groups: FxHashMap<(Root, i64), (Type, bool, bool, i64)> = FxHashMap::default();
+    // Set when the loop contains an operand-frozen access that can't be
+    // normalized to a concrete slot: `Root::V` groups could overlap it,
+    // `Root::S` groups can't (see the `ofz` note in the scan below).
+    let mut ofz_access = false;
     for &b in &body {
         for i in func.layout.block_insts(b) {
             // `(is_store, ty, width, addr)`: extending loads (`uload8` etc.)
@@ -750,22 +754,25 @@ fn promote(
             let (r, o) = loadfwd::norm_root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
             if !iso_l.contains(&r) {
-                // An operand-frozen root is its own name only inside its
-                // region, and each iteration enters the region afresh: its
-                // reads must see the previous iteration's stores, which
-                // promotion would hold back in a register until the exit.
-                // (aho-corasick's `ByteClassElements::next` re-read a stale
-                // cursor and looped forever.)
+                // An operand-frozen access is never a candidate: the scope
+                // is re-entered each iteration, so its reads must see the
+                // previous iteration's stores, which promotion would hold
+                // back in a register until the exit (aho-corasick's
+                // `ByteClassElements::next` re-read a stale cursor and
+                // looped forever). `noalias` also makes the pointee
+                // exclusive during the region, so it cannot alias a
+                // `Root::S` group — but it may shadow an opaque `V` loc, so
+                // this loop promotes only S-keyed groups once one appears.
                 if let Root::V(v) = r
                     && ofz.contains_key(&v)
                 {
                     if debug {
                         eprintln!(
-                            "licm: no promotion in {h}: operand-frozen access {}",
+                            "licm: operand-frozen access {} in {h} — V-keyed promotion off",
                             func.dfg.display_inst(i)
                         );
                     }
-                    return 0;
+                    ofz_access = true;
                 }
                 continue;
             }
@@ -791,6 +798,11 @@ fn promote(
     }
     for ((r, o), (ty, has_store, uniform, _)) in ks {
         if !uniform || !has_store || bad.contains(&r) || n >= MAX_MOVES {
+            continue;
+        }
+        // An unresolved operand-frozen access may shadow a `V` loc;
+        // stack slots are provably disjoint from the scope's pointee.
+        if ofz_access && matches!(r, Root::V(_)) {
             continue;
         }
         if !ty.is_int() && !ty.is_float() {
