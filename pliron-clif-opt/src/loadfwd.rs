@@ -235,14 +235,29 @@ pub fn norm_root(
     na: &FxHashSet<Value>,
     v: Value,
 ) -> (Root, i64) {
+    root_pair(func, ps, na, v).1
+}
+
+/// `root` plus its `norm_root` normalization in one peel: `((raw, off),
+/// (norm, off))`. The raw root keeps the scope name (`ofz` bounds are
+/// measured from the operand); the normalized root names the concrete
+/// object — locs keyed by it unify scoped and direct accesses of one
+/// slot, and stores to other slots are disjoint without `iso`.
+pub fn root_pair(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    v: Value,
+) -> ((Root, i64), (Root, i64)) {
     let (r, o) = root(func, ps, na, v);
-    match r {
+    let n = match r {
         Root::V(rv) => match concrete(func, ps, rv) {
             (Root::S(ss), so) => (Root::S(ss), o.wrapping_add(so)),
             _ => (r, o),
         },
         _ => (r, o),
-    }
+    };
+    ((r, o), n)
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
@@ -442,8 +457,8 @@ fn sel_split(
     else {
         return None;
     };
-    let (ra, oa) = root(func, ps, na, args[1]);
-    let (rb, ob) = root(func, ps, na, args[2]);
+    let (ra, oa) = norm_root(func, ps, na, args[1]);
+    let (rb, ob) = norm_root(func, ps, na, args[2]);
     let t = *av.get(&(ra, oa.wrapping_add(off), ty))?;
     let e = *av.get(&(rb, ob.wrapping_add(off), ty))?;
     Some(Fwd::Sel {
@@ -483,8 +498,12 @@ fn transfer(
             } if notrap(func, i) => {
                 let res = func.dfg.first_result(i);
                 let ty = func.dfg.value_type(res);
-                let (r, o) = root(func, ps, na, arg);
+                // Loc keys use the normalized root — `ofz` bookkeeping
+                // keeps the scope-named one, since its byte bound is
+                // measured from the operand, not the slot.
+                let ((r0, o0), (r, o)) = root_pair(func, ps, na, arg);
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
+                let off0 = o0.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
                 if crate::env_set("PLIRON_LFDEBUG") {
                     eprintln!(
@@ -502,12 +521,12 @@ fn transfer(
                 // inside the region, stores can't clobber locs rooted at
                 // the operand (`region_frozen_op`). The bytes bound keeps
                 // `pivot + 8` from claiming `pivot`'s frozen slot.
-                if let Root::V(rv) = r
+                if let Root::V(rv) = r0
                     && let Some(rs) = ofz.get(&rv)
                 {
                     for &(bytes, reg) in rs {
-                        if off >= 0
-                            && off + i64::from(ty.bytes()) <= bytes as i64
+                        if off0 >= 0
+                            && off0 + i64::from(ty.bytes()) <= bytes as i64
                             && cur.is_some_and(|cur| in_region(cur, reg, rpar))
                         {
                             invreg.entry(loc).or_default().push(reg);
@@ -536,7 +555,7 @@ fn transfer(
             } if notrap(func, i) => {
                 let val = func.dfg.resolve_aliases(args[0]);
                 let ty = func.dfg.value_type(val);
-                let (r, o) = root(func, ps, na, args[1]);
+                let (r, o) = norm_root(func, ps, na, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
                 kill(av, r, o, ty, iso, invs, cur, invreg, rpar);
                 // A store through `select c, pa, pb` may write either
@@ -550,7 +569,7 @@ fn transfer(
                     } = func.dfg.insts[si]
                 {
                     for &a in &sargs[1..] {
-                        let (ra, oa) = root(func, ps, na, a);
+                        let (ra, oa) = norm_root(func, ps, na, a);
                         kill(av, ra, oa.wrapping_add(o), ty, iso, invs, cur, invreg, rpar);
                     }
                 }
@@ -1056,7 +1075,7 @@ fn pre(
                 } if notrap(func, i) => {
                     let res = func.dfg.first_result(i);
                     let ty = func.dfg.value_type(res);
-                    let (r, o) = root(func, ps, na, arg);
+                    let (r, o) = norm_root(func, ps, na, arg);
                     let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                     if let Some(&s) = st.get(&loc) {
                         let v = match s {
@@ -1084,7 +1103,7 @@ fn pre(
                 } if notrap(func, i) => {
                     let val = func.dfg.resolve_aliases(args[0]);
                     let ty = func.dfg.value_type(val);
-                    let (r, o) = root(func, ps, na, args[1]);
+                    let (r, o) = norm_root(func, ps, na, args[1]);
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
                     kill_st(&mut st, r, o, ty, &iso);
                     writes.push((r, o, ty));
@@ -1100,7 +1119,7 @@ fn pre(
                         } = func.dfg.insts[si]
                     {
                         for &a in &sargs[1..] {
-                            let (ra, oa) = root(func, ps, na, a);
+                            let (ra, oa) = norm_root(func, ps, na, a);
                             let a = (ra, oa.wrapping_add(o), ty);
                             kill_st(&mut st, a.0, a.1, a.2, &iso);
                             writes.push(a);
