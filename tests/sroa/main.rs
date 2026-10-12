@@ -107,6 +107,54 @@ fn arr_elem(x: u64) -> u64 {
     a.iter().sum()
 }
 
+// sret2reg removes the sret pointer from a call's operand list;
+// `CallInfo::arg_extent`/`nocap` were indexed by the old positions, so a
+// by-value arg looked up the *previous* operand's extent. Here `big`'s pin
+// read `x`'s (16,8) instead of its own (24,8): the `c` slice promoted out
+// of the pinned copy and `rd` observed garbage in `big.c`.
+#[repr(C)]
+struct Big {
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+#[repr(C)]
+struct Ret {
+    x: u64,
+    y: u64,
+    z: u64,
+}
+
+#[inline(never)]
+fn rd(x: &[u64; 2], big: Big) -> Ret {
+    // Passing `&big` onward keeps it non-copyable, so the arg stays a Pin
+    // rather than an Escape.
+    keep_ptr(&big);
+    Ret {
+        x: x[0].wrapping_add(big.a),
+        y: big.b,
+        z: big.c,
+    }
+}
+
+#[inline(never)]
+fn keep_ptr(p: &Big) {
+    SAVED.store(p as *const Big as usize, Ordering::SeqCst);
+}
+
+#[inline(never)]
+fn sret_caller(x: u64) -> u64 {
+    let arr = [x, 9];
+    let big = Big {
+        a: 1,
+        b: 2,
+        c: 0xDEAD,
+    };
+    let r = rd(&arr, big);
+    r.x.wrapping_add(r.y).wrapping_add(r.z)
+}
+
 fn main() {
     // caller: r.a=x, r.b=0xBEEF, r.c=9 (via SAVED), r.d=4, inner={5,0xF00D},
     // tag=7. total = x + 0xBEEF + 9 + 4 + 5 + 0xF00D; result adds x + 7.
@@ -121,6 +169,10 @@ fn main() {
     // arr_elem: a[2] becomes 77 via the retained pointer.
     let x = black_box(5);
     assert_eq!(arr_elem(x), x + 1 + 77 + 3 + 4);
+
+    // sret_caller: r.x = x + 1, r.y = 2, r.z = 0xDEAD.
+    let x = black_box(7);
+    assert_eq!(sret_caller(x), (x + 1).wrapping_add(2).wrapping_add(0xDEAD));
 
     println!("sroa-pin ok");
 }
