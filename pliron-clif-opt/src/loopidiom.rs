@@ -181,9 +181,17 @@ pub fn gather(
     la: &LoopAnalysis,
     lp: Loop,
 ) -> Option<Info> {
+    macro_rules! gwhy {
+        ($($t:tt)*) => {{
+            if crate::env_set("PLIRON_GATHER_DEBUG") {
+                eprintln!("gather bail {:?}: {}", lp, format_args!($($t)*));
+            }
+            return None;
+        }};
+    }
     let h = la.loop_header(lp);
     if !dt.is_reachable(h) {
-        return None;
+        gwhy!("unreachable");
     }
     let body: FxHashSet<Block> = func
         .layout
@@ -192,9 +200,9 @@ pub fn gather(
         .collect();
     // Innermost only: nested loops confuse the count analysis.
     if body.iter().any(|&b| la.innermost_loop(b) != Some(lp)) {
-        return None;
+        gwhy!("not innermost");
     }
-    let mut entry: Option<Edge> = None;
+    let mut entries: Vec<Edge> = Vec::new();
     let mut latches = Vec::new();
     for p in cfg.pred_iter(h) {
         for (slot, bc) in func.dfg.insts[p.inst]
@@ -208,20 +216,21 @@ pub fn gather(
             let e = Edge { inst: p.inst, slot };
             if la.is_in_loop(p.block, lp) {
                 latches.push(e);
-            } else if entry.is_none() {
-                entry = Some(e);
             } else {
-                return None;
+                entries.push(e);
             }
         }
     }
-    let entry = entry?;
+    if entries.len() != 1 {
+        gwhy!("{} entry edges", entries.len());
+    }
+    let entry = entries[0];
     if latches.is_empty() {
-        return None;
+        gwhy!("no latches");
     }
     let mut exits = Vec::new();
     for &b in &body {
-        let t = func.layout.last_inst(b)?;
+        let t = func.layout.last_inst(b).expect("loop block");
         for (slot, bc) in func.dfg.insts[t]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             .iter()
@@ -233,11 +242,11 @@ pub fn gather(
         }
     }
     if exits.is_empty() {
-        return None;
+        gwhy!("no exits");
     }
     let entry_args = edge_args(func, entry);
     if entry_args.len() != func.dfg.block_params(h).len() {
-        return None;
+        gwhy!("entry args len");
     }
     Some(Info {
         h,
