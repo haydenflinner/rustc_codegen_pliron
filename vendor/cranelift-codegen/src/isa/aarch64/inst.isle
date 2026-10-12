@@ -2342,6 +2342,10 @@
 (decl pure partial ashr_from_u64 (Type u64) ShiftOpAndAmt)
 (extern constructor ashr_from_u64 ashr_from_u64)
 
+;; PLIRON: ROR operand for the logical (shifted register) fold.
+(decl pure partial rotr_from_u64 (Type u64) ShiftOpAndAmt)
+(extern constructor rotr_from_u64 rotr_from_u64)
+
 (spec (integral_ty ty)
       (provide (= result ty))
       (match (or

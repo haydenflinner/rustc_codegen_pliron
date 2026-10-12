@@ -650,12 +650,15 @@ pub fn run(
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                             .contains(&b)
                         {
-                            // `PLIRON_INLINE_LOOP` = bonus in limit/4 units
-                            // (default 2 = limit/2, the historical bonus).
+                            // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
+                            // A callsite in a loop pays the call+prologue cost
+                            // every iteration, so a fatter callee is worth it
+                            // (hashbrown's `hash_one`: SipHash inlined into the
+                            // probe loop wins ~30% on `HashMap::get`).
                             let lb: usize = std::env::var("PLIRON_INLINE_LOOP")
                                 .ok()
                                 .and_then(|s| s.parse().ok())
-                                .unwrap_or(2);
+                                .unwrap_or(8);
                             t = t.saturating_add(limit * lb / 4);
                         }
                         t = t.min(limit.saturating_mul(MAX_T));

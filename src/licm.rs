@@ -381,7 +381,10 @@ fn run_loop(
     let mut ph_inst: Option<Inst> = None; // nb's jump terminator
 
     // Constants are pure and rematerializable; leaving one in the body pins
-    // its dependents there via the `inv` operand check below.
+    // its dependents there via the `inv` operand check below. They hoist
+    // unconditionally (no `MAX_MOVES` share): an order-dependent cap left a
+    // loop's real constants (e.g. SipHash's four magics) unhoisted behind
+    // 96 junk iconsts.
     let consts: Vec<Inst> = body
         .iter()
         .flat_map(|&b| func.layout.block_insts(b))
@@ -392,10 +395,8 @@ fn run_loop(
             )
         })
         .collect();
+    let mut cn = 0;
     for i in consts {
-        if n >= MAX_MOVES {
-            break;
-        }
         if anchor.is_none() && ph_inst.is_none() {
             // No plain-jump entry edge to hoist to; `try_call`
             // edges can't take a normal trampoline.
@@ -409,7 +410,7 @@ fn run_loop(
         }
         func.layout.remove_inst(i);
         func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
-        n += 1;
+        cn += 1;
     }
 
     // Two rounds: results of moved instructions are themselves outside the
@@ -474,7 +475,7 @@ fn run_loop(
     if stores.len() == 1 {
         let s = stores[0];
         let InstructionData::Store { args, offset, .. } = func.dfg.insts[s] else {
-            return n;
+            return n + cn;
         };
         let (val, addr) = (func.dfg.resolve_aliases(args[0]), args[1]);
         let store_ty = func.dfg.value_type(val);
@@ -581,9 +582,9 @@ fn run_loop(
         }
     }
     if std::env::var_os("PLIRON_LICM_PROMOTE").is_some_and(|v| v == "0") {
-        return n;
+        return n + cn;
     }
-    n + promote(func, ps, na, cfg, dt, la, lp, iso, deref, debug)
+    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, deref, debug)
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the

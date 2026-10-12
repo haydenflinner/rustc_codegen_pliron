@@ -35,6 +35,15 @@ once proven out on the stage2 benchmark, then drop this copy.
    the ISLE overlap checker can prove them disjoint from each other and from
    the scalar `madd`/`dot` folds; `iadd(imul, imul)` matches only the first,
    leaving the second product as the accumulator operand.
+7. aarch64 logical-op shifted-operand fusion: `lower.isle` rules folding
+   `band`/`bxor` of i32/i64 with an `ishl`/`ushr`/`sshr`/`rotr`/`rotl`
+   immediate operand into `and`/`eor` with a shifted register operand
+   (`eor x, y, z, ror #k`, as LLVM emits for SipHash rounds). New
+   `rotr_from_u64` extern in `lower/isle.rs` + decl in `inst.isle`.
+   `rotl x, k` lowers as `ror x, bits-k`. `bor` deliberately skipped: ten
+   priorities can't fit below `extr_32_or_64`'s 5 without shadowing it.
+   ROR is only valid in the logical (shifted register) encoding — never
+   extend this to `iadd`/`isub` (their shifted-register form has no ROR).
 6. aarch64 `smlal`/`umlal` widening MAC: new `VecRRRLongModOp::{Smlal8,16,32}`
    variants (`umlal` already existed for 8/16/32), helpers, and `lower.isle`
    rules folding `iadd(acc, iadd(imul(widen_lo a, widen_lo b),
