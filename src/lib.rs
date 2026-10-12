@@ -30,7 +30,6 @@ mod eh;
 mod hot;
 mod intrinsic;
 mod lower;
-mod nounwind;
 mod objmerge;
 mod simd;
 mod type_of;
@@ -43,7 +42,7 @@ mod xcgu;
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
     address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
-    nowrite, phisimp, retarg, spec, sroa,
+    nounwind, nowrite, phisimp, retarg, spec, sroa,
 };
 
 use std::any::Any;

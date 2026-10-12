@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa inlinecm retattr loopalign commute xpack loopvec proc_macro wasm
+#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm
 #   (sysroot/mold still need their flags)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -197,6 +197,32 @@ t_inlinecm() {
       $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
 }
 
+t_facts() {
+  # Bottom-up summaries: the facts PLIRON_FACTS prints for tests/facts must
+  # match the expectations in its comments, and the program must still run.
+  PLIRON_NOUNWIND=1 PLIRON_FACTS=fx_ rustc $BE --edition 2021 -O -C codegen-units=1 tests/facts/main.rs -o $out/facts$exe 2> $out/facts.txt && $out/facts$exe
+  sed -E 's/_RNvCs[A-Za-z0-9]+_4main[0-9]+//' $out/facts.txt > $out/facts.got
+  local bad=0
+  while read -r want; do
+    grep -qxF "$want" $out/facts.got || { echo "facts: missing '$want'" >&2; bad=1; }
+  done <<'EOF'
+nocapture fx_stash: [1]
+nocapture fx_launder: []
+nocapture fx_poke: [0, 1]
+nocapture fx_copy: [0, 1]
+nocapture fx_sum: [0]
+nocapture fx_second: [0]
+nowrite fx_stash: None
+nowrite fx_sum: Some(true)
+nowrite fx_depth: Some(true)
+nnret fx_second: true
+nnret fx_maybe: false
+retarg fx_second: Some(1)
+nounwind fx_depth: true
+EOF
+  return $bad
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -338,6 +364,7 @@ want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
 want retattr && t_retattr
+want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
 want xpack && t_xpack

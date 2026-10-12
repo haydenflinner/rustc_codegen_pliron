@@ -11,118 +11,93 @@
 //! keep a function out of it. Foreign, bodiless and preemptible functions are
 //! never inferred.
 
-use cranelift_module::Linkage;
 use pliron::builtin::op_interfaces::CallOpInterface;
-use pliron::context::{Context, Ptr};
+use pliron::context::Context;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
 use rustc_hash::FxHashMap;
 
-use crate::has_body;
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
+use crate::{Syms, bodied, has_body};
 
-/// `f`'s values mapped to the parameter index they provably equal: the
-/// params themselves, results of calls to `returned(k)` callees passing a
-/// mapped value at k, and selects whose arms agree. Grows to a fixpoint
-/// (op order isn't def-first across blocks).
-fn param_map(
-    ctx: &Context,
-    st: &State,
-    f: Ptr<Operation>,
-    ra: &FxHashMap<String, u32>,
-) -> FxHashMap<Value, u32> {
-    let bs = blocks(ctx, f);
-    let mut m: FxHashMap<Value, u32> = FxHashMap::default();
-    for (i, a) in bs[0].deref(ctx).arguments().enumerate() {
-        m.insert(a, i as u32);
-    }
-    loop {
-        let mut changed = false;
-        for &b in &bs {
-            for op in ops(ctx, b) {
-                let add = if Operation::is_op::<CallOp>(op, ctx)
-                    && let Some(&k) = direct_callee(ctx, st, op).and_then(|c| ra.get(c))
-                {
-                    let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
-                    call.args(ctx)
-                        .get(k as usize)
-                        .and_then(|a| m.get(a))
-                        .copied()
-                } else if Operation::is_op::<SelectOp>(op, ctx) {
-                    let d = op.deref(ctx);
-                    match (m.get(&d.get_operand(1)), m.get(&d.get_operand(2))) {
-                        (Some(&a), Some(&b)) if a == b => Some(a),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some(i) = add
-                    && let Some(r) = op.deref(ctx).results().next()
-                    && m.get(&r) != Some(&i)
-                {
-                    m.insert(r, i);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return m;
-        }
-    }
-}
+ascent::ascent! {
+    struct Returned;
+    /// Entry param `i` is `v`.
+    relation param(Value, u32);
+    /// `r` is the result of a direct call to `c` whose argument `j` is `a`.
+    relation call(u32, Value, u32, Value);
+    /// `r` selects between `a` and `b`.
+    relation select(Value, Value, Value);
+    /// The `i`-th `ret` of `f` returns `v`; `f` has `n` `ret`s.
+    relation ret(u32, u32, Value);
+    relation nrets(u32, u32);
 
-/// `Some(k)` when every `ret` in `f` returns the value mapped to param `k`
-/// under table `ra`. `None` covers both "not provable yet" and a genuine
-/// conflict — either way the function stays out of the table.
-fn ret_idx(
-    ctx: &Context,
-    st: &State,
-    f: Ptr<Operation>,
-    ra: &FxHashMap<String, u32>,
-) -> Option<u32> {
-    let m = param_map(ctx, st, f, ra);
-    let mut acc = None;
-    for b in blocks(ctx, f) {
-        for op in ops(ctx, b) {
-            let Some(r) = Operation::get_op::<ReturnOp>(op, ctx) else {
-                continue;
-            };
-            let k = *m.get(&r.retval(ctx)?)?;
-            if acc.is_some_and(|a| a != k) {
-                return None;
-            }
-            acc = Some(k);
-        }
-    }
-    acc
+    /// `v` provably equals param `k` of its function.
+    relation is(Value, u32);
+    is(v, i) <-- param(v, i);
+    is(r, k) <-- call(c, r, j, a), returned(c, j), is(a, k);
+    is(r, k) <-- select(r, a, b), is(a, k), is(b, k);
+
+    /// `f`'s `ret`s up to the `i`-th all return param `k`.
+    relation upto(u32, u32, u32);
+    upto(f, 0, k) <-- ret(f, 0, v), is(v, k);
+    upto(f, i + 1, k) <-- upto(f, i, k), ret(f, i + 1, v), is(v, k);
+
+    /// Every `ret` of `f` returns its param `k`.
+    relation returned(u32, u32);
+    returned(f, k) <-- nrets(f, n), upto(f, n - 1, k);
 }
 
 pub fn run(ctx: &Context, st: &State) {
-    let bodied: Vec<String> = st
-        .funcs
+    let bodied = bodied(ctx, st);
+    let mut ids = Syms::default();
+    let mut p = Returned::default();
+    for s in &bodied {
+        let f = ids.id(s);
+        let bs = blocks(ctx, st.funcs[s].op);
+        for (i, a) in bs[0].deref(ctx).arguments().enumerate() {
+            p.param.push((a, i as u32));
+        }
+        let mut n = 0;
+        for b in bs {
+            for op in ops(ctx, b) {
+                let d = op.deref(ctx);
+                if let Some(r) = Operation::get_op::<ReturnOp>(op, ctx) {
+                    // A valueless `ret` breaks the chain.
+                    if let Some(v) = r.retval(ctx) {
+                        p.ret.push((f, n, v));
+                    }
+                    n += 1;
+                } else if Operation::is_op::<SelectOp>(op, ctx) {
+                    p.select
+                        .push((d.get_result(0), d.get_operand(1), d.get_operand(2)));
+                } else if Operation::is_op::<CallOp>(op, ctx)
+                    && let Some(r) = d.results().next()
+                    && let Some(c) = direct_callee(ctx, st, op)
+                {
+                    let c = ids.id(c);
+                    let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
+                    for (j, a) in args.into_iter().enumerate() {
+                        p.call.push((c, r, j as u32, a));
+                    }
+                }
+            }
+        }
+        if n > 0 {
+            p.nrets.push((f, n));
+        }
+    }
+    p.run();
+    let by_id: FxHashMap<u32, u32> = p.returned.iter().copied().collect();
+    let ra: FxHashMap<String, u32> = bodied
         .iter()
-        .filter(|(_, f)| f.linkage != Linkage::Preemptible && has_body(ctx, f.op))
-        .map(|(s, _)| s.clone())
+        .filter_map(|s| by_id.get(&ids.id(s)).map(|&k| (s.clone(), k)))
         .collect();
-    let mut ra: FxHashMap<String, u32> = FxHashMap::default();
-    loop {
-        let mut changed = false;
-        for s in &bodied {
-            if ra.contains_key(s) {
-                continue;
-            }
-            if let Some(k) = ret_idx(ctx, st, st.funcs[s].op, &ra) {
-                ra.insert(s.clone(), k);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
+    for s in &bodied {
+        crate::dump_fact("retarg", s, &ra.get(s));
     }
     // Consume: a `returned(k)` call's result is the k-th operand.
     let mut folded = 0usize;

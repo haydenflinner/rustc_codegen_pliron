@@ -41,3 +41,38 @@ pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
         .get_entry_block(ctx)
         .is_some()
 }
+
+/// Functions the bottom-up analyses infer facts for: bodied and not
+/// preemptible (an interposed definition could do anything).
+pub fn bodied(ctx: &Context, st: &State) -> Vec<String> {
+    st.funcs
+        .iter()
+        .filter(|(_, f)| f.linkage != cranelift_module::Linkage::Preemptible && has_body(ctx, f.op))
+        .map(|(s, _)| s.clone())
+        .collect()
+}
+
+/// Symbol interner: Datalog relations hold `u32` function ids, not strings.
+#[derive(Default)]
+pub struct Syms(rustc_hash::FxHashMap<String, u32>);
+
+impl Syms {
+    pub fn id(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.0.get(s) {
+            return i;
+        }
+        let i = self.0.len() as u32;
+        self.0.insert(s.to_string(), i);
+        i
+    }
+}
+
+/// `PLIRON_FACTS=<substr>`: print what a bottom-up analysis inferred for
+/// each function whose symbol contains the substring.
+pub fn dump_fact(analysis: &str, sym: &str, fact: &dyn std::fmt::Debug) {
+    if let Some(f) = crate::env_get("PLIRON_FACTS")
+        && sym.contains(f)
+    {
+        eprintln!("{analysis} {sym}: {fact:?}");
+    }
+}
