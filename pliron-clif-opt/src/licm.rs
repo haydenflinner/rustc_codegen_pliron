@@ -631,7 +631,7 @@ fn run_loop(
     }
     cn + n
         + promote(
-            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, ofz, debug,
+            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, nw, ofz, debug,
         )
 }
 
@@ -650,6 +650,7 @@ fn promote(
     iso: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    nw: &FxHashMap<FuncRef, bool>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     debug: bool,
 ) -> usize {
@@ -852,6 +853,8 @@ fn promote(
             h,
             (r, o, ty),
             off,
+            iso_l,
+            nw,
             debug,
         );
     }
@@ -874,6 +877,8 @@ fn promote_loc(
     h: Block,
     loc: Loc,
     off: i32,
+    iso: &FxHashSet<Root>,
+    nw: &FxHashMap<FuncRef, bool>,
     debug: bool,
 ) -> usize {
     let ty = loc.2;
@@ -1073,10 +1078,42 @@ fn promote_loc(
         }
     }
 
-    // `v0` = preheader load of `loc`, on the entry edge: before `pinst`
-    // when it is a plain jump, else on a fresh edge block whose jump is
-    // patched into `h`'s in-edges.
-    let v0: Value = if matches!(func.dfg.insts[pinst], InstructionData::Jump { .. }) {
+    // A store of `loc` that still reaches the entry edge supplies the
+    // seed directly: `v0 = load loc` would just read it back. Forwarding
+    // keeps the version param congruent with an existing param carrying
+    // the same local — an `iconst` init and the reload are equal at
+    // runtime but not `phi_cong`, so without this `phimerge` leaves two
+    // copies and regalloc pays a per-iteration spill on one.
+    let mut seed: Option<Value> = None;
+    for i in func.layout.block_insts(pb) {
+        if i == pinst {
+            break;
+        }
+        match func.dfg.insts[i] {
+            InstructionData::Store {
+                opcode: Opcode::Store,
+                args,
+                offset,
+                ..
+            } if func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty && {
+                let (r, o) = loadfwd::norm_root(func, ps, na, args[1]);
+                (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
+            } =>
+            {
+                seed = Some(func.dfg.resolve_aliases(args[0]));
+            }
+            _ if clobbers(func, ps, na, i, loc, iso, nw) => seed = None,
+            _ => {}
+        }
+    }
+
+    // `v0` = preheader value of `loc`, on the entry edge: the forwarded
+    // store's value, else a load before `pinst` when it is a plain jump,
+    // else on a fresh edge block whose jump is patched into `h`'s
+    // in-edges.
+    let v0: Value = if let Some(v) = seed {
+        v
+    } else if matches!(func.dfg.insts[pinst], InstructionData::Jump { .. }) {
         let a = match loc.0 {
             Root::V(v) => v,
             Root::S(ss) => FuncCursor::new(func)
