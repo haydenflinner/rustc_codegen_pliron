@@ -1209,6 +1209,41 @@ pub fn lower_to_object(
                 panic!("dse2 broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Lane-by-lane constant stores into a stack slot that whole-vector
+        // loads read back (rustc's `Simd` const materialization, e.g.
+        // hashbrown's `u8x8` special-byte checks in `reserve_rehash`) fold
+        // to `iconst`+`bitcast`, and the lane stores go dead.
+        if crate::pass_enabled("PLIRON_VECSLOT") && crate::bisect("vecslot") {
+            let k = crate::clifpeep::vecslot(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("vecslot {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after vecslot ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("vecslot broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Late value numbering: the edge transforms and vecslot leave
+        // identical insts in one block; also drives the mem-offset and
+        // neg folds on late-introduced addressing.
+        if crate::pass_enabled("PLIRON_LCSE") && crate::bisect("lcse") {
+            let k = crate::clifpeep::lcse(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("lcse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after lcse ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("lcse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // `uextend.i64 (load.i32)` -> `uload32.i64` + `ireduce.i32`: x64
         // emits movl either way, but dropping the extension vreg frees
         // regalloc from coalescing it (a stray `movq` showed up in

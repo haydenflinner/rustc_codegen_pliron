@@ -4222,6 +4222,317 @@ pub fn selfarg(func: &mut Function) -> usize {
     n
 }
 
+/// MIR materializes `Simd` constants lane-by-lane — `stack_addr`, a row of
+/// `store.i8 k` at consecutive offsets, then a whole-vector `load` back.
+/// That's ten instructions per loop iteration to build a constant
+/// (hashbrown's `u8x8` special-byte checks in `reserve_rehash`). When every
+/// byte a slot load reads is covered by constant stores that dominate it —
+/// and the slot's address never escapes those accesses — the load becomes
+/// `iconst` (`+bitcast` for vectors/floats); when all of the slot's loads
+/// fold, the lane stores go dead and are dropped.
+pub fn vecslot(func: &mut Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    use cranelift_codegen::ir::StackSlot;
+
+    #[derive(Default)]
+    struct Slot {
+        // byte offset -> (byte value, covering store inst)
+        bytes: FxHashMap<i64, (u8, Inst)>,
+        stores: Vec<Inst>,
+        loads: Vec<(Inst, i64, usize)>,
+        bad: bool,
+    }
+
+    // value -> insts using it as an operand; values on an edge disqualify
+    // their slot (address escapes into a param).
+    let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+    let mut edgevals: Vec<Value> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                uses.entry(func.dfg.resolve_aliases(a)).or_default().push(i);
+            }
+            for bc in func.dfg.insts[i].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        edgevals.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // value -> (slot, byte offset) for `stack_addr` and `iadd` chains off
+    // it. Results may be defined in a later-laid-out block, so propagate to
+    // a fixpoint.
+    let mut slotval: FxHashMap<Value, (StackSlot, i64)> = FxHashMap::default();
+    for _ in 0..8 {
+        let mut grew = false;
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i] {
+                    InstructionData::StackAddr {
+                        stack_slot, offset, ..
+                    } => {
+                        for &r in func.dfg.inst_results(i) {
+                            grew |= slotval
+                                .insert(r, (stack_slot, offset.into()))
+                                .is_none();
+                        }
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        args,
+                    } => {
+                        let r = func.dfg.first_result(i);
+                        for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
+                            if let Some(&(ss, o)) = slotval.get(&func.dfg.resolve_aliases(a))
+                                && let Some(k) = iconst(func, b)
+                                && slotval.insert(r, (ss, o + k)).is_none()
+                            {
+                                grew = true;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut slots: FxHashMap<StackSlot, Slot> = FxHashMap::default();
+    for v in edgevals {
+        if let Some(&(ss, _)) = slotval.get(&func.dfg.resolve_aliases(v)) {
+            slots.entry(ss).or_default().bad = true;
+        }
+    }
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            match func.dfg.insts[i] {
+                InstructionData::Store {
+                    opcode,
+                    args,
+                    offset,
+                    ..
+                } => {
+                    let p = func.dfg.resolve_aliases(args[1]);
+                    let Some(&(ss, o)) = slotval.get(&p) else {
+                        continue;
+                    };
+                    let off = o + i64::from(offset);
+                    let (n, k) = match opcode {
+                        Opcode::Store => {
+                            let t = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
+                            let k = iconst(func, args[0]);
+                            (t.bytes() as usize, k.map(|x| x as u64 as u128))
+                        }
+                        Opcode::Istore8 => {
+                            (1, iconst(func, args[0]).map(|x| x as u64 as u128))
+                        }
+                        _ => (0, None),
+                    };
+                    let s = slots.entry(ss).or_default();
+                    match (n, k) {
+                        (1..=16, Some(k)) if s.bytes.len() < 65536 => {
+                            s.stores.push(i);
+                            for j in 0..n as i64 {
+                                let byte = (k >> (j * 8)) as u8;
+                                if s.bytes.insert(off + j, (byte, i)).is_some() {
+                                    s.bad = true;
+                                }
+                            }
+                        }
+                        _ => s.bad = true,
+                    }
+                }
+                InstructionData::Load { arg, offset, .. } => {
+                    let p = func.dfg.resolve_aliases(arg);
+                    let Some(&(ss, o)) = slotval.get(&p) else {
+                        continue;
+                    };
+                    let n = func.dfg.value_type(func.dfg.first_result(i)).bytes() as usize;
+                    slots
+                        .entry(ss)
+                        .or_default()
+                        .loads
+                        .push((i, o + i64::from(offset), n));
+                }
+                InstructionData::LoadNoOffset { arg, .. } => {
+                    let p = func.dfg.resolve_aliases(arg);
+                    let Some(&(ss, o)) = slotval.get(&p) else {
+                        continue;
+                    };
+                    let n = func.dfg.value_type(func.dfg.first_result(i)).bytes() as usize;
+                    slots.entry(ss).or_default().loads.push((i, o, n));
+                }
+                _ => {
+                    // A non-load/store inst consuming a slot-rooted value:
+                    // the address escapes (unless it's an addr-chain iadd).
+                    for &a in func.dfg.inst_args(i) {
+                        let a = func.dfg.resolve_aliases(a);
+                        if let Some(&(ss, _)) = slotval.get(&a) {
+                            let chain = func.dfg.inst_results(i).iter().any(|&r| {
+                                slotval.contains_key(&func.dfg.resolve_aliases(r))
+                            });
+                            if !chain {
+                                slots.entry(ss).or_default().bad = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A `load`/`store` that uses a slot-rooted value as anything but its
+    // address operand also escapes it (e.g. `store ss_addr, p`).
+    for (v, &(ss, _)) in &slotval {
+        for &u in uses.get(v).into_iter().flatten() {
+            let escaped = match func.dfg.insts[u] {
+                InstructionData::Load { arg, .. }
+                | InstructionData::LoadNoOffset { arg, .. } => {
+                    func.dfg.resolve_aliases(arg) != *v
+                }
+                InstructionData::Store { args, .. } => func.dfg.resolve_aliases(args[1]) != *v,
+                _ => false,
+            };
+            if escaped {
+                slots.entry(ss).or_default().bad = true;
+            }
+        }
+    }
+
+    if slots.values().all(|s| s.bad || s.loads.is_empty()) {
+        return 0;
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+
+    let mut n = 0;
+    for (ss, s) in slots {
+        if s.bad || s.loads.is_empty() {
+            continue;
+        }
+        let mut all_folded = true;
+        for &(l, off, ln) in s.loads.iter() {
+            let Some(lbytes) = (0..ln as i64)
+                .map(|j| s.bytes.get(&(off + j)).copied())
+                .collect::<Option<Vec<_>>>()
+            else {
+                all_folded = false;
+                continue;
+            };
+            if !lbytes
+                .iter()
+                .all(|&(_, st)| domtree.dominates(st, l, &func.layout))
+            {
+                all_folded = false;
+                continue;
+            }
+            let lty = func.dfg.value_type(func.dfg.first_result(l));
+            let le: u128 = lbytes.iter().enumerate().fold(0u128, |acc, (j, (b, _))| {
+                acc | (*b as u128) << (j * 8)
+            });
+            let mut pos = FuncCursor::new(func).at_inst(l);
+            let nv = if lty.is_int() && !lty.is_vector() {
+                if ln <= 8 {
+                    let m = if lty.bits() == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << lty.bits()) - 1
+                    };
+                    pos.ins().iconst(lty, (le as u64 & m) as i64)
+                } else if ln == 16 {
+                    let lo = pos.ins().iconst(types::I64, le as u64 as i64);
+                    let hi = pos.ins().iconst(types::I64, (le >> 64) as u64 as i64);
+                    pos.ins().iconcat(lo, hi)
+                } else {
+                    all_folded = false;
+                    continue;
+                }
+            } else if matches!(ln, 4 | 8 | 16) && (lty.is_vector() || lty.is_float()) {
+                // Uniform lanes lower to `movi`/`dup` (`iconst.i64`+`bitcast`
+                // goes through `fmov` on a GPR and can't rematerialize).
+                let lb = lty.lane_bits();
+                let lmask: u128 = if lb == 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << lb) - 1
+                };
+                let uniform = lty.is_vector()
+                    && (1..ln).all(|j| (le >> (j as u32 * lb)) & lmask == le & lmask);
+                if uniform {
+                    let et = lty.lane_type();
+                    let mask = if et.bits() == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << et.bits()) - 1
+                    };
+                    let k = pos.ins().iconst(et, (le as u64 & mask) as i64);
+                    pos.ins().splat(lty, k)
+                } else {
+                    let wide = match ln {
+                        4 => pos.ins().iconst(types::I32, le as u32 as i64),
+                        8 => pos.ins().iconst(types::I64, le as u64 as i64),
+                        _ => {
+                            let lo = pos.ins().iconst(types::I64, le as u64 as i64);
+                            let hi = pos.ins().iconst(types::I64, (le >> 64) as u64 as i64);
+                            pos.ins().iconcat(lo, hi)
+                        }
+                    };
+                    pos.ins().bitcast(
+                        lty,
+                        cranelift_codegen::ir::MemFlagsData::new()
+                            .with_endianness(cranelift_codegen::ir::Endianness::Little),
+                        wide,
+                    )
+                }
+            } else {
+                all_folded = false;
+                continue;
+            };
+            let lres = func.dfg.first_result(l);
+            func.dfg.clear_results(l);
+            func.dfg.change_to_alias(lres, nv);
+            func.layout.remove_inst(l);
+            n += 1;
+        }
+        if all_folded {
+            // Every load folded: the lane stores are unobservable, and the
+            // `stack_addr`/`iadd` addr chain goes dead with them — the
+            // escape check proved chain values feed only this slot's
+            // accesses or other chain insts.
+            for i in &s.stores {
+                if func.layout.inst_block(*i).is_some() {
+                    func.layout.remove_inst(*i);
+                    func.dfg.clear_results(*i);
+                    n += 1;
+                }
+            }
+            for (v, &(ss2, _)) in &slotval {
+                if ss2 != ss {
+                    continue;
+                }
+                if let Some(d) = func.dfg.value_def(*v).inst()
+                    && func.layout.inst_block(d).is_some()
+                {
+                    func.layout.remove_inst(d);
+                    func.dfg.clear_results(d);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
