@@ -1,0 +1,159 @@
+diff --git a/src/licm.rs b/src/licm.rs
+index 57edd67..f2dcc38 100644
+--- a/src/licm.rs
++++ b/src/licm.rs
+@@ -80,7 +80,7 @@ fn clobbers(
+         // use of such an address escapes analysis — and this store IS a use.
+         InstructionData::Store { args, offset, .. } => {
+             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
+-            let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
++            let (r2, o2) = loadfwd::norm_root(func, ps, na, args[1]);
+             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
+             !overlap_keeps((r2, o2, ty), loc, iso)
+         }
+@@ -192,9 +192,10 @@ fn hoists(
+     }
+     let ty = func.dfg.value_type(func.dfg.first_result(i));
+     let (r, o) = loadfwd::root(func, ps, na, arg);
++    let (nr, no) = loadfwd::norm_root(func, ps, na, arg);
+     if dbg {
+         eprintln!(
+-            "licm? {}: root {:?} off {o} iso={} deref={:?}",
++            "licm? {}: root {:?}->{nr:?} off {o} iso={} deref={:?}",
+             func.dfg.display_inst(i),
+             r,
+             iso.contains(&r),
+@@ -204,14 +205,14 @@ fn hoists(
+             }
+         );
+     }
+-    let loc: Loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
++    let loc: Loc = (nr, no.wrapping_add(i64::from(i32::from(offset))), ty);
+     // `notrap` only asserts the load can't trap where it sits — invalid
+     // addresses are UB, so removal/reorder is fine — but hoisting speculates
+     // it onto paths where the address may be garbage (a pointer loaded from
+     // an enum payload is only valid on that variant's arm). Require the
+     // root dereferenceable unconditionally: a stack slot, a symbol or stack
+     // base, or a param rustc marked `dereferenceable` covering the access.
+-    let safe = match r {
++    let safe = match loc.0 {
+         Root::S(_) => true,
+         Root::V(v) => {
+             let proven = deref.get(&v).is_some_and(|&(bytes, _)| {
+@@ -511,7 +512,7 @@ fn run_loop(
+         };
+         let (val, addr) = (func.dfg.resolve_aliases(args[0]), args[1]);
+         let store_ty = func.dfg.value_type(val);
+-        let (sr, so) = loadfwd::root(func, ps, na, addr);
++        let (sr, so) = loadfwd::norm_root(func, ps, na, addr);
+         let sloc: Loc = (sr, so.wrapping_add(i64::from(i32::from(offset))), store_ty);
+         let mut ok = loadfwd::notrap(func, s) && inv(func, val) && inv(func, addr);
+         if ok {
+@@ -548,7 +549,7 @@ fn run_loop(
+                             ok = false;
+                             break;
+                         }
+-                        let (r, o) = loadfwd::root(func, ps, na, arg);
++                        let (r, o) = loadfwd::norm_root(func, ps, na, arg);
+                         let lloc = (
+                             r,
+                             o.wrapping_add(i64::from(i32::from(offset))),
+@@ -727,7 +728,7 @@ fn promote(
+                     continue;
+                 }
+             };
+-            let (r, o) = loadfwd::root(func, ps, na, addr.0);
++            let (r, o) = loadfwd::norm_root(func, ps, na, addr.0);
+             let o = o.wrapping_add(i64::from(addr.1));
+             if !iso_l.contains(&r) {
+                 continue;
+diff --git a/src/loadfwd.rs b/src/loadfwd.rs
+index cfb9fb0..535d7e2 100644
+--- a/src/loadfwd.rs
++++ b/src/loadfwd.rs
+@@ -215,6 +215,39 @@ pub(crate) fn notrap(func: &Function, i: Inst) -> bool {
+         && func.dfg.insts[i].memflags_trap_code(&func.dfg).is_none()
+ }
+ 
++/// `root` with no `noalias` scope stops: peel scope names to the concrete
++/// object underneath. Two scope roots are provably distinct objects only
++/// when both peels bottom out somewhere disjoint — today, separate
++/// `stack_addr`s. Returning `(V(v), off)` means "unresolved", not
++/// "different object": callers must keep treating it as may-alias.
++pub(crate) fn concrete(
++    func: &Function,
++    ps: &FxHashMap<Value, Value>,
++    v: Value,
++) -> (Root, i64) {
++    root(func, ps, &FxHashSet::default(), v)
++}
++
++/// `root` normalized for disjointness/dereferenceability checks: when a
++/// `V` scope name (`noalias` param, operand-frozen operand) peels to a
++/// `stack_addr`, report the slot itself so two scoped pointers into
++/// different locals compare disjoint like any other slot pair.
++pub(crate) fn norm_root(
++    func: &Function,
++    ps: &FxHashMap<Value, Value>,
++    na: &FxHashSet<Value>,
++    v: Value,
++) -> (Root, i64) {
++    let (r, o) = root(func, ps, na, v);
++    match r {
++        Root::V(rv) => match concrete(func, ps, rv) {
++            (Root::S(ss), so) => (Root::S(ss), o.wrapping_add(so)),
++            _ => (r, o),
++        },
++        _ => (r, o),
++    }
++}
++
+ /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
+ pub(crate) fn kill(
+     av: &mut Avail,
+@@ -616,14 +649,18 @@ pub fn run(
+         .chain(ofrozen.keys())
+         .copied()
+         .collect();
++    let iso = isolated(func, noalias, &ps, cfrozen);
+     if crate::pass_enabled("PLIRON_LOADPRE") {
+-        n += pre(func, &ps, &stop, &cfg, &rpo, entry);
++        // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
++        // which retains a loc across a store to a different root only when
++        // one side is isolated — an empty set would drop every loc at the
++        // first unrelated store.
++        n += pre(func, &ps, &stop, &cfg, &rpo, entry, &iso);
+         if n > 0 {
+             cfg = ControlFlowGraph::with_function(func);
+             rpo = rpo_of(&cfg);
+         }
+     }
+-    let iso = isolated(func, noalias, &ps, cfrozen);
+     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
+     let mut invs: FxHashSet<Loc> = FxHashSet::default();
+     let mut invreg: FxHashMap<Loc, Vec<Region>> = FxHashMap::default();
+@@ -920,8 +957,8 @@ fn pre(
+     cfg: &ControlFlowGraph,
+     rpo: &[Block],
+     entry: Block,
++    iso: &FxHashSet<Root>,
+ ) -> usize {
+-    let iso: FxHashSet<Root> = FxHashSet::default();
+     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
+     let eh = false;
+     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
+@@ -959,10 +996,12 @@ fn pre(
+                 b,
+                 &mut av,
+                 None,
+-                &iso,
++                iso,
+                 // `out` must agree with the `st` scan below, which tracks
+                 // no invariant immunity — pass empty sets so `transfer`
+-                // marks and retains nothing extra here.
++                // marks and retains nothing extra here. `iso` is real:
++                // `kill` needs it to keep locs disjoint from the store's
++                // root, or every unrelated store empties the set.
+                 &FxHashSet::default(),
+                 &mut FxHashSet::default(),
+                 None,
