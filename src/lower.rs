@@ -1196,7 +1196,7 @@ pub fn lower_to_object(
         // materialized for `HashMap::get`, dead once `hash_one`'s byte
         // loads forward from the key value itself).
         if crate::pass_enabled("PLIRON_DSE2") && crate::bisect("dse2") {
-            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite);
+            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("dse2 {k} {n}");
             }
@@ -1226,6 +1226,24 @@ pub fn lower_to_object(
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("uload32 broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
+        // Loop count tests against a wide constant rematerialize it per
+        // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
+        // a non-constant preheader value codegen pins in a register. Runs
+        // late (after loop rotation) so latch-copied tests are covered.
+        if crate::pass_enabled("PLIRON_BCMP") && crate::bisect("boundcmp") {
+            let k = crate::indvars::boundcmp(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("boundcmp {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after boundcmp ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("boundcmp broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
         // Small `br_table`s become `icmp eq`+`brif` chains: the table

@@ -81,8 +81,11 @@ enum Step {
 }
 
 struct LoopInfo {
-    /// Header param stepping `+1` per iteration.
+    /// Header param stepping by `istep` per iteration.
     iv: Value,
+    /// The iv's per-iteration delta (`K(1)` for the classic counter; `V` for
+    /// strides like `j += i` — always nonneg as an unsigned machine value).
+    istep: Step,
     /// Param index of `iv`; the entry value is the guard block's param.
     iv0: usize,
     /// The iv's entry value when constant and identical on all entry edges.
@@ -99,6 +102,9 @@ struct LoopInfo {
     h: Block,
     /// Backedge arg for each header param (None = unanalyzable).
     bargs: Vec<Option<Value>>,
+    /// Resolved entry arg for each header param when all entry edges pass
+    /// the same value (None = they disagree or are unanalyzable).
+    eargs: Vec<Option<Value>>,
 }
 
 /// A `brif` whose in-bounds edge is provably always taken given `hi < len`.
@@ -137,6 +143,42 @@ fn iconst_masked(pos: &mut FuncCursor, t: Type, k: i64) -> Value {
         -1
     };
     pos.ins().iconst(t, k & mask)
+}
+
+/// `v` provably equals `p` or `e` at runtime: it is one of them, or a body
+/// block param whose every incoming edge arg recursively is. Used to show a
+/// loop param fed through forwarded params stays invariant.
+fn feeds(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    body: &FxHashSet<Block>,
+    p: Value,
+    e: Value,
+    v: Value,
+    seen: &mut FxHashSet<Value>,
+    depth: usize,
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if v == p || v == e {
+        return true;
+    }
+    if depth == 0 || !seen.insert(v) {
+        return false;
+    }
+    let (Some(b), cranelift_codegen::ir::ValueDef::Param(_, n)) =
+        (def_block(func, v), func.dfg.value_def(v))
+    else {
+        return false;
+    };
+    if !body.contains(&b) {
+        return false;
+    }
+    edges_to(func, cfg, b)
+        .iter()
+        .all(|edge| match edge_arg(func, edge, n) {
+            Some(a) => feeds(func, cfg, body, p, e, a, seen, depth - 1),
+            None => false,
+        })
 }
 
 fn def_block(func: &Function, v: Value) -> Option<Block> {
@@ -199,6 +241,7 @@ fn step_of(func: &Function, p: Value, arg: Value) -> Option<Step> {
 /// backedge passes it through unchanged.
 fn invariant(
     func: &Function,
+    cfg: &ControlFlowGraph,
     info: &LoopInfo,
     body: &FxHashSet<Block>,
     v: Value,
@@ -213,7 +256,20 @@ fn invariant(
             if let cranelift_codegen::ir::ValueDef::Param(_, n) = func.dfg.value_def(v)
                 && let Some(Some(ba)) = info.bargs.get(n)
             {
-                return func.dfg.resolve_aliases(*ba) == v;
+                let ba = func.dfg.resolve_aliases(*ba);
+                if ba == v {
+                    return true;
+                }
+                // The param's value each iteration is `ba`; when every
+                // source of `ba` is the param itself or the
+                // identical-on-all-entries entry value, the param never
+                // changes across iterations.
+                if let Some(Some(ea)) = info.eargs.get(n) {
+                    let ea = func.dfg.resolve_aliases(*ea);
+                    let mut seen = FxHashSet::default();
+                    seen.insert(v);
+                    return feeds(func, cfg, body, v, ea, ba, &mut seen, 8);
+                }
             }
             false
         }
@@ -255,6 +311,7 @@ fn ubound_on() -> bool {
 /// `(lin, factor)` so `imul` by a constant scales through.
 fn affine(
     func: &Function,
+    cfg: &ControlFlowGraph,
     info: &LoopInfo,
     body: &FxHashSet<Block>,
     depth: usize,
@@ -265,6 +322,10 @@ fn affine(
     }
     let v = func.dfg.resolve_aliases(v);
     if v == info.iv {
+        // The count test bounds the iv itself: `iv <= bound - adj` at every
+        // iteration, whatever the step. Modeling it as `iv0 + i` evaluates at
+        // t = bound - iv0 - adj to exactly `bound - adj` — the tightest
+        // sound bound on every affine combination of the iv.
         return Some(Aff {
             m: Lin::K(1),
             b: [Term {
@@ -298,8 +359,8 @@ fn affine(
         } => {
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             for (x, y) in [(a, b), (b, a)] {
-                if let Some(mut af) = affine(func, info, body, depth - 1, x)
-                    && invariant(func, info, body, y)
+                if let Some(mut af) = affine(func, cfg, info, body, depth - 1, x)
+                    && invariant(func, cfg, info, body, y)
                 {
                     // Constants sign-extend into the wide domain; a `V` term
                     // would zext `-k` into `2^64-k` and sink every guard.
@@ -319,8 +380,8 @@ fn affine(
         } => {
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             // `affine - invariant`: subtract one b term.
-            if let Some(mut af) = affine(func, info, body, depth - 1, a)
-                && invariant(func, info, body, b)
+            if let Some(mut af) = affine(func, cfg, info, body, depth - 1, a)
+                && invariant(func, cfg, info, body, b)
             {
                 let (v, k) = match iconst(func, b) {
                     Some(k) => (Lin::K(k), -1),
@@ -332,8 +393,8 @@ fn affine(
             // `invariant - affine` (e.g. `n - 1 - i`): negate m and every
             // b term, then add the invariant. The index sequence decreases,
             // so the guard bounds the entry value instead of the last one.
-            if invariant(func, info, body, a)
-                && let Some(mut af) = affine(func, info, body, depth - 1, b)
+            if invariant(func, cfg, info, body, a)
+                && let Some(mut af) = affine(func, cfg, info, body, depth - 1, b)
             {
                 af.m = match af.m {
                     Lin::K(k) => Lin::K(k.checked_neg()?),
@@ -361,7 +422,7 @@ fn affine(
             for (x, y) in [(a, b), (b, a)] {
                 // counter * invariant: idx = i*y + iv0*y; the iv0*y term is
                 // a V*V product we can only express when iv0 is a constant.
-                if x == info.iv && invariant(func, info, body, y) {
+                if x == info.iv && invariant(func, cfg, info, body, y) {
                     let k = info.iv0k?;
                     return Some(Aff {
                         m: Lin::V(y),
@@ -375,7 +436,7 @@ fn affine(
                 }
                 // affine * const: scale m and every b term.
                 if let Some(k) = iconst(func, y)
-                    && let Some(mut af) = affine(func, info, body, depth - 1, x)
+                    && let Some(mut af) = affine(func, cfg, info, body, depth - 1, x)
                 {
                     // A runtime m stays linear only when it scales a const.
                     if let Lin::K(c) = af.m {
@@ -877,6 +938,17 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         .enumerate()
         .map(|(i, _)| edge_arg(func, &back, i))
         .collect();
+    let eargs: Vec<Option<Value>> = params
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let mut it = entries
+                .iter()
+                .map(|e| edge_arg(func, e, i).map(|v| func.dfg.resolve_aliases(v)));
+            let first = it.next().flatten();
+            first.filter(|f| it.all(|v| v == Some(*f)))
+        })
+        .collect();
 
     // Bound test `brif (icmp cc a, bound)` at `site` whose continue edge is
     // `cs`: for the latch that's the edge back to h; for the header it's the
@@ -953,9 +1025,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             continue;
         }
         let Some(ba) = bargs[idx] else { continue };
-        if !matches!(step_of(func, p, ba), Some(Step::K(1))) {
-            continue;
-        }
+        let Some(istep) = step_of(func, p, ba) else { continue };
         // iv's entry value is a constant only when all entry edges agree.
         let mut iv0k = None;
         let mut same = true;
@@ -977,6 +1047,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             };
             let mut lo = LoopInfo {
                 iv: p,
+                istep,
                 iv0: idx,
                 iv0k,
                 bound,
@@ -985,8 +1056,11 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 g: None,
                 h,
                 bargs: bargs.clone(),
+                eargs: eargs.clone(),
             };
-            if !invariant(func, &lo, &body, bound) {
+            if !invariant(func, cfg, &lo, &body, bound)
+                || matches!(istep, Step::V(sv) if !invariant(func, cfg, &lo, &body, sv))
+            {
                 continue;
             }
             for (j, &q) in params.iter().enumerate() {
@@ -997,7 +1071,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 let Some(s) = step_of(func, q, qa) else { continue };
                 let inv = match s {
                     Step::K(_) => true,
-                    Step::V(sv) => invariant(func, &lo, &body, sv),
+                    Step::V(sv) => invariant(func, cfg, &lo, &body, sv),
                 };
                 if inv {
                     lo.stepped.insert(q, (j, s));
@@ -1027,6 +1101,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 };
                 let lo = LoopInfo {
                     iv: p,
+                    istep: Step::K(1),
                     iv0: ix,
                     iv0k: None,
                     bound,
@@ -1035,8 +1110,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                     g: None,
                     h,
                     bargs: bargs.clone(),
+                    eargs: eargs.clone(),
                 };
-                if invariant(func, &lo, &body, bound) {
+                if invariant(func, cfg, &lo, &body, bound) {
                     found = Some(lo);
                     break;
                 }
@@ -1092,7 +1168,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 IntCC::UnsignedGreaterThan => (false, true),
                 _ => continue,
             };
-            if !invariant(func, &info, &body, bb) {
+            if !invariant(func, cfg, &info, &body, bb) {
                 if debug {
                     eprintln!("bcheck {name} block{}: blk{} len not invariant", h.as_u32(), b.as_u32());
                 }
@@ -1140,7 +1216,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                     None => continue,
                 }
             } else {
-                match affine(func, &info, &body, MAX_AFFINE_DEPTH, a) {
+                match affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, a) {
                     Some(af) => af,
                     // (x64 wt note) data-dependent but range-limited index:
                     // `cnt[a[i]]` with a u8 `a` is `hi = 255`, not affine. A
@@ -1215,14 +1291,14 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             for i in func.layout.block_insts(b) {
                 match func.dfg.insts[i] {
                     InstructionData::Store { args, .. } => {
-                        let ok = affine(func, &info, &body, MAX_AFFINE_DEPTH, args[1])
+                        let ok = affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, args[1])
                             .is_some_and(|af| !matches!(af.m, Lin::K(0)));
                         if !ok {
                             dyn_store = true;
                         }
                     }
                     InstructionData::Load { arg, .. } => {
-                        let ok = affine(func, &info, &body, MAX_AFFINE_DEPTH, arg)
+                        let ok = affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, arg)
                             .is_some_and(|af| !matches!(af.m, Lin::K(0)));
                         if !ok {
                             dyn_load = true;
