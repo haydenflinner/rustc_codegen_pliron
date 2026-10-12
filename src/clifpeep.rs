@@ -2763,6 +2763,16 @@ pub fn run(func: &mut Function) -> usize {
                 n += 1;
                 continue;
             }
+            if crate::pass_enabled("PLIRON_DIVCHK")
+                && ty.is_int()
+                && !ty.is_vector()
+                && ty.bits() <= 64
+                && matches!(cond, IntCC::Equal | IntCC::NotEqual)
+                && divchk(&mut pos, inst, cond, args, ty)
+            {
+                n += 1;
+                continue;
+            }
             if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
                 || pos.func.dfg.value_type(args[0]) != types::I128
             {
@@ -3166,6 +3176,78 @@ pub fn ovkill(func: &mut Function) -> usize {
         }
     }
     n
+}
+
+/// `x % C ==/!= 0` needs only a divisibility test, not the remainder.
+/// For odd C, `x·M` (M = C⁻¹ mod 2^w) is the quotient exactly when C|x:
+/// unsigned `x·M <=u B`; signed `x·M + floor(B/2) <=u B`, B = (2^w-1)/C.
+/// (LLVM emits the same magic for `x % 3 != 0` filters.)
+fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: Type) -> bool {
+    // Multiplicative inverse of odd `c` mod 2^64 via Newton iteration —
+    // doubles correct bits each step (c already has 3 from x₀ = c).
+    fn modinv(c: u64) -> u64 {
+        let mut x = c;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(c.wrapping_mul(x)));
+        }
+        x
+    }
+    let w = ty.bits() as u32;
+    let umax = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    // Normalize `icmp cc rem, 0` with the constant on the right.
+    let (x, _d) = match (iconst(pos.func, args[0]), iconst(pos.func, args[1])) {
+        (None, Some(0)) => (args[0], args[1]),
+        (Some(0), None) => (args[1], args[0]),
+        _ => return false,
+    };
+    let Some(i) = pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(x)).inst() else {
+        return false;
+    };
+    let InstructionData::Binary { opcode, args: ra } = pos.func.dfg.insts[i] else {
+        return false;
+    };
+    let signed = match opcode {
+        Opcode::Urem => false,
+        Opcode::Srem => true,
+        _ => return false,
+    };
+    // `x % C == 0` iff `x % |C| == 0` — take the magnitude; the masked
+    // value must itself be odd and >= 3 for the magic form. (`iconst`
+    // returns the raw bit pattern — sign-extend to the operand width
+    // for `srem` so a stored -3 isn't read as a huge divisor.)
+    let Some(c) = iconst(pos.func, ra[1]).map(|c| {
+        let cu = c as u64 & umax;
+        if signed && cu >> (w - 1) != 0 {
+            ((cu | !umax) as i64).unsigned_abs()
+        } else {
+            cu
+        }
+    }) else {
+        return false;
+    };
+    if c < 3 || c % 2 == 0 {
+        return false;
+    }
+    let m = modinv(c) & umax;
+    let b = umax / c;
+    let xv = ra[0];
+    let mk = |pos: &mut FuncCursor, k: u64| pos.ins().iconst(ty, k as i64);
+    let km = mk(pos, m);
+    let p = pos.ins().imul(xv, km);
+    let p = if signed {
+        let ko = mk(pos, b / 2);
+        pos.ins().iadd(p, ko)
+    } else {
+        p
+    };
+    let cc = if cond == IntCC::Equal {
+        IntCC::UnsignedLessThanOrEqual
+    } else {
+        IntCC::UnsignedGreaterThan
+    };
+    let k = mk(pos, b);
+    pos.func.replace(inst).icmp(cc, p, k);
+    true
 }
 
 /// `x >=u 1`, `x >u 0`, `x <=u 0`, `x <u 1` are equality tests;
