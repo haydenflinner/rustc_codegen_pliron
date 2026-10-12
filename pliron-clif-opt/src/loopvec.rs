@@ -949,6 +949,7 @@ fn plan(
     noalias: &FxHashSet<Value>,
     fname: &str,
     cmp64: bool,
+    x64: bool,
 ) -> Option<Plan> {
     let Some(info) = gather(func, cfg, dt, la, lp) else {
         why!(fname; "gather loop {:?}", lp);
@@ -1743,6 +1744,7 @@ fn plan(
                 elem,
                 r,
                 &extra_ok,
+                x64,
             ) {
                 why!(fname; "reduction type/op {} delta {}", info.h, func.dfg.display_inst(r.upd));
             }
@@ -2417,6 +2419,7 @@ fn widen_delta(
     elem: Type,
     r: &mut Reduc,
     extra_ok: &FxHashSet<Inst>,
+    x64: bool,
 ) -> bool {
     if r.op != Opcode::Iadd || !r.aty.is_int() || r.aty.bits() > 64 || r.aty.bits() <= elem.bits() {
         return false;
@@ -2545,6 +2548,14 @@ fn widen_delta(
             }
             // Product lanes need 2*elem bits — cap at i64.
             if 2 * elem.bits() > 64 {
+                return false;
+            }
+            // `imul` isn't native on 64-bit lanes (see `vec_op_ok`): the
+            // i32→i64 product emits `imul.i64x2`, which SSE2 expands to ~6
+            // insts of pmuludq/pshufd glue per 2 lanes — costlier than the
+            // scalar mul it replaces. aarch64's smull/umlal folds keep it
+            // profitable there.
+            if x64 && 2 * elem.bits() == 64 {
                 return false;
             }
             let mut ok = vec![r.upd];
@@ -4249,7 +4260,7 @@ pub fn run(
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
         let ps = crate::loadfwd::param_src(func);
-        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname, cmp64) else {
+        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64) else {
             continue;
         };
         if debug {
@@ -4337,5 +4348,97 @@ mod tests {
             false,
             true,
         );
+    }
+
+    /// `acc += (x as i64) * (x as i64)` over i32 elements — a `Widen::Mul`
+    /// reduction whose products land on i64 lanes. aarch64 folds it to
+    /// `smull`/`umlal`; on x64 `imul.i64x2` expands to pmuludq glue costing
+    /// more than the scalar mul, so the loop must stay scalar there.
+    /// Regression test for iterw (~2x slower vectorized than scalar on SSE2).
+    fn widening_mul_i64_loop() -> Function {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let body = b.create_block();
+            let exit = b.create_block();
+            b.append_block_param(head, types::I64);
+            b.append_block_param(head, types::I64);
+            b.append_block_param(exit, types::I64);
+
+            b.switch_to_block(entry);
+            let p0 = b.ins().iconst(types::I64, 0);
+            let n = b.ins().iconst(types::I64, 64);
+            let st = b.ins().iconst(types::I64, 4);
+            let nb = b.ins().imul(n, st);
+            let end = b.ins().iadd(p0, nb);
+            let zero = b.ins().iconst(types::I64, 0);
+            b.ins().jump(head, &[p0.into(), zero.into()]);
+
+            b.switch_to_block(head);
+            let (p, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
+            let done = b.ins().icmp(IntCC::Equal, p, end);
+            b.ins().brif(done, exit, &[acc.into()], body, &[]);
+
+            b.switch_to_block(body);
+            let x = b
+                .ins()
+                .load(types::I32, MemFlagsData::new().with_notrap(), p, 0);
+            let w = b.ins().sextend(types::I64, x);
+            let sq = b.ins().imul(w, w);
+            let acc1 = b.ins().iadd(acc, sq);
+            let p1 = b.ins().iadd_imm_s(p, 4);
+            b.ins().jump(head, &[p1.into(), acc1.into()]);
+
+            b.switch_to_block(exit);
+            let r = b.block_params(exit)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        func
+    }
+
+    #[test]
+    fn widening_mul_i64_stays_scalar_on_x64() {
+        let tcfg = TargetFrontendConfig {
+            default_call_conv: CallConv::SystemV,
+            pointer_width: PointerWidth::U64,
+            page_size_align_log2: 12,
+        };
+        let mut func = widening_mul_i64_loop();
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "widen_mul_i64",
+            &FxHashSet::default(),
+            tcfg,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn widening_mul_i64_vectorizes_on_aarch64() {
+        let tcfg = TargetFrontendConfig {
+            default_call_conv: CallConv::SystemV,
+            pointer_width: PointerWidth::U64,
+            page_size_align_log2: 12,
+        };
+        let mut func = widening_mul_i64_loop();
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "widen_mul_i64",
+            &FxHashSet::default(),
+            tcfg,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(n, 1);
     }
 }
