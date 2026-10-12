@@ -758,6 +758,9 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("slp {k} {n}");
             }
+            if std::env::var_os("PLIRON_XPACK_CLIF").is_some() {
+                eprintln!("==== clif {n} after slp ====\n{}", clctx.func.display());
+            }
             if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
