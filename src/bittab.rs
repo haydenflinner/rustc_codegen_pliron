@@ -40,7 +40,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::types::{I64, I128};
+use cranelift_codegen::ir::types::{I64, I128, I8};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
@@ -499,12 +499,149 @@ fn prep_args(
     Some(out)
 }
 
+/// Flat form: a `bor` tree over `icmp eq x, k` leaves inside one block —
+/// what the branchy tree becomes once ifconv or the vectorizer's scan
+/// expansion collapses it into straight-line data flow. With ≥4 distinct
+/// constants inside one 64-bit window the whole chain is the same guarded
+/// `ushr` test, emitted in place of the root; the dead leaves are left
+/// for regalloc to drop (they may have other uses).
+fn flat(func: &mut Function) -> usize {
+    fn const_of(func: &Function, v: Value) -> Option<i64> {
+        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = func.dfg.insts[di] {
+            Some(imm.bits())
+        } else {
+            None
+        }
+    }
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        // Values consumed by a `bor` in this block: a candidate whose own
+        // result is one is an interior tree node, not the root — folding
+        // it first would strand the parent's mixed tree.
+        let interior: FxHashSet<Value> = func
+            .layout
+            .block_insts(b)
+            .flat_map(|i| {
+                if let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i] {
+                    args.to_vec()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            if func.dfg.inst_results(i).len() != 1 {
+                continue;
+            }
+            let out = func.dfg.first_result(i);
+            if interior.contains(&func.dfg.resolve_aliases(out)) {
+                continue;
+            }
+            if func.dfg.value_type(out) != I8 || func.dfg.resolve_aliases(out) != out {
+                continue;
+            }
+            // Walk the tree: interior nodes are `bor`, leaves must all be
+            // `icmp eq` on the same resolved operand against an iconst.
+            let mut x = None;
+            let mut ks: Vec<u64> = Vec::new();
+            let mut stack = vec![args[0], args[1]];
+            let mut ok = true;
+            while let Some(v) = stack.pop() {
+                let v = func.dfg.resolve_aliases(v);
+                let Some(di) = func.dfg.value_def(v).inst() else {
+                    ok = false;
+                    break;
+                };
+                match func.dfg.insts[di] {
+                    InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                        stack.push(args[0]);
+                        stack.push(args[1]);
+                    }
+                    InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                        let (a, c) = (
+                            func.dfg.resolve_aliases(args[0]),
+                            func.dfg.resolve_aliases(args[1]),
+                        );
+                        let (xv, k) = match (const_of(func, a), const_of(func, c)) {
+                            (None, Some(k)) => (a, k),
+                            (Some(k), None) => (c, k),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let bits = func.dfg.value_type(xv).bits();
+                        let kv = mask(k as u64, bits);
+                        if bits > 64 || kv >= 64 {
+                            ok = false;
+                            break;
+                        }
+                        match x {
+                            None => x = Some(xv),
+                            Some(e) if e == xv => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ks.push(kv);
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || ks.len() < 4 {
+                continue;
+            }
+            let (lo, hi) = (ks.iter().copied().min().unwrap(), ks.iter().copied().max().unwrap());
+            if hi - lo >= 64 {
+                continue;
+            }
+            let bits = ks.iter().fold(0u64, |m, k| m | (1 << k));
+            let x = x.unwrap();
+            let xty = func.dfg.value_type(x);
+            let mut cur = FuncCursor::new(func).at_inst(i);
+            let d = if lo > 0 {
+                let c = cur.ins().iconst(xty, lo as i64);
+                cur.ins().isub(x, c)
+            } else {
+                x
+            };
+            let g = cur.ins().iconst(xty, 64);
+            let ig = cur.ins().icmp(IntCC::UnsignedLessThan, d, g);
+            let dx = if xty == I64 {
+                d
+            } else {
+                cur.ins().uextend(I64, d)
+            };
+            let m = cur.ins().iconst(I64, bits as i64);
+            let z = cur.ins().iconst(I64, 0);
+            let mg = cur.ins().select(ig, m, z);
+            let sh = cur.ins().ushr(mg, dx);
+            let bit = cur.ins().band_imm(sh, 1);
+            let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
+            func.dfg.clear_results(i);
+            func.dfg.change_to_alias(out, c);
+            func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn run(func: &mut Function) -> usize {
     // Fold one tree at a time and re-analyze after each: plans computed
     // against a stale dominator tree could otherwise keep a tested value
     // or leaf arg whose defining block an earlier fold just removed,
     // leaving dangling operands that crash `value_def` downstream.
-    let mut n = 0;
+    let mut n = flat(func);
     loop {
         let cfg = ControlFlowGraph::with_function(func);
         let dom = DominatorTree::with_function(func, &cfg);
