@@ -980,8 +980,8 @@ pub fn run(
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
 ) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
+    let mut cfg = ControlFlowGraph::with_function(func);
+    let mut dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
     let iso = loadfwd::isolated(func, noalias);
@@ -1005,11 +1005,114 @@ pub fn run(
     // early loop left zero moves for the hot char loop's loads). Keep a
     // looser function-level bound only as a compile-time guard.
     let mut n = 0;
+    let mut dirty = false;
     for lp in loops.into_iter().take(MAX_LOOPS) {
+        if dirty {
+            // Edge splits/promotion inside `run_loop` changed the CFG: the
+            // previous `cfg`/`dt` no longer reflect it — e.g. a split edge
+            // leaves `pred_iter` without the new block and without the
+            // pred's redirected edge, so an entry scan can count one
+            // outside edge where several exist. Loop membership for old
+            // blocks is preserved (splits only lengthen paths), and fresh
+            // blocks are in no loop, so `la` stays valid.
+            cfg = ControlFlowGraph::with_function(func);
+            dt = DominatorTree::with_function(func, &cfg);
+            dirty = false;
+        }
+        let before = n;
         n += run_loop(func, &cfg, &dt, &la, lp, &iso, deref, nw, debug);
+        dirty |= n != before;
         if n >= MAX_MOVES * MAX_LOOPS {
             break;
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{
+        AbiParam, Function, InstBuilder, Signature, StackSlotData, StackSlotKind,
+        UserFuncName,
+    };
+    use cranelift_codegen::isa::CallConv;
+
+    /// `run` caches `cfg`/`dt`/`la` once, but `run_loop` splits edges: a pred
+    /// redirected through a split block leaves the stale `pred_iter` seeing
+    /// the old pred whose edge no longer reaches `h` and not seeing the new
+    /// block at all, so the unique-entry scan undercounts and hoists to a
+    /// block that doesn't dominate the header (pulldown-cmark's
+    /// `Chars::advance_by` ICE'd stage2 on this).
+    /// Shape: sibling loop `sb`'s exit edge enters outer header `h`; `h`
+    /// also has the entry edge from `b0` and holds an iconst the header
+    /// uses.
+    #[test]
+    fn entry_scan_counts_split_edge_preds() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let rest = func.dfg.make_block();
+        let inh = func.dfg.make_block();
+        let sb = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let hbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, rest, inh, sb, h, hbody, done] {
+            func.layout.append_block(b);
+        }
+        let ss = func
+            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let hp = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let c0 = cur.ins().iconst(types::I8, 1);
+        let forty_two = cur.ins().iconst(types::I64, 42);
+        cur.ins().brif(c0, rest, &[], h, &[forty_two.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(rest);
+        cur.ins().jump(inh, &[]);
+
+        // Loop `sb`: the store makes `ss` a promote candidate; `sb`'s exit
+        // edge to `h` gets split by `promote_loc`, leaving `h` entered from
+        // both the `b0` edge and the fresh split block.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(inh);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let seven = cur.ins().iconst(types::I64, 7);
+        cur.ins().store(MemFlagsData::new(), seven, a, 0);
+        cur.ins().jump(sb, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(sb);
+        let c2 = cur.ins().iconst(types::I8, 0);
+        let three = cur.ins().iconst(types::I64, 3);
+        cur.ins().brif(c2, h, &[three.into()], inh, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let k = cur.ins().iconst(types::I64, 0);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, hp, k);
+        cur.ins().brif(r, hbody, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(hbody);
+        let one = cur.ins().iconst(types::I64, 1);
+        cur.ins().jump(h, &[one.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        run(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        let flags = cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        );
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
 }
