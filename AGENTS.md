@@ -111,9 +111,13 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   the pipeline, then retries per-step on failure for attribution.
 - Quick single-file check (no test.sh):
   `rustc +nightly-2026-10-06 -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs -o out`
-- Gotcha: rustc's incremental cache does **not** track `PLIRON_*` env or
-  the backend dylib — when reusing a `-Zcodegen-backend` output/target
-  dir, pass `--extern`-fresh inputs or clean it if results look stale.
+- Gotcha: build-level caching does **not** track `PLIRON_*` env or the
+  backend dylib. Empirically `-Cincremental` re-runs our backend every
+  invocation (work-product `.o`s are stored but codegen queries rerun),
+  so rustc-incremental stale reuse is not the risk — **cargo's own
+  fingerprinting is**: unchanged `RUSTFLAGS` means a `PLIRON_*` flip
+  never re-invokes rustc. When bisecting under `cargo build`/`-Zbuild-std`,
+  `cargo clean -p <pkg>` or use a fresh target dir after gate changes.
 - Dev profile: our crates at `opt-level=1`, deps at O3, vendored
   `cranelift-codegen` at O1 (override:
   `CARGO_PROFILE_DEV_PACKAGE_CRANELIFT_CODEGEN_OPT_LEVEL=3`),
