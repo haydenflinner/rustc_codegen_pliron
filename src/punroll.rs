@@ -49,7 +49,7 @@ use cranelift_codegen::ir::instructions::InstructionMapper;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Constant, DynamicStackSlot, ExceptionTable, FuncRef, Function,
     GlobalValue, Immediate, Inst, InstBuilder, InstructionData, JumpTable, Opcode, SigRef,
-    StackSlot, Value, ValueList, types,
+    StackSlot, Type, Value, ValueList, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -271,6 +271,10 @@ struct Cnt {
     bpidx: Option<usize>,
     le: bool,
     signed: bool,
+    /// Exit-on-`a == bound` (a `!=` continue test): the guard's strict
+    /// `a_{K-2} < bound` check is the same — a monotone counter that
+    /// hasn't reached `bound` can't equal it.
+    eq: bool,
 }
 
 pub fn run(func: &mut Function, name: &str) -> usize {
@@ -353,7 +357,9 @@ pub fn run(func: &mut Function, name: &str) -> usize {
                 hit = true;
                 break; // cfg/la stale; rescan
             }
-            if run_loop(func, &cfg, &dt, &la, lp, h, name).is_some() {
+            if run_loop(func, &cfg, &dt, &la, lp, h, name).is_some()
+                || run_region(func, &cfg, &dt, &la, lp, h, name).is_some()
+            {
                 n += 1;
                 hit = true;
                 break; // cfg/la stale; rescan
@@ -375,6 +381,23 @@ macro_rules! wbail {
     }};
 }
 
+/// An out-of-body edge target whose dominance cone is cloned once
+/// (shared by every copy's exit edge) when the cone uses loop values —
+/// the clone root's appended params carry each edge's own bindings.
+struct ExitCone {
+    /// Exit-edge target.
+    seblk: Block,
+    /// Loop values used inside `seblk`'s dominance cone, in the order
+    /// they become clone-root params (empty ⇒ edge retargets the
+    /// original block, no clone needed).
+    lvals: Vec<Value>,
+    /// Dominance cone blocks in emission (RPO) order, cone clones, and
+    /// the clone root when `lvals` is non-empty.
+    corder: Vec<Block>,
+    cmap: FxHashMap<Block, Block>,
+    clone_root: Option<Block>,
+}
+
 /// A mid-chain `brif` in the linear chain: one dest continues the chain,
 /// the other leaves the body (a side exit — bounds-check panic edge, or
 /// the loop's own exit when the counting test sits mid-chain).
@@ -385,19 +408,9 @@ struct SideExit {
     cont_bc: BlockCall,
     /// Out-of-body `brif` edge (the side exit).
     exit_bc: BlockCall,
-    /// `exit_bc` target.
-    seblk: Block,
     /// Position (0/1) of the exit dest in the original `brif`.
     epos: usize,
-    /// Loop values used inside `seblk`'s dominance cone, in the order
-    /// they become clone-root params (empty ⇒ edge retargets the
-    /// original block, no clone needed).
-    lvals: Vec<Value>,
-    /// Dominance cone blocks in emission (RPO) order, cone clones, and
-    /// the clone root when `lvals` is non-empty.
-    corder: Vec<Block>,
-    cmap: FxHashMap<Block, Block>,
-    clone_root: Option<Block>,
+    cone: ExitCone,
 }
 
 struct Walk {
@@ -485,12 +498,14 @@ fn walk(
                     pos: chain.len() - 1,
                     cont_bc,
                     exit_bc,
-                    seblk: exit_bc.block(&func.dfg.value_lists),
                     epos,
-                    lvals: Vec::new(),
-                    corder: Vec::new(),
-                    cmap: FxHashMap::default(),
-                    clone_root: None,
+                    cone: ExitCone {
+                        seblk: exit_bc.block(&func.dfg.value_lists),
+                        lvals: Vec::new(),
+                        corder: Vec::new(),
+                        cmap: FxHashMap::default(),
+                        clone_root: None,
+                    },
                 });
                 chain.push(nb);
                 if chain.len() > MAX_CHAIN {
@@ -609,6 +624,7 @@ fn find_count(
             bpidx,
             le,
             signed,
+            eq: false,
         });
     }
     None
@@ -728,6 +744,303 @@ fn sink_test(
     false
 }
 
+/// Analyze `seblk`'s dominance cone for the shared exit-clone
+/// treatment: collect the loop values it references and the cone's
+/// blocks. `Err(why)` when the cone is unclonable or over budget;
+/// `Ok` with empty `lvals` when the cone is clean (edges retarget the
+/// original block — no clone needed).
+fn analyze_exit_cone(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    dt: &DominatorTree,
+    lvals: &FxHashSet<Value>,
+    seblk: Block,
+    clone_insts: &mut usize,
+) -> Result<ExitCone, &'static str> {
+    let mut cone = ExitCone {
+        seblk,
+        lvals: Vec::new(),
+        corder: Vec::new(),
+        cmap: FxHashMap::default(),
+        clone_root: None,
+    };
+    let scone: Vec<Block> = func
+        .layout
+        .blocks()
+        .filter(|&b| !body.contains(&b) && dt.is_reachable(b) && dt.block_dominates(seblk, b))
+        .collect();
+    let mut lset: FxHashSet<Value> = FxHashSet::default();
+    let mut elvals: Vec<Value> = Vec::new();
+    let mut sconebad = false;
+    let mut sinsts = 0usize;
+    for &cb in &scone {
+        for i in func.layout.block_insts(cb) {
+            sinsts += 1;
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                if lvals.contains(&v) && lset.insert(v) {
+                    elvals.push(v);
+                }
+            }
+            let op = func.dfg.insts[i].opcode();
+            if matches!(
+                op,
+                Opcode::TryCall | Opcode::TryCallIndirect | Opcode::BrTable
+            ) {
+                sconebad = true;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        let v = func.dfg.resolve_aliases(v);
+                        if lvals.contains(&v) && lset.insert(v) {
+                            elvals.push(v);
+                        }
+                    }
+                }
+                if body.contains(&bc.block(&func.dfg.value_lists)) {
+                    return Err("exit cone re-enters loop");
+                }
+            }
+        }
+    }
+    if elvals.is_empty() {
+        return Ok(cone);
+    }
+    if sconebad || scone.len() > 8 || sinsts > 48 {
+        return Err("side-exit cone too big");
+    }
+    *clone_insts += sinsts;
+    if *clone_insts > 96 {
+        return Err("side-exit clone budget");
+    }
+    cone.lvals = elvals;
+    cone.corder = scone;
+    Ok(cone)
+}
+
+/// Emit the shared cone clone for every exit that needs one, deduped by
+/// `seblk` (equal cones share a clone). The clone root takes the cone's
+/// loop values as appended params so each copy's exit edge carries its
+/// own bindings. Contents are emitted immediately — the clone's value
+/// map is self-contained (loop values arrive only through the root
+/// params).
+fn emit_exit_cones(func: &mut Function, h: Block, exits: &mut [&mut ExitCone]) {
+    let mut seen_se: FxHashMap<Block, usize> = FxHashMap::default();
+    for ei in 0..exits.len() {
+        if exits[ei].lvals.is_empty() {
+            continue;
+        }
+        if let Some(&first) = seen_se.get(&exits[ei].seblk) {
+            let (lvals, corder, cmap, root) = {
+                let f = &exits[first];
+                (
+                    f.lvals.clone(),
+                    f.corder.clone(),
+                    f.cmap.clone(),
+                    f.clone_root,
+                )
+            };
+            let e = &mut exits[ei];
+            e.lvals = lvals;
+            e.corder = corder;
+            e.cmap = cmap;
+            e.clone_root = root;
+            continue;
+        }
+        seen_se.insert(exits[ei].seblk, ei);
+        let e = &mut exits[ei];
+        let cset: FxHashSet<Block> = e.corder.iter().copied().collect();
+        e.corder = cone_rpo(func, e.seblk, &cset);
+        let cold = func.layout.is_cold(e.seblk);
+        for (bi, &b) in e.corder.clone().iter().enumerate() {
+            let nb = func.dfg.make_block();
+            for &p in func.dfg.block_params(b).to_vec().iter() {
+                let ty = func.dfg.value_type(p);
+                func.dfg.append_block_param(nb, ty);
+            }
+            if bi == 0 {
+                // RPO root == seblk: appended params carry the loop
+                // values this copy's exit edge binds.
+                for &lv in &e.lvals {
+                    let ty = func.dfg.value_type(lv);
+                    func.dfg.append_block_param(nb, ty);
+                }
+            }
+            func.layout.insert_block(nb, h);
+            if cold && func.layout.is_cold(b) {
+                func.layout.set_cold(nb);
+            }
+            e.cmap.insert(b, nb);
+        }
+        e.clone_root = Some(e.cmap[&e.seblk]);
+        let root = e.clone_root.unwrap();
+        let orig_arity = func.dfg.block_params(e.seblk).len();
+        let mut xmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for (i, &lv) in e.lvals.iter().enumerate() {
+            xmap.insert(lv, func.dfg.block_params(root)[orig_arity + i]);
+        }
+        emit_cone_clone(func, &e.corder, &e.cmap, &mut xmap);
+    }
+}
+
+/// Outside uses of body values must stay inside each exit's own cone.
+/// An unrolled copy's exit clone binds the loop values used inside it,
+/// but its forward edges land on original blocks: from there the peeled
+/// path travels un-cloned code. Any ambient use of a body value
+/// reachable from an exit target without re-entering the body must
+/// therefore be dominated by that target — otherwise a peeled copy can
+/// reach the use without the defining inst ever running (most often an
+/// alias or live-out value pointing back into the body).
+fn exit_continuations_ok(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    dt: &DominatorTree,
+    lvals: &FxHashSet<Value>,
+    targets: &[Block],
+) -> bool {
+    let ambient = |func: &Function, b: Block| -> bool {
+        for i in func.layout.block_insts(b) {
+            if func
+                .dfg
+                .inst_values(i)
+                .any(|v| lvals.contains(&func.dfg.resolve_aliases(v)))
+            {
+                return true;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                if bc.args(&func.dfg.value_lists).any(|a| {
+                    matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    for &tgt in targets {
+        let mut seen: FxHashSet<Block> = FxHashSet::default();
+        let mut stack = vec![tgt];
+        while let Some(b) = stack.pop() {
+            if body.contains(&b) || !seen.insert(b) || !dt.is_reachable(b) {
+                continue;
+            }
+            if seen.len() > 512 {
+                return false; // exit continuation too big
+            }
+            if !dt.block_dominates(tgt, b) && ambient(func, b) {
+                return false; // body value used outside exit cones
+            }
+            for i in func.layout.block_insts(b) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    stack.push(bc.block(&func.dfg.value_lists));
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Emit the unrolled-loop guard at `hu`: iteration budget `bound - a0`
+/// must cover copies 0..K-2's entry tests (i.e. `a_{K-2} cc bound`),
+/// evaluated wide so it can't wrap. Branches to `uf` (unrolled body) on
+/// success and `h` (scalar remainder) otherwise.
+fn emit_trip_guard(
+    func: &mut Function,
+    hu: Block,
+    uf: Block,
+    h: Block,
+    cnt: &Cnt,
+    ity: Type,
+    wty: Type,
+    k: i64,
+) {
+    let huparams = func.dfg.block_params(hu).to_vec();
+    let mut pos = FuncCursor::new(func).at_bottom(hu);
+    let boundv = match cnt.bpidx {
+        Some(q) => huparams[q],
+        None => cnt.bound,
+    };
+    let a0 = if cnt.d == 0 {
+        huparams[cnt.pidx]
+    } else {
+        let dc = pos.ins().iconst(ity, cnt.d);
+        pos.ins().iadd(huparams[cnt.pidx], dc)
+    };
+    // Exit-on-eq latches reduce to the strict unsigned test: a monotone
+    // counter below the bound can't equal it.
+    let (le, signed) = if cnt.eq { (false, false) } else { (cnt.le, cnt.signed) };
+    let cc = match (signed, le) {
+        (true, true) => IntCC::SignedLessThanOrEqual,
+        (true, false) => IntCC::SignedLessThan,
+        (false, true) => IntCC::UnsignedLessThanOrEqual,
+        (false, false) => IntCC::UnsignedLessThan,
+    };
+    let ok1 = pos.ins().icmp(cc, a0, boundv);
+    let (a0w, bw) = if wty != ity && signed {
+        (
+            pos.ins().sextend(wty, a0),
+            pos.ins().sextend(wty, boundv),
+        )
+    } else if wty != ity {
+        (pos.ins().uextend(wty, a0), pos.ins().uextend(wty, boundv))
+    } else {
+        (a0, boundv)
+    };
+    let rem = pos.ins().isub(bw, a0w);
+    let lim = pos.ins().iconst(wty, (k - 2) * cnt.step);
+    let ok2 = pos.ins().icmp(
+        if le {
+            IntCC::UnsignedGreaterThanOrEqual
+        } else {
+            IntCC::UnsignedGreaterThan
+        },
+        rem,
+        lim,
+    );
+    let ok = pos.ins().band(ok1, ok2);
+    let args: Vec<BlockArg> = huparams.iter().map(|&v| v.into()).collect();
+    pos.ins().brif(ok, uf, &args, h, &args);
+}
+
+/// Redirect every outside-the-loop entry edge from `h` to `hu`.
+fn redirect_entries(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    body: &FxHashSet<Block>,
+    h: Block,
+    hu: Block,
+) {
+    let entries: Vec<(Block, Inst)> = cfg
+        .pred_iter(h)
+        .filter(|p| !body.contains(&p.block))
+        .map(|p| (p.block, p.inst))
+        .collect();
+    for (_pb, pi) in entries {
+        let dfg = &mut func.dfg;
+        let ndest = dfg.insts[pi]
+            .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+            .len();
+        for slot in 0..ndest {
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[pi].branch_destination_mut(
+                &mut dfg.jump_tables,
+                &mut dfg.exception_tables,
+            )[slot];
+            if bc.block(&dfg.value_lists) == h {
+                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                *bc = BlockCall::new(hu, args.iter().copied(), &mut dfg.value_lists);
+            }
+        }
+    }
+}
+
 fn run_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -752,53 +1065,18 @@ fn run_loop(
         rotated,
         body,
     } = walk(func, cfg, dt, la, lp, h, name)?;
-    // Loops already doing vector work (loopvec output, SIMD intrinsics) are
-    // vf*UNROLL-wide in the element domain; cloning the body again pays a
-    // fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
-    // mizes addressing (post-index forms get cloned into reg+imm offsets).
-    for &b in &chain {
-        let vec_param = func
-            .dfg
-            .block_params(b)
-            .iter()
-            .any(|&v| func.dfg.value_type(v).is_vector());
-        let vec_inst = func.layout.block_insts(b).any(|i| {
-            func.dfg
-                .inst_args(i)
-                .iter()
-                .chain(func.dfg.inst_results(i))
-                .any(|&v| func.dfg.value_type(v).is_vector())
-        });
-        if vec_param || vec_inst {
-            bail!("vector-typed loop");
-        }
+    if loop_uses_vectors(func, &chain) {
+        bail!("vector-typed loop");
     }
     let n_insts: usize = chain
         .iter()
         .map(|&b| func.layout.block_insts(b).count() - 1)
         .sum();
-    // 12 insts is the small-body cut for full unroll; 16 covers the
-    // load+check+store RMW shape bcheck clones leave (`movz; addl (mem)`
-    // bodies where stock still unrolls 8).
-    let k = if n_insts <= 16 {
-        UNROLL
-    } else if n_insts <= MAX_BODY {
-        UNROLL_BIG
-    } else {
+    let Some(k) = unroll_width(n_insts) else {
         bail!("body too big");
     };
-    // Mid-chain insts must be plain (no branches/calls-with-edges/etc.).
-    for &b in &chain {
-        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-        for &i in &insts[..insts.len() - 1] {
-            let op = func.dfg.insts[i].opcode();
-            if op.is_terminator()
-                || op.is_branch()
-                || matches!(op, Opcode::TryCall | Opcode::TryCallIndirect)
-            {
-                bail!("unclonable inst");
-            }
-        }
+    if !body_insts_clonable(func, &chain) {
+        bail!("unclonable inst");
     }
 
     // Rotated: h's `brif test -> body | exit` is the counting test — pop
@@ -966,119 +1244,18 @@ fn run_loop(
                 bail!("side-exit edge has non-value arg");
             }
         }
-        let scone: Vec<Block> = func
-            .layout
-            .blocks()
-            .filter(|&b| {
-                !body.contains(&b) && dt.is_reachable(b) && dt.block_dominates(e.seblk, b)
-            })
-            .collect();
-        let mut lset: FxHashSet<Value> = FxHashSet::default();
-        let mut elvals: Vec<Value> = Vec::new();
-        let mut sconebad = false;
-        let mut sinsts = 0usize;
-        for &cb in &scone {
-            for i in func.layout.block_insts(cb) {
-                sinsts += 1;
-                for v in func.dfg.inst_values(i) {
-                    let v = func.dfg.resolve_aliases(v);
-                    if lvals.contains(&v) && lset.insert(v) {
-                        elvals.push(v);
-                    }
-                }
-                let op = func.dfg.insts[i].opcode();
-                if matches!(
-                    op,
-                    Opcode::TryCall | Opcode::TryCallIndirect | Opcode::BrTable
-                ) {
-                    sconebad = true;
-                }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
-                    for a in bc.args(&func.dfg.value_lists) {
-                        if let BlockArg::Value(v) = a {
-                            let v = func.dfg.resolve_aliases(v);
-                            if lvals.contains(&v) && lset.insert(v) {
-                                elvals.push(v);
-                            }
-                        }
-                    }
-                    if body.contains(&bc.block(&func.dfg.value_lists)) {
-                        bail!("exit cone re-enters loop");
-                    }
-                }
-            }
+        match analyze_exit_cone(func, &body, dt, &lvals, e.cone.seblk, &mut clone_insts) {
+            Ok(cone) => e.cone = cone,
+            Err(why) => bail!(why),
         }
-        if elvals.is_empty() {
-            continue;
-        }
-        if sconebad || scone.len() > 8 || sinsts > 48 {
-            bail!("side-exit cone too big");
-        }
-        clone_insts += sinsts;
-        if clone_insts > 96 {
-            bail!("side-exit clone budget");
-        }
-        e.lvals = elvals;
-        e.corder = scone;
     }
 
-    // Outside uses of body values must stay inside each exit's own cone.
-    // An unrolled copy's exit clone (the latch's cone clone, or a side
-    // exit's scone clone) binds the loop values used inside it, but its
-    // forward edges land on original blocks: from there the peeled path
-    // travels un-cloned code. Any ambient use of a body value reachable
-    // from an exit target without re-entering the body must therefore be
-    // dominated by that target — otherwise a peeled copy can reach the
-    // use without the defining inst ever running (most often an alias or
-    // live-out value pointing back into the body).
     {
-        let ambient = |func: &Function, b: Block| -> bool {
-            for i in func.layout.block_insts(b) {
-                if func
-                    .dfg
-                    .inst_values(i)
-                    .any(|v| lvals.contains(&func.dfg.resolve_aliases(v)))
-                {
-                    return true;
-                }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
-                    if bc.args(&func.dfg.value_lists).any(|a| {
-                        matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
-                    }) {
-                        return true;
-                    }
-                }
-            }
-            false
-        };
-        for tgt in std::iter::once(eblk).chain(mid_exits.iter().map(|e| e.seblk)) {
-            let mut seen: FxHashSet<Block> = FxHashSet::default();
-            let mut stack = vec![tgt];
-            while let Some(b) = stack.pop() {
-                if body.contains(&b) || !seen.insert(b) || !dt.is_reachable(b) {
-                    continue;
-                }
-                if seen.len() > 512 {
-                    bail!("exit continuation too big");
-                }
-                if !dt.block_dominates(tgt, b) && ambient(func, b) {
-                    bail!("body value used outside exit cones");
-                }
-                for i in func.layout.block_insts(b) {
-                    for bc in func.dfg.insts[i].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    ) {
-                        stack.push(bc.block(&func.dfg.value_lists));
-                    }
-                }
-            }
+        let targets: Vec<Block> = std::iter::once(eblk)
+            .chain(mid_exits.iter().map(|e| e.cone.seblk))
+            .collect();
+        if !exit_continuations_ok(func, &body, dt, &lvals, &targets) {
+            bail!("body value used outside exit cones");
         }
     }
 
@@ -1096,7 +1273,6 @@ fn run_loop(
         func.dfg.append_block_param(hu, ty);
     }
     func.layout.insert_block(hu, h);
-    let huparams = func.dfg.block_params(hu).to_vec();
     // Segments: `usegs[kk][j]` is segment j of copy kk. A mid-chain side
     // exit ends a segment (the brif needs a real target); otherwise copies
     // stay in ONE block so load/consumer adjacency survives the egraph
@@ -1128,55 +1304,7 @@ fn run_loop(
     }
     let ufparams = func.dfg.block_params(uf).to_vec();
 
-    // Guard: iteration budget `bound - a0` must cover copies 0..K-2's entry
-    // tests (i.e. a_{K-2} cc bound), evaluated wide so it can't wrap.
-    {
-        let mut pos = FuncCursor::new(func).at_bottom(hu);
-        let boundv = match cnt.bpidx {
-            Some(q) => huparams[q],
-            None => cnt.bound,
-        };
-        let a0 = if cnt.d == 0 {
-            huparams[cnt.pidx]
-        } else {
-            let dc = pos.ins().iconst(ity, cnt.d);
-            pos.ins().iadd(huparams[cnt.pidx], dc)
-        };
-        let cc = match (cnt.signed, cnt.le) {
-            (true, true) => IntCC::SignedLessThanOrEqual,
-            (true, false) => IntCC::SignedLessThan,
-            (false, true) => IntCC::UnsignedLessThanOrEqual,
-            (false, false) => IntCC::UnsignedLessThan,
-        };
-        let ok1 = pos.ins().icmp(cc, a0, boundv);
-        let (a0w, bw) = if wty != ity && cnt.signed {
-            (
-                pos.ins().sextend(wty, a0),
-                pos.ins().sextend(wty, boundv),
-            )
-        } else if wty != ity {
-            (
-                pos.ins().uextend(wty, a0),
-                pos.ins().uextend(wty, boundv),
-            )
-        } else {
-            (a0, boundv)
-        };
-        let rem = pos.ins().isub(bw, a0w);
-        let lim = pos.ins().iconst(wty, (k - 2) * cnt.step);
-        let ok2 = pos.ins().icmp(
-            if cnt.le {
-                IntCC::UnsignedGreaterThanOrEqual
-            } else {
-                IntCC::UnsignedGreaterThan
-            },
-            rem,
-            lim,
-        );
-        let ok = pos.ins().band(ok1, ok2);
-        let args: Vec<BlockArg> = huparams.iter().map(|&v| v.into()).collect();
-        pos.ins().brif(ok, uf, &args, h, &args);
-    }
+    emit_trip_guard(func, hu, uf, h, &cnt, ity, wty, k);
 
     // When the exit cone references loop values, the unrolled loop's exit
     // clones the whole cone. Create the clone blocks now (the last copy's
@@ -1201,60 +1329,15 @@ fn run_loop(
 
     // Side-exit cone clones: one clone per exit (deduped by target), the
     // clone root taking the cone's loop values as appended params so each
-    // copy's `brif` carries that copy's bindings on the edge. Contents are
-    // emitted immediately — the clone's value map is self-contained (loop
-    // values arrive only through the root params).
-    let mut seen_se: FxHashMap<Block, usize> = FxHashMap::default();
-    for ei in 0..mid_exits.len() {
-        if mid_exits[ei].lvals.is_empty() {
-            continue;
-        }
-        if let Some(&first) = seen_se.get(&mid_exits[ei].seblk) {
-            let (lvals, corder, cmap, root) = {
-                let f = &mid_exits[first];
-                (f.lvals.clone(), f.corder.clone(), f.cmap.clone(), f.clone_root)
-            };
-            let e = &mut mid_exits[ei];
-            e.lvals = lvals;
-            e.corder = corder;
-            e.cmap = cmap;
-            e.clone_root = root;
-            continue;
-        }
-        seen_se.insert(mid_exits[ei].seblk, ei);
-        let e = &mut mid_exits[ei];
-        let cset: FxHashSet<Block> = e.corder.iter().copied().collect();
-        e.corder = cone_rpo(func, e.seblk, &cset);
-        let cold = func.layout.is_cold(e.seblk);
-        for (bi, &b) in e.corder.clone().iter().enumerate() {
-            let nb = func.dfg.make_block();
-            for &p in func.dfg.block_params(b).to_vec().iter() {
-                let ty = func.dfg.value_type(p);
-                func.dfg.append_block_param(nb, ty);
-            }
-            if bi == 0 {
-                // RPO root == seblk: appended params carry the loop values
-                // this copy's exit edge binds.
-                for &lv in &e.lvals {
-                    let ty = func.dfg.value_type(lv);
-                    func.dfg.append_block_param(nb, ty);
-                }
-            }
-            func.layout.insert_block(nb, h);
-            if cold && func.layout.is_cold(b) {
-                func.layout.set_cold(nb);
-            }
-            e.cmap.insert(b, nb);
-        }
-        e.clone_root = Some(e.cmap[&e.seblk]);
-        let root = e.clone_root.unwrap();
-        let orig_arity = func.dfg.block_params(e.seblk).len();
-        let mut xmap: FxHashMap<Value, Value> = FxHashMap::default();
-        for (i, &lv) in e.lvals.iter().enumerate() {
-            xmap.insert(lv, func.dfg.block_params(root)[orig_arity + i]);
-        }
-        emit_cone_clone(func, &e.corder, &e.cmap, &mut xmap);
-    }
+    // copy's `brif` carries that copy's bindings on the edge.
+    emit_exit_cones(
+        func,
+        h,
+        &mut mid_exits
+            .iter_mut()
+            .map(|e| &mut e.cone)
+            .collect::<Vec<_>>(),
+    );
 
     // Clone K copies of the chain into the single fused block. Block params
     // bind through `carry`: copy kk>0's header params come from copy kk-1's
@@ -1410,14 +1493,14 @@ fn run_loop(
                         .args(&func.dfg.value_lists)
                         .map(|a| mv(func, a))
                         .collect();
-                    if e.clone_root.is_some() {
-                        for &lv in &e.lvals {
+                    if e.cone.clone_root.is_some() {
+                        for &lv in &e.cone.lvals {
                             let lv = func.dfg.resolve_aliases(lv);
                             eargs.push(BlockArg::Value(*vmap.get(&lv).unwrap_or(&lv)));
                         }
                     }
                     let nxt = usegs[kk][seg_i + 1];
-                    let etgt = e.clone_root.unwrap_or(e.seblk);
+                    let etgt = e.cone.clone_root.unwrap_or(e.cone.seblk);
                     let mut pos = FuncCursor::new(func).at_bottom(curseg);
                     if e.epos == 0 {
                         pos.ins().brif(carg, etgt, &eargs, nxt, &[]);
@@ -1475,29 +1558,611 @@ fn run_loop(
         emit_cone_clone(func, &corder, &cmap, &mut lastmap);
     }
 
-    // Redirect every outside-the-loop entry edge from h to hu.
-    let entries: Vec<(Block, Inst)> = cfg
-        .pred_iter(h)
-        .filter(|p| !body.contains(&p.block))
-        .map(|p| (p.block, p.inst))
+    redirect_entries(func, cfg, &body, h, hu);
+    Some(())
+}
+
+/// Loops already doing vector work (loopvec output, SIMD intrinsics) are
+/// vf*UNROLL-wide in the element domain; cloning the body again pays a
+/// fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
+/// mizes addressing (post-index forms get cloned into reg+imm offsets).
+fn loop_uses_vectors(func: &Function, blocks: &[Block]) -> bool {
+    blocks.iter().any(|&b| {
+        func.dfg
+            .block_params(b)
+            .iter()
+            .any(|&v| func.dfg.value_type(v).is_vector())
+            || func.layout.block_insts(b).any(|i| {
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .chain(func.dfg.inst_results(i))
+                    .any(|&v| func.dfg.value_type(v).is_vector())
+            })
+    })
+}
+
+/// Copy count for a body of `n_insts` non-terminator instructions. 16 is
+/// the small-body cut for a full 8x unroll; it also covers the
+/// load+check+store RMW shape bcheck clones leave (`movz; addl (mem)`
+/// bodies where stock still unrolls 8). `None` when the body is too big.
+fn unroll_width(n_insts: usize) -> Option<i64> {
+    if n_insts <= 16 {
+        Some(UNROLL)
+    } else if n_insts <= MAX_BODY {
+        Some(UNROLL_BIG)
+    } else {
+        None
+    }
+}
+
+/// Non-terminator insts must be plain (no branches/calls-with-edges/etc.).
+fn body_insts_clonable(func: &Function, blocks: &[Block]) -> bool {
+    blocks.iter().all(|&b| {
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        insts[..insts.len() - 1].iter().all(|&i| {
+            let op = func.dfg.insts[i].opcode();
+            !(op.is_terminator()
+                || op.is_branch()
+                || matches!(op, Opcode::TryCall | Opcode::TryCallIndirect))
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Region unrolling: multi-block bodies
+// ---------------------------------------------------------------------------
+
+/// Body-block count cap for `run_region` — each copy clones every block,
+/// so regions stay small.
+const MAX_REGION_BLOCKS: usize = 8;
+
+/// A body block whose terminator has one edge to `h` — the backedge.
+/// `counting` when its test is the trip-count exit (droppable under the
+/// guard in interior copies); a non-counting latch is a conditional
+/// `break` kept verbatim in every copy, its h-edge retargeted to the
+/// next copy's header clone (or `hu` in the last).
+struct Latch {
+    blk: Block,
+    /// Backedge call (to `h`); its args re-bind `h`'s params.
+    back_bc: BlockCall,
+    /// Slot (0/1) of the h-dest in the `brif` (the other dest is an
+    /// out-of-body exit, remapped through `exits` at emission).
+    cpos: usize,
+    counting: bool,
+}
+
+/// `v` as `hparam + off` for the region walk: `h` params resolve to
+/// their own index; `iadd` by a constant shifts the offset; a param of
+/// an in-body block resolves to whatever its forward pred edges bind
+/// (all must agree — a real merge can't be affine). Fuel caps the
+/// recursion against degenerate param cycles.
+fn resolve_affine(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    h: Block,
+    body: &FxHashSet<Block>,
+    v: Value,
+    fuel: usize,
+) -> Option<(usize, i64)> {
+    if fuel == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(i) = param_idx(func, h, v) {
+        return Some((i, 0));
+    }
+    match func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Param(b, j) if body.contains(&b) => {
+            // Only `h` has out-of-body preds; a body block with one would
+            // be a second entry — not an affine value regardless.
+            let mut merged = None;
+            for p in cfg.pred_iter(b) {
+                if !body.contains(&p.block) {
+                    return None;
+                }
+                for bc in func.dfg.insts[p.inst].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                ) {
+                    if bc.block(&func.dfg.value_lists) != b {
+                        continue;
+                    }
+                    let BlockArg::Value(a) = bc.args(&func.dfg.value_lists).nth(j)? else {
+                        return None;
+                    };
+                    let r = resolve_affine(func, cfg, h, body, a, fuel - 1)?;
+                    if merged.is_some_and(|m| m != r) {
+                        return None;
+                    }
+                    merged = Some(r);
+                }
+            }
+            merged
+        }
+        _ => {
+            let ii = func.dfg.value_def(v).inst()?;
+            let InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } = func.dfg.insts[ii]
+            else {
+                return None;
+            };
+            for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                if let Some(k) = iconst(func, c)
+                    && let Some((p, d)) = resolve_affine(func, cfg, h, body, x, fuel - 1)
+                {
+                    return Some((p, d.wrapping_add(k)));
+                }
+            }
+            None
+        }
+    }
+}
+
+/// `find_count`'s counterpart for region latches: `a cc bound` where `a`
+/// resolves (through in-body params) to `hparam + d` stepping `+s` on
+/// *every* backedge in `backedges`, `bound` loop-invariant. Also accepts
+/// exit-on-`a == bound` (a `!=` continue test) — under a monotone
+/// counter it drops to the same strict `< bound` guard.
+fn latch_count(
+    func: &Function,
+    h: Block,
+    body: &FxHashSet<Block>,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    x: Value,
+    y: Value,
+    cond: IntCC,
+    hparams: &[Value],
+    backedges: &[BlockCall],
+) -> Option<Cnt> {
+    let try_one = |a: Value, b: Value, cc: IntCC| -> Option<Cnt> {
+        let (le, signed, eq) = match cc {
+            IntCC::UnsignedLessThan => (false, false, false),
+            IntCC::UnsignedLessThanOrEqual => (true, false, false),
+            IntCC::SignedLessThan => (false, true, false),
+            IntCC::SignedLessThanOrEqual => (true, true, false),
+            IntCC::NotEqual => (false, false, true),
+            _ => return None,
+        };
+        let (pidx, d) = resolve_affine(func, cfg, h, body, a, 16)?;
+        let pty = func.dfg.value_type(hparams[pidx]);
+        if !pty.is_int() || pty.bits() < 16 || pty.bits() > 64 {
+            return None;
+        }
+        // Step: the counter's backedge value must be `p + s` on *every*
+        // latch, s the same positive const.
+        let mut step = None;
+        for bc in backedges {
+            let BlockArg::Value(av) = bc.args(&func.dfg.value_lists).nth(pidx)? else {
+                return None;
+            };
+            let (p, s) = resolve_affine(func, cfg, h, body, av, 16)?;
+            if p != pidx || s <= 0 || step.is_some_and(|t| t != s) {
+                return None;
+            }
+            step = Some(s);
+        }
+        let step = step?;
+        // Bound must be loop-invariant: defined outside the body, or a
+        // header param passed back unchanged on every backedge (usable
+        // at hu as hu's own param).
+        let b = func.dfg.resolve_aliases(b);
+        let mut bpidx = None;
+        if let Some(bi) = func.dfg.value_def(b).inst() {
+            let bb = func.layout.inst_block(bi)?;
+            if body.contains(&bb) {
+                return None;
+            }
+            if !cfg
+                .pred_iter(h)
+                .filter(|p| !body.contains(&p.block))
+                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+            {
+                return None;
+            }
+        } else {
+            let unchanged = |q: usize| {
+                backedges.iter().all(|bc| {
+                    matches!(
+                        bc.args(&func.dfg.value_lists).nth(q),
+                        Some(BlockArg::Value(v)) if func.dfg.resolve_aliases(v) == b
+                    )
+                })
+            };
+            match func.dfg.value_def(b) {
+                cranelift_codegen::ir::ValueDef::Param(bb, q) if bb == h && unchanged(q) => {
+                    bpidx = Some(q);
+                }
+                cranelift_codegen::ir::ValueDef::Param(bb, _)
+                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                _ => return None,
+            }
+        }
+        Some(Cnt {
+            pidx,
+            d,
+            step,
+            bound: b,
+            bpidx,
+            le,
+            signed,
+            eq,
+        })
+    };
+    try_one(x, y, cond).or_else(|| try_one(y, x, cond.swap_args()))
+}
+
+/// Partial unrolling of a *multi-block* counted loop — the counterpart
+/// of `run_loop` for bodies the linear chain can't walk (diamonds like
+/// `h: brif sel -> armA | armB; arm*: ...; brif cnt -> h | exit`, where
+/// each arm carries its own latch test).
+///
+/// Copy kk clones every body block once — real CFG, not the chain's
+/// fused straight-line block, since the arm-select brif is
+/// data-dependent and must stay a branch. Interior copies drop the
+/// counting latch tests (guard-covered) and retarget their backedges to
+/// the next copy's header clone; the last copy's latches branch to
+/// `hu`/exit exactly like the chain path. Conditional (`break`) latches
+/// keep their test in every copy — only the h-edge is retargeted. The
+/// original loop is untouched and handles the tail.
+fn run_region(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: cranelift_codegen::loop_analysis::Loop,
+    h: Block,
+    name: &str,
+) -> Option<()> {
+    macro_rules! bail {
+        ($why:expr) => {{
+            if debug() {
+                eprintln!("punroll {name} block{}: {}", h.as_u32(), $why);
+            }
+            return None;
+        }};
+    }
+    // ---- shape ----
+    if !dt.is_reachable(h) || func.layout.is_cold(h) {
+        bail!("header unreachable/cold");
+    }
+    // Only for bodies `walk` can't linearize.
+    if walk(func, cfg, dt, la, lp, h, name).is_some() {
+        bail!("linear shape");
+    }
+    let body: FxHashSet<Block> = func
+        .layout
+        .blocks()
+        .filter(|&b| la.is_in_loop(b, lp))
         .collect();
-    for (_pb, pi) in entries {
-        let dfg = &mut func.dfg;
-        let ndest = dfg.insts[pi]
-            .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
-            .len();
-        for slot in 0..ndest {
-            let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[pi].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
-            if bc.block(&dfg.value_lists) == h {
-                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
-                *bc = BlockCall::new(hu, args.iter().copied(), &mut dfg.value_lists);
+    if body.len() < 2 || body.len() > MAX_REGION_BLOCKS {
+        bail!("region size");
+    }
+    if body.iter().any(|&b| func.layout.is_cold(b)) {
+        bail!("cold body block");
+    }
+    // An inner loop's blocks sit outside `body` but re-enter it — an
+    // edge to one would read as an exit and get cone-cloned.
+    if la.loops().any(|c| la.loop_parent(c) == Some(lp)) {
+        bail!("nested loop");
+    }
+    let rpo = cone_rpo(func, h, &body);
+    if rpo.len() != body.len() {
+        bail!("unreachable body block");
+    }
+    if loop_uses_vectors(func, &rpo) {
+        bail!("vector-typed loop");
+    }
+    if !body_insts_clonable(func, &rpo) {
+        bail!("unclonable inst");
+    }
+    // Every edge arg must be a plain value (the remap can't carry
+    // other BlockArg kinds).
+    for &b in &rpo {
+        for i in func.layout.block_insts(b) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                if bc
+                    .args(&func.dfg.value_lists)
+                    .any(|a| !matches!(a, BlockArg::Value(_)))
+                {
+                    bail!("edge arg not a value");
+                }
             }
         }
     }
+
+    // ---- classify edges: latches carry the backedges, everything else
+    // leaving the body is an exit ----
+    let mut latches: Vec<Latch> = Vec::new();
+    let mut exit_blks: FxHashSet<Block> = FxHashSet::default();
+    for &b in &rpo {
+        let t = func.layout.last_inst(b).unwrap();
+        let dests: Vec<BlockCall> = func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .to_vec();
+        match func.dfg.insts[t] {
+            InstructionData::Jump { .. } => {
+                let d = dests[0].block(&func.dfg.value_lists);
+                if d == h {
+                    bail!("unconditional backedge");
+                }
+                if !body.contains(&d) {
+                    exit_blks.insert(d);
+                }
+            }
+            InstructionData::Brif { .. } => {
+                let d0 = dests[0].block(&func.dfg.value_lists);
+                let d1 = dests[1].block(&func.dfg.value_lists);
+                match (d0 == h, d1 == h) {
+                    (true, true) => bail!("degenerate backedge"),
+                    (h0, h1) if h0 != h1 => {
+                        let cpos = if h0 { 0 } else { 1 };
+                        let other = dests[1 - cpos];
+                        if body.contains(&other.block(&func.dfg.value_lists)) {
+                            bail!("conditional continue");
+                        }
+                        latches.push(Latch {
+                            blk: b,
+                            back_bc: dests[cpos],
+                            cpos,
+                            counting: false,
+                        });
+                        exit_blks.insert(other.block(&func.dfg.value_lists));
+                    }
+                    _ => {
+                        for d in [d0, d1] {
+                            if !body.contains(&d) {
+                                exit_blks.insert(d);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => bail!("unhandled terminator"),
+        }
+    }
+    if latches.is_empty() {
+        bail!("no latch");
+    }
+    for l in &latches {
+        if l
+            .back_bc
+            .args(&func.dfg.value_lists)
+            .count()
+            != func.dfg.block_params(h).len()
+        {
+            bail!("backedge arity");
+        }
+    }
+
+    // ---- counting analysis: at least one latch must be the counted
+    // exit, and every counting latch must agree on the counter ----
+    let hparams = func.dfg.block_params(h).to_vec();
+    let backedges: Vec<BlockCall> = latches.iter().map(|l| l.back_bc).collect();
+    let mut cnt: Option<Cnt> = None;
+    for l in &mut latches {
+        let t = func.layout.last_inst(l.blk).unwrap();
+        let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
+            unreachable!()
+        };
+        let counting = (|| {
+            let ci = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+            let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond,
+                args: [x, y],
+            } = func.dfg.insts[ci]
+            else {
+                return None;
+            };
+            let cond = if l.cpos == 0 { cond } else { cond.complement() };
+            latch_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &backedges)
+        })();
+        let Some(c) = counting else { continue };
+        match &cnt {
+            None => cnt = Some(c),
+            Some(u)
+                if u.pidx == c.pidx
+                    && u.d == c.d
+                    && u.step == c.step
+                    && u.bound == c.bound
+                    && u.le == c.le
+                    && u.signed == c.signed
+                    && u.eq == c.eq => {}
+            Some(_) => bail!("inconsistent counting tests"),
+        }
+        l.counting = true;
+    }
+    let Some(cnt) = cnt else {
+        bail!("no counting latch");
+    };
+
+    // ---- exits: every out-of-body target gets the shared-cone
+    // treatment, exactly like chain side exits ----
+    let mut lvals: FxHashSet<Value> = FxHashSet::default();
+    for &p in &hparams {
+        lvals.insert(p);
+    }
+    for &b in &rpo {
+        lvals.extend(func.dfg.block_params(b).iter().copied());
+        for i in func.layout.block_insts(b) {
+            lvals.extend(func.dfg.inst_results(i).iter().copied());
+        }
+    }
+    let mut clone_insts = 0usize;
+    let mut exits: Vec<ExitCone> = Vec::new();
+    for &se in &exit_blks {
+        match analyze_exit_cone(func, &body, dt, &lvals, se, &mut clone_insts) {
+            Ok(cone) => exits.push(cone),
+            Err(why) => bail!(why),
+        }
+    }
+    let targets: Vec<Block> = exits.iter().map(|e| e.seblk).collect();
+    if !exit_continuations_ok(func, &body, dt, &lvals, &targets) {
+        bail!("body value used outside exit cones");
+    }
+
+    let n_insts: usize = rpo
+        .iter()
+        .map(|&b| func.layout.block_insts(b).count() - 1)
+        .sum();
+    let Some(k) = unroll_width(n_insts) else {
+        bail!("body too big");
+    };
+    let ity = func.dfg.value_type(hparams[cnt.pidx]);
+    let wty = if ity.bits() <= 32 { types::I64 } else { ity };
+
+    // ---- emit ----
+    // `hu` guard, then K full body clones: copy kk's latch edges go to
+    // copy kk+1's header clone, the last copy's to `hu`/the exit cones.
+    // Clone blocks take their source's params — interior edges bind
+    // them verbatim, so no carry threading is needed.
+    let hu = func.dfg.make_block();
+    for &p in &hparams {
+        let ty = func.dfg.value_type(p);
+        func.dfg.append_block_param(hu, ty);
+    }
+    func.layout.insert_block(hu, h);
+    let mut cmaps: Vec<FxHashMap<Block, Block>> = Vec::with_capacity(k as usize);
+    for _ in 0..k {
+        let mut cm: FxHashMap<Block, Block> = FxHashMap::default();
+        for &b in &rpo {
+            let nb = func.dfg.make_block();
+            for &p in func.dfg.block_params(b).to_vec().iter() {
+                let ty = func.dfg.value_type(p);
+                func.dfg.append_block_param(nb, ty);
+            }
+            func.layout.insert_block(nb, h);
+            cm.insert(b, nb);
+        }
+        cmaps.push(cm);
+    }
+    emit_exit_cones(func, h, &mut exits.iter_mut().collect::<Vec<_>>());
+    emit_trip_guard(func, hu, cmaps[0][&h], h, &cnt, ity, wty, k);
+
+    // `seblk` → its clone root (or itself when the cone needed no clone).
+    let etgt = |d: Block| -> Block {
+        exits
+            .iter()
+            .find(|e| e.seblk == d)
+            .and_then(|e| e.clone_root)
+            .unwrap_or(d)
+    };
+    let latch_at: FxHashMap<Block, &Latch> =
+        latches.iter().map(|l| (l.blk, l)).collect();
+
+    for kk in 0..k as usize {
+        let cmap = &cmaps[kk];
+        let last = kk + 1 == k as usize;
+        let hv = if last { hu } else { cmaps[kk + 1][&h] };
+        let mut xmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for &b in &rpo {
+            let nb = cmap[&b];
+            for (j, &sp) in func.dfg.block_params(b).to_vec().iter().enumerate() {
+                xmap.insert(sp, func.dfg.block_params(nb)[j]);
+            }
+            let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+            for &ii in &insts[..insts.len() - 1] {
+                let src = func.dfg.insts[ii];
+                let data = {
+                    let mut m = Vm {
+                        func,
+                        vmap: &xmap,
+                        bmap: cmap,
+                    };
+                    src.map(&mut m)
+                };
+                let ni = func.dfg.make_inst(data);
+                let ctv = func.dfg.ctrl_typevar(ii);
+                func.dfg.make_inst_results(ni, ctv);
+                func.layout.append_inst(ni, nb);
+                for (&o, &nv) in func
+                    .dfg
+                    .inst_results(ii)
+                    .iter()
+                    .zip(func.dfg.inst_results(ni).iter())
+                {
+                    xmap.insert(func.dfg.resolve_aliases(o), nv);
+                }
+            }
+            // Terminator: remap each dest by class. `h` → next copy's
+            // header clone (`hu` in the last), in-body → this copy's
+            // clone, out-of-body → the exit clone root (with the cone's
+            // `lvals` appended) or the original block.
+            let mv = |func: &Function, a: BlockArg| -> BlockArg {
+                match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        BlockArg::Value(*xmap.get(&v).unwrap_or(&v))
+                    }
+                    a => a,
+                }
+            };
+            let edge = |func: &Function, bc: BlockCall| -> (Block, Vec<BlockArg>) {
+                let d = bc.block(&func.dfg.value_lists);
+                let mut args: Vec<BlockArg> = bc
+                    .args(&func.dfg.value_lists)
+                    .map(|a| mv(func, a))
+                    .collect();
+                let t = if d == h {
+                    hv
+                } else if body.contains(&d) {
+                    cmap[&d]
+                } else {
+                    let t = etgt(d);
+                    if t != d {
+                        let e = exits.iter().find(|e| e.seblk == d).unwrap();
+                        for &lv in &e.lvals {
+                            let lv = func.dfg.resolve_aliases(lv);
+                            args.push(BlockArg::Value(*xmap.get(&lv).unwrap_or(&lv)));
+                        }
+                    }
+                    t
+                };
+                (t, args)
+            };
+            let t = *insts.last().unwrap();
+            let tdata = func.dfg.insts[t];
+            let dests: Vec<BlockCall> = tdata
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .to_vec();
+            match tdata {
+                InstructionData::Jump { .. } => {
+                    let (t, args) = edge(func, dests[0]);
+                    FuncCursor::new(func).at_bottom(nb).ins().jump(t, &args);
+                }
+                InstructionData::Brif { arg: c, .. } => {
+                    let c = func.dfg.resolve_aliases(c);
+                    let carg = *xmap.get(&c).unwrap_or(&c);
+                    let l = latch_at.get(&b);
+                    if !last && l.is_some_and(|l| l.counting) {
+                        // Interior copy: the guard implies continue —
+                        // drop the test, jump the next copy's header.
+                        let (t, args) = edge(func, dests[l.unwrap().cpos]);
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(t, &args);
+                    } else {
+                        let (t0, a0) = edge(func, dests[0]);
+                        let (t1, a1) = edge(func, dests[1]);
+                        FuncCursor::new(func)
+                            .at_bottom(nb)
+                            .ins()
+                            .brif(carg, t0, &a0, t1, &a1);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    if debug() {
+        eprintln!("punroll {name} block{}: region unrolled k={k}", h.as_u32());
+    }
+    redirect_entries(func, cfg, &body, h, hu);
     Some(())
 }
 
@@ -1737,7 +2402,7 @@ fn run_peel(
             }
             false
         };
-        let mut tgts: Vec<Block> = mid_exits.iter().map(|e| e.seblk).collect();
+        let mut tgts: Vec<Block> = mid_exits.iter().map(|e| e.cone.seblk).collect();
         if let Some(ebc) = lexit {
             tgts.push(ebc.block(&func.dfg.value_lists));
         }
@@ -1923,9 +2588,9 @@ fn run_peel(
                     let nxtblk = cblks[kk][i + 1];
                     let mut pos = FuncCursor::new(func).at_bottom(nb);
                     if e.epos == 0 {
-                        pos.ins().brif(carg, e.seblk, &ex, nxtblk, &[]);
+                        pos.ins().brif(carg, e.cone.seblk, &ex, nxtblk, &[]);
                     } else {
-                        pos.ins().brif(carg, nxtblk, &[], e.seblk, &ex);
+                        pos.ins().brif(carg, nxtblk, &[], e.cone.seblk, &ex);
                     }
                 }
                 InstructionData::Brif { arg: c, .. } => {
