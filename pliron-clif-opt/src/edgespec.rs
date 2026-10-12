@@ -678,15 +678,32 @@ impl<'a> W<'a> {
         if params.len() != args.len() {
             return self.fin_edge(d, args, &skipped);
         }
+        // Re-entering a walked block, or passing `d` one of its own params
+        // (a loop header fed from inside the loop), would rebind a value
+        // the args still mean in its old sense: `env` and `sub` are keyed
+        // by `Value`, so the old and new bindings can't coexist.
+        if skipped.contains(&d)
+            || args
+                .iter()
+                .any(|&a| params.contains(&subv(self.func, &sub, a)) || params.contains(&a))
+        {
+            return self.fin_edge(d, args, &skipped);
+        }
         let mut env = env.clone();
         let mut sub = sub;
-        for (&prm, &a) in params.iter().zip(&args) {
-            let e = eval(self.func, &mut env, &sub, a, 0);
-            let e = if e == E::Unk && is_bool(self.func, a, 0) {
-                E::S(a, 1, 0)
-            } else {
-                e
-            };
+        // Block params bind in parallel: evaluate every arg before binding.
+        let es: Vec<E> = args
+            .iter()
+            .map(|&a| {
+                let e = eval(self.func, &mut env, &sub, a, 0);
+                if e == E::Unk && is_bool(self.func, a, 0) {
+                    E::S(a, 1, 0)
+                } else {
+                    e
+                }
+            })
+            .collect();
+        for ((&prm, &a), e) in params.iter().zip(&args).zip(es) {
             env.insert(prm, e);
             sub.insert(prm, a);
         }
@@ -1465,17 +1482,20 @@ fn splices(func: &mut Function) -> usize {
             }
             let mut env: FxHashMap<Value, E> = FxHashMap::default();
             let sub: FxHashMap<Value, Value> = FxHashMap::default();
-            let mut ok = true;
-            for (&rpj, a) in rpjs.iter().zip(args) {
-                let BlockArg::Value(a) = a else {
-                    ok = false;
-                    break;
-                };
-                let e = eval(func, &mut env, &sub, *a, 0);
-                env.insert(rpj, e);
-            }
-            if !ok {
+            // Evaluate every arg before binding any param: an edge from
+            // inside a loop may pass J's own params, meaning their old values.
+            let es: Option<Vec<E>> = args
+                .iter()
+                .map(|a| match a {
+                    BlockArg::Value(a) => Some(eval(func, &mut env, &sub, *a, 0)),
+                    _ => None,
+                })
+                .collect();
+            let Some(es) = es else {
                 continue;
+            };
+            for (&rpj, e) in rpjs.iter().zip(es) {
+                env.insert(rpj, e);
             }
             let E::K(k) = eval(func, &mut env, &sub, c, 0) else {
                 continue;
