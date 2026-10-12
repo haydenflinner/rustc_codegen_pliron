@@ -2341,12 +2341,33 @@
 (rule 2 (lower (ctz_nonzero $I32 src))
       (emit_ret_gpr (x64_bsfl_rm_raw (put_in_gpr_mem_32 src))))
 
+;; `bsfl` on the 32-bit view of a narrow value's register: the operand is
+;; nonzero, so its lowest set bit is always below the value's width and
+;; garbage in the register's upper bits can't change the answer — saving
+;; the extend that a same-width `bsf` result would need.
 (rule 2 (lower (ctz_nonzero $I16 src))
-      (emit_ret_gpr (x64_bsfw_rm_raw (put_in_gpr_mem_16 src))))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
+
+;; `uextend` of `ctz_nonzero`: `bsfl` writes a 32-bit register (clearing
+;; the top 32) and the count is below the source width, so the extend is
+;; already done — reuse the same `bsf` for the wider result.
+(rule 3 (lower (uextend _ (ctz_nonzero $I8 src)))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
+
+(rule 3 (lower (uextend _ (ctz_nonzero $I16 src)))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
+
+(rule 3 (lower (uextend _ (uextend _ (ctz_nonzero $I8 src))))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
+
+(rule 3 (lower (uextend _ (uextend _ (ctz_nonzero $I16 src))))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
+
+(rule 3 (lower (uextend $I64 (ctz_nonzero $I32 src)))
+      (emit_ret_gpr (x64_bsfl_rm_raw (put_in_gpr_mem_32 src))))
 
 (rule 1 (lower (ctz_nonzero $I8 src))
-      (let ((extended Gpr (extend_to_gpr src $I32 (ExtendKind.Zero))))
-        (emit_ret_gpr (x64_bsfl_rm_raw extended))))
+      (emit_ret_gpr (x64_bsfl_rm_raw (gpr_to_gpr_mem_32 (put_in_gpr src)))))
 
 ;; Rules for `cls` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
