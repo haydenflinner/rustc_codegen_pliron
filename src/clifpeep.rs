@@ -4466,8 +4466,10 @@ pub fn vecslot(func: &mut Function) -> usize {
                 } else {
                     (1u128 << lb) - 1
                 };
+                let lanes = ln * 8 / lb as usize;
                 let uniform = lty.is_vector()
-                    && (1..ln).all(|j| (le >> (j as u32 * lb)) & lmask == le & lmask);
+                    && lanes > 1
+                    && (1..lanes).all(|j| (le >> (j as u32 * lb)) & lmask == le & lmask);
                 if uniform {
                     let et = lty.lane_type();
                     let mask = if et.bits() == 64 {
