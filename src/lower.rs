@@ -1087,16 +1087,18 @@ thread_local! {
 }
 
 /// `%al=8` + tail-`jmp` stub so foreign variadic callees dump all xmm regs.
+/// Every CGU that calls `sym` emits its own copy, so the stubs are weak:
+/// two CGUs of one crate in the same archive would otherwise collide.
 fn va_tramp_asm(sym: &str, macho: bool) -> String {
     let sym = crate::obj_sym(sym);
     let t = format!("__pliron_va8.{sym}");
     if macho {
         format!(
-            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp {sym}\n.text\n"
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.weak_definition {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp {sym}\n.text\n"
         )
     } else {
         format!(
-            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.weak {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp {sym}\n.size {t}, .-{t}\n.text\n"
         )
     }
 }
@@ -1107,11 +1109,11 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     let t = format!("__pliron_va8_ind_{reg}");
     if macho {
         format!(
-            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp *%{reg}\n.text\n"
+            ".att_syntax\n.section __TEXT,__text,regular,pure_instructions\n.globl {t}\n.weak_definition {t}\n.private_extern {t}\n{t}:\nmov $8, %eax\njmp *%{reg}\n.text\n"
         )
     } else {
         format!(
-            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.globl {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
+            ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.weak {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
         )
     }
 }
