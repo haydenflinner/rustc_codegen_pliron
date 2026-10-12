@@ -8,14 +8,13 @@
 //! folds the `Option<ptr>` niche null tests.
 //!
 //! `st.nnargs`/`st.nonnull`/`st.inbounds` are populated before inlining, so
-//! the sources they name are read here; recursion is handled by the same
-//! optimistic-start, shrink-to-fixpoint loop as nounwind.rs. Foreign and
-//! preemptible functions are never inferred.
+//! the sources they name are read here. The rules derive the complement,
+//! "may be null", as a least fixpoint, which handles recursion and loops
+//! through block params. Foreign and preemptible functions are never
+//! inferred.
 
-use cranelift_module::Linkage;
-use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::BranchOpInterface;
-use pliron::context::{Context, Ptr};
+use pliron::context::Context;
 use pliron::op::op_cast;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
@@ -27,13 +26,10 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::FxHashSet;
 
-use crate::has_body;
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
-
-/// Def-chain walk depth for one nonnull query.
-const MAX_DEPTH: u32 = 8;
+use crate::{Syms, bodied, has_body};
 
 /// `sym` resolves to an object/symbol defined in this CGU: its address can't
 /// be null. Declared-only and weakly-undefined symbols can resolve to 0.
@@ -42,158 +38,167 @@ fn defined(ctx: &Context, st: &State, sym: &str) -> bool {
         || st.globals.get(sym).is_some_and(|g| g.init.is_some())
 }
 
-/// Whether `v` is provably non-null under nnret table `t`; `known` holds the
-/// function's `nonnull` pointer params plus block params that have (so far)
-/// survived the all-incoming-args fixpoint.
-fn nn(
-    ctx: &Context,
-    st: &State,
-    known: &FxHashSet<Value>,
-    v: Value,
-    t: &FxHashSet<String>,
-    depth: u32,
-) -> bool {
-    if known.contains(&v) {
-        return true;
-    }
+/// A constant that can't be null: a defined symbol's address or non-zero
+/// bits.
+fn const_nonnull(ctx: &Context, st: &State, v: Value) -> bool {
     match st.consts.get(&v) {
-        Some(ConstVal::Sym { sym, .. }) => return defined(ctx, st, sym),
-        Some(ConstVal::Bits(b)) => return *b != 0,
-        Some(_) => return false,
-        None => {}
-    }
-    let Some(depth) = depth.checked_sub(1) else {
-        return false;
-    };
-    let Some(op) = v.defining_op() else {
-        return false;
-    };
-    if st.nonnull.contains(&op) {
-        return true;
-    }
-    macro_rules! is {
-        ($t:ty) => {
-            Operation::is_op::<$t>(op, ctx)
-        };
-    }
-    if is!(AllocaOp) {
-        true
-    } else if is!(BitcastOp) || is!(FreezeOp) {
-        nn(ctx, st, known, op.deref(ctx).get_operand(0), t, depth)
-    } else if is!(GetElementPtrOp) {
-        let inbounds = st.inbounds.contains(&op)
-            || Operation::get_op::<GetElementPtrOp>(op, ctx)
-                .unwrap()
-                .no_wrap_flags(ctx)
-                .contains(GepNoWrapFlags::INBOUNDS);
-        inbounds && nn(ctx, st, known, op.deref(ctx).get_operand(0), t, depth)
-    } else if is!(SelectOp) {
-        let d = op.deref(ctx);
-        nn(ctx, st, known, d.get_operand(1), t, depth)
-            && nn(ctx, st, known, d.get_operand(2), t, depth)
-    } else if is!(CallOp) {
-        direct_callee(ctx, st, op).is_some_and(|c| t.contains(c))
-    } else {
-        false
+        Some(ConstVal::Sym { sym, .. }) => defined(ctx, st, sym),
+        Some(ConstVal::Bits(b)) => *b != 0,
+        _ => false,
     }
 }
 
-/// Every `ret` in `f` returns a provably non-null value under table `t`.
-/// A body with no `ret`s (diverging) qualifies vacuously: a call to it never
-/// sees a result.
-fn returns_nn(ctx: &Context, st: &State, f: Ptr<Operation>, t: &FxHashSet<String>) -> bool {
-    let bs = blocks(ctx, f);
-    let ptr = |v: Value| v.get_type(ctx).deref(ctx).is::<PointerType>();
-    // Optimistic `known`: `nonnull` entry params plus every non-entry pointer
-    // block param — except a landing pad's, whose payload comes from the
-    // callee and is never provable. Params with no recorded incoming arg
-    // stay optimistically marked, which is only possible in unreachable
-    // blocks (their `ret`s can't run).
-    let pads: FxHashSet<Ptr<BasicBlock>> = st.invokes.values().map(|&(l, _)| l).collect();
-    let mut known: FxHashSet<Value> = bs[0]
-        .deref(ctx)
-        .arguments()
-        .filter(|a| ptr(*a) && st.nnargs.get(a).is_some_and(|m| m & 1 != 0))
+ascent::ascent! {
+    struct MayNull;
+    /// `v` may be null outright.
+    relation src(Value);
+    /// `d` may be null when `s` may be (bitcast, freeze, inbounds GEP,
+    /// either select arm, a branch arg flowing into its block param).
+    relation copy(Value, Value);
+    /// `d` is the result of a direct call to `c`.
+    relation call(u32, Value);
+    /// `f` returns `v`.
+    relation ret(u32, Value);
+    /// `f` has a `ret` with no value.
+    relation ret_void(u32);
+    /// Pointer-returning bodies the table can hold.
+    relation cand(u32);
+
+    relation null(Value);
+    null(v) <-- src(v);
+    null(d) <-- copy(s, d), null(s);
+    null(d) <-- call(c, d), !cand(c);
+    null(d) <-- call(c, d), ret_null(c);
+
+    relation ret_null(u32);
+    ret_null(f) <-- ret(f, v), null(v);
+    ret_null(f) <-- ret_void(f);
+}
+
+pub fn run(ctx: &Context, st: &mut State) {
+    let cand: Vec<String> = bodied(ctx, st)
+        .into_iter()
+        .filter(|s| {
+            matches!(classify(ctx, st.funcs[s].ty), TyK::Func(r, ..) if matches!(classify(ctx, r), TyK::Ptr))
+        })
         .collect();
-    for &b in &bs[1..] {
-        if !pads.contains(&b) {
-            known.extend(b.deref(ctx).arguments().filter(|&a| ptr(a)));
-        }
-    }
-    // (param, incoming arg) for every edge, then shrink `known` until every
-    // surviving param is justified on every edge (greatest fixpoint, as in
-    // jumpthread's NonNull).
-    let mut inc: Vec<(Value, Option<Value>)> = Vec::new();
-    for &b in &bs {
-        for op in ops(ctx, b) {
-            let d = op.deref(ctx);
-            if d.successors().next().is_none() {
-                continue;
+    let pads: FxHashSet<_> = st.invokes.values().map(|&(l, _)| l).collect();
+    let ptr = |v: Value| v.get_type(ctx).deref(ctx).is::<PointerType>();
+    let mut ids = Syms::default();
+    let mut p = MayNull::default();
+    // Every value the bodies define.
+    let mut local: FxHashSet<Value> = FxHashSet::default();
+    for s in &cand {
+        let f = ids.id(s);
+        p.cand.push((f,));
+        let bs = blocks(ctx, st.funcs[s].op);
+        for &b in &bs {
+            local.extend(b.deref(ctx).arguments());
+            for op in ops(ctx, b) {
+                local.extend(op.deref(ctx).results());
             }
-            let o = Operation::get_op_dyn(op, ctx);
-            let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
-                continue;
-            };
-            for (si, s) in d.successors().enumerate() {
-                let args = br.successor_operands(ctx, si);
-                for (k, p) in s.deref(ctx).arguments().enumerate() {
-                    inc.push((p, args.get(k).copied()));
+        }
+        // Entry params: only `nonnull` pointers. A landing pad's payload
+        // comes from the callee and is never provable. Other block params
+        // are non-null unless an incoming edge says otherwise (a param with
+        // no incoming edge is in an unreachable block, whose `ret`s can't
+        // run).
+        for a in bs[0].deref(ctx).arguments() {
+            if !(ptr(a) && st.nnargs.get(&a).is_some_and(|m| m & 1 != 0)) {
+                p.src.push((a,));
+            }
+        }
+        for &b in &bs[1..] {
+            let pad = pads.contains(&b);
+            p.src.extend(
+                b.deref(ctx)
+                    .arguments()
+                    .filter(|&a| pad || !ptr(a))
+                    .map(|a| (a,)),
+            );
+        }
+        for &b in &bs {
+            for op in ops(ctx, b) {
+                let d = op.deref(ctx);
+                if d.successors().next().is_some()
+                    && let Some(br) =
+                        op_cast::<dyn BranchOpInterface>(&*Operation::get_op_dyn(op, ctx))
+                {
+                    for (si, s) in d.successors().enumerate() {
+                        let args = br.successor_operands(ctx, si);
+                        for (k, prm) in s.deref(ctx).arguments().enumerate() {
+                            match args.get(k) {
+                                Some(&a) => p.copy.push((a, prm)),
+                                None => p.src.push((prm,)),
+                            }
+                        }
+                    }
+                }
+                if let Some(r) = Operation::get_op::<ReturnOp>(op, ctx) {
+                    match r.retval(ctx) {
+                        Some(v) => p.ret.push((f, v)),
+                        None => p.ret_void.push((f,)),
+                    }
+                    continue;
+                }
+                let Some(r) = d.results().next() else {
+                    continue;
+                };
+                macro_rules! is {
+                    ($t:ty) => {
+                        Operation::is_op::<$t>(op, ctx)
+                    };
+                }
+                if st.consts.contains_key(&r) {
+                    if !const_nonnull(ctx, st, r) {
+                        p.src.push((r,));
+                    }
+                } else if st.nonnull.contains(&op) || is!(AllocaOp) {
+                } else if is!(BitcastOp) || is!(FreezeOp) {
+                    p.copy.push((d.get_operand(0), r));
+                } else if is!(GetElementPtrOp)
+                    && (st.inbounds.contains(&op)
+                        || Operation::get_op::<GetElementPtrOp>(op, ctx)
+                            .unwrap()
+                            .no_wrap_flags(ctx)
+                            .contains(GepNoWrapFlags::INBOUNDS))
+                {
+                    p.copy.push((d.get_operand(0), r));
+                } else if is!(SelectOp) {
+                    p.copy.push((d.get_operand(1), r));
+                    p.copy.push((d.get_operand(2), r));
+                } else if is!(CallOp)
+                    && let Some(c) = direct_callee(ctx, st, op)
+                {
+                    p.call.push((ids.id(c), r));
+                } else {
+                    p.src.push((r,));
                 }
             }
         }
     }
-    loop {
-        let mut changed = false;
-        for &(p, a) in &inc {
-            if known.contains(&p)
-                && !a.is_some_and(|a| known.contains(&a) || nn(ctx, st, &known, a, t, MAX_DEPTH))
-            {
-                known.remove(&p);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    bs.into_iter().all(|b| {
-        ops(ctx, b).into_iter().all(|op| {
-            !Operation::is_op::<ReturnOp>(op, ctx)
-                || Operation::get_op::<ReturnOp>(op, ctx)
-                    .unwrap()
-                    .retval(ctx)
-                    .is_some_and(|v| nn(ctx, st, &known, v, t, MAX_DEPTH))
-        })
-    })
-}
-
-pub fn run(ctx: &Context, st: &mut State) {
-    let cand: Vec<String> = st
-        .funcs
+    // Values the bodies use but don't define (module-level constants).
+    let used: Vec<Value> = p
+        .copy
         .iter()
-        .filter(|(_, f)| {
-            f.linkage != Linkage::Preemptible
-                && has_body(ctx, f.op)
-                && matches!(classify(ctx, f.ty), TyK::Func(r, ..) if matches!(classify(ctx, r), TyK::Ptr))
-        })
-        .map(|(s, _)| s.clone())
+        .map(|&(s, _)| s)
+        .chain(p.ret.iter().map(|&(_, v)| v))
+        .filter(|v| !local.contains(v))
         .collect();
-    // Optimistic start, then drop functions until a fixpoint: handles
-    // recursion (a vacuous SCC of `return other(...)`s can only diverge, so
-    // keeping it is sound).
-    let mut t: FxHashSet<String> = cand.iter().cloned().collect();
-    loop {
-        let mut changed = false;
-        for s in &cand {
-            if t.contains(s) && !returns_nn(ctx, st, st.funcs[s].op, &t) {
-                t.remove(s);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
+    for v in used {
+        if !const_nonnull(ctx, st, v) {
+            p.src.push((v,));
         }
     }
+    p.run();
+    let null: FxHashSet<u32> = p.ret_null.iter().map(|&(f,)| f).collect();
+    // A body with no `ret`s (diverging) qualifies vacuously: a call to it
+    // never sees a result.
+    let t: FxHashSet<String> = cand
+        .iter()
+        .filter(|s| !null.contains(&ids.id(s)))
+        .cloned()
+        .collect();
     if crate::env_set("PLIRON_STATS") {
         eprintln!(
             "nnret {}: {} of {} pointer-returning bodies nonnull",
@@ -201,6 +206,9 @@ pub fn run(ctx: &Context, st: &mut State) {
             t.len(),
             cand.len()
         );
+    }
+    for s in &cand {
+        crate::dump_fact("nnret", s, &t.contains(s));
     }
     st.nnret = t;
 }

@@ -3,19 +3,18 @@
 //! intrinsic, or call to anything but a write-free function leaves memory as
 //! it found it (stores into its own frame aside), so loadfwd keeps loads available across calls to it.
 
-use cranelift_module::Linkage;
-use pliron::context::{Context, Ptr};
+use pliron::context::Context;
 use pliron::operation::Operation;
 use pliron::value::Value;
 use pliron_llvm::ops::{
     AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp,
     FenceOp, GetElementPtrOp, InlineAsmOp, StoreOp, UnreachableOp, VAArgOp,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::has_body;
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
+use crate::{Syms, bodied};
 
 /// libc functions that only read memory.
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];
@@ -68,103 +67,116 @@ fn frame_local(ctx: &Context, mut p: Value) -> bool {
     }
 }
 
-/// Whether `f` may write memory. Strict: never writes. Otherwise: writes
-/// only on paths that end in a plain noreturn call (a panic), which leave
-/// `f` by unwinding straight through it, so a normal return saw no write.
-/// Invokes may land in `f`'s own pads and return, so they need a strict callee.
-fn writes(
-    ctx: &Context,
-    st: &State,
-    f: Ptr<Operation>,
-    nw: &FxHashMap<String, bool>,
-    strict: bool,
-) -> bool {
-    blocks(ctx, f).into_iter().any(|b| {
-        let os = ops(ctx, b);
-        os.iter().enumerate().any(|(k, &op)| {
-            macro_rules! is {
-                ($t:ty) => {
-                    Operation::is_op::<$t>(op, ctx)
-                };
-            }
-            (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
-                || is!(AtomicRmwOp)
-                || is!(AtomicCmpxchgOp)
-                || is!(FenceOp)
-                || is!(AtomicLoadOp)
-                || is!(AtomicStoreOp)
-                || is!(InlineAsmOp)
-                || is!(VAArgOp)
-                || (is!(CallIntrinsicOp)
-                    && !st
-                        .intrinsics
-                        .get(&op)
-                        .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
-                || (is!(CallOp) && {
-                    let callee = direct_callee(ctx, st, op).and_then(|c| nw.get(c).copied());
-                    if strict || st.invokes.contains_key(&op) {
-                        callee != Some(true)
-                    } else {
-                        callee.is_none()
-                            && !os
-                                .get(k + 1)
-                                .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx))
-                    }
-                })
-        })
-    })
-}
+ascent::ascent! {
+    /// Write effects as a least fixpoint (the complement of the optimistic
+    /// "write-free until proven otherwise" table). Function ids index `Syms`.
+    struct WriteFx;
+    /// `f` has a write that isn't a call (store outside its frame, atomic,
+    /// fence, asm, va_arg, memory-writing intrinsic).
+    relation writes_here(u32);
+    /// A direct call in `f` to `c`, whether it is an invoke, and whether a
+    /// plain `unreachable` follows it (a panic: the write is only seen by
+    /// unwinding).
+    relation call(u32, u32, bool, bool);
+    /// The same for an indirect call (callee unknown).
+    relation icall(u32, bool, bool);
+    /// Functions with a table entry: bodied ones and `LIBC`.
+    relation known(u32);
 
-/// Drop optimistic `strict` entries until no listed body writes.
-fn fixpoint(
-    ctx: &Context,
-    st: &State,
-    bodied: &[String],
-    nw: &mut FxHashMap<String, bool>,
-    strict: bool,
-) {
-    loop {
-        let mut changed = false;
-        for s in bodied {
-            if nw.get(s) == Some(&strict) && writes(ctx, st, st.funcs[s].op, nw, strict) {
-                nw.remove(s);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    /// A call that may do anything.
+    relation any(u32, bool, bool);
+    any(f, inv, unr) <-- icall(f, inv, unr);
+    any(f, inv, unr) <-- call(f, c, inv, unr), !known(c);
+
+    /// May write at all.
+    relation strict(u32);
+    strict(f) <-- writes_here(f);
+    strict(f) <-- any(f, _, _);
+    strict(f) <-- call(f, c, _, _), strict(c);
+
+    /// May write on a path that returns normally. An invoke may land in
+    /// `f`'s own pad and return, so it needs a strictly write-free callee.
+    relation on_return(u32);
+    on_return(f) <-- writes_here(f);
+    on_return(f) <-- any(f, inv, unr), if *inv || !*unr;
+    on_return(f) <-- call(f, c, true, _), strict(c);
+    on_return(f) <-- call(f, c, false, false), on_return(c);
 }
 
 pub fn run(ctx: &Context, st: &mut State) {
-    let bodied: Vec<String> = st
-        .funcs
+    let bodied = bodied(ctx, st);
+    let mut ids = Syms::default();
+    let mut p = WriteFx::default();
+    for s in LIBC
         .iter()
-        .filter(|(_, f)| f.linkage != Linkage::Preemptible && has_body(ctx, f.op))
-        .map(|(s, _)| s.clone())
-        .collect();
-    // Optimistic start, then drop functions until a fixpoint: handles recursion.
-    let mut nw: FxHashMap<String, bool> = LIBC
-        .iter()
-        .map(|s| s.to_string())
-        .chain(bodied.iter().cloned())
-        .map(|s| (s, true))
-        .collect();
-    fixpoint(ctx, st, &bodied, &mut nw, true);
-    let strict = nw.len();
-    for s in &bodied {
-        nw.entry(s.clone()).or_insert(false);
+        .copied()
+        .chain(bodied.iter().map(|s| s.as_str()))
+    {
+        p.known.push((ids.id(s),));
     }
-    fixpoint(ctx, st, &bodied, &mut nw, false);
+    for s in &bodied {
+        let f = ids.id(s);
+        for b in blocks(ctx, st.funcs[s].op) {
+            let os = ops(ctx, b);
+            for (k, &op) in os.iter().enumerate() {
+                macro_rules! is {
+                    ($t:ty) => {
+                        Operation::is_op::<$t>(op, ctx)
+                    };
+                }
+                if is!(CallOp) {
+                    let inv = st.invokes.contains_key(&op);
+                    let unr = os
+                        .get(k + 1)
+                        .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx));
+                    match direct_callee(ctx, st, op) {
+                        Some(c) => p.call.push((f, ids.id(c), inv, unr)),
+                        None => p.icall.push((f, inv, unr)),
+                    }
+                } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
+                    || is!(AtomicRmwOp)
+                    || is!(AtomicCmpxchgOp)
+                    || is!(FenceOp)
+                    || is!(AtomicLoadOp)
+                    || is!(AtomicStoreOp)
+                    || is!(InlineAsmOp)
+                    || is!(VAArgOp)
+                    || (is!(CallIntrinsicOp)
+                        && !st
+                            .intrinsics
+                            .get(&op)
+                            .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
+                {
+                    p.writes_here.push((f,));
+                }
+            }
+        }
+    }
+    p.run();
+    let strict: FxHashSet<u32> = p.strict.iter().map(|&(f,)| f).collect();
+    let on_return: FxHashSet<u32> = p.on_return.iter().map(|&(f,)| f).collect();
+    // true: never writes; false: writes only on paths that end in a plain
+    // noreturn call (a panic), so a normal return saw no write.
+    let nw: FxHashMap<String, bool> = LIBC
+        .iter()
+        .map(|s| (s.to_string(), true))
+        .chain(bodied.iter().filter_map(|s| {
+            let f = ids.id(s);
+            (!on_return.contains(&f)).then(|| (s.clone(), !strict.contains(&f)))
+        }))
+        .collect();
     if crate::env_set("PLIRON_STATS") {
+        let strict = nw.values().filter(|&&v| v).count() - LIBC.len();
         eprintln!(
             "nowrite {}: {} of {} bodies write-free, {} more on return",
             st.cgu,
-            bodied.iter().filter(|s| nw.get(*s) == Some(&true)).count(),
+            strict,
             bodied.len(),
-            nw.len() - strict
+            nw.len() - LIBC.len() - strict
         );
+    }
+    for s in &bodied {
+        crate::dump_fact("nowrite", s, &nw.get(s));
     }
     st.nowrite = nw;
 }

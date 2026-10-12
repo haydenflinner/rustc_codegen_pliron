@@ -15,6 +15,11 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   spec, nnret, nocapture, nowrite, phisimp, instcombine, retarg,
   constload, domcheck), `state::State` (the side tables lowering reads),
   `types.rs` layout helpers, `has_body`/`address_taken`. Stable Rust.
+  The bottom-up function summaries (nowrite, nocapture, nnret, retarg,
+  nounwind) are Datalog rules in an `ascent!` block: `run` walks the
+  bodies once to fill input relations, the rules derive the "bad" side
+  (writes, captured, may be null, may unwind) as a least fixpoint, and the
+  table is everything not derived. Add a rule rather than another loop.
 - `pliron-clif-check/` — `clif-check` binary: replays and reduces
   differential-checker reports without rustc (see "Miscompile hunting").
 - `pliron-cfg/` — one-shot `PLIRON_*` env parse shared by both opt
@@ -131,6 +136,9 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   `PLIRON_PIPELINE=a,b` selects/orders pipeline steps, `PLIRON_PAR=0`
   serializes codegen (also forced by OPT_BISECT).
 - `PLIRON_STATS=1` — per-pass rewrite counts per function.
+- `PLIRON_FACTS=<substr>` — print what nowrite/nocapture/nnret/retarg/
+  nounwind inferred for functions whose symbol contains the substring
+  (`./test.sh --only facts` checks a few against `tests/facts/main.rs`).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
 - `PLIRON_STEPCACHE=1` — content-addressed pipeline cache in
   `$PLIRON_CACHE_DIR` (default `~/.cache/pliron-steps`). Two levels per
