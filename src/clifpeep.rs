@@ -1581,14 +1581,44 @@ fn cparm_round(func: &mut Function) -> usize {
 fn apply_param_drops(
     func: &mut Function,
     mut pmap: FxHashMap<Value, Value>,
-    arg_drops: Vec<(Inst, usize, Vec<usize>)>,
-    param_drops: Vec<Value>,
+    mut arg_drops: Vec<(Inst, usize, Vec<usize>)>,
+    mut param_drops: Vec<Value>,
 ) -> usize {
     // Flatten alias chains into inst data first: a `change_to_alias`'d
     // value (coldargs' `sadd_overflow` rebinds, deflag results) can point
     // at a param we're about to detach — uses through it wouldn't be
     // rewritten and the alias would dangle.
     func.dfg.resolve_all_aliases();
+    // A replacement may be a param of another block that's itself being
+    // dropped — `a -> b` in one block and `b -> a` in another form a
+    // cycle with no surviving value, and chasing into it leaves `w` on a
+    // param that's then detached under remaining uses (stage2 ICE'd on
+    // `argument v… -> v… is not attached` in rustc_middle /
+    // rustc_trait_selection / rustc_ty_utils). Keep the cyclic params:
+    // they drop nothing but still terminate other keys' chases.
+    let mut cyc = FxHashSet::<Value>::default();
+    for &p in pmap.keys() {
+        let mut w = p;
+        let mut path = vec![p];
+        while let Some(&u) = pmap.get(&w) {
+            if let Some(at) = path.iter().position(|&x| x == w) {
+                cyc.extend(&path[at..]);
+                break;
+            }
+            path.push(w);
+            w = u;
+        }
+    }
+    if !cyc.is_empty() {
+        pmap.retain(|p, _| !cyc.contains(p));
+        param_drops.retain(|p| !cyc.contains(p));
+        for (i, d, ixs) in &mut arg_drops {
+            let b = func.dfg.insts[*i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[*d]
+                .block(&func.dfg.value_lists);
+            ixs.retain(|&ix| !cyc.contains(&func.dfg.block_params(b)[ix]));
+        }
+    }
     // Replacements may themselves be dropped params: chase to a survivor.
     let keys: Vec<Value> = pmap.keys().copied().collect();
     for p in keys {
@@ -2482,5 +2512,55 @@ fn hoist_frozen(
         func.layout.remove_inst(i);
         func.dfg.clear_results(i);
         func.dfg.change_to_alias(r, nv);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+
+    /// `a`'s only edge feeds it `b`'s param and `b`'s only edge feeds it
+    /// `a`'s: dropping both maps each param onto the other, a replacement
+    /// cycle with no survivor — the old chase left `w` on a dropped param
+    /// and `remove_block_param` detached it under the icmp uses (stage2
+    /// ICE'd `argument v… is not attached` on rustc_middle et al).
+    #[test]
+    fn cyclic_param_drops_keep_a_survivor() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let a = func.dfg.make_block();
+        let b = func.dfg.make_block();
+        for blk in [entry, a, b] {
+            func.layout.append_block(blk);
+        }
+        let pa = func.dfg.append_block_param(a, types::I64);
+        let pb = func.dfg.append_block_param(b, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(a);
+        let one = cur.ins().iconst(types::I64, 1);
+        cur.ins().icmp(IntCC::NotEqual, pa, one);
+        cur.ins().jump(b, &[pa.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b);
+        let two = cur.ins().iconst(types::I64, 2);
+        cur.ins().icmp(IntCC::NotEqual, pb, two);
+        cur.ins().jump(a, &[pb.into()]);
+
+        sameargs(&mut func);
+        assert_eq!(func.dfg.block_params(a).len(), 1);
+        assert_eq!(func.dfg.block_params(b).len(), 1);
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("sameargs produced invalid IR: {e}\n{}", func.display());
+        }
     }
 }
