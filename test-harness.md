@@ -96,7 +96,7 @@ there instead of in the cwd.
 
 - `PLIRON_DIFFCHECK` over std, alloc, core and regex, hashbrown, smallvec,
   indexmap, serde_json, memchr, rustc-demangle (about 8,200 functions) found
-  four real miscompiles, all fixed with regression tests:
+  five real miscompiles, all fixed with regression tests:
   - `src/slp.rs` xpack dropped the immediate offset of a paired store (and
     of a paired load column), so regex-automata's `backtrack::Cache::new`
     wrote a `Vec` header 16 bytes low and left its pointer null. A program
@@ -109,6 +109,10 @@ there instead of in the cwd.
     `cur` as the new one and jumped to the wrong exit (std's
     `SocketAncillary` cmsg walk). Params now bind in parallel, and an edge
     that passes the header its own params is left alone.
+  - `src/licm.rs` promotion ignored reads through an operand-frozen root
+    (distinct only inside its region, which each iteration re-enters), so
+    a promoted store never reached them and aho-corasick's
+    `ByteClassElements::next` looped forever. It now skips such loops.
   - Unrelated to the checker but found running it: the `%al=8` variadic
     stubs were strong symbols per CGU and failed `-Zbuild-std` links.
   Known checker noise: a function whose output depends on stack addresses

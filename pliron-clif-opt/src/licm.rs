@@ -616,7 +616,7 @@ fn run_loop(
     if crate::env_get("PLIRON_LICM_PROMOTE") == Some("0") {
         return n + cn;
     }
-    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, escapes, deref, debug)
+    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, escapes, deref, ofz, debug)
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the
@@ -634,6 +634,7 @@ fn promote(
     iso: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     debug: bool,
 ) -> usize {
     let h = la.loop_header(lp);
@@ -730,6 +731,20 @@ fn promote(
             let (r, o) = loadfwd::root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
             if !iso_l.contains(&r) {
+                // An operand-frozen root is its own name only inside its
+                // region, and each iteration enters the region afresh: its
+                // reads must see the previous iteration's stores, which
+                // promotion would hold back in a register until the exit.
+                // (aho-corasick's `ByteClassElements::next` re-read a stale
+                // cursor and looped forever.)
+                if let Root::V(v) = r
+                    && ofz.contains_key(&v)
+                {
+                    if debug {
+                        eprintln!("licm: no promotion in {h}: operand-frozen access {}", func.dfg.display_inst(i));
+                    }
+                    return 0;
+                }
                 continue;
             }
             let g = groups.entry((r, o)).or_insert((ty, false, true, 0));
