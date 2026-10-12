@@ -24,6 +24,7 @@ use cranelift_codegen::ir::{
     ValueDef, types,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
@@ -2750,6 +2751,365 @@ pub fn run(func: &mut Function) -> usize {
     n
 }
 
+/// Forward-propagate unsigned upper bounds across CFG edges — a
+/// `brif (icmp uge d, 10)` proves `d <= 9` in the fall-through, params
+/// join as the `max` of their edge args — and through add/mul/band
+/// chains; kill provably-dead checks:
+/// `umul_overflow`/`uadd_overflow` flags, `ult (iadd a,b), a` carries, and
+/// compares vs constant the bounds decide. The peeled `acc*10+d` parse
+/// chains (`d <= 9`, <= 8 digits) can't overflow their type.
+pub fn ovkill(func: &mut Function) -> usize {
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    type BMap = FxHashMap<Value, u64>;
+    let cfg = ControlFlowGraph::with_function(func);
+
+    fn umax_ty(ty: Type) -> u64 {
+        let b = ty.bits();
+        if b >= 64 { u64::MAX } else { (1u64 << b) - 1 }
+    }
+    fn bnd(m: &BMap, func: &Function, v: Value) -> u64 {
+        // Bounds are recorded under the result value as-written; an
+        // `ovkill` rewrite can turn it into an alias afterwards, so check
+        // both spellings and keep the tighter (either is a valid bound).
+        let mut b = u64::MAX;
+        if let Some(&k) = m.get(&v) {
+            b = b.min(k);
+        }
+        let v = func.dfg.resolve_aliases(v);
+        if let Some(&k) = m.get(&v) {
+            b = b.min(k);
+        }
+        if b != u64::MAX {
+            return b;
+        }
+        if let Some(k) = iconst(func, v) {
+            return (k as u64) & umax_ty(func.dfg.value_type(v));
+        }
+        vmax(func, v)
+    }
+    fn inst_bounds(func: &Function, m: &mut BMap, i: Inst) {
+        for &r in func.dfg.inst_results(i) {
+            let t = func.dfg.value_type(r);
+            if !t.is_int() || t.is_vector() || t.bits() > 64 {
+                continue;
+            }
+            let um = umax_ty(t);
+            let b = match func.dfg.insts[i] {
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm,
+                } => (imm.bits() as u64) & um,
+                InstructionData::Binary { opcode, args } => {
+                    let (a, x) = (bnd(m, func, args[0]), bnd(m, func, args[1]));
+                    match opcode {
+                        Opcode::Iadd | Opcode::UaddOverflow => {
+                            a.checked_add(x).map_or(um, |s| s.min(um))
+                        }
+                        Opcode::Imul | Opcode::UmulOverflow => {
+                            a.checked_mul(x).map_or(um, |s| s.min(um))
+                        }
+                        Opcode::Band => a.min(x),
+                        _ => continue,
+                    }
+                }
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => bnd(m, func, args[1]).max(bnd(m, func, args[2])),
+                _ => continue,
+            };
+            if b < um {
+                m.insert(r, b);
+            }
+        }
+    }
+
+    // `brif (icmp cc x, k)` edge facts: `x <= k-1` on the `ult`/`uge`-fail
+    // edges, `x <= k` on `ule`/`ugt`-fail, `x == k` on `eq`-hit. Only
+    // meaningful when the cond selects this edge — if every destination
+    // is `b` there is no fact.
+    fn edge_fact(func: &Function, pi: Inst, matches: &[(usize, &BlockCall)]) -> BMap {
+        let mut f = BMap::default();
+        if matches.len() != 1 {
+            return f;
+        }
+        let InstructionData::Brif { arg, .. } = func.dfg.insts[pi] else {
+            return f;
+        };
+        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst() else {
+            return f;
+        };
+        let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: cc0,
+            args: ca,
+        } = func.dfg.insts[ci]
+        else {
+            return f;
+        };
+        let norm = if let Some(k) = iconst(func, ca[1]) {
+            Some((cc0, func.dfg.resolve_aliases(ca[0]), k))
+        } else {
+            iconst(func, ca[0]).map(|k| (cc0.swap_args(), func.dfg.resolve_aliases(ca[1]), k))
+        };
+        if let Some((cc, x, k)) = norm {
+            let ub = match (cc, matches[0].0) {
+                (IntCC::UnsignedLessThan, 0) => k.checked_sub(1),
+                (IntCC::UnsignedLessThanOrEqual, 0) => Some(k),
+                (IntCC::Equal, 0) => Some(k),
+                (IntCC::NotEqual, 1) => Some(k),
+                (IntCC::UnsignedGreaterThan, 1) => Some(k),
+                (IntCC::UnsignedGreaterThanOrEqual, 1) => k.checked_sub(1),
+                _ => None,
+            };
+            if let Some(ub) = ub {
+                f.insert(x, (ub as u64) & umax_ty(func.dfg.value_type(x)));
+            }
+        }
+        f
+    }
+
+    // `ememo`: bounds provable at block entry; `memo`: bounds at end.
+    // `visiting`: in-progress `end_b`s — a backedge re-entry returns empty
+    // (unbounded), which is conservative and breaks CFG cycles.
+    fn entry_b(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        ememo: &mut FxHashMap<Block, Rc<BMap>>,
+        memo: &mut FxHashMap<Block, Rc<BMap>>,
+        visiting: &mut FxHashSet<Block>,
+        b: Block,
+        depth: usize,
+    ) -> Rc<BMap> {
+        if let Some(m) = ememo.get(&b) {
+            return m.clone();
+        }
+        let mut m = BMap::default();
+        let preds: Vec<_> = cfg.pred_iter(b).collect();
+        if !preds.is_empty() && depth > 0 {
+            // Edge args → this block's params: `min` over a pred's matching
+            // edges, `max` over preds (an unsigned bound is an upper bound —
+            // the join must cover every incoming value). Each pred's
+            // `icmp` fact qualifies its own edge args.
+            let ebnd = |pe: &BMap, f: &BMap, v: Value| {
+                let v = func.dfg.resolve_aliases(v);
+                f.get(&v)
+                    .map_or_else(|| bnd(pe, func, v), |&fb| fb.min(bnd(pe, func, v)))
+            };
+            // Single-pred: every bound at the pred's end still holds here —
+            // seed the whole map (arg-less `jump` successors see nothing
+            // otherwise). Facts and param bindings may tighten it below.
+            if preds.len() == 1 {
+                let pe = end_b(func, cfg, ememo, memo, visiting, preds[0].block, depth - 1);
+                m = (*pe).clone();
+            }
+            for (pix, p) in func.dfg.block_params(b).iter().enumerate() {
+                let pty = func.dfg.value_type(*p);
+                if !pty.is_int() || pty.is_vector() || pty.bits() > 64 {
+                    continue;
+                }
+                let mut bv = Some(0u64);
+                for pred in &preds {
+                    let (pb, pi) = (pred.block, pred.inst);
+                    let pe = end_b(func, cfg, ememo, memo, visiting, pb, depth - 1);
+                    let dests = func.dfg.insts[pi].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    );
+                    let matches: Vec<(usize, &BlockCall)> = dests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == b)
+                        .collect();
+                    let fact = edge_fact(func, pi, &matches);
+                    let eb = matches
+                        .iter()
+                        .filter_map(|(_, bc)| {
+                            bc.args(&func.dfg.value_lists)
+                                .nth(pix)
+                                .and_then(|a| match a {
+                                    BlockArg::Value(v) => Some(v),
+                                    _ => None,
+                                })
+                        })
+                        .map(|v| ebnd(&pe, &fact, v))
+                        .min();
+                    bv = match (bv, eb) {
+                        (Some(a), Some(e)) => Some(a.max(e)),
+                        _ => None,
+                    };
+                }
+                if let Some(bv) = bv
+                    && bv < umax_ty(pty)
+                {
+                    m.insert(*p, bv);
+                }
+            }
+            // Single-pred: the `icmp` edge fact also bounds `x` itself in
+            // this block (`brif (ult d, 10)` → `d <= 9` on the taken edge).
+            if preds.len() == 1 {
+                let pi = preds[0].inst;
+                let dests = func.dfg.insts[pi].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                );
+                let matches: Vec<(usize, &BlockCall)> = dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == b)
+                    .collect();
+                for (x, ub) in edge_fact(func, pi, &matches) {
+                    m.entry(x).and_modify(|e| *e = (*e).min(ub)).or_insert(ub);
+                }
+            }
+        }
+        let m = Rc::new(m);
+        ememo.insert(b, m.clone());
+        m
+    }
+    fn end_b(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        ememo: &mut FxHashMap<Block, Rc<BMap>>,
+        memo: &mut FxHashMap<Block, Rc<BMap>>,
+        visiting: &mut FxHashSet<Block>,
+        b: Block,
+        depth: usize,
+    ) -> Rc<BMap> {
+        if let Some(m) = memo.get(&b) {
+            return m.clone();
+        }
+        if !visiting.insert(b) {
+            return Rc::new(BMap::default());
+        }
+        let mut m = (*entry_b(func, cfg, ememo, memo, visiting, b, depth)).clone();
+        for i in func.layout.block_insts(b) {
+            inst_bounds(func, &mut m, i);
+        }
+        visiting.remove(&b);
+        let m = Rc::new(m);
+        memo.insert(b, m.clone());
+        m
+    }
+
+    let mut ememo = FxHashMap::default();
+    let mut memo = FxHashMap::default();
+    let mut visiting = FxHashSet::default();
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        let mut m =
+            (*entry_b(func, &cfg, &mut ememo, &mut memo, &mut visiting, b, 512)).clone();
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            match func.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: op @ (Opcode::UaddOverflow | Opcode::UmulOverflow),
+                    args,
+                } => {
+                    let res = func.dfg.inst_results(i).to_vec();
+                    if res.len() != 2 {
+                        continue;
+                    }
+                    let um = umax_ty(func.dfg.value_type(res[0]));
+                    let (a, x) = (bnd(&m, func, args[0]), bnd(&m, func, args[1]));
+                    let ok = match op {
+                        Opcode::UaddOverflow => a.checked_add(x),
+                        _ => a.checked_mul(x),
+                    };
+                    let Some(lo) = ok.filter(|&s| s <= um) else {
+                        inst_bounds(func, &mut m, i);
+                        continue;
+                    };
+                    let mut pos = FuncCursor::new(func).at_inst(i);
+                    let nv = match op {
+                        Opcode::UaddOverflow => pos.ins().iadd(args[0], args[1]),
+                        _ => pos.ins().imul(args[0], args[1]),
+                    };
+                    let z = pos.ins().iconst(types::I8, 0);
+                    pos.func.dfg.clear_results(i);
+                    pos.func.dfg.change_to_alias(res[0], nv);
+                    pos.func.dfg.change_to_alias(res[1], z);
+                    pos.func.layout.remove_inst(i);
+                    m.insert(nv, lo);
+                    n += 1;
+                }
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                } => {
+                    let ty = func.dfg.value_type(args[0]);
+                    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+                        inst_bounds(func, &mut m, i);
+                        continue;
+                    }
+                    let um = umax_ty(ty);
+                    // `ult (a+b), a` / `ult (a+b), b`: the uadd carry —
+                    // dead when `max(a)+max(b)` can't wrap.
+                    if cond == IntCC::UnsignedLessThan {
+                        let s = func.dfg.resolve_aliases(args[0]);
+                        let c = func.dfg.resolve_aliases(args[1]);
+                        let isum = func.dfg.value_def(s).inst();
+                        let add = isum.and_then(|si| match func.dfg.insts[si] {
+                            InstructionData::Binary {
+                                opcode: Opcode::Iadd,
+                                args: aa,
+                            } => Some(aa),
+                            _ => None,
+                        });
+                        if let Some(aa) = add {
+                            let (a0, a1) = (
+                                func.dfg.resolve_aliases(aa[0]),
+                                func.dfg.resolve_aliases(aa[1]),
+                            );
+                            if (a0 == c || a1 == c)
+                                && bnd(&m, func, aa[0])
+                                    .checked_add(bnd(&m, func, aa[1]))
+                                    .is_some_and(|s| s <= um)
+                            {
+                                func.replace(i).iconst(types::I8, 0);
+                                n += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    // compares a bound decides outright.
+                    let (cc, x, k) = if let Some(k) = iconst(func, args[1]) {
+                        (cond, func.dfg.resolve_aliases(args[0]), k)
+                    } else if let Some(k) = iconst(func, args[0]) {
+                        (
+                            cond.swap_args(),
+                            func.dfg.resolve_aliases(args[1]),
+                            k,
+                        )
+                    } else {
+                        inst_bounds(func, &mut m, i);
+                        continue;
+                    };
+                    let ku = (k as u64) & um;
+                    let b = bnd(&m, func, x);
+                    let f = match cc {
+                        IntCC::UnsignedLessThan if b < ku => Some(1),
+                        IntCC::UnsignedLessThanOrEqual if b <= ku => Some(1),
+                        IntCC::UnsignedGreaterThan if b <= ku => Some(0),
+                        IntCC::UnsignedGreaterThanOrEqual if b < ku => Some(0),
+                        IntCC::Equal if b < ku => Some(0),
+                        IntCC::NotEqual if b < ku => Some(1),
+                        _ => None,
+                    };
+                    if let Some(f) = f {
+                        func.replace(i).iconst(types::I8, f);
+                        n += 1;
+                        continue;
+                    }
+                    inst_bounds(func, &mut m, i);
+                }
+                _ => inst_bounds(func, &mut m, i),
+            }
+        }
+    }
+    n
+}
+
 /// `x >=u 1`, `x >u 0`, `x <=u 0`, `x <u 1` are equality tests;
 /// `icmp eq/ne (x + c1), c2` → `icmp eq/ne x, c2 - c1` (wrapping add is a
 /// bijection, so equality survives the shift). Together they fold peeled
@@ -2858,6 +3218,15 @@ pub fn sublea(func: &mut Function) -> usize {
             pos.func.replace(inst).iadd(args[0], nk);
             n += 1;
         }
+    }
+    // Bound-propagated dead-check elimination — sees punroll's peeled
+    // `acc*10+d` chains, which is where it pays.
+    if crate::pass_enabled("PLIRON_OVKILL") {
+        let k = ovkill(func);
+        if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+            eprintln!("ovkill {k} {}", func.name);
+        }
+        n += k;
     }
     n
 }
