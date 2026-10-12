@@ -1089,6 +1089,27 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// Second load-forwarding pass. sameargs' param drops (esp. affparm's
+// `p_j = p_i + k` collapse) turn formerly opaque param addresses into
+// `iadd` chains that `concrete` peels to exact (root, offset) locs —
+// making stores/loads that were unprovable at the early run disjoint.
+fn s_loadfwd2(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = loadfwd::run(
+        &mut p.clctx.func,
+        p.noalias,
+        p.invariant,
+        p.operand_frozen,
+        p.block_region,
+        p.region_parent,
+        p.nowrite,
+        p.call_frozen,
+    );
+    if k > 0 && p.dump {
+        p.dump("loadfwd2");
+    }
+    k
+}
+
 // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization
 // residue around `icmp`/`uextend`/`select` booleans) — one `and`
 // per element in scalar count_if loops. After sameargs: the merged
@@ -1492,6 +1513,12 @@ pub static DEFAULT: &[Step] = &[
         "sameargs",
         Gate::Env("PLIRON_SAMEARG"),
         s_sameargs,
+    ),
+    step(
+        "loadfwd2",
+        "loadfwd2",
+        Gate::Flag(FlagId::Loadfwd),
+        s_loadfwd2,
     ),
     step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
     cstep(

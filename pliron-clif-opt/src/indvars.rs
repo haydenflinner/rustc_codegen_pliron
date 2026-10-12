@@ -256,10 +256,7 @@ fn edge_value(
 /// is itself address-only — `base + iv*scale` two levels deep still
 /// folds into one reg+reg*scale amode.
 fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bool {
-    let mut addr: FxHashSet<Value> = insts
-        .iter()
-        .map(|&i| func.dfg.first_result(i))
-        .collect();
+    let mut addr: FxHashSet<Value> = insts.iter().map(|&i| func.dfg.first_result(i)).collect();
     loop {
         let mut grew = false;
         for b in func.layout.blocks() {
@@ -276,7 +273,11 @@ fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bo
                             opcode: Opcode::Iadd,
                             args: [x, y],
                         } => {
-                            let other = if func.dfg.resolve_aliases(x) == a { y } else { x };
+                            let other = if func.dfg.resolve_aliases(x) == a {
+                                y
+                            } else {
+                                x
+                            };
                             match def_block(func, other) {
                                 Some(d) if body.contains(&d) => return false,
                                 _ => {}
@@ -435,11 +436,7 @@ fn run_loop(
     n
 }
 
-pub fn run(
-    func: &mut Function,
-    an: &mut crate::pipeline::Analysis,
-    amode_scale: bool,
-) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale: bool) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
     let loops = deepest_first(la);

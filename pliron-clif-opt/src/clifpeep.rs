@@ -1441,7 +1441,7 @@ pub fn fusechains(func: &mut Function) -> usize {
 pub fn sameargs(func: &mut Function) -> usize {
     let mut n = 0;
     for _ in 0..8 {
-        let k = sameargs_round(func) + phimerge(func);
+        let k = sameargs_round(func) + phimerge(func) + affparm(func);
         n += k;
         if k == 0 {
             break;
@@ -2274,6 +2274,152 @@ pub fn phimerge(func: &mut Function) -> usize {
     }
     if param_drops.is_empty() {
         return 0;
+    }
+    apply_param_drops(func, pmap, arg_drops, param_drops)
+}
+
+/// A block param that equals a sibling param plus a constant on every
+/// in-edge is redundant: `p_j = p_i + k`. Replace `p_j`'s uses with an
+/// `iadd p_i, k` at the block head and drop the slot from every edge —
+/// phimerge's `k = 0` special case, but with an offset. ipnsort's
+/// branchless scatter carries `dest = src - 8` through the loop as a
+/// param; as an `iadd` the constant offset is visible to `root`'s
+/// location keys, so the swap's store and the next element's load come
+/// out provably disjoint instead of forcing a reload.
+pub fn affparm(func: &mut Function) -> usize {
+    // Edge target -> [(inst, dest index)], as phimerge builds it.
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                edges
+                    .entry(bc.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push((i, d));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return 0;
+    }
+    // `concrete` peels to exact (base, offset) equalities: equal roots at
+    // offsets `k` apart prove the integer relation `arg_j = arg_i + k`
+    // regardless of what the unresolved base is.
+    let ps = crate::loadfwd::param_src(func);
+    let rt = |func: &Function, v: Value| crate::loadfwd::concrete(func, &ps, v);
+    // Per block: dropped param indices plus (p_j, base param, k) triples.
+    let mut rels: Vec<(Block, Vec<usize>, Vec<(Value, Value, i64)>)> = Vec::new();
+    for (&b, es) in &edges {
+        let params = func.dfg.block_params(b);
+        if params.len() < 2 || params.len() > 24 {
+            continue;
+        }
+        // Per-edge args as plain values; a non-Value arg or arity mismatch
+        // disqualifies the block.
+        let mut eargs: Vec<Vec<Value>> = Vec::with_capacity(es.len());
+        for &(i, d) in es {
+            let bc = &func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
+            let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+            if args.len() != params.len() {
+                eargs.clear();
+                break;
+            }
+            let mut vs = Vec::with_capacity(args.len());
+            for a in args {
+                let BlockArg::Value(v) = a else {
+                    vs.clear();
+                    break;
+                };
+                vs.push(v);
+            }
+            if vs.len() != params.len() {
+                eargs.clear();
+                break;
+            }
+            eargs.push(vs);
+        }
+        if eargs.len() != es.len() {
+            continue;
+        }
+        // `concrete` results cached per arg value: params^2 x edges root
+        // calls otherwise dominate compile time in param-heavy fns.
+        let mut rc: FxHashMap<Value, (crate::loadfwd::Root, i64)> = FxHashMap::default();
+        let mut drops: Vec<usize> = Vec::new();
+        let mut triples: Vec<(Value, Value, i64)> = Vec::new();
+        'jx: for jx in 0..params.len() {
+            let pj = params[jx];
+            let ty = func.dfg.value_type(pj);
+            if !ty.is_int() || ty.is_vector() {
+                continue;
+            }
+            for ix in 0..params.len() {
+                // Sources are never themselves dropped: a mutual pair
+                // (p_a = p_b + 8, p_b = p_a - 8) would otherwise produce
+                // cyclic replacements, and a chain (p3 = p2 + k with p2
+                // already dropped) folds to the surviving source directly
+                // since the composed relation is detected the same way.
+                if ix == jx || func.dfg.value_type(params[ix]) != ty || drops.contains(&ix) {
+                    continue;
+                }
+                let mut dk = None;
+                let ok = eargs.iter().all(|args| {
+                    let (rj, oj) = *rc.entry(args[jx]).or_insert_with(|| rt(func, args[jx]));
+                    let (ri, oi) = *rc.entry(args[ix]).or_insert_with(|| rt(func, args[ix]));
+                    if rj != ri {
+                        return false;
+                    }
+                    let d = oj.wrapping_sub(oi);
+                    match dk {
+                        None => {
+                            dk = Some(d);
+                            true
+                        }
+                        Some(k) => k == d,
+                    }
+                });
+                if ok && let Some(k) = dk {
+                    drops.push(jx);
+                    triples.push((pj, params[ix], k));
+                    continue 'jx;
+                }
+            }
+        }
+        if !drops.is_empty() {
+            rels.push((b, drops, triples));
+        }
+    }
+    if rels.is_empty() {
+        return 0;
+    }
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = Vec::new();
+    let mut param_drops: Vec<Value> = Vec::new();
+    for (b, mut drops, triples) in rels {
+        let params = func.dfg.block_params(b).to_vec();
+        for (pj, pi, k) in triples {
+            let w = if k == 0 {
+                pi
+            } else {
+                FuncCursor::new(func)
+                    .at_first_insertion_point(b)
+                    .ins()
+                    .iadd_imm_s(pi, k)
+            };
+            pmap.insert(pj, w);
+        }
+        drops.sort_unstable_by(|x, y| y.cmp(x));
+        drops.dedup();
+        for &(i, d) in &edges[&b] {
+            arg_drops.push((i, d, drops.clone()));
+        }
+        for &jx in &drops {
+            param_drops.push(params[jx]);
+        }
     }
     apply_param_drops(func, pmap, arg_drops, param_drops)
 }
@@ -4565,6 +4711,99 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("phimerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Head params `p, q` fed `(x, x + 8)` on entry and `(p + 16,
+    /// p + 24)` on the back edge: `q = p + 8` holds on every edge, so
+    /// affparm drops `q` and its uses become `iadd p, 8` — the collapse
+    /// that lets loadfwd prove the ipnsort scatter store disjoint from
+    /// the next element's load.
+    #[test]
+    fn affparm_collapses_offset_param() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let head = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for blk in [entry, head, exit] {
+            func.layout.append_block(blk);
+        }
+        let p = func.dfg.append_block_param(head, types::I64);
+        let q = func.dfg.append_block_param(head, types::I64);
+
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let eight = cur.ins().iconst(types::I64, 8);
+        let xp8 = cur.ins().iadd(x, eight);
+        cur.ins().jump(head, &[x.into(), xp8.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, q, p);
+        let p2 = cur.ins().iadd_imm_s(p, 16);
+        let q2 = cur.ins().iadd_imm_s(p2, 8);
+        cur.ins()
+            .brif(c, exit, &[q.into()], head, &[p2.into(), q2.into()]);
+
+        let r = func.dfg.append_block_param(exit, types::I64);
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[r]);
+
+        assert_eq!(affparm(&mut func), 1);
+        assert_eq!(func.dfg.block_params(head), &[q]);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("affparm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `q = p + 8` and `p = q - 8` are the same relation: both direction
+    /// checks pass, so a naive per-param drop replaces `p` with `q - 8`
+    /// and `q` with `p + 8` — cyclic SSA (`w = iadd v, -8` / `v = iadd
+    /// w, 8`) that sent `root`'s iadd peel into unbounded recursion.
+    /// Sources are never dropped, so exactly one survives.
+    #[test]
+    fn affparm_mutual_pair_keeps_one_source() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let head = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for blk in [entry, head, exit] {
+            func.layout.append_block(blk);
+        }
+        let p = func.dfg.append_block_param(head, types::I64);
+        let q = func.dfg.append_block_param(head, types::I64);
+
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let xp8 = cur.ins().iadd_imm_s(x, 8);
+        cur.ins().jump(head, &[x.into(), xp8.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, q, p);
+        let p2 = cur.ins().iadd_imm_s(p, 16);
+        let q2 = cur.ins().iadd_imm_s(p2, 8);
+        cur.ins()
+            .brif(c, exit, &[q.into()], head, &[p2.into(), q2.into()]);
+
+        let r = func.dfg.append_block_param(exit, types::I64);
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[r]);
+
+        assert_eq!(affparm(&mut func), 1);
+        assert_eq!(func.dfg.block_params(head).len(), 1);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("affparm produced invalid IR: {e}\n{}", func.display());
         }
     }
 }
