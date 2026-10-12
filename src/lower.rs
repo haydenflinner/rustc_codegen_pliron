@@ -308,6 +308,13 @@ pub fn lower_to_object(
     let mut forwarded = 0usize;
     let mut slot_dse = 0usize;
     let mut peeped = 0usize;
+    // `PLIRON_VERIFY=full` verifies after every pass. Any other truthy
+    // value verifies once after the pipeline: on failure the function is
+    // restored from a pre-pipeline snapshot and re-run with per-pass
+    // verification, so attribution costs a retry only when something
+    // actually broke.
+    let verify_env = std::env::var_os("PLIRON_VERIFY").is_some();
+    let verify_full_env = std::env::var("PLIRON_VERIFY").is_ok_and(|v| v == "full");
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -390,6 +397,9 @@ pub fn lower_to_object(
         if dump {
             eprintln!("==== clif {n} ====\n{}", clctx.func.display());
         }
+        let mut verify_full = verify_full_env;
+        let snapshot = (verify_env && !verify_full).then(|| clctx.func.clone());
+        'retry: loop {
         if st.jumpthread && crate::bisect("jumpthread") {
             let (n, dead, folds) = crate::jumpthread::run(&mut clctx.func, &nonnull, &mut derived);
             threaded += n;
@@ -401,7 +411,7 @@ pub fn lower_to_object(
                     clctx.func.display()
                 );
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
@@ -421,7 +431,7 @@ pub fn lower_to_object(
                     eprintln!("constbr {k} {n}");
                 }
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
@@ -454,7 +464,7 @@ pub fn lower_to_object(
             if dump {
                 eprintln!("==== clif {n} after unroll ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("unroll broke `{n}`: {e}\n{}", clctx.func.display());
@@ -462,7 +472,7 @@ pub fn lower_to_object(
         }
         if st.unreach && crate::bisect("unreach") {
             unreached += crate::unreach::run(&mut clctx.func);
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("unreach broke `{n}`: {e}\n{}", clctx.func.display());
@@ -473,7 +483,7 @@ pub fn lower_to_object(
         }
         if st.tailmerge && crate::bisect("tailmerge") {
             merged += crate::tailmerge::run(&mut clctx.func);
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("tailmerge broke `{n}`: {e}\n{}", clctx.func.display());
@@ -481,7 +491,7 @@ pub fn lower_to_object(
         }
         if st.taildup && crate::bisect("taildup") {
             dupd += crate::taildup::run(&mut clctx.func);
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("taildup broke `{n}`: {e}\n{}", clctx.func.display());
@@ -501,7 +511,7 @@ pub fn lower_to_object(
                     clctx.func.display()
                 );
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("tailrec broke `{n}`: {e}\n{}", clctx.func.display());
@@ -527,7 +537,7 @@ pub fn lower_to_object(
             if dump {
                 eprintln!("==== clif {n} after loadfwd ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("loadfwd broke `{n}`: {e}\n{}", clctx.func.display());
@@ -541,7 +551,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after dse ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("dse broke `{n}`: {e}\n{}", clctx.func.display());
@@ -589,7 +599,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("indvars {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("indvars broke `{n}`: {e}\n{}", clctx.func.display());
@@ -603,7 +613,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after licm ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("licm broke `{n}`: {e}\n{}", clctx.func.display());
@@ -616,7 +626,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("revnorm {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("revnorm broke `{n}`: {e}\n{}", clctx.func.display());
@@ -628,7 +638,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("idiom {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("loopidiom broke `{n}`: {e}\n{}", clctx.func.display());
@@ -683,7 +693,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after ifconv2 ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("ifconv2 broke `{n}`: {e}\n{}", clctx.func.display());
@@ -696,7 +706,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("bcheck {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("bcheck broke `{n}`: {e}\n{}", clctx.func.display());
@@ -723,7 +733,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopvec {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("loopvec broke `{n}`: {e}\n{}", clctx.func.display());
@@ -748,7 +758,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("slp {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("slp broke `{n}`: {e}\n{}", clctx.func.display());
@@ -774,7 +784,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_SWITCHMAP_DEBUG").is_some() {
                 eprintln!("switchmap {k} fold {f} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("switchmap broke `{n}`: {e}\n{}", clctx.func.display());
@@ -785,7 +795,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_CONSTBR_DEBUG").is_some() {
                 eprintln!("constbr {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
@@ -796,7 +806,7 @@ pub fn lower_to_object(
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopdel {k} {n}");
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("loopdel broke `{n}`: {e}\n{}", clctx.func.display());
@@ -807,7 +817,7 @@ pub fn lower_to_object(
             if dump {
                 eprintln!("==== clif {n} after looprot ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("looprot broke `{n}`: {e}\n{}", clctx.func.display());
@@ -823,7 +833,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after punroll ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("punroll broke `{n}`: {e}\n{}", clctx.func.display());
@@ -892,7 +902,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after fuse ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("fuse broke `{n}`: {e}\n{}", clctx.func.display());
@@ -910,7 +920,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after edgefwd ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("edgefwd broke `{n}`: {e}\n{}", clctx.func.display());
@@ -928,7 +938,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after foldf ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("foldf broke `{n}`: {e}\n{}", clctx.func.display());
@@ -945,7 +955,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after celim ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("celim broke `{n}`: {e}\n{}", clctx.func.display());
@@ -974,7 +984,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after ivrefold ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("ivrefold broke `{n}`: {e}\n{}", clctx.func.display());
@@ -993,7 +1003,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after deadrec ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("deadrec broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1012,7 +1022,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after sameargs ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("sameargs broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1030,7 +1040,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after mask01 ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("mask01 broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1049,7 +1059,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after edgespec ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("edgespec broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1066,7 +1076,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after bittab ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("bittab broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1085,7 +1095,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after coldedges ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1104,7 +1114,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after uload32 ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("uload32 broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1124,7 +1134,7 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after brchain ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("brchain broke `{n}`: {e}\n{}", clctx.func.display());
@@ -1146,11 +1156,24 @@ pub fn lower_to_object(
             if dump && k > 0 {
                 eprintln!("==== clif {n} after slotmerge ====\n{}", clctx.func.display());
             }
-            if std::env::var_os("PLIRON_VERIFY").is_some()
+            if verify_full
                 && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
             {
                 panic!("slotmerge broke `{n}`: {e}\n{}", clctx.func.display());
             }
+        }
+        if verify_env && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+        {
+            if !verify_full && let Some(snap) = &snapshot {
+                // Which pass broke it is unknown until the per-pass
+                // checks run — restore and re-run them.
+                clctx.func = snap.clone();
+                verify_full = true;
+                continue 'retry;
+            }
+            panic!("pipeline broke `{n}`: {e}\n{}", clctx.func.display());
+        }
+        break 'retry;
         }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
