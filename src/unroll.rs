@@ -20,8 +20,23 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use crate::jumpthread::{NonNull, eval, known};
 
 const MAX_ITERS: usize = 32;
-const MAX_INSTS: usize = 400;
+/// Cap on instructions emitted into the straight-line replacement block —
+/// the whole loop is gone, so the cost is pure code size. Must cover
+/// nested loops the trip simulation walks through: nbody's `advance`
+/// pair loop emits ~600 insts (10 inner iterations x ~55 each).
+/// `PLIRON_UNROLL_INSTS` overrides.
+const MAX_INSTS: usize = 1024;
 const MAX_LOOPS: usize = 8;
+
+fn max_insts() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PLIRON_UNROLL_INSTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_INSTS)
+    })
+}
 
 pub fn run(
     func: &mut Function,
@@ -439,7 +454,7 @@ fn trip(
                 env.remove(r);
             }
             insts += 1;
-            if insts > MAX_INSTS {
+            if insts > max_insts() {
                 return why("insts");
             }
             if let Some(nb) = nb {
