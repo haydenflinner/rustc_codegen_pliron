@@ -195,6 +195,14 @@ pub struct State<'tcx> {
     /// `readonly can_move` flags `FnLower::frozen` gets.
     pub region_frozen:
         rustc_data_structures::fx::FxHashMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
+    /// Caller-side operands bound to `region_frozen` leaves: `*v` is
+    /// frozen for the callee call's duration — exactly the clone's span —
+    /// so the record is `(dereferenceable bytes, clone entry)`. Kept
+    /// separate from `region_frozen`: those records seed `FnLower::noalias`
+    /// on clone args, while operands are ordinary caller values that
+    /// outlive the clone and must not claim function-wide `noalias`.
+    pub region_frozen_op:
+        rustc_data_structures::fx::FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     /// Load ops inside inlined clones whose address provably derives from a
     /// `region_frozen` arg at a constant offset inside the pointee: op →
     /// region id (the clone's entry block). At lowering these seed

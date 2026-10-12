@@ -1397,20 +1397,59 @@ fn ptr_base(
 /// `(bytes, region)` for a base resolved at leaf `bl`: an enclosing
 /// clone-arg record first; else a frozen param of the containing function
 /// itself — the outermost region, anchored at its entry.
+/// `anc` is `b` or a proper ancestor of it in the clone-region tree.
+fn anc_or_self(st: &State<'_>, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> bool {
+    for _ in 0..64 {
+        if b == anc {
+            return true;
+        }
+        match st.region_parent.get(&b) {
+            Some(&p) if p != b => b = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `(bytes, region)` for `*base` frozen within a region containing `entry`
+/// (the clone being processed): an enclosing clone-arg record, a caller
+/// operand record, or a frozen param of the containing function itself —
+/// the outermost region, anchored at its entry. Among several claims the
+/// shallowest anchor wins: it promises the widest frozen span, which is
+/// what lets a nested load reach an enclosing loop's preheader.
 fn frozen_of(
     ctx: &Context,
     st: &State<'_>,
     caller_frz: &[(usize, u64)],
     fentry: Option<Ptr<BasicBlock>>,
+    entry: Ptr<BasicBlock>,
     base: Value,
     bl: Option<usize>,
 ) -> Option<(u64, Ptr<BasicBlock>)> {
-    if let Some(&(_, bytes, r)) = st
-        .region_frozen
-        .get(&base)
-        .and_then(|rs| rs.iter().find(|&&(s, _, _)| bl.unwrap_or(0) == s as usize))
+    let mut best: Option<(u64, Ptr<BasicBlock>)> = None;
+    let mut pick = |st: &State<'_>, bytes: u64, r: Ptr<BasicBlock>| {
+        if anc_or_self(st, r, entry)
+            && best.is_none_or(|rb| anc_or_self(st, r, rb.1))
+        {
+            best = Some((bytes, r));
+        }
+    };
+    if let Some(rs) = st.region_frozen.get(&base) {
+        for &(s, bytes, r) in rs {
+            if bl.unwrap_or(0) == s as usize {
+                pick(st, bytes, r);
+            }
+        }
+    }
+    if bl.is_none_or(|b| b == 0)
+        && let Some(rs) = st.region_frozen_op.get(&base)
     {
-        return Some((bytes, r));
+        for &(bytes, r) in rs {
+            pick(st, bytes, r);
+        }
+    }
+    if best.is_some() {
+        return best;
     }
     let fe = fentry?;
     caller_frz.iter().find_map(|&(leaf, bytes)| {
@@ -1533,16 +1572,15 @@ fn frozen_args(
             .and_then(|k| call_args.get(k).copied());
         // `a` may cover several leaves (comparator tuples pack both refs
         // into one operand) — resolve the `sub`-th leaf of the operand.
-        let rb = cv
-            .and_then(|v| extract_leaf(ctx, &preds, v, sub, 0))
-            .and_then(|v| ptr_base(ctx, st, &preds, v, &mut FxHashSet::default()));
+        let lv = cv.and_then(|v| extract_leaf(ctx, &preds, v, sub, 0));
+        let rb = lv.and_then(|v| ptr_base(ctx, st, &preds, v, &mut FxHashSet::default()));
         // Inherit the enclosing region only when the operand's pointee
         // provably sits inside the outer frozen range — `a = pivot + 8`
         // resolves to pivot's base but points *past* its 8 frozen bytes.
         // The clone-entry region is always valid: `a`'s own `readonly`
         // contract holds for this call regardless.
         let inh = rb.and_then(|(b, l, off)| {
-            frozen_of(ctx, st, &caller_frz, fentry, b, l)
+            frozen_of(ctx, st, &caller_frz, fentry, entry, b, l)
                 .filter(|&(rb_, _)| {
                     off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64)
                 })
@@ -1581,6 +1619,20 @@ fn frozen_args(
             .entry(a)
             .or_default()
             .push((sub as u32, bytes, region));
+        // `*operand` is frozen for the call's duration — exactly this
+        // clone's span. Record the caller-side leaf too, in
+        // `region_frozen_op` (not `region_frozen`: seeding `noalias` on a
+        // caller value would claim function-wide disjointness it doesn't
+        // have). Clone loads that forward it through entry args — the
+        // partition pivot reaches `lt` callsites as the outer loop's own
+        // block param — tag this clone's region, which reaches an
+        // enclosing loop's preheader where the load's own entry can't.
+        if let Some(lv) = lv {
+            st.region_frozen_op
+                .entry(lv)
+                .or_default()
+                .push((bytes, entry));
+        }
     }
     // Loads inside the clone that provably read inside a frozen pointee:
     // they may hoist within the region without a clobber scan.
@@ -1598,7 +1650,7 @@ fn frozen_args(
             else {
                 continue;
             };
-            let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, base, bl)
+            let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
             else {
                 if dbg && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
                     let bs = base
@@ -1679,6 +1731,12 @@ fn inline_call(
             if let Some(f) = st.region_noalias.get(&a).cloned() {
                 st.region_noalias.insert(na, f);
             }
+            if let Some(f) = st.region_frozen_op.get(&a).cloned() {
+                st.region_frozen_op.insert(
+                    na,
+                    f.into_iter().map(|(b, r)| (b, remap(r))).collect(),
+                );
+            }
         }
         for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
             if let Some(c) = st.calls.get(&op).cloned() {
@@ -1725,6 +1783,12 @@ fn inline_call(
                 }
                 if let Some(c) = st.consts.get(&v).cloned() {
                     st.consts.insert(nv, c);
+                }
+                if let Some(f) = st.region_frozen_op.get(&v).cloned() {
+                    st.region_frozen_op.insert(
+                        nv,
+                        f.into_iter().map(|(b, r)| (b, remap(r))).collect(),
+                    );
                 }
             }
             if let Some(r) = Operation::get_op::<ReturnOp>(new, ctx) {

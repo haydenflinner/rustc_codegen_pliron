@@ -111,6 +111,19 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
                 hi = hi.min(d as u64 - 1);
             }
         }
+        // `icmp` yields 0/1; `a ^ b` sets no bit clear in both operands.
+        InstructionData::IntCompare { .. } => hi = hi.min(1),
+        InstructionData::Binary {
+            opcode: Opcode::Bxor,
+            args,
+        } => {
+            let m = vmax_d(func, args[0], depth - 1) | vmax_d(func, args[1], depth - 1);
+            hi = hi.min(
+                m.checked_add(1)
+                    .and_then(|x| x.checked_next_power_of_two())
+                    .map_or(u64::MAX, |p| p - 1),
+            );
+        }
         _ => {}
     }
     hi
@@ -2689,7 +2702,41 @@ pub fn run(func: &mut Function) -> usize {
                 arg,
             } = pos.func.dfg.insts[inst]
             {
-                if widen_on() && widen(&mut pos, inst, arg) {
+                // `uextend.iN (bxor.i8 (icmp cc a b), 1)` → `uextend.iN
+                // (icmp !cc a b)`: rustc's `!bool` on a widened compare
+                // (partition's `offset += !(x < p)`). Keeping `uextend`
+                // outermost lets a consuming `iadd` fold to `add x, w,
+                // uxtb` — one fused inst instead of `uxtb` + `eor`.
+                let b = pos.func.dfg.resolve_aliases(arg);
+                if let Some((c, 1)) = bin_k(pos.func, b, Opcode::Bxor)
+                    && let Some(cd) = pos
+                        .func
+                        .dfg
+                        .value_def(pos.func.dfg.resolve_aliases(c))
+                        .inst()
+                    && let InstructionData::IntCompare {
+                        opcode: Opcode::Icmp,
+                        cond,
+                        args: [l, r],
+                    } = pos.func.dfg.insts[cd]
+                {
+                    let inv = match cond {
+                        IntCC::Equal => IntCC::NotEqual,
+                        IntCC::NotEqual => IntCC::Equal,
+                        IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
+                        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
+                        IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
+                        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
+                        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
+                        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
+                        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
+                        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
+                    };
+                    let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                    let i = pos.ins().icmp(inv, l, r);
+                    pos.func.replace(inst).uextend(ty, i);
+                    n += 1;
+                } else if widen_on() && widen(&mut pos, inst, arg) {
                     n += 1;
                 }
                 continue;
@@ -2712,6 +2759,59 @@ pub fn run(func: &mut Function) -> usize {
                 {
                     let m = pos.ins().iconst(ty, k - 1);
                     pos.func.replace(inst).band(args[0], m);
+                    n += 1;
+                }
+                continue;
+            }
+            // `bxor (uextend.iN (icmp cc a b)), 1` → `uextend.iN (icmp !cc
+            // a b)`: rustc's `!bool` on a widened compare (partition's
+            // `offset += !(x < p)`). Keeping `uextend` outermost lets a
+            // consuming `iadd` fold to `add x, w, uxtb` — one fused inst
+            // instead of materializing `uxtb` + `eor` around the `add`.
+            if let InstructionData::Binary {
+                opcode: Opcode::Bxor,
+                args: [a0, a1],
+            } = pos.func.dfg.insts[inst]
+            {
+                let x = if iconst(pos.func, a1) == Some(1) {
+                    Some(a0)
+                } else if iconst(pos.func, a0) == Some(1) {
+                    Some(a1)
+                } else {
+                    None
+                };
+                if let Some(d) = x.and_then(|x| {
+                    pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(x)).inst()
+                }) && let InstructionData::Unary {
+                    opcode: Opcode::Uextend,
+                    arg: c,
+                } = pos.func.dfg.insts[d]
+                    && let Some(cd) = pos
+                        .func
+                        .dfg
+                        .value_def(pos.func.dfg.resolve_aliases(c))
+                        .inst()
+                    && let InstructionData::IntCompare {
+                        opcode: Opcode::Icmp,
+                        cond,
+                        args: [l, r],
+                    } = pos.func.dfg.insts[cd]
+                {
+                    let inv = match cond {
+                        IntCC::Equal => IntCC::NotEqual,
+                        IntCC::NotEqual => IntCC::Equal,
+                        IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
+                        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
+                        IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
+                        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
+                        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
+                        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
+                        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
+                        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
+                    };
+                    let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                    let i = pos.ins().icmp(inv, l, r);
+                    pos.func.replace(inst).uextend(ty, i);
                     n += 1;
                 }
                 continue;
