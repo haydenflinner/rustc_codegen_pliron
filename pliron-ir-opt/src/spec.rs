@@ -18,11 +18,11 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, UndefOp};
 use rustc_hash::FxHashMap;
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let dbg = crate::env_set("PLIRON_SPEC_DEBUG");
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
@@ -40,7 +40,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
     }
     // Symbols whose address escapes: an unseen caller could pass different
     // arguments.
-    let taken = crate::lower::address_taken(ctx, st);
+    let taken = crate::address_taken(ctx, st);
     let mut done = 0usize;
     for (sym, f) in &st.funcs {
         if dbg {

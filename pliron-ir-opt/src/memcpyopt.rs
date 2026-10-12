@@ -11,12 +11,12 @@ use pliron::{
 };
 use pliron_llvm::ops::{AllocaOp, GetElementPtrOp, LoadOp, StoreOp};
 
-use crate::context::{ArgExt, State};
-use crate::lower::has_body;
+use crate::state::{ArgExt, State};
+use crate::has_body;
 use crate::sroa::const_int;
 
 /// Pointer `p` only flows into address operands of loads, stores, mem intrinsics and GEPs.
-fn non_escaping(ctx: &Context, st: &State<'_>, p: Value) -> bool {
+fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
     p.uses(ctx).iter().all(|u| {
         let o = u.user_op();
         let i = u.find_index(ctx);
@@ -47,7 +47,7 @@ fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
 
 fn try_forward(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     sret_args: &[Value],
     m: Ptr<Operation>,
 ) -> bool {
@@ -149,7 +149,7 @@ fn dominates_in_block(ctx: &Context, d: Ptr<Operation>, user: Ptr<Operation>) ->
     false
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let mut n = 0;
     let funcs: Vec<_> = st
         .funcs

@@ -31,9 +31,9 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 use crate::nowrite::PURE;
 
 const MAX_PARAMS: usize = 64;
@@ -64,7 +64,7 @@ fn all_ops(ctx: &Context, m: &Masks, op: Ptr<Operation>) -> u64 {
 /// when `f` has no trackable params.
 fn deriv(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     f: Ptr<Operation>,
 ) -> Option<(Vec<Ptr<BasicBlock>>, Masks)> {
     let bs = blocks(ctx, f);
@@ -159,7 +159,7 @@ fn deriv(
 /// param index whose derived value reaches a retaining use.
 fn captured(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     bs: &[Ptr<BasicBlock>],
     m: &Masks,
     nc: &FxHashMap<String, FxHashSet<u32>>,
@@ -212,7 +212,7 @@ fn captured(
     cap
 }
 
-pub fn run(ctx: &Context, st: &mut State<'_>) {
+pub fn run(ctx: &Context, st: &mut State) {
     let bodied: Vec<String> = st
         .funcs
         .iter()

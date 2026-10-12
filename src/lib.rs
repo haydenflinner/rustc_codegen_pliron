@@ -24,27 +24,15 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod builder;
-mod constload;
 mod consts;
 mod context;
-mod domcheck;
 mod eh;
 mod hot;
-mod inline;
-mod instcombine;
 mod intrinsic;
 mod lower;
-mod memcpyopt;
-mod nnret;
-mod nocapture;
 mod nounwind;
-mod nowrite;
 mod objmerge;
-mod phisimp;
-mod retarg;
 mod simd;
-mod spec;
-mod sroa;
 mod type_of;
 mod types;
 mod wasm;
@@ -53,6 +41,10 @@ mod xcgu;
 // CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
+pub use pliron_ir_opt::{
+    address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt,
+    nnret, nocapture, nowrite, phisimp, retarg, spec, sroa,
+};
 
 use std::any::Any;
 use std::path::PathBuf;

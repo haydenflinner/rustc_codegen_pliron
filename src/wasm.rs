@@ -26,9 +26,8 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
-use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
+use pliron_llvm::attributes::{AtomicRmwKindAttr, FCmpPredicateAttr, ICmpPredicateAttr};
 use pliron_llvm::ops::*;
-use rustc_codegen_ssa::common::AtomicRmwBinOp;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use waffle::entity::EntityRef;
@@ -39,7 +38,8 @@ use waffle::{
 };
 
 use crate::context::{ArgExt, ConstVal, State};
-use crate::lower::{has_body, rpo, write_const};
+use crate::has_body;
+use crate::lower::{rpo, write_const};
 use crate::types::{TyK, classify, leaves, members, size_align, struct_offsets};
 
 type Vals = SmallVec<[WV; 2]>;
@@ -139,9 +139,9 @@ struct FDecl {
     no_inline: bool,
 }
 
-struct Obj<'a, 'tcx> {
+struct Obj<'a> {
     ctx: &'a Context,
-    st: &'a State<'tcx>,
+    st: &'a State,
     m: Module<'static>,
     sigs: FxHashMap<(Vec<WT>, Vec<WT>), Signature>,
     funcs: Vec<FDecl>,
@@ -156,7 +156,7 @@ struct Obj<'a, 'tcx> {
     trip: waffle::Global,
 }
 
-impl<'a, 'tcx> Obj<'a, 'tcx> {
+impl<'a> Obj<'a> {
     fn sig(&mut self, s: SignatureData) -> Signature {
         let key = (s.params.clone(), s.returns.clone());
         if let Some(x) = self.sigs.get(&key) {
@@ -248,7 +248,7 @@ pub fn target_features(
 
 pub fn lower_to_wasm(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     name: &str,
     features: &[String],
     unwind: bool,
@@ -2713,7 +2713,7 @@ fn link_flags(l: Linkage) -> u8 {
 /// `ndata { name, u8 flags, align, bytes, nrelocs { off, u8 is_func, sym, i32 addend } }`
 /// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
 /// `.init_array` entry (constructor pointers the linker calls from `__wasm_call_ctors`).
-fn link_section(ctx: &Context, st: &State<'_>) -> Vec<u8> {
+fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
     let mut out = Vec::new();
     let fs: Vec<_> = st
         .funcs
@@ -2791,10 +2791,10 @@ struct Promo {
     incomplete: FxHashMap<WBlock, Vec<(u32, WV)>>,
 }
 
-struct FL<'o, 'a, 'tcx> {
-    o: &'o mut Obj<'a, 'tcx>,
+struct FL<'o, 'a> {
+    o: &'o mut Obj<'a>,
     ctx: &'a Context,
-    st: &'a State<'tcx>,
+    st: &'a State,
     b: FunctionBody,
     cur: WBlock,
     vals: FxHashMap<Value, Vals>,
@@ -2821,8 +2821,8 @@ struct FL<'o, 'a, 'tcx> {
     name: String,
 }
 
-impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
-    fn new(o: &'o mut Obj<'a, 'tcx>, sig: Signature) -> Self {
+impl<'o, 'a> FL<'o, 'a> {
+    fn new(o: &'o mut Obj<'a>, sig: Signature) -> Self {
         let rets = o.m.signatures[sig].returns.clone();
         let b = FunctionBody::new(&o.m, sig);
         let cur = b.entry;
@@ -4209,27 +4209,28 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                 s.op(o, &[x, y], WT::I32)
             };
             let new = match self.st.rmw[&op] {
-                AtomicRmwBinOp::AtomicXchg => v,
-                AtomicRmwBinOp::AtomicAdd => self.ib(w, O::I32Add, O::I64Add, old, v),
-                AtomicRmwBinOp::AtomicSub => self.ib(w, O::I32Sub, O::I64Sub, old, v),
-                AtomicRmwBinOp::AtomicAnd => self.ib(w, O::I32And, O::I64And, old, v),
-                AtomicRmwBinOp::AtomicNand => {
+                AtomicRmwKindAttr::Xchg => v,
+                AtomicRmwKindAttr::Add => self.ib(w, O::I32Add, O::I64Add, old, v),
+                AtomicRmwKindAttr::Sub => self.ib(w, O::I32Sub, O::I64Sub, old, v),
+                AtomicRmwKindAttr::And => self.ib(w, O::I32And, O::I64And, old, v),
+                AtomicRmwKindAttr::Nand => {
                     let a = self.ib(w, O::I32And, O::I64And, old, v);
                     let m = self.ic(w, u64::MAX);
                     self.ib(w, O::I32Xor, O::I64Xor, a, m)
                 }
-                AtomicRmwBinOp::AtomicOr => self.ib(w, O::I32Or, O::I64Or, old, v),
-                AtomicRmwBinOp::AtomicXor => self.ib(w, O::I32Xor, O::I64Xor, old, v),
-                AtomicRmwBinOp::AtomicMax | AtomicRmwBinOp::AtomicUMax => {
-                    let signed = matches!(self.st.rmw[&op], AtomicRmwBinOp::AtomicMax);
+                AtomicRmwKindAttr::Or => self.ib(w, O::I32Or, O::I64Or, old, v),
+                AtomicRmwKindAttr::Xor => self.ib(w, O::I32Xor, O::I64Xor, old, v),
+                AtomicRmwKindAttr::Max | AtomicRmwKindAttr::UMax => {
+                    let signed = matches!(self.st.rmw[&op], AtomicRmwKindAttr::Max);
                     let c = lt(self, signed);
                     self.sel(c, v, old)
                 }
-                AtomicRmwBinOp::AtomicMin | AtomicRmwBinOp::AtomicUMin => {
-                    let signed = matches!(self.st.rmw[&op], AtomicRmwBinOp::AtomicMin);
+                AtomicRmwKindAttr::Min | AtomicRmwKindAttr::UMin => {
+                    let signed = matches!(self.st.rmw[&op], AtomicRmwKindAttr::Min);
                     let c = lt(self, signed);
                     self.sel(c, old, v)
                 }
+                _ => unreachable!(),
             };
             self.store(t, new, p, 0);
             self.set1(op, old);

@@ -665,6 +665,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-cfg"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "pliron-clif-opt"
 version = "0.1.0"
 dependencies = [
@@ -672,6 +679,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "pliron",
+ "pliron-cfg",
  "rustc-hash",
  "smallvec",
  "target-lexicon",
@@ -688,6 +696,20 @@ dependencies = [
  "quote",
  "rustc-hash",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "pliron-ir-opt"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-module",
+ "egg",
+ "indexmap",
+ "pliron",
+ "pliron-cfg",
+ "pliron-llvm",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -821,7 +843,9 @@ dependencies = [
  "gimli",
  "object",
  "pliron",
+ "pliron-cfg",
  "pliron-clif-opt",
+ "pliron-ir-opt",
  "pliron-llvm",
  "rsasm",
  "rustc-hash",

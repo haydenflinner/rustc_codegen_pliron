@@ -11,6 +11,12 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   `rustc_private` — `cargo test -p pliron-clif-opt` runs pass unit tests
   without building the dylib. Re-exported via `pub use pliron_clif_opt::*`
   so `crate::<pass>` paths still work in `src/`.
+- `pliron-ir-opt/` — pliron-LLVM-dialect passes (inline, sroa, memcpyopt,
+  spec, nnret, nocapture, nowrite, phisimp, instcombine, retarg,
+  constload, domcheck), `state::State` (the side tables lowering reads),
+  `types.rs` layout helpers, `has_body`/`address_taken`. Stable Rust.
+- `pliron-cfg/` — one-shot `PLIRON_*` env parse shared by both opt
+  crates (`PassConfig`, `env_*`, `pass_enabled`, `bisect`).
 - `src/lower.rs` — object lowering; `internal_fns` selects `CallConv::Tail`
   for local functions
 - `src/eh/mod.rs` — `.eh_frame` / LSDA emission; Mach-O needs

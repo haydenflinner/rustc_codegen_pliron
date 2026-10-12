@@ -25,8 +25,8 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::ArrayType;
 use rustc_hash::FxHashSet;
 
-use crate::context::{ConstVal, State, mask};
-use crate::lower::has_body;
+use crate::state::{ConstVal, State, mask};
+use crate::has_body;
 use crate::types::{TyK, classify, leaves, size_align, struct_offsets};
 
 const MAX_SIZE: u64 = 512;
@@ -78,7 +78,7 @@ struct Slice {
     pinned: bool,
 }
 
-pub(crate) fn const_int(ctx: &Context, st: &State<'_>, v: Value) -> Option<i128> {
+pub fn const_int(ctx: &Context, st: &State, v: Value) -> Option<i128> {
     let b = match st.consts.get(&v)? {
         ConstVal::Bits(b) => *b,
         ConstVal::Zero => return Some(0),
@@ -96,7 +96,7 @@ pub(crate) fn const_int(ctx: &Context, st: &State<'_>, v: Value) -> Option<i128>
 }
 
 /// Constant byte offset of a GEP, if all indices are constant.
-pub(crate) fn gep_offset(ctx: &Context, st: &State<'_>, op: Ptr<Operation>) -> Option<i64> {
+pub(crate) fn gep_offset(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<i64> {
     let gep = Operation::get_op::<GetElementPtrOp>(op, ctx)?;
     let mut cur = gep.src_elem_type(ctx);
     let mut off: i64 = 0;
@@ -146,7 +146,7 @@ fn diverging_arg(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
 /// to us could see. A panic-path writer is fine for a plain call — unwinding
 /// skips our frame — but not an invoke, whose catch pad must see pre-panic
 /// writes made through a shared pointer.
-fn copyable_arg(ctx: &Context, st: &State<'_>, op: Ptr<Operation>, _p: Value, idx: usize) -> bool {
+fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: usize) -> bool {
     let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
         return false;
     };
@@ -189,7 +189,7 @@ fn copyable_arg(ctx: &Context, st: &State<'_>, op: Ptr<Operation>, _p: Value, id
 /// else in the alloca can still promote.
 fn pin_extent(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     op: Ptr<Operation>,
     idx: usize,
 ) -> Option<(u64, u64)> {
@@ -210,14 +210,14 @@ fn pin_extent(
         .filter(|&e| e.0 > 0)
 }
 
-fn intrinsic<'a>(st: &'a State<'_>, op: Ptr<Operation>) -> Option<&'a str> {
+fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(&op).map(|s| s.as_str())
 }
 
 /// Collect every access to `a` (through constant-offset GEPs), or None if it escapes.
 fn accesses(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     a: Value,
     size: u64,
 ) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
@@ -478,9 +478,9 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
     Ok(typed)
 }
 
-pub(crate) fn mk_const(
+pub fn mk_const(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     ty: TypeHandle,
     cv: ConstVal,
 ) -> Value {
@@ -490,9 +490,9 @@ pub(crate) fn mk_const(
     v
 }
 
-pub(crate) fn ptr_plus(
+pub fn ptr_plus(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     p: Value,
     off: u64,
     before: Ptr<Operation>,
@@ -549,7 +549,7 @@ fn trivially_promotable(
     ty
 }
 
-fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool {
+fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     let a = alloca.deref(ctx).get_result(0);
     let Some(&(size, align)) = st.allocas.get(&a) else {
         return false;
@@ -776,7 +776,7 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
 
 /// Drop promotion for any alloca that ended up with a use lowering can't
 /// turn into a variable access (it then stays a stack slot).
-fn validate(ctx: &Context, st: &mut State<'_>, a: Value) {
+fn validate(ctx: &Context, st: &mut State, a: Value) {
     let Some(&ty) = st.promoted.get(&a) else {
         return;
     };
@@ -800,7 +800,7 @@ fn validate(ctx: &Context, st: &mut State<'_>, a: Value) {
 }
 
 /// Allocas anywhere in `f` (inlined callees' allocas live outside the entry block).
-pub(crate) fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
+pub fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
     let r = f.deref(ctx).get_region(0);
     r.deref(ctx)
         .iter(ctx)
@@ -813,7 +813,7 @@ pub(crate) fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
         .collect()
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let funcs: Vec<Ptr<Operation>> = st
         .funcs
         .values()
@@ -990,7 +990,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
 }
 
 /// First use that blocks promotion of alloca `a` (PLIRON_STATS_WHY).
-fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
+fn why(ctx: &Context, st: &State, a: Value) -> String {
     let mut work = vec![a];
     let mut uses = Vec::new();
     while let Some(p) = work.pop() {
@@ -1036,7 +1036,7 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
 }
 
 /// `why`, refined with the accesses/slices verdict (PLIRON_STATS_WHY).
-fn why2(ctx: &mut Context, st: &State<'_>, a: Value) -> String {
+fn why2(ctx: &mut Context, st: &State, a: Value) -> String {
     let w = why(ctx, st, a);
     if !w.starts_with("layout") {
         return w;
@@ -1061,7 +1061,7 @@ fn why2(ctx: &mut Context, st: &State<'_>, a: Value) -> String {
 
 /// `forward_single_store` on every body; run before `phisimp` so block args
 /// that only ever carry the forwarded value collapse before `split`.
-pub fn forward(ctx: &mut Context, st: &State<'_>) {
+pub fn forward(ctx: &mut Context, st: &State) {
     let funcs: Vec<Ptr<Operation>> = st
         .funcs
         .values()
@@ -1082,7 +1082,7 @@ pub fn forward(ctx: &mut Context, st: &State<'_>) {
 /// GEPs) is replaced by the stored value. This frees allocas whose address
 /// was parked in such a slot (e.g. a closure's captured `&&K`), so `split`
 /// can promote them too.
-fn forward_single_store(ctx: &mut Context, st: &State<'_>, f: Ptr<Operation>) -> usize {
+fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
     let Some(dom) = crate::domcheck::Dom::new(ctx, st, f) else {
         return 0;
     };

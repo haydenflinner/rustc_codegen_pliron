@@ -13,9 +13,9 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 
 /// libc functions that only read memory.
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];
@@ -74,7 +74,7 @@ fn frame_local(ctx: &Context, mut p: Value) -> bool {
 /// Invokes may land in `f`'s own pads and return, so they need a strict callee.
 fn writes(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     f: Ptr<Operation>,
     nw: &FxHashMap<String, bool>,
     strict: bool,
@@ -118,7 +118,7 @@ fn writes(
 /// Drop optimistic `strict` entries until no listed body writes.
 fn fixpoint(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     bodied: &[String],
     nw: &mut FxHashMap<String, bool>,
     strict: bool,
@@ -137,7 +137,7 @@ fn fixpoint(
     }
 }
 
-pub fn run(ctx: &Context, st: &mut State<'_>) {
+pub fn run(ctx: &Context, st: &mut State) {
     let bodied: Vec<String> = st
         .funcs
         .iter()

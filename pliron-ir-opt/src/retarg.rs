@@ -20,9 +20,9 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
 use rustc_hash::FxHashMap;
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 
 /// `f`'s values mapped to the parameter index they provably equal: the
 /// params themselves, results of calls to `returned(k)` callees passing a
@@ -30,7 +30,7 @@ use crate::lower::has_body;
 /// (op order isn't def-first across blocks).
 fn param_map(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     f: Ptr<Operation>,
     ra: &FxHashMap<String, u32>,
 ) -> FxHashMap<Value, u32> {
@@ -80,7 +80,7 @@ fn param_map(
 /// conflict — either way the function stays out of the table.
 fn ret_idx(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     f: Ptr<Operation>,
     ra: &FxHashMap<String, u32>,
 ) -> Option<u32> {
@@ -101,7 +101,7 @@ fn ret_idx(
     acc
 }
 
-pub fn run(ctx: &Context, st: &State<'_>) {
+pub fn run(ctx: &Context, st: &State) {
     let bodied: Vec<String> = st
         .funcs
         .iter()

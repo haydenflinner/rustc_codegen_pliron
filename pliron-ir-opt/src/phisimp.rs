@@ -14,9 +14,9 @@ use pliron::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::blocks;
-use crate::lower::has_body;
+use crate::has_body;
 
 /// Operand `i` that terminator `t` forwards to successor `si`, if `t` is a
 /// branch forwarding exactly `na` operands there.
@@ -34,7 +34,7 @@ fn defined_in(ctx: &Context, v: Value, b: Ptr<BasicBlock>) -> bool {
 }
 
 /// Blocks reachable from the entry, counting invoke landing-pad edges.
-fn reachable(ctx: &Context, st: &State<'_>, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr<BasicBlock>> {
+fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr<BasicBlock>> {
     let mut seen = FxHashSet::default();
     let mut work = vec![bs[0]];
     while let Some(b) = work.pop() {
@@ -49,7 +49,7 @@ fn reachable(ctx: &Context, st: &State<'_>, bs: &[Ptr<BasicBlock>]) -> FxHashSet
     seen
 }
 
-pub fn run(ctx: &mut Context, st: &State<'_>) {
+pub fn run(ctx: &mut Context, st: &State) {
     let landing: FxHashSet<Ptr<BasicBlock>> = st.invokes.values().map(|&(b, _)| b).collect();
     let fns: Vec<_> = st
         .funcs

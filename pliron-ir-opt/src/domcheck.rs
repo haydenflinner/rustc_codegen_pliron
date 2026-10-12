@@ -1,16 +1,16 @@
 //! Debug check (`PLIRON_CHECK_DOM=1`): after a pass, every operand's
 //! definition must dominate its use. Reports the first violation per function.
 
-use crate::context::State;
+use crate::state::State;
 use crate::inline::{blocks, ops};
-use crate::lower::has_body;
+use crate::has_body;
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron::value::DefiningEntity;
 use rustc_hash::FxHashMap;
 
-pub fn run(ctx: &Context, st: &State<'_>, pass: &str) {
+pub fn run(ctx: &Context, st: &State, pass: &str) {
     if !crate::env_set("PLIRON_CHECK_DOM") {
         return;
     }
@@ -23,7 +23,7 @@ pub fn run(ctx: &Context, st: &State<'_>, pass: &str) {
     }
 }
 
-fn succs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
+fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
     for op in ops(ctx, b) {
         v.extend(op.deref(ctx).successors());
@@ -32,7 +32,7 @@ fn succs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBloc
     v
 }
 
-fn check(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> Option<String> {
+fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
     let bs = blocks(ctx, f);
     let dom = Dom::new(ctx, st, f)?;
     let (post, idx) = (&dom.order, &dom.idx);
@@ -88,7 +88,7 @@ pub(crate) struct Dom {
 }
 
 impl Dom {
-    pub fn new(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> Option<Dom> {
+    pub fn new(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<Dom> {
         let bs = blocks(ctx, f);
         let entry = *bs.first()?;
         // Reverse post-order over reachable blocks.

@@ -67,12 +67,12 @@ fn fits_regs(ctx: &Context, leaves: &[(u64, TypeHandle)]) -> bool {
 
 fn call_sites(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     internal: &FxHashSet<String>,
 ) -> FxHashMap<String, Vec<Ptr<Operation>>> {
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     for f in st.funcs.values() {
-        if !crate::lower::has_body(ctx, f.op) {
+        if !crate::has_body(ctx, f.op) {
             continue;
         }
         for b in blocks(ctx, f.op) {
@@ -91,7 +91,7 @@ fn call_sites(
 /// Dead-argument elimination for internal functions: parameters the body
 /// never reads are dropped from the signature and from every call.
 /// Opt-in (`PLIRON_DEADARG=1`): stage2 instruction count unchanged.
-pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
+pub fn dead_args(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
     let mut cands: Vec<&String> = internal.iter().collect();
@@ -198,7 +198,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
     }
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
     if crate::env_set("PLIRON_STATS") {
@@ -258,7 +258,7 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
 
 fn rewrite(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     sym: &str,
     sty: TypeHandle,
     leaves: &[(u64, TypeHandle)],

@@ -20,8 +20,8 @@ use pliron::{
 use pliron_llvm::{attributes::ICmpPredicateAttr as P, ops::*};
 use rustc_hash::FxHashMap;
 
-use crate::context::{ConstVal, State};
-use crate::lower::has_body;
+use crate::state::{ConstVal, State};
+use crate::has_body;
 use crate::types::{TyK, classify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -269,7 +269,7 @@ fn int_width(ctx: &Context, v: Value) -> Option<u32> {
 
 const MAX_OPS: usize = 20_000;
 
-fn run_fn(ctx: &mut Context, st: &mut State<'_>, f: Ptr<Operation>) -> (usize, usize) {
+fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
     let mut eg: EGraph<IC, Fold> = EGraph::new(Fold::default());
     let mut ids: FxHashMap<Value, Id> = FxHashMap::default();
     let mut leaves: FxHashMap<Symbol, Value> = FxHashMap::default();
@@ -375,7 +375,7 @@ fn run_fn(ctx: &mut Context, st: &mut State<'_>, f: Ptr<Operation>) -> (usize, u
     (nc, nv)
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let (mut nc, mut nv) = (0, 0);
     let funcs: Vec<_> = st
         .funcs

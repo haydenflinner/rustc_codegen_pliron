@@ -31,8 +31,8 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::FuncType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::context::{ConstVal, State, leaf_arg};
-use crate::lower::has_body;
+use crate::state::{ConstVal, State, leaf_arg};
+use crate::has_body;
 use crate::types::{leaf_range, size_align};
 
 const DEFAULT_LIMIT: usize = 320;
@@ -59,20 +59,20 @@ const MAX_T: usize = 32;
 /// (`PLIRON_INLINE_GROWTH`).
 const GROWTH_MULT: usize = 25;
 
-pub(crate) fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+pub fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     if f.deref(ctx).regions().next().is_none() {
         panic!("blocks: op has no regions: {}", OpDbg { op: f, ctx });
     }
     f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
 }
 
-pub(crate) fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
+pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
-pub(crate) fn direct_callee<'a>(
+pub fn direct_callee<'a>(
     ctx: &Context,
-    st: &'a State<'_>,
+    st: &'a State,
     op: Ptr<Operation>,
 ) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
@@ -92,7 +92,7 @@ pub(crate) fn direct_callee<'a>(
 /// all; profitability is judged per callsite. `has_eh` = it has invokes or
 /// reads the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees
 /// outright.
-fn legal(ctx: &Context, st: &State<'_>, sym: &str) -> Option<(bool, usize, usize)> {
+fn legal(ctx: &Context, st: &State, sym: &str) -> Option<(bool, usize, usize)> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
         return None;
@@ -140,7 +140,7 @@ struct CInfo {
 /// did); the model profiles every plausibly inlinable body.
 fn callee_info(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     sym: &str,
     model: bool,
     limit: usize,
@@ -183,7 +183,7 @@ fn callee_info(
 /// constant becomes direct access the cleanup passes can resolve); `fold` =
 /// other uses a constant actual can fold. Call/branch/return uses earn
 /// neither — calls are priced by `ncalls`, block args don't fold in place.
-fn param_uses(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> (Vec<u32>, Vec<u32>) {
+fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u32>) {
     let bs = blocks(ctx, f);
     let Some(&entry) = bs.first() else {
         return (Vec::new(), Vec::new());
@@ -237,7 +237,7 @@ fn param_uses(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> (Vec<u32>, Ve
 /// Whether `v` is a scalar constant the model credits: literal bits, zero, or
 /// a symbol address (vtables and fn pointers fold indirect calls; global
 /// addresses make by-ref memory direct).
-fn const_arg(st: &State<'_>, v: &Value) -> bool {
+fn const_arg(st: &State, v: &Value) -> bool {
     matches!(
         st.consts.get(v),
         Some(ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. })
@@ -245,7 +245,7 @@ fn const_arg(st: &State<'_>, v: &Value) -> bool {
 }
 
 /// Successor blocks, counting invoke landing-pad edges.
-fn bsuccs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
+fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
     for op in ops(ctx, b) {
         v.extend(op.deref(ctx).successors());
@@ -257,7 +257,7 @@ fn bsuccs(ctx: &Context, st: &State<'_>, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlo
 /// Blocks of `f` that can reach themselves: the callsite-context "in a loop"
 /// signal (an inlined body there runs once per iteration, so a little extra
 /// code is worth it).
-fn loop_blocks(ctx: &Context, st: &State<'_>, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
     let mut out = FxHashSet::default();
     for b in blocks(ctx, f) {
         let mut seen = FxHashSet::default();
@@ -362,7 +362,7 @@ fn cond_params(ctx: &Context, f: Ptr<Operation>, incl_switch: bool) -> Vec<usize
     out
 }
 
-fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
+fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
     let mut n: FxHashMap<String, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
@@ -382,8 +382,8 @@ fn call_counts(ctx: &Context, st: &State<'_>) -> FxHashMap<String, usize> {
 /// Marks local fns that nothing references any more (typically fully inlined)
 /// so lowering skips them. Iterates because a dead fn's calls don't count.
 /// `PLIRON_DEADFN=0` disables it.
-pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
-    let taken = crate::lower::address_taken(ctx, st);
+pub fn dead_fns(ctx: &Context, st: &mut State) {
+    let taken = crate::address_taken(ctx, st);
     loop {
         let counts = call_counts(ctx, st);
         let dead: Vec<String> = st
@@ -414,7 +414,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
 }
 
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
-fn post_order(ctx: &Context, st: &State<'_>) -> Vec<String> {
+fn post_order(ctx: &Context, st: &State) -> Vec<String> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut out = Vec::new();
     for root in st.funcs.keys() {
@@ -438,7 +438,7 @@ fn post_order(ctx: &Context, st: &State<'_>) -> Vec<String> {
     out
 }
 
-fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
+fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
     blocks(ctx, st.funcs[sym].op)
         .into_iter()
         .flat_map(|b| ops(ctx, b))
@@ -467,7 +467,7 @@ fn callees(ctx: &Context, st: &State<'_>, sym: &str) -> Vec<String> {
 ///   bounds total size. `small` disables every bonus and the budget.
 pub fn run(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     small: bool,
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
@@ -485,7 +485,7 @@ pub fn run(
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
     let single: FxHashSet<String> = if once {
-        let taken = crate::lower::address_taken(ctx, st);
+        let taken = crate::address_taken(ctx, st);
         let counts = call_counts(ctx, st);
         st.funcs
             .iter()
@@ -730,7 +730,7 @@ pub fn run(
 /// Indirect calls whose callee is a constant function address (a vtable slot
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
 /// become direct calls. Returns the rewritten calls, for a second inline round.
-pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>> {
+pub fn devirt(ctx: &mut Context, st: &mut State) -> FxHashSet<Ptr<Operation>> {
     let mut out = FxHashSet::default();
     let fns: Vec<_> = st
         .funcs
@@ -800,7 +800,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State<'_>) -> FxHashSet<Ptr<Operation>
 }
 
 /// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
-fn left_stats(ctx: &Context, st: &State<'_>, infos: &FxHashMap<String, CInfo>) {
+fn left_stats(ctx: &Context, st: &State, infos: &FxHashMap<String, CInfo>) {
     let mut why: FxHashMap<&str, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
         if !has_body(ctx, f.op) {
@@ -998,7 +998,7 @@ fn is_alloca(ctx: &Context, v: Value) -> bool {
 /// intrinsics, and volatile ops all end the scan in a miss.
 fn store_src(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     load: Ptr<Operation>,
     mem: &mut FxHashSet<Ptr<Operation>>,
@@ -1038,7 +1038,7 @@ fn store_src(
 #[allow(clippy::too_many_arguments)]
 fn store_src_in(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     lb: Value,
     ll: Option<usize>,
@@ -1225,7 +1225,7 @@ fn store_src_in(
 /// bounds `ptr_base`.
 fn same_ptr(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     v1: Value,
     v2: Value,
@@ -1233,7 +1233,7 @@ fn same_ptr(
 ) -> bool {
     fn norm(
         ctx: &Context,
-        st: &State<'_>,
+        st: &State,
         preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
         mut v: Value,
         mem: &mut FxHashSet<Ptr<Operation>>,
@@ -1321,7 +1321,7 @@ fn same_ptr(
 /// `store_src`.
 fn ptr_base(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     mut v: Value,
     mem: &mut FxHashSet<Ptr<Operation>>,
@@ -1409,7 +1409,7 @@ fn ptr_base(
 /// clone-arg record first; else a frozen param of the containing function
 /// itself — the outermost region, anchored at its entry.
 /// `anc` is `b` or a proper ancestor of it in the clone-region tree.
-fn anc_or_self(st: &State<'_>, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> bool {
+fn anc_or_self(st: &State, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> bool {
     for _ in 0..64 {
         if b == anc {
             return true;
@@ -1430,7 +1430,7 @@ fn anc_or_self(st: &State<'_>, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> 
 /// what lets a nested load reach an enclosing loop's preheader.
 fn frozen_of(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     caller_frz: &[(usize, u64)],
     fentry: Option<Ptr<BasicBlock>>,
     entry: Ptr<BasicBlock>,
@@ -1438,7 +1438,7 @@ fn frozen_of(
     bl: Option<usize>,
 ) -> Option<(u64, Ptr<BasicBlock>)> {
     let mut best: Option<(u64, Ptr<BasicBlock>)> = None;
-    let mut pick = |st: &State<'_>, bytes: u64, r: Ptr<BasicBlock>| {
+    let mut pick = |st: &State, bytes: u64, r: Ptr<BasicBlock>| {
         if anc_or_self(st, r, entry)
             && best.is_none_or(|rb| anc_or_self(st, r, rb.1))
         {
@@ -1484,7 +1484,7 @@ fn frozen_of(
 /// only inside the clone, and a function-wide flag would escape the region.
 fn frozen_args(
     ctx: &Context,
-    st: &mut State<'_>,
+    st: &mut State,
     callee: Ptr<Operation>,
     src: &[Ptr<BasicBlock>],
     map: &IrMapping,
@@ -1697,7 +1697,7 @@ fn frozen_args(
 
 fn inline_call(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     rw: &mut IRRewriter<DummyListener>,
     call: Ptr<Operation>,
     callee: Ptr<Operation>,
@@ -1762,7 +1762,7 @@ fn inline_call(
             if let Some(s) = st.intrinsics.get(&op).cloned() {
                 st.intrinsics.insert(new, s);
             }
-            if let Some(r) = st.rmw.get(&op).copied() {
+            if let Some(r) = st.rmw.get(&op).cloned() {
                 st.rmw.insert(new, r);
             }
             if let Some(e) = st.expect.get(&op).copied() {

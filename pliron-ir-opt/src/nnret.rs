@@ -27,9 +27,9 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::FxHashSet;
 
-use crate::context::{ConstVal, State};
+use crate::state::{ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 use crate::types::{TyK, classify};
 
 /// Def-chain walk depth for one nonnull query.
@@ -37,7 +37,7 @@ const MAX_DEPTH: u32 = 8;
 
 /// `sym` resolves to an object/symbol defined in this CGU: its address can't
 /// be null. Declared-only and weakly-undefined symbols can resolve to 0.
-fn defined(ctx: &Context, st: &State<'_>, sym: &str) -> bool {
+fn defined(ctx: &Context, st: &State, sym: &str) -> bool {
     st.funcs.get(sym).is_some_and(|f| has_body(ctx, f.op))
         || st.globals.get(sym).is_some_and(|g| g.init.is_some())
 }
@@ -47,7 +47,7 @@ fn defined(ctx: &Context, st: &State<'_>, sym: &str) -> bool {
 /// survived the all-incoming-args fixpoint.
 fn nn(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     known: &FxHashSet<Value>,
     v: Value,
     t: &FxHashSet<String>,
@@ -101,7 +101,7 @@ fn nn(
 /// Every `ret` in `f` returns a provably non-null value under table `t`.
 /// A body with no `ret`s (diverging) qualifies vacuously: a call to it never
 /// sees a result.
-fn returns_nn(ctx: &Context, st: &State<'_>, f: Ptr<Operation>, t: &FxHashSet<String>) -> bool {
+fn returns_nn(ctx: &Context, st: &State, f: Ptr<Operation>, t: &FxHashSet<String>) -> bool {
     let bs = blocks(ctx, f);
     let ptr = |v: Value| v.get_type(ctx).deref(ctx).is::<PointerType>();
     // Optimistic `known`: `nonnull` entry params plus every non-entry pointer
@@ -167,7 +167,7 @@ fn returns_nn(ctx: &Context, st: &State<'_>, f: Ptr<Operation>, t: &FxHashSet<St
     })
 }
 
-pub fn run(ctx: &Context, st: &mut State<'_>) {
+pub fn run(ctx: &Context, st: &mut State) {
     let cand: Vec<String> = st
         .funcs
         .iter()

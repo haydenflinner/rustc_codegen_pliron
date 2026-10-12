@@ -28,10 +28,10 @@ use pliron_llvm::attributes::{
     FCmpPredicateAttr, GepNoWrapFlags, ICmpPredicateAttr,
 };
 use pliron_llvm::ops::*;
-use rustc_codegen_ssa::common::AtomicRmwBinOp;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
+use crate::{address_taken, has_body};
 use crate::context::{ArgExt, ConstVal, Exts, State, mask};
 use crate::types::{TyK, classify, leaf_range, leaves, size_align, struct_offsets};
 
@@ -114,7 +114,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// 8 int + 8 float return registers instead of SysV's 2+2).
 pub(crate) fn internal_fns(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
 ) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
@@ -141,49 +141,12 @@ pub(crate) fn internal_fns(
         .collect()
 }
 
-/// Functions whose address is used other than as a direct callee: symbol
-/// constants that are used or sit in global/aggregate initializers, and names
-/// mentioned in asm.
-pub(crate) fn address_taken(
-    ctx: &Context,
-    st: &State<'_>,
-) -> rustc_hash::FxHashSet<String> {
-    use rustc_hash::FxHashSet;
-    let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
-    for c in st.consts.values() {
-        if let ConstVal::Agg(vs) = c {
-            escaped.extend(vs.iter().copied());
-        }
-    }
-    let mut taken = FxHashSet::default();
-    for (v, c) in &st.consts {
-        if let ConstVal::Sym { sym, .. } = c {
-            if v.is_used(ctx) || escaped.contains(v) {
-                taken.insert(sym.clone());
-            }
-        }
-    }
-    taken.extend(
-        st.funcs
-            .keys()
-            .filter(|n| st.asm.contains(n.as_str()))
-            .cloned(),
-    );
-    taken
-}
-
-pub(crate) fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
-    Operation::get_op::<FuncOp>(f, ctx)
-        .unwrap()
-        .get_entry_block(ctx)
-        .is_some()
-}
 
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     isa: Arc<dyn TargetIsa>,
     name: &str,
     sess: &rustc_session::Session,
@@ -1073,7 +1036,7 @@ fn atomic_stub_asm(name: &str, macho: bool) -> String {
 
 pub(crate) fn write_const(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     v: Value,
     off: u64,
     bytes: &mut [u8],
@@ -1146,9 +1109,9 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     }
 }
 
-struct FnLower<'a, 'b, 'tcx> {
+struct FnLower<'a, 'b> {
     ctx: &'a Context,
-    st: &'a State<'tcx>,
+    st: &'a State,
     m: &'a mut ObjectModule,
     ids: &'a FxHashMap<String, Sym>,
     b: FunctionBuilder<'b>,
@@ -1224,7 +1187,7 @@ struct FnLower<'a, 'b, 'tcx> {
     eject: Option<Block>,
 }
 
-impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
+impl<'a, 'b> FnLower<'a, 'b> {
     /// Flags for a plain load/store. Non-volatile accesses to invalid memory are UB
     /// (as in LLVM), so at -O they need no trap record and may be removed or reordered.
     fn plain_mf(&self, op: Ptr<Operation>) -> MemFlagsData {
@@ -3066,18 +3029,20 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             use cranelift_codegen::ir::AtomicRmwOp as R;
             let p = self.get1(opnds[0]);
             let v = self.get1(opnds[1]);
+            use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
             let k = match self.st.rmw[&op] {
-                AtomicRmwBinOp::AtomicXchg => R::Xchg,
-                AtomicRmwBinOp::AtomicAdd => R::Add,
-                AtomicRmwBinOp::AtomicSub => R::Sub,
-                AtomicRmwBinOp::AtomicAnd => R::And,
-                AtomicRmwBinOp::AtomicNand => R::Nand,
-                AtomicRmwBinOp::AtomicOr => R::Or,
-                AtomicRmwBinOp::AtomicXor => R::Xor,
-                AtomicRmwBinOp::AtomicMax => R::Smax,
-                AtomicRmwBinOp::AtomicMin => R::Smin,
-                AtomicRmwBinOp::AtomicUMax => R::Umax,
-                AtomicRmwBinOp::AtomicUMin => R::Umin,
+                KA::Xchg => R::Xchg,
+                KA::Add => R::Add,
+                KA::Sub => R::Sub,
+                KA::And => R::And,
+                KA::Nand => R::Nand,
+                KA::Or => R::Or,
+                KA::Xor => R::Xor,
+                KA::Max => R::Smax,
+                KA::Min => R::Smin,
+                KA::UMax => R::Umax,
+                KA::UMin => R::Umin,
+                _ => unreachable!(),
             };
             let t = self.b.func.dfg.value_type(v);
             if self.needs_atomic_stub(t) {
@@ -4337,7 +4302,7 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
 /// unlikely side of an expect branch, or only lead to such blocks.
 fn cold_blocks(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     pblocks: &[Ptr<BasicBlock>],
 ) -> rustc_hash::FxHashSet<Ptr<BasicBlock>> {
     let mut cold = rustc_hash::FxHashSet::default();
@@ -4379,7 +4344,7 @@ fn cold_blocks(
 
 pub(crate) fn rpo(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     blocks: &[Ptr<BasicBlock>],
 ) -> Vec<Ptr<BasicBlock>> {
     rpo_split(ctx, st, blocks).0
@@ -4389,7 +4354,7 @@ pub(crate) fn rpo(
 /// also returns how many are reachable.
 fn rpo_split(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     blocks: &[Ptr<BasicBlock>],
 ) -> (Vec<Ptr<BasicBlock>>, usize) {
     // Invoke landing pads count as successors so values defined before an

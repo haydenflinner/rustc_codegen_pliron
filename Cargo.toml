@@ -22,10 +22,12 @@ smallvec = "1"
 egg = "0.10"
 waffle = "0.3.2"
 pliron-clif-opt = { path = "pliron-clif-opt" }
+pliron-ir-opt = { path = "pliron-ir-opt" }
+pliron-cfg = { path = "pliron-cfg" }
 rustc-hash = "2"
 
 [workspace]
-members = ["pliron-clif-opt"]
+members = ["pliron-clif-opt", "pliron-ir-opt", "pliron-cfg"]
 exclude = ["vendor"]
 
 [profile.dev]

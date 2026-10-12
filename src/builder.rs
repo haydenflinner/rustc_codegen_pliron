@@ -1052,10 +1052,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
-            AtomicRmwOp::new(&mut c, dst, src, kind, ord(order), SyncScopeAttr::System)
+            AtomicRmwOp::new(&mut c, dst, src, kind.clone(), ord(order), SyncScopeAttr::System)
                 .get_operation()
         };
-        self.st.borrow_mut().rmw.insert(p, op);
+        self.st.borrow_mut().rmw.insert(p, kind);
         self.push(p).unwrap()
     }
 

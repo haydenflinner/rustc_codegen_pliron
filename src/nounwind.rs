@@ -12,9 +12,9 @@ use rustc_hash::FxHashSet;
 
 use crate::context::State;
 use crate::inline::{blocks, direct_callee, ops};
-use crate::lower::has_body;
+use crate::has_body;
 
-fn may_unwind(ctx: &Context, st: &State<'_>, f: Ptr<Operation>, nw: &FxHashSet<String>) -> bool {
+fn may_unwind(ctx: &Context, st: &State, f: Ptr<Operation>, nw: &FxHashSet<String>) -> bool {
     blocks(ctx, f).into_iter().any(|b| {
         ops(ctx, b).into_iter().any(|op| {
             Operation::is_op::<CallOp>(op, ctx)
@@ -24,7 +24,7 @@ fn may_unwind(ctx: &Context, st: &State<'_>, f: Ptr<Operation>, nw: &FxHashSet<S
     })
 }
 
-pub fn run(ctx: &Context, st: &mut State<'_>) {
+pub fn run(ctx: &Context, st: &mut State) {
     let bodied: Vec<String> = st
         .funcs
         .iter()

@@ -14,8 +14,8 @@ use pliron::{
 use pliron_llvm::ops::{GetElementPtrOp, LoadOp};
 use rustc_hash::FxHashMap;
 
-use crate::context::{ConstVal, State};
-use crate::lower::has_body;
+use crate::state::{ConstVal, State};
+use crate::has_body;
 use crate::sroa::{gep_offset, mk_const};
 use crate::types::{TyK, classify, size_align, struct_offsets};
 
@@ -26,7 +26,7 @@ struct Image {
     relocs: FxHashMap<usize, (String, i64)>,
 }
 
-fn image(ctx: &Context, st: &State<'_>, v: Value, out: &mut Image) -> Option<()> {
+fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
     let ty = v.get_type(ctx);
     let (size, _) = size_align(ctx, ty);
     let start = out.bytes.len();
@@ -67,7 +67,7 @@ fn image(ctx: &Context, st: &State<'_>, v: Value, out: &mut Image) -> Option<()>
 }
 
 /// The global symbol and byte offset `p` points at, if constant.
-fn sym_off(ctx: &Context, st: &State<'_>, p: Value) -> Option<(String, i64)> {
+fn sym_off(ctx: &Context, st: &State, p: Value) -> Option<(String, i64)> {
     if let Some(ConstVal::Sym { sym, off }) = st.consts.get(&p) {
         return Some((sym.clone(), *off));
     }
@@ -106,7 +106,7 @@ fn fold(ctx: &Context, img: &Image, off: i64, ty: TypeHandle) -> Option<ConstVal
     }
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+pub fn run(ctx: &mut Context, st: &mut State) {
     let mut images: FxHashMap<String, Option<Image>> = FxHashMap::default();
     let fns: Vec<_> = st
         .funcs
