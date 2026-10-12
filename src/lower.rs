@@ -1123,6 +1123,25 @@ pub fn lower_to_object(
                 panic!("coldedges broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Second DSE: ifconv's store→load forwarding and the late edge
+        // transforms rewrite a slot's last readers to the stored value,
+        // leaving stores the early dse saw live (e.g. the `&key` slot
+        // materialized for `HashMap::get`, dead once `hash_one`'s byte
+        // loads forward from the key value itself).
+        if crate::pass_enabled("PLIRON_DSE2") && crate::bisect("dse2") {
+            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("dse2 {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after dse2 ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("dse2 broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // `uextend.i64 (load.i32)` -> `uload32.i64` + `ireduce.i32`: x64
         // emits movl either way, but dropping the extension vreg frees
         // regalloc from coalescing it (a stray `movq` showed up in
