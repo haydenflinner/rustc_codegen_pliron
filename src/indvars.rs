@@ -9,8 +9,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, condcodes::IntCC, Opcode, Type,
-    Value, ValueDef, types,
+    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, condcodes::IntCC,
+    Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -379,6 +379,538 @@ pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
         n += run_loop(func, &cfg, &dt, &la, lp, debug);
+    }
+    n
+}
+
+
+/// Loop-carried load reuse (LLVM GVN's backedge phi-translation). A load
+/// `B` rereads each iteration the address a sibling load `A` read last
+/// iteration whenever their affine addresses are one step apart:
+/// `koff_B + shift == koff_A`. Carrying `prev` as a header param —
+/// seeded by a compensating entry-edge load, fed `A`'s result on every
+/// backedge — turns the two-load scan into a one-load loop. Run
+/// detection (`v[i] < v[i-1]`), insertion-sort probes and sliding-window
+/// compares lose a load, the index arithmetic and a block per element;
+/// unrolled copies additionally collapse onto the previous copy's load
+/// by the same-address CSE in the same group.
+///
+/// Soundness: the compensating load evaluates exactly `B`'s first-
+/// iteration address on each entry edge, so nothing is speculated. `A`
+/// must dominate every backedge so its result is a legal edge argument
+/// — which also means it executes each iteration, and since its address
+/// is a pure function of the loop state every evaluation loads the same
+/// location. `B` may sit anywhere in the loop: `prev` equals its read
+/// whenever it runs, and never matters when it doesn't. The body may
+/// hold no stores or calls, so the carried location is unchanged
+/// between `A`'s load and `B`'s next-iteration read.
+
+const MAX_ROT: usize = 4;
+const DEC_FUEL: usize = 12;
+
+/// `v` as `Σ terms + kcoef*iter + koff`: the affine shape of a value
+/// expressed over an abstract iteration count `iter` (0 on the first).
+/// `terms` are sorted invariant-leaf (value, coef) pairs; `kcoef` is the
+/// per-iteration drift. Header params contribute their entry seed's own
+/// decomposition plus `step*iter`, so a strength-reduced pointer param
+/// and `iv*esize` over the index param express the same sequence.
+type Dec = (Vec<(Value, i64)>, i64, i64);
+
+/// Per-param loop behavior: uniform backedge step (None when any backedge
+/// passes a non-affine value) and the seed's leaf decomposition (None
+/// when entry edges pass different seeds).
+type ParamInfo = (Option<i64>, Option<(Vec<(Value, i64)>, i64)>);
+
+/// Invariant-leaf decomposition of a value: affine structure becomes
+/// leaf/const terms, everything else is an opaque leaf. Never fails —
+/// used on entry seeds, whose values sit outside the loop by definition.
+fn dec_term(
+    func: &Function,
+    v: Value,
+    fuel: usize,
+    terms: &mut FxHashMap<Value, i64>,
+    koff: &mut i64,
+) {
+    if fuel == 0 {
+        *terms.entry(v).or_default() += 1;
+        return;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(k) = iconst(func, v) {
+        *koff = koff.wrapping_add(k);
+        return;
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        *terms.entry(v).or_default() += 1;
+        return;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } => {
+            dec_term(func, args[0], fuel - 1, terms, koff);
+            dec_term(func, args[1], fuel - 1, terms, koff);
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args,
+        } => {
+            dec_term(func, args[0], fuel - 1, terms, koff);
+            let mut t2 = FxHashMap::default();
+            let mut k2 = 0i64;
+            dec_term(func, args[1], fuel - 1, &mut t2, &mut k2);
+            for (x, c) in t2 {
+                *terms.entry(x).or_default() -= c;
+            }
+            *koff = koff.wrapping_sub(k2);
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args,
+        } => {
+            for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                if let Some(k) = iconst(func, c) {
+                    let mut t2 = FxHashMap::default();
+                    let mut k2 = 0i64;
+                    dec_term(func, x, fuel - 1, &mut t2, &mut k2);
+                    for (y, d) in t2 {
+                        *terms.entry(y).or_default() += d.wrapping_mul(k);
+                    }
+                    *koff = koff.wrapping_add(k2.wrapping_mul(k));
+                    return;
+                }
+            }
+            *terms.entry(v).or_default() += 1;
+        }
+        _ => {
+            *terms.entry(v).or_default() += 1;
+        }
+    }
+}
+
+/// Add `scale * dec(v)` to (`terms`, `kcoef`, `koff`). An in-body value
+/// that isn't affine and isn't a header param changes per iteration —
+/// the decomposition fails.
+#[allow(clippy::too_many_arguments)]
+fn dec(
+    func: &Function,
+    params: &[Value],
+    pinfos: &[ParamInfo],
+    body: &FxHashSet<Block>,
+    v: Value,
+    scale: i64,
+    fuel: usize,
+    terms: &mut FxHashMap<Value, i64>,
+    kcoef: &mut i64,
+    koff: &mut i64,
+) -> Option<()> {
+    if fuel == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(j) = params.iter().position(|&p| p == v) {
+        let (step, seed) = &pinfos[j];
+        let (Some(s), Some((st, sk))) = (*step, seed) else {
+            return None;
+        };
+        *kcoef = kcoef.wrapping_add(s.wrapping_mul(scale));
+        *koff = koff.wrapping_add(sk.wrapping_mul(scale));
+        for &(t, c) in st {
+            *terms.entry(t).or_default() += c.wrapping_mul(scale);
+        }
+        return Some(());
+    }
+    if let Some(k) = iconst(func, v) {
+        *koff = koff.wrapping_add(scale.wrapping_mul(k));
+        return Some(());
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        // A non-header block param: invariant iff defined outside the loop.
+        if def_block(func, v).is_some_and(|b| !body.contains(&b)) {
+            *terms.entry(v).or_default() += scale;
+            return Some(());
+        }
+        return None;
+    };
+    // Non-affine nodes (or imul/shl without a constant factor): invariant
+    // leaf only when defined outside the loop — an in-body value changes
+    // per iteration.
+    fn leaf(
+        func: &Function,
+        body: &FxHashSet<Block>,
+        i: Inst,
+        v: Value,
+        scale: i64,
+        terms: &mut FxHashMap<Value, i64>,
+    ) -> Option<()> {
+        if func.layout.inst_block(i).is_some_and(|b| !body.contains(&b)) {
+            *terms.entry(v).or_default() += scale;
+            return Some(());
+        }
+        None
+    }
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } => {
+            dec(func, params, pinfos, body, args[0], scale, fuel - 1, terms, kcoef, koff)?;
+            dec(func, params, pinfos, body, args[1], scale, fuel - 1, terms, kcoef, koff)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args,
+        } => {
+            dec(func, params, pinfos, body, args[0], scale, fuel - 1, terms, kcoef, koff)?;
+            dec(func, params, pinfos, body, args[1], scale.wrapping_neg(), fuel - 1, terms, kcoef, koff)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args,
+        } => {
+            for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                if let Some(k) = iconst(func, c) {
+                    return dec(func, params, pinfos, body, x, scale.wrapping_mul(k), fuel - 1, terms, kcoef, koff);
+                }
+            }
+            leaf(func, body, i, v, scale, terms)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args,
+        } if iconst(func, args[1]).is_some_and(|s| (0..64).contains(&s)) => {
+            let s = iconst(func, args[1])?;
+            dec(func, params, pinfos, body, args[0], scale.wrapping_shl(s as u32), fuel - 1, terms, kcoef, koff)
+        }
+        _ => leaf(func, body, i, v, scale, terms),
+    }
+}
+
+fn dec_addr(
+    func: &Function,
+    params: &[Value],
+    pinfos: &[ParamInfo],
+    body: &FxHashSet<Block>,
+    v: Value,
+) -> Option<Dec> {
+    let mut tm = FxHashMap::default();
+    let (mut kcoef, mut koff) = (0i64, 0i64);
+    dec(func, params, pinfos, body, v, 1, DEC_FUEL, &mut tm, &mut kcoef, &mut koff)?;
+    let mut terms: Vec<(Value, i64)> = tm.into_iter().filter(|&(_, c)| c != 0).collect();
+    terms.sort();
+    Some((terms, kcoef, koff))
+}
+
+/// Can `dec`'s iteration-0 address be evaluated at edge `e`? Every term
+/// is an out-of-loop value that must dominate the branch.
+fn rot_edge_ok(func: &Function, dt: &DominatorTree, dec: &Dec, e: &Edge) -> bool {
+    dec.0.iter().all(|&(v, _)| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => dt.dominates(i, e.inst, &func.layout),
+        ValueDef::Param(b, _) => dt.dominates(b, e.inst, &func.layout),
+        _ => false,
+    })
+}
+
+/// The entry-edge seed for a rotated load: `Σ terms + koff` (the
+/// iteration-0 address), then the load itself. Caller must have checked
+/// `rot_edge_ok` first — every leaf resolves.
+fn emit_rot_load(func: &mut Function, dec: &Dec, ty: Type, flags: MemFlagsData, e: &Edge) -> Value {
+    let (terms, _, koff) = dec;
+    let mut pos = FuncCursor::new(func).at_inst(e.inst);
+    let mut acc: Option<Value> = None;
+    let mut add = |pos: &mut FuncCursor, v: Value, coef: i64| {
+        let t = if coef == 1 {
+            v
+        } else {
+            let c = iconst_masked(pos, pos.func.dfg.value_type(v), coef);
+            pos.ins().imul(v, c)
+        };
+        acc = Some(match acc {
+            Some(a) => pos.ins().iadd(a, t),
+            None => t,
+        });
+    };
+    for &(v, coef) in terms {
+        add(&mut pos, v, coef);
+    }
+    if *koff != 0 {
+        let c = iconst_masked(&mut pos, cranelift_codegen::ir::types::I64, *koff);
+        add(&mut pos, c, 1);
+    }
+    let a = match acc {
+        Some(a) => a,
+        None => pos.ins().iconst(types::I64, 0),
+    };
+    pos.ins().load(ty, flags, a, 0)
+}
+
+fn rot_loop(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: Loop,
+    debug: bool,
+) -> usize {
+    let h = la.loop_header(lp);
+    if !dt.is_reachable(h) {
+        return 0;
+    }
+    let body: FxHashSet<Block> = func
+        .layout
+        .blocks()
+        .filter(|&b| la.is_in_loop(b, lp))
+        .collect();
+    // The carried location must be stable between `A`'s load and the next
+    // iteration's read: no stores or calls anywhere in the loop.
+    for &b in &body {
+        for i in func.layout.block_insts(b) {
+            let op = func.dfg.insts[i].opcode();
+            if op.can_store()
+                || op.other_side_effects()
+                || matches!(
+                    op,
+                    Opcode::Call
+                        | Opcode::CallIndirect
+                        | Opcode::TryCall
+                        | Opcode::TryCallIndirect
+                        | Opcode::AtomicCas
+                        | Opcode::AtomicRmw
+                        | Opcode::AtomicLoad
+                        | Opcode::Fence
+                )
+            {
+                if debug {
+                    eprintln!("ldrot {h}: bail {op} at {b}");
+                }
+                return 0;
+            }
+        }
+    }
+    let edges = edges_to(func, cfg, h);
+    if !edges.iter().any(|e| {
+        func.layout
+            .inst_block(e.inst)
+            .is_some_and(|b| !body.contains(&b))
+    }) {
+        if debug {
+            eprintln!("ldrot {h}: bail no entry edge");
+        }
+        return 0; // no entry edge — nothing to seed `prev` from
+    }
+    let params = func.dfg.block_params(h).to_vec();
+    let inb = |func: &Function, e: &Edge| {
+        func.layout
+            .inst_block(e.inst)
+            .is_some_and(|b| body.contains(&b))
+    };
+    // Per-param (step, seed): the step must be a uniform constant on every
+    // backedge, and every entry edge must pass the same seed value so the
+    // param's sequence `seed + iter*step` is well-defined.
+    let mut pinfos: Vec<ParamInfo> = Vec::with_capacity(params.len());
+    'p: for (j, &p) in params.iter().enumerate() {
+        let (mut s, mut seed) = (None, None);
+        for e in &edges {
+            let Some(a) = edge_arg(func, e, j) else {
+                pinfos.push((None, None));
+                continue 'p;
+            };
+            if !inb(func, e) {
+                // Entry edge: all entries must seed the same value.
+                let a = func.dfg.resolve_aliases(a);
+                if seed.is_some_and(|x| x != a) {
+                    pinfos.push((None, None));
+                    continue 'p;
+                }
+                seed = Some(a);
+                continue;
+            }
+            let d = if a == p {
+                0
+            } else {
+                match step_form(func, p, &body, a) {
+                    Some(StepV::K(k)) => k,
+                    _ => {
+                        pinfos.push((None, None));
+                        continue 'p;
+                    }
+                }
+            };
+            if s.is_some_and(|x| x != d) {
+                pinfos.push((None, None));
+                continue 'p;
+            }
+            s = Some(d);
+        }
+        let Some(sd) = seed else {
+            // Params with no entry edge can't seed a sequence.
+            pinfos.push((None, None));
+            continue;
+        };
+        let (mut tm, mut koff) = (FxHashMap::default(), 0i64);
+        dec_term(func, sd, DEC_FUEL, &mut tm, &mut koff);
+        let mut st: Vec<(Value, i64)> = tm.into_iter().filter(|&(_, c)| c != 0).collect();
+        st.sort();
+        pinfos.push((s, Some((st, koff))));
+    }
+    // Affine loads anywhere in the loop, grouped by (invariant terms,
+    // per-iteration drift): within a group only the constant offset
+    // differs. `B` (the replaced load) may sit in any body block — `prev`
+    // is a pure function of the header params — but `A` must dominate the
+    // backedges so its result is a legal edge arg (which also means it
+    // runs each iteration).
+    type Key = (Vec<(Value, i64)>, i64);
+    let mut groups: FxHashMap<Key, Vec<(i64, Inst, Value, Type, Opcode)>> = FxHashMap::default();
+    let mut decs: FxHashMap<Inst, Dec> = FxHashMap::default();
+    for b in func.layout.blocks().filter(|b| body.contains(b)) {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::Load {
+                opcode: op,
+                arg,
+                flags,
+                offset,
+                ..
+            } = func.dfg.insts[i]
+                && func.dfg.mem_flags[flags].notrap()
+                && let Some((terms, kcoef, koff)) = dec_addr(func, &params, &pinfos, &body, arg)
+                && kcoef != 0
+            {
+                let res = func.dfg.first_result(i);
+                let ty = func.dfg.value_type(res);
+                let koff = koff.wrapping_add(i32::from(offset) as i64);
+                decs.insert(i, (terms.clone(), kcoef, koff));
+                groups
+                    .entry((terms, kcoef))
+                    .or_default()
+                    .push((koff, i, res, ty, op));
+            }
+        }
+    }
+    if debug {
+        for ((terms, kcoef), ls) in &groups {
+            eprintln!(
+                "ldrot {h}: group kcoef={kcoef} terms={terms:?} loads={:?}",
+                ls.iter().map(|&(k, i, ..)| (k, i)).collect::<Vec<_>>()
+            );
+        }
+    }
+    if groups.is_empty() {
+        return 0;
+    }
+    let mut removed = FxHashSet::default();
+    let mut rot = 0;
+    let mut n = 0;
+    for ((_, shift), ls) in &groups {
+        // Same-address reuse: a load whose `dec` matches an earlier
+        // dominating load reads the same address this iteration — the
+        // unrolled copies' `v[i-1]` against the previous copy's `v[i]`.
+        for &(koff, bi, bres, bty, bop) in ls {
+            if removed.contains(&bi) {
+                continue;
+            }
+            if let Some(&(_, _, ares, _, _)) = ls.iter().find(|&&(k, i, _, t, o)| {
+                k == koff
+                    && t == bty
+                    && o == bop
+                    && i != bi
+                    && !removed.contains(&i)
+                    && dt.dominates(i, bi, &func.layout)
+            }) {
+                let ares = func.dfg.resolve_aliases(ares);
+                func.layout.remove_inst(bi);
+                func.dfg.clear_results(bi);
+                func.dfg.change_to_alias(bres, ares);
+                removed.insert(bi);
+                n += 1;
+            }
+        }
+        // `shift` is the per-iteration address drift: `B`'s address this
+        // iteration is `A`'s last iteration when `koff_A = koff_B + shift`.
+        if *shift == 0 || rot >= MAX_ROT {
+            continue;
+        }
+        for &(koff, bi, _, bty, bop) in ls {
+            if rot >= MAX_ROT {
+                break;
+            }
+            if removed.contains(&bi) {
+                continue;
+            }
+            let want = koff.wrapping_add(*shift);
+            let Some(&(_, ai, ares, _, _)) = ls.iter().find(|&&(k, i, _, t, o)| {
+                k == want
+                    && t == bty
+                    && o == bop
+                    && i != bi
+                    && !removed.contains(&i)
+                    && edges
+                        .iter()
+                        .filter(|e| inb(func, e))
+                        .all(|e| dt.dominates(i, e.inst, &func.layout))
+            }) else {
+                continue;
+            };
+            let InstructionData::Load { flags, .. } = func.dfg.insts[ai] else {
+                continue;
+            };
+            let flags = func.dfg.mem_flags[flags];
+            let bdec = decs[&bi].clone();
+            // Every entry edge must be able to evaluate B's first-iteration
+            // address — checked upfront since the param can't be un-added.
+            let mut es = Vec::new();
+            let mut ok = true;
+            for e in &edges {
+                if inb(func, e) {
+                    es.push(None);
+                } else if rot_edge_ok(func, dt, &bdec, e) {
+                    es.push(Some(()));
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // `prev` = phi{entry load at B's first-iteration addr, A}.
+            let prev = func.dfg.append_block_param(h, bty);
+            for (e, seed) in edges.iter().zip(es) {
+                let v = match seed {
+                    Some(()) => emit_rot_load(func, &bdec, bty, flags, e),
+                    None => ares,
+                };
+                let dfg = &mut func.dfg;
+                dfg.insts[e.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [e.slot]
+                    .append_argument(v, &mut dfg.value_lists);
+            }
+            let r = func.dfg.first_result(bi);
+            func.layout.remove_inst(bi);
+            func.dfg.clear_results(bi);
+            func.dfg.change_to_alias(r, prev);
+            if debug {
+                eprintln!("ldrot {h}: load {bi} -> param {prev} (feed {ares}, shift {shift})");
+            }
+            removed.insert(bi);
+            rot += 1;
+            n += 1;
+        }
+    }
+    n
+}
+
+pub fn rotld(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    la.compute(func, &cfg, &dt);
+    let debug = std::env::var_os("PLIRON_LDROT_DEBUG").is_some();
+    let loops = deepest_first(&la);
+    let mut n = 0;
+    for lp in loops.into_iter().take(MAX_LOOPS) {
+        n += rot_loop(func, &cfg, &dt, &la, lp, debug);
     }
     n
 }

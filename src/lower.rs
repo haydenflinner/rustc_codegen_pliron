@@ -642,6 +642,22 @@ pub fn lower_to_object(
                 panic!("indvars broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Loop-carried load reuse: sibling to indvars since it grows
+        // stepped header params the same machinery produces.
+        if st.indvars
+            && crate::pass_enabled("PLIRON_LDROT")
+            && crate::bisect("ldrot")
+        {
+            let k = crate::indvars::rotld(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("ldrot {k} {n}");
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("ldrot broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.licm && crate::bisect("licm") {
             let k = crate::licm::run(
                 &mut clctx.func,
