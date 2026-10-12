@@ -102,6 +102,10 @@ struct Chk {
     aff: Aff,
     le: bool,
     len: Value,
+    /// Bound-subsumption check on `iv + k` (no counting iv): the header's
+    /// own `idx < B` test bounds every in-body iteration, so the guard is
+    /// `B - adj + k < len` rather than a trip-count `hi`.
+    bsub: Option<i64>,
 }
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -500,8 +504,21 @@ impl InstructionMapper for CloneMap<'_> {
 fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     let mut stack = vec![bad];
+    // Emulated-EH rethrow paths run drop glue (dozens of cold blocks) between
+    // the flag check and the dummy `return` that propagates the exception to
+    // the caller. Admit `return`s when the entry block itself does
+    // `call panic_*; load flag` — every reachable return is then past the
+    // flag check (the unset arm traps), i.e. a rethrow.
+    let mut rethrow = false;
+    let dbg = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
     while let Some(b) = stack.pop() {
-        if !seen.insert(b) || seen.len() > 16 || !func.layout.is_cold(b) {
+        if !seen.insert(b) {
+            continue;
+        }
+        if seen.len() > 64 || !func.layout.is_cold(b) {
+            if dbg {
+                eprintln!("dead_end blk{}: bail seen={} cold={}", b.as_u32(), seen.len(), func.layout.is_cold(b));
+            }
             return false;
         }
         let (mut call, mut flag) = (false, false);
@@ -518,8 +535,16 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                         flag = true;
                     }
                 }
-                Opcode::Return if !(throw_ret && call && flag) => return false,
+                Opcode::Return if !(throw_ret && (call && flag || rethrow)) => {
+                    if dbg {
+                        eprintln!("dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}", b.as_u32());
+                    }
+                    return false;
+                }
                 _ => {}
+            }
+            if b == bad {
+                rethrow = call && flag;
             }
             for bc in d.branch_destination(
                 &func.dfg.jump_tables,
@@ -829,7 +854,45 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             break 'iv;
         }
     }
-    let Some(mut info) = info else { bail!("no counting iv") };
+    // No `+1` counting iv? The header's own `p < B` test still bounds `p`
+    // on every in-body iteration, so an interior `(p + k) < len` check is
+    // implied whenever `B - adj + k < len` — provable once in the guard
+    // block with no trip count. `bsub_iv` marks the fallback: checks
+    // matching `p`/`p + k` take the bound guard instead of affine `hi`.
+    let (mut info, bsub_iv) = match info {
+        Some(i) => (i, None),
+        None => {
+            let mut found = None;
+            for (ix, &p) in params.iter().enumerate() {
+                let ty = func.dfg.value_type(p);
+                if !ty.is_int() || ty.bits() > 64 {
+                    continue;
+                }
+                let Some((bound, adj)) = bound_test(h, p, bargs[ix].unwrap_or(p))
+                else {
+                    continue;
+                };
+                let lo = LoopInfo {
+                    iv: p,
+                    iv0: ix,
+                    iv0k: None,
+                    bound,
+                    adj,
+                    stepped: FxHashMap::default(),
+                    g: None,
+                    h,
+                    bargs: bargs.clone(),
+                };
+                if invariant(func, &lo, &body, bound) {
+                    found = Some(lo);
+                    break;
+                }
+            }
+            let Some(lo) = found else { bail!("no counting iv") };
+            let iv = lo.iv;
+            (lo, Some(iv))
+        }
+    };
 
     // Foldable checks: `brif (icmp cc idx, len)` where idx is affine in the
     // counter, len invariant, and the unsafe edge is a cold (panic) block.
@@ -877,15 +940,41 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 _ => continue,
             };
             if !invariant(func, &info, &body, bb) {
+                if debug {
+                    eprintln!("bcheck {name} block{}: blk{} len not invariant", h.as_u32(), b.as_u32());
+                }
                 continue;
             }
-            let aff = match affine(func, &info, &body, MAX_AFFINE_DEPTH, a) {
-                Some(af) => af,
-                // (x64 wt note) data-dependent but range-limited index:
-                // `cnt[a[i]]` with a u8 `a` is `hi = 255`, not affine. A
-                // `ubound` cap synthesizes a constant Aff so the guard is
-                // `tymax < len` — hist's exact version.
-                None if ubound_on() => match ubound(func, a) {
+            // Bound-subsumption: `a` is `iv` or `iv + k` (k >= 0) — the
+            // header's bound test caps it without a trip count.
+            let mut bsub = None;
+            if let Some(p) = bsub_iv {
+                if a == p {
+                    bsub = Some(0);
+                } else if let Some(i) = func.dfg.value_def(a).inst()
+                    && let InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        args: [x, y],
+                    } = func.dfg.insts[i]
+                    && let Some(k) = (func.dfg.resolve_aliases(x) == p)
+                        .then(|| iconst(func, y))
+                        .or_else(|| (func.dfg.resolve_aliases(y) == p).then(|| iconst(func, x)))
+                        .flatten()
+                    && k >= 0
+                {
+                    bsub = Some(k);
+                }
+            }
+            let aff = if bsub.is_some() {
+                Aff {
+                    m: Lin::K(0),
+                    b: SmallVec::new(),
+                }
+            } else if bsub_iv.is_some() {
+                // Fallback mode: `affine` assumes a unit-step iv, which `p`
+                // is not — only `p + k` (handled above) and constant
+                // `ubound` caps are sound here.
+                match ubound(func, a).filter(|_| ubound_on()) {
                     Some(k) => Aff {
                         m: Lin::K(0),
                         b: [Term {
@@ -896,8 +985,28 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                         .collect(),
                     },
                     None => continue,
-                },
-                None => continue,
+                }
+            } else {
+                match affine(func, &info, &body, MAX_AFFINE_DEPTH, a) {
+                    Some(af) => af,
+                    // (x64 wt note) data-dependent but range-limited index:
+                    // `cnt[a[i]]` with a u8 `a` is `hi = 255`, not affine. A
+                    // `ubound` cap synthesizes a constant Aff so the guard is
+                    // `tymax < len` — hist's exact version.
+                    None if ubound_on() => match ubound(func, a) {
+                        Some(k) => Aff {
+                            m: Lin::K(0),
+                            b: [Term {
+                                v: Lin::K(k as i64),
+                                k: 1,
+                            }]
+                            .into_iter()
+                            .collect(),
+                        },
+                        None => continue,
+                    },
+                    None => continue,
+                }
             };
             let dests = func.dfg.insts[t].branch_destination(
                 &func.dfg.jump_tables,
@@ -906,6 +1015,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
             if !func.layout.is_cold(bad) || !dead_end(func, bad, throw_ret) {
+                if debug {
+                    eprintln!("bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})", h.as_u32(), b.as_u32(), bsub);
+                }
                 continue;
             }
             checks.push(Chk {
@@ -914,6 +1026,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 aff,
                 le,
                 len: bb,
+                bsub,
             });
             continue 'blk;
         }
@@ -1026,25 +1139,55 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         if ity == wty { v } else { pos.ins().uextend(wty, v) }
     };
     let boundv = gval(&info, &gp, &mut pos, info.bound);
-    let iv0v = gp[info.iv0];
-    let t = {
-        let d = pos.ins().isub(boundv, iv0v);
-        match info.adj.cmp(&0) {
-            core::cmp::Ordering::Equal => d,
-            core::cmp::Ordering::Greater => {
-                let k = pos.ins().iconst(ity, info.adj);
-                pos.ins().isub(d, k)
+    let bw = zext(&mut pos, boundv);
+    // Trip-count terms are only needed by affine checks.
+    let need_affine = checks.iter().any(|c| c.bsub.is_none());
+    let (tw, zero) = if need_affine {
+        let iv0v = gp[info.iv0];
+        let t = {
+            let d = pos.ins().isub(boundv, iv0v);
+            match info.adj.cmp(&0) {
+                core::cmp::Ordering::Equal => d,
+                core::cmp::Ordering::Greater => {
+                    let k = pos.ins().iconst(ity, info.adj);
+                    pos.ins().isub(d, k)
+                }
+                core::cmp::Ordering::Less => {
+                    let k = pos.ins().iconst(ity, -info.adj);
+                    pos.ins().iadd(d, k)
+                }
             }
-            core::cmp::Ordering::Less => {
-                let k = pos.ins().iconst(ity, -info.adj);
-                pos.ins().iadd(d, k)
-            }
-        }
+        };
+        (
+            Some(zext(&mut pos, t)),
+            Some(iconst_masked(&mut pos, wty, 0)),
+        )
+    } else {
+        (None, None)
     };
-    let tw = zext(&mut pos, t);
-    let zero = iconst_masked(&mut pos, wty, 0);
     let mut ok: Option<Value> = None;
     for c in &checks {
+        if let Some(k) = c.bsub {
+            // `iv + k < len` is implied by `B - adj + k < len`; `wty`
+            // keeps the bound arithmetic wrap-free.
+            let ka = iconst_masked(&mut pos, wty, info.adj - k);
+            let bh = pos.ins().isub(bw, ka);
+            let lenv = gval(&info, &gp, &mut pos, c.len);
+            let lenw = zext(&mut pos, lenv);
+            let cc = if c.le {
+                IntCC::UnsignedLessThanOrEqual
+            } else {
+                IntCC::UnsignedLessThan
+            };
+            let g = pos.ins().icmp(cc, bh, lenw);
+            ok = Some(match ok {
+                None => g,
+                Some(o) => pos.ins().band(o, g),
+            });
+            continue;
+        }
+        let tw = tw.unwrap();
+        let zero = zero.unwrap();
         let dec = match c.aff.m {
             // idx(i) = m*i + sum_b over true ints. m < 0 (K<0 or N) makes the
             // sequence decrease: the max is the entry value sum_b and the min
