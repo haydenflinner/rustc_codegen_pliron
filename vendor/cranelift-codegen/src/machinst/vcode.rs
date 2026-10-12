@@ -1051,6 +1051,22 @@ impl<I: VCodeInst> VCode<I> {
                             let (_, pd) = &preg_ops[iix.index()];
                             let (pu2, _) = &preg_ops[nix.index()];
                             if !pu2.iter().any(|r| pd.contains(r)) {
+                                // Union the partner's operand sets onto
+                                // the surviving slot — the fused pair
+                                // defines rt2 as well, and the post-index
+                                // sweep must see that def.
+                                let (u2, d2) = preg_ops[nix.index()].clone();
+                                let (u, d) = &mut preg_ops[iix.index()];
+                                for r in u2 {
+                                    if !u.contains(&r) {
+                                        u.push(r);
+                                    }
+                                }
+                                for r in d2 {
+                                    if !d.contains(&r) {
+                                        d.push(r);
+                                    }
+                                }
                                 self.insts[iix.index()] = fused;
                                 self.insts[nix.index()] = I::gen_nop(0);
                                 squashed[nix.index()] = true;
@@ -1091,12 +1107,19 @@ impl<I: VCodeInst> VCode<I> {
                         if ok_down {
                             // Union operand sets onto the surviving
                             // slot so the post-index sweep sees the
-                            // pair's full register footprint.
+                            // pair's full register footprint: partner
+                            // uses as uses, partner defs (e.g. the pair's
+                            // rt2) as defs.
                             let (u, d) = preg_ops[iix.index()].clone();
                             let (u2, d2) = &mut preg_ops[nix.index()];
-                            for r in u.iter().chain(d.iter()) {
-                                if !u2.contains(r) && !d2.contains(r) {
-                                    u2.push(*r);
+                            for r in u {
+                                if !u2.contains(&r) {
+                                    u2.push(r);
+                                }
+                            }
+                            for r in d {
+                                if !d2.contains(&r) {
+                                    d2.push(r);
                                 }
                             }
                             self.insts[iix.index()] = I::gen_nop(0);
@@ -1105,9 +1128,14 @@ impl<I: VCodeInst> VCode<I> {
                         } else if ok_up {
                             let (u2, d2) = preg_ops[nix.index()].clone();
                             let (u, d) = &mut preg_ops[iix.index()];
-                            for r in u2.iter().chain(d2.iter()) {
-                                if !u.contains(r) && !d.contains(r) {
-                                    u.push(*r);
+                            for r in u2 {
+                                if !u.contains(&r) {
+                                    u.push(r);
+                                }
+                            }
+                            for r in d2 {
+                                if !d.contains(&r) {
+                                    d.push(r);
                                 }
                             }
                             self.insts[iix.index()] = fused;
@@ -1153,6 +1181,12 @@ impl<I: VCodeInst> VCode<I> {
                 // Post-indexed access is always `[base]` — the chain
                 // must start at offset 0.
                 if off != 0 {
+                    continue;
+                }
+                // A pair that loads into its own base reg is legal with
+                // a plain offset, but post-index writeback with
+                // `Rn ∈ {Rt, Rt2}` is unpredictable — leave it alone.
+                if preg_ops[iix.index()].1.iter().any(|r| *r == base) {
                     continue;
                 }
                 let mut chain: SmallVec<[(InsnIndex, i64, Type); 8]> =

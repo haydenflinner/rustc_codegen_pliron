@@ -3961,6 +3961,20 @@ impl MachInstEmit for Inst {
     }
 
     fn set_post_index(&mut self, wb: i64) {
+        // Post-index writeback with `Rn ∈ {Rt, Rt2}` is constrained
+        // unpredictable — the sweep must not put such a pair in a
+        // writeback chain.
+        let defs_base = match self {
+            Inst::LoadP64 { rt, rt2, mem, .. }
+            | Inst::FpuLoadP64 { rt, rt2, mem, .. }
+            | Inst::FpuLoadP128 { rt, rt2, mem, .. } => match &*mem {
+                &PairAMode::SignedOffset { reg, .. } => {
+                    rt.to_reg() == reg || rt2.to_reg() == reg
+                }
+                _ => false,
+            },
+            _ => false,
+        };
         let mem = match self {
             Inst::LoadP64 { mem, .. }
             | Inst::StoreP64 { mem, .. }
@@ -3971,6 +3985,7 @@ impl MachInstEmit for Inst {
             _ => return,
         };
         if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+            debug_assert!(!defs_base);
             let simm7 = SImm7Scaled::maybe_from_i64(wb, simm7.scale_ty)
                 .expect("post-index writeback out of range");
             *mem = PairAMode::PostIndex { reg, simm7 };
