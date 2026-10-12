@@ -34,6 +34,13 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# Vendored backend: cheap rebuilds while patching ISLE/-meta (its
+# generated lowering is the bulk of the O3 cost downstream). Build-time
+# ISLE regeneration is already mtime-gated on the tracked .isle inputs.
+# Benchmarks / perf runs: CARGO_PROFILE_DEV_PACKAGE_CRANELIFT_CODEGEN_OPT_LEVEL=3
+[profile.dev.package.cranelift-codegen]
+opt-level = 1
+
 [package.metadata.rust-analyzer]
 rustc_private = true
 
