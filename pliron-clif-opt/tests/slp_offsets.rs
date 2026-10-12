@@ -5,6 +5,7 @@
 
 use cranelift_codegen::ir::Function;
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
+use pliron_clif_opt::pipeline::Analysis;
 use rustc_hash::FxHashSet;
 
 fn parse(src: &str) -> Function {
@@ -14,7 +15,7 @@ fn parse(src: &str) -> Function {
 fn slp_is_sound(src: &str) {
     let before = parse(src);
     let mut after = before.clone();
-    let n = pliron_clif_opt::slp::run(&mut after, &FxHashSet::default(), true);
+    let n = pliron_clif_opt::slp::run(&mut after, &mut Analysis::default(), &FxHashSet::default(), true);
     assert!(
         n > 0,
         "slp did nothing; the test no longer covers it:\n{}",
