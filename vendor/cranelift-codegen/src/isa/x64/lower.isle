@@ -2330,6 +2330,21 @@
 (rule 0 (do_ctz ty orig_ty src)
       (bsf_or_else ty src (imm $I64 (ty_bits_u64 orig_ty))))
 
+;; Rules for `ctz_nonzero` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The operand is guaranteed nonzero, so plain `bsf` is fully defined on all
+;; hardware: no tzcnt BMI1 check, no stop bit, and no zero-input cmove. The
+;; flags produced by `bsf` are dead, matching how e.g. `x64_add` emits.
+(rule 2 (lower (ctz_nonzero $I64 src))
+      (emit_ret_gpr (x64_bsfq_rm_raw (put_in_gpr_mem_64 src))))
+
+(rule 2 (lower (ctz_nonzero $I32 src))
+      (emit_ret_gpr (x64_bsfl_rm_raw (put_in_gpr_mem_32 src))))
+
+(rule 1 (lower (ctz_nonzero (ty_8_or_16 ty) src))
+      (let ((extended Gpr (extend_to_gpr src $I32 (ExtendKind.Zero))))
+        (emit_ret_gpr (x64_bsfl_rm_raw extended))))
+
 ;; Rules for `cls` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule 2 (lower (cls (ty_32_or_64 ty) src))

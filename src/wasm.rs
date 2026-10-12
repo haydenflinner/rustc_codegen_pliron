@@ -4869,7 +4869,7 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
         let a: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
         let a0 = a[0][0];
         let r: Vals = match name {
-            "llvm.ctpop" | "llvm.ctlz" | "llvm.cttz" if w(self, 0) == 128 => {
+            "llvm.ctpop" | "llvm.ctlz" | "llvm.cttz" | "llvm.cttz_nz" if w(self, 0) == 128 => {
                 let (lo, hi) = (a[0][0], a[0][1]);
                 let r = match name {
                     "llvm.ctpop" => {
@@ -4917,14 +4917,14 @@ impl<'o, 'a, 'tcx> FL<'o, 'a, 'tcx> {
                     self.ib(w, O::I32Sub, O::I64Sub, r, c)
                 }]
             }
-            "llvm.cttz" => {
+            "llvm.cttz" | "llvm.cttz_nz" => {
                 let w = w(self, 0);
                 let (o, k) = if w > 32 {
                     (O::I64Ctz, 64)
                 } else {
                     (O::I32Ctz, 32)
                 };
-                let x = if w == k {
+                let x = if w == k || name == "llvm.cttz_nz" {
                     a0
                 } else {
                     let c = self.ic(w, 1u64 << w);

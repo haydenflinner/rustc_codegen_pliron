@@ -4179,6 +4179,17 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             "llvm.ctpop" => self.b.ins().popcnt(a[0]),
             "llvm.ctlz" => self.b.ins().clz(a[0]),
             "llvm.cttz" => self.b.ins().ctz(a[0]),
+            "llvm.cttz_nz" => {
+                let ty = self.b.func.dfg.value_type(a[0]);
+                if self.m.isa().triple().architecture
+                    == target_lexicon::Architecture::X86_64
+                    && ty.bits() <= 64
+                {
+                    self.b.ins().ctz_nonzero(a[0])
+                } else {
+                    self.b.ins().ctz(a[0])
+                }
+            }
             "llvm.bswap" => {
                 if self.b.func.dfg.value_type(a[0]) == clt::I8 {
                     a[0]

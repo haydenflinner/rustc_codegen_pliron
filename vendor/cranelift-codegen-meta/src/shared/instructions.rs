@@ -2363,6 +2363,22 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
+            "ctz_nonzero",
+            r#"
+        Count trailing zeros of a nonzero value.
+
+        Like ``ctz``, but ``x`` must be nonzero; the result is undefined
+        when ``x`` is zero. Targets may use this to omit the zero-input
+        fallback that ``ctz`` requires.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", iB)])
+        .operands_out(vec![Operand::new("a", iB)]),
+    );
+
+    ig.push(
+        Inst::new(
             "bswap",
             r#"
         Reverse the byte order of an integer.
