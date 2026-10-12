@@ -510,16 +510,19 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     let mut stack = vec![bad];
     // Emulated-EH rethrow paths run drop glue (dozens of cold blocks) between
     // the flag check and the dummy `return` that propagates the exception to
-    // the caller. Admit `return`s when the entry block itself does
-    // `call panic_*; load flag` — every reachable return is then past the
-    // flag check (the unset arm traps), i.e. a rethrow.
+    // the caller. Admit `return`s when a block itself does `call panic_*;
+    // load flag` — every reachable return is then past the flag check (the
+    // unset arm traps), i.e. a rethrow. The TLS-flag load only exists under
+    // emulated EH, so the `call && flag` shape is self-identifying and needs
+    // no `throw_ret` gate: leaf throwers (panic_bounds_check callers with no
+    // landing pad of their own) end every OOB edge in exactly this shape.
     let mut rethrow = false;
     let dbg = std::env::var_os("PLIRON_BCHECK_DEBUG").is_some();
     while let Some(b) = stack.pop() {
         if !seen.insert(b) {
             continue;
         }
-        if seen.len() > 64 || !func.layout.is_cold(b) {
+        if seen.len() > 64 {
             if dbg {
                 eprintln!("dead_end blk{}: bail seen={} cold={}", b.as_u32(), seen.len(), func.layout.is_cold(b));
             }
@@ -539,7 +542,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                         flag = true;
                     }
                 }
-                Opcode::Return if !(throw_ret && (call && flag || rethrow)) => {
+                Opcode::Return if !(call && flag || (throw_ret && rethrow)) => {
                     if dbg {
                         eprintln!("dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}", b.as_u32());
                     }
@@ -1150,7 +1153,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             );
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
-            if !func.layout.is_cold(bad) || !dead_end(func, bad, throw_ret) {
+            if !dead_end(func, bad, throw_ret) {
                 if debug {
                     eprintln!("bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})", h.as_u32(), b.as_u32(), bsub);
                 }
