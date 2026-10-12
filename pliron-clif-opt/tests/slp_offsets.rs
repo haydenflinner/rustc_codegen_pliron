@@ -15,7 +15,12 @@ fn parse(src: &str) -> Function {
 fn slp_is_sound(src: &str) {
     let before = parse(src);
     let mut after = before.clone();
-    let n = pliron_clif_opt::slp::run(&mut after, &mut Analysis::default(), &FxHashSet::default(), true);
+    let n = pliron_clif_opt::slp::run(
+        &mut after,
+        &mut Analysis::default(),
+        &FxHashSet::default(),
+        true,
+    );
     assert!(
         n > 0,
         "slp did nothing; the test no longer covers it:\n{}",

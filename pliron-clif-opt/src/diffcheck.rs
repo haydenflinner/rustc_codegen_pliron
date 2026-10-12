@@ -180,14 +180,14 @@ pub fn check(
             .self_name
             .clone()
             .unwrap_or_else(|| before.name.to_string());
-        let b = run(before, &world, &nowrite_names, &self_name, cfg.fuel);
+        let b = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true);
         if !matches!(b, Outcome::Returned { .. }) {
             sum.inconclusive += 1;
             sum.why
                 .get_or_insert_with(|| format!("before {}", describe(&b)));
             continue;
         }
-        let a = run(after, &world, &nowrite_names, &self_name, cfg.fuel);
+        let a = run(after, &world, &nowrite_names, &self_name, cfg.fuel, false);
         match &a {
             Outcome::Inconclusive(r) if !r.starts_with("out of fuel") => {
                 sum.inconclusive += 1;
@@ -461,7 +461,10 @@ fn pointer_params(f: &Function, facts: &Facts) -> FxHashMap<Value, PtrInfo> {
             pi.frozen = true;
             known = true;
         }
-        known |= facts.noalias.is_some_and(|s| s.contains(&p));
+        // `nonnull` marks pointer params only; one that is just compared
+        // and offset (a slice iterator's start) still must not wrap to 0.
+        known |= facts.noalias.is_some_and(|s| s.contains(&p))
+            || facts.nonnull.is_some_and(|s| s.contains(&p));
         if known || reaches_address(f, p) {
             out.insert(p, pi);
         }
@@ -828,17 +831,21 @@ fn install_quiet_hook() {
     });
 }
 
+/// `check_nonnull`: stop as undefined behavior when a load known nonnull
+/// yields 0. Only for the original: an optimized function may hoist such a
+/// load to where its value goes unused, which is fine (it is poison, not UB).
 fn run(
     f: &Function,
     world: &World,
     nowrite: &FxHashSet<String>,
     self_name: &str,
     fuel: u64,
+    check_nonnull: bool,
 ) -> Outcome {
     install_quiet_hook();
     QUIET.with(|q| q.set(true));
     let r = catch_unwind(AssertUnwindSafe(|| {
-        run_inner(f, world, nowrite, self_name, fuel)
+        run_inner(f, world, nowrite, self_name, fuel, check_nonnull)
     }));
     QUIET.with(|q| q.set(false));
     match r {
@@ -866,7 +873,9 @@ fn run_inner(
     nowrite: &FxHashSet<String>,
     self_name: &str,
     fuel: u64,
+    check_nonnull: bool,
 ) -> Outcome {
+    let no_facts = FxHashSet::default();
     // Stack frame: slots laid out in order, aligned, seeded with a pattern.
     let mut slot_off = FxHashMap::default();
     let mut off = 0u64;
@@ -886,7 +895,11 @@ fn run_inner(
         syms: FxHashMap::default(),
         calls: Vec::new(),
         nowrite,
-        nonnull: &world.nonnull,
+        nonnull: if check_nonnull {
+            &world.nonnull
+        } else {
+            &no_facts
+        },
         seed: world.seed,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
