@@ -159,6 +159,11 @@
 (decl remat (Value) Value)
 (extern constructor remat remat)
 
+;; PLIRON: a constant worth rematerializing — must encode in one
+;; instruction (see `imm64_remat_cheap` in opts.rs).
+(decl pure partial imm64_remat_cheap (Type Imm64) Unit)
+(extern constructor imm64_remat_cheap imm64_remat_cheap)
+
 ;; Mark a node as subsuming whatever else it's rewritten from -- this
 ;; is definitely preferable, not just a possible option. Useful for,
 ;; e.g., constant propagation where we arrive at a definite "final

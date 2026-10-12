@@ -288,6 +288,16 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         }
     }
 
+    /// PLIRON: remat is only profitable when the immediate encodes in a
+    /// single instruction — `iconst.i64` can cost a `movz`+`movk` chain
+    /// per use on aarch64, so rematerializing it inside a loop beats
+    /// pinning a vreg only for tiny immediates. `u16` (movz) or
+    /// sign-extended-`i16` (mov/movn) are one insn on every target.
+    fn imm64_remat_cheap(&mut self, ty: Type, imm: Imm64) -> Option<()> {
+        let v = self.i64_sextend_imm64(ty, imm);
+        (v == i64::from(v as u16) || v == i64::from(v as i16)).then_some(())
+    }
+
     fn remat(&mut self, value: Value) -> Value {
         trace!("remat: {}", value);
         self.ctx.remat_values.insert(value);
