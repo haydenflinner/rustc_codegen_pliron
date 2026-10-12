@@ -8,7 +8,9 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::CondCode;
-use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, InstructionData, Value};
+use cranelift_codegen::ir::{
+    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value,
+};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
@@ -69,19 +71,35 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
     let [ref l] = latches[..] else {
         return false;
     };
-    if func.layout.last_inst(l.block) != Some(l.inst)
-        || !matches!(func.dfg.insts[l.inst], InstructionData::Jump { .. })
-    {
+    if func.layout.last_inst(l.block) != Some(l.inst) {
         return false;
     }
-    let InstructionData::Jump { destination, .. } = &func.dfg.insts[l.inst] else {
-        return false;
-    };
-    if destination
-        .args(pool)
-        .any(|a| !matches!(a, BlockArg::Value(_)))
-    {
-        return false;
+    // The back-edge is either `jump h(args)` or one arm of a `brif`; the brif
+    // form appears in `while`-style loops where the body ends in a conditional
+    // continue (e.g. hash-table probing's `while mask != 0`).
+    match &func.dfg.insts[l.inst] {
+        InstructionData::Jump { destination, .. } => {
+            if destination
+                .args(pool)
+                .any(|a| !matches!(a, BlockArg::Value(_)))
+            {
+                return false;
+            }
+        }
+        InstructionData::Brif { blocks, .. } => {
+            let arms: Vec<_> = blocks
+                .iter()
+                .filter(|b| b.block(pool) == h)
+                .collect();
+            if arms.len() != 1
+                || arms[0]
+                    .args(pool)
+                    .any(|a| !matches!(a, BlockArg::Value(_)))
+            {
+                return false;
+            }
+        }
+        _ => return false,
     }
     let mut k = 0;
     for i in func.layout.block_insts(h) {
@@ -176,22 +194,35 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
         }
     }
 
-    // Copy the header into the latch, in place of its `jump h(args)`.
-    let InstructionData::Jump { destination, .. } = func.dfg.insts[l.inst] else {
-        unreachable!()
+    // Copy the header into the latch, in place of its back-edge to `h`.
+    let args: Vec<BlockArg> = match &func.dfg.insts[l.inst] {
+        InstructionData::Jump { destination, .. } => destination
+            .args(&func.dfg.value_lists)
+            .collect(),
+        InstructionData::Brif { blocks, .. } => blocks
+            .iter()
+            .find(|b| b.block(&func.dfg.value_lists) == h)
+            .unwrap()
+            .args(&func.dfg.value_lists)
+            .collect(),
+        _ => unreachable!(),
     };
     let mut map: FxHashMap<Value, Value> = FxHashMap::default();
-    for (&prm, a) in func
-        .dfg
-        .block_params(h)
-        .to_vec()
-        .iter()
-        .zip(destination.args(&func.dfg.value_lists).collect::<Vec<_>>())
-    {
+    for (&prm, a) in func.dfg.block_params(h).to_vec().iter().zip(args) {
         let BlockArg::Value(a) = a else {
             unreachable!()
         };
         map.insert(prm, a);
+    }
+    // For a `brif` latch the cloned test needs its own block (`l` already ends
+    // in the conditional); place it right after `l` so the loop arm falls
+    // through. For a `jump` latch the clone replaces the terminator in place.
+    let brif_latch = matches!(func.dfg.insts[l.inst], InstructionData::Brif { .. });
+    let mut h2 = None;
+    if brif_latch {
+        let b = func.dfg.make_block();
+        func.layout.insert_block(b, l.block);
+        h2 = Some(b);
     }
     let body: Vec<Inst> = func.layout.block_insts(h).collect();
     let mut lt = None;
@@ -216,12 +247,49 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
             .zip(func.dfg.inst_results(ni).iter().copied())
             .collect();
         map.extend(res);
-        func.layout.insert_inst(ni, l.inst);
+        match h2 {
+            Some(h2) => func.layout.append_inst(ni, h2),
+            None => func.layout.insert_inst(ni, l.inst),
+        }
         if i == t {
             lt = Some(ni);
         }
     }
-    func.layout.remove_inst(l.inst);
+    if let Some(h2) = h2 {
+        // Keep the loop arm on the fall-through (else) slot: `brif c, exit,
+        // h2` emits `jcc exit` + fall-through into the cloned test.
+        if let InstructionData::Brif { blocks, .. } = &func.dfg.insts[l.inst]
+            && blocks[0].block(&func.dfg.value_lists) == h
+        {
+            if let InstructionData::Brif { arg, .. } = func.dfg.insts[l.inst]
+                && uses(func, arg) == 1
+                && let Some(ci) = func
+                    .dfg
+                    .value_def(func.dfg.resolve_aliases(arg))
+                    .inst()
+                && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+            {
+                *cond = cond.complement();
+                let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[l.inst]
+                else {
+                    unreachable!()
+                };
+                blocks.swap(0, 1);
+            }
+        }
+        let mut data = func.dfg.insts[l.inst];
+        let InstructionData::Brif { blocks, .. } = &mut data else {
+            unreachable!()
+        };
+        for b in blocks.iter_mut() {
+            if b.block(&func.dfg.value_lists) == h {
+                *b = BlockCall::new(h2, std::iter::empty(), &mut func.dfg.value_lists);
+            }
+        }
+        func.dfg.insts[l.inst] = data;
+    } else {
+        func.layout.remove_inst(l.inst);
+    }
     // The cloned test ends each iteration; keep the loop-directed edge on
     // the taken arm so the exit can fall through — `brif c, exit, loop`
     // emits `jcc tramp; jmp tramp` where `brif !c, loop, exit` is a single
