@@ -699,6 +699,23 @@ pub fn lower_to_object(
                 panic!("ifconv2 broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Unswitch invariant brifs before bcheck: the constant-folded
+        // copies (e.g. a `capacity == 0` early-out in HashMap::get) shrink
+        // each version's body and can expose more foldable checks.
+        if crate::pass_enabled("PLIRON_UNSWITCH") && crate::bisect("unswitch") {
+            let k = crate::bcheck::unswitch(&mut clctx.func, n);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("unswitch {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after unswitch ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("unswitch broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // bcheck before loopvec: the versioned fast path has no per-iteration
         // bounds branches, so it's vectorizable where the checked loop isn't.
         if st.bcheck && crate::bisect("bcheck") {

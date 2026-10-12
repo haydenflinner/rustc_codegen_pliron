@@ -71,6 +71,12 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/co
 # turned `s.contains('=')` into an out-of-bounds read (stage2 rustc
 # parse_cfg emitted the wrong --cfg diagnostic).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/bcheck/main.rs -o $out/bcheck$exe && $out/bcheck$exe
+# unswitch must drop a whole dead-fragment region, not just no-pred
+# blocks: the folded side of HashMap::get's capacity check leaves a
+# self-referencing dead cycle whose defs feed live clones — removing
+# only pred-less blocks detached v-defs still in use (hmget verifier hit).
+PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/unswitch/main.rs -o $out/unswitch$exe 2> $out/unswitch.stats && $out/unswitch$exe
+grep -Eq 'unswitch [1-9]' $out/unswitch.stats || { echo "unswitch did not fire" >&2; exit 1; }
 # slotmerge may only share slots with disjoint live ranges — escaped,
 # overlapping, and edge-carried pointers must keep their own memory or
 # live data is aliased (per-arm aggregate allocas are the frame-size win).
