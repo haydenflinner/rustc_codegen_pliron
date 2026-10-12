@@ -211,6 +211,11 @@ pub struct State<'tcx> {
     /// promises no write to the pointee for the call's duration.
     pub frozen_loads:
         rustc_data_structures::fx::FxHashMap<Ptr<Operation>, Ptr<BasicBlock>>,
+    /// Loads rustc marked `!invariant.load` (`set_invariant_load`): every
+    /// load from that address yields the same value, so the location can
+    /// forward across arbitrary stores — `*pivot` in the partition loop
+    /// stays live while the element swaps happen.
+    pub invariant: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
     /// Pliron blocks belonging to an inlined clone → the clone's entry
     /// block (the region id used by `frozen_loads`/`region_frozen`).
     pub region_blocks: rustc_data_structures::fx::FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,

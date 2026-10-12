@@ -38,6 +38,21 @@ pub(crate) enum Root {
 pub(crate) type Loc = (Root, i64, Type);
 type Avail = FxHashMap<Loc, Value>;
 
+type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
+
+/// `cur` is inside region `target` (or is it): regions nest through
+/// `region_parent` — same walk licm does for scoped loads.
+pub(crate) fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) -> bool {
+    let mut r = Some(cur);
+    while let Some(x) = r {
+        if x == target {
+            return true;
+        }
+        r = rpar.get(&x).copied().filter(|&n| n != x);
+    }
+    false
+}
+
 /// Block params that always carry one value: every predecessor passes the
 /// same argument (or the param itself — a loop-carried passthrough, like
 /// `partition`'s `pivot` threaded through the scan loop). Such a param is
@@ -135,6 +150,12 @@ pub(crate) fn root(
     na: &FxHashSet<Value>,
     v: Value,
 ) -> (Root, i64) {
+    // Check the un-resolved value too: a scope root may itself be an
+    // alias (`region_frozen_op`'s clone operand often is), and stopping
+    // before the peel keeps the scope name as the root.
+    if na.contains(&v) {
+        return (Root::V(v), 0);
+    }
     let mut v = func.dfg.resolve_aliases(v);
     let mut off = 0i64;
     for _ in 0..16 {
@@ -195,12 +216,41 @@ pub(crate) fn notrap(func: &Function, i: Inst) -> bool {
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
-pub(crate) fn kill(av: &mut Avail, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
+pub(crate) fn kill(
+    av: &mut Avail,
+    r: Root,
+    o: i64,
+    ty: Type,
+    iso: &FxHashSet<Root>,
+    invs: &FxHashSet<Loc>,
+    cur: Option<Region>,
+    invreg: &FxHashMap<Loc, Vec<Region>>,
+    rpar: &FxHashMap<Region, Region>,
+) {
     let n = i64::from(ty.bytes());
-    av.retain(|&(r2, o2, t2), _| match (r, r2) {
-        _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
-        (Root::S(_), Root::S(_)) => true,
-        _ => iso.contains(&r) || iso.contains(&r2),
+    av.retain(|&(r2, o2, t2), _| {
+        // An `!invariant.load` location holds the same value for the
+        // load's whole scope: a write to it would be UB, so no store can
+        // clobber it — not even one to the same normalized location.
+        if invs.contains(&(r2, o2, t2)) {
+            return true;
+        }
+        // A region-frozen operand's pointee can't be written while the
+        // clone runs — a store inside the region can't clobber it. This
+        // is LLVM's scoped `!noalias`: `*pivot` survives `partition`'s
+        // element swaps for the clone's whole span.
+        if let Some(cur) = cur
+            && invreg
+                .get(&(r2, o2, t2))
+                .is_some_and(|rs| rs.iter().any(|&t| in_region(cur, t, rpar)))
+        {
+            return true;
+        }
+        match (r, r2) {
+            _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
+            (Root::S(_), Root::S(_)) => true,
+            _ => iso.contains(&r) || iso.contains(&r2),
+        }
     });
 }
 
@@ -352,6 +402,7 @@ fn sel_split(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transfer(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
@@ -360,6 +411,12 @@ fn transfer(
     av: &mut Avail,
     rw: Option<&mut Vec<(Inst, Fwd)>>,
     iso: &FxHashSet<Root>,
+    inv_insts: &FxHashSet<Inst>,
+    invs: &mut FxHashSet<Loc>,
+    cur: Option<Region>,
+    ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    invreg: &mut FxHashMap<Loc, Vec<Region>>,
+    rpar: &FxHashMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     eh: bool,
 ) {
@@ -378,6 +435,31 @@ fn transfer(
                 let (r, o) = root(func, ps, na, arg);
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
+                if std::env::var_os("PLIRON_LFDEBUG").is_some() {
+                    eprintln!("load {res} arg {arg} root {r:?} off {off} av={:?}", av.get(&loc));
+                }
+                // `!invariant.load`: the location holds one value for the
+                // whole program point range the load is legal at — mark it
+                // unkillable so later stores can't evict the forwarding.
+                if inv_insts.contains(&i) {
+                    invs.insert(loc);
+                }
+                // `*v` is frozen while the clone that binds `v` runs —
+                // inside the region, stores can't clobber locs rooted at
+                // the operand (`region_frozen_op`). The bytes bound keeps
+                // `pivot + 8` from claiming `pivot`'s frozen slot.
+                if let Root::V(rv) = r
+                    && let Some(rs) = ofz.get(&rv)
+                {
+                    for &(bytes, reg) in rs {
+                        if off >= 0
+                            && off + i64::from(ty.bytes()) <= bytes as i64
+                            && cur.is_some_and(|cur| in_region(cur, reg, rpar))
+                        {
+                            invreg.entry(loc).or_default().push(reg);
+                        }
+                    }
+                }
                 if let Some(&v) = av.get(&loc) {
                     if let Some(rw) = rw.as_deref_mut() {
                         rw.push((i, Fwd::V(v)));
@@ -400,7 +482,7 @@ fn transfer(
                 let ty = func.dfg.value_type(val);
                 let (r, o) = root(func, ps, na, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
-                kill(av, r, o, ty, iso);
+                kill(av, r, o, ty, iso, invs, cur, invreg, rpar);
                 // A store through `select c, pa, pb` may write either
                 // arm's location — kill both so kept locs don't forward
                 // stale values (the select's own root is opaque `V`).
@@ -413,7 +495,7 @@ fn transfer(
                 {
                     for &a in &sargs[1..] {
                         let (ra, oa) = root(func, ps, na, a);
-                        kill(av, ra, oa.wrapping_add(o), ty, iso);
+                        kill(av, ra, oa.wrapping_add(o), ty, iso, invs, cur, invreg, rpar);
                     }
                 }
                 if av.len() < MAX_ENTRIES {
@@ -422,14 +504,29 @@ fn transfer(
             }
             _ if op.is_call() => {
                 if !write_free(func, i, nw, eh) {
-                    av.retain(|&(r, _, _), _| iso.contains(&r));
+                    av.retain(|&(r, o, t), _| {
+                        iso.contains(&r)
+                            || invs.contains(&(r, o, t))
+                            || cur.is_some_and(|cur| {
+                                invreg.get(&(r, o, t)).is_some_and(|rs| {
+                                    rs.iter().any(|&t2| in_region(cur, t2, rpar))
+                                })
+                            })
+                    });
                 }
             }
             _ if op.can_store()
                 || op.other_side_effects()
                 || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
             {
-                av.clear();
+                av.retain(|&(r, o, t), _| {
+                    invs.contains(&(r, o, t))
+                        || cur.is_some_and(|cur| {
+                            invreg.get(&(r, o, t)).is_some_and(|rs| {
+                                rs.iter().any(|&t2| in_region(cur, t2, rpar))
+                            })
+                        })
+                });
             }
             _ => {}
         }
@@ -444,9 +541,19 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 }
 
 /// Forward loads in `func`; returns the number removed.
+/// `inv_insts`: loads rustc marked `!invariant.load` — their locations
+/// forward across any store (the pointee can't legally change).
+/// `ofrozen`: caller-side operands bound to `noalias readonly` clone
+/// params — `*v` is immutable for the clone's region (`breg`/`rpar`
+/// scope the immunity, like LLVM's `!alias.scope`/`!noalias`).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
+    inv_insts: &FxHashSet<Inst>,
+    ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
+    breg: &FxHashMap<Block, Region>,
+    rpar: &FxHashMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> usize {
@@ -480,8 +587,16 @@ pub fn run(
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
     let ps = param_src(func);
+    // Root-resolution stop set: real `noalias` plus frozen operands —
+    // either way the value names its own memory scope. `isolated` keeps
+    // the real set so operand values don't get function-wide immunity.
+    let stop: FxHashSet<Value> = noalias
+        .iter()
+        .chain(ofrozen.keys())
+        .copied()
+        .collect();
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        n += pre(func, &ps, noalias, &cfg, &rpo, entry);
+        n += pre(func, &ps, &stop, inv_insts, &cfg, &rpo, entry);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -489,6 +604,8 @@ pub fn run(
     }
     let iso = isolated(func, noalias, &ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
+    let mut invs: FxHashSet<Loc> = FxHashSet::default();
+    let mut invreg: FxHashMap<Loc, Vec<Region>> = FxHashMap::default();
     let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, Avail>, b: Block| -> Option<Avail> {
         if b == entry {
@@ -515,7 +632,23 @@ pub fn run(
             let Some(mut av) = input(&out, b) else {
                 continue;
             };
-            transfer(func, &ps, noalias, b, &mut av, None, &iso, nw, eh);
+            transfer(
+                func,
+                &ps,
+                &stop,
+                b,
+                &mut av,
+                None,
+                &iso,
+                inv_insts,
+                &mut invs,
+                breg.get(&b).copied(),
+                ofrozen,
+                &mut invreg,
+                rpar,
+                nw,
+                eh,
+            );
             if out.get(&b) != Some(&av) {
                 out.insert(b, av);
                 changed = true;
@@ -532,7 +665,23 @@ pub fn run(
     let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
-            transfer(func, &ps, noalias, b, &mut av, Some(&mut fwd), &iso, nw, eh);
+            transfer(
+                func,
+                &ps,
+                &stop,
+                b,
+                &mut av,
+                Some(&mut fwd),
+                &iso,
+                inv_insts,
+                &mut invs,
+                breg.get(&b).copied(),
+                ofrozen,
+                &mut invreg,
+                rpar,
+                nw,
+                eh,
+            );
         }
     }
     let fwd_cnt = fwd.len();
@@ -744,6 +893,7 @@ fn pre(
     func: &mut Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    inv_insts: &FxHashSet<Inst>,
     cfg: &ControlFlowGraph,
     rpo: &[Block],
     entry: Block,
@@ -779,7 +929,23 @@ fn pre(
                 .into_iter()
                 .map(|k| (k, Value::reserved_value()))
                 .collect();
-            transfer(func, &ps, na, b, &mut av, None, &iso, nw, eh);
+            transfer(
+                func,
+                &ps,
+                na,
+                b,
+                &mut av,
+                None,
+                &iso,
+                inv_insts,
+                &mut FxHashSet::default(),
+                None,
+                &FxHashMap::default(),
+                &mut FxHashMap::default(),
+                &FxHashMap::default(),
+                nw,
+                eh,
+            );
             let ks: FxHashSet<Loc> = av.into_keys().collect();
             if out.get(&b) != Some(&ks) {
                 out.insert(b, ks);

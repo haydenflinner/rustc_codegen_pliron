@@ -1067,7 +1067,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| FenceOp::new(c, ord(order), s));
     }
 
-    fn set_invariant_load(&mut self, _load: Value) {}
+    fn set_invariant_load(&mut self, load: Value) {
+        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+            eprintln!("invariant.load {load:?}");
+        }
+        if let Some(op) = load.defining_op() {
+            self.st.borrow_mut().invariant.insert(op);
+        }
+    }
     // StorageLive/Dead reach us as lifetime markers; slotmerge consumes them
     // for exact stack-slot intervals (they emit no machine code).
     fn lifetime_start(&mut self, ptr: Value, size: Size) {

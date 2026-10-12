@@ -333,6 +333,8 @@ pub fn lower_to_object(
         let nowrite: FxHashMap<FuncRef, bool>;
         let call_frozen: FxHashMap<FuncRef, u64>;
         let scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>;
+        let invariant: FxHashSet<ir::Inst>;
+        let operand_frozen: FxHashMap<cranelift_codegen::ir::Value, Vec<(u64, Ptr<BasicBlock>)>>;
         let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
         let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
         let nocap: FxHashSet<(ir::Inst, u32)>;
@@ -365,6 +367,7 @@ pub fn lower_to_object(
                 deref: FxHashMap::default(),
                 call_frozen: FxHashMap::default(),
                 scoped: FxHashMap::default(),
+                invariant: FxHashSet::default(),
                 block_region: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
                 lifetimes: Vec::new(),
@@ -386,6 +389,7 @@ pub fn lower_to_object(
             nowrite = std::mem::take(&mut fl.nowrite);
             call_frozen = std::mem::take(&mut fl.call_frozen);
             scoped = std::mem::take(&mut fl.scoped);
+            invariant = std::mem::take(&mut fl.invariant);
             block_region = std::mem::take(&mut fl.block_region);
             // Resolve each marker's pointer to its CLIF value — safe now
             // that every def has been lowered. Untranslatable pointers
@@ -401,6 +405,21 @@ pub fn lower_to_object(
                 })
                 .collect();
             nocap = std::mem::take(&mut fl.nocap);
+            // Caller-side operands of `noalias readonly` clone params, in
+            // CLIF values (`State::region_frozen_op`): `*v` is immutable
+            // while the binding clone runs — loadfwd's scoped immunity.
+            let mut ofz = FxHashMap::default();
+            for (&pv, rs) in &fl.st.region_frozen_op {
+                if let Some(&v) = fl
+                    .vals
+                    .get(&pv)
+                    .or_else(|| fl.cconst.get(&pv))
+                    .and_then(|vs| vs.first())
+                {
+                    ofz.entry(v).or_insert_with(Vec::new).extend_from_slice(rs);
+                }
+            }
+            operand_frozen = ofz;
         }
         let dump = std::env::var("PLIRON_CLIF").is_ok_and(|f| n.contains(f.as_str()));
         if dump {
@@ -527,7 +546,16 @@ pub fn lower_to_object(
             }
         }
         if st.loadfwd && crate::bisect("loadfwd") {
-            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
+            forwarded += crate::loadfwd::run(
+                &mut clctx.func,
+                &noalias,
+                &invariant,
+                &operand_frozen,
+                &block_region,
+                &st.region_parent,
+                &nowrite,
+                &call_frozen,
+            );
             if st.slot_dse {
                 // A load whose only user was a removed dead store keeps its own
                 // slot alive, so alternate the two until nothing changes.
@@ -624,6 +652,7 @@ pub fn lower_to_object(
                 &scoped,
                 &block_region,
                 &st.region_parent,
+                &operand_frozen,
             );
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("licm {k} {n}");
@@ -1773,6 +1802,10 @@ struct FnLower<'a, 'b, 'tcx> {
     /// duration, so LICM may hoist it to an in-region preheader without
     /// proving every in-loop writer can't clobber it.
     scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
+    /// CLIF load insts from `!invariant.load` (`State::invariant`): the
+    /// pointee never changes while the load's scope is live, so their
+    /// locations forward across any store.
+    invariant: FxHashSet<ir::Inst>,
     /// CLIF block → inlined-clone region id (`State::region_blocks`), the
     /// same id space `scoped` uses: pliron clone-entry block ptr.
     block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
@@ -3262,6 +3295,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 for &v in &r {
                     if let Some(i) = self.b.func.dfg.value_def(v).inst() {
                         self.scoped.insert(i, reg);
+                    }
+                }
+            }
+            if self.st.invariant.contains(&op) {
+                for &v in &r {
+                    if let Some(i) = self.b.func.dfg.value_def(v).inst() {
+                        self.invariant.insert(i);
                     }
                 }
             }

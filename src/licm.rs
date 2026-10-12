@@ -19,7 +19,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
-use crate::loadfwd::{self, Loc, Root};
+use crate::loadfwd::{self, Loc, Root, in_region};
 
 const MAX_LOOPS: usize = 32;
 const MAX_MOVES: usize = 96;
@@ -151,6 +151,7 @@ fn hoists(
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
     rpar: &FxHashMap<Region, Region>,
+    ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     pb: Block,
     i: Inst,
 ) -> bool {
@@ -253,6 +254,35 @@ fn hoists(
             eprintln!("licm?   scoped miss chain={chain:?} target={target:?}");
         }
     }
+    // `region_frozen_op` records (operand-frozen roots) carry the same
+    // guarantee as a scoped tag: `*root` is unwritten for the record
+    // region's whole span. They reach where `frozen_loads` can't — the
+    // tag is bound to the clone that scanned the load, but sibling clones
+    // bind the same operand (partition's two `lt` calls), and CFG merging
+    // can land the load in a block whose region is the sibling's. As long
+    // as the load's block and the hoist target both sit inside the
+    // record's region, the hoist can't observe a write.
+    if let Root::V(rv) = r
+        && let Some(rs) = ofz.get(&rv)
+        && let (Some(&pbreg), Some(&breg_)) = (
+            breg.get(&pb),
+            func.layout.inst_block(i).and_then(|b| breg.get(&b)),
+        )
+    {
+        let off = o.wrapping_add(i64::from(i32::from(offset)));
+        for &(bytes, reg) in rs {
+            if off >= 0
+                && off + i64::from(ty.bytes()) <= bytes as i64
+                && in_region(pbreg, reg, rpar)
+                && in_region(breg_, reg, rpar)
+            {
+                if dbg {
+                    eprintln!("licm?   operand-frozen, in-region hoist");
+                }
+                return true;
+            }
+        }
+    }
     let nw_w = writers
         .iter()
         .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw))
@@ -291,6 +321,7 @@ fn run_loop(
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
     rpar: &FxHashMap<Region, Region>,
+    ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
 ) -> usize {
     let h = la.loop_header(lp);
     // Exactly one branch destination in from outside.
@@ -425,7 +456,7 @@ fn run_loop(
                 }
                 if hoists(
                     func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar,
-                    pb, i,
+                    ofz, pb, i,
                 ) {
                     if debug {
                         eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
@@ -1105,6 +1136,7 @@ pub fn run(
         pliron::context::Ptr<pliron::basic_block::BasicBlock>,
         pliron::context::Ptr<pliron::basic_block::BasicBlock>,
     >,
+    ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
 ) -> usize {
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut dt = DominatorTree::with_function(func, &cfg);
@@ -1112,6 +1144,11 @@ pub fn run(
     la.compute(func, &cfg, &dt);
     let ps = loadfwd::param_src(func);
     let iso = loadfwd::isolated(func, noalias, &ps, cfrozen);
+    // Operand-frozen values name their own scope roots (same merged set
+    // loadfwd uses): peeling past one would lose the `ofz` claim before the
+    // region check can apply it.
+    let mut stop: FxHashSet<Value> = noalias.clone();
+    stop.extend(ofz.keys().copied());
     let debug = std::env::var_os("PLIRON_LICM_DEBUG").is_some();
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
@@ -1148,8 +1185,8 @@ pub fn run(
         }
         let before = n;
         n += run_loop(
-            func, &ps, noalias, &cfg, &dt, &la, lp, &iso, deref, nw, debug, scoped,
-            breg, rpar,
+            func, &ps, &stop, &cfg, &dt, &la, lp, &iso, deref, nw, debug, scoped,
+            breg, rpar, ofz,
         );
         dirty |= n != before;
         if n >= MAX_MOVES * MAX_LOOPS {
@@ -1241,6 +1278,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashMap::default(),
         );
         let flags = cranelift_codegen::settings::Flags::new(
             cranelift_codegen::settings::builder(),
@@ -1295,6 +1333,7 @@ mod tests {
         run(
             &mut func,
             &FxHashSet::default(),
+            &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
