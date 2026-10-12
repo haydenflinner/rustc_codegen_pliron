@@ -60,6 +60,9 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim
 # values through un-cloned shared continuations (sequential loops with
 # converging exits — Lint::parse_rust_version hit the verifier/EntryLivein).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/punroll$exe && $out/punroll$exe
+# icmp_eqfold's eq/ne add-shift is i64-only: shifting the i8 whitespace
+# switch in strwork miscompiled through an untraced downstream path.
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/icmpfold/main.rs -o $out/icmpfold$exe && $out/icmpfold$exe
 # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
 # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs$exe && $out/coldargs$exe

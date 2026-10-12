@@ -2694,8 +2694,15 @@ pub fn run(func: &mut Function) -> usize {
                     if let Some(c) = c {
                         pos.func.replace(inst).iconst(types::I8, c);
                         n += 1;
+                        continue;
                     }
                 }
+            }
+            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+                && icmp_eqfold(&mut pos, inst, cond, args, ty)
+            {
+                n += 1;
+                continue;
             }
             if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
                 || pos.func.dfg.value_type(args[0]) != types::I128
@@ -2743,16 +2750,94 @@ pub fn run(func: &mut Function) -> usize {
     n
 }
 
+/// `x >=u 1`, `x >u 0`, `x <=u 0`, `x <u 1` are equality tests;
+/// `icmp eq/ne (x + c1), c2` → `icmp eq/ne x, c2 - c1` (wrapping add is a
+/// bijection, so equality survives the shift). Together they fold peeled
+/// countdowns `x - k >=u 1` to a single `cmp x, k`.
+fn icmp_eqfold(
+    pos: &mut FuncCursor,
+    inst: Inst,
+    cond: IntCC,
+    args: [Value; 2],
+    ty: Type,
+) -> bool {
+    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+        return false;
+    }
+    let ck = iconst(pos.func, args[1])
+        .map(|k| (cond, args[0], k))
+        .or_else(|| {
+            iconst(pos.func, args[0])
+                .map(|k| (cond.swap_args(), args[1], k))
+        });
+    let eqcc = match ck {
+        Some((IntCC::UnsignedGreaterThanOrEqual, _, 1))
+        | Some((IntCC::UnsignedGreaterThan, _, 0)) => Some(IntCC::NotEqual),
+        Some((IntCC::UnsignedLessThanOrEqual, _, 0))
+        | Some((IntCC::UnsignedLessThan, _, 1)) => Some(IntCC::Equal),
+        _ => None,
+    };
+    if let Some(ncc) = eqcc {
+        let x0 = ck.unwrap().1;
+        let z = pos.ins().iconst(ty, 0);
+        pos.func.replace(inst).icmp(ncc, x0, z);
+        return true;
+    }
+    let Some((cc0, x0, k0)) = ck else { return false };
+    // i64 only: the motivating pattern is the peeled pointer/countdown test.
+    // Narrower widths are correct in isolation but a `b-9` whitespace-switch
+    // fold in strwork miscompiled when shifted at i8 — untraced downstream
+    // interaction, no perf value.
+    if !matches!(cc0, IntCC::Equal | IntCC::NotEqual) || ty != types::I64 {
+        return false;
+    }
+    // `isub` must be `x - c` — `c - x` doesn't shift.
+    let issub = |v: Value| {
+        let i = pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(v)).inst()?;
+        let InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: aa,
+        } = pos.func.dfg.insts[i]
+        else {
+            return None;
+        };
+        iconst(pos.func, aa[1]).map(|c1| (aa[0], c1))
+    };
+    let adj = bin_k(pos.func, x0, Opcode::Iadd)
+        .map(|(v, c1)| (v, k0.wrapping_sub(c1)))
+        .or_else(|| issub(x0).map(|(v, c1)| (v, k0.wrapping_add(c1))));
+    let Some((v, kk)) = adj else { return false };
+    let c = pos.ins().iconst(ty, kk);
+    pos.func.replace(inst).icmp(cc0, v, c);
+    true
+}
+
 /// `isub x, k` → `iadd x, -k`: x64 lowers scalar iadd as `lea`, which
 /// writes any reg without destroying the input — `sub`'s operand
 /// destruction forces a `mov` when the input stays live (e.g. `n-1` as a
 /// call arg next to loop-carried `n-2`). Runs late so the earlier loop
-/// passes keep seeing canonical `isub` IV updates.
+/// passes keep seeing canonical `isub` IV updates — which also makes it
+/// the first icmp fold after punroll's peeled countdowns.
 pub fn sublea(func: &mut Function) -> usize {
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
+            // Post-punroll icmp normalization: the peeled countdowns and
+            // shifted compares only exist once punroll has run.
+            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+                && let InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                } = pos.func.dfg.insts[inst]
+            {
+                let ty = pos.func.dfg.value_type(args[0]);
+                if icmp_eqfold(&mut pos, inst, cond, args, ty) {
+                    n += 1;
+                }
+                continue;
+            }
             let InstructionData::Binary {
                 opcode: Opcode::Isub,
                 args,
