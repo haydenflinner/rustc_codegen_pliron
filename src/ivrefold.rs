@@ -450,10 +450,19 @@ fn refold_header(
         func.dfg.remove_block_param(params[ix]);
     }
     // Counter elimination: when a latch brif exits on
-    // `icmp ne/eq step(c), k` for a still-carried counter param `c`,
-    // retarget the compare to the anchor's own step value against
-    // `e_a + T*astep` (T = trip count). `c` then only feeds its own
-    // increment, so `deadrecs` drops the carried counter entirely.
+    // `icmp ne/eq step(c), k` — or directly on `brif step(c)` (a
+    // countdown-to-zero `testq` exit) — for a still-carried counter
+    // param `c`, retarget the compare to the anchor's own step value
+    // against `e_a + T*astep` (T = trip count). `c` then only feeds its
+    // own increment, so `deadrecs` drops the carried counter entirely.
+    //
+    // `k`/`e_c` may be runtime values when the counter step is a power
+    // of two and both are provably multiples of it (a masked trip count
+    // like `(n-1)&~7`): `t = (k - e_c)/sc` materializes on the entry
+    // edge next to `bound`. The retargeted exit coincides with the
+    // original's while the trip count stays below the anchor's additive
+    // order (≥2^57 for any nonzero step — a loop iterating past that
+    // can't terminate physically anyway).
     let e_a = entry_args[ai];
     for (cix, &cp) in params.iter().enumerate() {
         if cix == ai || ixs.contains(&cix) || steps[cix].is_none_or(|s| s == 0) {
@@ -463,52 +472,110 @@ fn refold_header(
         if func.dfg.value_type(cp) != aty {
             continue;
         }
-        let Some(ec) = iconst(func, entry_args[cix]) else {
-            continue;
-        };
+        let e_cv = entry_args[cix];
         for (j, &(bi, d)) in backs.iter().enumerate() {
             let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[bi] else {
                 continue;
             };
             let cr = func.dfg.resolve_aliases(cond);
-            let ValueDef::Result(cinst, _) = func.dfg.value_def(cr) else {
-                continue;
-            };
-            let InstructionData::IntCompare {
-                cond: cc, args: cargs, ..
-            } = func.dfg.insts[cinst]
-            else {
-                continue;
-            };
-            // `h` on the then-arm needs `ne` (loop while step != k); on
-            // the else-arm `eq` (exit when step == k).
-            if !(d == 0 && cc == IntCC::NotEqual || d == 1 && cc == IntCC::Equal) {
-                continue;
-            }
             let a_c = func.dfg.resolve_aliases(back_args[j][cix]);
-            let k = if func.dfg.resolve_aliases(cargs[0]) == a_c {
-                iconst(func, cargs[1])
-            } else if func.dfg.resolve_aliases(cargs[1]) == a_c {
-                iconst(func, cargs[0])
-            } else {
-                continue;
+            // Two exit forms: `icmp ne/eq step(c), k`, or `brif step(c)`
+            // directly — a countdown exiting when the step value is zero.
+            // `kv` is `None` for the brif form (k = 0).
+            let (cinst, kv): (Option<Inst>, Option<Value>) =
+                match func.dfg.value_def(cr) {
+                    ValueDef::Result(i, _)
+                        if let InstructionData::IntCompare {
+                            cond: cc, args: cargs, ..
+                        } = func.dfg.insts[i]
+                            && (d == 0 && cc == IntCC::NotEqual
+                                || d == 1 && cc == IntCC::Equal) =>
+                    {
+                        // `h` on the then-arm needs `ne` (loop while step
+                        // != k); on the else-arm `eq`.
+                        if func.dfg.resolve_aliases(cargs[0]) == a_c {
+                            (Some(i), Some(cargs[1]))
+                        } else if func.dfg.resolve_aliases(cargs[1]) == a_c {
+                            (Some(i), Some(cargs[0]))
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => {
+                        // `brif step(c)` with `h` on the then-arm exits
+                        // when the step value hits zero.
+                        if !(d == 0 && cr == a_c && func.dfg.value_type(cr) == aty) {
+                            continue;
+                        }
+                        (None, None)
+                    }
+                };
+            // A runtime `k` must dominate the entry edge `ei` — a
+            // loop-variant `k` isn't a fixed exit anyway, and emitting
+            // `num` at `ei` would use it before its def.
+            if let Some(v) = kv
+                && iconst(func, v).is_none()
+            {
+                let db = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+                    ValueDef::Result(i, _) => func.layout.inst_block(i),
+                    ValueDef::Param(b, _) => Some(b),
+                    _ => None,
+                };
+                let eb = func.layout.inst_block(ei);
+                if !matches!((db, eb), (Some(db), Some(eb))
+                        if domtree.dominates(db, eb, &func.layout))
+                {
+                    continue;
+                }
+            }
+            // Trip count `t = (k - e_c)/sc` must exist exactly: constant
+            // arithmetic when both bounds are iconst, else a power-of-two
+            // step and both bounds provably its multiples.
+            let k_iconst = match kv {
+                Some(v) => iconst(func, v),
+                None => Some(0),
             };
-            let Some(k) = k else { continue };
-            // Trip count must divide exactly in unwrapped arithmetic.
-            let num = k.wrapping_sub(ec);
-            if num % sc != 0 {
-                continue;
-            }
-            let t = num / sc;
-            // The new test exits at `t+1 ≡ T` under the anchor's step
-            // period; for it to coincide with the original's first exit,
-            // T must be the smallest positive solution in both moduli.
-            let pb = |s: i64| 64u32 - s.trailing_zeros().min(63);
-            if t < 1 || (t as u64 as u128) >= (1u128 << pb(astep).min(pb(sc))) {
-                continue;
-            }
+            let sa = sc.unsigned_abs();
+            let t = match (k_iconst, iconst(func, e_cv)) {
+                (Some(k), Some(ec)) => {
+                    let num = k.wrapping_sub(ec);
+                    if num.checked_rem(sc) != Some(0) {
+                        continue;
+                    }
+                    let t = num / sc;
+                    // The new test exits at `t+1 ≡ T` under the anchor's
+                    // step period; for it to coincide with the original's
+                    // first exit, T must be the smallest positive solution
+                    // in both moduli.
+                    let pb = |s: i64| 64u32 - s.trailing_zeros().min(63);
+                    if t < 1 || (t as u64 as u128) >= (1u128 << pb(astep).min(pb(sc))) {
+                        continue;
+                    }
+                    Some(t)
+                }
+                _ => {
+                    // Runtime `t` is computed mod order(sc) = 2^64/sa via
+                    // `ushr`; the retargeted test's first exit is `t mod
+                    // order(astep)`. With both step periods >= 2^57 the
+                    // two coincide on every physically reachable trip
+                    // count — a loop iterating past that can't terminate
+                    // on real hardware anyway.
+                    if aty.bits() != 64
+                        || !sa.is_power_of_two()
+                        || sa > 128
+                        || astep.trailing_zeros() > 7
+                        || !(k_iconst
+                            .is_some_and(|k| (k as u64).wrapping_rem(sa) == 0)
+                            || provably_div(func, edges, kv.unwrap(), sa))
+                        || !provably_div(func, edges, e_cv, sa)
+                    {
+                        continue;
+                    }
+                    None
+                }
+            };
             // `c` must only feed its own back-edge step insts, and the
-            // icmp only the latch brif.
+            // exit test (icmp or step value) only the latch brif.
             let step_insts: FxHashSet<Inst> = back_args
                 .iter()
                 .map(|a| func.dfg.resolve_aliases(a[cix]))
@@ -550,34 +617,155 @@ fn refold_header(
             if !ok {
                 continue;
             }
-            // Bound: `e_a + T*astep` materialized once on the entry edge.
-            // The anchor's next value `pa + astep` is re-emitted right
-            // before the icmp: `cinst` may sit in an earlier block than
-            // the latch's own step inst.
-            let off = t.wrapping_mul(astep);
-            let (bound, a_a) = {
+            // Bound: `e_a + T*astep` materialized once on the entry edge
+            // (`T` as `t` insts when runtime). The anchor's next value
+            // `pa + astep` is re-emitted right before the test: the icmp
+            // may sit in an earlier block than the latch's own step inst.
+            let bound = {
                 let mut pos = FuncCursor::new(func).at_inst(ei);
-                let bound = if off == 0 {
-                    e_a
-                } else {
-                    let kc = pos.ins().iconst(aty, off);
-                    pos.ins().iadd(e_a, kc)
-                };
+                match t {
+                    Some(t) => {
+                        let off = t.wrapping_mul(astep);
+                        if off == 0 {
+                            e_a
+                        } else {
+                            let kc = pos.ins().iconst(aty, off);
+                            pos.ins().iadd(e_a, kc)
+                        }
+                    }
+                    None => {
+                        let kv2 = match k_iconst {
+                            Some(k) => pos.ins().iconst(aty, k),
+                            None => kv.unwrap(),
+                        };
+                        let mut num = pos.ins().isub(kv2, e_cv);
+                        if sc < 0 {
+                            num = pos.ins().ineg(num);
+                        }
+                        // `num` is a multiple of `sa` mod 2^64, so `ushr`
+                        // gives the canonical trip count `t` in
+                        // `[0, order(sc))` directly.
+                        let tv = pos
+                            .ins()
+                            .ushr_imm_s(num, sc.unsigned_abs().trailing_zeros() as i64);
+                        let prod = pos.ins().imul_imm_s(tv, astep);
+                        pos.ins().iadd(e_a, prod)
+                    }
+                }
+            };
+            if let Some(cinst) = cinst {
                 let mut pos = FuncCursor::new(func).at_inst(cinst);
                 let kc = pos.ins().iconst(aty, astep);
-                (bound, pos.ins().iadd(pa, kc))
-            };
-            if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[cinst] {
-                *args = [a_a, bound];
+                let a_a = pos.ins().iadd(pa, kc);
+                if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[cinst] {
+                    *args = [a_a, bound];
+                }
+            } else {
+                // `brif a_c` → `brif (icmp ne a_a, bound)` — `h` is the
+                // then-arm, so the loop continues while the anchor's step
+                // value differs from the bound.
+                let mut pos = FuncCursor::new(func).at_inst(bi);
+                let kc = pos.ins().iconst(aty, astep);
+                let a_a = pos.ins().iadd(pa, kc);
+                let cmp = pos.ins().icmp(IntCC::NotEqual, a_a, bound);
+                if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[bi] {
+                    *arg = cmp;
+                }
             }
             if debug {
-                eprintln!("ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t})");
+                eprintln!("ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t:?})");
             }
             n += 1;
             break;
         }
     }
     n
+}
+
+/// `s | v` provable for `s` a power of two: constants check the remainder;
+/// `band`'s mask, `ishl`'s shift, or a multiple operand prove the low bits
+/// are zero; `iadd`/`isub`/`ineg` preserve multiples; `x - (x & (2^k-1))`
+/// rounds down to a multiple of `2^k`; a param of a single-pred block is
+/// its incoming edge arg.
+fn provably_div(
+    func: &Function,
+    edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
+    v: Value,
+    s: u64,
+) -> bool {
+    pd(func, edges, v, s, 16)
+}
+
+fn pd(
+    func: &Function,
+    edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
+    v: Value,
+    s: u64,
+    depth: u8,
+) -> bool {
+    if s == 0 || depth == 0 {
+        return false;
+    }
+    if let Some(k) = iconst(func, v) {
+        return (k as u64).wrapping_rem(s) == 0;
+    }
+    let pd = |a: Value| pd(func, edges, a, s, depth - 1);
+    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        // A param of a single-pred block equals the arg that edge passes —
+        // unless the edge is a self-loop, where the param is an IV.
+        ValueDef::Param(b, ix) => match edges.get(&b) {
+            Some(es)
+                if es.len() == 1 && func.layout.inst_block(es[0].0) != Some(b) =>
+            {
+                let (i, d) = es[0];
+                let np = func.dfg.block_params(b).len();
+                edge_args(func, i, d, np).is_some_and(|a| pd(a[ix]))
+            }
+            _ => false,
+        },
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::Binary { opcode, args } => match opcode {
+                Opcode::Band | Opcode::Imul => args.iter().any(|&a| pd(a)),
+                Opcode::Ishl => iconst(func, args[1])
+                    .is_some_and(|sh| sh >= 0 && (1u128 << sh.min(127)) % (s as u128) == 0),
+                Opcode::Iadd => args.iter().all(|&a| pd(a)),
+                Opcode::Isub => {
+                    args.iter().all(|&a| pd(a)) || {
+                        // `x - (x & m)` for `m = s*2^j - 1` rounds `x` down
+                        // to a multiple of `m+1`, hence of `s`.
+                        let x = func.dfg.resolve_aliases(args[0]);
+                        let ValueDef::Result(j, _) =
+                            func.dfg.value_def(func.dfg.resolve_aliases(args[1]))
+                        else {
+                            return false;
+                        };
+                        let InstructionData::Binary {
+                            opcode: Opcode::Band,
+                            args: ba,
+                        } = func.dfg.insts[j]
+                        else {
+                            return false;
+                        };
+                        let m_ok = |a: Value| {
+                            iconst(func, a).is_some_and(|k| {
+                                let m1 = (k as u64).wrapping_add(1);
+                                m1.is_power_of_two() && m1 % s == 0
+                            })
+                        };
+                        (func.dfg.resolve_aliases(ba[0]) == x && m_ok(ba[1]))
+                            || (func.dfg.resolve_aliases(ba[1]) == x && m_ok(ba[0]))
+                    }
+                }
+                _ => false,
+            },
+            InstructionData::Unary {
+                opcode: Opcode::Ineg,
+                arg,
+            } => pd(arg),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Uses of `v` that are all self-feeding into slot `ix` of header `h`:
