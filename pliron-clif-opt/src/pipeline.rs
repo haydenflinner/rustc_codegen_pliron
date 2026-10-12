@@ -591,6 +591,13 @@ fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, _) = an.cfg_dt(&p.clctx.func);
+    let k = slotprom::run(&mut p.clctx.func, cfg);
+    p.dump("slotprom");
+    k
+}
+
 fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = unroll::run(&mut p.clctx.func, an, p.nonnull, p.derived);
     // The skipped loop is now unreachable, and its trip count still
@@ -905,6 +912,19 @@ fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && p.dump {
         p.dump("punroll");
     }
+    k
+}
+
+fn s_constdedup(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (_, dt) = an.cfg_dt(&p.clctx.func);
+    let k = constdedup::run(&mut p.clctx.func, dt);
+    p.dump("constdedup");
+    k
+}
+
+fn s_splink(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = splink::run(&mut p.clctx.func);
+    p.dump("splink");
     k
 }
 
@@ -1299,6 +1319,14 @@ pub static DEFAULT: &[Step] = &[
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
+    // Stack-slot SSA promotion before the loop passes so the promoted
+    // fields are loop-carried SSA values indvars/licm/bcheck can see.
+    step(
+        "slotprom",
+        "slotprom",
+        Gate::Env("PLIRON_SLOTPROM"),
+        s_slotprom,
+    ),
     cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse),
     Step {
         name: "egraph",
@@ -1365,6 +1393,15 @@ pub static DEFAULT: &[Step] = &[
         "punroll",
         Gate::All(&[JT, Gate::Env("PLIRON_PUNROLL")]),
         s_punroll,
+    ),
+    // Merge identical constants across dominated blocks — unroll/clone
+    // passes stamp fresh `iconst`s per copy, and each one is a `mov`
+    // downstream instead of a shared register (or `wzr`).
+    step(
+        "constdedup",
+        "constdedup",
+        Gate::Env("PLIRON_CSTDEDUP"),
+        s_constdedup,
     ),
     Step {
         name: "frozen_loads",
@@ -1463,6 +1500,10 @@ pub static DEFAULT: &[Step] = &[
     step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp),
     step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
     step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain),
+    // Sink `splat(const)` defs into their use blocks: a cross-region live
+    // splat becomes a spill reload per loop iteration; a local one is a
+    // single `movi`/`dup` at the use.
+    step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge),
     Step {
         name: "coldret",

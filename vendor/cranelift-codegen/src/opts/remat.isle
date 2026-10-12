@@ -33,3 +33,12 @@
       (remat x))
 (rule (simplify x @ (f64const _ _))
       (remat x))
+;; PLIRON: a `splat` of a materializable constant is one `movi`/`dup` at
+;; the use — far cheaper than the spill reload a long-lived vector value
+;; gets in hot loops (hashbrown probe loops spilled the EMPTY splat).
+(rule (simplify x @ (splat _ (iconst _ _)))
+      (remat x))
+(rule (simplify x @ (splat _ (f32const _ _)))
+      (remat x))
+(rule (simplify x @ (splat _ (f64const _ _)))
+      (remat x))
