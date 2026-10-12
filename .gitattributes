@@ -1,0 +1,24 @@
+# LF everywhere — in the repo and in the working tree, on every platform.
+# Overrides per-machine core.autocrlf so Windows checkouts can't smuggle
+# CRLF into diffs or the index.
+* text=auto eol=lf
+
+# Windows-native formats that genuinely need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries — never line-ending-touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.dll binary
+*.exe binary
+*.so binary
+*.dylib binary
+*.a binary
+*.o binary
+*.rlib binary
+*.zip binary
+*.cargo-ok -text
