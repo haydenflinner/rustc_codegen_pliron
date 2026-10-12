@@ -30,8 +30,9 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
-    Count, Edge, Info, Ins, Param, Pred, count, deadend, def_block, edge_args, edge_dest, emit,
-    gather, guard_dead, guard_pred, iconst, ins_eval, outv, param_kinds, trips_idx, trips_ptr,
+    Count, Edge, Info, Ins, Param, Pred, count, deadend, deepest_first, def_block, edge_args,
+    edge_dest, emit, gather, guard_dead, guard_pred, iconst, ins_eval, outv, param_kinds,
+    trips_idx, trips_ptr,
 };
 
 const MAX_LOOPS: usize = 16;
@@ -4045,7 +4046,9 @@ pub fn run(
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let loops: Vec<Loop> = la.loops().collect();
+    // Deepest-first: parent loops always fail `gather`'s innermost check,
+    // so iterating them first would just burn the MAX_LOOPS budget.
+    let loops = deepest_first(&la);
     let debug = std::env::var_os("PLIRON_VEC_DEBUG").is_some();
     let pty = tcfg.pointer_type();
     let mut n = 0;

@@ -161,6 +161,18 @@ if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
   rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack.o &&
       "$llvmod" -d --no-show-raw-insn $out/xpack.o | grep -q sqrtpd || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
 fi
+# an inlined matmul's bounds-checked inner loop must version (bcheck) and
+# vectorize (loopvec) even though sibling loops crowd the pass budget and
+# the checks unwind through try_call panic paths.
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec$exe && $out/loopvec$exe
+if [[ -x "$llvmod" ]]; then
+  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec.o
+  if [[ "$(uname -m)" == x86_64 ]]; then
+      "$llvmod" -d --no-show-raw-insn $out/loopvec.o | grep -qE 'mulpd|addpd' || { echo "loopvec: no packed f64 emitted" >&2; exit 1; }
+  else
+      "$llvmod" -d --no-show-raw-insn $out/loopvec.o | grep -qE 'fmla\.2d|fmul\.2d|fadd\.2d' || { echo "loopvec: no f64x2 emitted" >&2; exit 1; }
+  fi
+fi
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&

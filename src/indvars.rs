@@ -15,6 +15,8 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
+use crate::loopidiom::deepest_first;
+
 const MAX_LOOPS: usize = 32;
 const MAX_PARAMS: usize = 6;
 
@@ -335,7 +337,7 @@ pub fn run(func: &mut Function) -> usize {
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
     let debug = std::env::var_os("PLIRON_INDUCT_DEBUG").is_some();
-    let loops: Vec<Loop> = la.loops().collect();
+    let loops = deepest_first(&la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
         n += run_loop(func, &cfg, &dt, &la, lp, debug);

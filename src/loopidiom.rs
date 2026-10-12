@@ -249,6 +249,23 @@ pub(crate) fn gather(
     })
 }
 
+/// All loops ordered deepest-first (stable within a level). Passes whose
+/// `take(MAX_LOOPS)` budget would otherwise be spent on outer loops — which
+/// they can't transform — should iterate this so inner loops win the budget.
+pub(crate) fn deepest_first(la: &LoopAnalysis) -> Vec<Loop> {
+    let mut v: Vec<Loop> = la.loops().collect();
+    v.sort_by_cached_key(|&lp| {
+        let mut d = 0;
+        let mut p = la.loop_parent(lp);
+        while let Some(l) = p {
+            d += 1;
+            p = la.loop_parent(l);
+        }
+        std::cmp::Reverse(d)
+    });
+    v
+}
+
 /// `store`/`istore8`/`istore16`/`istore32` details: (value, addr, size).
 pub(crate) fn store_parts(func: &Function, i: Inst) -> Option<(Value, Value, i64)> {
     match func.dfg.insts[i] {

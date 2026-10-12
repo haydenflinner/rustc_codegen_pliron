@@ -35,6 +35,8 @@ use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use crate::loopidiom::deepest_first;
+
 const MAX_LOOPS: usize = 8;
 const MAX_BODY: usize = 48;
 const MAX_CHECKS: usize = 8;
@@ -553,10 +555,22 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
             if b == bad {
                 rethrow = call && flag;
             }
-            for bc in d.branch_destination(
+            let dests = d.branch_destination(
                 &func.dfg.jump_tables,
                 &func.dfg.exception_tables,
-            ) {
+            );
+            // `try_call` lists its exception-handler edges first and the
+            // normal-return continuation last. An unwinding callee leaves
+            // the frame — the exception path runs cleanup and resignals,
+            // it can't resume this loop — so only the normal edge can
+            // reach back (loopidiom::deadend makes the same assumption).
+            let dests: &[cranelift_codegen::ir::BlockCall] = match d.opcode() {
+                Opcode::TryCall | Opcode::TryCallIndirect => {
+                    dests.last().map_or(&[], |bc| std::slice::from_ref(bc))
+                }
+                _ => dests,
+            };
+            for bc in dests {
                 stack.push(bc.block(&func.dfg.value_lists));
             }
         }
@@ -1596,7 +1610,7 @@ pub fn run(func: &mut Function, name: &str, throw_ret: bool) -> usize {
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
         let mut did = 0;
-        for lp in la.loops().take(MAX_LOOPS) {
+        for lp in deepest_first(&la).into_iter().take(MAX_LOOPS) {
             let k = run_loop(func, &cfg, &dt, &la, lp, name, throw_ret, &mut seen);
             did += k;
             if k > 0 {
