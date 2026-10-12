@@ -185,8 +185,9 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
     }
 }
 
-/// 128-bit int/float vectors are one native Cranelift SIMD leaf; other vectors
-/// are flattened lane-wise. `PLIRON_SIMD=0` flattens everything.
+/// 64/128-bit int/float vectors are one native Cranelift SIMD leaf; other
+/// vectors are flattened lane-wise. `PLIRON_SIMD=0` flattens everything.
+/// (64-bit matters for hashbrown's `Group<u64>`: `cmeq.8b` + `fmov x, d`.)
 pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
@@ -198,7 +199,7 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
         TyK::F64 => clt::F64,
         _ => return None,
     };
-    if lane.bits() as u64 * n != 128 {
+    if !matches!(lane.bits() as u64 * n, 64 | 128) {
         return None;
     }
     lane.by(n as u32)
