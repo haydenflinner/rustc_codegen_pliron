@@ -2300,9 +2300,12 @@
       (do_ctz ty ty src))
 
 (rule 1 (lower (ctz (ty_8_or_16 ty) src))
+      ;; The stop bit makes the operand nonzero, so `bsf` is always defined;
+      ;; skip the zero-input cmove fallback `do_ctz` would add. The flags
+      ;; produced by `bsf` are dead, matching how e.g. `x64_add` emits.
       (let ((extended Gpr (extend_to_gpr src $I32 (ExtendKind.Zero)))
             (stopbit Gpr (x64_or $I32 extended (RegMemImm.Imm (u32_wrapping_shl 1 (ty_bits ty))))))
-        (do_ctz $I32 ty stopbit)))
+        (emit_ret_gpr (x64_bsfl_rm_raw stopbit))))
 
 (rule 0 (lower
        (ctz $I128 src))
