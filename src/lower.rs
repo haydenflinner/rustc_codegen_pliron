@@ -19,7 +19,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
-use pliron::op::Op;
+use pliron::op::{Op, OpId};
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
@@ -3070,6 +3070,35 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         self.set(op, smallvec![v]);
     }
 
+    /// `op` is a pure int-producing op in `const_bits`' evaluable set (the
+    /// loads const_bits resolves are operands, not top-level results).
+    fn op_int_constable(&self, op: Ptr<Operation>, id: &OpId) -> bool {
+        let eval = [
+            ICmpOp::get_opid_static(),
+            SelectOp::get_opid_static(),
+            AddOp::get_opid_static(),
+            SubOp::get_opid_static(),
+            MulOp::get_opid_static(),
+            AndOp::get_opid_static(),
+            OrOp::get_opid_static(),
+            XorOp::get_opid_static(),
+            ShlOp::get_opid_static(),
+            LShrOp::get_opid_static(),
+            AShrOp::get_opid_static(),
+            UDivOp::get_opid_static(),
+            URemOp::get_opid_static(),
+            SDivOp::get_opid_static(),
+            SRemOp::get_opid_static(),
+        ];
+        if !eval.contains(id) {
+            return false;
+        }
+        matches!(
+            classify(self.ctx, self.res_ty(op)),
+            TyK::Int(_)
+        )
+    }
+
     fn res_ty(&self, op: Ptr<Operation>) -> TypeHandle {
         op.deref(self.ctx).get_result(0).get_type(self.ctx)
     }
@@ -3145,6 +3174,22 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 }
                 self.set(op, r);
             }};
+        }
+
+        // Lower-time constant fold: evaluable pure ops (select/icmp/int
+        // binops over constants, including alloca-loaded i128 consts) emit
+        // iconst directly. rustc's mir-opts leave some constant expressions
+        // unfolded (`7u128.max(1)` lowers to `select(icmp ..)`); folding
+        // here also collapses their dependent Assert(cond) checks.
+        if self.op_int_constable(op, &id) {
+            let r = op.deref(ctx).get_result(0);
+            let t = self.ty_leaves(r.get_type(ctx));
+            if t.len() == 1 {
+                if let Some((b, _)) = self.const_bits(r, 0) {
+                    let v = self.iconst_any(t[0].1, b);
+                    return self.set1(op, v);
+                }
+            }
         }
 
         if is!(ReturnOp) {
