@@ -231,6 +231,7 @@ impl Ctx<'_> {
             return None;
         }
         let (base, off) = first?;
+        i32::try_from(off).ok()?;
         Some(Pack::Load {
             base,
             off,
@@ -343,7 +344,7 @@ fn emit_pack(
             ..
         } => pos
             .ins()
-            .load(vt, wide_flags(flags), base, i32::try_from(off).unwrap_or(0)),
+            .load(vt, wide_flags(flags), base, i32::try_from(off).expect("checked at pack time")),
         Pack::Op { op, args, row } => {
             let vs: Vec<Value> = args
                 .iter()
@@ -372,7 +373,7 @@ fn emit_pack(
                 wide_flags(*flags),
                 v,
                 *base,
-                i32::try_from(*off).unwrap_or(0),
+                i32::try_from(*off).expect("checked at pack time"),
             );
             v
         }
@@ -520,7 +521,7 @@ fn try_block(
                         run.push(s);
                     }
                 }
-                if run.len() == lanes as usize {
+                if run.len() == lanes as usize && i32::try_from(run[0].off).is_ok() {
                     let emit = run.iter().map(|s| s.pos).min().unwrap();
                     let plan = Ctx {
                         func: &*func,
@@ -542,7 +543,7 @@ fn try_block(
                             wide_flags(run[0].flags),
                             vec,
                             run[0].base,
-                            run[0].off as i32,
+                            run[0].off as i32, // checked above
                         );
                         for s in &run {
                             cur.func.layout.remove_inst(s.inst);
@@ -889,10 +890,12 @@ impl X<'_> {
                     self.min_load = self.min_load.min(self.pos[&ia]).min(self.pos[&ib]);
                     self.loads.push(ra);
                     self.loads.push(rb);
-                    let InstructionData::Load { arg, .. } = self.func.dfg.insts[ia] else {
+                    let InstructionData::Load { arg, offset, .. } = self.func.dfg.insts[ia] else {
                         unreachable!()
                     };
                     let (base, off) = base_off(self.func, arg);
+                    let off = off + i64::from(offset);
+                    i32::try_from(off).ok()?;
                     return Some(Pack::Load {
                         base,
                         off,
@@ -1667,6 +1670,12 @@ fn plan_store(
     x.rows.push((sa, sb));
     let data = x.col(da, db, 1)?;
     let (base, off) = base_off(func, args[1]);
+    // `base_off` leaves the store's immediate offset to the caller.
+    let InstructionData::Store { offset: imm, .. } = func.dfg.insts[sa] else {
+        unreachable!()
+    };
+    let off = off + i64::from(imm);
+    i32::try_from(off).ok()?;
     if !x.avail(base) {
         return None;
     }

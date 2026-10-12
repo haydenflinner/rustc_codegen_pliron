@@ -94,6 +94,33 @@ there instead of in the cwd.
 
 ## Findings
 
+- `PLIRON_DIFFCHECK` over std, alloc, core and regex, hashbrown, smallvec,
+  indexmap, serde_json, memchr, rustc-demangle (about 8,200 functions) found
+  five real miscompiles, all fixed with regression tests:
+  - `src/slp.rs` xpack dropped the immediate offset of a paired store (and
+    of a paired load column), so regex-automata's `backtrack::Cache::new`
+    wrote a `Vec` header 16 bytes low and left its pointer null. A program
+    using `BoundedBacktracker` segfaulted at `-O`; it runs correctly now.
+  - `src/indvars.rs` ldrot seeded a rotated load on the loop entry edge even
+    when the loop can exit before reaching that load, reading through an
+    empty `Vec`'s dangling pointer (regex-syntax `IntervalSet`).
+  - `src/edgespec.rs` bound a walked block's params one at a time, so an
+    edge from inside a loop into its header (`header(0, cur)`) read the old
+    `cur` as the new one and jumped to the wrong exit (std's
+    `SocketAncillary` cmsg walk). Params now bind in parallel, and an edge
+    that passes the header its own params is left alone.
+  - `src/licm.rs` promotion ignored reads through an operand-frozen root
+    (distinct only inside its region, which each iteration re-enters), so
+    a promoted store never reached them and aho-corasick's
+    `ByteClassElements::next` looped forever. It now skips such loops.
+  - Unrelated to the checker but found running it: the `%al=8` variadic
+    stubs were strong symbols per CGU and failed `-Zbuild-std` links.
+  Known checker noise: a function whose output depends on stack addresses
+  (foldhash seeds from `&local`) differs when slotmerge moves slots.
+  Also open: `loopvec`'s shuffle-tree reduction emits `shuffle`, which x86-64
+  without SSSE3 lowers to an `__cranelift_x86_pshufb` libcall nobody
+  provides (rustc-demangle fails to link at the default target CPU).
+
 - `src/licm.rs` miscompiled `ui/impl-trait/example-calendar.rs` at `-O`
   (SIGBUS/SIGTRAP, `PLIRON_LICM=0` was clean): `clobbers` only ran the precise
   overlap check on `notrap` stores, so a hoisted load crossed a plain store to

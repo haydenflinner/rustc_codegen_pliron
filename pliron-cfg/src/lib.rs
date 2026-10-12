@@ -101,12 +101,19 @@ pub fn env_get(var: &str) -> Option<&'static str> {
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
 /// the budget is unlimited. `PLIRON_OPT_BISECT_DEBUG=1` logs each gate.
 pub fn bisect(name: &str) -> bool {
+    bisect_in(name, "")
+}
+
+/// [`bisect`] for a unit inside function `func`, which the debug log names
+/// (`bisect <n> <pass> run|skip <func>`) so `harness/bisect.py` can say
+/// which function the first bad unit touched.
+pub fn bisect_in(name: &str, func: &str) -> bool {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(limit) = bisect_limit() else { return true };
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     let ok = n < limit;
     if env_is("PLIRON_OPT_BISECT_DEBUG", "1") {
-        eprintln!("bisect {} {name} {}", n + 1, if ok { "run" } else { "skip" });
+        eprintln!("bisect {} {name} {} {func}", n + 1, if ok { "run" } else { "skip" });
     }
     ok
 }

@@ -15,6 +15,8 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   spec, nnret, nocapture, nowrite, phisimp, instcombine, retarg,
   constload, domcheck), `state::State` (the side tables lowering reads),
   `types.rs` layout helpers, `has_body`/`address_taken`. Stable Rust.
+- `pliron-clif-check/` — `clif-check` binary: replays and reduces
+  differential-checker reports without rustc (see "Miscompile hunting").
 - `pliron-cfg/` — one-shot `PLIRON_*` env parse shared by both opt
   crates (`PassConfig`, `env_*`, `pass_enabled`, `bisect`).
 - `src/lower.rs` — object lowering; `internal_fns` selects `CallConv::Tail`
@@ -49,6 +51,28 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 - `tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]` — runs directive-free
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)
+
+## Miscompile hunting
+
+- `PLIRON_DIFFCHECK=1` runs each function's CLIF before and after the
+  pipeline in `cranelift-interpreter` on random inputs (pointer params get
+  sandboxed memory; calls become recorded deterministic stubs) and compares
+  returns, calls and memory writes. On a mismatch it replays step by step to
+  name the step and saves `before.clif`/`after.clif`/`report.txt` under
+  `PLIRON_DIFFCHECK_DIR` (default `pliron-diffcheck/`). `=step` checks every
+  step. Also `_FN=<substr>`, `_TRIALS`, `_FUEL`, `_SEED`, `_PANIC=1`,
+  `_VERBOSE=1` (one summary line per function). Code:
+  `pliron-clif-opt/src/diffcheck.rs`; tests: `pliron-clif-opt/tests/`.
+  Traps and anything the sandbox can't model are skipped, never reported.
+- `cargo run --release -p pliron-clif-check -- step <step> before.clif`
+  replays a report in about a second (`pipeline`, `pair`, `corpus <dir>`,
+  `steps`; `--print` shows both functions). Reduce a repro by deleting
+  instructions while it still prints `MISMATCH`, then add it as a test.
+- `harness/bisect.py -- <cmd>` binary-searches `PLIRON_OPT_BISECT` for the
+  first bad step application when a program misbehaves at run time, and
+  prints the step and function it touched.
+- `cranelift-interpreter` is vendored with small fixes; see
+  `vendor/cranelift-interpreter/PLIRON_PATCH.md`.
 
 ## Platform notes
 

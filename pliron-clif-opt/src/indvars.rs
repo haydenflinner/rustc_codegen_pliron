@@ -609,6 +609,35 @@ fn rot_edge_ok(func: &Function, dt: &DominatorTree, dec: &Dec, e: &Edge) -> bool
     })
 }
 
+/// Whether `i` runs on every iteration that starts, so the entry edges may
+/// load its first-iteration address up front: its block dominates every
+/// backedge and every way out of the loop (exit edges, traps, returns).
+/// Otherwise the seed load is speculative, and its address may be an
+/// empty `Vec`'s dangling pointer.
+fn runs_every_iteration(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    body: &FxHashSet<Block>,
+    edges: &[Edge],
+    i: Inst,
+) -> bool {
+    let Some(ib) = func.layout.inst_block(i) else {
+        return false;
+    };
+    let latches_ok = edges
+        .iter()
+        .filter_map(|e| func.layout.inst_block(e.inst))
+        .filter(|b| body.contains(b))
+        .all(|b| dt.dominates(ib, b, &func.layout));
+    latches_ok
+        && body.iter().all(|&b| {
+            let mut succs = cfg.succ_iter(b).peekable();
+            let leaves = succs.peek().is_none() || succs.any(|s| !body.contains(&s));
+            !leaves || dt.dominates(ib, b, &func.layout)
+        })
+}
+
 /// The entry-edge seed for a rotated load: `Σ terms + koff` (the
 /// iteration-0 address), then the load itself. Caller must have checked
 /// `rot_edge_ok` first — every leaf resolves.
@@ -831,7 +860,7 @@ fn rot_loop(
             if rot >= MAX_ROT {
                 break;
             }
-            if removed.contains(&bi) {
+            if removed.contains(&bi) || !runs_every_iteration(func, cfg, dt, &body, &edges, bi) {
                 continue;
             }
             let want = koff.wrapping_add(*shift);

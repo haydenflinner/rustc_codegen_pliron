@@ -27,7 +27,7 @@ pliron-cfg = { path = "pliron-cfg" }
 rustc-hash = "2"
 
 [workspace]
-members = ["pliron-clif-opt", "pliron-ir-opt", "pliron-cfg"]
+members = ["pliron-clif-opt", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg"]
 exclude = ["vendor"]
 
 [profile.dev]
@@ -66,3 +66,6 @@ rsasm = { path = "vendor/rsasm" }
 # vendor/cranelift-assembler-x64-meta/PLIRON_PATCH.md.
 cranelift-assembler-x64 = { path = "vendor/cranelift-assembler-x64" }
 cranelift-assembler-x64-meta = { path = "vendor/cranelift-assembler-x64-meta" }
+# `x86_psadbw` arm for the exhaustive opcode match; see
+# vendor/cranelift-interpreter/PLIRON_PATCH.md.
+cranelift-interpreter = { path = "vendor/cranelift-interpreter" }
