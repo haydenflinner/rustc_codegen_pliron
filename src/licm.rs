@@ -315,6 +315,7 @@ fn run_loop(
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
+    escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
     debug: bool,
@@ -615,7 +616,7 @@ fn run_loop(
     if std::env::var_os("PLIRON_LICM_PROMOTE").is_some_and(|v| v == "0") {
         return n + cn;
     }
-    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, deref, debug)
+    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, escapes, deref, debug)
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the
@@ -631,6 +632,7 @@ fn promote(
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
+    escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     debug: bool,
 ) -> usize {
@@ -641,6 +643,31 @@ fn promote(
         .filter(|&b| la.is_in_loop(b, lp))
         .collect();
     let mut n = 0;
+    // A root rejected function-wide stays promotable here when every escape
+    // is strictly post-loop: an escape block that can't reach the header
+    // only runs after a loop exit, and `promote_loc` flushes the register
+    // back on every exit edge before that. `reachers` is the set of blocks
+    // that can reach `h` — the body plus every ancestor (including an
+    // enclosing loop's other blocks, which correctly stay disqualifying).
+    let mut iso_l = iso.clone();
+    if !escapes.is_empty() {
+        let mut reachers: FxHashSet<Block> = FxHashSet::default();
+        let mut stack = vec![h];
+        while let Some(b) = stack.pop() {
+            for p in cfg.pred_iter(b) {
+                if reachers.insert(p.block) {
+                    stack.push(p.block);
+                }
+            }
+        }
+        reachers.insert(h);
+        for (r, bs) in escapes {
+            if bs.iter().all(|b| !reachers.contains(b)) {
+                iso_l.insert(*r);
+            }
+        }
+    }
+    let iso_l = &iso_l;
 
     // Group in-loop accesses by (root, offset) -> (ty, saw_store, uniform,
     // byte extent). The extent is the widest access seen: a group mixing an
@@ -702,7 +729,7 @@ fn promote(
             };
             let (r, o) = loadfwd::root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
-            if !iso.contains(&r) {
+            if !iso_l.contains(&r) {
                 continue;
             }
             let g = groups.entry((r, o)).or_insert((ty, false, true, 0));
@@ -1143,7 +1170,7 @@ pub fn run(
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
     let ps = loadfwd::param_src(func);
-    let iso = loadfwd::isolated(func, noalias, &ps, cfrozen);
+    let (iso, escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
     // Operand-frozen values name their own scope roots (same merged set
     // loadfwd uses): peeling past one would lose the `ofz` claim before the
     // region check can apply it.
@@ -1185,8 +1212,8 @@ pub fn run(
         }
         let before = n;
         n += run_loop(
-            func, &ps, &stop, &cfg, &dt, &la, lp, &iso, deref, nw, debug, scoped,
-            breg, rpar, ofz,
+            func, &ps, &stop, &cfg, &dt, &la, lp, &iso, &escapes, deref, nw,
+            debug, scoped, breg, rpar, ofz,
         );
         dirty |= n != before;
         if n >= MAX_MOVES * MAX_LOOPS {

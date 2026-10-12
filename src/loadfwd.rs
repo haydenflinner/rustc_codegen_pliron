@@ -304,14 +304,31 @@ pub(crate) fn isolated(
     func: &Function,
     noalias: &FxHashSet<Value>,
     ps: &FxHashMap<Value, Value>,
-    _cfrozen: &FxHashMap<FuncRef, u64>,
+    cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> FxHashSet<Root> {
-    let mut iso: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
+    isolated_escapes(func, noalias, ps, cfrozen).0
+}
+
+/// `isolated` plus, for every rejected root, the blocks holding its
+/// non-benign uses. A root escapes only where the pointer value leaves the
+/// tracked load/store-address pattern (stored elsewhere, passed to a call,
+/// feeding an untracked op, ...). Loop consumers can treat a root as
+/// isolated for the duration of a loop when none of its escape blocks can
+/// reach the header: the pointer can't have leaked before the first
+/// iteration nor during any iteration.
+pub(crate) fn isolated_escapes(
+    func: &Function,
+    noalias: &FxHashSet<Value>,
+    ps: &FxHashMap<Value, Value>,
+    _cfrozen: &FxHashMap<FuncRef, u64>,
+) -> (FxHashSet<Root>, FxHashMap<Root, Vec<Block>>) {
+    let mut cand: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
     if crate::pass_enabled("PLIRON_FWD_SLOTS") {
-        iso.extend(func.sized_stack_slots.keys().map(Root::S));
+        cand.extend(func.sized_stack_slots.keys().map(Root::S));
     }
-    if iso.is_empty() {
-        return iso;
+    let mut escapes: FxHashMap<Root, Vec<Block>> = FxHashMap::default();
+    if cand.is_empty() {
+        return (cand, escapes);
     }
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -322,7 +339,7 @@ pub(crate) fn isolated(
             // pointer stays inside this equivalence class.
             for (k, v) in func.dfg.inst_values(i).enumerate() {
                 let (r, _) = root(func, ps, noalias, v);
-                if !iso.contains(&r) {
+                if !cand.contains(&r) {
                     continue;
                 }
                 let fwd = |j: usize| {
@@ -353,12 +370,16 @@ pub(crate) fn isolated(
                     _ => k >= nargs && fwd(k - nargs),
                 };
                 if !ok {
-                    iso.remove(&r);
+                    escapes.entry(r).or_default().push(b);
                 }
             }
         }
     }
-    iso
+    let iso: FxHashSet<Root> = cand
+        .into_iter()
+        .filter(|r| !escapes.contains_key(r))
+        .collect();
+    (iso, escapes)
 }
 
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
