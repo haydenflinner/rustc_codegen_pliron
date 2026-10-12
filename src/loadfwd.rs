@@ -596,7 +596,7 @@ pub fn run(
         .copied()
         .collect();
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        n += pre(func, &ps, &stop, inv_insts, &cfg, &rpo, entry);
+        n += pre(func, &ps, &stop, &cfg, &rpo, entry);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -760,12 +760,15 @@ fn end_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Value {
     }
 }
 
-fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type) {
+fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
     let n = i64::from(ty.bytes());
+    // Same retain rule as `kill` (minus the invariant sets `pre` doesn't
+    // track): `st` must agree with the `out` availability sets or
+    // `end_val`'s `St::In` lookup finds a loc `st` dropped.
     st.retain(|&(r2, o2, t2), _| match (r, r2) {
         _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
         (Root::S(_), Root::S(_)) => true,
-        _ => false,
+        _ => iso.contains(&r) || iso.contains(&r2),
     });
 }
 
@@ -893,7 +896,6 @@ fn pre(
     func: &mut Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
-    inv_insts: &FxHashSet<Inst>,
     cfg: &ControlFlowGraph,
     rpo: &[Block],
     entry: Block,
@@ -937,7 +939,10 @@ fn pre(
                 &mut av,
                 None,
                 &iso,
-                inv_insts,
+                // `out` must agree with the `st` scan below, which tracks
+                // no invariant immunity — pass empty sets so `transfer`
+                // marks and retains nothing extra here.
+                &FxHashSet::default(),
                 &mut FxHashSet::default(),
                 None,
                 &FxHashMap::default(),
@@ -1023,7 +1028,7 @@ fn pre(
                     let ty = func.dfg.value_type(val);
                     let (r, o) = root(func, ps, na, args[1]);
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
-                    kill_st(&mut st, r, o, ty);
+                    kill_st(&mut st, r, o, ty, &iso);
                     writes.push((r, o, ty));
                     // A store through `select c, pa, pb` may write either
                     // arm's location — kill both, mirroring `transfer` (a
@@ -1039,7 +1044,7 @@ fn pre(
                         for &a in &sargs[1..] {
                             let (ra, oa) = root(func, ps, na, a);
                             let a = (ra, oa.wrapping_add(o), ty);
-                            kill_st(&mut st, a.0, a.1, a.2);
+                            kill_st(&mut st, a.0, a.1, a.2, &iso);
                             writes.push(a);
                         }
                     }
@@ -1052,7 +1057,9 @@ fn pre(
                     || op.other_side_effects()
                     || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
                 {
-                    st.clear();
+                    // `transfer`'s call arm keeps `iso` roots — retain the
+                    // same set here or `st` disagrees with `out`.
+                    st.retain(|&(r, _, _), _| iso.contains(&r));
                     clobbered = true;
                 }
                 _ => {}
