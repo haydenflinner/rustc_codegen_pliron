@@ -129,6 +129,17 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   serializes codegen (also forced by OPT_BISECT).
 - `PLIRON_STATS=1` — per-pass rewrite counts per function.
 - `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
+- `PLIRON_STEPCACHE=1` — content-addressed pipeline cache in
+  `$PLIRON_CACHE_DIR` (default `~/.cache/pliron-steps`). Two levels per
+  function: a whole-pipeline entry (warm reruns are ~50x faster) and
+  per-step entries for the expensive passes (`Step.cached`), so a gate
+  flip (`PLIRON_X=0`) invalidates only what it actually changed —
+  repeat bisect runs at the same config hit fully. Keys include the
+  crate build hash, so a backend edit cold-misses everything.
+  `PLIRON_CACHE_LOG=1` prints hit/miss per step. Caveats: cold runs pay
+  ~1.3x for hashing+storing; hits replay results rather than
+  re-executing, so in-pass `eprintln!` debug prints don't fire on hits
+  (aggregated `PLIRON_STATS` counters replay exactly).
 - `PLIRON_CLIF=<substr>` — dump CLIF after every step for functions whose
   name contains the substring; `PLIRON_VERIFY=full` runs the cranelift
   verifier after each step; any other truthy value verifies once after

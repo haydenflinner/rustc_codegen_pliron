@@ -513,6 +513,7 @@ pub fn lower_to_object(
         if crate::env_set("PLIRON_FROZEN_DEBUG") {
             eprintln!("==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
         }
+        let tpipe = std::time::Instant::now();
         'retry: loop {
         {
             let mut pipe = crate::pipeline::Pipe {
@@ -564,18 +565,23 @@ pub fn lower_to_object(
         }
         break 'retry;
         }
+        // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
+        // per-function total for the tier-1 cache sizing question.
+        *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
         if j.dump {
             eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
         }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.
+        let tcomp = std::time::Instant::now();
         let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             clctx
                 .compile(sh.isa, &mut ControlPlane::default())
                 .map(|_| ())
                 .map_err(|e| e.inner)
         }));
+        *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
         match defr {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => j.err = Some(e),

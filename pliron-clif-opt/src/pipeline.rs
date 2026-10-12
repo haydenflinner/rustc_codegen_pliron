@@ -18,7 +18,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::context::Ptr;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::config::{bisect, config, env_set};
+use crate::config::{bisect, bisect_count, config, env_set, reads_begin, reads_take};
 use crate::*;
 
 /// Per-CGU pass categories, mirroring the `State::*` flags in the
@@ -85,7 +85,7 @@ impl FnFlags {
 }
 
 /// Counts accumulated across functions for the `PLIRON_STATS` summary.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Stats {
     pub threaded: usize,
     pub dead_params: usize,
@@ -152,7 +152,7 @@ pub struct Pipe<'a> {
 }
 
 impl Pipe<'_> {
-    fn dump(&self, tag: &str) {
+    pub(crate) fn dump(&self, tag: &str) {
         if self.dump {
             eprintln!(
                 "==== clif {} after {tag} ====\n{}",
@@ -210,6 +210,16 @@ pub struct Analysis {
     cfg: Option<ControlFlowGraph>,
     dt: Option<DominatorTree>,
     la: Option<LoopAnalysis>,
+    /// Step-cache hash chain: the previous step's output hash is this
+    /// step's input hash, so cache hits never re-hash the function.
+    /// `fnh` hashes the FnJob input maps once per function. `pk` is
+    /// the function's file key; `stepfile` is its per-step cache file,
+    /// loaded lazily and written back once if `stepfile_dirty`.
+    pub(crate) clif_hash: Option<[u8; 32]>,
+    pub(crate) fnh: Option<[u8; 32]>,
+    pub(crate) pk: Option<[u8; 32]>,
+    pub(crate) stepfile: Option<Vec<crate::stepcache::StepEntry>>,
+    pub(crate) stepfile_dirty: bool,
 }
 
 /// One borrow of the three structural analyses (`&self` tuple).
@@ -254,7 +264,10 @@ impl Analysis {
             self.cfg = Some(ControlFlowGraph::with_function(func));
         }
         if self.dt.is_none() {
-            self.dt = Some(DominatorTree::with_function(func, self.cfg.as_ref().unwrap()));
+            self.dt = Some(DominatorTree::with_function(
+                func,
+                self.cfg.as_ref().unwrap(),
+            ));
         }
         if self.la.is_none() {
             let mut la = LoopAnalysis::new();
@@ -276,10 +289,7 @@ impl Analysis {
     /// Recompute whatever is missing, then borrow cfg+domtree.
     pub fn cfg_dt<'a>(&'a mut self, func: &Function) -> (&'a ControlFlowGraph, &'a DominatorTree) {
         self.materialize(func);
-        (
-            self.cfg.as_ref().unwrap(),
-            self.dt.as_ref().unwrap(),
-        )
+        (self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap())
     }
 
     pub fn cfg<'a>(&'a mut self, func: &Function) -> &'a ControlFlowGraph {
@@ -307,6 +317,10 @@ pub struct Step {
     /// The step may rewrite the function — the driver bumps the
     /// analysis version after it runs. Pure steps keep the cache.
     pub mutates: bool,
+    /// Worth a per-step disk entry under `PLIRON_STEPCACHE`: the
+    /// expensive passes. Cheap steps recompute on a partial miss —
+    /// a file read + stencil deserialize costs more than they do.
+    pub cached: bool,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
 }
@@ -323,6 +337,27 @@ const fn step(
         stat,
         verify: true,
         mutates: true,
+        cached: false,
+        gate,
+        run,
+    }
+}
+
+/// `step` for the passes heavy enough that replaying a cached result
+/// beats recomputing (`PLIRON_TIMING` shows the top of the list).
+const fn cstep(
+    name: &'static str,
+    stat: &'static str,
+    gate: Gate,
+    run: fn(&mut Pipe, &mut Analysis) -> usize,
+) -> Step {
+    Step {
+        name,
+        bisect: Some(name),
+        stat,
+        verify: true,
+        mutates: true,
+        cached: true,
         gate,
         run,
     }
@@ -341,8 +376,15 @@ pub fn run_pipeline(p: &mut Pipe) {
 }
 
 /// The steps this run selects, in order: `PLIRON_PIPELINE` if set (plus
-/// the `Gate::Always` lowerings), else every default step whose gate holds.
-fn selected(p: &Pipe) -> Vec<&'static Step> {
+/// the `Gate::Always` lowerings), else every default step whose gate
+/// holds. Gate decisions are pure functions of `p.flags` + the env
+/// snapshot — `p.flags` is fixed for the run — so the list is identical
+/// before, during, and after the pipeline. `pipeline_lookup`
+/// re-evaluates it: a gate flip that changes *which* steps run must
+/// miss even when every recorded env read happens to match. `quiet`
+/// suppresses the unknown-name diagnostic for that read-only
+/// evaluation.
+pub(crate) fn selected(p: &Pipe, quiet: bool) -> Vec<&'static Step> {
     if let Some(list) = &config().pipeline {
         let mut out = Vec::new();
         for name in list {
@@ -351,7 +393,8 @@ fn selected(p: &Pipe) -> Vec<&'static Step> {
                 .find(|s| s.name == name.as_str() && !matches!(s.gate, Gate::Always))
             {
                 Some(s) => out.push(s),
-                None => eprintln!("PLIRON_PIPELINE: unknown step `{name}`"),
+                None if !quiet => eprintln!("PLIRON_PIPELINE: unknown step `{name}`"),
+                None => {}
             }
         }
         out.extend(DEFAULT.iter().filter(|s| matches!(s.gate, Gate::Always)));
@@ -363,11 +406,31 @@ fn selected(p: &Pipe) -> Vec<&'static Step> {
 
 /// Runs the selected steps. With `check_each`, every step that changes
 /// the function is differentially checked against its input; returns
-/// whether any check reported a mismatch.
+/// whether any check reported a mismatch. The step-cache only engages
+/// on the normal path — a checked run must see the pipeline actually
+/// execute.
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     let mut an = Analysis::default();
+    let pk = if check_each {
+        None
+    } else {
+        match crate::stepcache::pipeline_lookup(p, &mut an) {
+            crate::stepcache::PipeLookup::Hit => return false,
+            crate::stepcache::PipeLookup::Miss(k) => Some(k),
+            crate::stepcache::PipeLookup::Off => None,
+        }
+    };
+    // The outer read window accumulates the union of every step's env
+    // reads (frames nest); `draws` records the bisect units consumed so
+    // a cache hit can replay them and keep bisect numbering identical.
+    // `pk` is only `Some` when the cache is on — off means zero
+    // recorder overhead for the normal path.
+    let stats0 = pk.is_some().then(|| p.stats.clone());
+    let armed = pk.is_some() && reads_begin();
+    let draws0 = bisect_count();
+    let sel = selected(p, false);
     let mut found = false;
-    for s in selected(p) {
+    for &s in &sel {
         if !check_each {
             run_step(p, s, &mut an);
             continue;
@@ -385,6 +448,13 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
             );
         }
     }
+    let reads = reads_take();
+    let draws = bisect_count() - draws0;
+    if let (Some(k), true) = (pk, armed) {
+        let ran = sel.iter().map(|s| s.name);
+        crate::stepcache::pipeline_store(&k, p, stats0.as_ref().unwrap(), reads, draws, ran);
+    }
+    crate::stepcache::flush(&mut an);
     found
 }
 
@@ -408,7 +478,12 @@ fn run_whole_checked(p: &mut Pipe) {
     let derived0 = p.derived.clone();
     run_steps(p, false);
     let facts = facts_of(p);
-    let m = match crate::diffcheck::check(&initial, &p.clctx.func, &facts, &crate::diffcheck::config_from_env()) {
+    let m = match crate::diffcheck::check(
+        &initial,
+        &p.clctx.func,
+        &facts,
+        &crate::diffcheck::config_from_env(),
+    ) {
         Ok(sum) => {
             if crate::config::env_is("PLIRON_DIFFCHECK_VERBOSE", "1") {
                 eprintln!(
@@ -433,13 +508,20 @@ fn run_whole_checked(p: &mut Pipe) {
     p.clctx.func = final_func;
     *p.derived = final_derived;
     if !localized {
-        crate::diffcheck::report(p.fname, "<whole pipeline>", &initial, &p.clctx.func, &facts_of(p), &m);
+        crate::diffcheck::report(
+            p.fname,
+            "<whole pipeline>",
+            &initial,
+            &p.clctx.func,
+            &facts_of(p),
+            &m,
+        );
     }
 }
 
 /// Names of the steps this run selects, in order (for `clif-check`).
 pub fn selected_names(p: &Pipe) -> Vec<&'static str> {
-    selected(p).iter().map(|s| s.name).collect()
+    selected(p, true).iter().map(|s| s.name).collect()
 }
 
 /// Runs one step by name regardless of its gate (for `clif-check`).
@@ -455,7 +537,19 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let k = (s.run)(p, an);
+    let k = if s.cached {
+        match crate::stepcache::lookup(p, s, an) {
+            Some(k) => k,
+            None => crate::stepcache::compute(p, s, an),
+        }
+    } else {
+        let k = (s.run)(p, an);
+        if s.mutates {
+            // The next cached step's chain key must see this mutation.
+            an.clif_hash = None;
+        }
+        k
+    };
     *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
     if s.mutates {
         an.bump();
@@ -515,7 +609,10 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
             }
         }
         if env_set("PLIRON_UNROLL_DEBUG") {
-            eprintln!("unroll cleanup {}: {ub} blocks, {dp} params, {di} insts", p.fname);
+            eprintln!(
+                "unroll cleanup {}: {ub} blocks, {dp} params, {di} insts",
+                p.fname
+            );
         }
     }
     if k > 0 && env_set("PLIRON_UNROLL_DEBUG") {
@@ -620,9 +717,13 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     p.clctx.func.dfg.resolve_all_aliases();
     p.clctx.compute_cfg();
     p.clctx.compute_domtree();
-    p.clctx
-        .egraph_pass(p.isa, &mut cp)
-        .unwrap_or_else(|e| panic!("egraph broke `{}`: {e}\n{}", p.fname, p.clctx.func.display()));
+    p.clctx.egraph_pass(p.isa, &mut cp).unwrap_or_else(|e| {
+        panic!(
+            "egraph broke `{}`: {e}\n{}",
+            p.fname,
+            p.clctx.func.display()
+        )
+    });
     // The egraph populated cfg/domtree; later passes don't maintain
     // them, so drop them rather than leave stale-but-"valid" state
     // that `compile`'s initial verify would check.
@@ -749,11 +850,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     );
     // loopvec emits `base + iv*esize` addressing fresh each iteration;
     // a second indvars round turns them into stepped pointers.
-    if k > 0
-        && p.flags.indvars
-        && config().enabled("PLIRON_INDUCT2")
-        && bisect("indvars2")
-    {
+    if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         // loopvec rewrote the loop the cache describes.
         an.invalidate();
         indvars::run(&mut p.clctx.func, an);
@@ -776,20 +873,19 @@ fn s_slp(p: &mut Pipe, an: &mut Analysis) -> usize {
 fn s_switchmap(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = switchmap::run(&mut p.clctx.func);
     // The new bounds tests are often implied by a dominating check.
-    let f = if k > 0
-        && config().enabled("PLIRON_DOMCOND")
-        && config().enabled("PLIRON_SWITCHMAP_FOLD")
-    {
-        let folds = jumpthread::fold_dominated_conds(&mut p.clctx.func);
-        p.stats.dominated_folds += folds;
-        if folds > 0 {
-            jumpthread::fold_const_branches(&mut p.clctx.func)
+    let f =
+        if k > 0 && config().enabled("PLIRON_DOMCOND") && config().enabled("PLIRON_SWITCHMAP_FOLD")
+        {
+            let folds = jumpthread::fold_dominated_conds(&mut p.clctx.func);
+            p.stats.dominated_folds += folds;
+            if folds > 0 {
+                jumpthread::fold_const_branches(&mut p.clctx.func)
+            } else {
+                0
+            }
         } else {
             0
-        }
-    } else {
-        0
-    };
+        };
     if k > 0 && env_set("PLIRON_SWITCHMAP_DEBUG") {
         eprintln!("switchmap {k} fold {f} {}", p.fname);
     }
@@ -1112,7 +1208,11 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
             .values()
             .map(|d| d.size as u64)
             .sum();
-        eprintln!("slotmerge {k} {before}->{after}B {} {}", p.nocap.len(), p.fname);
+        eprintln!(
+            "slotmerge {k} {before}->{after}B {} {}",
+            p.nocap.len(),
+            p.fname
+        );
     }
     if k > 0 && p.dump {
         p.dump("slotmerge");
@@ -1155,16 +1255,23 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: true,
         mutates: true,
+        cached: true,
         gate: JT,
         run: s_jumpthread,
     },
-    step("constbr", "constbr", Gate::All(&[JT, Gate::Env("PLIRON_CONSTBR")]), s_constbr),
+    cstep(
+        "constbr",
+        "constbr",
+        Gate::All(&[JT, Gate::Env("PLIRON_CONSTBR")]),
+        s_constbr,
+    ),
     Step {
         name: "unroll",
         bisect: Some("unroll"),
         stat: "",
         verify: true,
         mutates: true,
+        cached: true,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
     },
@@ -1175,6 +1282,7 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: false,
         mutates: true,
+        cached: true,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
     },
@@ -1187,39 +1295,51 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: true,
         mutates: true,
+        cached: true,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
-    step("dse", "dse", Gate::Flag(FlagId::Dse), s_dse),
+    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse),
     Step {
         name: "egraph",
         bisect: Some("egraph"),
         stat: "",
         verify: false,
         mutates: true,
+        cached: true,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
     },
-    step("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars),
+    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars),
     step(
         "ldrot",
         "ldrot",
         Gate::All(&[Gate::Flag(FlagId::Indvars), Gate::Env("PLIRON_LDROT")]),
         s_ldrot,
     ),
-    step("licm", "licm", Gate::Flag(FlagId::Licm), s_licm),
+    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm),
     step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm),
-    step("loopidiom", "idiom", Gate::Flag(FlagId::Loopidiom), s_loopidiom),
     step(
+        "loopidiom",
+        "idiom",
+        Gate::Flag(FlagId::Loopidiom),
+        s_loopidiom,
+    ),
+    cstep(
         "ifconv2",
         "ifconv2",
         Gate::All(&[Gate::Flag(FlagId::Loopvec), Gate::Env("PLIRON_IFCONV2")]),
         s_ifconv2,
     ),
-    step("unswitch", "unswitch", Gate::Env("PLIRON_UNSWITCH"), s_unswitch),
-    step("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck),
-    step("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec),
-    step("slp", "slp", Gate::Flag(FlagId::Slp), s_slp),
+    cstep(
+        "unswitch",
+        "unswitch",
+        Gate::Env("PLIRON_UNSWITCH"),
+        s_unswitch,
+    ),
+    cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck),
+    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec),
+    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp),
     step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap),
     Step {
         name: "constbr2",
@@ -1227,19 +1347,20 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: true,
         mutates: true,
+        cached: false,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
     },
-    step(
+    cstep(
         "loopdel",
         "loopdel",
         Gate::All(&[JT, Gate::Env("PLIRON_LOOPDEL")]),
         s_loopdel,
     ),
-    step("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot),
+    cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot),
     // Scalar unroll of linear counted loops (e.g. ordered float
     // reductions that can't vectorize): K bodies per branch.
-    step(
+    cstep(
         "punroll",
         "punroll",
         Gate::All(&[JT, Gate::Env("PLIRON_PUNROLL")]),
@@ -1251,10 +1372,11 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: false,
         mutates: true,
+        cached: false,
         gate: Gate::Always,
         run: s_frozen_loads,
     },
-    step(
+    cstep(
         "sublea",
         "sublea",
         Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_SUBLEA")]),
@@ -1266,6 +1388,7 @@ pub static DEFAULT: &[Step] = &[
         stat: "commute",
         verify: false,
         mutates: true,
+        cached: false,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
     },
@@ -1275,6 +1398,7 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: false,
         mutates: true,
+        cached: false,
         gate: Gate::Always,
         run: s_wide_minmax,
     },
@@ -1284,22 +1408,43 @@ pub static DEFAULT: &[Step] = &[
         stat: "coldarg",
         verify: false,
         mutates: true,
+        cached: false,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
     },
     step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse),
-    step("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd),
+    cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd),
     step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf),
-    step("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim),
-    step("ivrefold", "ivrefold", Gate::Env("PLIRON_IVREFOLD"), s_ivrefold),
-    step("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec),
-    step("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
-    step("sameargs", "sameargs", Gate::Env("PLIRON_SAMEARG"), s_sameargs),
+    cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim),
+    cstep(
+        "ivrefold",
+        "ivrefold",
+        Gate::Env("PLIRON_IVREFOLD"),
+        s_ivrefold,
+    ),
+    cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec),
+    cstep("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
+    cstep(
+        "sameargs",
+        "sameargs",
+        Gate::Env("PLIRON_SAMEARG"),
+        s_sameargs,
+    ),
     step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
-    step("edgespec", "edgespec", Gate::Env("PLIRON_EDGESPEC"), s_edgespec),
-    step("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab),
-    step("coldedge", "coldedge", Gate::Env("PLIRON_COLDEDGE"), s_coldedge),
-    step("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2),
+    cstep(
+        "edgespec",
+        "edgespec",
+        Gate::Env("PLIRON_EDGESPEC"),
+        s_edgespec,
+    ),
+    cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab),
+    step(
+        "coldedge",
+        "coldedge",
+        Gate::Env("PLIRON_COLDEDGE"),
+        s_coldedge,
+    ),
+    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2),
     step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot),
     // Late value numbering: the edge transforms and vecslot leave
     // identical insts in one block; also drives the mem-offset and
@@ -1310,6 +1455,7 @@ pub static DEFAULT: &[Step] = &[
         stat: "lcse",
         verify: true,
         mutates: true,
+        cached: false,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -1317,13 +1463,14 @@ pub static DEFAULT: &[Step] = &[
     step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp),
     step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
     step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain),
-    step("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge),
+    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge),
     Step {
         name: "coldret",
         bisect: Some("coldret"),
         stat: "coldret",
         verify: false,
         mutates: true,
+        cached: false,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
     },

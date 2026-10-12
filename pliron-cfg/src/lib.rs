@@ -42,20 +42,24 @@ impl PassConfig {
 
     /// `PLIRON_X` unset or `!= "0"` — the default-on pass gate.
     pub fn enabled(&self, var: &str) -> bool {
+        record(var, self.values.get(var).map(String::as_str));
         self.values.get(var).map_or(true, |v| v != "0")
     }
 
     /// `PLIRON_X` present at all — presence-flag debug knobs.
     pub fn set(&self, var: &str) -> bool {
+        record(var, self.values.get(var).map(String::as_str));
         self.values.contains_key(var)
     }
 
     /// `PLIRON_X == v` — opt-in gates (`=1` and model selects).
     pub fn is(&self, var: &str, v: &str) -> bool {
+        record(var, self.values.get(var).map(String::as_str));
         self.values.get(var).is_some_and(|x| x == v)
     }
 
     pub fn get(&self, var: &str) -> Option<&str> {
+        record(var, self.values.get(var).map(String::as_str));
         self.values.get(var).map(String::as_str)
     }
 
@@ -74,6 +78,48 @@ impl PassConfig {
             None => format!("default, off: {}", off.join(",")),
         }
     }
+}
+
+// Cache read tracking: a cached entry's validity depends only on the
+// `PLIRON_*` vars the producing run actually consulted, so flipping a
+// var invalidates only entries that read it. `READS` is a stack of
+// windows: a read lands in every open frame, so an outer (pipeline-
+// level) window accumulates the union of its inner (per-step) windows.
+// Reads outside a tracking window cost a TLS borrow-check.
+thread_local! {
+    static READS: std::cell::RefCell<Vec<std::collections::BTreeMap<String, Option<String>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Open a read-recording frame. Always succeeds — frames nest, and each
+/// frame sees only the reads that happen inside it.
+pub fn reads_begin() -> bool {
+    READS.with(|r| {
+        r.borrow_mut().push(Default::default());
+        true
+    })
+}
+
+/// Close the innermost frame and return its `(var, value)` pairs.
+pub fn reads_take() -> std::collections::BTreeMap<String, Option<String>> {
+    READS.with(|r| r.borrow_mut().pop().unwrap_or_default())
+}
+
+fn record(k: &str, v: Option<&str>) {
+    // Cache-machinery knobs are inputs to the cache itself, not to the
+    // computation — recording them would tie variants to the cache dir
+    // or log flag rather than to the work performed.
+    if matches!(
+        k,
+        "PLIRON_STEPCACHE" | "PLIRON_CACHE_DIR" | "PLIRON_CACHE_LOG"
+    ) {
+        return;
+    }
+    READS.with(|r| {
+        for m in r.borrow_mut().iter_mut() {
+            m.insert(k.to_string(), v.map(str::to_string));
+        }
+    });
 }
 
 /// `PLIRON_<PASS>=0` disables a pass at runtime (default on).
@@ -100,6 +146,8 @@ pub fn env_get(var: &str) -> Option<&'static str> {
 /// applications (across all passes and functions), like LLVM's
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
 /// the budget is unlimited. `PLIRON_OPT_BISECT_DEBUG=1` logs each gate.
+static BISECT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub fn bisect(name: &str) -> bool {
     bisect_in(name, "")
 }
@@ -108,12 +156,17 @@ pub fn bisect(name: &str) -> bool {
 /// (`bisect <n> <pass> run|skip <func>`) so `harness/bisect.py` can say
 /// which function the first bad unit touched.
 pub fn bisect_in(name: &str, func: &str) -> bool {
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(limit) = bisect_limit() else { return true };
-    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let Some(limit) = bisect_limit() else {
+        return true;
+    };
+    let n = BISECT_COUNT.fetch_add(1, Ordering::Relaxed);
     let ok = n < limit;
     if env_is("PLIRON_OPT_BISECT_DEBUG", "1") {
-        eprintln!("bisect {} {name} {} {func}", n + 1, if ok { "run" } else { "skip" });
+        eprintln!(
+            "bisect {} {name} {} {func}",
+            n + 1,
+            if ok { "run" } else { "skip" }
+        );
     }
     ok
 }
@@ -125,4 +178,16 @@ pub fn bisect_limit() -> Option<u64> {
     static LIMIT: LazyLock<Option<u64>> =
         LazyLock::new(|| env_get("PLIRON_OPT_BISECT").and_then(|v| v.parse().ok()));
     *LIMIT
+}
+
+/// Current bisect position and a way to replay skipped draws. A
+/// whole-pipeline cache hit bypasses the per-step `bisect` calls, so it
+/// advances the counter by the recorded amount to keep downstream
+/// numbering identical to an uncached run.
+pub fn bisect_count() -> u64 {
+    BISECT_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn bisect_skip(n: u64) {
+    BISECT_COUNT.fetch_add(n, Ordering::Relaxed);
 }

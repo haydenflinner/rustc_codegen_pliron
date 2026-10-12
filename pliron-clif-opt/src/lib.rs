@@ -7,11 +7,11 @@
 
 pub mod bcheck;
 pub mod bittab;
-pub mod config;
 pub mod brchain;
 pub mod celim;
 pub mod clifpeep;
 pub mod commute;
+pub mod config;
 pub mod diffcheck;
 pub mod dse;
 pub mod edgefwd;
@@ -31,6 +31,7 @@ pub mod punroll;
 pub mod revnorm;
 pub mod slotmerge;
 pub mod slp;
+pub mod stepcache;
 pub mod switchmap;
 pub mod taildup;
 pub mod tailmerge;
