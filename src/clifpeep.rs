@@ -1329,7 +1329,7 @@ pub fn fusechains(func: &mut Function) -> usize {
 pub fn sameargs(func: &mut Function) -> usize {
     let mut n = 0;
     for _ in 0..8 {
-        let k = sameargs_round(func);
+        let k = sameargs_round(func) + phimerge(func);
         n += k;
         if k == 0 {
             break;
@@ -1601,12 +1601,12 @@ fn apply_param_drops(
         let mut w = p;
         let mut path = vec![p];
         while let Some(&u) = pmap.get(&w) {
+            w = u;
             if let Some(at) = path.iter().position(|&x| x == w) {
                 cyc.extend(&path[at..]);
                 break;
             }
             path.push(w);
-            w = u;
         }
     }
     if !cyc.is_empty() {
@@ -1898,6 +1898,282 @@ fn sameargs_round(func: &mut Function) -> usize {
         eprintln!("sameargs drops {} params", param_drops.len());
     }
     apply_param_drops(func, pmap, arg_drops, param_drops)
+}
+
+/// Merge same-block param pairs that are equal by coinduction: the edge
+/// args agree outright on non-recursive edges and are congruent — same
+/// pure op applied to assumed-equal args — on recursive ones. This is the
+/// mutually-inductive case sameargs' literal equality can't see: the
+/// vectorizer's separate c-load/c-store address streams stay equal iff
+/// each other's params do (`p' = q' = p + 64`), so no pair proves first.
+///
+/// Partition refinement: start with every same-typed param pair pending,
+/// drop any pair an edge disproves under the pending assumption, repeat
+/// to fixpoint. Surviving pairs are coinductively sound — assume all of
+/// them equal at block entry, congruent ops preserve it along every edge.
+/// The later param drops to the earlier, as in sameargs.
+pub fn phimerge(func: &mut Function) -> usize {
+    // Edge target -> [(inst, dest index)].
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                edges
+                    .entry(bc.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push((i, d));
+            }
+        }
+    }
+    // Candidate pairs (pi < pj) per block: same type, uniform edge arity.
+    let mut pending: Vec<(Block, usize, usize)> = Vec::new();
+    for (&b, es) in &edges {
+        let ps = func.dfg.block_params(b);
+        if ps.len() < 2 || ps.len() > 24 {
+            continue;
+        }
+        let arity_ok = es.iter().all(|&(i, d)| {
+            func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                .args(&func.dfg.value_lists)
+                .len()
+                == ps.len()
+        });
+        if !arity_ok {
+            continue;
+        }
+        for ix in 0..ps.len() {
+            for jx in ix + 1..ps.len() {
+                if func.dfg.value_type(ps[ix]) == func.dfg.value_type(ps[jx]) {
+                    pending.push((b, ix, jx));
+                }
+            }
+        }
+    }
+    if pending.is_empty() {
+        return 0;
+    }
+    // uf rep for the pending-pair assumption: pi -> pi, pj -> pi.
+    let mut uf: FxHashMap<Value, Value> = FxHashMap::default();
+    let find = |uf: &FxHashMap<Value, Value>, mut v: Value| {
+        while let Some(&p) = uf.get(&v) {
+            if p == v {
+                break;
+            }
+            v = p;
+        }
+        v
+    };
+    let mut alive = vec![true; pending.len()];
+    loop {
+        uf.clear();
+        for (k, &(b, ix, jx)) in pending.iter().enumerate() {
+            if !alive[k] {
+                continue;
+            }
+            let ps = func.dfg.block_params(b);
+            uf.entry(ps[ix]).or_insert(ps[ix]);
+            let r = find(&uf, ps[ix]);
+            uf.insert(ps[jx], r);
+        }
+        let mut changed = false;
+        for (k, &(b, ix, jx)) in pending.iter().enumerate() {
+            if !alive[k] {
+                continue;
+            }
+            let ok = edges[&b].iter().all(|&(i, d)| {
+                let bc = &func.dfg.insts[i].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                )[d];
+                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                match (args.get(ix), args.get(jx)) {
+                    (Some(&BlockArg::Value(x)), Some(&BlockArg::Value(y))) => {
+                        phi_cong(func, x, y, &uf, &find, 4)
+                    }
+                    _ => false,
+                }
+            });
+            if !ok {
+                alive[k] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Survivors -> pmap/param_drops/arg_drops, grouped per block (later
+    // slots first so earlier indices stay valid).
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
+    let mut param_drops: Vec<Value> = vec![];
+    let mut per_block: FxHashMap<Block, Vec<(usize, usize)>> = FxHashMap::default();
+    for (k, &(b, ix, jx)) in pending.iter().enumerate() {
+        if alive[k] {
+            per_block.entry(b).or_default().push((ix, jx));
+        }
+    }
+    for (b, mut prs) in per_block {
+        let ps = func.dfg.block_params(b).to_vec();
+        prs.sort_unstable_by_key(|&(ix, jx)| (ix, jx));
+        let mut drops: Vec<usize> = Vec::new();
+        for (ix, jx) in prs {
+            // pj may already be mapped through an earlier merge.
+            let t = pmap.get(&ps[ix]).copied().unwrap_or(ps[ix]);
+            pmap.insert(ps[jx], t);
+            drops.push(jx);
+        }
+        drops.sort_unstable_by(|x, y| y.cmp(x));
+        drops.dedup();
+        for &(i, d) in &edges[&b] {
+            arg_drops.push((i, d, drops.clone()));
+        }
+        for &jx in &drops {
+            param_drops.push(ps[jx]);
+        }
+    }
+    if param_drops.is_empty() {
+        return 0;
+    }
+    apply_param_drops(func, pmap, arg_drops, param_drops)
+}
+
+/// Congruence under the pending-param assumption `uf`: resolved-equal,
+/// uf-equal, same constant, or same pure inst shape applied to
+/// pointwise-congruent args.
+fn phi_cong(
+    func: &Function,
+    x: Value,
+    y: Value,
+    uf: &FxHashMap<Value, Value>,
+    find: &dyn Fn(&FxHashMap<Value, Value>, Value) -> Value,
+    depth: u32,
+) -> bool {
+    let (x, y) = (
+        func.dfg.resolve_aliases(x),
+        func.dfg.resolve_aliases(y),
+    );
+    if x == y || find(uf, x) == find(uf, y) {
+        return true;
+    }
+    let (Some(di), Some(dj)) = (func.dfg.value_def(x).inst(), func.dfg.value_def(y).inst())
+    else {
+        return false;
+    };
+    if func.dfg.value_type(x) != func.dfg.value_type(y) || depth == 0 {
+        return false;
+    }
+    let c = |x: Value, y: Value, d: u32| phi_cong(func, x, y, uf, find, d - 1);
+    match (func.dfg.insts[di], func.dfg.insts[dj]) {
+        (
+            InstructionData::Unary { opcode: o1, arg: a1 },
+            InstructionData::Unary { opcode: o2, arg: a2 },
+        ) => o1 == o2 && c(a1, a2, depth),
+        (
+            InstructionData::UnaryImm {
+                opcode: o1,
+                imm: i1,
+            },
+            InstructionData::UnaryImm {
+                opcode: o2,
+                imm: i2,
+            },
+        ) => o1 == o2 && i1 == i2,
+        (
+            InstructionData::Binary {
+                opcode: o1,
+                args: s1,
+            },
+            InstructionData::Binary {
+                opcode: o2,
+                args: s2,
+            },
+        ) => {
+            o1 == o2
+                && ((c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
+                    || (phi_comm(o1) && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth)))
+        }
+        (
+            InstructionData::BinaryImm8 {
+                opcode: o1,
+                arg: a1,
+                imm: m1,
+            },
+            InstructionData::BinaryImm8 {
+                opcode: o2,
+                arg: a2,
+                imm: m2,
+            },
+        ) => o1 == o2 && m1 == m2 && c(a1, a2, depth),
+        (
+            InstructionData::IntCompare {
+                cond: c1,
+                args: s1,
+                ..
+            },
+            InstructionData::IntCompare {
+                cond: c2,
+                args: s2,
+                ..
+            },
+        ) => {
+            (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
+                || (c1 == c2.swap_args() && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth))
+        }
+        (
+            InstructionData::FloatCompare {
+                cond: c1,
+                args: s1,
+                ..
+            },
+            InstructionData::FloatCompare {
+                cond: c2,
+                args: s2,
+                ..
+            },
+        ) => {
+            (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
+                || (c1 == c2.swap_args() && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth))
+        }
+        (
+            InstructionData::Ternary {
+                opcode: o1,
+                args: s1,
+            },
+            InstructionData::Ternary {
+                opcode: o2,
+                args: s2,
+            },
+        ) => {
+            o1 == o2
+                && c(s1[0], s2[0], depth)
+                && c(s1[1], s2[1], depth)
+                && c(s1[2], s2[2], depth)
+        }
+        _ => false,
+    }
+}
+
+fn phi_comm(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Iadd
+            | Opcode::Imul
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Umin
+            | Opcode::Umax
+            | Opcode::Smin
+            | Opcode::Smax
+            | Opcode::Fadd
+            | Opcode::Fmul
+    )
 }
 
 /// `band v, 1` where `v` is already 0/1 (rustc's i1 normalization residue:
@@ -2515,6 +2791,133 @@ fn hoist_frozen(
     }
 }
 
+/// Per-block CSE: duplicate pure insts collapse to the earliest value
+/// computing them, so redundant chains — the vectorizer's separate
+/// c-load/c-store address streams, rustc's repeated index math — become
+/// one block arg where `sameargs` can merge the params. Keyed on
+/// (opcode, result type, resolved args, imm/cond) within each block:
+/// later insts alias the earliest equivalent def, which dominates them.
+pub fn lcse(func: &mut Function) -> usize {
+    #[derive(PartialEq, Eq, Hash)]
+    enum K {
+        U(Opcode, Type, Value),
+        UI(Opcode, Type, i64),
+        F32(Type, u32),
+        F64(Type, u64),
+        B(Opcode, Type, Value, Value),
+        B8(Opcode, Type, Value, u8),
+        IC(IntCC, Type, Value, Value),
+        FC(FloatCC, Type, Value, Value),
+        T(Opcode, Type, Value, Value, Value),
+    }
+    use cranelift_codegen::ir::condcodes::FloatCC;
+    // Commutative integer ops get sorted args; fadd/fmul are bitwise
+    // commutative too (same NaN semantics both ways).
+    fn comm(op: Opcode) -> bool {
+        matches!(
+            op,
+            Opcode::Iadd
+                | Opcode::Imul
+                | Opcode::Band
+                | Opcode::Bor
+                | Opcode::Bxor
+                | Opcode::Umin
+                | Opcode::Umax
+                | Opcode::Smin
+                | Opcode::Smax
+                | Opcode::Fadd
+                | Opcode::Fmul
+        )
+    }
+    let r = |func: &Function, v: Value| func.dfg.resolve_aliases(v);
+    let key = |func: &Function, i: Inst| -> Option<K> {
+        let t = func.dfg.value_type(func.dfg.first_result(i));
+        match func.dfg.insts[i] {
+            InstructionData::Unary { opcode, arg } => Some(K::U(opcode, t, r(func, arg))),
+            InstructionData::UnaryImm { opcode, imm } => Some(K::UI(opcode, t, imm.bits())),
+            InstructionData::UnaryIeee32 { opcode: _, imm } => Some(K::F32(t, imm.bits())),
+            InstructionData::UnaryIeee64 { opcode: _, imm } => Some(K::F64(t, imm.bits())),
+            InstructionData::Binary { opcode, args } => {
+                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
+                if comm(opcode) && a > b {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                Some(K::B(opcode, t, a, b))
+            }
+            InstructionData::BinaryImm8 { opcode, arg, imm } => {
+                Some(K::B8(opcode, t, r(func, arg), imm))
+            }
+            InstructionData::IntCompare {
+                opcode: _,
+                cond: mut cc,
+                args,
+            } => {
+                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
+                if a > b {
+                    std::mem::swap(&mut a, &mut b);
+                    cc = cc.swap_args();
+                }
+                Some(K::IC(cc, t, a, b))
+            }
+            InstructionData::FloatCompare {
+                opcode: _,
+                cond: mut cc,
+                args,
+            } => {
+                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
+                if a > b {
+                    std::mem::swap(&mut a, &mut b);
+                    cc = cc.swap_args();
+                }
+                Some(K::FC(cc, t, a, b))
+            }
+            InstructionData::Ternary { opcode, args } => Some(K::T(
+                opcode,
+                t,
+                r(func, args[0]),
+                r(func, args[1]),
+                r(func, args[2]),
+            )),
+            _ => None,
+        }
+    };
+    let mut n = 0;
+    let mut seen: FxHashMap<K, Value> = FxHashMap::default();
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        seen.clear();
+        let mut dead = Vec::new();
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            // Single-result insts whose result isn't already an alias.
+            if func.dfg.inst_results(i).len() != 1 {
+                continue;
+            }
+            let res = func.dfg.first_result(i);
+            if func.dfg.resolve_aliases(res) != res {
+                continue;
+            }
+            let Some(k) = key(func, i) else { continue };
+            match seen.entry(k) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    // Alias eagerly so later insts in this block key on the
+                    // resolved args (an iconst dedup must unblock the imul
+                    // dedup that feeds it); only the layout removal defers.
+                    func.dfg.clear_results(i);
+                    func.dfg.change_to_alias(res, *e.get());
+                    dead.push(i);
+                    n += 1;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(res);
+                }
+            }
+        }
+        for i in dead {
+            func.layout.remove_inst(i);
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2561,6 +2964,52 @@ mod tests {
             cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("sameargs produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Loop header params `p, q` fed `(x, x)` on entry and
+    /// `(iadd p, 8)`/`(iadd q, 8)` on the back edge are equal by
+    /// coinduction — literal-equality sameargs can't merge either without
+    /// the other, so phimerge's partition refinement collapses them.
+    #[test]
+    fn phimerge_inductive_param_pair() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let head = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for blk in [entry, head, exit] {
+            func.layout.append_block(blk);
+        }
+        let p = func.dfg.append_block_param(head, types::I64);
+        let q = func.dfg.append_block_param(head, types::I64);
+        let n = func.dfg.append_block_param(head, types::I64);
+
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().jump(head, &[x.into(), x.into(), x.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+        let eight = cur.ins().iconst(types::I64, 8);
+        let p2 = cur.ins().iadd(p, eight);
+        let q2 = cur.ins().iadd(q, eight);
+        let one = cur.ins().iconst(types::I64, 1);
+        let n2 = cur.ins().isub(n, one);
+        let z = cur.ins().iconst(types::I64, 0);
+        let done = cur.ins().icmp(IntCC::Equal, n2, z);
+        cur.ins().brif(done, exit, &[p2.into()], head, &[p2.into(), q2.into(), n2.into()]);
+
+        let r = func.dfg.append_block_param(exit, types::I64);
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[r]);
+
+        assert_eq!(phimerge(&mut func), 1);
+        assert_eq!(func.dfg.block_params(head).len(), 2);
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("phimerge produced invalid IR: {e}\n{}", func.display());
         }
     }
 }

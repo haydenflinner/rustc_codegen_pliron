@@ -1012,12 +1012,35 @@ pub fn lower_to_object(
                 panic!("deadrec broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Per-block CSE of duplicate pure insts so redundant chains
+        // (the vectorizer's separate load/store address streams,
+        // rustc's repeated index math) collapse to one value before
+        // sameargs merges the now-identical edge args.
+        if crate::pass_enabled("PLIRON_LCSE") && crate::bisect("lcse") {
+            let k = crate::clifpeep::lcse(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("lcse {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after lcse ====\n{}", clctx.func.display());
+            }
+            if verify_full
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("lcse broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         // Drop block params that receive the same value on every
         // incoming edge (and merge duplicate params): each surviving
         // param costs a regalloc parallel copy per conditional pred —
         // the `mov;b` edge-split blocks that dominate the block count.
         // Runs before coldedges so adapters inherit smaller arg lists.
         if crate::pass_enabled("PLIRON_SAMEARG") && crate::bisect("sameargs") {
+            if std::env::var_os("PLIRON_SA_DEBUG").is_some()
+                || std::env::var_os("PLIRON_PHI_DEBUG").is_some()
+            {
+                eprintln!("--- sameargs {n}");
+            }
             let k = crate::clifpeep::sameargs(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("sameargs {k} {n}");
