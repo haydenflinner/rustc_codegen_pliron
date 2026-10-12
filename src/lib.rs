@@ -29,6 +29,7 @@ mod brchain;
 mod builder;
 mod celim;
 mod clifpeep;
+mod commute;
 mod constload;
 mod consts;
 mod context;

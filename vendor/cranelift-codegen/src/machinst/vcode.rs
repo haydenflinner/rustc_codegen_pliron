@@ -769,6 +769,28 @@ impl<I: VCodeInst> VCode<I> {
         }
         final_order.extend(cold_blocks.clone());
 
+        // PLIRON: mark blocks that are targets of backward edges in the
+        // final emission order — loop headers — so their first instruction
+        // can be 16-byte aligned below (the back-edge jumps to the block's
+        // label, which binds after the padding, so the padding costs a few
+        // NOPs only on the fallthrough entry). `PLIRON_ALIGN=0` disables.
+        let align_loops = std::env::var("PLIRON_ALIGN").map_or(true, |v| v != "0");
+        let mut loop_head = vec![false; self.num_blocks()];
+        if align_loops {
+            let mut order_of = vec![usize::MAX; self.num_blocks()];
+            for (i, &b) in final_order.iter().enumerate() {
+                order_of[b.index()] = i;
+            }
+            for (pred, range) in self.block_succ_range.iter() {
+                for succ in &self.block_succs[range] {
+                    let s = succ.index();
+                    if s < self.num_blocks() && order_of[s] <= order_of[pred] {
+                        loop_head[s] = true;
+                    }
+                }
+            }
+        }
+
         // Compute/save info we need for the prologue: clobbers and
         // number of spillslots.
         //
@@ -825,14 +847,18 @@ impl<I: VCodeInst> VCode<I> {
         };
         let mut total_bb_padding = 0;
 
-        for &block in final_order.iter() {
+        for (oi, &block) in final_order.iter().enumerate() {
             trace!("emitting block {:?}", block);
 
             // Call the new block hook for state
             state.on_new_block();
 
             // Emit NOPs to align the block.
-            let new_offset = I::align_basic_block(buffer.cur_offset());
+            let mut new_offset = I::align_basic_block(buffer.cur_offset());
+            // PLIRON: loop headers get 16-byte alignment.
+            if loop_head[block.index()] {
+                new_offset = new_offset.max((buffer.cur_offset() + 15) & !15);
+            }
             while new_offset > buffer.cur_offset() {
                 // Pad with NOPs up to the aligned block offset.
                 let nop = I::gen_nop((new_offset - buffer.cur_offset()) as usize);
@@ -945,6 +971,28 @@ impl<I: VCodeInst> VCode<I> {
 
             let items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
+
+            // PLIRON: when this block unconditionally branches to the next
+            // emitted block and that block is a loop header, skip the jump
+            // and emit the header's alignment pad at this block's end
+            // instead — the block then falls through the NOPs to the aligned
+            // header rather than executing a trampoline branch over them
+            // (MachBuffer can only fold a jump into the following label when
+            // they're byte-adjacent, which pre-label padding breaks).
+            let skip_jmp = final_order
+                .get(oi + 1)
+                .filter(|nb| loop_head[nb.index()])
+                .and_then(|_nb| {
+                    let succs =
+                        &self.block_succs[self.block_succ_range.get(block.index())];
+                    let range = self.block_ranges.get(block.index());
+                    (succs.len() == 1
+                        && succs[0].index() == _nb.index()
+                        && range.end > range.start
+                        && self.insts[InsnIndex::new(range.end - 1).index()].is_term()
+                            == MachTerminator::Branch)
+                    .then(|| InsnIndex::new(range.end - 1))
+                });
 
             // Apply allocations eagerly: the peepholes below inspect
             // physical registers, and `preg_ops` must be fully
@@ -1185,6 +1233,13 @@ impl<I: VCodeInst> VCode<I> {
                             k += 1;
                             continue;
                         }
+                        // PLIRON: an unconditional jump to the following
+                        // loop header is dropped; the header's pad emitted
+                        // at this block's end carries the fallthrough.
+                        if Some(iix) == skip_jmp {
+                            k += 1;
+                            continue;
+                        }
                         if !self.debug_value_labels.is_empty() {
                             // If we need to produce debug info,
                             // record the offset of each instruction
@@ -1357,6 +1412,16 @@ impl<I: VCodeInst> VCode<I> {
             if cur_srcloc.is_some() {
                 buffer.end_srcloc();
                 cur_srcloc = None;
+            }
+
+            // PLIRON: for a skipped header jump, land the pad here — the
+            // block falls through it to the aligned header label.
+            if skip_jmp.is_some() {
+                while buffer.cur_offset() & 15 != 0 {
+                    let pad = 16 - (buffer.cur_offset() & 15) as usize;
+                    let nop = I::gen_nop(pad);
+                    nop.emit(&mut buffer, &self.emit_info, &mut Default::default());
+                }
             }
 
             // Insert padding, if configured, to stress the `MachBuffer`'s

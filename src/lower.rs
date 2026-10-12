@@ -407,6 +407,26 @@ pub fn lower_to_object(
                 panic!("jumpthread broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // rustc emits bounds-check `brif`s whose conditions become constants
+        // once jumpthread folds dominated tests; left in place they make a
+        // loop read as a long side-exit chain to unroll/punroll/loopvec.
+        // Fold early so the loop passes see the canonical shape; the late
+        // `PLIRON_CONSTBR=1` run below still catches constants exposed by
+        // later passes.
+        if st.jumpthread && crate::pass_enabled("PLIRON_CONSTBR") && crate::bisect("constbr") {
+            let k = crate::jumpthread::fold_const_branches(&mut clctx.func);
+            if k > 0 {
+                crate::jumpthread::remove_unreachable_blocks(&mut clctx.func);
+                if std::env::var_os("PLIRON_STATS").is_some() {
+                    eprintln!("constbr {k} {n}");
+                }
+            }
+            if std::env::var_os("PLIRON_VERIFY").is_some()
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
+            {
+                panic!("constbr broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+        }
         if st.jumpthread && crate::pass_enabled("PLIRON_UNROLL") && crate::bisect("unroll") {
             let k = crate::unroll::run(&mut clctx.func, &nonnull, &derived);
             // The skipped loop is now unreachable, and its trip count still
@@ -828,6 +848,19 @@ pub fn lower_to_object(
             let k = crate::clifpeep::sublea(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("sublea {k} {n}");
+            }
+        }
+        // `op multi_use, one_use` → `op one_use, multi_use` on commutative
+        // binops: the fewer-use operand takes two-address dst, so regalloc
+        // clobbers it in place instead of copying the live one (`movdqa`
+        // splat copies in matmul's `mulpd` loop).
+        if st.peep
+            && crate::pass_enabled("PLIRON_COMMUTE")
+            && crate::bisect("commute")
+        {
+            let k = crate::commute::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("commute {k} {n}");
             }
         }
         // Scalar min/max wider than a register (i128) has no Cranelift
