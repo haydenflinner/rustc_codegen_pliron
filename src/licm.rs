@@ -241,7 +241,11 @@ fn hoists(
                 if dbg {
                     eprintln!("licm?   scoped frozen, in-region hoist");
                 }
-                return safe;
+                // The tag is the dereferenceability proof: `frozen_args`
+                // only tags accesses bounded by the param's
+                // `dereferenceable` bytes, and a `&T` pointee is live for
+                // the whole clone — the hoist stays inside it.
+                return true;
             }
             r = rpar.get(&x).copied().filter(|&n| n != x);
         }
