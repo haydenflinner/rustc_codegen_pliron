@@ -1508,7 +1508,10 @@ fn finish_plan(
     // their extracts feed sibling stores that later packs reuse for free via
     // `Pack::Vec`, refunding the overhead once dce runs.
     let min_net = match &root {
-        Pack::Store2 { .. } => 1,
+        // Deep store trees get slack — their extracts feed sibling stores
+        // that later packs reuse for free via `Pack::Vec`, refunding the
+        // overhead once dce runs.
+        Pack::Store2 { .. } => 1 - kept.len() as i32,
         _ => 1,
     };
     if net < min_net {
