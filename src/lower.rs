@@ -2253,23 +2253,203 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
     }
 
     fn const_int(&self, v: Value) -> Option<i128> {
-        let ConstVal::Bits(b) = self.st.consts.get(&v)? else {
-            return if matches!(self.st.consts.get(&v)?, ConstVal::Zero) {
-                Some(0)
-            } else {
-                None
-            };
-        };
-        let w = match classify(self.ctx, v.get_type(self.ctx)) {
-            TyK::Int(w) => w,
-            _ => 64,
-        };
-        let b = *b;
+        let (b, w) = self.const_bits(v, 0)?;
         Some(if w < 128 && (b >> (w - 1)) & 1 == 1 {
             (b | (!0u128 << w)) as i128
         } else {
             b as i128
         })
+    }
+
+    /// The constant bit pattern and width of `v`, evaluating a bounded
+    /// chain of pure ops (`icmp`/`select`/casts/int binops) whose operands
+    /// are themselves constant — `7u128.max(1)` arrives as
+    /// `select(icmp ugt 7, 1, 7, 1)`, not a literal.
+    fn const_bits(&self, v: Value, depth: u32) -> Option<(u128, u32)> {
+        let width = |ty: TypeHandle| match classify(self.ctx, ty) {
+            TyK::Int(w) => w.min(128),
+            _ => 64,
+        };
+        let int_ty = |v: Value| width(v.get_type(self.ctx));
+        if let Some(cv) = self.st.consts.get(&v) {
+            let w = int_ty(v);
+            return match cv {
+                ConstVal::Bits(b) => Some((mask(*b, w), w)),
+                ConstVal::Zero | ConstVal::Undef => Some((0, w)),
+                _ => None,
+            };
+        }
+        if depth >= 8 {
+            return None;
+        }
+        let op = v.defining_op()?;
+        let ctx = self.ctx;
+        let id = Operation::get_opid(op, ctx);
+        if std::env::var_os("PLIRON_CONSTDBG").is_some() {
+            eprintln!("const_bits {}: {}", depth, id);
+        }
+        let ops: Vec<Value> = op.deref(ctx).operands().collect();
+        let bit = |v| self.const_bits(v, depth + 1);
+        let sext = |(b, w): (u128, u32)| -> i128 {
+            if w < 128 && (b >> (w - 1)) & 1 == 1 {
+                (b | (!0u128 << w)) as i128
+            } else {
+                b as i128
+            }
+        };
+        let r = if id == SelectOp::get_opid_static() {
+            let (c, _) = bit(ops[0])?;
+            bit(if c & 1 == 1 { ops[1] } else { ops[2] })?.0
+        } else if id == ICmpOp::get_opid_static() {
+            use ICmpPredicateAttr as P;
+            let pred = Operation::get_op::<ICmpOp>(op, ctx).unwrap().predicate(ctx);
+            let (a, wa) = bit(ops[0])?;
+            let (b, _) = bit(ops[1])?;
+            let (sa, sb) = (sext((a, wa)), sext((b, wa)));
+            let r = match pred {
+                P::EQ => a == b,
+                P::NE => a != b,
+                P::SLT => sa < sb,
+                P::SLE => sa <= sb,
+                P::SGT => sa > sb,
+                P::SGE => sa >= sb,
+                P::ULT => a < b,
+                P::ULE => a <= b,
+                P::UGT => a > b,
+                P::UGE => a >= b,
+            };
+            return Some((u128::from(r), 1));
+        } else if id == LoadOp::get_opid_static() && !self.st.volatile.contains(&op) {
+            // `const 7i128` operands codegen_ssa spills to an alloca come
+            // back as loads. Whenever the load executes before any store it
+            // reads uninitialized memory (UB), so the value is determined by
+            // whichever constant stores can run before it.
+            if !self.st.allocas.contains_key(&ops[0]) {
+                return None;
+            }
+            let lb = op.deref(ctx).get_parent_block()?;
+            let mut stores = Vec::new();
+            for u in ops[0].uses(ctx) {
+                let uop = u.user_op();
+                let uid = Operation::get_opid(uop, ctx);
+                // Loads read whatever the matching stores wrote; lifetime
+                // markers don't touch memory.
+                if uid == LoadOp::get_opid_static()
+                    || self
+                        .st
+                        .intrinsics
+                        .get(&uop)
+                        .is_some_and(|n| n.starts_with("llvm.lifetime"))
+                {
+                    continue;
+                }
+                if uid != StoreOp::get_opid_static()
+                    || u.find_index(ctx) != 1
+                    || self.st.volatile.contains(&uop)
+                {
+                    return None;
+                }
+                stores.push((uop, bit(uop.deref(ctx).get_operand(0))?));
+            }
+            let (pre, rest): (Vec<_>, Vec<_>) = stores.iter().partition(|(uop, _)| {
+                uop.deref(ctx).get_parent_block() == Some(lb)
+            });
+            // A store in the load's own block: the latest one before the load
+            // wins outright — nothing can write between them.
+            let lops: Vec<Ptr<Operation>> = lb.deref(ctx).iter(ctx).collect();
+            let lpos = lops.iter().position(|o| *o == op)?;
+            let local = pre
+                .iter()
+                .filter_map(|(uop, s)| {
+                    lops
+                        .iter()
+                        .position(|o| o == uop)
+                        .filter(|p| *p < lpos)
+                        .map(|p| (p, s))
+                })
+                .max_by_key(|(p, _)| *p);
+            if let Some((_, s)) = local {
+                return Some(*s);
+            }
+            // Stores in other blocks: paths reaching the load either ran one
+            // of these or read uninitialized (UB).
+            if rest.is_empty() {
+                return None;
+            }
+            if rest.iter().all(|(_, s)| *s == rest[0].1) {
+                rest[0].1 .0
+            } else if rest.len() == 2 {
+                let b1 = rest[0].0.deref(ctx).get_parent_block()?;
+                let b2 = rest[1].0.deref(ctx).get_parent_block()?;
+                if b1 == b2 {
+                    // Sequential stores in one block: the later wins.
+                    let bl: Vec<Ptr<Operation>> = b1.deref(ctx).iter(ctx).collect();
+                    let p1 = bl.iter().position(|o| *o == rest[0].0)?;
+                    let p2 = bl.iter().position(|o| *o == rest[1].0)?;
+                    if p1 > p2 { rest[0].1 .0 } else { rest[1].1 .0 }
+                } else {
+                    // `if c { v_t } else { v_f }` arms: each arm must be
+                    // single-entry from one shared `condbr`.
+                    let arm = |b: Ptr<BasicBlock>| {
+                        let us = b.uses(ctx);
+                        (us.len() == 1).then(|| (us[0].user_op(), us[0].find_index(ctx)))
+                    };
+                    let (t1, i1) = arm(b1)?;
+                    let (t2, i2) = arm(b2)?;
+                    if t1 != t2
+                        || i1 == i2
+                        || Operation::get_opid(t1, ctx) != CondBrOp::get_opid_static()
+                    {
+                        return None;
+                    }
+                    let (c, _) = bit(t1.deref(ctx).get_operand(0))?;
+                    if (i1 == 0) == (c & 1 == 1) {
+                        rest[0].1 .0
+                    } else {
+                        rest[1].1 .0
+                    }
+                }
+            } else {
+                return None;
+            }
+        } else {
+            let (a, wa) = bit(ops[0])?;
+            let (b, _) = if ops.len() > 1 { bit(ops[1])? } else { (0, wa) };
+            let (sa, sb) = (sext((a, wa)), sext((b, wa)));
+            let v = if id == AddOp::get_opid_static() {
+                a.wrapping_add(b)
+            } else if id == SubOp::get_opid_static() {
+                a.wrapping_sub(b)
+            } else if id == MulOp::get_opid_static() {
+                a.wrapping_mul(b)
+            } else if id == AndOp::get_opid_static() {
+                a & b
+            } else if id == OrOp::get_opid_static() {
+                a | b
+            } else if id == XorOp::get_opid_static() {
+                a ^ b
+            } else if id == ShlOp::get_opid_static() && b < wa as u128 {
+                a.wrapping_shl(b as u32)
+            } else if id == LShrOp::get_opid_static() && b < wa as u128 {
+                a.wrapping_shr(b as u32)
+            } else if id == AShrOp::get_opid_static() && b < wa as u128 {
+                sa.wrapping_shr(b as u32) as u128
+            } else if id == UDivOp::get_opid_static() && b != 0 {
+                a / b
+            } else if id == URemOp::get_opid_static() && b != 0 {
+                a % b
+            } else if id == SDivOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1)
+            {
+                (sa / sb) as u128
+            } else if id == SRemOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1)
+            {
+                (sa % sb) as u128
+            } else {
+                return None;
+            };
+            mask(v, wa)
+        };
+        Some((r, int_ty(v)))
     }
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
@@ -2541,6 +2721,135 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             .collect()
     }
 
+    /// Integer `div`/`rem` elementwise, with an i128 fast path: constant
+    /// unsigned divisors become limb magic-multiply sequences instead of
+    /// `__udivti3`/`__umodti3` libcalls (~15 insts vs ~100+ cycles).
+    fn int_divrem(
+        &mut self,
+        op: Ptr<Operation>,
+        opnds: Vec<Value>,
+        lib: &str,
+        unsigned: bool,
+        rem: bool,
+    ) {
+        let a = self.get(opnds[0]);
+        let b = self.get(opnds[1]);
+        let mut r = Vals::new();
+        for (x, y) in a.iter().zip(b.iter()) {
+            let v = if self.b.func.dfg.value_type(*x) == clt::I128 {
+                let d = unsigned
+                    .then(|| self.const_int(opnds[1]).map(|d| d as u128))
+                    .flatten();
+                d.and_then(|d| self.div_u128_const(*x, d, rem))
+                    .unwrap_or_else(|| {
+                        self.libcall(lib, &[clt::I128, clt::I128], &[clt::I128], &[*x, *y])[0]
+                    })
+            } else {
+                match (unsigned, rem) {
+                    (true, false) => self.b.ins().udiv(*x, *y),
+                    (true, true) => self.b.ins().urem(*x, *y),
+                    (false, false) => self.b.ins().sdiv(*x, *y),
+                    (false, true) => self.b.ins().srem(*x, *y),
+                }
+            };
+            r.push(v);
+        }
+        self.set(op, r);
+    }
+
+    /// Unsigned `x / d` or `x % d` for i128 `x` and constant `d`, expanded to
+    /// 64-bit limb multiplies (LLVM's `BuildUDIV`): powers of two shift,
+    /// otherwise `q = mulhi(x, M) >> s` with the `(x - q)/2 + q` fixup when
+    /// the magic needs a 129th bit. `None` asks the caller to libcall.
+    fn div_u128_const(&mut self, x: ir::Value, d: u128, rem: bool) -> Option<ir::Value> {
+        if d == 0 {
+            return None;
+        }
+        // Even divisors: pull the shared power of two out of x first.
+        let pre = d.trailing_zeros();
+        let d_odd = d >> pre;
+        let xs = if pre > 0 { self.ushr128_imm(x, pre) } else { x };
+        let mut q = xs;
+        if d_odd > 1 {
+            let (m, s, add) = magicu128(d_odd);
+            let (xl, xh) = self.b.ins().isplit(xs);
+            let ml = self.b.ins().iconst(clt::I64, m as u64 as i64);
+            let mh = self.b.ins().iconst(clt::I64, (m >> 64) as u64 as i64);
+            q = self.mulhi128(xl, xh, ml, mh);
+            if add {
+                // True magic is 2^128 + M; recover the missing term as
+                // q = ((x - mulhi(x, M)) >> 1) + mulhi(x, M).
+                let diff = self.b.ins().isub(xs, q);
+                let half = self.ushr128_imm(diff, 1);
+                q = self.b.ins().iadd(half, q);
+            }
+            if s > 0 {
+                q = self.ushr128_imm(q, s);
+            }
+        }
+        if !rem {
+            return Some(q);
+        }
+        let dc = self.iconst_any(clt::I128, d);
+        let qd = self.b.ins().imul(q, dc);
+        Some(self.b.ins().isub(x, qd))
+    }
+
+    /// High 128 bits of the 256-bit product of two u128s given as (lo, hi)
+    /// u64 limbs: `p3hi : (p1h + p2h + p3l + carries)` where carries bubble
+    /// up out of the bits-[127:64] partial sums.
+    fn mulhi128(
+        &mut self,
+        xl: ir::Value,
+        xh: ir::Value,
+        ml: ir::Value,
+        mh: ir::Value,
+    ) -> ir::Value {
+        let t0 = self.b.ins().umulhi(xl, ml);
+        let p1l = self.b.ins().imul(xl, mh);
+        let p1h = self.b.ins().umulhi(xl, mh);
+        let p2l = self.b.ins().imul(xh, ml);
+        let p2h = self.b.ins().umulhi(xh, ml);
+        let p3l = self.b.ins().imul(xh, mh);
+        let p3h = self.b.ins().umulhi(xh, mh);
+        // Bits [191:128] take carry from the [127:64] column.
+        let (s1, c1) = self.add_carry64(t0, p1l);
+        let (_, c2) = self.add_carry64(s1, p2l);
+        let cs = self.b.ins().iadd(c1, c2);
+        let (h1, c3) = self.add_carry64(p1h, p2h);
+        let (h2, c4) = self.add_carry64(h1, p3l);
+        let (h, c5) = self.add_carry64(h2, cs);
+        let c45 = self.b.ins().iadd(c4, c5);
+        let ch = self.b.ins().iadd(c3, c45);
+        let hi = self.b.ins().iadd(p3h, ch);
+        self.b.ins().iconcat(h, hi)
+    }
+
+    /// `(sum, carry)` for two u64s: `a + b` wraps iff `sum < a`.
+    fn add_carry64(&mut self, a: ir::Value, b: ir::Value) -> (ir::Value, ir::Value) {
+        let s = self.b.ins().iadd(a, b);
+        let c = self.b.ins().icmp(IntCC::UnsignedLessThan, s, a);
+        (s, self.b.ins().uextend(clt::I64, c))
+    }
+
+    /// `x >> imm` on i128 via its 64-bit limbs: the generic i128 shift
+    /// legalization treats constant amounts as variable and emits a
+    /// `tst`/`csel` dance, while limb shifts are 2-3 real insts.
+    fn ushr128_imm(&mut self, x: ir::Value, imm: u32) -> ir::Value {
+        debug_assert!(imm > 0 && imm < 128);
+        let (lo, hi) = self.b.ins().isplit(x);
+        let (lo, hi) = if imm >= 64 {
+            let lo = self.b.ins().ushr_imm(hi, (imm - 64) as i64);
+            (lo, self.b.ins().iconst(clt::I64, 0))
+        } else {
+            let l = self.b.ins().ushr_imm(lo, imm as i64);
+            let c = self.b.ins().ishl_imm(hi, (64 - imm) as i64);
+            let lo = self.b.ins().bor(l, c);
+            (lo, self.b.ins().ushr_imm(hi, imm as i64))
+        };
+        self.b.ins().iconcat(lo, hi)
+    }
+
     /// Cranelift can't lower 16-byte atomic ops on aarch64: route them through
     /// the `ldxp`/`stlxp` assembly stubs emitted by `lower_to_object`.
     fn needs_atomic_stub(&self, t: ClType) -> bool {
@@ -2732,23 +3041,6 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     .zip(b.iter())
                     .map(|(x, y)| self.b.ins().$m(*x, *y))
                     .collect();
-                self.set(op, r);
-            }};
-        }
-        macro_rules! divop {
-            ($m:ident, $lib:expr) => {{
-                let a = self.get(opnds[0]);
-                let b = self.get(opnds[1]);
-                let mut r = Vals::new();
-                for (x, y) in a.iter().zip(b.iter()) {
-                    if self.b.func.dfg.value_type(*x) == clt::I128 {
-                        r.push(
-                            self.libcall($lib, &[clt::I128, clt::I128], &[clt::I128], &[*x, *y])[0],
-                        );
-                    } else {
-                        r.push(self.b.ins().$m(*x, *y));
-                    }
-                }
                 self.set(op, r);
             }};
         }
@@ -3057,13 +3349,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         } else if is!(AShrOp) {
             binop!(sshr)
         } else if is!(UDivOp) {
-            divop!(udiv, "__udivti3")
+            self.int_divrem(op, opnds, "__udivti3", true, false)
         } else if is!(SDivOp) {
-            divop!(sdiv, "__divti3")
+            self.int_divrem(op, opnds, "__divti3", false, false)
         } else if is!(URemOp) {
-            divop!(urem, "__umodti3")
+            self.int_divrem(op, opnds, "__umodti3", true, true)
         } else if is!(SRemOp) {
-            divop!(srem, "__modti3")
+            self.int_divrem(op, opnds, "__modti3", false, true)
         } else if is!(FAddOp) {
             float_binop!(fadd, "__addtf3")
         } else if is!(FSubOp) {
@@ -4723,4 +5015,46 @@ fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
         }
     }
     v
+}
+
+/// `UnsignedDivisionByConstantInfo` for u128 (Hacker's Delight ch. 10,
+/// `magicu`): returns `(magic, post_shift, is_add)` where
+/// `x / d == mulhi128(x, magic) >> post_shift` for all `x < 2^128`, or with
+/// `is_add`, `q = (mulhi128(x, magic) + ((x - mulhi128(x, magic)) >> 1))`
+/// then `>> post_shift`. All arithmetic wraps mod 2^128 like a W-bit APInt.
+fn magicu128(d: u128) -> (u128, u32, bool) {
+    debug_assert!(d > 1);
+    let all_ones = u128::MAX;
+    let signed_min = 1u128 << 127;
+    let signed_max = signed_min - 1;
+    // NC: largest dividend with NC % d == d - 1.
+    let nc = all_ones - all_ones.wrapping_add(1).wrapping_sub(d) % d;
+    let mut p = 127u32;
+    let (mut q1, mut r1) = (signed_min / nc, signed_min % nc);
+    let (mut q2, mut r2) = (signed_max / d, signed_max % d);
+    let mut add = false;
+    loop {
+        p += 1;
+        if r1 >= nc - r1 {
+            q1 = (q1 << 1) | 1;
+            r1 = (r1 << 1).wrapping_sub(nc);
+        } else {
+            q1 <<= 1;
+            r1 <<= 1;
+        }
+        if r2 + 1 >= d - r2 {
+            add |= q2 >= signed_max;
+            q2 = (q2 << 1) | 1;
+            r2 = (r2 << 1).wrapping_add(1).wrapping_sub(d);
+        } else {
+            add |= q2 >= signed_min;
+            q2 <<= 1;
+            r2 = (r2 << 1).wrapping_add(1);
+        }
+        let delta = d - 1 - r2;
+        if !(p < 256 && (q1 < delta || (q1 == delta && r1 == 0))) {
+            break;
+        }
+    }
+    (q2.wrapping_add(1), p - 128 - u32::from(add), add)
 }
