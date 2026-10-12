@@ -1349,15 +1349,32 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             // keeps the bound arithmetic wrap-free.
             let d = info.adj.wrapping_sub(k);
             let g = if narrowable(c) {
-                let (bh, of) = if d >= 0 {
-                    let ka = iconst_masked(&mut pos, ity, d);
-                    pos.ins().usub_overflow(boundv, ka)
+                if let Some(bk) = iconst(pos.func, boundv) {
+                    // Constant bound: the adjust is a fold — the compare
+                    // alone remains (no overflow machinery to emit).
+                    let kb = bk as u64 & umax;
+                    let dd = d.unsigned_abs() & umax;
+                    let (bhv, ovf) = if d >= 0 {
+                        (kb.wrapping_sub(dd) & umax, kb < dd)
+                    } else {
+                        (kb.wrapping_add(dd) & umax, dd > umax - kb)
+                    };
+                    if ovf {
+                        flags.push(pos.ins().iconst(types::I8, 1));
+                    }
+                    let bh = iconst_masked(&mut pos, ity, bhv as i64);
+                    pos.ins().icmp(cc, bh, lenv)
                 } else {
-                    let ka = iconst_masked(&mut pos, ity, d.wrapping_neg());
-                    pos.ins().uadd_overflow(boundv, ka)
-                };
-                flags.push(of);
-                pos.ins().icmp(cc, bh, lenv)
+                    let (bh, of) = if d >= 0 {
+                        let ka = iconst_masked(&mut pos, ity, d);
+                        pos.ins().usub_overflow(boundv, ka)
+                    } else {
+                        let ka = iconst_masked(&mut pos, ity, d.wrapping_neg());
+                        pos.ins().uadd_overflow(boundv, ka)
+                    };
+                    flags.push(of);
+                    pos.ins().icmp(cc, bh, lenv)
+                }
             } else {
                 let ka = iconst_masked(&mut pos, wty, d);
                 let bh = pos.ins().isub(bw.unwrap(), ka);
@@ -1687,7 +1704,7 @@ fn unswitch_loop(
         }
     };
     let mut cond: Option<Value> = None;
-    'blk: for &b in &body {
+    'blk: for b in func.layout.blocks().filter(|b| body.contains(b)) {
         let Some(t) = func.layout.last_inst(b) else {
             continue;
         };
