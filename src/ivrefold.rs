@@ -1,20 +1,26 @@
-//! Loop-carried affine-param refolding (`PLIRON_IVREFOLD`).
+//! Loop-carried affine-param refolding (`PLIRON_IVREFOLD`, default on).
 //!
 //! A header param stepped by a constant on every back edge is an affine
 //! IV `p = base + r * iv` for any sibling affine param `iv` with a
 //! dividing step. Carrying `p` costs a regalloc parallel copy plus an
 //! `iadd` increment per back edge; LLVM instead keeps ONE scalar IV and
 //! indexes `base + iv*step` straight into the x64 amode. This pass does
-//! the same refold on final CLIF: uses of the carried param `p` become
-//! `bp + r * iv` (with `bp = p0 - r * i0` materialized on the entry
-//! edge, so `bp` is loop-invariant and needs no param), then `p`'s slot
-//! is stripped from every edge. The multi-pointer gather/scatter loops
-//! lose ~4 carried values and their per-iter copy chains this way.
+//! the same refold on final CLIF: load/store uses of the carried param
+//! `p` get a fresh `iadd bp, scaled(iv)` per use (folding into
+//! base+index*scale amodes — no address math materializes), other uses
+//! share `pv = bp + r * iv` at the header top (with `bp = p0 - r * i0`
+//! materialized on the entry edge, so `bp` is loop-invariant and needs
+//! no param), then `p`'s slot is stripped from every edge. When a
+//! positive-step sibling yields amode-scale ratios ({1,2,4,8}) it is
+//! chosen as anchor over the icmp counter.
 //!
 //! Ring arithmetic makes the refold exact: `(p0 - r*i0) + r*(i0 + t*s)`
 //! reduces to `p0 + r*t*s` mod 2^w with no nowrap requirement. Params
 //! whose back edge passes the param itself (`jump h(p)` — a wasted
-//! carried copy) are replaced by their entry value outright.
+//! carried copy) are replaced by their entry value outright. A
+//! constant-trip counter whose only remaining use is its own step +
+//! exit test is folded onto the anchor's step value and dies with
+//! deadrecs.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::EntityRef;
@@ -23,7 +29,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData, Opcode,
-    Value, ValueDef,
+    Value, ValueDef, condcodes::IntCC,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -124,6 +130,7 @@ fn refold_header(
     domtree: &DominatorTree,
     edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
     h: Block,
+    debug: bool,
 ) -> usize {
     let params = func.dfg.block_params(h).to_vec();
     if params.len() < 2 {
@@ -192,7 +199,10 @@ fn refold_header(
         steps.push(if ok { step } else { None });
     }
     // Anchor: an affine slot (nonzero step) whose param feeds an icmp
-    // — the loop counter — else the smallest |step|.
+    // — the loop counter — else the smallest |step|. When a positive-step
+    // sibling yields more drops whose ratio is an x64 amode scale
+    // ({1,2,4,8}), prefer it: those uses refold into `base + iv*scale`
+    // address modes (LLVM's shape) instead of a `bp - |r|*iv` product.
     let mut icmp_use = vec![false; params.len()];
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -206,6 +216,22 @@ fn refold_header(
             }
         }
     }
+    let good_drops = |c: usize, astep: i64| -> usize {
+        let cty = func.dfg.value_type(params[c]);
+        steps
+            .iter()
+            .enumerate()
+            .filter(|&(ix, st)| {
+                ix != c
+                    && st.is_some_and(|s| {
+                        s != 0
+                            && s % astep == 0
+                            && matches!(s / astep, 1 | 2 | 4 | 8)
+                            && func.dfg.value_type(params[ix]) == cty
+                    })
+            })
+            .count()
+    };
     let pick = |icmp_only: bool| -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         for (ix, &st) in steps.iter().enumerate() {
@@ -219,8 +245,30 @@ fn refold_header(
         }
         best.map(|(ix, _)| ix)
     };
-    let Some(ai) = pick(true).or_else(|| pick(false)) else {
+    let mut ai_opt: Option<(usize, usize, bool, u64)> = None;
+    for (ix, &st) in steps.iter().enumerate() {
+        let Some(s) = st else { continue };
+        if s == 0 {
+            continue;
+        }
+        let t = func.dfg.value_type(params[ix]);
+        if !t.is_int() || t.bits() > 64 {
+            continue;
+        }
+        let g = good_drops(ix, s);
+        if ai_opt
+            .is_none_or(|(_, g2, ic, b)| (g, icmp_use[ix], u64::MAX - s.unsigned_abs()) > (g2, ic, b))
+        {
+            ai_opt = Some((ix, g, icmp_use[ix], u64::MAX - s.unsigned_abs()));
+        }
+    }
+    let Some((ai_scaled, g, ..)) = ai_opt else {
         return 0;
+    };
+    let ai = if g > 0 {
+        ai_scaled
+    } else {
+        pick(true).or_else(|| pick(false)).unwrap_or(ai_scaled)
     };
     let astep = steps[ai].unwrap();
     let pa = params[ai];
@@ -258,6 +306,29 @@ fn refold_header(
         .iter()
         .map(|&(ix, r)| (ix, r, iconst(func, i0), iconst(func, entry_args[ix])))
         .collect();
+    // Load/store uses of a dropped param get a fresh `iadd bp, scaled(iv)`
+    // per use: single-use chains fold into base+index*scale amodes, so
+    // no address computation materializes at all. Non-address uses share
+    // the `pv` materialized at the top of `h` as before.
+    let drop_of: FxHashMap<Value, usize> = drops
+        .iter()
+        .map(|&(ix, _)| (params[ix], ix))
+        .collect();
+    let mut addr_uses: Vec<(Inst, usize)> = vec![];
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let a = match func.dfg.insts[i] {
+                InstructionData::Load { arg, .. }
+                | InstructionData::LoadNoOffset { arg, .. } => arg,
+                InstructionData::Store { args, .. }
+                | InstructionData::StoreNoOffset { args, .. } => args[1],
+                _ => continue,
+            };
+            if let Some(&ix) = drop_of.get(&func.dfg.resolve_aliases(a)) {
+                addr_uses.push((i, ix));
+            }
+        }
+    }
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut n = 0;
     // Phase 1: `bp` values on the entry edge (its pred dominates `h`
@@ -283,31 +354,57 @@ fn refold_header(
         }
     }
     // Phase 2: `pv = bp + r*iv` at the top of `h`, one cursor so the
-    // emitted chain stays in def-before-use order.
+    // emitted chain stays in def-before-use order. Per slot, `slot` keeps
+    // `(bp, scaled)` for the per-use amode chains below.
     let bp_zero: Vec<bool> = bpv.iter().map(|&bp| iconst(func, bp) == Some(0)).collect();
+    let mut slot: FxHashMap<usize, (Value, Value)> = FxHashMap::default();
     {
         let mut pos = FuncCursor::new(func).at_first_insertion_point(h);
         let mut scaled_cache: FxHashMap<i64, Value> = FxHashMap::default();
         for (j, &(ix, r, ..)) in drops_pre.iter().enumerate() {
             let bp = bpv[j];
+            let sh = if r == 1 {
+                pa
+            } else {
+                *scaled_cache
+                    .entry(r)
+                    .or_insert_with(|| emit_scaled(&mut pos, pa, r))
+            };
             let pv = if r == 1 {
                 pos.ins().iadd(bp, pa)
+            } else if bp_zero[j] {
+                sh
             } else {
-                let sh = *scaled_cache
-                    .entry(r)
-                    .or_insert_with(|| emit_scaled(&mut pos, pa, r));
-                if bp_zero[j] {
-                    sh
-                } else {
-                    pos.ins().iadd(bp, sh)
-                }
+                pos.ins().iadd(bp, sh)
             };
+            slot.insert(ix, (bp, sh));
             pmap.insert(params[ix], pv);
             n += 1;
         }
         for &ix in &idents {
             pmap.insert(params[ix], entry_args[ix]);
             n += 1;
+        }
+    }
+    // Per-use addressing: `iadd bp, scaled(iv)` right before each
+    // load/store; the single-use chain folds into a base+index*scale
+    // amode so no address math materializes.
+    for &(i, ix) in &addr_uses {
+        let &(bp, sh) = &slot[&ix];
+        let v_a = if iconst(func, bp) == Some(0) {
+            sh
+        } else {
+            FuncCursor::new(func).at_inst(i).ins().iadd(bp, sh)
+        };
+        match &mut func.dfg.insts[i] {
+            InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => {
+                *arg = v_a;
+            }
+            InstructionData::Store { args, .. }
+            | InstructionData::StoreNoOffset { args, .. } => {
+                args[1] = v_a;
+            }
+            _ => {}
         }
     }
     // Every value that resolves to a dropped param needs a map entry:
@@ -351,6 +448,134 @@ fn refold_header(
     }
     for &ix in &ixs {
         func.dfg.remove_block_param(params[ix]);
+    }
+    // Counter elimination: when a latch brif exits on
+    // `icmp ne/eq step(c), k` for a still-carried counter param `c`,
+    // retarget the compare to the anchor's own step value against
+    // `e_a + T*astep` (T = trip count). `c` then only feeds its own
+    // increment, so `deadrecs` drops the carried counter entirely.
+    let e_a = entry_args[ai];
+    for (cix, &cp) in params.iter().enumerate() {
+        if cix == ai || ixs.contains(&cix) || steps[cix].is_none_or(|s| s == 0) {
+            continue;
+        }
+        let sc = steps[cix].unwrap();
+        if func.dfg.value_type(cp) != aty {
+            continue;
+        }
+        let Some(ec) = iconst(func, entry_args[cix]) else {
+            continue;
+        };
+        for (j, &(bi, d)) in backs.iter().enumerate() {
+            let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[bi] else {
+                continue;
+            };
+            let cr = func.dfg.resolve_aliases(cond);
+            let ValueDef::Result(cinst, _) = func.dfg.value_def(cr) else {
+                continue;
+            };
+            let InstructionData::IntCompare {
+                cond: cc, args: cargs, ..
+            } = func.dfg.insts[cinst]
+            else {
+                continue;
+            };
+            // `h` on the then-arm needs `ne` (loop while step != k); on
+            // the else-arm `eq` (exit when step == k).
+            if !(d == 0 && cc == IntCC::NotEqual || d == 1 && cc == IntCC::Equal) {
+                continue;
+            }
+            let a_c = func.dfg.resolve_aliases(back_args[j][cix]);
+            let k = if func.dfg.resolve_aliases(cargs[0]) == a_c {
+                iconst(func, cargs[1])
+            } else if func.dfg.resolve_aliases(cargs[1]) == a_c {
+                iconst(func, cargs[0])
+            } else {
+                continue;
+            };
+            let Some(k) = k else { continue };
+            // Trip count must divide exactly in unwrapped arithmetic.
+            let num = k.wrapping_sub(ec);
+            if num % sc != 0 {
+                continue;
+            }
+            let t = num / sc;
+            // The new test exits at `t+1 ≡ T` under the anchor's step
+            // period; for it to coincide with the original's first exit,
+            // T must be the smallest positive solution in both moduli.
+            let pb = |s: i64| 64u32 - s.trailing_zeros().min(63);
+            if t < 1 || (t as u64 as u128) >= (1u128 << pb(astep).min(pb(sc))) {
+                continue;
+            }
+            // `c` must only feed its own back-edge step insts, and the
+            // icmp only the latch brif.
+            let step_insts: FxHashSet<Inst> = back_args
+                .iter()
+                .map(|a| func.dfg.resolve_aliases(a[cix]))
+                .filter_map(|a| match func.dfg.value_def(a) {
+                    ValueDef::Result(i, _) => Some(i),
+                    _ => None,
+                })
+                .collect();
+            let mut ok = true;
+            'scan: for b in func.layout.blocks() {
+                for i in func.layout.block_insts(b) {
+                    for &a in func.dfg.inst_args(i) {
+                        let r = func.dfg.resolve_aliases(a);
+                        if r == cp && !step_insts.contains(&i) {
+                            ok = false;
+                            break 'scan;
+                        }
+                        if r == cr && i != bi {
+                            ok = false;
+                            break 'scan;
+                        }
+                    }
+                    for bc in func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    ) {
+                        for a in bc.args(&func.dfg.value_lists) {
+                            if let BlockArg::Value(x) = a {
+                                let r = func.dfg.resolve_aliases(x);
+                                if r == cp || (r == cr && i != bi) {
+                                    ok = false;
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Bound: `e_a + T*astep` materialized once on the entry edge.
+            // The anchor's next value `pa + astep` is re-emitted right
+            // before the icmp: `cinst` may sit in an earlier block than
+            // the latch's own step inst.
+            let off = t.wrapping_mul(astep);
+            let (bound, a_a) = {
+                let mut pos = FuncCursor::new(func).at_inst(ei);
+                let bound = if off == 0 {
+                    e_a
+                } else {
+                    let kc = pos.ins().iconst(aty, off);
+                    pos.ins().iadd(e_a, kc)
+                };
+                let mut pos = FuncCursor::new(func).at_inst(cinst);
+                let kc = pos.ins().iconst(aty, astep);
+                (bound, pos.ins().iadd(pa, kc))
+            };
+            if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[cinst] {
+                *args = [a_a, bound];
+            }
+            if debug {
+                eprintln!("ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t})");
+            }
+            n += 1;
+            break;
+        }
     }
     n
 }
@@ -496,9 +721,10 @@ pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let edges = edges_to(func);
+    let debug = std::env::var_os("PLIRON_IVREFOLD_DEBUG").is_some();
     let mut n = 0;
     for h in func.layout.blocks().collect::<Vec<_>>() {
-        n += refold_header(func, &domtree, &edges, h);
+        n += refold_header(func, &domtree, &edges, h, debug);
     }
     if n > 0 {
         // The stripped increments (`p + step` edge args) are usually dead now.

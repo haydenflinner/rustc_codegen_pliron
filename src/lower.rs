@@ -971,15 +971,11 @@ pub fn lower_to_object(
         // change which param is the counter) and before sameargs so
         // newly-uniform params are still picked up.
         //
-        // OPT-IN: the transform is exact and produces LLVM-shaped code,
-        // but measurement (x64 Rosetta, gather/scatter/prefix) shows it
-        // loses today — regalloc2 allocates load results into the freed
-        // param registers, emitting save/restore copies that serialize
-        // the previously-independent cursor recurrences. Re-evaluate
-        // after regalloc changes; prefix does win (+25%).
-        if std::env::var("PLIRON_IVREFOLD").is_ok_and(|v| v == "1")
-            && crate::bisect("ivrefold")
-        {
+        // Load/store uses of dropped params get a fresh `bp + scaled(iv)`
+        // per use that folds into a base+index*scale amode, so no
+        // address math materializes; constant-trip counters fold their
+        // exit test onto the anchor's step value and die with deadrecs.
+        if crate::pass_enabled("PLIRON_IVREFOLD") && crate::bisect("ivrefold") {
             let k = crate::ivrefold::run(&mut clctx.func);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("ivrefold {k} {n}");
