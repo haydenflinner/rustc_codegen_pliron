@@ -23,36 +23,16 @@ extern crate rustc_target;
 
 mod abi;
 mod asm;
-mod bcheck;
-mod bittab;
-mod brchain;
 mod builder;
-mod celim;
-mod clifpeep;
-mod commute;
 mod constload;
 mod consts;
 mod context;
 mod domcheck;
-mod dse;
-mod edgefwd;
-mod edgespec;
 mod eh;
 mod hot;
-mod ifconv;
-mod indvars;
 mod inline;
 mod instcombine;
 mod intrinsic;
-mod ivrefold;
-mod jumpthread;
-mod licm;
-mod loadfwd;
-mod loopdel;
-mod loopidiom;
-mod looprot;
-mod loopvec;
-mod unroll;
 mod lower;
 mod memcpyopt;
 mod nnret;
@@ -61,23 +41,18 @@ mod nounwind;
 mod nowrite;
 mod objmerge;
 mod phisimp;
-mod punroll;
 mod retarg;
-mod revnorm;
 mod simd;
-mod slp;
-mod slotmerge;
 mod spec;
 mod sroa;
-mod switchmap;
-mod taildup;
-mod tailmerge;
-mod tailrec;
 mod type_of;
 mod types;
-mod unreach;
 mod wasm;
 mod xcgu;
+
+// CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
+// glob re-export keeps `crate::<pass>` paths working unchanged.
+pub use pliron_clif_opt::*;
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -289,10 +264,6 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
 /// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
 pub(crate) fn obj_sym(n: &str) -> &str {
     n.strip_prefix('\u{1}').unwrap_or(n)
-}
-
-pub(crate) fn pass_enabled(var: &str) -> bool {
-    std::env::var(var).map_or(true, |v| v != "0")
 }
 
 /// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass

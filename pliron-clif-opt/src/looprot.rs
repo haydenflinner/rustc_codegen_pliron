@@ -11,7 +11,7 @@ use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
 const MAX_ROTATIONS: usize = 256;
@@ -355,7 +355,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
 }
 
 /// Number of times `v` is used as an operand (inst args + branch args).
-pub(crate) fn uses(func: &Function, v: Value) -> usize {
+pub fn uses(func: &Function, v: Value) -> usize {
     let v = func.dfg.resolve_aliases(v);
     func.layout
         .blocks()

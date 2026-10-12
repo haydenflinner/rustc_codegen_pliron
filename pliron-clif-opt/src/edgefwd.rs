@@ -26,7 +26,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, TrapCode, Value,
     ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::{pure_op, remove_unreachable_blocks};
 

@@ -14,7 +14,7 @@ use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_ENTRIES: usize = 64;
 const MAX_ITERS: usize = 32;
@@ -30,19 +30,19 @@ enum Fwd {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Root {
+pub enum Root {
     V(Value),
     S(StackSlot),
 }
 
-pub(crate) type Loc = (Root, i64, Type);
+pub type Loc = (Root, i64, Type);
 type Avail = FxHashMap<Loc, Value>;
 
 type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 
 /// `cur` is inside region `target` (or is it): regions nest through
 /// `region_parent` — same walk licm does for scoped loads.
-pub(crate) fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) -> bool {
+pub fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) -> bool {
     let mut r = Some(cur);
     while let Some(x) = r {
         if x == target {
@@ -57,7 +57,7 @@ pub(crate) fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Re
 /// same argument (or the param itself — a loop-carried passthrough, like
 /// `partition`'s `pivot` threaded through the scan loop). Such a param is
 /// that value for analysis purposes. Maps param → that value.
-pub(crate) fn param_src(func: &Function) -> FxHashMap<Value, Value> {
+pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
     let mut src: FxHashMap<Value, Option<Value>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -103,7 +103,7 @@ pub(crate) fn param_src(func: &Function) -> FxHashMap<Value, Value> {
 /// Chase `param_src` links (plus value aliases) to the value `v` provably
 /// always equals. Bounded: param chains are short, and cycles can't occur
 /// in valid SSA — a param can only feed blocks it dominates.
-pub(crate) fn psrc(
+pub fn psrc(
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
     func: &Function,
@@ -144,7 +144,7 @@ fn fwd_arg(func: &Function, i: Inst, mut j: usize) -> Option<(Block, usize)> {
     None
 }
 
-pub(crate) fn root(
+pub fn root(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
@@ -210,13 +210,13 @@ pub(crate) fn root(
     (Root::V(v), off)
 }
 
-pub(crate) fn notrap(func: &Function, i: Inst) -> bool {
+pub fn notrap(func: &Function, i: Inst) -> bool {
     func.dfg.insts[i].memflags().is_some()
         && func.dfg.insts[i].memflags_trap_code(&func.dfg).is_none()
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite.
-pub(crate) fn kill(
+pub fn kill(
     av: &mut Avail,
     r: Root,
     o: i64,
@@ -257,7 +257,7 @@ pub(crate) fn kill(
 /// A direct call to a function that writes no memory before returning
 /// normally; across `try_call` it must not write at all unless `eh`, where
 /// [`unwind_edge`] clears the exception edges instead (nowrite.rs).
-pub(crate) fn write_free(
+pub fn write_free(
     func: &Function,
     i: Inst,
     nw: &FxHashMap<FuncRef, bool>,
@@ -300,7 +300,7 @@ fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bo
 /// back to the same root. Call args are never benign: the callee reads
 /// the pointee and may stash the pointer. Anything else lets the address
 /// reach memory analysis can't see.
-pub(crate) fn isolated(
+pub fn isolated(
     func: &Function,
     noalias: &FxHashSet<Value>,
     ps: &FxHashMap<Value, Value>,
@@ -316,7 +316,7 @@ pub(crate) fn isolated(
 /// isolated for the duration of a loop when none of its escape blocks can
 /// reach the header: the pointer can't have leaked before the first
 /// iteration nor during any iteration.
-pub(crate) fn isolated_escapes(
+pub fn isolated_escapes(
     func: &Function,
     noalias: &FxHashSet<Value>,
     ps: &FxHashMap<Value, Value>,

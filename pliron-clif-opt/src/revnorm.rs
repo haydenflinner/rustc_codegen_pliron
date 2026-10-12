@@ -28,11 +28,11 @@ use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loopidiom::{gather, iconst, outv, param_kinds, Param};
 
-pub(crate) fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();

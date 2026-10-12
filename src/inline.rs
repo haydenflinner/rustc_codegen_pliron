@@ -29,7 +29,7 @@ use pliron_llvm::ops::{
     UnreachableOp,
 };
 use pliron_llvm::types::FuncType;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::{ConstVal, State, leaf_arg};
 use crate::lower::has_body;
@@ -415,7 +415,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State<'_>) {
 
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
 fn post_order(ctx: &Context, st: &State<'_>) -> Vec<String> {
-    let mut seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut out = Vec::new();
     for root in st.funcs.keys() {
         if !has_body(ctx, st.funcs[root].op) || !seen.insert(root.clone()) {

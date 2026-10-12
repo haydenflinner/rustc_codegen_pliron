@@ -29,7 +29,7 @@ use pliron_llvm::ops::{
     InlineAsmOp, ReturnOp, StoreOp,
 };
 use pliron_llvm::types::PointerType;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::State;
 use crate::inline::{blocks, direct_callee, ops};

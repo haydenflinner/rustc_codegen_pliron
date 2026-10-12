@@ -18,7 +18,7 @@ use cranelift_codegen::ir::{
     ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 
@@ -35,7 +35,7 @@ macro_rules! why {
     }};
 }
 
-pub(crate) fn iconst(func: &Function, v: Value) -> Option<i64> {
+pub fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
     match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => match func.dfg.insts[i] {
@@ -49,7 +49,7 @@ pub(crate) fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
-pub(crate) fn def_block(func: &Function, v: Value) -> Option<Block> {
+pub fn def_block(func: &Function, v: Value) -> Option<Block> {
     match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -59,18 +59,18 @@ pub(crate) fn def_block(func: &Function, v: Value) -> Option<Block> {
 
 /// One destination of `inst`: its index in the destination list and target.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Edge {
+pub struct Edge {
     pub(crate) inst: Inst,
     pub(crate) slot: usize,
 }
 
-pub(crate) fn edge_dest(func: &Function, e: Edge) -> Block {
+pub fn edge_dest(func: &Function, e: Edge) -> Block {
     func.dfg.insts[e.inst]
         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[e.slot]
         .block(&func.dfg.value_lists)
 }
 
-pub(crate) fn edge_args(func: &Function, e: Edge) -> Vec<Value> {
+pub fn edge_args(func: &Function, e: Edge) -> Vec<Value> {
     func.dfg.insts[e.inst]
         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[e.slot]
         .args(&func.dfg.value_lists)
@@ -84,7 +84,7 @@ pub(crate) fn edge_args(func: &Function, e: Edge) -> Vec<Value> {
 
 /// `v` as `base + lin` where `lin` is `iv*K`, `iv<<log2K`, or `iv` (K = 1):
 /// (base, K). `None` for the bare-param form handled by the caller.
-pub(crate) fn scaled_addr(func: &Function, iv: Value, addr: Value) -> Option<(Value, i64)> {
+pub fn scaled_addr(func: &Function, iv: Value, addr: Value) -> Option<(Value, i64)> {
     let mut v = func.dfg.resolve_aliases(addr);
     // Tolerate a pointer-width uextend around the sum.
     for _ in 0..2 {
@@ -118,7 +118,7 @@ pub(crate) fn scaled_addr(func: &Function, iv: Value, addr: Value) -> Option<(Va
 }
 
 /// `v` as `iv*K`: `imul(iv, K)`, `ishl(iv, log2K)`, or bare `iv` (K = 1).
-pub(crate) fn scaled(func: &Function, iv: Value, v: Value) -> Option<i64> {
+pub fn scaled(func: &Function, iv: Value, v: Value) -> Option<i64> {
     let mut v = func.dfg.resolve_aliases(v);
     for _ in 0..2 {
         let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
@@ -161,7 +161,7 @@ pub(crate) fn scaled(func: &Function, iv: Value, v: Value) -> Option<i64> {
     }
 }
 
-pub(crate) struct Info {
+pub struct Info {
     pub(crate) h: Block,
     pub(crate) body: FxHashSet<Block>,
     /// The one edge into `h` from outside and its arguments.
@@ -174,7 +174,7 @@ pub(crate) struct Info {
     pub(crate) latches: Vec<Edge>,
 }
 
-pub(crate) fn gather(
+pub fn gather(
     func: &Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
@@ -252,7 +252,7 @@ pub(crate) fn gather(
 /// All loops ordered deepest-first (stable within a level). Passes whose
 /// `take(MAX_LOOPS)` budget would otherwise be spent on outer loops — which
 /// they can't transform — should iterate this so inner loops win the budget.
-pub(crate) fn deepest_first(la: &LoopAnalysis) -> Vec<Loop> {
+pub fn deepest_first(la: &LoopAnalysis) -> Vec<Loop> {
     let mut v: Vec<Loop> = la.loops().collect();
     v.sort_by_cached_key(|&lp| {
         let mut d = 0;
@@ -267,7 +267,7 @@ pub(crate) fn deepest_first(la: &LoopAnalysis) -> Vec<Loop> {
 }
 
 /// `store`/`istore8`/`istore16`/`istore32` details: (value, addr, size).
-pub(crate) fn store_parts(func: &Function, i: Inst) -> Option<(Value, Value, i64)> {
+pub fn store_parts(func: &Function, i: Inst) -> Option<(Value, Value, i64)> {
     match func.dfg.insts[i] {
         InstructionData::Store {
             opcode,
@@ -316,7 +316,7 @@ fn fill_byte(func: &Function, v: Value) -> Option<Option<Value>> {
 }
 
 /// Which libc call and the expressions for its arguments.
-pub(crate) struct Plan {
+pub struct Plan {
     /// The entry edge to redirect through the check block.
     entry: Edge,
     h: Block,
@@ -332,13 +332,13 @@ pub(crate) struct Plan {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Fill {
+pub enum Fill {
     C(i64),
     V(Value),
 }
 
 /// A guard predicate, emitted as an `i8` condition in the check block.
-pub(crate) enum Pred {
+pub enum Pred {
     Cmp(IntCC, Ins, Ins),
     /// `x & (size-1) == 0` — divisibility of a byte distance.
     Aligned(Ins, i64),
@@ -348,7 +348,7 @@ pub(crate) enum Pred {
 
 /// A tiny expression DSL emitted into the check/call blocks.
 #[derive(Clone, PartialEq)]
-pub(crate) enum Ins {
+pub enum Ins {
     Val(Value),
     K(i64),
     Add(Box<Ins>, Box<Ins>),
@@ -362,7 +362,7 @@ pub(crate) enum Ins {
 /// `e` evaluates to a known constant (constants and `iconst` values folded
 /// through the tree). `None` on any non-constant input or `Div` by zero —
 /// the ops here all wrap like the emitted code does.
-pub(crate) fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
+pub fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
     Some(match e {
         Ins::K(k) => *k,
         Ins::Val(v) => iconst(func, *v)?,
@@ -392,7 +392,7 @@ fn cmp_cc(cc: IntCC, x: i64, y: i64) -> bool {
     }
 }
 
-pub(crate) fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
+pub fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
     // Cheap folds for shapes stream/address exprs produce (e.g. `iv0=0`
     // turns `base + iv0*K` into `base + 0*K`).
     match e {
@@ -470,7 +470,7 @@ pub(crate) fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
 /// The analysis result for one loop: how the store address advances (`iv`,
 /// its positive `step`, the entry value, the per-element multiplier `k`),
 /// the exit comparison, and which side of the `brif` stays in the loop.
-pub(crate) struct Count {
+pub struct Count {
     /// Header param index of the induction variable.
     pub(crate) iv: Value,
     pub(crate) iv0: Value,
@@ -494,13 +494,13 @@ pub(crate) struct Count {
 /// Per-param: constant step per back edge (`Some`) or effectively invariant
 /// (`Inv`, re-passed unchanged on every latch).
 #[derive(Clone, Copy)]
-pub(crate) enum Param {
+pub enum Param {
     Step(i64),
     Inv,
     Other,
 }
 
-pub(crate) fn param_kinds(func: &Function, info: &Info) -> Vec<Param> {
+pub fn param_kinds(func: &Function, info: &Info) -> Vec<Param> {
     let h = info.h;
     let params = func.dfg.block_params(h).to_vec();
     params
@@ -568,7 +568,7 @@ pub(crate) fn param_kinds(func: &Function, info: &Info) -> Vec<Param> {
 }
 
 /// `v` resolves to header param `idx` or to `idx`'s back-edge value `param+step`.
-pub(crate) fn iv_side(func: &Function, info: &Info, kinds: &[Param], v: Value) -> Option<(usize, bool)> {
+pub fn iv_side(func: &Function, info: &Info, kinds: &[Param], v: Value) -> Option<(usize, bool)> {
     let v = func.dfg.resolve_aliases(v);
     let params = func.dfg.block_params(info.h).to_vec();
     for (i, &p) in params.iter().enumerate() {
@@ -595,7 +595,7 @@ pub(crate) fn iv_side(func: &Function, info: &Info, kinds: &[Param], v: Value) -
 
 /// Outside-the-loop view of `v`: invariant defs pass through; an effectively
 /// invariant header param reads as its entry value.
-pub(crate) fn outv(func: &Function, info: &Info, kinds: &[Param], v: Value) -> Option<Value> {
+pub fn outv(func: &Function, info: &Info, kinds: &[Param], v: Value) -> Option<Value> {
     let v = func.dfg.resolve_aliases(v);
     if let ValueDef::Param(b, i) = func.dfg.value_def(v)
         && b == info.h
@@ -613,7 +613,7 @@ pub(crate) fn outv(func: &Function, info: &Info, kinds: &[Param], v: Value) -> O
 
 /// Match the exit test: a `brif` on `icmp cc x y` where one side tracks an
 /// iv param and the other is loop-invariant. Returns the count model.
-pub(crate) fn count(
+pub fn count(
     func: &Function,
     dt: &DominatorTree,
     info: &Info,
@@ -687,7 +687,7 @@ pub(crate) fn count(
 /// "normal return" at `trap`, possibly through cold forwarding blocks. The
 /// exception edge unwinds out of the frame, so it can't resume the loop
 /// either. A few hops suffice; a cycle isn't a dead end.
-pub(crate) fn deadend(func: &Function, b: Block) -> bool {
+pub fn deadend(func: &Function, b: Block) -> bool {
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     let mut cur = b;
     loop {
@@ -772,7 +772,7 @@ fn iv_add_k(func: &Function, iv: Value, x: Value) -> Option<i64> {
 /// deadend block reached through a `brif` on the same `icmp` as the loop's
 /// stay test, going the failing way. Only sound pre-test (`!post_tested`):
 /// in-loop execution then implies the stay condition already held.
-pub(crate) fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
+pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
     if !deadend(func, edge_dest(func, e)) {
         return false;
     }
@@ -897,7 +897,7 @@ pub(crate) fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
 /// entry-side value `c - iv0 <u lim` plus `bound - 1 <=u c` so it can't
 /// wrap mid-loop. Returns `false` when the guard isn't an affine `ult`
 /// against an invariant limit; otherwise pushes the runtime predicates.
-pub(crate) fn guard_pred(
+pub fn guard_pred(
     func: &Function,
     info: &Info,
     kinds: &[Param],
@@ -1030,7 +1030,7 @@ pub(crate) fn guard_pred(
 }
 
 /// `base + iv0*K` as a plan expression.
-pub(crate) fn start_expr(iv0: Value, base: Value, k: i64) -> Ins {
+pub fn start_expr(iv0: Value, base: Value, k: i64) -> Ins {
     Ins::Add(
         Box::new(Ins::Val(base)),
         Box::new(Ins::Mul(
@@ -1042,7 +1042,7 @@ pub(crate) fn start_expr(iv0: Value, base: Value, k: i64) -> Ins {
 
 /// Element count for an index induction (`iv` counts, address = base+iv*K).
 /// `ne` needs `step == 1`; `ult` divides the saturated difference.
-pub(crate) fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
+pub fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
     let iv0 = || Ins::Val(cnt.iv0);
     let n = || Ins::Val(cnt.bound);
     match (cnt.stay, cnt.post_tested, cnt.on_next) {
@@ -1140,7 +1140,7 @@ pub(crate) fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
 }
 
 /// Pointer-form count for `p` stepping `size` bytes; len is already bytes.
-pub(crate) fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
+pub fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
     if size <= 0 || (size & (size - 1)) != 0 {
         return None;
     }
@@ -1215,7 +1215,7 @@ pub(crate) fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
 }
 
 /// The affine destination `dst0` + byte `len` + guards for one loop, or None.
-pub(crate) fn plan(
+pub fn plan(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     cfg: &ControlFlowGraph,
@@ -1488,7 +1488,7 @@ pub(crate) fn plan(
 }
 
 /// `memset`/`memcpy` as a `LibCall` import of `func`.
-pub(crate) fn libcall(
+pub fn libcall(
     func: &mut Function,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
     lc: LibCall,
@@ -1512,7 +1512,7 @@ pub(crate) fn libcall(
 
 /// Rewrite `p`: route the entry edge through a check block running `preds`,
 /// emit the libcall on success and keep the loop as the fallback path.
-pub(crate) fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa::TargetFrontendConfig) {
+pub fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa::TargetFrontendConfig) {
     let pblock = func.layout.inst_block(p.entry.inst).unwrap();
     let nb = func.dfg.make_block();
     func.layout.insert_block_after(nb, pblock);
@@ -1638,7 +1638,7 @@ struct DeadPlan {
 }
 
 /// How a stored value relates to the location's current contents.
-pub(crate) enum RmwDelta {
+pub enum RmwDelta {
     /// `st(ld)` — contents unchanged.
     Keep,
     /// `st(ld + d)` or `st(d + ld)`: final = `init + d * iters`.

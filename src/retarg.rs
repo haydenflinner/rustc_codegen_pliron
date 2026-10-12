@@ -18,7 +18,7 @@ use pliron::operation::Operation;
 use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::context::State;
 use crate::inline::{blocks, direct_callee, ops};

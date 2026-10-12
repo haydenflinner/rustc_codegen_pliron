@@ -41,7 +41,7 @@ use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 fn mask(v: u64, bits: u32) -> u64 {
     if bits >= 64 {

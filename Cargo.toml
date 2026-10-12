@@ -21,8 +21,11 @@ object = { version = "0.39", default-features = false, features = ["std", "read_
 smallvec = "1"
 egg = "0.10"
 waffle = "0.3.2"
+pliron-clif-opt = { path = "pliron-clif-opt" }
+rustc-hash = "2"
 
 [workspace]
+members = ["pliron-clif-opt"]
 exclude = ["vendor"]
 
 [profile.dev]

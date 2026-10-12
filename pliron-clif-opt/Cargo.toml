@@ -1,0 +1,16 @@
+[package]
+name = "pliron-clif-opt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+pliron = { path = "../vendor/pliron", default-features = false, features = ["std"] }
+cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std"] }
+cranelift-module = "0.135.5"
+target-lexicon = "0.13"
+rustc-hash = "2"
+smallvec = "1"
+
+[dev-dependencies]
+cranelift-frontend = "0.135.5"

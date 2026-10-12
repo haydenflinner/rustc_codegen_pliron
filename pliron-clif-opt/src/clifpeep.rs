@@ -23,7 +23,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
     ValueDef, types,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -42,7 +42,7 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 /// most 255), `band` masks, `ushr`, `urem`, and narrow `uload*`. Used to fold
 /// `icmp`s whose constant bound lies outside the operand's range
 /// (`x8 < 0x100000`); `bcheck` also calls it for bounded-index versioning.
-pub(crate) fn vmax(func: &Function, v: Value) -> u64 {
+pub fn vmax(func: &Function, v: Value) -> u64 {
     vmax_d(func, v, 8)
 }
 
@@ -253,7 +253,7 @@ fn widen_on() -> bool {
 }
 
 fn uloads(func: &mut Function) -> usize {
-    let mut users: rustc_data_structures::fx::FxHashMap<Value, Vec<Inst>> = Default::default();
+    let mut users: rustc_hash::FxHashMap<Value, Vec<Inst>> = Default::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             if let InstructionData::Unary {
@@ -318,7 +318,7 @@ fn uloads(func: &mut Function) -> usize {
 /// (licm/loadfwd/dse/bcheck/celim) match `Opcode::Load` and would lose
 /// sight of the load if it were rewritten sooner.
 pub fn uloads32(func: &mut Function) -> usize {
-    let mut users: rustc_data_structures::fx::FxHashMap<Value, Vec<Inst>> = Default::default();
+    let mut users: rustc_hash::FxHashMap<Value, Vec<Inst>> = Default::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             if let InstructionData::Unary {
@@ -1035,7 +1035,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
     use cranelift_codegen::dominator_tree::DominatorTree;
     use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::{Block, BlockCall};
-    use rustc_data_structures::fx::FxHashMap;
+    use rustc_hash::FxHashMap;
 
     enum Rw {
         /// Retarget edge `di` of `pinst` to a new block call.
@@ -1363,7 +1363,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
 /// edge args, and the per-edge copies disappear. Repeat to fixpoint: each
 /// fusion can expose the next block of the same chain.
 pub fn fusechains(func: &mut Function) -> usize {
-    use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
     let mut n = 0;
     loop {
         // Incoming-edge count per block (self-edges included).
@@ -3587,7 +3587,7 @@ pub fn wide_minmax(func: &mut Function) -> usize {
 /// hoists them out of loops, as LLVM's LICM/GVN do with the same facts.
 pub fn frozen_loads(
     func: &mut Function,
-    frozen: &rustc_data_structures::fx::FxHashMap<Value, u64>,
+    frozen: &rustc_hash::FxHashMap<Value, u64>,
 ) -> usize {
     let mut n = 0;
     let mut hoist = Vec::new();
@@ -3673,7 +3673,7 @@ fn hoist_frozen(
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let mut done: rustc_data_structures::fx::FxHashMap<
+    let mut done: rustc_hash::FxHashMap<
         (Opcode, cranelift_codegen::ir::Type, Value, i32),
         Value,
     > = Default::default();

@@ -6,7 +6,7 @@
 //! visible), or externally linked in its home CGU.
 
 use rustc_attr_ir::{InlineAttr, Linkage};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags as F;
 use rustc_middle::mono::{CodegenUnit, CollectionMode, MonoItem};
 use rustc_middle::ty::print::with_no_trimmed_paths;

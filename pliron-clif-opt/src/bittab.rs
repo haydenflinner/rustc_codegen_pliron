@@ -44,7 +44,7 @@ use cranelift_codegen::ir::types::{I64, I128, I8};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Internal test nodes allowed per tree (codegen cost bound).
 const MAX_NODES: usize = 8;

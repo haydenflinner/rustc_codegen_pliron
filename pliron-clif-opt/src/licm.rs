@@ -17,7 +17,7 @@ use cranelift_codegen::ir::{
     MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Loc, Root, in_region};
 

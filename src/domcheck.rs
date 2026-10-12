@@ -8,7 +8,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron::value::DefiningEntity;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 pub fn run(ctx: &Context, st: &State<'_>, pass: &str) {
     if std::env::var_os("PLIRON_CHECK_DOM").is_none() {

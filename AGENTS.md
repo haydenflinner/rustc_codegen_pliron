@@ -6,6 +6,11 @@
 rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift →
 cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
 
+- `pliron-clif-opt/` — workspace crate holding all Cranelift-IR passes
+  (`&mut Function` peepholes, loops, DSE, ...). Stable Rust, no
+  `rustc_private` — `cargo test -p pliron-clif-opt` runs pass unit tests
+  without building the dylib. Re-exported via `pub use pliron_clif_opt::*`
+  so `crate::<pass>` paths still work in `src/`.
 - `src/lower.rs` — object lowering; `internal_fns` selects `CallConv::Tail`
   for local functions
 - `src/eh/mod.rs` — `.eh_frame` / LSDA emission; Mach-O needs

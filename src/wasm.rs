@@ -29,7 +29,7 @@ use pliron::value::Value;
 use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
 use pliron_llvm::ops::*;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use waffle::entity::EntityRef;
 use waffle::{

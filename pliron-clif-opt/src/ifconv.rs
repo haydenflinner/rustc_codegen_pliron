@@ -22,7 +22,7 @@ use cranelift_codegen::ir::{
     ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::LoopAnalysis;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// One branch arm resolved against a candidate merge point.
 struct Arm {

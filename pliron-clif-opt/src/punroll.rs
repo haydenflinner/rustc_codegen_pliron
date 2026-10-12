@@ -52,7 +52,7 @@ use cranelift_codegen::ir::{
     StackSlot, Type, Value, ValueList, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_LOOPS: usize = 8;
 const MAX_CHAIN: usize = 4;

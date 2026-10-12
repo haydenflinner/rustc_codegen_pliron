@@ -7,7 +7,7 @@
 //! `unwrap_unchecked` and `match` `otherwise: unreachable` arms.
 
 use cranelift_codegen::ir::{Block, Function, InstructionData, Opcode, TrapCode};
-use rustc_data_structures::fx::FxHashSet;
+use rustc_hash::FxHashSet;
 
 /// The trap code `lower` uses for LLVM `unreachable`.
 pub const UNREACHABLE: u8 = 2;

@@ -25,7 +25,7 @@ use pliron_llvm::ops::{
     AllocaOp, BitcastOp, CallOp, FreezeOp, GetElementPtrOp, ReturnOp, SelectOp,
 };
 use pliron_llvm::types::PointerType;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_hash::FxHashSet;
 
 use crate::context::{ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};

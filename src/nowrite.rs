@@ -11,7 +11,7 @@ use pliron_llvm::ops::{
     AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp,
     FenceOp, GetElementPtrOp, InlineAsmOp, StoreOp, UnreachableOp, VAArgOp,
 };
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::context::State;
 use crate::inline::{blocks, direct_callee, ops};

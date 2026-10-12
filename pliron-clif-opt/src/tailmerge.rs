@@ -5,7 +5,7 @@
 //! identically (internal results renamed) are redirected to one copy.
 
 use cranelift_codegen::ir::{Block, Function, Opcode, Value};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 32;
 

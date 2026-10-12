@@ -12,7 +12,7 @@ use pliron::{
     value::Value,
 };
 use pliron_llvm::ops::{GetElementPtrOp, LoadOp};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::context::{ConstVal, State};
 use crate::lower::has_body;

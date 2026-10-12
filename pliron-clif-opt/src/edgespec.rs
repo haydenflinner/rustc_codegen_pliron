@@ -43,7 +43,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
     Opcode, Value, ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Bound on pure-op chains evaluated per value, and on dispatch blocks
 /// threaded per edge.
@@ -995,7 +995,7 @@ fn emit_args(cur: &mut FuncCursor, args: &[A]) -> Vec<BlockArg> {
 }
 
 /// Drop unreachable blocks (folds can orphan whole dispatch chains).
-pub(crate) fn sweep_blocks(func: &mut Function) {
+pub fn sweep_blocks(func: &mut Function) {
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     let dead: Vec<Block> = func
@@ -1013,7 +1013,7 @@ pub(crate) fn sweep_blocks(func: &mut Function) {
 
 /// Remove dead pure insts left by the rewrites (selects/extends/icmps whose
 /// results no longer feed anything).
-pub(crate) fn sweep_dead(func: &mut Function) {
+pub fn sweep_dead(func: &mut Function) {
     let mut uses: FxHashMap<Value, u32> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {

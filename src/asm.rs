@@ -15,7 +15,7 @@ use rustc_abi::{Align, Size};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::interpret::Scalar as ConstScalar;
 use rustc_middle::ty::layout::LayoutOf;

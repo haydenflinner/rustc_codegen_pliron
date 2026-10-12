@@ -8,7 +8,7 @@ use cranelift_module::Linkage;
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron_llvm::ops::CallOp;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_hash::FxHashSet;
 
 use crate::context::State;
 use crate::inline::{blocks, direct_callee, ops};

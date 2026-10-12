@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, TrapCode,
     Type, Value, ValueDef, types,
 };
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::unreach::UNREACHABLE;
 

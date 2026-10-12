@@ -12,7 +12,7 @@ use pliron::{
     operation::Operation,
     value::Value,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::State;
 use crate::inline::blocks;

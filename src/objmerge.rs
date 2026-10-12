@@ -10,7 +10,7 @@ use object::{
 };
 use rsasm::assembler::{Assembler, Options};
 use rsasm::lexer::Dialect;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 
 pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     let macho = out.format() == BinaryFormat::MachO;

@@ -26,7 +26,7 @@ use cranelift_codegen::ir::{
     InstructionData, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
@@ -4195,6 +4195,6 @@ mod tests {
             pointer_width: PointerWidth::U64,
             page_size_align_log2: 12,
         };
-        run(&mut func, "band1_cond", &FxHashSet::default(), tcfg, true, false);
+        run(&mut func, "band1_cond", &FxHashSet::default(), tcfg, true, false, true);
     }
 }

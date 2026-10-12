@@ -32,7 +32,7 @@ use cranelift_codegen::ir::{
     InstructionData, JumpTable, JumpTableData, Opcode, SigRef, StackSlot, Type, Value, ValueList,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::loopidiom::deepest_first;

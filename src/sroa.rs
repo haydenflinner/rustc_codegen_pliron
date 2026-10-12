@@ -23,7 +23,7 @@ use pliron_llvm::ops::{
     TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
 use pliron_llvm::types::ArrayType;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_hash::FxHashSet;
 
 use crate::context::{ConstVal, State, mask};
 use crate::lower::has_body;

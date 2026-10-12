@@ -25,7 +25,7 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, FuncRef, Function, Inst, InstructionData, Opcode, Value,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 

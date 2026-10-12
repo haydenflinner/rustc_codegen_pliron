@@ -19,7 +19,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
     Opcode, ProgramPoint, Type, Value, ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_BODY: usize = 12;
 
@@ -46,7 +46,7 @@ fn bits(func: &Function, v: Value) -> Option<u32> {
 }
 
 /// Constant value of `v`: from `env`, or an `iconst` anywhere in the function.
-pub(crate) fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
+pub fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     if let Some(&c) = env.get(&v) {
         return Some(c);
@@ -80,7 +80,7 @@ fn icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
 }
 
 /// Evaluate one pure body instruction of a merge block.
-pub(crate) fn eval(
+pub fn eval(
     func: &Function,
     env: &FxHashMap<Value, u64>,
     nz: &dyn Fn(Value) -> bool,
@@ -257,7 +257,7 @@ fn kfold(func: &Function, env: &FxHashMap<Value, u64>, kenv: &KBits, i: Inst) ->
     (z | o == full).then_some(o)
 }
 
-pub(crate) fn pure_op(func: &Function, inst: Inst) -> bool {
+pub fn pure_op(func: &Function, inst: Inst) -> bool {
     use Opcode::*;
     matches!(
         func.dfg.insts[inst].opcode(),
@@ -325,7 +325,7 @@ pub struct NonNull<'a> {
 }
 
 impl<'a> NonNull<'a> {
-    pub(crate) fn new(
+    pub fn new(
         func: &Function,
         loads: &'a FxHashSet<Value>,
         derived: &'a FxHashMap<Value, Value>,
@@ -376,7 +376,7 @@ impl<'a> NonNull<'a> {
         nn
     }
 
-    pub(crate) fn is(&self, func: &Function, v: Value) -> bool {
+    pub fn is(&self, func: &Function, v: Value) -> bool {
         // `select c, a, b` is non-null iff both arms are; every term on
         // the worklist must justify itself (a `!nonnull` load, a param
         // the fixpoint kept, a symbol/stack address, or an `inbounds`
@@ -2190,7 +2190,7 @@ fn remove_unused_notrap_loads(func: &mut Function) {
 
 /// Drop blocks not reachable from the entry, unless a reachable instruction
 /// uses a value they define (then nothing is removed). Returns blocks removed.
-pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> usize {
+pub fn remove_unreachable_blocks(func: &mut Function) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -2237,7 +2237,7 @@ pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> usize {
 }
 
 /// `brif c, B(args), B(args)` -> `jump B(args)`. Returns branches folded.
-pub(crate) fn fold_same_target_brifs(func: &mut Function) -> usize {
+pub fn fold_same_target_brifs(func: &mut Function) -> usize {
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for b in blocks {
@@ -2272,7 +2272,7 @@ fn nonzero_iconst(func: &Function, v: Value) -> bool {
 /// Can `inst` be deleted when none of its results are used? Always true for
 /// `notrap` loads; with `pure`, also for side-effect-free, non-trapping ops
 /// (plus `udiv`/`urem` by a nonzero constant).
-pub(crate) fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
+pub fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
     let data = &func.dfg.insts[inst];
     if let InstructionData::Load { flags, .. } = *data {
         return func.dfg.mem_flags[flags].notrap();
@@ -2294,7 +2294,7 @@ pub(crate) fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
 
 /// Delete instructions whose results are all unused (see `removable`),
 /// repeating until nothing changes. Returns the number deleted.
-pub(crate) fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
+pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
     let mut n = 0;
     loop {
         let mut used: FxHashSet<Value> = FxHashSet::default();

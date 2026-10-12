@@ -26,7 +26,7 @@ use cranelift_codegen::ir::{
     ArgumentPurpose, Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, StackSlot,
     Value, instructions::CallInfo,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
 pub fn run(

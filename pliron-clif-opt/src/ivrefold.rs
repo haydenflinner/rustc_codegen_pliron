@@ -31,7 +31,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData, Opcode,
     Value, ValueDef, condcodes::IntCC,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);

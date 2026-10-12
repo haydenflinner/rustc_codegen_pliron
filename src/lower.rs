@@ -28,7 +28,7 @@ use pliron_llvm::attributes::{
 };
 use pliron_llvm::ops::*;
 use rustc_codegen_ssa::common::AtomicRmwBinOp;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use crate::context::{ArgExt, ConstVal, Exts, State, mask};
@@ -114,8 +114,8 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 pub(crate) fn internal_fns(
     ctx: &Context,
     st: &State<'_>,
-) -> rustc_data_structures::fx::FxHashSet<String> {
-    use rustc_data_structures::fx::FxHashSet;
+) -> rustc_hash::FxHashSet<String> {
+    use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();
     }
@@ -146,8 +146,8 @@ pub(crate) fn internal_fns(
 pub(crate) fn address_taken(
     ctx: &Context,
     st: &State<'_>,
-) -> rustc_data_structures::fx::FxHashSet<String> {
-    use rustc_data_structures::fx::FxHashSet;
+) -> rustc_hash::FxHashSet<String> {
+    use rustc_hash::FxHashSet;
     let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
     for c in st.consts.values() {
         if let ConstVal::Agg(vs) = c {
@@ -298,7 +298,7 @@ pub fn lower_to_object(
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
-    let mut asm_stubs = rustc_data_structures::fx::FxHashSet::default();
+    let mut asm_stubs = rustc_hash::FxHashSet::default();
     let mut threaded = 0usize;
     let mut dead_params = 0usize;
     let mut dominated_folds = 0usize;
@@ -358,7 +358,7 @@ pub fn lower_to_object(
                 own_tail: internal.contains(n),
                 exn: None,
                 vars: FxHashMap::default(),
-                stubs: rustc_data_structures::fx::FxHashSet::default(),
+                stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
                 bool01: FxHashSet::default(),
                 derived: FxHashMap::default(),
@@ -1867,7 +1867,7 @@ struct FnLower<'a, 'b, 'tcx> {
     terminated: bool,
     cc: CallConv,
     /// Local functions using our internal ABI (`CallConv::Tail`).
-    internal: &'a rustc_data_structures::fx::FxHashSet<String>,
+    internal: &'a rustc_hash::FxHashSet<String>,
     /// This function's own convention is `CallConv::Tail` (it is internal), so
     /// `return_call`/`return_call_indirect` are legal in its body.
     own_tail: bool,
@@ -1875,7 +1875,7 @@ struct FnLower<'a, 'b, 'tcx> {
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
     /// 16-byte atomic helper stubs this function needs (aarch64 only).
-    stubs: rustc_data_structures::fx::FxHashSet<&'static str>,
+    stubs: rustc_hash::FxHashSet<&'static str>,
     /// Results of `!nonnull` memory loads.
     nonnull: FxHashSet<cranelift_codegen::ir::Value>,
     /// Results of `bool` loads known to be 0 or 1.
@@ -5043,8 +5043,8 @@ fn cold_blocks(
     ctx: &Context,
     st: &State<'_>,
     pblocks: &[Ptr<BasicBlock>],
-) -> rustc_data_structures::fx::FxHashSet<Ptr<BasicBlock>> {
-    let mut cold = rustc_data_structures::fx::FxHashSet::default();
+) -> rustc_hash::FxHashSet<Ptr<BasicBlock>> {
+    let mut cold = rustc_hash::FxHashSet::default();
     let term = |b: Ptr<BasicBlock>| b.deref(ctx).iter(ctx).last().unwrap();
     for &b in pblocks {
         let hit = b.deref(ctx).iter(ctx).any(|op| {

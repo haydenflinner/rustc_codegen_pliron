@@ -120,7 +120,7 @@ fn reachable_without(
     let Some(entry) = func.layout.entry_block() else {
         return Vec::new();
     };
-    let mut seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut work = vec![entry];
     let mut out = Vec::new();
     while let Some(b) = work.pop() {
@@ -148,7 +148,7 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
     }
 }
 
-type Env = rustc_data_structures::fx::FxHashMap<Value, u64>;
+type Env = rustc_hash::FxHashMap<Value, u64>;
 
 /// Live successors of `b`'s terminator: a `brif` on a known value (a constant, or a
 /// condition decided by a dominating test such as the loop's own `i < n`) has one.

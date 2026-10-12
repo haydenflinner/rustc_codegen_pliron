@@ -665,6 +665,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-clif-opt"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-module",
+ "pliron",
+ "rustc-hash",
+ "smallvec",
+ "target-lexicon",
+]
+
+[[package]]
 name = "pliron-derive"
 version = "0.19.0"
 dependencies = [
@@ -808,8 +821,10 @@ dependencies = [
  "gimli",
  "object",
  "pliron",
+ "pliron-clif-opt",
  "pliron-llvm",
  "rsasm",
+ "rustc-hash",
  "smallvec",
  "target-lexicon",
  "waffle",

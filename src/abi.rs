@@ -17,7 +17,7 @@ use pliron_llvm::ops::{
     AllocaOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
 };
 use pliron_llvm::types::{ArrayType, FuncType, StructLayout, StructType};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::{ArgExt, ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};

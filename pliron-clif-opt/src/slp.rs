@@ -31,7 +31,7 @@ use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
     ValueDef,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Max recursion depth when packing operand trees.
 const MAX_DEPTH: usize = 6;
