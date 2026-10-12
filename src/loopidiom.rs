@@ -509,10 +509,16 @@ pub(crate) fn param_kinds(func: &Function, info: &Info) -> Vec<Param> {
         .map(|(idx, &p)| {
             let mut same = true;
             let mut step: Option<i64> = Some(0);
+            // Latches that feed `p` back unchanged. Mixed with a stepping
+            // latch that's a conditional update (`if c { acc += 1 }`), not
+            // a counting iv — it must classify `Other` so the conditional-
+            // update reduction analysis sees it.
+            let mut passthru = 0usize;
             for e in &info.latches {
                 let v = *edge_args(func, *e).get(idx).unwrap_or(&p);
                 let v = func.dfg.resolve_aliases(v);
                 if v == p {
+                    passthru += 1;
                     continue;
                 }
                 same = false;
@@ -549,6 +555,8 @@ pub(crate) fn param_kinds(func: &Function, info: &Info) -> Vec<Param> {
             }
             if same {
                 Param::Inv
+            } else if passthru > 0 {
+                Param::Other
             } else {
                 match step {
                     Some(s) if s != 0 => Param::Step(s),

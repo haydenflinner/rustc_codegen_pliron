@@ -947,6 +947,9 @@ fn plan(
             continue;
         }
         let p = func.dfg.block_params(info.h)[j];
+        if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+            eprintln!("vec reduc?: param {j} analyzing, {} latches", info.latches.len());
+        }
         // The acc update as a lane op + delta: a whitelisted binary
         // (`acc ⊕ d`), a select-diamond min/max (`select(icmp cc acc d)`,
         // post-`ifconv`), or a conditional update (`select(c, acc ⊕ d, acc)`
@@ -995,6 +998,9 @@ fn plan(
         let Some((ui, op, delta, aux, mut cnd)) = upd else {
             // Every latch passed `acc` through (e.g. behind a block
             // param) — effectively invariant, just not recognized.
+            if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
+                eprintln!("vec reduc?: param {j} no update inst");
+            }
             other_ok = false;
             continue;
         };
@@ -1005,31 +1011,62 @@ fn plan(
                 other_ok = false;
                 continue;
             }
-            let gc = func.layout.last_inst(info.h).and_then(|t| {
-                let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
-                    return None;
-                };
-                let dests = func
-                    .dfg
-                    .insts[t]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
-                let [tb, eb] = dests[..] else { return None };
-                let tb = tb.block(&func.dfg.value_lists);
-                let eb = eb.block(&func.dfg.value_lists);
-                let gated = |a: Block, p: Block| {
-                    arms.iter().all(|&(s, pass)| {
-                        dt.block_dominates(if pass { p } else { a }, s)
-                    })
-                };
-                let gc = func.dfg.resolve_aliases(arg);
-                if gated(tb, eb) {
-                    Some((gc, false))
-                } else if gated(eb, tb) {
-                    Some((gc, true))
-                } else {
-                    None
-                }
-            });
+            let gc = func
+                .layout
+                .last_inst(info.h)
+                .and_then(|t| {
+                    let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
+                        return None;
+                    };
+                    let dests = func
+                        .dfg
+                        .insts[t]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                    let [tb, eb] = dests[..] else { return None };
+                    let tb = tb.block(&func.dfg.value_lists);
+                    let eb = eb.block(&func.dfg.value_lists);
+                    let gated = |a: Block, p: Block| {
+                        arms.iter().all(|&(s, pass)| {
+                            dt.block_dominates(if pass { p } else { a }, s)
+                        })
+                    };
+                    let gc = func.dfg.resolve_aliases(arg);
+                    if gated(tb, eb) {
+                        Some((gc, false))
+                    } else if gated(eb, tb) {
+                        Some((gc, true))
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    // The pass-through latch itself may be an arm of the
+                    // gating brif: `if c { acc ⊕= d }` in an interior block
+                    // ends `brif c, upd_path, h` — the pass edge is slot 1.
+                    // The brif's other dest must dominate every update
+                    // arm's latch, and there can be only one pass arm.
+                    if arms.iter().filter(|&&(_, pass)| pass).count() != 1 {
+                        return None;
+                    }
+                    let (i, _) = arms.iter().enumerate().find(|&(_, &(_, pass))| pass)?;
+                    let e = info.latches[i];
+                    let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
+                        return None;
+                    };
+                    let dests = func
+                        .dfg
+                        .insts[e.inst]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                    let [d0, d1] = dests[..] else { return None };
+                    let other = if e.slot == 0 { d1 } else { d0 }
+                        .block(&func.dfg.value_lists);
+                    // Pass on the true arm means the update fires when the
+                    // cond is false — the lane mask needs the inversion.
+                    let invert = e.slot == 0;
+                    arms.iter()
+                        .all(|&(s, pass)| pass || dt.block_dominates(other, s))
+                        .then(|| (func.dfg.resolve_aliases(arg), invert))
+                });
             let Some(gc) = gc else {
                 if std::env::var_os("PLIRON_VEC_DEBUG").is_some() {
                     eprintln!("vec reduc?: param {j} CFG diamond has no gating brif");

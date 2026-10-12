@@ -159,7 +159,8 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack
   echo "xpack ok" || exit 1
 if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
   rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack.o &&
-      "$llvmod" -d --no-show-raw-insn $out/xpack.o | grep -q sqrtpd || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
+      "$llvmod" -d --no-show-raw-insn $out/xpack.o > $out/xpack.dis &&
+      grep -q sqrtpd $out/xpack.dis || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
 fi
 # an inlined matmul's bounds-checked inner loop must version (bcheck) and
 # vectorize (loopvec) even though sibling loops crowd the pass budget and
@@ -167,10 +168,15 @@ fi
 rustc $BE --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec$exe && $out/loopvec$exe
 if [[ -x "$llvmod" ]]; then
   rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec.o
+  # File, not pipe: `grep -q` closing early would SIGPIPE llvm-objdump and
+  # pipefail would turn a match into a failure.
+  "$llvmod" -d --no-show-raw-insn $out/loopvec.o > $out/loopvec.dis
   if [[ "$(uname -m)" == x86_64 ]]; then
-      "$llvmod" -d --no-show-raw-insn $out/loopvec.o | grep -qE 'mulpd|addpd' || { echo "loopvec: no packed f64 emitted" >&2; exit 1; }
+      grep -qE 'mulpd|addpd' $out/loopvec.dis || { echo "loopvec: no packed f64 emitted" >&2; exit 1; }
+      grep -qE 'pcmpeqb' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
   else
-      "$llvmod" -d --no-show-raw-insn $out/loopvec.o | grep -qE 'fmla\.2d|fmul\.2d|fadd\.2d' || { echo "loopvec: no f64x2 emitted" >&2; exit 1; }
+      grep -qE 'fmla\.2d|fmul\.2d|fadd\.2d' $out/loopvec.dis || { echo "loopvec: no f64x2 emitted" >&2; exit 1; }
+      grep -qE 'cmeq\.16b' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
   fi
 fi
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
