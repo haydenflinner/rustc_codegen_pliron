@@ -5,13 +5,13 @@
 
 use std::sync::Arc;
 
+use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
     self, AbiParam, ArgumentPurpose, Block, FuncRef, GlobalValue, InstBuilder, MemFlagsData,
     Signature, StackSlotData, StackSlotKind, TrapCode, Type as ClType, types as clt,
 };
-use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
@@ -24,16 +24,14 @@ use pliron::op::{Op, OpId};
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
-use pliron_llvm::attributes::{
-    FCmpPredicateAttr, GepNoWrapFlags, ICmpPredicateAttr,
-};
+use pliron_llvm::attributes::{FCmpPredicateAttr, GepNoWrapFlags, ICmpPredicateAttr};
 use pliron_llvm::ops::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
-use crate::{address_taken, has_body};
 use crate::context::{ArgExt, ConstVal, Exts, State, mask};
 use crate::types::{TyK, classify, leaf_range, leaves, size_align, struct_offsets};
+use crate::{address_taken, has_body};
 
 type Vals = SmallVec<[ir::Value; 2]>;
 
@@ -112,10 +110,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// Local, non-variadic functions whose address never escapes and that are
 /// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
 /// 8 int + 8 float return registers instead of SysV's 2+2).
-pub(crate) fn internal_fns(
-    ctx: &Context,
-    st: &State,
-) -> rustc_hash::FxHashSet<String> {
+pub(crate) fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();
@@ -140,7 +135,6 @@ pub(crate) fn internal_fns(
         .map(|(n, _)| n.clone())
         .collect()
 }
-
 
 pub fn lower_to_object(
     unwind: bool,
@@ -244,9 +238,7 @@ pub fn lower_to_object(
     // defined by the allocator module) checked after every call; a "throw"
     // sets it and unwinds by early-return. Real SEH can still unwind through
     // our frames via `.pdata`/`.xdata` (see eh/mod.rs).
-    let eh_data = if unwind
-        && isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
-    {
+    let eh_data = if unwind && isa.triple().binary_format == target_lexicon::BinaryFormat::Coff {
         match ids.get("__pliron_eh") {
             Some(&Sym::D(id, _)) => Some(id),
             _ => Some(
@@ -493,11 +485,7 @@ pub fn lower_to_object(
         fn_flags: &fn_flags,
         region_parent: &st.region_parent,
     };
-    fn run_job(
-        j: &mut FnJob,
-        clctx: &mut cranelift_codegen::Context,
-        sh: &JobShared,
-    ) {
+    fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
         CUR_FN.with(|c| {
             let mut c = c.borrow_mut();
             c.clear();
@@ -515,55 +503,54 @@ pub fn lower_to_object(
         }
         let tpipe = std::time::Instant::now();
         'retry: loop {
-        {
-            let mut pipe = crate::pipeline::Pipe {
-                clctx,
-                isa: sh.isa,
-                fname: n,
-                func_id: j.id,
-                nonnull: &j.nonnull,
-                derived: &mut j.derived,
-                frozen: &j.frozen,
-                noalias: &j.noalias,
-                deref: &j.deref,
-                nowrite: &j.nowrite,
-                call_frozen: &j.call_frozen,
-                scoped: &j.scoped,
-                invariant: &j.invariant,
-                operand_frozen: &j.operand_frozen,
-                block_region: &j.block_region,
-                region_parent: sh.region_parent,
-                lifetimes: &j.lifetimes,
-                nocap: &j.nocap,
-                tcfg: sh.tcfg,
-                simd: sh.simd,
-                x64: sh.x64,
-                cmp64: sh.cmp64,
-                has_eh: sh.has_eh,
-                flags: sh.fn_flags,
-                dump: j.dump,
-                verify_full,
-                stats: &mut j.stats,
-            };
-            crate::pipeline::run_pipeline(&mut pipe);
-        }
-        if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
-            clctx.set_disasm(true);
-        }
-        if sh.verify_env
-            && let Err(e) =
-                cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
-        {
-            if !verify_full && let Some(snap) = &snapshot {
-                // Which pass broke it is unknown until the per-pass
-                // checks run — restore and re-run them.
-                clctx.func = snap.clone();
-                verify_full = true;
-                continue 'retry;
+            {
+                let mut pipe = crate::pipeline::Pipe {
+                    clctx,
+                    isa: sh.isa,
+                    fname: n,
+                    func_id: j.id,
+                    nonnull: &j.nonnull,
+                    derived: &mut j.derived,
+                    frozen: &j.frozen,
+                    noalias: &j.noalias,
+                    deref: &j.deref,
+                    nowrite: &j.nowrite,
+                    call_frozen: &j.call_frozen,
+                    scoped: &j.scoped,
+                    invariant: &j.invariant,
+                    operand_frozen: &j.operand_frozen,
+                    block_region: &j.block_region,
+                    region_parent: sh.region_parent,
+                    lifetimes: &j.lifetimes,
+                    nocap: &j.nocap,
+                    tcfg: sh.tcfg,
+                    simd: sh.simd,
+                    x64: sh.x64,
+                    cmp64: sh.cmp64,
+                    has_eh: sh.has_eh,
+                    flags: sh.fn_flags,
+                    dump: j.dump,
+                    verify_full,
+                    stats: &mut j.stats,
+                };
+                crate::pipeline::run_pipeline(&mut pipe);
             }
-            panic!("pipeline broke `{n}`: {e}\n{}", clctx.func.display());
-        }
-        break 'retry;
+            if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
+                clctx.set_disasm(true);
+            }
+            if sh.verify_env
+                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
+            {
+                if !verify_full && let Some(snap) = &snapshot {
+                    // Which pass broke it is unknown until the per-pass
+                    // checks run — restore and re-run them.
+                    clctx.func = snap.clone();
+                    verify_full = true;
+                    continue 'retry;
+                }
+                panic!("pipeline broke `{n}`: {e}\n{}", clctx.func.display());
+            }
+            break 'retry;
         }
         // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
         // per-function total for the tier-1 cache sizing question.
@@ -602,11 +589,9 @@ pub fn lower_to_object(
     let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
         1
     } else {
-        par.unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(1, |n| n.get())
-        })
-        .min(jobs.len().max(1))
-        .max(1)
+        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(jobs.len().max(1))
+            .max(1)
     };
     let jobs = if nthreads <= 1 {
         let mut wcl = cranelift_codegen::Context::new();
@@ -628,16 +613,13 @@ pub fn lower_to_object(
                         if i >= jobs.len() {
                             break;
                         }
-                        let mut j =
-                            jobs[i].lock().unwrap_or_else(|e| e.into_inner());
+                        let mut j = jobs[i].lock().unwrap_or_else(|e| e.into_inner());
                         run_job(&mut j, &mut wcl, shared);
                     }
                 });
             }
         });
-        jobs.into_iter()
-            .map(|m| m.into_inner().unwrap())
-            .collect()
+        jobs.into_iter().map(|m| m.into_inner().unwrap()).collect()
     };
 
     // Phase (C): apply compiled code to the object in the original
@@ -658,7 +640,11 @@ pub fn lower_to_object(
             {
                 sess.dcx().fatal(format!("function `{n}` too large: {e}"));
             }
-            panic!("cranelift rejected `{n}`: {:?}\n{}", j.err, j.func.display());
+            panic!(
+                "cranelift rejected `{n}`: {:?}\n{}",
+                j.err,
+                j.func.display()
+            );
         };
         if let Some(v) = &code.vcode {
             eprintln!("==== vcode {} ====\n{v}", j.name);
@@ -690,8 +676,7 @@ pub fn lower_to_object(
         eprintln!("pipeline {name}: {}", crate::config::config().describe());
     }
     if st.loadfwd && crate::env_set("PLIRON_STATS") {
-        let (forwarded, peeped, slot_dse) =
-            (stats.forwarded, stats.peeped, stats.slot_dse);
+        let (forwarded, peeped, slot_dse) = (stats.forwarded, stats.peeped, stats.slot_dse);
         eprintln!(
             "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
         );
@@ -855,7 +840,16 @@ pub fn lower_to_object(
 /// single section per name.
 fn emit_merged_custom_sections(
     obj: &mut object::write::Object<'_>,
-    globals: Vec<(String, Vec<u8>, u64, Vec<(u64, String, i64)>, bool, bool, String, Linkage)>,
+    globals: Vec<(
+        String,
+        Vec<u8>,
+        u64,
+        Vec<(u64, String, i64)>,
+        bool,
+        bool,
+        String,
+        Linkage,
+    )>,
 ) {
     use object::write::{Relocation, Symbol as WSymbol, SymbolSection};
     use object::{
@@ -1252,9 +1246,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             continue;
                         };
                         if crate::env_set("PLIRON_FROZEN_DEBUG") {
-                            eprintln!(
-                                "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}"
-                            );
+                            eprintln!("region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}");
                         }
                         self.noalias.insert(v);
                         self.deref.insert(v, (bytes, false));
@@ -1376,8 +1368,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .iter()
                 .map(|r| r.value_type)
                 .collect();
-            let rets: Vec<ir::Value> =
-                tys.into_iter().map(|t| self.iconst_any(t, 0)).collect();
+            let rets: Vec<ir::Value> = tys.into_iter().map(|t| self.iconst_any(t, 0)).collect();
             self.b.ins().return_(&rets);
         }
         self.b.seal_all_blocks();
@@ -1721,9 +1712,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 stores.push((uop, bit(uop.deref(ctx).get_operand(0))?));
             }
-            let (pre, rest): (Vec<_>, Vec<_>) = stores.iter().partition(|(uop, _)| {
-                uop.deref(ctx).get_parent_block() == Some(lb)
-            });
+            let (pre, rest): (Vec<_>, Vec<_>) = stores
+                .iter()
+                .partition(|(uop, _)| uop.deref(ctx).get_parent_block() == Some(lb));
             // A store in the load's own block: the latest one before the load
             // wins outright — nothing can write between them.
             let lops: Vec<Ptr<Operation>> = lb.deref(ctx).iter(ctx).collect();
@@ -1731,8 +1722,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let local = pre
                 .iter()
                 .filter_map(|(uop, s)| {
-                    lops
-                        .iter()
+                    lops.iter()
                         .position(|o| o == uop)
                         .filter(|p| *p < lpos)
                         .map(|p| (p, s))
@@ -1747,7 +1737,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 return None;
             }
             if rest.iter().all(|(_, s)| *s == rest[0].1) {
-                rest[0].1 .0
+                rest[0].1.0
             } else if rest.len() == 2 {
                 let b1 = rest[0].0.deref(ctx).get_parent_block()?;
                 let b2 = rest[1].0.deref(ctx).get_parent_block()?;
@@ -1756,7 +1746,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let bl: Vec<Ptr<Operation>> = b1.deref(ctx).iter(ctx).collect();
                     let p1 = bl.iter().position(|o| *o == rest[0].0)?;
                     let p2 = bl.iter().position(|o| *o == rest[1].0)?;
-                    if p1 > p2 { rest[0].1 .0 } else { rest[1].1 .0 }
+                    if p1 > p2 { rest[0].1.0 } else { rest[1].1.0 }
                 } else {
                     // `if c { v_t } else { v_f }` arms: each arm must be
                     // single-entry from one shared `condbr`.
@@ -1774,9 +1764,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                     let (c, _) = bit(t1.deref(ctx).get_operand(0))?;
                     if (i1 == 0) == (c & 1 == 1) {
-                        rest[0].1 .0
+                        rest[0].1.0
                     } else {
-                        rest[1].1 .0
+                        rest[1].1.0
                     }
                 }
             } else {
@@ -1811,11 +1801,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 a / b
             } else if id == URemOp::get_opid_static() && b != 0 {
                 a % b
-            } else if id == SDivOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1)
-            {
+            } else if id == SDivOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
                 (sa / sb) as u128
-            } else if id == SRemOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1)
-            {
+            } else if id == SRemOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
                 (sa % sb) as u128
             } else {
                 return None;
@@ -1927,7 +1915,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     lv.iter()
                         .map(|&(lo, lt)| {
                             let w = lt.bits() as u64;
-                            let m = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+                            let m = if w >= 128 {
+                                u128::MAX
+                            } else {
+                                (1u128 << w) - 1
+                            };
                             self.iconst_any(lt, bits >> (lo * 8) & m)
                         })
                         .collect()
@@ -1994,10 +1986,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let t = format!("__pliron_va8.{}", crate::obj_sym(sym));
         if !self.va_fids.contains_key(&t) {
             let sig = Signature::new(self.cc);
-            let id = self
-                .m
-                .declare_function(&t, Linkage::Import, &sig)
-                .unwrap();
+            let id = self.m.declare_function(&t, Linkage::Import, &sig).unwrap();
             self.va_fids.insert(t.clone(), id);
         }
         let macho = self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
@@ -2046,8 +2035,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // and returns them in xmm0. Cranelift's ABI doesn't model that, so
         // spill wide args to stack slots and pass the pointers ourselves, and
         // read the result back as a vector.
-        let coff =
-            self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Coff;
+        let coff = self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Coff;
         let wideof = |t: ClType| t == clt::I128 || t == clt::F128;
         let wide = coff && (params.iter().any(|t| wideof(*t)) || rets.iter().any(|t| wideof(*t)));
         let mut sig = Signature::new(self.cc);
@@ -2063,13 +2051,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 call_args.push(*a);
             }
         }
-        sig.returns.extend(rets.iter().map(|t| {
-            AbiParam::new(if wide && wideof(*t) {
-                clt::I8X16
-            } else {
-                *t
-            })
-        }));
+        sig.returns.extend(
+            rets.iter()
+                .map(|t| AbiParam::new(if wide && wideof(*t) { clt::I8X16 } else { *t })),
+        );
         let id = self
             .m
             .declare_function(crate::obj_sym(name), Linkage::Import, &sig)
@@ -2212,13 +2197,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
         debug_assert!(imm > 0 && imm < 128);
         let (lo, hi) = self.b.ins().isplit(x);
         let (lo, hi) = if imm >= 64 {
-            let lo = self.b.ins().ushr_imm(hi, (imm - 64) as i64);
+            let lo = self.b.ins().ushr_imm_u(hi, (imm - 64) as i64);
             (lo, self.b.ins().iconst(clt::I64, 0))
         } else {
-            let l = self.b.ins().ushr_imm(lo, imm as i64);
-            let c = self.b.ins().ishl_imm(hi, (64 - imm) as i64);
+            let l = self.b.ins().ushr_imm_u(lo, imm as i64);
+            let c = self.b.ins().ishl_imm_u(hi, (64 - imm) as i64);
             let lo = self.b.ins().bor(l, c);
-            (lo, self.b.ins().ushr_imm(hi, imm as i64))
+            (lo, self.b.ins().ushr_imm_u(hi, imm as i64))
         };
         self.b.ins().iconcat(lo, hi)
     }
@@ -2247,7 +2232,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
             &[],
             &[p, tmp],
         );
-        self.b.ins().load(clt::I128, MemFlagsData::trusted(), tmp, 0)
+        self.b
+            .ins()
+            .load(clt::I128, MemFlagsData::trusted(), tmp, 0)
     }
 
     fn atomic_store_stub(&mut self, p: ir::Value, o: u64, v: ir::Value) {
@@ -2346,9 +2333,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let hi = self.b.ins().icmp(cc, a_hi, b_hi);
         let eq = self.b.ins().icmp(IntCC::Equal, a_hi, b_hi);
         let lo_cc = match cc {
-            IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => {
-                IntCC::UnsignedGreaterThan
-            }
+            IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => IntCC::UnsignedGreaterThan,
             _ => IntCC::UnsignedLessThan,
         };
         let lo = self.b.ins().icmp(lo_cc, a_lo, b_lo);
@@ -2390,10 +2375,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if !eval.contains(id) {
             return false;
         }
-        matches!(
-            classify(self.ctx, self.res_ty(op)),
-            TyK::Int(_)
-        )
+        matches!(classify(self.ctx, self.res_ty(op)), TyK::Int(_))
     }
 
     fn res_ty(&self, op: Ptr<Operation>) -> TypeHandle {
@@ -2535,7 +2517,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let mut by_hi: std::collections::BTreeMap<u64, Vec<(u64, ir::Block)>> =
                         Default::default();
                     for &(v, b) in &vals {
-                        by_hi.entry((v >> 64) as u64).or_default().push((v as u64, b));
+                        by_hi
+                            .entry((v >> 64) as u64)
+                            .or_default()
+                            .push((v as u64, b));
                     }
                     let mut hi_switch = cranelift_frontend::Switch::new();
                     let groups: Vec<(ir::Block, Vec<(u64, ir::Block)>)> = by_hi
@@ -2636,8 +2621,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 };
                 let cmp = match pred {
                     P::False | P::True => {
-                        let v =
-                            self.b.ins().iconst(clt::I8, matches!(pred, P::True) as i64);
+                        let v = self.b.ins().iconst(clt::I8, matches!(pred, P::True) as i64);
                         return self.set1(op, v);
                     }
                     P::OEQ => {
@@ -2652,9 +2636,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     P::OGE => {
                         let r = lc(self, "__getf2");
                         let z = z(self);
-                        self.b
-                            .ins()
-                            .icmp(IntCC::SignedGreaterThanOrEqual, r, z)
+                        self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, r, z)
                     }
                     P::OLT => {
                         let r = lc(self, "__lttf2");
@@ -2664,9 +2646,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     P::OLE => {
                         let r = lc(self, "__letf2");
                         let z = z(self);
-                        self.b
-                            .ins()
-                            .icmp(IntCC::SignedLessThanOrEqual, r, z)
+                        self.b.ins().icmp(IntCC::SignedLessThanOrEqual, r, z)
                     }
                     P::UNE => {
                         let r = lc(self, "__netf2");
@@ -2715,9 +2695,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             P::UGE => {
                                 let r = lc(self, "__getf2");
                                 let z = z(self);
-                                self.b
-                                    .ins()
-                                    .icmp(IntCC::SignedGreaterThanOrEqual, r, z)
+                                self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, r, z)
                             }
                             P::ULT => {
                                 let r = lc(self, "__lttf2");
@@ -2727,9 +2705,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             _ => {
                                 let r = lc(self, "__letf2");
                                 let z = z(self);
-                                self.b
-                                    .ins()
-                                    .icmp(IntCC::SignedLessThanOrEqual, r, z)
+                                self.b.ins().icmp(IntCC::SignedLessThanOrEqual, r, z)
                             }
                         };
                         self.b.ins().bor(u, o)
@@ -2868,7 +2844,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let r = if t == clt::F16 {
                 // compiler-builtins doesn't ship `__float*hf`; go via f32.
                 let f32v = if it == clt::I128 {
-                    let name = if signed { "__floattisf" } else { "__floatuntisf" };
+                    let name = if signed {
+                        "__floattisf"
+                    } else {
+                        "__floatuntisf"
+                    };
                     self.libcall(name, &[clt::I128], &[clt::F32], &[x])[0]
                 } else if signed {
                     self.b.ins().fcvt_from_sint(clt::F32, x)
@@ -3211,8 +3191,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if over == 0 {
             return p;
         }
-        let p = self.b.ins().iadd_imm(p, align as i64 - 1);
-        self.b.ins().band_imm(p, -(align as i64))
+        let p = self.b.ins().iadd_imm_u(p, align as i64 - 1);
+        self.b.ins().band_imm_s(p, -(align as i64))
     }
 
     /// A `pliron.v*` op on vectors split into several native parts.
@@ -3259,7 +3239,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let ty = self.b.func.dfg.value_type(x);
         if !ty.is_vector() {
             // 1-lane vectors flatten to their scalar lane type.
-            let s = self.b.ins().ushr_imm(x, ty.bits() as i64 - 1);
+            let s = self.b.ins().ushr_imm_u(x, ty.bits() as i64 - 1);
             return self.resize(s, clt::I32, false);
         }
         if ty.bits() != 64 {
@@ -3268,7 +3248,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let s = self.bitcast_to(clt::I64, x);
         let l = ty.lane_bits() as u64;
         let m = if l == 64 {
-            self.b.ins().ushr_imm(s, 63)
+            self.b.ins().ushr_imm_u(s, 63)
         } else {
             let msbs = (u64::MAX / ((1u64 << l) - 1)) << (l - 1);
             let n = 64 / l;
@@ -3277,8 +3257,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .map(|i| 1u64 << (65 - l - n - (l - 1) * i))
                 .fold(0, |a, b| a | b);
             let m = self.b.ins().band_imm_u(s, msbs as i64);
-            let m = self.b.ins().imul_imm(m, magic as i64);
-            self.b.ins().ushr_imm(m, (64 - n) as i64)
+            let m = self.b.ins().imul_imm_u(m, magic as i64);
+            self.b.ins().ushr_imm_u(m, (64 - n) as i64)
         };
         self.b.ins().ireduce(clt::I32, m)
     }
@@ -3532,15 +3512,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // guards reshapes the `split_whitespace` dispatch badly enough to
         // cost ~8% on tokenize while the chars loop it was aimed at gains
         // nothing (see `chars_alpha` in coordination-ledger.md).
-        static IBNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            crate::env_is("PLIRON_INBOUNDSNN", "1")
-        });
+        static IBNN: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| crate::env_is("PLIRON_INBOUNDSNN", "1"));
         if addr != base_v
             && (self.st.inbounds.contains(&op)
-                || (*IBNN
-                    && gep
-                        .no_wrap_flags(ctx)
-                        .contains(GepNoWrapFlags::INBOUNDS)))
+                || (*IBNN && gep.no_wrap_flags(ctx).contains(GepNoWrapFlags::INBOUNDS)))
         {
             self.derived.insert(addr, base_v);
         }
@@ -3710,9 +3686,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             || matches!(p.value_type, clt::F32 | clt::F64)),
                         "unsupported argument type in C-variadic call on aarch64-apple-darwin"
                     );
-                    let sret = usize::from(
-                        matches!(sig.params[0].purpose, ArgumentPurpose::StructReturn),
-                    );
+                    let sret = usize::from(matches!(
+                        sig.params[0].purpose,
+                        ArgumentPurpose::StructReturn
+                    ));
                     let (mut xi, mut vi) = (0usize, 0usize);
                     for p in &sig.params[sret..fixed] {
                         if p.value_type.is_int() {
@@ -3763,7 +3740,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let buf = self.slot(off.max(1), 16);
                 for (a, ty, slot) in plan {
                     for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
-                        self.b.ins().store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
                     }
                 }
                 cargs.push(buf);
@@ -3810,8 +3789,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             CallOpCallable::Indirect(v) => {
                 let addr = self.get1(v);
                 if var_arg
-                    && self.m.isa().triple().architecture
-                        == target_lexicon::Architecture::X86_64
+                    && self.m.isa().triple().architecture == target_lexicon::Architecture::X86_64
                 {
                     // fp appended as a hidden last argument; a per-register
                     // stub sets %al=8 then tail-jumps to it (fp's SysV
@@ -3831,16 +3809,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         Some(reg) => {
                             let t = format!("__pliron_va8_ind_{reg}");
                             if !self.va_fids.contains_key(&t) {
-                                let id = self
-                                    .m
-                                    .declare_function(&t, Linkage::Import, &sig)
-                                    .unwrap();
+                                let id =
+                                    self.m.declare_function(&t, Linkage::Import, &sig).unwrap();
                                 self.va_fids.insert(t.clone(), id);
                             }
                             let macho = self.m.isa().triple().binary_format
                                 == target_lexicon::BinaryFormat::Macho;
-                            VA_TRAMPS
-                                .with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg, macho)));
+                            VA_TRAMPS.with(|v| v.borrow_mut().insert(va_tramp_ind_asm(reg, macho)));
                             Ok(self.call_fref(self.va_fids[&t]))
                         }
                         // fp lands on the stack (rare): call it directly; %al
@@ -3877,9 +3852,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             if sym == "_Unwind_Resume" {
                 let tls = self.eh_tls();
-                self.b
-                    .ins()
-                    .store(MemFlagsData::new(), cargs[0], tls, 8);
+                self.b.ins().store(MemFlagsData::new(), cargs[0], tls, 8);
                 self.eh_raise();
                 return;
             }
@@ -3931,7 +3904,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if info.nocap.is_some() || own.is_some() {
             for (k, &s) in csrc.iter().enumerate() {
                 let flagged = s != usize::MAX
-                    && (info.nocap.as_ref().is_some_and(|nc| nc.get(s) == Some(&true))
+                    && (info
+                        .nocap
+                        .as_ref()
+                        .is_some_and(|nc| nc.get(s) == Some(&true))
                         || own.is_some_and(|o| o.contains(&(s as u32))));
                 if flagged {
                     self.nocap.insert((inst, k as u32));
@@ -4105,8 +4081,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             "llvm.cttz" => self.b.ins().ctz(a[0]),
             "llvm.cttz_nz" => {
                 let ty = self.b.func.dfg.value_type(a[0]);
-                if self.m.isa().triple().architecture
-                    == target_lexicon::Architecture::X86_64
+                if self.m.isa().triple().architecture == target_lexicon::Architecture::X86_64
                     && ty.bits() <= 64
                 {
                     self.b.ins().ctz_nonzero(a[0])
@@ -4199,8 +4174,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.usub.sat" => zero,
                         _ => {
                             // x < 0 saturates to MIN (= !MAX), else to MAX.
-                            let max = self.b.ins().ushr_imm(ones, 1);
-                            let sign = self.b.ins().sshr_imm(x, t.bits() as i64 - 1);
+                            let max = self.b.ins().ushr_imm_u(ones, 1);
+                            let sign = self.b.ins().sshr_imm_u(x, t.bits() as i64 - 1);
                             self.b.ins().bxor(sign, max)
                         }
                     };
@@ -4231,9 +4206,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     self.b.ins().fcopysign(a[0], a[1])
                 }
             }
-            n @ ("llvm.sqrt" | "llvm.floor" | "llvm.ceil" | "llvm.trunc"
-            | "llvm.roundeven" | "llvm.fma" | "llvm.fmuladd" | "llvm.minimum"
-            | "llvm.maximum") => {
+            n @ ("llvm.sqrt" | "llvm.floor" | "llvm.ceil" | "llvm.trunc" | "llvm.roundeven"
+            | "llvm.fma" | "llvm.fmuladd" | "llvm.minimum" | "llvm.maximum") => {
                 let t = self.b.func.dfg.value_type(a[0]);
                 if t == clt::F16 || t == clt::F128 {
                     // No Cranelift lowering; compiler-builtins' libm port
@@ -4248,10 +4222,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.maximum" => "fmaximum",
                         _ => "fma",
                     };
-                    let f = format!(
-                        "{base}f{}",
-                        if t == clt::F16 { "16" } else { "128" }
-                    );
+                    let f = format!("{base}f{}", if t == clt::F16 { "16" } else { "128" });
                     let ps = vec![t; a.len()];
                     self.libcall(&f, &ps, &[t], &a)[0]
                 } else {
@@ -4286,10 +4257,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let f = match t {
                     clt::F32 => format!("{base}f"),
                     clt::F64 => base.to_string(),
-                    clt::F16 | clt::F128 if n == "llvm.round" => format!(
-                        "{base}f{}",
-                        if t == clt::F16 { "16" } else { "128" }
-                    ),
+                    clt::F16 | clt::F128 if n == "llvm.round" => {
+                        format!("{base}f{}", if t == clt::F16 { "16" } else { "128" })
+                    }
                     _ => panic!("pliron->cranelift: unsupported intrinsic {n} on {t}"),
                 };
                 let ps = vec![t; a.len()];
@@ -4357,11 +4327,7 @@ fn cold_blocks(
     cold
 }
 
-pub(crate) fn rpo(
-    ctx: &Context,
-    st: &State,
-    blocks: &[Ptr<BasicBlock>],
-) -> Vec<Ptr<BasicBlock>> {
+pub(crate) fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     rpo_split(ctx, st, blocks).0
 }
 

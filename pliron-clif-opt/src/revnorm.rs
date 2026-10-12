@@ -30,7 +30,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::loopidiom::{gather, iconst, outv, param_kinds, Param};
+use crate::loopidiom::{Param, gather, iconst, outv, param_kinds};
 
 pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
@@ -61,7 +61,11 @@ fn iv_sub(
 }
 
 /// Emit `inst` before the edge's terminator.
-fn emit_before(func: &mut Function, e: crate::loopidiom::Edge, f: impl FnOnce(&mut FuncCursor) -> Value) -> Value {
+fn emit_before(
+    func: &mut Function,
+    e: crate::loopidiom::Edge,
+    f: impl FnOnce(&mut FuncCursor) -> Value,
+) -> Value {
     let mut pos = FuncCursor::new(func).at_inst(e.inst);
     f(&mut pos)
 }
@@ -102,8 +106,8 @@ fn normalize(
         return false;
     };
     let in_body = {
-        let dests = func.dfg.insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let dests =
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         [
             info.body.contains(&dests[0].block(&func.dfg.value_lists)),
             info.body.contains(&dests[1].block(&func.dfg.value_lists)),
@@ -216,10 +220,7 @@ fn normalize(
                     opcode: Opcode::Isub,
                     args: [a, k],
                 } => {
-                    let (a, k) = (
-                        func.dfg.resolve_aliases(a),
-                        func.dfg.resolve_aliases(k),
-                    );
+                    let (a, k) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(k));
                     if desc.contains(&a) {
                         // iv - k = (e - k) - j
                         let Some(kv) = outv(func, &info, &kinds, k) else {
@@ -244,10 +245,7 @@ fn normalize(
                     opcode: Opcode::Iadd,
                     args: [a, b2],
                 } => {
-                    let (a, b2) = (
-                        func.dfg.resolve_aliases(a),
-                        func.dfg.resolve_aliases(b2),
-                    );
+                    let (a, b2) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b2));
                     let (p, k) = if desc.contains(&a) && !desc.contains(&b2) {
                         (a, b2)
                     } else if desc.contains(&b2) && !desc.contains(&a) {
@@ -336,8 +334,7 @@ fn normalize(
             });
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[le.inst]
-                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                [le.slot];
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[le.slot];
             let mut cur = 0usize;
             bc.update_args(&mut dfg.value_lists, |a| {
                 let r = if cur == i { BlockArg::Value(nxt) } else { a };

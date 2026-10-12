@@ -51,7 +51,9 @@ fn main() {
     // c[i][j] = sum_k (i*n+k)/2 * (k*n+j)/4; spot-check a few entries.
     for i in [0usize, 3, 15] {
         for j in [0usize, 7, 15] {
-            let want: f64 = (0..n).map(|k| (i * n + k) as f64 * 0.5 * (k * n + j) as f64 * 0.25).sum();
+            let want: f64 = (0..n)
+                .map(|k| (i * n + k) as f64 * 0.5 * (k * n + j) as f64 * 0.25)
+                .sum();
             assert_eq!(c[i * n + j], want);
         }
     }

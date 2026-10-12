@@ -80,11 +80,7 @@ fn side_effecting(func: &Function, i: Inst) -> bool {
 /// a merged vector load cannot be moved across them.
 fn writer(func: &Function, i: Inst) -> bool {
     let op = func.dfg.insts[i].opcode();
-    op.is_terminator()
-        || op.is_call()
-        || op.can_store()
-        || op.other_side_effects()
-        || op.can_trap()
+    op.is_terminator() || op.is_call() || op.can_store() || op.other_side_effects() || op.can_trap()
 }
 
 /// A packable operand column: how to produce the vector for N lane values.
@@ -322,12 +318,7 @@ fn iconst_val(func: &Function, v: Value) -> Option<i64> {
 /// Emit a packed operand tree at the cursor; returns the vector value.
 /// `rows`, when given, records the emitted vector for each `Pack::Op` whose
 /// `row` index is valid (xpack extracts lane values from these).
-fn emit_pack(
-    pos: &mut FuncCursor,
-    vt: Type,
-    p: &Pack,
-    mut rows: Option<&mut Vec<Value>>,
-) -> Value {
+fn emit_pack(pos: &mut FuncCursor, vt: Type, p: &Pack, mut rows: Option<&mut Vec<Value>>) -> Value {
     match p {
         Pack::Splat(v) => pos.ins().splat(vt, *v),
         Pack::Gather(vals) => {
@@ -338,13 +329,13 @@ fn emit_pack(
             v
         }
         &Pack::Load {
+            base, off, flags, ..
+        } => pos.ins().load(
+            vt,
+            wide_flags(flags),
             base,
-            off,
-            flags,
-            ..
-        } => pos
-            .ins()
-            .load(vt, wide_flags(flags), base, i32::try_from(off).expect("checked at pack time")),
+            i32::try_from(off).expect("checked at pack time"),
+        ),
         Pack::Op { op, args, row } => {
             let vs: Vec<Value> = args
                 .iter()
@@ -437,22 +428,20 @@ struct StoreInfo {
 fn try_block(
     func: &mut Function,
     domtree: &DominatorTree,
-    na: &FxHashSet<Value>,
+    _na: &FxHashSet<Value>,
     block: Block,
 ) -> usize {
-    let ps = crate::loadfwd::param_src(func);
+    let _ps = crate::loadfwd::param_src(func);
     let insts: Vec<Inst> = func.layout.block_insts(block).collect();
-    let pos: FxHashMap<Inst, usize> = insts
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| (i, k))
-        .collect();
+    let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
     // Use map over the whole function.
     let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
     for b2 in func.layout.blocks() {
         for i in func.layout.block_insts(b2) {
             for v in func.dfg.inst_values(i) {
-                uses.entry(func.dfg.resolve_aliases(v)).or_default().insert(i);
+                uses.entry(func.dfg.resolve_aliases(v))
+                    .or_default()
+                    .insert(i);
             }
         }
     }
@@ -606,7 +595,12 @@ impl Ctx<'_> {
 }
 
 /// Pack lane-wise scalar inst trees feeding adjacent stores into vector ops.
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, na: &FxHashSet<Value>, simd: bool) -> usize {
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    na: &FxHashSet<Value>,
+    simd: bool,
+) -> usize {
     if !simd {
         return 0;
     }
@@ -842,9 +836,7 @@ impl X<'_> {
                     self.avail(va)
                 );
             }
-        } else if crate::env_set("PLIRON_XPACK_DEBUG")
-            && (la.is_some() || lb.is_some())
-        {
+        } else if crate::env_set("PLIRON_XPACK_DEBUG") && (la.is_some() || lb.is_some()) {
             eprintln!("    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
         }
         // A column may legitimately need a member's scalar result (e.g. the
@@ -956,7 +948,9 @@ impl X<'_> {
                             Some(p) => args.push(p),
                             None => {
                                 if dbg {
-                                    eprintln!("    xpack col-rec d{depth}: {oa:?} arg{j} {ca:?}/{cb:?}");
+                                    eprintln!(
+                                        "    xpack col-rec d{depth}: {oa:?} arg{j} {ca:?}/{cb:?}"
+                                    );
                                 }
                                 ok = false;
                                 break;
@@ -965,20 +959,12 @@ impl X<'_> {
                     }
                     if ok {
                         self.colmap.insert((a, b), row);
-                        return Some(Pack::Op {
-                            op: oa,
-                            args,
-                            row,
-                        });
+                        return Some(Pack::Op { op: oa, args, row });
                     }
                     self.rows.truncate(row);
                     self.loads.truncate(n_loads);
                     self.min_load = min_load;
-                    self.members = self
-                        .rows
-                        .iter()
-                        .flat_map(|&(x, y)| [x, y])
-                        .collect();
+                    self.members = self.rows.iter().flat_map(|&(x, y)| [x, y]).collect();
                     self.colmap.retain(|_, &mut r| r < row);
                 }
                 if dbg {
@@ -1085,8 +1071,7 @@ fn ext_ok(x: &X<'_>, u: Inst) -> bool {
     if x.func.layout.inst_block(u) == Some(x.block) {
         x.pos.get(&u).is_some_and(|&p| p > x.emit)
     } else {
-        x.domtree
-            .dominates(x.insts[x.emit], u, &x.func.layout)
+        x.domtree.dominates(x.insts[x.emit], u, &x.func.layout)
     }
 }
 
@@ -1094,12 +1079,7 @@ fn ext_ok(x: &X<'_>, u: Inst) -> bool {
 /// overlapping access in `(pos(u), emit]`. `skip` holds insts the plan is
 /// already removing or moving, which stay ordered the same way relative to
 /// `u` and so can't block it.
-fn sinkable(
-    x: &X<'_>,
-    u: Inst,
-    dead: &FxHashSet<Inst>,
-    sink: &FxHashSet<Inst>,
-) -> Option<bool> {
+fn sinkable(x: &X<'_>, u: Inst, dead: &FxHashSet<Inst>, sink: &FxHashSet<Inst>) -> Option<bool> {
     let op = x.func.dfg.insts[u].opcode();
     if !(op.is_terminator()
         || op.is_branch()
@@ -1138,7 +1118,9 @@ fn sinkable(
         {
             return None;
         }
-        if (o2.can_load() || o2.can_store() || o2.other_side_effects()) && mem_range(x.func, x.ps, x.na, i2).is_none() {
+        if (o2.can_load() || o2.can_store() || o2.other_side_effects())
+            && mem_range(x.func, x.ps, x.na, i2).is_none()
+        {
             return None;
         }
     }
@@ -1169,10 +1151,7 @@ fn store_dead(
         if !may_overlap(ur, r2) {
             continue;
         }
-        if o2 == Opcode::Store
-            && r2.1 <= ur.1
-            && ur.1 + i64::from(ur.2) <= r2.1 + i64::from(r2.2)
-        {
+        if o2 == Opcode::Store && r2.1 <= ur.1 && ur.1 + i64::from(ur.2) <= r2.1 + i64::from(r2.2) {
             return true; // fully covered by a later store
         }
         return false; // a read or partial write of the bytes
@@ -1207,7 +1186,11 @@ fn plan_pair(
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
-                eprintln!("  xpack {} {ia:?}/{ib:?}: {}", $why, func.dfg.insts[ia].opcode());
+                eprintln!(
+                    "  xpack {} {ia:?}/{ib:?}: {}",
+                    $why,
+                    func.dfg.insts[ia].opcode()
+                );
             }
             return None;
         }};
@@ -1254,7 +1237,9 @@ fn plan_pair(
     let mut args = Vec::with_capacity(nargs);
     for j in 0..nargs {
         let (ca, cb) = (func.dfg.inst_args(ia)[j], func.dfg.inst_args(ib)[j]);
-        let Some(p) = x.col(ca, cb, 1) else { bail!("col") };
+        let Some(p) = x.col(ca, cb, 1) else {
+            bail!("col")
+        };
         args.push(p);
     }
     let root = Pack::Op { op, args, row: 0 };
@@ -1285,7 +1270,11 @@ fn finish_plan(
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
-                eprintln!("  xpack {} {ia:?}/{ib:?}: {}", $why, func.dfg.insts[ia].opcode());
+                eprintln!(
+                    "  xpack {} {ia:?}/{ib:?}: {}",
+                    $why,
+                    func.dfg.insts[ia].opcode()
+                );
             }
             return None;
         }};
@@ -1500,12 +1489,7 @@ fn finish_plan(
     // count extra — they halve occupied-port cycles.
     let heavy = kept
         .iter()
-        .filter(|&&(_, (i, _))| {
-            matches!(
-                func.dfg.insts[i].opcode(),
-                Opcode::Sqrt | Opcode::Fdiv
-            )
-        })
+        .filter(|&&(_, (i, _))| matches!(func.dfg.insts[i].opcode(), Opcode::Sqrt | Opcode::Fdiv))
         .count();
     let n_keep = x.members.iter().filter(|m| x.keep.contains(m)).count() as i32;
     let net = 2 * kept.len() as i32 + 3 * heavy as i32
@@ -1580,16 +1564,16 @@ fn plan_store(
         return None;
     }
     let (
-        (InstructionData::Store {
+        InstructionData::Store {
             opcode: Opcode::Store,
             args: args1,
             ..
-        }),
-        (InstructionData::Store {
+        },
+        InstructionData::Store {
             opcode: Opcode::Store,
             args: args2,
             ..
-        }),
+        },
     ) = (func.dfg.insts[i1], func.dfg.insts[i2])
     else {
         return None;
@@ -1760,11 +1744,7 @@ fn xpack_block(
     let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
     loop {
         let insts: Vec<Inst> = func.layout.block_insts(block).collect();
-        let pos: FxHashMap<Inst, usize> = insts
-            .iter()
-            .enumerate()
-            .map(|(k, &i)| (i, k))
-            .collect();
+        let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
         let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
         for b2 in func.layout.blocks() {
             for i in func.layout.block_insts(b2) {
@@ -1790,7 +1770,12 @@ fn xpack_block(
                     .iter()
                     .map(|v| format!("{v:?}"))
                     .collect();
-                eprintln!("    map p{p} {i:?} {:?} {} -> {}", d.opcode(), args.join(","), ress.join(","));
+                eprintln!(
+                    "    map p{p} {i:?} {:?} {} -> {}",
+                    d.opcode(),
+                    args.join(","),
+                    ress.join(",")
+                );
             }
         }
         let mut applied = false;
@@ -1847,49 +1832,49 @@ fn xpack_block(
                     }
                     continue;
                 }
-                    cands += 1;
+                cands += 1;
+                tried += 1;
+                // Both lane orders: swapping lanes changes column order,
+                // which decides whether adjacent loads merge.
+                let plan = plan_pair(
+                    func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                )
+                .or_else(|| {
                     tried += 1;
-                    // Both lane orders: swapping lanes changes column order,
-                    // which decides whether adjacent loads merge.
-                    let plan = plan_pair(
-                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                    plan_pair(
+                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
                     )
-                    .or_else(|| {
-                        tried += 1;
-                        plan_pair(
-                            func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
-                        )
-                    });
-                    if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
-                        let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
-                        let n = apply_pair(
-                            func,
-                            &insts,
-                            pos[&ib].max(pos[&ia]),
-                            &root,
-                            vt,
-                            &kept,
-                            n_rows,
-                            &sink,
-                            &dead,
-                            &extracts,
-                            &keep,
+                });
+                if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
+                    let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
+                    let n = apply_pair(
+                        func,
+                        &insts,
+                        pos[&ib].max(pos[&ia]),
+                        &root,
+                        vt,
+                        &kept,
+                        n_rows,
+                        &sink,
+                        &dead,
+                        &extracts,
+                        &keep,
+                    );
+                    total += n;
+                    if dbg {
+                        eprintln!(
+                            "xpack APPLY {:?} {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
+                            func.dfg.insts[ia].opcode(),
+                            kept.len()
                         );
-                        total += n;
-                        if dbg {
-                            eprintln!(
-                                "xpack APPLY {:?} {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
-                                func.dfg.insts[ia].opcode(),
-                                kept.len()
-                            );
-                        }
-                        for &(_, (la, lb)) in &kept {
-                            taken.insert(la);
-                            taken.insert(lb);
-                        }
-                        applied = true;
-                        break;
                     }
+                    for &(_, (la, lb)) in &kept {
+                        taken.insert(la);
+                        taken.insert(lb);
+                    }
+                    applied = true;
+                    break;
+                }
             }
             if applied {
                 break;

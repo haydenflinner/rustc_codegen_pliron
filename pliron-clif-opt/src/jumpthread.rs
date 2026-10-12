@@ -388,8 +388,7 @@ impl<'a> NonNull<'a> {
                 continue;
             }
             for _ in 0..8 {
-                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v)
-                {
+                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {
                     continue 'terms;
                 }
                 if let Some(i) = func.dfg.value_def(v).inst()
@@ -448,10 +447,8 @@ fn edge_guard(
                 if preds.next().is_some() {
                     return None;
                 }
-                let dests = func.dfg.insts[p.inst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                );
+                let dests = func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                 // If `src` is reachable on more than one arm the edge
                 // carries no arm information.
                 let mut hit = dests
@@ -562,10 +559,8 @@ fn ne_params(
                 if !reach.contains(&pred.block) {
                     continue;
                 }
-                let dests = func.dfg.insts[pred.inst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                );
+                let dests = func.dfg.insts[pred.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                 for bc in dests {
                     if bc.block(&func.dfg.value_lists) != b {
                         continue;
@@ -598,11 +593,7 @@ fn ne_params(
     loop {
         let mut drop = Vec::new();
         for (&p, args) in &args_of {
-            if cand.contains(&p)
-                && args
-                    .iter()
-                    .any(|&a| !ne_const(func, env, &cand, a, k, 0))
-            {
+            if cand.contains(&p) && args.iter().any(|&a| !ne_const(func, env, &cand, a, k, 0)) {
                 drop.push(p);
             }
         }
@@ -685,8 +676,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 else {
                     continue;
                 };
-                let cfg =
-                    cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
                 let cand = ne_sets
                     .entry(k)
                     .or_insert_with(|| ne_params(func, cfg, &none, k));
@@ -702,8 +692,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                     continue;
                 };
                 let c = sa[0];
-                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst))
-                {
+                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst)) {
                     continue;
                 }
                 // `x == K` ⇔ `eq_is_c ? c : !c`; `ne` inverts.
@@ -733,22 +722,18 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 let mut guard: Option<(Block, Value)> = None;
                 let mut ok = true;
                 for pred in cfg.pred_iter(d) {
-                    let dests = func.dfg.insts[pred.inst].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    );
+                    let dests = func.dfg.insts[pred.inst]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                     for (di, bc) in dests.iter().enumerate() {
                         if bc.block(&func.dfg.value_lists) != d {
                             continue;
                         }
-                        let Some(BlockArg::Value(arg)) =
-                            bc.args(&func.dfg.value_lists).nth(pidx)
+                        let Some(BlockArg::Value(arg)) = bc.args(&func.dfg.value_lists).nth(pidx)
                         else {
                             ok = false;
                             break;
                         };
-                        let Some((gb, c, arm)) = edge_guard(func, cfg, pred.block, di)
-                        else {
+                        let Some((gb, c, arm)) = edge_guard(func, cfg, pred.block, di) else {
                             ok = false;
                             break;
                         };
@@ -819,9 +804,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 // block passes the guard, so it does — except a guard
                 // inside the merge block itself (self-edge), where the
                 // compare could precede `c`'s def.
-                let dt = dt_lazy.get_or_insert_with(|| {
-                    DominatorTree::with_function(func, cfg)
-                });
+                let dt = dt_lazy.get_or_insert_with(|| DominatorTree::with_function(func, cfg));
                 let pp = match func.dfg.value_def(c) {
                     ValueDef::Result(ci, _) => ProgramPoint::Inst(ci),
                     ValueDef::Param(cb, _) => ProgramPoint::Block(cb),
@@ -2349,9 +2332,7 @@ pub fn run(
         if chk
             && let Err(e) = cranelift_codegen::verify_function(
                 func,
-                &cranelift_codegen::settings::Flags::new(
-                    cranelift_codegen::settings::builder(),
-                ),
+                &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
             )
         {
             panic!("jt step {tag}: {e}\n{}", func.display());
@@ -2381,7 +2362,11 @@ pub fn run(
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
         // sweep them once unreachable.
-        let ic = if ifconv { crate::ifconv::run(func, derived) } else { 0 };
+        let ic = if ifconv {
+            crate::ifconv::run(func, derived)
+        } else {
+            0
+        };
         check(func, "ifconv");
         if ic > 0 {
             remove_unreachable_blocks(func);

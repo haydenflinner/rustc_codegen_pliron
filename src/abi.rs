@@ -165,22 +165,12 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
             // `nocap`/`arg_extent` are indexed by operand position — re-index
             // them like `kept` so they line up with the rewritten arg list.
             if let Some(v) = info.nocap.take() {
-                info.nocap = (v.len() == cargs.len()).then(|| {
-                    v.iter()
-                        .zip(&live)
-                        .filter(|p| *p.1)
-                        .map(|p| *p.0)
-                        .collect()
-                });
+                info.nocap = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
             if let Some(v) = info.arg_extent.take() {
-                info.arg_extent = (v.len() == cargs.len()).then(|| {
-                    v.iter()
-                        .zip(&live)
-                        .filter(|p| *p.1)
-                        .map(|p| *p.0)
-                        .collect()
-                });
+                info.arg_extent = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
             st.calls.insert(nc, info);
             if let Some(u) = st.invokes.remove(&c) {

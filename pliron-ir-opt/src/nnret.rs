@@ -27,9 +27,9 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::FxHashSet;
 
-use crate::state::{ConstVal, State};
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
+use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 
 /// Def-chain walk depth for one nonnull query.

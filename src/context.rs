@@ -657,11 +657,7 @@ fn frozen_params(
             v.push((i, s));
         }
         if let Some(a) = a.filter(|a| a.regular.contains(A::NoAlias)) {
-            na.push((
-                i,
-                a.pointee_size.bytes(),
-                !a.regular.contains(A::ReadOnly),
-            ));
+            na.push((i, a.pointee_size.bytes(), !a.regular.contains(A::ReadOnly)));
         }
         // `nonnull` leaf attrs: direct/pair element attrs and the
         // indirect/meta pointers. Cast args are packed; skip them.

@@ -170,24 +170,21 @@ pub struct State {
     /// duration — the region id is the clone's entry block, so hoists can
     /// stay inside the scope (`frozen_loads`) rather than the function-wide
     /// `readonly can_move` flags `FnLower::frozen` gets.
-    pub region_frozen:
-        FxHashMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
+    pub region_frozen: FxHashMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
     /// Caller-side operands bound to `region_frozen` leaves: `*v` is
     /// frozen for the callee call's duration — exactly the clone's span —
     /// so the record is `(dereferenceable bytes, clone entry)`. Kept
     /// separate from `region_frozen`: those records seed `FnLower::noalias`
     /// on clone args, while operands are ordinary caller values that
     /// outlive the clone and must not claim function-wide `noalias`.
-    pub region_frozen_op:
-        FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    pub region_frozen_op: FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     /// Load ops inside inlined clones whose address provably derives from a
     /// `region_frozen` arg at a constant offset inside the pointee: op →
     /// region id (the clone's entry block). At lowering these seed
     /// `FnLower::scoped` — licm may hoist them without a clobber scan as
     /// long as the preheader stays inside the region: `noalias readonly`
     /// promises no write to the pointee for the call's duration.
-    pub frozen_loads:
-        FxHashMap<Ptr<Operation>, Ptr<BasicBlock>>,
+    pub frozen_loads: FxHashMap<Ptr<Operation>, Ptr<BasicBlock>>,
     /// Loads rustc marked `!invariant.load` (`set_invariant_load`): every
     /// load from that address yields the same value, so the location can
     /// forward across arbitrary stores — `*pivot` in the partition loop
@@ -258,7 +255,6 @@ pub struct State {
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
     pub wasm_imports: FxHashMap<String, (String, String)>,
 }
-
 
 pub fn mask(bits: u128, w: u32) -> u128 {
     if w >= 128 {

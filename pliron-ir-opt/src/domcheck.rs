@@ -1,9 +1,9 @@
 //! Debug check (`PLIRON_CHECK_DOM=1`): after a pass, every operand's
 //! definition must dominate its use. Reports the first violation per function.
 
-use crate::state::State;
-use crate::inline::{blocks, ops};
 use crate::has_body;
+use crate::inline::{blocks, ops};
+use crate::state::State;
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;

@@ -33,7 +33,11 @@ pub fn parse_rust_version(version: &str) -> RustcVersion {
     let minor = parse_part(&mut bytes);
     let patch = parse_part(&mut bytes);
     assert!(bytes.is_empty());
-    RustcVersion { major, minor, patch }
+    RustcVersion {
+        major,
+        minor,
+        patch,
+    }
 }
 
 fn main() {

@@ -14,9 +14,9 @@ use pliron::{
 use pliron_llvm::ops::{GetElementPtrOp, LoadOp};
 use rustc_hash::FxHashMap;
 
-use crate::state::{ConstVal, State};
 use crate::has_body;
 use crate::sroa::{gep_offset, mk_const};
+use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify, size_align, struct_offsets};
 
 /// Byte image of a constant: known bytes, plus pointer relocations by offset.

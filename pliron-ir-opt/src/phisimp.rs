@@ -14,9 +14,9 @@ use pliron::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::state::State;
-use crate::inline::blocks;
 use crate::has_body;
+use crate::inline::blocks;
+use crate::state::State;
 
 /// Operand `i` that terminator `t` forwards to successor `si`, if `t` is a
 /// branch forwarding exactly `na` operands there.

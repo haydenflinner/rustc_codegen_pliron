@@ -40,7 +40,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::types::{I64, I128, I8};
+use cranelift_codegen::ir::types::{I8, I64, I128};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
@@ -54,7 +54,11 @@ const MAX_NODES: usize = 8;
 type ISet = Vec<(u64, u64)>;
 
 fn mask(v: u64, bits: u32) -> u64 {
-    if bits >= 64 { v } else { v & ((1u64 << bits) - 1) }
+    if bits >= 64 {
+        v
+    } else {
+        v & ((1u64 << bits) - 1)
+    }
 }
 
 fn sext(v: u64, bits: u32) -> i64 {
@@ -147,20 +151,36 @@ fn sat(cc: IntCC, k: u64, bits: u32) -> ISet {
         IntCC::Equal => vec![(k, k)],
         IntCC::NotEqual => complement(&vec![(k, k)], bits),
         IntCC::UnsignedLessThan => {
-            if k == 0 { vec![] } else { vec![(0, k - 1)] }
+            if k == 0 {
+                vec![]
+            } else {
+                vec![(0, k - 1)]
+            }
         }
         IntCC::UnsignedLessThanOrEqual => vec![(0, k)],
         IntCC::UnsignedGreaterThanOrEqual => vec![(k, max)],
         IntCC::UnsignedGreaterThan => {
-            if k == max { vec![] } else { vec![(k + 1, max)] }
+            if k == max {
+                vec![]
+            } else {
+                vec![(k + 1, max)]
+            }
         }
         IntCC::SignedLessThan => {
-            if sk == smin { vec![] } else { signed_to_unsigned(smin, sk - 1, bits) }
+            if sk == smin {
+                vec![]
+            } else {
+                signed_to_unsigned(smin, sk - 1, bits)
+            }
         }
         IntCC::SignedLessThanOrEqual => signed_to_unsigned(smin, sk, bits),
         IntCC::SignedGreaterThanOrEqual => signed_to_unsigned(sk, smax, bits),
         IntCC::SignedGreaterThan => {
-            if sk == smax { vec![] } else { signed_to_unsigned(sk + 1, smax, bits) }
+            if sk == smax {
+                vec![]
+            } else {
+                signed_to_unsigned(sk + 1, smax, bits)
+            }
         }
     }
 }
@@ -224,10 +244,7 @@ fn cand_ok(func: &Function, b: Block) -> bool {
             func.dfg
                 .block_params(destination.block(&func.dfg.value_lists))
                 .is_empty()
-                && destination
-                    .args(&func.dfg.value_lists)
-                    .next()
-                    .is_none()
+                && destination.args(&func.dfg.value_lists).next().is_none()
         }
         InstructionData::Brif { .. } => test_of(func, b).is_some(),
         _ => false,
@@ -371,8 +388,7 @@ fn try_tree(
         match func.dfg.insts[t] {
             InstructionData::Jump { destination, .. } => {
                 let db = destination.block(&func.dfg.value_lists);
-                let dargs: Vec<BlockArg> =
-                    destination.args(&func.dfg.value_lists).collect();
+                let dargs: Vec<BlockArg> = destination.args(&func.dfg.value_lists).collect();
                 out.push((db, dargs, iset));
             }
             InstructionData::Brif { blocks, .. } => {
@@ -478,9 +494,7 @@ fn prep_args(
                 let live_dom = func
                     .layout
                     .inst_block(i)
-                    .is_some_and(|b| {
-                        !dead.contains(&b) && dom.dominates(i, rterm, &func.layout)
-                    });
+                    .is_some_and(|b| !dead.contains(&b) && dom.dominates(i, rterm, &func.layout));
                 if live_dom {
                     out.push(A::V(v));
                 } else {
@@ -539,11 +553,7 @@ fn eqrange(func: &mut Function) -> usize {
         }
     }
     /// `ty`-typed constant `k`: `iconst` scalar or splat `vconst`.
-    fn kconst(
-        cur: &mut FuncCursor,
-        ty: cranelift_codegen::ir::Type,
-        k: u64,
-    ) -> Value {
+    fn kconst(cur: &mut FuncCursor, ty: cranelift_codegen::ir::Type, k: u64) -> Value {
         if ty.is_vector() {
             let lb = (ty.lane_bits() / 8) as usize;
             let mut bytes = Vec::with_capacity(lb * ty.lane_count() as usize);
@@ -562,7 +572,11 @@ fn eqrange(func: &mut Function) -> usize {
             .layout
             .block_insts(b)
             .flat_map(|i| {
-                if let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i] {
+                if let InstructionData::Binary {
+                    opcode: Opcode::Bor,
+                    args,
+                } = func.dfg.insts[i]
+                {
                     args.to_vec()
                 } else {
                     Vec::new()
@@ -570,7 +584,10 @@ fn eqrange(func: &mut Function) -> usize {
             })
             .collect();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
-            let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i]
+            let InstructionData::Binary {
+                opcode: Opcode::Bor,
+                args,
+            } = func.dfg.insts[i]
             else {
                 continue;
             };
@@ -598,11 +615,18 @@ fn eqrange(func: &mut Function) -> usize {
                     break;
                 };
                 match func.dfg.insts[di] {
-                    InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                    InstructionData::Binary {
+                        opcode: Opcode::Bor,
+                        args,
+                    } => {
                         stack.push(args[0]);
                         stack.push(args[1]);
                     }
-                    InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                    InstructionData::IntCompare {
+                        cond: IntCC::Equal,
+                        args,
+                        ..
+                    } => {
                         let (a, c) = (
                             func.dfg.resolve_aliases(args[0]),
                             func.dfg.resolve_aliases(args[1]),
@@ -674,11 +698,18 @@ fn eqrange(func: &mut Function) -> usize {
                             continue;
                         };
                         match func.dfg.insts[di] {
-                            InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                            InstructionData::Binary {
+                                opcode: Opcode::Bor,
+                                args,
+                            } => {
                                 st.push(args[0]);
                                 st.push(args[1]);
                             }
-                            InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                            InstructionData::IntCompare {
+                                cond: IntCC::Equal,
+                                args,
+                                ..
+                            } => {
                                 let (a, c) = (
                                     func.dfg.resolve_aliases(args[0]),
                                     func.dfg.resolve_aliases(args[1]),
@@ -744,7 +775,11 @@ fn eqrange(func: &mut Function) -> usize {
 fn flat(func: &mut Function) -> usize {
     fn const_of(func: &Function, v: Value) -> Option<i64> {
         let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
-        if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = func.dfg.insts[di] {
+        if let InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = func.dfg.insts[di]
+        {
             Some(imm.bits())
         } else {
             None
@@ -759,7 +794,11 @@ fn flat(func: &mut Function) -> usize {
             .layout
             .block_insts(b)
             .flat_map(|i| {
-                if let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i] {
+                if let InstructionData::Binary {
+                    opcode: Opcode::Bor,
+                    args,
+                } = func.dfg.insts[i]
+                {
                     args.to_vec()
                 } else {
                     Vec::new()
@@ -767,7 +806,10 @@ fn flat(func: &mut Function) -> usize {
             })
             .collect();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
-            let InstructionData::Binary { opcode: Opcode::Bor, args } = func.dfg.insts[i]
+            let InstructionData::Binary {
+                opcode: Opcode::Bor,
+                args,
+            } = func.dfg.insts[i]
             else {
                 continue;
             };
@@ -794,11 +836,18 @@ fn flat(func: &mut Function) -> usize {
                     break;
                 };
                 match func.dfg.insts[di] {
-                    InstructionData::Binary { opcode: Opcode::Bor, args } => {
+                    InstructionData::Binary {
+                        opcode: Opcode::Bor,
+                        args,
+                    } => {
                         stack.push(args[0]);
                         stack.push(args[1]);
                     }
-                    InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+                    InstructionData::IntCompare {
+                        cond: IntCC::Equal,
+                        args,
+                        ..
+                    } => {
                         let (a, c) = (
                             func.dfg.resolve_aliases(args[0]),
                             func.dfg.resolve_aliases(args[1]),
@@ -836,7 +885,10 @@ fn flat(func: &mut Function) -> usize {
             if !ok || ks.len() < 4 {
                 continue;
             }
-            let (lo, hi) = (ks.iter().copied().min().unwrap(), ks.iter().copied().max().unwrap());
+            let (lo, hi) = (
+                ks.iter().copied().min().unwrap(),
+                ks.iter().copied().max().unwrap(),
+            );
             if hi - lo >= 64 {
                 continue;
             }
@@ -861,7 +913,7 @@ fn flat(func: &mut Function) -> usize {
             let z = cur.ins().iconst(I64, 0);
             let mg = cur.ins().select(ig, m, z);
             let sh = cur.ins().ushr(mg, dx);
-            let bit = cur.ins().band_imm(sh, 1);
+            let bit = cur.ins().band_imm_u(sh, 1);
             let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
             func.dfg.clear_results(i);
             func.dfg.change_to_alias(out, c);
@@ -973,7 +1025,7 @@ pub fn run(func: &mut Function) -> usize {
         // Bit `d` of the mask lands at bit 0 of `sh`: test it, not the
         // whole shifted value — `sh != 0` would accept every `x` at or
         // below the mask's highest set bit, i.e. the interval's holes.
-        let bit = cur.ins().band_imm(sh, 1);
+        let bit = cur.ins().band_imm_u(sh, 1);
         let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
         cur.ins().brif(c, pl.hit.0, &ha, pl.miss.0, &ma);
         for &b in &pl.dead {

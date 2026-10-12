@@ -60,78 +60,83 @@ impl UnwindContext {
         let binary_format = module.isa().triple().binary_format;
         let macho = binary_format == target_lexicon::BinaryFormat::Macho;
         let coff = binary_format == target_lexicon::BinaryFormat::Coff;
-        let x86_macho = macho
-            && module.isa().triple().architecture == target_lexicon::Architecture::X86_64;
+        let x86_macho =
+            macho && module.isa().triple().architecture == target_lexicon::Architecture::X86_64;
         let mut personality_fn = None;
         // No DWARF CIE on COFF: unwind info is .pdata/.xdata per function.
         let cie_id = if coff {
             None
         } else {
             module.isa().create_systemv_cie().map(|mut cie| {
-            let ptr_enc = if pic {
-                gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
-            } else {
-                gimli::DW_EH_PE_absptr
-            };
-            cie.fde_address_encoding = ptr_enc;
-            if unwind {
-                let code_enc = if pic {
-                    let fmt = if module.isa().triple().binary_format
-                        == target_lexicon::BinaryFormat::Macho
-                        || module.isa().triple().architecture
-                            == target_lexicon::Architecture::X86_64
-                    {
-                        // ld64/ld64.lld require sdata4 for the CIE personality.
-                        gimli::DW_EH_PE_sdata4
-                    } else {
-                        gimli::DW_EH_PE_sdata8
-                    };
-                    gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | fmt.0)
+                let ptr_enc = if pic {
+                    gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
                 } else {
-                    gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_absptr.0)
+                    gimli::DW_EH_PE_absptr
                 };
-                cie.lsda_encoding = Some(ptr_enc);
-                let pt = module.target_config().pointer_type();
-                let personality = match module.get_name("rust_eh_personality") {
-                    Some(FuncOrDataId::Func(id)) => id,
-                    _ => {
-                        let sig = Signature {
-                            params: vec![
-                                AbiParam::new(types::I32),
-                                AbiParam::new(types::I32),
-                                AbiParam::new(types::I64),
-                                AbiParam::new(pt),
-                                AbiParam::new(pt),
-                            ],
-                            returns: vec![AbiParam::new(types::I32)],
-                            call_conv: module.target_config().default_call_conv,
+                cie.fde_address_encoding = ptr_enc;
+                if unwind {
+                    let code_enc = if pic {
+                        let fmt = if module.isa().triple().binary_format
+                            == target_lexicon::BinaryFormat::Macho
+                            || module.isa().triple().architecture
+                                == target_lexicon::Architecture::X86_64
+                        {
+                            // ld64/ld64.lld require sdata4 for the CIE personality.
+                            gimli::DW_EH_PE_sdata4
+                        } else {
+                            gimli::DW_EH_PE_sdata8
                         };
-                        module
-                            .declare_function("rust_eh_personality", Linkage::Import, &sig)
-                            .unwrap()
+                        gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | fmt.0)
+                    } else {
+                        gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_absptr.0)
+                    };
+                    cie.lsda_encoding = Some(ptr_enc);
+                    let pt = module.target_config().pointer_type();
+                    let personality = match module.get_name("rust_eh_personality") {
+                        Some(FuncOrDataId::Func(id)) => id,
+                        _ => {
+                            let sig = Signature {
+                                params: vec![
+                                    AbiParam::new(types::I32),
+                                    AbiParam::new(types::I32),
+                                    AbiParam::new(types::I64),
+                                    AbiParam::new(pt),
+                                    AbiParam::new(pt),
+                                ],
+                                returns: vec![AbiParam::new(types::I32)],
+                                call_conv: module.target_config().default_call_conv,
+                            };
+                            module
+                                .declare_function("rust_eh_personality", Linkage::Import, &sig)
+                                .unwrap()
+                        }
+                    };
+                    if macho {
+                        // Mach-O: the CIE personality reloc points at the function
+                        // itself and is emitted as POINTER_TO_GOT; the linker GOT
+                        // supplies the `indirect` hop, so no DW.ref slot is needed.
+                        personality_fn = Some(personality.as_u32());
+                        cie.personality = Some((code_enc, address_for_func(personality)));
+                    } else {
+                        // Indirect so the personality may live in another DSO.
+                        let pref = module
+                            .declare_data(
+                                "DW.ref.rust_eh_personality",
+                                Linkage::Local,
+                                false,
+                                false,
+                            )
+                            .unwrap();
+                        let mut d = DataDescription::new();
+                        // Must not be zero-init: the unwinder can't handle it in .bss.
+                        d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
+                        let fr = module.declare_func_in_data(personality, &mut d);
+                        d.write_function_addr(0, fr);
+                        module.define_data(pref, &d).unwrap();
+                        cie.personality = Some((code_enc, address_for_data(pref)));
                     }
-                };
-                if macho {
-                    // Mach-O: the CIE personality reloc points at the function
-                    // itself and is emitted as POINTER_TO_GOT; the linker GOT
-                    // supplies the `indirect` hop, so no DW.ref slot is needed.
-                    personality_fn = Some(personality.as_u32());
-                    cie.personality = Some((code_enc, address_for_func(personality)));
-                } else {
-                    // Indirect so the personality may live in another DSO.
-                    let pref = module
-                        .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
-                        .unwrap();
-                    let mut d = DataDescription::new();
-                    // Must not be zero-init: the unwinder can't handle it in .bss.
-                    d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
-                    let fr = module.declare_func_in_data(personality, &mut d);
-                    d.write_function_addr(0, fr);
-                    module.define_data(pref, &d).unwrap();
-                    cie.personality = Some((code_enc, address_for_data(pref)));
                 }
-            }
-            frame_table.add_cie(cie)
+                frame_table.add_cie(cie)
             })
         };
         UnwindContext {
@@ -158,7 +163,8 @@ impl UnwindContext {
             if let Some(UnwindInfo::WindowsX64(info)) = info {
                 let mut buf = vec![0; info.emit_size()];
                 info.emit(&mut buf);
-                self.pdata.push((func_id, buf, u64::from(code.buffer.total_size())));
+                self.pdata
+                    .push((func_id, buf, u64::from(code.buffer.total_size())));
             }
             return;
         }
@@ -277,11 +283,7 @@ impl UnwindContext {
                 flags: object::SymbolFlags::None,
             });
             let poff = obj.append_section_data(pdata, &[0; 12], 4);
-            for (off, sym, addend) in [
-                (0u64, fsym, 0i64),
-                (4, fsym, size as i64),
-                (8, xsym, 0),
-            ] {
+            for (off, sym, addend) in [(0u64, fsym, 0i64), (4, fsym, size as i64), (8, xsym, 0)] {
                 obj.add_relocation(
                     pdata,
                     Relocation {

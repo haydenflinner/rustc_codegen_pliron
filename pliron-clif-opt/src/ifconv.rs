@@ -14,8 +14,8 @@
 //! `PLIRON_IFCONV=0` disables it.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
@@ -293,7 +293,8 @@ fn emit_arm(
                         .value_alias_dest_for_serialization(b)
                         .is_none_or(|d| d != Value::reserved_value())
                 {
-                    let b = map.get(&pos.func.dfg.resolve_aliases(b))
+                    let b = map
+                        .get(&pos.func.dfg.resolve_aliases(b))
                         .copied()
                         .unwrap_or(b);
                     derived.insert(nr, b);
@@ -325,8 +326,9 @@ fn edge_ok(
 ) -> bool {
     mset.iter().all(|&x| {
         func.layout.block_insts(x).all(|i| {
-            func.dfg.inst_values(i).all(|v| {
-                match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            func.dfg
+                .inst_values(i)
+                .all(|v| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
                     ValueDef::Param(d, _) => {
                         !chains.contains(&d)
                             && (d == m
@@ -336,12 +338,10 @@ fn edge_ok(
                     ValueDef::Result(di, _) => {
                         let db = func.layout.inst_block(di).unwrap_or(m);
                         !chains.contains(&db)
-                            && (mset.contains(&db)
-                                || domtree.dominates(di, term, &func.layout))
+                            && (mset.contains(&db) || domtree.dominates(di, term, &func.layout))
                     }
                     _ => true,
-                }
-            })
+                })
         })
     })
 }
@@ -369,12 +369,7 @@ fn reachable(func: &Function, cfg: &ControlFlowGraph) -> FxHashSet<Block> {
 /// width decode) speculation only buys always-paid selects. Blocks with
 /// no reachable path (dead dispatch arms like `RangeInclusive`'s
 /// exhausted-flag branch) don't count.
-fn flat_loop(
-    func: &Function,
-    la: &LoopAnalysis,
-    reach: &FxHashSet<Block>,
-    b: Block,
-) -> bool {
+fn flat_loop(func: &Function, la: &LoopAnalysis, reach: &FxHashSet<Block>, b: Block) -> bool {
     let Some(lp) = la.innermost_loop(b) else {
         return true;
     };
@@ -387,9 +382,7 @@ fn flat_loop(
                 return true;
             };
             // An interior brif keeps both destinations in the loop.
-            !func
-                .dfg
-                .insts[i]
+            !func.dfg.insts[i]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 .iter()
                 .all(|bc| la.is_in_loop(bc.block(&func.dfg.value_lists), lp))
@@ -442,7 +435,10 @@ fn conv_table(
                     arg,
                 } = func.dfg.insts[i] =>
         {
-            (func.dfg.resolve_aliases(arg), func.dfg.value_type(func.dfg.resolve_aliases(arg)))
+            (
+                func.dfg.resolve_aliases(arg),
+                func.dfg.value_type(func.dfg.resolve_aliases(arg)),
+            )
         }
         _ => (idx, ity0),
     };
@@ -482,9 +478,8 @@ fn conv_table(
         return false;
     }
     let dflt = arm_of[0];
-    let covered = |ai: usize| -> Vec<usize> {
-        (0..nidx).filter(|&i| arm_of[1 + i] == ai).collect()
-    };
+    let covered =
+        |ai: usize| -> Vec<usize> { (0..nidx).filter(|&i| arm_of[1 + i] == ai).collect() };
     let total_hits: usize = (0..arms.len())
         .filter(|&ai| ai != dflt)
         .map(|ai| covered(ai).len())
@@ -585,7 +580,10 @@ fn conv_table(
         }
     }
     *dirty = true;
-    let avals: Vec<Vec<Value>> = arms.iter().map(|a| emit_arm(func, term, a, derived)).collect();
+    let avals: Vec<Vec<Value>> = arms
+        .iter()
+        .map(|a| emit_arm(func, term, a, derived))
+        .collect();
     let mut sargs: Vec<BlockArg> = Vec::with_capacity(np);
     for j in 0..np {
         let mut sel = avals[dflt][j];
@@ -604,11 +602,14 @@ fn conv_table(
             let mut pos = FuncCursor::new(func).at_inst(term);
             let mut hit = {
                 let k = pos.ins().iconst(ity, s[0] as i64);
-                pos.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k)
+                pos.ins()
+                    .icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k)
             };
             for &k in &s[1..] {
                 let k = pos.ins().iconst(ity, k as i64);
-                let c = pos.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k);
+                let c = pos
+                    .ins()
+                    .icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, idx, k);
                 hit = pos.ins().bor(hit, c);
             }
             sel = pos.ins().select(hit, v, sel);
@@ -735,12 +736,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 continue;
             }
         }
-        let chains: FxHashSet<Block> = ta
-            .chain
-            .iter()
-            .chain(ea.chain.iter())
-            .copied()
-            .collect();
+        let chains: FxHashSet<Block> = ta.chain.iter().chain(ea.chain.iter()).copied().collect();
         let mset = mset_cache.entry(m).or_insert_with(|| {
             func.layout
                 .blocks()
@@ -815,9 +811,9 @@ mod tests {
                 InstructionData::Binary {
                     opcode: Opcode::Bor,
                     args,
-                } => i64::from(
-                    eval(func, args[0], idx, b) != 0 || eval(func, args[1], idx, b) != 0,
-                ),
+                } => {
+                    i64::from(eval(func, args[0], idx, b) != 0 || eval(func, args[1], idx, b) != 0)
+                }
                 InstructionData::Ternary {
                     opcode: Opcode::Select,
                     args,
@@ -968,15 +964,11 @@ mod tests {
             fb.ins().brif(cnd, arm_t, &[], arm_e, &[]);
 
             fb.switch_to_block(arm_t);
-            fb.ins().jump(
-                merge,
-                &[z, hp[2], hp[2], hp[3]].map(BlockArg::Value),
-            );
+            fb.ins()
+                .jump(merge, &[z, hp[2], hp[2], hp[3]].map(BlockArg::Value));
             fb.switch_to_block(arm_e);
-            fb.ins().jump(
-                merge,
-                &[hp[2], hp[3], hp[2], hp[3]].map(BlockArg::Value),
-            );
+            fb.ins()
+                .jump(merge, &[hp[2], hp[3], hp[2], hp[3]].map(BlockArg::Value));
 
             fb.switch_to_block(merge);
             let mp = fb.block_params(merge).to_vec();
@@ -988,7 +980,9 @@ mod tests {
             fb.ins()
                 .jump(hdr, &[z, z, hp[0], hp[1]].map(BlockArg::Value));
             fb.switch_to_block(blk410);
-            let v = fb.ins().uload8(types::I8, MemFlagsData::new().with_notrap(), mp[0], 0);
+            let v = fb
+                .ins()
+                .uload8(types::I8, MemFlagsData::new().with_notrap(), mp[0], 0);
             let f = fb.ins().icmp_imm_u(IntCC::UnsignedLessThan, v, 128);
             fb.ins().brif(f, blk415, &[], blk413, &[]);
             fb.switch_to_block(blk415);
@@ -1004,8 +998,13 @@ mod tests {
             fb.switch_to_block(hdr);
             let dp = fb.block_params(hdr).to_vec();
             let live = fb.ins().icmp_imm_u(IntCC::Equal, dp[2], 0);
-            fb.ins()
-                .brif(live, latch, &[BlockArg::Value(dp[0])], ret, &[BlockArg::Value(dp[2])]);
+            fb.ins().brif(
+                live,
+                latch,
+                &[BlockArg::Value(dp[0])],
+                ret,
+                &[BlockArg::Value(dp[2])],
+            );
 
             // Digit latch: inject has=1, base=16 into the shared header.
             fb.switch_to_block(latch);

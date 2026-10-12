@@ -13,9 +13,9 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::state::State;
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
+use crate::state::State;
 
 /// libc functions that only read memory.
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];

@@ -77,13 +77,13 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 "floorf16" | "floorf32" | "floorf64" | "floorf128" => "llvm.floor",
                 "ceilf16" | "ceilf32" | "ceilf64" | "ceilf128" => "llvm.ceil",
                 "truncf16" | "truncf32" | "truncf64" | "truncf128" => "llvm.trunc",
-                "round_ties_even_f16" | "round_ties_even_f32" | "round_ties_even_f64"
+                "round_ties_even_f16"
+                | "round_ties_even_f32"
+                | "round_ties_even_f64"
                 | "round_ties_even_f128" => "llvm.roundeven",
-                "copysignf16" | "copysignf32" | "copysignf64" | "copysignf128" => {
-                    "llvm.copysign"
-                }
-                "fmaf16" | "fmaf32" | "fmaf64" | "fmaf128" | "fmuladdf16"
-                | "fmuladdf32" | "fmuladdf64" | "fmuladdf128" => "llvm.fma",
+                "copysignf16" | "copysignf32" | "copysignf64" | "copysignf128" => "llvm.copysign",
+                "fmaf16" | "fmaf32" | "fmaf64" | "fmaf128" | "fmuladdf16" | "fmuladdf32"
+                | "fmuladdf64" | "fmuladdf128" => "llvm.fma",
                 "minimumf16" | "minimumf32" | "minimumf64" | "minimumf128" => "llvm.minimum",
                 "maximumf16" | "maximumf32" | "maximumf64" | "maximumf128" => "llvm.maximum",
                 _ => return None,
@@ -318,11 +318,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::is_val_statically_known => self.const_bool(false),
             sym::compare_bytes => {
                 let i32t = self.type_i32();
-                let kn = crate::sroa::const_int(
-                    &self.pctx.borrow(),
-                    &self.st.borrow(),
-                    a(2),
-                );
+                let kn = crate::sroa::const_int(&self.pctx.borrow(), &self.st.borrow(), a(2));
                 match kn {
                     // Small constant n: the common result is equality,
                     // so scan inline and only call memcmp for ordering

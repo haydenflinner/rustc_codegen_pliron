@@ -396,13 +396,14 @@ fn uses_of(func: &Function, v: Value) -> usize {
                 .iter()
                 .filter(|&&a| func.dfg.resolve_aliases(a) == v)
                 .count();
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 c += bc
                     .args(&func.dfg.value_lists)
-                    .filter(|a| matches!(a, BlockArg::Value(x) if func.dfg.resolve_aliases(*x) == v))
+                    .filter(
+                        |a| matches!(a, BlockArg::Value(x) if func.dfg.resolve_aliases(*x) == v),
+                    )
                     .count();
             }
         }
@@ -466,18 +467,21 @@ fn cover(func: &Function, v: Value, depth: usize) -> u64 {
             opcode: Opcode::Uextend,
             arg,
         } => cover(func, arg, depth - 1),
-        InstructionData::Binary { opcode: Opcode::Band, args } => {
-            cover(func, args[0], depth - 1) & cover(func, args[1], depth - 1)
-        }
-        InstructionData::Binary { opcode: Opcode::Bor, args } => {
-            (cover(func, args[0], depth - 1) | cover(func, args[1], depth - 1)) & all
-        }
-        InstructionData::Binary { opcode: Opcode::Ushr, args } => {
-            match iconst(func, args[1]) {
-                Some(s) => cover(func, args[0], depth - 1) >> (s as u64 % ty.bits() as u64),
-                None => all,
-            }
-        }
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => cover(func, args[0], depth - 1) & cover(func, args[1], depth - 1),
+        InstructionData::Binary {
+            opcode: Opcode::Bor,
+            args,
+        } => (cover(func, args[0], depth - 1) | cover(func, args[1], depth - 1)) & all,
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => match iconst(func, args[1]) {
+            Some(s) => cover(func, args[0], depth - 1) >> (s as u64 % ty.bits() as u64),
+            None => all,
+        },
         InstructionData::Load { opcode, .. } => match opcode {
             Opcode::Uload8 => 0xff,
             Opcode::Uload16 => 0xffff,
@@ -581,13 +585,9 @@ fn minmax(pos: &mut FuncCursor, inst: Inst) -> bool {
         let direct = if same_lane(f, tt, a, w) && same_lane(f, ff, b, w) {
             Some(match cc {
                 IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => Opcode::Umin,
-                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => {
-                    Opcode::Umax
-                }
+                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => Opcode::Umax,
                 IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual => Opcode::Smin,
-                IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual => {
-                    Opcode::Smax
-                }
+                IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual => Opcode::Smax,
                 _ => continue,
             })
         } else {
@@ -870,9 +870,7 @@ pub fn coldedges(func: &mut Function) -> usize {
         let Some(t) = func.layout.last_inst(b) else {
             continue;
         };
-        for (di, bc) in func
-            .dfg
-            .insts[t]
+        for (di, bc) in func.dfg.insts[t]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             .iter()
             .enumerate()
@@ -897,9 +895,8 @@ pub fn coldedges(func: &mut Function) -> usize {
         FuncCursor::new(func).at_bottom(a).ins().jump(c, &args);
         let bc = func.dfg.block_call(a, &[]);
         let dfg = &mut func.dfg;
-        let dests = dfg
-            .insts[t]
-            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+        let dests =
+            dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
         if let Some(d) = dests.get_mut(di) {
             *d = bc;
         }
@@ -1039,9 +1036,17 @@ pub fn foldforwarders(func: &mut Function) -> usize {
 
     enum Rw {
         /// Retarget edge `di` of `pinst` to a new block call.
-        Edge { pinst: Inst, di: usize, call: BlockCall },
+        Edge {
+            pinst: Inst,
+            di: usize,
+            call: BlockCall,
+        },
         /// Replace `pinst` (a `jump`) with a cloned `brif` in `pb`.
-        Brif { pb: Block, pinst: Inst, data: InstructionData },
+        Brif {
+            pb: Block,
+            pinst: Inst,
+            data: InstructionData,
+        },
     }
 
     // Substitute a forwarder-internal value `v` onto the edge
@@ -1061,9 +1066,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
             return Some(pargs[k]);
         }
         let ok = match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => {
-                i != pinst && domtree.dominates(i, pinst, &func.layout)
-            }
+            ValueDef::Result(i, _) => i != pinst && domtree.dominates(i, pinst, &func.layout),
             ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
             _ => false,
         };
@@ -1082,9 +1085,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
         let mut out = Vec::new();
         for a in bc.args(pool) {
             match a {
-                BlockArg::Value(v) => {
-                    out.push(subst(func, domtree, params, pargs, v, pb, pinst)?)
-                }
+                BlockArg::Value(v) => out.push(subst(func, domtree, params, pargs, v, pb, pinst)?),
                 // Pseudo-values can't be introduced onto a `jump` edge,
                 // and we only call this for jump preds anyway.
                 _ => return None,
@@ -1118,10 +1119,9 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                 for &v in func.dfg.inst_args(i) {
                     note(v);
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             note(v);
@@ -1134,25 +1134,23 @@ pub fn foldforwarders(func: &mut Function) -> usize {
         // reachable from `targets` without traversing b, so the new
         // edges could reach that use while its param is undefined.
         // Cheap when nothing escapes at all.
-        let escapes_hazard = |cfg: &ControlFlowGraph,
-                              b: Block,
-                              targets: &[Block],
-                              esc: &FxHashSet<Block>| {
-            if esc.is_empty() {
-                return false;
-            }
-            let mut reach = FxHashSet::default();
-            let mut work: Vec<Block> = targets.to_vec();
-            while let Some(x) = work.pop() {
-                if x == b || !reach.insert(x) {
-                    continue;
+        let escapes_hazard =
+            |cfg: &ControlFlowGraph, b: Block, targets: &[Block], esc: &FxHashSet<Block>| {
+                if esc.is_empty() {
+                    return false;
                 }
-                for s in cfg.succ_iter(x) {
-                    work.push(s);
+                let mut reach = FxHashSet::default();
+                let mut work: Vec<Block> = targets.to_vec();
+                while let Some(x) = work.pop() {
+                    if x == b || !reach.insert(x) {
+                        continue;
+                    }
+                    for s in cfg.succ_iter(x) {
+                        work.push(s);
+                    }
                 }
-            }
-            reach.iter().any(|u| esc.contains(u))
-        };
+                reach.iter().any(|u| esc.contains(u))
+            };
         let mut rws: Vec<Rw> = Vec::new();
         // A `jump` can only carry one edge, so at most one Brif rewrite
         // per inst — dedup defensively.
@@ -1177,9 +1175,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                     let mut ok = true;
                     for a in destination.args(&func.dfg.value_lists) {
                         match a {
-                            BlockArg::Value(v) => {
-                                targs.push(func.dfg.resolve_aliases(v))
-                            }
+                            BlockArg::Value(v) => targs.push(func.dfg.resolve_aliases(v)),
                             _ => {
                                 ok = false;
                                 break;
@@ -1192,33 +1188,29 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                     if escapes_hazard(&cfg, b, &[t], &escape_blocks) {
                         continue;
                     }
-                    for (pb, pinst) in
-                        cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect::<Vec<_>>()
+                    for (pb, pinst) in cfg
+                        .pred_iter(b)
+                        .map(|p| (p.block, p.inst))
+                        .collect::<Vec<_>>()
                     {
                         if pb == b {
                             continue;
                         }
                         let dests = func.dfg.insts[pinst]
-                            .branch_destination(
-                                &func.dfg.jump_tables,
-                                &func.dfg.exception_tables,
-                            )
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                             .to_vec();
                         for (di, bc) in dests.iter().enumerate() {
                             if bc.block(&func.dfg.value_lists) != b {
                                 continue;
                             }
-                            let pargs: Vec<BlockArg> =
-                                bc.args(&func.dfg.value_lists).collect();
+                            let pargs: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
                             if pargs.len() != params.len() {
                                 continue;
                             }
                             let mut new = Vec::with_capacity(targs.len());
                             let mut ok = true;
                             for &v in &targs {
-                                if let Some(k) =
-                                    params.iter().position(|&p| p == v)
-                                {
+                                if let Some(k) = params.iter().position(|&p| p == v) {
                                     // Verbatim: valid on this same edge
                                     // even if a try_call pseudo-value.
                                     new.push(pargs[k]);
@@ -1226,15 +1218,9 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                                 }
                                 let dom = match func.dfg.value_def(v) {
                                     ValueDef::Result(i, _) => {
-                                        i != pinst
-                                            && domtree.dominates(
-                                                i,
-                                                pinst,
-                                                &func.layout,
-                                            )
+                                        i != pinst && domtree.dominates(i, pinst, &func.layout)
                                     }
-                                    ValueDef::Param(d, _) => domtree
-                                        .block_dominates(d, pb),
+                                    ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                                     _ => false,
                                 };
                                 if !dom {
@@ -1246,13 +1232,8 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                             if !ok {
                                 continue;
                             }
-                            let call =
-                                BlockCall::new(t, new, &mut func.dfg.value_lists);
-                            rws.push(Rw::Edge {
-                                pinst,
-                                di,
-                                call,
-                            });
+                            let call = BlockCall::new(t, new, &mut func.dfg.value_lists);
+                            rws.push(Rw::Edge { pinst, di, call });
                         }
                     }
                 }
@@ -1262,8 +1243,10 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                     if escapes_hazard(&cfg, b, &[t1, t2], &escape_blocks) {
                         continue;
                     }
-                    for (pb, pinst) in
-                        cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect::<Vec<_>>()
+                    for (pb, pinst) in cfg
+                        .pred_iter(b)
+                        .map(|p| (p.block, p.inst))
+                        .collect::<Vec<_>>()
                     {
                         if pb == b || brifed.contains_key(&pinst) {
                             continue;
@@ -1279,23 +1262,21 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                         if pd.block(&func.dfg.value_lists) != b {
                             continue;
                         }
-                        let pargs: Vec<BlockArg> =
-                            pd.args(&func.dfg.value_lists).collect();
+                        let pargs: Vec<BlockArg> = pd.args(&func.dfg.value_lists).collect();
                         if pargs.len() != params.len() {
                             continue;
                         }
-                        let Some(BlockArg::Value(cv)) = subst(
-                            func, &domtree, &params, &pargs, c, pb, pinst,
-                        ) else {
+                        let Some(BlockArg::Value(cv)) =
+                            subst(func, &domtree, &params, &pargs, c, pb, pinst)
+                        else {
                             continue;
                         };
                         let mut nb = Vec::with_capacity(2);
                         let mut ok = true;
                         for bc in blocks {
-                            let Some(new) = subst_args(
-                                func, &domtree, &params, &pargs, bc, pb,
-                                pinst,
-                            ) else {
+                            let Some(new) =
+                                subst_args(func, &domtree, &params, &pargs, bc, pb, pinst)
+                            else {
                                 ok = false;
                                 break;
                             };
@@ -1328,10 +1309,8 @@ pub fn foldforwarders(func: &mut Function) -> usize {
             match rw {
                 Rw::Edge { pinst, di, call } => {
                     let dfg = &mut func.dfg;
-                    let dests = dfg.insts[pinst].branch_destination_mut(
-                        &mut dfg.jump_tables,
-                        &mut dfg.exception_tables,
-                    );
+                    let dests = dfg.insts[pinst]
+                        .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
                     if let Some(d) = dests.get_mut(di) {
                         *d = call;
                         applied += 1;
@@ -1372,10 +1351,9 @@ pub fn fusechains(func: &mut Function) -> usize {
             let Some(lt) = func.layout.last_inst(b) else {
                 continue;
             };
-            for bc in func.dfg.insts[lt].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[lt]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 *preds.entry(bc.block(&func.dfg.value_lists)).or_default() += 1;
             }
         }
@@ -1395,9 +1373,7 @@ pub fn fusechains(func: &mut Function) -> usize {
                 .to_vec();
             let pick = dests.iter().find(|bc| {
                 let t = bc.block(&func.dfg.value_lists);
-                t != b
-                    && !func.layout.is_cold(t)
-                    && preds.get(&t).copied().unwrap_or(0) == 1
+                t != b && !func.layout.is_cold(t) && preds.get(&t).copied().unwrap_or(0) == 1
             });
             let Some(bc) = pick else { continue };
             let t = bc.block(&func.dfg.value_lists);
@@ -1562,9 +1538,7 @@ pub fn coldrets(func: &mut Function) -> usize {
             let ni = func.dfg.clone_inst(i);
             let dfg = &mut func.dfg;
             let mut d = dfg.insts[ni];
-            for dst in
-                d.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-            {
+            for dst in d.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
                 *dst = dst.deep_clone(&mut dfg.value_lists);
             }
             dfg.insts[ni] = d;
@@ -1664,10 +1638,8 @@ fn cparm_round(func: &mut Function) -> usize {
         let mut rows = Vec::with_capacity(es.len());
         let mut ok = true;
         for &(i, d) in es {
-            let bc = &func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            )[d];
+            let bc = &func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
             let args: Vec<Value> = bc
                 .args(&func.dfg.value_lists)
                 .map(|a| match a {
@@ -1921,10 +1893,8 @@ fn apply_param_drops(
     // earlier indices stay valid), then drop the params themselves.
     for (i, d, ixs) in arg_drops {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[i].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[d];
+        let bc = &mut dfg.insts[i]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
         for &ix in &ixs {
             bc.remove(ix, &mut dfg.value_lists);
         }
@@ -2032,10 +2002,8 @@ fn sameargs_round(func: &mut Function) -> usize {
         let mut edge_args: Vec<Vec<AKey>> = Vec::with_capacity(es.len());
         let mut uniform = true;
         for &(i, d) in es {
-            let bc = &func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            )[d];
+            let bc = &func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
             let args: Vec<AKey> = bc
                 .args(&func.dfg.value_lists)
                 .map(|a| match a {
@@ -2096,9 +2064,7 @@ fn sameargs_round(func: &mut Function) -> usize {
                         // itself (a self-edge passing an in-block
                         // def/param).
                         let in_b = match func.dfg.value_def(v) {
-                            ValueDef::Result(i, _) => {
-                                func.layout.inst_block(i) == Some(b)
-                            }
+                            ValueDef::Result(i, _) => func.layout.inst_block(i) == Some(b),
                             ValueDef::Param(bb, _) => bb == b,
                             _ => true,
                         };
@@ -2208,8 +2174,8 @@ pub fn phimerge(func: &mut Function) -> usize {
             continue;
         }
         let arity_ok = es.iter().all(|&(i, d)| {
-            func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+            func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                [d]
                 .args(&func.dfg.value_lists)
                 .len()
                 == ps.len()
@@ -2257,10 +2223,8 @@ pub fn phimerge(func: &mut Function) -> usize {
                 continue;
             }
             let ok = edges[&b].iter().all(|&(i, d)| {
-                let bc = &func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                )[d];
+                let bc = &func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
                 let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
                 match (args.get(ix), args.get(jx)) {
                     (Some(&BlockArg::Value(x)), Some(&BlockArg::Value(y))) => {
@@ -2325,15 +2289,11 @@ fn phi_cong(
     find: &dyn Fn(&FxHashMap<Value, Value>, Value) -> Value,
     depth: u32,
 ) -> bool {
-    let (x, y) = (
-        func.dfg.resolve_aliases(x),
-        func.dfg.resolve_aliases(y),
-    );
+    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
     if x == y || find(uf, x) == find(uf, y) {
         return true;
     }
-    let (Some(di), Some(dj)) = (func.dfg.value_def(x).inst(), func.dfg.value_def(y).inst())
-    else {
+    let (Some(di), Some(dj)) = (func.dfg.value_def(x).inst(), func.dfg.value_def(y).inst()) else {
         return false;
     };
     if func.dfg.value_type(x) != func.dfg.value_type(y) || depth == 0 {
@@ -2342,8 +2302,14 @@ fn phi_cong(
     let c = |x: Value, y: Value, d: u32| phi_cong(func, x, y, uf, find, d - 1);
     match (func.dfg.insts[di], func.dfg.insts[dj]) {
         (
-            InstructionData::Unary { opcode: o1, arg: a1 },
-            InstructionData::Unary { opcode: o2, arg: a2 },
+            InstructionData::Unary {
+                opcode: o1,
+                arg: a1,
+            },
+            InstructionData::Unary {
+                opcode: o2,
+                arg: a2,
+            },
         ) => o1 == o2 && c(a1, a2, depth),
         (
             InstructionData::UnaryImm {
@@ -2383,14 +2349,10 @@ fn phi_cong(
         ) => o1 == o2 && m1 == m2 && c(a1, a2, depth),
         (
             InstructionData::IntCompare {
-                cond: c1,
-                args: s1,
-                ..
+                cond: c1, args: s1, ..
             },
             InstructionData::IntCompare {
-                cond: c2,
-                args: s2,
-                ..
+                cond: c2, args: s2, ..
             },
         ) => {
             (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
@@ -2398,14 +2360,10 @@ fn phi_cong(
         }
         (
             InstructionData::FloatCompare {
-                cond: c1,
-                args: s1,
-                ..
+                cond: c1, args: s1, ..
             },
             InstructionData::FloatCompare {
-                cond: c2,
-                args: s2,
-                ..
+                cond: c2, args: s2, ..
             },
         ) => {
             (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
@@ -2420,12 +2378,7 @@ fn phi_cong(
                 opcode: o2,
                 args: s2,
             },
-        ) => {
-            o1 == o2
-                && c(s1[0], s2[0], depth)
-                && c(s1[1], s2[1], depth)
-                && c(s1[2], s2[2], depth)
-        }
+        ) => o1 == o2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth) && c(s1[2], s2[2], depth),
         _ => false,
     }
 }
@@ -2521,10 +2474,7 @@ fn sel_regions(func: &mut Function) -> usize {
         let Some(t) = func.layout.last_inst(b) else {
             continue;
         };
-        let InstructionData::Brif {
-            arg: c, blocks, ..
-        } = func.dfg.insts[t]
-        else {
+        let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[t] else {
             continue;
         };
         let c = func.dfg.resolve_aliases(c);
@@ -2533,9 +2483,7 @@ fn sel_regions(func: &mut Function) -> usize {
         // way once niche tests rewrite the branch to such a compare.
         let mut conds = vec![(c, false)];
         if let Some(ci) = func.dfg.value_def(c).inst()
-            && let InstructionData::IntCompare {
-                cond, args: ia, ..
-            } = func.dfg.insts[ci]
+            && let InstructionData::IntCompare { cond, args: ia, .. } = func.dfg.insts[ci]
             && matches!(cond, IntCC::Equal | IntCC::NotEqual)
         {
             let konst = |v: Value| match func.dfg.value_def(v) {
@@ -2610,8 +2558,7 @@ fn sel_regions(func: &mut Function) -> usize {
                     let BlockArg::Value(v) = a else {
                         continue;
                     };
-                    let Some(d) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
-                    else {
+                    let Some(d) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
                         continue;
                     };
                     let InstructionData::Ternary {
@@ -2635,10 +2582,8 @@ fn sel_regions(func: &mut Function) -> usize {
     let mut n = 0;
     for (i, di, ai, v) in edge_edits {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[i].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[di];
+        let bc = &mut dfg.insts[i]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di];
         let mut at = 0;
         bc.update_args(&mut dfg.value_lists, |a| {
             let r = if at == ai { BlockArg::Value(v) } else { a };
@@ -2653,8 +2598,7 @@ fn sel_regions(func: &mut Function) -> usize {
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             for &a in func.dfg.inst_args(i) {
-                uses
-                    .entry(func.dfg.resolve_aliases(a))
+                uses.entry(func.dfg.resolve_aliases(a))
                     .or_default()
                     .insert(b);
             }
@@ -2663,8 +2607,7 @@ fn sel_regions(func: &mut Function) -> usize {
             {
                 for a in bc.args(&func.dfg.value_lists) {
                     if let BlockArg::Value(v) = a {
-                        uses
-                            .entry(func.dfg.resolve_aliases(v))
+                        uses.entry(func.dfg.resolve_aliases(v))
                             .or_default()
                             .insert(b);
                     }
@@ -2817,7 +2760,10 @@ pub fn run(func: &mut Function) -> usize {
                     None
                 };
                 if let Some(d) = x.and_then(|x| {
-                    pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(x)).inst()
+                    pos.func
+                        .dfg
+                        .value_def(pos.func.dfg.resolve_aliases(x))
+                        .inst()
                 }) && let InstructionData::Unary {
                     opcode: Opcode::Uextend,
                     arg: c,
@@ -2887,7 +2833,11 @@ pub fn run(func: &mut Function) -> usize {
                 }
                 if let Some(k) = iconst(pos.func, k) {
                     let bits = ty.bits() as u32;
-                    let umax = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let umax = if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
                     let smin = (-1i128 << (bits - 1)) as i64;
                     let smax = ((1i128 << (bits - 1)) - 1) as i64;
                     let ku = k as u64 & umax;
@@ -3157,10 +3107,8 @@ pub fn ovkill(func: &mut Function) -> usize {
                 for pred in &preds {
                     let (pb, pi) = (pred.block, pred.inst);
                     let pe = end_b(func, cfg, ememo, memo, visiting, pb, depth - 1);
-                    let dests = func.dfg.insts[pi].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    );
+                    let dests = func.dfg.insts[pi]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                     let matches: Vec<(usize, &BlockCall)> = dests
                         .iter()
                         .enumerate()
@@ -3194,10 +3142,8 @@ pub fn ovkill(func: &mut Function) -> usize {
             // this block (`brif (ult d, 10)` → `d <= 9` on the taken edge).
             if preds.len() == 1 {
                 let pi = preds[0].inst;
-                let dests = func.dfg.insts[pi].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                );
+                let dests = func.dfg.insts[pi]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                 let matches: Vec<(usize, &BlockCall)> = dests
                     .iter()
                     .enumerate()
@@ -3242,8 +3188,7 @@ pub fn ovkill(func: &mut Function) -> usize {
     let mut visiting = FxHashSet::default();
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
-        let mut m =
-            (*entry_b(func, &cfg, &mut ememo, &mut memo, &mut visiting, b, 512)).clone();
+        let mut m = (*entry_b(func, &cfg, &mut ememo, &mut memo, &mut visiting, b, 512)).clone();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
             match func.dfg.insts[i] {
                 InstructionData::Binary {
@@ -3321,11 +3266,7 @@ pub fn ovkill(func: &mut Function) -> usize {
                     let (cc, x, k) = if let Some(k) = iconst(func, args[1]) {
                         (cond, func.dfg.resolve_aliases(args[0]), k)
                     } else if let Some(k) = iconst(func, args[0]) {
-                        (
-                            cond.swap_args(),
-                            func.dfg.resolve_aliases(args[1]),
-                            k,
-                        )
+                        (cond.swap_args(), func.dfg.resolve_aliases(args[1]), k)
                     } else {
                         inst_bounds(func, &mut m, i);
                         continue;
@@ -3377,7 +3318,12 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
         (Some(0), None) => (args[1], args[0]),
         _ => return false,
     };
-    let Some(i) = pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(x)).inst() else {
+    let Some(i) = pos
+        .func
+        .dfg
+        .value_def(pos.func.dfg.resolve_aliases(x))
+        .inst()
+    else {
         return false;
     };
     let InstructionData::Binary { opcode, args: ra } = pos.func.dfg.insts[i] else {
@@ -3431,27 +3377,19 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
 /// `icmp eq/ne (x + c1), c2` → `icmp eq/ne x, c2 - c1` (wrapping add is a
 /// bijection, so equality survives the shift). Together they fold peeled
 /// countdowns `x - k >=u 1` to a single `cmp x, k`.
-fn icmp_eqfold(
-    pos: &mut FuncCursor,
-    inst: Inst,
-    cond: IntCC,
-    args: [Value; 2],
-    ty: Type,
-) -> bool {
+fn icmp_eqfold(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: Type) -> bool {
     if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
         return false;
     }
     let ck = iconst(pos.func, args[1])
         .map(|k| (cond, args[0], k))
-        .or_else(|| {
-            iconst(pos.func, args[0])
-                .map(|k| (cond.swap_args(), args[1], k))
-        });
+        .or_else(|| iconst(pos.func, args[0]).map(|k| (cond.swap_args(), args[1], k)));
     let eqcc = match ck {
         Some((IntCC::UnsignedGreaterThanOrEqual, _, 1))
         | Some((IntCC::UnsignedGreaterThan, _, 0)) => Some(IntCC::NotEqual),
-        Some((IntCC::UnsignedLessThanOrEqual, _, 0))
-        | Some((IntCC::UnsignedLessThan, _, 1)) => Some(IntCC::Equal),
+        Some((IntCC::UnsignedLessThanOrEqual, _, 0)) | Some((IntCC::UnsignedLessThan, _, 1)) => {
+            Some(IntCC::Equal)
+        }
         _ => None,
     };
     if let Some(ncc) = eqcc {
@@ -3460,7 +3398,9 @@ fn icmp_eqfold(
         pos.func.replace(inst).icmp(ncc, x0, z);
         return true;
     }
-    let Some((cc0, x0, k0)) = ck else { return false };
+    let Some((cc0, x0, k0)) = ck else {
+        return false;
+    };
     // i64 only: the motivating pattern is the peeled pointer/countdown test.
     // Narrower widths are correct in isolation but a `b-9` whitespace-switch
     // fold in strwork miscompiled when shifted at i8 — untraced downstream
@@ -3470,7 +3410,11 @@ fn icmp_eqfold(
     }
     // `isub` must be `x - c` — `c - x` doesn't shift.
     let issub = |v: Value| {
-        let i = pos.func.dfg.value_def(pos.func.dfg.resolve_aliases(v)).inst()?;
+        let i = pos
+            .func
+            .dfg
+            .value_def(pos.func.dfg.resolve_aliases(v))
+            .inst()?;
         let InstructionData::Binary {
             opcode: Opcode::Isub,
             args: aa,
@@ -3585,10 +3529,7 @@ pub fn wide_minmax(func: &mut Function) -> usize {
 /// readonly` `&T`: immutable and live for the whole call) become `readonly
 /// can_move`, which Cranelift's egraph treats as pure: it merges repeats and
 /// hoists them out of loops, as LLVM's LICM/GVN do with the same facts.
-pub fn frozen_loads(
-    func: &mut Function,
-    frozen: &rustc_hash::FxHashMap<Value, u64>,
-) -> usize {
+pub fn frozen_loads(func: &mut Function, frozen: &rustc_hash::FxHashMap<Value, u64>) -> usize {
     let mut n = 0;
     let mut hoist = Vec::new();
     let insts: Vec<Inst> = func
@@ -3673,10 +3614,8 @@ fn hoist_frozen(
     let dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let mut done: rustc_hash::FxHashMap<
-        (Opcode, cranelift_codegen::ir::Type, Value, i32),
-        Value,
-    > = Default::default();
+    let mut done: rustc_hash::FxHashMap<(Opcode, cranelift_codegen::ir::Type, Value, i32), Value> =
+        Default::default();
     for (i, opcode, base, off, flags) in hoist {
         let Some(b) = func.layout.inst_block(i) else {
             continue;
@@ -3822,10 +3761,7 @@ pub fn lcse(func: &mut Function) -> usize {
             {
                 let x = func.dfg.resolve_aliases(x);
                 let w = func.dfg.value_type(func.dfg.first_result(d)).bits();
-                if func.dfg.value_type(x) == res_ty
-                    && w < 64
-                    && (vmax(func, x) >> w) == 0
-                {
+                if func.dfg.value_type(x) == res_ty && w < 64 && (vmax(func, x) >> w) == 0 {
                     return Some(x);
                 }
             }
@@ -3868,11 +3804,7 @@ pub fn lcse(func: &mut Function) -> usize {
     // `(a + k) + x` chains: rewrite the outer add's args to
     // `(a, x)` — in-place, so its operands still dominate it — and
     // carry `k` into the offset too (outer add must be single-use).
-    let memoff = |func: &mut Function,
-                  v: &mut Value,
-                  off: &mut i64,
-                  seen: &mut Seen|
-     -> usize {
+    let memoff = |func: &mut Function, v: &mut Value, off: &mut i64, seen: &mut Seen| -> usize {
         if !crate::pass_enabled("PLIRON_MEMOFF") {
             return 0;
         }
@@ -3922,8 +3854,10 @@ pub fn lcse(func: &mut Function) -> usize {
             *off = i64::from(no);
             let other = args[1 - ix];
             untrack(func, seen, d);
-            func.dfg.insts[d] =
-                InstructionData::Binary { opcode: Opcode::Iadd, args: [b, other] };
+            func.dfg.insts[d] = InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args: [b, other],
+            };
             depth += 1;
         }
         depth
@@ -3952,8 +3886,7 @@ pub fn lcse(func: &mut Function) -> usize {
                     let mut a = args[1];
                     let mut off = i64::from(offset);
                     if memoff(func, &mut a, &mut off, &mut seen) > 0 {
-                        if let InstructionData::Store { args, offset, .. } =
-                            &mut func.dfg.insts[i]
+                        if let InstructionData::Store { args, offset, .. } = &mut func.dfg.insts[i]
                         {
                             args[1] = a;
                             *offset = (off as i32).into();
@@ -3962,9 +3895,10 @@ pub fn lcse(func: &mut Function) -> usize {
                         continue;
                     }
                 }
-                InstructionData::Binary { opcode: Opcode::Iadd, args }
-                    if crate::pass_enabled("PLIRON_NEGFOLD") =>
-                {
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } if crate::pass_enabled("PLIRON_NEGFOLD") => {
                     let ra = func.dfg.resolve_aliases(args[0]);
                     let rb = func.dfg.resolve_aliases(args[1]);
                     // `iadd (ineg a), b` → `isub b, a` — isel turns the
@@ -4012,9 +3946,7 @@ pub fn lcse(func: &mut Function) -> usize {
                             return None;
                         }
                         untrack(func, seen, mi);
-                        if let InstructionData::Binary { args, .. } =
-                            &mut func.dfg.insts[mi]
-                        {
+                        if let InstructionData::Binary { args, .. } = &mut func.dfg.insts[mi] {
                             args[ix] = inner;
                         }
                         Some(func.dfg.first_result(mi))
@@ -4025,8 +3957,10 @@ pub fn lcse(func: &mut Function) -> usize {
                         neg(rb, &mut seen).map(|x| [ra, x])
                     };
                     if let Some(args) = sub {
-                        func.dfg.insts[i] =
-                            InstructionData::Binary { opcode: Opcode::Isub, args };
+                        func.dfg.insts[i] = InstructionData::Binary {
+                            opcode: Opcode::Isub,
+                            args,
+                        };
                         n += 1;
                         continue;
                     }
@@ -4078,8 +4012,7 @@ pub fn lcse(func: &mut Function) -> usize {
 pub fn selfarg(func: &mut Function) -> usize {
     // use map: v -> (inst operand uses, branch-arg uses as (inst, slot, arg
     // index) so `p` passed to `h` at its own index is recognizable).
-    let mut uses: FxHashMap<Value, (Vec<Inst>, Vec<(Inst, usize, usize)>)> =
-        FxHashMap::default();
+    let mut uses: FxHashMap<Value, (Vec<Inst>, Vec<(Inst, usize, usize)>)> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             for &a in func.dfg.inst_args(i) {
@@ -4088,12 +4021,10 @@ pub fn selfarg(func: &mut Function) -> usize {
                     .0
                     .push(i);
             }
-            for (d, bc) in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            )
-            .iter()
-            .enumerate()
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
             {
                 let blk = bc.block(&func.dfg.value_lists);
                 for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
@@ -4143,10 +4074,8 @@ pub fn selfarg(func: &mut Function) -> usize {
                     }
                 }
                 for &(i, d, ai) in edges {
-                    let bc = func.dfg.insts[i].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    )[d];
+                    let bc = func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
                     if bc.block(&func.dfg.value_lists) != h || ai != idx {
                         ok = false;
                     }
@@ -4172,10 +4101,9 @@ pub fn selfarg(func: &mut Function) -> usize {
                         }
                     }
                     for &(u, d, ai) in edges {
-                        let bc = func.dfg.insts[u].branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        )[d];
+                        let bc = func.dfg.insts[u]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                            [d];
                         if bc.block(&func.dfg.value_lists) != h || ai != idx {
                             ok = false;
                         }
@@ -4253,10 +4181,9 @@ pub fn vecslot(func: &mut Function) -> usize {
             for &a in func.dfg.inst_args(i) {
                 uses.entry(func.dfg.resolve_aliases(a)).or_default().push(i);
             }
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 for a in bc.args(&func.dfg.value_lists) {
                     if let BlockArg::Value(v) = a {
                         edgevals.push(v);
@@ -4279,9 +4206,7 @@ pub fn vecslot(func: &mut Function) -> usize {
                         stack_slot, offset, ..
                     } => {
                         for &r in func.dfg.inst_results(i) {
-                            grew |= slotval
-                                .insert(r, (stack_slot, offset.into()))
-                                .is_none();
+                            grew |= slotval.insert(r, (stack_slot, offset.into())).is_none();
                         }
                     }
                     InstructionData::Binary {
@@ -4334,9 +4259,7 @@ pub fn vecslot(func: &mut Function) -> usize {
                             let k = iconst(func, args[0]);
                             (t.bytes() as usize, k.map(|x| x as u64 as u128))
                         }
-                        Opcode::Istore8 => {
-                            (1, iconst(func, args[0]).map(|x| x as u64 as u128))
-                        }
+                        Opcode::Istore8 => (1, iconst(func, args[0]).map(|x| x as u64 as u128)),
                         _ => (0, None),
                     };
                     let s = slots.entry(ss).or_default();
@@ -4379,9 +4302,11 @@ pub fn vecslot(func: &mut Function) -> usize {
                     for &a in func.dfg.inst_args(i) {
                         let a = func.dfg.resolve_aliases(a);
                         if let Some(&(ss, _)) = slotval.get(&a) {
-                            let chain = func.dfg.inst_results(i).iter().any(|&r| {
-                                slotval.contains_key(&func.dfg.resolve_aliases(r))
-                            });
+                            let chain = func
+                                .dfg
+                                .inst_results(i)
+                                .iter()
+                                .any(|&r| slotval.contains_key(&func.dfg.resolve_aliases(r)));
                             if !chain {
                                 slots.entry(ss).or_default().bad = true;
                             }
@@ -4396,8 +4321,7 @@ pub fn vecslot(func: &mut Function) -> usize {
     for (v, &(ss, _)) in &slotval {
         for &u in uses.get(v).into_iter().flatten() {
             let escaped = match func.dfg.insts[u] {
-                InstructionData::Load { arg, .. }
-                | InstructionData::LoadNoOffset { arg, .. } => {
+                InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => {
                     func.dfg.resolve_aliases(arg) != *v
                 }
                 InstructionData::Store { args, .. } => func.dfg.resolve_aliases(args[1]) != *v,
@@ -4437,9 +4361,10 @@ pub fn vecslot(func: &mut Function) -> usize {
                 continue;
             }
             let lty = func.dfg.value_type(func.dfg.first_result(l));
-            let le: u128 = lbytes.iter().enumerate().fold(0u128, |acc, (j, (b, _))| {
-                acc | (*b as u128) << (j * 8)
-            });
+            let le: u128 = lbytes
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (j, (b, _))| acc | (*b as u128) << (j * 8));
             let mut pos = FuncCursor::new(func).at_inst(l);
             let nv = if lty.is_int() && !lty.is_vector() {
                 if ln <= 8 {
@@ -4583,8 +4508,7 @@ mod tests {
         sameargs(&mut func);
         assert_eq!(func.dfg.block_params(a).len(), 1);
         assert_eq!(func.dfg.block_params(b).len(), 1);
-        let flags =
-            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("sameargs produced invalid IR: {e}\n{}", func.display());
         }
@@ -4622,15 +4546,23 @@ mod tests {
         let n2 = cur.ins().isub(n, one);
         let z = cur.ins().iconst(types::I64, 0);
         let done = cur.ins().icmp(IntCC::Equal, n2, z);
-        cur.ins().brif(done, exit, &[p2.into()], head, &[p2.into(), q2.into(), n2.into()]);
+        cur.ins().brif(
+            done,
+            exit,
+            &[p2.into()],
+            head,
+            &[p2.into(), q2.into(), n2.into()],
+        );
 
         let r = func.dfg.append_block_param(exit, types::I64);
-        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[r]);
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[r]);
 
         assert_eq!(phimerge(&mut func), 1);
         assert_eq!(func.dfg.block_params(head).len(), 2);
-        let flags =
-            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("phimerge produced invalid IR: {e}\n{}", func.display());
         }

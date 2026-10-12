@@ -13,7 +13,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, BlockCall, ExternalName, ExtFuncData, FuncRef, Function, Inst,
+    AbiParam, Block, BlockArg, BlockCall, ExtFuncData, ExternalName, FuncRef, Function, Inst,
     InstBuilder, InstructionData, LibCall, MemFlagsData, Opcode, Signature, StackSlot, Type, Value,
     ValueDef, types,
 };
@@ -65,14 +65,14 @@ pub struct Edge {
 }
 
 pub fn edge_dest(func: &Function, e: Edge) -> Block {
-    func.dfg.insts[e.inst]
-        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[e.slot]
+    func.dfg.insts[e.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        [e.slot]
         .block(&func.dfg.value_lists)
 }
 
 pub fn edge_args(func: &Function, e: Edge) -> Vec<Value> {
-    func.dfg.insts[e.inst]
-        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[e.slot]
+    func.dfg.insts[e.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        [e.slot]
         .args(&func.dfg.value_lists)
         .map(|a| match a {
             BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
@@ -371,8 +371,9 @@ pub fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
         Ins::SatSub(a, b) => ins_eval(func, a)?.saturating_sub(ins_eval(func, b)?),
         Ins::Mul(a, b) => ins_eval(func, a)?.wrapping_mul(ins_eval(func, b)?),
         Ins::And(a, b) => ins_eval(func, a)? & ins_eval(func, b)?,
-        Ins::Div(a, b) => (ins_eval(func, a)? as u64)
-            .checked_div(ins_eval(func, b)? as u64)? as i64,
+        Ins::Div(a, b) => {
+            (ins_eval(func, a)? as u64).checked_div(ins_eval(func, b)? as u64)? as i64
+        }
     })
 }
 
@@ -651,10 +652,7 @@ pub fn count(
         (false, true, 0) => cond.complement(),
         _ => return None,
     };
-    let (x, y) = (
-        func.dfg.resolve_aliases(x),
-        func.dfg.resolve_aliases(y),
-    );
+    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
     let ((idx, on_next), bound) = if let Some(t) = iv_side(func, info, kinds, x) {
         (t, outv(func, info, kinds, y)?)
     } else {
@@ -761,9 +759,7 @@ fn iv_add_k(func: &Function, iv: Value, x: Value) -> Option<i64> {
         InstructionData::Binary {
             opcode: Opcode::Isub,
             args: [a, b],
-        } if func.dfg.resolve_aliases(a) == iv => {
-            iconst(func, b).and_then(|k| k.checked_neg())
-        }
+        } if func.dfg.resolve_aliases(a) == iv => iconst(func, b).and_then(|k| k.checked_neg()),
         _ => None,
     }
 }
@@ -807,22 +803,17 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
                 args: [a, b],
             } = func.dfg.insts[xi]
             && func.dfg.resolve_aliases(b) == cnt.iv
-            && let ValueDef::Result(ai, _) =
-                func.dfg.value_def(func.dfg.resolve_aliases(a))
+            && let ValueDef::Result(ai, _) = func.dfg.value_def(func.dfg.resolve_aliases(a))
         {
             let km1 = match func.dfg.insts[ai] {
                 InstructionData::Binary {
                     opcode: Opcode::Isub,
                     args: [t, k],
-                } => {
-                    func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(1)
-                }
+                } => func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(1),
                 InstructionData::Binary {
                     opcode: Opcode::Iadd,
                     args: [t, k],
-                } => {
-                    func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(-1)
-                }
+                } => func.dfg.resolve_aliases(t) == cnt.bound && iconst(func, k) == Some(-1),
                 _ => false,
             };
             if km1 {
@@ -839,9 +830,7 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
         && cnt.step > 0
         && matches!(
             cnt.stay,
-            IntCC::UnsignedLessThan
-                | IntCC::UnsignedLessThanOrEqual
-                | IntCC::NotEqual
+            IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual | IntCC::NotEqual
         )
         && let ValueDef::Result(ci, _) = func.dfg.value_def(c)
         && let InstructionData::IntCompare {
@@ -853,9 +842,7 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
         && func.dfg.resolve_aliases(y) == cnt.bound
         && let Some(k) = iv_add_k(func, cnt.iv, x)
         && k < 0
-        && iconst(func, cnt.iv0).is_some_and(|v0| {
-            v0.checked_add(k).is_some_and(|s| s >= 0)
-        })
+        && iconst(func, cnt.iv0).is_some_and(|v0| v0.checked_add(k).is_some_and(|s| s >= 0))
     {
         return true;
     }
@@ -975,9 +962,7 @@ pub fn guard_pred(
             let Some(nk) = k.checked_neg() else {
                 return false;
             };
-            if iconst(func, cnt.iv0)
-                .is_none_or(|v0| v0.checked_add(k).is_none_or(|s| s < 0))
-            {
+            if iconst(func, cnt.iv0).is_none_or(|v0| v0.checked_add(k).is_none_or(|s| s < 0)) {
                 out.push(Pred::Cmp(
                     IntCC::UnsignedGreaterThanOrEqual,
                     Ins::Val(cnt.iv0),
@@ -1033,10 +1018,7 @@ pub fn guard_pred(
 pub fn start_expr(iv0: Value, base: Value, k: i64) -> Ins {
     Ins::Add(
         Box::new(Ins::Val(base)),
-        Box::new(Ins::Mul(
-            Box::new(Ins::Val(iv0)),
-            Box::new(Ins::K(k)),
-        )),
+        Box::new(Ins::Mul(Box::new(Ins::Val(iv0)), Box::new(Ins::K(k)))),
     )
 }
 
@@ -1053,10 +1035,7 @@ pub fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
                 diff
             } else {
                 Ins::Div(
-                    Box::new(Ins::Add(
-                        Box::new(diff),
-                        Box::new(Ins::K(cnt.step - 1)),
-                    )),
+                    Box::new(Ins::Add(Box::new(diff), Box::new(Ins::K(cnt.step - 1)))),
                     Box::new(Ins::K(cnt.step)),
                 )
             };
@@ -1070,10 +1049,7 @@ pub fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
                 diff
             } else {
                 Ins::Div(
-                    Box::new(Ins::Add(
-                        Box::new(diff),
-                        Box::new(Ins::K(cnt.step - 1)),
-                    )),
+                    Box::new(Ins::Add(Box::new(diff), Box::new(Ins::K(cnt.step - 1)))),
                     Box::new(Ins::K(cnt.step)),
                 )
             };
@@ -1126,10 +1102,7 @@ pub fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
                 diff
             } else {
                 Ins::Div(
-                    Box::new(Ins::Add(
-                        Box::new(diff),
-                        Box::new(Ins::K(cnt.step - 1)),
-                    )),
+                    Box::new(Ins::Add(Box::new(diff), Box::new(Ins::K(cnt.step - 1)))),
                     Box::new(Ins::K(cnt.step)),
                 )
             };
@@ -1251,8 +1224,13 @@ pub fn plan(
                 store = Some(i);
                 continue;
             }
-            if matches!(func.dfg.insts[i], InstructionData::Load { opcode: Opcode::Load, .. })
-                && loadfwd::notrap(func, i)
+            if matches!(
+                func.dfg.insts[i],
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    ..
+                }
+            ) && loadfwd::notrap(func, i)
             {
                 if load.is_some() {
                     return None;
@@ -1299,9 +1277,7 @@ pub fn plan(
                 if e2 == e {
                     continue;
                 }
-                if !guard_dead(func, &c, e2)
-                    && !guard_pred(func, &info, &kinds, &c, e2, &mut ps)
-                {
+                if !guard_dead(func, &c, e2) && !guard_pred(func, &info, &kinds, &c, e2, &mut ps) {
                     return None;
                 }
             }
@@ -1519,10 +1495,8 @@ pub fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa::Target
     // Redirect the entry edge to `nb`.
     {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[p.entry.inst].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[p.entry.slot];
+        let bc = &mut dfg.insts[p.entry.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[p.entry.slot];
         *bc = BlockCall::new(nb, core::iter::empty(), &mut dfg.value_lists);
     }
     let pty = tcfg.pointer_type();
@@ -1530,8 +1504,7 @@ pub fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa::Target
     let emit_call = |pos: &mut FuncCursor| {
         let dst = emit(pos, pty, &p.dst);
         let len = emit(pos, pty, &p.len);
-        let exit_args: Vec<BlockArg> =
-            p.exit_args.iter().map(|&v| BlockArg::Value(v)).collect();
+        let exit_args: Vec<BlockArg> = p.exit_args.iter().map(|&v| BlockArg::Value(v)).collect();
         match (p.fill, &p.src) {
             (Some(fill), None) => {
                 let f = libcall(pos.func, tcfg, LibCall::Memset);
@@ -1601,11 +1574,7 @@ pub fn apply(func: &mut Function, p: &Plan, tcfg: cranelift_codegen::isa::Target
         });
     }
     let ok = ok.unwrap();
-    let h_args: Vec<BlockArg> = p
-        .entry_args
-        .iter()
-        .map(|&v| BlockArg::Value(v))
-        .collect();
+    let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().brif(ok, mb, &[], p.h, &h_args);
     let mut pos = FuncCursor::new(func).at_bottom(mb);
     emit_call(&mut pos);
@@ -1877,9 +1846,7 @@ fn rmw_locs(
                     InstructionData::Binary {
                         opcode: Opcode::Isub,
                         args: [a, b],
-                    } if is_ld(a) => {
-                        RmwDelta::Sub(Ins::Val(outv(func, info, kinds, b)?))
-                    }
+                    } if is_ld(a) => RmwDelta::Sub(Ins::Val(outv(func, info, kinds, b)?)),
                     _ => return None,
                 },
                 _ => {
@@ -2002,12 +1969,9 @@ fn plan_dead(
             else {
                 return None;
             };
-            let (x, y) = (
-                func.dfg.resolve_aliases(x),
-                func.dfg.resolve_aliases(y),
-            );
-            let (idx, on_next) = iv_side(func, &info, &kinds, x)
-                .or_else(|| iv_side(func, &info, &kinds, y))?;
+            let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+            let (idx, on_next) =
+                iv_side(func, &info, &kinds, x).or_else(|| iv_side(func, &info, &kinds, y))?;
             let upd = info.latches.iter().find_map(|&l| {
                 let a = func.dfg.resolve_aliases(*edge_args(func, l).get(idx)?);
                 match func.dfg.value_def(a) {
@@ -2048,11 +2012,10 @@ fn plan_dead(
             e2 == e
                 || never_taken(func, e2)
                 || guard_dead(func, &cnt, e2)
-                || inv_guard_pred(func, &info, &kinds, e2)
-                    .is_some_and(|p| {
-                        inv_preds.push(p);
-                        true
-                    })
+                || inv_guard_pred(func, &info, &kinds, e2).is_some_and(|p| {
+                    inv_preds.push(p);
+                    true
+                })
         }) {
             continue;
         }
@@ -2082,9 +2045,7 @@ fn plan_dead(
                 Pred::Cmp(cc, a, b) => ins_eval(func, a)
                     .zip(ins_eval(func, b))
                     .map(|(x, y)| cmp_cc(*cc, x, y)),
-                Pred::Aligned(a, size) => {
-                    ins_eval(func, a).map(|x| *size > 0 && x % size == 0)
-                }
+                Pred::Aligned(a, size) => ins_eval(func, a).map(|x| *size > 0 && x % size == 0),
                 Pred::Disjoint => None,
             };
             match known {
@@ -2165,16 +2126,13 @@ fn plan_dead(
                         why!("dead: {b:?} reads loop values");
                     }
                     if !escapes.iter().any(|&(v, _)| v == a) {
-                        let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, a, 0)
-                        else {
+                        let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, a, 0) else {
                             continue 'exits;
                         };
                         escapes.push((a, ins));
                     }
                 }
-                for bc in func
-                    .dfg
-                    .insts[i]
+                for bc in func.dfg.insts[i]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     for a in bc.args(&func.dfg.value_lists) {
@@ -2188,9 +2146,7 @@ fn plan_dead(
                             why!("dead: {b:?} reads loop values");
                         }
                         if !escapes.iter().any(|&(e, _)| e == v) {
-                            let Some(ins) =
-                                arg_ins(func, &info, &kinds, &itb, &fwd, v, 0)
-                            else {
+                            let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, v, 0) else {
                                 continue 'exits;
                             };
                             escapes.push((v, ins));
@@ -2228,10 +2184,8 @@ fn apply_dead(
     func.layout.insert_block_after(nb, pblock);
     {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[p.entry.inst].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[p.entry.slot];
+        let bc = &mut dfg.insts[p.entry.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[p.entry.slot];
         *bc = BlockCall::new(nb, core::iter::empty(), &mut dfg.value_lists);
     }
     let pty = tcfg.pointer_type();
@@ -2266,10 +2220,8 @@ fn apply_dead(
         }
         for (inst, slot) in edges {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[inst].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
+            let bc = &mut dfg.insts[inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             for &(v, _) in &p.escapes {
                 bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
             }
@@ -2281,9 +2233,7 @@ fn apply_dead(
             .escapes
             .iter()
             .zip(&new_params)
-            .flat_map(|(&(v, _), &np)| {
-                [(v, np), (func.dfg.resolve_aliases(v), np)]
-            })
+            .flat_map(|(&(v, _), &np)| [(v, np), (func.dfg.resolve_aliases(v), np)])
             .collect();
         let insts: Vec<Inst> = func.layout.block_insts(p.exit_dest).collect();
         for i in insts {
@@ -2293,15 +2243,11 @@ fn apply_dead(
                 }
             }
             let dfg = &mut func.dfg;
-            for bc in dfg.insts[i].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            ) {
+            for bc in
+                dfg.insts[i].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            {
                 bc.update_args(&mut dfg.value_lists, |a| match a {
-                    BlockArg::Value(v) => remap
-                        .get(&v)
-                        .map(|&np| BlockArg::Value(np))
-                        .unwrap_or(a),
+                    BlockArg::Value(v) => remap.get(&v).map(|&np| BlockArg::Value(np)).unwrap_or(a),
                     a => a,
                 });
             }
@@ -2329,8 +2275,7 @@ fn apply_dead(
             Some(o) => pos.ins().band(o, c),
         });
     }
-    let mut exit_args: Vec<BlockArg> =
-        Vec::with_capacity(p.exit_args.len() + p.escapes.len());
+    let mut exit_args: Vec<BlockArg> = Vec::with_capacity(p.exit_args.len() + p.escapes.len());
     for (j, ins) in p.exit_args.iter().enumerate() {
         let ty = pos.func.dfg.value_type(dst_params[j]);
         let v = emit(&mut pos, ty, ins);
@@ -2341,11 +2286,7 @@ fn apply_dead(
         let v = emit(&mut pos, ty, ins);
         exit_args.push(BlockArg::Value(v));
     }
-    let h_args: Vec<BlockArg> = p
-        .entry_args
-        .iter()
-        .map(|&v| BlockArg::Value(v))
-        .collect();
+    let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
     if !p.rmw.is_empty() {
         // The folded RMW load/stores are side effects: they may only run
         // on the fast path, so they go in a block past the preds check.
@@ -2425,7 +2366,11 @@ pub fn run(
             }
             if let Some(p) = plan(func, &ps, cfg, dt, la, lp, noalias) {
                 if debug {
-                    eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
+                    eprintln!(
+                        "idiom {fname}: loop {:?} -> {}",
+                        p.h,
+                        if p.src.is_some() { "memcpy" } else { "memset" }
+                    );
                 }
                 apply(func, &p, tcfg);
                 done.insert(p.h);
@@ -2452,6 +2397,3 @@ pub fn run(
     }
     n
 }
-
-
-

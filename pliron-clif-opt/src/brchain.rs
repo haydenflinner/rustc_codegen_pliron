@@ -34,7 +34,8 @@ const MAX_ENTRIES: usize = 4;
 /// then an explicit test for that index is redundant with the default.
 fn same_target(func: &Function, a: BlockCall, b: BlockCall) -> bool {
     a.block(&func.dfg.value_lists) == b.block(&func.dfg.value_lists)
-        && a.args(&func.dfg.value_lists).eq(b.args(&func.dfg.value_lists))
+        && a.args(&func.dfg.value_lists)
+            .eq(b.args(&func.dfg.value_lists))
 }
 
 fn dest(func: &Function, bc: BlockCall) -> (Block, Vec<BlockArg>) {

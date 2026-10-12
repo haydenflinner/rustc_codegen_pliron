@@ -109,7 +109,10 @@ fn main() {
     println!("aliased {}", aliased(black_box(9)));
     println!("last {:?}", last(black_box(5)));
     println!("narrow {}", narrow());
-    println!("dynamic {}", dynamic(black_box(11), &[1, 2, 3, 4, 5, 6, 7, 8]));
+    println!(
+        "dynamic {}",
+        dynamic(black_box(11), &[1, 2, 3, 4, 5, 6, 7, 8])
+    );
     println!("panics {}", panics(black_box(2)));
     println!("opts {}", opts());
     println!("arith {}", arith(black_box(0xdead_beef)));

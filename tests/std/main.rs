@@ -72,17 +72,15 @@ fn main() {
         // only hold with a backend-built std (`-Zbuild-std`).
         #[cfg(not(pliron_stock_seh))]
         {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                copy1(&a, &mut d, 200)
-            }));
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| copy1(&a, &mut d, 200)));
             assert!(r.is_err());
         }
         incl(&a, &mut d, 99);
         #[cfg(not(pliron_stock_seh))]
         {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                incl(&a, &mut d, 100)
-            }));
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| incl(&a, &mut d, 100)));
             assert!(r.is_err());
         }
         let mut d2 = vec![0u32; 100];

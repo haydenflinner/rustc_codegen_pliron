@@ -232,21 +232,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let fty = TypedHandle::<FuncType>::from_handle(fn_ty, &c).unwrap();
             CallOp::new(&mut c, callable, fty, args.to_vec()).get_operation()
         };
-        self.st
-            .borrow_mut()
-            .calls
-            .insert(
-                p,
-                CallInfo {
-                    fn_ty,
-                    exts,
-                    foreign: false,
-                    cc: None,
-                    tail: false,
-                    nocap: None,
-                    arg_extent: None,
-                },
-            );
+        self.st.borrow_mut().calls.insert(
+            p,
+            CallInfo {
+                fn_ty,
+                exts,
+                foreign: false,
+                cc: None,
+                tail: false,
+                nocap: None,
+                arg_extent: None,
+            },
+        );
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -1052,8 +1049,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
-            AtomicRmwOp::new(&mut c, dst, src, kind.clone(), ord(order), SyncScopeAttr::System)
-                .get_operation()
+            AtomicRmwOp::new(
+                &mut c,
+                dst,
+                src,
+                kind.clone(),
+                ord(order),
+                SyncScopeAttr::System,
+            )
+            .get_operation()
         };
         self.st.borrow_mut().rmw.insert(p, kind);
         self.push(p).unwrap()
@@ -1113,13 +1117,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     && matches!(i.def, rustc_middle::ty::InstanceKind::Item(_)) =>
             {
                 let foreign = self.tcx.is_foreign_item(i.def_id())
-                    || self
-                        .tcx
-                        .codegen_fn_attrs(i.def_id())
-                        .flags
-                        .contains(
-                            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
-                        );
+                    || self.tcx.codegen_fn_attrs(i.def_id()).flags.contains(
+                        rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
+                    );
                 let cc = match self.tcx.fn_sig(i.def_id()).skip_binder().abi() {
                     rustc_abi::ExternAbi::Win64 { .. } => {
                         Some(cranelift_codegen::isa::CallConv::WindowsFastcall)
@@ -1161,12 +1161,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 let n = match &a.mode {
                     PassMode::Ignore => 0,
                     PassMode::Pair(..) => 2,
-                    PassMode::Indirect { meta_attrs, .. } => {
-                        usize::from(meta_attrs.is_some()) + 1
-                    }
-                    PassMode::Cast { pad_i32_count, .. } => {
-                        usize::from(*pad_i32_count) + 1
-                    }
+                    PassMode::Indirect { meta_attrs, .. } => usize::from(meta_attrs.is_some()) + 1,
+                    PassMode::Cast { pad_i32_count, .. } => usize::from(*pad_i32_count) + 1,
                     PassMode::Direct(_) => 1,
                 };
                 let cap = matches!(a.mode, PassMode::Indirect { .. })
@@ -1183,13 +1179,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     PassMode::Indirect { meta_attrs, .. } if meta_attrs.is_none() => {
                         Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
                     }
-                    PassMode::Direct(_)
-                        if matches!(a.layout.ty.kind(), ty::Ref(..)) =>
-                    {
+                    PassMode::Direct(_) if matches!(a.layout.ty.kind(), ty::Ref(..)) => {
                         a.layout.ty.builtin_deref(true).and_then(|t| {
                             let l = self.cx.layout_of(t);
-                            l.is_sized()
-                                .then(|| (l.size.bytes(), l.align.abi.bytes()))
+                            l.is_sized().then(|| (l.size.bytes(), l.align.abi.bytes()))
                         })
                     }
                     _ => None,

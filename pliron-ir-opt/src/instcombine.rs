@@ -20,8 +20,8 @@ use pliron::{
 use pliron_llvm::{attributes::ICmpPredicateAttr as P, ops::*};
 use rustc_hash::FxHashMap;
 
-use crate::state::{ConstVal, State};
 use crate::has_body;
+use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -11,9 +11,9 @@ use pliron::{
 };
 use pliron_llvm::ops::{AllocaOp, GetElementPtrOp, LoadOp, StoreOp};
 
-use crate::state::{ArgExt, State};
 use crate::has_body;
 use crate::sroa::const_int;
+use crate::state::{ArgExt, State};
 
 /// Pointer `p` only flows into address operands of loads, stores, mem intrinsics and GEPs.
 fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
@@ -45,12 +45,7 @@ fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
     })
 }
 
-fn try_forward(
-    ctx: &mut Context,
-    st: &mut State,
-    sret_args: &[Value],
-    m: Ptr<Operation>,
-) -> bool {
+fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Operation>) -> bool {
     if st.volatile.contains(&m) || st.intrinsics.get(&m).map(|s| s.as_str()) != Some("llvm.memcpy")
     {
         return false;

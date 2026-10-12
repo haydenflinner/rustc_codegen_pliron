@@ -234,7 +234,12 @@ pub fn target_features(
         .to_vec()
     };
     let cg = opts.cg.target_feature.as_str();
-    for t in target.features.split(',').chain(cg.split(',')).map(str::trim) {
+    for t in target
+        .features
+        .split(',')
+        .chain(cg.split(','))
+        .map(str::trim)
+    {
         if let Some(n) = t.strip_prefix('+') {
             if !f.iter().any(|x| x == n) {
                 f.push(n.into());
@@ -435,8 +440,7 @@ pub fn lower_to_wasm(
     let mut bytes =
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
-    if crate::pass_enabled("PLIRON_WASM_PEEP")
-    {
+    if crate::pass_enabled("PLIRON_WASM_PEEP") {
         wpeep(&mut bytes);
     }
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
@@ -456,7 +460,10 @@ pub fn lower_to_wasm(
             let mut data = vec![0u8; size as usize];
             let mut relocs = Vec::new();
             write_const(ctx, st, init, 0, &mut data, &mut relocs);
-            assert!(relocs.is_empty(), "pliron-wasm: {n}: relocations in custom section {sec}");
+            assert!(
+                relocs.is_empty(),
+                "pliron-wasm: {n}: relocations in custom section {sec}"
+            );
             custom_section(&mut bytes, sec, &data);
         }
     }
@@ -753,8 +760,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     // could observe a different local value, or a load could cross a
     // store). Stack shape is preserved exactly: each producer replayed
     // at its use contributes the +1 the deleted `local.get` provided.
-    if crate::env_get("PLIRON_WASM_FWD") != Some("0")
-    {
+    if crate::env_get("PLIRON_WASM_FWD") != Some("0") {
         // Stack (pops, pushes) for instrs allowed inside producers and
         // in set->use gaps. None = opaque (barrier).
         let tr = |i: usize| -> Option<(u32, u32)> {
@@ -763,13 +769,13 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 WPeek::Other => {
                     let op = b[ins[i].1];
                     Some(match op {
-                        0x01 => (0, 0),        // nop
-                        0x1a => (1, 0),        // drop
-                        0x1b | 0x1c => (3, 1), // select
-                        0x23 => (0, 1),        // global.get
-                        0x28..=0x35 => (1, 1), // loads
-                        0x41..=0x44 => (0, 1), // consts
-                        0x45 | 0x50 => (1, 1), // eqz
+                        0x01 => (0, 0),                      // nop
+                        0x1a => (1, 0),                      // drop
+                        0x1b | 0x1c => (3, 1),               // select
+                        0x23 => (0, 1),                      // global.get
+                        0x28..=0x35 => (1, 1),               // loads
+                        0x41..=0x44 => (0, 1),               // consts
+                        0x45 | 0x50 => (1, 1),               // eqz
                         0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
                         0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => (1, 1),
                         0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => (2, 1),
@@ -844,9 +850,9 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                         u < i
                             && !del[u]
                             && !arm_div(i, u)
-                            && ctx[ins[i].3].iter().any(|e| {
-                                dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e)
-                            })
+                            && ctx[ins[i].3]
+                                .iter()
+                                .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e))
                     })
                 })
                 .unwrap_or(false)
@@ -871,9 +877,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                             !defs
                                 .get(&t)
                                 .map(|v| {
-                                    v.iter().any(|&d| {
-                                        d > i && d < u && !del[d] && covers(d, u)
-                                    })
+                                    v.iter().any(|&d| d > i && d < u && !del[d] && covers(d, u))
                                 })
                                 .unwrap_or(false)
                         })
@@ -888,11 +892,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             // producer, possibly trapping, no longer always runs).
             {
                 let (ci, cu) = (&ctx[ins[i].3], &ctx[ins[*u].3]);
-                let lcp = ci
-                    .iter()
-                    .zip(cu.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let lcp = ci.iter().zip(cu.iter()).take_while(|(a, b)| a == b).count();
                 if ci[lcp..]
                     .iter()
                     .chain(&cu[lcp..])
@@ -922,11 +922,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                     return Some(k);
                 }
             }
-            if need == 0 {
-                Some(lo)
-            } else {
-                None
-            }
+            if need == 0 { Some(lo) } else { None }
         };
         let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
         let mut del = vec![false; ins.len()]; // forwarded sets + moved producers
@@ -994,8 +990,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 // A producer that reads a forwarded temp would observe
                 // its deleted set's value: replaying it at the use site
                 // would see the pre-segment local instead.
-                let temps: FxHashSet<u32> =
-                    segsets[..k].iter().map(|&(_, t, _)| t).collect();
+                let temps: FxHashSet<u32> = segsets[..k].iter().map(|&(_, t, _)| t).collect();
                 for &(s, _, _) in &segsets[..k] {
                     match prod_start(plo, s) {
                         Some(ps)
@@ -1121,10 +1116,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             if t == x {
                 continue; // get x ... set x: stack-neutral no-op, leave it
             }
-            let Some(&p1) = defs
-                .get(&t)
-                .and_then(|v| v.iter().rev().find(|&&d| d < gi))
-            else {
+            let Some(&p1) = defs.get(&t).and_then(|v| v.iter().rev().find(|&&d| d < gi)) else {
                 continue;
             };
             cand.push((p1, gi, si, t, x));
@@ -1216,10 +1208,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                             if verbose {
                                 eprintln!(
                                     "  fail3 t={} use@{} uctx={:?} pctx={:?}",
-                                    t,
-                                    ins[u].1,
-                                    ctx[ins[u].3],
-                                    ctx[ins[p1].3]
+                                    t, ins[u].1, ctx[ins[u].3], ctx[ins[p1].3]
                                 );
                             }
                             break;
@@ -1237,9 +1226,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                                 why = 4;
                                 break;
                             }
-                            WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l)
-                                if l == x =>
-                            {
+                            WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l) if l == x => {
                                 if !mset.contains_key(&i) {
                                     ok = false;
                                     why = 5;
@@ -1263,10 +1250,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                         if cj == ci {
                             continue;
                         }
-                        if qg == p1
-                            || qs == p1
-                            || ((qx == x || qt == t) && live[cj] && cj < ci)
-                        {
+                        if qg == p1 || qs == p1 || ((qx == x || qt == t) && live[cj] && cj < ci) {
                             ok = false;
                             why = 6;
                             break;
@@ -1480,9 +1464,9 @@ fn tree_touches(cb: &FunctionBody, v: WV, set: &FxHashSet<WV>, depth: u32) -> bo
         return true;
     }
     match cb.values[v] {
-        ValueDef::Operator(op, aa, _) if op.is_pure() => {
-            cb.arg_pool[aa].iter().any(|&a| tree_touches(cb, a, set, depth + 1))
-        }
+        ValueDef::Operator(op, aa, _) if op.is_pure() => cb.arg_pool[aa]
+            .iter()
+            .any(|&a| tree_touches(cb, a, set, depth + 1)),
         _ => false,
     }
 }
@@ -1518,8 +1502,7 @@ fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, 
     }
     let mut out = Vec::new();
     for cv in cb.values.iter() {
-        let ValueDef::Operator(O::GlobalGet { global_index }, ..) = &cb.values[cv]
-        else {
+        let ValueDef::Operator(O::GlobalGet { global_index }, ..) = &cb.values[cv] else {
             continue;
         };
         if *global_index != sp || tused.contains(&cv) {
@@ -1536,8 +1519,7 @@ fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, 
                 {
                     sub = Some(u)
                 }
-                ValueDef::Operator(O::GlobalSet { global_index }, ..)
-                    if *global_index == sp => {}
+                ValueDef::Operator(O::GlobalSet { global_index }, ..) if *global_index == sp => {}
                 _ => ok = false,
             }
         }
@@ -1613,8 +1595,7 @@ fn inline_site(
         // (sub, and, gset entry position) of the caller's frame chain.
         let mut acc: Option<(WV, WV, usize)> = None;
         if let Some(&first) = body.blocks[entry].insts.first()
-            && let ValueDef::Operator(O::GlobalGet { global_index }, ..) =
-                &body.values[first]
+            && let ValueDef::Operator(O::GlobalGet { global_index }, ..) = &body.values[first]
             && *global_index == sp
         {
             let mut sub = None;
@@ -1627,9 +1608,7 @@ fn inline_site(
                     {
                         sub = sub.or(Some(iv))
                     }
-                    ValueDef::Operator(O::GlobalSet { global_index }, ..)
-                        if global_index == sp =>
-                    {
+                    ValueDef::Operator(O::GlobalSet { global_index }, ..) if global_index == sp => {
                         gpos = Some(i);
                         break;
                     }
@@ -1678,32 +1657,29 @@ fn inline_site(
         // right after the frame's `global.set` (or before the call if
         // that comes first), but always after `a`'s def.
         let anchor_ok = match acc {
-            Some((_, a, gpos)) => {
-                (gpos + 1).min(call_idx.unwrap_or(usize::MAX)) > pos_of(body, a)
-            }
+            Some((_, a, gpos)) => (gpos + 1).min(call_idx.unwrap_or(usize::MAX)) > pos_of(body, a),
             None => false,
         };
         // Lay out the folded frames after whatever space the chain
         // already reserves (0 for a fresh one).
-        let (mut k, mut maxa, anchor): (u64, u64, Option<(WV, WV, usize)>) =
-            if anchor_ok {
-                let (s, a, gpos) = acc.unwrap();
-                let sa = match &body.values[s] {
-                    ValueDef::Operator(_, aa, _) => *aa,
-                    _ => unreachable!(),
-                };
-                let aa = match &body.values[a] {
-                    ValueDef::Operator(_, aa, _) => *aa,
-                    _ => unreachable!(),
-                };
-                (
-                    wconst(body, body.arg_pool[sa][1]).unwrap_or(0) as u64,
-                    -wconst(body, body.arg_pool[aa][1]).unwrap_or(-16) as u64,
-                    Some((s, a, gpos)),
-                )
-            } else {
-                (0, 16, None)
+        let (mut k, mut maxa, anchor): (u64, u64, Option<(WV, WV, usize)>) = if anchor_ok {
+            let (s, a, gpos) = acc.unwrap();
+            let sa = match &body.values[s] {
+                ValueDef::Operator(_, aa, _) => *aa,
+                _ => unreachable!(),
             };
+            let aa = match &body.values[a] {
+                ValueDef::Operator(_, aa, _) => *aa,
+                _ => unreachable!(),
+            };
+            (
+                wconst(body, body.arg_pool[sa][1]).unwrap_or(0) as u64,
+                -wconst(body, body.arg_pool[aa][1]).unwrap_or(-16) as u64,
+                Some((s, a, gpos)),
+            )
+        } else {
+            (0, 16, None)
+        };
         let mut offs = Vec::with_capacity(chains.len());
         for &(_, _, _, sz, al) in &chains {
             k = crate::types::align_to(k, al);
@@ -1826,8 +1802,7 @@ fn inline_site(
             // the reservation lands before the pre-existing read.
             let mut first_get = None;
             for (i, &iv) in body.blocks[entry].insts.iter().enumerate() {
-                if let ValueDef::Operator(O::GlobalGet { global_index }, ..) =
-                    &body.values[iv]
+                if let ValueDef::Operator(O::GlobalGet { global_index }, ..) = &body.values[iv]
                     && *global_index == sp
                     && !seq.contains(&iv)
                 {
@@ -1868,10 +1843,7 @@ fn inline_site(
             }
             for (v, anchor) in chunk {
                 let mut p = match anchor {
-                    Some(a) => insts
-                        .iter()
-                        .position(|&i| i == a)
-                        .unwrap_or(insts.len()),
+                    Some(a) => insts.iter().position(|&i| i == a).unwrap_or(insts.len()),
                     None => insts.len(),
                 };
                 if blk == entry
@@ -1896,14 +1868,11 @@ fn inline_site(
             .flat_map(|&(g, s, cfp, _, _)| [g, s, cfp])
             .collect();
         for cv in callee.values.iter() {
-            let ValueDef::Operator(O::GlobalSet { global_index }, aa, _) =
-                &callee.values[cv]
+            let ValueDef::Operator(O::GlobalSet { global_index }, aa, _) = &callee.values[cv]
             else {
                 continue;
             };
-            if *global_index == sp
-                && tree_touches(callee, callee.arg_pool[*aa][0], &folded, 0)
-            {
+            if *global_index == sp && tree_touches(callee, callee.arg_pool[*aa][0], &folded, 0) {
                 fold_drop.insert(cv);
             }
         }
@@ -2130,7 +2099,9 @@ fn wrange(b: &mut FunctionBody) -> bool {
             ValueDef::Operator(O::I32Load8U { .. }, ..) => Some(0xff),
             ValueDef::Operator(O::I32Load16U { .. }, ..) => Some(0xffff),
             ValueDef::Operator(O::I32And, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 // x & K <= K for a constant mask K.
                 match (wconst(b, x), wconst(b, y)) {
                     (Some(m), _) => {
@@ -2143,19 +2114,25 @@ fn wrange(b: &mut FunctionBody) -> bool {
                 }
             }
             ValueDef::Operator(O::I32ShrU, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 // wasm masks the shift count to 5 bits.
                 let s = (wconst(b, y)? as u32) & 31;
                 Some(ubound(b, x, depth + 1)? >> s)
             }
             ValueDef::Operator(O::I32RemU, aa, _) => {
-                let &[_, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[_, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 // x % K < K (K = 0 traps, never produces a value).
                 let m = wconst(b, y)? as u32;
                 (m != 0).then_some(m - 1)
             }
             ValueDef::Operator(O::Select, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 Some(ubound(b, x, depth + 1)?.max(ubound(b, y, depth + 1)?))
             }
             _ => None,
@@ -2170,8 +2147,7 @@ fn wrange(b: &mut FunctionBody) -> bool {
             // operands are consts, picking it by `wconst(x).is_some()`
             // shifts the wrong one.
             if !crate::env_set("PLIRON_WASM_NOSHL")
-                && let ValueDef::Operator(op @ (O::I32Mul | O::I64Mul), aa, _) =
-                    &b.values[iv]
+                && let ValueDef::Operator(op @ (O::I32Mul | O::I64Mul), aa, _) = &b.values[iv]
             {
                 if let &[x, y, ..] = &b.arg_pool[*aa][..] {
                     let pow2 = |v| -> Option<u32> {
@@ -2191,8 +2167,14 @@ fn wrange(b: &mut FunctionBody) -> bool {
                 continue;
             }
             let fold = match &b.values[iv] {
-                ValueDef::Operator(op @ (O::I32LtU | O::I32LeU | O::I32GtU | O::I32GeU | O::I32Eq | O::I32Ne), aa, _) => {
-                    let &[x, y, ..] = &b.arg_pool[*aa][..] else { continue };
+                ValueDef::Operator(
+                    op @ (O::I32LtU | O::I32LeU | O::I32GtU | O::I32GeU | O::I32Eq | O::I32Ne),
+                    aa,
+                    _,
+                ) => {
+                    let &[x, y, ..] = &b.arg_pool[*aa][..] else {
+                        continue;
+                    };
                     let Some(c) = wconst(b, y) else { continue };
                     let c = c as u32;
                     match op {
@@ -2323,59 +2305,59 @@ fn wrange(b: &mut FunctionBody) -> bool {
 /// defined program can't produce.
 fn memarg_of(op: &O) -> Option<waffle::MemoryArg> {
     Some(*match op {
-            O::I32Load { memory }
-            | O::I64Load { memory }
-            | O::F32Load { memory }
-            | O::F64Load { memory }
-            | O::I32Load8S { memory }
-            | O::I32Load8U { memory }
-            | O::I32Load16S { memory }
-            | O::I32Load16U { memory }
-            | O::I64Load8S { memory }
-            | O::I64Load8U { memory }
-            | O::I64Load16S { memory }
-            | O::I64Load16U { memory }
-            | O::I64Load32S { memory }
-            | O::I64Load32U { memory }
-            | O::I32Store { memory }
-            | O::I64Store { memory }
-            | O::F32Store { memory }
-            | O::F64Store { memory }
-            | O::I32Store8 { memory }
-            | O::I32Store16 { memory }
-            | O::I64Store8 { memory }
-            | O::I64Store16 { memory }
-            | O::I64Store32 { memory } => memory,
-            _ => return None,
-        })
-    }
-    fn memarg_mut(op: &mut O) -> Option<&mut waffle::MemoryArg> {
-        Some(match op {
-            O::I32Load { memory }
-            | O::I64Load { memory }
-            | O::F32Load { memory }
-            | O::F64Load { memory }
-            | O::I32Load8S { memory }
-            | O::I32Load8U { memory }
-            | O::I32Load16S { memory }
-            | O::I32Load16U { memory }
-            | O::I64Load8S { memory }
-            | O::I64Load8U { memory }
-            | O::I64Load16S { memory }
-            | O::I64Load16U { memory }
-            | O::I64Load32S { memory }
-            | O::I64Load32U { memory }
-            | O::I32Store { memory }
-            | O::I64Store { memory }
-            | O::F32Store { memory }
-            | O::F64Store { memory }
-            | O::I32Store8 { memory }
-            | O::I32Store16 { memory }
-            | O::I64Store8 { memory }
-            | O::I64Store16 { memory }
-            | O::I64Store32 { memory } => memory,
-            _ => return None,
-        })
+        O::I32Load { memory }
+        | O::I64Load { memory }
+        | O::F32Load { memory }
+        | O::F64Load { memory }
+        | O::I32Load8S { memory }
+        | O::I32Load8U { memory }
+        | O::I32Load16S { memory }
+        | O::I32Load16U { memory }
+        | O::I64Load8S { memory }
+        | O::I64Load8U { memory }
+        | O::I64Load16S { memory }
+        | O::I64Load16U { memory }
+        | O::I64Load32S { memory }
+        | O::I64Load32U { memory }
+        | O::I32Store { memory }
+        | O::I64Store { memory }
+        | O::F32Store { memory }
+        | O::F64Store { memory }
+        | O::I32Store8 { memory }
+        | O::I32Store16 { memory }
+        | O::I64Store8 { memory }
+        | O::I64Store16 { memory }
+        | O::I64Store32 { memory } => memory,
+        _ => return None,
+    })
+}
+fn memarg_mut(op: &mut O) -> Option<&mut waffle::MemoryArg> {
+    Some(match op {
+        O::I32Load { memory }
+        | O::I64Load { memory }
+        | O::F32Load { memory }
+        | O::F64Load { memory }
+        | O::I32Load8S { memory }
+        | O::I32Load8U { memory }
+        | O::I32Load16S { memory }
+        | O::I32Load16U { memory }
+        | O::I64Load8S { memory }
+        | O::I64Load8U { memory }
+        | O::I64Load16S { memory }
+        | O::I64Load16U { memory }
+        | O::I64Load32S { memory }
+        | O::I64Load32U { memory }
+        | O::I32Store { memory }
+        | O::I64Store { memory }
+        | O::F32Store { memory }
+        | O::F64Store { memory }
+        | O::I32Store8 { memory }
+        | O::I32Store16 { memory }
+        | O::I64Store8 { memory }
+        | O::I64Store16 { memory }
+        | O::I64Store32 { memory } => memory,
+        _ => return None,
+    })
 }
 
 fn waddr(b: &mut FunctionBody) -> bool {
@@ -2528,9 +2510,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // optimize() rounds dominate compile time and triples module size.
     const ALWAYS_CAP: usize = 300;
     const ROUNDS: usize = 8;
-    let body_size = |b: &FunctionBody| -> usize {
-        b.blocks.values().map(|d| d.insts.len()).sum()
-    };
+    let body_size = |b: &FunctionBody| -> usize { b.blocks.values().map(|d| d.insts.len()).sum() };
     let mut inlined = 0usize;
     for round in 0..ROUNDS {
         // callsite count per callee; ref.func keeps the standalone
@@ -2604,8 +2584,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // must match (the args become the params).
                             if !cb.blocks[cb.entry].preds.is_empty()
                                 || cb.locals.len() != cb.n_params
-                                || cb.blocks[cb.entry].params.len()
-                                    != b.arg_pool[*args].len()
+                                || cb.blocks[cb.entry].params.len() != b.arg_pool[*args].len()
                             {
                                 continue;
                             }
@@ -2616,9 +2595,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // callee body + call ops + func entry
                             // (~10B); roughly break-even inside this
                             // budget in inst units.
-                            let gc_done = refs[fi] == 0
-                                && k >= 2
-                                && n * (k - 1) <= 5 + 2 * k;
+                            let gc_done = refs[fi] == 0 && k >= 2 && n * (k - 1) <= 5 + 2 * k;
                             // Hint sites only in round 0: unrestricted
                             // re-scanning cascades `#[inline]` chains
                             // inside fresh splice copies and blows up
@@ -2647,8 +2624,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                     if !blk.is_valid() {
                         continue;
                     }
-                    if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv)
-                    {
+                    if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv) {
                         inline_site(b, blk, pos, iv, &callee, sp);
                         inlined += 1;
                     }
@@ -2880,10 +2856,9 @@ impl<'o, 'a> FL<'o, 'a> {
             // restoring. A stray consumer of the dead values cancels
             // the whole rewrite (defensive).
             let sp = self.o.sp;
-            let mut dead: FxHashSet<WV> =
-                [self.sp0, self.fp, self.frame_c, self.mask_c]
-                    .into_iter()
-                    .collect();
+            let mut dead: FxHashSet<WV> = [self.sp0, self.fp, self.frame_c, self.mask_c]
+                .into_iter()
+                .collect();
             let mut wl: Vec<WV> = dead.iter().copied().collect();
             while let Some(v) = wl.pop() {
                 if let ValueDef::Operator(_, args, _) = &self.b.values[v] {
@@ -2912,9 +2887,7 @@ impl<'o, 'a> FL<'o, 'a> {
                     if kill.contains(&i) {
                         continue;
                     }
-                    self.b.values[i].visit_uses(&self.b.arg_pool, |u| {
-                        bad |= dead.contains(&u)
-                    });
+                    self.b.values[i].visit_uses(&self.b.arg_pool, |u| bad |= dead.contains(&u));
                 }
                 self.b.blocks[blk]
                     .terminator
@@ -2944,7 +2917,11 @@ impl<'o, 'a> FL<'o, 'a> {
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false);
         if dbg {
-            eprintln!("==== pre-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
+            eprintln!(
+                "==== pre-loopopt {} ====\n{}",
+                self.name,
+                self.b.display("  ", None)
+            );
         }
         // Second range pass: optimize/wtab can expose new bounded
         // operands (copy-prop through and/select). DCE immediately so
@@ -2988,12 +2965,14 @@ impl<'o, 'a> FL<'o, 'a> {
             );
         }
         if dbg {
-            eprintln!("==== post-loopopt {} ====\n{}", self.name, self.b.display("  ", None));
+            eprintln!(
+                "==== post-loopopt {} ====\n{}",
+                self.name,
+                self.b.display("  ", None)
+            );
         }
         self.b.optimize(&waffle::OptOptions::default());
-        if let Some(lim) = crate::env_get("PLIRON_WASM_TRIP")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+        if let Some(lim) = crate::env_get("PLIRON_WASM_TRIP").and_then(|v| v.parse::<u64>().ok()) {
             if self.o.trip == waffle::Global::invalid() {
                 // Resolved by the linker to one shared mutable global.
                 self.o.trip = self.o.import_global("env", "__pliron_trip", true);
@@ -3440,9 +3419,7 @@ impl<'o, 'a> FL<'o, 'a> {
         let mut non_self = results.iter().filter(|&&v| v != ph);
         let alias = match non_self.next() {
             None => None,
-            Some(&first)
-                if non_self.all(|&v| v == first) && self.b.resolve_alias(first) != ph =>
-            {
+            Some(&first) if non_self.all(|&v| v == first) && self.b.resolve_alias(first) != ph => {
                 Some(first)
             }
             Some(_) => None,
@@ -3470,9 +3447,7 @@ impl<'o, 'a> FL<'o, 'a> {
         {
             return;
         }
-        if self
-            .b
-            .blocks[wb]
+        if self.b.blocks[wb]
             .preds
             .iter()
             .all(|p| self.promo.finished.contains(p))
@@ -3532,7 +3507,9 @@ impl<'o, 'a> FL<'o, 'a> {
             if let Some(&ty) = self.st.promoted.get(&a) {
                 let base = self.promo.tys.len() as u32;
                 let n = wleaves(ctx, ty).len() as u32;
-                self.promo.tys.extend(wleaves(ctx, ty).iter().map(|&(_, t)| wty(t)));
+                self.promo
+                    .tys
+                    .extend(wleaves(ctx, ty).iter().map(|&(_, t)| wty(t)));
                 self.promo.slots.insert(a, (base, n));
             }
         }
@@ -4174,9 +4151,7 @@ impl<'o, 'a> FL<'o, 'a> {
             let r = wleaves(ctx, self.res_ty(op))
                 .into_iter()
                 .map(|(o, t)| match wide {
-                    Some(s) if matches!(t, clt::I8 | clt::I16 | clt::I32) => {
-                        self.wload(t, p, o, s)
-                    }
+                    Some(s) if matches!(t, clt::I8 | clt::I16 | clt::I32) => self.wload(t, p, o, s),
                     _ => self.load(t, p, o),
                 })
                 .collect();
@@ -4844,7 +4819,9 @@ impl<'o, 'a> FL<'o, 'a> {
                 return;
             }
             "pliron.va.buf" => {
-                let v = self.va_buf.expect("pliron.va.buf in a non-variadic function");
+                let v = self
+                    .va_buf
+                    .expect("pliron.va.buf in a non-variadic function");
                 self.set(op, smallvec![v]);
                 return;
             }
@@ -5251,12 +5228,17 @@ fn mk_pre(b: &mut FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> WBlock
         .map(|(t, _)| b.add_blockparam(pre, t))
         .collect();
     for (pr, tidx) in edges {
-        b.blocks[pr].terminator.update_target(tidx, |t| t.block = pre);
+        b.blocks[pr]
+            .terminator
+            .update_target(tidx, |t| t.block = pre);
     }
     b.set_terminator(
         pre,
         Terminator::Br {
-            target: BlockTarget { block: h, args: fwd },
+            target: BlockTarget {
+                block: h,
+                args: fwd,
+            },
         },
     );
     b.recompute_edges();
@@ -5306,7 +5288,9 @@ fn wloop_opt(
         preds.sort();
         preds.dedup();
         if let [pre] = preds[..] {
-            loop_licm(b, &cfg, &mut defb, inloop, pre, sp, frozen, deref, funcs, nowrite);
+            loop_licm(
+                b, &cfg, &mut defb, inloop, pre, sp, frozen, deref, funcs, nowrite,
+            );
         }
         // Indvars to a fixed point: each new param may itself be the
         // `pv` of a `mul(pv, K)` addressing site (e.g. `idx*4` where
@@ -5320,8 +5304,7 @@ fn wloop_opt(
         }
         // Loop-closed exits: funnel leaked loop values through exit
         // block params so cloning (wbcheck/unroll) is legal.
-        if crate::pass_enabled("PLIRON_WASM_SEAL")
-        {
+        if crate::pass_enabled("PLIRON_WASM_SEAL") {
             wseal_exits(b, &mut defb, &cfg, inloop, *h);
         }
     }
@@ -5367,9 +5350,7 @@ fn wloop_opt(
         .unwrap_or(8);
     let uloops = wloops(b, &cfg);
     for (h, inloop) in &uloops {
-        let innermost = uloops
-            .iter()
-            .all(|(h2, _)| h2 == h || !inloop.contains(h2));
+        let innermost = uloops.iter().all(|(h2, _)| h2 == h || !inloop.contains(h2));
         if innermost {
             wunroll(b, &mut defb, &cfg, inloop, *h, unr, fname);
         }
@@ -5403,7 +5384,14 @@ fn wtrip_guard(b: &mut FunctionBody, g: waffle::Global, limit: u64) {
         let one = b.add_op(chk, O::I32Const { value: 1 }, &[], &[WT::I32]);
         let c2 = b.add_op(chk, O::I32Add, &[c, one], &[WT::I32]);
         b.add_op(chk, O::GlobalSet { global_index: g }, &[c2], &[]);
-        let lim = b.add_op(chk, O::I32Const { value: limit as u32 }, &[], &[WT::I32]);
+        let lim = b.add_op(
+            chk,
+            O::I32Const {
+                value: limit as u32,
+            },
+            &[],
+            &[WT::I32],
+        );
         let over = b.add_op(chk, O::I32GeU, &[c, lim], &[WT::I32]);
         let t = *trap.get_or_insert_with(|| {
             let t = b.add_block();
@@ -5418,10 +5406,15 @@ fn wtrip_guard(b: &mut FunctionBody, g: waffle::Global, limit: u64) {
                     block: t,
                     args: vec![],
                 },
-                if_false: BlockTarget { block: h, args: fwd },
+                if_false: BlockTarget {
+                    block: h,
+                    args: fwd,
+                },
             },
         );
-        b.blocks[p].terminator.update_target(tidx, |t| t.block = chk);
+        b.blocks[p]
+            .terminator
+            .update_target(tidx, |t| t.block = chk);
     }
     b.recompute_edges();
 }
@@ -5566,9 +5559,9 @@ fn frame_based(cb: &FunctionBody, v: WV, sp: waffle::Global, depth: u32) -> bool
     }
     match cb.values[cb.resolve_alias(v)] {
         ValueDef::Operator(O::GlobalGet { global_index }, ..) => global_index == sp,
-        ValueDef::Operator(op, aa, _) if op.is_pure() => {
-            cb.arg_pool[aa].iter().any(|&a| frame_based(cb, a, sp, depth + 1))
-        }
+        ValueDef::Operator(op, aa, _) if op.is_pure() => cb.arg_pool[aa]
+            .iter()
+            .any(|&a| frame_based(cb, a, sp, depth + 1)),
         _ => false,
     }
 }
@@ -5612,9 +5605,7 @@ fn callee_writes(cb: &FunctionBody, sp: waffle::Global) -> Option<Vec<(u32, i64,
                 continue;
             };
             if let Some(sz) = store_bytes(op) {
-                let (Some(m), Some(&base)) =
-                    (memarg_of(op), cb.arg_pool[*aa].first())
-                else {
+                let (Some(m), Some(&base)) = (memarg_of(op), cb.arg_pool[*aa].first()) else {
                     return None;
                 };
                 if frame_based(cb, base, sp, 0) {
@@ -5732,9 +5723,7 @@ fn loop_licm(
                                     load_bytes(&op)
                                         .and_then(|sz| {
                                             let m = memarg_of(&op)?;
-                                            let a = b.resolve_alias(
-                                                *b.arg_pool[args].first()?,
-                                            );
+                                            let a = b.resolve_alias(*b.arg_pool[args].first()?);
                                             let lo = m.offset as u64;
                                             if let Some(&bound) = frozen.get(&a) {
                                                 return (lo + sz <= bound).then_some(());
@@ -5744,9 +5733,8 @@ fn loop_licm(
                                                 return None;
                                             }
                                             if writers.is_none() {
-                                                writers = Some(loop_writers(
-                                                    b, inloop, funcs, nowrite,
-                                                ));
+                                                writers =
+                                                    Some(loop_writers(b, inloop, funcs, nowrite));
                                             }
                                             let ok = !clobbered(
                                                 b,
@@ -5765,9 +5753,9 @@ fn loop_licm(
                                 }
                             }
                         };
-                        safe && b.arg_pool[args].iter().all(|&a| {
-                            !inloop.contains(&defb[b.resolve_alias(a)])
-                        })
+                        safe && b.arg_pool[args]
+                            .iter()
+                            .all(|&a| !inloop.contains(&defb[b.resolve_alias(a)]))
                     }
                     _ => false,
                 };
@@ -5856,8 +5844,7 @@ fn wtab(b: &mut FunctionBody) -> bool {
             uses.entry(b.resolve_alias(u)).or_default().insert(blk);
         });
     }
-    let mut edits: Vec<(WBlock, WV, i64, i64, BlockTarget, BlockTarget, BlockTarget)> =
-        Vec::new();
+    let mut edits: Vec<(WBlock, WV, i64, i64, BlockTarget, BlockTarget, BlockTarget)> = Vec::new();
     for blk in b.blocks.iter() {
         let Terminator::CondBr {
             cond: c1,
@@ -5989,10 +5976,7 @@ fn winv(
         ) => true,
         ValueDef::Operator(op, aa, _) => {
             !inloop.contains(&defb[v])
-                || (op.is_pure()
-                    && b.arg_pool[aa]
-                        .iter()
-                        .all(|&a| winv(b, defb, inloop, a)))
+                || (op.is_pure() && b.arg_pool[aa].iter().all(|&a| winv(b, defb, inloop, a)))
         }
         _ => !inloop.contains(&defb[v]),
     }
@@ -6010,9 +5994,7 @@ fn mat_inv(
 ) -> WV {
     let v = b.resolve_alias(v);
     let (op, aa, tt) = match b.values[v] {
-        ValueDef::Operator(op, aa, tt) if inloop.contains(&defb[v]) && op.is_pure() => {
-            (op, aa, tt)
-        }
+        ValueDef::Operator(op, aa, tt) if inloop.contains(&defb[v]) && op.is_pure() => (op, aa, tt),
         _ => return v,
     };
     let mut args: Vec<WV> = Vec::with_capacity(b.arg_pool[aa].len());
@@ -6028,12 +6010,16 @@ fn mat_inv(
 
 /// The value arriving for param `pidx` of `h` on edge `tidx` of `pred`.
 fn edge_arg(b: &mut FunctionBody, pred: WBlock, tidx: usize, pidx: usize) -> WV {
-    b.blocks[pred].terminator.visit_target(tidx, |t| t.args[pidx])
+    b.blocks[pred]
+        .terminator
+        .visit_target(tidx, |t| t.args[pidx])
 }
 
 /// Push `v` as an extra block-arg on the `tidx`-th target of `pred`.
 fn edge_push(b: &mut FunctionBody, pred: WBlock, tidx: usize, v: WV) {
-    b.blocks[pred].terminator.update_target(tidx, |t| t.args.push(v));
+    b.blocks[pred]
+        .terminator
+        .update_target(tidx, |t| t.args.push(v));
 }
 
 /// Turn `add(base, iv*K)` addresses into `p += step*K` induction params.
@@ -6120,7 +6106,9 @@ fn loop_indvars(
         for &lb in inloop.iter() {
             for &inst in &b.blocks[lb].insts {
                 if let ValueDef::Operator(O::I32Add, aa, _) = b.values[inst] {
-                    let &[x, y, ..] = &b.arg_pool[aa][..] else { continue };
+                    let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                        continue;
+                    };
                     for (m, base) in [(x, y), (y, x)] {
                         let m = b.resolve_alias(m);
                         let base = b.resolve_alias(base);
@@ -6128,7 +6116,9 @@ fn loop_indvars(
                             continue;
                         }
                         if let ValueDef::Operator(O::I32Mul, mm, _) = b.values[m] {
-                            let &[u, k, ..] = &b.arg_pool[mm][..] else { continue };
+                            let &[u, k, ..] = &b.arg_pool[mm][..] else {
+                                continue;
+                            };
                             let (u, k) = (b.resolve_alias(u), b.resolve_alias(k));
                             for (x, kk) in [(u, k), (k, u)] {
                                 if let Some(off) = affine_pv(b, x, pv) {
@@ -6241,12 +6231,9 @@ fn wdce(b: &mut FunctionBody, deref: &FxHashMap<WV, u64>) {
                                         load_bytes(&op)
                                             .and_then(|sz| {
                                                 let m = memarg_of(&op)?;
-                                                let a = b.resolve_alias(
-                                                    *b.arg_pool[args].first()?,
-                                                );
+                                                let a = b.resolve_alias(*b.arg_pool[args].first()?);
                                                 let bound = *deref.get(&a)?;
-                                                (m.offset as u64 + sz <= bound)
-                                                    .then_some(())
+                                                (m.offset as u64 + sz <= bound).then_some(())
                                             })
                                             .is_some()
                                     )
@@ -6287,10 +6274,7 @@ fn wunroll(
     // a tiny one gets the full 8. `unreachable` panic sinks are cold:
     // they inflate the raw CFG shape but not the hot path, so count
     // them separately when deciding whether the loop is worth cloning.
-    let sink_blocks: usize = inloop
-        .iter()
-        .filter(|&&lb| cloneable_sink(b, lb))
-        .count();
+    let sink_blocks: usize = inloop.iter().filter(|&&lb| cloneable_sink(b, lb)).count();
     let insts: usize = inloop
         .iter()
         .filter(|&&lb| !cloneable_sink(b, lb))
@@ -6416,17 +6400,20 @@ fn wunroll_flat(
         }
         match b.values[b.resolve_alias(cond)] {
             ValueDef::Operator(O::I32Eq, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 Some((b.resolve_alias(x), b.resolve_alias(y), false))
             }
             ValueDef::Operator(O::I32Ne, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 Some((b.resolve_alias(x), b.resolve_alias(y), true))
             }
             _ => None,
         }
-    })(*cond)
-    else {
+    })(*cond) else {
         rej!("cond not a recognized check");
     };
     let (pass, _) = if pass_true {
@@ -6445,9 +6432,7 @@ fn wunroll_flat(
     };
     // A stale BlockParam can outlive its slot if optimize dropped the
     // param; `iv` must still own index `pidx` before edge args are read.
-    if hb != h
-        || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == iv)
-    {
+    if hb != h || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == iv) {
         rej!("iv blockparam slot stale");
     }
     // Uniform positive constant step on iv across all latches (an
@@ -6495,7 +6480,9 @@ fn wunroll_flat(
             _ => rej!("non-uniform step"),
         }
     }
-    let Some(step) = step else { rej!("step not positive (or none)") };
+    let Some(step) = step else {
+        rej!("step not positive (or none)")
+    };
     if step <= 0 {
         return false;
     }
@@ -6568,7 +6555,9 @@ fn wunroll_flat(
         },
     );
     for (pr, tidx) in edges {
-        b.blocks[pr].terminator.update_target(tidx, |t| t.block = h_t);
+        b.blocks[pr]
+            .terminator
+            .update_target(tidx, |t| t.block = h_t);
     }
     // Chain the group: copy i's edges to its own header instead enter
     // copy i+1's; the last copy's loop back to h_t.
@@ -6594,15 +6583,12 @@ fn wunroll_flat(
 /// leaking into them stay dominated.
 fn cloneable_sink(b: &FunctionBody, blk: WBlock) -> bool {
     matches!(b.blocks[blk].terminator, Terminator::Unreachable)
-        && b.blocks[blk]
-            .insts
-            .iter()
-            .all(|&v| {
-                matches!(
-                    b.values[v],
-                    ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
-                )
-            })
+        && b.blocks[blk].insts.iter().all(|&v| {
+            matches!(
+                b.values[v],
+                ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
+            )
+        })
 }
 
 /// Can this loop's blocks be safely cloned? Requires ordinary insts only,
@@ -6810,9 +6796,7 @@ fn seal_value(
         let preds = b.blocks[cur].preds.clone();
         let poss = b.blocks[cur].pos_in_pred_succ.clone();
         for (j, pr) in preds.iter().enumerate() {
-            let c = if !reach.contains(pr)
-                || (inloop.contains(pr) && cfg.dominates(dblk, *pr))
-            {
+            let c = if !reach.contains(pr) || (inloop.contains(pr) && cfg.dominates(dblk, *pr)) {
                 v
             } else if let Some(&c) = carriers.get(&(*pr, v)) {
                 c
@@ -6848,14 +6832,13 @@ fn seal_pick(
     ty: WT,
 ) -> WV {
     let from = b.resolve_alias(from);
-    let mkpick = |b: &mut FunctionBody,
-                  defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-                  blk: WBlock| {
-        let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
-        defb[pv] = blk;
-        b.blocks[blk].insts.push(pv);
-        pv
-    };
+    let mkpick =
+        |b: &mut FunctionBody, defb: &mut waffle::entity::PerEntity<WV, WBlock>, blk: WBlock| {
+            let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
+            defb[pv] = blk;
+            b.blocks[blk].insts.push(pv);
+            pv
+        };
     if inloop.contains(&blk) || !reach.contains(&blk) {
         return mkpick(b, defb, blk);
     }
@@ -6892,9 +6875,7 @@ fn seal_pick(
         let preds = b.blocks[cur].preds.clone();
         let poss = b.blocks[cur].pos_in_pred_succ.clone();
         for (j, pr) in preds.iter().enumerate() {
-            let c = if !reach.contains(pr)
-                || (inloop.contains(pr) && cfg.dominates(dblk, *pr))
-            {
+            let c = if !reach.contains(pr) || (inloop.contains(pr) && cfg.dominates(dblk, *pr)) {
                 mkpick(b, defb, *pr)
             } else if let Some(&c) = carriers.get(&(*pr, from, idx)) {
                 c
@@ -7153,15 +7134,29 @@ fn bound_u64(
     match b.values[v] {
         ValueDef::Operator(O::I32Const { value }, ..) => Some(value as u32 as u64),
         ValueDef::Operator(O::I32Add, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
-            let s = bound_u64(b, loops, h, x, depth + 1)?
-                .checked_add(bound_u64(b, loops, h, y, depth + 1)?)?;
+            let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                return None;
+            };
+            let s = bound_u64(b, loops, h, x, depth + 1)?.checked_add(bound_u64(
+                b,
+                loops,
+                h,
+                y,
+                depth + 1,
+            )?)?;
             (s <= u32::MAX as u64).then_some(s)
         }
         ValueDef::Operator(O::I32Mul, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
-            let s = bound_u64(b, loops, h, x, depth + 1)?
-                .checked_mul(bound_u64(b, loops, h, y, depth + 1)?)?;
+            let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                return None;
+            };
+            let s = bound_u64(b, loops, h, x, depth + 1)?.checked_mul(bound_u64(
+                b,
+                loops,
+                h,
+                y,
+                depth + 1,
+            )?)?;
             (s <= u32::MAX as u64).then_some(s)
         }
         ValueDef::BlockParam(oh, opidx, WT::I32) if oh != h => {
@@ -7203,7 +7198,9 @@ fn bound_u64(
                 }
                 let tidx = b.blocks[oh].pos_in_pred_succ[j];
                 let mut arg = None;
-                b.blocks[p].terminator.visit_target(tidx, |t| arg = t.args.get(opidx as usize).copied());
+                b.blocks[p]
+                    .terminator
+                    .visit_target(tidx, |t| arg = t.args.get(opidx as usize).copied());
                 let arg = b.resolve_alias(arg?);
                 let s = if arg == pv {
                     0
@@ -7245,11 +7242,15 @@ fn bound_u64(
 fn as_check(b: &FunctionBody, cond: WV) -> Option<(WV, WV, bool)> {
     match b.values[b.resolve_alias(cond)] {
         ValueDef::Operator(O::I32LtU, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                return None;
+            };
             Some((b.resolve_alias(x), b.resolve_alias(y), true))
         }
         ValueDef::Operator(O::I32GeU, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+            let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                return None;
+            };
             Some((b.resolve_alias(x), b.resolve_alias(y), false))
         }
         _ => None,
@@ -7278,7 +7279,9 @@ fn wbcheck(
     let mut preds: Vec<WBlock> = edges.iter().map(|&(p, _)| p).collect();
     preds.sort();
     preds.dedup();
-    let [pre] = preds[..] else { bail!("outside preds {preds:?}") };
+    let [pre] = preds[..] else {
+        bail!("outside preds {preds:?}")
+    };
     let pre_tidx = edges.iter().find(|&&(p, _)| p == pre)?.1;
     let Terminator::Br { target: pre_t } = &b.blocks[pre].terminator else {
         bail!("pre {pre} not a forwarder");
@@ -7381,7 +7384,9 @@ fn wbcheck(
             let d = if x == pv {
                 Chk::Same(None)
             } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[x] {
-                let &[u, v, ..] = &b.arg_pool[aa][..] else { continue };
+                let &[u, v, ..] = &b.arg_pool[aa][..] else {
+                    continue;
+                };
                 let (u, v) = (b.resolve_alias(u), b.resolve_alias(v));
                 if u == pv && winv(b, defb, inloop, v) {
                     Chk::Same(Some(v))
@@ -7473,7 +7478,9 @@ fn wbcheck(
         }
         let step = match b.values[arg] {
             ValueDef::Operator(O::I32Add, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else { return None };
+                let &[x, y, ..] = &b.arg_pool[aa][..] else {
+                    return None;
+                };
                 let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
                 if x == pv && winv(b, defb, inloop, y) {
                     y
@@ -7546,9 +7553,7 @@ fn wbcheck(
                             return None;
                         }
                         n_c.and_then(|nc| {
-                            nc.checked_sub(1)?
-                                .checked_mul(*k as u64)?
-                                .checked_add(xb)
+                            nc.checked_sub(1)?.checked_mul(*k as u64)?.checked_add(xb)
                         })
                     }
                 }
@@ -7625,12 +7630,7 @@ fn clone_sink(
     vmap: &FxHashMap<WV, WV>,
     blk: WBlock,
 ) -> WBlock {
-    fn mapv(
-        b: &FunctionBody,
-        lmap: &FxHashMap<WV, WV>,
-        vmap: &FxHashMap<WV, WV>,
-        v: WV,
-    ) -> WV {
+    fn mapv(b: &FunctionBody, lmap: &FxHashMap<WV, WV>, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
         let r = b.resolve_alias(v);
         lmap.get(&r).or_else(|| vmap.get(&r)).copied().unwrap_or(r)
     }
@@ -7656,11 +7656,7 @@ fn clone_sink(
                 lmap.insert(inst, nv);
             }
             ValueDef::PickOutput(from, idx, ty) => {
-                let nv = b.add_value(ValueDef::PickOutput(
-                    mapv(b, &lmap, vmap, from),
-                    idx,
-                    ty,
-                ));
+                let nv = b.add_value(ValueDef::PickOutput(mapv(b, &lmap, vmap, from), idx, ty));
                 b.blocks[nb].insts.push(nv);
                 defb[nv] = nb;
                 lmap.insert(inst, nv);

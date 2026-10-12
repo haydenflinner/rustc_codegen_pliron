@@ -27,9 +27,9 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::instructions::InstructionMapper;
 use cranelift_codegen::ir::{
-    types, Block, BlockArg, BlockCall, Constant, DynamicStackSlot, ExceptionTable,
-    ExceptionTableItem, FuncRef, Function, GlobalValue, Immediate, Inst, InstBuilder,
-    InstructionData, JumpTable, JumpTableData, Opcode, SigRef, StackSlot, Type, Value, ValueList,
+    Block, BlockArg, BlockCall, Constant, DynamicStackSlot, ExceptionTable, ExceptionTableItem,
+    FuncRef, Function, GlobalValue, Immediate, Inst, InstBuilder, InstructionData, JumpTable,
+    JumpTableData, Opcode, SigRef, StackSlot, Type, Value, ValueList, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -83,9 +83,6 @@ enum Step {
 struct LoopInfo {
     /// Header param stepping by `istep` per iteration.
     iv: Value,
-    /// The iv's per-iteration delta (`K(1)` for the classic counter; `V` for
-    /// strides like `j += i` — always nonneg as an unsigned machine value).
-    istep: Step,
     /// Param index of `iv`; the entry value is the guard block's param.
     iv0: usize,
     /// The iv's entry value when constant and identical on all entry edges.
@@ -301,9 +298,8 @@ fn ubound(func: &Function, v: Value) -> Option<u64> {
 
 /// `PLIRON_BCHECK_UBOUND=0` disables bounded-index versioning.
 fn ubound_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        crate::pass_enabled("PLIRON_BCHECK_UBOUND")
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_BCHECK_UBOUND"));
     *ON
 }
 
@@ -426,12 +422,7 @@ fn affine(
                     let k = info.iv0k?;
                     return Some(Aff {
                         m: Lin::V(y),
-                        b: [Term {
-                            v: Lin::V(y),
-                            k,
-                        }]
-                        .into_iter()
-                        .collect(),
+                        b: [Term { v: Lin::V(y), k }].into_iter().collect(),
                     });
                 }
                 // affine * const: scale m and every b term.
@@ -487,10 +478,8 @@ impl InstructionMapper for CloneMap<'_> {
     fn map_jump_table(&mut self, jt: JumpTable) -> JumpTable {
         let def = self.map_block_call(self.func.dfg.jump_tables[jt].default_block());
         let calls: Vec<BlockCall> = self.func.dfg.jump_tables[jt].as_slice().to_vec();
-        let table: SmallVec<[BlockCall; 8]> = calls
-            .iter()
-            .map(|bc| self.map_block_call(*bc))
-            .collect();
+        let table: SmallVec<[BlockCall; 8]> =
+            calls.iter().map(|bc| self.map_block_call(*bc)).collect();
         self.func
             .dfg
             .jump_tables
@@ -517,7 +506,9 @@ impl InstructionMapper for CloneMap<'_> {
         self.func
             .dfg
             .exception_tables
-            .push(cranelift_codegen::ir::ExceptionTableData::new(sig, nr, items))
+            .push(cranelift_codegen::ir::ExceptionTableData::new(
+                sig, nr, items,
+            ))
     }
     fn map_block_call(&mut self, bc: BlockCall) -> BlockCall {
         let blk = bc.block(&self.func.dfg.value_lists);
@@ -587,7 +578,12 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
         }
         if seen.len() > 64 {
             if dbg {
-                eprintln!("dead_end blk{}: bail seen={} cold={}", b.as_u32(), seen.len(), func.layout.is_cold(b));
+                eprintln!(
+                    "dead_end blk{}: bail seen={} cold={}",
+                    b.as_u32(),
+                    seen.len(),
+                    func.layout.is_cold(b)
+                );
             }
             return false;
         }
@@ -599,8 +595,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 Opcode::Call | Opcode::CallIndirect => call = true,
                 Opcode::Load => {
                     if let InstructionData::Load { arg, .. } = *d
-                        && let Some(ai) =
-                            func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+                        && let Some(ai) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
                         && func.dfg.insts[ai].opcode() == Opcode::TlsValue
                     {
                         flag = true;
@@ -608,15 +603,10 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 }
                 Opcode::Brif => {
                     if let InstructionData::Brif { arg, .. } = *d {
-                        if let Some(li) = func
-                            .dfg
-                            .value_def(func.dfg.resolve_aliases(arg))
-                            .inst()
+                        if let Some(li) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
                             && let InstructionData::Load { arg: la, .. } = func.dfg.insts[li]
-                            && let Some(ai) = func
-                                .dfg
-                                .value_def(func.dfg.resolve_aliases(la))
-                                .inst()
+                            && let Some(ai) =
+                                func.dfg.value_def(func.dfg.resolve_aliases(la)).inst()
                             && func.dfg.insts[ai].opcode() == Opcode::TlsValue
                         {
                             flag_brif = true;
@@ -625,7 +615,10 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 }
                 Opcode::Return if !(call && flag || (throw_ret && rethrow)) => {
                     if dbg {
-                        eprintln!("dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}", b.as_u32());
+                        eprintln!(
+                            "dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}",
+                            b.as_u32()
+                        );
                     }
                     return false;
                 }
@@ -641,10 +634,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 // sound only in the first case.
                 rethrow = call && flag && !flag_brif;
             }
-            let dests = d.branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            );
+            let dests = d.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             // `try_call` lists its exception-handler edges first and the
             // normal-return continuation last. An unwinding callee leaves
             // the frame — the exception path runs cleanup and resignals,
@@ -710,10 +700,9 @@ fn closed_region(
                     {
                         return true;
                     }
-                    for bc in func.dfg.insts[i].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    ) {
+                    for bc in func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    {
                         if bc.args(&func.dfg.value_lists).any(|a| {
                             matches!(a, BlockArg::Value(v) if {
                                 rvals.contains(&func.dfg.resolve_aliases(v))
@@ -723,8 +712,7 @@ fn closed_region(
                         }
                     }
                     if let InstructionData::TryCall { exception, .. }
-                    | InstructionData::TryCallIndirect { exception, .. } =
-                        func.dfg.insts[i]
+                    | InstructionData::TryCallIndirect { exception, .. } = func.dfg.insts[i]
                         && func.dfg.exception_tables[exception].items().any(|it| {
                             matches!(it, ExceptionTableItem::Context(v) if {
                                 rvals.contains(&func.dfg.resolve_aliases(v))
@@ -741,10 +729,9 @@ fn closed_region(
                 let Some(t) = func.layout.last_inst(r) else {
                     continue;
                 };
-                for bc in func.dfg.insts[t].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let d = bc.block(&func.dfg.value_lists);
                     if !region.contains(&d) && !targets.contains(&d) {
                         targets.push(d);
@@ -764,10 +751,9 @@ fn closed_region(
                         break;
                     }
                     if let Some(t) = func.layout.last_inst(x) {
-                        for bc in func.dfg.insts[t].branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        ) {
+                        for bc in func.dfg.insts[t]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                        {
                             stack.push(bc.block(&func.dfg.value_lists));
                         }
                     }
@@ -812,10 +798,9 @@ fn clone_region(
             }
             stack.push((b, true));
             if let Some(t) = func.layout.last_inst(b) {
-                for bc in func.dfg.insts[t].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let d = bc.block(&func.dfg.value_lists);
                     if region.contains(&d) {
                         stack.push((d, false));
@@ -847,10 +832,8 @@ fn clone_region(
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for i in insts {
             if let Some(&slot) = fold.get(&i) {
-                let bc = func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                )[slot];
+                let bc = func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot];
                 let nbc = {
                     let mut cm = CloneMap {
                         func,
@@ -895,20 +878,26 @@ fn clone_region(
 fn retarget_entries(func: &mut Function, entries: &[Edge], g: Block) {
     for e in entries {
         let args: Vec<BlockArg> = func.dfg.insts[e.inst]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                [e.slot]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[e.slot]
             .args(&func.dfg.value_lists)
             .collect();
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[e.inst].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[e.slot];
+        let bc = &mut dfg.insts[e.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e.slot];
         *bc = BlockCall::new(g, args.iter().copied(), &mut dfg.value_lists);
     }
 }
 
-fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop, name: &str, throw_ret: bool, seen: &mut FxHashSet<Block>) -> usize {
+fn run_loop(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    lp: Loop,
+    name: &str,
+    throw_ret: bool,
+    seen: &mut FxHashSet<Block>,
+) -> usize {
     let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
     let h = la.loop_header(lp);
     if !seen.insert(h) {
@@ -984,10 +973,8 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         if func.dfg.insts[i].opcode() != Opcode::Brif {
             return None;
         }
-        let dests = func.dfg.insts[i].branch_destination(
-            &func.dfg.jump_tables,
-            &func.dfg.exception_tables,
-        );
+        let dests =
+            func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         let in_latch = site == latch;
         let cs = if in_latch {
             dests
@@ -1050,7 +1037,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             continue;
         }
         let Some(ba) = bargs[idx] else { continue };
-        let Some(istep) = step_of(func, p, ba) else { continue };
+        let Some(istep) = step_of(func, p, ba) else {
+            continue;
+        };
         // iv's entry value is a constant only when all entry edges agree.
         let mut iv0k = None;
         let mut same = true;
@@ -1072,7 +1061,6 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             };
             let mut lo = LoopInfo {
                 iv: p,
-                istep,
                 iv0: idx,
                 iv0k,
                 bound,
@@ -1093,7 +1081,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                     continue;
                 }
                 let Some(qa) = bargs[j] else { continue };
-                let Some(s) = step_of(func, q, qa) else { continue };
+                let Some(s) = step_of(func, q, qa) else {
+                    continue;
+                };
                 let inv = match s {
                     Step::K(_) => true,
                     Step::V(sv) => invariant(func, cfg, &lo, &body, sv),
@@ -1120,13 +1110,11 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 if !ty.is_int() || ty.bits() > 64 {
                     continue;
                 }
-                let Some((bound, adj, _)) = bound_test(h, p, bargs[ix].unwrap_or(p))
-                else {
+                let Some((bound, adj, _)) = bound_test(h, p, bargs[ix].unwrap_or(p)) else {
                     continue;
                 };
                 let lo = LoopInfo {
                     iv: p,
-                    istep: Step::K(1),
                     iv0: ix,
                     iv0k: None,
                     bound,
@@ -1142,7 +1130,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                     break;
                 }
             }
-            let Some(lo) = found else { bail!("no counting iv") };
+            let Some(lo) = found else {
+                bail!("no counting iv")
+            };
             let iv = lo.iv;
             (lo, Some(iv))
         }
@@ -1167,7 +1157,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     let mut checks: Vec<Chk> = Vec::new();
     let mut total_checks = 0usize;
     'blk: for &b in &body {
-        let Some(t) = func.layout.last_inst(b) else { continue };
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
         if func.dfg.insts[t].opcode() != Opcode::Brif || trip_tests.contains(&t) {
             continue;
         }
@@ -1209,7 +1201,11 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             };
             if !invariant(func, cfg, &info, &body, bb) {
                 if debug {
-                    eprintln!("bcheck {name} block{}: blk{} len not invariant", h.as_u32(), b.as_u32());
+                    eprintln!(
+                        "bcheck {name} block{}: blk{} len not invariant",
+                        h.as_u32(),
+                        b.as_u32()
+                    );
                 }
                 continue;
             }
@@ -1276,15 +1272,18 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                     None => continue,
                 }
             };
-            let dests = func.dfg.insts[t].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            );
+            let dests = func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
             if !dead_end(func, bad, throw_ret) {
                 if debug {
-                    eprintln!("bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})", h.as_u32(), b.as_u32(), bsub);
+                    eprintln!(
+                        "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
+                        h.as_u32(),
+                        b.as_u32(),
+                        bsub
+                    );
                 }
                 continue;
             }
@@ -1320,10 +1319,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     // not a correctness gate: PLIRON_BCHECK_PARTIAL overrides entirely.
     // (x64 wt note: widened the original all-stores-affine rule to this
     // store+load test — merge-flag for native's bcheck.rs.)
-    if checks.len() < total_checks
-        && checks.len() < 2
-        && !crate::env_set("PLIRON_BCHECK_PARTIAL")
-    {
+    if checks.len() < total_checks && checks.len() < 2 && !crate::env_set("PLIRON_BCHECK_PARTIAL") {
         let mut dyn_store = false;
         let mut dyn_load = false;
         for &b in &body {
@@ -1404,7 +1400,11 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     };
     let mut pos = FuncCursor::new(func).at_bottom(g);
     let zext = |pos: &mut FuncCursor, v: Value| -> Value {
-        if ity == wty { v } else { pos.ins().uextend(wty, v) }
+        if ity == wty {
+            v
+        } else {
+            pos.ins().uextend(wty, v)
+        }
     };
     let boundv = gval(&info, &gp, &mut pos, info.bound);
     // Trip-count terms are only needed by affine checks. `t` is the last
@@ -1451,7 +1451,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             Lin::N(_) => false,
         };
         m_ok && c.aff.b.iter().all(|t| match t.v {
-            Lin::K(kv) => kv.checked_mul(t.k).is_some_and(|p| p >= 0 && (p as u64) <= umax),
+            Lin::K(kv) => kv
+                .checked_mul(t.k)
+                .is_some_and(|p| p >= 0 && (p as u64) <= umax),
             Lin::V(_) | Lin::P(_) => kfits(t.k),
             Lin::N(_) => false,
         })
@@ -1713,7 +1715,12 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     1
 }
 
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str, throw_ret: bool) -> usize {
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    name: &str,
+    throw_ret: bool,
+) -> usize {
     let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
@@ -1822,9 +1829,9 @@ fn unswitch_loop(
         match def_block(func, v) {
             Some(b) if b == h => {
                 if let cranelift_codegen::ir::ValueDef::Param(_, n) = func.dfg.value_def(v) {
-                    backs.iter().all(|e| {
-                        edge_arg(func, e, n).is_some_and(|a| a == v)
-                    })
+                    backs
+                        .iter()
+                        .all(|e| edge_arg(func, e, n).is_some_and(|a| a == v))
                 } else {
                     false
                 }
@@ -1873,10 +1880,7 @@ fn unswitch_loop(
     let g = func.dfg.make_block();
     let pb = func.layout.inst_block(entries[0].inst).unwrap();
     func.layout.insert_block_after(g, pb);
-    let gtys: Vec<Type> = params
-        .iter()
-        .map(|&p| func.dfg.value_type(p))
-        .collect();
+    let gtys: Vec<Type> = params.iter().map(|&p| func.dfg.value_type(p)).collect();
     let gp: Vec<Value> = gtys
         .iter()
         .map(|&t| func.dfg.append_block_param(g, t))
@@ -1901,10 +1905,8 @@ fn unswitch_loop(
         if !fold.contains_key(&t) {
             continue;
         }
-        let bc = func.dfg.insts[t].branch_destination(
-            &func.dfg.jump_tables,
-            &func.dfg.exception_tables,
-        )[1];
+        let bc = func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[1];
         let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
         let d = bc.block(&func.dfg.value_lists);
         func.layout.remove_inst(t);

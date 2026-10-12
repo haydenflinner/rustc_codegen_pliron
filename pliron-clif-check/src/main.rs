@@ -21,7 +21,6 @@ use cranelift_codegen::settings::Configurable;
 use cranelift_module::FuncId;
 use pliron_clif_opt::diffcheck::{self, Config, OwnedFacts};
 use pliron_clif_opt::pipeline::{self, FnFlags, Pipe, Stats};
-use rustc_hash::FxHashMap;
 
 struct Opts {
     cfg: Config,

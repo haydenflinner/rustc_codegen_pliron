@@ -96,9 +96,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let imm_sigil = if intel { "" } else { "$" };
         for piece in template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => {
-                    s.push_str(&t.replace("$$", imm_sigil))
-                }
+                InlineAsmTemplatePiece::String(t) => s.push_str(&t.replace("$$", imm_sigil)),
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx, span, ..
                 } => match operands[*operand_idx] {
@@ -132,8 +130,8 @@ impl<'tcx> CodegenCx<'tcx> {
             .collect();
         // COFF weak linkage needs COMDAT machinery; a per-module-unique name
         // dedups the same way since nothing external defines these.
-        let coff = self.tcx.sess.target.options.binary_format
-            == rustc_target::spec::BinaryFormat::Coff;
+        let coff =
+            self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
         let sym = if coff {
             st.counter += 1;
             let cgu: String = st
@@ -158,8 +156,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
         // Win64 integer args: rcx, rdx, r8 (SysV: rdi, rsi, rdx).
         let win64 = x86
-            && self.tcx.sess.target.options.binary_format
-                == rustc_target::spec::BinaryFormat::Coff;
+            && self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
         let body = match name {
             "llvm.x86.xgetbv" if x86 && win64 => {
                 "    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n".to_string()
@@ -261,11 +258,20 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
             return None;
         }
         if op.starts_with("tbl") {
-            let tbl = (0..n).map(|r| format!("v{r}.16b")).collect::<Vec<_>>().join(", ");
+            let tbl = (0..n)
+                .map(|r| format!("v{r}.16b"))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Some(format!("    tbl v0.16b, {{{tbl}}}, v{n}.16b\n    ret\n"));
         }
-        let tbl = (1..=n).map(|r| format!("v{r}.16b")).collect::<Vec<_>>().join(", ");
-        return Some(format!("    tbx v0.16b, {{{tbl}}}, v{}.16b\n    ret\n", n + 1));
+        let tbl = (1..=n)
+            .map(|r| format!("v{r}.16b"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "    tbx v0.16b, {{{tbl}}}, v{}.16b\n    ret\n",
+            n + 1
+        ));
     }
     // 2-vector unary ops.
     const UNARY: &[&str] = &[
@@ -595,7 +601,11 @@ impl Gen<'_, '_> {
         let mut s = String::new();
         if macho {
             writeln!(s, ".globl {name}\n.private_extern {name}").unwrap();
-            writeln!(s, ".section __TEXT,__text,regular,pure_instructions\n{name}:").unwrap();
+            writeln!(
+                s,
+                ".section __TEXT,__text,regular,pure_instructions\n{name}:"
+            )
+            .unwrap();
         } else if coff {
             writeln!(s, ".globl {name}\n.text\n{name}:").unwrap();
         } else {
@@ -637,9 +647,7 @@ impl Gen<'_, '_> {
         let imm_sigil = if att { "$" } else { "" };
         for piece in self.template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => {
-                    s.push_str(&t.replace("$$", imm_sigil))
-                }
+                InlineAsmTemplatePiece::String(t) => s.push_str(&t.replace("$$", imm_sigil)),
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx,
                     modifier,

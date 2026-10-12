@@ -308,7 +308,11 @@ fn affine(
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return None;
     };
-    if !func.layout.inst_block(i).is_some_and(|b| info.body.contains(&b)) {
+    if !func
+        .layout
+        .inst_block(i)
+        .is_some_and(|b| info.body.contains(&b))
+    {
         return None;
     }
     let d = depth + 1;
@@ -342,10 +346,18 @@ fn affine(
                 (0, 0, Ins::Mul(Box::new(oa), Box::new(ob)))
             } else if ca != 0 {
                 let m = ins_k(&ob)?;
-                (ca.wrapping_mul(m), 0, Ins::Mul(Box::new(oa), Box::new(Ins::K(m))))
+                (
+                    ca.wrapping_mul(m),
+                    0,
+                    Ins::Mul(Box::new(oa), Box::new(Ins::K(m))),
+                )
             } else {
                 let m = ins_k(&oa)?;
-                (0, cb.wrapping_mul(m), Ins::Mul(Box::new(ob), Box::new(Ins::K(m))))
+                (
+                    0,
+                    cb.wrapping_mul(m),
+                    Ins::Mul(Box::new(ob), Box::new(Ins::K(m))),
+                )
             }
         }
         InstructionData::Binary {
@@ -454,10 +466,7 @@ fn stream_base(
             );
             let expr = Ins::Add(
                 Box::new(c),
-                Box::new(Ins::Mul(
-                    Box::new(Ins::K(rate)),
-                    Box::new(Ins::Val(cnt.iv)),
-                )),
+                Box::new(Ins::Mul(Box::new(Ins::K(rate)), Box::new(Ins::Val(cnt.iv)))),
             );
             return Some((expr, info.entry_args[j], false, neg, stride));
         }
@@ -467,7 +476,10 @@ fn stream_base(
     if k * cnt.step != ebytes && k * cnt.step != -ebytes {
         // Strided-gather stream: `k*step` bytes/iter, a whole-element
         // multiple ≥ 2 of the access width (columns, every-nth walks).
-        if !(gather && k * cnt.step > ebytes && (k * cnt.step) % ebytes == 0 && k * cnt.step <= MAX_GATHER)
+        if !(gather
+            && k * cnt.step > ebytes
+            && (k * cnt.step) % ebytes == 0
+            && k * cnt.step <= MAX_GATHER)
         {
             return None;
         }
@@ -476,12 +488,15 @@ fn stream_base(
     let neg = k * cnt.step < 0;
     let expr = Ins::Add(
         Box::new(off.clone()),
-        Box::new(Ins::Mul(
-            Box::new(Ins::Val(cnt.iv)),
-            Box::new(Ins::K(k)),
-        )),
+        Box::new(Ins::Mul(Box::new(Ins::Val(cnt.iv)), Box::new(Ins::K(k)))),
     );
-    Some((expr, root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0), false, neg, stride))
+    Some((
+        expr,
+        root_leaf(&off, cnt.iv).unwrap_or(cnt.iv0),
+        false,
+        neg,
+        stride,
+    ))
 }
 
 /// `v` as `Σ coeff·param + const`: add `mul`·(param coeffs of `v`) into
@@ -582,10 +597,10 @@ fn upgrade_lagged(func: &Function, info: &Info, kinds: &mut Vec<Param>) {
                 continue;
             }
             // All latches must pass back the same value.
-            let mut it = info
-                .latches
-                .iter()
-                .map(|&e| func.dfg.resolve_aliases(*edge_args(func, e).get(j).unwrap_or(&Value::from_u32(0))));
+            let mut it = info.latches.iter().map(|&e| {
+                func.dfg
+                    .resolve_aliases(*edge_args(func, e).get(j).unwrap_or(&Value::from_u32(0)))
+            });
             let Some(bv) = it.next() else { continue };
             if !it.all(|v| v == bv) {
                 continue;
@@ -683,7 +698,11 @@ fn is_splat(
 fn eqchain_testable(func: &Function, v: Value) -> bool {
     fn k_of(func: &Function, v: Value) -> Option<i64> {
         let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
-        if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = func.dfg.insts[di] {
+        if let InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = func.dfg.insts[di]
+        {
             Some(imm.bits())
         } else {
             None
@@ -697,11 +716,18 @@ fn eqchain_testable(func: &Function, v: Value) -> bool {
             return false;
         };
         match func.dfg.insts[di] {
-            InstructionData::Binary { opcode: Opcode::Bor, args } => {
+            InstructionData::Binary {
+                opcode: Opcode::Bor,
+                args,
+            } => {
                 stack.push(func.dfg.resolve_aliases(args[0]));
                 stack.push(func.dfg.resolve_aliases(args[1]));
             }
-            InstructionData::IntCompare { cond: IntCC::Equal, args, .. } => {
+            InstructionData::IntCompare {
+                cond: IntCC::Equal,
+                args,
+                ..
+            } => {
                 let (a, c) = (
                     func.dfg.resolve_aliases(args[0]),
                     func.dfg.resolve_aliases(args[1]),
@@ -715,7 +741,11 @@ fn eqchain_testable(func: &Function, v: Value) -> bool {
                 if bits > 64 {
                     return false;
                 }
-                let kv = if bits == 64 { k as u64 } else { (k as u64) & ((1u64 << bits) - 1) };
+                let kv = if bits == 64 {
+                    k as u64
+                } else {
+                    (k as u64) & ((1u64 << bits) - 1)
+                };
                 if kv >= 64 {
                     return false;
                 }
@@ -791,7 +821,11 @@ fn upd_decomp(
                 func.dfg.resolve_aliases(args[0]),
                 func.dfg.resolve_aliases(args[1]),
             );
-            let d = if x == p { y } else if y == p { x } else {
+            let d = if x == p {
+                y
+            } else if y == p {
+                x
+            } else {
                 return None;
             };
             Some((opcode, d, vec![], vec![]))
@@ -806,8 +840,9 @@ fn upd_decomp(
                 func.dfg.resolve_aliases(args[2]),
             );
             if let ValueDef::Result(ci, _) = func.dfg.value_def(c)
-                && let InstructionData::IntCompare { cond, args: cargs, .. } =
-                    func.dfg.insts[ci]
+                && let InstructionData::IntCompare {
+                    cond, args: cargs, ..
+                } = func.dfg.insts[ci]
             {
                 let (a, b) = (
                     func.dfg.resolve_aliases(cargs[0]),
@@ -815,10 +850,7 @@ fn upd_decomp(
                 );
                 // Both the icmp and the select pair `acc` with the
                 // same single delta value.
-                let (da, dx) = (
-                    if a == p { b } else { a },
-                    if x == p { y } else { x },
-                );
+                let (da, dx) = (if a == p { b } else { a }, if x == p { y } else { x });
                 if (a == p) != (b == p) && (x == p) != (y == p) && da == dx && da != p {
                     let d = da;
                     // `select(a cc b, x, y)`: picking the same operand
@@ -863,10 +895,7 @@ fn upd_decomp(
             let (op, d, mut aux, mut conds) = upd_decomp(func, p, ii, depth + 1)?;
             // Only zero-identity ops mask this way — a nested min/max
             // or fadd select can't be a conditional update's inner.
-            if !matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor)
-                || d == p
-                || c == p
-            {
+            if !matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor) || d == p || c == p {
                 return None;
             }
             aux.push(ii);
@@ -950,7 +979,10 @@ fn plan(
         }
         let p = func.dfg.block_params(info.h)[j];
         if crate::env_set("PLIRON_VEC_DEBUG") {
-            eprintln!("vec reduc?: param {j} analyzing, {} latches", info.latches.len());
+            eprintln!(
+                "vec reduc?: param {j} analyzing, {} latches",
+                info.latches.len()
+            );
         }
         // The acc update as a lane op + delta: a whitelisted binary
         // (`acc ⊕ d`), a select-diamond min/max (`select(icmp cc acc d)`,
@@ -1020,17 +1052,14 @@ fn plan(
                     let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
                         return None;
                     };
-                    let dests = func
-                        .dfg
-                        .insts[t]
+                    let dests = func.dfg.insts[t]
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                     let [tb, eb] = dests[..] else { return None };
                     let tb = tb.block(&func.dfg.value_lists);
                     let eb = eb.block(&func.dfg.value_lists);
                     let gated = |a: Block, p: Block| {
-                        arms.iter().all(|&(s, pass)| {
-                            dt.block_dominates(if pass { p } else { a }, s)
-                        })
+                        arms.iter()
+                            .all(|&(s, pass)| dt.block_dominates(if pass { p } else { a }, s))
                     };
                     let gc = func.dfg.resolve_aliases(arg);
                     if gated(tb, eb) {
@@ -1055,13 +1084,10 @@ fn plan(
                     let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
                         return None;
                     };
-                    let dests = func
-                        .dfg
-                        .insts[e.inst]
+                    let dests = func.dfg.insts[e.inst]
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                     let [d0, d1] = dests[..] else { return None };
-                    let other = if e.slot == 0 { d1 } else { d0 }
-                        .block(&func.dfg.value_lists);
+                    let other = if e.slot == 0 { d1 } else { d0 }.block(&func.dfg.value_lists);
                     // Pass on the true arm means the update fires when the
                     // cond is false — the lane mask needs the inversion.
                     let invert = e.slot == 0;
@@ -1085,7 +1111,12 @@ fn plan(
         let mut used: FxHashSet<Value> = FxHashSet::default();
         for &b in &info.body {
             for i in func.layout.block_insts(b) {
-                used.extend(func.dfg.inst_args(i).iter().map(|&a| func.dfg.resolve_aliases(a)));
+                used.extend(
+                    func.dfg
+                        .inst_args(i)
+                        .iter()
+                        .map(|&a| func.dfg.resolve_aliases(a)),
+                );
             }
         }
         let allowed: FxHashSet<Inst> = [ui]
@@ -1102,33 +1133,44 @@ fn plan(
             .flat_map(|&b| func.layout.block_insts(b))
             .filter(|&i| !deadend(func, func.layout.inst_block(i).unwrap()))
             .any(|i| {
-            if allowed.contains(&i)
-                || !func.dfg.inst_args(i).iter().any(|&a| func.dfg.resolve_aliases(a) == p)
-            {
-                return false;
-            }
-            let op = func.dfg.insts[i].opcode();
-            let pure = !(op.can_trap()
-                || op.can_load()
-                || op.can_store()
-                || op.is_call()
-                || op.is_terminator()
-                || op.other_side_effects());
-            !(pure
-                && func
-                    .dfg
-                    .inst_results(i)
-                    .iter()
-                    .all(|&r| !used.contains(&func.dfg.resolve_aliases(r))))
-        });
+                if allowed.contains(&i)
+                    || !func
+                        .dfg
+                        .inst_args(i)
+                        .iter()
+                        .any(|&a| func.dfg.resolve_aliases(a) == p)
+                {
+                    return false;
+                }
+                let op = func.dfg.insts[i].opcode();
+                let pure = !(op.can_trap()
+                    || op.can_load()
+                    || op.can_store()
+                    || op.is_call()
+                    || op.is_terminator()
+                    || op.other_side_effects());
+                !(pure
+                    && func
+                        .dfg
+                        .inst_results(i)
+                        .iter()
+                        .all(|&r| !used.contains(&func.dfg.resolve_aliases(r))))
+            });
         if bad_use || reducs.len() >= 2 {
             if crate::env_set("PLIRON_VEC_DEBUG") {
                 for &b in &info.body {
                     for i in func.layout.block_insts(b) {
                         if !allowed.contains(&i)
-                            && func.dfg.inst_args(i).iter().any(|&a| func.dfg.resolve_aliases(a) == p)
+                            && func
+                                .dfg
+                                .inst_args(i)
+                                .iter()
+                                .any(|&a| func.dfg.resolve_aliases(a) == p)
                         {
-                            eprintln!("vec reduc?: param {j} extra use {}", func.dfg.display_inst(i));
+                            eprintln!(
+                                "vec reduc?: param {j} extra use {}",
+                                func.dfg.display_inst(i)
+                            );
                         }
                     }
                 }
@@ -1178,13 +1220,17 @@ fn plan(
             continue;
         }
         for &pv in func.dfg.block_params(b) {
-            let bad = info.body.iter().flat_map(|&bb| func.layout.block_insts(bb)).any(|i| {
-                func.dfg
-                    .inst_args(i)
-                    .iter()
-                    .any(|&a| func.dfg.resolve_aliases(a) == pv)
-                    && !func.dfg.insts[i].opcode().is_terminator()
-            });
+            let bad = info
+                .body
+                .iter()
+                .flat_map(|&bb| func.layout.block_insts(bb))
+                .any(|i| {
+                    func.dfg
+                        .inst_args(i)
+                        .iter()
+                        .any(|&a| func.dfg.resolve_aliases(a) == pv)
+                        && !func.dfg.insts[i].opcode().is_terminator()
+                });
             if bad {
                 why!(fname; "interior block params {:?}", info.h);
             }
@@ -1562,11 +1608,14 @@ fn plan(
                     args,
                     opcode: Opcode::Select,
                     ..
-                } => masks.contains(&func.dfg.resolve_aliases(args[0]))
-                    && args[1..].iter().all(|&a| {
-                        let a = func.dfg.resolve_aliases(a);
-                        can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
-                    }),
+                } => {
+                    masks.contains(&func.dfg.resolve_aliases(args[0]))
+                        && args[1..].iter().all(|&a| {
+                            let a = func.dfg.resolve_aliases(a);
+                            can_vec.contains(&a)
+                                || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                        })
+                }
                 InstructionData::Ternary { args, .. } => args.iter().all(|&a| {
                     let a = func.dfg.resolve_aliases(a);
                     can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
@@ -1614,20 +1663,14 @@ fn plan(
                     // (uniform lanes) or hit emit_scalar's in-body check.
                     args.iter().all(|&a| ib(a))
                         || (func.dfg.insts[i].opcode() == Opcode::Band
-                            && args.iter().any(|&a| {
-                                iconst(func, func.dfg.resolve_aliases(a)) == Some(1)
-                            })
+                            && args
+                                .iter()
+                                .any(|&a| iconst(func, func.dfg.resolve_aliases(a)) == Some(1))
                             && args.iter().all(|&a| {
                                 let a = func.dfg.resolve_aliases(a);
                                 ib(a)
                                     || can_vec.contains(&a)
-                                    || is_splat(
-                                        func,
-                                        &info,
-                                        &kinds,
-                                        &mut splat_cache,
-                                        a,
-                                    )
+                                    || is_splat(func, &info, &kinds, &mut splat_cache, a)
                             }))
                 }
                 InstructionData::Ternary {
@@ -1761,18 +1804,19 @@ fn plan(
             };
             let c = func.dfg.resolve_aliases(arg);
             let gated = reducs.iter().any(|r| {
-                r.cond.as_ref().is_some_and(|cd| {
-                    cd.cs
-                        .iter()
-                        .any(|t| func.dfg.resolve_aliases(t.c) == c)
-                })
+                r.cond
+                    .as_ref()
+                    .is_some_and(|cd| cd.cs.iter().any(|t| func.dfg.resolve_aliases(t.c) == c))
             });
             if !gated {
                 why!(fname; "interior brif {}", func.dfg.display_inst(i));
             }
             continue;
         }
-        if op.can_trap() || op.can_load() || op.can_store() || op.is_call()
+        if op.can_trap()
+            || op.can_load()
+            || op.can_store()
+            || op.is_call()
             || op.other_side_effects()
         {
             why!(fname; "side effects {}", func.dfg.display_inst(i));
@@ -1889,13 +1933,8 @@ fn plan(
             let args_ok = |b: Block| {
                 func.layout.block_insts(b).all(|i| {
                     func.dfg.inst_args(i).iter().all(|&a| ok_arg(a, entry_blk))
-                        && func
-                            .dfg
-                            .insts[i]
-                            .branch_destination(
-                                &func.dfg.jump_tables,
-                                &func.dfg.exception_tables,
-                            )
+                        && func.dfg.insts[i]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                             .iter()
                             .all(|bc| {
                                 bc.args(&func.dfg.value_lists).all(|ba| match ba {
@@ -1913,8 +1952,7 @@ fn plan(
             // keep their original value, so its def must dominate the
             // entry, or block every successor→use path that skips it.
             let succs: Vec<Block> = func.layout.last_inst(xb).map_or(Vec::new(), |t| {
-                func.dfg
-                    .insts[t]
+                func.dfg.insts[t]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                     .iter()
                     .map(|bc| bc.block(&func.dfg.value_lists))
@@ -1934,10 +1972,7 @@ fn plan(
                         if db == t || dt.block_dominates(db, entry_blk) {
                             continue;
                         }
-                        if succs
-                            .iter()
-                            .any(|&s| reaches_avoiding(func, s, t, db))
-                        {
+                        if succs.iter().any(|&s| reaches_avoiding(func, s, t, db)) {
                             return None;
                         }
                     }
@@ -1955,10 +1990,7 @@ fn plan(
                             if db == t || dt.block_dominates(db, entry_blk) {
                                 continue;
                             }
-                            if succs
-                                .iter()
-                                .any(|&s| reaches_avoiding(func, s, t, db))
-                            {
+                            if succs.iter().any(|&s| reaches_avoiding(func, s, t, db)) {
                                 return None;
                             }
                         }
@@ -2016,9 +2048,7 @@ fn subst(e: &Ins, iv: Value, w: Value) -> Ins {
         Ins::K(k) => Ins::K(*k),
         Ins::Add(a, b) => Ins::Add(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::Sub(a, b) => Ins::Sub(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
-        Ins::SatSub(a, b) => {
-            Ins::SatSub(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w)))
-        }
+        Ins::SatSub(a, b) => Ins::SatSub(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::Mul(a, b) => Ins::Mul(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::And(a, b) => Ins::And(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::Div(a, b) => Ins::Div(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
@@ -2208,92 +2238,88 @@ fn emit_val(
     };
     let data = pos.func.dfg.insts[i];
     let out = match data {
-                InstructionData::Load { .. } => {
-                    let j = p.loads.iter().find(|&&(l, _)| l == i).unwrap().1;
-                    emit_vload(pos, p, j, addrs, false)
-                }
-                InstructionData::Binary { opcode, args } => {
-                    let a = m!(args[0]);
-                    // Shift amounts stay scalar (Cranelift has no per-lane
-                    // vector shift); everything else is lane-wise.
-                    let b = if matches!(opcode, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
-                        emit_scalar(pos, p, smemo, args[1], 0)
-                    } else {
-                        m!(args[1])
-                    };
-                    match opcode {
-                        Opcode::Iadd => pos.ins().iadd(a, b),
-                        Opcode::Isub => pos.ins().isub(a, b),
-                        Opcode::Imul => pos.ins().imul(a, b),
-                        Opcode::Band => pos.ins().band(a, b),
-                        Opcode::Bor => pos.ins().bor(a, b),
-                        Opcode::Bxor => pos.ins().bxor(a, b),
-                        Opcode::Smin => pos.ins().smin(a, b),
-                        Opcode::Smax => pos.ins().smax(a, b),
-                        Opcode::Umin => pos.ins().umin(a, b),
-                        Opcode::Umax => pos.ins().umax(a, b),
-                        Opcode::Ishl => pos.ins().ishl(a, b),
-                        Opcode::Ushr => pos.ins().ushr(a, b),
-                        Opcode::Sshr => pos.ins().sshr(a, b),
-                        Opcode::Fadd => pos.ins().fadd(a, b),
-                        Opcode::Fsub => pos.ins().fsub(a, b),
-                        Opcode::Fmul => pos.ins().fmul(a, b),
-                        Opcode::Fdiv => pos.ins().fdiv(a, b),
-                        Opcode::Fmin => pos.ins().fmin(a, b),
-                        Opcode::Fmax => pos.ins().fmax(a, b),
-                        _ => unreachable!(),
-                    }
-                }
-                InstructionData::Unary { opcode, arg } => {
-                    let a = m!(arg);
-                    match opcode {
-                        Opcode::Ineg => pos.ins().ineg(a),
-                        Opcode::Bnot => pos.ins().bnot(a),
-                        Opcode::Fneg => pos.ins().fneg(a),
-                        Opcode::Fabs => pos.ins().fabs(a),
-                        Opcode::Sqrt => pos.ins().sqrt(a),
-                        // Casts drop at element lanes — `cond_data` only
-                        // admits ones where trunc-evaluation commutes.
-                        Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce => a,
-                        _ => unreachable!(),
-                    }
-                }
-                InstructionData::IntCompare { cond, args, .. } => {
-                    let (x, y) = (m!(args[0]), m!(args[1]));
-                    pos.ins().icmp(cond, x, y)
-                }
-                InstructionData::FloatCompare { cond, args, .. } => {
-                    let (x, y) = (m!(args[0]), m!(args[1]));
-                    pos.ins().fcmp(cond, x, y)
-                }
-                InstructionData::Ternary {
-                    opcode: Opcode::Select,
-                    args,
-                } => {
-                    let c = m!(args[0]);
-                    let (x, y) = (m!(args[1]), m!(args[2]));
-                    // Mask lanes are int-typed; bitselect needs the data type.
-                    let xt = pos.func.dfg.value_type(x);
-                    let c = if pos.func.dfg.value_type(c) != xt {
-                        pos.ins().bitcast(xt, MemFlagsData::new(), c)
-                    } else {
-                        c
-                    };
-                    pos.ins().bitselect(c, x, y)
-                }
-                InstructionData::Ternary {
-                    opcode: Opcode::Fma,
-                    args,
-                } => {
-                    let (x, y, z) = (
-                        m!(args[0]),
-                        m!(args[1]),
-                        m!(args[2]),
-                    );
-                    pos.ins().fma(x, y, z)
-                }
-            _ => unreachable!("non-vectorizable inst in emit_val"),
-        };
+        InstructionData::Load { .. } => {
+            let j = p.loads.iter().find(|&&(l, _)| l == i).unwrap().1;
+            emit_vload(pos, p, j, addrs, false)
+        }
+        InstructionData::Binary { opcode, args } => {
+            let a = m!(args[0]);
+            // Shift amounts stay scalar (Cranelift has no per-lane
+            // vector shift); everything else is lane-wise.
+            let b = if matches!(opcode, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
+                emit_scalar(pos, p, smemo, args[1], 0)
+            } else {
+                m!(args[1])
+            };
+            match opcode {
+                Opcode::Iadd => pos.ins().iadd(a, b),
+                Opcode::Isub => pos.ins().isub(a, b),
+                Opcode::Imul => pos.ins().imul(a, b),
+                Opcode::Band => pos.ins().band(a, b),
+                Opcode::Bor => pos.ins().bor(a, b),
+                Opcode::Bxor => pos.ins().bxor(a, b),
+                Opcode::Smin => pos.ins().smin(a, b),
+                Opcode::Smax => pos.ins().smax(a, b),
+                Opcode::Umin => pos.ins().umin(a, b),
+                Opcode::Umax => pos.ins().umax(a, b),
+                Opcode::Ishl => pos.ins().ishl(a, b),
+                Opcode::Ushr => pos.ins().ushr(a, b),
+                Opcode::Sshr => pos.ins().sshr(a, b),
+                Opcode::Fadd => pos.ins().fadd(a, b),
+                Opcode::Fsub => pos.ins().fsub(a, b),
+                Opcode::Fmul => pos.ins().fmul(a, b),
+                Opcode::Fdiv => pos.ins().fdiv(a, b),
+                Opcode::Fmin => pos.ins().fmin(a, b),
+                Opcode::Fmax => pos.ins().fmax(a, b),
+                _ => unreachable!(),
+            }
+        }
+        InstructionData::Unary { opcode, arg } => {
+            let a = m!(arg);
+            match opcode {
+                Opcode::Ineg => pos.ins().ineg(a),
+                Opcode::Bnot => pos.ins().bnot(a),
+                Opcode::Fneg => pos.ins().fneg(a),
+                Opcode::Fabs => pos.ins().fabs(a),
+                Opcode::Sqrt => pos.ins().sqrt(a),
+                // Casts drop at element lanes — `cond_data` only
+                // admits ones where trunc-evaluation commutes.
+                Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce => a,
+                _ => unreachable!(),
+            }
+        }
+        InstructionData::IntCompare { cond, args, .. } => {
+            let (x, y) = (m!(args[0]), m!(args[1]));
+            pos.ins().icmp(cond, x, y)
+        }
+        InstructionData::FloatCompare { cond, args, .. } => {
+            let (x, y) = (m!(args[0]), m!(args[1]));
+            pos.ins().fcmp(cond, x, y)
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => {
+            let c = m!(args[0]);
+            let (x, y) = (m!(args[1]), m!(args[2]));
+            // Mask lanes are int-typed; bitselect needs the data type.
+            let xt = pos.func.dfg.value_type(x);
+            let c = if pos.func.dfg.value_type(c) != xt {
+                pos.ins().bitcast(xt, MemFlagsData::new(), c)
+            } else {
+                c
+            };
+            pos.ins().bitselect(c, x, y)
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Fma,
+            args,
+        } => {
+            let (x, y, z) = (m!(args[0]), m!(args[1]), m!(args[2]));
+            pos.ins().fma(x, y, z)
+        }
+        _ => unreachable!("non-vectorizable inst in emit_val"),
+    };
     vmap.insert(v, out);
     out
 }
@@ -2384,11 +2410,7 @@ fn widen_delta(
     r: &mut Reduc,
     extra_ok: &FxHashSet<Inst>,
 ) -> bool {
-    if r.op != Opcode::Iadd
-        || !r.aty.is_int()
-        || r.aty.bits() > 64
-        || r.aty.bits() <= elem.bits()
-    {
+    if r.op != Opcode::Iadd || !r.aty.is_int() || r.aty.bits() > 64 || r.aty.bits() <= elem.bits() {
         return false;
     }
     let mut d = func.dfg.resolve_aliases(r.delta);
@@ -2462,10 +2484,7 @@ fn widen_delta(
                     ext_insts.push(i);
                     return Some((
                         v,
-                        matches!(
-                            opcode,
-                            Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32
-                        ),
+                        matches!(opcode, Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32),
                     ));
                 }
                 _ => return None,
@@ -2506,7 +2525,11 @@ fn widen_delta(
             };
             // The `usdot` lowering pattern only matches unsigned×signed —
             // normalize signed×unsigned into it (imul is commutative).
-            let (a, sa, b, sb) = if sa && !sb { (b, sb, a, sa) } else { (a, sa, b, sb) };
+            let (a, sa, b, sb) = if sa && !sb {
+                (b, sb, a, sa)
+            } else {
+                (a, sa, b, sb)
+            };
             if (!can_vec.contains(&a) && !is_splat(func, info, kinds, splat_cache, a))
                 || (!can_vec.contains(&b) && !is_splat(func, info, kinds, splat_cache, b))
             {
@@ -2564,7 +2587,9 @@ fn widen_delta(
                     };
                     let k = iconst(func, arg)?;
                     let nb = func.dfg.value_type(func.dfg.resolve_aliases(arg)).bits();
-                    if nb >= 64 { return None }
+                    if nb >= 64 {
+                        return None;
+                    }
                     Some(k & ((1i64 << nb) - 1))
                 };
                 let (k, nn) = if let Some(k) = cst(args[1]) {
@@ -2584,11 +2609,7 @@ fn widen_delta(
                 // acc-typed value is already a lane bool. A bare `0`/`1`
                 // constant delta under a conditional update is the same
                 // count (`acc += 1` gated by the filter arm).
-                None if bools.contains(&d)
-                    || matches!(iconst(func, d), Some(0 | 1)) =>
-                {
-                    (d, false)
-                }
+                None if bools.contains(&d) || matches!(iconst(func, d), Some(0 | 1)) => (d, false),
                 None => {
                     if dbg {
                         eprintln!("widen_delta: no ext in {d:?}");
@@ -2615,8 +2636,7 @@ fn widen_delta(
                 // `band 1` normalizes 0/-1 mask lanes to 0/1 counts before
                 // the unsigned widening sum — an outer `band d, k` is only
                 // identity when `k == 1`.
-                let x_bool = bools.contains(&x)
-                    || matches!(iconst(func, x), Some(0 | 1));
+                let x_bool = bools.contains(&x) || matches!(iconst(func, x), Some(0 | 1));
                 if !x_bool || !matches!(mask, None | Some(1)) {
                     if dbg {
                         eprintln!("widen_delta: {:?} not can_vec/bool", x);
@@ -2644,11 +2664,7 @@ fn widen_delta(
                 }
                 let mut bad = false;
                 for &v in &tree {
-                    for i in info
-                        .body
-                        .iter()
-                        .flat_map(|&b| func.layout.block_insts(b))
-                    {
+                    for i in info.body.iter().flat_map(|&b| func.layout.block_insts(b)) {
                         if ok.contains(&i)
                             || !func
                                 .dfg
@@ -2660,15 +2676,12 @@ fn widen_delta(
                         }
                         let rs = func.dfg.inst_results(i);
                         if rs.is_empty()
-                            || !rs.iter().all(|&rr| {
-                                bools.contains(&func.dfg.resolve_aliases(rr))
-                            })
+                            || !rs
+                                .iter()
+                                .all(|&rr| bools.contains(&func.dfg.resolve_aliases(rr)))
                         {
                             if dbg {
-                                eprintln!(
-                                    "widen_delta: bool reader {}",
-                                    func.dfg.display_inst(i)
-                                );
+                                eprintln!("widen_delta: bool reader {}", func.dfg.display_inst(i));
                             }
                             bad = true;
                         }
@@ -2807,7 +2820,10 @@ fn cond_data(
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return false;
     };
-    if !info.body.contains(&func.layout.inst_block(i).unwrap_or(info.h)) {
+    if !info
+        .body
+        .contains(&func.layout.inst_block(i).unwrap_or(info.h))
+    {
         return false;
     }
     let d = |func: &Function,
@@ -2817,7 +2833,18 @@ fn cond_data(
              splat_cache: &mut FxHashMap<Value, bool>,
              v: Value,
              insts: &mut FxHashSet<Inst>| {
-        cond_data(func, info, kinds, can_vec, splat_cache, elem, acc, v, insts, depth + 1)
+        cond_data(
+            func,
+            info,
+            kinds,
+            can_vec,
+            splat_cache,
+            elem,
+            acc,
+            v,
+            insts,
+            depth + 1,
+        )
     };
     let ok = match func.dfg.insts[i] {
         InstructionData::Binary { opcode, args }
@@ -2890,7 +2917,10 @@ fn mask_node(
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return false;
     };
-    if !info.body.contains(&func.layout.inst_block(i).unwrap_or(info.h)) {
+    if !info
+        .body
+        .contains(&func.layout.inst_block(i).unwrap_or(info.h))
+    {
         return false;
     }
     let ebits = elem.bits();
@@ -2898,42 +2928,48 @@ fn mask_node(
         InstructionData::IntCompare { cond, args, .. } => {
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
             let tb = ty.bits();
-            cond_data(func, info, kinds, can_vec, splat_cache, elem, acc, args[0], insts, depth + 1)
-                && cond_data(
-                    func,
-                    info,
-                    kinds,
-                    can_vec,
-                    splat_cache,
-                    elem,
-                    acc,
-                    args[1],
-                    insts,
-                    depth + 1,
-                )
-                && match cond {
-                    IntCC::Equal | IntCC::NotEqual => true,
-                    // Unsigned order survives truncation exactly when both
-                    // operands fit the lane width; narrower compares
-                    // zero-extend into the lane identically.
-                    IntCC::UnsignedLessThan
-                    | IntCC::UnsignedLessThanOrEqual
-                    | IntCC::UnsignedGreaterThan
-                    | IntCC::UnsignedGreaterThanOrEqual => {
-                        tb <= ebits
-                            || args
-                                .iter()
-                                .all(|&a| ubits(func, a).is_some_and(|w| w <= ebits))
-                    }
-                    // Signed compares need sign-preserving lanes: exact when
-                    // the compare is at lane width; a wider scalar compare
-                    // needs each operand provably in signed lane range; a
-                    // narrower one would lose the sign under zext.
-                    _ => {
-                        tb == ebits
-                            || (tb > ebits && args.iter().all(|&a| sfits(func, a, ebits)))
-                    }
+            cond_data(
+                func,
+                info,
+                kinds,
+                can_vec,
+                splat_cache,
+                elem,
+                acc,
+                args[0],
+                insts,
+                depth + 1,
+            ) && cond_data(
+                func,
+                info,
+                kinds,
+                can_vec,
+                splat_cache,
+                elem,
+                acc,
+                args[1],
+                insts,
+                depth + 1,
+            ) && match cond {
+                IntCC::Equal | IntCC::NotEqual => true,
+                // Unsigned order survives truncation exactly when both
+                // operands fit the lane width; narrower compares
+                // zero-extend into the lane identically.
+                IntCC::UnsignedLessThan
+                | IntCC::UnsignedLessThanOrEqual
+                | IntCC::UnsignedGreaterThan
+                | IntCC::UnsignedGreaterThanOrEqual => {
+                    tb <= ebits
+                        || args
+                            .iter()
+                            .all(|&a| ubits(func, a).is_some_and(|w| w <= ebits))
                 }
+                // Signed compares need sign-preserving lanes: exact when
+                // the compare is at lane width; a wider scalar compare
+                // needs each operand provably in signed lane range; a
+                // narrower one would lose the sign under zext.
+                _ => tb == ebits || (tb > ebits && args.iter().all(|&a| sfits(func, a, ebits))),
+            }
         }
         InstructionData::FloatCompare { args, .. } => {
             func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == elem
@@ -2966,24 +3002,45 @@ fn mask_node(
             opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
             args,
         } => {
-            mask_node(func, info, kinds, can_vec, splat_cache, elem, acc, args[0], insts, depth + 1)
-                && mask_node(
-                    func,
-                    info,
-                    kinds,
-                    can_vec,
-                    splat_cache,
-                    elem,
-                    acc,
-                    args[1],
-                    insts,
-                    depth + 1,
-                )
+            mask_node(
+                func,
+                info,
+                kinds,
+                can_vec,
+                splat_cache,
+                elem,
+                acc,
+                args[0],
+                insts,
+                depth + 1,
+            ) && mask_node(
+                func,
+                info,
+                kinds,
+                can_vec,
+                splat_cache,
+                elem,
+                acc,
+                args[1],
+                insts,
+                depth + 1,
+            )
         }
         InstructionData::Unary {
             opcode: Opcode::Bnot,
             arg,
-        } => mask_node(func, info, kinds, can_vec, splat_cache, elem, acc, arg, insts, depth + 1),
+        } => mask_node(
+            func,
+            info,
+            kinds,
+            can_vec,
+            splat_cache,
+            elem,
+            acc,
+            arg,
+            insts,
+            depth + 1,
+        ),
         _ => false,
     };
     if ok {
@@ -3010,7 +3067,16 @@ fn cond_mask(
 ) -> bool {
     cd.cs.iter_mut().all(|t| {
         cond_term(
-            func, info, kinds, can_vec, bools, splat_cache, elem, acc, t, &mut cd.insts,
+            func,
+            info,
+            kinds,
+            can_vec,
+            bools,
+            splat_cache,
+            elem,
+            acc,
+            t,
+            &mut cd.insts,
         )
     })
 }
@@ -3056,9 +3122,7 @@ fn cond_term(
                     ok = false;
                 } else if bools.contains(&a) {
                     todo.push(a);
-                } else if !can_vec.contains(&a)
-                    && !is_splat(func, info, kinds, splat_cache, a)
-                {
+                } else if !can_vec.contains(&a) && !is_splat(func, info, kinds, splat_cache, a) {
                     // emit_val must produce every non-bool operand too:
                     // lane-replicated or splatted. An unemittable in-body
                     // value would miscompile as a uniform splat (or ICE on
@@ -3073,14 +3137,36 @@ fn cond_term(
             return true;
         }
     }
-    if mask_node(func, info, kinds, can_vec, splat_cache, elem, acc, t.c, insts, 0) {
+    if mask_node(
+        func,
+        info,
+        kinds,
+        can_vec,
+        splat_cache,
+        elem,
+        acc,
+        t.c,
+        insts,
+        0,
+    ) {
         return true;
     }
     if !ubits(func, t.c).is_some_and(|w| w <= elem.bits()) {
         return false;
     }
     t.needs_ne = true;
-    cond_data(func, info, kinds, can_vec, splat_cache, elem, acc, t.c, insts, 0)
+    cond_data(
+        func,
+        info,
+        kinds,
+        can_vec,
+        splat_cache,
+        elem,
+        acc,
+        t.c,
+        insts,
+        0,
+    )
 }
 
 /// The identity element for a reduction op at lane type `elem`.
@@ -3116,11 +3202,7 @@ fn red_emit(pos: &mut FuncCursor, op: Opcode, a: Value, b: Value) -> Value {
 }
 
 /// Signed or unsigned `widen_low`/`widen_high` pair.
-fn widen_halves(
-    pos: &mut FuncCursor,
-    signed: bool,
-    v: Value,
-) -> (Value, Value) {
+fn widen_halves(pos: &mut FuncCursor, signed: bool, v: Value) -> (Value, Value) {
     if signed {
         (pos.ins().swiden_low(v), pos.ins().swiden_high(v))
     } else {
@@ -3275,10 +3357,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // Redirect the scalar loop's entry edge through the check block.
     {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[p.entry.inst].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[p.entry.slot];
+        let bc = &mut dfg.insts[p.entry.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[p.entry.slot];
         *bc = BlockCall::new(cb, core::iter::empty(), &mut dfg.value_lists);
     }
     let ivv = func.dfg.append_block_param(vh, iv_ty);
@@ -3292,10 +3372,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // instruction cheaper than `add` + `cmp` + `b.lo`; the epilogue resume
     // index is just `end_v` since rem hits 0 exactly on exit. iv-stream
     // loops read `ivv` for the lane base, so they keep the count-up form.
-    let countdown = p.step > 0
-        && !p.iv_stream
-        && p.early.is_empty()
-        && p.streams.iter().all(|s| !s.direct);
+    let countdown =
+        p.step > 0 && !p.iv_stream && p.early.is_empty() && p.streams.iter().all(|s| !s.direct);
     let mut pos = FuncCursor::new(func).at_bottom(cb);
     // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
@@ -3372,10 +3450,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 let last = Ins::Add(
                     Box::new(Ins::Val(p.iv0)),
                     Box::new(Ins::Mul(
-                        Box::new(Ins::Sub(
-                            Box::new(p.iters.clone()),
-                            Box::new(Ins::K(1)),
-                        )),
+                        Box::new(Ins::Sub(Box::new(p.iters.clone()), Box::new(Ins::K(1)))),
                         Box::new(Ins::K(p.step)),
                     )),
                 );
@@ -3411,9 +3486,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         });
     }
     // The vector iv must not wrap: end_v >= iv0.
-    let nw = pos
-        .ins()
-        .icmp(IntCC::UnsignedLessThanOrEqual, p.iv0, end);
+    let nw = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, p.iv0, end);
     ok = Some(match ok {
         None => nw,
         Some(o) => pos.ins().band(o, nw),
@@ -3607,10 +3680,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 continue;
             };
             let dests = pos.func.dfg.insts[t]
-                .branch_destination(
-                    &pos.func.dfg.jump_tables,
-                    &pos.func.dfg.exception_tables,
-                )
+                .branch_destination(&pos.func.dfg.jump_tables, &pos.func.dfg.exception_tables)
                 .to_vec();
             for bc in dests {
                 if bc.block(&pos.func.dfg.value_lists) != p.h {
@@ -3680,7 +3750,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                     &mut dfg.exception_tables,
                     |a| {
                         let a = resolved_r.get(&a).copied().unwrap_or(a);
-                        cmap_r.get(&a).or_else(|| xmap_r.get(&a)).copied().unwrap_or(a)
+                        cmap_r
+                            .get(&a)
+                            .or_else(|| xmap_r.get(&a))
+                            .copied()
+                            .unwrap_or(a)
                     },
                 );
                 pos.func.dfg.insts[ni] = data;
@@ -3737,9 +3811,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let first_store = p
         .mems
         .iter()
-        .position(|&(i, _)| {
-            matches!(pos.func.dfg.insts[i], InstructionData::Store { .. })
-        })
+        .position(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Store { .. }))
         .unwrap_or(p.mems.len());
     let hoist = p.early.is_empty();
     let mut groups: Vec<(Vec<(Value, i64)>, FxHashMap<Value, Value>)> = Vec::new();
@@ -3864,7 +3936,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 }
                 InstructionData::Store { args, .. } => {
                     let mut vv = emit_val(
-                        &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, args[0], 0,
+                        &mut pos,
+                        p,
+                        &mut vmap,
+                        &mut splats,
+                        &mut smemo,
+                        &addrs,
+                        args[0],
+                        0,
                     );
                     if p.streams[j].neg {
                         vv = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vv);
@@ -3892,12 +3971,17 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         // and re-finds the exact lane itself — correct for both
         // polarities, and the rare path is just a few extra scalar lanes.
         for &(cv, exits_true) in &p.early {
-            let m = emit_val(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, cv, 0);
-            let m = if exits_true {
-                pos.ins().bnot(m)
-            } else {
-                m
-            };
+            let m = emit_val(
+                &mut pos,
+                p,
+                &mut vmap,
+                &mut splats,
+                &mut smemo,
+                &addrs,
+                cv,
+                0,
+            );
+            let m = if exits_true { pos.ins().bnot(m) } else { m };
             let ty = pos.func.dfg.value_type(m);
             match exit_accs
                 .iter_mut()
@@ -3927,7 +4011,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 // fold each lane in iteration order. Loads and the delta
                 // still vectorize; only the combine serializes.
                 let vd = emit_val(
-                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                    &mut pos,
+                    p,
+                    &mut vmap,
+                    &mut splats,
+                    &mut smemo,
+                    &addrs,
+                    r.delta,
+                    0,
                 );
                 let mut acc = ord_accs[k];
                 for l in 0..p.vf {
@@ -3958,7 +4049,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             // must be summed before `band`, so it keeps the detached form.
             if let Some(Widen::Add { signed, mask: None }) = &r.widen {
                 let mut v = emit_val(
-                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                    &mut pos,
+                    p,
+                    &mut vmap,
+                    &mut splats,
+                    &mut smemo,
+                    &addrs,
+                    r.delta,
+                    0,
                 );
                 v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                 let (lo, hi) =
@@ -3972,7 +4070,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             // aarch64 folds the chain to `cmXX` + `uaddlp`.
             if matches!(r.widen, Some(Widen::Cnt)) {
                 let mut v = emit_val(
-                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                    &mut pos,
+                    p,
+                    &mut vmap,
+                    &mut splats,
+                    &mut smemo,
+                    &addrs,
+                    r.delta,
+                    0,
                 );
                 v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                 let one = pos.ins().iconst(p.elem, 1);
@@ -3986,11 +4091,25 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             }
             if let Some(Widen::Mul { sa, sb, a, b, .. }) = &r.widen {
                 let mut av = emit_val(
-                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *a, 0,
+                    &mut pos,
+                    p,
+                    &mut vmap,
+                    &mut splats,
+                    &mut smemo,
+                    &addrs,
+                    *a,
+                    0,
                 );
                 av = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, av);
                 let bv = emit_val(
-                    &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, *b, 0,
+                    &mut pos,
+                    p,
+                    &mut vmap,
+                    &mut splats,
+                    &mut smemo,
+                    &addrs,
+                    *b,
+                    0,
                 );
                 back_accs[k].extend(widen_mul(&mut pos, *sa, *sb, av, bv, r.aty, accs));
                 continue;
@@ -3999,7 +4118,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             let vd = match &r.widen {
                 None | Some(Widen::Add { .. }) => {
                     let mut v = emit_val(
-                        &mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, r.delta, 0,
+                        &mut pos,
+                        p,
+                        &mut vmap,
+                        &mut splats,
+                        &mut smemo,
+                        &addrs,
+                        r.delta,
+                        0,
                     );
                     v = mask(&mut pos, &mut vmap, &mut splats, &mut smemo, &addrs, v);
                     match &r.widen {
@@ -4193,6 +4319,15 @@ mod tests {
             pointer_width: PointerWidth::U64,
             page_size_align_log2: 12,
         };
-        run(&mut func, &mut crate::pipeline::Analysis::default(), "band1_cond", &FxHashSet::default(), tcfg, true, false, true);
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "band1_cond",
+            &FxHashSet::default(),
+            tcfg,
+            true,
+            false,
+            true,
+        );
     }
 }

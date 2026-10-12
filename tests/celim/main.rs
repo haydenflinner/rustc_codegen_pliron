@@ -17,7 +17,10 @@ fn main() {
             m.insert(j, j * 3);
         }
         assert_eq!(m.iter().count(), n);
-        assert_eq!(m.iter().map(|(k, _)| *k).sum::<u32>(), (0..n as u32).sum::<u32>());
+        assert_eq!(
+            m.iter().map(|(k, _)| *k).sum::<u32>(),
+            (0..n as u32).sum::<u32>()
+        );
         // Consuming iteration frees internal nodes mid-walk.
         assert_eq!(m.into_iter().count(), n);
     }

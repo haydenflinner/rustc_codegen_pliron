@@ -96,13 +96,15 @@ fn clobbers(
 
 /// Whether a store of `w = (r2,o2,ty2)` provably leaves `loc` intact; mirrors
 /// `loadfwd::kill`'s keep-rule.
-fn overlap_keeps(w: (Root, i64, cranelift_codegen::ir::Type), loc: Loc, iso: &FxHashSet<Root>) -> bool {
+fn overlap_keeps(
+    w: (Root, i64, cranelift_codegen::ir::Type),
+    loc: Loc,
+    iso: &FxHashSet<Root>,
+) -> bool {
     let (r, o, ty) = loc;
     let (r2, o2, ty2) = w;
     match (r, r2) {
-        _ if r == r2 => {
-            o >= o2 + i64::from(ty2.bytes()) || o2 >= o + i64::from(ty.bytes())
-        }
+        _ if r == r2 => o >= o2 + i64::from(ty2.bytes()) || o2 >= o + i64::from(ty.bytes()),
         (Root::S(_), Root::S(_)) => true,
         _ => iso.contains(&r) || iso.contains(&r2),
     }
@@ -129,7 +131,8 @@ fn split_edge(func: &mut Function, pinst: Inst, slot: usize) -> Option<Block> {
     func.layout.insert_block_after(nb, pb);
     FuncCursor::new(func).at_bottom(nb).ins().jump(dst, &args);
     let dfg = &mut func.dfg;
-    let bc = &mut dfg.insts[pinst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
+    let bc = &mut dfg.insts[pinst]
+        .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
     *bc = BlockCall::new(nb, core::iter::empty(), &mut dfg.value_lists);
     Some(nb)
 }
@@ -157,9 +160,7 @@ fn hoists(
 ) -> bool {
     let dbg = crate::env_set("PLIRON_LICM_DEBUG2")
         && matches!(func.dfg.insts[i], InstructionData::Load { .. });
-    if dbg
-        && let Some(&reg) = scoped.get(&i)
-    {
+    if dbg && let Some(&reg) = scoped.get(&i) {
         eprintln!(
             "licm? {}: scoped region {reg:?} breg={:?}",
             func.dfg.display_inst(i),
@@ -214,9 +215,9 @@ fn hoists(
     let safe = match r {
         Root::S(_) => true,
         Root::V(v) => {
-            let proven = deref.get(&v).is_some_and(|&(bytes, _)| {
-                o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64
-            });
+            let proven = deref
+                .get(&v)
+                .is_some_and(|&(bytes, _)| o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64);
             proven
                 || func.dfg.value_def(v).inst().is_some_and(|d| {
                     matches!(
@@ -368,8 +369,7 @@ fn run_loop(
     // body — not a given: LoopAnalysis admits irreducible bodies with
     // external entries bypassing it.
     let pb = func.layout.inst_block(pinst).unwrap();
-    if !dt.dominates(pb, h, &func.layout)
-        || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
+    if !dt.dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
     {
         if debug {
             eprintln!("licm: skip {h:?} of {}: dom", func.name);
@@ -438,7 +438,12 @@ fn run_loop(
             ph_inst = func.layout.last_inst(nb);
         }
         if debug {
-            eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
+            eprintln!(
+                "licm: hoist {} in {:?} of {}",
+                func.dfg.display_inst(i),
+                h,
+                func.name
+            );
         }
         func.layout.remove_inst(i);
         func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
@@ -456,11 +461,15 @@ fn run_loop(
                     break;
                 }
                 if hoists(
-                    func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar,
-                    ofz, pb, i,
+                    func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar, ofz, pb, i,
                 ) {
                     if debug {
-                        eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
+                        eprintln!(
+                            "licm: hoist {} in {:?} of {}",
+                            func.dfg.display_inst(i),
+                            h,
+                            func.name
+                        );
                     }
                     if anchor.is_none() && ph_inst.is_none() {
                         // No plain-jump entry edge to hoist to; `try_call`
@@ -485,8 +494,7 @@ fn run_loop(
                         *a = r;
                     }
                     func.layout.remove_inst(i);
-                    func.layout
-                        .insert_inst(i, anchor.or(ph_inst).unwrap());
+                    func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
                     n += 1;
                     moved += 1;
                 }
@@ -549,11 +557,7 @@ fn run_loop(
                             break;
                         }
                         let (r, o) = loadfwd::root(func, ps, na, arg);
-                        let lloc = (
-                            r,
-                            o.wrapping_add(i64::from(i32::from(offset))),
-                            ty,
-                        );
+                        let lloc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                         if !overlap_keeps(sloc, lloc, iso) {
                             ok = false;
                             break;
@@ -605,7 +609,12 @@ fn run_loop(
                     let j = func.layout.last_inst(nb).unwrap();
                     func.layout.insert_inst(ni, j);
                     if debug {
-                        eprintln!("licm: sink {} past {:?} of {}", func.dfg.display_inst(s), h, func.name);
+                        eprintln!(
+                            "licm: sink {} past {:?} of {}",
+                            func.dfg.display_inst(s),
+                            h,
+                            func.name
+                        );
                     }
                     n += 1;
                 }
@@ -616,7 +625,10 @@ fn run_loop(
     if crate::env_get("PLIRON_LICM_PROMOTE") == Some("0") {
         return n + cn;
     }
-    cn + n + promote(func, ps, na, cfg, dt, la, lp, iso, escapes, deref, ofz, debug)
+    cn + n
+        + promote(
+            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, ofz, debug,
+        )
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the
@@ -741,7 +753,10 @@ fn promote(
                     && ofz.contains_key(&v)
                 {
                     if debug {
-                        eprintln!("licm: no promotion in {h}: operand-frozen access {}", func.dfg.display_inst(i));
+                        eprintln!(
+                            "licm: no promotion in {h}: operand-frozen access {}",
+                            func.dfg.display_inst(i)
+                        );
                     }
                     return 0;
                 }
@@ -788,23 +803,37 @@ fn promote(
             let proven = deref.get(&v).is_some_and(|&(bytes, writable)| {
                 writable && o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64
             });
-            let ok = proven || func.layout.block_insts(h).any(|i| {
-                matches!(
-                    func.dfg.insts[i],
-                    InstructionData::Store { opcode: Opcode::Store, args, offset, .. }
-                        if loadfwd::notrap(func, i)
-                            && {
-                                let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
-                                (r2, o2.wrapping_add(i64::from(i32::from(offset)))) == (r, o)
-                            }
-                            && func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
-                )
-            });
+            let ok = proven
+                || func.layout.block_insts(h).any(|i| {
+                    matches!(
+                        func.dfg.insts[i],
+                        InstructionData::Store { opcode: Opcode::Store, args, offset, .. }
+                            if loadfwd::notrap(func, i)
+                                && {
+                                    let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
+                                    (r2, o2.wrapping_add(i64::from(i32::from(offset)))) == (r, o)
+                                }
+                                && func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
+                    )
+                });
             if !ok {
                 continue;
             }
         }
-        n += promote_loc(func, ps, na, cfg, dt, la, lp, &body, h, (r, o, ty), off, debug);
+        n += promote_loc(
+            func,
+            ps,
+            na,
+            cfg,
+            dt,
+            la,
+            lp,
+            &body,
+            h,
+            (r, o, ty),
+            off,
+            debug,
+        );
     }
     n
 }
@@ -839,13 +868,11 @@ fn promote_loc(
         let Some(t) = func.layout.last_inst(b) else {
             continue;
         };
-        let dests = func.dfg.insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let dests =
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         if body.contains(&b) && dests.is_empty() {
             match func.dfg.insts[t].opcode() {
-                Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect => {
-                    rets.push(t)
-                }
+                Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect => rets.push(t),
                 // `trap` never observes memory afterwards.
                 Opcode::Trap => {}
                 _ => return 0,
@@ -855,7 +882,8 @@ fn promote_loc(
         for (slot, bc) in dests.iter().enumerate() {
             let d = bc.block(&func.dfg.value_lists);
             if (body.contains(&d) || body.contains(&b))
-                && bc.args(&func.dfg.value_lists)
+                && bc
+                    .args(&func.dfg.value_lists)
                     .any(|a| !matches!(a, BlockArg::Value(_)))
             {
                 // A `try_call` edge we would have to split or extend; its
@@ -880,7 +908,9 @@ fn promote_loc(
             entry = Some((pb, pi, s));
         }
     }
-    let Some((pb, pinst, pslot)) = entry else { return 0 };
+    let Some((pb, pinst, pslot)) = entry else {
+        return 0;
+    };
 
     // A `Root::V` address is used by the synthesized entry load and by the
     // store-back on every exit/return edge. "Defined outside the loop"
@@ -907,7 +937,8 @@ fn promote_loc(
             for i in func.layout.block_insts(b) {
                 if let InstructionData::Load {
                     opcode: Opcode::Load,
-                    arg, ..
+                    arg,
+                    ..
                 }
                 | InstructionData::Store {
                     opcode: Opcode::Store,
@@ -1033,10 +1064,12 @@ fn promote_loc(
                 .ins()
                 .stack_addr(addr_ty, ss, 0),
         };
-        FuncCursor::new(func)
-            .at_inst(pinst)
-            .ins()
-            .load(ty, MemFlagsData::new().with_notrap(), a, off)
+        FuncCursor::new(func).at_inst(pinst).ins().load(
+            ty,
+            MemFlagsData::new().with_notrap(),
+            a,
+            off,
+        )
     } else {
         let Some(nb) = split_edge(func, pinst, pslot) else {
             return 0;
@@ -1049,12 +1082,17 @@ fn promote_loc(
                 .ins()
                 .stack_addr(addr_ty, ss, 0),
         };
-        let v = FuncCursor::new(func)
-            .at_inst(j)
-            .ins()
-            .load(ty, MemFlagsData::new().with_notrap(), a, off);
+        let v = FuncCursor::new(func).at_inst(j).ins().load(
+            ty,
+            MemFlagsData::new().with_notrap(),
+            a,
+            off,
+        );
         let es = in_edges.get_mut(&h).unwrap();
-        let k = es.iter().position(|&(_, pi, s)| pi == pinst && s == pslot).unwrap();
+        let k = es
+            .iter()
+            .position(|&(_, pi, s)| pi == pinst && s == pslot)
+            .unwrap();
         es[k] = (nb, j, 0);
         v
     };
@@ -1084,11 +1122,10 @@ fn promote_loc(
                     arg,
                     offset,
                     ..
-                } if func.dfg.value_type(func.dfg.first_result(i)) == ty
-                    && {
-                        let (r, o) = loadfwd::root(func, ps, na, arg);
-                        (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
-                    } =>
+                } if func.dfg.value_type(func.dfg.first_result(i)) == ty && {
+                    let (r, o) = loadfwd::root(func, ps, na, arg);
+                    (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
+                } =>
                 {
                     let r = func.dfg.first_result(i);
                     func.layout.remove_inst(i);
@@ -1100,11 +1137,10 @@ fn promote_loc(
                     args,
                     offset,
                     ..
-                } if func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
-                    && {
-                        let (r, o) = loadfwd::root(func, ps, na, args[1]);
-                        (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
-                    } =>
+                } if func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty && {
+                    let (r, o) = loadfwd::root(func, ps, na, args[1]);
+                    (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
+                } =>
                 {
                     cur = func.dfg.resolve_aliases(args[0]);
                     func.layout.remove_inst(i);
@@ -1222,8 +1258,8 @@ pub fn run(
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, nw,
-                debug, scoped, breg, rpar, ofz,
+                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, nw, debug, scoped, breg,
+                rpar, ofz,
             )
         };
         n += n2;
@@ -1242,8 +1278,7 @@ mod tests {
     use super::*;
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{
-        AbiParam, Function, InstBuilder, Signature, StackSlotData, StackSlotKind,
-        UserFuncName,
+        AbiParam, Function, InstBuilder, Signature, StackSlotData, StackSlotKind, UserFuncName,
     };
     use cranelift_codegen::isa::CallConv;
 
@@ -1271,8 +1306,8 @@ mod tests {
         for b in [b0, rest, inh, sb, h, hbody, done] {
             func.layout.append_block(b);
         }
-        let ss = func
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let hp = func.dfg.append_block_param(h, types::I64);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
@@ -1322,9 +1357,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
         );
-        let flags = cranelift_codegen::settings::Flags::new(
-            cranelift_codegen::settings::builder(),
-        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
         }
@@ -1384,9 +1417,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
         );
-        let flags = cranelift_codegen::settings::Flags::new(
-            cranelift_codegen::settings::builder(),
-        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
         }

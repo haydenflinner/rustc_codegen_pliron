@@ -20,9 +20,9 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
 use rustc_hash::FxHashMap;
 
-use crate::state::State;
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
+use crate::state::State;
 
 /// `f`'s values mapped to the parameter index they provably equal: the
 /// params themselves, results of calls to `returned(k)` callees passing a

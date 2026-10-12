@@ -31,8 +31,8 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::FuncType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::state::{ConstVal, State, leaf_arg};
 use crate::has_body;
+use crate::state::{ConstVal, State, leaf_arg};
 use crate::types::{leaf_range, size_align};
 
 const DEFAULT_LIMIT: usize = 320;
@@ -70,11 +70,7 @@ pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
-pub fn direct_callee<'a>(
-    ctx: &Context,
-    st: &'a State,
-    op: Ptr<Operation>,
-) -> Option<&'a String> {
+pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
     match c.callee(ctx) {
         CallOpCallable::Direct(id) => st.ident_to_sym.get(&id.to_string()),
@@ -567,12 +563,14 @@ pub fn run(
         // `only` (the devirt-inline pass) restricts which pre-existing
         // callsites may inline; ops this run itself splices in are fair game —
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
-        let pre: FxHashSet<Ptr<Operation>> = only.map(|_| {
-            blocks(ctx, caller)
-                .iter()
-                .flat_map(|&b| ops(ctx, b))
-                .collect()
-        }).unwrap_or_default();
+        let pre: FxHashSet<Ptr<Operation>> = only
+            .map(|_| {
+                blocks(ctx, caller)
+                    .iter()
+                    .flat_map(|&b| ops(ctx, b))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Inlining exposes nested callsites the scan hadn't seen: e.g.
         // `HashMap::get` brings `hash_one` inside the caller's loop, where
         // the in-loop bonus may now accept it. Rescan until a round finds
@@ -941,9 +939,7 @@ fn extract_leaf(
                 let l = extract_leaf(ctx, preds, w, sub, depth + 1)?;
                 if uniq.is_some_and(|u| u != l) {
                     if scan {
-                        eprintln!(
-                            "extract_leaf: arg {v:?} of {b:?} merges {uniq:?} with {l:?}"
-                        );
+                        eprintln!("extract_leaf: arg {v:?} of {b:?} merges {uniq:?} with {l:?}");
                     }
                     return None;
                 }
@@ -964,8 +960,7 @@ fn extract_leaf(
             let idx = Operation::get_op::<InsertValueOp>(op, ctx)
                 .unwrap()
                 .indices(ctx);
-            let (s, n, _) =
-                leaf_range(ctx, op.deref(ctx).get_operand(0).get_type(ctx), &idx);
+            let (s, n, _) = leaf_range(ctx, op.deref(ctx).get_operand(0).get_type(ctx), &idx);
             if sub >= s && sub < s + n {
                 sub -= s;
                 v = op.deref(ctx).get_operand(1);
@@ -1070,9 +1065,7 @@ fn store_src_in(
                 let Some(n) = crate::sroa::const_int(ctx, st, od.get_operand(2)) else {
                     return None;
                 };
-                let Some((db, dl, doff)) =
-                    ptr_base(ctx, st, preds, od.get_operand(0), mem)
-                else {
+                let Some((db, dl, doff)) = ptr_base(ctx, st, preds, od.get_operand(0), mem) else {
                     return None;
                 };
                 let Some(doff) = doff else { return None };
@@ -1139,10 +1132,7 @@ fn store_src_in(
                 || Operation::is_op::<StoreOp>(o, ctx)
             {
                 if scan {
-                    eprintln!(
-                        "store_src: writer {} for {load:?}",
-                        OpDbg { op: o, ctx }
-                    );
+                    eprintln!("store_src: writer {} for {load:?}", OpDbg { op: o, ctx });
                 }
                 return None;
             }
@@ -1207,9 +1197,7 @@ fn store_src_in(
                 })
             {
                 if scan {
-                    eprintln!(
-                        "store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}"
-                    );
+                    eprintln!("store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}");
                 }
                 return None;
             }
@@ -1349,9 +1337,8 @@ fn ptr_base(
         if Operation::is_op::<GetElementPtrOp>(op, ctx) {
             // A dynamic index poisons the offset but not the base — region
             // inheritance only needs which frozen arg it lands in.
-            off = off.and_then(|o| {
-                crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d))
-            });
+            off = off
+                .and_then(|o| crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d)));
             v = op.deref(ctx).get_operand(0);
         } else if Operation::is_op::<BitcastOp>(op, ctx)
             || Operation::is_op::<FreezeOp>(op, ctx)
@@ -1439,9 +1426,7 @@ fn frozen_of(
 ) -> Option<(u64, Ptr<BasicBlock>)> {
     let mut best: Option<(u64, Ptr<BasicBlock>)> = None;
     let mut pick = |st: &State, bytes: u64, r: Ptr<BasicBlock>| {
-        if anc_or_self(st, r, entry)
-            && best.is_none_or(|rb| anc_or_self(st, r, rb.1))
-        {
+        if anc_or_self(st, r, entry) && best.is_none_or(|rb| anc_or_self(st, r, rb.1)) {
             best = Some((bytes, r));
         }
     };
@@ -1546,8 +1531,7 @@ fn frozen_args(
     // block-arg resolution: a load's pointer (or a caller operand bound to
     // a frozen arg) is often phi-forwarded through args of *enclosing*
     // clone blocks — `partition`'s pivot reaches `lt` callsites that way.
-    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> =
-        FxHashMap::default();
+    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> = FxHashMap::default();
     if !f.frozen.is_empty()
         && let Some(region) = call_block.deref(ctx).get_parent_region()
     {
@@ -1592,9 +1576,7 @@ fn frozen_args(
         // contract holds for this call regardless.
         let inh = rb.and_then(|(b, l, off)| {
             frozen_of(ctx, st, &caller_frz, fentry, entry, b, l)
-                .filter(|&(rb_, _)| {
-                    off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64)
-                })
+                .filter(|&(rb_, _)| off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64))
                 .map(|(_, r)| r)
         });
         let region = inh.unwrap_or(entry);
@@ -1668,9 +1650,7 @@ fn frozen_args(
                         .defining_op()
                         .map(|o| OpDbg { op: o, ctx }.to_string())
                         .unwrap_or_default();
-                    eprintln!(
-                        "frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}"
-                    );
+                    eprintln!("frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}");
                 }
                 continue;
             };
@@ -1726,27 +1706,19 @@ fn inline_call(
         if let Some(&pp) = st.region_parent.get(&b) {
             st.region_parent.insert(nb, remap(pp));
         }
-        for (a, na) in b
-            .deref(ctx)
-            .arguments()
-            .zip(nb.deref(ctx).arguments())
-        {
+        for (a, na) in b.deref(ctx).arguments().zip(nb.deref(ctx).arguments()) {
             if let Some(f) = st.region_frozen.get(&a).cloned() {
                 st.region_frozen.insert(
                     na,
-                    f.into_iter()
-                        .map(|(s, b, r)| (s, b, remap(r)))
-                        .collect(),
+                    f.into_iter().map(|(s, b, r)| (s, b, remap(r))).collect(),
                 );
             }
             if let Some(f) = st.region_noalias.get(&a).cloned() {
                 st.region_noalias.insert(na, f);
             }
             if let Some(f) = st.region_frozen_op.get(&a).cloned() {
-                st.region_frozen_op.insert(
-                    na,
-                    f.into_iter().map(|(b, r)| (b, remap(r))).collect(),
-                );
+                st.region_frozen_op
+                    .insert(na, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
             }
         }
         for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
@@ -1796,10 +1768,8 @@ fn inline_call(
                     st.consts.insert(nv, c);
                 }
                 if let Some(f) = st.region_frozen_op.get(&v).cloned() {
-                    st.region_frozen_op.insert(
-                        nv,
-                        f.into_iter().map(|(b, r)| (b, remap(r))).collect(),
-                    );
+                    st.region_frozen_op
+                        .insert(nv, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
                 }
             }
             if let Some(r) = Operation::get_op::<ReturnOp>(new, ctx) {

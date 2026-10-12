@@ -157,10 +157,9 @@ fn cone_rpo(func: &Function, root: Block, cset: &FxHashSet<Block>) -> Vec<Block>
         }
         stack.push((b, true));
         for i in func.layout.block_insts(b) {
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 let t = bc.block(&func.dfg.value_lists);
                 if cset.contains(&t) && !seen.contains(&t) {
                     stack.push((t, false));
@@ -285,84 +284,84 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) 
         let mut hit = false;
         {
             let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
-        let loops: Vec<_> = la.loops().collect();
-        // Canonicalize mid-chain counting exits into the latch: bcheck/
-        // sameargs leave `brif const -> h` dead latches behind the real
-        // trip test sitting mid-chain. Moving the test to the latch
-        // gives jam and unroll the canonical do-while shape — jam's
-        // "inner latch exits elsewhere" check needs exactly this.
-        for lp in loops.iter().copied() {
-            let h = la.loop_header(lp);
-            if normed.contains(&h) {
-                continue;
-            }
-            normed.insert(h);
-            if sink_test(func, cfg, dt, la, lp, h, name) {
-                hit = true;
-                break; // cfg/la stale; rescan
-            }
-        }
-        // Unroll-and-jam runs first: an outer loop wrapping a single
-        // linear inner chain gets J fused copies before punroll can
-        // disturb the inner loop's shape. Jammed loop headers join
-        // `tried` so a rescan doesn't re-jam the same outer loop.
-        if crate::pass_enabled("PLIRON_JAM") {
+            let loops: Vec<_> = la.loops().collect();
+            // Canonicalize mid-chain counting exits into the latch: bcheck/
+            // sameargs leave `brif const -> h` dead latches behind the real
+            // trip test sitting mid-chain. Moving the test to the latch
+            // gives jam and unroll the canonical do-while shape — jam's
+            // "inner latch exits elsewhere" check needs exactly this.
             for lp in loops.iter().copied() {
+                let h = la.loop_header(lp);
+                if normed.contains(&h) {
+                    continue;
+                }
+                normed.insert(h);
+                if sink_test(func, cfg, dt, la, lp, h, name) {
+                    hit = true;
+                    break; // cfg/la stale; rescan
+                }
+            }
+            // Unroll-and-jam runs first: an outer loop wrapping a single
+            // linear inner chain gets J fused copies before punroll can
+            // disturb the inner loop's shape. Jammed loop headers join
+            // `tried` so a rescan doesn't re-jam the same outer loop.
+            if crate::pass_enabled("PLIRON_JAM") {
+                for lp in loops.iter().copied() {
+                    let h = la.loop_header(lp);
+                    if tried.contains(&h) {
+                        continue;
+                    }
+                    let nch = la
+                        .loops()
+                        .filter(|&c| la.loop_parent(c) == Some(lp))
+                        .count();
+                    if debug() {
+                        eprintln!("jam {name} block{}: children={}", h.as_u32(), nch);
+                    }
+                    if nch == 0 || nch > 2 {
+                        continue;
+                    }
+                    tried.insert(h);
+                    let r = if nch == 2 {
+                        run_jam_chooser(func, cfg, dt, la, lp, h, name)
+                    } else {
+                        run_jam(func, cfg, dt, la, lp, h, name)
+                    };
+                    if let Some(newhs) = r {
+                        tried.extend(newhs);
+                        n += 1;
+                        hit = true;
+                        break; // cfg/la stale; rescan
+                    }
+                }
+            }
+            for lp in loops {
+                if hit {
+                    break;
+                }
                 let h = la.loop_header(lp);
                 if tried.contains(&h) {
                     continue;
                 }
-                let nch = la
-                    .loops()
-                    .filter(|&c| la.loop_parent(c) == Some(lp))
-                    .count();
-                if debug() {
-                    eprintln!("jam {name} block{}: children={}", h.as_u32(), nch);
-                }
-                if nch == 0 || nch > 2 {
-                    continue;
-                }
                 tried.insert(h);
-                let r = if nch == 2 {
-                    run_jam_chooser(func, cfg, dt, la, lp, h, name)
-                } else {
-                    run_jam(func, cfg, dt, la, lp, h, name)
-                };
-                if let Some(newhs) = r {
-                    tried.extend(newhs);
+                if debug() {
+                    eprintln!("punroll {name} try block{}", h.as_u32());
+                }
+                if crate::pass_enabled("PLIRON_PEEL")
+                    && run_peel(func, cfg, dt, la, lp, h, name).is_some()
+                {
+                    n += 1;
+                    hit = true;
+                    break; // cfg/la stale; rescan
+                }
+                if run_loop(func, cfg, dt, la, lp, h, name).is_some()
+                    || run_region(func, cfg, dt, la, lp, h, name).is_some()
+                {
                     n += 1;
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
             }
-        }
-        for lp in loops {
-            if hit {
-                break;
-            }
-            let h = la.loop_header(lp);
-            if tried.contains(&h) {
-                continue;
-            }
-            tried.insert(h);
-            if debug() {
-                eprintln!("punroll {name} try block{}", h.as_u32());
-            }
-            if crate::pass_enabled("PLIRON_PEEL")
-                && run_peel(func, cfg, dt, la, lp, h, name).is_some()
-            {
-                n += 1;
-                hit = true;
-                break; // cfg/la stale; rescan
-            }
-            if run_loop(func, cfg, dt, la, lp, h, name).is_some()
-                || run_region(func, cfg, dt, la, lp, h, name).is_some()
-            {
-                n += 1;
-                hit = true;
-                break; // cfg/la stale; rescan
-            }
-        }
         }
         if !hit {
             break;
@@ -601,9 +600,7 @@ fn find_count(
             match func.dfg.value_def(b) {
                 // Bound is a header param passed back unchanged on the
                 // backedge (usable at hu as hu's own param).
-                cranelift_codegen::ir::ValueDef::Param(bb, q)
-                    if bb == h && cont_args[q] == b =>
-                {
+                cranelift_codegen::ir::ValueDef::Param(bb, q) if bb == h && cont_args[q] == b => {
                     bpidx = Some(q);
                 }
                 // A param of any other block dominating h — e.g. a slice
@@ -975,7 +972,11 @@ fn emit_trip_guard(
     };
     // Exit-on-eq latches reduce to the strict unsigned test: a monotone
     // counter below the bound can't equal it.
-    let (le, signed) = if cnt.eq { (false, false) } else { (cnt.le, cnt.signed) };
+    let (le, signed) = if cnt.eq {
+        (false, false)
+    } else {
+        (cnt.le, cnt.signed)
+    };
     let cc = match (signed, le) {
         (true, true) => IntCC::SignedLessThanOrEqual,
         (true, false) => IntCC::SignedLessThan,
@@ -984,10 +985,7 @@ fn emit_trip_guard(
     };
     let ok1 = pos.ins().icmp(cc, a0, boundv);
     let (a0w, bw) = if wty != ity && signed {
-        (
-            pos.ins().sextend(wty, a0),
-            pos.ins().sextend(wty, boundv),
-        )
+        (pos.ins().sextend(wty, a0), pos.ins().sextend(wty, boundv))
     } else if wty != ity {
         (pos.ins().uextend(wty, a0), pos.ins().uextend(wty, boundv))
     } else {
@@ -1029,10 +1027,8 @@ fn redirect_entries(
             .len();
         for slot in 0..ndest {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[pi].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
+            let bc = &mut dfg.insts[pi]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             if bc.block(&dfg.value_lists) == h {
                 let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
                 *bc = BlockCall::new(hu, args.iter().copied(), &mut dfg.value_lists);
@@ -1150,8 +1146,7 @@ fn run_loop(
         bail!("backedge arity");
     }
 
-    let Some(cnt) = find_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &cont_args)
-    else {
+    let Some(cnt) = find_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &cont_args) else {
         bail!("no counting test")
     };
 
@@ -1180,9 +1175,7 @@ fn run_loop(
     let cone: Vec<Block> = func
         .layout
         .blocks()
-        .filter(|&b| {
-            !body.contains(&b) && dt.is_reachable(b) && dt.block_dominates(eblk, b)
-        })
+        .filter(|&b| !body.contains(&b) && dt.is_reachable(b) && dt.block_dominates(eblk, b))
         .collect();
     let mut needs_cone = false;
     let mut cone_bad = false;
@@ -1204,10 +1197,9 @@ fn run_loop(
             ) {
                 cone_bad = true;
             }
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 if bc.args(&func.dfg.value_lists).any(|a| {
                     matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
                 }) {
@@ -1661,10 +1653,9 @@ fn resolve_affine(
                 if !body.contains(&p.block) {
                     return None;
                 }
-                for bc in func.dfg.insts[p.inst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     if bc.block(&func.dfg.value_lists) != b {
                         continue;
                     }
@@ -1930,12 +1921,7 @@ fn run_region(
         bail!("no latch");
     }
     for l in &latches {
-        if l
-            .back_bc
-            .args(&func.dfg.value_lists)
-            .count()
-            != func.dfg.block_params(h).len()
-        {
+        if l.back_bc.args(&func.dfg.value_lists).count() != func.dfg.block_params(h).len() {
             bail!("backedge arity");
         }
     }
@@ -2053,8 +2039,7 @@ fn run_region(
             .and_then(|e| e.clone_root)
             .unwrap_or(d)
     };
-    let latch_at: FxHashMap<Block, &Latch> =
-        latches.iter().map(|l| (l.blk, l)).collect();
+    let latch_at: FxHashMap<Block, &Latch> = latches.iter().map(|l| (l.blk, l)).collect();
 
     for kk in 0..k as usize {
         let cmap = &cmaps[kk];
@@ -2322,8 +2307,8 @@ fn run_peel(
     // Every edge arg in the chain must be a plain value.
     for &b in &chain {
         let t = func.layout.last_inst(b).unwrap();
-        for bc in func.dfg.insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             if bc
                 .args(&func.dfg.value_lists)
@@ -2347,9 +2332,15 @@ fn run_peel(
             steps.push(Some(0));
             continue;
         }
-        let s = func.dfg.value_def(a).inst().and_then(|i| {
-            match func.dfg.insts[i] {
-                InstructionData::Binary { opcode: Opcode::Iadd, args } => {
+        let s = func
+            .dfg
+            .value_def(a)
+            .inst()
+            .and_then(|i| match func.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } => {
                     for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
                         if func.dfg.resolve_aliases(x) == p {
                             return iconst(func, c);
@@ -2357,15 +2348,17 @@ fn run_peel(
                     }
                     None
                 }
-                InstructionData::Binary { opcode: Opcode::Isub, args } => {
+                InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args,
+                } => {
                     if func.dfg.resolve_aliases(args[0]) == p {
                         return iconst(func, args[1]).map(|c| c.wrapping_neg());
                     }
                     None
                 }
                 _ => None,
-            }
-        });
+            });
         steps.push(s);
     }
 
@@ -2389,10 +2382,9 @@ fn run_peel(
                 {
                     return true;
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     if bc.args(&func.dfg.value_lists).any(|a| {
                         matches!(a, BlockArg::Value(v) if lvals.contains(&func.dfg.resolve_aliases(v)))
                     }) {
@@ -2425,10 +2417,9 @@ fn run_peel(
                     bail!("body value used outside exit edges");
                 }
                 for i in func.layout.block_insts(b) {
-                    for bc in func.dfg.insts[i].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    ) {
+                    for bc in func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    {
                         stack.push(bc.block(&func.dfg.value_lists));
                     }
                 }
@@ -2459,7 +2450,10 @@ fn run_peel(
                 .collect()
         })
         .collect();
-    FuncCursor::new(func).at_bottom(pe).ins().jump(cblks[0][0], &[]);
+    FuncCursor::new(func)
+        .at_bottom(pe)
+        .ins()
+        .jump(cblks[0][0], &[]);
 
     let mpos: FxHashMap<usize, usize> = mid_exits
         .iter()
@@ -2525,10 +2519,7 @@ fn run_peel(
                 }
                 let ni = func.dfg.clone_inst(ii);
                 let srcs: Vec<Value> = func.dfg.inst_values(ni).collect();
-                let vals: Vec<Value> = srcs
-                    .iter()
-                    .map(|&v| matv(func, nb, &mut smap, v))
-                    .collect();
+                let vals: Vec<Value> = srcs.iter().map(|&v| matv(func, nb, &mut smap, v)).collect();
                 func.dfg.overwrite_inst_values(ni, vals.into_iter());
                 func.layout.append_inst(ni, nb);
                 let orig: Vec<Value> = func.dfg.inst_results(ii).to_vec();
@@ -2552,11 +2543,7 @@ fn run_peel(
                     })
                     .collect()
             }
-            fn sargs(
-                func: &Function,
-                smap: &FxHashMap<Value, Seed>,
-                bc: BlockCall,
-            ) -> Vec<Seed> {
+            fn sargs(func: &Function, smap: &FxHashMap<Value, Seed>, bc: BlockCall) -> Vec<Seed> {
                 bc.args(&func.dfg.value_lists)
                     .map(|a| match a {
                         BlockArg::Value(v) => seed_of(func, smap, v),
@@ -2568,13 +2555,19 @@ fn run_peel(
                 InstructionData::Jump { .. } if i + 1 < chain.len() => {
                     let bc = bcs_of(func, t)[0];
                     pend = sargs(func, &smap, bc);
-                    FuncCursor::new(func).at_bottom(nb).ins().jump(cblks[kk][i + 1], &[]);
+                    FuncCursor::new(func)
+                        .at_bottom(nb)
+                        .ins()
+                        .jump(cblks[kk][i + 1], &[]);
                 }
                 InstructionData::Jump { .. } => {
                     // Rotated backedge `jump h`.
                     if kk + 1 < k {
                         nxt = sargs(func, &smap, back_bc);
-                        FuncCursor::new(func).at_bottom(nb).ins().jump(cblks[kk + 1][0], &[]);
+                        FuncCursor::new(func)
+                            .at_bottom(nb)
+                            .ins()
+                            .jump(cblks[kk + 1][0], &[]);
                     } else {
                         let cont = eargs(func, nb, &mut smap, back_bc);
                         FuncCursor::new(func).at_bottom(nb).ins().jump(h, &cont);
@@ -2633,10 +2626,8 @@ fn run_peel(
             .len();
         for slot in 0..ndest {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[pi].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
+            let bc = &mut dfg.insts[pi]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             if bc.block(&dfg.value_lists) == h {
                 let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
                 *bc = BlockCall::new(pe, args.iter().copied(), &mut dfg.value_lists);
@@ -2816,8 +2807,8 @@ fn run_jam(
     // the same `post`.
     {
         let lt = func.layout.last_inst(ilatch).unwrap();
-        for bc in func.dfg.insts[lt]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[lt].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             let d = bc.block(&func.dfg.value_lists);
             if d != ih && d != post {
@@ -2943,7 +2934,7 @@ fn run_jam(
     let mut oexits: Vec<JamExit> = Vec::new();
     let mut seen_inner = false;
     let mut into_inner: Option<(usize, BlockCall)> = None;
-    let mut olatch = None;
+    let olatch;
     {
         // Position counters are indices into (opre ++ opost); pre-INNER
         // exits keep indices < inner_pos.
@@ -3065,8 +3056,8 @@ fn run_jam(
     // invariance check below and cloned through J copies automatically.
     {
         let lt = func.layout.last_inst(olatch).unwrap();
-        for bc in func.dfg.insts[lt]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[lt].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             let d = bc.block(&func.dfg.value_lists);
             if d != oh && !func.layout.is_cold(d) {
@@ -3132,8 +3123,7 @@ fn run_jam(
                     {
                         if bc.block(&func.dfg.value_lists) == b {
                             match bc.args(&func.dfg.value_lists).nth(q) {
-                                Some(BlockArg::Value(a))
-                                    if func.dfg.resolve_aliases(a) == v => {}
+                                Some(BlockArg::Value(a)) if func.dfg.resolve_aliases(a) == v => {}
                                 _ => passthrough = false,
                             }
                         }
@@ -3162,12 +3152,11 @@ fn run_jam(
                             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                         {
                             if bc.block(&func.dfg.value_lists) == b {
-                                next = bc.args(&func.dfg.value_lists).nth(q).and_then(|a| {
-                                    match a {
+                                next =
+                                    bc.args(&func.dfg.value_lists).nth(q).and_then(|a| match a {
                                         BlockArg::Value(v) => Some(v),
                                         _ => None,
-                                    }
-                                });
+                                    });
                             }
                         }
                     }
@@ -3219,10 +3208,9 @@ fn run_jam(
             }
             // Params: dep if any incoming edge binds a dep arg.
             for p in cfg.pred_iter(b) {
-                for bc in func.dfg.insts[p.inst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     if bc.block(&func.dfg.value_lists) != b {
                         continue;
                     }
@@ -3282,9 +3270,7 @@ fn run_jam(
         let scone: Vec<Block> = func
             .layout
             .blocks()
-            .filter(|&b| {
-                !obody.contains(&b) && dt.is_reachable(b) && dt.block_dominates(e.tgt, b)
-            })
+            .filter(|&b| !obody.contains(&b) && dt.is_reachable(b) && dt.block_dominates(e.tgt, b))
             .collect();
         let mut lset: FxHashSet<Value> = FxHashSet::default();
         let mut bad = false;
@@ -3305,10 +3291,9 @@ fn run_jam(
                 ) {
                     bad = true;
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             let v = func.dfg.resolve_aliases(v);
@@ -3348,10 +3333,9 @@ fn run_jam(
                         bail!("body value used outside");
                     }
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             let v = func.dfg.resolve_aliases(v);
@@ -3478,7 +3462,7 @@ fn run_jam(
 
     // ojh: jammed outer header — same params/insts as oh, but the guard
     // demands budget for all J tile elements: rem = bound - a0 > (J-1)*step.
-    let mut jam_ok = None;
+    let jam_ok;
     let ojh = func.dfg.make_block();
     for &p in &ohparams {
         let ty = func.dfg.value_type(p);
@@ -3657,10 +3641,7 @@ fn run_jam(
         for (pi, &b) in opre.iter().enumerate() {
             let nb = preblk[d][pi];
             for (q, &p) in func.dfg.block_params(b).to_vec().iter().enumerate() {
-                vmaps[d].insert(
-                    func.dfg.resolve_aliases(p),
-                    func.dfg.block_params(nb)[q],
-                );
+                vmaps[d].insert(func.dfg.resolve_aliases(p), func.dfg.block_params(nb)[q]);
             }
             jam_emit_flat(func, b, nb, d, &mut vmaps);
             let t = func.layout.last_inst(b).unwrap();
@@ -3674,18 +3655,16 @@ fn run_jam(
                         // final copy's entry into the fused inner loop is
                         // emitted after this loop.
                         if d + 1 < j {
-                            let args: Vec<BlockArg> =
-                                jam_flat_args(func, d + 1, ocont_bc, &vmaps);
+                            let args: Vec<BlockArg> = jam_flat_args(func, d + 1, ocont_bc, &vmaps);
                             FuncCursor::new(func)
                                 .at_bottom(nb)
                                 .ins()
                                 .jump(preblk[d + 1][0], &args);
                         }
                     } else {
-                        let bc = func.dfg.insts[t].branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        )[0];
+                        let bc = func.dfg.insts[t]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                            [0];
                         let args = jam_flat_args(func, d, bc, &vmaps);
                         FuncCursor::new(func)
                             .at_bottom(nb)
@@ -3764,10 +3743,7 @@ fn run_jam(
                     let cm = *vmaps[0].get(&c).unwrap_or(&c);
                     let (cont_bc, post_bc, epos) = {
                         let dests: Vec<BlockCall> = func.dfg.insts[t]
-                            .branch_destination(
-                                &func.dfg.jump_tables,
-                                &func.dfg.exception_tables,
-                            )
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                             .to_vec();
                         if dests[0].block(&func.dfg.value_lists) == post {
                             (dests[1], dests[0], 0)
@@ -3777,7 +3753,8 @@ fn run_jam(
                     };
                     let cblk = fblk[&cont_bc.block(&func.dfg.value_lists)];
                     let cargs = jam_fused_args(
-                        func, j,
+                        func,
+                        j,
                         cont_bc,
                         cont_bc.block(&func.dfg.value_lists),
                         &vmaps,
@@ -3807,7 +3784,8 @@ fn run_jam(
                             let (cargs, nxt) = if is_last {
                                 (
                                     jam_fused_args(
-                                        func, j,
+                                        func,
+                                        j,
                                         e.cont_bc,
                                         e.cont_bc.block(&func.dfg.value_lists),
                                         &vmaps,
@@ -3833,7 +3811,8 @@ fn run_jam(
                     } else {
                         let cm = *vmaps[0].get(&c).unwrap_or(&c);
                         let cargs = jam_fused_args(
-                            func, j,
+                            func,
+                            j,
                             e.cont_bc,
                             e.cont_bc.block(&func.dfg.value_lists),
                             &vmaps,
@@ -3862,10 +3841,7 @@ fn run_jam(
         for (pi, &b) in opost.iter().enumerate() {
             let nb = tailblk[d][pi];
             for (q, &p) in func.dfg.block_params(b).to_vec().iter().enumerate() {
-                vmaps[d].insert(
-                    func.dfg.resolve_aliases(p),
-                    func.dfg.block_params(nb)[q],
-                );
+                vmaps[d].insert(func.dfg.resolve_aliases(p), func.dfg.block_params(nb)[q]);
             }
             jam_emit_flat(func, b, nb, d, &mut vmaps);
             let t = func.layout.last_inst(b).unwrap();
@@ -3883,10 +3859,7 @@ fn run_jam(
                         } else {
                             (ojh, jam_flat_args(func, d, destination, &vmaps))
                         };
-                        FuncCursor::new(func)
-                            .at_bottom(nb)
-                            .ins()
-                            .jump(tgt, &args);
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(tgt, &args);
                     } else {
                         let args = jam_flat_args(func, d, destination, &vmaps);
                         FuncCursor::new(func)
@@ -3913,7 +3886,10 @@ fn run_jam(
                             (dests[1], dests[0], 1)
                         };
                         let (otgt, oargs): (Block, Vec<BlockArg>) = if d + 1 < j {
-                            (tailblk[d + 1][0], jam_flat_args(func, d + 1, ipost_bc, &vmaps))
+                            (
+                                tailblk[d + 1][0],
+                                jam_flat_args(func, d + 1, ipost_bc, &vmaps),
+                            )
                         } else {
                             (ojh, jam_flat_args(func, d, oh_bc, &vmaps))
                         };
@@ -3974,10 +3950,8 @@ fn run_jam(
             .len();
         for slot in 0..ndest {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[pi].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
+            let bc = &mut dfg.insts[pi]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             if bc.block(&dfg.value_lists) == oh {
                 let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
                 *bc = BlockCall::new(ojh, args.iter().copied(), &mut dfg.value_lists);
@@ -4049,10 +4023,7 @@ fn jam_lane(
             }
             InstructionData::Brif { .. } => {
                 let d: Vec<BlockCall> = func.dfg.insts[t]
-                    .branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    )
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                     .to_vec();
                 let mut entry: Option<(BlockCall, usize)> = None;
                 let mut body: Option<BlockCall> = None;
@@ -4196,17 +4167,17 @@ fn run_jam_chooser(
                 }
                 InstructionData::Brif { .. } => {
                     let d: Vec<BlockCall> = func.dfg.insts[t]
-                        .branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        )
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                         .to_vec();
                     let d0 = d[0].block(&func.dfg.value_lists);
                     let d1 = d[1].block(&func.dfg.value_lists);
                     if d0 == ih || d1 == ih {
                         // Latch: the other dest must be the normal exit.
-                        let (cont_bc, exit_bc, epos) =
-                            if d0 == ih { (d[0], d[1], 1) } else { (d[1], d[0], 0) };
+                        let (cont_bc, exit_bc, epos) = if d0 == ih {
+                            (d[0], d[1], 1)
+                        } else {
+                            (d[1], d[0], 0)
+                        };
                         let eb = exit_bc.block(&func.dfg.value_lists);
                         if post.is_some() || !obody.contains(&eb) || other_ib.contains(&eb) {
                             ifail!("bad latch exit");
@@ -4323,7 +4294,7 @@ fn run_jam_chooser(
     let mut lane_bc: Option<BlockCall> = None; // chooser edge into flane[0]/ih
     let mut flane: Vec<Block> = Vec::new();
     let mut pre_entry_bc: Option<BlockCall> = None; // edge into opre[0]
-    let mut olatch: Option<Block> = None;
+    let olatch: Option<Block>;
     let mut oexit_bc: Option<BlockCall> = None;
     let mut seen_inner = false;
     {
@@ -4365,10 +4336,7 @@ fn run_jam_chooser(
                 }
                 InstructionData::Brif { arg: c, .. } => {
                     let d: Vec<BlockCall> = func.dfg.insts[t]
-                        .branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        )
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                         .to_vec();
                     let d0 = d[0].block(&func.dfg.value_lists);
                     let d1 = d[1].block(&func.dfg.value_lists);
@@ -4430,12 +4398,11 @@ fn run_jam_chooser(
                                     &func.dfg.exception_tables,
                                 )
                                 .to_vec();
-                            let (cbc, epos) =
-                                if ld[0].block(&func.dfg.value_lists) == etgt {
-                                    (ld[1], 0)
-                                } else {
-                                    (ld[0], 1)
-                                };
+                            let (cbc, epos) = if ld[0].block(&func.dfg.value_lists) == etgt {
+                                (ld[1], 0)
+                            } else {
+                                (ld[0], 1)
+                            };
                             lexits.push(JamExit {
                                 pos: lp,
                                 cont_bc: cbc,
@@ -4677,9 +4644,7 @@ fn run_jam_chooser(
             }
         } else if param_idx(func, oh, b).is_some() {
             ok = true;
-        } else if let cranelift_codegen::ir::ValueDef::Param(pblk, _) =
-            func.dfg.value_def(b)
-        {
+        } else if let cranelift_codegen::ir::ValueDef::Param(pblk, _) = func.dfg.value_def(b) {
             // Loop-invariant bound defined outside the loop body.
             ok = !obody.contains(&pblk);
         }
@@ -4729,7 +4694,12 @@ fn run_jam_chooser(
     // All edge args must be plain values.
     for bc in [ientry_bc, ipost_bc, latch_bc]
         .into_iter()
-        .chain(cands[fused].iexits.iter().flat_map(|e| [e.cont_bc, e.exit_bc]))
+        .chain(
+            cands[fused]
+                .iexits
+                .iter()
+                .flat_map(|e| [e.cont_bc, e.exit_bc]),
+        )
         .chain(oexits.iter().flat_map(|e| [e.cont_bc, e.exit_bc]))
         .chain(lexits.iter().flat_map(|e| [e.cont_bc, e.exit_bc]))
         .chain(lane_post.iter().map(|&(_, bc)| bc))
@@ -4764,10 +4734,9 @@ fn run_jam_chooser(
                 }
             }
             for p in cfg.pred_iter(b) {
-                for bc in func.dfg.insts[p.inst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     if bc.block(&func.dfg.value_lists) != b {
                         continue;
                     }
@@ -4871,14 +4840,11 @@ fn run_jam_chooser(
         all_exits.push(e);
     }
 
-
     for e in &mut all_exits {
         let scone: Vec<Block> = func
             .layout
             .blocks()
-            .filter(|&b| {
-                !obody.contains(&b) && dt.is_reachable(b) && dt.block_dominates(e.tgt, b)
-            })
+            .filter(|&b| !obody.contains(&b) && dt.is_reachable(b) && dt.block_dominates(e.tgt, b))
             .collect();
         let mut lset: FxHashSet<Value> = FxHashSet::default();
         let mut bad = false;
@@ -4896,13 +4862,15 @@ fn run_jam_chooser(
                     }
                 }
                 let op = func.dfg.insts[i].opcode();
-                if matches!(op, Opcode::TryCall | Opcode::TryCallIndirect | Opcode::BrTable) {
+                if matches!(
+                    op,
+                    Opcode::TryCall | Opcode::TryCallIndirect | Opcode::BrTable
+                ) {
                     bad = true;
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             let v = func.dfg.resolve_aliases(v);
@@ -4951,10 +4919,9 @@ fn run_jam_chooser(
                         ));
                     }
                 }
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             let v = func.dfg.resolve_aliases(v);
@@ -5344,10 +5311,7 @@ fn run_jam_chooser(
         for (pi, &b) in opre[..chpos].iter().enumerate() {
             let nb = preblk[d][pi];
             for (q, &p) in func.dfg.block_params(b).to_vec().iter().enumerate() {
-                vmaps[d].insert(
-                    func.dfg.resolve_aliases(p),
-                    func.dfg.block_params(nb)[q],
-                );
+                vmaps[d].insert(func.dfg.resolve_aliases(p), func.dfg.block_params(nb)[q]);
             }
             jam_emit_flat(func, b, nb, d, &mut vmaps);
             let t = func.layout.last_inst(b).unwrap();
@@ -5368,10 +5332,7 @@ fn run_jam_chooser(
                         jam_flat_args(func, d + 1, pre_entry_bc.unwrap(), vm),
                     )
                 } else {
-                    (
-                        fch,
-                        jam_fused_args(func, j, bc, opre[chpos], vm, &poff),
-                    )
+                    (fch, jam_fused_args(func, j, bc, opre[chpos], vm, &poff))
                 }
             };
             match func.dfg.insts[t] {
@@ -5464,10 +5425,7 @@ fn run_jam_chooser(
                 let c = func.dfg.resolve_aliases(c);
                 let cm = *vmaps[0].get(&c).unwrap_or(&c);
                 let dests: Vec<BlockCall> = func.dfg.insts[t]
-                    .branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    )
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                     .to_vec();
                 let mut out: Vec<(Block, Vec<BlockArg>)> = Vec::new();
                 for bc in dests {
@@ -5475,10 +5433,7 @@ fn run_jam_chooser(
                     if db == ih {
                         out.push((fih, jam_fused_args(func, j, bc, ih, &vmaps, &poff)));
                     } else if flblk.contains_key(&db) {
-                        out.push((
-                            flblk[&db],
-                            jam_fused_args(func, j, bc, db, &vmaps, &poff),
-                        ));
+                        out.push((flblk[&db], jam_fused_args(func, j, bc, db, &vmaps, &poff)));
                     } else if db == post {
                         out.push((fpost, jam_fused_args(func, j, bc, post, &vmaps, &poff)));
                     } else {
@@ -5490,8 +5445,7 @@ fn run_jam_chooser(
                     }
                 }
                 let mut pos = FuncCursor::new(func).at_bottom(fb);
-                pos.ins()
-                    .brif(cm, out[0].0, &out[0].1, out[1].0, &out[1].1);
+                pos.ins().brif(cm, out[0].0, &out[0].1, out[1].0, &out[1].1);
             }
             _ => unreachable!("jam2: lane terminator"),
         }
@@ -5526,8 +5480,7 @@ fn run_jam_chooser(
                     let dests: Vec<BlockCall> = func.dfg.insts[t]
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                         .to_vec();
-                    let (cont_bc, post_bc, epos) = if dests[0].block(&func.dfg.value_lists)
-                        == post
+                    let (cont_bc, post_bc, epos) = if dests[0].block(&func.dfg.value_lists) == post
                     {
                         (dests[1], dests[0], 0)
                     } else {
@@ -5638,10 +5591,7 @@ fn run_jam_chooser(
         for (pi, &b) in opost.iter().enumerate() {
             let nb = tailblk[d][pi];
             for (q, &p) in func.dfg.block_params(b).to_vec().iter().enumerate() {
-                vmaps[d].insert(
-                    func.dfg.resolve_aliases(p),
-                    func.dfg.block_params(nb)[q],
-                );
+                vmaps[d].insert(func.dfg.resolve_aliases(p), func.dfg.block_params(nb)[q]);
             }
             jam_emit_flat(func, b, nb, d, &mut vmaps);
             let t = func.layout.last_inst(b).unwrap();
@@ -5654,10 +5604,7 @@ fn run_jam_chooser(
                         } else {
                             (ojh, jam_flat_args(func, d, destination, &vmaps))
                         };
-                        FuncCursor::new(func)
-                            .at_bottom(nb)
-                            .ins()
-                            .jump(tgt, &args);
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(tgt, &args);
                     } else {
                         let args = jam_flat_args(func, d, destination, &vmaps);
                         FuncCursor::new(func)
@@ -5754,10 +5701,8 @@ fn run_jam_chooser(
             .len();
         for slot in 0..ndest {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[pi].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[slot];
+            let bc = &mut dfg.insts[pi]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             if bc.block(&dfg.value_lists) == oh {
                 let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
                 *bc = BlockCall::new(ojh, args.iter().copied(), &mut dfg.value_lists);

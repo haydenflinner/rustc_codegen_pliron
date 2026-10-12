@@ -9,8 +9,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, condcodes::IntCC,
-    Opcode, Type, Value, ValueDef, types,
+    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
+    Value, ValueDef, condcodes::IntCC, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -52,12 +52,7 @@ enum Mul {
 
 /// `v` as `iv*K`: `imul(iv, K)`, `ishl(iv, log2K)`, or bare `iv` (K = 1).
 /// `K` may be a constant or a value defined outside `body`.
-fn scaled(
-    func: &Function,
-    iv: Value,
-    v: Value,
-    body: &FxHashSet<Block>,
-) -> Option<Mul> {
+fn scaled(func: &Function, iv: Value, v: Value, body: &FxHashSet<Block>) -> Option<Mul> {
     let v = func.dfg.resolve_aliases(v);
     if v == iv {
         return Some(Mul::K(1));
@@ -119,10 +114,7 @@ fn edges_to(func: &Function, cfg: &ControlFlowGraph, h: Block) -> Vec<Edge> {
             .enumerate()
         {
             if bc.block(&func.dfg.value_lists) == h {
-                out.push(Edge {
-                    inst: p.inst,
-                    slot,
-                });
+                out.push(Edge { inst: p.inst, slot });
             }
         }
     }
@@ -148,7 +140,11 @@ fn iconst_masked(pos: &mut FuncCursor, t: Type, k: i64) -> Value {
         let hi = pos.ins().iconst(types::I64, k >> 63);
         return pos.ins().iconcat(lo, hi);
     }
-    let mask = if t.bits() < 64 { (1i64 << t.bits()) - 1 } else { -1 };
+    let mask = if t.bits() < 64 {
+        (1i64 << t.bits()) - 1
+    } else {
+        -1
+    };
     pos.ins().iconst(t, k & mask)
 }
 
@@ -286,8 +282,7 @@ fn run_loop(
         // `bare` flag records whether a `base + iv` add references the iv
         // directly (vs `imul iv, 1`): converting the former only buys
         // regalloc parallel-copy movs.
-        let mut targets: FxHashMap<(Option<Value>, Mul, bool), Vec<Inst>> =
-            FxHashMap::default();
+        let mut targets: FxHashMap<(Option<Value>, Mul, bool), Vec<Inst>> = FxHashMap::default();
         for &b in &body {
             for i in func.layout.block_insts(b) {
                 match func.dfg.insts[i] {
@@ -336,10 +331,7 @@ fn run_loop(
             }
             // Every edge must pass a plain value for the iv param, else the
             // new param can't be filled in.
-            let args: Option<Vec<Value>> = edges
-                .iter()
-                .map(|e| edge_arg(func, e, idx))
-                .collect();
+            let args: Option<Vec<Value>> = edges.iter().map(|e| edge_arg(func, e, idx)).collect();
             let Some(args) = args else {
                 continue;
             };
@@ -348,10 +340,9 @@ fn run_loop(
             for (e, arg) in edges.iter().zip(args) {
                 let v = edge_value(func, iv, np, &body, base, mul, e, arg);
                 let dfg = &mut func.dfg;
-                let bc = &mut dfg.insts[e.inst].branch_destination_mut(
-                    &mut dfg.jump_tables,
-                    &mut dfg.exception_tables,
-                )[e.slot];
+                let bc = &mut dfg.insts[e.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [e.slot];
                 bc.append_argument(v, &mut dfg.value_lists);
             }
             for &i in insts {
@@ -361,7 +352,10 @@ fn run_loop(
                 func.dfg.change_to_alias(r, np);
             }
             if debug {
-                eprintln!("indvars {h}: base {base:?} mul {mul:?} -> {np} ({} insts)", insts.len());
+                eprintln!(
+                    "indvars {h}: base {base:?} mul {mul:?} -> {np} ({} insts)",
+                    insts.len()
+                );
             }
             n += 1;
         }
@@ -379,7 +373,6 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     }
     n
 }
-
 
 /// Loop-carried load reuse (LLVM GVN's backedge phi-translation). A load
 /// `B` rereads each iteration the address a sibling load `A` read last
@@ -541,7 +534,11 @@ fn dec(
         scale: i64,
         terms: &mut FxHashMap<Value, i64>,
     ) -> Option<()> {
-        if func.layout.inst_block(i).is_some_and(|b| !body.contains(&b)) {
+        if func
+            .layout
+            .inst_block(i)
+            .is_some_and(|b| !body.contains(&b))
+        {
             *terms.entry(v).or_default() += scale;
             return Some(());
         }
@@ -552,15 +549,59 @@ fn dec(
             opcode: Opcode::Iadd,
             args,
         } => {
-            dec(func, params, pinfos, body, args[0], scale, fuel - 1, terms, kcoef, koff)?;
-            dec(func, params, pinfos, body, args[1], scale, fuel - 1, terms, kcoef, koff)
+            dec(
+                func,
+                params,
+                pinfos,
+                body,
+                args[0],
+                scale,
+                fuel - 1,
+                terms,
+                kcoef,
+                koff,
+            )?;
+            dec(
+                func,
+                params,
+                pinfos,
+                body,
+                args[1],
+                scale,
+                fuel - 1,
+                terms,
+                kcoef,
+                koff,
+            )
         }
         InstructionData::Binary {
             opcode: Opcode::Isub,
             args,
         } => {
-            dec(func, params, pinfos, body, args[0], scale, fuel - 1, terms, kcoef, koff)?;
-            dec(func, params, pinfos, body, args[1], scale.wrapping_neg(), fuel - 1, terms, kcoef, koff)
+            dec(
+                func,
+                params,
+                pinfos,
+                body,
+                args[0],
+                scale,
+                fuel - 1,
+                terms,
+                kcoef,
+                koff,
+            )?;
+            dec(
+                func,
+                params,
+                pinfos,
+                body,
+                args[1],
+                scale.wrapping_neg(),
+                fuel - 1,
+                terms,
+                kcoef,
+                koff,
+            )
         }
         InstructionData::Binary {
             opcode: Opcode::Imul,
@@ -568,7 +609,18 @@ fn dec(
         } => {
             for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
                 if let Some(k) = iconst(func, c) {
-                    return dec(func, params, pinfos, body, x, scale.wrapping_mul(k), fuel - 1, terms, kcoef, koff);
+                    return dec(
+                        func,
+                        params,
+                        pinfos,
+                        body,
+                        x,
+                        scale.wrapping_mul(k),
+                        fuel - 1,
+                        terms,
+                        kcoef,
+                        koff,
+                    );
                 }
             }
             leaf(func, body, i, v, scale, terms)
@@ -578,7 +630,18 @@ fn dec(
             args,
         } if iconst(func, args[1]).is_some_and(|s| (0..64).contains(&s)) => {
             let s = iconst(func, args[1])?;
-            dec(func, params, pinfos, body, args[0], scale.wrapping_shl(s as u32), fuel - 1, terms, kcoef, koff)
+            dec(
+                func,
+                params,
+                pinfos,
+                body,
+                args[0],
+                scale.wrapping_shl(s as u32),
+                fuel - 1,
+                terms,
+                kcoef,
+                koff,
+            )
         }
         _ => leaf(func, body, i, v, scale, terms),
     }
@@ -593,7 +656,9 @@ fn dec_addr(
 ) -> Option<Dec> {
     let mut tm = FxHashMap::default();
     let (mut kcoef, mut koff) = (0i64, 0i64);
-    dec(func, params, pinfos, body, v, 1, DEC_FUEL, &mut tm, &mut kcoef, &mut koff)?;
+    dec(
+        func, params, pinfos, body, v, 1, DEC_FUEL, &mut tm, &mut kcoef, &mut koff,
+    )?;
     let mut terms: Vec<(Value, i64)> = tm.into_iter().filter(|&(_, c)| c != 0).collect();
     terms.sort();
     Some((terms, kcoef, koff))
@@ -938,7 +1003,6 @@ pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     n
 }
 
-
 /// Whether a latch's continue test is `a < K` (strict) or `a <= K`.
 #[derive(Clone, Copy, PartialEq)]
 enum Lt {
@@ -1020,8 +1084,7 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                 };
                 // The edge to `h` must be the compare's below-bound arm,
                 // strictly (`ult j0, K` -> `j0 <= K - 1 <= D`).
-                let Some(k) = (e.slot == 0
-                    && blocks[0].block(&func.dfg.value_lists) == h)
+                let Some(k) = (e.slot == 0 && blocks[0].block(&func.dfg.value_lists) == h)
                     .then(|| {
                         func.dfg
                             .value_def(func.dfg.resolve_aliases(cond))
@@ -1032,9 +1095,7 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                                     args: [x, y],
                                     ..
                                 } if func.dfg.resolve_aliases(x) == a => {
-                                    iconst(func, y).filter(|k| {
-                                        (4096..=i64::MAX).contains(k)
-                                    })
+                                    iconst(func, y).filter(|k| (4096..=i64::MAX).contains(k))
                                 }
                                 _ => None,
                             })
@@ -1074,10 +1135,9 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
             let rem = func.dfg.append_block_param(h, ty);
             {
                 let dfg = &mut func.dfg;
-                let bc = &mut dfg.insts[entry.inst].branch_destination_mut(
-                    &mut dfg.jump_tables,
-                    &mut dfg.exception_tables,
-                )[entry.slot];
+                let bc = &mut dfg.insts[entry.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [entry.slot];
                 bc.append_argument(rem0, &mut dfg.value_lists);
             }
             for (e, _, step) in &latches {
@@ -1094,10 +1154,9 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                     }
                 };
                 let dfg = &mut func.dfg;
-                let bc = &mut dfg.insts[e.inst].branch_destination_mut(
-                    &mut dfg.jump_tables,
-                    &mut dfg.exception_tables,
-                )[e.slot];
+                let bc = &mut dfg.insts[e.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [e.slot];
                 bc.append_argument(v, &mut dfg.value_lists);
             }
             // Rewrite the latch count test to `ule (D - a), rem0`.
@@ -1151,9 +1210,7 @@ fn count_tested(
     }
     let ci = func.dfg.value_def(func.dfg.resolve_aliases(cond)).inst()?;
     let InstructionData::IntCompare {
-        cond,
-        args: [x, y],
-        ..
+        cond, args: [x, y], ..
     } = func.dfg.insts[ci]
     else {
         return None;
@@ -1207,9 +1264,8 @@ fn step_ok(
         return (0..=i64::MAX).contains(&sk).then_some(StepV::K(sk));
     }
     let s = func.dfg.resolve_aliases(s);
-    (def_block(func, s).is_some_and(|d| !body.contains(&d))
-        && bounded(func, dt, psrc, i, s))
-    .then_some(StepV::V(s))
+    (def_block(func, s).is_some_and(|d| !body.contains(&d)) && bounded(func, dt, psrc, i, s))
+        .then_some(StepV::V(s))
 }
 
 /// `icmp ult/ule b, k` with `k <= i64::MAX` in a dominator block of `i`,
@@ -1227,9 +1283,7 @@ fn bounded(
     while let Some(d) = dom {
         for j in func.layout.block_insts(d) {
             let InstructionData::IntCompare {
-                cond,
-                args: [a, b],
-                ..
+                cond, args: [a, b], ..
             } = func.dfg.insts[j]
             else {
                 continue;

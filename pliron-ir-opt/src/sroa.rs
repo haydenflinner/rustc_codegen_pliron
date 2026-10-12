@@ -25,8 +25,8 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::ArrayType;
 use rustc_hash::FxHashSet;
 
-use crate::state::{ConstVal, State, mask};
 use crate::has_body;
+use crate::state::{ConstVal, State, mask};
 use crate::types::{TyK, classify, leaves, size_align, struct_offsets};
 
 const MAX_SIZE: u64 = 512;
@@ -187,12 +187,7 @@ fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: u
 /// `CallInfo::arg_extent`), the callee may legally touch `(size, align)`
 /// bytes from `p`. The slices covering them must stay memory; anything
 /// else in the alloca can still promote.
-fn pin_extent(
-    ctx: &Context,
-    st: &State,
-    op: Ptr<Operation>,
-    idx: usize,
-) -> Option<(u64, u64)> {
+fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Option<(u64, u64)> {
     if !crate::pass_enabled("PLIRON_SROA_PIN") {
         return None;
     }
@@ -478,12 +473,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
     Ok(typed)
 }
 
-pub fn mk_const(
-    ctx: &mut Context,
-    st: &mut State,
-    ty: TypeHandle,
-    cv: ConstVal,
-) -> Value {
+pub fn mk_const(ctx: &mut Context, st: &mut State, ty: TypeHandle, cv: ConstVal) -> Value {
     let op = UndefOp::new(ctx, ty).get_operation();
     let v = op.deref(ctx).get_result(0);
     st.consts.insert(v, cv);

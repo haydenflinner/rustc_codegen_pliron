@@ -8,9 +8,7 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::CondCode;
-use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value,
-};
+use cranelift_codegen::ir::{Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
@@ -96,15 +94,8 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
             }
         }
         InstructionData::Brif { blocks, .. } => {
-            let arms: Vec<_> = blocks
-                .iter()
-                .filter(|b| b.block(pool) == h)
-                .collect();
-            if arms.len() != 1
-                || arms[0]
-                    .args(pool)
-                    .any(|a| !matches!(a, BlockArg::Value(_)))
-            {
+            let arms: Vec<_> = blocks.iter().filter(|b| b.block(pool) == h).collect();
+            if arms.len() != 1 || arms[0].args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
                 bail!("brif latch arms");
             }
         }
@@ -229,9 +220,9 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
 
     // Copy the header into the latch, in place of its back-edge to `h`.
     let args: Vec<BlockArg> = match &func.dfg.insts[l.inst] {
-        InstructionData::Jump { destination, .. } => destination
-            .args(&func.dfg.value_lists)
-            .collect(),
+        InstructionData::Jump { destination, .. } => {
+            destination.args(&func.dfg.value_lists).collect()
+        }
         InstructionData::Brif { blocks, .. } => blocks
             .iter()
             .find(|b| b.block(&func.dfg.value_lists) == h)
@@ -296,15 +287,11 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
         {
             if let InstructionData::Brif { arg, .. } = func.dfg.insts[l.inst]
                 && uses(func, arg) == 1
-                && let Some(ci) = func
-                    .dfg
-                    .value_def(func.dfg.resolve_aliases(arg))
-                    .inst()
+                && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
                 && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
             {
                 *cond = cond.complement();
-                let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[l.inst]
-                else {
+                let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[l.inst] else {
                     unreachable!()
                 };
                 blocks.swap(0, 1);
@@ -334,10 +321,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
         == Some(1)
         && let InstructionData::Brif { arg, .. } = func.dfg.insts[lt]
         && uses(func, arg) == 1
-        && let Some(ci) = func
-            .dfg
-            .value_def(func.dfg.resolve_aliases(arg))
-            .inst()
+        && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
         && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
     {
         *cond = cond.complement();

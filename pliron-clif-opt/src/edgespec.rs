@@ -71,7 +71,11 @@ fn ebit(w: u32, m: u64, v: u64) -> E {
 }
 
 fn mask(v: u64, bits: u32) -> u64 {
-    if bits >= 64 { v } else { v & ((1u64 << bits) - 1) }
+    if bits >= 64 {
+        v
+    } else {
+        v & ((1u64 << bits) - 1)
+    }
 }
 
 fn sext(v: u64, bits: u32) -> i64 {
@@ -267,25 +271,19 @@ fn eval(
                         tob(eval(func, env, sub, args[0], depth + 1)),
                         tob(eval(func, env, sub, args[1], depth + 1)),
                     ) {
-                        (Opcode::Band, Some((m1, v1)), Some((m2, v2))) => ebit(
-                            w,
-                            (m1 & m2) | (m1 & !v1) | (m2 & !v2),
-                            v1 & v2,
-                        ),
+                        (Opcode::Band, Some((m1, v1)), Some((m2, v2))) => {
+                            ebit(w, (m1 & m2) | (m1 & !v1) | (m2 & !v2), v1 & v2)
+                        }
                         (Opcode::Band, None, Some((m, v))) | (Opcode::Band, Some((m, v)), None) => {
                             ebit(w, m & !v, 0)
                         }
-                        (Opcode::Bor, Some((m1, v1)), Some((m2, v2))) => ebit(
-                            w,
-                            (m1 & m2) | (m1 & v1) | (m2 & v2),
-                            v1 | v2,
-                        ),
+                        (Opcode::Bor, Some((m1, v1)), Some((m2, v2))) => {
+                            ebit(w, (m1 & m2) | (m1 & v1) | (m2 & v2), v1 | v2)
+                        }
                         (Opcode::Bor, None, Some((m, v))) | (Opcode::Bor, Some((m, v)), None) => {
                             ebit(w, m & v, m & v)
                         }
-                        (Opcode::Bxor, Some((m1, v1)), Some((m2, v2))) => {
-                            ebit(w, m1 & m2, v1 ^ v2)
-                        }
+                        (Opcode::Bxor, Some((m1, v1)), Some((m2, v2))) => ebit(w, m1 & m2, v1 ^ v2),
                         _ => E::Unk,
                     }
                 }
@@ -448,7 +446,11 @@ impl<'a> W<'a> {
     }
 
     /// Substitute walked-block params in a call's args with pred values.
-    fn map_call(&self, bc: BlockCall, sub: &FxHashMap<Value, Value>) -> Option<(Block, Vec<Value>)> {
+    fn map_call(
+        &self,
+        bc: BlockCall,
+        sub: &FxHashMap<Value, Value>,
+    ) -> Option<(Block, Vec<Value>)> {
         let b = bc.block(&self.func.dfg.value_lists);
         let mut args = Vec::new();
         for a in bc.args(&self.func.dfg.value_lists) {
@@ -539,10 +541,9 @@ impl<'a> W<'a> {
             let Some(t) = self.func.layout.last_inst(b) else {
                 continue;
             };
-            for bc in self.func.dfg.insts[t].branch_destination(
-                &self.func.dfg.jump_tables,
-                &self.func.dfg.exception_tables,
-            ) {
+            for bc in self.func.dfg.insts[t]
+                .branch_destination(&self.func.dfg.jump_tables, &self.func.dfg.exception_tables)
+            {
                 let s = bc.block(&self.func.dfg.value_lists);
                 if seen.insert(s) {
                     order.push(s);
@@ -587,24 +588,18 @@ impl<'a> W<'a> {
                     let db = match self.func.dfg.value_def(v) {
                         ValueDef::Param(b, _) if b == u => continue,
                         ValueDef::Param(b, _) => b,
-                        ValueDef::Result(di, _) => {
-                            match self.func.layout.inst_block(di) {
-                                Some(b) if b == u => continue,
-                                None => return false,
-                                Some(b) => {
-                                    if !skipped.contains(&b)
-                                        && self.dom.dominates(
-                                            di,
-                                            self.pterm,
-                                            &self.func.layout,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    b
+                        ValueDef::Result(di, _) => match self.func.layout.inst_block(di) {
+                            Some(b) if b == u => continue,
+                            None => return false,
+                            Some(b) => {
+                                if !skipped.contains(&b)
+                                    && self.dom.dominates(di, self.pterm, &self.func.layout)
+                                {
+                                    continue;
                                 }
+                                b
                             }
-                        }
+                        },
                         _ => return false,
                     };
                     // A def-block that cone-dominates `u` stays on every new
@@ -629,12 +624,7 @@ impl<'a> W<'a> {
     /// not be consumed anywhere downstream (`cone_ok`) and the carried args
     /// must not themselves be skipped defs that a re-walked binding would
     /// have refreshed.
-    fn fin_edge(
-        &self,
-        d: Block,
-        args: Vec<Value>,
-        skipped: &FxHashSet<Block>,
-    ) -> Option<Edge> {
+    fn fin_edge(&self, d: Block, args: Vec<Value>, skipped: &FxHashSet<Block>) -> Option<Edge> {
         if !self.cone_ok(d, skipped) {
             return None;
         }
@@ -718,8 +708,16 @@ impl<'a> W<'a> {
         /// prefix between `p` and `d`.
         macro_rules! go {
             ($env:expr, $sub:expr, $nb:expr, $nargs:expr) => {
-                self.resolve($env, $sub, $nb, $nargs, depth + 1, split_ok, through.clone())
-                    .or_else(|| self.fin_edge(d, args.clone(), &skipped))
+                self.resolve(
+                    $env,
+                    $sub,
+                    $nb,
+                    $nargs,
+                    depth + 1,
+                    split_ok,
+                    through.clone(),
+                )
+                .or_else(|| self.fin_edge(d, args.clone(), &skipped))
             };
         }
         match self.func.dfg.insts[term] {
@@ -742,8 +740,7 @@ impl<'a> W<'a> {
                         } else {
                             // tv == ev, or both nonzero: the condition is
                             // constant from this edge's point of view.
-                            let (nb, nargs) =
-                                self.map_call(blocks[usize::from(tv == 0)], &sub)?;
+                            let (nb, nargs) = self.map_call(blocks[usize::from(tv == 0)], &sub)?;
                             return go!(env, sub, nb, nargs);
                         };
                         if !split_ok {
@@ -849,7 +846,13 @@ fn plan(
     p: Block,
     pterm: Inst,
 ) -> Option<NewTerm> {
-    let w = W { func, cfg, dom, p, pterm };
+    let w = W {
+        func,
+        cfg,
+        dom,
+        p,
+        pterm,
+    };
     match func.dfg.insts[pterm] {
         InstructionData::Jump { destination, .. } => {
             let (d, args) = call_parts(func, destination)?;
@@ -942,8 +945,7 @@ fn plan(
                     let (eb, ea) = thread(blocks[1])?;
                     if tb == blocks[0].block(&func.dfg.value_lists)
                         && eb == blocks[1].block(&func.dfg.value_lists)
-                        && ta
-                            == call_parts(func, blocks[0])?.1
+                        && ta == call_parts(func, blocks[0])?.1
                         && ea == call_parts(func, blocks[1])?.1
                     {
                         return None;
@@ -975,16 +977,13 @@ fn prep_args(
         let v = func.dfg.resolve_aliases(v);
         match func.dfg.value_def(v) {
             ValueDef::Param(b, _)
-                if b == p
-                    || (func.layout.is_block_inserted(b) && dom.block_dominates(b, p)) =>
+                if b == p || (func.layout.is_block_inserted(b) && dom.block_dominates(b, p)) =>
             {
                 out.push(A::V(v));
             }
             ValueDef::Result(i, _) => {
                 let inst = func.dfg.insts[i];
-                if func.layout.inst_block(i).is_some()
-                    && dom.dominates(i, pterm, &func.layout)
-                {
+                if func.layout.inst_block(i).is_some() && dom.dominates(i, pterm, &func.layout) {
                     out.push(A::V(v));
                 } else if let InstructionData::UnaryImm {
                     opcode: Opcode::Iconst,
@@ -1049,11 +1048,12 @@ pub fn sweep_dead(func: &mut Function) {
         for i in insts {
             if func.dfg.insts[i].opcode().is_terminator()
                 || !crate::jumpthread::pure_op(func, i)
-                || func
-                    .dfg
-                    .inst_results(i)
-                    .iter()
-                    .any(|r| uses.get(&func.dfg.resolve_aliases(*r)).copied().unwrap_or(0) > 0)
+                || func.dfg.inst_results(i).iter().any(|r| {
+                    uses.get(&func.dfg.resolve_aliases(*r))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                })
             {
                 continue;
             }
@@ -1091,8 +1091,7 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     let mut n = 0;
-    let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT")
-        .and_then(|s| s.parse::<usize>().ok());
+    let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT").and_then(|s| s.parse::<usize>().ok());
     for (p, t, nt) in plans {
         if let Some(l) = lim
             && n >= l
@@ -1198,12 +1197,8 @@ fn deadbits(func: &mut Function) -> usize {
                 let w = bits(func, args[0]).unwrap_or(64);
                 let wm = mask(u64::MAX, w);
                 let l = match (op, iconst(func, args[1])) {
-                    (Opcode::Ushr, Some(k)) if k < w as u64 => {
-                        (out_need << k as u32) & wm
-                    }
-                    (Opcode::Ishl, Some(k)) if k < w as u64 => {
-                        (out_need >> k as u32) & wm
-                    }
+                    (Opcode::Ushr, Some(k)) if k < w as u64 => (out_need << k as u32) & wm,
+                    (Opcode::Ishl, Some(k)) if k < w as u64 => (out_need >> k as u32) & wm,
                     (Opcode::Sshr, Some(k)) if k < w as u64 => {
                         let k = k as u32;
                         let mut m = (out_need << k) & wm;
@@ -1216,7 +1211,11 @@ fn deadbits(func: &mut Function) -> usize {
                 };
                 vec![l, if out_need != 0 { wm } else { 0 }]
             }
-            InstructionData::BinaryImm8 { opcode: op, arg, imm } => {
+            InstructionData::BinaryImm8 {
+                opcode: op,
+                arg,
+                imm,
+            } => {
                 let w = bits(func, arg).unwrap_or(64);
                 let wm = mask(u64::MAX, w);
                 let k = u64::from(imm);
@@ -1242,7 +1241,11 @@ fn deadbits(func: &mut Function) -> usize {
                     Opcode::Uextend => out_need & mask(u64::MAX, w),
                     Opcode::Sextend => {
                         (out_need & mask(u64::MAX, w))
-                            | if (out_need >> (w - 1)) != 0 { 1u64 << (w - 1) } else { 0 }
+                            | if (out_need >> (w - 1)) != 0 {
+                                1u64 << (w - 1)
+                            } else {
+                                0
+                            }
                     }
                     Opcode::Bnot => out_need,
                     _ => mask(u64::MAX, w),
@@ -1280,9 +1283,10 @@ fn deadbits(func: &mut Function) -> usize {
                 let ds = demand(func, i, out_need);
                 let av: Vec<Value> = func.dfg.inst_args(i).to_vec();
                 for (k, &a) in av.iter().enumerate() {
-                    let d = ds.get(k).copied().unwrap_or_else(|| {
-                        mask(u64::MAX, bits(func, a).unwrap_or(64))
-                    });
+                    let d = ds
+                        .get(k)
+                        .copied()
+                        .unwrap_or_else(|| mask(u64::MAX, bits(func, a).unwrap_or(64)));
                     let a = func.dfg.resolve_aliases(a);
                     if d & !need.get(&a).copied().unwrap_or(0) != 0 {
                         *need.entry(a).or_default() |= d;
@@ -1304,10 +1308,9 @@ fn deadbits(func: &mut Function) -> usize {
                     }
                 }
                 // Edge args inherit the bound param's need.
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let t = bc.block(&func.dfg.value_lists);
                     for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
                         let Some(&p) = func.dfg.block_params(t).get(k) else {
@@ -1454,7 +1457,9 @@ fn splices(func: &mut Function) -> usize {
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
                 for v in func.dfg.inst_values(i) {
-                    uses.entry(func.dfg.resolve_aliases(v)).or_default().insert(b);
+                    uses.entry(func.dfg.resolve_aliases(v))
+                        .or_default()
+                        .insert(b);
                 }
             }
         }
@@ -1475,7 +1480,8 @@ fn splices(func: &mut Function) -> usize {
             .collect();
         let all_edges = collect_edges(func);
         // Edges into J and which successor each one decides (if any).
-        let mut decided: Vec<(Block, Inst, usize, Vec<BlockArg>, Block, Vec<BlockArg>)> = Vec::new();
+        let mut decided: Vec<(Block, Inst, usize, Vec<BlockArg>, Block, Vec<BlockArg>)> =
+            Vec::new();
         for (p, pt, di, _, args) in all_edges.iter().filter(|e| e.3 == j) {
             if *p == j || args.len() != params.len() {
                 continue;
@@ -1610,9 +1616,7 @@ fn splices(func: &mut Function) -> usize {
                         {
                             new_args.push(BlockArg::Value(av))
                         }
-                        ValueDef::Param(b, _)
-                            if b != j && dom.block_dominates(b, *p) =>
-                        {
+                        ValueDef::Param(b, _) if b != j && dom.block_dominates(b, *p) => {
                             new_args.push(BlockArg::Value(av))
                         }
                         ValueDef::Result(i, _)
@@ -1640,8 +1644,8 @@ fn splices(func: &mut Function) -> usize {
                 let dfg = &mut func.dfg;
                 let nbc = BlockCall::new(s, new_args, &mut dfg.value_lists);
                 dfg.insts[*pt]
-                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                    [*di] = nbc;
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[*di] =
+                    nbc;
                 n += 1;
             }
         }

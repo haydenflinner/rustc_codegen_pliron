@@ -25,7 +25,6 @@ use crate::{
     OperandPos, PReg, ProgPoint, RegAllocError, VReg, VecExt,
 };
 use core::convert::TryFrom;
-use core::usize;
 use smallvec::{smallvec, SmallVec};
 
 /// A spill weight computed for a certain Use.

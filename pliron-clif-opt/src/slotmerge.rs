@@ -67,10 +67,9 @@ pub fn run(
             for &a in func.dfg.inst_args(i) {
                 users[func.dfg.resolve_aliases(a)].push(i);
             }
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 for ba in bc.args(&func.dfg.value_lists) {
                     if let BlockArg::Value(v) = ba {
                         users[func.dfg.resolve_aliases(v)].push(i);
@@ -118,10 +117,9 @@ pub fn run(
             } else {
                 Vec::new()
             };
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 let blk = bc.block(&func.dfg.value_lists);
                 for (k, ba) in bc.args(&func.dfg.value_lists).enumerate() {
                     let src: Vec<StackSlot> = match ba {
@@ -246,10 +244,7 @@ pub fn run(
     // (src, dst): memcpy/memmove copied src's bytes into dst, so pointers
     // contained in src are now contained in dst as well.
     let mut cpy: Vec<(StackSlot, StackSlot)> = Vec::new();
-    let use_at = |iv: &mut Vec<(u32, u32)>,
-                      uses: &mut Vec<Vec<u32>>,
-                      s: StackSlot,
-                      p: u32| {
+    let use_at = |iv: &mut Vec<(u32, u32)>, uses: &mut Vec<Vec<u32>>, s: StackSlot, p: u32| {
         uses[s.index()].push(p);
         let e = &mut iv[s.index()];
         e.0 = e.0.min(p);
@@ -280,9 +275,7 @@ pub fn run(
                     match op {
                         // A tail-called callee can outlive this frame; a
                         // stack switch may touch it from another stack.
-                        Opcode::ReturnCall
-                        | Opcode::ReturnCallIndirect
-                        | Opcode::StackSwitch => {
+                        Opcode::ReturnCall | Opcode::ReturnCallIndirect | Opcode::StackSwitch => {
                             for k in 0..args.len() {
                                 for &s in arg_slots(k) {
                                     use_at(&mut iv, &mut uses, s, pos);
@@ -291,10 +284,8 @@ pub fn run(
                             }
                         }
                         _ => {
-                            let info = d.analyze_call(
-                                &func.dfg.value_lists,
-                                &func.dfg.exception_tables,
-                            );
+                            let info =
+                                d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
                             let plain = matches!(info, CallInfo::Direct(..));
                             match info {
                                 CallInfo::Direct(fr, cargs)
@@ -332,9 +323,7 @@ pub fn run(
                                     };
                                     if copy && cargs.len() >= 2 {
                                         for &x in &derived[func.dfg.resolve_aliases(cargs[1])] {
-                                            for &d in
-                                                &derived[func.dfg.resolve_aliases(cargs[0])]
-                                            {
+                                            for &d in &derived[func.dfg.resolve_aliases(cargs[0])] {
                                                 cpy.push((x, d));
                                             }
                                         }
@@ -466,7 +455,11 @@ pub fn run(
                 // The marker sits between `i` and the next inst: a start
                 // marker is live from the next position, an end marker's
                 // last live point is `i` itself.
-                if start { (ipos[i] + 1).min(last) } else { ipos[i] }
+                if start {
+                    (ipos[i] + 1).min(last)
+                } else {
+                    ipos[i]
+                }
             }
             _ if in_layout.contains(&b) => bfirst[b],
             _ => continue,
@@ -489,10 +482,9 @@ pub fn run(
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for &b in &order {
         for i in func.layout.block_insts(b) {
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 let v = bc.block(&func.dfg.value_lists);
                 if bpos[v] < bpos[b] {
                     spans.push((bfirst[v], blast[b]));
@@ -581,7 +573,10 @@ pub fn run(
         };
         let mut best: Option<usize> = None;
         for (r, &(end, rsize, ralign, _)) in regions.iter().enumerate() {
-            if end < lo && rsize >= size && ralign >= align && best.is_none_or(|b| regions[b].1 > rsize)
+            if end < lo
+                && rsize >= size
+                && ralign >= align
+                && best.is_none_or(|b| regions[b].1 > rsize)
             {
                 best = Some(r);
             }

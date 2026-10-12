@@ -6,7 +6,11 @@ use std::hint::black_box;
 
 #[inline(never)]
 fn fib(n: u32) -> u64 {
-    if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) }
+    if n < 2 {
+        n as u64
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
 }
 
 #[inline(never)]
@@ -38,7 +42,11 @@ fn ackish(n: u64, m: u64) -> u64 {
 // Not associative+commutative — must not fold, still must be right.
 #[inline(never)]
 fn subdown(n: u64) -> u64 {
-    if n == 0 { 0 } else { subdown(n - 1).wrapping_sub(n) }
+    if n == 0 {
+        0
+    } else {
+        subdown(n - 1).wrapping_sub(n)
+    }
 }
 
 fn main() {

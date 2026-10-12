@@ -23,8 +23,7 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, TrapCode, Value,
-    ValueDef,
+    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, TrapCode, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -140,8 +139,7 @@ fn bypass_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
             pure_op(func, i)
                 && func.dfg.inst_results(i).iter().all(|&r| {
                     let r = func.dfg.resolve_aliases(r);
-                    uses.get(&r).copied().unwrap_or(0)
-                        == local.get(&r).copied().unwrap_or(0)
+                    uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
                 })
         }) {
             continue;
@@ -474,12 +472,7 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                             cand.iter().copied().find(|&c| same_value(func, r, c))
                         })
                         .collect();
-                    for (&r, s) in func
-                        .dfg
-                        .inst_results(i)
-                        .iter()
-                        .zip(subs.iter())
-                    {
+                    for (&r, s) in func.dfg.inst_results(i).iter().zip(subs.iter()) {
                         if let &Some(s) = s {
                             vmap.insert(func.dfg.resolve_aliases(r), s);
                         }

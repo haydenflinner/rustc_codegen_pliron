@@ -12,7 +12,6 @@
 //   TR-06-33870
 //   https://www.cs.rice.edu/~keith/EMBED/dom.pdf
 
-use core::u32;
 
 use alloc::vec::Vec;
 

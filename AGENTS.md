@@ -48,6 +48,9 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 - `harness/run.py [--tier 0|1] [--accept]` — runs suites (smoke with
   stock-rustc output diff, object determinism, ui) and fails on regressions
   against `harness/expectations/`; plan and status in `test-harness.md`
+- Pushing: this is a personal fork that may never be upstreamed — commit
+  and push completed work freely; no confirmation or personal-diff-review
+  protocol applies. Do not add `Co-Authored-By` trailers.
 - `tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]` — runs directive-free
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)

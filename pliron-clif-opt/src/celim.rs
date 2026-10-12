@@ -177,7 +177,10 @@ fn norm_icmp(func: &Function, i: Inst, peel: bool) -> Option<(Cmp, (Value, Value
             // as raw so range queries use `x`, not the `x - y` value.
             return Some((
                 (cond, op(func, s[0]), op(func, s[1])),
-                (func.dfg.resolve_aliases(s[0]), func.dfg.resolve_aliases(s[1])),
+                (
+                    func.dfg.resolve_aliases(s[0]),
+                    func.dfg.resolve_aliases(s[1]),
+                ),
             ));
         }
     }
@@ -285,12 +288,10 @@ fn uniform_slot(
             .iter()
             .filter(|bc| bc.block(&func.dfg.value_lists) == s)
             .all(|bc| {
-                bc.args(&func.dfg.value_lists)
-                    .nth(slot)
-                    .is_some_and(|a| {
-                        matches!(a, cranelift_codegen::ir::BlockArg::Value(u)
+                bc.args(&func.dfg.value_lists).nth(slot).is_some_and(|a| {
+                    matches!(a, cranelift_codegen::ir::BlockArg::Value(u)
                             if func.dfg.resolve_aliases(u) == v)
-                    })
+                })
             })
     })
 }
@@ -338,11 +339,7 @@ fn edge_facts(
                     let m = edge_args(func, cfg, t, s);
                     let fs = fact.entry(s).or_default();
                     // The branch value itself: `v != 0` on the taken edge.
-                    let vc = if take {
-                        IntCC::NotEqual
-                    } else {
-                        IntCC::Equal
-                    };
+                    let vc = if take { IntCC::NotEqual } else { IntCC::Equal };
                     fs.push((vc, sub_op(&m, plain(func, arg)), Op::K(0)));
                     for &i in if take { &icmps } else { &n_icmps } {
                         if let Some(((cc, x, y), _)) = norm_icmp(func, i, true) {
@@ -500,9 +497,7 @@ fn shift_k(cc: IntCC, k: u64, d: i64, full: u64) -> Option<u64> {
         IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual if d > 0 => {
             k.checked_sub(d as u64)
         }
-        IntCC::Equal | IntCC::NotEqual if d != 0 => {
-            Some(k.wrapping_sub(d as u64) & full)
-        }
+        IntCC::Equal | IntCC::NotEqual if d != 0 => Some(k.wrapping_sub(d as u64) & full),
         _ if d == 0 => Some(k),
         _ => None,
     }
@@ -510,9 +505,9 @@ fn shift_k(cc: IntCC, k: u64, d: i64, full: u64) -> Option<u64> {
 
 fn shift_ks(cc: IntCC, k: i64, d: i64, smin: i64, smax: i64) -> Option<i64> {
     match cc {
-        IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual if d < 0 => {
-            k.checked_add(d.unsigned_abs() as i64).filter(|&k2| k2 <= smax)
-        }
+        IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual if d < 0 => k
+            .checked_add(d.unsigned_abs() as i64)
+            .filter(|&k2| k2 <= smax),
         IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual if d > 0 => {
             k.checked_sub(d).filter(|&k2| k2 >= smin)
         }
@@ -556,9 +551,7 @@ fn urange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(u64, u6
                 IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual if d < 0 => {
                     lo = lo.max(d.unsigned_abs());
                 }
-                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual
-                    if d > 0 =>
-                {
+                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual if d > 0 => {
                     hi = hi.min(full.wrapping_sub(d as u64));
                 }
                 _ => {}
@@ -767,9 +760,7 @@ fn srange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(i64, i6
     let (mut lo, mut hi) = (smin, smax);
     for &&(cc, a, b) in fs {
         let (cc, k, d) = match (a, b) {
-            (Op::V(x, d), Op::K(k)) if x == v => {
-                (cc, shift_ks(cc, sext(k, w), d, smin, smax), d)
-            }
+            (Op::V(x, d), Op::K(k)) if x == v => (cc, shift_ks(cc, sext(k, w), d, smin, smax), d),
             (Op::K(k), Op::V(y, d)) if y == v => {
                 let cc = cc.swap_args();
                 (cc, shift_ks(cc, sext(k, w), d, smin, smax), d)
@@ -873,12 +864,8 @@ fn srange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(i64, i6
     // `x + d scc k` restates exactly when the add can't signed-wrap.
     for &&(cc, a, b) in fs {
         let (cc, k, d) = match (a, b) {
-            (Op::V(x, d), Op::K(k)) if x == v && d != 0 => {
-                (cc, sext(k, w), d)
-            }
-            (Op::K(k), Op::V(x, d)) if x == v && d != 0 => {
-                (cc.swap_args(), sext(k, w), d)
-            }
+            (Op::V(x, d), Op::K(k)) if x == v && d != 0 => (cc, sext(k, w), d),
+            (Op::K(k), Op::V(x, d)) if x == v && d != 0 => (cc.swap_args(), sext(k, w), d),
             _ => continue,
         };
         if shift_ks(cc, k, d, smin, smax).is_some() {
@@ -1165,9 +1152,7 @@ fn delta_implied(fc: IntCC, f: i128, q: i128, qc: IntCC) -> Option<bool> {
             UnsignedLessThan | SignedLessThan => (f <= q).then_some(true),
             UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f <= q + 1).then_some(true),
             UnsignedGreaterThan | SignedGreaterThan => (f <= q + 1).then_some(false),
-            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
-                (f <= q).then_some(false)
-            }
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => (f <= q).then_some(false),
             Equal => (f <= q).then_some(false),
             NotEqual => (f <= q).then_some(true),
         },
@@ -1176,18 +1161,14 @@ fn delta_implied(fc: IntCC, f: i128, q: i128, qc: IntCC) -> Option<bool> {
             UnsignedLessThan | SignedLessThan => (f < q).then_some(true),
             UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f <= q).then_some(true),
             UnsignedGreaterThan | SignedGreaterThan => (f <= q).then_some(false),
-            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
-                (f < q).then_some(false)
-            }
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => (f < q).then_some(false),
             Equal => (f < q).then_some(false),
             NotEqual => (f < q).then_some(true),
         },
         // x >= y + F + 1
         UnsignedGreaterThan | SignedGreaterThan => match qc {
             UnsignedGreaterThan | SignedGreaterThan => (f >= q).then_some(true),
-            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
-                (f + 1 >= q).then_some(true)
-            }
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => (f + 1 >= q).then_some(true),
             UnsignedLessThan | SignedLessThan => (f + 1 >= q).then_some(false),
             UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f >= q).then_some(false),
             Equal => (q <= f).then_some(false),
@@ -1196,13 +1177,9 @@ fn delta_implied(fc: IntCC, f: i128, q: i128, qc: IntCC) -> Option<bool> {
         // x >= y + F
         UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => match qc {
             UnsignedGreaterThan | SignedGreaterThan => (f > q).then_some(true),
-            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => {
-                (f >= q).then_some(true)
-            }
+            UnsignedGreaterThanOrEqual | SignedGreaterThanOrEqual => (f >= q).then_some(true),
             UnsignedLessThan | SignedLessThan => (f >= q).then_some(false),
-            UnsignedLessThanOrEqual | SignedLessThanOrEqual => {
-                (f > q).then_some(false)
-            }
+            UnsignedLessThanOrEqual | SignedLessThanOrEqual => (f > q).then_some(false),
             Equal => (q < f).then_some(false),
             NotEqual => (q < f).then_some(true),
         },
@@ -1306,9 +1283,7 @@ fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<b
                     if let Some(r) = off_implied(cc, qd2 - fd2, qd1 - fd1, q.0.swap_args()) {
                         return Some(r);
                     }
-                    if let Some(r) =
-                        fact_off_implied(cc, fd2 - qd2, fd1 - qd1, q.0.swap_args())
-                    {
+                    if let Some(r) = fact_off_implied(cc, fd2 - qd2, fd1 - qd1, q.0.swap_args()) {
                         return Some(r);
                     }
                 }
@@ -1499,11 +1474,8 @@ fn fold_guard_bands(func: &mut Function) -> usize {
                     let ty = func.dfg.value_type(func.dfg.first_result(i));
                     func.replace(i).iconst(ty, 0);
                 } else {
-                    func.replace(i).icmp_imm_u(
-                        IntCC::UnsignedLessThanOrEqual,
-                        x,
-                        bnd as i64,
-                    );
+                    func.replace(i)
+                        .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, x, bnd as i64);
                 }
                 break;
             }

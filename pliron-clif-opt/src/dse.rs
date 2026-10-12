@@ -22,9 +22,7 @@
 //! (they just can't be removed).
 
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{
-    Block, FuncRef, Function, Inst, InstructionData, Opcode, Value,
-};
+use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, InstructionData, Opcode, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
@@ -120,9 +118,11 @@ fn mem_width(func: &Function, i: Inst) -> Option<i64> {
             _ => return None,
         }),
         InstructionData::Store { opcode, args, .. } => Some(match opcode {
-            Opcode::Store => {
-                i64::from(func.dfg.value_type(func.dfg.resolve_aliases(args[0])).bytes())
-            }
+            Opcode::Store => i64::from(
+                func.dfg
+                    .value_type(func.dfg.resolve_aliases(args[0]))
+                    .bytes(),
+            ),
             Opcode::Istore8 => 1,
             Opcode::Istore16 => 2,
             Opcode::Istore32 => 4,

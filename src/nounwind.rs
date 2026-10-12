@@ -11,8 +11,8 @@ use pliron_llvm::ops::CallOp;
 use rustc_hash::FxHashSet;
 
 use crate::context::State;
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
 
 fn may_unwind(ctx: &Context, st: &State, f: Ptr<Operation>, nw: &FxHashSet<String>) -> bool {
     blocks(ctx, f).into_iter().any(|b| {

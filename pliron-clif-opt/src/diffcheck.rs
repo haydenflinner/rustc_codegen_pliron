@@ -1431,7 +1431,7 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
         .map(|b| f.dfg.block_params(b).iter().copied().collect())
         .unwrap_or_default();
     let mut s = String::from("; diffcheck-facts:");
-    let mut sorted = |vals: Vec<String>| {
+    let sorted = |vals: Vec<String>| {
         let mut v = vals;
         v.sort();
         v.join(",")

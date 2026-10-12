@@ -23,9 +23,9 @@
 //! deadrecs.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::entity::packed_option::ReservedValue;
-use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::ir::{
     Block, BlockArg, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData, Opcode,
     Value, ValueDef, condcodes::IntCC,
@@ -99,10 +99,8 @@ fn edges_to(func: &Function) -> FxHashMap<Block, Vec<(Inst, usize)>> {
 /// Resolved `Value` args of one edge destination; `None` on non-Value
 /// pseudo-args (TryCallRet/Exn) or arity mismatch.
 fn edge_args(func: &Function, i: Inst, d: usize, n: usize) -> Option<Vec<Value>> {
-    let bc = &func.dfg.insts[i].branch_destination(
-        &func.dfg.jump_tables,
-        &func.dfg.exception_tables,
-    )[d];
+    let bc =
+        &func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
     let mut v = Vec::with_capacity(n);
     for a in bc.args(&func.dfg.value_lists) {
         match a {
@@ -255,9 +253,9 @@ fn refold_header(
             continue;
         }
         let g = good_drops(ix, s);
-        if ai_opt
-            .is_none_or(|(_, g2, ic, b)| (g, icmp_use[ix], u64::MAX - s.unsigned_abs()) > (g2, ic, b))
-        {
+        if ai_opt.is_none_or(|(_, g2, ic, b)| {
+            (g, icmp_use[ix], u64::MAX - s.unsigned_abs()) > (g2, ic, b)
+        }) {
             ai_opt = Some((ix, g, icmp_use[ix], u64::MAX - s.unsigned_abs()));
         }
     }
@@ -309,16 +307,14 @@ fn refold_header(
     // per use: single-use chains fold into base+index*scale amodes, so
     // no address computation materializes at all. Non-address uses share
     // the `pv` materialized at the top of `h` as before.
-    let drop_of: FxHashMap<Value, usize> = drops
-        .iter()
-        .map(|&(ix, _)| (params[ix], ix))
-        .collect();
+    let drop_of: FxHashMap<Value, usize> = drops.iter().map(|&(ix, _)| (params[ix], ix)).collect();
     let mut addr_uses: Vec<(Inst, usize)> = vec![];
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let a = match func.dfg.insts[i] {
-                InstructionData::Load { arg, .. }
-                | InstructionData::LoadNoOffset { arg, .. } => arg,
+                InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => {
+                    arg
+                }
                 InstructionData::Store { args, .. }
                 | InstructionData::StoreNoOffset { args, .. } => args[1],
                 _ => continue,
@@ -399,8 +395,7 @@ fn refold_header(
             InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => {
                 *arg = v_a;
             }
-            InstructionData::Store { args, .. }
-            | InstructionData::StoreNoOffset { args, .. } => {
+            InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
                 args[1] = v_a;
             }
             _ => {}
@@ -425,7 +420,8 @@ fn refold_header(
     // Global use rewrite (inst args, branch-dest args, exn contexts).
     for b in func.layout.blocks().collect::<Vec<_>>() {
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
-            func.dfg.map_inst_values(i, |x| pmap.get(&x).copied().unwrap_or(x));
+            func.dfg
+                .map_inst_values(i, |x| pmap.get(&x).copied().unwrap_or(x));
         }
     }
     // Strip the dropped arg slots (descending keeps indices valid).
@@ -437,10 +433,8 @@ fn refold_header(
     ixs.sort_unstable_by(|x, y| y.cmp(x));
     for &(i, d) in entries.iter().chain(backs.iter()) {
         let dfg = &mut func.dfg;
-        let bc = &mut dfg.insts[i].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[d];
+        let bc = &mut dfg.insts[i]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
         for &ix in &ixs {
             bc.remove(ix, &mut dfg.value_lists);
         }
@@ -481,34 +475,34 @@ fn refold_header(
             // Two exit forms: `icmp ne/eq step(c), k`, or `brif step(c)`
             // directly — a countdown exiting when the step value is zero.
             // `kv` is `None` for the brif form (k = 0).
-            let (cinst, kv): (Option<Inst>, Option<Value>) =
-                match func.dfg.value_def(cr) {
-                    ValueDef::Result(i, _)
-                        if let InstructionData::IntCompare {
-                            cond: cc, args: cargs, ..
-                        } = func.dfg.insts[i]
-                            && (d == 0 && cc == IntCC::NotEqual
-                                || d == 1 && cc == IntCC::Equal) =>
-                    {
-                        // `h` on the then-arm needs `ne` (loop while step
-                        // != k); on the else-arm `eq`.
-                        if func.dfg.resolve_aliases(cargs[0]) == a_c {
-                            (Some(i), Some(cargs[1]))
-                        } else if func.dfg.resolve_aliases(cargs[1]) == a_c {
-                            (Some(i), Some(cargs[0]))
-                        } else {
-                            continue;
-                        }
+            let (cinst, kv): (Option<Inst>, Option<Value>) = match func.dfg.value_def(cr) {
+                ValueDef::Result(i, _)
+                    if let InstructionData::IntCompare {
+                        cond: cc,
+                        args: cargs,
+                        ..
+                    } = func.dfg.insts[i]
+                        && (d == 0 && cc == IntCC::NotEqual || d == 1 && cc == IntCC::Equal) =>
+                {
+                    // `h` on the then-arm needs `ne` (loop while step
+                    // != k); on the else-arm `eq`.
+                    if func.dfg.resolve_aliases(cargs[0]) == a_c {
+                        (Some(i), Some(cargs[1]))
+                    } else if func.dfg.resolve_aliases(cargs[1]) == a_c {
+                        (Some(i), Some(cargs[0]))
+                    } else {
+                        continue;
                     }
-                    _ => {
-                        // `brif step(c)` with `h` on the then-arm exits
-                        // when the step value hits zero.
-                        if !(d == 0 && cr == a_c && func.dfg.value_type(cr) == aty) {
-                            continue;
-                        }
-                        (None, None)
+                }
+                _ => {
+                    // `brif step(c)` with `h` on the then-arm exits
+                    // when the step value hits zero.
+                    if !(d == 0 && cr == a_c && func.dfg.value_type(cr) == aty) {
+                        continue;
                     }
-                };
+                    (None, None)
+                }
+            };
             // A runtime `k` must dominate the entry edge `ei` — a
             // loop-variant `k` isn't a fixed exit anyway, and emitting
             // `num` at `ei` would use it before its def.
@@ -563,8 +557,7 @@ fn refold_header(
                         || !sa.is_power_of_two()
                         || sa > 128
                         || astep.trailing_zeros() > 7
-                        || !(k_iconst
-                            .is_some_and(|k| (k as u64).wrapping_rem(sa) == 0)
+                        || !(k_iconst.is_some_and(|k| (k as u64).wrapping_rem(sa) == 0)
                             || provably_div(func, edges, kv.unwrap(), sa))
                         || !provably_div(func, edges, e_cv, sa)
                     {
@@ -597,10 +590,9 @@ fn refold_header(
                             break 'scan;
                         }
                     }
-                    for bc in func.dfg.insts[i].branch_destination(
-                        &func.dfg.jump_tables,
-                        &func.dfg.exception_tables,
-                    ) {
+                    for bc in func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    {
                         for a in bc.args(&func.dfg.value_lists) {
                             if let BlockArg::Value(x) = a {
                                 let r = func.dfg.resolve_aliases(x);
@@ -713,9 +705,7 @@ fn pd(
         // A param of a single-pred block equals the arg that edge passes —
         // unless the edge is a self-loop, where the param is an IV.
         ValueDef::Param(b, ix) => match edges.get(&b) {
-            Some(es)
-                if es.len() == 1 && func.layout.inst_block(es[0].0) != Some(b) =>
-            {
+            Some(es) if es.len() == 1 && func.layout.inst_block(es[0].0) != Some(b) => {
                 let (i, d) = es[0];
                 let np = func.dfg.block_params(b).len();
                 edge_args(func, i, d, np).is_some_and(|a| pd(a[ix]))
@@ -883,10 +873,8 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
         ixs.sort_unstable_by(|x, y| y.cmp(x));
         for &(i, d) in es {
             let dfg = &mut func.dfg;
-            let bc = &mut dfg.insts[i].branch_destination_mut(
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-            )[d];
+            let bc = &mut dfg.insts[i]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
             for &ix in &ixs {
                 bc.remove(ix, &mut dfg.value_lists);
             }

@@ -31,10 +31,10 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::state::State;
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
 use crate::nowrite::PURE;
+use crate::state::State;
 
 const MAX_PARAMS: usize = 64;
 
@@ -62,11 +62,7 @@ fn all_ops(ctx: &Context, m: &Masks, op: Ptr<Operation>) -> u64 {
 /// neither), branch operands flow into successor block params, and a call's
 /// landing-pad exception payload conservatively inherits its args. `None`
 /// when `f` has no trackable params.
-fn deriv(
-    ctx: &Context,
-    st: &State,
-    f: Ptr<Operation>,
-) -> Option<(Vec<Ptr<BasicBlock>>, Masks)> {
+fn deriv(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<(Vec<Ptr<BasicBlock>>, Masks)> {
     let bs = blocks(ctx, f);
     let mut m: Masks = FxHashMap::default();
     let mut seeds = 0;
@@ -91,8 +87,8 @@ fn deriv(
                     (ae | e, af | f)
                 });
                 let d = op.deref(ctx);
-                let pred = Operation::is_op::<ICmpOp>(op, ctx)
-                    || Operation::is_op::<FCmpOp>(op, ctx);
+                let pred =
+                    Operation::is_op::<ICmpOp>(op, ctx) || Operation::is_op::<FCmpOp>(op, ctx);
                 for r in d.results() {
                     // A pointer result is the derived pointer itself; an
                     // int result may still encode it. Predicates encode
@@ -192,9 +188,7 @@ fn captured(
                 match st.intrinsics.get(&op).map(|s| s.as_str()) {
                     // Copies the src region out; its contents may hold
                     // pointers into it. dst is a region write.
-                    Some("llvm.memcpy") | Some("llvm.memmove") => {
-                        cap |= mask(m, d.get_operand(1))
-                    }
+                    Some("llvm.memcpy") | Some("llvm.memmove") => cap |= mask(m, d.get_operand(1)),
                     // Writes the dst region; nothing retained.
                     Some("llvm.memset") => {}
                     Some(n)
@@ -244,8 +238,11 @@ pub fn run(ctx: &Context, st: &mut State) {
             let Some((bs, m)) = ds.get(s) else { continue };
             let cap = captured(ctx, st, bs, m, &nc);
             let cur = nc.get_mut(s).unwrap();
-            let keep: FxHashSet<u32> =
-                cur.iter().copied().filter(|&i| cap & (1 << i) == 0).collect();
+            let keep: FxHashSet<u32> = cur
+                .iter()
+                .copied()
+                .filter(|&i| cap & (1 << i) == 0)
+                .collect();
             if keep.len() != cur.len() {
                 *cur = keep;
                 changed = true;
@@ -257,7 +254,10 @@ pub fn run(ctx: &Context, st: &mut State) {
     }
     if crate::env_set("PLIRON_STATS") {
         let (p, t): (usize, usize) = nc.values().fold((0, 0), |(p, t), s| (p + s.len(), t + 1));
-        eprintln!("nocapture {}: {p} non-capturing params across {t} bodies", st.cgu);
+        eprintln!(
+            "nocapture {}: {p} non-capturing params across {t} bodies",
+            st.cgu
+        );
     }
     st.nocapture = nc;
 }

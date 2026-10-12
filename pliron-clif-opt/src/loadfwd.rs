@@ -61,10 +61,9 @@ pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
     let mut src: FxHashMap<Value, Option<Value>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
-            for bc in func.dfg.insts[i].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 let dst = bc.block(&func.dfg.value_lists);
                 let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
                 let params = func.dfg.block_params(dst);
@@ -97,7 +96,9 @@ pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
             }
         }
     }
-    src.into_iter().filter_map(|(p, s)| s.map(|s| (p, s))).collect()
+    src.into_iter()
+        .filter_map(|(p, s)| s.map(|s| (p, s)))
+        .collect()
 }
 
 /// Chase `param_src` links (plus value aliases) to the value `v` provably
@@ -129,8 +130,8 @@ pub fn psrc(
 /// `j` counts only `BlockArg::Value`s, matching `inst_values`' ordering.
 /// `None` for exception-context uses, which can't be traced.
 fn fwd_arg(func: &Function, i: Inst, mut j: usize) -> Option<(Block, usize)> {
-    for bc in func.dfg.insts[i]
-        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+    for bc in
+        func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
     {
         for (pos, a) in bc.args(&func.dfg.value_lists).enumerate() {
             if a.as_value().is_some() {
@@ -257,12 +258,7 @@ pub fn kill(
 /// A direct call to a function that writes no memory before returning
 /// normally; across `try_call` it must not write at all unless `eh`, where
 /// [`unwind_edge`] clears the exception edges instead (nowrite.rs).
-pub fn write_free(
-    func: &Function,
-    i: Inst,
-    nw: &FxHashMap<FuncRef, bool>,
-    eh: bool,
-) -> bool {
+pub fn write_free(func: &Function, i: Inst, nw: &FxHashMap<FuncRef, bool>, eh: bool) -> bool {
     match func.dfg.insts[i] {
         InstructionData::Call { func_ref, .. } => nw.contains_key(&func_ref),
         InstructionData::TryCall { func_ref, .. } => {
@@ -395,7 +391,12 @@ fn sel_split(
     off: i64,
     ty: Type,
 ) -> Option<Fwd> {
-    if !(ty.is_int() && ty.bits() <= 64 || matches!(ty, cranelift_codegen::ir::types::F32 | cranelift_codegen::ir::types::F64)) {
+    if !(ty.is_int() && ty.bits() <= 64
+        || matches!(
+            ty,
+            cranelift_codegen::ir::types::F32 | cranelift_codegen::ir::types::F64
+        ))
+    {
         return None;
     }
     let (r, _) = root(func, ps, na, arg);
@@ -457,7 +458,10 @@ fn transfer(
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
                 if crate::env_set("PLIRON_LFDEBUG") {
-                    eprintln!("load {res} arg {arg} root {r:?} off {off} av={:?}", av.get(&loc));
+                    eprintln!(
+                        "load {res} arg {arg} root {r:?} off {off} av={:?}",
+                        av.get(&loc)
+                    );
                 }
                 // `!invariant.load`: the location holds one value for the
                 // whole program point range the load is legal at — mark it
@@ -485,8 +489,10 @@ fn transfer(
                     if let Some(rw) = rw.as_deref_mut() {
                         rw.push((i, Fwd::V(v)));
                     }
-                } else if let Some(s) =
-                    rw.is_some().then(|| sel_split(func, ps, na, av, arg, off, ty)).flatten()
+                } else if let Some(s) = rw
+                    .is_some()
+                    .then(|| sel_split(func, ps, na, av, arg, off, ty))
+                    .flatten()
                 {
                     rw.as_deref_mut().unwrap().push((i, s));
                 } else if av.len() < MAX_ENTRIES {
@@ -529,9 +535,9 @@ fn transfer(
                         iso.contains(&r)
                             || invs.contains(&(r, o, t))
                             || cur.is_some_and(|cur| {
-                                invreg.get(&(r, o, t)).is_some_and(|rs| {
-                                    rs.iter().any(|&t2| in_region(cur, t2, rpar))
-                                })
+                                invreg
+                                    .get(&(r, o, t))
+                                    .is_some_and(|rs| rs.iter().any(|&t2| in_region(cur, t2, rpar)))
                             })
                     });
                 }
@@ -543,9 +549,9 @@ fn transfer(
                 av.retain(|&(r, o, t), _| {
                     invs.contains(&(r, o, t))
                         || cur.is_some_and(|cur| {
-                            invreg.get(&(r, o, t)).is_some_and(|rs| {
-                                rs.iter().any(|&t2| in_region(cur, t2, rpar))
-                            })
+                            invreg
+                                .get(&(r, o, t))
+                                .is_some_and(|rs| rs.iter().any(|&t2| in_region(cur, t2, rpar)))
                         })
                 });
             }
@@ -611,11 +617,7 @@ pub fn run(
     // Root-resolution stop set: real `noalias` plus frozen operands —
     // either way the value names its own memory scope. `isolated` keeps
     // the real set so operand values don't get function-wide immunity.
-    let stop: FxHashSet<Value> = noalias
-        .iter()
-        .chain(ofrozen.keys())
-        .copied()
-        .collect();
+    let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
     if crate::pass_enabled("PLIRON_LOADPRE") {
         n += pre(func, &ps, &stop, &cfg, &rpo, entry);
         if n > 0 {

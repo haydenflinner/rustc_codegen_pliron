@@ -217,12 +217,21 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
         macro_rules! require {
             ($cond:expr, $err:expr) => {
-                if !$cond { fail!($err) }
+                if !$cond {
+                    fail!($err)
+                }
             };
         }
         macro_rules! require_simd {
             ($ty:expr, $variant:ident) => {{
-                require!($ty.is_simd(), IM::$variant { span, name: name_sym, ty: $ty });
+                require!(
+                    $ty.is_simd(),
+                    IM::$variant {
+                        span,
+                        name: name_sym,
+                        ty: $ty
+                    }
+                );
                 $ty.simd_size_and_type(self.tcx)
             }};
         }
@@ -258,7 +267,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             };
             require!(
                 ok,
-                IM::InvalidBitmask { span, name: name_sym, mask_ty, expected_int_bits, expected_bytes }
+                IM::InvalidBitmask {
+                    span,
+                    name: name_sym,
+                    mask_ty,
+                    expected_int_bits,
+                    expected_bytes
+                }
             );
         }
 
@@ -279,18 +294,33 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 require!(
                     out_len == in_len,
                     IM::ReturnLengthInputType {
-                        span, name: name_sym, in_len, in_ty, ret_ty: ret_rty, out_len
+                        span,
+                        name: name_sym,
+                        in_len,
+                        in_ty,
+                        ret_ty: ret_rty,
+                        out_len
                     }
                 );
                 require!(
                     out_ty.is_integral(),
-                    IM::ReturnIntegerType { span, name: name_sym, ret_ty: ret_rty, out_ty }
+                    IM::ReturnIntegerType {
+                        span,
+                        name: name_sym,
+                        ret_ty: ret_rty,
+                        out_ty
+                    }
                 );
             }
             "and" | "or" | "xor" | "shl" | "shr" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
+                    IM::UnsupportedOperation {
+                        span,
+                        name: name_sym,
+                        in_ty,
+                        in_elem
+                    }
                 );
             }
             "saturating_add" | "saturating_sub" => {
@@ -304,11 +334,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     }
                 );
             }
-            "bswap" | "bitreverse" | "ctlz" | "ctpop" | "cttz" | "carryless_mul"
-            | "funnel_shl" | "funnel_shr" => {
+            "bswap" | "bitreverse" | "ctlz" | "ctpop" | "cttz" | "carryless_mul" | "funnel_shl"
+            | "funnel_shr" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
+                    IM::UnsupportedOperation {
+                        span,
+                        name: name_sym,
+                        in_ty,
+                        in_elem
+                    }
                 );
             }
             "cast" => {
@@ -316,20 +351,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 require!(
                     out_len == in_len,
                     IM::ReturnLengthInputType {
-                        span, name: name_sym, in_len, in_ty, ret_ty: ret_rty, out_len
+                        span,
+                        name: name_sym,
+                        in_len,
+                        in_ty,
+                        ret_ty: ret_rty,
+                        out_len
                     }
                 );
             }
             "select" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: in_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: in_elem
+                    }
                 );
                 let (v_len, _) = require_simd!(args[1].layout.ty, SimdArgument);
                 require_simd!(args[2].layout.ty, SimdArgument);
                 require!(
                     v_len == in_len,
-                    IM::MismatchedLengths { span, name: name_sym, m_len: in_len, v_len }
+                    IM::MismatchedLengths {
+                        span,
+                        name: name_sym,
+                        m_len: in_len,
+                        v_len
+                    }
                 );
             }
             "insert" => {
@@ -360,7 +409,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "extract" => {
                 require!(
                     ret_rty == in_elem,
-                    IM::ReturnType { span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty }
+                    IM::ReturnType {
+                        span,
+                        name: name_sym,
+                        in_elem,
+                        in_ty,
+                        ret_ty: ret_rty
+                    }
                 );
                 if name == "simd_extract"
                     && let Some(ConstVal::Bits(bits)) = self.cval(a(1))
@@ -389,7 +444,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     {
                         idx_ty.simd_size_and_type(self.tcx).0
                     } else {
-                        fail!(IM::SimdShuffle { span, name: name_sym, ty: idx_ty })
+                        fail!(IM::SimdShuffle {
+                            span,
+                            name: name_sym,
+                            ty: idx_ty
+                        })
                     }
                 };
                 let (out_len, out_ty) = require_simd!(ret_rty, SimdReturn);
@@ -416,8 +475,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 let total_len = u128::from(in_len) * 2;
                 if name == "simd_shuffle_const_generic" {
-                    for (i, c) in
-                        instance.args[2].expect_const().to_branch().iter().enumerate()
+                    for (i, c) in instance.args[2]
+                        .expect_const()
+                        .to_branch()
+                        .iter()
+                        .enumerate()
                     {
                         if u128::from(c.to_leaf().to_u32()) >= total_len {
                             fail!(IM::SimdIndexOutOfBounds {
@@ -430,7 +492,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     }
                 } else if let Some(ConstVal::Agg(ids)) = self.cval(a(2)) {
                     for (i, id) in ids.iter().enumerate() {
-                        if self.const_to_opt_u128(*id, true).is_some_and(|k| k >= total_len) {
+                        if self
+                            .const_to_opt_u128(*id, true)
+                            .is_some_and(|k| k >= total_len)
+                        {
                             fail!(IM::SimdIndexOutOfBounds {
                                 span,
                                 name: name_sym,
@@ -488,7 +553,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 require!(
                     in_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: in_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: in_elem
+                    }
                 );
             }
             "gather" | "scatter" => {
@@ -521,7 +590,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 if base == "gather" {
                     require!(
                         ret_rty == in_ty,
-                        IM::ExpectedReturnType { span, name: name_sym, in_ty, ret_ty: ret_rty }
+                        IM::ExpectedReturnType {
+                            span,
+                            name: name_sym,
+                            in_ty,
+                            ret_ty: ret_rty
+                        }
                     );
                 }
                 let mutability = if base == "scatter" {
@@ -543,7 +617,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 require!(
                     mask_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: mask_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: mask_elem
+                    }
                 );
             }
             "bitmask" => {
@@ -551,11 +629,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let expected_bytes = in_len / 8 + u64::from(!in_len.is_multiple_of(8));
                 let ok = match *ret_rty.kind() {
                     ty::Int(i) => i.bit_width() == Some(expected_int_bits),
-                ty::Uint(i) => i.bit_width() == Some(expected_int_bits),
+                    ty::Uint(i) => i.bit_width() == Some(expected_int_bits),
                     ty::Array(elem, l) => {
                         matches!(elem.kind(), ty::Uint(ty::UintTy::U8))
-                            && l.try_to_target_usize(self.tcx).unwrap_or(u64::MAX)
-                                == expected_bytes
+                            && l.try_to_target_usize(self.tcx).unwrap_or(u64::MAX) == expected_bytes
                     }
                     _ => false,
                 };
@@ -578,14 +655,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     require!(
                         ret_rty == in_elem,
                         IM::ReturnType {
-                            span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty
+                            span,
+                            name: name_sym,
+                            in_elem,
+                            in_ty,
+                            ret_ty: ret_rty
                         }
                     );
                 }
                 let int_only = !matches!(
                     base,
-                    "reduce_add" | "reduce_mul" | "reduce_add_ordered" | "reduce_mul_ordered"
-                        | "reduce_add_unordered" | "reduce_mul_unordered"
+                    "reduce_add"
+                        | "reduce_mul"
+                        | "reduce_add_ordered"
+                        | "reduce_mul_ordered"
+                        | "reduce_add_unordered"
+                        | "reduce_mul_unordered"
                 );
                 require!(
                     if int_only {
@@ -607,7 +692,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
 
         if op == "expose_provenance" || op == "with_exposed_provenance" {
-            let (n, _) = self.elem_of(ret_rty);
+            let (_n, _) = self.elem_of(ret_rty);
             let et = self.element_type(ret);
             let xs = self.arg_lanes(&args[0]);
             let out = xs
@@ -630,7 +715,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (n, e) = if args[0].layout.ty.is_simd() {
             self.elem_of(args[0].layout.ty)
         } else {
-            (0, Elem { signed: false, float: false })
+            (
+                0,
+                Elem {
+                    signed: false,
+                    float: false,
+                },
+            )
         };
         match base {
             "add" | "sub" | "mul" | "div" | "rem" | "shl" | "shr" | "and" | "or" | "xor"
@@ -1107,7 +1198,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | "llvm.x86.avx512.max.ps.512"
             | "llvm.x86.avx512.max.pd.512" => {
                 // maxps returns the second operand unless a > b (NaNs, +-0).
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -1123,7 +1214,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | "llvm.x86.avx512.min.ps.512"
             | "llvm.x86.avx512.min.pd.512" => {
                 // minps returns the second operand unless a < b (NaNs, +-0).
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -1135,7 +1226,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "llvm.x86.avx512.mask.cmp.ps.512" | "llvm.x86.avx512.mask.cmp.pd.512" => {
                 // (a, b, imm, k, sae) -> integer bitmask of the predicate, ANDed with k.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
-                let (n, _) = self.elem_of(args[0].layout.ty);
+                let (_n, _) = self.elem_of(args[0].layout.ty);
                 let mt = self.val_ty(a(3));
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut acc = self.const_int(mt, 0);
@@ -1161,7 +1252,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Predicates 16..31 only differ in signaling, so the low 4 bits suffice.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
                 let pred = X86_CMP[imm as usize];
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
                 let it = self.type_ix(if name.contains(".ps") { 32 } else { 64 });
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
@@ -1201,5 +1292,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 /// x86 `cmpps` immediate (low 4 bits) to predicate.
 const X86_CMP: [rustc_codegen_ssa::common::RealPredicate; 16] = {
     use rustc_codegen_ssa::common::RealPredicate::*;
-    [RealOEQ, RealOLT, RealOLE, RealUNO, RealUNE, RealUGE, RealUGT, RealORD, RealUEQ, RealULT, RealULE, RealPredicateFalse, RealONE, RealOGE, RealOGT, RealPredicateTrue]
+    [
+        RealOEQ,
+        RealOLT,
+        RealOLE,
+        RealUNO,
+        RealUNE,
+        RealUGE,
+        RealUGT,
+        RealORD,
+        RealUEQ,
+        RealULT,
+        RealULE,
+        RealPredicateFalse,
+        RealONE,
+        RealOGE,
+        RealOGT,
+        RealPredicateTrue,
+    ]
 };

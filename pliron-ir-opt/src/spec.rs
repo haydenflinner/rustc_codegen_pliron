@@ -18,9 +18,9 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, UndefOp};
 use rustc_hash::FxHashMap;
 
-use crate::state::State;
-use crate::inline::{blocks, direct_callee, ops};
 use crate::has_body;
+use crate::inline::{blocks, direct_callee, ops};
+use crate::state::State;
 
 pub fn run(ctx: &mut Context, st: &mut State) {
     let dbg = crate::env_set("PLIRON_SPEC_DEBUG");
@@ -62,10 +62,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let Some(calls) = sites.get(sym) else {
             continue;
         };
-        let params: Vec<Value> = blocks(ctx, f.op)[0]
-            .deref(ctx)
-            .arguments()
-            .collect();
+        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments().collect();
         let args: Vec<Vec<Value>> = calls
             .iter()
             .map(|&c| Operation::get_op::<CallOp>(c, ctx).unwrap().args(ctx))

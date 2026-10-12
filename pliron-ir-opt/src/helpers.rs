@@ -10,10 +10,7 @@ use crate::state::{ConstVal, State};
 /// Functions whose address is used other than as a direct callee: symbol
 /// constants that are used or sit in global/aggregate initializers, and names
 /// mentioned in asm.
-pub fn address_taken(
-    ctx: &Context,
-    st: &State,
-) -> rustc_hash::FxHashSet<String> {
+pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
     for c in st.consts.values() {

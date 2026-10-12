@@ -44,9 +44,8 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
         let f = object::read::macho::MachOFile64::<object::Endianness>::parse(&*bytes).unwrap();
         splice(&f, out, x86);
     } else if coff {
-        let f =
-            object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(&*bytes)
-                .unwrap();
+        let f = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(&*bytes)
+            .unwrap();
         splice(&f, out, x86);
     } else {
         let f = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes).unwrap();
@@ -81,7 +80,10 @@ where
         if !keep {
             continue;
         }
-        let seg = s.segment_name_bytes().unwrap_or_default().unwrap_or_default();
+        let seg = s
+            .segment_name_bytes()
+            .unwrap_or_default()
+            .unwrap_or_default();
         let id = out.add_section(seg.to_vec(), name.to_vec(), kind);
         let sec = out.section_mut(id);
         if matches!(

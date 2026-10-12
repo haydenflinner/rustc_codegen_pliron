@@ -90,7 +90,9 @@ fn rename(func: &mut Function, old: Value, new: Value) {
 /// `ir::FuncRef` whose user name refers back to `id`, if one is declared.
 fn self_ref(func: &Function, id: FuncId) -> Option<FuncRef> {
     func.dfg.ext_funcs.iter().find_map(|(fr, d)| {
-        let ExternalName::User(u) = &d.name else { return None };
+        let ExternalName::User(u) = &d.name else {
+            return None;
+        };
         let n = &func.params.user_named_funcs()[*u];
         (n.namespace == 0 && n.index == id.as_u32()).then_some(fr)
     })
@@ -111,7 +113,9 @@ pub fn run(func: &mut Function, id: FuncId) -> usize {
     if !rty.is_int() || rty == types::I128 {
         return 0;
     }
-    let Some(sref) = self_ref(func, id) else { return 0 };
+    let Some(sref) = self_ref(func, id) else {
+        return 0;
+    };
     // Find `call self; ..; acc_op(expr, r); return`: the call, the
     // accumulate, and the return must be the block's last three insts so
     // nothing observes the removed call between them.
@@ -133,7 +137,9 @@ pub fn run(func: &mut Function, id: FuncId) -> usize {
         let InstructionData::Binary { opcode, args } = func.dfg.insts[bi] else {
             continue;
         };
-        let Some(ident) = accop(opcode, rty) else { continue };
+        let Some(ident) = accop(opcode, rty) else {
+            continue;
+        };
         let rv = func.dfg.resolve_aliases(func.dfg.inst_args(ri)[0]);
         if func.dfg.value_def(rv).inst() != Some(bi) {
             continue;

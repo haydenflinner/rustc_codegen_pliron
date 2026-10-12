@@ -42,8 +42,8 @@ mod xcgu;
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
-    address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt,
-    nnret, nocapture, nowrite, phisimp, retarg, spec, sroa,
+    address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
+    nowrite, phisimp, retarg, spec, sroa,
 };
 
 use std::any::Any;
@@ -101,7 +101,8 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
     // symbol's bytes rather than its address.
     let coff = sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
-    fb.set("is_pic", if coff { "false" } else { "true" }).unwrap();
+    fb.set("is_pic", if coff { "false" } else { "true" })
+        .unwrap();
     if crate::env_is("PLIRON_RA_CHECK", "1") {
         fb.set("regalloc_checker", "true").unwrap();
     }
@@ -166,9 +167,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
     fb.set(
         "opt_level",
-        if sess.opts.optimize == OptLevel::No
-            || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH")
-        {
+        if sess.opts.optimize == OptLevel::No || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH") {
             "none"
         } else {
             "speed_and_size"
@@ -192,7 +191,10 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
     // Target features → ISA flags. `sess.internal_target_features` holds the
     // effective set (spec baseline + `-Ctarget-cpu` + `-Ctarget-feature`).
-    let tf = |rust: &str| sess.internal_target_features.contains(&Symbol::intern(rust));
+    let tf = |rust: &str| {
+        sess.internal_target_features
+            .contains(&Symbol::intern(rust))
+    };
     let isa_feats: &[(&str, &str)] = match triple.architecture {
         target_lexicon::Architecture::Aarch64(_) => &[
             ("lse", "has_lse"),
@@ -319,9 +321,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let coff_eh = cx.tcx.sess.target.options.binary_format
             == rustc_target::spec::BinaryFormat::Coff
             && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
-        if crate::env_is("PLIRON_NOUNWIND", "1")
-            || (coff_eh && pass_enabled("PLIRON_NOUNWIND"))
-        {
+        if crate::env_is("PLIRON_NOUNWIND", "1") || (coff_eh && pass_enabled("PLIRON_NOUNWIND")) {
             nounwind::run(ctx, st);
         }
         if pass_enabled("PLIRON_SRET2REG") {
@@ -435,7 +435,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     let isa = build_isa(
         cx.tcx.sess,
-        cx.tcx.features().enabled(rustc_span::sym::explicit_tail_calls)
+        cx.tcx
+            .features()
+            .enabled(rustc_span::sym::explicit_tail_calls)
             || crate::env_set("PLIRON_TAILCALL"),
     );
     let hot = crate::env_get("PLIRON_HOT")
@@ -478,7 +480,12 @@ fn base_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool {
     if baseline.contains(&feature) {
         return true;
     }
-    let cpu = sess.opts.cg.target_cpu.as_deref().unwrap_or(&sess.target.cpu);
+    let cpu = sess
+        .opts
+        .cg
+        .target_cpu
+        .as_deref()
+        .unwrap_or(&sess.target.cpu);
     if cpu == "native" {
         return native_has_feature(sess, feature);
     }
@@ -533,21 +540,55 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
     const X64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse4.2"];
     const X64_AVX: &[&str] = &["avx", "cmpxchg16b", "lahfsahf", "popcnt"];
     const X64_V3: &[&str] = &[
-        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
     ];
     const X64_V4: &[&str] = &[
-        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
-        "avx512bw", "avx512cd", "avx512dq", "avx512vl",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
     ];
     const X64_V4_EXT: &[&str] = &[
-        "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "cmpxchg16b", "lahfsahf", "popcnt",
-        "avx512bw", "avx512cd", "avx512dq", "avx512vl", "avx512bitalg", "avx512vbmi", "avx512vnni",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
+        "avx512bitalg",
+        "avx512vbmi",
+        "avx512vnni",
     ];
     match cpu {
         // Apple A12-generation and later: v8.3/v8.4+ — dotprod, lse, fp16.
-        "apple-a12" | "apple-s4" | "apple-s5" => {
-            &["aes", "sha2", "dotprod", "lse", "fp16"]
-        }
+        "apple-a12" | "apple-s4" | "apple-s5" => &["aes", "sha2", "dotprod", "lse", "fp16"],
         // FEAT_SHA3 arrived with A13; all Apple Silicon Macs (M1+) have it.
         "apple-a13" | "apple-a14" | "apple-s6" | "apple-s7" | "apple-s8" | "apple-m1" => {
             &["aes", "sha2", "sha3", "dotprod", "lse", "fp16"]
@@ -562,17 +603,17 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         // SSE4.1-era (Penryn; also the x86_64-apple-darwin spec default).
         "penryn" => &["cmpxchg16b", "lahfsahf", "sse4.1"],
         // SSE4.2-era Intel (v2): Nehalem/Westmere and friends.
-        "x86-64-v2" | "nehalem" | "corei7" | "westmere" | "silvermont" | "slm"
-        | "goldmont" | "goldmont-plus" | "tremont" => X64_V2,
+        "x86-64-v2" | "nehalem" | "corei7" | "westmere" | "silvermont" | "slm" | "goldmont"
+        | "goldmont-plus" | "tremont" => X64_V2,
         // AVX without AVX2: Sandy Bridge/Ivy Bridge and the matching AMD.
         "sandybridge" | "corei7-avx" | "ivybridge" | "core-avx-i" | "bdver1" | "bdver2"
         | "btver2" => X64_AVX,
         // AVX2-class (v3): Haswell onward, Zen 1–3, recent E-cores.
         "x86-64-v3" | "haswell" | "core-avx2" | "broadwell" | "skylake" | "kabylake"
-        | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake"
-        | "raptorlake" | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake"
-        | "pantherlake" | "sierraforest" | "grandridge" | "clearwaterforest" | "gracemont"
-        | "bdver4" | "znver1" | "znver2" | "znver3" => X64_V3,
+        | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake" | "raptorlake"
+        | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake"
+        | "sierraforest" | "grandridge" | "clearwaterforest" | "gracemont" | "bdver4"
+        | "znver1" | "znver2" | "znver3" => X64_V3,
         // AVX-512 F/BW/CD/DQ/VL (v4): Skylake-SP through Cascade/Cooper Lake.
         "x86-64-v4" | "skylake-avx512" | "cascadelake" | "cooperlake" => X64_V4,
         // v4 plus the VNNI/VBMI/BITALG extensions Cranelift has flags for
@@ -698,8 +739,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             None,
         );
         if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind
-            && tcx.sess.target.options.binary_format
-                == rustc_target::spec::BinaryFormat::Coff
+            && tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff
         {
             // TLS slot driving emulated EH on COFF: `{ flag: i32, _pad: i32,
             // exn: ptr, buf: [u8; 32] }` — the buffer holds a copy of
@@ -850,7 +890,8 @@ impl WriteBackendMethods for PlironCodegenBackend {
         _each_linked_rlib_for_lto: &[PathBuf],
         _modules: Vec<FatLtoInput<Self>>,
     ) -> CompiledModule {
-        sess.dcx().fatal("LTO is not supported by the pliron backend")
+        sess.dcx()
+            .fatal("LTO is not supported by the pliron backend")
     }
 
     fn run_thin_lto(
