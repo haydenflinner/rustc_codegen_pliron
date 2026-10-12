@@ -46,5 +46,19 @@ fn main() {
     // Same shape through the library path (`position`/`contains`).
     assert!(!head.contains(&b'='));
     assert_eq!(head.iter().position(|&b| b == b'='), None);
+
+    // The loop's own trip test must never fold even when its exit edge is
+    // provably dead — dropping `i < n` makes the loop infinite, not just
+    // removes a check. Under emulated EH a plain post-loop call site is
+    // `call; load tls_flag; brif flag`: `dead_end` read the `call; flag`
+    // part as a throw and admitted every return downstream, so the
+    // inlined `reverse`'s trip test folded away and the swap walked off
+    // the end of the buffer until a wild store faulted.
+    let n = 200_000u64;
+    let mut w: Vec<u64> = (0..n).collect();
+    w.reverse();
+    eprintln!("reversed");
+    assert_eq!(w[0], n - 1);
+    assert_eq!(w[n as usize - 1], 0);
     println!("bcheck ok");
 }

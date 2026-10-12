@@ -592,6 +592,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
             return false;
         }
         let (mut call, mut flag) = (false, false);
+        let mut flag_brif = false;
         for i in func.layout.block_insts(b) {
             let d = &func.dfg.insts[i];
             match d.opcode() {
@@ -605,6 +606,23 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                         flag = true;
                     }
                 }
+                Opcode::Brif => {
+                    if let InstructionData::Brif { arg, .. } = *d {
+                        if let Some(li) = func
+                            .dfg
+                            .value_def(func.dfg.resolve_aliases(arg))
+                            .inst()
+                            && let InstructionData::Load { arg: la, .. } = func.dfg.insts[li]
+                            && let Some(ai) = func
+                                .dfg
+                                .value_def(func.dfg.resolve_aliases(la))
+                                .inst()
+                            && func.dfg.insts[ai].opcode() == Opcode::TlsValue
+                        {
+                            flag_brif = true;
+                        }
+                    }
+                }
                 Opcode::Return if !(call && flag || (throw_ret && rethrow)) => {
                     if dbg {
                         eprintln!("dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}", b.as_u32());
@@ -614,7 +632,14 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 _ => {}
             }
             if b == bad {
-                rethrow = call && flag;
+                // `call; load flag` identifies a throw only when nothing
+                // branches on the flag: a known-throwing callee (panic_*)
+                // leaves the load dead, while a normal call's flag check
+                // keeps a live flag-clear continuation — exactly the
+                // `call f; load flag; brif flag` every emulated-EH call
+                // site emits. `rethrow` admitting downstream returns is
+                // sound only in the first case.
+                rethrow = call && flag && !flag_brif;
             }
             let dests = d.branch_destination(
                 &func.dfg.jump_tables,
@@ -952,9 +977,9 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
 
     // Bound test `brif (icmp cc a, bound)` at `site` whose continue edge is
     // `cs`: for the latch that's the edge back to h; for the header it's the
-    // edge staying in the body. Returns (bound, adj) where the last counter
-    // value entering the body is `bound - adj`.
-    let bound_test = |site: Block, p: Value, ba: Value| -> Option<(Value, i64)> {
+    // edge staying in the body. Returns (bound, adj, inst) where the last
+    // counter value entering the body is `bound - adj`.
+    let bound_test = |site: Block, p: Value, ba: Value| -> Option<(Value, i64, Inst)> {
         let i = func.layout.last_inst(site)?;
         if func.dfg.insts[i].opcode() != Opcode::Brif {
             return None;
@@ -1011,7 +1036,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 (IntCC::UnsignedLessThanOrEqual, false, _, true) => 0,
                 _ => continue,
             };
-            return Some((b, adj));
+            return Some((b, adj, i));
         }
         None
     };
@@ -1042,7 +1067,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             iv0k = None;
         }
         for site in [latch, h] {
-            let Some((bound, adj)) = bound_test(site, p, ba) else {
+            let Some((bound, adj, _)) = bound_test(site, p, ba) else {
                 continue;
             };
             let mut lo = LoopInfo {
@@ -1095,7 +1120,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
                 if !ty.is_int() || ty.bits() > 64 {
                     continue;
                 }
-                let Some((bound, adj)) = bound_test(h, p, bargs[ix].unwrap_or(p))
+                let Some((bound, adj, _)) = bound_test(h, p, bargs[ix].unwrap_or(p))
                 else {
                     continue;
                 };
@@ -1123,13 +1148,27 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         }
     };
 
+    // The loop's own bound tests are never foldable: their "bad" edge is
+    // the exit path, not a redundant panic — folding the test removes the
+    // exit and turns the loop infinite even when the edge is dead.
+    let mut trip_tests: FxHashSet<Inst> = FxHashSet::default();
+    {
+        let iv = info.iv;
+        let ba = bargs[info.iv0].unwrap_or(iv);
+        for site in [latch, h] {
+            if let Some((_, _, ti)) = bound_test(site, iv, ba) {
+                trip_tests.insert(ti);
+            }
+        }
+    }
+
     // Foldable checks: `brif (icmp cc idx, len)` where idx is affine in the
     // counter, len invariant, and the unsafe edge is a cold (panic) block.
     let mut checks: Vec<Chk> = Vec::new();
     let mut total_checks = 0usize;
     'blk: for &b in &body {
         let Some(t) = func.layout.last_inst(b) else { continue };
-        if func.dfg.insts[t].opcode() != Opcode::Brif {
+        if func.dfg.insts[t].opcode() != Opcode::Brif || trip_tests.contains(&t) {
             continue;
         }
         let to_cold = func.dfg.insts[t]
