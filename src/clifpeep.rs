@@ -20,8 +20,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
-    types,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
+    ValueDef, types,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -1337,6 +1337,141 @@ pub fn sameargs(func: &mut Function) -> usize {
     }
     if crate::pass_enabled("PLIRON_CSWEEP") {
         n += const_sweep(func);
+    }
+    n
+}
+
+/// A `brif` arm to a small `return` block whose sibling arm is a loop header
+/// gets its own copy of the return placed right after the source: the loop
+/// edge becomes the single taken `jcc` back and the exit falls through.
+/// Without the copy the exit shares a return block that RPO can't always
+/// place adjacent, and every iteration pays `jcc` + `jmp`. The shared
+/// return itself is marked cold for its other preds.
+pub fn coldrets(func: &mut Function) -> usize {
+    fn leaf_ret(func: &Function, b: Block) -> bool {
+        let mut k = 0;
+        for i in func.layout.block_insts(b) {
+            if func.dfg.insts[i].opcode() == Opcode::Return {
+                return k <= 8;
+            }
+            k += 1;
+        }
+        false
+    }
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let domtree = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+    let mut mark = Vec::new();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif { blocks, .. } = &func.dfg.insts[t] else {
+            continue;
+        };
+        for side in 0..2 {
+            let (t, o) = (
+                blocks[side].block(&func.dfg.value_lists),
+                blocks[1 - side].block(&func.dfg.value_lists),
+            );
+            if t == o
+                || func.layout.is_cold(t)
+                || func.layout.is_cold(o)
+                || !leaf_ret(func, t)
+                || leaf_ret(func, o)
+            {
+                continue;
+            }
+            // `o` is a loop header when some predecessor (itself included,
+            // for a self-loop) is dominated by `o`.
+            if cfg
+                .pred_iter(o)
+                .any(|p| domtree.block_dominates(o, p.block))
+            {
+                mark.push((b, t, side, domtree.block_dominates(o, b)));
+            }
+        }
+    }
+    let n = mark.len();
+    for (b, t, side, inloop) in mark {
+        func.layout.set_cold(t);
+        if !inloop {
+            // `b` is a pre-loop guard, not a latch: the cold mark alone gets
+            // the layout right (loop arm stays adjacent fall-through).
+            continue;
+        }
+        // Copy `t` into a fresh block right after `b`, binding `t`'s params
+        // to this edge's args, and retarget the arm.
+        let nt = func.dfg.make_block();
+        let mut data = func.dfg.insts[func.layout.last_inst(b).unwrap()];
+        let InstructionData::Brif { blocks, .. } = &mut data else {
+            unreachable!()
+        };
+        let args: Vec<Value> = blocks[side]
+            .args(&func.dfg.value_lists)
+            .filter_map(|a| match a {
+                BlockArg::Value(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let mut map: FxHashMap<Value, Value> = func
+            .dfg
+            .block_params(t)
+            .iter()
+            .copied()
+            .zip(args.iter().copied())
+            .collect();
+        let insts: Vec<Inst> = func.layout.block_insts(t).collect();
+        func.layout.insert_block_after(nt, b);
+        for i in insts {
+            let ni = func.dfg.clone_inst(i);
+            let dfg = &mut func.dfg;
+            let mut d = dfg.insts[ni];
+            for dst in
+                d.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            {
+                *dst = dst.deep_clone(&mut dfg.value_lists);
+            }
+            dfg.insts[ni] = d;
+            let vals: Vec<Value> = func
+                .dfg
+                .inst_values(ni)
+                .map(|v| *map.get(&func.dfg.resolve_aliases(v)).unwrap_or(&v))
+                .collect();
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            for (r, nr) in func
+                .dfg
+                .inst_results(i)
+                .iter()
+                .copied()
+                .zip(func.dfg.inst_results(ni).iter().copied())
+            {
+                map.insert(r, nr);
+            }
+            func.layout.append_inst(ni, nt);
+        }
+        let InstructionData::Brif { blocks, .. } = &mut data else {
+            unreachable!()
+        };
+        blocks[side] = BlockCall::new(nt, std::iter::empty(), &mut func.dfg.value_lists);
+        let tinst = func.layout.last_inst(b).unwrap();
+        func.dfg.insts[tinst] = data;
+        // Keep the loop arm on the `then` (jcc) slot so the back-edge is the
+        // single taken branch and `nt` is the fall-through: `brif c, cold-nt,
+        // loop` emits `jcc` fwd + `jmp` back otherwise.
+        if side == 0
+            && let InstructionData::Brif { arg, .. } = func.dfg.insts[tinst]
+            && crate::looprot::uses(func, arg) == 1
+            && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+            && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+        {
+            *cond = cond.complement();
+            let mut data = func.dfg.insts[tinst];
+            let InstructionData::Brif { blocks, .. } = &mut data else {
+                unreachable!()
+            };
+            blocks.swap(0, 1);
+            func.dfg.insts[tinst] = data;
+        }
     }
     n
 }

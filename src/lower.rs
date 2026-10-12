@@ -1188,6 +1188,19 @@ pub fn lower_to_object(
                 panic!("slotmerge broke `{n}`: {e}\n{}", clctx.func.display());
             }
         }
+        // Leaf `return` blocks that share a `brif` with a loop header are
+        // colder than the loop: mark them cold so the emitted RPO order puts
+        // them last and the loop arm falls through. Runs last — it's pure
+        // layout metadata, so nothing downstream needs to see it.
+        if crate::pass_enabled("PLIRON_COLDRET") && crate::bisect("coldret") {
+            let k = crate::clifpeep::coldrets(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("coldret {k} {n}");
+            }
+            if dump && k > 0 {
+                eprintln!("==== clif {n} after coldrets ====\n{}", clctx.func.display());
+            }
+        }
         if verify_env && let Err(e) = cranelift_codegen::verify_function(&clctx.func, isa.flags())
         {
             if !verify_full && let Some(snap) = &snapshot {

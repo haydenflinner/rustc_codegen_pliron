@@ -221,7 +221,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
     let mut h2 = None;
     if brif_latch {
         let b = func.dfg.make_block();
-        func.layout.insert_block(b, l.block);
+        func.layout.insert_block_after(b, l.block);
         h2 = Some(b);
     }
     let body: Vec<Inst> = func.layout.block_insts(h).collect();
@@ -317,7 +317,7 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
 }
 
 /// Number of times `v` is used as an operand (inst args + branch args).
-fn uses(func: &Function, v: Value) -> usize {
+pub(crate) fn uses(func: &Function, v: Value) -> usize {
     let v = func.dfg.resolve_aliases(v);
     func.layout
         .blocks()
