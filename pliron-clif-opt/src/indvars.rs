@@ -1092,8 +1092,10 @@ enum Lt {
 /// overshoots `D` — `ule (D - a), (D - j0)` then reproduces `a cc K`
 /// precisely. `rem0 = D - j0` is a non-constant preheader value, so codegen
 /// pins it in a register; `rem - s` doubles as the backedge arg, so the
-/// loop trades two remat instructions for one `isub`.
-pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+/// loop trades two remat instructions for one `isub`. Bounds `K < kmin`
+/// fold into the compare itself (x64's `cmp reg, imm32`), where the
+/// countdown's extra param and `isub` are pure overhead.
+pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis, kmin: i64) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let psrc = crate::loadfwd::param_src(func);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
@@ -1168,7 +1170,7 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                                     args: [x, y],
                                     ..
                                 } if func.dfg.resolve_aliases(x) == a => {
-                                    iconst(func, y).filter(|k| (4096..=i64::MAX).contains(k))
+                                    iconst(func, y).filter(|k| (kmin..=i64::MAX).contains(k))
                                 }
                                 _ => None,
                             })
@@ -1213,16 +1215,19 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                     [entry.slot];
                 bc.append_argument(rem0, &mut dfg.value_lists);
             }
-            for (e, _, step) in &latches {
+            // One `rem - s` per latch, emitted before the compare `li`
+            // (which dominates the brif it feeds) so the backedge arg and
+            // the rewritten test `ule (D - a), rem0` share it.
+            for (e, li, step) in &latches {
                 let v = match step {
                     StepV::K(0) => rem,
                     StepV::K(s) => {
-                        let mut pos = FuncCursor::new(func).at_inst(e.inst);
+                        let mut pos = FuncCursor::new(func).at_inst(*li);
                         let c = iconst_masked(&mut pos, ty, *s);
                         pos.ins().isub(rem, c)
                     }
                     StepV::V(x) => {
-                        let mut pos = FuncCursor::new(func).at_inst(e.inst);
+                        let mut pos = FuncCursor::new(func).at_inst(*li);
                         pos.ins().isub(rem, *x)
                     }
                 };
@@ -1231,26 +1236,11 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
                     [e.slot];
                 bc.append_argument(v, &mut dfg.value_lists);
-            }
-            // Rewrite the latch count test to `ule (D - a), rem0`.
-            for (_, li, step) in &latches {
-                let cur = match step {
-                    StepV::K(0) => rem,
-                    StepV::K(s) => {
-                        let mut pos = FuncCursor::new(func).at_inst(*li);
-                        let c = iconst_masked(&mut pos, ty, *s);
-                        pos.ins().isub(rem, c)
-                    }
-                    StepV::V(x) => {
-                        let mut pos = FuncCursor::new(func).at_inst(*li);
-                        pos.ins().isub(rem, *x)
-                    }
-                };
                 if let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[*li] {
                     *cond = IntCC::UnsignedLessThanOrEqual;
                 }
                 let args = func.dfg.inst_args_mut(*li);
-                args[0] = cur;
+                args[0] = v;
                 args[1] = rem0;
                 if debug {
                     eprintln!("indvars {h}: countdown {li} (bound {k})");

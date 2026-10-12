@@ -1202,7 +1202,11 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // a non-constant preheader value codegen pins in a register. Runs
 // late (after loop rotation) so latch-copied tests are covered.
 fn s_boundcmp(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = indvars::boundcmp(&mut p.clctx.func, an);
+    // x64 `cmp reg, imm32` sign-extends the immediate, so unsigned bounds
+    // up to i32::MAX compare for free — the countdown only earns its
+    // extra param and isub past that. Other targets keep the old floor.
+    let kmin = if p.x64 { i32::MAX as i64 + 1 } else { 4096 };
+    let k = indvars::boundcmp(&mut p.clctx.func, an, kmin);
     if k > 0 && p.dump {
         p.dump("boundcmp");
     }
