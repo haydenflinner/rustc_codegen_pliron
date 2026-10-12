@@ -2431,7 +2431,10 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                 return None;
             }
         } else {
-            let (a, wa) = bit(ops[0])?;
+            let Some(&o0) = ops.first() else {
+                return None;
+            };
+            let (a, wa) = bit(o0)?;
             let (b, _) = if ops.len() > 1 { bit(ops[1])? } else { (0, wa) };
             let (sa, sb) = (sext((a, wa)), sext((b, wa)));
             let v = if id == AddOp::get_opid_static() {
