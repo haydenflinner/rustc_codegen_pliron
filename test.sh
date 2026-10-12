@@ -136,6 +136,11 @@ if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
   (( back > 0 )) || { echo "loopalign: no back-edge found" >&2; exit 1; }
   (( bad == 0 )) || { echo "loopalign: $bad unaligned back-edge target(s)" >&2; exit 1; }
 fi
+# commute must order the fewer-use operand first on commutative binops so
+# two-address isel clobbers the dead operand (a loop-invariant splat in
+# `a * b[i]` must become `mulpd splat, load`, not `movdqa` + `mulpd`).
+PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/commute/main.rs -o $out/commute$exe 2> $out/commute.stats && $out/commute$exe
+grep -Eq 'commute [1-9][0-9]* .*saxpy' $out/commute.stats || { echo "commute did not fire on saxpy" >&2; exit 1; }
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&

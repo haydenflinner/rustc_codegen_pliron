@@ -850,6 +850,19 @@ pub fn lower_to_object(
                 eprintln!("sublea {k} {n}");
             }
         }
+        // `op multi_use, one_use` → `op one_use, multi_use` on commutative
+        // binops: the fewer-use operand takes two-address dst, so regalloc
+        // clobbers it in place instead of copying the live one (`movdqa`
+        // splat copies in matmul's `mulpd` loop).
+        if st.peep
+            && crate::pass_enabled("PLIRON_COMMUTE")
+            && crate::bisect("commute")
+        {
+            let k = crate::commute::run(&mut clctx.func);
+            if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
+                eprintln!("commute {k} {n}");
+            }
+        }
         // Scalar min/max wider than a register (i128) has no Cranelift
         // lowering on any target; several passes can emit it.
         crate::clifpeep::wide_minmax(&mut clctx.func);
