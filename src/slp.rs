@@ -110,6 +110,18 @@ enum Pack {
     /// Reuse the vector emitted for an identical earlier column (xpack
     /// only); the index is the `row` of that column's `Op` node.
     Dup(usize),
+    /// Column values are `extractlane(v, 0)`/`extractlane(v, 1)` of one
+    /// earlier vector — reuse `v` directly so sequential packs fuse instead
+    /// of round-tripping through scalars (xpack only).
+    Vec(Value),
+    /// A pair of adjacent `store`s merged into one vector store; `data`
+    /// packs the two stored scalars. Pack-root only (xpack only).
+    Store2 {
+        data: Box<Pack>,
+        base: Value,
+        off: i64,
+        flags: MemFlagsData,
+    },
 }
 
 struct Ctx<'a> {
@@ -349,6 +361,22 @@ fn emit_pack(
         // The original column sits earlier in emission order, so its row
         // vector is already written.
         Pack::Dup(r) => rows.expect("xpack rows")[*r],
+        Pack::Vec(v) => *v,
+        Pack::Store2 {
+            data,
+            base,
+            off,
+            flags,
+        } => {
+            let v = emit_pack(pos, vt, data, rows);
+            pos.ins().store(
+                wide_flags(*flags),
+                v,
+                *base,
+                i32::try_from(*off).unwrap_or(0),
+            );
+            v
+        }
     }
 }
 
@@ -766,6 +794,47 @@ impl X<'_> {
         if let Some(&r) = self.colmap.get(&(a, b)) {
             return Some(Pack::Dup(r));
         }
+        // `extractlane(v,0)`/`extractlane(v,1)` of one earlier vector: the
+        // column is `v` itself. This is what fuses sequential packs — a
+        // consumer-side pack reuses the lanes a producer pack emitted
+        // instead of gathering the extracted scalars back.
+        let lane_of = |v: Value| -> Option<(Value, u8)> {
+            let i = self.def(v)?;
+            let InstructionData::BinaryImm8 {
+                opcode: Opcode::Extractlane,
+                imm,
+                arg,
+            } = self.func.dfg.insts[i]
+            else {
+                return None;
+            };
+            Some((arg, imm.into()))
+        };
+        let (la, lb) = (lane_of(a), lane_of(b));
+        if let (Some((va, 0)), Some((vb, 1))) = (la, lb) {
+            if va == vb
+                && self
+                    .func
+                    .dfg
+                    .value_type(a)
+                    .by(2)
+                    .is_some_and(|vt| vt == self.func.dfg.value_type(va))
+                && self.avail(va)
+            {
+                return Some(Pack::Vec(va));
+            }
+            if std::env::var_os("PLIRON_XPACK_DEBUG").is_some() {
+                eprintln!(
+                    "    xpack novec d{depth}: {a:?}/{b:?} va={va:?} vb={vb:?} samev={} avail={}",
+                    va == vb,
+                    self.avail(va)
+                );
+            }
+        } else if std::env::var_os("PLIRON_XPACK_DEBUG").is_some()
+            && (la.is_some() || lb.is_some())
+        {
+            eprintln!("    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
+        }
         // A column may legitimately need a member's scalar result (e.g. the
         // `dx` shared by `dx*dx` and another row). Mark the producer to stay
         // alive as a scalar inst rather than rejecting the pack.
@@ -826,6 +895,21 @@ impl X<'_> {
         // Isomorphic ops: pack recursively. A failed attempt rolls back the
         // rows/members it pushed, then the column falls back to a gather.
         let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+        if dbg
+            && depth <= 6
+            && let (da, db) = (self.def(a), self.def(b))
+            && (da.is_none()
+                || db.is_none()
+                || self.func.dfg.insts[da.unwrap()].opcode()
+                    == self.func.dfg.insts[db.unwrap()].opcode())
+        {
+            eprintln!(
+                "    xpack col-enter d{depth}: {a:?}(def={da:?} pos={:?}) {b:?}(def={db:?} pos={:?}) emit={}",
+                da.and_then(|i| self.pos.get(&i)),
+                db.and_then(|i| self.pos.get(&i)),
+                self.emit
+            );
+        }
         if let (Some(ia), Some(ib)) = (self.before_emit(a), self.before_emit(b)) {
             let oa = self.func.dfg.insts[ia].opcode();
             let ta = self.func.dfg.value_type(a);
@@ -883,6 +967,24 @@ impl X<'_> {
                         .collect();
                     self.colmap.retain(|_, &mut r| r < row);
                 }
+                if dbg {
+                    eprintln!(
+                        "    xpack nopair d{depth}: {a:?}/{b:?} -> {:?}/{:?}",
+                        self.func.dfg.insts[ia].opcode(),
+                        self.func.dfg.insts[ib].opcode()
+                    );
+                }
+            } else if dbg {
+                let why = if oa != self.func.dfg.insts[ib].opcode() {
+                    "op"
+                } else if ta != tb {
+                    "ty"
+                } else if !vecable(oa) {
+                    "vecable"
+                } else {
+                    "member"
+                };
+                eprintln!("    xpack nopair-{why} d{depth}: {a:?}/{b:?} ({oa:?})");
             }
         }
         self.gathers += 1;
@@ -917,6 +1019,11 @@ impl X<'_> {
         match p {
             Pack::Splat(_) | Pack::Load { .. } => (1, 0),
             Pack::Gather(_) => (2, 0),
+            Pack::Vec(_) => (0, 0),
+            Pack::Store2 { data, .. } => {
+                let (e, n) = self.col_cost(data);
+                (1 + e, 1 + n)
+            }
             Pack::Dup(r) => {
                 // The original column was already emitted; if its row was
                 // pruned away, this lane must gather the scalar results.
@@ -1111,7 +1218,7 @@ fn plan_pair(
         pos,
         insts,
         block,
-        emit: pos[&ib],
+        emit: pos[&ia].max(pos[&ib]),
         rows: Vec::new(),
         members: FxHashSet::default(),
         loads: Vec::new(),
@@ -1132,7 +1239,39 @@ fn plan_pair(
         let Some(p) = x.col(ca, cb, 1) else { bail!("col") };
         args.push(p);
     }
-    let mut root = Pack::Op { op, args, row: 0 };
+    let root = Pack::Op { op, args, row: 0 };
+    finish_plan(&mut x, root, vt, uses, (ia, ib))
+}
+
+/// Shared legality/profitability tail for pack plans: prune unprofitable
+/// subtrees, fix the keep set, verify load/sink ordering, assign extracts,
+/// and score. `tag` is the debug seed pair.
+fn finish_plan(
+    x: &mut X<'_>,
+    mut root: Pack,
+    vt: Type,
+    uses: &FxHashMap<Value, FxHashSet<Inst>>,
+    tag: (Inst, Inst),
+) -> Option<(
+    Pack,
+    Type,
+    Vec<(usize, (Inst, Inst))>,
+    Vec<Inst>,
+    Vec<Inst>,
+    Vec<(Value, usize, u8)>,
+    FxHashSet<Inst>,
+)> {
+    let (func, pos, insts) = (x.func, x.pos, x.insts);
+    let (ia, ib) = tag;
+    let dbg = std::env::var_os("PLIRON_XPACK_DEBUG").is_some();
+    macro_rules! bail {
+        ($why:expr) => {{
+            if dbg {
+                eprintln!("  xpack {} {ia:?}/{ib:?}: {}", $why, func.dfg.insts[ia].opcode());
+            }
+            return None;
+        }};
+    }
     if x.rows.len() > 24 || x.gathers > 12 {
         bail!("size");
     }
@@ -1150,25 +1289,89 @@ fn plan_pair(
     if x.members.len() < 2 {
         bail!("empty");
     }
-    // A kept (scalar-retained) member reads its args as scalars, so any arg
-    // produced by another member must be kept too; iterate to a fixpoint.
-    loop {
-        let mut added = false;
-        for &m in &x.members {
-            if !x.keep.contains(&m) {
+    // Leaf operands (gather/splat scalars, load/store bases) may read a value
+    // whose def became a member *after* the leaf was built — too late for the
+    // in-`col` keep marking to catch. Collect every leaf-operand def: member
+    // defs get kept, and non-member defs must stay before the emit point
+    // (they may not sink).
+    fn leaf_walk(x: &X<'_>, p: &Pack, leaf_defs: &mut FxHashSet<Inst>) {
+        match p {
+            Pack::Splat(v) | Pack::Vec(v) | Pack::Load { base: v, .. } => {
+                if let Some(d) = x.def(*v) {
+                    leaf_defs.insert(d);
+                }
+            }
+            Pack::Gather(vs) => {
+                for &v in vs {
+                    if let Some(d) = x.def(v) {
+                        leaf_defs.insert(d);
+                    }
+                }
+            }
+            Pack::Op { args, .. } => {
+                for a in args {
+                    leaf_walk(x, a, leaf_defs);
+                }
+            }
+            Pack::Store2 { data, base, .. } => {
+                leaf_walk(x, data, leaf_defs);
+                if let Some(d) = x.def(*base) {
+                    leaf_defs.insert(d);
+                }
+            }
+            Pack::Dup(_) => {}
+        }
+    }
+    let mut leaf_defs: FxHashSet<Inst> = FxHashSet::default();
+    leaf_walk(x, &root, &mut leaf_defs);
+    // `stay(i)` marks an inst that must not move: members are kept alive as
+    // scalars, other same-block defs are pinned against sinking. Expansion
+    // walks arg defs transitively — an inst that stays still reads its args
+    // at its original position, so their producers must stay too. Fails if a
+    // producer already committed to sinking.
+    fn stay(
+        x: &mut X<'_>,
+        pin: &mut FxHashSet<Inst>,
+        sink_set: &FxHashSet<Inst>,
+        seed: Inst,
+    ) -> bool {
+        let mut seen: FxHashSet<Inst> = FxHashSet::default();
+        let mut stack = vec![seed];
+        while let Some(p) = stack.pop() {
+            if !seen.insert(p) {
                 continue;
             }
-            for &a in func.dfg.inst_args(m) {
-                if let Some(d) = x.def(a)
-                    && x.members.contains(&d)
-                    && x.keep.insert(d)
-                {
-                    added = true;
+            if sink_set.contains(&p) {
+                return false;
+            }
+            if x.members.contains(&p) {
+                x.keep.insert(p);
+            } else if x.pos.contains_key(&p) {
+                pin.insert(p);
+            } else if p != seed {
+                // Other-block defs can't move; no need to chase their args.
+                continue;
+            }
+            for &a in x.func.dfg.inst_args(p) {
+                if let Some(d) = x.def(a) {
+                    stack.push(d);
                 }
             }
         }
-        if !added {
-            break;
+        true
+    }
+    let mut pin: FxHashSet<Inst> = FxHashSet::default();
+    let sink_set0 = FxHashSet::default();
+    for &d in &leaf_defs {
+        if !stay(x, &mut pin, &sink_set0, d) {
+            bail!("use-order");
+        }
+    }
+    // Members kept during `col` (a leaf reads their scalar result) stay put
+    // too — expand their arg defs the same way.
+    for m in x.keep.iter().copied().collect::<Vec<_>>() {
+        if !stay(x, &mut pin, &sink_set0, m) {
+            bail!("use-order");
         }
     }
     // Merged loads read both lanes at the emit point: every writer between
@@ -1199,42 +1402,51 @@ fn plan_pair(
     let mut extracts: Vec<(Value, usize, u8)> = Vec::new();
     let mut work: Vec<Inst> = Vec::new();
     for &(r, (la, lb)) in &kept {
-        let vb = func.dfg.inst_results(lb)[0];
-        if !x.keep.contains(&la) {
-            let va = func.dfg.inst_results(la)[0];
-            let mut need_a = false;
-            if let Some(us) = uses.get(&ra_fix(func, va)) {
+        // Store rows have no results — nothing to extract.
+        if func.dfg.inst_results(la).is_empty() {
+            continue;
+        }
+        // Both lanes need the same treatment: either lane's inst may sit
+        // before the emit point, so uses there must sink rather than take an
+        // extract (the extract would land after the use).
+        for (l, lane) in [(la, 0u8), (lb, 1)] {
+            if x.keep.contains(&l) {
+                continue;
+            }
+            let v = func.dfg.inst_results(l)[0];
+            let mut need = false;
+            if let Some(us) = uses.get(&ra_fix(func, v)) {
                 for &u in us {
                     if x.members.contains(&u) {
                         continue;
                     }
-                    need_a = true;
+                    need = true;
                     if !ext_ok(&x, u) {
                         work.push(u);
                     }
                 }
             }
-            if need_a {
-                extracts.push((va, r, 0));
+            if need {
+                extracts.push((v, r, lane));
             }
-        }
-        if !x.keep.contains(&lb)
-            && uses
-                .get(&ra_fix(func, vb))
-                .is_some_and(|us| us.iter().any(|u| !x.members.contains(u)))
-        {
-            extracts.push((vb, r, 1));
         }
     }
     while let Some(u) = work.pop() {
         if x.members.contains(&u) || sink_set.contains(&u) || dead.contains(&u) {
             continue;
         }
-        let Some(sk) = sinkable(&x, u, &dead, &sink_set) else {
-            bail!("use-order")
+        // A pinned inst must stay before the emit point, so it can't sink —
+        // and it can't sink from another block into this one either. Those
+        // and anything that can't legally sink get the same fallback: keep
+        // every member result it reads alive, and pin its other local defs.
+        let same_blk = func.layout.inst_block(u) == Some(x.block);
+        let sk = if pin.contains(&u) || !same_blk {
+            None
+        } else {
+            sinkable(&x, u, &dead, &sink_set)
         };
         match sk {
-            true => {
+            Some(true) => {
                 sink_set.insert(u);
                 sink.push(u);
                 for &ru in func.dfg.inst_results(u) {
@@ -1248,11 +1460,22 @@ fn plan_pair(
                     }
                 }
             }
-            false => {
+            Some(false) => {
                 dead.insert(u);
+            }
+            None => {
+                if !stay(x, &mut pin, &sink_set, u) {
+                    bail!("use-order");
+                }
             }
         }
     }
+    // The fallback path may add keeps; drop extracts for kept lanes (their
+    // results stay real scalars).
+    extracts.retain(|&(_, r, lane)| {
+        let (la, lb) = x.rows[r];
+        !x.keep.contains(if lane == 0 { &la } else { &lb })
+    });
     sink.sort_by_key(|&i| pos[&i]);
     // Profitability: every kept row swaps two scalars for one vector op;
     // gathers/splats/extracts cost insts. High-port-pressure rows (sqrt/div)
@@ -1266,16 +1489,29 @@ fn plan_pair(
             )
         })
         .count();
-    let net = 2 * kept.len() as i32 + 3 * heavy as i32 - emit_cost as i32 - extracts.len() as i32;
+    let n_keep = x.members.iter().filter(|m| x.keep.contains(m)).count() as i32;
+    let net = 2 * kept.len() as i32 + 3 * heavy as i32
+        - emit_cost as i32
+        - extracts.len() as i32
+        - n_keep;
     if dbg && net <= 10 {
         eprintln!(
-            "    xpack cost {op:?}: rows={} heavy={heavy} emit={emit_cost} ext={} sink={} net={net}",
+            "    xpack cost {:?}: rows={} heavy={heavy} emit={emit_cost} ext={} sink={} net={net}",
+            func.dfg.insts[ia].opcode(),
             kept.len(),
             extracts.len(),
             sink.len()
         );
     }
-    if net <= 0 {
+    // Store-seeded packs: a `Gather` data column (splat+insertlane+store) is a
+    // pure loss against two scalar stores. Deeper store trees get slack —
+    // their extracts feed sibling stores that later packs reuse for free via
+    // `Pack::Vec`, refunding the overhead once dce runs.
+    let min_net = match &root {
+        Pack::Store2 { .. } => 1,
+        _ => 1,
+    };
+    if net < min_net {
         bail!("cost");
     }
     Some((
@@ -1285,13 +1521,140 @@ fn plan_pair(
         sink,
         dead.into_iter().collect(),
         extracts,
-        x.keep,
+        std::mem::take(&mut x.keep),
     ))
 }
 
 /// `resolve_aliases` through a helper so `uses` lookups stay uniform.
 fn ra_fix(func: &Function, v: Value) -> Value {
     func.dfg.resolve_aliases(v)
+}
+
+/// Try to merge two address-adjacent `store`s into one vector store; the
+/// stored scalars' producer chain packs as ordinary columns. Lane order is
+/// address order (lane 0 covers the lower `sz` bytes) — fixed by the store
+/// layout, unlike op pairs which can swap.
+fn plan_store(
+    func: &Function,
+    domtree: &DominatorTree,
+    uses: &FxHashMap<Value, FxHashSet<Inst>>,
+    insts: &[Inst],
+    pos: &FxHashMap<Inst, usize>,
+    block: Block,
+    taken: &FxHashSet<Inst>,
+    i1: Inst,
+    i2: Inst,
+) -> Option<(
+    Pack,
+    Type,
+    Vec<(usize, (Inst, Inst))>,
+    Vec<Inst>,
+    Vec<Inst>,
+    Vec<(Value, usize, u8)>,
+    FxHashSet<Inst>,
+)> {
+    if taken.contains(&i1) || taken.contains(&i2) {
+        return None;
+    }
+    let (
+        (InstructionData::Store {
+            opcode: Opcode::Store,
+            args: args1,
+            ..
+        }),
+        (InstructionData::Store {
+            opcode: Opcode::Store,
+            args: args2,
+            ..
+        }),
+    ) = (func.dfg.insts[i1], func.dfg.insts[i2])
+    else {
+        return None;
+    };
+    let (r1, r2) = (mem_range(func, i1)?, mem_range(func, i2)?);
+    let (sa, sb) = if r1.0 == r2.0
+        && r1.2 == r2.2
+        && r1.1 + i64::from(r1.2) == r2.1
+        && matches!(r1.2, 4 | 8)
+    {
+        (i1, i2)
+    } else if r1.0 == r2.0
+        && r1.2 == r2.2
+        && r2.1 + i64::from(r2.2) == r1.1
+        && matches!(r1.2, 4 | 8)
+    {
+        (i2, i1)
+    } else {
+        return None;
+    };
+    let fa = func.dfg.mem_flags[func.dfg.insts[sa].memflags()?];
+    if !fa.notrap() || fa != func.dfg.mem_flags[func.dfg.insts[sb].memflags()?] {
+        return None;
+    }
+    let args = if sa == i1 { args1 } else { args2 };
+    let (da, db) = if sa == i1 {
+        (args1[0], args2[0])
+    } else {
+        (args2[0], args1[0])
+    };
+    let ty = func.dfg.value_type(da);
+    if ty.is_vector() || ty != func.dfg.value_type(db) || ty.bytes() != r1.2 {
+        return None;
+    }
+    let vt = ty.by(2)?;
+    // The store earlier in layout re-emits its write at the emit point, so
+    // nothing in between may touch its bytes (or be an opaque side effect).
+    let (first, last) = if pos[&sa] < pos[&sb] {
+        (sa, sb)
+    } else {
+        (sb, sa)
+    };
+    let r_first = mem_range(func, first)?;
+    for p in pos[&first] + 1..pos[&last] {
+        let i2 = insts[p];
+        let o2 = func.dfg.insts[i2].opcode();
+        if o2.is_call() || o2.is_terminator() || o2.is_branch() {
+            return None;
+        }
+        match mem_range(func, i2) {
+            Some(rx) if may_overlap(r_first, rx) => return None,
+            Some(_) => {}
+            None if o2.can_store() || o2.other_side_effects() || o2.can_trap() => return None,
+            None => {}
+        }
+    }
+    let mut x = X {
+        func,
+        domtree,
+        pos,
+        insts,
+        block,
+        emit: pos[&last],
+        rows: Vec::new(),
+        members: FxHashSet::default(),
+        loads: Vec::new(),
+        min_load: usize::MAX,
+        gathers: 0,
+        splats: 0,
+        pruned: FxHashSet::default(),
+        keep: FxHashSet::default(),
+        colmap: FxHashMap::default(),
+    };
+    x.members.insert(sa);
+    x.members.insert(sb);
+    x.rows.push((sa, sb));
+    let data = x.col(da, db, 1)?;
+    let (base, off) = base_off(func, args[1]);
+    if !x.avail(base) {
+        return None;
+    }
+    let root = Pack::Store2 {
+        data: Box::new(data),
+        base,
+        off,
+        flags: fa,
+    };
+    finish_plan(&mut x, root, vt, uses, (sa, sb))
 }
 
 /// Emit the pair tree, extracts, and apply the sink/dead plan for one pack.
@@ -1326,8 +1689,9 @@ fn apply_pair(
         let ex = cur.ins().extractlane(rowvec[r], lane);
         cur.func.dfg.change_to_alias(v, ex);
     }
-    // Sink consumers that used lane-0 results before the emit point, then
-    // drop dead overwritten stores. Order is preserved.
+    // Sink consumers that used lane results before the emit point, then
+    // drop dead overwritten stores. `insert_inst` inserts before the anchor,
+    // so inserting each `u` before `ib` lands them in order.
     for &u in sink {
         cur.func.layout.remove_inst(u);
         cur.func.layout.insert_inst(u, ib);
@@ -1374,13 +1738,32 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                 }
             }
         }
+        if std::env::var_os("PLIRON_XPACK_DEBUG").is_some() && total > 0 {
+            for (p, &i) in insts.iter().enumerate() {
+                let d = &func.dfg.insts[i];
+                let args: Vec<String> = func
+                    .dfg
+                    .inst_args(i)
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect();
+                let ress: Vec<String> = func
+                    .dfg
+                    .inst_results(i)
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect();
+                eprintln!("    map p{p} {i:?} {:?} {} -> {}", d.opcode(), args.join(","), ress.join(","));
+            }
+        }
         let mut applied = false;
         for (p, &ia) in insts.iter().enumerate() {
             if taken.contains(&ia) {
                 continue;
             }
             let op = func.dfg.insts[ia].opcode();
-            if !vecable(op) || res_of(func, ia).is_none() {
+            let is_store = op == Opcode::Store;
+            if !is_store && (!vecable(op) || res_of(func, ia).is_none()) {
                 continue;
             }
             let mut cands = 0;
@@ -1388,17 +1771,20 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                 if cands >= 4 {
                     break;
                 }
-                if func.dfg.insts[ib].opcode() == op {
+                if taken.contains(&ib) || func.dfg.insts[ib].opcode() != op {
+                    continue;
+                }
+                if is_store {
                     cands += 1;
                     tried += 1;
-                    if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan_pair(
+                    if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan_store(
                         func, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
                     ) {
                         let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
                         let n = apply_pair(
                             func,
                             &insts,
-                            pos[&ib],
+                            pos[&ib].max(pos[&ia]),
                             &root,
                             vt,
                             &kept,
@@ -1409,6 +1795,12 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                             &keep,
                         );
                         total += n;
+                        if dbg {
+                            eprintln!(
+                                "xpack APPLY Store {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
+                                kept.len()
+                            );
+                        }
                         for &(_, (la, lb)) in &kept {
                             taken.insert(la);
                             taken.insert(lb);
@@ -1416,7 +1808,51 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                         applied = true;
                         break;
                     }
+                    continue;
                 }
+                    cands += 1;
+                    tried += 1;
+                    // Both lane orders: swapping lanes changes column order,
+                    // which decides whether adjacent loads merge.
+                    let plan = plan_pair(
+                        func, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                    )
+                    .or_else(|| {
+                        tried += 1;
+                        plan_pair(
+                            func, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
+                        )
+                    });
+                    if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
+                        let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
+                        let n = apply_pair(
+                            func,
+                            &insts,
+                            pos[&ib].max(pos[&ia]),
+                            &root,
+                            vt,
+                            &kept,
+                            n_rows,
+                            &sink,
+                            &dead,
+                            &extracts,
+                            &keep,
+                        );
+                        total += n;
+                        if dbg {
+                            eprintln!(
+                                "xpack APPLY {:?} {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
+                                func.dfg.insts[ia].opcode(),
+                                kept.len()
+                            );
+                        }
+                        for &(_, (la, lb)) in &kept {
+                            taken.insert(la);
+                            taken.insert(lb);
+                        }
+                        applied = true;
+                        break;
+                    }
             }
             if applied {
                 break;
