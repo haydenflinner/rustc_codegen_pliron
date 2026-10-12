@@ -507,6 +507,17 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         self.backend.x64_flags.has_bmi2()
     }
 
+    /// pliron: true when `val` is not an `iconst` — the `emit_cmp` LHS-load
+    /// swap keeps constants in the RMI/imm slot, so it must not fire when the
+    /// other operand is a constant (`cmp reg, imm` / `test reg, reg` wins).
+    #[inline]
+    fn pliron_not_iconst(&mut self, val: Value) -> bool {
+        self.lower_ctx
+            .get_value_as_source_or_const(val)
+            .constant
+            .is_none()
+    }
+
     /// pliron: `PLIRON_X64_BITTAB=0` disables the `(bitmap >> x) & 1`
     /// -> `bt` fold in `is_nonzero_band`.
     #[inline]

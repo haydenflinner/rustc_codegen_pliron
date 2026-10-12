@@ -1315,6 +1315,11 @@
 (decl pure pliron_bittab () bool)
 (extern constructor pliron_bittab pliron_bittab)
 
+;; pliron: true when the value is not an `iconst` — guards the `emit_cmp`
+;; LHS-load swap so constants keep the RMI/imm slot.
+(decl pure pliron_not_iconst (Value) bool)
+(extern constructor pliron_not_iconst pliron_not_iconst)
+
 (decl pure use_popcnt () bool)
 (extern constructor use_popcnt use_popcnt)
 
@@ -3987,6 +3992,23 @@
 (rule 3 (emit_cmp cc (u64_from_iconst 0) b @ (value_type ty))
       (let ((b Gpr (put_in_reg b)))
         (CondResult.CC (x64_test ty b b) (intcc_swap_args cc))))
+
+;; pliron: x64 `cmp` only takes a memory operand on its right-hand side, so a
+;; sinkable `load` on the LHS of `icmp` can never fold into the compare: it
+;; is always materialized into a register first. Swap the comparison order —
+;; `cmp reg, [mem]` — and the condition code with it, which is a no-op for
+;; `eq`/`ne` (e.g. hashbrown's `*key == probe` candidate check) and still
+;; correct for ordered compares. Requires an actually-sinkable load so a
+;; non-sinkable LHS load doesn't steal the RMI slot from a sinkable RHS.
+;; Kept above the `is_nonzero` rewrites in priority but guarded so `b` stays
+;; in the RMI/imm slot when it's a constant (`cmp reg, imm` / `test` wins
+;; there); `i128` is excluded by `fits_in_64`.
+(rule 7 (emit_cmp cc a @ (and (sinkable_load sl)
+                            (value_type (ty_int (fits_in_64 ty))))
+                  b)
+      (if-let true (pliron_not_iconst b))
+      (CondResult.CC (x64_cmp ty (put_in_gpr b) (sink_load_to_gpr_mem_imm sl))
+                     (intcc_swap_args cc)))
 
 ;; For I128 values (held in two GPRs), the instruction sequences depend on what
 ;; kind of condition is tested.

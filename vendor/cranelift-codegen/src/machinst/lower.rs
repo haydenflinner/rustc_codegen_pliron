@@ -1013,6 +1013,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // When considering code-motion opportunities, consider the current
         // program point to be this branch.
         self.cur_inst = Some(branch);
+        // PLIRON: the branch is itself a side-effecting instruction, so its
+        // entry color describes the program point at which it executes.
+        // Without this, `cur_scan_entry_color` is stale/`None` here and
+        // `get_value_as_source_or_const` can never classify a load
+        // immediately feeding the branch (e.g. `brif (icmp (load ..) x)`) as
+        // sinkable, so `cmp reg, [mem]` folding never fires at branches.
+        self.cur_scan_entry_color = Some(self.side_effect_inst_entry_colors[branch]);
 
         // Lower the branch in ISLE.
         backend
