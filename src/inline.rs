@@ -525,6 +525,13 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // Extra threshold for callsites inside a loop (`PLIRON_INLINE_LOOPB`,
+    // in units of the base limit). Loop probes like `hash_one` sit several
+    // limits over base but must inline to match LLVM's hot-callsite bonus.
+    let loopb: usize = std::env::var("PLIRON_INLINE_LOOPB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let verbose = std::env::var("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
@@ -637,7 +644,7 @@ pub fn run(
                         .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                         .contains(&b)
                     {
-                        t = t.saturating_add(limit / 2);
+                        t = t.saturating_add(limit.saturating_mul(loopb));
                     }
                     t = t.min(limit.saturating_mul(MAX_T));
                     if free {

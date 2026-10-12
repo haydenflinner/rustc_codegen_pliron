@@ -358,6 +358,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             st.nnargs = context::nonnull_values(ctx, st).into_iter().collect();
         }
         inline::run(ctx, st, small, None, false);
+        // Second round: callsites that just moved into a hot caller (e.g.
+        // `get`'s `hash_one` landing inside `main`'s probe loop) never got
+        // scored in their new context — re-run so the loop bonus applies.
+        if pass_enabled("PLIRON_INLINE_ITER") {
+            inline::run(ctx, st, small, None, false);
+        }
         domcheck::run(ctx, st, "inline");
         if pass_enabled("PLIRON_SPEC") {
             spec::run(ctx, st);
