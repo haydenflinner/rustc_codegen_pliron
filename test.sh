@@ -141,6 +141,14 @@ fi
 # `a * b[i]` must become `mulpd splat, load`, not `movdqa` + `mulpd`).
 PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/commute/main.rs -o $out/commute$exe 2> $out/commute.stats && $out/commute$exe
 grep -Eq 'commute [1-9][0-9]* .*saxpy' $out/commute.stats || { echo "commute did not fire on saxpy" >&2; exit 1; }
+# xpack pairs isomorphic scalar insts in one block into two-lane vector ops;
+# the quad_roots sqrts must pack into sqrtpd (x64 SSE2).
+rustc $BE --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack$exe && $out/xpack$exe &&
+  echo "xpack ok" || exit 1
+if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
+  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack.o &&
+      "$llvmod" -d --no-show-raw-insn $out/xpack.o | grep -q sqrtpd || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
+fi
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
