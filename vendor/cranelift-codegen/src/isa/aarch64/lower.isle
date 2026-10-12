@@ -3055,6 +3055,42 @@
       (side_effect
        (aarch64_store32 (amode $I32 address offset) flags value)))
 
+;; Storing a constant zero can use `wzr`/`xzr` directly, avoiding a
+;; `mov` materialization per use (regalloc remats iconsts at each use,
+;; so a shared `iconst 0` still costs a `mov` every time it is stored).
+(rule store_i8_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I8 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (zero_reg))))
+(rule store_i16_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I16 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (zero_reg))))
+(rule store_i32_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I32 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store32 (amode $I32 address offset) flags (zero_reg))))
+(rule store_i64_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I64 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store64 (amode $I64 address offset) flags (zero_reg))))
+(rule istore8_zero 1 (lower
+       (istore8 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (zero_reg))))
+(rule istore16_zero 1 (lower
+       (istore16 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (zero_reg))))
+(rule istore32_zero 1 (lower
+       (istore32 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store32 (amode $I32 address offset) flags (zero_reg))))
+
 (rule store_i128 (lower
        (store (little_or_native_endian flags) value @ (value_type $I128) address offset))
       (side_effect

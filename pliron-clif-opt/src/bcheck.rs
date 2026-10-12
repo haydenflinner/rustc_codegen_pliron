@@ -1729,7 +1729,15 @@ pub fn run(
     for _ in 0..MAX_VERSIONS {
         let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let mut did = 0;
-        for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
+        let lps = deepest_first(la);
+        if debug {
+            eprintln!(
+                "bcheck {name}: {} loops: {:?}",
+                lps.len(),
+                lps.iter().map(|&lp| la.loop_header(lp)).collect::<Vec<_>>()
+            );
+        }
+        for lp in lps.into_iter().take(MAX_LOOPS) {
             let k = run_loop(func, cfg, dt, la, lp, name, throw_ret, &mut seen);
             did += k;
             if k > 0 {
