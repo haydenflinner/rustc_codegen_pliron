@@ -14,25 +14,29 @@ use cranelift_codegen::ir::{
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
-const MAX_ROTATIONS: usize = 64;
+const MAX_ROTATIONS: usize = 256;
 
 pub fn run(func: &mut Function) -> usize {
-    let mut done: FxHashSet<Block> = FxHashSet::default();
+    // Each block is evaluated once, in layout order: re-scanning let cloned
+    // headers created by earlier rotations starve late-layout loops (e.g.
+    // bcheck clones appended at the end) of the rotation budget.
     let mut n = 0;
-    while n < MAX_ROTATIONS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let domtree = DominatorTree::with_function(func, &cfg);
-        let Some(h) = func
-            .layout
-            .blocks()
-            .filter(|b| !done.contains(b))
-            .find(|&h| rotatable(func, &cfg, &domtree, h))
-        else {
+    let mut cfg = ControlFlowGraph::with_function(func);
+    let mut domtree = DominatorTree::with_function(func, &cfg);
+    let mut dirty = false;
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for h in blocks {
+        if n >= MAX_ROTATIONS {
             break;
-        };
-        done.insert(h);
-        if rotate(func, &cfg, &domtree, h) {
+        }
+        if dirty {
+            cfg = ControlFlowGraph::with_function(func);
+            domtree = DominatorTree::with_function(func, &cfg);
+            dirty = false;
+        }
+        if rotatable(func, &cfg, &domtree, h) && rotate(func, &cfg, &domtree, h) {
             n += 1;
+            dirty = true;
         }
     }
     n
@@ -41,11 +45,20 @@ pub fn run(func: &mut Function) -> usize {
 /// Header `h` with one latch ending in `jump h`, a small call-free body and a
 /// `brif` to two blocks that only `h` reaches.
 fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
+    let dbg = std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some();
+    macro_rules! bail {
+        ($($t:tt)*) => {{
+            if dbg {
+                eprintln!("looprot {h}: bail {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
     if Some(h) == func.layout.entry_block() || !domtree.is_reachable(h) {
-        return false;
+        bail!("entry/unreachable");
     }
     let Some(t) = func.layout.last_inst(h) else {
-        return false;
+        bail!("no last inst");
     };
     let InstructionData::Brif { blocks, .. } = &func.dfg.insts[t] else {
         return false;
@@ -59,20 +72,21 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
         .iter()
         .any(|b| b.args(pool).any(|a| !matches!(a, BlockArg::Value(_))))
     {
-        return false;
+        bail!("non-value blockarg");
     }
-    if cfg.pred_iter(s1).count() != 1 || cfg.pred_iter(s2).count() != 1 {
-        return false;
-    }
+    // A multi-pred successor is fine as long as no `h`-defined value is live
+    // into its region (`rotate` appends params for those, which other preds
+    // couldn't supply); checked there once `need` is known.
+
     let latches: Vec<_> = cfg
         .pred_iter(h)
         .filter(|p| domtree.block_dominates(h, p.block))
         .collect();
     let [ref l] = latches[..] else {
-        return false;
+        bail!("latches {:?}", latches);
     };
     if func.layout.last_inst(l.block) != Some(l.inst) {
-        return false;
+        bail!("latch not last inst");
     }
     // The back-edge is either `jump h(args)` or one arm of a `brif`; the brif
     // form appears in `while`-style loops where the body ends in a conditional
@@ -96,10 +110,10 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
                     .args(pool)
                     .any(|a| !matches!(a, BlockArg::Value(_)))
             {
-                return false;
+                bail!("brif latch arms");
             }
         }
-        _ => return false,
+        _ => bail!("latch terminator"),
     }
     let mut k = 0;
     for i in func.layout.block_insts(h) {
@@ -108,11 +122,17 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
         }
         let op = func.dfg.insts[i].opcode();
         if op.is_call() || op.is_branch() || op.is_terminator() {
-            return false;
+            bail!("header op {:?}", op);
         }
         k += 1;
     }
-    k <= MAX_INSTS
+    if k > MAX_INSTS {
+        bail!("header size {k}");
+    }
+    if dbg {
+        eprintln!("looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block);
+    }
+    true
 }
 
 fn resolved_args(func: &Function, i: Inst) -> Vec<Value> {
@@ -158,10 +178,28 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
                 continue;
             }
             let Some(side) = side else {
+                if std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some() {
+                    eprintln!("looprot {h}: bail side-none blk{b} used {used:?}");
+                }
                 return false;
             };
             need[side].extend(used);
             users.push((i, side));
+        }
+    }
+
+    // Params are appended per need[side]; a multi-pred successor can only be
+    // accepted when nothing is live into its region — other preds can't
+    // supply appended params.
+    for side in 0..2 {
+        if cfg.pred_iter(succ[side]).count() > 1 && !need[side].is_empty() {
+            if std::env::var_os("PLIRON_LOOPROT_DEBUG").is_some() {
+                eprintln!(
+                    "looprot {h}: bail multipred {:?} need {:?}",
+                    succ[side], need[side]
+                );
+            }
+            return false;
         }
     }
 
