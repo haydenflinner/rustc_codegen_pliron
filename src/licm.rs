@@ -255,6 +255,18 @@ fn hoists(
         .count();
     if dbg {
         eprintln!("licm?   safe={safe} writers_clobbering={nw_w}");
+        for &w in writers {
+            if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
+                && clobbers(func, ps, na, w, loc, iso, nw)
+            {
+                let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
+                eprintln!(
+                    "licm?     clob {} root {r2:?} off {}",
+                    func.dfg.display_inst(w),
+                    o2.wrapping_add(i64::from(i32::from(offset)))
+                );
+            }
+        }
     }
     safe && nw_w == 0
 }
@@ -420,6 +432,20 @@ fn run_loop(
                             continue;
                         };
                         ph_inst = func.layout.last_inst(nb);
+                    }
+                    // `inv` judged operands by their `psrc` resolution: a
+                    // loop param every edge fills with the same preheader
+                    // value counts as that value — but the param itself
+                    // does not dominate `pinst`. Move with the resolved
+                    // operand, which `inv` proved does.
+                    let args: Vec<Value> = func
+                        .dfg
+                        .inst_args(i)
+                        .iter()
+                        .map(|&a| loadfwd::psrc(ps, na, func, a))
+                        .collect();
+                    for (a, r) in func.dfg.inst_args_mut(i).iter_mut().zip(args) {
+                        *a = r;
                     }
                     func.layout.remove_inst(i);
                     func.layout
@@ -1196,6 +1222,66 @@ mod tests {
         let mut cur = FuncCursor::new(&mut func).at_bottom(hbody);
         let one = cur.ins().iconst(types::I64, 1);
         cur.ins().jump(h, &[one.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        run(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        let flags = cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        );
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A header param `p` that every edge fills with the same preheader
+    /// value resolves through `param_src` to that value, so `inv` accepts
+    /// it — but the param does not dominate the preheader. Hoisting must
+    /// move the resolved operand, not the param (memchr's
+    /// `searcher_kind_two_way` ICE'd stage1 on this: an `iadd p, 48` moved
+    /// out still naming `p`).
+    #[test]
+    fn hoist_rewrites_forwarded_param_operand() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let lbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, lbody, done] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let fv = cur.ins().iconst(types::I64, 5);
+        cur.ins().jump(h, &[fv.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+        cur.ins().brif(r, lbody, &[], done, &[]);
+
+        // `iadd p, k` in the body; `p` forwards `fv` on both edges into
+        // `h`, so `psrc(p)` is `fv` and `inv(p)` holds — the hoisted inst
+        // must use `fv`, not `p`. `s` needs no use: the verifier checks a
+        // moved inst's operands regardless.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+        let k = cur.ins().iconst(types::I64, 48);
+        cur.ins().iadd(p, k);
+        cur.ins().jump(h, &[fv.into()]);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(done);
         let z = cur.ins().iconst(types::I64, 0);
