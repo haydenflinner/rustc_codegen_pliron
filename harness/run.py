@@ -30,8 +30,9 @@ OUT = os.path.join(ROOT, "target/harness")
 EXPECT = os.path.join(ROOT, "harness/expectations")
 ICES = os.path.join(OUT, "ices")
 TOOLCHAIN = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
-SO = "dylib" if sys.platform == "darwin" else "so"
-BACKEND = os.path.join(ROOT, f"target/debug/librustc_codegen_pliron.{SO}")
+SO = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
+LIB = "" if sys.platform == "win32" else "lib"
+BACKEND = os.path.join(ROOT, f"target/debug/{LIB}rustc_codegen_pliron.{SO}")
 ARCH = platform.machine()
 
 os.environ["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
@@ -87,6 +88,15 @@ OPTS = {"O0": [], "O": ["-O"]}
 
 def smoke_cases():
     for name, src, ed, flags, archs in SMOKE:
+        if sys.platform == "win32":
+            # Same as test.sh: against the stock LLVM std, panics are real
+            # SEH throws the emulated-EH invoke path can't intercept — the
+            # std test gates its catch_unwind asserts on pliron_stock_seh and
+            # the unwind test only runs under -Zbuild-std.
+            if name == "unwind":
+                continue
+            if name == "std":
+                flags = flags + ["--cfg", "pliron_stock_seh"]
         if archs is None or ARCH in archs:
             for opt, oflags in OPTS.items():
                 yield f"{name}@{opt}", src, ["--edition", ed] + flags + oflags

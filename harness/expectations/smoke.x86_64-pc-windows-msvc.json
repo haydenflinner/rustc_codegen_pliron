@@ -1,0 +1,9 @@
+{
+"nostd@O": "pass",
+"nostd@O0": "pass",
+"proc_macro": "pass",
+"std@O": "pass",
+"std@O0": "pass",
+"unroll@O": "pass",
+"unroll@O0": "pass"
+}
