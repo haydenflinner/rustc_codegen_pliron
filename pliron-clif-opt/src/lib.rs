@@ -12,6 +12,7 @@ pub mod brchain;
 pub mod celim;
 pub mod clifpeep;
 pub mod commute;
+pub mod diffcheck;
 pub mod dse;
 pub mod edgefwd;
 pub mod edgespec;

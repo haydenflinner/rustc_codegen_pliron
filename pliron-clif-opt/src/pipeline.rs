@@ -329,35 +329,127 @@ const fn step(
 }
 
 pub fn run_pipeline(p: &mut Pipe) {
-    let mut an = Analysis::default();
+    match crate::diffcheck::mode_for(p.fname) {
+        None => {
+            run_steps(p, false);
+        }
+        Some(crate::diffcheck::Mode::PerStep) => {
+            run_steps(p, true);
+        }
+        Some(crate::diffcheck::Mode::Whole) => run_whole_checked(p),
+    }
+}
+
+/// The steps this run selects, in order: `PLIRON_PIPELINE` if set (plus
+/// the `Gate::Always` lowerings), else every default step whose gate holds.
+fn selected(p: &Pipe) -> Vec<&'static Step> {
     if let Some(list) = &config().pipeline {
+        let mut out = Vec::new();
         for name in list {
             match DEFAULT
                 .iter()
                 .find(|s| s.name == name.as_str() && !matches!(s.gate, Gate::Always))
             {
-                Some(s) => run_step(p, s, &mut an),
+                Some(s) => out.push(s),
                 None => eprintln!("PLIRON_PIPELINE: unknown step `{name}`"),
             }
         }
-        for s in DEFAULT
-            .iter()
-            .filter(|s| matches!(s.gate, Gate::Always))
-        {
-            run_step(p, s, &mut an);
-        }
+        out.extend(DEFAULT.iter().filter(|s| matches!(s.gate, Gate::Always)));
+        out
     } else {
-        for s in DEFAULT {
-            if s.gate.ok(p) {
-                run_step(p, s, &mut an);
-            }
+        DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
+    }
+}
+
+/// Runs the selected steps. With `check_each`, every step that changes
+/// the function is differentially checked against its input; returns
+/// whether any check reported a mismatch.
+fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
+    let mut an = Analysis::default();
+    let mut found = false;
+    for s in selected(p) {
+        if !check_each {
+            run_step(p, s, &mut an);
+            continue;
+        }
+        let before = p.clctx.func.clone();
+        let before_text = before.display().to_string();
+        run_step(p, s, &mut an);
+        if p.clctx.func.display().to_string() != before_text {
+            found |= crate::diffcheck::check_and_report(
+                p.fname,
+                s.name,
+                &before,
+                &p.clctx.func,
+                &facts_of(p),
+            );
         }
     }
+    found
+}
+
+fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
+    crate::diffcheck::Facts {
+        nonnull: Some(p.nonnull),
+        noalias: Some(p.noalias),
+        deref: Some(p.deref),
+        frozen: Some(p.frozen),
+        nowrite: Some(p.nowrite),
+        // `cranelift_module` names a declared function `u0:<FuncId>`.
+        self_name: Some(format!("u0:{}", p.func_id.as_u32())),
+    }
+}
+
+/// `PLIRON_DIFFCHECK=1`: check the whole pipeline once per function, and
+/// only on a mismatch replay it step by step to name the guilty step.
+fn run_whole_checked(p: &mut Pipe) {
+    let initial = p.clctx.func.clone();
+    let derived0 = p.derived.clone();
+    run_steps(p, false);
+    let facts = facts_of(p);
+    let m = match crate::diffcheck::check(&initial, &p.clctx.func, &facts, &crate::diffcheck::config_from_env()) {
+        Ok(sum) => {
+            if crate::config::env_is("PLIRON_DIFFCHECK_VERBOSE", "1") {
+                eprintln!(
+                    "diffcheck {} compared={} inconclusive={} {}",
+                    p.fname,
+                    sum.compared,
+                    sum.inconclusive,
+                    sum.why.unwrap_or_default().lines().next().unwrap_or("")
+                );
+            }
+            return;
+        }
+        Err(m) => m,
+    };
+    // Replay from the start with per-step checks, then put the real
+    // result back so the build carries on exactly as without checking.
+    let final_func = std::mem::replace(&mut p.clctx.func, initial.clone());
+    let final_derived = std::mem::replace(p.derived, derived0);
+    let real_stats = std::mem::take(p.stats);
+    let localized = run_steps(p, true);
+    *p.stats = real_stats;
+    p.clctx.func = final_func;
+    *p.derived = final_derived;
+    if !localized {
+        crate::diffcheck::report(p.fname, "<whole pipeline>", &initial, &p.clctx.func, &facts_of(p), &m);
+    }
+}
+
+/// Names of the steps this run selects, in order (for `clif-check`).
+pub fn selected_names(p: &Pipe) -> Vec<&'static str> {
+    selected(p).iter().map(|s| s.name).collect()
+}
+
+/// Runs one step by name regardless of its gate (for `clif-check`).
+pub fn run_named(p: &mut Pipe, name: &str) -> Option<usize> {
+    let s = DEFAULT.iter().find(|s| s.name == name)?;
+    Some((s.run)(p, &mut Analysis::default()))
 }
 
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     if let Some(b) = s.bisect
-        && !bisect(b)
+        && !crate::config::bisect_in(b, p.fname)
     {
         return;
     }

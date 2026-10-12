@@ -286,6 +286,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-interpreter"
+version = "0.135.5"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-entity",
+ "libm",
+ "log",
+ "smallvec",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "cranelift-isle"
 version = "0.135.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,6 +325,18 @@ dependencies = [
  "gimli",
  "log",
  "object",
+ "target-lexicon",
+]
+
+[[package]]
+name = "cranelift-reader"
+version = "0.135.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1a08a039039326065a106417e448714c164a21c439b7091cec292489cd58d"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "smallvec",
  "target-lexicon",
 ]
 
@@ -672,12 +696,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-clif-check"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-module",
+ "cranelift-reader",
+ "pliron-clif-opt",
+ "rustc-hash",
+ "target-lexicon",
+]
+
+[[package]]
 name = "pliron-clif-opt"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
+ "cranelift-interpreter",
  "cranelift-module",
+ "cranelift-reader",
  "pliron",
  "pliron-cfg",
  "rustc-hash",

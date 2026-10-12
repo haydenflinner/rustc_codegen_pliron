@@ -56,6 +56,7 @@ rustc -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.so main.rs
 ```
 Uses the nightly pinned in `rust-toolchain.toml`. It needs `rustc-dev` because the backend links against rustc_private crates.
 ```
+PLIRON_DIFFCHECK=1 rustc ...   # differentially check every CLIF optimization (see AGENTS.md)
 tests/ui_run_pass.py           # rustc UI run-pass slice (needs a rust checkout, default ~/work/rust)
 examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game
 ```
