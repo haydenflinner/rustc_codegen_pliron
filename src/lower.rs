@@ -786,6 +786,12 @@ pub fn lower_to_object(
                     | target_lexicon::Architecture::X86_64
             );
             let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+            // 64-bit vector compares are cheap on aarch64 and with sse4.2
+            // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
+            let cmp64 = !x64
+                || sess
+                    .internal_target_features
+                    .contains(&rustc_span::Symbol::intern("sse4.2"));
             let k = crate::loopvec::run(
                 &mut clctx.func,
                 n,
@@ -793,6 +799,7 @@ pub fn lower_to_object(
                 m.target_config(),
                 simd,
                 x64,
+                cmp64,
             );
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("loopvec {k} {n}");

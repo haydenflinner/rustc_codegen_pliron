@@ -915,6 +915,7 @@ fn plan(
     lp: Loop,
     noalias: &FxHashSet<Value>,
     fname: &str,
+    cmp64: bool,
 ) -> Option<Plan> {
     let Some(info) = gather(func, cfg, dt, la, lp) else {
         why!(fname; "gather loop {:?}", lp);
@@ -1720,6 +1721,21 @@ fn plan(
         }
         if eqchain_testable(func, cv) {
             why!(fname; "early cond is a cheap scalar bit test {:?}", info.h);
+        }
+        // A 64-bit `icmp` has no cheap SSE2 lowering — the unsigned/signed
+        // 64-lane compare expands to ~10 insts of pcmpgtd/pshufd glue, far
+        // costlier than the scalar `cmp; jcc` per lane it replaces. aarch64
+        // (`cmhi.2d`) and sse4.2 (`pcmpgtq`) are fine — `cmp64` gates this.
+        if !cmp64
+            && let Some(ci) = func.dfg.value_def(cv).inst()
+            && let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                args,
+                ..
+            } = func.dfg.insts[ci]
+            && func.dfg.value_type(args[0]).bits() == 64
+        {
+            why!(fname; "early cond i64 icmp has no cheap SSE2 lowering {:?}", info.h);
         }
     }
     // Every stored value must be replicable or a splattable invariant.
@@ -3685,21 +3701,23 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // would need a store->load distance < VF*UNROLL, which can't exist:
     // same-stream addresses differ by whole iterations).
     //
-    // Early-exit loops put each group in its own block — a lane check can
-    // branch out mid-body — with an extra tail block for the backedge and
-    // a `resumes[g]` block per group that re-enters the scalar loop at the
-    // group's first lane.
+    // Early-exit loops put each group in its own block (the fused lane
+    // test ends the last one), with an extra tail block for the backedge
+    // and one `resume` block that re-enters the scalar loop at the
+    // iteration's first lane.
     let mut vbs = vec![vb];
-    let mut resumes = Vec::new();
+    let mut resume = None;
     if !p.early.is_empty() {
         for _ in 0..UNROLL {
             let b = pos.func.dfg.make_block();
             pos.func.layout.insert_block_after(b, *vbs.last().unwrap());
-            let r = pos.func.dfg.make_block();
-            pos.func.layout.insert_block_after(r, b);
             vbs.push(b);
-            resumes.push(r);
         }
+        // The fused lane test branches to a single resume: scalar re-walks
+        // from this iteration's first lane and finds the exit itself.
+        let r = pos.func.dfg.make_block();
+        pos.func.layout.insert_block_after(r, *vbs.last().unwrap());
+        resume = Some(r);
     }
     let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
     let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
@@ -3815,6 +3833,9 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 .collect::<Vec<_>>()
         );
     }
+    // Lane-wise early-exit checks accumulate across all groups into
+    // `exit_accs` — see the fused test emitted at the last group below.
+    let mut exit_accs: Vec<Value> = Vec::new();
     for g in 0..UNROLL {
         let (addrs, mut vmap) = core::mem::take(&mut groups[g]);
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
@@ -3862,31 +3883,40 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 _ => unreachable!(),
             }
         }
-        // Lane-wise early-exit checks: on a hit, resume the scalar loop at
-        // this group's first lane — it re-finds the exact lane and takes
-        // the real exit edge with its original args. Each check ends its
-        // block; several checks in one group chain through fresh blocks.
-        let nchecks = p.early.len();
-        let mut cur = vbs[g.min(vbs.len() - 1)];
-        for (i, &(cv, exits_true)) in p.early.iter().enumerate() {
+        // Lane-wise early-exit checks: early-exit loops are pure scans
+        // (no stores, no reductions), so every group's checks defer to one
+        // fused test at the last group. Each check normalizes to a
+        // lane-ok mask — `bnot` for exit-on-hit — and `band`-accumulates
+        // per mask type; `vall_true` of the whole lot means continue.
+        // On a hit the scalar loop resumes at this iteration's first lane
+        // and re-finds the exact lane itself — correct for both
+        // polarities, and the rare path is just a few extra scalar lanes.
+        for &(cv, exits_true) in &p.early {
             let m = emit_val(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs, cv, 0);
-            let nxt = if i + 1 == nchecks {
-                vbs[g + 1]
+            let m = if exits_true {
+                pos.ins().bnot(m)
             } else {
-                let nb = pos.func.dfg.make_block();
-                pos.func.layout.insert_block_after(nb, cur);
-                nb
+                m
             };
-            if exits_true {
-                let hit = pos.ins().vany_true(m);
-                pos.ins().brif(hit, resumes[g], &[], nxt, &[]);
-            } else {
-                let all = pos.ins().vall_true(m);
-                pos.ins().brif(all, nxt, &[], resumes[g], &[]);
+            let ty = pos.func.dfg.value_type(m);
+            match exit_accs
+                .iter_mut()
+                .find(|a| pos.func.dfg.value_type(**a) == ty)
+            {
+                Some(a) => *a = pos.ins().band(*a, m),
+                None => exit_accs.push(m),
             }
-            if i + 1 != nchecks {
-                pos = FuncCursor::new(pos.func).at_bottom(nxt);
-                cur = nxt;
+        }
+        if !p.early.is_empty() {
+            if g + 1 == UNROLL {
+                let mut ok = pos.ins().vall_true(exit_accs[0]);
+                for &a in &exit_accs[1..] {
+                    let t = pos.ins().vall_true(a);
+                    ok = pos.ins().band(ok, t);
+                }
+                pos.ins().brif(ok, vbs[UNROLL], &[], resume.unwrap(), &[]);
+            } else {
+                pos.ins().jump(vbs[g + 1], &[]);
             }
         }
         // vacc = vacc ⊕ delta per group; deltas come after the group's
@@ -4022,28 +4052,22 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     }
     let bargs: Vec<BlockArg> = back.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().jump(vh, &bargs);
-    // Resume blocks: re-enter the scalar loop at group g's first lane,
-    // `ivv + g*vf*step`. `Step` params advance s per elapsed iteration —
-    // `iters = (wg - iv0) / step` (`wg` is in iv units; for a pointer iv
+    // Resume block: re-enter the scalar loop at the iteration's first
+    // lane (`ivv`). `Step` params advance s per elapsed iteration —
+    // `iters = (ivv - iv0) / step` (`ivv` is in iv units; for a pointer iv
     // `step` is the per-iteration byte advance).
-    for (g, &r) in resumes.iter().enumerate() {
+    if let Some(r) = resume {
         let mut pos = FuncCursor::new(pos.func).at_bottom(r);
-        let wg = if g == 0 {
-            ivv
-        } else {
-            let c = pos.ins().iconst(iv_ty, g as i64 * p.vf * p.step);
-            pos.ins().iadd(ivv, c)
-        };
         let mut args: Vec<Value> = Vec::new();
         for (j, _) in params.iter().enumerate() {
             if j == p.iv_idx {
-                args.push(wg);
+                args.push(ivv);
                 continue;
             }
             match p.kinds[j] {
                 Param::Inv => args.push(p.entry_args[j]),
                 Param::Step(s) => {
-                    let d = pos.ins().isub(wg, p.iv0);
+                    let d = pos.ins().isub(ivv, p.iv0);
                     let it = if p.step == 1 {
                         d
                     } else {
@@ -4069,6 +4093,7 @@ pub fn run(
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
     simd: bool,
     x64: bool,
+    cmp64: bool,
 ) -> usize {
     if !simd {
         return 0;
@@ -4092,7 +4117,7 @@ pub fn run(
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
         let ps = crate::loadfwd::param_src(func);
-        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname) else {
+        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname, cmp64) else {
             continue;
         };
         if debug {
