@@ -434,7 +434,13 @@ struct StoreInfo {
 }
 
 /// Find groups of stores to `base + i*esz` in one block and pack them.
-fn try_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> usize {
+fn try_block(
+    func: &mut Function,
+    domtree: &DominatorTree,
+    na: &FxHashSet<Value>,
+    block: Block,
+) -> usize {
+    let ps = crate::loadfwd::param_src(func);
     let insts: Vec<Inst> = func.layout.block_insts(block).collect();
     let pos: FxHashMap<Inst, usize> = insts
         .iter()
@@ -600,7 +606,7 @@ impl Ctx<'_> {
 }
 
 /// Pack lane-wise scalar inst trees feeding adjacent stores into vector ops.
-pub fn run(func: &mut Function, simd: bool) -> usize {
+pub fn run(func: &mut Function, na: &FxHashSet<Value>, simd: bool) -> usize {
     if !simd {
         return 0;
     }
@@ -608,11 +614,11 @@ pub fn run(func: &mut Function, simd: bool) -> usize {
     let domtree = DominatorTree::with_function(func, &cfg);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, &domtree, block);
+        changed += try_block(func, &domtree, na, block);
     }
     if crate::pass_enabled("PLIRON_XPACK") {
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            changed += xpack_block(func, &domtree, block);
+            changed += xpack_block(func, &domtree, na, block);
         }
     }
     if changed > 0 {
@@ -634,7 +640,12 @@ pub fn run(func: &mut Function, simd: bool) -> usize {
 // whose bytes are overwritten before any read drop dead.
 
 /// A `(root, offset, size)` memory footprint for an access inst.
-fn mem_range(func: &Function, i: Inst) -> Option<(crate::loadfwd::Root, i64, u32)> {
+fn mem_range(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    i: Inst,
+) -> Option<(crate::loadfwd::Root, i64, u32)> {
     match func.dfg.insts[i] {
         InstructionData::Load {
             opcode: Opcode::Load,
@@ -642,7 +653,7 @@ fn mem_range(func: &Function, i: Inst) -> Option<(crate::loadfwd::Root, i64, u32
             offset,
             ..
         } => {
-            let (r, o) = crate::loadfwd::root(func, arg);
+            let (r, o) = crate::loadfwd::root(func, ps, na, arg);
             let sz = func.dfg.value_type(func.dfg.inst_results(i)[0]).bytes();
             Some((r, o + i64::from(i32::from(offset)), sz))
         }
@@ -652,7 +663,7 @@ fn mem_range(func: &Function, i: Inst) -> Option<(crate::loadfwd::Root, i64, u32
             offset,
             ..
         } => {
-            let (r, o) = crate::loadfwd::root(func, args[1]);
+            let (r, o) = crate::loadfwd::root(func, ps, na, args[1]);
             let sz = func.dfg.value_type(args[0]).bytes();
             Some((r, o + i64::from(i32::from(offset)), sz))
         }
@@ -680,6 +691,8 @@ fn res_of(func: &Function, i: Inst) -> Option<Value> {
 
 struct X<'a> {
     func: &'a Function,
+    ps: &'a FxHashMap<Value, Value>,
+    na: &'a FxHashSet<Value>,
     domtree: &'a DominatorTree,
     pos: &'a FxHashMap<Inst, usize>,
     insts: &'a [Inst],
@@ -849,8 +862,8 @@ impl X<'_> {
         // merge, otherwise the lanes are an unrelated gather.
         if let (Some(ia), Some(ib)) = (self.before_emit(a), self.before_emit(b))
             && let (Some(ra), Some(rb)) = (
-                mem_range(self.func, ia),
-                mem_range(self.func, ib),
+                mem_range(self.func, self.ps, self.na, ia),
+                mem_range(self.func, self.ps, self.na, ib),
             )
             && matches!(
                 self.func.dfg.insts[ia],
@@ -1100,7 +1113,7 @@ fn sinkable(
     if op != Opcode::Store {
         return None;
     }
-    let ur = mem_range(x.func, u)?;
+    let ur = mem_range(x.func, x.ps, x.na, u)?;
     if store_dead(x, u, ur, dead) {
         return Some(false); // dead store: drop, don't sink
     }
@@ -1119,12 +1132,12 @@ fn sinkable(
         if o2.is_call() || o2.is_terminator() || o2.is_branch() {
             return None;
         }
-        if let Some(r2) = mem_range(x.func, i2)
+        if let Some(r2) = mem_range(x.func, x.ps, x.na, i2)
             && may_overlap(ur, r2)
         {
             return None;
         }
-        if (o2.can_load() || o2.can_store() || o2.other_side_effects()) && mem_range(x.func, i2).is_none() {
+        if (o2.can_load() || o2.can_store() || o2.other_side_effects()) && mem_range(x.func, x.ps, x.na, i2).is_none() {
             return None;
         }
     }
@@ -1149,7 +1162,7 @@ fn store_dead(
         if o2.is_terminator() || o2.is_branch() || o2.is_call() {
             return false;
         }
-        let Some(r2) = mem_range(x.func, i2) else {
+        let Some(r2) = mem_range(x.func, x.ps, x.na, i2) else {
             continue;
         };
         if !may_overlap(ur, r2) {
@@ -1170,6 +1183,8 @@ fn store_dead(
 /// edits are applied by [`apply_pair`].
 fn plan_pair(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     domtree: &DominatorTree,
     uses: &FxHashMap<Value, FxHashSet<Inst>>,
     insts: &[Inst],
@@ -1214,6 +1229,8 @@ fn plan_pair(
     let vt = ty.by(2)?;
     let mut x = X {
         func,
+        ps: &ps,
+        na,
         domtree,
         pos,
         insts,
@@ -1387,7 +1404,7 @@ fn finish_plan(
                 bail!("ld-order");
             }
             if o2.can_store() || o2.other_side_effects() || o2.can_trap() {
-                match mem_range(func, i2) {
+                match mem_range(x.func, x.ps, x.na, i2) {
                     Some(r2) if x.loads.iter().all(|&lr| !may_overlap(lr, r2)) => {}
                     _ => bail!("ld-order"),
                 }
@@ -1539,6 +1556,8 @@ fn ra_fix(func: &Function, v: Value) -> Value {
 /// layout, unlike op pairs which can swap.
 fn plan_store(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     domtree: &DominatorTree,
     uses: &FxHashMap<Value, FxHashSet<Inst>>,
     insts: &[Inst],
@@ -1574,7 +1593,7 @@ fn plan_store(
     else {
         return None;
     };
-    let (r1, r2) = (mem_range(func, i1)?, mem_range(func, i2)?);
+    let (r1, r2) = (mem_range(func, ps, na, i1)?, mem_range(func, ps, na, i2)?);
     let (sa, sb) = if r1.0 == r2.0
         && r1.2 == r2.2
         && r1.1 + i64::from(r1.2) == r2.1
@@ -1612,14 +1631,14 @@ fn plan_store(
     } else {
         (sb, sa)
     };
-    let r_first = mem_range(func, first)?;
+    let r_first = mem_range(func, ps, na, first)?;
     for p in pos[&first] + 1..pos[&last] {
         let i2 = insts[p];
         let o2 = func.dfg.insts[i2].opcode();
         if o2.is_call() || o2.is_terminator() || o2.is_branch() {
             return None;
         }
-        match mem_range(func, i2) {
+        match mem_range(func, ps, na, i2) {
             Some(rx) if may_overlap(r_first, rx) => return None,
             Some(_) => {}
             None if o2.can_store() || o2.other_side_effects() || o2.can_trap() => return None,
@@ -1628,6 +1647,8 @@ fn plan_store(
     }
     let mut x = X {
         func,
+        ps: &ps,
+        na,
         domtree,
         pos,
         insts,
@@ -1719,7 +1740,13 @@ fn apply_pair(
 
 /// Greedily pair same-op insts in one block; rebuilds position state after
 /// each applied pack.
-fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> usize {
+fn xpack_block(
+    func: &mut Function,
+    domtree: &DominatorTree,
+    na: &FxHashSet<Value>,
+    block: Block,
+) -> usize {
+    let ps = crate::loadfwd::param_src(func);
     let mut total = 0;
     let mut tried = 0usize;
     let mut taken: FxHashSet<Inst> = FxHashSet::default();
@@ -1781,7 +1808,7 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                     cands += 1;
                     tried += 1;
                     if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan_store(
-                        func, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
                     ) {
                         let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
                         let n = apply_pair(
@@ -1818,12 +1845,12 @@ fn xpack_block(func: &mut Function, domtree: &DominatorTree, block: Block) -> us
                     // Both lane orders: swapping lanes changes column order,
                     // which decides whether adjacent loads merge.
                     let plan = plan_pair(
-                        func, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
                     )
                     .or_else(|| {
                         tried += 1;
                         plan_pair(
-                            func, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
+                            func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
                         )
                     });
                     if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {

@@ -331,6 +331,9 @@ pub fn lower_to_object(
         let noalias: FxHashSet<cranelift_codegen::ir::Value>;
         let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
         let nowrite: FxHashMap<FuncRef, bool>;
+        let call_frozen: FxHashMap<FuncRef, u64>;
+        let scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>;
+        let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
         let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
         let nocap: FxHashSet<(ir::Inst, u32)>;
         {
@@ -360,6 +363,9 @@ pub fn lower_to_object(
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
                 deref: FxHashMap::default(),
+                call_frozen: FxHashMap::default(),
+                scoped: FxHashMap::default(),
+                block_region: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
                 lifetimes: Vec::new(),
                 nocap: FxHashSet::default(),
@@ -378,6 +384,9 @@ pub fn lower_to_object(
             noalias = std::mem::take(&mut fl.noalias);
             deref = std::mem::take(&mut fl.deref);
             nowrite = std::mem::take(&mut fl.nowrite);
+            call_frozen = std::mem::take(&mut fl.call_frozen);
+            scoped = std::mem::take(&mut fl.scoped);
+            block_region = std::mem::take(&mut fl.block_region);
             // Resolve each marker's pointer to its CLIF value — safe now
             // that every def has been lowered. Untranslatable pointers
             // (promoted allocas, folded ops) just drop the marker.
@@ -518,7 +527,7 @@ pub fn lower_to_object(
             }
         }
         if st.loadfwd && crate::bisect("loadfwd") {
-            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite);
+            forwarded += crate::loadfwd::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
             if st.slot_dse {
                 // A load whose only user was a removed dead store keeps its own
                 // slot alive, so alternate the two until nothing changes.
@@ -544,7 +553,7 @@ pub fn lower_to_object(
             }
         }
         if st.dse && crate::bisect("dse") {
-            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite);
+            let k = crate::dse::run(&mut clctx.func, &noalias, &nowrite, &call_frozen);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("dse {k} {n}");
             }
@@ -606,7 +615,16 @@ pub fn lower_to_object(
             }
         }
         if st.licm && crate::bisect("licm") {
-            let k = crate::licm::run(&mut clctx.func, &noalias, &deref, &nowrite);
+            let k = crate::licm::run(
+                &mut clctx.func,
+                &noalias,
+                &deref,
+                &nowrite,
+                &call_frozen,
+                &scoped,
+                &block_region,
+                &st.region_parent,
+            );
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("licm {k} {n}");
             }
@@ -771,7 +789,7 @@ pub fn lower_to_object(
                 target_lexicon::Architecture::Aarch64(_)
                     | target_lexicon::Architecture::X86_64
             );
-            let k = crate::slp::run(&mut clctx.func, simd);
+            let k = crate::slp::run(&mut clctx.func, &noalias, simd);
             if k > 0 && std::env::var_os("PLIRON_STATS").is_some() {
                 eprintln!("slp {k} {n}");
             }
@@ -858,6 +876,9 @@ pub fn lower_to_object(
             {
                 panic!("punroll broke `{n}`: {e}\n{}", clctx.func.display());
             }
+        }
+        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+            eprintln!("==== {n}: noalias={noalias:?} deref={deref:?}");
         }
         if !frozen.is_empty() {
             let k = crate::clifpeep::frozen_loads(&mut clctx.func, &frozen);
@@ -1744,6 +1765,17 @@ struct FnLower<'a, 'b, 'tcx> {
     deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>,
     /// FuncRefs of calls to write-free functions (nowrite.rs).
     nowrite: FxHashMap<FuncRef, bool>,
+    /// FuncRefs of calls → bitmask of arg positions bound to a callee param
+    /// rustc marks `noalias readonly`: the callee can't write the pointee.
+    call_frozen: FxHashMap<FuncRef, u64>,
+    /// CLIF load inst → inlined-clone region id (`State::frozen_loads`):
+    /// the load reads a `noalias readonly` pointee for the clone's
+    /// duration, so LICM may hoist it to an in-region preheader without
+    /// proving every in-loop writer can't clobber it.
+    scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
+    /// CLIF block → inlined-clone region id (`State::region_blocks`), the
+    /// same id space `scoped` uses: pliron clone-entry block ptr.
+    block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
     /// `llvm.lifetime.{start,end}` markers, as (pointer operand, anchor
     /// instruction, block, is_start); the pointer is a pliron value — its
     /// CLIF form is resolved after lowering since an inlined alloca may
@@ -1785,6 +1817,11 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
         for pb in &pblocks {
             let cb = self.b.create_block();
             self.blocks.insert(*pb, cb);
+            // Unmapped blocks belong to the outermost region — the function
+            // body — anchored at its entry so licm's ancestry walk bottoms
+            // out here.
+            let r = self.st.region_blocks.get(pb).copied().unwrap_or(pblocks[0]);
+            self.block_region.insert(cb, r);
         }
         let entry = self.blocks[&pblocks[0]];
         self.b.append_block_params_for_function_params(entry);
@@ -1801,6 +1838,42 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                     .into_iter()
                     .map(|(_, t)| self.b.append_block_param(cb, t))
                     .collect();
+                // A cloned arg bound to a `noalias readonly` callee param
+                // (`inline::frozen_args`): the freeze holds only inside the
+                // clone, so seed `noalias`/`deref` — licm's hoists stay
+                // inside the region — rather than `frozen`'s function-wide
+                // `readonly can_move` load flags.
+                if let Some(rs) = self.st.region_frozen.get(&a) {
+                    for &(sub, bytes, _) in rs {
+                        let Some(&v) = vs.get(sub as usize) else {
+                            continue;
+                        };
+                        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+                            eprintln!(
+                                "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}"
+                            );
+                        }
+                        self.noalias.insert(v);
+                        self.deref.insert(v, (bytes, false));
+                    }
+                }
+                // Any `noalias` callee param — the pivot/slice scope split
+                // described on `State::region_noalias`.
+                if let Some(subs) = self.st.region_noalias.get(&a) {
+                    for &sub in subs {
+                        let Some(&v) = vs.get(sub as usize) else {
+                            continue;
+                        };
+                        if std::env::var_os("PLIRON_FROZEN_DEBUG").is_some() {
+                            eprintln!(
+                                "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
+                                *pb,
+                                pb.deref(ctx).arguments().count()
+                            );
+                        }
+                        self.noalias.insert(v);
+                    }
+                }
                 self.vals.insert(a, vs);
             }
         }
@@ -3185,6 +3258,13 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
             if r.len() == 1 && self.st.bool01.contains(&op) {
                 self.bool01.insert(r[0]);
             }
+            if let Some(&reg) = self.st.frozen_loads.get(&op) {
+                for &v in &r {
+                    if let Some(i) = self.b.func.dfg.value_def(v).inst() {
+                        self.scoped.insert(i, reg);
+                    }
+                }
+            }
             self.set(op, r);
         } else if is!(StoreOp) || is!(AtomicStoreOp) {
             let vs = self.get(opnds[0]);
@@ -3919,6 +3999,15 @@ impl<'a, 'b, 'tcx> FnLower<'a, 'b, 'tcx> {
                         let fr = self.call_fref(fid);
                         if let Some(strict) = nw {
                             self.nowrite.insert(fr, strict);
+                        }
+                        if let Some(f) = self.st.funcs.get(sym) {
+                            let m = f
+                                .frozen
+                                .iter()
+                                .fold(0u64, |m, &(i, _)| if i < 64 { m | 1 << i } else { m });
+                            if m != 0 {
+                                self.call_frozen.insert(fr, m);
+                            }
                         }
                         Ok(fr)
                     }

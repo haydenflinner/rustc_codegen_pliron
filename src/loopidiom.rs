@@ -1217,6 +1217,7 @@ pub(crate) fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
 /// The affine destination `dst0` + byte `len` + guards for one loop, or None.
 pub(crate) fn plan(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1453,8 +1454,8 @@ pub(crate) fn plan(
         // predicates) — `isolated` itself is stricter than needed here since
         // it also guards load-forwarding, which drops roots whose pointers
         // are offset by dynamic amounts.
-        let (sr, _) = loadfwd::root(func, sbase);
-        let (dr, _) = loadfwd::root(func, dbase);
+        let (sr, _) = loadfwd::root(func, ps, noalias, sbase);
+        let (dr, _) = loadfwd::root(func, ps, noalias, dbase);
         let na = |r: Root| matches!(r, Root::V(v) if noalias.contains(&v));
         let proven = match (sr, dr) {
             (Root::S(a), Root::S(b)) => a != b,
@@ -1756,6 +1757,8 @@ fn inv_guard_pred(func: &Function, info: &Info, kinds: &[Param], e: Edge) -> Opt
 /// None when the shape doesn't fit — the loop stays undeleted.
 fn rmw_locs(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     dt: &DominatorTree,
     info: &Info,
     kinds: &[Param],
@@ -1770,7 +1773,7 @@ fn rmw_locs(
             return None;
         };
         let ty = func.dfg.value_type(func.dfg.first_result(i));
-        let (r, o) = loadfwd::root(func, arg);
+        let (r, o) = loadfwd::root(func, ps, na, arg);
         let o = o.wrapping_add(i64::from(i32::from(offset)));
         let e = groups
             .entry((r, o))
@@ -1785,7 +1788,7 @@ fn rmw_locs(
             return None;
         };
         let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-        let (r, o) = loadfwd::root(func, args[1]);
+        let (r, o) = loadfwd::root(func, ps, na, args[1]);
         let o = o.wrapping_add(i64::from(i32::from(offset)));
         let e = groups
             .entry((r, o))
@@ -1920,6 +1923,8 @@ fn rmw_locs(
 /// the count isn't provable, or an exit edge arg can't be recomputed.
 fn plan_dead(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1972,7 +1977,7 @@ fn plan_dead(
     let rmw = if loads.is_empty() && stores.is_empty() {
         Vec::new()
     } else {
-        let Some(r) = rmw_locs(func, dt, &info, &kinds, &loads, &stores) else {
+        let Some(r) = rmw_locs(func, ps, na, dt, &info, &kinds, &loads, &stores) else {
             why!("dead: rmw shape {:?}", info.h);
         };
         r
@@ -2415,17 +2420,18 @@ pub fn run(
         let dt = DominatorTree::with_function(func, &cfg);
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
+        let ps = crate::loadfwd::param_src(func);
         for lp in la.loops() {
             if done.contains(&la.loop_header(lp)) {
                 continue;
             }
-            if let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias) {
+            if let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias) {
                 if debug {
                     eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
                 }
                 apply(func, &p, tcfg);
                 done.insert(p.h);
-            } else if let Some(d) = plan_dead(func, &cfg, &dt, &la, lp) {
+            } else if let Some(d) = plan_dead(func, &ps, noalias, &cfg, &dt, &la, lp) {
                 if debug {
                     eprintln!("idiom {fname}: dead loop {:?} eliminated", d.h);
                 }

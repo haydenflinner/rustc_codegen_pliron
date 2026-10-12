@@ -133,14 +133,19 @@ fn mem_width(func: &Function, i: Inst) -> Option<i64> {
 }
 
 /// Location `(root, offset, width)` touched by a plain load/store inst.
-fn mem_loc(func: &Function, i: Inst) -> Option<(Root, i64, i64)> {
+fn mem_loc(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    i: Inst,
+) -> Option<(Root, i64, i64)> {
     let (addr, off) = match func.dfg.insts[i] {
         InstructionData::Load { arg, offset, .. } => (arg, i32::from(offset)),
         InstructionData::Store { args, offset, .. } => (args[1], i32::from(offset)),
         _ => return None,
     };
     let w = mem_width(func, i)?;
-    let (r, o) = loadfwd::root(func, addr);
+    let (r, o) = loadfwd::root(func, ps, na, addr);
     Some((r, o.wrapping_add(i64::from(off)), w))
 }
 
@@ -148,6 +153,8 @@ fn mem_loc(func: &Function, i: Inst) -> Option<(Root, i64, i64)> {
 /// `dead`, when given, collects stores proven dead on this walk.
 fn transfer(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     b: Block,
     d: &mut Demands,
     iso: &FxHashSet<Root>,
@@ -159,14 +166,14 @@ fn transfer(
     for i in insts.into_iter().rev() {
         match func.dfg.insts[i] {
             InstructionData::Load { .. } => {
-                if let Some((r, o, w)) = mem_loc(func, i) {
+                if let Some((r, o, w)) = mem_loc(func, ps, na, i) {
                     d.demand(r, o, w);
                 } else {
                     d.barrier(iso);
                 }
             }
             InstructionData::Store { opcode, .. } => {
-                let Some((r, o, w)) = mem_loc(func, i) else {
+                let Some((r, o, w)) = mem_loc(func, ps, na, i) else {
                     d.barrier(iso);
                     continue;
                 };
@@ -217,12 +224,14 @@ pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
+    cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
     let cfg = ControlFlowGraph::with_function(func);
-    let iso = loadfwd::isolated(func, noalias);
+    let ps = loadfwd::param_src(func);
+    let iso = loadfwd::isolated(func, noalias, &ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut order = Vec::new();
     let mut seen: FxHashSet<Block> = FxHashSet::default();
@@ -265,7 +274,7 @@ pub fn run(
                 changed = true;
             }
             let mut din = d;
-            transfer(func, b, &mut din, &iso, nw, eh, None);
+            transfer(func, &ps, noalias, b, &mut din, &iso, nw, eh, None);
             if inn.get(&b) != Some(&din) {
                 inn.insert(b, din);
                 changed = true;
@@ -282,7 +291,7 @@ pub fn run(
     let mut dead = Vec::new();
     for &b in &order {
         let mut d = out.get(&b).cloned().unwrap_or_default();
-        transfer(func, b, &mut d, &iso, nw, eh, Some(&mut dead));
+        transfer(func, &ps, noalias, b, &mut d, &iso, nw, eh, Some(&mut dead));
     }
     for i in &dead {
         func.layout.remove_inst(*i);

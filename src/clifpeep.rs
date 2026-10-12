@@ -640,12 +640,11 @@ fn minmax(pos: &mut FuncCursor, inst: Inst) -> bool {
     false
 }
 
-/// `brif (bxor (band c, 1), 1), a, b` (rustc's `!bool` after `i1`
-/// normalization) becomes `brif c, b, a`.
-fn brif_not(func: &mut Function, inst: Inst) -> bool {
-    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
-        return false;
-    };
+/// Peel rustc's `!bool` spellings off a branch/select condition —
+/// `bxor x, 1` and `band x, 1` over known 0/1 values, `ireduce`, and the
+/// `select c, 0, 1` (`!c`) / `select c, 1, 0` residues. Returns the
+/// stripped value and whether the chain logically negates it.
+fn un_not(func: &Function, arg: Value) -> (Value, bool) {
     let (mut v, mut neg) = (func.dfg.resolve_aliases(arg), false);
     for _ in 0..8 {
         match (bin_k(func, v, Opcode::Band), bin_k(func, v, Opcode::Bxor)) {
@@ -686,6 +685,16 @@ fn brif_not(func: &mut Function, inst: Inst) -> bool {
             }
         }
     }
+    (v, neg)
+}
+
+/// `brif (bxor (band c, 1), 1), a, b` (rustc's `!bool` after `i1`
+/// normalization) becomes `brif c, b, a`.
+fn brif_not(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
+        return false;
+    };
+    let (v, neg) = un_not(func, arg);
     if v == func.dfg.resolve_aliases(arg) {
         return false;
     }
@@ -696,6 +705,35 @@ fn brif_not(func: &mut Function, inst: Inst) -> bool {
     {
         *a = v;
         *bs = blocks;
+    }
+    true
+}
+
+/// `select (bxor (icmp cc a b), 1) t, f` (rustc's `!bool` select predicate)
+/// becomes `select (icmp cc a b) f, t`: the icmp's own flags then feed the
+/// `csel`, instead of materializing the negation with `eor`+`tst` — the
+/// shape LLVM emits for partition/insertion-sort inner loops.
+fn sel_not(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = func.dfg.insts[inst]
+    else {
+        return false;
+    };
+    let (v, neg) = un_not(func, args[0]);
+    if v == func.dfg.resolve_aliases(args[0]) {
+        return false;
+    }
+    let (t, f) = if neg {
+        (args[2], args[1])
+    } else {
+        (args[1], args[2])
+    };
+    if let InstructionData::Ternary { args: a, .. } = &mut func.dfg.insts[inst] {
+        a[0] = v;
+        a[1] = t;
+        a[2] = f;
     }
     true
 }
@@ -2682,6 +2720,9 @@ pub fn run(func: &mut Function) -> usize {
                 pos.func.dfg.insts[inst].opcode(),
                 Opcode::Select | Opcode::Bitselect
             ) {
+                if crate::pass_enabled("PLIRON_SELNOT") && sel_not(pos.func, inst) {
+                    n += 1;
+                }
                 if crate::pass_enabled("PLIRON_MINMAX") && minmax(&mut pos, inst) {
                     n += 1;
                 }

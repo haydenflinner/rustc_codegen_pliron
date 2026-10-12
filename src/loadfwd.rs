@@ -12,7 +12,7 @@ use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
-    Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
+    Block, BlockArg, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -38,10 +38,117 @@ pub(crate) enum Root {
 pub(crate) type Loc = (Root, i64, Type);
 type Avail = FxHashMap<Loc, Value>;
 
-pub(crate) fn root(func: &Function, v: Value) -> (Root, i64) {
+/// Block params that always carry one value: every predecessor passes the
+/// same argument (or the param itself — a loop-carried passthrough, like
+/// `partition`'s `pivot` threaded through the scan loop). Such a param is
+/// that value for analysis purposes. Maps param → that value.
+pub(crate) fn param_src(func: &Function) -> FxHashMap<Value, Value> {
+    let mut src: FxHashMap<Value, Option<Value>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for bc in func.dfg.insts[i].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                let dst = bc.block(&func.dfg.value_lists);
+                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                let params = func.dfg.block_params(dst);
+                for (k, a) in args.into_iter().enumerate() {
+                    let Some(&p) = params.get(k) else {
+                        break;
+                    };
+                    let v = match a {
+                        BlockArg::Value(v) => func.dfg.resolve_aliases(v),
+                        // Pseudo-args (try_call ret/exn) can't be read here.
+                        _ => {
+                            src.insert(p, None);
+                            continue;
+                        }
+                    };
+                    if v == p {
+                        continue;
+                    }
+                    match src.entry(p) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(Some(v));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if *e.get() != Some(v) {
+                                e.insert(None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    src.into_iter().filter_map(|(p, s)| s.map(|s| (p, s))).collect()
+}
+
+/// Chase `param_src` links (plus value aliases) to the value `v` provably
+/// always equals. Bounded: param chains are short, and cycles can't occur
+/// in valid SSA — a param can only feed blocks it dominates.
+pub(crate) fn psrc(
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    func: &Function,
+    mut v: Value,
+) -> Value {
+    for _ in 0..16 {
+        if na.contains(&v) {
+            return v;
+        }
+        v = func.dfg.resolve_aliases(v);
+        if na.contains(&v) {
+            return v;
+        }
+        match ps.get(&v) {
+            Some(&s) if s != v => v = s,
+            _ => return v,
+        }
+    }
+    v
+}
+
+/// The (dst block, param index) the `j`th branch-arg use of `i` feeds —
+/// `j` counts only `BlockArg::Value`s, matching `inst_values`' ordering.
+/// `None` for exception-context uses, which can't be traced.
+fn fwd_arg(func: &Function, i: Inst, mut j: usize) -> Option<(Block, usize)> {
+    for bc in func.dfg.insts[i]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+    {
+        for (pos, a) in bc.args(&func.dfg.value_lists).enumerate() {
+            if a.as_value().is_some() {
+                if j == 0 {
+                    return Some((bc.block(&func.dfg.value_lists), pos));
+                }
+                j -= 1;
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn root(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    v: Value,
+) -> (Root, i64) {
     let mut v = func.dfg.resolve_aliases(v);
     let mut off = 0i64;
-    for _ in 0..8 {
+    for _ in 0..16 {
+        // A `noalias` value is its own scope root: the name carries the
+        // alias class (`&v[1..]` computes `pivot + 8` but is a different
+        // object), so resolve no further.
+        if na.contains(&v) {
+            break;
+        }
+        // A single-source param is its source (`param_src`); keep peeling.
+        if let Some(&s) = ps.get(&v) {
+            v = func.dfg.resolve_aliases(s);
+            continue;
+        }
         let Some(i) = func.dfg.value_def(v).inst() else {
             break;
         };
@@ -65,10 +172,7 @@ pub(crate) fn root(func: &Function, v: Value) -> (Root, i64) {
                     } => Some(imm.bits()),
                     _ => None,
                 };
-                let (a, b) = (
-                    func.dfg.resolve_aliases(args[0]),
-                    func.dfg.resolve_aliases(args[1]),
-                );
+                let (a, b) = (psrc(ps, na, func, args[0]), psrc(ps, na, func, args[1]));
                 if let Some(k) = c(b) {
                     off = off.wrapping_add(k);
                     v = a;
@@ -140,9 +244,18 @@ fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bo
 /// Roots whose memory is reachable only through addresses with that root:
 /// stack slots (`PLIRON_FWD_SLOTS`) and rustc-`noalias` entry params
 /// (`PLIRON_NOALIAS_FWD`) that never escape. Every use of a value with such
-/// a root must be a load/store address or a const `iadd` that `root` still
-/// resolves to it, so calls and stores through other roots can't touch it.
-pub(crate) fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet<Root> {
+/// a root must keep the address tracked: a load/store address, a const
+/// `iadd` that `root` still resolves, an `icmp` (a bool can't carry the
+/// pointer), or a branch arg feeding a param that `param_src` resolves
+/// back to the same root. Call args are never benign: the callee reads
+/// the pointee and may stash the pointer. Anything else lets the address
+/// reach memory analysis can't see.
+pub(crate) fn isolated(
+    func: &Function,
+    noalias: &FxHashSet<Value>,
+    ps: &FxHashMap<Value, Value>,
+    _cfrozen: &FxHashMap<FuncRef, u64>,
+) -> FxHashSet<Root> {
     let mut iso: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
     if crate::pass_enabled("PLIRON_FWD_SLOTS") {
         iso.extend(func.sized_stack_slots.keys().map(Root::S));
@@ -153,19 +266,41 @@ pub(crate) fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let data = &func.dfg.insts[i];
+            let nargs = func.dfg.inst_args(i).len();
+            // A use that is a branch arg (index ≥ the inst's own args):
+            // benign iff the param it feeds is the same root — i.e., the
+            // pointer stays inside this equivalence class.
             for (k, v) in func.dfg.inst_values(i).enumerate() {
-                let (r, _) = root(func, v);
+                let (r, _) = root(func, ps, noalias, v);
                 if !iso.contains(&r) {
                     continue;
                 }
+                let fwd = |j: usize| {
+                    fwd_arg(func, i, j).is_some_and(|(dst, pos)| {
+                        Root::V(psrc(ps, noalias, func, func.dfg.block_params(dst)[pos])) == r
+                    })
+                };
                 let ok = match data {
                     InstructionData::Load { .. } => k == 0,
                     InstructionData::Store { .. } => k == 1,
+                    // The result is tracked under the same root, or is
+                    // itself a distinct `noalias` scope (a param bound to
+                    // `base + k`, like `&v[1..]` next to `pivot`): either
+                    // way the address stays tracked.
                     InstructionData::Binary {
                         opcode: Opcode::Iadd,
                         ..
-                    } => root(func, func.dfg.first_result(i)).0 == r,
-                    _ => false,
+                    } => {
+                        let res = func.dfg.first_result(i);
+                        root(func, ps, noalias, res).0 == r || noalias.contains(&res)
+                    }
+                    // A comparison can't carry the pointer anywhere.
+                    _ if matches!(data.opcode(), Opcode::Icmp) => true,
+                    // A call use is never benign: the callee reads the
+                    // pointee and can stash the pointer, so the root has
+                    // untracked aliases either way.
+                    _ if data.opcode().is_call() => false,
+                    _ => k >= nargs && fwd(k - nargs),
                 };
                 if !ok {
                     iso.remove(&r);
@@ -180,11 +315,19 @@ pub(crate) fn isolated(func: &Function, noalias: &FxHashSet<Value>) -> FxHashSet
 /// `load (select c, pa, pb)` with both arms forwarding: the result is
 /// `select c, aval(pa), aval(pb)`. Keeps the select to scalar types the
 /// targets legalize (aarch64 can't pick an i128 or a vector lane-wise).
-fn sel_split(func: &Function, av: &Avail, arg: Value, off: i64, ty: Type) -> Option<Fwd> {
+fn sel_split(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    av: &Avail,
+    arg: Value,
+    off: i64,
+    ty: Type,
+) -> Option<Fwd> {
     if !(ty.is_int() && ty.bits() <= 64 || matches!(ty, cranelift_codegen::ir::types::F32 | cranelift_codegen::ir::types::F64)) {
         return None;
     }
-    let (r, _) = root(func, arg);
+    let (r, _) = root(func, ps, na, arg);
     let Root::V(rv) = r else {
         return None;
     };
@@ -198,8 +341,8 @@ fn sel_split(func: &Function, av: &Avail, arg: Value, off: i64, ty: Type) -> Opt
     else {
         return None;
     };
-    let (ra, oa) = root(func, args[1]);
-    let (rb, ob) = root(func, args[2]);
+    let (ra, oa) = root(func, ps, na, args[1]);
+    let (rb, ob) = root(func, ps, na, args[2]);
     let t = *av.get(&(ra, oa.wrapping_add(off), ty))?;
     let e = *av.get(&(rb, ob.wrapping_add(off), ty))?;
     Some(Fwd::Sel {
@@ -211,6 +354,8 @@ fn sel_split(func: &Function, av: &Avail, arg: Value, off: i64, ty: Type) -> Opt
 
 fn transfer(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     b: Block,
     av: &mut Avail,
     rw: Option<&mut Vec<(Inst, Fwd)>>,
@@ -230,7 +375,7 @@ fn transfer(
             } if notrap(func, i) => {
                 let res = func.dfg.first_result(i);
                 let ty = func.dfg.value_type(res);
-                let (r, o) = root(func, arg);
+                let (r, o) = root(func, ps, na, arg);
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
                 if let Some(&v) = av.get(&loc) {
@@ -238,7 +383,7 @@ fn transfer(
                         rw.push((i, Fwd::V(v)));
                     }
                 } else if let Some(s) =
-                    rw.is_some().then(|| sel_split(func, av, arg, off, ty)).flatten()
+                    rw.is_some().then(|| sel_split(func, ps, na, av, arg, off, ty)).flatten()
                 {
                     rw.as_deref_mut().unwrap().push((i, s));
                 } else if av.len() < MAX_ENTRIES {
@@ -253,7 +398,7 @@ fn transfer(
             } if notrap(func, i) => {
                 let val = func.dfg.resolve_aliases(args[0]);
                 let ty = func.dfg.value_type(val);
-                let (r, o) = root(func, args[1]);
+                let (r, o) = root(func, ps, na, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
                 kill(av, r, o, ty, iso);
                 // A store through `select c, pa, pb` may write either
@@ -267,7 +412,7 @@ fn transfer(
                     } = func.dfg.insts[si]
                 {
                     for &a in &sargs[1..] {
-                        let (ra, oa) = root(func, a);
+                        let (ra, oa) = root(func, ps, na, a);
                         kill(av, ra, oa.wrapping_add(o), ty, iso);
                     }
                 }
@@ -303,6 +448,7 @@ pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
+    cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
@@ -333,14 +479,15 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
+    let ps = param_src(func);
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        n += pre(func, &cfg, &rpo, entry);
+        n += pre(func, &ps, noalias, &cfg, &rpo, entry);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
         }
     }
-    let iso = isolated(func, noalias);
+    let iso = isolated(func, noalias, &ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, Avail>, b: Block| -> Option<Avail> {
@@ -368,7 +515,7 @@ pub fn run(
             let Some(mut av) = input(&out, b) else {
                 continue;
             };
-            transfer(func, b, &mut av, None, &iso, nw, eh);
+            transfer(func, &ps, noalias, b, &mut av, None, &iso, nw, eh);
             if out.get(&b) != Some(&av) {
                 out.insert(b, av);
                 changed = true;
@@ -385,7 +532,7 @@ pub fn run(
     let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
-            transfer(func, b, &mut av, Some(&mut fwd), &iso, nw, eh);
+            transfer(func, &ps, noalias, b, &mut av, Some(&mut fwd), &iso, nw, eh);
         }
     }
     let fwd_cnt = fwd.len();
@@ -593,7 +740,14 @@ fn edge_pre(
 /// promotion for loop-carried fields): a location available from every
 /// predecessor, even as different values, becomes a block param. The key
 /// sets follow `transfer` exactly, so every needed end value exists.
-fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block) -> usize {
+fn pre(
+    func: &mut Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    cfg: &ControlFlowGraph,
+    rpo: &[Block],
+    entry: Block,
+) -> usize {
     let iso: FxHashSet<Root> = FxHashSet::default();
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;
@@ -625,7 +779,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 .into_iter()
                 .map(|k| (k, Value::reserved_value()))
                 .collect();
-            transfer(func, b, &mut av, None, &iso, nw, eh);
+            transfer(func, &ps, na, b, &mut av, None, &iso, nw, eh);
             let ks: FxHashSet<Loc> = av.into_keys().collect();
             if out.get(&b) != Some(&ks) {
                 out.insert(b, ks);
@@ -673,7 +827,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 } if notrap(func, i) => {
                     let res = func.dfg.first_result(i);
                     let ty = func.dfg.value_type(res);
-                    let (r, o) = root(func, arg);
+                    let (r, o) = root(func, ps, na, arg);
                     let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                     if let Some(&s) = st.get(&loc) {
                         let v = match s {
@@ -701,7 +855,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                 } if notrap(func, i) => {
                     let val = func.dfg.resolve_aliases(args[0]);
                     let ty = func.dfg.value_type(val);
-                    let (r, o) = root(func, args[1]);
+                    let (r, o) = root(func, ps, na, args[1]);
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
                     kill_st(&mut st, r, o, ty);
                     writes.push((r, o, ty));
@@ -717,7 +871,7 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
                         } = func.dfg.insts[si]
                     {
                         for &a in &sargs[1..] {
-                            let (ra, oa) = root(func, a);
+                            let (ra, oa) = root(func, ps, na, a);
                             let a = (ra, oa.wrapping_add(o), ty);
                             kill_st(&mut st, a.0, a.1, a.2);
                             writes.push(a);
@@ -775,6 +929,8 @@ fn pre(func: &mut Function, cfg: &ControlFlowGraph, rpo: &[Block], entry: Block)
 /// escapes, typically left behind once every load out of the slot has been
 /// forwarded (`PLIRON_SLOT_DSE`). Returns the number of stores removed.
 pub fn dead_slot_stores(func: &mut Function) -> usize {
+    let ps = &param_src(func);
+    let na: &FxHashSet<Value> = &FxHashSet::default();
     let mut dead: FxHashSet<StackSlot> = func.sized_stack_slots.keys().collect();
     if dead.is_empty() {
         return 0;
@@ -791,7 +947,7 @@ pub fn dead_slot_stores(func: &mut Function) -> usize {
                 dead.remove(&stack_slot);
             }
             for (k, v) in func.dfg.inst_values(i).enumerate() {
-                let Root::S(s) = root(func, v).0 else {
+                let Root::S(s) = root(func, ps, na, v).0 else {
                     continue;
                 };
                 if !dead.contains(&s) {
@@ -805,7 +961,7 @@ pub fn dead_slot_stores(func: &mut Function) -> usize {
                     InstructionData::Binary {
                         opcode: Opcode::Iadd,
                         ..
-                    } => root(func, func.dfg.first_result(i)).0 == Root::S(s),
+                    } => root(func, ps, na, func.dfg.first_result(i)).0 == Root::S(s),
                     _ => false,
                 };
                 if !ok {

@@ -63,6 +63,8 @@ fn speculatable(func: &Function, i: Inst) -> bool {
 /// Whether a write-ish instruction `w` can touch `loc`.
 fn clobbers(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     w: Inst,
     loc: Loc,
     iso: &FxHashSet<Root>,
@@ -78,7 +80,7 @@ fn clobbers(
         // use of such an address escapes analysis — and this store IS a use.
         InstructionData::Store { args, offset, .. } => {
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-            let (r2, o2) = loadfwd::root(func, args[1]);
+            let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
             !overlap_keeps((r2, o2, ty), loc, iso)
         }
@@ -134,16 +136,39 @@ fn split_edge(func: &mut Function, pinst: Inst, slot: usize) -> Option<Block> {
 
 /// Insts the loop may move out: speculatable or a `notrap` load no in-loop
 /// write can clobber.
+type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
+
+#[allow(clippy::too_many_arguments)]
 fn hoists(
     func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped: &FxHashMap<Inst, Region>,
+    breg: &FxHashMap<Block, Region>,
+    rpar: &FxHashMap<Region, Region>,
+    pb: Block,
     i: Inst,
 ) -> bool {
+    let dbg = std::env::var_os("PLIRON_LICM_DEBUG2").is_some()
+        && matches!(func.dfg.insts[i], InstructionData::Load { .. });
+    if dbg
+        && let Some(&reg) = scoped.get(&i)
+    {
+        eprintln!(
+            "licm? {}: scoped region {reg:?} breg={:?}",
+            func.dfg.display_inst(i),
+            breg.get(&pb)
+        );
+    }
     if !func.dfg.inst_args(i).iter().all(|&a| inv(func, a)) {
+        if dbg {
+            eprintln!("licm? {}: arg not invariant", func.dfg.display_inst(i));
+        }
         return false;
     }
     if speculatable(func, i) {
@@ -159,10 +184,25 @@ fn hoists(
         return false;
     };
     if !loadfwd::notrap(func, i) {
+        if dbg {
+            eprintln!("licm? {}: trapping", func.dfg.display_inst(i));
+        }
         return false;
     }
     let ty = func.dfg.value_type(func.dfg.first_result(i));
-    let (r, o) = loadfwd::root(func, arg);
+    let (r, o) = loadfwd::root(func, ps, na, arg);
+    if dbg {
+        eprintln!(
+            "licm? {}: root {:?} off {o} iso={} deref={:?}",
+            func.dfg.display_inst(i),
+            r,
+            iso.contains(&r),
+            match r {
+                Root::V(v) => deref.get(&v).copied(),
+                _ => None,
+            }
+        );
+    }
     let loc: Loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
     // `notrap` only asserts the load can't trap where it sits — invalid
     // addresses are UB, so removal/reorder is fine — but hoisting speculates
@@ -185,11 +225,45 @@ fn hoists(
                 })
         }
     };
-    safe && writers.iter().all(|&w| !clobbers(func, w, loc, iso, nw))
+    // A load tagged region-frozen (`inline::frozen_args`) reads a `noalias
+    // readonly` pointee for its inlined clone's duration — no writer inside
+    // the region can clobber it, so the clobber scan is unnecessary when the
+    // hoist stays in-region: the preheader is `pb`, or a fresh block split
+    // on the `pb`→`h` edge (dominated by `pb`, hence in `pb`'s region).
+    // Regions nest — `pb` may sit in a deeper clone than the tagged region;
+    // walk `region_parent` to check containment.
+    if let Some(&target) = scoped.get(&i) {
+        let mut r = breg.get(&pb).copied();
+        let mut chain = Vec::new();
+        while let Some(x) = r {
+            chain.push(x);
+            if x == target {
+                if dbg {
+                    eprintln!("licm?   scoped frozen, in-region hoist");
+                }
+                return safe;
+            }
+            r = rpar.get(&x).copied().filter(|&n| n != x);
+        }
+        if dbg {
+            eprintln!("licm?   scoped miss chain={chain:?} target={target:?}");
+        }
+    }
+    let nw_w = writers
+        .iter()
+        .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw))
+        .count();
+    if dbg {
+        eprintln!("licm?   safe={safe} writers_clobbering={nw_w}");
+    }
+    safe && nw_w == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     func: &mut Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -198,6 +272,9 @@ fn run_loop(
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
     debug: bool,
+    scoped: &FxHashMap<Inst, Region>,
+    breg: &FxHashMap<Block, Region>,
+    rpar: &FxHashMap<Region, Region>,
 ) -> usize {
     let h = la.loop_header(lp);
     // Exactly one branch destination in from outside.
@@ -252,10 +329,14 @@ fn run_loop(
         return 0;
     }
     let inv = |func: &Function, v: Value| {
+        // A loop-carried param that merely forwards a preheader value is
+        // that value (`param_src`) — `partition`'s pivot is the case that
+        // matters: the pointer is constant even though the SSA name isn't.
+        let v = loadfwd::psrc(ps, na, func, v);
         if body.contains(&def_block(func, v).unwrap_or(h)) {
             return false;
         }
-        match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        match func.dfg.value_def(v) {
             ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
             ValueDef::Param(b, _) => dt.dominates(b, pinst, &func.layout),
             _ => false,
@@ -325,7 +406,10 @@ fn run_loop(
                 if n >= MAX_MOVES {
                     break;
                 }
-                if hoists(func, &inv, &writers, iso, nw, deref, i) {
+                if hoists(
+                    func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar,
+                    pb, i,
+                ) {
                     if debug {
                         eprintln!("licm: hoist {} in {:?} of {}", func.dfg.display_inst(i), h, func.name);
                     }
@@ -364,7 +448,7 @@ fn run_loop(
         };
         let (val, addr) = (func.dfg.resolve_aliases(args[0]), args[1]);
         let store_ty = func.dfg.value_type(val);
-        let (sr, so) = loadfwd::root(func, addr);
+        let (sr, so) = loadfwd::root(func, ps, na, addr);
         let sloc: Loc = (sr, so.wrapping_add(i64::from(i32::from(offset))), store_ty);
         let mut ok = loadfwd::notrap(func, s) && inv(func, val) && inv(func, addr);
         if ok {
@@ -401,7 +485,7 @@ fn run_loop(
                             ok = false;
                             break;
                         }
-                        let (r, o) = loadfwd::root(func, arg);
+                        let (r, o) = loadfwd::root(func, ps, na, arg);
                         let lloc = (
                             r,
                             o.wrapping_add(i64::from(i32::from(offset))),
@@ -469,7 +553,7 @@ fn run_loop(
     if std::env::var_os("PLIRON_LICM_PROMOTE").is_some_and(|v| v == "0") {
         return n;
     }
-    n + promote(func, cfg, dt, la, lp, iso, deref, debug)
+    n + promote(func, ps, na, cfg, dt, la, lp, iso, deref, debug)
 }
 
 /// `PromoteMem2Reg` for one loop: a loop-invariant isolated location the
@@ -478,6 +562,8 @@ fn run_loop(
 /// be a plain `load`/`store` of one type at one offset.
 fn promote(
     func: &mut Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -552,7 +638,7 @@ fn promote(
                     continue;
                 }
             };
-            let (r, o) = loadfwd::root(func, addr.0);
+            let (r, o) = loadfwd::root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
             if !iso.contains(&r) {
                 continue;
@@ -604,7 +690,7 @@ fn promote(
                     InstructionData::Store { opcode: Opcode::Store, args, offset, .. }
                         if loadfwd::notrap(func, i)
                             && {
-                                let (r2, o2) = loadfwd::root(func, args[1]);
+                                let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                                 (r2, o2.wrapping_add(i64::from(i32::from(offset)))) == (r, o)
                             }
                             && func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
@@ -614,7 +700,7 @@ fn promote(
                 continue;
             }
         }
-        n += promote_loc(func, cfg, dt, la, lp, &body, h, (r, o, ty), off, debug);
+        n += promote_loc(func, ps, na, cfg, dt, la, lp, &body, h, (r, o, ty), off, debug);
     }
     n
 }
@@ -625,6 +711,8 @@ fn promote(
 /// out-version on every exit edge (and before each in-loop `return`).
 fn promote_loc(
     func: &mut Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -795,7 +883,7 @@ fn promote_loc(
             } = func.dfg.insts[i]
                 && func.dfg.value_type(func.dfg.first_result(i)) == ty
                 && {
-                    let (r, o) = loadfwd::root(func, arg);
+                    let (r, o) = loadfwd::root(func, ps, na, arg);
                     (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                 }
             {
@@ -894,7 +982,7 @@ fn promote_loc(
                     ..
                 } if func.dfg.value_type(func.dfg.first_result(i)) == ty
                     && {
-                        let (r, o) = loadfwd::root(func, arg);
+                        let (r, o) = loadfwd::root(func, ps, na, arg);
                         (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                     } =>
                 {
@@ -910,7 +998,7 @@ fn promote_loc(
                     ..
                 } if func.dfg.value_type(func.dfg.resolve_aliases(args[0])) == ty
                     && {
-                        let (r, o) = loadfwd::root(func, args[1]);
+                        let (r, o) = loadfwd::root(func, ps, na, args[1]);
                         (r, o.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
                     } =>
                 {
@@ -979,12 +1067,20 @@ pub fn run(
     noalias: &FxHashSet<Value>,
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
+    cfrozen: &FxHashMap<FuncRef, u64>,
+    scoped: &FxHashMap<Inst, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
+    breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
+    rpar: &FxHashMap<
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    >,
 ) -> usize {
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     la.compute(func, &cfg, &dt);
-    let iso = loadfwd::isolated(func, noalias);
+    let ps = loadfwd::param_src(func);
+    let iso = loadfwd::isolated(func, noalias, &ps, cfrozen);
     let debug = std::env::var_os("PLIRON_LICM_DEBUG").is_some();
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
@@ -1020,7 +1116,10 @@ pub fn run(
             dirty = false;
         }
         let before = n;
-        n += run_loop(func, &cfg, &dt, &la, lp, &iso, deref, nw, debug);
+        n += run_loop(
+            func, &ps, noalias, &cfg, &dt, &la, lp, &iso, deref, nw, debug, scoped,
+            breg, rpar,
+        );
         dirty |= n != before;
         if n >= MAX_MOVES * MAX_LOOPS {
             break;
@@ -1105,6 +1204,10 @@ mod tests {
         run(
             &mut func,
             &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
         );

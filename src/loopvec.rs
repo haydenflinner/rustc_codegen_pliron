@@ -908,6 +908,7 @@ fn reaches_avoiding(func: &Function, from: Block, to: Block, avoid: Block) -> bo
 
 fn plan(
     func: &mut Function,
+    ps: &FxHashMap<Value, Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1427,8 +1428,8 @@ fn plan(
             if streams[li].base == streams[si].base {
                 continue;
             }
-            let (lr, _) = loadfwd::root(func, streams[li].root_val);
-            let (sr, _) = loadfwd::root(func, streams[si].root_val);
+            let (lr, _) = loadfwd::root(func, ps, noalias, streams[li].root_val);
+            let (sr, _) = loadfwd::root(func, ps, noalias, streams[si].root_val);
             let na = |r: Root| matches!(r, Root::V(v) if noalias.contains(&v));
             let proven = match (lr, sr) {
                 (Root::S(a), Root::S(b)) => a != b,
@@ -4090,7 +4091,8 @@ pub fn run(
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        let Some(p) = plan(func, &cfg, &dt, &la, lp, noalias, fname) else {
+        let ps = crate::loadfwd::param_src(func);
+        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname) else {
             continue;
         };
         if debug {

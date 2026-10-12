@@ -187,6 +187,38 @@ pub struct State<'tcx> {
     pub nnret: rustc_data_structures::fx::FxHashSet<String>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
+    /// Args inside inlined clones that bind a `noalias readonly` callee
+    /// param (`inline.rs`): arg → (leaf within the arg, dereferenceable
+    /// bytes, region id). The pointee is frozen only for the clone's
+    /// duration — the region id is the clone's entry block, so hoists can
+    /// stay inside the scope (`frozen_loads`) rather than the function-wide
+    /// `readonly can_move` flags `FnLower::frozen` gets.
+    pub region_frozen:
+        rustc_data_structures::fx::FxHashMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
+    /// Load ops inside inlined clones whose address provably derives from a
+    /// `region_frozen` arg at a constant offset inside the pointee: op →
+    /// region id (the clone's entry block). At lowering these seed
+    /// `FnLower::scoped` — licm may hoist them without a clobber scan as
+    /// long as the preheader stays inside the region: `noalias readonly`
+    /// promises no write to the pointee for the call's duration.
+    pub frozen_loads:
+        rustc_data_structures::fx::FxHashMap<Ptr<Operation>, Ptr<BasicBlock>>,
+    /// Pliron blocks belonging to an inlined clone → the clone's entry
+    /// block (the region id used by `frozen_loads`/`region_frozen`).
+    pub region_blocks: rustc_data_structures::fx::FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    /// Clone entry block → the enclosing clone's entry block (the region
+    /// containing the callsite), or itself when the call sits in original
+    /// code. Regions nest: a load tagged R may hoist anywhere in R, so a
+    /// block whose own region is a descendant of R is in-region for it.
+    pub region_parent: rustc_data_structures::fx::FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    /// Args inside inlined clones that bind any `noalias` callee param
+    /// (`&mut [T]` included — `frozen` is the `readonly` subset): arg →
+    /// leaf within the arg. Each becomes a DISTINCT memory root at
+    /// lowering (`FnLower::noalias`) — `partition`'s `v` and `pivot` must
+    /// not merge even though `v.as_ptr() == pivot + 1`: `noalias` declares
+    /// their pointees disjoint, and keeping the roots separate is what lets
+    /// licm hoist the pivot load past the element swaps.
+    pub region_noalias: rustc_data_structures::fx::FxHashMap<Value, Vec<u32>>,
     /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
     /// `NonNull`): a bitmask over the arg's leaf indices (see
     /// `FuncInfo::nonnull`).
@@ -893,7 +925,7 @@ fn frozen_params(
 /// flattened signature while a fat pliron arg covers several leaves; map
 /// each leaf index to its pliron arg and the leaf offset within it. `None`
 /// if the leaf counts disagree.
-fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<(Value, usize)> {
+pub(crate) fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<(Value, usize)> {
     let mut off = 0usize;
     for a in e.deref(ctx).arguments() {
         let n = crate::types::leaves(ctx, a.get_type(ctx)).len();
