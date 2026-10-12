@@ -10,6 +10,10 @@
 //! `hi` is evaluated in double-width arithmetic (i128 for i64 indices): a
 //! wrapped recurrence or empty/degenerate trip range makes `hi` huge and the
 //! guard fails to the slow path — no separate overflow/domain tests needed.
+//! When every affine contribution is non-negative the same wrap-catching
+//! falls out of native add/sub/mul carry flags, so the guard is emitted in
+//! the index type with `!carry` ANDed in — the i128 path only survives for
+//! checks with negative terms.
 //!
 //! Monotonicity: idx = b + i*m for i in [0, T). As an unsigned machine value
 //! m is >= 0 in true-arithmetic terms, so idx is non-decreasing in i and
@@ -1139,47 +1143,179 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
         if ity == wty { v } else { pos.ins().uextend(wty, v) }
     };
     let boundv = gval(&info, &gp, &mut pos, info.bound);
-    let bw = zext(&mut pos, boundv);
-    // Trip-count terms are only needed by affine checks.
+    // Trip-count terms are only needed by affine checks. `t` is the last
+    // counter value, in the index type; the wide path zextends it.
     let need_affine = checks.iter().any(|c| c.bsub.is_none());
-    let (tw, zero) = if need_affine {
+    let t = if need_affine {
         let iv0v = gp[info.iv0];
-        let t = {
-            let d = pos.ins().isub(boundv, iv0v);
-            match info.adj.cmp(&0) {
-                core::cmp::Ordering::Equal => d,
-                core::cmp::Ordering::Greater => {
-                    let k = pos.ins().iconst(ity, info.adj);
-                    pos.ins().isub(d, k)
-                }
-                core::cmp::Ordering::Less => {
-                    let k = pos.ins().iconst(ity, -info.adj);
-                    pos.ins().iadd(d, k)
-                }
+        let d = pos.ins().isub(boundv, iv0v);
+        Some(match info.adj.cmp(&0) {
+            core::cmp::Ordering::Equal => d,
+            core::cmp::Ordering::Greater => {
+                let k = pos.ins().iconst(ity, info.adj);
+                pos.ins().isub(d, k)
             }
+            core::cmp::Ordering::Less => {
+                let k = pos.ins().iconst(ity, -info.adj);
+                pos.ins().iadd(d, k)
+            }
+        })
+    } else {
+        None
+    };
+
+    // When every contribution to `hi` is a non-negative unsigned quantity,
+    // the wrap-catching semantics of the wide guard fall out of native
+    // add/sub/mul carry flags: emit it in `ity` and AND in `!carry` — a
+    // fraction of the i128 dependency chain.
+    let umax: u64 = if ity.bits() < 64 {
+        (1u64 << ity.bits()) - 1
+    } else {
+        u64::MAX
+    };
+    let kfits = |k: i64| k >= 0 && (k as u64) <= umax;
+    let narrowable = |c: &Chk| -> bool {
+        if ity == types::I128 {
+            return false;
+        }
+        if c.bsub.is_some() {
+            return true;
+        }
+        let m_ok = match c.aff.m {
+            Lin::K(k) => kfits(k),
+            Lin::V(_) | Lin::P(_) => true,
+            Lin::N(_) => false,
         };
+        m_ok && c.aff.b.iter().all(|t| match t.v {
+            Lin::K(kv) => kv.checked_mul(t.k).is_some_and(|p| p >= 0 && (p as u64) <= umax),
+            Lin::V(_) | Lin::P(_) => kfits(t.k),
+            Lin::N(_) => false,
+        })
+    };
+    // Wide values are only needed when some check can't go narrow.
+    let any_wide = checks.iter().any(|c| !narrowable(c));
+    let (bw, tw, zero) = if any_wide {
         (
-            Some(zext(&mut pos, t)),
+            Some(zext(&mut pos, boundv)),
+            t.map(|t| zext(&mut pos, t)),
             Some(iconst_masked(&mut pos, wty, 0)),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
+    let mut flags: Vec<Value> = Vec::new();
     let mut ok: Option<Value> = None;
     for c in &checks {
+        let lenv = gval(&info, &gp, &mut pos, c.len);
+        let cc = if c.le {
+            IntCC::UnsignedLessThanOrEqual
+        } else {
+            IntCC::UnsignedLessThan
+        };
         if let Some(k) = c.bsub {
             // `iv + k < len` is implied by `B - adj + k < len`; `wty`
             // keeps the bound arithmetic wrap-free.
-            let ka = iconst_masked(&mut pos, wty, info.adj - k);
-            let bh = pos.ins().isub(bw, ka);
-            let lenv = gval(&info, &gp, &mut pos, c.len);
-            let lenw = zext(&mut pos, lenv);
-            let cc = if c.le {
-                IntCC::UnsignedLessThanOrEqual
+            let d = info.adj.wrapping_sub(k);
+            let g = if narrowable(c) {
+                let (bh, of) = if d >= 0 {
+                    let ka = iconst_masked(&mut pos, ity, d);
+                    pos.ins().usub_overflow(boundv, ka)
+                } else {
+                    let ka = iconst_masked(&mut pos, ity, d.wrapping_neg());
+                    pos.ins().uadd_overflow(boundv, ka)
+                };
+                flags.push(of);
+                pos.ins().icmp(cc, bh, lenv)
             } else {
-                IntCC::UnsignedLessThan
+                let ka = iconst_masked(&mut pos, wty, d);
+                let bh = pos.ins().isub(bw.unwrap(), ka);
+                let lenw = zext(&mut pos, lenv);
+                pos.ins().icmp(cc, bh, lenw)
             };
-            let g = pos.ins().icmp(cc, bh, lenw);
+            ok = Some(match ok {
+                None => g,
+                Some(o) => pos.ins().band(o, g),
+            });
+            continue;
+        }
+        if narrowable(c) {
+            let t = t.unwrap();
+            let mut hi = match c.aff.m {
+                Lin::K(0) => iconst_masked(&mut pos, ity, 0),
+                Lin::K(1) => t,
+                Lin::K(k) => {
+                    let kv = iconst_masked(&mut pos, ity, k);
+                    let (r, of) = pos.ins().umul_overflow(t, kv);
+                    flags.push(of);
+                    r
+                }
+                Lin::V(v) => {
+                    let v = gval(&info, &gp, &mut pos, v);
+                    let (r, of) = pos.ins().umul_overflow(v, t);
+                    flags.push(of);
+                    r
+                }
+                Lin::P(i) => {
+                    let (r, of) = pos.ins().umul_overflow(gp[i], t);
+                    flags.push(of);
+                    r
+                }
+                Lin::N(_) => unreachable!("narrowable excludes N terms"),
+            };
+            let mut sum_b: Option<Value> = None;
+            for tm in &c.aff.b {
+                let term = match tm.v {
+                    Lin::K(kv) => {
+                        let p = kv.checked_mul(tm.k).unwrap_or(0);
+                        if p == 0 {
+                            continue;
+                        }
+                        iconst_masked(&mut pos, ity, p)
+                    }
+                    Lin::V(v) => {
+                        let v = gval(&info, &gp, &mut pos, v);
+                        if tm.k == 0 {
+                            continue;
+                        }
+                        if tm.k == 1 {
+                            v
+                        } else {
+                            let k = iconst_masked(&mut pos, ity, tm.k);
+                            let (r, of) = pos.ins().umul_overflow(v, k);
+                            flags.push(of);
+                            r
+                        }
+                    }
+                    Lin::P(i) => {
+                        if tm.k == 0 {
+                            continue;
+                        }
+                        if tm.k == 1 {
+                            gp[i]
+                        } else {
+                            let k = iconst_masked(&mut pos, ity, tm.k);
+                            let (r, of) = pos.ins().umul_overflow(gp[i], k);
+                            flags.push(of);
+                            r
+                        }
+                    }
+                    Lin::N(_) => unreachable!("narrowable excludes N terms"),
+                };
+                sum_b = Some(match sum_b {
+                    None => term,
+                    Some(s) => {
+                        let (r, of) = pos.ins().uadd_overflow(s, term);
+                        flags.push(of);
+                        r
+                    }
+                });
+            }
+            if let Some(s) = sum_b {
+                let (r, of) = pos.ins().uadd_overflow(hi, s);
+                flags.push(of);
+                hi = r;
+            }
+            let g = pos.ins().icmp(cc, hi, lenv);
             ok = Some(match ok {
                 None => g,
                 Some(o) => pos.ins().band(o, g),
@@ -1235,13 +1371,7 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             sum_b = pos.ins().iadd(sum_b, term);
         }
         hi = pos.ins().iadd(hi, sum_b);
-        let lenv = gval(&info, &gp, &mut pos, c.len);
         let lenw = zext(&mut pos, lenv);
-        let cc = if c.le {
-            IntCC::UnsignedLessThanOrEqual
-        } else {
-            IntCC::UnsignedLessThan
-        };
         let (minv, maxv) = if dec { (hi, sum_b) } else { (sum_b, hi) };
         // The max over the trip range must be < len; the min must be >= 0
         // (a dip below 0 wraps to a huge machine value that would panic).
@@ -1265,7 +1395,16 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
             Some(o) => pos.ins().band(o, g),
         });
     }
-    let ok = ok.unwrap();
+    let mut ok = ok.unwrap();
+    if !flags.is_empty() {
+        let mut b = flags[0];
+        for &f in &flags[1..] {
+            b = pos.ins().bor(b, f);
+        }
+        let z8 = pos.ins().iconst(types::I8, 0);
+        let nb = pos.ins().icmp(IntCC::Equal, b, z8);
+        ok = pos.ins().band(ok, nb);
+    }
 
     // Clone the region blocks in RPO so in-loop defs precede their uses.
     let rpo = {
