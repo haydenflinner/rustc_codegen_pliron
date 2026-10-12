@@ -115,6 +115,27 @@ PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/retattr/main
 grep -Eq 'nnret .*: [1-9][0-9]* of' $out/retattr.stats || { echo "nnret inferred nothing" >&2; exit 1; }
 grep -Eq 'retarg .*: [1-9][0-9]* returned-arg bodies' $out/retattr.stats || { echo "retarg inferred nothing" >&2; exit 1; }
 grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
+# Loop headers are 16-byte aligned (vcode marks back-edge targets in
+# emission order and pads before their labels — LLVM's `.p2align 4` loop
+# tops). Every backward-jump target must sit on a 16-byte boundary;
+# PLIRON_ALIGN=0 disables.
+llvmod="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin/llvm-objdump$exe"
+if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
+  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopalign/main.rs -o $out/loopalign.o &&
+      "$llvmod" -d --no-show-raw-insn $out/loopalign.o | sed -n '/spin.*>:/,/retq/p' > $out/loopalign.dis
+  back=0; bad=0
+  while read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*([0-9a-f]+):.*j[a-z]+[[:space:]]+0x([0-9a-f]+) ]]; then
+      addr=$((16#${BASH_REMATCH[1]})); tgt=$((16#${BASH_REMATCH[2]}))
+      if (( tgt < addr )); then
+        back=$((back+1))
+        (( tgt % 16 != 0 )) && bad=$((bad+1))
+      fi
+    fi
+  done < $out/loopalign.dis
+  (( back > 0 )) || { echo "loopalign: no back-edge found" >&2; exit 1; }
+  (( bad == 0 )) || { echo "loopalign: $bad unaligned back-edge target(s)" >&2; exit 1; }
+fi
 # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
 so=${lib##*.}
 rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
