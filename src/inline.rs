@@ -525,13 +525,6 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
-    // Extra threshold for callsites inside a loop (`PLIRON_INLINE_LOOPB`,
-    // in units of the base limit). Loop probes like `hash_one` sit several
-    // limits over base but must inline to match LLVM's hot-callsite bonus.
-    let loopb: usize = std::env::var("PLIRON_INLINE_LOOPB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
     let verbose = std::env::var("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
@@ -565,131 +558,151 @@ pub fn run(
     let mut rw = IRRewriter::<DummyListener>::default();
     for sym in order {
         let caller = st.funcs[&sym].op;
-        let mut sites = Vec::new();
         let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
         let mut grown = 0usize;
-        let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
-        for b in blocks(ctx, caller) {
-            for op in ops(ctx, b) {
-                if !bottom_up && st.invokes.contains_key(&op) {
-                    continue;
-                }
-                if only.is_some_and(|o| !o.contains(&op)) {
-                    continue;
-                }
-                let Some(cs) = direct_callee(ctx, st, op) else {
-                    continue;
-                };
-                let Some(ci) = infos.get(cs) else {
-                    if verbose {
-                        eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
+        let mut seen: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+        // Inlining exposes nested callsites the scan hadn't seen: e.g.
+        // `HashMap::get` brings `hash_one` inside the caller's loop, where
+        // the in-loop bonus may now accept it. Rescan until a round finds
+        // nothing worth inlining (`size`/`grown`/`cap` bound the fixpoint).
+        for _round in 0..32 {
+            let mut sites = Vec::new();
+            let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
+            for b in blocks(ctx, caller) {
+                for op in ops(ctx, b) {
+                    if !seen.insert(op) {
+                        continue;
                     }
-                    continue;
-                };
-                let f = &st.funcs[cs];
-                // Free inlines: the out-of-line copy disappears
-                // (single-callsite locals) or rustc demanded it.
-                let free = f.always_inline || (once && single.contains(cs));
-                let mut t = if free {
-                    limit.saturating_mul(10)
-                } else {
-                    limit
-                };
-                let args = Operation::get_op::<CallOp>(op, ctx)
-                    .map(|c| c.args(ctx))
-                    .unwrap_or_default();
-                // A constant address feeding an indirect-call param lets
-                // `devirt` make the call direct; a scalar constant feeding a
-                // branch condition folds it. (The old `dv` map's bonuses.)
-                if bonus > 1
-                    && ci.dvirt.iter().any(|&i| {
-                        args.get(i)
-                            .is_some_and(|a| matches!(st.consts.get(a), Some(ConstVal::Sym { .. })))
-                    })
-                {
-                    t = t.max(limit.saturating_mul(bonus));
-                }
-                if fold > 1
-                    && ci
-                        .conds
-                        .iter()
-                        .any(|&i| args.get(i).is_some_and(|a| const_arg(st, a)))
-                {
-                    t = t.max(limit.saturating_mul(fold));
-                }
-                if hint > 1 && f.inline_hint {
-                    t = t.max(limit.saturating_mul(hint));
-                }
-                let mut cost = ci.n;
-                if model {
-                    cost = ci.n.saturating_add(ci.ncalls.saturating_mul(CALL_OP_W));
-                    let mut save = 0usize;
-                    for (i, a) in args.iter().enumerate() {
-                        if const_arg(st, a) {
-                            save = save.saturating_add(
-                                FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
-                            );
+                    if !bottom_up && st.invokes.contains_key(&op) {
+                        continue;
+                    }
+                    if only.is_some_and(|o| !o.contains(&op)) {
+                        continue;
+                    }
+                    let Some(cs) = direct_callee(ctx, st, op) else {
+                        continue;
+                    };
+                    let Some(ci) = infos.get(cs) else {
+                        if verbose {
+                            eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
                         }
-                        if const_arg(st, a) || st.allocas.contains_key(a) {
-                            save = save.saturating_add(
-                                MEM_USE * ci.mem.get(i).copied().unwrap_or(0) as usize,
-                            );
-                        }
-                    }
-                    t = t.saturating_add(save);
-                    if f.cold {
-                        cost = cost.saturating_mul(COLD_W);
-                    }
-                    if loops
-                        .get_or_insert_with(|| loop_blocks(ctx, st, caller))
-                        .contains(&b)
+                        continue;
+                    };
+                    let f = &st.funcs[cs];
+                    // Free inlines: the out-of-line copy disappears
+                    // (single-callsite locals) or rustc demanded it.
+                    let free = f.always_inline || (once && single.contains(cs));
+                    let mut t = if free {
+                        limit.saturating_mul(10)
+                    } else {
+                        limit
+                    };
+                    let args = Operation::get_op::<CallOp>(op, ctx)
+                        .map(|c| c.args(ctx))
+                        .unwrap_or_default();
+                    // A constant address feeding an indirect-call param lets
+                    // `devirt` make the call direct; a scalar constant feeding a
+                    // branch condition folds it. (The old `dv` map's bonuses.)
+                    if bonus > 1
+                        && ci.dvirt.iter().any(|&i| {
+                            args.get(i).is_some_and(|a| {
+                                matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
+                            })
+                        })
                     {
-                        t = t.saturating_add(limit.saturating_mul(loopb));
+                        t = t.max(limit.saturating_mul(bonus));
                     }
-                    t = t.min(limit.saturating_mul(MAX_T));
-                    if free {
-                        // Net global growth is ~0 — the callee's out-of-line
-                        // copy dies — so nested calls and coldness aren't
-                        // charged; `cap` still bounds the caller's size.
-                        cost = ci.n;
+                    if fold > 1
+                        && ci
+                            .conds
+                            .iter()
+                            .any(|&i| args.get(i).is_some_and(|a| const_arg(st, a)))
+                    {
+                        t = t.max(limit.saturating_mul(fold));
                     }
-                }
-                // A callee with landing pads may go into an invoke whose pad is a
-                // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
-                // into a catch pad: unwinder phase 1 would never see that catch.
-                let eh_block = ci.eh
-                    && st
-                        .invokes
-                        .get(&op)
-                        .is_some_and(|&(_, catch)| catch || !eh_invoke);
-                let why = if cost > t {
-                    "reject (score)"
-                } else if eh_block {
-                    "reject (eh)"
-                } else if ci.op == caller || st.calls[&op].fn_ty != f.ty {
-                    "reject (self/fnty)"
-                } else if size + ci.n > cap {
-                    "reject (cap)"
-                } else if model && !free && grown + ci.n > growth {
-                    "reject (growth)"
-                } else {
-                    if model && !free {
-                        grown += ci.n;
+                    if hint > 1 && f.inline_hint {
+                        t = t.max(limit.saturating_mul(hint));
                     }
-                    size += ci.n;
-                    sites.push((op, ci.op));
-                    "accept"
-                };
-                if verbose {
-                    eprintln!(
-                        "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
-                        st.cgu, ci.n, ci.ncalls
-                    );
+                    let mut cost = ci.n;
+                    if model {
+                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(CALL_OP_W));
+                        let mut save = 0usize;
+                        for (i, a) in args.iter().enumerate() {
+                            if const_arg(st, a) {
+                                save = save.saturating_add(
+                                    FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
+                                );
+                            }
+                            if const_arg(st, a) || st.allocas.contains_key(a) {
+                                save = save.saturating_add(
+                                    MEM_USE * ci.mem.get(i).copied().unwrap_or(0) as usize,
+                                );
+                            }
+                        }
+                        t = t.saturating_add(save);
+                        if f.cold {
+                            cost = cost.saturating_mul(COLD_W);
+                        }
+                        if loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                        {
+                            // `PLIRON_INLINE_LOOP` = bonus in limit/4 units
+                            // (default 2 = limit/2, the historical bonus).
+                            let lb: usize = std::env::var("PLIRON_INLINE_LOOP")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(2);
+                            t = t.saturating_add(limit * lb / 4);
+                        }
+                        t = t.min(limit.saturating_mul(MAX_T));
+                        if free {
+                            // Net global growth is ~0 — the callee's out-of-line
+                            // copy dies — so nested calls and coldness aren't
+                            // charged; `cap` still bounds the caller's size.
+                            cost = ci.n;
+                        }
+                    }
+                    // A callee with landing pads may go into an invoke whose pad is a
+                    // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
+                    // into a catch pad: unwinder phase 1 would never see that catch.
+                    let eh_block = ci.eh
+                        && st
+                            .invokes
+                            .get(&op)
+                            .is_some_and(|&(_, catch)| catch || !eh_invoke);
+                    let why = if cost > t {
+                        "reject (score)"
+                    } else if eh_block {
+                        "reject (eh)"
+                    } else if ci.op == caller || st.calls[&op].fn_ty != f.ty {
+                        "reject (self/fnty)"
+                    } else if size + ci.n > cap {
+                        "reject (cap)"
+                    } else if model && !free && grown + ci.n > growth {
+                        "reject (growth)"
+                    } else {
+                        if model && !free {
+                            grown += ci.n;
+                        }
+                        size += ci.n;
+                        sites.push((op, ci.op));
+                        "accept"
+                    };
+                    if verbose {
+                        eprintln!(
+                            "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
+                            st.cgu, ci.n, ci.ncalls
+                        );
+                    }
                 }
             }
-        }
-        for (call, callee) in sites {
-            inline_call(ctx, st, &mut rw, call, callee);
+            if sites.is_empty() {
+                break;
+            }
+            for (call, callee) in sites {
+                inline_call(ctx, st, &mut rw, call, callee);
+            }
         }
         if bottom_up {
             add_info!(&sym);
