@@ -1153,6 +1153,7 @@ fn promote_loc(
 
 pub fn run(
     func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
     noalias: &FxHashSet<Value>,
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
@@ -1165,10 +1166,9 @@ pub fn run(
     >,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
 ) -> usize {
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut dt = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+    let (cfg, dt) = an.cfg_dt(func);
+    la.compute(func, cfg, dt);
     let ps = loadfwd::param_src(func);
     let (iso, escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
     // Operand-frozen values name their own scope roots (same merged set
@@ -1196,26 +1196,25 @@ pub fn run(
     // early loop left zero moves for the hot char loop's loads). Keep a
     // looser function-level bound only as a compile-time guard.
     let mut n = 0;
-    let mut dirty = false;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        if dirty {
-            // Edge splits/promotion inside `run_loop` changed the CFG: the
-            // previous `cfg`/`dt` no longer reflect it — e.g. a split edge
-            // leaves `pred_iter` without the new block and without the
-            // pred's redirected edge, so an entry scan can count one
-            // outside edge where several exist. Loop membership for old
-            // blocks is preserved (splits only lengthen paths), and fresh
-            // blocks are in no loop, so `la` stays valid.
-            cfg = ControlFlowGraph::with_function(func);
-            dt = DominatorTree::with_function(func, &cfg);
-            dirty = false;
+        // `la` is owned by this pass and stays valid across `run_loop`'s
+        // edge splits/promotion (splits only lengthen paths, and fresh
+        // blocks are in no loop), but `cfg`/`dt` no longer reflect the
+        // CFG — e.g. a split edge leaves `pred_iter` without the new
+        // block and without the pred's redirected edge, so an entry
+        // scan can count one outside edge where several exist. Read the
+        // fresh pair through `an` each iteration.
+        let n2 = {
+            let (cfg, dt) = an.cfg_dt(func);
+            run_loop(
+                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, nw,
+                debug, scoped, breg, rpar, ofz,
+            )
+        };
+        n += n2;
+        if n2 > 0 {
+            an.invalidate();
         }
-        let before = n;
-        n += run_loop(
-            func, &ps, &stop, &cfg, &dt, &la, lp, &iso, &escapes, deref, nw,
-            debug, scoped, breg, rpar, ofz,
-        );
-        dirty |= n != before;
         if n >= MAX_MOVES * MAX_LOOPS {
             break;
         }
@@ -1298,6 +1297,7 @@ mod tests {
 
         run(
             &mut func,
+            &mut crate::pipeline::Analysis::default(),
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
@@ -1359,6 +1359,7 @@ mod tests {
 
         run(
             &mut func,
+            &mut crate::pipeline::Analysis::default(),
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),

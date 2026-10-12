@@ -39,21 +39,21 @@ fn max_insts() -> usize {
 
 pub fn run(
     func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
     loads: &FxHashSet<Value>,
     derived: &FxHashMap<Value, Value>,
 ) -> usize {
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
     'outer: while n < MAX_LOOPS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
+        let (cfg, dt) = an.cfg_dt(func);
         let nn = NonNull::new(func, loads, derived);
         let blocks: Vec<Block> = func.layout.blocks().collect();
         for h in blocks {
             if !tried.insert(h) {
                 continue;
             }
-            let Some((pred, pinst, body, entry, used_out)) = candidate(func, &cfg, &dt, h) else {
+            let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, h) else {
                 continue;
             };
             if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
@@ -102,6 +102,8 @@ pub fn run(
                 }
             }
             n += 1;
+            // The preheader block + edge retargets rewired the CFG.
+            an.invalidate();
             continue 'outer;
         }
         break;

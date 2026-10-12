@@ -26,7 +26,6 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
     ValueDef,
@@ -606,15 +605,14 @@ impl Ctx<'_> {
 }
 
 /// Pack lane-wise scalar inst trees feeding adjacent stores into vector ops.
-pub fn run(func: &mut Function, na: &FxHashSet<Value>, simd: bool) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, na: &FxHashSet<Value>, simd: bool) -> usize {
     if !simd {
         return 0;
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+    let (_, domtree) = an.cfg_dt(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, &domtree, na, block);
+        changed += try_block(func, domtree, na, block);
     }
     if crate::pass_enabled("PLIRON_XPACK") {
         for block in func.layout.blocks().collect::<Vec<_>>() {

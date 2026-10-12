@@ -4088,6 +4088,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
 
 pub fn run(
     func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
     fname: &str,
     noalias: &FxHashSet<Value>,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
@@ -4105,10 +4106,7 @@ pub fn run(
     {
         return 0;
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     // Deepest-first: parent loops always fail `gather`'s innermost check,
     // so iterating them first would just burn the MAX_LOOPS budget.
     let loops = deepest_first(&la);
@@ -4195,6 +4193,6 @@ mod tests {
             pointer_width: PointerWidth::U64,
             page_size_align_log2: 12,
         };
-        run(&mut func, "band1_cond", &FxHashSet::default(), tcfg, true, false, true);
+        run(&mut func, &mut crate::pipeline::Analysis::default(), "band1_cond", &FxHashSet::default(), tcfg, true, false, true);
     }
 }

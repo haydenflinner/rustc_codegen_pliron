@@ -277,16 +277,14 @@ struct Cnt {
     eq: bool,
 }
 
-pub fn run(func: &mut Function, name: &str) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
     while n < MAX_LOOPS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
         let mut hit = false;
+        {
+            let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let loops: Vec<_> = la.loops().collect();
         // Canonicalize mid-chain counting exits into the latch: bcheck/
         // sameargs leave `brif const -> h` dead latches behind the real
@@ -299,7 +297,7 @@ pub fn run(func: &mut Function, name: &str) -> usize {
                 continue;
             }
             normed.insert(h);
-            if sink_test(func, &cfg, &dt, &la, lp, h, name) {
+            if sink_test(func, cfg, dt, la, lp, h, name) {
                 hit = true;
                 break; // cfg/la stale; rescan
             }
@@ -326,9 +324,9 @@ pub fn run(func: &mut Function, name: &str) -> usize {
                 }
                 tried.insert(h);
                 let r = if nch == 2 {
-                    run_jam_chooser(func, &cfg, &dt, &la, lp, h, name)
+                    run_jam_chooser(func, cfg, dt, la, lp, h, name)
                 } else {
-                    run_jam(func, &cfg, &dt, &la, lp, h, name)
+                    run_jam(func, cfg, dt, la, lp, h, name)
                 };
                 if let Some(newhs) = r {
                     tried.extend(newhs);
@@ -351,23 +349,25 @@ pub fn run(func: &mut Function, name: &str) -> usize {
                 eprintln!("punroll {name} try block{}", h.as_u32());
             }
             if crate::pass_enabled("PLIRON_PEEL")
-                && run_peel(func, &cfg, &dt, &la, lp, h, name).is_some()
+                && run_peel(func, cfg, dt, la, lp, h, name).is_some()
             {
                 n += 1;
                 hit = true;
                 break; // cfg/la stale; rescan
             }
-            if run_loop(func, &cfg, &dt, &la, lp, h, name).is_some()
-                || run_region(func, &cfg, &dt, &la, lp, h, name).is_some()
+            if run_loop(func, cfg, dt, la, lp, h, name).is_some()
+                || run_region(func, cfg, dt, la, lp, h, name).is_some()
             {
                 n += 1;
                 hit = true;
                 break; // cfg/la stale; rescan
             }
+        }
         }
         if !hit {
             break;
         }
+        an.invalidate();
     }
     n
 }

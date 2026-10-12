@@ -1713,22 +1713,20 @@ fn run_loop(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la:
     1
 }
 
-pub fn run(func: &mut Function, name: &str, throw_ret: bool) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str, throw_ret: bool) -> usize {
     let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
     // find the first loop that versions, then rescan.
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..MAX_VERSIONS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
+        let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let mut did = 0;
-        for lp in deepest_first(&la).into_iter().take(MAX_LOOPS) {
-            let k = run_loop(func, &cfg, &dt, &la, lp, name, throw_ret, &mut seen);
+        for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
+            let k = run_loop(func, cfg, dt, la, lp, name, throw_ret, &mut seen);
             did += k;
             if k > 0 {
+                an.invalidate();
                 break; // cfg/dt/la now stale; rescan
             }
         }
@@ -1956,20 +1954,18 @@ fn unswitch_loop(
 }
 
 /// `PLIRON_UNSWITCH=0` disables invariant-brif loop unswitching.
-pub fn unswitch(func: &mut Function, name: &str) -> usize {
+pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
     let debug = crate::env_set("PLIRON_UNSWITCH_DEBUG");
     let mut n = 0;
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..MAX_VERSIONS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
+        let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let mut did = 0;
         for lp in la.loops().take(MAX_LOOPS) {
-            let k = unswitch_loop(func, &cfg, &dt, &la, lp, name, &mut seen);
+            let k = unswitch_loop(func, cfg, dt, la, lp, name, &mut seen);
             did += k;
             if k > 0 {
+                an.invalidate();
                 break; // cfg/dt/la now stale; rescan
             }
         }

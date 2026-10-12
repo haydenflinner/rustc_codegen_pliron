@@ -16,27 +16,22 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MAX_INSTS: usize = 8;
 const MAX_ROTATIONS: usize = 256;
 
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
     // bcheck clones appended at the end) of the rotation budget.
     let mut n = 0;
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut domtree = DominatorTree::with_function(func, &cfg);
-    let mut dirty = false;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for h in blocks {
         if n >= MAX_ROTATIONS {
             break;
         }
-        if dirty {
-            cfg = ControlFlowGraph::with_function(func);
-            domtree = DominatorTree::with_function(func, &cfg);
-            dirty = false;
-        }
-        if rotatable(func, &cfg, &domtree, h) && rotate(func, &cfg, &domtree, h) {
+        let (cfg, domtree) = an.cfg_dt(func);
+        if rotatable(func, cfg, domtree, h) && rotate(func, cfg, domtree, h) {
             n += 1;
-            dirty = true;
+            // Edge splits/clones rewired the CFG — the next candidate's
+            // reads must see the new shape.
+            an.invalidate();
         }
     }
     n

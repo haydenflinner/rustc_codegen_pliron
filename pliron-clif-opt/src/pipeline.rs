@@ -8,8 +8,11 @@
 
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::{Block, FuncRef, Inst, Value};
+use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_module::FuncId;
 use pliron::basic_block::BasicBlock;
 use pliron::context::Ptr;
@@ -185,6 +188,106 @@ impl Gate {
     }
 }
 
+/// Version-keyed cache of the analyses passes share. Owned by
+/// `run_pipeline` (outside `Pipe`) so an `&Analysis` result and
+/// `&mut Function` can be borrowed at once.
+///
+/// Entries are dropped when the pipeline bumps `ver` after a mutating
+/// step, and passes that mutate mid-step call `invalidate()` at the same
+/// places they previously recomputed. Accessors also check a cheap shape
+/// fingerprint — a read after an un-`invalidate`d structural mutation
+/// panics instead of silently serving stale data.
+#[derive(Default)]
+pub struct Analysis {
+    ver: u64,
+    shape: (usize, usize),
+    cfg: Option<ControlFlowGraph>,
+    dt: Option<DominatorTree>,
+    la: Option<LoopAnalysis>,
+}
+
+/// One borrow of the three structural analyses (`&self` tuple).
+pub struct CfgDtLa<'a> {
+    pub cfg: &'a ControlFlowGraph,
+    pub dt: &'a DominatorTree,
+    pub la: &'a LoopAnalysis,
+}
+
+impl Analysis {
+    fn clear(&mut self) {
+        self.cfg = None;
+        self.dt = None;
+        self.la = None;
+    }
+
+    /// The pipeline advanced the IR version (a step declared `mutates`).
+    pub fn bump(&mut self) {
+        self.ver += 1;
+        self.clear();
+    }
+
+    /// A pass mutated the function mid-step; drop everything computed
+    /// against the old shape.
+    pub fn invalidate(&mut self) {
+        self.clear();
+    }
+
+    fn shape(func: &Function) -> (usize, usize) {
+        (func.dfg.num_insts(), func.layout.blocks().count())
+    }
+
+    fn materialize(&mut self, func: &Function) {
+        let shape = Self::shape(func);
+        if self.cfg.is_some() {
+            debug_assert_eq!(
+                self.shape, shape,
+                "analysis read after IR mutation without Analysis::invalidate()"
+            );
+        } else {
+            self.shape = shape;
+            self.cfg = Some(ControlFlowGraph::with_function(func));
+        }
+        if self.dt.is_none() {
+            self.dt = Some(DominatorTree::with_function(func, self.cfg.as_ref().unwrap()));
+        }
+        if self.la.is_none() {
+            let mut la = LoopAnalysis::new();
+            la.compute(func, self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap());
+            self.la = Some(la);
+        }
+    }
+
+    /// Recompute whatever is missing, then borrow all three.
+    pub fn cfg_dt_la<'a>(&'a mut self, func: &Function) -> CfgDtLa<'a> {
+        self.materialize(func);
+        CfgDtLa {
+            cfg: self.cfg.as_ref().unwrap(),
+            dt: self.dt.as_ref().unwrap(),
+            la: self.la.as_ref().unwrap(),
+        }
+    }
+
+    /// Recompute whatever is missing, then borrow cfg+domtree.
+    pub fn cfg_dt<'a>(&'a mut self, func: &Function) -> (&'a ControlFlowGraph, &'a DominatorTree) {
+        self.materialize(func);
+        (
+            self.cfg.as_ref().unwrap(),
+            self.dt.as_ref().unwrap(),
+        )
+    }
+
+    pub fn cfg<'a>(&'a mut self, func: &Function) -> &'a ControlFlowGraph {
+        self.materialize(func);
+        self.cfg.as_ref().unwrap()
+    }
+
+    /// `ver` counter — bumping it is how the driver invalidates the
+    /// whole cache between steps.
+    pub fn version(&self) -> u64 {
+        self.ver
+    }
+}
+
 pub struct Step {
     /// `PLIRON_PIPELINE` name (unique per entry).
     pub name: &'static str,
@@ -195,34 +298,39 @@ pub struct Step {
     pub stat: &'static str,
     /// Run the verifier after this step under `verify_full`.
     pub verify: bool,
+    /// The step may rewrite the function — the driver bumps the
+    /// analysis version after it runs. Pure steps keep the cache.
+    pub mutates: bool,
     pub gate: Gate,
-    pub run: fn(&mut Pipe) -> usize,
+    pub run: fn(&mut Pipe, &mut Analysis) -> usize,
 }
 
 const fn step(
     name: &'static str,
     stat: &'static str,
     gate: Gate,
-    run: fn(&mut Pipe) -> usize,
+    run: fn(&mut Pipe, &mut Analysis) -> usize,
 ) -> Step {
     Step {
         name,
         bisect: Some(name),
         stat,
         verify: true,
+        mutates: true,
         gate,
         run,
     }
 }
 
 pub fn run_pipeline(p: &mut Pipe) {
+    let mut an = Analysis::default();
     if let Some(list) = &config().pipeline {
         for name in list {
             match DEFAULT
                 .iter()
                 .find(|s| s.name == name.as_str() && !matches!(s.gate, Gate::Always))
             {
-                Some(s) => run_step(p, s),
+                Some(s) => run_step(p, s, &mut an),
                 None => eprintln!("PLIRON_PIPELINE: unknown step `{name}`"),
             }
         }
@@ -230,24 +338,27 @@ pub fn run_pipeline(p: &mut Pipe) {
             .iter()
             .filter(|s| matches!(s.gate, Gate::Always))
         {
-            run_step(p, s);
+            run_step(p, s, &mut an);
         }
     } else {
         for s in DEFAULT {
             if s.gate.ok(p) {
-                run_step(p, s);
+                run_step(p, s, &mut an);
             }
         }
     }
 }
 
-fn run_step(p: &mut Pipe, s: &Step) {
+fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     if let Some(b) = s.bisect
         && !bisect(b)
     {
         return;
     }
-    let k = (s.run)(p);
+    let k = (s.run)(p, an);
+    if s.mutates {
+        an.bump();
+    }
     p.log(s.stat, k);
     if s.verify
         && p.verify_full
@@ -262,7 +373,7 @@ fn run_step(p: &mut Pipe, s: &Step) {
     }
 }
 
-fn s_jumpthread(p: &mut Pipe) -> usize {
+fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let (n, dead, folds) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
     p.stats.threaded += n;
     p.stats.dead_params += dead;
@@ -277,7 +388,7 @@ fn s_jumpthread(p: &mut Pipe) -> usize {
 // Fold early so the loop passes see the canonical shape; the late
 // `PLIRON_CONSTBR=1` run below still catches constants exposed by
 // later passes.
-fn s_constbr(p: &mut Pipe) -> usize {
+fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = jumpthread::fold_const_branches(&mut p.clctx.func);
     if k > 0 {
         jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
@@ -285,8 +396,8 @@ fn s_constbr(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_unroll(p: &mut Pipe) -> usize {
-    let k = unroll::run(&mut p.clctx.func, p.nonnull, p.derived);
+fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = unroll::run(&mut p.clctx.func, an, p.nonnull, p.derived);
     // The skipped loop is now unreachable, and its trip count still
     // flows into dead params/branches; dropping them frees the slot
     // address arithmetic so slot DSE can see the slot doesn't escape.
@@ -313,25 +424,25 @@ fn s_unroll(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_unreach(p: &mut Pipe) -> usize {
+fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = unreach::run(&mut p.clctx.func);
     p.stats.unreached += k;
     k
 }
 
-fn s_clifpeep(p: &mut Pipe) -> usize {
+fn s_clifpeep(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::run(&mut p.clctx.func);
     p.stats.peeped += k;
     k
 }
 
-fn s_tailmerge(p: &mut Pipe) -> usize {
+fn s_tailmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = tailmerge::run(&mut p.clctx.func);
     p.stats.merged += k;
     k
 }
 
-fn s_taildup(p: &mut Pipe) -> usize {
+fn s_taildup(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = taildup::run(&mut p.clctx.func);
     p.stats.dupd += k;
     k
@@ -340,7 +451,7 @@ fn s_taildup(p: &mut Pipe) -> usize {
 // `f(a) + f(b)`-style recursion → accumulate the first call and
 // loop on the second's args (LLVM TRE); before loadfwd/licm so
 // they can still hoist out of the new back-edge.
-fn s_tailrec(p: &mut Pipe) -> usize {
+fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = tailrec::run(&mut p.clctx.func, p.func_id);
     if k > 0 && p.dump {
         p.dump("tailrec");
@@ -348,7 +459,7 @@ fn s_tailrec(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_loadfwd(p: &mut Pipe) -> usize {
+fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
     p.stats.forwarded += loadfwd::run(
         &mut p.clctx.func,
         p.noalias,
@@ -378,7 +489,7 @@ fn s_loadfwd(p: &mut Pipe) -> usize {
     0
 }
 
-fn s_dse(p: &mut Pipe) -> usize {
+fn s_dse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
     if k > 0 && p.dump {
         p.dump("dse");
@@ -391,7 +502,7 @@ fn s_dse(p: &mut Pipe) -> usize {
 // wins vs. our own passes are measured.
 // Upstream's egraph doesn't know `try_call` (it predates EH), so
 // functions with invokes are skipped entirely.
-fn s_egraph(p: &mut Pipe) -> usize {
+fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let has_try_call = p
         .clctx
         .func
@@ -422,13 +533,14 @@ fn s_egraph(p: &mut Pipe) -> usize {
 
 // Loop-carried load reuse: sibling to indvars since it grows
 // stepped header params the same machinery produces.
-fn s_ldrot(p: &mut Pipe) -> usize {
-    indvars::rotld(&mut p.clctx.func)
+fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
+    indvars::rotld(&mut p.clctx.func, an)
 }
 
-fn s_licm(p: &mut Pipe) -> usize {
+fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = licm::run(
         &mut p.clctx.func,
+        an,
         p.noalias,
         p.deref,
         p.nowrite,
@@ -446,12 +558,12 @@ fn s_licm(p: &mut Pipe) -> usize {
 
 // Rebase descending counted ivs (`(0..n).rev()`) to ascending so
 // loopidiom/loopvec see the canonical `0..bound` count shape.
-fn s_revnorm(p: &mut Pipe) -> usize {
-    revnorm::run(&mut p.clctx.func)
+fn s_revnorm(p: &mut Pipe, an: &mut Analysis) -> usize {
+    revnorm::run(&mut p.clctx.func, an)
 }
 
-fn s_loopidiom(p: &mut Pipe) -> usize {
-    loopidiom::run(&mut p.clctx.func, p.noalias, p.tcfg, p.fname)
+fn s_loopidiom(p: &mut Pipe, an: &mut Analysis) -> usize {
+    loopidiom::run(&mut p.clctx.func, an, p.noalias, p.tcfg, p.fname)
 }
 
 // A second ifconv round: loadfwd/egraph dedup re-loaded predicate
@@ -459,7 +571,7 @@ fn s_loopidiom(p: &mut Pipe) -> usize {
 // `filter(pred)` range-check diamonds folded only now that they're
 // pure forwarders. Flattening them to `select` chains is what lets
 // loopvec see the count-if/conditional-update shapes.
-fn s_ifconv2(p: &mut Pipe) -> usize {
+fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // Carried-constant params (`RangeInclusive`'s exhausted flag
     // — a self-edge param fed a literal at entry) fold here so
     // the dispatch arms they drive die before flattening
@@ -507,8 +619,8 @@ fn s_ifconv2(p: &mut Pipe) -> usize {
 // Unswitch invariant brifs before bcheck: the constant-folded
 // copies (e.g. a `capacity == 0` early-out in HashMap::get) shrink
 // each version's body and can expose more foldable checks.
-fn s_unswitch(p: &mut Pipe) -> usize {
-    let k = bcheck::unswitch(&mut p.clctx.func, p.fname);
+fn s_unswitch(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = bcheck::unswitch(&mut p.clctx.func, an, p.fname);
     if k > 0 && p.dump {
         p.dump("unswitch");
     }
@@ -517,15 +629,16 @@ fn s_unswitch(p: &mut Pipe) -> usize {
 
 // bcheck before loopvec: the versioned fast path has no per-iteration
 // bounds branches, so it's vectorizable where the checked loop isn't.
-fn s_bcheck(p: &mut Pipe) -> usize {
-    let k = bcheck::run(&mut p.clctx.func, p.fname, p.has_eh);
+fn s_bcheck(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = bcheck::run(&mut p.clctx.func, an, p.fname, p.has_eh);
     p.dump("bcheck");
     k
 }
 
-fn s_loopvec(p: &mut Pipe) -> usize {
+fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = loopvec::run(
         &mut p.clctx.func,
+        an,
         p.fname,
         p.noalias,
         p.tcfg,
@@ -540,13 +653,15 @@ fn s_loopvec(p: &mut Pipe) -> usize {
         && config().enabled("PLIRON_INDUCT2")
         && bisect("indvars2")
     {
-        indvars::run(&mut p.clctx.func);
+        // loopvec rewrote the loop the cache describes.
+        an.invalidate();
+        indvars::run(&mut p.clctx.func, an);
     }
     k
 }
 
-fn s_slp(p: &mut Pipe) -> usize {
-    let k = slp::run(&mut p.clctx.func, p.noalias, p.simd);
+fn s_slp(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = slp::run(&mut p.clctx.func, an, p.noalias, p.simd);
     if env_set("PLIRON_XPACK_CLIF") {
         eprintln!(
             "==== clif {} after slp ====\n{}",
@@ -557,7 +672,7 @@ fn s_slp(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_switchmap(p: &mut Pipe) -> usize {
+fn s_switchmap(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = switchmap::run(&mut p.clctx.func);
     // The new bounds tests are often implied by a dominating check.
     let f = if k > 0
@@ -580,7 +695,7 @@ fn s_switchmap(p: &mut Pipe) -> usize {
     0
 }
 
-fn s_constbr2(p: &mut Pipe) -> usize {
+fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = jumpthread::fold_const_branches(&mut p.clctx.func);
     if k > 0 && env_set("PLIRON_CONSTBR_DEBUG") {
         eprintln!("constbr {k} {}", p.fname);
@@ -588,15 +703,15 @@ fn s_constbr2(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_punroll(p: &mut Pipe) -> usize {
-    let k = punroll::run(&mut p.clctx.func, p.fname);
+fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = punroll::run(&mut p.clctx.func, an, p.fname);
     if k > 0 && p.dump {
         p.dump("punroll");
     }
     k
 }
 
-fn s_frozen_loads(p: &mut Pipe) -> usize {
+fn s_frozen_loads(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if p.frozen.is_empty() {
         return 0;
     }
@@ -614,7 +729,7 @@ fn s_frozen_loads(p: &mut Pipe) -> usize {
 
 // `isub x, k` → `iadd x, -k` so x64's `lea` lowering can write a
 // call-arg/phi result non-destructively instead of `mov` + `sub`.
-fn s_sublea(p: &mut Pipe) -> usize {
+fn s_sublea(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::sublea(&mut p.clctx.func)
 }
 
@@ -622,20 +737,20 @@ fn s_sublea(p: &mut Pipe) -> usize {
 // binops: the fewer-use operand takes two-address dst, so regalloc
 // clobbers it in place instead of copying the live one (`movdqa`
 // splat copies in matmul's `mulpd` loop).
-fn s_commute(p: &mut Pipe) -> usize {
+fn s_commute(p: &mut Pipe, _an: &mut Analysis) -> usize {
     commute::run(&mut p.clctx.func)
 }
 
 // Scalar min/max wider than a register (i128) has no Cranelift
 // lowering on any target; several passes can emit it.
-fn s_wide_minmax(p: &mut Pipe) -> usize {
+fn s_wide_minmax(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::wide_minmax(&mut p.clctx.func)
 }
 
 // Rebind cold-call args defined in hot code so their ABI register
 // pinning lands at the cold call site instead of constraining the
 // whole hot loop's register allocation.
-fn s_coldarg(p: &mut Pipe) -> usize {
+fn s_coldarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::coldargs(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("coldargs");
@@ -646,7 +761,7 @@ fn s_coldarg(p: &mut Pipe) -> usize {
 // Splice single-predecessor successors into their predecessor so
 // hot loops broken into several blocks by cold-edge branches lose
 // the per-edge register-allocation copy shuffle.
-fn s_fuse(p: &mut Pipe) -> usize {
+fn s_fuse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::fusechains(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("fuse");
@@ -658,7 +773,7 @@ fn s_fuse(p: &mut Pipe) -> usize {
 // try_call landing-pad and normal-return edges that the earlier
 // jumpthread bypass cannot touch; each surviving forwarder emits a
 // `b` in the final stream.
-fn s_edgefwd(p: &mut Pipe) -> usize {
+fn s_edgefwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgefwd::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("edgefwd");
@@ -670,7 +785,7 @@ fn s_edgefwd(p: &mut Pipe) -> usize {
 // absorbed into `jump` preds, and `jump` forwarders with
 // escaping params. Must run before coldedges so any hot->cold
 // edges it creates still get cold adapters.
-fn s_foldf(p: &mut Pipe) -> usize {
+fn s_foldf(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::foldforwarders(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("foldf");
@@ -681,7 +796,7 @@ fn s_foldf(p: &mut Pipe) -> usize {
 // Fold compares decided by dominating branch conditions (bounds
 // checks implied by earlier checks) before the cold-edge split:
 // a folded check's dead panic edge then never gets an adapter.
-fn s_celim(p: &mut Pipe) -> usize {
+fn s_celim(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = celim::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("celim");
@@ -700,8 +815,8 @@ fn s_celim(p: &mut Pipe) -> usize {
 // per use that folds into a base+index*scale amode, so no
 // address math materializes; constant-trip counters fold their
 // exit test onto the anchor's step value and die with deadrecs.
-fn s_ivrefold(p: &mut Pipe) -> usize {
-    let k = ivrefold::run(&mut p.clctx.func);
+fn s_ivrefold(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = ivrefold::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("ivrefold");
     }
@@ -713,8 +828,8 @@ fn s_ivrefold(p: &mut Pipe) -> usize {
 // indvars leaves when addressing moved to another param).
 // Forward liveness can't see these: the param is "used" by
 // its increment and the increment is "used" by the edge.
-fn s_deadrec(p: &mut Pipe) -> usize {
-    let k = ivrefold::deadrecs(&mut p.clctx.func);
+fn s_deadrec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = ivrefold::deadrecs(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("deadrec");
     }
@@ -725,7 +840,7 @@ fn s_deadrec(p: &mut Pipe) -> usize {
 // (the vectorizer's separate load/store address streams,
 // rustc's repeated index math) collapse to one value before
 // sameargs merges the now-identical edge args.
-fn s_lcse(p: &mut Pipe) -> usize {
+fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::lcse(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("lcse");
@@ -738,7 +853,7 @@ fn s_lcse(p: &mut Pipe) -> usize {
 // param costs a regalloc parallel copy per conditional pred —
 // the `mov;b` edge-split blocks that dominate the block count.
 // Runs before coldedges so adapters inherit smaller arg lists.
-fn s_sameargs(p: &mut Pipe) -> usize {
+fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if env_set("PLIRON_SA_DEBUG") || env_set("PLIRON_PHI_DEBUG") {
         eprintln!("--- sameargs {}", p.fname);
     }
@@ -753,7 +868,7 @@ fn s_sameargs(p: &mut Pipe) -> usize {
 // residue around `icmp`/`uextend`/`select` booleans) — one `and`
 // per element in scalar count_if loops. After sameargs: the merged
 // predicate param is only alias-visible once it has dropped.
-fn s_mask01(p: &mut Pipe) -> usize {
+fn s_mask01(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::mask01(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("mask01");
@@ -766,7 +881,7 @@ fn s_mask01(p: &mut Pipe) -> usize {
 // `select`/`ireduce`/`icmp eq k` cascades collapse to a `brif` on the
 // flag or a direct edge. Runs before coldedges so any hot->cold edge
 // it creates still gets an adapter.
-fn s_edgespec(p: &mut Pipe) -> usize {
+fn s_edgespec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgespec::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("edgespec");
@@ -777,7 +892,7 @@ fn s_edgespec(p: &mut Pipe) -> usize {
 // Sparse small-domain membership trees (is_whitespace/is_ascii_*
 // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
 // the accepted set fits a 64-bit window.
-fn s_bittab(p: &mut Pipe) -> usize {
+fn s_bittab(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = bittab::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("bittab");
@@ -790,7 +905,7 @@ fn s_bittab(p: &mut Pipe) -> usize {
 // Runs after edgefwd: its bypass has no cold check and would
 // retarget straight through the adapters, putting the parallel
 // copy back in the hot predecessor tail.
-fn s_coldedge(p: &mut Pipe) -> usize {
+fn s_coldedge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::coldedges(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("coldedges");
@@ -803,7 +918,7 @@ fn s_coldedge(p: &mut Pipe) -> usize {
 // leaving stores the early dse saw live (e.g. the `&key` slot
 // materialized for `HashMap::get`, dead once `hash_one`'s byte
 // loads forward from the key value itself).
-fn s_dse2(p: &mut Pipe) -> usize {
+fn s_dse2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
     if k > 0 && p.dump {
         p.dump("dse2");
@@ -815,7 +930,7 @@ fn s_dse2(p: &mut Pipe) -> usize {
 // loads read back (rustc's `Simd` const materialization, e.g.
 // hashbrown's `u8x8` special-byte checks in `reserve_rehash`) fold
 // to `iconst`+`bitcast`, and the lane stores go dead.
-fn s_vecslot(p: &mut Pipe) -> usize {
+fn s_vecslot(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::vecslot(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("vecslot");
@@ -828,7 +943,7 @@ fn s_vecslot(p: &mut Pipe) -> usize {
 // regalloc from coalescing it (a stray `movq` showed up in
 // loop bodies). Last transform before codegen — earlier passes
 // match `Opcode::Load` and must still see the load.
-fn s_uload32(p: &mut Pipe) -> usize {
+fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::uloads32(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("uload32");
@@ -840,8 +955,8 @@ fn s_uload32(p: &mut Pipe) -> usize {
 // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
 // a non-constant preheader value codegen pins in a register. Runs
 // late (after loop rotation) so latch-copied tests are covered.
-fn s_boundcmp(p: &mut Pipe) -> usize {
-    let k = indvars::boundcmp(&mut p.clctx.func);
+fn s_boundcmp(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = indvars::boundcmp(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("boundcmp");
     }
@@ -851,7 +966,7 @@ fn s_boundcmp(p: &mut Pipe) -> usize {
 // Dead self-feed recurrences — boundcmp's countdown replaces the
 // bound-tested iv with `rem`, leaving the iv's `+=` update feeding
 // only its own edge arg. Runs after boundcmp/looprot.
-fn s_selfarg(p: &mut Pipe) -> usize {
+fn s_selfarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::selfarg(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("selfarg");
@@ -865,7 +980,7 @@ fn s_selfarg(p: &mut Pipe) -> usize {
 // `SplitWhitespace::next`'s per-char discriminant dispatch).
 // Runs last so nothing un-does the chains and adapters/edge
 // forwarding have already collapsed the surrounding shape.
-fn s_brchain(p: &mut Pipe) -> usize {
+fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = brchain::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("brchain");
@@ -875,7 +990,7 @@ fn s_brchain(p: &mut Pipe) -> usize {
 
 // Merge disjoint-lifetime explicit slots — last, so slot references
 // cloned by earlier passes are all accounted for before sharing.
-fn s_slotmerge(p: &mut Pipe) -> usize {
+fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let stats = env_set("PLIRON_STATS");
     let before: u64 = stats
         .then(|| {
@@ -908,7 +1023,7 @@ fn s_slotmerge(p: &mut Pipe) -> usize {
 // colder than the loop: mark them cold so the emitted RPO order puts
 // them last and the loop arm falls through. Runs last — it's pure
 // layout metadata, so nothing downstream needs to see it.
-fn s_coldret(p: &mut Pipe) -> usize {
+fn s_coldret(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::coldrets(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("coldrets");
@@ -916,16 +1031,16 @@ fn s_coldret(p: &mut Pipe) -> usize {
     k
 }
 
-fn s_indvars(p: &mut Pipe) -> usize {
-    indvars::run(&mut p.clctx.func)
+fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
+    indvars::run(&mut p.clctx.func, an)
 }
 
-fn s_loopdel(p: &mut Pipe) -> usize {
-    loopdel::run(&mut p.clctx.func)
+fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
+    loopdel::run(&mut p.clctx.func, an)
 }
 
-fn s_looprot(p: &mut Pipe) -> usize {
-    let k = looprot::run(&mut p.clctx.func);
+fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = looprot::run(&mut p.clctx.func, an);
     p.dump("looprot");
     k
 }
@@ -938,6 +1053,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("jumpthread"),
         stat: "",
         verify: true,
+        mutates: true,
         gate: JT,
         run: s_jumpthread,
     },
@@ -947,6 +1063,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("unroll"),
         stat: "",
         verify: true,
+        mutates: true,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
     },
@@ -956,6 +1073,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("clifpeep"),
         stat: "",
         verify: false,
+        mutates: true,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
     },
@@ -967,6 +1085,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("loadfwd"),
         stat: "",
         verify: true,
+        mutates: true,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
@@ -976,6 +1095,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("egraph"),
         stat: "",
         verify: false,
+        mutates: true,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
     },
@@ -1005,6 +1125,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("constbr"),
         stat: "",
         verify: true,
+        mutates: true,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
     },
@@ -1028,6 +1149,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: None,
         stat: "",
         verify: false,
+        mutates: true,
         gate: Gate::Always,
         run: s_frozen_loads,
     },
@@ -1042,6 +1164,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("commute"),
         stat: "commute",
         verify: false,
+        mutates: true,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
     },
@@ -1050,6 +1173,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: None,
         stat: "",
         verify: false,
+        mutates: true,
         gate: Gate::Always,
         run: s_wide_minmax,
     },
@@ -1058,6 +1182,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("coldarg"),
         stat: "coldarg",
         verify: false,
+        mutates: true,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
     },
@@ -1083,6 +1208,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("lcse"),
         stat: "lcse",
         verify: true,
+        mutates: true,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -1096,6 +1222,7 @@ pub static DEFAULT: &[Step] = &[
         bisect: Some("coldret"),
         stat: "coldret",
         verify: false,
+        mutates: true,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
     },

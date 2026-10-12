@@ -32,11 +32,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loopidiom::{gather, iconst, outv, param_kinds, Param};
 
-pub fn run(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let loops: Vec<Loop> = la.loops().collect();
     let mut n = 0;
     for lp in loops {

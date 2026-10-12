@@ -21,18 +21,16 @@ use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 
 const MAX_DELETIONS: usize = 16;
 
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     fold_inc_overflow(func);
+    an.invalidate();
     let mut n = 0;
     while n < MAX_DELETIONS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
+        let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let env = crate::jumpthread::known_values(func);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
         let Some((lp, exit, args)) = la
             .loops()
-            .find_map(|lp| deletable(func, &cfg, &dt, &la, &env, lp))
+            .find_map(|lp| deletable(func, cfg, dt, la, &env, lp))
         else {
             break;
         };
@@ -54,6 +52,10 @@ pub fn run(func: &mut Function) -> usize {
             }
         }
         n += 1;
+        // Redirected preds rewired the graph — recompute before the next
+        // deletion candidate scan (edge edits don't change the shape
+        // fingerprint, so this stays explicit).
+        an.invalidate();
     }
     n
 }

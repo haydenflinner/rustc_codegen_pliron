@@ -26,7 +26,6 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData, Opcode,
     Value, ValueDef, condcodes::IntCC,
@@ -838,9 +837,8 @@ fn self_feeding(
 /// `p -> iadd p,k -> jump h(...)` byte-offset cursor indvars leaves
 /// when the body's addressing moved to another param). Uses outside
 /// that chain keep `p` live. Returns slots eliminated.
-pub fn deadrecs(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
     // Values that are alias targets: removing them would strand the
     // alias. `Alias{INVALID, reserved}` tombstones read as aliases but
@@ -905,14 +903,13 @@ pub fn deadrecs(func: &mut Function) -> usize {
 }
 
 /// Refold carried affine params; returns slots eliminated.
-pub fn run(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
     let debug = crate::env_set("PLIRON_IVREFOLD_DEBUG");
     let mut n = 0;
     for h in func.layout.blocks().collect::<Vec<_>>() {
-        n += refold_header(func, &domtree, &edges, h, debug);
+        n += refold_header(func, domtree, &edges, h, debug);
     }
     if n > 0 {
         // The stripped increments (`p + step` edge args) are usually dead now.

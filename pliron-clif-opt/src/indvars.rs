@@ -369,16 +369,13 @@ fn run_loop(
     n
 }
 
-pub fn run(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
-    let loops = deepest_first(&la);
+    let loops = deepest_first(la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += run_loop(func, &cfg, &dt, &la, lp, debug);
+        n += run_loop(func, cfg, dt, la, lp, debug);
     }
     n
 }
@@ -901,16 +898,13 @@ fn rot_loop(
     n
 }
 
-pub fn rotld(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_LDROT_DEBUG");
-    let loops = deepest_first(&la);
+    let loops = deepest_first(la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += rot_loop(func, &cfg, &dt, &la, lp, debug);
+        n += rot_loop(func, cfg, dt, la, lp, debug);
     }
     n
 }
@@ -933,15 +927,12 @@ enum Lt {
 /// precisely. `rem0 = D - j0` is a non-constant preheader value, so codegen
 /// pins it in a register; `rem - s` doubles as the backedge arg, so the
 /// loop trades two remat instructions for one `isub`.
-pub fn boundcmp(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
+pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let psrc = crate::loadfwd::param_src(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
     let mut n = 0;
-    for lp in deepest_first(&la).into_iter().take(MAX_LOOPS) {
+    for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
         let h = la.loop_header(lp);
         if !dt.is_reachable(h) {
             continue;
@@ -952,7 +943,7 @@ pub fn boundcmp(func: &mut Function) -> usize {
             .filter(|&b| la.is_in_loop(b, lp))
             .collect();
         let params = func.dfg.block_params(h).to_vec();
-        let edges = edges_to(func, &cfg, h);
+        let edges = edges_to(func, cfg, h);
         for (idx, &p) in params.iter().enumerate() {
             if !func.dfg.value_type(p).is_int() {
                 continue;

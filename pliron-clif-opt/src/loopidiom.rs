@@ -2399,6 +2399,7 @@ fn apply_dead(
 
 pub fn run(
     func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
     noalias: &FxHashSet<Value>,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
     fname: &str,
@@ -2416,22 +2417,19 @@ pub fn run(
     // conversion rather than letting `plan` see stale dominance/latches.
     let mut done = FxHashSet::default();
     'outer: for _ in 0..MAX_LOOPS {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
+        let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         let ps = crate::loadfwd::param_src(func);
-        for lp in la.loops() {
+        for lp in la.loops().collect::<Vec<_>>() {
             if done.contains(&la.loop_header(lp)) {
                 continue;
             }
-            if let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias) {
+            if let Some(p) = plan(func, &ps, cfg, dt, la, lp, noalias) {
                 if debug {
                     eprintln!("idiom {fname}: loop {:?} -> {}", p.h, if p.src.is_some() { "memcpy" } else { "memset" });
                 }
                 apply(func, &p, tcfg);
                 done.insert(p.h);
-            } else if let Some(d) = plan_dead(func, &ps, noalias, &cfg, &dt, &la, lp) {
+            } else if let Some(d) = plan_dead(func, &ps, noalias, cfg, dt, la, lp) {
                 if debug {
                     eprintln!("idiom {fname}: dead loop {:?} eliminated", d.h);
                 }
@@ -2444,6 +2442,10 @@ pub fn run(
             if n >= MAX_CONV {
                 break 'outer;
             }
+            // `apply`/`apply_dead` rewired the CFG — refresh analyses
+            // before the next conversion rather than letting `plan`
+            // see stale dominance/latches.
+            an.invalidate();
             continue 'outer;
         }
         break;
