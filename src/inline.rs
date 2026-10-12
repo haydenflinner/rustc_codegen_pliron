@@ -76,10 +76,16 @@ pub(crate) fn direct_callee<'a>(
     op: Ptr<Operation>,
 ) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
-    let CallOpCallable::Direct(id) = c.callee(ctx) else {
-        return None;
-    };
-    st.ident_to_sym.get(&id.to_string())
+    match c.callee(ctx) {
+        CallOpCallable::Direct(id) => st.ident_to_sym.get(&id.to_string()),
+        // An indirect call through a provable function address (a monomorphized
+        // closure shim like hashbrown's `make_hasher`) is direct for inlining:
+        // `devirt` rewrites these later, but that runs after the main pass.
+        CallOpCallable::Indirect(p) => match st.consts.get(&p) {
+            Some(ConstVal::Sym { sym, off: 0 }) => st.funcs.get_key_value(sym).map(|(k, _)| k),
+            _ => None,
+        },
+    }
 }
 
 /// Legality only — `Some((has_eh, ops, calls))` if `sym` may be inlined at
@@ -564,6 +570,15 @@ pub fn run(
         let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
         let mut grown = 0usize;
         let mut seen: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+        // `only` (the devirt-inline pass) restricts which pre-existing
+        // callsites may inline; ops this run itself splices in are fair game —
+        // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
+        let pre: FxHashSet<Ptr<Operation>> = only.map(|_| {
+            blocks(ctx, caller)
+                .iter()
+                .flat_map(|&b| ops(ctx, b))
+                .collect()
+        }).unwrap_or_default();
         // Inlining exposes nested callsites the scan hadn't seen: e.g.
         // `HashMap::get` brings `hash_one` inside the caller's loop, where
         // the in-loop bonus may now accept it. Rescan until a round finds
@@ -579,7 +594,7 @@ pub fn run(
                     if !bottom_up && st.invokes.contains_key(&op) {
                         continue;
                     }
-                    if only.is_some_and(|o| !o.contains(&op)) {
+                    if pre.contains(&op) && only.is_some_and(|o| !o.contains(&op)) {
                         continue;
                     }
                     let Some(cs) = direct_callee(ctx, st, op) else {
