@@ -56,6 +56,10 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 - Pushing: this is a personal fork that may never be upstreamed — commit
   and push completed work freely; no confirmation or personal-diff-review
   protocol applies. Do not add `Co-Authored-By` trailers.
+- Disk cleanup: worktree source dirs are small — the weight is each
+  worktree's `target/`. Reclaim space with `cargo clean` (or remove
+  `target/`) inside a worktree rather than `git worktree remove`, which
+  permanently loses uncommitted changes.
 - `tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]` — runs directive-free
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)
