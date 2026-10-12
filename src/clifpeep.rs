@@ -4500,6 +4500,12 @@ pub fn vecslot(func: &mut Function) -> usize {
             };
             let lres = func.dfg.first_result(l);
             func.dfg.clear_results(l);
+            if func.dfg.value_is_attached(lres) {
+                // Still attached somewhere else — leave the load alone
+                // rather than corrupt the DFG aliasing a live result.
+                all_folded = false;
+                continue;
+            }
             func.dfg.change_to_alias(lres, nv);
             func.layout.remove_inst(l);
             n += 1;
