@@ -1808,7 +1808,7 @@ fn run_peel(
         let mut smap: FxHashMap<Value, Seed> = FxHashMap::default();
         for (j, &p) in hparams.iter().enumerate() {
             let s = match steps[j] {
-                Some(s) => Seed::Aff(peps[j], kk as i64 * s),
+                Some(s) => Seed::Aff(peps[j], s.wrapping_mul(kk as i64)),
                 None => nxt[j],
             };
             smap.insert(p, s);
@@ -1833,13 +1833,17 @@ fn run_peel(
                             if iconst(func, c).is_some() =>
                         {
                             match seed_of(func, &smap, x) {
-                                Seed::Aff(bv, o) => Some((bv, o + iconst(func, c).unwrap())),
+                                Seed::Aff(bv, o) => {
+                                    Some((bv, o.wrapping_add(iconst(func, c).unwrap())))
+                                }
                                 _ => None,
                             }
                         }
                         (Opcode::Isub, [x, c]) if iconst(func, c).is_some() => {
                             match seed_of(func, &smap, x) {
-                                Seed::Aff(bv, o) => Some((bv, o - iconst(func, c).unwrap())),
+                                Seed::Aff(bv, o) => {
+                                    Some((bv, o.wrapping_sub(iconst(func, c).unwrap())))
+                                }
                                 _ => None,
                             }
                         }
