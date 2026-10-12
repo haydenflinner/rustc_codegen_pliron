@@ -514,6 +514,13 @@ pub fn run(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 2 });
+    // `#[inline]` callees get up to `hint`x the limit (`PLIRON_INLINE_HINT`):
+    // rustc's hint means "small or hot leaf" — std's `hash_one`/iterator
+    // adapters sit just over the base limit but must inline to match LLVM.
+    let hint: usize = std::env::var("PLIRON_INLINE_HINT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 4 });
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
@@ -602,6 +609,9 @@ pub fn run(
                         .any(|&i| args.get(i).is_some_and(|a| const_arg(st, a)))
                 {
                     t = t.max(limit.saturating_mul(fold));
+                }
+                if hint > 1 && f.inline_hint {
+                    t = t.max(limit.saturating_mul(hint));
                 }
                 let mut cost = ci.n;
                 if model {
