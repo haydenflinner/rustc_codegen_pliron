@@ -32,7 +32,11 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
 Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 `rustc-dev`, `rust-src`, `llvm-tools-preview`).
 
-- `cargo build` → `target/debug/librustc_codegen_pliron.{so,dylib}`
+- `cargo build` → `target/debug/librustc_codegen_pliron.{so,dylib}`;
+  incremental after a `pliron-clif-opt`/`src` edit is ~2s
+- `cargo check|test -p pliron-clif-opt` (or `-p pliron-ir-opt`) — the opt
+  crates build on stable Rust: sub-second typecheck, pass unit tests with
+  no dylib link and no rustc
 - `./test.sh` — smoke tests (nostd, std, unwind, asm, proc-macro, wasm if
   node is installed); `--sysroot` also rebuilds std via `-Zbuild-std`;
   `--mold` cross-links the std test to `*-linux-musl` with mold (PATH or a
@@ -58,6 +62,7 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   `test.sh --sysroot`); with stock std, real SEH throws unwind *through* our
   frames (correct `.pdata`) but our `catch_unwind` can't intercept them —
   `tests/std/main.rs` gates those asserts on `--cfg pliron_stock_seh`.
+
   MSVC i128/f128 libcall ABI: args byval through pointers, return in xmm0 —
   `libcall()` in lower.rs adapts (`__udivti3`, `__floattisf`, `__rust_i128_*`).
   rsasm COFF: `.linkonce`, `.seh_*`, `3f@IMGREL` local-label modifiers; LLVM
@@ -87,3 +92,29 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   Handles Darwin's `rust-objcopy` PATH requirement and watchdog-kills
   rustc stuck idle (miscompiled-rustc deadlocks). Run it after optimizer
   changes that touch stage2 codegen.
+
+## Fast iteration / debugging knobs
+
+- `./test.sh --only a,b,c` — run a subset (names in the test.sh header:
+  nostd, std, bcheck, loopvec, ...). The script always `cargo build`s
+  first, but incremental rebuild is ~2s.
+- `PLIRON_*` env gates flip passes **without rebuilding the dylib**:
+  `PLIRON_<PASS>=0` disables, `PLIRON_OPT_BISECT=N` truncates the pass
+  budget, `PLIRON_OPT_BISECT_DEBUG=1` logs gate decisions,
+  `PLIRON_PIPELINE=a,b` selects/orders pipeline steps, `PLIRON_PAR=0`
+  serializes codegen (also forced by OPT_BISECT).
+- `PLIRON_STATS=1` — per-pass rewrite counts per function.
+- `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
+- `PLIRON_CLIF=<substr>` — dump CLIF after every step for functions whose
+  name contains the substring; `PLIRON_VERIFY=full` runs the cranelift
+  verifier after each step; any other truthy value verifies once after
+  the pipeline, then retries per-step on failure for attribution.
+- Quick single-file check (no test.sh):
+  `rustc +nightly-2026-10-06 -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs -o out`
+- Gotcha: rustc's incremental cache does **not** track `PLIRON_*` env or
+  the backend dylib — when reusing a `-Zcodegen-backend` output/target
+  dir, pass `--extern`-fresh inputs or clean it if results look stale.
+- Dev profile: our crates at `opt-level=1`, deps at O3, vendored
+  `cranelift-codegen` at O1 (override:
+  `CARGO_PROFILE_DEV_PACKAGE_CRANELIFT_CODEGEN_OPT_LEVEL=3`),
+  `debug="line-tables-only"` (revert for lldb variable inspection).

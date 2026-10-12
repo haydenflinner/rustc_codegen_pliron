@@ -32,6 +32,11 @@ exclude = ["vendor"]
 
 [profile.dev]
 opt-level = 1
+# Emitting full DWARF for ~100k lines of vendored cranelift + rustc
+# glue costs build time and disk (Mach-O keeps debug in the .o files,
+# so this shows up as smaller objects, not a smaller dylib). Line
+# tables keep ICE locations readable. Revert for lldb variables.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

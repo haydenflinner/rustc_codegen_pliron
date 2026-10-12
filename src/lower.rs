@@ -673,6 +673,13 @@ pub fn lower_to_object(
         eh.add_function(&mut m, j.id, code);
     }
 
+    if crate::env_set("PLIRON_TIMING") {
+        let mut t: Vec<_> = stats.timing.iter().collect();
+        t.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
+        for (n, d) in t {
+            eprintln!("timing {name} {n} {:.3}ms", d.as_secs_f64() * 1e3);
+        }
+    }
     if crate::env_set("PLIRON_STATS") {
         eprintln!("pipeline {name}: {}", crate::config::config().describe());
     }

@@ -96,6 +96,9 @@ pub struct Stats {
     pub dupd: usize,
     pub forwarded: usize,
     pub slot_dse: usize,
+    /// Wall time per step name, summed over functions; printed under
+    /// `PLIRON_TIMING`.
+    pub timing: FxHashMap<&'static str, std::time::Duration>,
 }
 
 impl Stats {
@@ -109,6 +112,9 @@ impl Stats {
         self.dupd += o.dupd;
         self.forwarded += o.forwarded;
         self.slot_dse += o.slot_dse;
+        for (n, d) in &o.timing {
+            *self.timing.entry(n).or_default() += *d;
+        }
     }
 }
 
@@ -355,7 +361,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     {
         return;
     }
+    let t0 = std::time::Instant::now();
     let k = (s.run)(p, an);
+    *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
     if s.mutates {
         an.bump();
     }

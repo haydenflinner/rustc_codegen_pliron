@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
-# Usage: ./test.sh [--sysroot] [--mold]
+# Usage: ./test.sh [--sysroot] [--mold] [--only a,b,c]
 # Builds the backend, then compiles and runs tests/{nostd,std,asm} with it.
 # --sysroot additionally rebuilds core/alloc/std with the backend (-Zbuild-std).
 # --mold additionally cross-links the std test to *-linux-musl with a pure-Rust
 # linker — wild (PATH, cargo install wild-linker) or mold (PATH or a sibling
 # `mold` checkout) — and runs it via docker/qemu.
 # Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
+# --only runs only the comma-listed test names:
+#   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
+#   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
+#   sroa inlinecm retattr loopalign commute xpack loopvec proc_macro wasm
+#   (sysroot/mold still need their flags)
 set -euo pipefail
 cd "$(dirname "$0")"
+
+only=; sysroot=; mold=
+for a in "$@"; do
+  case "$a" in
+    --only=*) only="${a#--only=}" ;;
+    --sysroot) sysroot=1 ;;
+    --mold) mold=1 ;;
+    *) echo "test.sh: unknown flag '$a' (want --sysroot|--mold|--only=a,b,c)" >&2; exit 2 ;;
+  esac
+done
+want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
+
 cargo build
 case "$(uname -s)" in
   Darwin)              lib=librustc_codegen_pliron.dylib; exe= ;;
@@ -22,204 +39,313 @@ if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
   BE="$BE -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$PWD/target/wild-ld"
 fi
 out=target/tests; mkdir -p $out
-# nostd links libc directly on unix; on Windows msvcrt ships with the toolchain.
-lc=-lc; [[ -n "$exe" ]] && lc=
-rustc $BE --edition 2024 -Cpanic=abort ${lc:+-Clink-arg=$lc} tests/nostd/main.rs -o $out/nostd$exe && $out/nostd$exe
-tests="std unwind"; stockcfg=
+llvmod="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin/llvm-objdump$exe"
+so=${lib##*.}
 # On Windows the unwind machinery only interoperates when std is also built by
 # us: against the stock LLVM std, panics are real SEH throws our emulated-EH
 # invoke path can't intercept. The unwind test still runs under --sysroot.
-if [[ -n "$exe" ]]; then tests="std"; stockcfg="--cfg pliron_stock_seh"; fi
-# asm test has x86-64 and aarch64 variants; other targets unsupported.
-case "$(uname -m)" in x86_64|aarch64|arm64) tests="$tests asm" ;; esac
-for t in $tests; do rustc $BE $stockcfg --edition 2024 tests/$t/main.rs -o $out/$t$exe && $out/$t$exe; done
-# -O passes (full unroll of constant-trip loops): output must match stock LLVM rustc's
-rustc $BE --edition 2021 -O tests/unroll/main.rs -o $out/unroll$exe && $out/unroll$exe | diff --strip-trailing-cr - tests/unroll/expected.out
-# LICM must not speculate enum-payload derefs past the discriminant guard.
-rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm$exe && $out/licm$exe
-# loadpre's edge insertion must feed the post-store/post-call value across
-# join edges — a compensating load on a missing arm reads end-of-pred
-# memory, so an aliasing store or writing call there must not go stale.
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/loadpre/main.rs -o $out/loadpre$exe && $out/loadpre$exe
-# Post-alloc pair fusion must not pair a load with a load that uses its
-# result as an address (pointer-chase + closure-env dependent loads).
-rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse$exe && $out/pairfuse$exe
-# edgespec must not thread an edge past a dispatch block whose params it
-# leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
-# iterator spun forever. It must also see through enum tag+payload merges:
-# parse() exit blocks re-pack a Result whose tag is per-edge constant, so
-# the join's tag test and the packed word itself must both fold away.
-PLIRON_STATS=1 rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec$exe 2> $out/edgespec.stats && $out/edgespec$exe
-grep -Eq 'edgespec [1-9]' $out/edgespec.stats || { echo "edgespec did not fire" >&2; exit 1; }
-# cparm must materialize carried-chain constants in each carried param's
-# home block — one const in the join block leaves non-dominating uses on
-# sibling arms (Vec::into_boxed_slice / try_call edges hit the verifier).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/cparm/main.rs -o $out/cparm$exe && $out/cparm$exe
-# celim's unpeeled retry must range the retry's own operands — a stale
-# peeled base turned `depth != 0` into `depth-1 != 0` and broke
-# BTreeMap's drop walk (build-script SIGSEGV compiling blake3).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim$exe && $out/celim$exe
-# punroll's peeled side-exit clones must not reach ambient uses of body
-# values through un-cloned shared continuations (sequential loops with
-# converging exits — Lint::parse_rust_version hit the verifier/EntryLivein).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/punroll$exe && $out/punroll$exe
-# icmp_eqfold's eq/ne add-shift is i64-only: shifting the i8 whitespace
-# switch in strwork miscompiled through an untraced downstream path.
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/icmpfold/main.rs -o $out/icmpfold$exe && $out/icmpfold$exe
-# coldargs' i128 arg rebind must build the zero via iconcat — iconst has
-# no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs$exe && $out/coldargs$exe
-# bcheck may only fold a bound check whose unsafe edge dies — a cold
-# not-found exit is cold yet live; folding the scan loop's own bound test
-# turned `s.contains('=')` into an out-of-bounds read (stage2 rustc
-# parse_cfg emitted the wrong --cfg diagnostic).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/bcheck/main.rs -o $out/bcheck$exe && $out/bcheck$exe
-# unswitch must drop a whole dead-fragment region, not just no-pred
-# blocks: the folded side of HashMap::get's capacity check leaves a
-# self-referencing dead cycle whose defs feed live clones — removing
-# only pred-less blocks detached v-defs still in use (hmget verifier hit).
-PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/unswitch/main.rs -o $out/unswitch$exe 2> $out/unswitch.stats && $out/unswitch$exe
-grep -Eq 'unswitch [1-9]' $out/unswitch.stats || { echo "unswitch did not fire" >&2; exit 1; }
-# slotmerge may only share slots with disjoint live ranges — escaped,
-# overlapping, and edge-carried pointers must keep their own memory or
-# live data is aliased (per-arm aggregate allocas are the frame-size win).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotmerge/main.rs -o $out/slotmerge$exe && $out/slotmerge$exe
-# frame-size regression: 20 match arms x 2 disjoint 136-B aggregates must
-# color to ~2 regions (~272 B), not sum to ~5.4 KB — unmerged, this is the
-# shape that made stage2 rustc_parse::parse_item_kind allocate ~18 KB and
-# SIGBUS on deep parser recursion (tests/ui/expr/if/expr-stack-overflow).
-if command -v objdump >/dev/null; then
-  rustc $BE --crate-type rlib --edition 2021 -O -C codegen-units=1 tests/slotmerge/big.rs -o $out/big.rlib
-  objdump -d $out/big.rlib > $out/big.dis
-  frame=$(awk '/dispatch.*>:/{f=1} f&&/sub/{print; exit}' $out/big.dis |
-      sed -n 's/.*sub[[:space:]]*sp, sp, #\(0x[0-9a-f]*\).*/\1/p; s/.*sub[ql]*[[:space:]]*\$\(0x[0-9a-f]*\),%rsp.*/\1/p')
-  if [ -n "$frame" ] && [ "$((frame))" -ge 1024 ]; then
-      echo "slotmerge: dispatch frame is $((frame))B (expected <1024)" >&2; exit 1
+stockcfg=; [[ -n "$exe" ]] && stockcfg="--cfg pliron_stock_seh"
+
+t_nostd() {
+  # nostd links libc directly on unix; on Windows msvcrt ships with the toolchain.
+  local lc=-lc; [[ -n "$exe" ]] && lc=
+  rustc $BE --edition 2024 -Cpanic=abort ${lc:+-Clink-arg=$lc} tests/nostd/main.rs -o $out/nostd$exe && $out/nostd$exe
+}
+
+t_std() { rustc $BE $stockcfg --edition 2024 tests/std/main.rs -o $out/std$exe && $out/std$exe; }
+t_unwind() { rustc $BE $stockcfg --edition 2024 tests/unwind/main.rs -o $out/unwind$exe && $out/unwind$exe; }
+t_asm() { rustc $BE --edition 2024 tests/asm/main.rs -o $out/asm$exe && $out/asm$exe; }
+
+t_unroll() {
+  # -O passes (full unroll of constant-trip loops): output must match stock LLVM rustc's
+  rustc $BE --edition 2021 -O tests/unroll/main.rs -o $out/unroll$exe && $out/unroll$exe | diff --strip-trailing-cr - tests/unroll/expected.out
+}
+
+t_licm() {
+  # LICM must not speculate enum-payload derefs past the discriminant guard.
+  rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm$exe && $out/licm$exe
+}
+
+t_loadpre() {
+  # loadpre's edge insertion must feed the post-store/post-call value across
+  # join edges — a compensating load on a missing arm reads end-of-pred
+  # memory, so an aliasing store or writing call there must not go stale.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/loadpre/main.rs -o $out/loadpre$exe && $out/loadpre$exe
+}
+
+t_pairfuse() {
+  # Post-alloc pair fusion must not pair a load with a load that uses its
+  # result as an address (pointer-chase + closure-env dependent loads).
+  rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse$exe && $out/pairfuse$exe
+}
+
+t_edgespec() {
+  # edgespec must not thread an edge past a dispatch block whose params it
+  # leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
+  # iterator spun forever. It must also see through enum tag+payload merges:
+  # parse() exit blocks re-pack a Result whose tag is per-edge constant, so
+  # the join's tag test and the packed word itself must both fold away.
+  PLIRON_STATS=1 rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec$exe 2> $out/edgespec.stats && $out/edgespec$exe
+  grep -Eq 'edgespec [1-9]' $out/edgespec.stats || { echo "edgespec did not fire" >&2; exit 1; }
+}
+
+t_cparm() {
+  # cparm must materialize carried-chain constants in each carried param's
+  # home block — one const in the join block leaves non-dominating uses on
+  # sibling arms (Vec::into_boxed_slice / try_call edges hit the verifier).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/cparm/main.rs -o $out/cparm$exe && $out/cparm$exe
+}
+
+t_celim() {
+  # celim's unpeeled retry must range the retry's own operands — a stale
+  # peeled base turned `depth != 0` into `depth-1 != 0` and broke
+  # BTreeMap's drop walk (build-script SIGSEGV compiling blake3).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/celim/main.rs -o $out/celim$exe && $out/celim$exe
+}
+
+t_punroll() {
+  # punroll's peeled side-exit clones must not reach ambient uses of body
+  # values through un-cloned shared continuations (sequential loops with
+  # converging exits — Lint::parse_rust_version hit the verifier/EntryLivein).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/punroll/main.rs -o $out/punroll$exe && $out/punroll$exe
+}
+
+t_icmpfold() {
+  # icmp_eqfold's eq/ne add-shift is i64-only: shifting the i8 whitespace
+  # switch in strwork miscompiled through an untraced downstream path.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/icmpfold/main.rs -o $out/icmpfold$exe && $out/icmpfold$exe
+}
+
+t_coldargs() {
+  # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
+  # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs$exe && $out/coldargs$exe
+}
+
+t_bcheck() {
+  # bcheck may only fold a bound check whose unsafe edge dies — a cold
+  # not-found exit is cold yet live; folding the scan loop's own bound test
+  # turned `s.contains('=')` into an out-of-bounds read (stage2 rustc
+  # parse_cfg emitted the wrong --cfg diagnostic).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/bcheck/main.rs -o $out/bcheck$exe && $out/bcheck$exe
+}
+
+t_unswitch() {
+  # unswitch must drop a whole dead-fragment region, not just no-pred
+  # blocks: the folded side of HashMap::get's capacity check leaves a
+  # self-referencing dead cycle whose defs feed live clones — removing
+  # only pred-less blocks detached v-defs still in use (hmget verifier hit).
+  PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/unswitch/main.rs -o $out/unswitch$exe 2> $out/unswitch.stats && $out/unswitch$exe
+  grep -Eq 'unswitch [1-9]' $out/unswitch.stats || { echo "unswitch did not fire" >&2; exit 1; }
+}
+
+t_slotmerge() {
+  # slotmerge may only share slots with disjoint live ranges — escaped,
+  # overlapping, and edge-carried pointers must keep their own memory or
+  # live data is aliased (per-arm aggregate allocas are the frame-size win).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotmerge/main.rs -o $out/slotmerge$exe && $out/slotmerge$exe
+  # frame-size regression: 20 match arms x 2 disjoint 136-B aggregates must
+  # color to ~2 regions (~272 B), not sum to ~5.4 KB — unmerged, this is the
+  # shape that made stage2 rustc_parse::parse_item_kind allocate ~18 KB and
+  # SIGBUS on deep parser recursion (tests/ui/expr/if/expr-stack-overflow).
+  if command -v objdump >/dev/null; then
+    rustc $BE --crate-type rlib --edition 2021 -O -C codegen-units=1 tests/slotmerge/big.rs -o $out/big.rlib
+    objdump -d $out/big.rlib > $out/big.dis
+    frame=$(awk '/dispatch.*>:/{f=1} f&&/sub/{print; exit}' $out/big.dis |
+        sed -n 's/.*sub[[:space:]]*sp, sp, #\(0x[0-9a-f]*\).*/\1/p; s/.*sub[ql]*[[:space:]]*\$\(0x[0-9a-f]*\),%rsp.*/\1/p')
+    if [ -n "$frame" ] && [ "$((frame))" -ge 1024 ]; then
+        echo "slotmerge: dispatch frame is $((frame))B (expected <1024)" >&2; exit 1
+    fi
   fi
-fi
-# bittab must test bit 0 of the shifted mask — `sh != 0` accepts the whole
-# [lo, max] interval, so sparse sets take the interval's holes (rustc's
-# check_const_closure matched `kw::Fn` against {Move,Static,Use}).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/bittab/main.rs -o $out/bittab$exe && $out/bittab$exe
-# switch-on-sparse-discriminant dispatch (rustc's param_default_policy shape)
-rustc $BE --edition 2024 -O tests/polsw/main.rs -o $out/polsw$exe && $out/polsw$exe
-# tailrec must carry updated params AND the accumulator across the
-# back-edge (LLVM TRE for `op(expr, f(args))`) — a re-executed identity or
-# stale param miscomputes; non-commutative ops must be left alone.
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/tailrec/main.rs -o $out/tailrec$exe && $out/tailrec$exe
-# sroa pin: a non-copyable call arg with a known pointee extent pins only
-# that byte range into shared `pin_a` memory — the callee's writes and
-# pointers retained past the call must land where the caller's promoted
-# fields live, and multiple pinned args on one call retarget
-# independently (two Pins on one op must not trip the self-copy guard).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/sroa/main.rs -o $out/sroa$exe && $out/sroa$exe
-# inlinecm: the cost model must accept the constant-mode dispatch the fixed
-# thresholds reject (and reject call-dense bodies they'd take); recursive
-# and oversized callees stay calls under both. Outputs must match.
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm$exe &&
-    $out/inlinecm$exe > $out/inlinecm.out
-PLIRON_INLINE_MODEL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm_l$exe &&
-    $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
-# nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
-# inferred nonnull-return or returned-arg folds these null/equality checks
-# the wrong way.
-PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/retattr/main.rs -o $out/retattr$exe 2> $out/retattr.stats && $out/retattr$exe
-grep -Eq 'nnret .*: [1-9][0-9]* of' $out/retattr.stats || { echo "nnret inferred nothing" >&2; exit 1; }
-grep -Eq 'retarg .*: [1-9][0-9]* returned-arg bodies' $out/retattr.stats || { echo "retarg inferred nothing" >&2; exit 1; }
-grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
-# Loop headers are 16-byte aligned (vcode marks back-edge targets in
-# emission order and pads before their labels — LLVM's `.p2align 4` loop
-# tops). Every backward-jump target must sit on a 16-byte boundary;
-# PLIRON_ALIGN=0 disables.
-llvmod="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin/llvm-objdump$exe"
-if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
-  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopalign/main.rs -o $out/loopalign.o &&
-      "$llvmod" -d --no-show-raw-insn $out/loopalign.o | sed -n '/spin.*>:/,/retq/p' > $out/loopalign.dis
-  back=0; bad=0
-  while read -r line; do
-    if [[ "$line" =~ ^[[:space:]]*([0-9a-f]+):.*j[a-z]+[[:space:]]+0x([0-9a-f]+) ]]; then
-      addr=$((16#${BASH_REMATCH[1]})); tgt=$((16#${BASH_REMATCH[2]}))
-      if (( tgt < addr )); then
-        back=$((back+1))
-        (( tgt % 16 != 0 )) && bad=$((bad+1))
+}
+
+t_bittab() {
+  # bittab must test bit 0 of the shifted mask — `sh != 0` accepts the whole
+  # [lo, max] interval, so sparse sets take the interval's holes (rustc's
+  # check_const_closure matched `kw::Fn` against {Move,Static,Use}).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/bittab/main.rs -o $out/bittab$exe && $out/bittab$exe
+}
+
+t_polsw() {
+  # switch-on-sparse-discriminant dispatch (rustc's param_default_policy shape)
+  rustc $BE --edition 2024 -O tests/polsw/main.rs -o $out/polsw$exe && $out/polsw$exe
+}
+
+t_tailrec() {
+  # tailrec must carry updated params AND the accumulator across the
+  # back-edge (LLVM TRE for `op(expr, f(args))`) — a re-executed identity or
+  # stale param miscomputes; non-commutative ops must be left alone.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/tailrec/main.rs -o $out/tailrec$exe && $out/tailrec$exe
+}
+
+t_sroa() {
+  # sroa pin: a non-copyable call arg with a known pointee extent pins only
+  # that byte range into shared `pin_a` memory — the callee's writes and
+  # pointers retained past the call must land where the caller's promoted
+  # fields live, and multiple pinned args on one call retarget
+  # independently (two Pins on one op must not trip the self-copy guard).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/sroa/main.rs -o $out/sroa$exe && $out/sroa$exe
+}
+
+t_inlinecm() {
+  # inlinecm: the cost model must accept the constant-mode dispatch the fixed
+  # thresholds reject (and reject call-dense bodies they'd take); recursive
+  # and oversized callees stay calls under both. Outputs must match.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm$exe &&
+      $out/inlinecm$exe > $out/inlinecm.out
+  PLIRON_INLINE_MODEL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm_l$exe &&
+      $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
+}
+
+t_retattr() {
+  # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
+  # inferred nonnull-return or returned-arg folds these null/equality checks
+  # the wrong way.
+  PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/retattr/main.rs -o $out/retattr$exe 2> $out/retattr.stats && $out/retattr$exe
+  grep -Eq 'nnret .*: [1-9][0-9]* of' $out/retattr.stats || { echo "nnret inferred nothing" >&2; exit 1; }
+  grep -Eq 'retarg .*: [1-9][0-9]* returned-arg bodies' $out/retattr.stats || { echo "retarg inferred nothing" >&2; exit 1; }
+  grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
+}
+
+t_loopalign() {
+  # Loop headers are 16-byte aligned (vcode marks back-edge targets in
+  # emission order and pads before their labels — LLVM's `.p2align 4` loop
+  # tops). Every backward-jump target must sit on a 16-byte boundary;
+  # PLIRON_ALIGN=0 disables.
+  if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopalign/main.rs -o $out/loopalign.o &&
+        "$llvmod" -d --no-show-raw-insn $out/loopalign.o | sed -n '/spin.*>:/,/retq/p' > $out/loopalign.dis
+    back=0; bad=0
+    while read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*([0-9a-f]+):.*j[a-z]+[[:space:]]+0x([0-9a-f]+) ]]; then
+        addr=$((16#${BASH_REMATCH[1]})); tgt=$((16#${BASH_REMATCH[2]}))
+        if (( tgt < addr )); then
+          back=$((back+1))
+          (( tgt % 16 != 0 )) && bad=$((bad+1))
+        fi
       fi
+    done < $out/loopalign.dis
+    (( back > 0 )) || { echo "loopalign: no back-edge found" >&2; exit 1; }
+    (( bad == 0 )) || { echo "loopalign: $bad unaligned back-edge target(s)" >&2; exit 1; }
+  fi
+}
+
+t_commute() {
+  # commute must order the fewer-use operand first on commutative binops so
+  # two-address isel clobbers the dead operand (a loop-invariant splat in
+  # `a * b[i]` must become `mulpd splat, load`, not `movdqa` + `mulpd`).
+  PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/commute/main.rs -o $out/commute$exe 2> $out/commute.stats && $out/commute$exe
+  grep -Eq 'commute [1-9][0-9]* .*saxpy' $out/commute.stats || { echo "commute did not fire on saxpy" >&2; exit 1; }
+}
+
+t_xpack() {
+  # xpack pairs isomorphic scalar insts in one block into two-lane vector ops;
+  # the quad_roots sqrts must pack into sqrtpd (x64 SSE2).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack$exe && $out/xpack$exe &&
+    echo "xpack ok" || exit 1
+  if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack.o &&
+        "$llvmod" -d --no-show-raw-insn $out/xpack.o > $out/xpack.dis &&
+        grep -q sqrtpd $out/xpack.dis || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
+  fi
+}
+
+t_loopvec() {
+  # an inlined matmul's bounds-checked inner loop must version (bcheck) and
+  # vectorize (loopvec) even though sibling loops crowd the pass budget and
+  # the checks unwind through try_call panic paths.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec$exe && $out/loopvec$exe
+  if [[ -x "$llvmod" ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec.o
+    # File, not pipe: `grep -q` closing early would SIGPIPE llvm-objdump and
+    # pipefail would turn a match into a failure.
+    "$llvmod" -d --no-show-raw-insn $out/loopvec.o > $out/loopvec.dis
+    if [[ "$(uname -m)" == x86_64 ]]; then
+        grep -qE 'mulpd|addpd' $out/loopvec.dis || { echo "loopvec: no packed f64 emitted" >&2; exit 1; }
+        grep -qE 'pcmpeqb' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
+    else
+        grep -qE 'fmla\.2d|fmul\.2d|fadd\.2d' $out/loopvec.dis || { echo "loopvec: no f64x2 emitted" >&2; exit 1; }
+        grep -qE 'cmeq\.16b' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
     fi
-  done < $out/loopalign.dis
-  (( back > 0 )) || { echo "loopalign: no back-edge found" >&2; exit 1; }
-  (( bad == 0 )) || { echo "loopalign: $bad unaligned back-edge target(s)" >&2; exit 1; }
-fi
-# commute must order the fewer-use operand first on commutative binops so
-# two-address isel clobbers the dead operand (a loop-invariant splat in
-# `a * b[i]` must become `mulpd splat, load`, not `movdqa` + `mulpd`).
-PLIRON_STATS=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/commute/main.rs -o $out/commute$exe 2> $out/commute.stats && $out/commute$exe
-grep -Eq 'commute [1-9][0-9]* .*saxpy' $out/commute.stats || { echo "commute did not fire on saxpy" >&2; exit 1; }
-# xpack pairs isomorphic scalar insts in one block into two-lane vector ops;
-# the quad_roots sqrts must pack into sqrtpd (x64 SSE2).
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack$exe && $out/xpack$exe &&
-  echo "xpack ok" || exit 1
-if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
-  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/xpack/main.rs -o $out/xpack.o &&
-      "$llvmod" -d --no-show-raw-insn $out/xpack.o > $out/xpack.dis &&
-      grep -q sqrtpd $out/xpack.dis || { echo "xpack: no sqrtpd emitted" >&2; exit 1; }
-fi
-# an inlined matmul's bounds-checked inner loop must version (bcheck) and
-# vectorize (loopvec) even though sibling loops crowd the pass budget and
-# the checks unwind through try_call panic paths.
-rustc $BE --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec$exe && $out/loopvec$exe
-if [[ -x "$llvmod" ]]; then
-  rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopvec/main.rs -o $out/loopvec.o
-  # File, not pipe: `grep -q` closing early would SIGPIPE llvm-objdump and
-  # pipefail would turn a match into a failure.
-  "$llvmod" -d --no-show-raw-insn $out/loopvec.o > $out/loopvec.dis
-  if [[ "$(uname -m)" == x86_64 ]]; then
-      grep -qE 'mulpd|addpd' $out/loopvec.dis || { echo "loopvec: no packed f64 emitted" >&2; exit 1; }
-      grep -qE 'pcmpeqb' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
+  fi
+}
+
+t_proc_macro() {
+  # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
+  rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
+      rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
+}
+
+t_sysroot() {
+  (cd tests/sysroot && export RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot &&
+    T="$(rustc -vV | sed -n 's/host: //p')" &&
+    cargo build -Zbuild-std=std,panic_unwind --target "$T" --bins &&
+    ../../target/sysroot/$T/debug/sysroot-test$exe &&
+    ../../target/sysroot/$T/debug/unwind-test$exe)
+}
+
+t_mold() {
+  # Both pure-Rust linkers are ELF-only (Mach-O lives in the commercial sold
+  # fork), so this path targets *-linux-musl: static, self-contained CRT.
+  # wild speaks the lld-compatible dialect; mold speaks GNU ld.
+  case "$(uname -m)" in
+    arm64|aarch64) mtarget=aarch64-unknown-linux-musl ;;
+    x86_64)        mtarget=x86_64-unknown-linux-musl ;;
+    *) echo "mold test: unsupported host arch" >&2; exit 1 ;;
+  esac
+  if command -v wild >/dev/null; then
+    LD="$(command -v wild)"; flavor=ld.lld
   else
-      grep -qE 'fmla\.2d|fmul\.2d|fadd\.2d' $out/loopvec.dis || { echo "loopvec: no f64x2 emitted" >&2; exit 1; }
-      grep -qE 'cmeq\.16b' $out/loopvec.dis || { echo "loopvec: no byte-mask count emitted" >&2; exit 1; }
+    LD="$(command -v mold || echo "$PWD/../mold/target/release/mold")"; flavor=ld
   fi
-fi
-# proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
-so=${lib##*.}
-rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
-    rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
-for a in "$@"; do
-  if [[ "$a" == --sysroot ]]; then
-    (cd tests/sysroot && export RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot &&
-      T="$(rustc -vV | sed -n 's/host: //p')" &&
-      cargo build -Zbuild-std=std,panic_unwind --target "$T" --bins &&
-      ../../target/sysroot/$T/debug/sysroot-test$exe &&
-      ../../target/sysroot/$T/debug/unwind-test$exe)
-  elif [[ "$a" == --mold ]]; then
-    # Both pure-Rust linkers are ELF-only (Mach-O lives in the commercial sold
-    # fork), so this path targets *-linux-musl: static, self-contained CRT.
-    # wild speaks the lld-compatible dialect; mold speaks GNU ld.
-    case "$(uname -m)" in
-      arm64|aarch64) mtarget=aarch64-unknown-linux-musl ;;
-      x86_64)        mtarget=x86_64-unknown-linux-musl ;;
-      *) echo "mold test: unsupported host arch" >&2; exit 1 ;;
-    esac
-    if command -v wild >/dev/null; then
-      LD="$(command -v wild)"; flavor=ld.lld
-    else
-      LD="$(command -v mold || echo "$PWD/../mold/target/release/mold")"; flavor=ld
-    fi
-    rustup target list --installed | grep -qx "$mtarget" ||
-      rustup target add "$mtarget"
-    rustc $BE --edition 2024 -O --target "$mtarget" \
-      -Clinker="$LD" -Clinker-flavor=$flavor \
-      tests/std/main.rs -o "$out/std_rustld"
-    if [[ "$(uname -s)" == Linux ]]; then "$out/std_rustld";
-    elif command -v docker >/dev/null; then
-      docker run --rm -v "$PWD/$out:/t" -w /t alpine ./std_rustld
-    elif command -v "qemu-${mtarget%%-*}" >/dev/null; then
-      "qemu-${mtarget%%-*}" "$out/std_rustld"
-    else
-      echo "rust-ld: linked $out/std_rustld (no docker/qemu to run it)"
-    fi
+  rustup target list --installed | grep -qx "$mtarget" ||
+    rustup target add "$mtarget"
+  rustc $BE --edition 2024 -O --target "$mtarget" \
+    -Clinker="$LD" -Clinker-flavor=$flavor \
+    tests/std/main.rs -o "$out/std_rustld"
+  if [[ "$(uname -s)" == Linux ]]; then "$out/std_rustld";
+  elif command -v docker >/dev/null; then
+    docker run --rm -v "$PWD/$out:/t" -w /t alpine ./std_rustld
+  elif command -v "qemu-${mtarget%%-*}" >/dev/null; then
+    "qemu-${mtarget%%-*}" "$out/std_rustld"
+  else
+    echo "rust-ld: linked $out/std_rustld (no docker/qemu to run it)"
   fi
-done
-if command -v node >/dev/null \
+}
+
+want nostd && t_nostd
+want std && t_std
+# unwind can't intercept stock-std SEH throws on Windows; --sysroot covers it.
+[[ -z "$exe" ]] && want unwind && t_unwind
+# asm test has x86-64 and aarch64 variants; other targets unsupported.
+case "$(uname -m)" in x86_64|aarch64|arm64) want asm && t_asm ;; esac
+want unroll && t_unroll
+want licm && t_licm
+want loadpre && t_loadpre
+want pairfuse && t_pairfuse
+want edgespec && t_edgespec
+want cparm && t_cparm
+want celim && t_celim
+want punroll && t_punroll
+want icmpfold && t_icmpfold
+want coldargs && t_coldargs
+want bcheck && t_bcheck
+want unswitch && t_unswitch
+want slotmerge && t_slotmerge
+want bittab && t_bittab
+want polsw && t_polsw
+want tailrec && t_tailrec
+want sroa && t_sroa
+want inlinecm && t_inlinecm
+want retattr && t_retattr
+want loopalign && t_loopalign
+want commute && t_commute
+want xpack && t_xpack
+want loopvec && t_loopvec
+want proc_macro && t_proc_macro
+[[ -n "$sysroot" ]] && want sysroot && t_sysroot
+[[ -n "$mold" ]] && want mold && t_mold
+if want wasm && command -v node >/dev/null \
     && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
   tests/wasm/run.sh
 fi
