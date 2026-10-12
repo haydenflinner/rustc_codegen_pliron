@@ -40,8 +40,8 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::I8;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
-    ValueDef,
+    Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
+    Opcode, Value, ValueDef,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
@@ -50,13 +50,24 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 const MAX_EVAL: usize = 16;
 const MAX_HOPS: usize = 8;
 
-/// A value's worth under the supplied-arg environment: a constant, or
-/// `S(c, t, e)` = `t` when `c != 0` else `e` for known `t`/`e`.
+/// A value's worth under the supplied-arg environment: a constant,
+/// `S(c, t, e)` = `t` when `c != 0` else `e` for known `t`/`e`, or
+/// `B(m, v)` — every bit covered by `m` equals the matching bit of `v`
+/// (a partially-known value, e.g. an enum tag byte a `band`/`bor` merge
+/// forces while the payload stays unknown).
 #[derive(Clone, Copy, PartialEq)]
 enum E {
     Unk,
     K(u64),
     S(Value, u64, u64),
+    B(u64, u64),
+}
+
+/// Normalize: a `B` whose mask covers all `w` bits is a `K`.
+fn ebit(w: u32, m: u64, v: u64) -> E {
+    let wm = mask(u64::MAX, w);
+    let (m, v) = (m & wm, v & wm);
+    if m == wm { E::K(v) } else { E::B(m, v) }
 }
 
 fn mask(v: u64, bits: u32) -> u64 {
@@ -171,12 +182,22 @@ fn eval(
         } => match eval(func, env, sub, arg, depth + 1) {
             E::K(k) => E::K(mask(k, w)),
             E::S(c, t, e) => E::S(c, mask(t, w), mask(e, w)),
+            E::B(m, v) => ebit(w, m, v),
             E::Unk => E::Unk,
         },
         InstructionData::Unary {
             opcode: Opcode::Uextend,
             arg,
-        } => eval(func, env, sub, arg, depth + 1),
+        } => {
+            let sw = bits(func, arg).unwrap_or(w);
+            match eval(func, env, sub, arg, depth + 1) {
+                E::B(m, v) => {
+                    let sm = mask(u64::MAX, sw);
+                    ebit(w, m | !sm, v & sm)
+                }
+                e => e,
+            }
+        }
         InstructionData::Unary {
             opcode: Opcode::Sextend,
             arg,
@@ -185,6 +206,15 @@ fn eval(
             match eval(func, env, sub, arg, depth + 1) {
                 E::K(k) => E::K(mask(sext(k, sw) as u64, w)),
                 E::S(c, t, e) => E::S(c, mask(sext(t, sw) as u64, w), mask(sext(e, sw) as u64, w)),
+                E::B(m, v) => {
+                    let sbit = 1u64 << (sw - 1);
+                    let (m, v) = (m & mask(u64::MAX, sw), mask(sext(v, sw) as u64, w));
+                    if m & sbit != 0 {
+                        ebit(w, m | !mask(u64::MAX, sw), v)
+                    } else {
+                        ebit(w, m & !sbit, v)
+                    }
+                }
                 E::Unk => E::Unk,
             }
         }
@@ -194,14 +224,16 @@ fn eval(
         } => match eval(func, env, sub, arg, depth + 1) {
             E::K(k) => E::K(mask(!k, w)),
             E::S(c, t, e) => E::S(c, mask(!t, w), mask(!e, w)),
+            E::B(m, v) => ebit(w, m, !v),
             E::Unk => E::Unk,
         },
         InstructionData::Binary {
             opcode: op @ (Opcode::Band | Opcode::Bor | Opcode::Bxor),
             args,
         } => {
+            let opc = op;
             let op = |a: u64, b: u64| -> u64 {
-                match op {
+                match opc {
                     Opcode::Band => a & b,
                     Opcode::Bor => a | b,
                     _ => a ^ b,
@@ -218,7 +250,73 @@ fn eval(
                 (E::S(c, a, b), E::S(c2, x, y)) if c == c2 => {
                     E::S(c, mask(op(a, x), w), mask(op(b, y), w))
                 }
-                _ => E::Unk,
+                // A const (or partially-known side) fixes bits the other
+                // side can't unset — this is how `or`-merged enum tags
+                // survive as known bits while the payload stays unknown.
+                _ => {
+                    let wm = mask(u64::MAX, w);
+                    let tob = |e: E| -> Option<(u64, u64)> {
+                        match e {
+                            E::K(k) => Some((wm, k)),
+                            E::B(m, v) => Some((m, v)),
+                            _ => None,
+                        }
+                    };
+                    match (
+                        opc,
+                        tob(eval(func, env, sub, args[0], depth + 1)),
+                        tob(eval(func, env, sub, args[1], depth + 1)),
+                    ) {
+                        (Opcode::Band, Some((m1, v1)), Some((m2, v2))) => ebit(
+                            w,
+                            (m1 & m2) | (m1 & !v1) | (m2 & !v2),
+                            v1 & v2,
+                        ),
+                        (Opcode::Band, None, Some((m, v))) | (Opcode::Band, Some((m, v)), None) => {
+                            ebit(w, m & !v, 0)
+                        }
+                        (Opcode::Bor, Some((m1, v1)), Some((m2, v2))) => ebit(
+                            w,
+                            (m1 & m2) | (m1 & v1) | (m2 & v2),
+                            v1 | v2,
+                        ),
+                        (Opcode::Bor, None, Some((m, v))) | (Opcode::Bor, Some((m, v)), None) => {
+                            ebit(w, m & v, m & v)
+                        }
+                        (Opcode::Bxor, Some((m1, v1)), Some((m2, v2))) => {
+                            ebit(w, m1 & m2, v1 ^ v2)
+                        }
+                        _ => E::Unk,
+                    }
+                }
+            }
+        }
+        InstructionData::Binary {
+            opcode: op @ (Opcode::Ushr | Opcode::Ishl),
+            args,
+        } => {
+            // Shifts by a known amount shift the known mask too, and expose
+            // freshly-known bits at the vacated edge.
+            let (ea, eb) = (
+                eval(func, env, sub, args[0], depth + 1),
+                eval(func, env, sub, args[1], depth + 1),
+            );
+            let E::K(k) = eb else { return E::Unk };
+            if k >= w as u64 {
+                return E::Unk;
+            }
+            let (k, wm) = (k as u32, mask(u64::MAX, w));
+            let (m, v) = match ea {
+                E::K(vv) => (wm, vv),
+                E::B(m, v) => (m, v),
+                _ => (0, 0),
+            };
+            match op {
+                Opcode::Ushr => {
+                    let hi = if k == 0 { 0 } else { wm & (wm << (w - k)) };
+                    ebit(w, (m >> k) | hi, v >> k)
+                }
+                _ => ebit(w, (m << k) | mask(u64::MAX, k), v << k),
             }
         }
         InstructionData::IntCompare {
@@ -237,6 +335,19 @@ fn eval(
                 (E::K(x), E::K(y)) => E::K(f(x, y)),
                 (E::S(c, t, e), E::K(y)) => E::S(c, f(t, y), f(e, y)),
                 (E::K(x), E::S(c, t, e)) => E::S(c, f(x, t), f(x, e)),
+                // Differing known bits settle eq/ne even when the rest is
+                // unknown.
+                (E::B(m, v), E::K(k)) | (E::K(k), E::B(m, v)) => {
+                    if (v & m) != (mask(k, ow) & m) {
+                        match cond {
+                            IntCC::Equal => E::K(0),
+                            IntCC::NotEqual => E::K(1),
+                            _ => E::Unk,
+                        }
+                    } else {
+                        E::Unk
+                    }
+                }
                 _ => E::Unk,
             }
         }
@@ -278,6 +389,7 @@ fn eval(
                                 // the pred without the substitution).
                                 E::Unk => E::S(subv(func, sub, args[0]), t, e),
                                 E::K(_) => unreachable!(),
+                                E::B(..) => E::Unk,
                             }
                         }
                     } else {
@@ -600,7 +712,7 @@ impl<'a> W<'a> {
             }
             InstructionData::Brif { arg: c, blocks, .. } => {
                 match eval(self.func, &mut env, &sub, c, 0) {
-                    E::Unk => self.fin_edge(d, args, &skipped),
+                    E::Unk | E::B(..) => self.fin_edge(d, args, &skipped),
                     E::K(k) => {
                         let (nb, nargs) = self.map_call(blocks[usize::from(k == 0)], &sub)?;
                         go!(env, sub, nb, nargs)
@@ -1012,6 +1124,509 @@ pub fn run(func: &mut Function) -> usize {
     if n > 0 {
         sweep_blocks(func);
         sweep_dead(func);
+    }
+    n += splices(func);
+    if n > 0 {
+        sweep_blocks(func);
+        sweep_dead(func);
+    }
+    let d = deadbits(func);
+    if d > 0 {
+        crate::jumpthread::remove_dead_params(func);
+        sweep_dead(func);
+        sweep_blocks(func);
+        n += d;
+    }
+    n
+}
+
+/// Bits of `v` some sink actually reads, propagated backward to a fixpoint.
+/// Enum packing threads a tag+payload word through loop phis whose tag byte
+/// is the only part ever consumed — once the dispatch join dies, the packed
+/// word's bits circulate through `band`/`bor` merges forever without ever
+/// being read. When a block param's needed-bit set is empty, its value is
+/// unconstrained: substitute `iconst 0` at every use, which folds the whole
+/// `band`/`bor` merge chain feeding it to dead code.
+fn deadbits(func: &mut Function) -> usize {
+    // Operand-bit demand for a value instruction given the need on its
+    // result(s). `kth` = the operand's constant value when it is an iconst.
+    fn demand(func: &Function, i: Inst, out_need: u64) -> Vec<u64> {
+        let wm_of = |func: &Function, v: Value| mask(u64::MAX, bits(func, v).unwrap_or(64));
+        match func.dfg.insts[i] {
+            InstructionData::Binary {
+                opcode:
+                    op @ (Opcode::Band | Opcode::Bor | Opcode::Bxor | Opcode::Iadd | Opcode::Isub),
+                args,
+            } => {
+                let mut d = vec![out_need; 2];
+                for (k, &a) in args.iter().enumerate() {
+                    let other = iconst(func, args[1 - k]);
+                    d[k] = match (op, other) {
+                        (Opcode::Band, Some(c)) => out_need & c,
+                        (Opcode::Band, None) => out_need,
+                        (Opcode::Bor, Some(c)) => out_need & !c,
+                        (Opcode::Bor, None) => out_need,
+                        (Opcode::Bxor, _) => out_need,
+                        // Carry: bit j can depend on operand bits 0..=j.
+                        _ if out_need != 0 => out_need | (out_need - 1),
+                        _ => 0,
+                    };
+                    d[k] &= wm_of(func, a);
+                }
+                d
+            }
+            InstructionData::Binary {
+                opcode: op @ (Opcode::Ushr | Opcode::Ishl | Opcode::Sshr),
+                args,
+            } => {
+                let w = bits(func, args[0]).unwrap_or(64);
+                let wm = mask(u64::MAX, w);
+                let l = match (op, iconst(func, args[1])) {
+                    (Opcode::Ushr, Some(k)) if k < w as u64 => {
+                        (out_need << k as u32) & wm
+                    }
+                    (Opcode::Ishl, Some(k)) if k < w as u64 => {
+                        (out_need >> k as u32) & wm
+                    }
+                    (Opcode::Sshr, Some(k)) if k < w as u64 => {
+                        let k = k as u32;
+                        let mut m = (out_need << k) & wm;
+                        if k > 0 && (out_need >> (w - k)) != 0 {
+                            m |= 1u64 << (w - 1);
+                        }
+                        m
+                    }
+                    _ => wm,
+                };
+                vec![l, if out_need != 0 { wm } else { 0 }]
+            }
+            InstructionData::BinaryImm8 { opcode: op, arg, imm } => {
+                let w = bits(func, arg).unwrap_or(64);
+                let wm = mask(u64::MAX, w);
+                let k = u64::from(imm);
+                let l = match op {
+                    Opcode::Ushr if k < w as u64 => (out_need << k as u32) & wm,
+                    Opcode::Ishl if k < w as u64 => (out_need >> k as u32) & wm,
+                    Opcode::Sshr if k < w as u64 => {
+                        let k = k as u32;
+                        let mut m = (out_need << k) & wm;
+                        if k > 0 && (out_need >> (w - k)) != 0 {
+                            m |= 1u64 << (w - 1);
+                        }
+                        m
+                    }
+                    _ => wm,
+                };
+                vec![l]
+            }
+            InstructionData::Unary { opcode, arg } => {
+                let w = bits(func, arg).unwrap_or(64);
+                let m = match opcode {
+                    Opcode::Ireduce => out_need,
+                    Opcode::Uextend => out_need & mask(u64::MAX, w),
+                    Opcode::Sextend => {
+                        (out_need & mask(u64::MAX, w))
+                            | if (out_need >> (w - 1)) != 0 { 1u64 << (w - 1) } else { 0 }
+                    }
+                    Opcode::Bnot => out_need,
+                    _ => mask(u64::MAX, w),
+                };
+                vec![m & mask(u64::MAX, w)]
+            }
+            InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } => vec![wm_of(func, args[0]), out_need, out_need],
+            _ => func
+                .dfg
+                .inst_args(i)
+                .iter()
+                .map(|&a| wm_of(func, a))
+                .collect(),
+        }
+    }
+
+    let mut need: FxHashMap<Value, u64> = FxHashMap::default();
+    // Param of each block, by index — edge args feed param needs back.
+    let mut n = 0;
+    loop {
+        let mut changed = false;
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+                // Result need -> operand demand (all results — a
+                // multi-result inst keeps every operand it computes for).
+                let out_need = func.dfg.inst_results(i).iter().fold(0u64, |m, r| {
+                    m | need
+                        .get(&func.dfg.resolve_aliases(*r))
+                        .copied()
+                        .unwrap_or(0)
+                });
+                let ds = demand(func, i, out_need);
+                let av: Vec<Value> = func.dfg.inst_args(i).to_vec();
+                for (k, &a) in av.iter().enumerate() {
+                    let d = ds.get(k).copied().unwrap_or_else(|| {
+                        mask(u64::MAX, bits(func, a).unwrap_or(64))
+                    });
+                    let a = func.dfg.resolve_aliases(a);
+                    if d & !need.get(&a).copied().unwrap_or(0) != 0 {
+                        *need.entry(a).or_default() |= d;
+                        changed = true;
+                    }
+                }
+                // Exception contexts are opaque reads: demand all bits.
+                if let Some(et) = func.dfg.insts[i].exception_table() {
+                    for item in func.dfg.exception_tables[et].items().collect::<Vec<_>>() {
+                        let ExceptionTableItem::Context(ctx) = item else {
+                            continue;
+                        };
+                        let v = func.dfg.resolve_aliases(ctx);
+                        let d = mask(u64::MAX, bits(func, v).unwrap_or(64));
+                        if d & !need.get(&v).copied().unwrap_or(0) != 0 {
+                            *need.entry(v).or_default() |= d;
+                            changed = true;
+                        }
+                    }
+                }
+                // Edge args inherit the bound param's need.
+                for bc in func.dfg.insts[i].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                ) {
+                    let t = bc.block(&func.dfg.value_lists);
+                    for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                        let Some(&p) = func.dfg.block_params(t).get(k) else {
+                            break;
+                        };
+                        let BlockArg::Value(av) = a else { continue };
+                        let av = func.dfg.resolve_aliases(av);
+                        let p = func.dfg.resolve_aliases(p);
+                        let pn = need.get(&p).copied().unwrap_or(0);
+                        let d = pn & mask(u64::MAX, bits(func, av).unwrap_or(64));
+                        if d & !need.get(&av).copied().unwrap_or(0) != 0 {
+                            *need.entry(av).or_default() |= d;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+        n += 1;
+        if n > 32 {
+            break;
+        }
+    }
+    // Params with empty need are unconstrained: replace their uses with a
+    // zero constant; the merge chains feeding them die with them.
+    let mut deadp: Vec<Value> = Vec::new();
+    for b in func.layout.blocks() {
+        for &p in func.dfg.block_params(b) {
+            let p = func.dfg.resolve_aliases(p);
+            if bits(func, p).is_some() && need.get(&p).copied().unwrap_or(0) == 0 {
+                deadp.push(p);
+            }
+        }
+    }
+    if deadp.is_empty() {
+        return 0;
+    }
+    // Every raw value naming a dead param (aliases resolve to it) gets the
+    // same zero substitute.
+    let deadset: FxHashSet<Value> = deadp.iter().copied().collect();
+    let mut raw: Vec<Value> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                if deadset.contains(&func.dfg.resolve_aliases(v)) {
+                    raw.push(v);
+                }
+            }
+        }
+    }
+    let entry = func.layout.entry_block().unwrap();
+    let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
+    for &v in &raw {
+        if repl.contains_key(&v) {
+            continue;
+        }
+        let ty = func.dfg.value_type(v);
+        let mut cur = FuncCursor::new(func).at_first_insertion_point(entry);
+        repl.insert(v, cur.ins().iconst(ty, 0));
+    }
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            func.dfg
+                .map_inst_values(i, |v| repl.get(&v).copied().unwrap_or(v));
+        }
+    }
+    deadp.len()
+}
+
+/// Thread `p -> J` edges past a dispatch join `J` whose `brif` the supplied
+/// args decide — even when `J`'s params are used upward-exposed in the
+/// picked successor. The ordinary walk lands on `J` in that case because
+/// skipping it would orphan the param; here the param is spliced onto the
+/// successor's signature instead (every pred of the successor is `J`, so its
+/// edge supplies the value), turning `p`'s jump into a direct edge that
+/// carries the arg it already computed.
+///
+/// This is the enum/Result shape rustc's packing produces: exit blocks merge
+/// tag+payload bits through `band`/`bor` into a join that re-tests the tag
+/// bit and forwards the packed word onward. Each pred's tag is already
+/// constant (the merge only ever sets known bits), so the join and its test
+/// are pure overhead.
+fn splices(func: &mut Function) -> usize {
+    // The walker's redirects mutated the CFG since `run`'s domtree was
+    // built — recompute it so dominance answers match the current graph.
+    let cfg = ControlFlowGraph::with_function(func);
+    let dom = DominatorTree::with_function(func, &cfg);
+    // Every edge in the function: (pred block, terminator, dest index,
+    // target, args). Rebuilt after each splice since it mutates calls.
+    let collect_edges = |func: &Function| -> Vec<(Block, Inst, usize, Block, Vec<BlockArg>)> {
+        let mut out = Vec::new();
+        for p in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(p) else {
+                continue;
+            };
+            for (di, bc) in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .enumerate()
+            {
+                out.push((
+                    p,
+                    t,
+                    di,
+                    bc.block(&func.dfg.value_lists),
+                    bc.args(&func.dfg.value_lists).collect(),
+                ));
+            }
+        }
+        out
+    };
+    let mut n = 0;
+    for j in func.layout.blocks().collect::<Vec<_>>() {
+        if !dom.is_reachable(j) {
+            continue;
+        }
+        let params = func.dfg.block_params(j).to_vec();
+        if params.is_empty() {
+            continue;
+        }
+        let Some(t) = func.layout.last_inst(j) else {
+            continue;
+        };
+        let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        // J must be safe to skip: pure body, and none of its inst results may
+        // be used anywhere outside J (they cannot be rematerialized at the
+        // pred without re-executing J).
+        if !func
+            .layout
+            .block_insts(j)
+            .take_while(|&i| i != t)
+            .all(|i| crate::jumpthread::pure_op(func, i))
+        {
+            continue;
+        }
+        // Uses of values outside their def block: v -> blocks containing a
+        // use. Built lazily per candidate (the splice mutates them).
+        let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    uses.entry(func.dfg.resolve_aliases(v)).or_default().insert(b);
+                }
+            }
+        }
+        let rpjs: Vec<Value> = params
+            .iter()
+            .map(|&p| func.dfg.resolve_aliases(p))
+            .collect();
+        let jdefs: Vec<Value> = params
+            .iter()
+            .map(|&p| func.dfg.resolve_aliases(p))
+            .chain(func.layout.block_insts(j).flat_map(|i| {
+                func.dfg
+                    .inst_results(i)
+                    .iter()
+                    .map(|r| func.dfg.resolve_aliases(*r))
+                    .collect::<Vec<_>>()
+            }))
+            .collect();
+        let all_edges = collect_edges(func);
+        // Edges into J and which successor each one decides (if any).
+        let mut decided: Vec<(Block, Inst, usize, Vec<BlockArg>, Block, Vec<BlockArg>)> = Vec::new();
+        for (p, pt, di, _, args) in all_edges.iter().filter(|e| e.3 == j) {
+            if *p == j || args.len() != params.len() {
+                continue;
+            }
+            let mut env: FxHashMap<Value, E> = FxHashMap::default();
+            let sub: FxHashMap<Value, Value> = FxHashMap::default();
+            let mut ok = true;
+            for (&rpj, a) in rpjs.iter().zip(args) {
+                let BlockArg::Value(a) = a else {
+                    ok = false;
+                    break;
+                };
+                let e = eval(func, &mut env, &sub, *a, 0);
+                env.insert(rpj, e);
+            }
+            if !ok {
+                continue;
+            }
+            let E::K(k) = eval(func, &mut env, &sub, c, 0) else {
+                continue;
+            };
+            let bc = blocks[usize::from(k == 0)];
+            decided.push((
+                *p,
+                *pt,
+                *di,
+                args.clone(),
+                bc.block(&func.dfg.value_lists),
+                bc.args(&func.dfg.value_lists).collect(),
+            ));
+        }
+        if decided.is_empty() {
+            continue;
+        }
+        // Successor set decided edges need.
+        let sset: FxHashSet<Block> = decided.iter().map(|d| d.4).collect();
+        let mut ok = !sset.contains(&j);
+        // Feasibility per successor: only J may feed it (its signature is
+        // about to grow); J's inst results may not escape J at all; J's
+        // params may only escape into the spliced successors.
+        for &s in &sset {
+            if !ok {
+                break;
+            }
+            ok &= all_edges.iter().all(|e| e.3 != s || e.0 == j);
+        }
+        if ok {
+            'defs: for (di, &d) in jdefs.iter().enumerate() {
+                let is_param = di < params.len();
+                for &u in uses.get(&d).into_iter().flatten() {
+                    if u == j || (is_param && sset.contains(&u)) {
+                        continue;
+                    }
+                    ok = false;
+                    break 'defs;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Splice J's params onto each needed successor: append one param per
+        // used J-param, remap the upward-exposed uses, grow J's calls to it.
+        for &s in &sset {
+            let mut added: Vec<usize> = Vec::new();
+            for (k, (&pj, &rpj)) in params.iter().zip(&rpjs).enumerate() {
+                if !uses.get(&rpj).is_some_and(|u| u.contains(&s)) {
+                    continue;
+                }
+                // Raw arg values in s naming this param (aliases resolve
+                // to it): remap every one to the new param.
+                let mut targets: FxHashSet<Value> = FxHashSet::default();
+                for i in func.layout.block_insts(s) {
+                    for v in func.dfg.inst_values(i) {
+                        if func.dfg.resolve_aliases(v) == rpj {
+                            targets.insert(v);
+                        }
+                    }
+                }
+                let np = {
+                    let ty = func.dfg.value_type(pj);
+                    func.dfg.append_block_param(s, ty)
+                };
+                for i in func.layout.block_insts(s).collect::<Vec<_>>() {
+                    func.dfg
+                        .map_inst_values(i, |v| if targets.contains(&v) { np } else { v });
+                }
+                added.push(k);
+            }
+            if !added.is_empty() {
+                // J's own calls to s grow by the same params.
+                let calls: Vec<(usize, Vec<BlockArg>)> = func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == s)
+                    .map(|(di, bc)| (di, bc.args(&func.dfg.value_lists).collect()))
+                    .collect();
+                for (di, mut args) in calls {
+                    args.extend(added.iter().map(|&k| BlockArg::Value(params[k])));
+                    let dfg = &mut func.dfg;
+                    let nbc = BlockCall::new(s, args, &mut dfg.value_lists);
+                    dfg.insts[t]
+                        .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                        [di] = nbc;
+                }
+            }
+            // Redirect decided preds: p -> s(sub'd call args, supplied
+            // params). Call args that are J-params take the pred's arg;
+            // iconsts rematerialize; anything else must already dominate
+            // the pred's tail.
+            for (p, pt, di, jargs, _, sargs) in decided.iter().filter(|d| d.4 == s) {
+                let mut new_args: Vec<BlockArg> = Vec::new();
+                let mut ok2 = true;
+                for a in sargs {
+                    let BlockArg::Value(av) = a else {
+                        ok2 = false;
+                        break;
+                    };
+                    let av = func.dfg.resolve_aliases(*av);
+                    if let Some(k) = rpjs.iter().position(|&rpj| rpj == av) {
+                        new_args.push(jargs[k]);
+                        continue;
+                    }
+                    match func.dfg.value_def(av) {
+                        ValueDef::Result(i, _)
+                            if func.layout.inst_block(i) != Some(j)
+                                && dom.dominates(i, *pt, &func.layout) =>
+                        {
+                            new_args.push(BlockArg::Value(av))
+                        }
+                        ValueDef::Param(b, _)
+                            if b != j && dom.block_dominates(b, *p) =>
+                        {
+                            new_args.push(BlockArg::Value(av))
+                        }
+                        ValueDef::Result(i, _)
+                            if let InstructionData::UnaryImm {
+                                opcode: Opcode::Iconst,
+                                imm,
+                            } = func.dfg.insts[i] =>
+                        {
+                            let ty = func.dfg.value_type(av);
+                            let mut cur = FuncCursor::new(func).at_inst(*pt);
+                            new_args.push(BlockArg::Value(cur.ins().iconst(ty, imm.bits())));
+                        }
+                        _ => {
+                            ok2 = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok2 {
+                    continue;
+                }
+                for &k in &added {
+                    new_args.push(jargs[k]);
+                }
+                let dfg = &mut func.dfg;
+                let nbc = BlockCall::new(s, new_args, &mut dfg.value_lists);
+                dfg.insts[*pt]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [*di] = nbc;
+                n += 1;
+            }
+        }
+        // J may now be unreachable; leave it for sweep_blocks.
     }
     n
 }

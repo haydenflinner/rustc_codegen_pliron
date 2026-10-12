@@ -32,5 +32,24 @@ fn main() {
     let toks: Vec<&str> = t.split_whitespace().collect();
     assert_eq!(toks, ["a", "b", "é", "c"]);
 
+    // Enum-pack threading: `str::parse` merges tag+payload bits into a
+    // shared join that re-tests the tag and forwards the packed word through
+    // the loop phi. edgespec must see through the `band`/`bor` merge (the
+    // tag bits are per-edge constants), splice the join's params onto the
+    // picked successor, and drop the now-unreadable packed word entirely.
+    // The loop mixes Ok/Err so both versions must stay correct.
+    let words = ["1234", "oops", "567", "nope", "89", "12345678", "42", "x"];
+    let mut acc = 0u64;
+    let mut errs = 0u64;
+    for i in 0..10_000u64 {
+        let w = words[(i % 8) as usize];
+        match w.parse::<u32>() {
+            Ok(v) => acc = acc.wrapping_add(v as u64),
+            Err(_) => errs += 1,
+        }
+    }
+    assert_eq!(errs, 3750);
+    assert_eq!(acc, 1250u64 * (1234 + 567 + 89 + 12345678 + 42));
+
     println!("edgespec ok");
 }

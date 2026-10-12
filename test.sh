@@ -46,8 +46,11 @@ rustc $BE --edition 2021 -O -C codegen-units=1 tests/loadpre/main.rs -o $out/loa
 rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse$exe && $out/pairfuse$exe
 # edgespec must not thread an edge past a dispatch block whose params it
 # leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
-# iterator spun forever.
-rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec$exe && $out/edgespec$exe
+# iterator spun forever. It must also see through enum tag+payload merges:
+# parse() exit blocks re-pack a Result whose tag is per-edge constant, so
+# the join's tag test and the packed word itself must both fold away.
+PLIRON_STATS=1 rustc $BE --edition 2021 -O tests/edgespec/main.rs -o $out/edgespec$exe 2> $out/edgespec.stats && $out/edgespec$exe
+grep -Eq 'edgespec [1-9]' $out/edgespec.stats || { echo "edgespec did not fire" >&2; exit 1; }
 # cparm must materialize carried-chain constants in each carried param's
 # home block — one const in the join block leaves non-dominating uses on
 # sibling arms (Vec::into_boxed_slice / try_call edges hit the verifier).
