@@ -990,6 +990,7 @@ fn store_src(
     st: &State<'_>,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     load: Ptr<Operation>,
+    mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<Value> {
     let scan = std::env::var_os("PLIRON_FROZEN_SCAN").is_some();
     let fail = |why: &str| -> Option<Value> {
@@ -1002,14 +1003,20 @@ fn store_src(
         return fail("volatile");
     }
     let addr = load.deref(ctx).get_operand(0);
-    let (lb, ll, loff) = ptr_base(ctx, st, preds, addr)?;
-    let loff = loff?;
+    let Some((lb, ll, loff)) = ptr_base(ctx, st, preds, addr, mem) else {
+        return fail("ptr_base");
+    };
+    let Some(loff) = loff else {
+        return fail("dynoff");
+    };
     let lsz = size_align(ctx, load.deref(ctx).get_result(0).get_type(ctx)).0 as i64;
-    let b = load.deref(ctx).get_parent_block()?;
+    let Some(b) = load.deref(ctx).get_parent_block() else {
+        return fail("noblock");
+    };
     let pos = ops(ctx, b).iter().position(|o| *o == load);
     let mut fuel = 32;
     store_src_in(
-        ctx, st, preds, lb, ll, loff, lsz, b, pos, &mut fuel, scan, load,
+        ctx, st, preds, lb, ll, loff, lsz, b, pos, &mut fuel, scan, load, mem,
     )
 }
 
@@ -1031,6 +1038,7 @@ fn store_src_in(
     fuel: &mut usize,
     scan: bool,
     load: Ptr<Operation>,
+    mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<Value> {
     loop {
         *fuel = fuel.checked_sub(1)?;
@@ -1051,7 +1059,8 @@ fn store_src_in(
                 let Some(n) = crate::sroa::const_int(ctx, st, od.get_operand(2)) else {
                     return None;
                 };
-                let Some((db, dl, doff)) = ptr_base(ctx, st, preds, od.get_operand(0))
+                let Some((db, dl, doff)) =
+                    ptr_base(ctx, st, preds, od.get_operand(0), mem)
                 else {
                     return None;
                 };
@@ -1060,7 +1069,7 @@ fn store_src_in(
                     let (lo, hi) = (doff, doff + n as i64);
                     if loff >= lo && loff + lsz <= hi {
                         let Some((sb2, sl2, soff2)) =
-                            ptr_base(ctx, st, preds, od.get_operand(1))
+                            ptr_base(ctx, st, preds, od.get_operand(1), mem)
                         else {
                             return None;
                         };
@@ -1078,6 +1087,7 @@ fn store_src_in(
                             fuel,
                             scan,
                             load,
+                            mem,
                         );
                     }
                     if hi <= loff || lo >= loff + lsz {
@@ -1092,7 +1102,7 @@ fn store_src_in(
             }
             if Operation::is_op::<StoreOp>(o, ctx) && !st.volatile.contains(&o) {
                 let od = o.deref(ctx);
-                let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(1))?;
+                let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(1), mem)?;
                 let soff = soff?;
                 let ssz = size_align(ctx, od.get_operand(0).get_type(ctx)).0 as i64;
                 if sb == lb && sl == ll {
@@ -1128,7 +1138,13 @@ fn store_src_in(
         }
         // No decisive store here — follow the predecessors.
         let mut pr: Vec<Ptr<BasicBlock>> = Vec::new();
-        for (t, _) in preds.get(&b)? {
+        let Some(pr_ops) = preds.get(&b) else {
+            if scan {
+                eprintln!("store_src: no preds {b:?} for {load:?}");
+            }
+            return None;
+        };
+        for (t, _) in pr_ops {
             let Some(p) = t.deref(ctx).get_parent_block() else {
                 continue;
             };
@@ -1141,20 +1157,144 @@ fn store_src_in(
             pos = None;
             continue;
         }
-        // Merge: every predecessor path must store the same value.
+        // Merge: every predecessor path must store the same value —
+        // compared after arg/cast normalization: paths can store the same
+        // pointer under different SSA names (`pivot` reborrowed into two
+        // arg chains is still one pointer).
         let mut it = pr.iter();
-        let v = store_src_in(ctx, st, preds, lb, ll, loff, lsz, *it.next()?, None, fuel, scan, load)?;
+        let v = store_src_in(
+            ctx,
+            st,
+            preds,
+            lb,
+            ll,
+            loff,
+            lsz,
+            *it.next()?,
+            None,
+            fuel,
+            scan,
+            load,
+            mem,
+        )?;
         for &p in it {
-            if store_src_in(ctx, st, preds, lb, ll, loff, lsz, p, None, fuel, scan, load) != Some(v)
+            let pv = store_src_in(
+                ctx, st, preds, lb, ll, loff, lsz, p, None, fuel, scan, load, mem,
+            );
+            if pv != Some(v)
+                && !pv.is_some_and(|w| {
+                    let eq = same_ptr(ctx, st, preds, w, v, mem);
+                    if scan && !eq {
+                        fn d(ctx: &Context, v: Value) -> String {
+                            v.defining_op()
+                                .map(|o| OpDbg { op: o, ctx }.to_string())
+                                .unwrap_or_else(|| format!("{v:?}"))
+                        }
+                        eprintln!("store_src: merge diff {} vs {}", d(ctx, w), d(ctx, v));
+                    }
+                    eq
+                })
             {
                 if scan {
-                    eprintln!("store_src: merge {b:?} for {load:?}");
+                    eprintln!(
+                        "store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}"
+                    );
                 }
                 return None;
             }
         }
         return Some(v);
     }
+}
+
+/// Same pointer after arg/cast normalization: two SSA names prove equal
+/// when they resolve — through `arg_src`, GEPs, bitcasts, freezes, and
+/// `extractvalue`, and store-forwarded loads — to the same base at the
+/// same constant offset. `mem` bounds the load forwarding the same way it
+/// bounds `ptr_base`.
+fn same_ptr(
+    ctx: &Context,
+    st: &State<'_>,
+    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    v1: Value,
+    v2: Value,
+    mem: &mut FxHashSet<Ptr<Operation>>,
+) -> bool {
+    fn norm(
+        ctx: &Context,
+        st: &State<'_>,
+        preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+        mut v: Value,
+        mem: &mut FxHashSet<Ptr<Operation>>,
+    ) -> (Value, Option<i64>) {
+        let mut off = Some(0i64);
+        let mut seen = FxHashSet::default();
+        loop {
+            if !seen.insert(v) {
+                return (v, off);
+            }
+            if let Some(b) = v.defining_block()
+                && let Some(w) = arg_src(ctx, preds, b, v)
+            {
+                v = w;
+                continue;
+            }
+            let Some(op) = v.defining_op() else {
+                return (v, off);
+            };
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+                off = off.and_then(|o| {
+                    crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d))
+                });
+                v = op.deref(ctx).get_operand(0);
+            } else if Operation::is_op::<BitcastOp>(op, ctx)
+                || Operation::is_op::<FreezeOp>(op, ctx)
+                || Operation::is_op::<AddrSpaceCastOp>(op, ctx)
+            {
+                v = op.deref(ctx).get_operand(0);
+            } else if Operation::is_op::<ExtractValueOp>(op, ctx) {
+                let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
+                    .unwrap()
+                    .indices(ctx);
+                let agg = op.deref(ctx).get_operand(0);
+                let (s, n, _) = leaf_range(ctx, agg.get_type(ctx), &idx);
+                if n != 1 {
+                    return (v, off);
+                }
+                match extract_leaf(ctx, preds, agg, s, 0) {
+                    Some(l) => v = l,
+                    None => return (v, off),
+                }
+            } else if Operation::is_op::<LoadOp>(op, ctx) && mem.insert(op) {
+                // Same-slot loads forwarded through their stores — the
+                // `(a, b)` tuple is rebuilt and re-spilled per diamond
+                // arm, so the arms' `b` values are distinct loads of
+                // what is nonetheless the same source pointer.
+                match store_src(ctx, st, preds, op, mem) {
+                    Some(sv) => v = sv,
+                    None => return (v, off),
+                }
+            } else {
+                return (v, off);
+            }
+        }
+    }
+    // Each normalization gets its own `mem` clone — seeded with the
+    // shared set for cycle-breaking, but independent so that a load `v1`
+    // already forwarded isn't skipped when `v2`'s chain needs it.
+    let (n1, n2) = (
+        norm(ctx, st, preds, v1, &mut mem.clone()),
+        norm(ctx, st, preds, v2, &mut mem.clone()),
+    );
+    if n1 != n2 && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
+        let d = |v: Value| {
+            v.defining_op()
+                .map(|o| OpDbg { op: o, ctx }.to_string())
+                .unwrap_or_else(|| format!("{v:?}"))
+        };
+        eprintln!("same_ptr: {n1:?} ({}) vs {n2:?} ({})", d(n1.0), d(n2.0));
+    }
+    n1 == n2
 }
 
 /// Follow GEPs/bitcasts back to a block arg or instruction result,
@@ -1173,6 +1313,7 @@ fn ptr_base(
     st: &State<'_>,
     preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
     mut v: Value,
+    mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<(Value, Option<usize>, Option<i64>)> {
     let mut off = Some(0i64);
     let mut seen = FxHashSet::default();
@@ -1236,7 +1377,14 @@ fn ptr_base(
             // A pointer fetched through memory — the comparator's args
             // tuple is spilled to an alloca. Forward through the store
             // that produced it when the clobber scan proves it out.
-            match store_src(ctx, st, preds, op) {
+            // `mem` is shared across the whole `ptr_base`/`store_src`
+            // recursion: store pointers can themselves be load results,
+            // and without it a value cycle overflows the stack (stage1
+            // `core` did — SIGBUS).
+            if mem.len() >= 64 || !mem.insert(op) {
+                return Some((v, None, off));
+            }
+            match store_src(ctx, st, preds, op, mem) {
                 Some(sv) => v = sv,
                 None => return Some((v, None, off)),
             }
@@ -1321,7 +1469,9 @@ fn frozen_args(
     st.region_parent.insert(entry, parent);
     for &b in src {
         if let Some(nb) = map.lookup_block(b) {
-            st.region_blocks.insert(nb, entry);
+            // Nested clones inside `src` keep their own (remapped) region;
+            // only unclaimed blocks belong to this clone's region.
+            st.region_blocks.entry(nb).or_insert(entry);
         }
     }
     let Some(f) = st.funcs.values().find(|f| f.op == callee) else {
@@ -1330,14 +1480,14 @@ fn frozen_args(
         }
         return;
     };
+    let fname = st
+        .funcs
+        .iter()
+        .find(|(_, x)| x.op == callee)
+        .map(|(n, _)| n.clone());
     if dbg {
-        let caller = st
-            .funcs
-            .iter()
-            .find(|(_, x)| x.op == callee)
-            .map(|(n, _)| n.as_str());
         eprintln!(
-            "frozen_args: na={:?} frz={:?} callee={caller:?}",
+            "frozen_args: na={:?} frz={:?} callee={fname:?} entry={entry:?}",
             f.noalias.len(),
             f.frozen.len()
         );
@@ -1385,21 +1535,25 @@ fn frozen_args(
         // into one operand) — resolve the `sub`-th leaf of the operand.
         let rb = cv
             .and_then(|v| extract_leaf(ctx, &preds, v, sub, 0))
-            .and_then(|v| ptr_base(ctx, st, &preds, v));
+            .and_then(|v| ptr_base(ctx, st, &preds, v, &mut FxHashSet::default()));
         // Inherit the enclosing region only when the operand's pointee
         // provably sits inside the outer frozen range — `a = pivot + 8`
         // resolves to pivot's base but points *past* its 8 frozen bytes.
         // The clone-entry region is always valid: `a`'s own `readonly`
         // contract holds for this call regardless.
-        let region = rb
-            .and_then(|(b, l, off)| {
-                frozen_of(ctx, st, &caller_frz, fentry, b, l)
-                    .filter(|&(rb_, _)| {
-                        off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64)
-                    })
-                    .map(|(_, r)| r)
-            })
-            .unwrap_or(entry);
+        let inh = rb.and_then(|(b, l, off)| {
+            frozen_of(ctx, st, &caller_frz, fentry, b, l)
+                .filter(|&(rb_, _)| {
+                    off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64)
+                })
+                .map(|(_, r)| r)
+        });
+        let region = inh.unwrap_or(entry);
+        if dbg && std::env::var_os("PLIRON_FROZEN_SCAN").is_some() {
+            eprintln!(
+                "frozen_args: leaf {leaf} sub {sub} entry {entry:?} inh={inh:?} rb={rb:?} cv={cv:?}"
+            );
+        }
         if dbg {
             let rbs = rb
                 .and_then(|(v, ..)| v.defining_op())
@@ -1409,8 +1563,18 @@ fn frozen_args(
                 .and_then(|v| v.defining_op())
                 .map(|o| OpDbg { op: o, ctx }.to_string())
                 .unwrap_or_default();
+            let cas = call_args
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    v.defining_op()
+                        .map(|o| format!("{k}: {}", OpDbg { op: o, ctx }))
+                        .unwrap_or_else(|| format!("{k}: {v:?}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ; ");
             eprintln!(
-                "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} cv={cv:?} rb={rb:?} {rbs} | {cvs}"
+                "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={fname:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
             );
         }
         st.region_frozen
@@ -1429,7 +1593,9 @@ fn frozen_args(
                 continue;
             }
             let ptr = op.deref(ctx).get_operand(0);
-            let Some((base, bl, Some(off))) = ptr_base(ctx, st, &preds, ptr) else {
+            let Some((base, bl, Some(off))) =
+                ptr_base(ctx, st, &preds, ptr, &mut FxHashSet::default())
+            else {
                 continue;
             };
             let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, base, bl)
@@ -1483,15 +1649,32 @@ fn inline_call(
     let src = blocks(ctx, callee);
     let mut map = IrMapping::new();
     clone_blocks_into(&src, region, ctx, rw, &mut map);
+    // Region ids are `Ptr<BasicBlock>`s in the source's block space: every
+    // record copied below must remap through `map` so a tag anchored at
+    // the callee's own entry (or a nested clone's) resolves inside the
+    // clone — verbatim copies point at blocks the caller's `region_blocks`
+    // never maps, and licm's ancestry walk dead-ends on them.
+    let remap = |r: Ptr<BasicBlock>| map.lookup_block(r).unwrap_or(r);
     for &b in &src {
         let nb = map.lookup_block(b).unwrap();
+        if let Some(&pr) = st.region_blocks.get(&b) {
+            st.region_blocks.insert(nb, remap(pr));
+        }
+        if let Some(&pp) = st.region_parent.get(&b) {
+            st.region_parent.insert(nb, remap(pp));
+        }
         for (a, na) in b
             .deref(ctx)
             .arguments()
             .zip(nb.deref(ctx).arguments())
         {
             if let Some(f) = st.region_frozen.get(&a).cloned() {
-                st.region_frozen.insert(na, f);
+                st.region_frozen.insert(
+                    na,
+                    f.into_iter()
+                        .map(|(s, b, r)| (s, b, remap(r)))
+                        .collect(),
+                );
             }
             if let Some(f) = st.region_noalias.get(&a).cloned() {
                 st.region_noalias.insert(na, f);
@@ -1529,7 +1712,7 @@ fn inline_call(
                 st.bool01.insert(new);
             }
             if let Some(r) = st.frozen_loads.get(&op).copied() {
-                st.frozen_loads.insert(new, r);
+                st.frozen_loads.insert(new, remap(r));
             }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
