@@ -13,6 +13,7 @@ pub mod clifpeep;
 pub mod commute;
 pub mod config;
 pub mod diffcheck;
+pub mod divconst;
 pub mod dse;
 pub mod edgefwd;
 pub mod edgespec;

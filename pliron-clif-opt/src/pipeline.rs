@@ -837,6 +837,14 @@ fn s_bcheck(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_divconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = divconst::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("divconst");
+    }
+    k
+}
+
 fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = loopvec::run(
         &mut p.clctx.func,
@@ -1338,6 +1346,16 @@ pub static DEFAULT: &[Step] = &[
         s_unswitch,
     ),
     cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck),
+    // `x / k` / `x % k` → magic-multiply + shift sequences. The div/rem
+    // ops are `can_trap` side effects to loopvec, so expanding here is
+    // what lets a `x % 3 != 0` filter predicate vectorize at all — and
+    // the ~5-instr sequence beats a hardware `sdiv` in scalar code too.
+    step(
+        "divconst",
+        "divconst",
+        Gate::Env("PLIRON_DIVCONST"),
+        s_divconst,
+    ),
     cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec),
     cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp),
     step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap),

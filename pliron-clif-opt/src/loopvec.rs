@@ -75,6 +75,10 @@ fn vec_op_ok(op: Opcode, elem: Type) -> bool {
         Iadd | Isub | Band | Bor | Bxor | Ineg | Bnot | Smin | Smax | Umin | Umax | Fadd | Fsub
         | Fmul | Fdiv | Fmin | Fmax | Fneg | Fabs | Sqrt | Fma | Select | Icmp | Fcmp => true,
         Imul => elem.bits() <= 32,
+        // No backend lowers vector mulhi; emit_val expands it to
+        // widen+imul+uzp2 (`smull`/`smull2`+`uzp2` on aarch64), which needs
+        // a doubled product vector — i64 lanes are out.
+        Smulhi | Umulhi => elem.bits() <= 32,
         Ishl | Ushr | Sshr => true,
         _ => false,
     }
@@ -2265,6 +2269,10 @@ fn emit_val(
                 Opcode::Ishl => pos.ins().ishl(a, b),
                 Opcode::Ushr => pos.ins().ushr(a, b),
                 Opcode::Sshr => pos.ins().sshr(a, b),
+                // Lane-wise mulhi = widen+2×-imul+uzp2 (see divconst::mulhi)
+                // — the `x % k` magic-div sequences vectorize through it.
+                Opcode::Smulhi => crate::divconst::mulhi(pos, p.vt, true, a, b),
+                Opcode::Umulhi => crate::divconst::mulhi(pos, p.vt, false, a, b),
                 Opcode::Fadd => pos.ins().fadd(a, b),
                 Opcode::Fsub => pos.ins().fsub(a, b),
                 Opcode::Fmul => pos.ins().fmul(a, b),
