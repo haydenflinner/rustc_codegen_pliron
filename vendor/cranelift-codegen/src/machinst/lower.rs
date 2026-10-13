@@ -229,6 +229,10 @@ pub struct Lower<'func, I: VCodeInst> {
     /// The register to use for GetPinnedReg, if any, on this architecture.
     pinned_reg: Option<Reg>,
 
+    /// PLIRON: pending post-indexed load/store to emit at an earlier
+    /// inst's position; see `set_pending_postindex`.
+    pending_postindex: Option<(Inst, I, InstOutput)>,
+
     /// Compilation flags.
     flags: Flags,
 }
@@ -513,6 +517,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             try_call_rets,
             try_call_payloads,
             pinned_reg: None,
+            pending_postindex: None,
             flags,
         })
     }
@@ -1724,38 +1729,40 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.inst_sunk.insert(ir_inst);
     }
 
-    /// PLIRON: mark `ir_inst`, a side-effecting instruction, as fused into
-    /// the instruction currently being lowered — its side effect is now
-    /// carried by a machine inst emitted at the current scan position
-    /// (e.g., a load folded into a post-index load/store). Unlike
-    /// `sink_inst`, the inst's results remain live: the fused inst
-    /// defines their canonical vregs directly. Returns `false` unless
-    /// `ir_inst` is the most recent side-effecting inst before the
-    /// current position (i.e., no side effects sit between them) or it
-    /// has already been merged/sunk.
-    pub fn merge_side_effecting(&mut self, ir_inst: Inst) -> bool {
-        if !has_lowering_side_effect(self.f, ir_inst) || self.inst_sunk.contains(&ir_inst)
-        {
-            return false;
-        }
-        let Some(scan_entry) = self.cur_scan_entry_color else {
-            return false;
-        };
-        let entry = self.side_effect_inst_entry_colors[ir_inst];
-        if InstColor::new(entry.get() + 1) != scan_entry {
-            return false;
-        }
-        self.cur_scan_entry_color = Some(entry);
-        self.inst_sunk.insert(ir_inst);
-        true
+    /// PLIRON: record that `cand` (an earlier inst in this block, not
+    /// yet lowered) should emit `inst` — producing `out` — in place of
+    /// its normal lowering. Used by post-index fusion: the fused
+    /// load/store is emitted at the load/store's own position while
+    /// the pointer increment it folds is handled at the current
+    /// (later) position.
+    pub fn set_pending_postindex(&mut self, cand: Inst, inst: I, out: InstOutput) {
+        assert!(self.pending_postindex.is_none());
+        self.pending_postindex = Some((cand, inst, out));
     }
 
-    /// PLIRON: the canonical vregs assigned to `val` before lowering.
-    /// A fused inst may define these directly (in lieu of the usual
-    /// temp-plus-alias convention) to hand a value to an inst that will
-    /// not itself be lowered.
-    pub fn get_value_regs(&self, val: Value) -> ValueRegs<Reg> {
-        self.value_regs[val]
+    /// PLIRON: if `ir_inst` was claimed by `set_pending_postindex`,
+    /// return the machine inst and output to emit/return for it.
+    pub fn take_pending_postindex(&mut self, ir_inst: Inst) -> Option<(I, InstOutput)> {
+        match self.pending_postindex.take() {
+            Some((cand, inst, out)) if cand == ir_inst => Some((inst, out)),
+            pending => {
+                self.pending_postindex = pending;
+                None
+            }
+        }
+    }
+
+    /// PLIRON: is a pending post-index fusion still in flight?
+    pub fn has_pending_postindex(&self) -> bool {
+        self.pending_postindex.is_some()
+    }
+
+    /// PLIRON: does `val` have more than one use (per the
+    /// `ValueUseState` analysis)? A value with a single use may have its
+    /// producing inst sunk into that use, which must not be allowed to
+    /// consume a pending fusion candidate.
+    pub fn value_has_multiple_uses(&self, val: Value) -> bool {
+        self.value_ir_uses[val] == ValueUseState::Multiple
     }
 
     /// Retrieve immediate data given a handle.

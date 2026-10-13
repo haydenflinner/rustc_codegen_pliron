@@ -8,7 +8,7 @@
 //! - Floating-point immediates (FIMM instruction).
 
 use crate::inst_predicates::{
-    has_lowering_side_effect, inst_addr_offset_type, inst_store_data, is_constant_64bit,
+    inst_addr_offset_type, inst_store_data, is_constant_64bit,
 };
 use crate::ir::Inst as IRInst;
 use crate::ir::condcodes::{FloatCC, IntCC};
@@ -146,6 +146,9 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
     {
         return None;
     }
+    if ctx.has_pending_postindex() {
+        return None;
+    }
     let f = ctx.f;
 
     // `vN = iadd vB, C` / `isub vB, C`, 64-bit only.
@@ -171,61 +174,41 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         return None;
     }
     let base = f.dfg.resolve_aliases(base);
-
-    // The most recent side-effecting inst before `ir_inst` (sunk insts
-    // are transparent — their effects moved elsewhere) must be the
-    // load/store to fuse: `merge_side_effecting` re-checks this through
-    // the color accounting anyway, but locating it here lets us look at
-    // its shape first.
     let block = f.layout.inst_block(ir_inst)?;
+
+    // Find the nearest scalar load/store through `[base + 0]` earlier
+    // in this block. The fused inst is emitted at the load/store's own
+    // position (via `pending_postindex`), so the memory access does not
+    // move at all — only the pointer increment disappears.
     let mut cand = None;
     for inst in f.layout.block_insts(block) {
         if inst == ir_inst {
             break;
         }
-        if !ctx.is_inst_sunk(inst) && has_lowering_side_effect(f, inst) {
+        if !ctx.is_inst_sunk(inst) && postindex_mem(f, inst, base).is_some() {
             cand = Some(inst);
         }
     }
     let cand = cand?;
     let kind = postindex_mem(f, cand, base)?;
 
-    // `base` may only be used inside `block`, at positions no later
-    // than `ir_inst`: the writeback happens at the add's slot, so a use
-    // after it (or in any other block, which necessarily executes after
-    // the writeback when it executes at all) would observe the
-    // post-increment value. Uses earlier in the block still read the
-    // old value, exactly as before — except a use by a *sunk* inst
-    // in between, whose args are consumed at its sink site, which may
-    // be at or after `ir_inst`: reject those too.
-    let mut past_add = false;
-    let mut between = false;
+    // The writeback is modeled as a use of `base`'s vreg plus a
+    // reuse-def tied to it, so the register allocator preserves `base`'s
+    // old value with a copy whenever it is still needed. That copy costs
+    // as much as the `add` we remove, so fuse only when `base` is dead
+    // at the fused inst: no use of `base` other than `ir_inst`'s arg,
+    // at or after `cand`'s position, in any block.
+    let mut in_range = false;
     for inst in f.layout.block_insts(block) {
-        if inst == ir_inst {
-            past_add = true;
-            break;
-        }
         if inst == cand {
-            between = true;
+            in_range = true;
             continue;
         }
-        if between
-            && ctx.is_inst_sunk(inst)
-            && f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base)
-        {
-            return None;
+        if !in_range || inst == ir_inst {
+            continue;
         }
-    }
-    if past_add {
-        let mut past = false;
-        for inst in f.layout.block_insts(block) {
-            if inst == ir_inst {
-                past = true;
-                continue;
-            }
-            if past && f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
-                return None;
-            }
+        if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
+            return None;
         }
     }
     for bb in f.layout.blocks() {
@@ -239,39 +222,36 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
     }
 
-    // A fused load defines its result's canonical vreg directly; the
-    // value must not be consumed by anything between the load and the
-    // add (nor by the add itself — impossible in practice since the
-    // add's args are checked above, but be explicit).
+    // The pending inst is emitted when the scan reaches `cand`. `cand`
+    // can only be stolen from under us if some inst in between sinks it
+    // (requires the load result's sole use to be that inst), so a
+    // single-use result with a user in between is rejected. Multi-use
+    // results can't be sunk at all; uses in other blocks are already
+    // lowered (a sinking user would already show in `inst_sunk`).
     let ld_result = f
         .dfg
         .inst_results(cand)
         .first()
         .map(|v| f.dfg.resolve_aliases(*v));
     if let Some(v) = ld_result {
-        let mut in_range = false;
-        for inst in f.layout.block_insts(block) {
-            if inst == cand {
-                in_range = true;
-                continue;
-            }
-            if !in_range {
-                continue;
-            }
-            if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == v) {
-                return None;
-            }
-            if inst == ir_inst {
-                break;
+        if !ctx.value_has_multiple_uses(v) {
+            let mut in_range = false;
+            for inst in f.layout.block_insts(block) {
+                if inst == cand {
+                    in_range = true;
+                    continue;
+                }
+                if !in_range {
+                    continue;
+                }
+                if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == v) {
+                    return None;
+                }
+                if inst == ir_inst {
+                    break;
+                }
             }
         }
-    }
-
-    // Everything is checked; claim the load/store. Fails only if some
-    // other side effect is scheduled between it and this point (the
-    // color check) — then the reorder would be unsafe.
-    if !ctx.merge_side_effecting(cand) {
-        return None;
     }
 
     let flags = match f.dfg.insts[cand] {
@@ -286,30 +266,37 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
     let rwb = ctx.alloc_tmp(types::I64).only_reg().unwrap();
     match kind {
         PostIndexCand::Load(op) => {
-            let rd =
-                Writable::from_reg(ctx.get_value_regs(ld_result.unwrap()).only_reg().unwrap());
-            ctx.emit(Inst::LoadPost {
-                op,
-                rd,
-                rwb,
-                rn,
-                simm9,
-                flags,
-            });
+            let rd = ctx.alloc_tmp(ctx.output_ty(cand, 0)).only_reg().unwrap();
+            ctx.set_pending_postindex(
+                cand,
+                Inst::LoadPost {
+                    op,
+                    rd,
+                    rwb,
+                    rn,
+                    simm9,
+                    flags,
+                },
+                smallvec![ValueRegs::one(rd.to_reg())],
+            );
         }
         PostIndexCand::Store(op, data) => {
             let rt = ctx
                 .put_value_in_regs(f.dfg.resolve_aliases(data))
                 .only_reg()
                 .unwrap();
-            ctx.emit(Inst::StorePost {
-                op,
-                rt,
-                rwb,
-                rn,
-                simm9,
-                flags,
-            });
+            ctx.set_pending_postindex(
+                cand,
+                Inst::StorePost {
+                    op,
+                    rt,
+                    rwb,
+                    rn,
+                    simm9,
+                    flags,
+                },
+                smallvec![],
+            );
         }
     }
     // `vN`'s value is the writeback temp; the framework aliases the
@@ -324,6 +311,10 @@ impl LowerBackend for AArch64Backend {
     type MInst = Inst;
 
     fn lower(&self, ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
+        if let Some((inst, out)) = ctx.take_pending_postindex(ir_inst) {
+            ctx.emit(inst);
+            return Some(out);
+        }
         if let out @ Some(_) = try_postindex(ctx, ir_inst) {
             return out;
         }
