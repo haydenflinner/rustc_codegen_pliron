@@ -3312,6 +3312,33 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         n += 1;
                         continue;
                     }
+                    // `x <=u C` → `x <u C+1`, `x >u C` → `x >=u C+1` —
+                    // the strict/swapped-bound forms keep the constant
+                    // in the compare's immediate-capable rhs so isel's
+                    // CF-fusion rules (`cmp $imm` + `adc`/`sbb`) don't
+                    // materialize a register for a reversed compare
+                    // (e.g. `count += c <=u 127`). Same result bit for
+                    // every consumer.
+                    let ncc = match cc {
+                        IntCC::UnsignedLessThanOrEqual => Some(IntCC::UnsignedLessThan),
+                        IntCC::UnsignedGreaterThan => {
+                            Some(IntCC::UnsignedGreaterThanOrEqual)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ncc) = ncc
+                        && ku < umax
+                    {
+                        let c1 = pos.ins().iconst(ty, ku.wrapping_add(1) as i64);
+                        if let InstructionData::IntCompare { cond, args, .. } =
+                            &mut pos.func.dfg.insts[inst]
+                        {
+                            *cond = ncc;
+                            *args = [x, c1];
+                            n += 1;
+                            continue;
+                        }
+                    }
                 }
             }
             if crate::pass_enabled("PLIRON_ICMPEQFOLD")
