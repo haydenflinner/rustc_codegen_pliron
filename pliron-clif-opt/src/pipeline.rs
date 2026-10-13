@@ -2023,6 +2023,16 @@ pub static DEFAULT: &[Step] = &[
     // merge becomes one `icmp` per element instead of cmp+cmp+select
     // (or two `pcmpgtd` + mask ops per SIMD group).
     step("rgmerge", "rgmerge", Gate::Env("PLIRON_RGPAIR"), s_rgmerge),
+    // selargs/seltest resolve the niche selects in edge args, exposing
+    // affine relations (`next = cur + 1` cursor pairs) that were opaque
+    // to affparm at sameargs2 — one more round drops them, shrinking
+    // the per-iteration edge copies in decode loops.
+    step(
+        "sameargs3",
+        "sameargs",
+        Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG3")]),
+        s_sameargs,
+    ),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one

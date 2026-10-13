@@ -2781,7 +2781,7 @@ pub fn affparm(func: &mut Function) -> usize {
     let ps = crate::loadfwd::param_src(func);
     let rt = |func: &Function, v: Value| crate::loadfwd::concrete(func, &ps, v);
     // Per block: dropped param indices plus (p_j, base param, k) triples.
-    let mut rels: Vec<(Block, Vec<usize>, Vec<(Value, Value, i64)>)> = Vec::new();
+    let mut rels: Vec<(Block, Vec<usize>, Vec<(Value, Value, i64, bool)>)> = Vec::new();
     for (&b, es) in &edges {
         let params = func.dfg.block_params(b);
         if params.len() < 2 || params.len() > 24 {
@@ -2815,12 +2815,39 @@ pub fn affparm(func: &mut Function) -> usize {
         if eargs.len() != es.len() {
             continue;
         }
+        // Params used as a load/store address inside `b`: when the
+        // affine relation holds both ways, keeping such a param alive
+        // as the source lets the emitted `iadd` fuse with its memory
+        // op as a post-index access (`[x], #k` on aarch64). Dropping
+        // the base instead buries the load as `[x, -k]` plus a
+        // separate add.
+        let mut membase: FxHashSet<usize> = FxHashSet::default();
+        for i in func.layout.block_insts(b) {
+            let a = match func.dfg.insts[i] {
+                InstructionData::Load { arg, .. }
+                | InstructionData::LoadNoOffset { arg, .. } => Some(arg),
+                InstructionData::Store { args, .. }
+                | InstructionData::StoreNoOffset { args, .. } => Some(args[1]),
+                _ => None,
+            };
+            if let Some(a) = a {
+                let a = func.dfg.resolve_aliases(a);
+                for (ix, &p) in params.iter().enumerate() {
+                    if p == a {
+                        membase.insert(ix);
+                    }
+                }
+            }
+        }
         // `concrete` results cached per arg value: params^2 x edges root
         // calls otherwise dominate compile time in param-heavy fns.
         let mut rc: FxHashMap<Value, (crate::loadfwd::Root, i64)> = FxHashMap::default();
         let mut drops: Vec<usize> = Vec::new();
-        let mut triples: Vec<(Value, Value, i64)> = Vec::new();
+        let mut triples: Vec<(Value, Value, i64, bool)> = Vec::new();
         'jx: for jx in 0..params.len() {
+            if drops.contains(&jx) {
+                continue;
+            }
             let pj = params[jx];
             let ty = func.dfg.value_type(pj);
             if !ty.is_int() || ty.is_vector() {
@@ -2852,8 +2879,18 @@ pub fn affparm(func: &mut Function) -> usize {
                     }
                 });
                 if ok && let Some(k) = dk {
-                    drops.push(jx);
-                    triples.push((pj, params[ix], k));
+                    // Both directions of `p_j = p_i + k` are provable
+                    // here. When p_j is a memory base and p_i is not,
+                    // drop p_i instead and derive it late: the emitted
+                    // `iadd p_j, -k` then sits right after the load on
+                    // p_j and fuses into a post-index access.
+                    if k != 0 && membase.contains(&jx) && !membase.contains(&ix) {
+                        drops.push(ix);
+                        triples.push((params[ix], pj, k.wrapping_neg(), true));
+                    } else {
+                        drops.push(jx);
+                        triples.push((pj, params[ix], k, false));
+                    }
                     continue 'jx;
                 }
             }
@@ -2870,14 +2907,35 @@ pub fn affparm(func: &mut Function) -> usize {
     let mut param_drops: Vec<Value> = Vec::new();
     for (b, mut drops, triples) in rels {
         let params = func.dfg.block_params(b).to_vec();
-        for (pj, pi, k) in triples {
+        for (pj, pi, k, late) in triples {
             let w = if k == 0 {
                 pi
             } else {
-                FuncCursor::new(func)
-                    .at_first_insertion_point(b)
-                    .ins()
-                    .iadd_imm_s(pi, k)
+                // Post-index fusion needs `load base` before
+                // `iadd base, k` in program order: when keeping the
+                // memory-base param, emit the derived add just ahead of
+                // the terminator. Only legal when the dropped param has
+                // no in-block uses before the terminator itself.
+                let last = func.layout.last_inst(b);
+                let early = !late
+                    || func.layout.block_insts(b).any(|i| {
+                        Some(i) != last
+                            && func
+                                .dfg
+                                .inst_values(i)
+                                .any(|v| func.dfg.resolve_aliases(v) == pj)
+                    });
+                if early {
+                    FuncCursor::new(func)
+                        .at_first_insertion_point(b)
+                        .ins()
+                        .iadd_imm_s(pi, k)
+                } else {
+                    FuncCursor::new(func)
+                        .at_inst(last.unwrap())
+                        .ins()
+                        .iadd_imm_s(pi, k)
+                }
             };
             pmap.insert(pj, w);
         }
