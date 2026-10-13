@@ -199,7 +199,213 @@ impl Context {
             self.egraph_pass(isa, ctrl_plane)?;
         }
 
+        // PLIRON: reorder pure insts so a shared operand's last use lands
+        // on a destructive two-address op; elaboration's DFS arg order can
+        // strand a later use past a `rotl`-like op, forcing a live-range
+        // copy at codegen.
+        self.lastuse_schedule();
+        self.verify_if(isa)?;
+
         Ok(())
+    }
+
+    /// PLIRON: "last-use" scheduling.
+    ///
+    /// An inst `r` that lowers to a destructive two-address form
+    /// (integer/fp ALU ops, rotates, shifts) can consume a source operand
+    /// in place only when that operand dies at `r`. The egraph
+    /// elaborator emits pure insts in DFS order over argument trees and
+    /// routinely strands a shared operand's other use *after* such an
+    /// `r`, forcing the register allocator to materialize a copy.
+    ///
+    /// For each `r`, take the operand(s) its lowering may tie to the
+    /// destination (arg0; either arg when commutative) and, when one of
+    /// them has uses later in the same block, move those uses — plus the
+    /// pure producer chain feeding them — to just before `r`, making `r`
+    /// a last use. Pure insts are freely movable upward and moving uses
+    /// earlier can only shorten live ranges, so this never creates new
+    /// copies elsewhere. Placed insts are frozen so cyclic operand
+    /// sharing cannot oscillate; the move set and per-block budget keep
+    /// the pass effectively linear.
+    fn lastuse_schedule(&mut self) {
+        use crate::inst_predicates::is_pure_for_egraph;
+        use crate::ir::{Inst, Opcode, Value};
+        use crate::{FxHashMap, FxHashSet};
+        use alloc::vec::Vec;
+
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("PLIRON_LASTUSE").is_none_or(|v| v != "0"))
+        {
+            return;
+        }
+
+        // Opcodes whose lowering can tie a source operand to the
+        // destination register (two-address forms: add/sub/and/xor/rol/...
+        // on x64 and friends). `r` must be in this set for a last use to
+        // enable in-place operation.
+        fn rmw(op: Opcode) -> bool {
+            use Opcode::*;
+            matches!(
+                op,
+                Iadd | Isub
+                    | Imul
+                    | Band
+                    | Bor
+                    | Bxor
+                    | Ishl
+                    | Ushr
+                    | Sshr
+                    | Rotl
+                    | Rotr
+                    | Fadd
+                    | Fsub
+                    | Fmul
+                    | Fdiv
+            )
+        }
+
+        // For commutative ops either source can be the tied operand; for
+        // the rest only arg0 is destructive.
+        fn commutative(op: Opcode) -> bool {
+            use Opcode::*;
+            matches!(op, Iadd | Imul | Band | Bor | Bxor | Fadd | Fmul)
+        }
+
+        // Bound on insts relocated for a single operand; keeps the pass
+        // effectively linear in block size.
+        const MAX_MOVE: usize = 24;
+
+        // uses[v] = every inst that reads v, function-wide.
+        let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for inst in self.func.layout.block_insts(b) {
+                for &a in self.func.dfg.inst_args(inst) {
+                    uses.entry(a).or_default().push(inst);
+                }
+            }
+        }
+
+        let mut pos: FxHashMap<Inst, u32> = FxHashMap::default();
+        let mut r_args: Vec<Value> = Vec::new();
+        let mut move_set: Vec<Inst> = Vec::new();
+        let mut stack: Vec<Inst> = Vec::new();
+        let mut seen: FxHashSet<Inst> = FxHashSet::default();
+        // Insts that have already been placed (as moved uses or as the
+        // inst a move anchored on). A frozen inst is never relocated
+        // again — this guarantees termination even when two insts share
+        // operands cyclically.
+        let mut frozen: FxHashSet<Inst> = FxHashSet::default();
+        let blocks: Vec<_> = self.func.layout.blocks().collect();
+        for block in blocks {
+            let mut order: Vec<Inst> = self.func.layout.block_insts(block).collect();
+            // Bound the work on pathological blocks: at most this many
+            // accepted moves per block.
+            let mut budget = 128usize;
+            pos.clear();
+            let mut i = 0;
+            while i < order.len() {
+                let r = order[i];
+                i += 1;
+                if !rmw(self.func.dfg.insts[r].opcode()) {
+                    continue;
+                }
+                if pos.is_empty() {
+                    pos.extend(order.iter().enumerate().map(|(j, &x)| (x, j as u32)));
+                }
+                let op = self.func.dfg.insts[r].opcode();
+                r_args.clear();
+                r_args.extend_from_slice(self.func.dfg.inst_args(r));
+                // Candidate operands that lowering could tie to `r`'s
+                // destination: arg0 always, arg1 too when commutative.
+                let ncand = if commutative(op) && r_args.len() > 1 {
+                    2
+                } else {
+                    1
+                };
+                'cand: for k in 0..ncand {
+                    let v = r_args[k];
+                    let Some(us) = uses.get(&v) else {
+                        if k == 0 {
+                            break 'cand;
+                        }
+                        continue;
+                    };
+                    // `v` can only die at `r` if all of its uses are in
+                    // this block. If it already has no use after `r`, `r`
+                    // is fine as-is — stop (the candidate is satisfied).
+                    stack.clear();
+                    for &u in us {
+                        match pos.get(&u) {
+                            Some(&p) if p as usize >= i => stack.push(u),
+                            Some(_) => {}
+                            None => continue 'cand,
+                        }
+                    }
+                    if stack.is_empty() {
+                        break 'cand;
+                    }
+                    // Try to make `r` the last use of `v`: move every
+                    // later use, plus the pure producer chain feeding
+                    // them that sits after `r`, to just before `r`.
+                    move_set.clear();
+                    seen.clear();
+                    let mut ok = budget > 0 && !frozen.contains(&r);
+                    while ok && let Some(u) = stack.pop() {
+                        if u == r || frozen.contains(&u) || !is_pure_for_egraph(&self.func, u) {
+                            ok = false;
+                            break;
+                        }
+                        if !seen.insert(u) {
+                            continue;
+                        }
+                        move_set.push(u);
+                        if move_set.len() > MAX_MOVE {
+                            ok = false;
+                            break;
+                        }
+                        for &a in self.func.dfg.inst_args(u) {
+                            if let Some(p) = self.func.dfg.value_def(a).inst() {
+                                if p == r {
+                                    ok = false;
+                                    break;
+                                }
+                                if pos.get(&p).is_some_and(|&pp| pp as usize >= i) {
+                                    stack.push(p);
+                                }
+                            }
+                        }
+                    }
+                    stack.clear();
+                    if !ok {
+                        continue;
+                    }
+                    // Emit `move_set` in original order, just before `r`.
+                    budget -= 1;
+                    if std::env::var_os("PLIRON_LUDEBUG").is_some() {
+                        eprintln!("lastuse: move {:?} before {}", move_set, r);
+                    }
+                    frozen.extend(move_set.iter().copied());
+                    frozen.insert(r);
+                    move_set.sort_by_key(|u| pos[u]);
+                    for u in move_set.iter() {
+                        self.func.layout.remove_inst(*u);
+                        self.func.layout.insert_inst(*u, r);
+                    }
+                    // Keep `order`/`pos` consistent: `r` keeps its index
+                    // (all moved insts came from after it), then reinsert
+                    // the moved insts ahead of it and rescan them.
+                    order.retain(|u| !seen.contains(u));
+                    let ri = order.iter().position(|&x| x == r).unwrap();
+                    for (k, &u) in move_set.iter().enumerate() {
+                        order.insert(ri + k, u);
+                    }
+                    pos.clear();
+                    pos.extend(order.iter().enumerate().map(|(j, &x)| (x, j as u32)));
+                    i = ri;
+                    break 'cand;
+                }
+            }
+        }
     }
 
     /// Perform function call inlining.
