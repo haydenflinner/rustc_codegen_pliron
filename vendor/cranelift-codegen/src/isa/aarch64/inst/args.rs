@@ -394,6 +394,11 @@ impl PrettyPrint for AMode {
                 let simm9 = simm9.pretty_print(8);
                 format!("[sp], {simm9}")
             }
+            &AMode::PostIndex { rn, simm9 } => {
+                let reg = pretty_print_reg(rn);
+                let simm9 = simm9.pretty_print(8);
+                format!("[{reg}], {simm9}")
+            }
             AMode::Const { addr } => format!("[const({})]", addr.as_u32()),
 
             // Eliminated by `mem_finalize()`.

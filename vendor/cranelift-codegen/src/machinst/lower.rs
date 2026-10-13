@@ -707,7 +707,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Has this instruction been sunk to a use-site (i.e., away from its
     /// original location)?
-    fn is_inst_sunk(&self, inst: Inst) -> bool {
+    pub fn is_inst_sunk(&self, inst: Inst) -> bool {
         self.inst_sunk.contains(&inst)
     }
 
@@ -1722,6 +1722,40 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         assert!(sunk_inst_exit_color == self.cur_scan_entry_color.unwrap());
         self.cur_scan_entry_color = Some(sunk_inst_entry_color);
         self.inst_sunk.insert(ir_inst);
+    }
+
+    /// PLIRON: mark `ir_inst`, a side-effecting instruction, as fused into
+    /// the instruction currently being lowered — its side effect is now
+    /// carried by a machine inst emitted at the current scan position
+    /// (e.g., a load folded into a post-index load/store). Unlike
+    /// `sink_inst`, the inst's results remain live: the fused inst
+    /// defines their canonical vregs directly. Returns `false` unless
+    /// `ir_inst` is the most recent side-effecting inst before the
+    /// current position (i.e., no side effects sit between them) or it
+    /// has already been merged/sunk.
+    pub fn merge_side_effecting(&mut self, ir_inst: Inst) -> bool {
+        if !has_lowering_side_effect(self.f, ir_inst) || self.inst_sunk.contains(&ir_inst)
+        {
+            return false;
+        }
+        let Some(scan_entry) = self.cur_scan_entry_color else {
+            return false;
+        };
+        let entry = self.side_effect_inst_entry_colors[ir_inst];
+        if InstColor::new(entry.get() + 1) != scan_entry {
+            return false;
+        }
+        self.cur_scan_entry_color = Some(entry);
+        self.inst_sunk.insert(ir_inst);
+        true
+    }
+
+    /// PLIRON: the canonical vregs assigned to `val` before lowering.
+    /// A fused inst may define these directly (in lieu of the usual
+    /// temp-plus-alias convention) to hand a value to an inst that will
+    /// not itself be lowered.
+    pub fn get_value_regs(&self, val: Value) -> ValueRegs<Reg> {
+        self.value_regs[val]
     }
 
     /// Retrieve immediate data given a handle.

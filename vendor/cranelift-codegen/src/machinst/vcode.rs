@@ -1155,15 +1155,14 @@ impl<I: VCodeInst> VCode<I> {
                 }
             }
 
-            // Post-index rewrite: a run of load/store pairs on one
-            // base at successive offsets, followed by
-            // `add base, base, #C`, folds the pointer bump into
-            // post-indexed pair writebacks — each pair keeps its
-            // access address since `wb_i = o_{i+1} - o_i` telescopes,
-            // the last taking `C - o_n` — and the add is deleted.
-            // Between the first pair and the add, the base may only
-            // be read by chain pairs (their offsets anchor the write-
-            // back chain) and written by the add itself.
+            // Post-index rewrite: a run of loads/stores on one base at
+            // successive offsets, followed by `add base, base, #C`,
+            // folds the pointer bump into post-indexed writebacks —
+            // each access keeps its address since `wb_i = o_{i+1} - o_i`
+            // telescopes, the last taking `C - o_n` — and the add is
+            // deleted. Between the first access and the add, the base
+            // may only be read by chain members (their offsets anchor
+            // the writeback chain) and written by the add itself.
             for i in 0..items.len() {
                 if no_fuse {
                     break;
@@ -1174,7 +1173,7 @@ impl<I: VCodeInst> VCode<I> {
                 if squashed[iix.index()] {
                     continue;
                 }
-                let Some((base, off, ty)) = self.insts[iix.index()].pair_signed_offset()
+                let Some((base, off, ty)) = self.insts[iix.index()].mem_signed_offset()
                 else {
                     continue;
                 };
@@ -1183,7 +1182,7 @@ impl<I: VCodeInst> VCode<I> {
                 if off != 0 {
                     continue;
                 }
-                // A pair that loads into its own base reg is legal with
+                // An access that writes its own base reg is legal with
                 // a plain offset, but post-index writeback with
                 // `Rn ∈ {Rt, Rt2}` is unpredictable — leave it alone.
                 if preg_ops[iix.index()].1.iter().any(|r| *r == base) {
@@ -1218,7 +1217,7 @@ impl<I: VCodeInst> VCode<I> {
                                 break;
                             }
                             if uses.iter().any(|r| *r == base) {
-                                match self.insts[jix.index()].pair_signed_offset() {
+                                match self.insts[jix.index()].mem_signed_offset() {
                                     Some((r, o, ty)) if r == base => {
                                         chain.push((jix, o, ty));
                                     }
@@ -1240,8 +1239,7 @@ impl<I: VCodeInst> VCode<I> {
                 for m in 0..n {
                     let next = if m + 1 < n { chain[m + 1].1 } else { c };
                     let wb = next - chain[m].1;
-                    let s = i64::from(chain[m].2.bytes());
-                    if wb % s != 0 || !(-64 * s..=63 * s).contains(&wb) {
+                    if !self.insts[chain[m].0.index()].post_index_imm_ok(wb) {
                         wbs.clear();
                         break;
                     }

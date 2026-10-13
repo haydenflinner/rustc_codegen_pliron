@@ -150,6 +150,30 @@
         (mem AMode)
         (flags MemFlagsData))
 
+       ;; A scalar load with post-index writeback: `rd = [rn]`, then
+       ;; `rwb = rn + simm9`. `rwb` is allocated to the same register as
+       ;; `rn` (a reuse-def operand), so the writeback lands in the base
+       ;; register. Only created by post-index fusion during lowering, or
+       ;; post-allocation by the emit-time writeback sweep.
+       (LoadPost
+        (op LoadPostOp)
+        (rd WritableReg)
+        (rwb WritableReg)
+        (rn Reg)
+        (simm9 SImm9)
+        (flags MemFlagsData))
+
+       ;; A scalar store with post-index writeback: `[rn] = rt`, then
+       ;; `rwb = rn + simm9`. `rwb` is allocated to the same register as
+       ;; `rn` (a reuse-def operand). Same provenance as `LoadPost`.
+       (StorePost
+        (op StorePostOp)
+        (rt Reg)
+        (rwb WritableReg)
+        (rn Reg)
+        (simm9 SImm9)
+        (flags MemFlagsData))
+
        ;; A store of a pair of registers.
        (StoreP64
         (rt Reg)
@@ -1490,7 +1514,16 @@
         ;; adjustment meta-instructions). See the diagram in the documentation
         ;; for [crate::isa::aarch64::abi](the ABI module) for more details.
         (SlotOffset
-         (off i64))))
+         (off i64))
+
+        ;; "post-indexed" mode as per AArch64 docs on a general register:
+        ;; postincrement `rn` after the access. Only created post-allocation
+        ;; (by the emit-time writeback sweep), so the writeback carries no
+        ;; regalloc metadata; the def is implied to be the same reg as the
+        ;; use. Lowering-time fusion uses `LoadPost`/`StorePost` instead.
+        (PostIndex
+         (rn Reg)
+         (simm9 SImm9))))
 
 (attr AMode.Const (tag amode_const))
 
@@ -1503,6 +1536,17 @@
 (instantiate AMode.RegExtended            ((args (bv 64) (bv 64) (named ExtendOp)) (ret (named AMode))))
 
 (instantiate AMode.RegOffset              ((args (bv 64) (named i64)) (ret (named AMode))))
+
+;; Which scalar load a `LoadPost` performs: the unsigned/signed integer
+;; forms and the FP/vector forms.
+(type LoadPostOp (enum
+  (ULoad8) (SLoad8) (ULoad16) (SLoad16) (ULoad32) (SLoad32) (ULoad64)
+  (FpuLoad16) (FpuLoad32) (FpuLoad64) (FpuLoad128)))
+
+;; Which scalar store a `StorePost` performs.
+(type StorePostOp (enum
+  (Store8) (Store16) (Store32) (Store64)
+  (FpuStore16) (FpuStore32) (FpuStore64) (FpuStore128)))
 
 ;; A memory argument to a load/store-pair.
 (type PairAMode (enum

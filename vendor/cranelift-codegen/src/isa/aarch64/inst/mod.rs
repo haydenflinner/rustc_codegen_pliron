@@ -35,7 +35,8 @@ mod emit_tests;
 
 pub use crate::isa::aarch64::lower::isle::generated_code::{
     ALUOp, ALUOp3, AMode, APIKey, AtomicRMWLoopOp, AtomicRMWOp, BitOp, BranchTargetType, FPUOp1,
-    FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, MInst as Inst, MoveWideOp, VecALUModOp,
+    FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, LoadPostOp, MInst as Inst, MoveWideOp,
+    StorePostOp, VecALUModOp,
     VecALUOp, VecExtendOp, VecLanesOp, VecMisc2, VecPairOp, VecRRLongOp, VecRRNarrowOp,
     VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp, VecShiftImmModOp, VecShiftImmOp,
 };
@@ -313,6 +314,26 @@ impl Inst {
             Inst::FpuStore32 { .. } => Some(F32),
             Inst::FpuStore64 { .. } => Some(F64),
             Inst::FpuStore128 { .. } => Some(I8X16),
+            Inst::LoadPost { op, .. } => Some(match op {
+                LoadPostOp::ULoad8 | LoadPostOp::SLoad8 => I8,
+                LoadPostOp::ULoad16 | LoadPostOp::SLoad16 => I16,
+                LoadPostOp::ULoad32 | LoadPostOp::SLoad32 => I32,
+                LoadPostOp::ULoad64 => I64,
+                LoadPostOp::FpuLoad16 => F16,
+                LoadPostOp::FpuLoad32 => F32,
+                LoadPostOp::FpuLoad64 => F64,
+                LoadPostOp::FpuLoad128 => I8X16,
+            }),
+            Inst::StorePost { op, .. } => Some(match op {
+                StorePostOp::Store8 => I8,
+                StorePostOp::Store16 => I16,
+                StorePostOp::Store32 => I32,
+                StorePostOp::Store64 => I64,
+                StorePostOp::FpuStore16 => F16,
+                StorePostOp::FpuStore32 => F32,
+                StorePostOp::FpuStore64 => F64,
+                StorePostOp::FpuStore128 => I8X16,
+            }),
             _ => None,
         }
     }
@@ -338,6 +359,11 @@ fn memarg_operands(memarg: &mut AMode, collector: &mut impl OperandVisitor) {
         AMode::FPOffset { .. } | AMode::IncomingArg { .. } => {}
         AMode::SPOffset { .. } | AMode::SlotOffset { .. } => {}
         AMode::RegOffset { rn, .. } => {
+            collector.reg_use(rn);
+        }
+        // Created post-allocation: the writeback def is implied to be
+        // `rn` itself, so only the use is declared.
+        AMode::PostIndex { rn, .. } => {
             collector.reg_use(rn);
         }
         AMode::Const { .. } => {}
@@ -411,6 +437,20 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         | Inst::Store64 { rd, mem, .. } => {
             collector.reg_use(rd);
             memarg_operands(mem, collector);
+        }
+        Inst::LoadPost {
+            rd, rwb, rn, ..
+        } => {
+            collector.reg_def(rd);
+            collector.reg_use(rn);
+            collector.reg_reuse_def(rwb, 1); // `rwb` == `rn` (operand 1).
+        }
+        Inst::StorePost {
+            rt, rwb, rn, ..
+        } => {
+            collector.reg_use(rt);
+            collector.reg_use(rn);
+            collector.reg_reuse_def(rwb, 1); // `rwb` == `rn` (operand 1).
         }
         Inst::StoreP64 { rt, rt2, mem, .. } => {
             collector.reg_use(rt);
@@ -1061,7 +1101,9 @@ impl MachInst for Inst {
             | &Inst::FpuStore16 { .. }
             | &Inst::FpuStore32 { .. }
             | &Inst::FpuStore64 { .. }
-            | &Inst::FpuStore128 { .. } => true,
+            | &Inst::FpuStore128 { .. }
+            | &Inst::LoadPost { .. }
+            | &Inst::StorePost { .. } => true,
             // TODO: verify this carefully
             _ => false,
         }
@@ -1445,6 +1487,69 @@ impl Inst {
                 let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
 
                 format!("{mem_str}{op} {rd}, {mem}")
+            }
+            &Inst::LoadPost {
+                op,
+                rd,
+                rwb,
+                rn,
+                simm9,
+                ..
+            } => {
+                let (op_str, size) = match op {
+                    LoadPostOp::ULoad8 => ("ldrb", OperandSize::Size32),
+                    LoadPostOp::SLoad8 => ("ldrsb", OperandSize::Size64),
+                    LoadPostOp::ULoad16 => ("ldrh", OperandSize::Size32),
+                    LoadPostOp::SLoad16 => ("ldrsh", OperandSize::Size64),
+                    LoadPostOp::ULoad32 => ("ldr", OperandSize::Size32),
+                    LoadPostOp::SLoad32 => ("ldrsw", OperandSize::Size64),
+                    LoadPostOp::ULoad64 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad16 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad32 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad64 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad128 => ("ldr", OperandSize::Size64),
+                };
+                let rd = match op {
+                    LoadPostOp::FpuLoad16 | LoadPostOp::FpuLoad32
+                    | LoadPostOp::FpuLoad64 | LoadPostOp::FpuLoad128 => {
+                        pretty_print_reg(rd.to_reg())
+                    }
+                    _ => pretty_print_ireg(rd.to_reg(), size),
+                };
+                let rn = pretty_print_reg(rn);
+                let wb = pretty_print_reg(rwb.to_reg());
+                let simm9 = simm9.pretty_print(8);
+                format!("{op_str} {rd}, [{rn}], {simm9} ; wb={wb}")
+            }
+            &Inst::StorePost {
+                op,
+                rt,
+                rwb,
+                rn,
+                simm9,
+                ..
+            } => {
+                let (op_str, size) = match op {
+                    StorePostOp::Store8 => ("strb", OperandSize::Size32),
+                    StorePostOp::Store16 => ("strh", OperandSize::Size32),
+                    StorePostOp::Store32 => ("str", OperandSize::Size32),
+                    StorePostOp::Store64 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore16 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore32 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore64 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore128 => ("str", OperandSize::Size64),
+                };
+                let rt = match op {
+                    StorePostOp::FpuStore16 | StorePostOp::FpuStore32
+                    | StorePostOp::FpuStore64 | StorePostOp::FpuStore128 => {
+                        pretty_print_reg(rt)
+                    }
+                    _ => pretty_print_ireg(rt, size),
+                };
+                let rn = pretty_print_reg(rn);
+                let wb = pretty_print_reg(rwb.to_reg());
+                let simm9 = simm9.pretty_print(8);
+                format!("{op_str} {rt}, [{rn}], {simm9} ; wb={wb}")
             }
             &Inst::StoreP64 {
                 rt, rt2, ref mem, ..

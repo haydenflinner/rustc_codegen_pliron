@@ -1090,6 +1090,9 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_simm9(op, simm9, 0b01, reg, rd));
                     }
+                    &AMode::PostIndex { rn, simm9 } => {
+                        sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd));
+                    }
                     // Eliminated by `mem_finalize()` above.
                     &AMode::SPOffset { .. }
                     | &AMode::FPOffset { .. }
@@ -1186,6 +1189,9 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_simm9(op, simm9, 0b01, reg, rd));
                     }
+                    &AMode::PostIndex { rn, simm9 } => {
+                        sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd));
+                    }
                     // Eliminated by `mem_finalize()` above.
                     &AMode::SPOffset { .. }
                     | &AMode::FPOffset { .. }
@@ -1196,6 +1202,61 @@ impl MachInstEmit for Inst {
                         panic!("Should not see {mem:?} here!")
                     }
                 }
+            }
+
+            &Inst::LoadPost {
+                op,
+                rd,
+                rwb: _,
+                rn,
+                simm9,
+                flags,
+            } => {
+                let op = match op {
+                    LoadPostOp::ULoad8 => 0b0011100001,
+                    LoadPostOp::SLoad8 => 0b0011100010,
+                    LoadPostOp::ULoad16 => 0b0111100001,
+                    LoadPostOp::SLoad16 => 0b0111100010,
+                    LoadPostOp::ULoad32 => 0b1011100001,
+                    LoadPostOp::SLoad32 => 0b1011100010,
+                    LoadPostOp::ULoad64 => 0b1111100001,
+                    LoadPostOp::FpuLoad16 => 0b0111110001,
+                    LoadPostOp::FpuLoad32 => 0b1011110001,
+                    LoadPostOp::FpuLoad64 => 0b1111110001,
+                    LoadPostOp::FpuLoad128 => 0b0011110011,
+                };
+
+                if let Some(trap_code) = flags.trap_code() {
+                    sink.add_trap(trap_code);
+                }
+
+                sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd.to_reg()));
+            }
+
+            &Inst::StorePost {
+                op,
+                rt,
+                rwb: _,
+                rn,
+                simm9,
+                flags,
+            } => {
+                let op = match op {
+                    StorePostOp::Store8 => 0b0011100000,
+                    StorePostOp::Store16 => 0b0111100000,
+                    StorePostOp::Store32 => 0b1011100000,
+                    StorePostOp::Store64 => 0b1111100000,
+                    StorePostOp::FpuStore16 => 0b0111110000,
+                    StorePostOp::FpuStore32 => 0b1011110000,
+                    StorePostOp::FpuStore64 => 0b1111110000,
+                    StorePostOp::FpuStore128 => 0b0011110010,
+                };
+
+                if let Some(trap_code) = flags.trap_code() {
+                    sink.add_trap(trap_code);
+                }
+
+                sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rt));
             }
 
             &Inst::StoreP64 {
@@ -3943,21 +4004,70 @@ impl MachInstEmit for Inst {
         )
     }
 
-    fn pair_signed_offset(&self) -> Option<(Reg, i64, Type)> {
-        // A pair inst on a plain signed-offset amode: (base reg, byte
-        // offset, scale type for writeback immediates).
-        let (mem, ty) = match self {
-            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => (mem, I64),
-            Inst::FpuLoadP64 { mem, .. } | Inst::FpuStoreP64 { mem, .. } => (mem, F64),
-            Inst::FpuLoadP128 { mem, .. } | Inst::FpuStoreP128 { mem, .. } => (mem, I8X16),
-            _ => return None,
-        };
-        match mem {
-            &PairAMode::SignedOffset { reg, simm7 } => {
-                Some((reg, i64::from(simm7.value), ty))
+    fn mem_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+        // A load/store inst on a plain signed-offset register base:
+        // (base reg, byte offset, scale type for writeback immediates).
+        match self {
+            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), I64))
+                }
+                _ => None,
+            },
+            Inst::FpuLoadP64 { mem, .. } | Inst::FpuStoreP64 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), F64))
+                }
+                _ => None,
+            },
+            Inst::FpuLoadP128 { mem, .. } | Inst::FpuStoreP128 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), I8X16))
+                }
+                _ => None,
+            },
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad16 { mem, .. }
+            | Inst::FpuLoad32 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore16 { mem, .. }
+            | Inst::FpuStore32 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => {
+                let ty = self.mem_type().unwrap();
+                let (rn, off) = match mem {
+                    &AMode::Unscaled { rn, simm9 } => (rn, i64::from(simm9.value)),
+                    &AMode::UnsignedOffset { rn, uimm12 } => {
+                        (rn, i64::from(uimm12.value()))
+                    }
+                    &AMode::RegOffset { rn, off } => (rn, off),
+                    _ => return None,
+                };
+                Some((rn, off, ty))
             }
             _ => None,
         }
+    }
+
+    fn post_index_imm_ok(&self, wb: i64) -> bool {
+        let ty = match self {
+            Inst::LoadP64 { .. } | Inst::StoreP64 { .. } => I64,
+            Inst::FpuLoadP64 { .. } | Inst::FpuStoreP64 { .. } => F64,
+            Inst::FpuLoadP128 { .. } | Inst::FpuStoreP128 { .. } => I8X16,
+            _ => return SImm9::maybe_from_i64(wb).is_some(),
+        };
+        SImm7Scaled::maybe_from_i64(wb, ty).is_some()
     }
 
     fn set_post_index(&mut self, wb: i64) {
@@ -3975,20 +4085,56 @@ impl MachInstEmit for Inst {
             },
             _ => false,
         };
-        let mem = match self {
+        match self {
             Inst::LoadP64 { mem, .. }
             | Inst::StoreP64 { mem, .. }
             | Inst::FpuLoadP64 { mem, .. }
             | Inst::FpuStoreP64 { mem, .. }
             | Inst::FpuLoadP128 { mem, .. }
-            | Inst::FpuStoreP128 { mem, .. } => mem,
-            _ => return,
-        };
-        if let PairAMode::SignedOffset { reg, simm7 } = *mem {
-            debug_assert!(!defs_base);
-            let simm7 = SImm7Scaled::maybe_from_i64(wb, simm7.scale_ty)
-                .expect("post-index writeback out of range");
-            *mem = PairAMode::PostIndex { reg, simm7 };
+            | Inst::FpuStoreP128 { mem, .. } => {
+                if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+                    debug_assert!(!defs_base);
+                    let simm7 = SImm7Scaled::maybe_from_i64(wb, simm7.scale_ty)
+                        .expect("post-index writeback out of range");
+                    *mem = PairAMode::PostIndex { reg, simm7 };
+                }
+            }
+            _ => {
+                if self.mem_type().is_none() {
+                    return;
+                }
+                let mem = match self {
+                    Inst::ULoad8 { mem, .. }
+                    | Inst::SLoad8 { mem, .. }
+                    | Inst::ULoad16 { mem, .. }
+                    | Inst::SLoad16 { mem, .. }
+                    | Inst::ULoad32 { mem, .. }
+                    | Inst::SLoad32 { mem, .. }
+                    | Inst::ULoad64 { mem, .. }
+                    | Inst::Store8 { mem, .. }
+                    | Inst::Store16 { mem, .. }
+                    | Inst::Store32 { mem, .. }
+                    | Inst::Store64 { mem, .. }
+                    | Inst::FpuLoad16 { mem, .. }
+                    | Inst::FpuLoad32 { mem, .. }
+                    | Inst::FpuLoad64 { mem, .. }
+                    | Inst::FpuLoad128 { mem, .. }
+                    | Inst::FpuStore16 { mem, .. }
+                    | Inst::FpuStore32 { mem, .. }
+                    | Inst::FpuStore64 { mem, .. }
+                    | Inst::FpuStore128 { mem, .. } => mem,
+                    _ => return,
+                };
+                let rn = match *mem {
+                    AMode::Unscaled { rn, .. }
+                    | AMode::UnsignedOffset { rn, .. }
+                    | AMode::RegOffset { rn, .. } => rn,
+                    _ => return,
+                };
+                let simm9 =
+                    SImm9::maybe_from_i64(wb).expect("post-index writeback out of range");
+                *mem = AMode::PostIndex { rn, simm9 };
+            }
         }
     }
 

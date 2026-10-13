@@ -2826,6 +2826,393 @@ pub fn mask01(func: &mut Function) -> usize {
     n
 }
 
+/// What an `icmp cc x, K` feeding a `brif` is really asking when the
+/// compare reduces to a single-bit test (`PLIRON_SGNTEST`).
+enum SgnFold {
+    /// True iff bit `b` of the compared value is `set`.
+    Bit { b: u32, set: bool },
+    /// The answer is fixed; `then` is taken iff the icmp is true.
+    Const(bool),
+}
+
+/// `x`'s sign bit is provably clear — `x <s 0` is const, `x >=s 0` too.
+fn sign_known_clear(func: &Function, x: Value, all: u64) -> bool {
+    vmax(func, x) <= all >> 1
+}
+
+/// `icmp cc x, k` as a one-bit test. `k` is the compare constant masked
+/// to the operand width `w = all.count_ones()`; `all` is the type's max.
+fn icmp_bit_test(func: &Function, x: Value, cc: IntCC, k: u64, all: u64) -> Option<SgnFold> {
+    let w = all.count_ones();
+    let sign = w - 1;
+    let signbit = 1u64 << sign;
+    match cc {
+        // `x <s 0` (`x <=s -1`) tests the sign bit; `x >=s 0` (`x >s -1`)
+        // tests its complement.
+        IntCC::SignedLessThan if k == 0 => {
+            if sign_known_clear(func, x, all) {
+                Some(SgnFold::Const(false))
+            } else {
+                Some(SgnFold::Bit { b: sign, set: true })
+            }
+        }
+        IntCC::SignedLessThanOrEqual if k == all => {
+            if sign_known_clear(func, x, all) {
+                Some(SgnFold::Const(false))
+            } else {
+                Some(SgnFold::Bit { b: sign, set: true })
+            }
+        }
+        IntCC::SignedGreaterThanOrEqual if k == 0 => {
+            if sign_known_clear(func, x, all) {
+                Some(SgnFold::Const(true))
+            } else {
+                Some(SgnFold::Bit { b: sign, set: false })
+            }
+        }
+        IntCC::SignedGreaterThan if k == all => {
+            if sign_known_clear(func, x, all) {
+                Some(SgnFold::Const(true))
+            } else {
+                Some(SgnFold::Bit { b: sign, set: false })
+            }
+        }
+        // `x <s INT_MIN` never holds; `x >=s INT_MIN` always does.
+        IntCC::SignedLessThan if k == signbit => Some(SgnFold::Const(false)),
+        IntCC::SignedGreaterThanOrEqual if k == signbit => Some(SgnFold::Const(true)),
+        // `x <u 1<<b` / `x <=u (1<<b)-1` with `x < 2^(b+1)` tests bit b
+        // clear — the UTF-8 lead-byte check `byte <u 0x80`.
+        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => {
+            let kp = k as u128 + u128::from(cc == IntCC::UnsignedLessThanOrEqual);
+            if kp == 0 {
+                return Some(SgnFold::Const(false));
+            }
+            let hi = vmax(func, x) as u128;
+            if hi < kp {
+                return Some(SgnFold::Const(true));
+            }
+            if kp.is_power_of_two() && hi < 2 * kp {
+                return Some(SgnFold::Bit {
+                    b: kp.trailing_zeros(),
+                    set: false,
+                });
+            }
+            None
+        }
+        // `x >=u 1<<b` / `x >u (1<<b)-1` with `x < 2^(b+1)` tests bit b.
+        IntCC::UnsignedGreaterThanOrEqual | IntCC::UnsignedGreaterThan => {
+            let kp = k as u128 + u128::from(cc == IntCC::UnsignedGreaterThan);
+            if kp == 0 {
+                return Some(SgnFold::Const(true));
+            }
+            let hi = vmax(func, x) as u128;
+            if hi < kp {
+                return Some(SgnFold::Const(false));
+            }
+            if kp.is_power_of_two() && hi < 2 * kp {
+                return Some(SgnFold::Bit {
+                    b: kp.trailing_zeros(),
+                    set: true,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Where a `1 << b` test of a chain-peeled value can be emitted.
+enum Probe {
+    /// `band v, 1<<b` is the brif arg.
+    Bit(Value, u32),
+    /// The tested bit is provably 0 or 1.
+    Const(bool),
+}
+
+/// Peel `ireduce`/`band`/`ushr` wrappers off `v` tracking the tested
+/// bit, preferring a carrier whose type encodes `1<<b` as a positive
+/// `iconst` — aarch64's `tbnz` fusion matches `u64_from_iconst` with
+/// exactly one bit, and a narrow type's sign-bit mask stores as
+/// all-ones-extended (`band.i8 x, -128` is 57 one bits, no fusion). So
+/// `icmp.i8 ult (ireduce.i8 b64), -128` reaches through the reduce and
+/// emits `band.i64 b64, 0x80` → `tbnz x, #7`. `peeled` collects the
+/// insts traversed so the caller can reap the ones left dead.
+fn bit_probe(func: &Function, x: Value, mut b: u32, peeled: &mut Vec<Inst>) -> Probe {
+    let mut v = func.dfg.resolve_aliases(x);
+    for _ in 0..16 {
+        let w = func.dfg.value_type(v).bits();
+        let all = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let Some(d) = func.dfg.value_def(v).inst() else {
+            return Probe::Bit(v, b);
+        };
+        match func.dfg.insts[d] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => return Probe::Const((imm.bits() as u64 >> b) & 1 == 1),
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } if func.dfg.value_type(arg).bits() <= 64 => {
+                peeled.push(d);
+                v = func.dfg.resolve_aliases(arg);
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => match bin_k_data(func, args) {
+                // `(z & m)`'s bit b is z's when `m` keeps it, always
+                // clear when it doesn't.
+                Some((z, m)) if (m as u64 & all) >> b & 1 == 1 => {
+                    peeled.push(d);
+                    v = z;
+                }
+                Some(_) => return Probe::Const(false),
+                None => return Probe::Bit(v, b),
+            },
+            InstructionData::Binary {
+                opcode: Opcode::Ushr,
+                args,
+            } => match iconst(func, args[1]) {
+                // `band (ushr z, s), 1<<b` is bit `b+s` of `z` — or
+                // always 0 when it shifted out.
+                Some(s) if (b as u64 + (s as u64) % (w as u64)) < w as u64 => {
+                    peeled.push(d);
+                    v = func.dfg.resolve_aliases(args[0]);
+                    b += (s as u64 % w as u64) as u32;
+                }
+                Some(_) => return Probe::Const(false),
+                None => return Probe::Bit(v, b),
+            },
+            _ => {
+                // A `band` imm is a single bit as stored iff it sits
+                // below the sign bit — or the type is already i64
+                // (`iconst.i64 MIN` is the one negative one-bit imm).
+                if b + 1 < w || w == 64 {
+                    return Probe::Bit(v, b);
+                }
+                // `b` is the sign bit of a narrow type: extends in the
+                // chain may hide a wider carrier underneath.
+                match func.dfg.insts[d] {
+                    InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg,
+                    } => {
+                        let m = func.dfg.value_type(arg).bits();
+                        if b < m {
+                            peeled.push(d);
+                            v = func.dfg.resolve_aliases(arg);
+                        } else {
+                            return Probe::Const(false);
+                        }
+                    }
+                    InstructionData::Unary {
+                        opcode: Opcode::Sextend,
+                        arg,
+                    } => {
+                        // The wide sign bit is the narrow one's, copied.
+                        peeled.push(d);
+                        v = func.dfg.resolve_aliases(arg);
+                        b = func.dfg.value_type(v).bits() - 1;
+                    }
+                    _ => return Probe::Bit(v, b),
+                }
+            }
+        }
+    }
+    Probe::Bit(v, b)
+}
+
+/// Drop insts whose result is now unused — the compare and the chain /
+/// operand wrappers a `sgntest` rewrite orphaned. Removed insts feed
+/// their `iconst` operand defs back into the worklist so the compare's
+/// constant dies with it.
+fn reap_dead(func: &mut Function, insts: &[Inst]) {
+    let mut wl: Vec<Inst> = insts.to_vec();
+    let mut seen: FxHashSet<Inst> = wl.iter().copied().collect();
+    // Fixpoint: each removal can free a candidate seen earlier (the
+    // list is roughly outermost-first but chain/extend peels
+    // interleave), so rescan until nothing else drops.
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let mut i = 0;
+        while i < wl.len() {
+            let d = wl[i];
+            i += 1;
+            if func.layout.inst_block(d).is_none() {
+                continue;
+            }
+            let r = func.dfg.first_result(d);
+            if uses_of(func, r) != 0 {
+                continue;
+            }
+            for dd in func
+                .dfg
+                .inst_args(d)
+                .iter()
+                .filter_map(|&a| func.dfg.value_def(func.dfg.resolve_aliases(a)).inst())
+            {
+                if seen.insert(dd) && func.dfg.insts[dd].opcode() == Opcode::Iconst {
+                    wl.push(dd);
+                }
+            }
+            func.dfg.clear_results(d);
+            func.layout.remove_inst(d);
+            progress = true;
+        }
+    }
+}
+
+/// `brif (icmp cc x, K)` where the compare is a one-bit test —
+/// `icmp ult byte, 0x80` (UTF-8 ASCII/continuation in tokenize,
+/// chars_*), `icmp slt x, 0` — becomes `brif (band v, 1<<b)` with the
+/// targets swapped when the icmp fires on the clear bit. aarch64 fuses
+/// the band+brif into a single `tbnz` (LLVM's `ldrsb`+`tbz` shape, and
+/// the `uextend`+`cmp`+`b.hs` triple disappears); x64 emits
+/// `test`+`jnz`, never worse than `cmp`+`jcc`. Runs as its own late
+/// step: the `icmp` form is canonical for every earlier pass.
+pub fn sgntest(func: &mut Function) -> usize {
+    let mut brifs = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if func.dfg.insts[i].opcode() == Opcode::Brif {
+                brifs.push(i);
+            }
+        }
+    }
+    let mut n = 0;
+    for i in brifs {
+        n += usize::from(sgn_brif(func, i));
+    }
+    n
+}
+
+fn sgn_brif(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
+        return false;
+    };
+    // Find the compare under rustc's boolean spellings: `!c` wrappers
+    // (`un_not_chain` — it also tracks the parity) and `uextend`/`sextend`
+    // of the flag, which keep the 0/1-ness `brif` tests.
+    let mut chain = Vec::new();
+    let mut dead: Vec<Inst> = Vec::new();
+    let mut neg = false;
+    let mut cv = func.dfg.resolve_aliases(arg);
+    let ci = loop {
+        let (v, n) = un_not_chain(func, cv, Some(&mut chain));
+        cv = v;
+        neg ^= n;
+        let Some(i) = func.dfg.value_def(cv).inst() else {
+            return false;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                ..
+            } => break i,
+            InstructionData::Unary {
+                opcode: Opcode::Uextend | Opcode::Sextend,
+                arg: a,
+            } => {
+                dead.push(i);
+                cv = func.dfg.resolve_aliases(a);
+                if dead.len() > 8 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    };
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[ci]
+    else {
+        return false;
+    };
+    let ty = func.dfg.value_type(args[0]);
+    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+        return false;
+    }
+    let all = if ty.bits() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << ty.bits()) - 1
+    };
+    let (cc, x, k) = if let Some(k) = iconst(func, args[1]) {
+        (cond, args[0], k as u64 & all)
+    } else if let Some(k) = iconst(func, args[0]) {
+        (cond.swap_args(), args[1], k as u64 & all)
+    } else {
+        return false;
+    };
+    let Some(test) = icmp_bit_test(func, x, cc, k, all) else {
+        return false;
+    };
+    // `dead` already holds the peeled extends; add the condition-chain
+    // wrappers, the compare, then the operand-side peels `bit_probe`
+    // reports (appended below) — outermost first so removals cascade.
+    // `reap_dead` rechecks uses live, so a wrapper still referenced
+    // elsewhere survives.
+    for &(v, _) in &chain {
+        if let Some(d) = func.dfg.value_def(v).inst()
+            && d != ci
+            && !dead.contains(&d)
+        {
+            dead.push(d);
+        }
+    }
+    dead.push(ci);
+    match test {
+        SgnFold::Const(t) => {
+            // `then` iff the icmp answer `t` survives the chain negation.
+            let dest = blocks[usize::from(t == neg)];
+            func.dfg.insts[inst] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: dest,
+            };
+        }
+        SgnFold::Bit { b, set } => {
+            let mut peeled = Vec::new();
+            let (v, vb) = match bit_probe(func, x, b, &mut peeled) {
+                Probe::Bit(v, vb) => (v, vb),
+                Probe::Const(bit) => {
+                    dead.extend(peeled);
+                    let t = bit == set;
+                    let dest = blocks[usize::from(t == neg)];
+                    func.dfg.insts[inst] = InstructionData::Jump {
+                        opcode: Opcode::Jump,
+                        destination: dest,
+                    };
+                    reap_dead(func, &dead);
+                    return true;
+                }
+            };
+            dead.extend(peeled);
+            let vty = func.dfg.value_type(v);
+            let sh = 64 - vty.bits();
+            let imm = ((1u64 << vb) << sh) as i64 >> sh;
+            let mut cur = FuncCursor::new(func).at_inst(inst);
+            let m = cur.ins().iconst(vty, imm);
+            let nb = cur.ins().band(v, m);
+            if let InstructionData::Brif {
+                arg: a, blocks: bs, ..
+            } = &mut cur.func.dfg.insts[inst]
+            {
+                *a = nb;
+                // `then` fires iff `set`'s polarity matches the chain's.
+                if set == neg {
+                    bs.swap(0, 1);
+                }
+            }
+        }
+    }
+    reap_dead(func, &dead);
+    true
+}
+
 /// `select c, a, b` whose every use sits in the region where `c`'s truth
 /// is already decided collapses to that arm — the `Option<NonNull>`
 /// niche selects (`select end?, 0, ptr`) ifconv materialises: the load
@@ -5850,5 +6237,149 @@ mod tests {
         let r = cur.ins().iadd(l1, l2);
         cur.ins().return_(&[r]);
         func
+    }
+
+    /// `brif (icmp ult (ireduce.i8 (uload8.i64 p)), -128)` — the UTF-8
+    /// ASCII test — becomes `brif (band load, 0x80)` on the wide load
+    /// value with the arms swapped (bit set == multibyte), so isel emits
+    /// one `tbnz`. The compare, reduce, and constant all die.
+    #[test]
+    fn sgntest_lead_byte() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let ascii = func.dfg.make_block();
+        let multi = func.dfg.make_block();
+        for blk in [entry, ascii, multi] {
+            func.layout.append_block(blk);
+        }
+        let p = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let w = cur
+            .ins()
+            .uload8(types::I64, MemFlagsData::new().with_notrap(), p, 0);
+        let b8 = cur.ins().ireduce(types::I8, w);
+        let k = cur.ins().iconst(types::I8, -128);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, b8, k);
+        cur.ins().brif(c, ascii, &[], multi, &[]);
+        for (i, blk) in [ascii, multi].iter().enumerate() {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(*blk);
+            let r = cur.ins().iconst(types::I64, i as i64);
+            cur.ins().return_(&[r]);
+        }
+
+        assert_eq!(sgntest(&mut func), 1);
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        assert_eq!(
+            ops,
+            [Opcode::Uload8, Opcode::Iconst, Opcode::Band, Opcode::Brif],
+            "{}",
+            func.display()
+        );
+        let br = func.layout.block_insts(entry).last().unwrap();
+        let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[br] else {
+            panic!()
+        };
+        // Band operand is the load itself; then/else swapped.
+        let InstructionData::Binary { args, .. } =
+            func.dfg.insts[func.dfg.value_def(arg).inst().unwrap()]
+        else {
+            panic!()
+        };
+        assert_eq!(func.dfg.resolve_aliases(args[0]), w);
+        assert_eq!(
+            blocks[0].block(&func.dfg.value_lists),
+            multi,
+            "{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("sgntest produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `brif (icmp slt x, 0)` keeps the same arm order — bit set is the
+    /// then-edge — and the mask lands on a positive `1 << 63`… no: on
+    /// i32 the sign bit is still one stored bit only via i64, so the
+    /// fold emits `band.i32 x, MIN` — not fused, but never worse.
+    #[test]
+    fn sgntest_sign_bit_i32() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let neg = func.dfg.make_block();
+        let pos = func.dfg.make_block();
+        for blk in [entry, neg, pos] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I32);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let z = cur.ins().iconst(types::I32, 0);
+        let c = cur.ins().icmp(IntCC::SignedLessThan, x, z);
+        cur.ins().brif(c, neg, &[], pos, &[]);
+        for (i, blk) in [neg, pos].iter().enumerate() {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(*blk);
+            let r = cur.ins().iconst(types::I64, i as i64);
+            cur.ins().return_(&[r]);
+        }
+
+        assert_eq!(sgntest(&mut func), 1);
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        assert_eq!(
+            ops,
+            [Opcode::Iconst, Opcode::Band, Opcode::Brif],
+            "{}",
+            func.display()
+        );
+        // Same arm order: the sign bit *is* the predicate.
+        let br = func.layout.block_insts(entry).last().unwrap();
+        let InstructionData::Brif { blocks, .. } = func.dfg.insts[br] else {
+            panic!()
+        };
+        assert_eq!(blocks[0].block(&func.dfg.value_lists), neg);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("sgntest produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A range test that is *not* one bit (`x <u 96` on an i8) is left
+    /// alone — it needs real compare semantics, not a mask.
+    #[test]
+    fn sgntest_skips_range() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I8));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let a = func.dfg.make_block();
+        let b = func.dfg.make_block();
+        for blk in [entry, a, b] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I8);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k = cur.ins().iconst(types::I8, 96);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, x, k);
+        cur.ins().brif(c, a, &[], b, &[]);
+        for blk in [a, b] {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(blk);
+            let r = cur.ins().iconst(types::I64, 0);
+            cur.ins().return_(&[r]);
+        }
+        assert_eq!(sgntest(&mut func), 0);
     }
 }

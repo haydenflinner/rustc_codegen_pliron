@@ -567,11 +567,17 @@ pub trait MachInstEmit: MachInst {
         false
     }
 
-    /// If this is a load/store-pair on a signed-offset register base,
-    /// return `(base, byte_offset, scale_ty)`: the writeback immediate
-    /// for a post-indexed form must be a multiple of `scale_ty`'s size.
-    fn pair_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+    /// If this is a load/store on a signed-offset register base,
+    /// return `(base, byte_offset, access_ty)` describing the memory
+    /// access a post-indexed rewrite would replace.
+    fn mem_signed_offset(&self) -> Option<(Reg, i64, Type)> {
         None
+    }
+
+    /// Whether `wb` bytes is encodable as this instruction's post-index
+    /// writeback immediate.
+    fn post_index_imm_ok(&self, _wb: i64) -> bool {
+        false
     }
 
     /// Rewrite this instruction to access `[base]` and write back
