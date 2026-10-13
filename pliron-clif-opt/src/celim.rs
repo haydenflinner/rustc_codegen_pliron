@@ -41,7 +41,8 @@ use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
-use rustc_hash::FxHashMap;
+use cranelift_codegen::loop_analysis::LoopAnalysis;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 fn mask(v: u64, bits: u32) -> u64 {
     if bits >= 64 {
@@ -83,7 +84,7 @@ fn known(func: &Function, v: Value) -> Option<u64> {
 /// An icmp operand: `base + off` (from `iadd`/`isub` with a constant), or
 /// a plain constant. The offset is canonicalized to the signed residue
 /// class of the operand's width (`x + 255` on `i8` is `x - 1`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Op {
     V(Value, i64),
     K(u64),
@@ -438,6 +439,151 @@ fn facts_at<'a>(
         cur = domtree.idom(c);
     }
     fs
+}
+
+const MAX_INDUCT_LOOPS: usize = 32;
+const MAX_INDUCT_EDGES: usize = 8;
+const MAX_INDUCT_CONDS: usize = 8;
+const MAX_INDUCT_CANDS: usize = 8;
+
+/// Conditions the edge `inst` -> `s` establishes itself: a `brif`'s taken
+/// edge gives `arg != 0` plus every `band` leaf, its not-taken edge gives
+/// `arg == 0` plus every `bor` leaf complemented — the same rules
+/// `edge_facts` applies, kept in the source block's own value namespace.
+fn edge_conds(func: &Function, inst: Inst, s: Block) -> Vec<Cmp> {
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[inst] else {
+        return Vec::new();
+    };
+    let dests = func.dfg.insts[inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    );
+    let (t0, t1) = (
+        dests[0].block(&func.dfg.value_lists) == s,
+        dests[1].block(&func.dfg.value_lists) == s,
+    );
+    if t0 == t1 {
+        return Vec::new();
+    }
+    let take = t0;
+    let arg = func.dfg.resolve_aliases(arg);
+    let mut out = vec![(
+        if take { IntCC::NotEqual } else { IntCC::Equal },
+        plain(func, arg),
+        Op::K(0),
+    )];
+    let mut icmps = Vec::new();
+    tree_icmps(
+        func,
+        arg,
+        if take { Opcode::Band } else { Opcode::Bor },
+        &mut icmps,
+        0,
+    );
+    for i in icmps {
+        if let Some(((cc, x, y), _)) = norm_icmp(func, i, true) {
+            out.push((if take { cc } else { cc.complement() }, x, y));
+        }
+    }
+    out
+}
+
+/// Facts provable on every arrival at a loop header. A candidate stated
+/// on the header's params holds inductively when each in-edge's source
+/// proves the candidate restated on that edge's own args: entry edges
+/// cover iteration 0 and a backedge covers re-entry — typically via its
+/// own latch test. This lifts `i' < n` latch guards into `i < n` at the
+/// header, deciding guards like `isub(n-1), i < n` that no dominating
+/// edge can prove.
+fn induction_facts(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+    fact: &FxHashMap<Block, Vec<Cmp>>,
+    srcs: &FxHashMap<Value, Value>,
+) -> FxHashMap<Block, Vec<Cmp>> {
+    let mut la = LoopAnalysis::new();
+    la.compute(func, cfg, domtree);
+    let mut out: FxHashMap<Block, Vec<Cmp>> = FxHashMap::default();
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    for lp in la.loops().take(MAX_INDUCT_LOOPS) {
+        let h = la.loop_header(lp);
+        if !seen.insert(h) || !domtree.is_reachable(h) {
+            continue;
+        }
+        let params = func.dfg.block_params(h).to_vec();
+        if params.is_empty() {
+            continue;
+        }
+        // Per in-edge: source block, the conditions the edge itself
+        // establishes, and maps between the header-param and edge-arg
+        // operand namespaces (`decomp`d `Op`s: `arg` is `param + k` in the
+        // common `i + 1` backedge shape).
+        let mut edges: Vec<(Block, Vec<Cmp>, FxHashMap<Op, Op>, FxHashMap<Op, Op>)> =
+            Vec::new();
+        for q in cfg.pred_iter(h).take(MAX_INDUCT_EDGES + 1) {
+            let mut a2p: FxHashMap<Op, Op> = FxHashMap::default();
+            let mut p2a: FxHashMap<Op, Op> = FxHashMap::default();
+            for bc in func.dfg.insts[q.inst].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                if bc.block(&func.dfg.value_lists) != h {
+                    continue;
+                }
+                for (i, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let (Some(&p), cranelift_codegen::ir::BlockArg::Value(v)) =
+                        (params.get(i), a)
+                    {
+                        let a = decomp(func, func.dfg.resolve_aliases(v));
+                        a2p.insert(a, Op::V(p, 0));
+                        p2a.insert(Op::V(p, 0), a);
+                    }
+                }
+            }
+            if domtree.is_reachable(q.block) {
+                edges.push((q.block, edge_conds(func, q.inst, h), a2p, p2a));
+            }
+        }
+        if edges.len() < 2 || edges.len() > MAX_INDUCT_EDGES {
+            continue;
+        }
+        // Candidates: each edge's own conditions restated on the header's
+        // params.
+        let sub = |m: &FxHashMap<Op, Op>, o: Op| m.get(&o).copied().unwrap_or(o);
+        let mut cands: Vec<Cmp> = Vec::new();
+        for (_, cs, a2p, _) in &edges {
+            for &c in cs.iter().take(MAX_INDUCT_CONDS) {
+                let c = (c.0, sub(a2p, c.1), sub(a2p, c.2));
+                if !cands.contains(&c) {
+                    cands.push(c);
+                }
+            }
+        }
+        'cand: for c in cands.into_iter().take(MAX_INDUCT_CANDS) {
+            if !matches!(c.1, Op::V(..)) && !matches!(c.2, Op::V(..)) {
+                continue;
+            }
+            for (src, cs, _, p2a) in &edges {
+                let ce = (c.0, sub(p2a, c.1), sub(p2a, c.2));
+                let rv = match (ce.1, ce.2) {
+                    (Op::V(x, _), _) => x,
+                    (_, Op::V(y, _)) => y,
+                    _ => continue 'cand,
+                };
+                let mut fs: Vec<&Cmp> = facts_at(domtree, fact, *src);
+                fs.extend(cs.iter());
+                if decide_d(func, &fs, ce, (rv, rv), srcs, 0) != Some(true) {
+                    continue 'cand;
+                }
+            }
+            out.entry(h).or_default().push(c);
+        }
+        if crate::env_set("PLIRON_INDUCT_DEBUG") {
+            eprintln!("induct {h}: facts={:?}", out.get(&h));
+        }
+    }
+    out
 }
 
 /// What a true fact `f` says about a query `q` on the same two operands.
@@ -1663,10 +1809,13 @@ pub fn run(func: &mut Function) -> usize {
     }
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
-    let fact = edge_facts(func, &cfg, &domtree);
+    let mut fact = edge_facts(func, &cfg, &domtree);
     let mut folds: Vec<(Inst, bool)> = Vec::new();
+    let srcs = crate::proots::alias_map(func);
+    for (h, fs) in induction_facts(func, &cfg, &domtree, &fact, &srcs) {
+        fact.entry(h).or_default().extend(fs);
+    }
     if !fact.is_empty() {
-        let srcs = crate::proots::alias_map(func);
         for b in func.layout.blocks() {
             let fs = facts_at(&domtree, &fact, b);
             if fs.is_empty() {
@@ -1707,4 +1856,71 @@ pub fn run(func: &mut Function) -> usize {
         crate::jumpthread::fold_const_branches(func);
     }
     folds.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{
+        AbiParam, Function, InstBuilder, Signature, UserFuncName, types,
+    };
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::isa::CallConv;
+
+    /// A swap loop's mirror guard `isub(n-1), i < n` can't be decided by
+    /// any dominating edge — the only proofs are the loop's own `i+1 < n`
+    /// latch test and the entry's `i0 < n`. Lifting them into the
+    /// inductive header fact `i < n` folds the guard.
+    #[test]
+    fn induction_folds_mirror_bounds_check() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let panic = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for b in [entry, h, body, panic, exit] {
+            func.layout.append_block(b);
+        }
+        let n = func.dfg.append_block_param(entry, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let mone = cur.ins().iconst(types::I64, -1);
+        let nm1 = cur.ins().iadd(n, mone);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, zero, n);
+        cur.ins().brif(c, h, &[zero.into()], exit, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let m = cur.ins().isub(nm1, i);
+        let chk = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, m, n);
+        cur.ins().brif(chk, panic, &[], body, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let one = cur.ins().iconst(types::I64, 1);
+        let i2 = cur.ins().iadd(i, one);
+        let c2 = cur.ins().icmp(IntCC::UnsignedLessThan, i2, n);
+        cur.ins().brif(c2, h, &[i2.into()], exit, &[]);
+
+        FuncCursor::new(&mut func).at_bottom(panic).ins().return_(&[]);
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[]);
+
+        assert!(run(&mut func) >= 1);
+        // The folded guard leaves an unconditional edge into `body`.
+        let t = func.layout.last_inst(h).unwrap();
+        assert!(
+            matches!(func.dfg.insts[t], InstructionData::Jump { .. }),
+            "guard not folded: {}",
+            func.display()
+        );
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("celim produced invalid IR: {e}\n{}", func.display());
+        }
+    }
 }
