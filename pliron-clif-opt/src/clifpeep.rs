@@ -2371,6 +2371,186 @@ fn sameargs_round(func: &mut Function) -> usize {
     apply_param_drops(func, pmap, arg_drops, param_drops)
 }
 
+/// Structural key of a pure arg inst: two insts on different edges
+/// compute the same value iff opcode, resolved operands and the extra
+/// field (icmp's cond, iadd_imm's imm) all match.
+fn arg_shape(func: &Function, di: Inst) -> Option<(Opcode, Vec<Value>, u64)> {
+    let rv = |v: &Value| func.dfg.resolve_aliases(*v);
+    Some(match func.dfg.insts[di] {
+        InstructionData::Binary { opcode, args } => (opcode, args.iter().map(rv).collect(), 0),
+        InstructionData::Unary { opcode, arg } => (opcode, vec![rv(&arg)], 0),
+        InstructionData::IntCompare { opcode, args, cond } => {
+            (opcode, args.iter().map(rv).collect(), cond as u64)
+        }
+        InstructionData::Ternary { opcode, args }
+            if opcode == Opcode::Select =>
+        {
+            (opcode, args.iter().map(rv).collect(), 0)
+        }
+        _ => return None,
+    })
+}
+
+/// `v` usable at the top of `b`: defined in a block strictly dominating
+/// `b`. Excluding `b` itself also excludes self-edge operands bound by
+/// `b`'s params — `iadd p1, x` as a self-edge arg is next-iteration's
+/// value, not the value on entry, so it must not hoist.
+fn dominates_entry(
+    func: &Function,
+    dom: &cranelift_codegen::dominator_tree::DominatorTree,
+    v: Value,
+    b: Block,
+) -> bool {
+    let db = match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(pb, _) => Some(pb),
+        ValueDef::Union(_, _) => None,
+    };
+    matches!(db, Some(db) if db != b && dom.block_dominates(db, b))
+}
+
+/// When every edge supplies `op(x, y)` for a param slot — jumpthread
+/// copies `iadd ptr, off` into each pred of a forwarding block — the
+/// param can be the op itself, computed once at the top of the target:
+/// the per-edge materialization and its regalloc copies disappear
+/// entirely (the `iadd v4215, v4300` cloned into seven tokenize preds).
+/// Dead arg insts left in preds get swept by `remove_dead_insts`.
+pub fn arghoist(func: &mut Function) -> usize {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                edges
+                    .entry(bc.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push((i, d));
+            }
+        }
+    }
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut param_drops: Vec<Value> = vec![];
+    let mut inserts: Vec<(Block, Inst)> = vec![];
+    // Drop indices per edge — all of a block call's drops must apply
+    // together, descending: `bc.remove(1)` renumbers index 3 to 2, so
+    // per-param entries would chase slots that already moved.
+    let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
+    for (&b, es) in &edges {
+        let ps = func.dfg.block_params(b).to_vec();
+        if ps.is_empty() {
+            continue;
+        }
+        let arity_ok = es.iter().all(|&(i, d)| {
+            func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                .args(&func.dfg.value_lists)
+                .len()
+                == ps.len()
+        });
+        if !arity_ok {
+            continue;
+        }
+        for (ix, &p) in ps.iter().enumerate() {
+            if pmap.contains_key(&p) {
+                continue;
+            }
+            let mut shape = None;
+            let mut ok = true;
+            for &(i, d) in es {
+                let a = func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                    .args(&func.dfg.value_lists)
+                    .nth(ix);
+                let Some(BlockArg::Value(v)) = a else {
+                    ok = false;
+                    break;
+                };
+                let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+                    ok = false;
+                    break;
+                };
+                let Some(s) = arg_shape(func, di) else {
+                    ok = false;
+                    break;
+                };
+                if !crate::jumpthread::pure_op(func, di) {
+                    ok = false;
+                    break;
+                }
+                match shape {
+                    None => shape = Some(s),
+                    Some(ref t) if *t != s => {
+                        ok = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some((_, ops, _)) = shape.filter(|_| ok) else {
+                continue;
+            };
+            if !ops
+                .iter()
+                .all(|&o| dominates_entry(func, &dom, o, b))
+            {
+                continue;
+            }
+            // Clone the first edge's arg inst into `b`'s head — its
+            // operands dominate, so placement is legal and identical on
+            // every entry.
+            let di = es
+                .iter()
+                .find_map(|&(i, d)| {
+                    match func.dfg.insts[i]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                        .args(&func.dfg.value_lists)
+                        .nth(ix)
+                    {
+                        Some(BlockArg::Value(v)) => {
+                            func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap();
+            let data = func.dfg.insts[di];
+            let ty = func.dfg.value_type(func.dfg.first_result(di));
+            let ni = func.dfg.make_inst(data);
+            func.dfg.make_inst_results(ni, ty);
+            inserts.push((b, ni));
+            pmap.insert(p, func.dfg.first_result(ni));
+            param_drops.push(p);
+            for &(i, d) in es {
+                drop_ixs.entry((i, d)).or_default().push(ix);
+            }
+        }
+    }
+    if param_drops.is_empty() {
+        return 0;
+    }
+    let arg_drops: Vec<(Inst, usize, Vec<usize>)> = drop_ixs
+        .into_iter()
+        .map(|((i, d), mut ixs)| {
+            ixs.sort_unstable_by(|a, b| b.cmp(a));
+            (i, d, ixs)
+        })
+        .collect();
+    for (b, ni) in inserts {
+        match func.layout.first_inst(b) {
+            Some(fi) => func.layout.insert_inst(ni, fi),
+            None => func.layout.append_inst(ni, b),
+        }
+    }
+    let n = param_drops.len();
+    apply_param_drops(func, pmap, arg_drops, param_drops);
+    n
+}
+
 /// Merge same-block param pairs that are equal by coinduction: the edge
 /// args agree outright on non-recursive edges and are congruent — same
 /// pure op applied to assumed-equal args — on recursive ones. This is the

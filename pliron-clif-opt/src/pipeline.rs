@@ -1329,6 +1329,13 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
     rangefold::run(&mut p.clctx.func)
 }
 
+// Same-shape edge args hoisted into the target block; the pred-side
+// arg insts they orphaned get swept.
+fn s_arghoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::arghoist(&mut p.clctx.func)
+        + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
+}
+
 fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::lcse(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -1929,6 +1936,10 @@ pub static DEFAULT: &[Step] = &[
         Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
         s_sameargs,
     ),
+    // Same-shape edge args (`iadd v4215,v4300` cloned into seven
+    // tokenize preds) hoisted into the target — deletes the param
+    // slot and its regalloc edge copies outright.
+    step("arghoist", "arghoist", Gate::Env("PLIRON_ARGHOIST"), s_arghoist),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
