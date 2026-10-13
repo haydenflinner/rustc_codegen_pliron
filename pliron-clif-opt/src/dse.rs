@@ -42,7 +42,10 @@ const MAX_ITERS: usize = 32;
 ///   params (they are caller memory), but not `Root::S` stack slots,
 ///   which die with the frame.
 /// `locs`/`roots` are explicit per-location demands — the only way an
-/// isolated root accumulates demand.
+/// isolated root accumulates demand. `cov` tracks byte ranges a live store
+/// definitely rewrites later: it satisfies the blanket top demands on
+/// exactly those bytes, so a store chain `st A; st A` collapses even when
+/// the only pending demand is a return or barrier.
 #[derive(Clone, PartialEq, Eq, Default)]
 struct Demands {
     top_non_iso: bool,
@@ -51,9 +54,16 @@ struct Demands {
     /// Whole-root demands for when `locs` overflows: conservative, never
     /// cleared (a store covers one range, not a whole root).
     roots: FxHashSet<Root>,
+    /// Bytes a live store provably rewrites before any still-pending read.
+    /// Satisfies top demands per-range; `roots` demands stay unsatisfiable
+    /// (the lost precision means the read may predate the covering store).
+    cov: FxHashSet<DLoc>,
 }
 
 impl Demands {
+    /// Union demand-side state. `cov` is handled separately at merge
+    /// points: it must hold on every incoming path, so merges intersect it
+    /// rather than union.
     fn union(&mut self, o: &Demands) {
         self.top_non_iso |= o.top_non_iso;
         self.top_non_stack |= o.top_non_stack;
@@ -67,23 +77,32 @@ impl Demands {
 
     /// Does some live read demand a byte of `[o, o+w)` on root `r`?
     fn read(&self, r: Root, o: i64, w: i64, iso: &FxHashSet<Root>) -> bool {
-        if self.roots.contains(&r)
-            || (self.top_non_iso && !iso.contains(&r))
-            || (self.top_non_stack && matches!(r, Root::V(_)))
+        if self.locs.iter().any(|&(r2, o2, w2)| match (r, r2) {
+            _ if r == r2 => o < o2 + w2 && o2 < o + w,
+            _ => !iso.contains(&r) && !iso.contains(&r2),
+        }) || self.roots.contains(&r)
         {
             return true;
         }
-        self.locs.iter().any(|&(r2, o2, w2)| match (r, r2) {
-            _ if r == r2 => o < o2 + w2 && o2 < o + w,
-            _ => !iso.contains(&r) && !iso.contains(&r2),
-        })
+        ((self.top_non_iso && !iso.contains(&r))
+            || (self.top_non_stack && matches!(r, Root::V(_))))
+            && !self.cov.iter().any(|&(r2, o2, w2)| {
+                r2 == r && o2 <= o && o + w <= o2 + w2
+            })
     }
 
     /// A write of `[o, o+w)` on `r` satisfies the demands it provably
-    /// covers: same root, demand range inside the store range.
+    /// covers: same root, demand range inside the store range. The store's
+    /// own range also joins `cov` so earlier stores under a blanket demand
+    /// can die.
     fn written(&mut self, r: Root, o: i64, w: i64) {
         self.locs
             .retain(|&(r2, o2, w2)| r2 != r || o2 < o || o2 + w2 > o + w);
+        self.cov
+            .retain(|&(r2, o2, w2)| r2 != r || o2 < o || o2 + w2 > o + w);
+        if self.cov.len() < MAX_LOCS {
+            self.cov.insert((r, o, w));
+        }
     }
 
     /// Add a read of `[o, o+w)` on `r`.
@@ -95,12 +114,21 @@ impl Demands {
         }
     }
 
+    /// A may-read barrier (call/atomic/other side effect): observes any
+    /// reachable memory, so coverage a later store provides is no help to
+    /// earlier non-isolated stores — the barrier's own reads see the
+    /// pre-store values. Isolated roots stay precisely tracked.
+    fn read_barrier(&mut self, iso: &FxHashSet<Root>) {
+        self.top_non_iso = true;
+        self.cov.retain(|&(r, _, _)| iso.contains(&r));
+    }
+
     /// An unknown writer (call that may write, atomic/fence/other side
     /// effects): reads everything reachable and may satisfy any
     /// non-isolated pending read. Isolated roots stay precisely tracked —
     /// barriers can't reach them.
     fn barrier(&mut self, iso: &FxHashSet<Root>) {
-        self.top_non_iso = true;
+        self.read_barrier(iso);
         self.locs.retain(|&(r, _, _)| iso.contains(&r));
         self.roots.retain(|r| iso.contains(r));
     }
@@ -203,7 +231,7 @@ fn transfer(
                     // Readonly calls still read anything reachable; writing
                     // calls also satisfy pending non-isolated reads.
                     if loadfwd::write_free(func, i, nw, eh) {
-                        d.top_non_iso = true;
+                        d.read_barrier(iso);
                     } else {
                         d.barrier(iso);
                     }
@@ -264,11 +292,25 @@ pub fn run(
                 }),
                 ..Demands::default()
             };
+            // Demands union over successors; coverage intersects — a byte
+            // counts covered only when every successor path rewrites it.
+            // A successor with no recorded state claims no coverage.
+            let mut cov: Option<FxHashSet<DLoc>> = None;
             for s in cfg.succ_iter(b) {
-                if let Some(i) = inn.get(&s) {
-                    d.union(i);
+                match inn.get(&s) {
+                    Some(i) => {
+                        match &mut cov {
+                            None => cov = Some(i.cov.clone()),
+                            Some(c) => c.retain(|l| i.cov.contains(l)),
+                        }
+                        d.union(i);
+                    }
+                    // Empty: intersecting stays empty however later
+                    // successors merge.
+                    None => cov = Some(FxHashSet::default()),
                 }
             }
+            d.cov = cov.unwrap_or_default();
             if out.get(&b) != Some(&d) {
                 out.insert(b, d.clone());
                 changed = true;
@@ -297,4 +339,80 @@ pub fn run(
         func.layout.remove_inst(*i);
     }
     dead.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+
+    /// One-entry-block function `fn(p: i64)`; `body` fills the block, then
+    /// it returns. Stores go through the param pointer so the return's
+    /// blanket caller-memory demand is the only read in play.
+    fn func_with(body: impl Fn(&mut cranelift_codegen::cursor::FuncCursor, Value)) -> Function {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        body(&mut cur, p);
+        cur.ins().return_(&[]);
+        func
+    }
+
+    fn dse(func: &mut Function) -> usize {
+        run(
+            func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        )
+    }
+
+    /// `st p; st p; ret`: the second store's coverage satisfies the
+    /// return demand on those bytes, so the first dies — previously the
+    /// blanket `top_non_stack` demand kept every store to caller memory
+    /// alive.
+    #[test]
+    fn store_chain_kills_earlier() {
+        let mut func = func_with(|cur, p| {
+            let one = cur.ins().iconst(types::I64, 1);
+            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+            let two = cur.ins().iconst(types::I64, 2);
+            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 0);
+        });
+        assert_eq!(dse(&mut func), 1);
+    }
+
+    /// `st p; ld p; st p; ret`: the load between the stores reads the
+    /// first store's bytes, so it stays live.
+    #[test]
+    fn load_between_stores_keeps_earlier() {
+        let mut func = func_with(|cur, p| {
+            let one = cur.ins().iconst(types::I64, 1);
+            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+            cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), p, 0);
+            let two = cur.ins().iconst(types::I64, 2);
+            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 0);
+        });
+        assert_eq!(dse(&mut func), 0);
+    }
+
+    /// `st p; st p+8; ret`: disjoint ranges don't cover each other — the
+    /// first store is still reachable by the return's demand.
+    #[test]
+    fn disjoint_store_survives() {
+        let mut func = func_with(|cur, p| {
+            let one = cur.ins().iconst(types::I64, 1);
+            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+            let two = cur.ins().iconst(types::I64, 2);
+            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 8);
+        });
+        assert_eq!(dse(&mut func), 0);
+    }
 }
