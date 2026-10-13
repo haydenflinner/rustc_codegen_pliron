@@ -1114,10 +1114,7 @@ fn run_loop(
     if loop_uses_vectors(func, &chain) {
         bail!("vector-typed loop");
     }
-    let n_insts: usize = chain
-        .iter()
-        .map(|&b| func.layout.block_insts(b).count() - 1)
-        .sum();
+    let n_insts = body_insts(func, &chain);
     let Some(k) = unroll_width(n_insts) else {
         bail!("body too big");
     };
@@ -1636,6 +1633,27 @@ fn loop_uses_vectors(func: &Function, blocks: &[Block]) -> bool {
     })
 }
 
+/// Non-terminator body size for unroll sizing. Calls dominate a body —
+/// a `call`+`ret` pair costs far more than the few loop-closing insts
+/// an unroll saves — so bodies containing a call size themselves out.
+fn body_insts(func: &Function, blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|&b| {
+            func.layout.block_insts(b).fold(0, |n, i| {
+                let op = func.dfg.insts[i].opcode();
+                n + if op.is_terminator() {
+                    0
+                } else if op.is_call() {
+                    MAX_BODY + 1
+                } else {
+                    1
+                }
+            })
+        })
+        .sum()
+}
+
 /// Copy count for a body of `n_insts` non-terminator instructions. 16 is
 /// the small-body cut for a full 8x unroll; it also covers the
 /// load+check+store RMW shape bcheck clones leave (`movz; addl (mem)`
@@ -2055,10 +2073,7 @@ fn run_region(
         bail!("body value used outside exit cones");
     }
 
-    let n_insts: usize = rpo
-        .iter()
-        .map(|&b| func.layout.block_insts(b).count() - 1)
-        .sum();
+    let n_insts = body_insts(func, &rpo);
     let Some(k) = unroll_width(n_insts) else {
         bail!("body too big");
     };
