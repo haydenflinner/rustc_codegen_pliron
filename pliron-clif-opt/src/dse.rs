@@ -280,9 +280,12 @@ pub fn run(
     let mut inn: FxHashMap<Block, Demands> = FxHashMap::default();
     let mut out: FxHashMap<Block, Demands> = FxHashMap::default();
     let mut stable = false;
+    // Backward flow: visit successors before predecessors (reverse DFS
+    // order) so demands propagate a whole chain per pass instead of one
+    // edge — preorder would need CFG-depth iterations to reach entry.
     for _ in 0..MAX_ITERS {
         let mut changed = false;
-        for &b in &order {
+        for &b in order.iter().rev() {
             let mut d = Demands {
                 top_non_stack: func.layout.last_inst(b).is_some_and(|t| {
                     matches!(
@@ -311,12 +314,27 @@ pub fn run(
                 }
             }
             d.cov = cov.unwrap_or_default();
+            // Widen demands upward and coverage downward so the flow
+            // can't oscillate: a covering store removes the read demand
+            // that justified it, which next round resurfaces the demand
+            // and revives the store — a two-state flip-flop that never
+            // stabilizes (hashmap's loop-carried `&key` slot). Unioning
+            // demands and intersecting coverage is a post-fixpoint, a
+            // conservative over-approximation of live reads.
+            if let Some(old) = out.get(&b) {
+                d.union(old);
+                d.cov.retain(|l| old.cov.contains(l));
+            }
             if out.get(&b) != Some(&d) {
                 out.insert(b, d.clone());
                 changed = true;
             }
             let mut din = d;
             transfer(func, ps, noalias, b, &mut din, &iso, nw, eh, None);
+            if let Some(old) = inn.get(&b) {
+                din.union(old);
+                din.cov.retain(|l| old.cov.contains(l));
+            }
             if inn.get(&b) != Some(&din) {
                 inn.insert(b, din);
                 changed = true;
@@ -328,6 +346,12 @@ pub fn run(
         }
     }
     if !stable {
+        if crate::env_set("PLIRON_DSE_DEBUG") {
+            eprintln!(
+                "dse: fixpoint unstable after {MAX_ITERS} iters, bailing ({:?})",
+                func.name
+            );
+        }
         return 0;
     }
     let mut dead = Vec::new();

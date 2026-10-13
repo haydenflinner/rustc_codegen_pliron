@@ -1518,6 +1518,14 @@ fn s_dse2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_dse3(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+    if k > 0 && p.dump {
+        p.dump("dse3");
+    }
+    k
+}
+
 // Lane-by-lane constant stores into a stack slot that whole-vector
 // loads read back (rustc's `Simd` const materialization, e.g.
 // hashbrown's `u8x8` special-byte checks in `reserve_rehash`) fold
@@ -2121,6 +2129,12 @@ pub static DEFAULT: &[Step] = &[
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
+    // Third DSE: the late edge/jtr cleanup can delete a slot's last
+    // readers after `dse2` ran (SipHash's `&key` tail-byte loads —
+    // hashmap's per-iteration `x` store dies only once the tail branch
+    // structure resolves) — the orphaned store would otherwise reach
+    // codegen as a stack write per loop iteration.
+    cstep("dse3", "dse3", Gate::Env("PLIRON_DSE3"), s_dse3).needs(shape::MEM),
     // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
     // shrink under MAX_INSTS after the late folds — clone them last so the
     // loop's hot tail lands on the fallthrough edge instead of a `jmp`
