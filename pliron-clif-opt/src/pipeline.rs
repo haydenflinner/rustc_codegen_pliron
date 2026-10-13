@@ -636,7 +636,7 @@ fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_clifpeep(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::run(&mut p.clctx.func);
+    let k = clifpeep::run(&mut p.clctx.func, p.x64);
     p.stats.peeped += k;
     k
 }

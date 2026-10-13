@@ -411,6 +411,22 @@ fn uses_of(func: &Function, v: Value) -> usize {
     c
 }
 
+/// `v` as `uextend b` where `b` is an i8 provably in {0,1} — returns `b`,
+/// usable as a `select` condition.
+fn uext01(func: &Function, v: Value) -> Option<Value> {
+    let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    if let InstructionData::Unary {
+        opcode: Opcode::Uextend,
+        arg,
+    } = func.dfg.insts[d]
+        && func.dfg.value_type(arg) == types::I8
+        && is01(func, arg, 4)
+    {
+        return Some(arg);
+    }
+    None
+}
+
 /// Whether `v` is always 0 or 1.
 fn is01(func: &Function, v: Value, depth: u32) -> bool {
     let v = func.dfg.resolve_aliases(v);
@@ -2805,7 +2821,7 @@ fn sel_regions(func: &mut Function) -> usize {
 }
 
 /// Returns the number of rewrites.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut n = 0;
     if crate::pass_enabled("PLIRON_DEFLAG") {
         n += deflag(func);
@@ -2940,6 +2956,39 @@ pub fn run(func: &mut Function) -> usize {
                     let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
                     let i = pos.ins().icmp(inv, l, r);
                     pos.func.replace(inst).uextend(ty, i);
+                    n += 1;
+                }
+                continue;
+            }
+            // `iadd x, uextend(bool)` / `isub x, uextend(bool)` →
+            // `select bool, x+1, x` / `select bool, x-1, x`: x64 pays
+            // `setb`+`movzbq` for the widened bool inside `add`, while
+            // `select(icmp)` lowers to `cmp`+`cmov` — one fewer inst and
+            // a shorter loop-carried recurrence (partition's
+            // `offset += is_less`). aarch64 already fuses
+            // `add x, w, uxtb`, so this stays x64-only.
+            if x64
+                && let InstructionData::Binary {
+                    opcode: op @ (Opcode::Iadd | Opcode::Isub),
+                    args,
+                } = pos.func.dfg.insts[inst]
+            {
+                let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                let cx = |v| uext01(pos.func, v);
+                let sel = if ty.is_int() && !ty.is_vector() && ty.bits() <= 64 {
+                    if let Some(c) = cx(args[1]) {
+                        Some((c, args[0], if op == Opcode::Iadd { 1 } else { -1 }))
+                    } else if op == Opcode::Iadd {
+                        cx(args[0]).map(|c| (c, args[1], 1))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((c, x, d)) = sel {
+                    let inc = pos.ins().iadd_imm_s(x, d);
+                    pos.func.replace(inst).select(c, inc, x);
                     n += 1;
                 }
                 continue;
@@ -4804,6 +4853,46 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("affparm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `x + uextend(icmp)` becomes `select icmp, x + 1, x` on x64 (the
+    /// `offset += is_less` idiom — `setb`+`movzbq`+`add` vs `lea`+`cmov`),
+    /// and stays an add elsewhere where `add x, w, uxtb` already fuses.
+    #[test]
+    fn bool_add_becomes_select_on_x64() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let a = func.dfg.append_block_param(entry, types::I64);
+        let b = func.dfg.append_block_param(entry, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, a, b);
+        let z = cur.ins().uextend(types::I64, c);
+        let s = cur.ins().iadd(a, z);
+        let d = cur.ins().isub(s, z);
+        cur.ins().return_(&[d]);
+
+        let sels = |f: &Function| {
+            f.layout
+                .blocks()
+                .flat_map(|b| f.layout.block_insts(b))
+                .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Select)
+                .count()
+        };
+        let mut f2 = func.clone();
+        assert_eq!(run(&mut func, true), 2);
+        assert_eq!(sels(&func), 2);
+        assert_eq!(run(&mut f2, false), 0);
+        assert_eq!(sels(&f2), 0);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("bool_add select produced invalid IR: {e}\n{}", func.display());
         }
     }
 }
