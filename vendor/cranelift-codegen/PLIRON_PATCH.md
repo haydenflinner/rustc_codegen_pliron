@@ -150,3 +150,13 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     CLIF inside `compile_stencil` after `optimize()` — the exact form
     `compile_function`/isel consumes, unlike the backend-side `PLIRON_CLIF`
     `final` dump which precedes `remove_constant_phis`/egraph.
+
+16. x64 loop-header 16-byte alignment (`src/machinst/vcode.rs`): blocks
+    targeted by back-edges in the final emission order get `gen_nop`
+    padding before their label binds, like LLVM's `.p2align 4` loop tops.
+    `PLIRON_ALIGN=0` disables. A companion fix lives in vendored
+    `cranelift-object` (`backend.rs`): `define_function_inner` maxes the
+    ISA's `function_alignment().preferred` (32 on x64) into symbol
+    alignment — the buffer minimum is usually 1, so without it functions
+    land at arbitrary offsets and buffer-relative 16-alignment means
+    nothing in the final image.

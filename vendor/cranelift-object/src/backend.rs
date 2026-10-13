@@ -656,7 +656,13 @@ impl ObjectModule {
         }
         *defined = true;
 
-        let align = alignment.max(self.isa.symbol_alignment());
+        // PLIRON: honor the ISA's preferred function alignment so that
+        // intra-function loop-header alignment is meaningful in the final
+        // object (the buffer's minimum is often 1, which scatters
+        // functions at arbitrary offsets).
+        let align = alignment
+            .max(self.isa.symbol_alignment())
+            .max(u64::from(self.isa.function_alignment().preferred));
         let section = if self.per_function_section {
             // FIXME pass empty symbol name once add_subsection produces `.text` as section name
             // instead of `.text.` when passed an empty symbol name. (object#748) Until then pass
