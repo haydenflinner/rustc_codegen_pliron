@@ -606,15 +606,19 @@ impl NonNull<'_> {
     /// `iadd`/`isub` offset's base is its single non-const operand.
     fn derived_base(&self, func: &Function, v: Value) -> Option<Value> {
         let &b = self.derived.get(&v)?;
+        // Bases are recorded at lowering and can alias later params —
+        // chase the chain to its canonical value; a tombstone (alias to
+        // the reserved slot) means the recorded base was deleted, so
+        // recover positionally below.
+        let mut b = b;
+        for _ in 0..16 {
+            match func.dfg.value_alias_dest_for_serialization(b) {
+                Some(d) if d != Value::reserved_value() => b = d,
+                _ => break,
+            }
+        }
         if func.dfg.value_is_real(b) {
             return Some(b);
-        }
-        // An alias to a live value still proves; a tombstone (alias to
-        // the reserved slot) means the recorded base was deleted.
-        if let Some(d) = func.dfg.value_alias_dest_for_serialization(b)
-            && d != Value::reserved_value()
-        {
-            return Some(d);
         }
         let i = func.dfg.value_def(v).inst()?;
         let InstructionData::Binary {
