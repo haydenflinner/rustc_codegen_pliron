@@ -431,11 +431,16 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         let inputs = self.lower_ctx.get_value_as_source_or_const(val);
 
         if let Some(c) = inputs.constant {
-            // A load from the constant pool is better than a
-            // rematerialization into a register, because it reduces
-            // register pressure.
-            let vcode_constant = self.emit_u64_le_const(c);
-            return RegMem::mem(SyntheticAmode::ConstantOffset(vcode_constant));
+            if c != 0 {
+                // A load from the constant pool is better than a
+                // rematerialization into a register, because it reduces
+                // register pressure.
+                let vcode_constant = self.emit_u64_le_const(c);
+                return RegMem::mem(SyntheticAmode::ConstantOffset(vcode_constant));
+            }
+            // Zero materializes as `xorl` — cheaper than a constant-pool
+            // load in hot loops (e.g. cmov of an Option niche sentinel).
+            return RegMem::reg(self.put_in_reg(val));
         }
 
         if let Some(load) = self.sinkable_load(val) {

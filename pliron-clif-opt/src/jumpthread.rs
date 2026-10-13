@@ -396,7 +396,9 @@ impl<'a> NonNull<'a> {
                 continue;
             }
             for _ in 0..8 {
-                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v) {
+                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v)
+                    || non_zero_const(func, v)
+                {
                     continue 'terms;
                 }
                 if let Some(i) = func.dfg.value_def(v).inst()
@@ -425,6 +427,23 @@ impl<'a> NonNull<'a> {
         }
         true
     }
+}
+
+/// `iconst` that stays non-zero after masking to its type width — the
+/// `NonNull::dangling()` (=1) a `Vec::new`/`str::new` iterator merges
+/// with the real data pointer.
+fn non_zero_const(func: &Function, v: Value) -> bool {
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = func.dfg.insts[i]
+    else {
+        return false;
+    };
+    mask(imm.bits() as u64, bits(func, v).unwrap_or(64)) != 0
 }
 
 /// Addresses of symbols, thread-locals and stack slots are never null.
