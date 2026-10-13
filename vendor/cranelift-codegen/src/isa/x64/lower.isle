@@ -102,6 +102,51 @@
 (rule -3 (lower (iadd (fits_in_64 ty) (sinkable_load x) y))
       (x64_add ty y x))
 
+;; pliron: `x + uextend(icmp uCC a, b)` — `cmp` leaves the unsigned
+;; compare bit in CF, so a flag-chained `adc`/`sbb` folds the
+;; setb+movzbl+add sequence into one instruction (e.g. ipnsort's
+;; `off += is_less`). `x64_cmp` is used rather than `emit_cmp` because
+;; the compare-with-zero rewrites emit `test`, which leaves CF
+;; undefined. `$I64` only: `x64_adc_raw` has no narrower form.
+;;
+;; `ult`/`ugt` are CF directly (`ugt a, b` is `cmp b, a`); `ule`/`uge`
+;; invert it: `x + (a <=u b)` = x+1-CF(b<a) via `sbb x, -1`, etc.
+;;
+;; `asm_consumes_flags_returns_gpr` rather than `x64_{adc,sbb}_paired`:
+;; those yield `ConsumesFlagsReturnsResultWithProducer`, which
+;; `with_flags` only pairs with a *result-returning* producer.
+(decl adc_of_cmp (Type Value Value Value u32) Reg)
+(rule (adc_of_cmp ty l r x k)
+      (with_flags_reg (x64_cmp ty l r)
+                      (asm_consumes_flags_returns_gpr
+                        (x64_adc_raw $I64 x (RegMemImm.Imm k)))))
+(decl sbb_of_cmp (Type Value Value Value u32) Reg)
+(rule (sbb_of_cmp ty l r x k)
+      (with_flags_reg (x64_cmp ty l r)
+                      (asm_consumes_flags_returns_gpr
+                        (x64_sbb_raw $I64 x (RegMemImm.Imm k)))))
+
+(decl iadd_uext_ucmp (Type IntCC Value Value Value Value) Reg)
+(rule 1 (iadd_uext_ucmp ty (IntCC.UnsignedLessThan) a b x _)
+      (adc_of_cmp ty a b x 0))
+(rule 1 (iadd_uext_ucmp ty (IntCC.UnsignedGreaterThan) a b x _)
+      (adc_of_cmp ty b a x 0))
+(rule 1 (iadd_uext_ucmp ty (IntCC.UnsignedLessThanOrEqual) a b x _)
+      (sbb_of_cmp ty b a x 0xffffffff))
+(rule 1 (iadd_uext_ucmp ty (IntCC.UnsignedGreaterThanOrEqual) a b x _)
+      (sbb_of_cmp ty a b x 0xffffffff))
+;; Other condition codes can't ride CF; lower as `x + movzbl(setcc)` —
+;; `y` is the `uextend` result, which lowers via the `icmp` as usual.
+(rule 0 (iadd_uext_ucmp _ _ _ _ x y)
+      (x64_add $I64 x y))
+
+(rule 2 (lower (iadd $I64 x y @ (uextend _ (icmp $I8 cc
+                                             a @ (value_type (fits_in_64 cty)) b))))
+      (iadd_uext_ucmp cty cc a b x y))
+(rule 3 (lower (iadd $I64 y @ (uextend _ (icmp $I8 cc
+                                             a @ (value_type (fits_in_64 cty)) b)) x))
+      (iadd_uext_ucmp cty cc a b x y))
+
 ;; SSE.
 
 (rule (lower (iadd (multi_lane 8 16) x y))
@@ -265,6 +310,26 @@
 ;; Sub two registers.
 (rule -3 (lower (isub (fits_in_64 ty) x y))
       (x64_sub ty x y))
+
+;; pliron: `x - uextend(icmp uCC a, b)` — the CF-chain mirror of the
+;; `iadd` rules above (see that comment); `x - (a <=u b)` = x-1+CF(b<a)
+;; via `adc x, -1`.
+(decl isub_uext_ucmp (Type IntCC Value Value Value Value) Reg)
+(rule 1 (isub_uext_ucmp ty (IntCC.UnsignedLessThan) a b x _)
+      (sbb_of_cmp ty a b x 0))
+(rule 1 (isub_uext_ucmp ty (IntCC.UnsignedGreaterThan) a b x _)
+      (sbb_of_cmp ty b a x 0))
+(rule 1 (isub_uext_ucmp ty (IntCC.UnsignedLessThanOrEqual) a b x _)
+      (adc_of_cmp ty b a x 0xffffffff))
+(rule 1 (isub_uext_ucmp ty (IntCC.UnsignedGreaterThanOrEqual) a b x _)
+      (adc_of_cmp ty a b x 0xffffffff))
+;; See the `iadd` fallback — `x - movzbl(setcc)` via the `uextend` result.
+(rule 0 (isub_uext_ucmp _ _ _ _ x y)
+      (x64_sub $I64 x y))
+
+(rule 2 (lower (isub $I64 x y @ (uextend _ (icmp $I8 cc
+                                             a @ (value_type (fits_in_64 cty)) b))))
+      (isub_uext_ucmp cty cc a b x y))
 
 ;; SSE.
 

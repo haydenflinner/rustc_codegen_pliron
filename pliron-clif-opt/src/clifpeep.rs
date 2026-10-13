@@ -427,6 +427,26 @@ fn uext01(func: &Function, v: Value) -> Option<Value> {
     None
 }
 
+/// `v` is a scalar `icmp` boolean with an unsigned condition — on x64
+/// these fuse into the `cmp`'s CF for `adc`/`sbb` consumers.
+fn ucmp_bool(func: &Function, v: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    matches!(
+        func.dfg.insts[i],
+        InstructionData::IntCompare { cond, .. }
+            if matches!(
+                cond,
+                IntCC::UnsignedLessThan
+                    | IntCC::UnsignedGreaterThan
+                    | IntCC::UnsignedLessThanOrEqual
+                    | IntCC::UnsignedGreaterThanOrEqual
+            )
+    )
+}
+
 /// Whether `v` is always 0 or 1.
 fn is01(func: &Function, v: Value, depth: u32) -> bool {
     let v = func.dfg.resolve_aliases(v);
@@ -2986,6 +3006,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 } else {
                     None
                 };
+                // i64 unsigned-`icmp` bools instead fold into
+                // `cmp`+`adc`/`sbb` off CF at isel — rewriting to a
+                // select would hide that pattern.
+                let sel = sel
+                    .filter(|(c, ..)| ty != types::I64 || !ucmp_bool(pos.func, *c));
                 if let Some((c, x, d)) = sel {
                     let inc = pos.ins().iadd_imm_s(x, d);
                     pos.func.replace(inst).select(c, inc, x);
@@ -4872,11 +4897,16 @@ mod tests {
         let b = func.dfg.append_block_param(entry, types::I64);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
-        let c = cur.ins().icmp(IntCC::UnsignedLessThan, a, b);
+        let c = cur.ins().icmp(IntCC::SignedLessThan, a, b);
         let z = cur.ins().uextend(types::I64, c);
         let s = cur.ins().iadd(a, z);
         let d = cur.ins().isub(s, z);
-        cur.ins().return_(&[d]);
+        // unsigned bools stay as `iadd x, uextend(icmp)` on x64 — isel
+        // fuses them into `cmp`+`adc`/`sbb` off CF.
+        let cu = cur.ins().icmp(IntCC::UnsignedLessThan, a, b);
+        let zu = cur.ins().uextend(types::I64, cu);
+        let e = cur.ins().iadd(d, zu);
+        cur.ins().return_(&[e]);
 
         let sels = |f: &Function| {
             f.layout
