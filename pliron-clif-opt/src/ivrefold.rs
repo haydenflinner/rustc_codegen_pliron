@@ -354,30 +354,40 @@ fn refold_header(
     }
     // Refolding `p` replaces its carried uses with `bp + iv*r`, where
     // `bp = p0 - r*i0` folds back onto the non-arithmetic base `p0` is
-    // built on. When that base is live-out of the loop yet unused inside
+    // built on. When that base is live through the loop yet unused inside
     // it, the refold recreates a cross-region liverange spanning the
     // loop — the split regalloc reconciles with per-iteration copies.
     // Keeping the carried param costs one `iadd` on the back edge but
-    // leaves the loop free of the shared base entirely.
+    // leaves the loop free of the shared base entirely. Uses confined to
+    // blocks dominating `h` die at loop entry — the base is not live
+    // through the loop, so `bp` just trades places with the param.
     if !drops.is_empty() {
         let body = loop_body(func, edges, h, &backs);
         let mut in_use = FxHashSet::default();
-        let mut out_use = FxHashSet::default();
+        let mut out_live = FxHashSet::default();
         for b in func.layout.blocks() {
-            let dst = if body.contains(&b) {
-                &mut in_use
+            let body_b = body.contains(&b);
+            let dom_h = domtree.dominates(b, h, &func.layout);
+            if body_b || dom_h {
+                for i in func.layout.block_insts(b) {
+                    for v in func.dfg.inst_values(i) {
+                        let v = func.dfg.resolve_aliases(v);
+                        if body_b {
+                            in_use.insert(v);
+                        }
+                    }
+                }
             } else {
-                &mut out_use
-            };
-            for i in func.layout.block_insts(b) {
-                for v in func.dfg.inst_values(i) {
-                    dst.insert(func.dfg.resolve_aliases(v));
+                for i in func.layout.block_insts(b) {
+                    for v in func.dfg.inst_values(i) {
+                        out_live.insert(func.dfg.resolve_aliases(v));
+                    }
                 }
             }
         }
         drops.retain(|&(ix, _)| {
             let leaf = base_leaf(func, entry_args[ix]);
-            iconst(func, leaf).is_some() || in_use.contains(&leaf) || !out_use.contains(&leaf)
+            iconst(func, leaf).is_some() || in_use.contains(&leaf) || !out_live.contains(&leaf)
         });
     }
     if drops.is_empty() && idents.is_empty() {
@@ -730,21 +740,35 @@ fn refold_header(
                     }
                 }
             };
+            // The anchor's own back-edge arg is `pa + astep` — reuse it
+            // when its def reaches the test instead of emitting a fresh
+            // `iconst`+`iadd` (duplicate step adds confuse isel into
+            // separate increment/copy pairs).
+            let a_step = func.dfg.resolve_aliases(back_args[j][ai]);
+            let step_reaches = |pos: Inst| -> bool {
+                match func.dfg.value_def(a_step) {
+                    ValueDef::Result(si, _) => domtree.dominates(si, pos, &func.layout),
+                    _ => false,
+                }
+            };
             if let Some(cinst) = cinst {
-                let mut pos = FuncCursor::new(func).at_inst(cinst);
-                let kc = pos.ins().iconst(aty, astep);
-                let a_a = pos.ins().iadd(pa, kc);
+                let a_a = if step_reaches(cinst) {
+                    a_step
+                } else {
+                    let mut pos = FuncCursor::new(func).at_inst(cinst);
+                    let kc = pos.ins().iconst(aty, astep);
+                    pos.ins().iadd(pa, kc)
+                };
                 if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[cinst] {
                     *args = [a_a, bound];
                 }
             } else {
                 // `brif a_c` → `brif (icmp ne a_a, bound)` — `h` is the
                 // then-arm, so the loop continues while the anchor's step
-                // value differs from the bound.
+                // value differs from the bound. `a_step` is an arg of `bi`
+                // itself, so its def always dominates the brif.
                 let mut pos = FuncCursor::new(func).at_inst(bi);
-                let kc = pos.ins().iconst(aty, astep);
-                let a_a = pos.ins().iadd(pa, kc);
-                let cmp = pos.ins().icmp(IntCC::NotEqual, a_a, bound);
+                let cmp = pos.ins().icmp(IntCC::NotEqual, a_step, bound);
                 if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[bi] {
                     *arg = cmp;
                 }
