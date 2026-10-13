@@ -894,7 +894,16 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Loop-carried load reuse: sibling to indvars since it grows
 // stepped header params the same machinery produces.
 fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
-    indvars::rotld(&mut p.clctx.func, an)
+    let k = indvars::rotld(&mut p.clctx.func, an);
+    // Rotation drops the carried load's address chain; its leftover
+    // `base + (iv-1)*s` computation is then dead, and a second indvars
+    // round can step the remaining address into a param and evict the
+    // shared base from the loop.
+    if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
+        an.invalidate();
+        indvars::run(&mut p.clctx.func, an, amode_scale(p.isa));
+    }
+    k
 }
 
 fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {

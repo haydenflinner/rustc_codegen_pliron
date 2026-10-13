@@ -309,6 +309,59 @@ fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bo
     }
 }
 
+/// Would replacing `insts`' uses of `base` leave `base` with no use inside
+/// the loop, while it stays live outside it? Then converting `base + iv*K`
+/// to a stepped pointer param evicts `base` from the loop even though the
+/// reg+reg*scale amode folds the address for free: it shrinks `base`'s
+/// liverange so it no longer spans the whole loop, which both frees a
+/// register inside and avoids the per-iteration copies regalloc emits when
+/// reconciling such a range's in-loop/out-of-loop assignments.
+fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: Value) -> bool {
+    let instset: FxHashSet<Inst> = insts.iter().copied().collect();
+    // Anything appearing as an operand (inst args or branch args). A result
+    // outside this set is dead: its def can't keep `base` live past the
+    // next dead-inst sweep, so it doesn't block eviction.
+    let used: FxHashSet<Value> = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .flat_map(|i| func.dfg.inst_values(i))
+        .map(|v| func.dfg.resolve_aliases(v))
+        .collect();
+    let base = func.dfg.resolve_aliases(base);
+    let mut outside = false;
+    for b in func.layout.blocks() {
+        let in_body = body.contains(&b);
+        for i in func.layout.block_insts(b) {
+            if instset.contains(&i)
+                || !func
+                    .dfg
+                    .inst_values(i)
+                    .any(|v| func.dfg.resolve_aliases(v) == base)
+            {
+                continue;
+            }
+            let op = func.dfg.insts[i].opcode();
+            let dead = func.dfg.inst_results(i).iter().all(|&r| !used.contains(&r))
+                && !(op.can_load()
+                    || op.can_store()
+                    || op.can_trap()
+                    || op.is_call()
+                    || op.is_branch()
+                    || op.is_terminator()
+                    || op.other_side_effects());
+            if dead {
+                continue;
+            }
+            if in_body {
+                return false;
+            }
+            outside = true;
+        }
+    }
+    outside
+}
+
 fn run_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -389,10 +442,14 @@ fn run_loop(
             // bound check and paid `lea`+`addq` per element on the
             // redundant pointer param). Only where the target folds
             // scaled addressing — wasm/riscv compute addresses
-            // explicitly and genuinely want the stepped pointer.
+            // explicitly and genuinely want the stepped pointer. Except
+            // when the conversion evicts `base` from the loop: a live-out
+            // invariant no longer spans the loop, so the pointer param
+            // buys back the register and the liverange-split copies.
             if amode_scale
                 && matches!(mul, Mul::K(1 | 2 | 4 | 8))
                 && mem_addr_only(func, &body, insts)
+                && !base.is_some_and(|b| evicts_base(func, &body, insts, b))
             {
                 continue;
             }

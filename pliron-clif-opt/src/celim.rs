@@ -1104,6 +1104,33 @@ fn ucmp(cc: IntCC, lo: u64, hi: u64, k: u64, swapped: bool) -> Option<bool> {
     }
 }
 
+/// Decide `v cc t` for `v` in `[l, h]` with `t` an exact integer — the
+/// shifted-constant form `v + d cc k` becomes (`k - d` may sit outside
+/// the type's domain; the boundary positions decide without a range).
+fn rng_decide(cc: IntCC, l: i128, h: i128, t: i128) -> Option<bool> {
+    let dec = |t_: bool, f: bool| {
+        if t_ {
+            Some(true)
+        } else if f {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    match cc {
+        IntCC::UnsignedLessThan | IntCC::SignedLessThan => dec(h < t, l >= t),
+        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => {
+            dec(h <= t, l > t)
+        }
+        IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => dec(l > t, h <= t),
+        IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedGreaterThanOrEqual => {
+            dec(l >= t, h < t)
+        }
+        IntCC::Equal => dec(l == h && l == t, t < l || t > h),
+        IntCC::NotEqual => dec(t < l || t > h, l == h && l == t),
+    }
+}
+
 /// Decide `x cc k` (`k cc x` when `swapped`) from a signed `[lo, hi]`.
 fn scmp(cc: IntCC, lo: i64, hi: i64, k: i64, swapped: bool) -> Option<bool> {
     let cc = if swapped { cc.swap_args() } else { cc };
@@ -1662,34 +1689,93 @@ fn decide_d(
                 IntCC::UnsignedLessThanOrEqual => a <= b,
             })
         }
-        (Op::V(_, _), Op::K(k)) | (Op::K(k), Op::V(_, _)) => {
-            let (rv, swapped) = if matches!(q.1, Op::V(_, _)) {
-                (func.dfg.resolve_aliases(raw.0), false)
-            } else {
-                (func.dfg.resolve_aliases(raw.1), true)
-            };
-            if let Some((l, h)) = urange(func, fs, rv, 0) {
-                // A signed cc on a low-half range behaves as unsigned.
-                let half = 1u64 << (w - 1);
-                let cc = if h < half && k < half {
-                    match q.0 {
-                        IntCC::SignedLessThan => IntCC::UnsignedLessThan,
-                        IntCC::SignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
-                        IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
-                        IntCC::SignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
-                        c => c,
+        (Op::V(v, d), Op::K(k)) | (Op::K(k), Op::V(v, d)) => {
+            let swapped = matches!(q.1, Op::K(_));
+            let cc = if swapped { q.0.swap_args() } else { q.0 };
+            if d == 0 {
+                let rv = func
+                    .dfg
+                    .resolve_aliases(if swapped { raw.1 } else { raw.0 });
+                if let Some((l, h)) = urange(func, fs, rv, 0) {
+                    // A signed cc on a low-half range behaves as unsigned.
+                    let half = 1u64 << (w - 1);
+                    let cc = if h < half && k < half {
+                        match cc {
+                            IntCC::SignedLessThan => IntCC::UnsignedLessThan,
+                            IntCC::SignedLessThanOrEqual => {
+                                IntCC::UnsignedLessThanOrEqual
+                            }
+                            IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
+                            IntCC::SignedGreaterThanOrEqual => {
+                                IntCC::UnsignedGreaterThanOrEqual
+                            }
+                            c => c,
+                        }
+                    } else {
+                        cc
+                    };
+                    if let Some(r) = ucmp(cc, l, h, k, false) {
+                        return Some(r);
                     }
-                } else {
-                    q.0
-                };
-                if let Some(r) = ucmp(cc, l, h, k, swapped) {
+                }
+                if let Some((l, h)) = srange(func, fs, rv, 0)
+                    && let Some(r) = scmp(cc, l, h, sext(k, w), false)
+                {
                     return Some(r);
                 }
+                return None;
             }
-            if let Some((l, h)) = srange(func, fs, rv, 0)
-                && let Some(r) = scmp(q.0, l, h, sext(k, w), swapped)
-            {
-                return Some(r);
+            // `v + d cc k`, restated `v cc k - d` and decided on `v`'s
+            // own range. `raw` isn't consulted: a caller may pair a
+            // peeled operand with a `raw` naming `v`, not `v + d` (the
+            // induction pass's synthesized queries have no operand
+            // value at all) — ranging `v` there would decide `v cc k`,
+            // not the asked `v + d cc k`. Eq/ne restate exactly mod
+            // 2^w; ordered ccs need `v + d` provably nowrap so the
+            // integer compare is exact. `k - d` may leave the type's
+            // domain — `rng_decide` resolves those boundary positions
+            // outright.
+            let full = mask(u64::MAX, w) as i128;
+            if matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+                let k2 = mask((k as i128 - d as i128) as u64, w);
+                if let Some((l, h)) = urange(func, fs, v, 0)
+                    && let Some(r) = rng_decide(cc, l as i128, h as i128, k2 as i128)
+                {
+                    return Some(r);
+                }
+                if let Some((l, h)) = srange(func, fs, v, 0)
+                    && let Some(r) =
+                        rng_decide(cc, l as i128, h as i128, sext(k2, w) as i128)
+                {
+                    return Some(r);
+                }
+                return None;
+            }
+            if ucc(cc) {
+                let (l, h) = urange(func, fs, v, 0).unwrap_or((0, full as u64));
+                let nw = if d > 0 {
+                    h as i128 + d as i128 <= full
+                } else {
+                    l as i128 >= -(d as i128)
+                };
+                return nw.then(|| rng_decide(cc, l as i128, h as i128, k as i128 - d as i128))?;
+            }
+            if scc(cc) {
+                let (smin, smax) = if w >= 64 {
+                    (i64::MIN as i128, i64::MAX as i128)
+                } else {
+                    (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
+                };
+                let (l, h) =
+                    srange(func, fs, v, 0).unwrap_or((smin as i64, smax as i64));
+                let nw = if d > 0 {
+                    h as i128 + d as i128 <= smax
+                } else {
+                    l as i128 - (-(d as i128)) >= smin
+                };
+                return nw.then(|| {
+                    rng_decide(cc, l as i128, h as i128, sext(k, w) as i128 - d as i128)
+                })?;
             }
             None
         }
@@ -1922,5 +2008,45 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("celim produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// A countdown loop `c != 0` / `c := c - 1` must not induct `c != 0`:
+    /// the backedge asks whether `c - 1 != 0`, which the latch's `c != 0`
+    /// does not prove (`c = 1` exits). Folding the latch away makes the
+    /// loop unconditional — an infinite store loop. Regression for a
+    /// `decide` raw/operand mismatch that ranged `c`, not `c - 1`.
+    #[test]
+    fn induction_rejects_countdown_exit() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for b in [entry, h, exit] {
+            func.layout.append_block(b);
+        }
+        let c = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let ten = cur.ins().iconst(types::I64, 10);
+        cur.ins().jump(h, &[ten.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let mone = cur.ins().iconst(types::I64, -1);
+        let next = cur.ins().iadd(c, mone);
+        let cond = cur.ins().icmp(IntCC::NotEqual, c, zero);
+        cur.ins().brif(cond, h, &[next.into()], exit, &[]);
+
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[]);
+
+        run(&mut func);
+        let t = func.layout.last_inst(h).unwrap();
+        assert!(
+            matches!(func.dfg.insts[t], InstructionData::Brif { .. }),
+            "countdown exit folded to unconditional loop: {}",
+            func.display()
+        );
     }
 }

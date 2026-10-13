@@ -111,6 +111,64 @@ fn edge_args(func: &Function, i: Inst, d: usize, n: usize) -> Option<Vec<Value>>
     (v.len() == n).then_some(v)
 }
 
+/// The non-arithmetic base `v` is built on: resolve `x + k` / `x - k`
+/// layers to the value they extend.
+fn base_leaf(func: &Function, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+            return v;
+        };
+        let (a, b) = match func.dfg.insts[i] {
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args: [a, b],
+            } => (a, b),
+            InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args: [a, b],
+            } if iconst(func, b).is_some() => (a, b),
+            _ => return v,
+        };
+        if iconst(func, b).is_some() {
+            v = func.dfg.resolve_aliases(a);
+        } else if iconst(func, a).is_some() {
+            v = func.dfg.resolve_aliases(b);
+        } else {
+            return v;
+        }
+    }
+    v
+}
+
+/// `h`'s natural loop body: `h` plus every block that can reach a
+/// back-edge source without passing through `h`.
+fn loop_body(
+    func: &Function,
+    edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
+    h: Block,
+    backs: &[(Inst, usize)],
+) -> FxHashSet<Block> {
+    let mut body: FxHashSet<Block> = [h].into_iter().collect();
+    let mut wl: Vec<Block> = backs
+        .iter()
+        .filter_map(|&(i, _)| func.layout.inst_block(i))
+        .collect();
+    while let Some(b) = wl.pop() {
+        if !body.insert(b) {
+            continue;
+        }
+        for &(pi, _) in edges.get(&b).into_iter().flatten() {
+            if let Some(p) = func.layout.inst_block(pi)
+                && !body.contains(&p)
+            {
+                wl.push(p);
+            }
+        }
+    }
+    body
+}
+
 /// `x * r` at cursor `pos`: `ishl` for positive powers of two so the
 /// result folds straight into a base+index*scale amode.
 fn emit_scaled(pos: &mut FuncCursor, x: Value, r: i64) -> Value {
@@ -293,6 +351,34 @@ fn refold_header(
             continue;
         }
         drops.push((ix, s / astep));
+    }
+    // Refolding `p` replaces its carried uses with `bp + iv*r`, where
+    // `bp = p0 - r*i0` folds back onto the non-arithmetic base `p0` is
+    // built on. When that base is live-out of the loop yet unused inside
+    // it, the refold recreates a cross-region liverange spanning the
+    // loop — the split regalloc reconciles with per-iteration copies.
+    // Keeping the carried param costs one `iadd` on the back edge but
+    // leaves the loop free of the shared base entirely.
+    if !drops.is_empty() {
+        let body = loop_body(func, edges, h, &backs);
+        let mut in_use = FxHashSet::default();
+        let mut out_use = FxHashSet::default();
+        for b in func.layout.blocks() {
+            let dst = if body.contains(&b) {
+                &mut in_use
+            } else {
+                &mut out_use
+            };
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    dst.insert(func.dfg.resolve_aliases(v));
+                }
+            }
+        }
+        drops.retain(|&(ix, _)| {
+            let leaf = base_leaf(func, entry_args[ix]);
+            iconst(func, leaf).is_some() || in_use.contains(&leaf) || !out_use.contains(&leaf)
+        });
     }
     if drops.is_empty() && idents.is_empty() {
         return 0;
