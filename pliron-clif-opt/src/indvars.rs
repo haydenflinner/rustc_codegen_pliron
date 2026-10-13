@@ -9,8 +9,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
-    Value, ValueDef, condcodes::{CondCode, IntCC}, types,
+    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode,
+    ProgramPoint, Type, Value, ValueDef, condcodes::{CondCode, IntCC}, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1995,6 +1995,162 @@ fn bounded(
     false
 }
 
+/// `icmp cc p, K` at a count latch whose backedge arg is `p + s` (const
+/// `0 < s <= smax`) is rewritten to `icmp cc (p+s), K+s` — the test moves
+/// onto the already-computed step value so the latch lowers to
+/// `add $s; cmp $K+s; jcc` on one register instead of a `lea` step plus
+/// `cmp` on the pre-inc value (which pins the old count in a second
+/// register).
+///
+/// `p cc K` ⟺ `(p+s) cc (K+s)` needs `p + s` not to wrap where the
+/// compare sees it. Entries must feed args provably `<= K` (an `iconst`,
+/// or a `count_tested`-shaped `ult`/`ule` guard on the edge to `h`);
+/// latch args are `p + s` with `p cc K` tested, so the compare operand
+/// is `<= K + s` and its step `<= K + 2s`, gated to fit `i64`.
+///
+/// Rewriting to the post-inc form also produces the latch shape
+/// `boundcmp` expects, so a later countdown pass can still fire.
+pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i64) -> usize {
+    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
+    let dbg = std::env::var("PLIRON_POSTINC_DEBUG").is_ok();
+    let mut n = 0;
+    for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
+        let h = la.loop_header(lp);
+        if !dt.is_reachable(h) {
+            continue;
+        }
+        let body: FxHashSet<Block> = func
+            .layout
+            .blocks()
+            .filter(|&b| la.is_in_loop(b, lp))
+            .collect();
+        let edges = edges_to(func, cfg, h);
+        for (idx, &p) in func.dfg.block_params(h).to_vec().iter().enumerate() {
+            let ty = func.dfg.value_type(p);
+            if !ty.is_int() || ty.is_vector() {
+                continue;
+            }
+            let mut latches = Vec::new();
+            let mut entries = Vec::new();
+            for e in &edges {
+                let eb = func.layout.inst_block(e.inst).unwrap();
+                if body.contains(&eb) {
+                    latches.push(e.clone());
+                } else {
+                    entries.push(e.clone());
+                }
+            }
+            if latches.is_empty() {
+                if dbg && !entries.is_empty() {
+                    eprintln!("postinc {h} p{p}: no latch edge");
+                }
+                continue;
+            }
+            // Every latch must test `p` below a common `K` on the edge to
+            // `h`, with backedge arg `p + s` dominating the compare.
+            let mut k_bound = None;
+            let mut rewrite = Vec::new();
+            let mut ok = true;
+            for e in &latches {
+                let Some(a) = edge_arg(func, e, idx) else {
+                    if dbg {
+                        eprintln!("postinc {h} p{p}: latch edge arg not a value");
+                    }
+                    ok = false;
+                    break;
+                };
+                let Some((k, _lt, ci)) = count_tested(func, e.inst, e.slot, p, h)
+                    .filter(|(k, _, _)| k_bound.is_none_or(|b| b == *k))
+                else {
+                    if dbg {
+                        eprintln!("postinc {h} p{p}: latch {} not `p cc K`", e.inst);
+                    }
+                    ok = false;
+                    break;
+                };
+                let Some(StepV::K(s)) = step_form(func, p, &body, a) else {
+                    if dbg {
+                        eprintln!("postinc {h} p{p}: backedge arg {a} not `p + const`");
+                    }
+                    ok = false;
+                    break;
+                };
+                if s <= 0 || s > smax || k > i64::MAX - 2 * s {
+                    if dbg {
+                        eprintln!("postinc {h} p{p}: s={s} k={k} rejected");
+                    }
+                    ok = false;
+                    break;
+                }
+                k_bound = Some(k);
+                rewrite.push((e.clone(), ci, a, k + s));
+            }
+            // Entries must feed args provably `<= K`: an `iconst`, or a
+            // `count_tested`-style `ult`/`ule` guard on the edge to `h`.
+            if ok && let Some(k) = k_bound {
+                for e in &entries {
+                    let bounded = edge_arg(func, e, idx).is_some_and(|a| {
+                        iconst(func, a).is_some_and(|ka| ka <= k)
+                            || count_tested(func, e.inst, e.slot, a, h)
+                                .is_some_and(|(kg, lt, _)| kg - lt as i64 <= k)
+                    });
+                    if !bounded {
+                        if dbg {
+                            eprintln!("postinc {h} p{p}: entry {} arg unbounded", e.inst);
+                        }
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if dbg {
+                eprintln!("postinc {h} p{p}: rewriting {} compares", rewrite.len());
+            }
+            for (e, ci, a, k) in rewrite {
+                let dom = match func.dfg.value_def(a) {
+                    ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+                    ValueDef::Param(db, _) => ProgramPoint::Block(db),
+                    ValueDef::Union(_, _) => continue,
+                };
+                if !dt.dominates(dom, ci, &func.layout) {
+                    // `a`'s def sits after `ci` in the latch — move the
+                    // compare down beside its new operand, safe while the
+                    // brif is its only use.
+                    let Some(&cr) = func.dfg.inst_results(ci).first() else {
+                        continue;
+                    };
+                    let single = func
+                        .layout
+                        .blocks()
+                        .flat_map(|b| func.layout.block_insts(b))
+                        .all(|i| {
+                            i == e.inst
+                                || !func
+                                    .dfg
+                                    .inst_values(i)
+                                    .any(|v| func.dfg.resolve_aliases(v) == cr)
+                        });
+                    if !single {
+                        continue;
+                    }
+                    func.layout.remove_inst(ci);
+                    func.layout.insert_inst(ci, e.inst);
+                }
+                let mut pos = FuncCursor::new(func).at_inst(ci);
+                let ks = iconst_masked(&mut pos, ty, k);
+                if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[ci] {
+                    *args = [a, ks];
+                }
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2087,6 +2243,65 @@ mod tests {
         );
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("ldrot produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `icmp p, K` where the backedge arg `p + s` is defined *after* the
+    /// compare in the latch (paramsink's re-based form): the compare
+    /// moves down beside the brif and retargets to `icmp (p+s), K+s`.
+    #[test]
+    fn postinc_moves_count_test_onto_step() {
+        let mut func = Function::with_name_signature(
+            UserFuncName::user(0, 0),
+            Signature::new(CallConv::Fast),
+        );
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [entry, h, done] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().jump(h, &[z.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let k = cur.ins().iconst(types::I64, 5000);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, p, k);
+        let one = cur.ins().iconst(types::I64, 1);
+        let a = cur.ins().iadd(p, one);
+        cur.ins().brif(c, h, &[a.into()], done, &[]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(done)
+            .ins()
+            .return_(&[]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(postinc(&mut func, &mut an, 1024), 1);
+
+        // `icmp ult (p+1), 5001` is the last inst before the brif.
+        let brif = func.layout.block_insts(h).last().unwrap();
+        let ci = func.layout.prev_inst(brif).unwrap();
+        let InstructionData::IntCompare {
+            cond,
+            args: [x, y],
+            ..
+        } = func.dfg.insts[ci]
+        else {
+            panic!("no compare before brif: {}", func.display());
+        };
+        assert_eq!(cond, IntCC::UnsignedLessThan);
+        assert_eq!(func.dfg.resolve_aliases(x), a);
+        assert_eq!(iconst(&func, y), Some(5001));
+
+        let flags = cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        );
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("postinc produced invalid IR: {e}\n{}", func.display());
         }
     }
 }
