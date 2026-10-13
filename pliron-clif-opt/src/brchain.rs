@@ -437,11 +437,17 @@ pub fn run(func: &mut Function) -> usize {
         }
         todo.push((b, term, arg, live, dest(func, dflt)));
     }
+    // `param_dispatch` duplicates the dispatch block per edge; on
+    // tokenize's `state = if ws {0} else {1}` shape it measured a
+    // ~17% regression (9.0ms vs 7.6 with it off) — the duplicated
+    // param edges cost more than the removed indirection saves on
+    // this corpus. Opt-in until the profitability guard is fixed.
+    let pdispatch = crate::config::config().is("PLIRON_PDISPATCH", "1");
     let mut n = 0;
     let mut cfg_lazy = None;
     for (b, term, arg, live, (db, dargs)) in todo {
         let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
-        if let Some(k) = param_dispatch(func, cfg, term) {
+        if pdispatch && let Some(k) = param_dispatch(func, cfg, term) {
             n += k;
             // The rewrite changed edges — the cached cfg is stale.
             cfg_lazy = None;
