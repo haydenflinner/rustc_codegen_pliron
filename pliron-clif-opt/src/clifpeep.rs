@@ -2551,6 +2551,61 @@ pub fn arghoist(func: &mut Function) -> usize {
     n
 }
 
+/// `brif c` edge args `select(c, a, b)` resolve to a single arm on each
+/// edge: `a` taken, `b` otherwise. Niche-select loop tails pass
+/// `select(end?, 0, cursor)` on the continue edge where `end?` is
+/// known-false — without this the `csel` materializes a value that is
+/// just `cursor` on that edge.
+pub fn selargs(func: &mut Function) -> usize {
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        let Some(term) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[term] else {
+            continue;
+        };
+        let c = func.dfg.resolve_aliases(c);
+        let bcs = blocks;
+        for (ei, bc) in bcs.iter().enumerate() {
+            let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+            let mut changed = false;
+            let new: Vec<BlockArg> = args
+                .iter()
+                .map(|&a| {
+                    let Some(v) = a.as_value() else { return a };
+                    let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
+                    else {
+                        return a;
+                    };
+                    let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: sa,
+                    } = func.dfg.insts[di]
+                    else {
+                        return a;
+                    };
+                    if func.dfg.resolve_aliases(sa[0]) != c {
+                        return a;
+                    }
+                    changed = true;
+                    BlockArg::Value(sa[1 + ei])
+                })
+                .collect();
+            if changed {
+                let dest = bc.block(&func.dfg.value_lists);
+                let nc = BlockCall::new(dest, new, &mut func.dfg.value_lists);
+                let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[term] else {
+                    continue;
+                };
+                blocks[ei] = nc;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Merge same-block param pairs that are equal by coinduction: the edge
 /// args agree outright on non-recursive edges and are congruent — same
 /// pure op applied to assumed-equal args — on recursive ones. This is the

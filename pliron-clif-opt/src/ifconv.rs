@@ -15,7 +15,6 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
@@ -283,22 +282,7 @@ fn emit_arm(
                 map.insert(o, nr);
                 // A clone of an `inbounds` offset is still inbounds on the
                 // renamed base — keep the fact so `NonNull` can see it.
-                // `derived` may hold a stale alias tombstone (`Alias` whose
-                // dest is the reserved value) — `resolve_aliases` on it
-                // indexes the reserved slot, so leave it unpropagated.
-                if let Some(&b) = derived.get(&o)
-                    && pos
-                        .func
-                        .dfg
-                        .value_alias_dest_for_serialization(b)
-                        .is_none_or(|d| d != Value::reserved_value())
-                {
-                    let b = map
-                        .get(&pos.func.dfg.resolve_aliases(b))
-                        .copied()
-                        .unwrap_or(b);
-                    derived.insert(nr, b);
-                }
+                crate::jumpthread::prop_derived(&pos.func.dfg, derived, o, nr, &map);
             }
         }
     }

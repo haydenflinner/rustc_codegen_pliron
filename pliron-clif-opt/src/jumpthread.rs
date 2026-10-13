@@ -12,6 +12,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::types;
@@ -365,15 +366,26 @@ impl<'a> NonNull<'a> {
                 let Some(t) = func.layout.last_inst(b) else {
                     continue;
                 };
-                for bc in func.dfg.insts[t]
+                for (ei, bc) in func
+                    .dfg
+                    .insts[t]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .into_iter()
+                    .enumerate()
                 {
                     let d = bc.block(&func.dfg.value_lists);
                     let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
                     for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
                         if nn.params.contains(&p)
-                            && !matches!(args.get(i), Some(&BlockArg::Value(v)) if nn.is(func, v))
+                            && !matches!(args.get(i), Some(&BlockArg::Value(v))
+                                if nn.is_edge(func, t, ei, v))
                         {
+                            if std::env::var_os("PLIRON_NN_DEBUG").is_some() {
+                                eprintln!(
+                                    "nn evict {p} via b{b} i{t} ei{ei} arg{:?}",
+                                    args.get(i)
+                                );
+                            }
                             nn.params.remove(&p);
                             changed = true;
                         }
@@ -411,11 +423,8 @@ impl<'a> NonNull<'a> {
                     work.push(func.dfg.resolve_aliases(args[2]));
                     continue 'terms;
                 }
-                match self.derived.get(&v) {
-                    // The map outlives the passes that fill it — a target
-                    // deleted since is stored as a dangling alias, so chase
-                    // only values that are still real; else unprovable.
-                    Some(&b) if func.dfg.value_is_real(b) => {
+                match self.derived_base(func, v) {
+                    Some(b) => {
                         v = b;
                         continue;
                     }
@@ -444,6 +453,183 @@ fn non_zero_const(func: &Function, v: Value) -> bool {
         return false;
     };
     mask(imm.bits() as u64, bits(func, v).unwrap_or(64)) != 0
+}
+
+/// `nr` clones `o` — carry `derived`'s inbounds mark over, renaming the
+/// recorded base through `map`. Tombstones propagate deliberately:
+/// `NonNull` recovers the live base positionally from the clone's def.
+pub fn prop_derived(
+    dfg: &cranelift_codegen::ir::DataFlowGraph,
+    derived: &mut FxHashMap<Value, Value>,
+    o: Value,
+    nr: Value,
+    map: &FxHashMap<Value, Value>,
+) {
+    let Some(&b) = derived.get(&o) else {
+        return;
+    };
+    let b = dfg
+        .value_alias_dest_for_serialization(b)
+        .filter(|&d| d != Value::reserved_value())
+        .map(|d| map.get(&dfg.resolve_aliases(d)).copied().unwrap_or(d))
+        .unwrap_or(b);
+    derived.insert(nr, b);
+}
+
+fn is_iconst(func: &Function, v: Value) -> bool {
+    func.dfg
+        .value_def(func.dfg.resolve_aliases(v))
+        .inst()
+        .is_some_and(|i| {
+            matches!(
+                func.dfg.insts[i],
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    ..
+                }
+            )
+        })
+}
+
+fn zero_iconst(func: &Function, v: Value) -> bool {
+    func.dfg
+        .value_def(func.dfg.resolve_aliases(v))
+        .inst()
+        .is_some_and(|i| {
+            matches!(
+                func.dfg.insts[i],
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm
+                } if imm.bits() == 0
+            )
+        })
+}
+
+impl NonNull<'_> {
+    /// Debug: is `v` an admitted non-null param?
+    pub fn params_debug(&self, _func: &Function, v: Value) -> bool {
+        self.params.contains(&v)
+    }
+
+    /// Debug: `derived` base for `v`, if present.
+    pub fn derived_debug(&self, func: &Function, v: Value) -> Option<Value> {
+        self.derived.get(&func.dfg.resolve_aliases(v)).copied()
+    }
+
+    /// Is `v` provably non-null on edge `ei` of terminator `t`? Beyond
+    /// the context-free `is`, the edge's own condition carries facts:
+    /// `brif (icmp eq s,0)`'s false arm means `s != 0`; when `s` is a
+    /// niche select `select(k,0,x)` it also means `!k` and `x != 0`
+    /// — the shape `Option::is_none` produces at loop tails.
+    pub fn is_edge(&self, func: &Function, t: Inst, ei: usize, v: Value) -> bool {
+        self.edge_aux(func, t, ei, func.dfg.resolve_aliases(v), 0)
+    }
+
+    fn edge_aux(&self, func: &Function, t: Inst, ei: usize, v: Value, d: usize) -> bool {
+        if self.is(func, v) {
+            return true;
+        }
+        if d > 6 {
+            return false;
+        }
+        let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
+            return false;
+        };
+        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+            return false;
+        };
+        let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            args: cmp_args,
+            cond,
+        } = func.dfg.insts[ci]
+        else {
+            return false;
+        };
+        if cond != IntCC::Equal && cond != IntCC::NotEqual {
+            return false;
+        }
+        // The edge must assert `s != 0` for the compared operand `s`.
+        let (s, nz) = if zero_iconst(func, cmp_args[1]) {
+            (cmp_args[0], (cond == IntCC::Equal) == (ei != 0))
+        } else if zero_iconst(func, cmp_args[0]) {
+            (cmp_args[1], (cond == IntCC::Equal) == (ei != 0))
+        } else {
+            return false;
+        };
+        // On this edge `s` is nonzero iff `nz`.
+        if !nz {
+            return false;
+        }
+        let s = func.dfg.resolve_aliases(s);
+        if v == s {
+            return true;
+        }
+        // `s = select(k, 0, x)`: nonzero gives `!k` and `x != 0`.
+        let Some(si) = func.dfg.value_def(s).inst() else {
+            return false;
+        };
+        let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: sa,
+        } = func.dfg.insts[si]
+        else {
+            return false;
+        };
+        if !zero_iconst(func, sa[1]) {
+            return false;
+        }
+        if v == func.dfg.resolve_aliases(sa[2]) {
+            return true;
+        }
+        // `v = select(k, _, b)`: `!k` on this edge collapses v to b.
+        if let Some(vi) = func.dfg.value_def(v).inst()
+            && let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: va,
+            } = func.dfg.insts[vi]
+            && func.dfg.resolve_aliases(va[0]) == func.dfg.resolve_aliases(sa[0])
+        {
+            return self.edge_aux(func, t, ei, func.dfg.resolve_aliases(va[2]), d + 1);
+        }
+        // `v` an inbounds offset of a base that is nn on this edge.
+        if let Some(base) = self.derived_base(func, v) {
+            return self.edge_aux(func, t, ei, func.dfg.resolve_aliases(base), d + 1);
+        }
+        false
+    }
+
+    /// `derived[v]` with a live base: entries go stale as passes alias
+    /// or delete the recorded base — resolve it, and when the target is
+    /// a tombstone recover positionally from the def: an inbounds
+    /// `iadd`/`isub` offset's base is its single non-const operand.
+    fn derived_base(&self, func: &Function, v: Value) -> Option<Value> {
+        let &b = self.derived.get(&v)?;
+        if func.dfg.value_is_real(b) {
+            return Some(b);
+        }
+        // An alias to a live value still proves; a tombstone (alias to
+        // the reserved slot) means the recorded base was deleted.
+        if let Some(d) = func.dfg.value_alias_dest_for_serialization(b)
+            && d != Value::reserved_value()
+        {
+            return Some(d);
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd | Opcode::Isub,
+            args,
+        } = func.dfg.insts[i]
+        else {
+            return None;
+        };
+        let mut nc = args.iter().filter(|&&a| !is_iconst(func, a));
+        let (Some(&b0), None) = (nc.next(), nc.next()) else {
+            return None;
+        };
+        Some(func.dfg.resolve_aliases(b0))
+    }
 }
 
 /// Addresses of symbols, thread-locals and stack slots are never null.

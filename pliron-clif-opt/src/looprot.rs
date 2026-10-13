@@ -14,7 +14,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MAX_INSTS: usize = 8;
 const MAX_ROTATIONS: usize = 256;
 
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    derived: &mut FxHashMap<Value, Value>,
+) -> usize {
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
     // bcheck clones appended at the end) of the rotation budget.
@@ -25,7 +29,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
             break;
         }
         let (cfg, domtree) = an.cfg_dt(func);
-        if rotatable(func, cfg, domtree, h) && rotate(func, cfg, domtree, h) {
+        if rotatable(func, cfg, domtree, h) && rotate(func, cfg, domtree, h, derived) {
             n += 1;
             // Edge splits/clones rewired the CFG — the next candidate's
             // reads must see the new shape.
@@ -128,7 +132,13 @@ fn resolved_args(func: &Function, i: Inst) -> Vec<Value> {
         .collect()
 }
 
-fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
+fn rotate(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+    h: Block,
+    derived: &mut FxHashMap<Value, Value>,
+) -> bool {
     let t = func.layout.last_inst(h).unwrap();
     let InstructionData::Brif { blocks, .. } = func.dfg.insts[t] else {
         unreachable!()
@@ -270,6 +280,9 @@ fn rotate(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, 
             .copied()
             .zip(func.dfg.inst_results(ni).iter().copied())
             .collect();
+        for &(o, nr) in &res {
+            crate::jumpthread::prop_derived(&func.dfg, derived, o, nr, &map);
+        }
         map.extend(res);
         match h2 {
             Some(h2) => func.layout.append_inst(ni, h2),

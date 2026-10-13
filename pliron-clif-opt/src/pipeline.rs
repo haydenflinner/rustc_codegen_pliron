@@ -1346,6 +1346,43 @@ fn s_arghoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
         + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
 }
 
+// A merge param's pure use-chain sunk onto the incoming edges (the
+// inverse of arghoist): `count + flag` where flag merges as 1/0/ret
+// becomes per-edge `count+1` / `count+ret0` — the flag's merge slot
+// (a spill in regalloc) disappears.
+fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = paramsink::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("paramsink");
+    }
+    k
+}
+
+// `icmp eq (select c, 0, ptr), 0` → `c` when `ptr` is non-null — the
+// Option-niche test behind `Chars::next`'s bounds check; kills the
+// `mov 0; cmp; csel; cmp` tail sequence.
+fn s_niche(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
+    let k = niche::run(&mut p.clctx.func, &nn)
+        + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+    if k > 0 {
+        p.dump("niche");
+    }
+    k
+}
+
+// `brif c` edge args `select(c,a,b)` collapse to an arm — the loop-tail
+// `csel` materializing `select(end?, 0, cursor)` on the edge where
+// `end?` is already known-false.
+fn s_selargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::selargs(&mut p.clctx.func)
+        + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+    if k > 0 {
+        p.dump("selargs");
+    }
+    k
+}
+
 fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::lcse(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -1619,7 +1656,7 @@ fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = looprot::run(&mut p.clctx.func, an);
+    let k = looprot::run(&mut p.clctx.func, an, p.derived);
     p.dump("looprot");
     k
 }
@@ -1961,6 +1998,18 @@ pub static DEFAULT: &[Step] = &[
     // tokenize preds) hoisted into the target — deletes the param
     // slot and its regalloc edge copies outright.
     step("arghoist", "arghoist", Gate::Env("PLIRON_ARGHOIST"), s_arghoist),
+    step(
+        "paramsink",
+        "paramsink",
+        Gate::Env("PLIRON_PARAMSINK"),
+        s_paramsink,
+    ),
+    // `icmp CC (select c,K,x), K` folds to `c`/`!c` when the live arm's
+    // compare is provable — a pure fold, so it gets first crack at the
+    // niche dispatch; `seltest` below handles the unprovable cases by
+    // splitting the branch.
+    step("nfold", "niche", Gate::Env("PLIRON_NFOLD"), s_niche),
+    step("selargs", "selargs", Gate::Env("PLIRON_SELARGS"), s_selargs),
     // `brif (icmp (select c,K,x), K)` niche dispatch → `brif c` +
     // `icmp x,K` middle block — every edge knows `c`'s side, so the
     // `select c,·,·` args fold to arms and the cmov cluster dies

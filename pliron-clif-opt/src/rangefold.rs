@@ -153,6 +153,102 @@ fn args_avail(
     })
 }
 
+/// A hit-edge arg's materialization plan at the merge point.
+enum Mat {
+    /// Keep the edge arg verbatim (pseudo-args or dominating values).
+    Arg(BlockArg),
+    /// Pure inst the fold bypasses: re-emit it with dominating
+    /// operands (`iadd count,1` produced per-arm by paramsink).
+    Clone(Inst),
+    /// Literal — re-emit an iconst.
+    K(u64, cranelift_codegen::ir::Type),
+}
+
+/// Can this edge arg be materialized at `at`? Dominating defs reuse;
+/// a pure inst may be re-emitted when every operand dominates `at` or
+/// is itself an iconst (depth-1 — enough for `count+1` arms).
+fn mat_of(
+    func: &Function,
+    dom: &DominatorTree,
+    a: BlockArg,
+    at: Inst,
+) -> Option<Mat> {
+    // Pseudo-args (try_call ret/exn) are bound to their own terminator
+    // — they can't ride the merged edge.
+    let v = a.as_value()?;
+    let v = func.dfg.resolve_aliases(v);
+    let pp = match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => ProgramPoint::Inst(i),
+        ValueDef::Param(b, _) => ProgramPoint::Block(b),
+        _ => return None,
+    };
+    if dom.dominates(pp, at, &func.layout) {
+        return Some(Mat::Arg(a));
+    }
+    if let Some(k) = iconst(func, v) {
+        return Some(Mat::K(k, func.dfg.value_type(v)));
+    }
+    let ValueDef::Result(di, 0) = func.dfg.value_def(v) else {
+        return None;
+    };
+    if !crate::jumpthread::pure_op(func, di) {
+        return None;
+    }
+    let ok = func.dfg.inst_args(di).to_vec().iter().all(|&o| {
+        let o = func.dfg.resolve_aliases(o);
+        if iconst(func, o).is_some() {
+            return true;
+        }
+        let pp = match func.dfg.value_def(o) {
+            ValueDef::Result(i, _) => ProgramPoint::Inst(i),
+            ValueDef::Param(b, _) => ProgramPoint::Block(b),
+            _ => return false,
+        };
+        dom.dominates(pp, at, &func.layout)
+    });
+    ok.then_some(Mat::Clone(di))
+}
+
+fn emit_mat(func: &mut Function, at: Inst, m: &Mat) -> BlockArg {
+    match m {
+        Mat::Arg(a) => *a,
+        Mat::K(k, ty) => {
+            let mut pos = FuncCursor::new(func).at_inst(at);
+            BlockArg::Value(pos.ins().iconst(*ty, *k as i64))
+        }
+        Mat::Clone(di) => {
+            let data = func.dfg.insts[*di];
+            let ty = func.dfg.value_type(func.dfg.first_result(*di));
+            let ops: Vec<Result<Value, (u64, cranelift_codegen::ir::Type)>> = func
+                .dfg
+                .inst_args(*di)
+                .to_vec()
+                .iter()
+                .map(|&o| {
+                    let o = func.dfg.resolve_aliases(o);
+                    match iconst(func, o) {
+                        Some(k) => Err((k, func.dfg.value_type(o))),
+                        None => Ok(o),
+                    }
+                })
+                .collect();
+            let mut pos = FuncCursor::new(func).at_inst(at);
+            let vs: Vec<Value> = ops
+                .iter()
+                .map(|o| match o {
+                    Ok(v) => *v,
+                    Err((k, ty)) => pos.ins().iconst(*ty, *k as i64),
+                })
+                .collect();
+            let nd = crate::paramsink::rebuild(&data, &vs);
+            let ni = pos.func.dfg.make_inst(nd);
+            pos.func.dfg.make_inst_results(ni, ty);
+            pos.func.layout.insert_inst(ni, at);
+            BlockArg::Value(pos.func.dfg.first_result(ni))
+        }
+    }
+}
+
 /// `v` defined as `isub x, k` → `(x, k)`.
 fn isub_const(func: &Function, v: Value) -> Option<(Value, u64)> {
     let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
@@ -243,32 +339,38 @@ fn bound_pairs(func: &mut Function, dom: &DominatorTree) -> usize {
         let Some((x2, Half::Hi(hi))) = half_bound(func, c2) else {
             continue;
         };
-        // Merging the tests hoists the hit edge's args into this block,
-        // where they materialize unconditionally — a `mov;stur` flag
-        // write LLVM's shape only pays on the lo-test hit (chars_alpha
-        // regressed ~50%). Only fold when the hit edge is arg-free.
-        if hbc.args(&func.dfg.value_lists).len() != 0 {
+        // Merging the tests moves the hit edge's args to this block.
+        // Values that dominate reuse; a pure inst paramsink sunk
+        // (`iadd count,1`) or a const re-emits. Unmaterializable args
+        // — defs that stay inside the bypassed block — would dangle or
+        // hoist unconditionally: the `mov;stur` flag regression shape.
+        let Some(hit_mats) = hbc
+            .args(&func.dfg.value_lists)
+            .map(|a| mat_of(func, dom, a, term))
+            .collect::<Option<Vec<_>>>()
+        else {
             continue;
-        }
+        };
         let ok = func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2)
             && hi > lo
-            && same_edge(func, fbc, mbc)
-            && args_avail(func, dom, hbc, term);
+            && same_edge(func, fbc, mbc);
         if dbg {
             eprintln!(
-                "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} args? {}",
+                "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
                 func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
                 hi > lo,
                 same_edge(func, fbc, mbc),
-                args_avail(func, dom, hbc, term)
+                hit_mats.len()
             );
         }
         if !ok {
             continue;
         }
-        rewrites.push((term, x, lo, hi - lo, hbc, fbc));
+        rewrites.push((term, x, lo, hi - lo, dest_block(func, hbc), fbc, hit_mats));
     }
-    for (term, x, lo, w, hbc, fbc) in &rewrites {
+    for (term, x, lo, w, hdest, fbc, mats) in &rewrites {
+        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, *term, m)).collect();
+        let hbc = BlockCall::new(*hdest, hargs, &mut func.dfg.value_lists);
         let ty = func.dfg.value_type(*x);
         let mut pos = FuncCursor::new(func).at_inst(*term);
         let k = pos.ins().iconst(ty, *lo as i64);
@@ -279,9 +381,66 @@ fn bound_pairs(func: &mut Function, dom: &DominatorTree) -> usize {
             continue;
         };
         *arg = c;
-        *blocks = [*hbc, *fbc].into();
+        *blocks = [hbc, *fbc].into();
     }
     rewrites.len()
+}
+
+/// Operand-equality for clone shape checks: same resolved value, or
+/// both iconsts with the same bits and type.
+fn op_eq(func: &Function, x: Value, y: Value) -> bool {
+    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+    x == y
+        || match (iconst(func, x), iconst(func, y)) {
+            (Some(a), Some(b)) => a == b && func.dfg.value_type(x) == func.dfg.value_type(y),
+            _ => false,
+        }
+}
+
+/// Same pure op on equal operands — edge args paramsink produced read
+/// as different insts (`iadd count,1` cloned per classification arm).
+fn shape_eq(func: &Function, di: Inst, dj: Inst) -> bool {
+    if func.dfg.insts[di].opcode() != func.dfg.insts[dj].opcode() {
+        return false;
+    }
+    let (aa, bb) = (func.dfg.inst_args(di).to_vec(), func.dfg.inst_args(dj).to_vec());
+    aa.len() == bb.len() && aa.iter().zip(&bb).all(|(&x, &y)| op_eq(func, x, y))
+}
+
+/// Hit-edge args for a union merge: same dest, and per-slot either the
+/// identical arg or shape-equal pure args (`iadd count,1` on each arm)
+/// that materialize at `at`. Returns the merged edge's arg plans.
+fn shared_args(
+    func: &Function,
+    dom: &DominatorTree,
+    a: BlockCall,
+    b: BlockCall,
+    at: Inst,
+) -> Option<Vec<Mat>> {
+    let av: Vec<BlockArg> = a.args(&func.dfg.value_lists).collect();
+    let bv: Vec<BlockArg> = b.args(&func.dfg.value_lists).collect();
+    if av.len() != bv.len() {
+        return None;
+    }
+    av.iter()
+        .zip(&bv)
+        .map(|(&x, &y)| {
+            if x == y {
+                return mat_of(func, dom, x, at);
+            }
+            let (Some(xv), Some(yv)) = (x.as_value(), y.as_value()) else {
+                return None;
+            };
+            let (xi, yi) = (
+                func.dfg.value_def(func.dfg.resolve_aliases(xv)).inst()?,
+                func.dfg.value_def(func.dfg.resolve_aliases(yv)).inst()?,
+            );
+            if !shape_eq(func, xi, yi) {
+                return None;
+            }
+            mat_of(func, dom, x, at)
+        })
+        .collect()
 }
 
 /// Rule 2: `brif (x-k1 u<w) → HIT else [brif (x-k2 u<w) → HIT else MISS]`
@@ -325,9 +484,15 @@ fn range_unions(func: &mut Function, dom: &DominatorTree) -> usize {
         let Some((x2, k2, w2)) = offset_test(func, c2) else {
             continue;
         };
-        if x1 != x2 || w1 != w2 || k1 == k2 || !same_edge(func, tbc, tbc2) {
+        if x1 != x2 || w1 != w2 || k1 == k2 || dest_block(func, tbc) != dest_block(func, tbc2) {
             continue;
         }
+        // The hit edges must agree on args: identical values, or the
+        // same sunk computation on each arm (`iadd count,1`), which
+        // re-emits once at the merged edge.
+        let Some(hit_mats) = shared_args(func, dom, tbc, tbc2, term) else {
+            continue;
+        };
         let (k_lo, k_hi) = (k1.min(k2), k1.max(k2));
         let d = k_hi - k_lo;
         if !d.is_power_of_two() {
@@ -341,9 +506,11 @@ fn range_unions(func: &mut Function, dom: &DominatorTree) -> usize {
         if !args_avail(func, dom, fbc2, term) {
             continue;
         }
-        rewrites.push((term, x1, k_hi, d, w1, tbc, fbc2));
+        rewrites.push((term, x1, k_hi, d, w1, dest_block(func, tbc), fbc2, hit_mats));
     }
-    for (term, x, k_hi, d, w, tbc, fbc) in &rewrites {
+    for (term, x, k_hi, d, w, hdest, fbc, mats) in &rewrites {
+        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, *term, m)).collect();
+        let hbc = BlockCall::new(*hdest, hargs, &mut func.dfg.value_lists);
         let ty = func.dfg.value_type(*x);
         let mut pos = FuncCursor::new(func).at_inst(*term);
         let dv = pos.ins().iconst(ty, *d as i64);
@@ -356,7 +523,7 @@ fn range_unions(func: &mut Function, dom: &DominatorTree) -> usize {
             continue;
         };
         *arg = c;
-        *blocks = [*tbc, *fbc].into();
+        *blocks = [hbc, *fbc].into();
     }
     rewrites.len()
 }
@@ -367,10 +534,10 @@ pub fn run(func: &mut Function) -> usize {
     // consumes; iterate so a union exposing the next pair gets folded.
     // The dominator tree is rebuilt per round: rewrites move edges.
     let r1 = crate::config::config().enabled("PLIRON_RF1");
-    // Unions lengthen the test chain (bor → isub → cmp) and measured a
-    // regression on chars_alpha's mixed-hit-rate loop — opt-in until the
-    // profitability signal is understood.
-    let r2 = crate::config::config().is("PLIRON_RF2", "1");
+    // Unions lengthen the test chain (bor → isub → cmp) but only fire on
+    // shared materializable hit args, which measured ~6% on chars_alpha and
+    // neutral elsewhere — default on; PLIRON_RF2=0 disables.
+    let r2 = crate::config::config().enabled("PLIRON_RF2");
     for _ in 0..4 {
         let cfg = ControlFlowGraph::with_function(func);
         let dom = DominatorTree::with_function(func, &cfg);
