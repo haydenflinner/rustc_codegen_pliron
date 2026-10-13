@@ -1503,13 +1503,15 @@ fn finish_plan(
     sink.sort_by_key(|&i| pos[&i]);
     // Profitability: every kept row swaps two scalars for one vector op;
     // gathers/splats/extracts cost insts. High-port-pressure rows (sqrt/div)
-    // count extra — they halve occupied-port cycles.
+    // count extra — halving a ~13–20-cycle op is worth many simple insts,
+    // and deep trees around them are what unlocks the packed sqrt/div at
+    // all (nbody's `dt/(d2·sqrt d2)` pairs).
     let heavy = kept
         .iter()
         .filter(|&&(_, (i, _))| matches!(func.dfg.insts[i].opcode(), Opcode::Sqrt | Opcode::Fdiv))
         .count();
     let n_keep = x.members.iter().filter(|m| x.keep.contains(m)).count() as i32;
-    let net = 2 * kept.len() as i32 + 3 * heavy as i32
+    let net = 2 * kept.len() as i32 + 5 * heavy as i32
         - emit_cost as i32
         - extracts.len() as i32
         - n_keep;
