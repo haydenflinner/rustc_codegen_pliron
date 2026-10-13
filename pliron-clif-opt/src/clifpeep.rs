@@ -726,12 +726,22 @@ fn minmax(pos: &mut FuncCursor, inst: Inst) -> bool {
 }
 
 /// Peel rustc's `!bool` spellings off a branch/select condition —
-/// `bxor x, 1` and `band x, 1` over known 0/1 values, `ireduce`, and the
-/// `select c, 0, 1` (`!c`) / `select c, 1, 0` residues. Returns the
-/// stripped value and whether the chain logically negates it.
-fn un_not(func: &Function, arg: Value) -> (Value, bool) {
+/// `bxor x, 1` and `band x, 1` over known 0/1 values, `ireduce`, the
+/// `select c, 0, 1` (`!c`) / `select c, 1, 0` residues, and
+/// `icmp eq/ne (0/1 x), 0/1` tests. Returns the stripped value and
+/// whether the chain logically negates it. When `chain` is given it
+/// receives each intermediate `(value, negated-vs-arg)` — an arg whose
+/// select on an intermediate condition is decided edge-side.
+fn un_not_chain(
+    func: &Function,
+    arg: Value,
+    mut chain: Option<&mut Vec<(Value, bool)>>,
+) -> (Value, bool) {
     let (mut v, mut neg) = (func.dfg.resolve_aliases(arg), false);
     for _ in 0..8 {
+        if let Some(c) = chain.as_deref_mut() {
+            c.push((v, neg));
+        }
         match (bin_k(func, v, Opcode::Band), bin_k(func, v, Opcode::Bxor)) {
             (Some((x, 1)), _) if is01(func, x, 4) => v = x,
             (_, Some((x, 1))) if is01(func, x, 4) => {
@@ -765,6 +775,33 @@ fn un_not(func: &Function, arg: Value) -> (Value, bool) {
                             _ => break,
                         }
                     }
+                    // `icmp eq/ne x, k` on a 0/1 `x` is `x` or `!x` —
+                    // `icmp eq (select c, 0, 1), 1` style residue.
+                    InstructionData::IntCompare {
+                        opcode: Opcode::Icmp,
+                        cond,
+                        args,
+                        ..
+                    } if crate::pass_enabled("PLIRON_EQ01")
+                        && matches!(cond, IntCC::Equal | IntCC::NotEqual) =>
+                    {
+                        let (x, k) = if let Some(k) =
+                            iconst(func, func.dfg.resolve_aliases(args[1]))
+                        {
+                            (args[0], k)
+                        } else if let Some(k) =
+                            iconst(func, func.dfg.resolve_aliases(args[0]))
+                        {
+                            (args[1], k)
+                        } else {
+                            break;
+                        };
+                        if !matches!(k, 0 | 1) || !is01(func, x, 4) {
+                            break;
+                        }
+                        v = x;
+                        neg ^= (cond == IntCC::Equal) == (k == 0);
+                    }
                     _ => break,
                 }
             }
@@ -773,9 +810,13 @@ fn un_not(func: &Function, arg: Value) -> (Value, bool) {
     (v, neg)
 }
 
+fn un_not(func: &Function, arg: Value) -> (Value, bool) {
+    un_not_chain(func, arg, None)
+}
+
 /// `brif (bxor (band c, 1), 1), a, b` (rustc's `!bool` after `i1`
 /// normalization) becomes `brif c, b, a`.
-fn brif_not(func: &mut Function, inst: Inst) -> bool {
+pub fn brif_not(func: &mut Function, inst: Inst) -> bool {
     let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
         return false;
     };
@@ -794,7 +835,155 @@ fn brif_not(func: &mut Function, inst: Inst) -> bool {
     true
 }
 
-/// `select (bxor (icmp cc a b), 1) t, f` (rustc's `!bool` select predicate)
+/// `brif c, T(.., select c', t, e, ..), E(..)` — an edge arg built on a
+/// condition the `un_not` chain equates with the branch's own is decided
+/// per edge: `c'` is known-true on the taken arm's edge, known-false on
+/// the other. Peel `ireduce`/`uextend`/`sextend` wrappers around a
+/// `select c', t, e` (and a bare chain value `c'` itself) and substitute
+/// what each edge picks — enum discriminants rematerialized ahead of a
+/// dispatch block fold to the edge's constant.
+pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
+    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[inst] else {
+        return 0;
+    };
+    let mut chain = Vec::with_capacity(8);
+    un_not_chain(func, arg, Some(&mut chain));
+    /// What `v` becomes on an edge where the chain intermediates take the
+    /// values in `tset` — either a decided `iconst` (`K`), or the arm a
+    /// decided `select` forwards re-wrapped in `v`'s extends (`W`).
+    enum Pick {
+        K(i64),
+        W(Value, Vec<(Opcode, Type)>),
+    }
+    fn spec_of(func: &Function, tset: &FxHashMap<Value, bool>, v: Value) -> Option<Pick> {
+        let mut ops = Vec::new();
+        let mut v = func.dfg.resolve_aliases(v);
+        for _ in 0..4 {
+            if let Some(&t) = tset.get(&v) {
+                // A chain intermediate used as an edge arg: a 0/1
+                // decided by the edge itself.
+                return Some(Pick::K(t as i64));
+            }
+            let i = func.dfg.value_def(v).inst()?;
+            match func.dfg.insts[i] {
+                InstructionData::Unary {
+                    opcode: op @ (Opcode::Ireduce | Opcode::Uextend | Opcode::Sextend),
+                    arg: x,
+                } => {
+                    ops.push((op, func.dfg.value_type(v)));
+                    v = func.dfg.resolve_aliases(x);
+                }
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => {
+                    let &t = tset.get(&func.dfg.resolve_aliases(args[0]))?;
+                    return Some(Pick::W(args[2 - usize::from(t)], ops));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+    let mut n = 0;
+    for (d, &bc) in blocks.iter().enumerate() {
+        // truth[x]: value chain value `x` takes on this edge — on the
+        // then-edge `arg` is nonzero and each intermediate applies its
+        // recorded parity; the else-edge flips it.
+        let tset: FxHashMap<Value, bool> = chain
+            .iter()
+            .map(|&(x, neg)| (x, (d == 0) != neg))
+            .collect();
+        let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+        let mut repl = Vec::new();
+        for (ai, a) in args.iter().enumerate() {
+            let BlockArg::Value(a) = a else {
+                continue;
+            };
+            let ty = func.dfg.value_type(*a);
+            let Some(pick) = spec_of(func, &tset, *a) else {
+                continue;
+            };
+            let mut cur = FuncCursor::new(func).at_inst(inst);
+            let val = match pick {
+                Pick::K(k) => cur.ins().iconst(ty, k),
+                Pick::W(base, ops) => {
+                    let mut v = cur.func.dfg.resolve_aliases(base);
+                    // `ops` were peeled outside-in; replay them
+                    // inside-out (innermost first). Const arms fold.
+                    for &(op, oty) in ops.iter().rev() {
+                        if let Some(k) = iconst(cur.func, v) {
+                            let bits = match op {
+                                Opcode::Ireduce if oty.bits() < 64 => {
+                                    k & ((1i64 << oty.bits()) - 1)
+                                }
+                                Opcode::Sextend => {
+                                    let w = cur.func.dfg.value_type(v).bits();
+                                    (k << (64 - w)) >> (64 - w)
+                                }
+                                _ => k,
+                            };
+                            v = cur.ins().iconst(oty, bits);
+                        } else {
+                            v = match op {
+                                Opcode::Ireduce => cur.ins().ireduce(oty, v),
+                                Opcode::Uextend => cur.ins().uextend(oty, v),
+                                _ => cur.ins().sextend(oty, v),
+                            };
+                        }
+                    }
+                    v
+                }
+            };
+            repl.push((ai, val));
+        }
+        if repl.is_empty() {
+            continue;
+        }
+        n += repl.len();
+        let mut repl = repl.into_iter().peekable();
+        let dfg = &mut func.dfg;
+        let bc_mut = &mut dfg.insts[inst].branch_destination_mut(
+            &mut dfg.jump_tables,
+            &mut dfg.exception_tables,
+        )[d];
+        let mut ai = 0;
+        bc_mut.update_args(&mut dfg.value_lists, |a| {
+            let a = match repl.peek() {
+                Some(&(i, v)) if i == ai => {
+                    repl.next();
+                    BlockArg::Value(v)
+                }
+                _ => a,
+            };
+            ai += 1;
+            a
+        });
+    }
+    n
+}
+
+/// Sweep every `brif` applying `brif_not` (`PLIRON_BRIFNOT`) and
+/// `brif_argspec` (`PLIRON_ARGSPEC`) — the late pipeline step's driver
+/// after `merge_chains` remerged a dispatch block into its pred.
+pub fn brif_fold(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            if pos.func.dfg.insts[inst].opcode() != Opcode::Brif {
+                continue;
+            }
+            if crate::pass_enabled("PLIRON_ARGSPEC") {
+                n += brif_argspec(pos.func, inst);
+            }
+            if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
 /// becomes `select (icmp cc a b) f, t`: the icmp's own flags then feed the
 /// `csel`, instead of materializing the negation with `eor`+`tst` — the
 /// shape LLVM emits for partition/insertion-sort inner loops.
@@ -3064,6 +3253,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 continue;
             }
             if pos.func.dfg.insts[inst].opcode() == Opcode::Brif {
+                // `brif_argspec` must see the brif's own chain before
+                // `brif_not` strips it.
+                if crate::pass_enabled("PLIRON_ARGSPEC") {
+                    n += brif_argspec(pos.func, inst);
+                }
                 if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
                     n += 1;
                 }
@@ -4272,6 +4466,22 @@ pub fn lcse(func: &mut Function) -> usize {
             }
             return None;
         }
+        // `select c, x, x` is `x` — a decided discriminant select left
+        // behind by spec folds.
+        if let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } = data
+        {
+            let (t, f) = (
+                func.dfg.resolve_aliases(args[1]),
+                func.dfg.resolve_aliases(args[2]),
+            );
+            if t == f {
+                return Some(t);
+            }
+            return None;
+        }
         let InstructionData::Binary { opcode, args } = data else {
             return None;
         };
@@ -4465,6 +4675,46 @@ pub fn lcse(func: &mut Function) -> usize {
                         func.dfg.insts[i] = InstructionData::Binary {
                             opcode: Opcode::Isub,
                             args,
+                        };
+                        n += 1;
+                        continue;
+                    }
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args,
+                } if crate::pass_enabled("PLIRON_SUBSUB") => {
+                    // `isub (isub e, a), (isub e, b)` → `isub b, a`: the
+                    // shared minuend telescopes —
+                    // `(e - a) - (e - b) = b - a` in wrapping arithmetic —
+                    // so `end`-relative lengths recomputed per iteration
+                    // collapse to a pure cursor delta (`pre_len - len`
+                    // becomes `ptr' - ptr`), deading the inner subs when
+                    // single-use and shortening the dep chain off `e`.
+                    // Each rewrite drops the result a def-level deeper in
+                    // the DAG, so repeat applications terminate.
+                    let sub_of = |func: &Function, v: Value| -> Option<(Value, Value)> {
+                        let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        if let InstructionData::Binary {
+                            opcode: Opcode::Isub,
+                            args: [e, x],
+                        } = func.dfg.insts[d]
+                        {
+                            Some((
+                                func.dfg.resolve_aliases(e),
+                                func.dfg.resolve_aliases(x),
+                            ))
+                        } else {
+                            None
+                        }
+                    };
+                    if let (Some((e0, a)), Some((e1, b))) =
+                        (sub_of(func, args[0]), sub_of(func, args[1]))
+                        && e0 == e1
+                    {
+                        func.dfg.insts[i] = InstructionData::Binary {
+                            opcode: Opcode::Isub,
+                            args: [b, a],
                         };
                         n += 1;
                         continue;

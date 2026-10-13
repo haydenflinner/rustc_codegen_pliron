@@ -1026,8 +1026,16 @@ pub fn run(func: &mut Function) -> usize {
         // whole shifted value — `sh != 0` would accept every `x` at or
         // below the mask's highest set bit, i.e. the interval's holes.
         let bit = cur.ins().band_imm_u(sh, 1);
-        let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
-        cur.ins().brif(c, pl.hit.0, &ha, pl.miss.0, &ma);
+        // Branch on the 0/1 `band` result directly: aarch64 lowers
+        // `brif (band x, pow2)` to `tbnz`, but only matches the
+        // `icmp eq`-against-zero form (`tbz`) — the `ne` here would
+        // lower to cmp+csel+branch instead.
+        if crate::pass_enabled("PLIRON_BITBRIF") {
+            cur.ins().brif(bit, pl.hit.0, &ha, pl.miss.0, &ma);
+        } else {
+            let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
+            cur.ins().brif(c, pl.hit.0, &ha, pl.miss.0, &ma);
+        }
         for &b in &pl.dead {
             while let Some(i) = func.layout.first_inst(b) {
                 func.layout.remove_inst(i);

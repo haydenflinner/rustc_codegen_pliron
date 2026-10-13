@@ -534,6 +534,9 @@ impl<'a> W<'a> {
         let mut i = 0;
         while i < order.len() {
             if order.len() > MAX_CONE {
+                if crate::env_get("PLIRON_EDGESPEC_DEBUG").is_some() {
+                    eprintln!("edgespec cone_ok: {:?} cone>64 from {:?}", self.p, d);
+                }
                 return false;
             }
             let b = order[i];
@@ -612,6 +615,12 @@ impl<'a> W<'a> {
                             && self.dom.block_dominates(db, self.p))
                     {
                         continue;
+                    }
+                    if crate::env_get("PLIRON_EDGESPEC_DEBUG").is_some() {
+                        eprintln!(
+                            "edgespec cone_ok: {:?} use of {:?} (def blk {:?}) at {:?} fails",
+                            self.p, v, db, u
+                        );
                     }
                     return false;
                 }

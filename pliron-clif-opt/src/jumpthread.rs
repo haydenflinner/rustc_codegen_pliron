@@ -229,6 +229,13 @@ fn kbits(
             opcode: Opcode::Ireduce,
             arg,
         } => sub(arg),
+        // Zero-extending loads: the upper bits are known zero.
+        InstructionData::Load { opcode, .. } => match opcode {
+            Opcode::Uload8 => (full & !0xFFu64, 0),
+            Opcode::Uload16 => (full & !0xFFFFu64, 0),
+            Opcode::Uload32 => (full & !0xFFFF_FFFFu64, 0),
+            _ => (0, 0),
+        },
         _ => (0, 0),
     };
     (r.0 & full, r.1 & full)
@@ -876,6 +883,89 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
 enum Arg {
     V(Value),
     K(u64, Type),
+    /// Clone of a merge-block body inst, args already rewritten to `Arg`s
+    /// resolved in the pred — materialized before `pinst` at apply time.
+    R(Inst, Vec<Arg>),
+}
+
+/// Resolve `v` (a merge-block value) to something usable on the threaded
+/// edge: an incoming edge arg, a known constant, a cloneable pure body
+/// inst (bounded depth), or the value itself if its def dominates `pinst`.
+fn map_val(
+    func: &Function,
+    argv: &FxHashMap<Value, Value>,
+    body_vals: &FxHashSet<Value>,
+    env: &FxHashMap<Value, u64>,
+    dom: &DominatorTree,
+    pinst: Inst,
+    v: Value,
+    out: &mut Vec<Arg>,
+    depth: usize,
+) -> bool {
+    if let Some(&pv) = argv.get(&v) {
+        out.push(Arg::V(pv));
+        return true;
+    }
+    if !body_vals.contains(&v) {
+        // An external value is a legal edge arg only if its def
+        // dominates the threaded branch — dominating `b` is not enough
+        // (`pinst` may have arms that never reach `b`'s dominator).
+        let pp = match func.dfg.value_def(v) {
+            ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+            ValueDef::Param(db, _) => ProgramPoint::Block(db),
+            _ => return false,
+        };
+        if !dom.dominates(pp, pinst, &func.layout) {
+            return false;
+        }
+        out.push(Arg::V(v));
+        return true;
+    }
+    // `env` tracks 64 bits; it can't describe a wider param (and `iconst`
+    // tops out at i64).
+    if let Some(&k) = env.get(&v) {
+        if func.dfg.value_type(v).bits() <= 64 {
+            out.push(Arg::K(k, func.dfg.value_type(v)));
+            return true;
+        }
+        return false;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Some(di) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    if !pure_op(func, di) || func.dfg.inst_results(di).len() != 1 {
+        return false;
+    }
+    let args: Vec<Value> = func.dfg.inst_args(di).to_vec();
+    let mut subs = Vec::with_capacity(args.len());
+    for a in args {
+        let a = func.dfg.resolve_aliases(a);
+        let mut tmp = Vec::with_capacity(1);
+        if !map_val(func, argv, body_vals, env, dom, pinst, a, &mut tmp, depth - 1) {
+            return false;
+        }
+        subs.push(tmp.pop().unwrap());
+    }
+    out.push(Arg::R(di, subs));
+    true
+}
+
+/// Emit an `Arg` before `pinst`, cloning remat insts in order.
+fn emit_arg(func: &mut Function, pinst: Inst, a: &Arg) -> Value {
+    match a {
+        Arg::V(v) => *v,
+        Arg::K(k, ty) => FuncCursor::new(func).at_inst(pinst).ins().iconst(*ty, *k as i64),
+        Arg::R(di, subs) => {
+            let vals: Vec<Value> = subs.iter().map(|s| emit_arg(func, pinst, s)).collect();
+            let ni = func.dfg.clone_inst(*di);
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            func.layout.insert_inst(ni, pinst);
+            func.dfg.first_result(ni)
+        }
+    }
 }
 
 /// A retargeted edge `pinst`'s destination `di` → `s`. With `repair`, the values
@@ -886,7 +976,61 @@ struct Edit {
     di: usize,
     s: Block,
     args: Vec<Arg>,
-    repair: Option<(Inst, usize, Vec<Value>, Vec<Block>)>,
+    /// (merge term, arm, needed exports, region, other edges into `s`
+    /// that must also feed the new params — (pred inst, dest idx)).
+    repair: Option<(Inst, usize, Vec<Value>, Vec<Block>, Vec<(Inst, usize)>)>,
+    /// Resolved args for each `repair` extra edge, filled in by the
+    /// post-edit dominance validation (parallel to the `extra` list).
+    eargs: Vec<Vec<Arg>>,
+}
+
+/// Blocks reachable from the entry without passing `defb`, in the graph
+/// where each planned edit's `pinst -> s` edge already exists (the old
+/// `pinst -> b` edges are kept too — an over-approximation that can only
+/// reject, never accept wrongly).
+fn reach_avoid(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    new_succs: &FxHashMap<Block, Vec<Block>>,
+    defb: Block,
+) -> FxHashSet<Block> {
+    let mut seen = FxHashSet::default();
+    let Some(entry) = func.layout.entry_block() else {
+        return seen;
+    };
+    if entry == defb {
+        return seen;
+    }
+    seen.insert(entry);
+    let mut work = vec![entry];
+    while let Some(x) = work.pop() {
+        let extra = new_succs.get(&x).into_iter().flatten().copied();
+        for nx in cfg.succ_iter(x).chain(extra) {
+            if nx != defb && seen.insert(nx) {
+                work.push(nx);
+            }
+        }
+    }
+    seen
+}
+
+/// Constants a block's body computes without any incoming-edge context
+/// (`iconst`s and pure folds of them). Those are the only merge values
+/// safe to rematerialize on a repair edge when the original def stops
+/// dominating it — a fresh `iconst` dominates every use by construction.
+fn const_env(func: &Function, b: Block) -> FxHashMap<Value, u64> {
+    let mut env = FxHashMap::default();
+    let nz = |_: Value| false;
+    let rg = |_: Value| None;
+    for i in func.layout.block_insts(b) {
+        if !pure_op(func, i) {
+            continue;
+        }
+        if let Some(c) = eval(func, &env, &nz, &rg, i) {
+            env.insert(func.dfg.first_result(i), c);
+        }
+    }
+    env
 }
 
 /// Blocks reachable from `s` without entering `b`, or None past MAX_WALK.
@@ -920,6 +1064,7 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
     let entry = func.layout.entry_block();
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
+    let dbg = std::env::var_os("PLIRON_JT_DEBUG").is_some();
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -1055,9 +1200,15 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                 let t = targets[ti];
                 let s = t.block(&func.dfg.value_lists);
                 if s == b || locked.contains(&s) {
+                    if dbg {
+                        eprintln!("jt skip {b}->{s}: self/locked");
+                    }
                     continue;
                 }
                 let Some(reg) = region(&cfg, b, s) else {
+                    if dbg {
+                        eprintln!("jt skip {b}->{s}: region>MAX_WALK");
+                    }
                     continue;
                 };
                 // B's values used from `s` on (resolved), in first-use order.
@@ -1080,10 +1231,57 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                     }
                 }
                 let repair = !needed.is_empty();
+                // `s`'s other incoming edges (beyond the merge arm) must
+                // also feed the new params: append the needed b-values
+                // verbatim — legal when each def dominates that pred's
+                // terminator (true for loop-carried exports like
+                // tokenize's v1899, and always for the merge term's own
+                // second arm when both arms land on `s`).
+                let mut extra: Vec<(Inst, usize)> = Vec::new();
+                if repair {
+                    let mut okr = true;
+                    for pr in cfg.pred_iter(s) {
+                        let q = pr.inst;
+                        let qdests = func.dfg.insts[q].branch_destination(
+                            &func.dfg.jump_tables,
+                            &func.dfg.exception_tables,
+                        );
+                        for (dj, qbc) in qdests.iter().enumerate() {
+                            if qbc.block(&func.dfg.value_lists) != s || (q == term && dj == ti) {
+                                continue;
+                            }
+                            for &w in &needed {
+                                let pp = match func.dfg.value_def(w) {
+                                    ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+                                    ValueDef::Param(db, _) => ProgramPoint::Block(db),
+                                    _ => {
+                                        okr = false;
+                                        break;
+                                    }
+                                };
+                                if !domtree.dominates(pp, q, &func.layout) {
+                                    okr = false;
+                                    break;
+                                }
+                            }
+                            if !okr {
+                                break;
+                            }
+                            extra.push((q, dj));
+                        }
+                        if !okr {
+                            break;
+                        }
+                    }
+                    if !okr {
+                        if dbg {
+                            eprintln!("jt skip {b}->{s} from {pblock}: extra edge can't supply exports");
+                        }
+                        continue;
+                    }
+                }
                 if repair
-                    && (cfg.pred_iter(s).count() != 1
-                        || targets[1 - ti].block(&func.dfg.value_lists) == s
-                        || seen.contains(&b)
+                    && (seen.contains(&b)
                         || seen.contains(&s)
                         || seen.contains(&pblock)
                         || reg.iter().any(|x| seen.contains(x))
@@ -1092,35 +1290,42 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                             .filter(|x| b_users.is_some_and(|bu| bu.contains(x)))
                             .all(|&x| domtree.block_dominates(s, x)))
                 {
+                    if dbg {
+                        eprintln!(
+                            "jt skip {b}->{s} from {pblock}: repair seen={}/{}/{} regseen={} dom={}",
+                            seen.contains(&b),
+                            seen.contains(&s),
+                            seen.contains(&pblock),
+                            reg.iter().any(|x| seen.contains(x)),
+                            reg.iter()
+                                .filter(|x| b_users.is_some_and(|bu| bu.contains(x)))
+                                .all(|&x| domtree.block_dominates(s, x))
+                        );
+                    }
                     continue;
                 }
-                let map = |v: Value, out: &mut Vec<Arg>| -> bool {
-                    if let Some(&pv) = argv.get(&v) {
-                        out.push(Arg::V(pv));
-                    } else if body_vals.contains(&v) {
-                        match env.get(&v) {
-                            // `env` tracks 64 bits; it can't describe a wider
-                            // param (and `iconst` tops out at i64).
-                            Some(&k) if func.dfg.value_type(v).bits() <= 64 => {
-                                out.push(Arg::K(k, func.dfg.value_type(v)))
-                            }
-                            _ => return false,
-                        }
-                    } else {
-                        out.push(Arg::V(v));
-                    }
-                    true
-                };
                 let mut new = Vec::new();
                 for a in t.args(&func.dfg.value_lists) {
                     let BlockArg::Value(v) = a else {
                         ok = false;
                         break;
                     };
-                    ok &= map(func.dfg.resolve_aliases(v), &mut new);
+                    ok &= map_val(
+                        func,
+                        &argv,
+                        &body_vals,
+                        &env,
+                        &domtree,
+                        pinst,
+                        func.dfg.resolve_aliases(v),
+                        &mut new,
+                        4,
+                    );
                 }
                 for &w in &needed {
-                    ok &= map(w, &mut new);
+                    ok &= map_val(
+                        func, &argv, &body_vals, &env, &domtree, pinst, w, &mut new, 4,
+                    );
                 }
                 if !ok {
                     continue;
@@ -1131,7 +1336,7 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                     touched.insert(term);
                     locked.extend([b, s, pblock]);
                     locked.extend(reg.iter().copied());
-                    (term, ti, needed, reg)
+                    (term, ti, needed, reg, extra)
                 });
                 edits.push(Edit {
                     pinst,
@@ -1139,14 +1344,107 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                     s,
                     args: new,
                     repair,
+                    eargs: Vec::new(),
                 });
                 break;
             }
         }
     }
-    let n = edits.len();
-    for e in edits {
-        if let Some((term, ti, needed, reg)) = e.repair {
+    // The batch's planned `pinst -> s` edges can open fresh paths that
+    // bypass a def some appended edge arg relies on (an export fed
+    // verbatim to `s`'s other preds dominated them only because every
+    // route used to pass through `b` — think `s` looping back to its own
+    // pred). Re-check every value placed on an edge against the
+    // post-edit graph, rematerializing constants where possible and
+    // dropping the edit otherwise.
+    let mut new_succs: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+    for e in &edits {
+        if let Some(pb) = func.layout.inst_block(e.pinst) {
+            new_succs.entry(pb).or_default().push(e.s);
+        }
+    }
+    let mut memo: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+    let mut post_safe = |func: &Function, v: Value, u: Inst| -> bool {
+        let pp = match func.dfg.value_def(v) {
+            ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+            ValueDef::Param(db, _) => ProgramPoint::Block(db),
+            _ => return false,
+        };
+        if !domtree.dominates(pp, u, &func.layout) {
+            return false;
+        }
+        let Some(db) = def_block(v) else {
+            return false;
+        };
+        let Some(ub) = func.layout.inst_block(u) else {
+            return false;
+        };
+        if db == ub {
+            // Dominance within the block was just checked: the def
+            // sits before the terminator regardless of how the block
+            // is reached.
+            return true;
+        }
+        let r = memo
+            .entry(db)
+            .or_insert_with(|| reach_avoid(func, &cfg, &new_succs, db));
+        !r.contains(&ub)
+    };
+    let mut benvs: FxHashMap<Block, FxHashMap<Value, u64>> = FxHashMap::default();
+    let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
+    'edits: for mut e in edits {
+        // `V` leaves carried onto the retargeted edge itself.
+        let mut bad = {
+            let mut stack: Vec<&Arg> = e.args.iter().collect();
+            let mut bad = false;
+            while let Some(a) = stack.pop() {
+                match a {
+                    Arg::K(..) => {}
+                    Arg::R(_, subs) => stack.extend(subs.iter()),
+                    Arg::V(v) => {
+                        let v = func.dfg.resolve_aliases(*v);
+                        if !post_safe(func, v, e.pinst) {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            bad
+        };
+        if !bad && let Some((term, _, needed, _, extra)) = &e.repair {
+            let b = func.layout.inst_block(*term).unwrap();
+            let benv = benvs.entry(b).or_insert_with(|| const_env(func, b));
+            for &(q, _) in extra {
+                let mut es = Vec::with_capacity(needed.len());
+                for &w in needed {
+                    let k = benv
+                        .get(&w)
+                        .filter(|_| func.dfg.value_type(w).bits() <= 64)
+                        .copied();
+                    if let Some(k) = k {
+                        es.push(Arg::K(k, func.dfg.value_type(w)));
+                    } else if post_safe(func, w, q) {
+                        es.push(Arg::V(w));
+                    } else {
+                        bad = true;
+                        break;
+                    }
+                }
+                if bad {
+                    break;
+                }
+                e.eargs.push(es);
+            }
+        }
+        if bad {
+            continue 'edits;
+        }
+        kept.push(e);
+    }
+    let n = kept.len();
+    for e in kept {
+        if let Some((term, ti, needed, reg, extra)) = e.repair {
             let mut to: FxHashMap<Value, Value> = FxHashMap::default();
             for &w in &needed {
                 let ty = func.dfg.value_type(w);
@@ -1166,6 +1464,33 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
                     }
                 }
             }
+            // Every other edge into `s` feeds the new params — verbatim
+            // b-values when they still dominate that edge post-edit,
+            // freshly rematerialized constants otherwise (both resolved
+            // during validation into `e.eargs`).
+            for ((q, dj), es) in extra.iter().zip(&e.eargs) {
+                let dest_ok = {
+                    let dfg = &func.dfg;
+                    dfg.insts[*q].branch_destination(
+                        &dfg.jump_tables,
+                        &dfg.exception_tables,
+                    )[*dj]
+                    .block(&dfg.value_lists)
+                        == e.s
+                };
+                if !dest_ok {
+                    continue;
+                }
+                let vals: Vec<Value> = es.iter().map(|a| emit_arg(func, *q, a)).collect();
+                let dfg = &mut func.dfg;
+                let bc = &mut dfg.insts[*q].branch_destination_mut(
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                )[*dj];
+                for v in vals {
+                    bc.append_argument(v, &mut dfg.value_lists);
+                }
+            }
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[term]
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[ti];
@@ -1174,14 +1499,8 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
             }
         }
         let mut args = Vec::with_capacity(e.args.len());
-        for a in e.args {
-            args.push(BlockArg::Value(match a {
-                Arg::V(v) => v,
-                Arg::K(k, ty) => {
-                    let mut cur = FuncCursor::new(func).at_inst(e.pinst);
-                    cur.ins().iconst(ty, k as i64)
-                }
-            }));
+        for a in &e.args {
+            args.push(BlockArg::Value(emit_arg(func, e.pinst, a)));
         }
         let bc = BlockCall::new(e.s, args, &mut func.dfg.value_lists);
         let dfg = &mut func.dfg;
@@ -1193,7 +1512,7 @@ pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
 
 /// Splice `jump`-only successors that have no other predecessor into their
 /// predecessor, so a merge block and its test end up in one block.
-fn merge_chains(func: &mut Function) {
+pub fn merge_chains(func: &mut Function) {
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -1245,6 +1564,294 @@ fn merge_chains(func: &mut Function) {
             gone.insert(y);
         }
     }
+}
+
+/// A dispatch block `y`'s successors may use `y`'s params and results
+/// directly — which is exactly what strands them when an edge tries to
+/// thread past `y`. Rebind each sole-pred successor `s`: append a param
+/// for every `y` value `s`'s dominated cone consumes, feed it on `y`'s
+/// edge, and rename the uses. Once the exports travel as edge args an
+/// edgespec threading can land on `s` — an enum-discriminant dispatch
+/// whose use-cone is small (a couple of epilogue blocks) then folds.
+pub fn rebind_exports(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let dom = DominatorTree::with_function(func, &cfg);
+    let mut edits = Vec::new();
+    for y in func.layout.blocks().collect::<Vec<_>>() {
+        let mut exports: FxHashSet<Value> = func.dfg.block_params(y).iter().copied().collect();
+        for i in func.layout.block_insts(y) {
+            for r in func.dfg.inst_results(i).iter() {
+                exports.insert(*r);
+            }
+        }
+        let Some(term) = func.layout.last_inst(y) else {
+            continue;
+        };
+        let dests = func.dfg.insts[term]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .to_vec();
+        let mut done: FxHashSet<Block> = FxHashSet::default();
+        for bc in &dests {
+            let s = bc.block(&func.dfg.value_lists);
+            // Every edge into `s` must leave `y`'s terminator — `pred_iter`
+            // counts instructions, so a brif with both arms on `s` still
+            // qualifies (all its calls get args appended below).
+            if s == y
+                || !done.insert(s)
+                || !cfg.pred_iter(s).all(|e| e.inst == term)
+            {
+                continue;
+            }
+            // `y` values consumed from `s`'s dominated cone — `s` owns the
+            // only path there, so a param can carry each.
+            let mut needed: Vec<Value> = Vec::new();
+            let mut bail = false;
+            for b in func.layout.blocks() {
+                if b == y || (b != s && !dom.block_dominates(s, b)) {
+                    continue;
+                }
+                for i in func.layout.block_insts(b) {
+                    for v in func.dfg.inst_values(i) {
+                        let v = func.dfg.resolve_aliases(v);
+                        if exports.contains(&v) && !needed.contains(&v) {
+                            if needed.len() >= 8 {
+                                bail = true;
+                                break;
+                            }
+                            needed.push(v);
+                        }
+                    }
+                }
+            }
+            if bail || needed.is_empty() {
+                continue;
+            }
+            edits.push((y, term, s, needed));
+        }
+    }
+    let n = edits.len();
+    for (y, term, s, needed) in edits {
+        let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
+        for &w in &needed {
+            let ty = func.dfg.value_type(w);
+            let p = func.dfg.append_block_param(s, ty);
+            repl.insert(w, p);
+        }
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            if b == y || (b != s && !dom.block_dominates(s, b)) {
+                continue;
+            }
+            let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+            for i in insts {
+                let to: FxHashMap<Value, Value> = func
+                    .dfg
+                    .inst_values(i)
+                    .filter_map(|v| {
+                        repl.get(&func.dfg.resolve_aliases(v))
+                            .map(|&n| (v, n))
+                    })
+                    .collect();
+                if !to.is_empty() {
+                    func.dfg
+                        .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
+                }
+            }
+        }
+        let dfg = &mut func.dfg;
+        for bc in
+            dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if bc.block(&dfg.value_lists) == s {
+                for &w in &needed {
+                    bc.append_argument(w, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Clone a small pure dispatch block into a `jump` predecessor — the pred's
+/// edge then carries the dispatch's test and branch args itself (the
+/// `select→icmp` discriminant in the pred folds against the clone to a
+/// raw `brif`). Legal only while every def of `y` is used inside `y` —
+/// `rebind_exports` creates exactly that shape by moving shared uses
+/// onto successor params.
+pub fn dispatch_dup(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let dom = DominatorTree::with_function(func, &cfg);
+    let entry = func.layout.entry_block();
+    // Values with any use outside their def block: a `y` whose defs all
+    // stay internal can be cloned without stranding downstream uses.
+    let mut escaping: FxHashSet<Value> = FxHashSet::default();
+    for x in func.layout.blocks() {
+        for i in func.layout.block_insts(x) {
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                let db = match func.dfg.value_def(v) {
+                    ValueDef::Param(b, _) => Some(b),
+                    ValueDef::Result(di, _) => func.layout.inst_block(di),
+                    _ => None,
+                };
+                if db.is_some_and(|b| b != x) {
+                    escaping.insert(v);
+                }
+            }
+        }
+    }
+    let mut edits = Vec::new();
+    for p in func.layout.blocks() {
+        let Some(term) = func.layout.last_inst(p) else {
+            continue;
+        };
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+            continue;
+        };
+        let y = destination.block(&func.dfg.value_lists);
+        if y == p || Some(y) == entry {
+            continue;
+        }
+        let insts: Vec<Inst> = func.layout.block_insts(y).collect();
+        let Some((&yterm, body)) = insts.split_last() else {
+            continue;
+        };
+        if body.len() > 12 || !body.iter().all(|&i| pure_op(func, i)) {
+            continue;
+        }
+        if !matches!(
+            func.dfg.insts[yterm],
+            InstructionData::Brif { .. } | InstructionData::Jump { .. }
+        ) {
+            continue;
+        }
+        let params = func.dfg.block_params(y).to_vec();
+        let args: Vec<Value> = destination
+            .args(&func.dfg.value_lists)
+            .filter_map(|a| match a {
+                BlockArg::Value(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        if args.len() != params.len() {
+            continue;
+        }
+        // A `y` param re-bound to `y` itself can't be cloned.
+        let pset: FxHashSet<Value> = params.iter().copied().collect();
+        if args
+            .iter()
+            .any(|&a| pset.contains(&func.dfg.resolve_aliases(a)))
+        {
+            continue;
+        }
+        let map: FxHashMap<Value, Value> = params.iter().copied().zip(args).collect();
+        let mut ok = true;
+        // `y` insts and branch args must resolve to clones or to values
+        // dominating `p`'s tail.
+        for i in insts.iter().take(body.len()).chain([&yterm]) {
+            for v in func.dfg.inst_values(*i) {
+                let v = func.dfg.resolve_aliases(v);
+                if map.contains_key(&v) {
+                    continue;
+                }
+                let okd = match func.dfg.value_def(v) {
+                    ValueDef::Param(b, _) => {
+                        b == y
+                            || (func.layout.is_block_inserted(b)
+                                && dom.block_dominates(b, p))
+                    }
+                    ValueDef::Result(di, _) => {
+                        func.layout.inst_block(di) == Some(y)
+                            || dom.dominates(di, term, &func.layout)
+                    }
+                    _ => false,
+                };
+                if !okd {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        // Nothing `y` defines may be observed outside `y`.
+        if ok {
+            for i in insts.iter().take(body.len()) {
+                for r in func.dfg.inst_results(*i).iter() {
+                    if escaping.contains(&func.dfg.resolve_aliases(*r)) {
+                        ok = false;
+                    }
+                }
+            }
+            if params.iter().any(|pv| escaping.contains(pv)) {
+                ok = false;
+            }
+        }
+        if ok {
+            edits.push((p, term, y, map));
+        }
+    }
+    let mut n = 0;
+    for (_p, term, y, mut map) in edits {
+        let insts: Vec<Inst> = func.layout.block_insts(y).collect();
+        let Some((&yterm, body)) = insts.split_last() else {
+            continue;
+        };
+        for &i in body {
+            let ni = func.dfg.clone_inst(i);
+            let vals: Vec<Value> = func
+                .dfg
+                .inst_values(ni)
+                .map(|v| {
+                    let v = func.dfg.resolve_aliases(v);
+                    *map.get(&v).unwrap_or(&v)
+                })
+                .collect();
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            func.layout.insert_inst(ni, term);
+            let nrs = func.dfg.inst_results(ni).to_vec();
+            for (r, nr) in func.dfg.inst_results(i).to_vec().into_iter().zip(nrs) {
+                map.insert(r, nr);
+            }
+        }
+        let sub = |bc: BlockCall, map: &FxHashMap<Value, Value>, func: &Function| -> Vec<BlockArg> {
+            bc.args(&func.dfg.value_lists)
+                .map(|a| match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        BlockArg::Value(*map.get(&v).unwrap_or(&v))
+                    }
+                    a => a,
+                })
+                .collect()
+        };
+        let mut cur = FuncCursor::new(func).at_inst(term);
+        let made = match cur.func.dfg.insts[yterm] {
+            InstructionData::Jump { destination, .. } => {
+                let d = destination.block(&cur.func.dfg.value_lists);
+                let args = sub(destination, &map, cur.func);
+                Some(cur.ins().jump(d, &args))
+            }
+            InstructionData::Brif { arg, blocks, .. } => {
+                let c = cur.func.dfg.resolve_aliases(arg);
+                let c = *map.get(&c).unwrap_or(&c);
+                let (tb, eb) = (
+                    blocks[0].block(&cur.func.dfg.value_lists),
+                    blocks[1].block(&cur.func.dfg.value_lists),
+                );
+                let ta = sub(blocks[0], &map, cur.func);
+                let ea = sub(blocks[1], &map, cur.func);
+                Some(cur.ins().brif(c, tb, &ta, eb, &ea))
+            }
+            _ => None,
+        };
+        if made.is_none() {
+            continue;
+        }
+        func.layout.remove_inst(term);
+        n += 1;
+    }
+    n
 }
 
 /// Retarget edges into blocks that only `jump` onward straight to the final

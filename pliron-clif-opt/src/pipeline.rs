@@ -719,13 +719,84 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     }
 }
 
+// Late dispatch merge: `edgespec`/`bittab` leave a dispatch block whose
+// preds already computed the discriminator it re-tests. Single-pred
+// chains splice in via `merge_chains`; the multi-pred case is edgespec's
+// own edge threading, which only becomes legal once later passes have
+// rebundled the dispatch's uses behind edge args (the `select→icmp`
+// discriminant in the pred then folds to `brif` on the raw flag via
+// `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
+fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let mut n = 0;
+    if crate::pass_enabled("PLIRON_CHAINMERGE") {
+        jumpthread::merge_chains(&mut p.clctx.func);
+    }
+    if crate::pass_enabled("PLIRON_DISPATCHDUP") {
+        // Duplicating a dispatch into a jump pred rewires that pred's own
+        // jump-preds onto the dispatch — run to fixpoint so multi-hop
+        // chains (851/853/854 -> 388 -> 859) fully collapse.
+        for _ in 0..6 {
+            let k = jumpthread::dispatch_dup(&mut p.clctx.func);
+            n += k;
+            if k == 0 {
+                break;
+            }
+        }
+    }
+    if crate::pass_enabled("PLIRON_EDGESPEC2") {
+        if crate::pass_enabled("PLIRON_REBIND") {
+            n += jumpthread::rebind_exports(&mut p.clctx.func);
+        }
+        n += edgespec::run(&mut p.clctx.func);
+        if crate::pass_enabled("PLIRON_DISPATCHDUP") {
+            // Edgespec can leave fresh jump preds on small dispatch blocks.
+            for _ in 0..6 {
+                let k = jumpthread::dispatch_dup(&mut p.clctx.func);
+                n += k;
+                if k == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let k = clifpeep::brif_fold(&mut p.clctx.func);
+    n += k;
+    if n > 0 {
+        jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+        edgespec::sweep_dead(&mut p.clctx.func);
+    }
+    if p.dump {
+        p.dump("mergechain");
+    }
+    n
+}
+
 // Late single threading round: edge args turned constant by sameargs/celim
 // decide merge-block brifs jumpthread's early fixpoint couldn't see.
 fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
-    let n = jumpthread::round(&mut p.clctx.func, &nn, crate::pass_enabled("PLIRON_DOMCOND"));
-    p.stats.threaded += n;
-    n
+    let mut total = 0;
+    // One `round` can apply at most one export-repair per merge block
+    // (the `seen`/`locked` guards), and every repair locks the region it
+    // touched. Later dispatch-dup edges decided by constants (the
+    // block388 -> block935 disc) need follow-up rounds.
+    for i in 0..8 {
+        let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
+        let n = jumpthread::round(&mut p.clctx.func, &nn, crate::pass_enabled("PLIRON_DOMCOND"));
+        total += n;
+        if p.dump {
+            p.dump(&format!("jtr{i}"));
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    if total > 0 {
+        // Threaded edges strand the merge blocks they bypassed.
+        jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+        edgespec::sweep_dead(&mut p.clctx.func);
+    }
+    p.stats.threaded += total;
+    total
 }
 
 fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -1803,6 +1874,13 @@ pub static DEFAULT: &[Step] = &[
     // Flag-merge brif blocks (a bool merged through a param, then tested)
     // only settle after edgespec/celim — dup them onto const edges here too.
     step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
+    // Late dispatch-block duplication + edge re-spec: collapses the
+    // `select -> ireduce -> icmp -> brif` dispatch tail onto a direct brif
+    // on the flag (tokenize's block388/block859 discriminant chain —
+    // only pays off once jtround can repair multi-pred targets, so this
+    // sits right before the looping jtround).
+    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain)
+        .needs(shape::CONDBR),
     step("jtround", "threaded", Gate::Env("PLIRON_JTROUND"), s_jtround).needs(shape::CONDBR),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
     step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
