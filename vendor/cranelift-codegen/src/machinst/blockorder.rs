@@ -161,6 +161,9 @@ impl BlockLoweringOrder {
         // Step 1: compute the in-edge and out-edge count of every block.
         let mut block_in_count = SecondaryMap::with_default(0);
         let mut block_out_count = SecondaryMap::with_default(0);
+        // PLIRON: predecessor lists for the chained-order loop heuristic.
+        let mut block_preds: SecondaryMap<Block, SmallVec<[Block; 4]>> =
+            SecondaryMap::with_default(SmallVec::new());
 
         // Block successors are stored as `LoweredBlocks` to simplify the construction of
         // `lowered_succs` in the final result. Initially, all entries are `Orig` values, and are
@@ -175,6 +178,7 @@ impl BlockLoweringOrder {
             visit_block_succs(f, block, |_, succ, from_table| {
                 block_out_count[block] += 1;
                 block_in_count[succ] += 1;
+                block_preds[succ].push(block);
                 block_succs.push(LoweredBlock::Orig { block: succ });
 
                 if from_table {
@@ -231,20 +235,46 @@ impl BlockLoweringOrder {
                 let range = block_succ_range[block].clone();
                 let mut pick: Option<Block> = None;
                 let mut pick_in = 0;
+                let mut pick_rank = 0;
                 for lb in &block_succs[range] {
                     let succ = lb.orig_block().unwrap();
                     if f.is_effectively_cold(succ) || domtree.block_dominates(succ, block) {
                         continue;
                     }
-                    match domtree.idom(succ) {
-                        Some(d) if domtree.block_dominates(d, block) => {}
+                    let idom = match domtree.idom(succ) {
+                        Some(d) if domtree.block_dominates(d, block) => d,
                         _ => continue,
-                    }
-                    // On ties prefer the later successor: dispatch
-                    // brifs list the unusual target first.
-                    if pick.is_none() || block_in_count[succ] >= pick_in {
+                    };
+                    // Succ preference, highest first:
+                    // - a succ that dominates a predecessor of `block` is
+                    //   on a cycle back to it — the loop body past a head's
+                    //   exit check. `brif done, exit-merge, continue`
+                    //   should fall through to the body, not the exit.
+                    // - a domtree child — a continuation only reachable
+                    //   through this block, including merges fully inside
+                    //   its region (dispatch preds converge on the hot
+                    //   continuation).
+                    // - a shared merge whose region extends outside
+                    //   `block`'s subtree — adjacent only as a last resort;
+                    //   pulling it in scatters the region.
+                    // In-count breaks ties within a class.
+                    let rank = if block_preds[block]
+                        .iter()
+                        .any(|&p| domtree.block_dominates(succ, p))
+                    {
+                        2
+                    } else if idom == block {
+                        1
+                    } else {
+                        0
+                    };
+                    if pick.is_none()
+                        || rank > pick_rank
+                        || (rank == pick_rank && block_in_count[succ] >= pick_in)
+                    {
                         pick = Some(succ);
                         pick_in = block_in_count[succ];
+                        pick_rank = rank;
                     }
                 }
                 if let Some(s) = pick {
