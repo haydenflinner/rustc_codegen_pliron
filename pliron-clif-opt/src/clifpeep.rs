@@ -2849,6 +2849,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     if crate::pass_enabled("PLIRON_ULOAD") {
         n += uloads(func);
     }
+    let mut uses = None;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -3104,7 +3105,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 }
             }
             if crate::pass_enabled("PLIRON_ICMPEQFOLD")
-                && icmp_eqfold(&mut pos, inst, cond, args, ty)
+                && icmp_eqfold(&mut pos, inst, cond, args, ty, &mut uses)
             {
                 n += 1;
                 continue;
@@ -3592,11 +3593,40 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
     true
 }
 
+/// Inst-arg + branch-arg use counts for every value, built on demand.
+fn use_counts(func: &Function) -> FxHashMap<Value, usize> {
+    let mut m: FxHashMap<Value, usize> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                *m.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(x) = a {
+                        *m.entry(func.dfg.resolve_aliases(x)).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
 /// `x >=u 1`, `x >u 0`, `x <=u 0`, `x <u 1` are equality tests;
 /// `icmp eq/ne (x + c1), c2` → `icmp eq/ne x, c2 - c1` (wrapping add is a
 /// bijection, so equality survives the shift). Together they fold peeled
 /// countdowns `x - k >=u 1` to a single `cmp x, k`.
-fn icmp_eqfold(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: Type) -> bool {
+fn icmp_eqfold(
+    pos: &mut FuncCursor,
+    inst: Inst,
+    cond: IntCC,
+    args: [Value; 2],
+    ty: Type,
+    uses: &mut Option<FxHashMap<Value, usize>>,
+) -> bool {
     if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
         return false;
     }
@@ -3647,6 +3677,20 @@ fn icmp_eqfold(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], 
         .map(|(v, c1)| (v, k0.wrapping_sub(c1)))
         .or_else(|| issub(x0).map(|(v, c1)| (v, k0.wrapping_add(c1))));
     let Some((v, kk)) = adj else { return false };
+    // Only shift when `x0` is dead apart from this compare — then the
+    // add/sub folds away entirely. When it's still needed (e.g. a loop's
+    // latch `iv - c` passed back as the next IV), `icmp x0, 0` rides that
+    // def for free and keeps the countdown-mergeable `x - c != 0` shape;
+    // shifting to `icmp x, c` forced `lea`+`mov`+`cmp`+`jcc` on x64.
+    if uses
+        .get_or_insert_with(|| use_counts(pos.func))
+        .get(&pos.func.dfg.resolve_aliases(x0))
+        .copied()
+        .unwrap_or(0)
+        > 1
+    {
+        return false;
+    }
     let c = pos.ins().iconst(ty, kk);
     pos.func.replace(inst).icmp(cc0, v, c);
     true
@@ -3660,6 +3704,7 @@ fn icmp_eqfold(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], 
 /// the first icmp fold after punroll's peeled countdowns.
 pub fn sublea(func: &mut Function) -> usize {
     let mut n = 0;
+    let mut uses = None;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -3673,7 +3718,7 @@ pub fn sublea(func: &mut Function) -> usize {
                 } = pos.func.dfg.insts[inst]
             {
                 let ty = pos.func.dfg.value_type(args[0]);
-                if icmp_eqfold(&mut pos, inst, cond, args, ty) {
+                if icmp_eqfold(&mut pos, inst, cond, args, ty, &mut uses) {
                     n += 1;
                 }
                 continue;
