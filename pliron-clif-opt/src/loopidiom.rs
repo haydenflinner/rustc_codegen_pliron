@@ -688,51 +688,60 @@ pub fn count(
     })
 }
 
-/// `b` is a diverging dead end: it ends in `trap` and has no successors, or
-/// it ends in a `try_call` (unwinding panic/abort stub) whose fall-through
-/// edge reaches a dead end — rustc points a `-> !` callee's impossible
-/// "normal return" at `trap`, possibly through cold forwarding blocks. The
-/// exception edge unwinds out of the frame, so it can't resume the loop
-/// either. A few hops suffice; a cycle isn't a dead end.
+/// `b` is a diverging dead end: every path from it leaves the frame or
+/// spins inside the cone — it can never resume the loop. Paths end at
+/// `trap`, at a `cold` `return`/`return_call` (emulated-EH unwind
+/// propagation ends in a flag-clearing cold `return`; a normal early
+/// return is never cold), or at a `try_call` whose normal-return
+/// continuation is itself dead — rustc points a `-> !` callee's
+/// impossible "normal return" at `trap`, and the exception edges unwind
+/// out of the frame. Branch edges recurse through the whole cone: panic
+/// paths on emulated-EH targets dispatch on the TLS flag across several
+/// cold blocks (`bcheck::dead_end` makes the same walk). Non-cold
+/// interior blocks are admitted — edge-splitting passes forward to cold
+/// blocks through unmarked ones — but a path reaching a non-cold
+/// `return` is a live exit, not a dead end. Bounded; a cycle counts as
+/// diverging.
 pub fn deadend(func: &Function, b: Block) -> bool {
     let mut seen: FxHashSet<Block> = FxHashSet::default();
-    let mut cur = b;
-    loop {
+    let mut stack = vec![b];
+    while let Some(cur) = stack.pop() {
         if !seen.insert(cur) {
+            continue;
+        }
+        if seen.len() > 64 {
             return false;
         }
         let Some(t) = func.layout.last_inst(cur) else {
             return false;
         };
+        let dests = func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         match func.dfg.insts[t].opcode() {
-            Opcode::Trap => return true,
-            Opcode::TryCall => {
+            Opcode::Trap => {}
+            Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect
+                if func.layout.is_cold(cur) => {}
+            Opcode::TryCall | Opcode::TryCallIndirect => {
                 // The exception table lists the handler targets first and
-                // the normal-return continuation last; an unwinding callee
-                // leaves the frame, so only the normal edge could resume
-                // the loop. A `-> !` callee's continuation is `trap`.
-                let Some(bc) = func.dfg.insts[t]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                    .last()
-                else {
-                    return false;
-                };
-                cur = bc.block(&func.dfg.value_lists);
+                // the normal-return continuation last.
+                if let Some(bc) = dests.last() {
+                    stack.push(bc.block(&func.dfg.value_lists));
+                }
             }
-            Opcode::Jump => {
-                let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
-                    return false;
-                };
-                cur = destination.block(&func.dfg.value_lists);
+            _ if !dests.is_empty() => {
+                for bc in dests {
+                    stack.push(bc.block(&func.dfg.value_lists));
+                }
             }
             _ => return false,
         }
     }
+    true
 }
 
 /// Exit edge `e` is never taken because its `brif` arg is a constant
 /// selecting the in-loop destination (a folded-away interior test).
-fn never_taken(func: &Function, e: Edge) -> bool {
+pub fn never_taken(func: &Function, e: Edge) -> bool {
     let InstructionData::Brif { arg, .. } = func.dfg.insts[e.inst] else {
         return false;
     };
@@ -790,6 +799,14 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
     if let Some(k) = iconst(func, c) {
         return e.slot == usize::from(k != 0);
     }
+    // The icmp's condition under which the exit edge is taken: `cond` on a
+    // taken exit, its complement on a not-taken exit. `x u>= bound` and
+    // `x u> bound` spellings share the same deadness proofs below.
+    let fires = |cond: IntCC, slot: usize| match slot {
+        0 => Some(cond),
+        1 => Some(cond.complement()),
+        _ => None,
+    };
     // A descending-index bounds check `ult(bound-1-iv, bound)` never fires:
     // a unit-step stay condition keeps `iv <= bound-1`, so the index stays
     // in `[0, bound-1]` (no wrap) on every iteration. The index must read
@@ -797,10 +814,13 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
     if let ValueDef::Result(ci, _) = func.dfg.value_def(c)
         && let InstructionData::IntCompare {
             opcode: Opcode::Icmp,
-            cond: IntCC::UnsignedLessThan,
+            cond,
             args: [x, y],
         } = func.dfg.insts[ci]
-        && e.slot == 1
+        && matches!(
+            fires(cond, e.slot),
+            Some(IntCC::UnsignedGreaterThanOrEqual | IntCC::UnsignedGreaterThan)
+        )
         && func.dfg.resolve_aliases(y) == cnt.bound
         && cnt.step == 1
         && matches!(cnt.stay, IntCC::UnsignedLessThan | IntCC::NotEqual)
@@ -844,10 +864,13 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
         && let ValueDef::Result(ci, _) = func.dfg.value_def(c)
         && let InstructionData::IntCompare {
             opcode: Opcode::Icmp,
-            cond: IntCC::UnsignedLessThan,
+            cond,
             args: [x, y],
         } = func.dfg.insts[ci]
-        && e.slot == 1
+        && matches!(
+            fires(cond, e.slot),
+            Some(IntCC::UnsignedGreaterThanOrEqual | IntCC::UnsignedGreaterThan)
+        )
         && func.dfg.resolve_aliases(y) == cnt.bound
         && let Some(k) = iv_add_k(func, cnt.iv, x)
         && k < 0

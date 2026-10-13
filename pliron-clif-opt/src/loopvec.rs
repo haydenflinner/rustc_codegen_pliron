@@ -31,8 +31,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
     Count, Edge, Info, Ins, Param, Pred, count, deadend, deepest_first, def_block, edge_args,
-    edge_dest, emit, gather, guard_dead, guard_pred, iconst, ins_eval, outv, param_kinds,
-    trips_idx, trips_ptr,
+    edge_dest, emit, gather, guard_dead, guard_pred, iconst, ins_eval, never_taken, outv,
+    param_kinds, trips_idx, trips_ptr,
 };
 use crate::proots;
 
@@ -1460,7 +1460,7 @@ fn plan(
         let mut es = Vec::new();
         let mut ok = true;
         for &e2 in &info.exits {
-            if e2 == e || guard_dead(func, &c, e2) {
+            if e2 == e || never_taken(func, e2) || guard_dead(func, &c, e2) {
                 continue;
             }
             // A duplicate count test on a sibling latch (`filter`-shape
@@ -1481,8 +1481,22 @@ fn plan(
             }
             if !guard_pred(func, &info, &kinds, &c, e2, &mut ps) {
                 match early_cond(func, &info, e2) {
-                    Some(ec) => es.push(ec),
+                    Some(ec) => {
+                        if crate::env_set("PLIRON_VEC_DEBUG") {
+                            eprintln!(
+                                "vec exit {} -> early_cond {ec:?}",
+                                func.dfg.display_inst(e2.inst)
+                            );
+                        }
+                        es.push(ec);
+                    }
                     None => {
+                        if crate::env_set("PLIRON_VEC_DEBUG") {
+                            eprintln!(
+                                "vec exit {} uncovered, kills count cand",
+                                func.dfg.display_inst(e2.inst)
+                            );
+                        }
                         ok = false;
                         break;
                     }
