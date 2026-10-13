@@ -1378,8 +1378,23 @@ impl MachInst for Inst {
         debug_assert!(rc_dst == rc_src);
         let inst = match rc_dst {
             RegClass::Int => {
-                asm::inst::movq_mr::new(dst_reg.map(Gpr::unwrap_new), Gpr::unwrap_new(src_reg))
+                // pliron: a `movl` is a byte shorter than `movq` and exact for
+                // <=32-bit vregs (upper bits are undefined in CLIF), which is
+                // common in i8/i16/i32-heavy loops where phi copies are
+                // frequent.
+                if ty.bits() <= 32 {
+                    asm::inst::movl_mr::new(
+                        dst_reg.map(Gpr::unwrap_new),
+                        Gpr::unwrap_new(src_reg),
+                    )
                     .into()
+                } else {
+                    asm::inst::movq_mr::new(
+                        dst_reg.map(Gpr::unwrap_new),
+                        Gpr::unwrap_new(src_reg),
+                    )
+                    .into()
+                }
             }
             RegClass::Float => {
                 // The Intel optimization manual, in "3.5.1.13 Zero-Latency MOV Instructions",
