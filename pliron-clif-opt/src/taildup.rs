@@ -8,7 +8,9 @@
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, BlockArg, Function, InstructionData, Opcode, Value, ValueDef};
+use cranelift_codegen::ir::{
+    Block, BlockArg, BlockCall, Function, InstructionData, Opcode, Value, ValueDef,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 4;
@@ -36,9 +38,15 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
             || op.is_branch()
             || op.is_terminator()
         {
+            if crate::env_set("PLIRON_TDDBG") {
+                eprintln!("taildup: cand {b} impure {i} (fn {})", func.name);
+            }
             return false;
         }
         n += 1;
+    }
+    if n > MAX_INSTS && crate::env_set("PLIRON_TDDBG") {
+        eprintln!("taildup: cand {b} too-big {n} (fn {})", func.name);
     }
     n <= MAX_INSTS
 }
@@ -62,7 +70,14 @@ fn use_blocks(func: &Function, domtree: &DominatorTree) -> FxHashMap<Value, Opti
 
 /// No parameter or result of `b` is used outside `b` (so copies need no SSA repair).
 fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
-    let ok = |v: &Value| uses.get(v).is_none_or(|&u| u == Some(b));
+    let dbg = crate::env_set("PLIRON_TDDBG");
+    let ok = |v: &Value| {
+        let good = uses.get(v).is_none_or(|&u| u == Some(b));
+        if dbg && !good {
+            eprintln!("taildup: cand {b} escapes {v} (fn {})", func.name);
+        }
+        good
+    };
     func.dfg.block_params(b).iter().all(ok)
         && func
             .layout
@@ -121,69 +136,120 @@ pub fn run(func: &mut Function) -> usize {
         let Some(t) = func.layout.last_inst(p) else {
             continue;
         };
-        let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
-            continue;
+        // A `jump` pred gets the copy in place; a `brif` pred gets one clone
+        // block per edge to a candidate (the flag merge it feeds, e.g.
+        // `is_alphabetic`'s bool param, then never materialises as a value).
+        let dests: Vec<BlockCall> = match func.dfg.insts[t] {
+            InstructionData::Jump { destination, .. } => vec![destination],
+            InstructionData::Brif { blocks, .. } if crate::pass_enabled("PLIRON_TAILDUP_EDGE") => {
+                blocks.to_vec()
+            }
+            _ => continue,
         };
-        let r = destination.block(&func.dfg.value_lists);
-        if r == p
-            || !rets.contains(&r)
-            || !domtree.is_reachable(p)
-            || !outer_dominate(func, &domtree, r, p)
-        {
-            continue;
-        }
-        let mut map: FxHashMap<Value, Value> = FxHashMap::default();
-        let args: Vec<BlockArg> = destination.args(&func.dfg.value_lists).collect();
-        let mut ok = true;
-        for (&prm, a) in func.dfg.block_params(r).iter().zip(&args) {
-            match a {
-                BlockArg::Value(v) => {
-                    map.insert(prm, *v);
-                }
-                _ => ok = false,
-            }
-        }
-        if !ok {
-            continue;
-        }
-        let body: Vec<_> = func.layout.block_insts(r).collect();
-        let alias: FxHashMap<Value, Value> = body
-            .iter()
-            .flat_map(|&i| func.dfg.inst_values(i))
-            .map(|v| (v, func.dfg.resolve_aliases(v)))
-            .collect();
-        for i in body {
-            let ni = func.dfg.clone_inst(i);
-            let dfg = &mut func.dfg;
-            let mut data = dfg.insts[ni];
-            for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
-                *d = d.deep_clone(&mut dfg.value_lists);
-            }
-            dfg.insts[ni] = data;
-            let mut data = func.dfg.insts[ni];
-            let dfg = &mut func.dfg;
-            data.map_values(
-                &mut dfg.value_lists,
-                &mut dfg.jump_tables,
-                &mut dfg.exception_tables,
-                |v| {
-                    let v = *alias.get(&v).unwrap_or(&v);
-                    *map.get(&v).unwrap_or(&v)
-                },
-            );
-            func.dfg.insts[ni] = data;
-            for (&o, &nv) in func
-                .dfg
-                .inst_results(i)
-                .iter()
-                .zip(func.dfg.inst_results(ni))
+        for (di, &dest) in dests.iter().enumerate() {
+            // Brif-edge clones only pay when an arg is a constant the cloned
+            // body can fold — otherwise it's pure dispatch-chain duplication.
+            if matches!(func.dfg.insts[t], InstructionData::Brif { .. })
+                && !dest.args(&func.dfg.value_lists).any(|a| {
+                    matches!(a, BlockArg::Value(v)
+                        if func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
+                            .is_some_and(|i| func.dfg.insts[i].opcode() == Opcode::Iconst))
+                })
             {
-                map.insert(o, nv);
+                continue;
             }
-            func.layout.insert_inst(ni, t);
+            let r = dest.block(&func.dfg.value_lists);
+            let why = if r == p {
+                "self"
+            } else if !rets.contains(&r) {
+                "not-candidate"
+            } else if !domtree.is_reachable(p) {
+                "unreachable"
+            } else if !outer_dominate(func, &domtree, r, p) {
+                "outer-dom"
+            } else {
+                ""
+            };
+            if crate::env_set("PLIRON_TDDBG") && !why.is_empty() {
+                eprintln!("taildup: skip {p}->{r} edge {di}: {why} (fn {})", func.name);
+            }
+            if !why.is_empty() {
+                continue;
+            }
+            let mut map: FxHashMap<Value, Value> = FxHashMap::default();
+            let args: Vec<BlockArg> = dest.args(&func.dfg.value_lists).collect();
+            let mut ok = true;
+            for (&prm, a) in func.dfg.block_params(r).iter().zip(&args) {
+                match a {
+                    BlockArg::Value(v) => {
+                        map.insert(prm, *v);
+                    }
+                    _ => ok = false,
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if crate::env_set("PLIRON_TDDBG") {
+                eprintln!("taildup: clone {r} into {p} edge {di} (fn {})", func.name);
+            }
+            let body: Vec<_> = func.layout.block_insts(r).collect();
+            let alias: FxHashMap<Value, Value> = body
+                .iter()
+                .flat_map(|&i| func.dfg.inst_values(i))
+                .map(|v| (v, func.dfg.resolve_aliases(v)))
+                .collect();
+            let mut new_insts = Vec::with_capacity(body.len());
+            for i in body {
+                let ni = func.dfg.clone_inst(i);
+                let dfg = &mut func.dfg;
+                let mut data = dfg.insts[ni];
+                for d in
+                    data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                {
+                    *d = d.deep_clone(&mut dfg.value_lists);
+                }
+                dfg.insts[ni] = data;
+                let mut data = func.dfg.insts[ni];
+                let dfg = &mut func.dfg;
+                data.map_values(
+                    &mut dfg.value_lists,
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                    |v| {
+                        let v = *alias.get(&v).unwrap_or(&v);
+                        *map.get(&v).unwrap_or(&v)
+                    },
+                );
+                func.dfg.insts[ni] = data;
+                for (&o, &nv) in func
+                    .dfg
+                    .inst_results(i)
+                    .iter()
+                    .zip(func.dfg.inst_results(ni))
+                {
+                    map.insert(o, nv);
+                }
+                new_insts.push(ni);
+            }
+            if matches!(func.dfg.insts[t], InstructionData::Jump { .. }) {
+                for &ni in &new_insts {
+                    func.layout.insert_inst(ni, t);
+                }
+                func.layout.remove_inst(t);
+            } else {
+                let nb = func.dfg.make_block();
+                func.layout.insert_block_after(nb, p);
+                for &ni in &new_insts {
+                    func.layout.append_inst(ni, nb);
+                }
+                let dfg = &mut func.dfg;
+                dfg.insts[t]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
+                    BlockCall::new(nb, std::iter::empty(), &mut dfg.value_lists);
+            }
+            n += 1;
         }
-        func.layout.remove_inst(t);
-        n += 1;
     }
     // Return blocks left without predecessors would fail dominance checks.
     let cfg = ControlFlowGraph::with_function(func);

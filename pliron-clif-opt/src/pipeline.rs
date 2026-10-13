@@ -719,6 +719,15 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     }
 }
 
+// Late single threading round: edge args turned constant by sameargs/celim
+// decide merge-block brifs jumpthread's early fixpoint couldn't see.
+fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
+    let n = jumpthread::round(&mut p.clctx.func, &nn, crate::pass_enabled("PLIRON_DOMCOND"));
+    p.stats.threaded += n;
+    n
+}
+
 fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let (n, dead, folds) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
     p.stats.threaded += n;
@@ -1791,6 +1800,10 @@ pub static DEFAULT: &[Step] = &[
     // splat becomes a spill reload per loop iteration; a local one is a
     // single `movi`/`dup` at the use.
     step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
+    // Flag-merge brif blocks (a bool merged through a param, then tested)
+    // only settle after edgespec/celim — dup them onto const edges here too.
+    step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
+    step("jtround", "threaded", Gate::Env("PLIRON_JTROUND"), s_jtround).needs(shape::CONDBR),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
     step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
     // Fold constants any earlier pass left behind — late value folds

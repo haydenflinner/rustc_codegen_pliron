@@ -403,11 +403,14 @@ impl<'a> NonNull<'a> {
                     continue 'terms;
                 }
                 match self.derived.get(&v) {
-                    Some(&b) => {
-                        v = func.dfg.resolve_aliases(b);
+                    // The map outlives the passes that fill it — a target
+                    // deleted since is stored as a dangling alias, so chase
+                    // only values that are still real; else unprovable.
+                    Some(&b) if func.dfg.value_is_real(b) => {
+                        v = b;
                         continue;
                     }
-                    None => return false,
+                    _ => return false,
                 }
             }
             // Derived chain too deep to prove.
@@ -905,7 +908,7 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
-fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
+pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let users = users(func);
