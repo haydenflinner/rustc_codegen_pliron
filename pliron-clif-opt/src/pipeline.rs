@@ -1118,6 +1118,14 @@ fn s_sublea(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::sublea(&mut p.clctx.func)
 }
 
+// Complementary `load (select)` pairs → two speculative loads + value
+// selects. The diamonds only collapse into selects late (fuse/
+// sameargs), so this runs near the end rather than in `clifpeep`'s
+// early round (which also runs it for anything already selected).
+fn s_loadsel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::loadsel(&mut p.clctx.func)
+}
+
 // `op multi_use, one_use` → `op one_use, multi_use` on commutative
 // binops: the fewer-use operand takes two-address dst, so regalloc
 // clobbers it in place instead of copying the live one (`movdqa`
@@ -1728,6 +1736,10 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_SAMEARG"),
         s_sameargs,
     ),
+    // `load (select)` speculation once the compare-exchange diamonds
+    // are selects (fuse/sameargs ran) — early enough that loadfwd2 can
+    // forward the network's own stores into the fresh arm loads.
+    step("loadsel", "loadsel", Gate::Env("PLIRON_LDSEL"), s_loadsel).needs(shape::MEM),
     step(
         "loadfwd2",
         "loadfwd2",

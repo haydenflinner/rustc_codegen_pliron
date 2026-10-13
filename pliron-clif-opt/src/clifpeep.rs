@@ -2840,6 +2840,208 @@ fn sel_regions(func: &mut Function) -> usize {
     n
 }
 
+/// `load.notrap (select c, pa, pb)` → `select c, (load pa), (load pb)` —
+/// speculating both loads lets them issue in parallel and feeds `cmov`
+/// the values directly, instead of serializing pointer-select → load
+/// (rustc's small_sort merge networks select between two element
+/// pointers then load the winner). Speculating the non-taken arm is
+/// only trap-safe if that address is dereferenceable anyway — require a
+/// same-block sibling `load (select _, pb, pa)` covering the same two
+/// addresses, so the pair already dereferences both unconditionally.
+fn loadsel_pair(
+    pos: &mut FuncCursor,
+    inst: Inst,
+    arg: Value,
+    flags: cranelift_codegen::ir::MemFlags,
+    offset: cranelift_codegen::ir::immediates::Offset32,
+) -> bool {
+    if !pos.func.dfg.mem_flags[flags].notrap() {
+        return false;
+    }
+    let a = pos.func.dfg.resolve_aliases(arg);
+    let Some(d) = pos.func.dfg.value_def(a).inst() else {
+        return false;
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: [c, pa, pb],
+    } = pos.func.dfg.insts[d]
+    else {
+        return false;
+    };
+    let c = pos.func.dfg.resolve_aliases(c);
+    let (pa, pb) = (
+        pos.func.dfg.resolve_aliases(pa),
+        pos.func.dfg.resolve_aliases(pb),
+    );
+    let b = pos.func.layout.inst_block(inst).unwrap();
+    let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+    // Find the complementary sibling: a same-typed notrap load of
+    // `select c, pb, pa` — same condition, swapped arms. The pair
+    // picks opposite arms on every execution, so both `pa` and `pb`
+    // get dereferenced unconditionally whenever this block runs.
+    let mut sib = None;
+    let mut sib_after = false;
+    for i in pos.func.layout.block_insts(b) {
+        if i == inst {
+            sib_after = true;
+            continue;
+        }
+        let InstructionData::Load {
+            arg: a2, flags: f2, ..
+        } = pos.func.dfg.insts[i]
+        else {
+            continue;
+        };
+        if !pos.func.dfg.mem_flags[f2].notrap() {
+            continue;
+        }
+        let Some(d2) = pos
+            .func
+            .dfg
+            .value_def(pos.func.dfg.resolve_aliases(a2))
+            .inst()
+        else {
+            continue;
+        };
+        let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: [c2, x, y],
+        } = pos.func.dfg.insts[d2]
+        else {
+            continue;
+        };
+        let c2 = pos.func.dfg.resolve_aliases(c2);
+        let x = pos.func.dfg.resolve_aliases(x);
+        let y = pos.func.dfg.resolve_aliases(y);
+        if c2 == c
+            && x == pb
+            && y == pa
+            && pos.func.dfg.value_type(pos.func.dfg.first_result(i)) == ty
+        {
+            sib = Some(i);
+            break;
+        }
+    }
+    let Some(sib) = sib else {
+        return false;
+    };
+    // Nothing memory-affecting may sit between the pair: a call or
+    // store to `pa`/`pb` could change what the later load reads, and a
+    // trap would leave the sibling unexecuted on paths where `inst`
+    // runs — either way the arm's validity at the witness wouldn't
+    // carry to the speculated load.
+    let mut between = false;
+    for i in pos.func.layout.block_insts(b) {
+        if i == inst || i == sib {
+            if between {
+                break;
+            }
+            between = true;
+            continue;
+        }
+        if between {
+            let op = pos.func.dfg.insts[i].opcode();
+            if op.can_store() || op.can_trap() || op.is_call() {
+                return false;
+            }
+        }
+    }
+    let flags = pos.func.dfg.mem_flags[flags].clone();
+    // Emit `iadd`-armed loads as `base + k`: the arm pointers are often
+    // `noalias` scope roots (rustc seeds them when passing `&mut` into
+    // noalias callees), so `load pa` keys an opaque root that forwards
+    // with nothing, while `load base + k` unifies with the sibling
+    // accesses and the network's own stores.
+    let arm = |pos: &mut FuncCursor, a: Value| -> Option<(Value, i32)> {
+        let mut a = a;
+        let mut off = i64::from(i32::from(offset));
+        for _ in 0..8 {
+            let Some(i) = pos.func.dfg.value_def(a).inst() else {
+                break;
+            };
+            let InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } = pos.func.dfg.insts[i]
+            else {
+                break;
+            };
+            let (x, y) = (
+                pos.func.dfg.resolve_aliases(args[0]),
+                pos.func.dfg.resolve_aliases(args[1]),
+            );
+            let (base, k) = if let Some(k) = iconst(pos.func, y) {
+                (x, k)
+            } else if let Some(k) = iconst(pos.func, x) {
+                (y, k)
+            } else {
+                break;
+            };
+            a = base;
+            off = off.wrapping_add(k);
+        }
+        Some((a, i32::try_from(off).ok()?))
+    };
+    let Some(((pa2, offa), (pb2, offb))) = arm(&mut *pos, pa).zip(arm(&mut *pos, pb))
+    else {
+        return false;
+    };
+    pos.goto_inst(if sib_after { inst } else { sib });
+    let la = pos.ins().load(ty, flags.clone(), pa2, offa);
+    let lb = pos.ins().load(ty, flags, pb2, offb);
+    // Rewrite each load of `select c, x, y` to `select c, (x==pa ? la :
+    // lb), (y==pa ? la : lb)` — arm order preserved.
+    for l in [inst, sib] {
+        let ldef = pos
+            .func
+            .dfg
+            .value_def(pos.func.dfg.resolve_aliases(match pos.func.dfg.insts[l] {
+                InstructionData::Load { arg, .. } => arg,
+                _ => unreachable!(),
+            }))
+            .inst()
+            .unwrap();
+        let InstructionData::Ternary {
+            args: [c, x, y], ..
+        } = pos.func.dfg.insts[ldef]
+        else {
+            unreachable!()
+        };
+        let (x, y) = (
+            pos.func.dfg.resolve_aliases(x),
+            pos.func.dfg.resolve_aliases(y),
+        );
+        let (tv, fv) = (
+            if x == pa { la } else { lb },
+            if y == pa { la } else { lb },
+        );
+        pos.func.replace(l).select(c, tv, fv);
+    }
+    pos.goto_inst(inst);
+    true
+}
+
+/// Speculate both arms of `load.notrap (select c, pa, pb)` pairs into
+/// `select c, (load pa), (load pb)`. Runs as its own late step too —
+/// the compare-exchange diamonds only collapse into selects after
+/// `fuse`/`sameargs`, well past `run`'s usual round.
+pub fn loadsel(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            if let InstructionData::Load { arg, flags, offset, .. } =
+                pos.func.dfg.insts[inst]
+                && loadsel_pair(&mut pos, inst, arg, flags, offset)
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut n = 0;
@@ -2853,6 +3055,14 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
+            if let InstructionData::Load { arg, flags, offset, .. } =
+                pos.func.dfg.insts[inst]
+                && crate::pass_enabled("PLIRON_LDSEL")
+                && loadsel_pair(&mut pos, inst, arg, flags, offset)
+            {
+                n += 1;
+                continue;
+            }
             if pos.func.dfg.insts[inst].opcode() == Opcode::Brif {
                 if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
                     n += 1;
@@ -5251,5 +5461,117 @@ mod tests {
                 _ => None,
             });
         assert_eq!(arg, Some(i1));
+    }
+
+    /// Complementary `load.notrap (select c, pa, pb)` /
+    /// `load.notrap (select c, pb, pa)` — the pair dereferences both
+    /// addresses unconditionally, so each folds to a select of two
+    /// shared speculative loads.
+    #[test]
+    fn loadsel_speculates_complementary_pair() {
+        let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true);
+        let entry = func.layout.entry_block().unwrap();
+        assert!(run(&mut func, true) > 0);
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                Opcode::Select,
+                Opcode::Load,
+                Opcode::Load,
+                Opcode::Select,
+                Opcode::Select,
+                Opcode::Select,
+                Opcode::Iadd,
+                Opcode::Return,
+            ],
+            "{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("loadsel produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A lone `load (select …)` may only speculatively dereference the
+    /// selected arm — without the complementary sibling the non-taken
+    /// arm could fault, so nothing is rewritten. Same for a
+    /// trap-checked pair.
+    #[test]
+    fn loadsel_needs_sibling_and_notrap() {
+        for (flags, sibling) in [
+            (MemFlagsData::new().with_notrap(), false),
+            (MemFlagsData::new(), true),
+        ] {
+            let mut func = loadsel_func(flags, sibling);
+            let entry = func.layout.entry_block().unwrap();
+            run(&mut func, true);
+            let ops: Vec<Opcode> = func
+                .layout
+                .block_insts(entry)
+                .map(|i| func.dfg.insts[i].opcode())
+                .collect();
+            assert_eq!(
+                ops.iter().filter(|&&o| o == Opcode::Load).count(),
+                if sibling { 2 } else { 1 },
+                "{}",
+                func.display()
+            );
+            // Every surviving load still addresses a select — no
+            // speculative value-selects were introduced.
+            assert!(
+                func.layout.block_insts(entry).all(|i| {
+                    match func.dfg.insts[i] {
+                        InstructionData::Load { arg, .. } => {
+                            func.dfg.insts[func
+                                .dfg
+                                .value_def(func.dfg.resolve_aliases(arg))
+                                .inst()
+                                .unwrap()]
+                            .opcode()
+                                == Opcode::Select
+                        }
+                        _ => true,
+                    }
+                }),
+                "{}",
+                func.display()
+            );
+        }
+    }
+
+    /// `select c, pa, pb; *sel` ×2 (the second with swapped arms), sum.
+    fn loadsel_func(flags: MemFlagsData, sibling: bool) -> Function {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params = vec![
+            AbiParam::new(types::I64),
+            AbiParam::new(types::I64),
+            AbiParam::new(types::I8),
+        ];
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let pa = func.dfg.append_block_param(entry, types::I64);
+        let pb = func.dfg.append_block_param(entry, types::I64);
+        let c = func.dfg.append_block_param(entry, types::I8);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let s1 = cur.ins().select(c, pa, pb);
+        let l1 = cur.ins().load(types::I64, flags.clone(), s1, 0);
+        let l2 = if sibling {
+            let s2 = cur.ins().select(c, pb, pa);
+            cur.ins().load(types::I64, flags, s2, 0)
+        } else {
+            cur.ins().iconst(types::I64, 0)
+        };
+        let r = cur.ins().iadd(l1, l2);
+        cur.ins().return_(&[r]);
+        func
     }
 }
