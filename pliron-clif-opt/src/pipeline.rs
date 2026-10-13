@@ -1919,6 +1919,16 @@ pub static DEFAULT: &[Step] = &[
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
+    // Late uniform-param drop: mergechain/jtround retarget edges past
+    // shared join blocks, and the remaining edges often agree on an
+    // arg that was non-uniform when sameargs first ran (chars_alpha's
+    // Option<char> flag: exits retargeted away, all survivors pass 1).
+    step(
+        "sameargs2",
+        "sameargs",
+        Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
+        s_sameargs,
+    ),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
