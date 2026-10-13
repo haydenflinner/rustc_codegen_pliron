@@ -80,9 +80,12 @@
 
 ;; `i64` and smaller.
 
-;; Base case for 8 and 16-bit types
+;; Base case for 8 and 16-bit types — pliron: `leal` rather than
+;; `mov`+`addw`: the low bits of a sum depend only on the low input bits,
+;; so the widened form is exact, skips the operand-size prefix, and
+;; computes base+index+disp without clobbering a live input.
 (rule -6 (lower (iadd (fits_in_16 ty) x y))
-      (x64_add ty x y))
+      (x64_leal_rm (to_amode_add (mem_flags_trusted_data) x y (zero_offset))))
 
 ;; Base case for 32 and 64-bit types which might end up using the `lea`
 ;; instruction to fold multiple operations into one.
@@ -310,6 +313,11 @@
 ;; Sub two registers.
 (rule -3 (lower (isub (fits_in_64 ty) x y))
       (x64_sub ty x y))
+
+;; pliron: `x - k` on `i8`/`i16` via `leal -k(x)` — same widening
+;; argument as the `iadd` rule above; also keeps `x` live for free.
+(rule -2 (lower (isub (ty_8_or_16 ty) x (i32_from_iconst k)))
+      (x64_leal_rm (amode_imm_reg (mem_flags_trusted_data) x (i32_wrapping_sub 0 k))))
 
 ;; pliron: `x - uextend(icmp uCC a, b)` — the CF-chain mirror of the
 ;; `iadd` rules above (see that comment); `x - (a <=u b)` = x-1+CF(b<a)
@@ -560,21 +568,23 @@
 (rule 0 (val_minus_one (iadd _ x (i64_from_iconst -1))) x)
 (rule 1 (val_minus_one (iadd _ (i64_from_iconst -1) x)) x)
 
-(rule 12 (lower (band (ty_32_or_64 ty) x y))
+;; pliron: `i8`/`i16` are included — the widened `blsrl` is exact at the
+;; type's low bits (the `x-1` borrow into them depends only on them).
+(rule 12 (lower (band (ty_int_ref_scalar_64_extract ty) x y))
          (if-let true (has_bmi1))
          (if-let x (val_minus_one y))
          (x64_blsr ty x))
-(rule 13 (lower (band (ty_32_or_64 ty) y x))
+(rule 13 (lower (band (ty_int_ref_scalar_64_extract ty) y x))
          (if-let true (has_bmi1))
          (if-let x (val_minus_one y))
          (x64_blsr ty x))
 
 ;; Specialization of `blsi` for BMI1
 
-(rule 14 (lower (band (ty_32_or_64 ty) (ineg _ x) x))
+(rule 14 (lower (band (ty_int_ref_scalar_64_extract ty) (ineg _ x) x))
          (if-let true (has_bmi1))
          (x64_blsi ty x))
-(rule 15 (lower (band (ty_32_or_64 ty) x (ineg _ x)))
+(rule 15 (lower (band (ty_int_ref_scalar_64_extract ty) x (ineg _ x)))
          (if-let true (has_bmi1))
          (x64_blsi ty x))
 
@@ -710,11 +720,12 @@
 
 ;; Specialization of `blsmsk` for BMI1
 
-(rule 8 (lower (bxor (ty_32_or_64 ty) x y))
+;; pliron: `i8`/`i16` are included, as for `band`/`blsr` above.
+(rule 8 (lower (bxor (ty_int_ref_scalar_64_extract ty) x y))
         (if-let true (has_bmi1))
         (if-let x (val_minus_one y))
         (x64_blsmsk ty x))
-(rule 9 (lower (bxor (ty_32_or_64 ty) y x))
+(rule 9 (lower (bxor (ty_int_ref_scalar_64_extract ty) y x))
         (if-let true (has_bmi1))
         (if-let x (val_minus_one y))
         (x64_blsmsk ty x))

@@ -3236,16 +3236,28 @@
 
 ;; Helper for creating `blsi` instructions.
 (decl x64_blsi (Type GprMem) Gpr)
+;; pliron: `blsrl` is used for `i8`/`i16` too — the low bits of `x & -x`
+;; depend only on the low bits of `x`, so truncation makes the widened
+;; form exact.
+(rule (x64_blsi ty @ $I8  src) (x64_blsil_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsi ty @ $I16 src) (x64_blsil_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsi ty @ $I32 src) (x64_blsil_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsi ty @ $I64 src) (x64_blsiq_vm (gpr_mem_64_for_ty ty src)))
 
 ;; Helper for creating `blsmsk` instructions.
 (decl x64_blsmsk (Type GprMem) Gpr)
+;; pliron: as for `blsi`, `x ^ (x-1)` is low-bit exact under a widened form.
+(rule (x64_blsmsk ty @ $I8  src) (x64_blsmskl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsmsk ty @ $I16 src) (x64_blsmskl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsmsk ty @ $I32 src) (x64_blsmskl_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsmsk ty @ $I64 src) (x64_blsmskq_vm (gpr_mem_64_for_ty ty src)))
 
 ;; Helper for creating `blsr` instructions.
 (decl x64_blsr (Type GprMem) Gpr)
+;; pliron: as for `blsi`, `x & (x-1)` is low-bit exact under a widened
+;; form — the borrow into the low bits depends only on the low bits.
+(rule (x64_blsr ty @ $I8  src) (x64_blsrl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsr ty @ $I16 src) (x64_blsrl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsr ty @ $I32 src) (x64_blsrl_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsr ty @ $I64 src) (x64_blsrq_vm (gpr_mem_64_for_ty ty src)))
 
