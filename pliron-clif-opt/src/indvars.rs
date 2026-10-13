@@ -10,7 +10,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
-    Value, ValueDef, condcodes::IntCC, types,
+    Value, ValueDef, condcodes::{CondCode, IntCC}, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -362,6 +362,444 @@ fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: V
     outside
 }
 
+/// `np = base + iv*e` (stepped `e*step` per iteration) evicts a live-out
+/// `base` from the loop, but leaves `iv` shadowed when its only
+/// remaining work is bound tests and exit values: `iv+c cc bound`
+/// rewrites to `np+c*e cc pend` with `pend = base + bound*e`
+/// materialized on each entry edge, and exits recover the dropped
+/// index as `(np+c*e - base) >> log2(e)` through a shared cold shim.
+/// The loop then carries one counter instead of two — LLVM's one-IV
+/// scan shape.
+///
+/// Soundness: `pend` and every compared `np+c*e` stay inside the
+/// object's address range — the loop's own `notrap` accesses on `np`
+/// establish it contains each visited element, and the bound test
+/// exits on first failure so no pointer past `pend` is evaluated —
+/// so neither add wraps and the unsigned compare is faithful. `e`
+/// must be a positive power of two for the shift recovery; `isub` is
+/// exact mod 2^w regardless.
+fn elim_shadowed(
+    func: &mut Function,
+    dt: &DominatorTree,
+    body: &FxHashSet<Block>,
+    h: Block,
+    edges: &[Edge],
+    iv: Value,
+    np: Value,
+    base: Value,
+    e: i64,
+    debug: bool,
+) -> usize {
+    if e <= 0 || !e.unsigned_abs().is_power_of_two() || !crate::pass_enabled("PLIRON_IVELIM") {
+        return 0;
+    }
+    let sh = i64::from(e.trailing_zeros());
+    let ty = func.dfg.value_type(np);
+    if func.dfg.value_type(iv) != ty || func.dfg.value_type(base) != ty {
+        return 0;
+    }
+    let (iv, np, base) = (
+        func.dfg.resolve_aliases(iv),
+        func.dfg.resolve_aliases(np),
+        func.dfg.resolve_aliases(base),
+    );
+    let params = func.dfg.block_params(h).to_vec();
+    let (Some(iv_idx), Some(np_idx)) = (
+        params.iter().position(|&p| func.dfg.resolve_aliases(p) == iv),
+        params.iter().position(|&p| func.dfg.resolve_aliases(p) == np),
+    ) else {
+        return 0;
+    };
+    // Backedges must step both params in lockstep (`np += e*step`), or
+    // the `np = base + iv*e` recurrence identity doesn't hold.
+    if debug {
+        eprintln!("indvars {h}: ivelim cand iv={iv} np={np} base={base} e={e}");
+    }
+    let mut step = None;
+    for e2 in edges {
+        if !func.layout.inst_block(e2.inst).is_some_and(|b| body.contains(&b)) {
+            continue;
+        }
+        let si = edge_arg(func, e2, iv_idx).and_then(|a| step_form(func, iv, body, a));
+        let sn = edge_arg(func, e2, np_idx).and_then(|a| step_form(func, np, body, a));
+        let (Some(StepV::K(s)), Some(StepV::K(sn))) = (si, sn) else {
+            if debug {
+                eprintln!("indvars {h}: ivelim bail stepform");
+            }
+            return 0;
+        };
+        if sn != s.wrapping_mul(e) || step.is_some_and(|x| x != s) {
+            if debug {
+                eprintln!("indvars {h}: ivelim bail lockstep s={s} sn={sn}");
+            }
+            return 0;
+        }
+        step = Some(s);
+    }
+    if step.is_none() {
+        return 0;
+    }
+    // `iv + c` results in the loop, and the `np + c*e` counterparts
+    // that already exist to stand in for them (the step's np arg).
+    let mut off: FxHashMap<Value, i64> = [(iv, 0)].into_iter().collect();
+    let mut noff: FxHashMap<i64, Value> = [(0, np)].into_iter().collect();
+    let mut adefs: FxHashSet<Inst> = FxHashSet::default();
+    for &b in body {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode, args: [x, y] } = func.dfg.insts[i] else {
+                continue;
+            };
+            let r = func.dfg.first_result(i);
+            let mut try_off = |a: Value, d: i64| {
+                let a = func.dfg.resolve_aliases(a);
+                if let Some(&o) = off.get(&a) {
+                    off.insert(r, o.wrapping_add(d));
+                    adefs.insert(i);
+                }
+                if a == np {
+                    noff.insert(d, r);
+                }
+            };
+            match opcode {
+                Opcode::Iadd => {
+                    if let Some(d) = iconst(func, y) {
+                        try_off(x, d);
+                    }
+                    if let Some(d) = iconst(func, x) {
+                        try_off(y, d);
+                    }
+                }
+                Opcode::Isub => {
+                    if let Some(d) = iconst(func, y) {
+                        try_off(x, d.wrapping_neg());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Pure insts whose results are unreferenced — transitively — are
+    // waste: they can't keep `iv` live, and they get removed along
+    // with the affine adds. `used` shrinks until stable.
+    let mut used: FxHashSet<Value> = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .flat_map(|i| func.dfg.inst_values(i))
+        .map(|v| func.dfg.resolve_aliases(v))
+        .collect();
+    let mut dead: FxHashSet<Inst> = FxHashSet::default();
+    loop {
+        let mut grew = false;
+        for &b in body {
+            for i in func.layout.block_insts(b) {
+                if dead.contains(&i) {
+                    continue;
+                }
+                let op = func.dfg.insts[i].opcode();
+                let pure = !(op.can_load()
+                    || op.can_store()
+                    || op.can_trap()
+                    || op.is_call()
+                    || op.is_branch()
+                    || op.is_terminator()
+                    || op.other_side_effects());
+                if pure && func.dfg.inst_results(i).iter().all(|&r| !used.contains(&r)) {
+                    dead.insert(i);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+        used = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|&i| !dead.contains(&i))
+            .flat_map(|i| func.dfg.inst_values(i))
+            .map(|v| func.dfg.resolve_aliases(v))
+            .collect();
+    }
+    // The recurrence identity is unsigned: `np+c*e <_u pend` tracks
+    // `iv+c <_u bound` only while both stay inside the object, which a
+    // `notrap` access on an `np`-affine address proves — as long as it
+    // runs every iteration, i.e. its block dominates every backedge.
+    let nvals: FxHashSet<Value> = noff.values().copied().collect();
+    let guarded = body.iter().any(|&b| {
+        let access = func.layout.block_insts(b).any(|i| match func.dfg.insts[i] {
+            InstructionData::Load { arg, flags, .. } => {
+                func.dfg.mem_flags[flags].notrap()
+                    && nvals.contains(&func.dfg.resolve_aliases(arg))
+            }
+            InstructionData::Store { args, flags, .. } => {
+                func.dfg.mem_flags[flags].notrap()
+                    && nvals.contains(&func.dfg.resolve_aliases(args[1]))
+            }
+            _ => false,
+        });
+        access
+            && edges.iter().all(|e2| {
+                func.layout
+                    .inst_block(e2.inst)
+                    .is_none_or(|pb| !body.contains(&pb) || dt.dominates(b, pb, &func.layout))
+            })
+    });
+    if !guarded {
+        if debug {
+            eprintln!("indvars {h}: ivelim bail notrap");
+        }
+        return 0;
+    }
+    // `np` is a header param and dominates the loop; a derived
+    // `np + c*e` only substitutes for `iv + c` where its def already
+    // dominates the use.
+    let pmap = |w: Value, at: Inst| -> Option<Value> {
+        let c = off.get(&func.dfg.resolve_aliases(w))?;
+        let m = *noff.get(&c.wrapping_mul(e))?;
+        (m == np
+            || matches!(func.dfg.value_def(m), ValueDef::Result(di, _)
+                if dt.dominates(di, at, &func.layout)))
+        .then_some(m)
+    };
+    // Every use of an `iv`-affine value must be a bound icmp (both
+    // sides affine is ambiguous), the lockstep adds themselves, the
+    // step backedge arg, or an exit arg with a live `np` counterpart.
+    let mut icmps: Vec<(Inst, Value, Value, Value)> = vec![]; // (inst, aff, bound, map)
+    let mut exits: Vec<(Inst, usize, Block, Vec<Value>)> = vec![]; // (inst, slot, dst, shim args)
+    for &b in body {
+        for i in func.layout.block_insts(b) {
+            if adefs.contains(&i) || dead.contains(&i) {
+                continue;
+            }
+            for (slot, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                let dst = bc.block(&func.dfg.value_lists);
+                let mut mapped = vec![];
+                let mut hit = false;
+                for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    let BlockArg::Value(a) = a else {
+                        return 0;
+                    };
+                    let a = func.dfg.resolve_aliases(a);
+                    match off.get(&a) {
+                        None => mapped.push(a),
+                        Some(_) if dst == h => {
+                            if ai != iv_idx {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail harg slot {ai}");
+                                }
+                                return 0;
+                            }
+                            hit = true;
+                        }
+                        Some(_) if !body.contains(&dst) => {
+                            hit = true;
+                            let Some(m) = pmap(a, i) else {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail exitmap {a} at {b}");
+                                }
+                                return 0;
+                            };
+                            mapped.push(m);
+                        }
+                        Some(_) => {
+                            if debug {
+                                eprintln!("indvars {h}: ivelim bail inbody arg {a} -> {dst}");
+                            }
+                            return 0;
+                        }
+                    }
+                }
+                if hit && dst != h {
+                    exits.push((i, slot, dst, mapped));
+                }
+            }
+            match func.dfg.insts[i] {
+                InstructionData::IntCompare { args: [x, y], .. } => {
+                    match (
+                        off.contains_key(&func.dfg.resolve_aliases(x)),
+                        off.contains_key(&func.dfg.resolve_aliases(y)),
+                    ) {
+                        (true, true) => return 0,
+                        (false, false) => {}
+                        (ax, _) => {
+                            let (w, bound) = if ax { (x, y) } else { (y, x) };
+                            let bound = func.dfg.resolve_aliases(bound);
+                            // `pend` materializes on entry edges, so the
+                            // bound must reach every entry pred.
+                            if iconst(func, bound).is_none()
+                                && def_block(func, bound).is_some_and(|d| body.contains(&d))
+                            {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail bound {bound} in body");
+                                }
+                                return 0;
+                            }
+                            let Some(m) = pmap(w, i) else {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail icmpmap {w} at {b}");
+                                }
+                                return 0;
+                            };
+                            icmps.push((i, w, bound, m));
+                        }
+                    }
+                }
+                _ => {
+                    for &v in func.dfg.inst_args(i) {
+                        if off.contains_key(&func.dfg.resolve_aliases(v)) {
+                            if debug {
+                                eprintln!("indvars {h}: ivelim bail use {v} in {i} @{b}");
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // `iv`-affine values can't be used below the loop either (a header
+    // param can reach dominated exit blocks).
+    for b in func.layout.blocks() {
+        if body.contains(&b) {
+            continue;
+        }
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                if off.contains_key(&func.dfg.resolve_aliases(v)) {
+                    if debug {
+                        eprintln!("indvars {h}: ivelim bail outer use {v} @{b}");
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+    if icmps.is_empty() {
+        if debug {
+            eprintln!("indvars {h}: ivelim bail noicmps");
+        }
+        return 0;
+    }
+    // `pend = base + bound*e` per distinct bound, carried as a new
+    // header param: materialized on entry edges, fed itself on
+    // backedges.
+    let mut pends: FxHashMap<Value, Value> = FxHashMap::default();
+    for &(_, _, bnd, _) in &icmps {
+        if pends.contains_key(&bnd) {
+            continue;
+        }
+        let pend = func.dfg.append_block_param(h, ty);
+        for e2 in edges {
+            let v = if func.layout.inst_block(e2.inst).is_some_and(|b| body.contains(&b)) {
+                pend
+            } else {
+                let mut pos = FuncCursor::new(func).at_inst(e2.inst);
+                let s = iconst_masked(&mut pos, ty, e);
+                let m = pos.ins().imul(bnd, s);
+                pos.ins().iadd(base, m)
+            };
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[e2.inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                [e2.slot];
+            bc.append_argument(v, &mut dfg.value_lists);
+        }
+        pends.insert(bnd, pend);
+    }
+    for &(i, w, bnd, m) in &icmps {
+        let pend = pends[&bnd];
+        let mut data = func.dfg.insts[i];
+        if let InstructionData::IntCompare { cond, args, .. } = &mut data {
+            if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(w) {
+                *args = [m, pend];
+            } else {
+                *args = [pend, m];
+                *cond = cond.swap_args();
+            }
+        }
+        func.dfg.insts[i] = data;
+    }
+    // Exit edges carrying affine args route through a shared shim that
+    // recovers each index as `(p - base) >> log2(e)` — one shim per
+    // (target, affine-signature). Shims are marked cold: they run once
+    // per loop exit, and the marking keeps forwarder-folding passes
+    // (fusechains, foldforwarders) from inlining the recovery back into
+    // the loop's exiting blocks, where it would execute unconditionally
+    // every iteration.
+    let mut shims: FxHashMap<(Block, Vec<Option<Type>>), Block> = FxHashMap::default();
+    for &(i, slot, dst, ref mapped) in &exits {
+        let b = func.layout.inst_block(i).unwrap();
+        let sig: Vec<Option<Type>> = func.dfg.insts[i]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot]
+            .args(&func.dfg.value_lists)
+            .map(|a| match a {
+                BlockArg::Value(v) => {
+                    let v = func.dfg.resolve_aliases(v);
+                    (!off.contains_key(&v)).then_some(func.dfg.value_type(v))
+                }
+                _ => None,
+            })
+            .collect();
+        let shim = match shims.get(&(dst, sig.clone())) {
+            Some(&s) => s,
+            None => {
+                let s = func.dfg.make_block();
+                func.layout.set_cold(s);
+                func.layout.insert_block_after(s, b);
+                let mut args = vec![];
+                for &t in &sig {
+                    args.push(func.dfg.append_block_param(s, t.unwrap_or(ty)));
+                }
+                let mut pos = FuncCursor::new(func).at_bottom(s);
+                for (ai, t) in sig.iter().enumerate() {
+                    if t.is_none() {
+                        let d = pos.ins().isub(args[ai], base);
+                        args[ai] = if sh == 0 {
+                            d
+                        } else {
+                            let sc = pos.ins().iconst(ty, sh);
+                            pos.ins().ushr(d, sc)
+                        };
+                    }
+                }
+                let jargs: Vec<BlockArg> = args.iter().map(|&v| BlockArg::from(v)).collect();
+                pos.ins().jump(dst, &jargs);
+                shims.insert((dst, sig), s);
+                s
+            }
+        };
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[i]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
+        bc.set_block(shim, &mut dfg.value_lists);
+        bc.clear(&mut dfg.value_lists);
+        bc.extend(mapped.iter().copied(), &mut dfg.value_lists);
+    }
+    // Strip `iv`'s edge arg and param; the affine adds are dead once
+    // their uses are gone, along with the waste insts ignored above.
+    for e2 in edges {
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[e2.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e2.slot];
+        bc.remove(iv_idx, &mut dfg.value_lists);
+    }
+    for &i in adefs.union(&dead) {
+        func.dfg.clear_results(i);
+        func.layout.remove_inst(i);
+    }
+    func.dfg.remove_block_param(params[iv_idx]);
+    if debug {
+        eprintln!("indvars {h}: ivelim {iv} via {np} (e={e})");
+    }
+    1
+}
+
 fn run_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -383,6 +821,9 @@ fn run_loop(
     let edges = edges_to(func, cfg, h);
     let params = func.dfg.block_params(h).to_vec();
     let mut n = 0;
+    // Pointer params created for live-out bases may fully shadow their
+    // index: (iv param, np, base, e) for `elim_shadowed` below.
+    let mut cands: Vec<(Value, Value, Value, i64)> = vec![];
     // Every `iv*K` in the loop, and every `invariant + iv*K`, is a candidate.
     for (idx, &iv) in params.iter().enumerate() {
         if n >= MAX_PARAMS {
@@ -487,8 +928,14 @@ fn run_loop(
                     insts.len()
                 );
             }
+            if let (Some(b), Mul::K(k)) = (base, mul) {
+                cands.push((iv, np, b, k));
+            }
             n += 1;
         }
+    }
+    for (iv, np, b, k) in cands {
+        n += elim_shadowed(func, dt, &body, h, &edges, iv, np, b, k, debug);
     }
     n
 }

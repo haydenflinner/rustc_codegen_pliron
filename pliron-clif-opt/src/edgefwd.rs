@@ -291,7 +291,11 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
 
     let mut n = 0;
     for b in blocks {
+        // Cold forwarders exist to keep their work off the hot path
+        // (cold-edge adapters, exit-recovery shims); cloning them into
+        // hot predecessors would execute that work unconditionally.
         if Some(b) == entry
+            || func.layout.is_cold(b)
             || func
                 .dfg
                 .block_params(b)
