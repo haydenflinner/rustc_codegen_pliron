@@ -1340,3 +1340,28 @@ and drop fallbacks) instead of conservative whole-block ranges;
 `why` diagnostic skips lifetime markers; pliron printer switched the
 optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
 `llvm_fcmp_predicate`) to `opt_attr` so `PLIRON_DUMP_OPT` no longer ICEs.
+
+## taildup const-edge clones + late jtround (79e728f)
+- chars_alpha 2.29x -> ~1.85x: `Option<char>` decode flag and the
+  `is_alphabetic` bool no longer materialize through a stack-slot phi;
+  `add n,#1` sits directly on the a-z/A-Z range-check edges.
+- taildup: brif preds get one clone block per edge to a candidate, but
+  ONLY when the edge passes a const arg — without that guard it cloned
+  the range-check chain into itself (dispatch explosion, regression).
+  A second `taildup2` step runs after splink because the flag-merge
+  brif shape only settles post-edgespec/celim (early taildup sees the
+  same blocks with `jump` terminators).
+- `jtround` late step: single jumpthread::round (no fixpoint) after
+  sameargs/celim turn edge args const — threads `brif flag` merges the
+  early fixpoint couldn't decide. NonNull::is now guards `derived`
+  targets with value_is_real (deleted values are dangling aliases;
+  resolve_aliases on one panics — latent crash, first hit by jtround).
+- New bench kernels recreating the deleted wt/native-opt suite:
+  chars_alpha/ascii/mixed, tokenize, contains_rng. Ratios vs stock:
+  chars_alpha ~1.85x, chars_ascii ~1.1x, chars_mixed ~1.05x,
+  tokenize ~1.9x (state-machine residual — in progress), contains_rng
+  ~0.95x.
+- Residual on chars_alpha (~16 insts/char vs stock ~11): cbz null-check
+  (cursor nonnull unproven — INBOUNDSNN territory), uxtb+cmp#0x80 vs
+  stock ldrsb+tbnz sign dispatch, per-edge param movs (post-index
+  amode territory), a-z|A-Z as two range checks vs stock case-fold.
