@@ -1210,6 +1210,16 @@ fn s_sgntest(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::sgntest(&mut p.clctx.func)
 }
 
+// Two-compare range predicates (`x >= lo && x <= hi`) merged to
+// `(x - lo) <u w` — see `clifpeep::rgmerge`.
+fn s_rgmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::rgmerge(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("rgmerge");
+    }
+    k
+}
+
 // Complementary `load (select)` pairs → two speculative loads + value
 // selects. The diamonds only collapse into selects late (fuse/
 // sameargs), so this runs near the end rather than in `clifpeep`'s
@@ -1958,6 +1968,12 @@ pub static DEFAULT: &[Step] = &[
     // the select form only exists after ifconv/merge retargeting.
     step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest)
         .needs(shape::CONDBR),
+    // `(x >= lo) && (x < hi)` merged to `(x - lo) <u w` — select/band
+    // scalar forms plus loopvec's `bitselect(masked cmp, cmp, 0)` —
+    // after sameargs folds the bounds to `iconst`/`splat(iconst)` the
+    // merge becomes one `icmp` per element instead of cmp+cmp+select
+    // (or two `pcmpgtd` + mask ops per SIMD group).
+    step("rgmerge", "rgmerge", Gate::Env("PLIRON_RGPAIR"), s_rgmerge),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one

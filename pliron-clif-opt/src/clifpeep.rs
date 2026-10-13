@@ -3999,6 +3999,19 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 }
                 continue;
             }
+            // `band (x >= lo), (x < hi)` → `(x - lo) <u w` — the
+            // `Range*::contains` merge, when rustc lowered `&&` as a
+            // plain `&` on bools.
+            if let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } = pos.func.dfg.insts[inst]
+                && crate::pass_enabled("PLIRON_RGPAIR")
+                && let Some(f) = rgpair(pos.func, args[0], args[1])
+            {
+                n += rgapply(&mut pos, inst, f);
+                continue;
+            }
             if matches!(
                 pos.func.dfg.insts[inst].opcode(),
                 Opcode::Select | Opcode::Bitselect
@@ -4024,6 +4037,17 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         let r = pos.func.dfg.first_result(inst);
                         dead_sel.push((inst, r, a));
                         n += 1;
+                        continue;
+                    }
+                    // `select (x >= lo), (x < hi), 0` → `(x - lo) <u w` —
+                    // `Range*::contains` as one sub+compare instead of a
+                    // guard branch's worth of work; under loopvec a
+                    // single pcmpgtd group per lane.
+                    if crate::pass_enabled("PLIRON_RGPAIR")
+                        && iconst(pos.func, args[2]) == Some(0)
+                        && let Some(f) = rgpair(pos.func, args[0], args[1])
+                    {
+                        n += rgapply(&mut pos, inst, f);
                         continue;
                     }
                 }
@@ -4693,6 +4717,281 @@ enum SelFold {
     K(bool),
     /// The compare is `c`'s truth value, or its negation.
     C(Value, bool),
+}
+
+/// Lane constant: `iconst`, `splat(k)`, or a uniform `vconst` — the
+/// per-lane value as u64 (vector bounds reach the compares as splats).
+fn kof(func: &Function, v: Value) -> Option<u64> {
+    let v = func.dfg.resolve_aliases(v);
+    let d = func.dfg.value_def(v).inst()?;
+    match func.dfg.insts[d] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => Some(imm.bits() as u64),
+        InstructionData::Unary {
+            opcode: Opcode::Splat,
+            arg,
+        } => kof(func, arg),
+        InstructionData::UnaryConst {
+            opcode: Opcode::Vconst,
+            constant_handle,
+        } => {
+            let ty = func.dfg.value_type(func.dfg.first_result(d));
+            let lb = (ty.lane_bits() / 8) as usize;
+            if lb == 0 || lb > 8 {
+                return None;
+            }
+            let d = func.dfg.constants.get(constant_handle).as_slice();
+            if d.is_empty() || d.len() % lb != 0 || !d.chunks(lb).all(|c| c == &d[..lb]) {
+                return None;
+            }
+            let mut k = 0u64;
+            for (i, &b) in d[..lb].iter().enumerate() {
+                k |= (b as u64) << (8 * i);
+            }
+            Some(k)
+        }
+        _ => None,
+    }
+}
+
+/// What `a && b` reduced to when both are unsigned compares on `x`.
+enum RgFold {
+    /// `(x - lo) <u w` — one sub+compare; `lo`'s bound value is reused
+    /// for the subtract. The `Option` is a `& 1`-per-lane mask a side
+    /// carried — vector `icmp` lanes are all-ones and the merged
+    /// compare must be re-normalized to 0/1.
+    Ck(Value, Value, u64, Option<Value>),
+    /// The range is empty or covers the whole type.
+    K(bool),
+}
+
+/// `a && b` as the range test `x ∈ [lo, hi)` / `[lo, hi]` — the
+/// two-compare predicate `Range*::contains`/`matches!` emit — rewritten
+/// as `(x - lo) <u w`: one sub+icmp instead of two icmps and the merge
+/// op, and one `pcmpgtd` group per lane under loopvec.
+fn rgpair(func: &Function, a: Value, b: Value) -> Option<RgFold> {
+    // `(x, cc, k, kv, m01)` for `icmp cc x, k` or `icmp cc k, x` —
+    // `kv` the bound value itself (`iconst`/`splat`) so the subtract
+    // can reuse the materialized splat instead of minting a second
+    // one; `m01` a `& 1`-per-lane normalizer the merge must reapply.
+    let cmp = |v: Value| -> Option<(Value, IntCC, u64, Value, Option<Value>)> {
+        let mut v = func.dfg.resolve_aliases(v);
+        // `band c, m` around an `icmp` is i1-normalization residue: a
+        // scalar compare is already 0/1 so an odd mask is a no-op; a
+        // vector compare's all-ones lanes need the `& splat(1)` kept
+        // (and only the all-ones mask vanishes outright).
+        let mut m01 = None;
+        loop {
+            let d = func.dfg.value_def(v).inst()?;
+            let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } = func.dfg.insts[d]
+            else {
+                break;
+            };
+            let mut next = None;
+            for &a in args.iter() {
+                let other = if a == args[0] { args[1] } else { args[0] };
+                let Some(k) = kof(func, a) else { continue };
+                let lb = func.dfg.value_type(other).lane_bits();
+                let lm = if lb == 64 { u64::MAX } else { (1u64 << lb) - 1 };
+                if !func.dfg.value_type(v).is_vector() {
+                    if k & 1 == 1 {
+                        next = Some(other);
+                        break;
+                    }
+                } else if k & lm == lm {
+                    next = Some(other);
+                    break;
+                } else if k == 1 {
+                    m01 = Some(func.dfg.resolve_aliases(a));
+                    next = Some(other);
+                    break;
+                }
+            }
+            v = func.dfg.resolve_aliases(next?);
+        }
+        let d = func.dfg.value_def(v).inst()?;
+        let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond,
+            args,
+        } = func.dfg.insts[d]
+        else {
+            return None;
+        };
+        if let Some(k) = kof(func, args[1]) {
+            Some((
+                func.dfg.resolve_aliases(args[0]),
+                cond,
+                k,
+                func.dfg.resolve_aliases(args[1]),
+                m01,
+            ))
+        } else {
+            Some((
+                func.dfg.resolve_aliases(args[1]),
+                cond.swap_args(),
+                kof(func, args[0])?,
+                func.dfg.resolve_aliases(args[0]),
+                m01,
+            ))
+        }
+    };
+    let (x1, c1, k1, v1, m1) = cmp(a)?;
+    let (x2, c2, k2, v2, m2) = cmp(b)?;
+    if x1 != x2 {
+        return None;
+    }
+    let ty = func.dfg.value_type(x1);
+    if !ty.lane_type().is_int() || ty.lane_bits() > 64 {
+        return None;
+    }
+    let lb = ty.lane_bits();
+    let umax = if lb == 64 { u64::MAX } else { (1u64 << lb) - 1 };
+    // One side must give the lo bound (`x >= k`), the other the
+    // exclusive hi bound (`x < k`); extra same-side compares just
+    // tighten their bound.
+    let (mut lo, mut hi, mut lo_v) = (None::<u128>, None::<u128>, x1);
+    for (cc, k, kv) in [(c1, k1 & umax, v1), (c2, k2 & umax, v2)] {
+        match cc {
+            IntCC::UnsignedGreaterThanOrEqual => {
+                if lo.is_none_or(|s| k as u128 >= s) {
+                    lo_v = kv;
+                }
+                lo = Some(lo.map_or(k as u128, |s| s.max(k as u128)))
+            }
+            IntCC::UnsignedGreaterThan => {
+                if lo.is_none_or(|s| k as u128 + 1 >= s) {
+                    lo_v = kv;
+                }
+                lo = Some(lo.map_or(k as u128 + 1, |s| s.max(k as u128 + 1)))
+            }
+            IntCC::UnsignedLessThan => {
+                hi = Some(hi.map_or(k as u128, |s| s.min(k as u128)))
+            }
+            IntCC::UnsignedLessThanOrEqual => {
+                hi = Some(hi.map_or(k as u128 + 1, |s| s.min(k as u128 + 1)))
+            }
+            _ => return None,
+        }
+    }
+    let (lo, hi) = (lo?, hi?);
+    if hi <= lo {
+        return Some(RgFold::K(false));
+    }
+    if lo == 0 && hi > umax as u128 {
+        return Some(RgFold::K(true));
+    }
+    Some(RgFold::Ck(x1, lo_v, (hi - lo) as u64, m1.or(m2)))
+}
+
+/// `band`/`select c1,c2,0` merges of unsigned range compares —
+/// `ifconv2` mints the select form, which the main `clifpeep` run is
+/// too early to see, so this also runs as its own step right after it
+/// (before `loopvec`, which turns the single compare into one
+/// `pcmpgtd` group per lane).
+pub fn rgmerge(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let f = match pos.func.dfg.insts[inst] {
+                InstructionData::Binary {
+                    opcode: Opcode::Band,
+                    args,
+                } => rgpair(pos.func, args[0], args[1]),
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } if iconst(pos.func, args[2]) == Some(0) => {
+                    rgpair(pos.func, args[0], args[1])
+                }
+                // `bitselect m, t, 0` is `band m, t` — loopvec's
+                // vectorized `select` arrives this way.
+                InstructionData::Ternary {
+                    opcode: Opcode::Bitselect,
+                    args,
+                } if kof(pos.func, args[2]) == Some(0) => {
+                    if let Some(f) = rgpair(pos.func, args[0], args[1]) {
+                        Some(f)
+                    } else {
+                        let (m, t) = (args[0], args[1]);
+                        pos.func.replace(inst).band(m, t);
+                        n += 1;
+                        continue;
+                    }
+                }
+                _ => None,
+            };
+            if let Some(f) = f {
+                n += rgapply(&mut pos, inst, f);
+            }
+        }
+    }
+    n
+}
+
+/// A `ty`-typed materialized `k` — `iconst` scalar or a splat `vconst`
+/// for vectors.
+fn kvconst(pos: &mut FuncCursor, ty: Type, k: u64) -> Value {
+    if !ty.is_vector() {
+        return pos.ins().iconst(ty, k as i64);
+    }
+    let lb = (ty.lane_bits() / 8) as usize;
+    let k = k & if lb == 8 { u64::MAX } else { (1u64 << (lb * 8)) - 1 };
+    let mut bytes = Vec::with_capacity(lb * ty.lane_count() as usize);
+    for _ in 0..ty.lane_count() {
+        bytes.extend_from_slice(&k.to_le_bytes()[..lb]);
+    }
+    let h = pos.func.dfg.constants.insert(bytes.into());
+    pos.ins().vconst(ty, h)
+}
+
+/// Emit an `rgpair` fold in place of `inst`. Scalar `select`s/`band`s
+/// of `icmp`s yield `i8` like the replacement compare; vector bands
+/// keep the all-ones lane mask.
+fn rgapply(pos: &mut FuncCursor, inst: Inst, f: RgFold) -> usize {
+    match f {
+        RgFold::K(b) => {
+            let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+            if ty.is_vector() {
+                let n = (ty.lane_bits() / 8) as usize * ty.lane_count() as usize;
+                let h = pos
+                    .func
+                    .dfg
+                    .constants
+                    .insert(vec![if b { 0xff } else { 0 }; n].into());
+                pos.func.replace(inst).vconst(ty, h);
+            } else {
+                pos.func.replace(inst).iconst(ty, b as i64);
+            }
+        }
+        RgFold::Ck(x, lo_v, w, m01) => {
+            let ty = pos.func.dfg.value_type(x);
+            // `lo_v` is the compare's own bound operand — the splat or
+            // `iconst` as-materialized, so `x - lo` costs one inst.
+            let x = if kof(pos.func, lo_v) == Some(0) {
+                x
+            } else {
+                pos.ins().isub(x, lo_v)
+            };
+            let w = kvconst(pos, ty, w);
+            match m01 {
+                Some(m) => {
+                    let c = pos.ins().icmp(IntCC::UnsignedLessThan, x, w);
+                    pos.func.replace(inst).band(c, m);
+                }
+                None => {
+                    pos.func.replace(inst).icmp(IntCC::UnsignedLessThan, x, w);
+                }
+            }
+        }
+    }
+    1
 }
 
 /// `icmp cc (select c, ka, kb), k` with `ka`/`kb` constants: evaluate
