@@ -331,6 +331,85 @@
                                              a @ (value_type (fits_in_64 cty)) b))))
       (isub_uext_ucmp cty cc a b x y))
 
+;; pliron: `x - (uextend(icmp uCC a, b) << k)`, k ≤ 3 — `sbb m, m` turns
+;; the unsigned compare's carry straight into a {0,-1} mask and `lea`
+;; scales it into the address, collapsing cmp+setcc+movzbl+shl+sub to
+;; cmp+sbb+lea (the reverse-direction merge cursors in ipnsort).
+;; `ule`/`uge` need the complement mask — `not` of the sbb result —
+;; still one inst shorter. `sbb g, g` yields -CF whatever `g` held, so
+;; the compare's lhs doubles as the dummy operand.
+(decl sbb_neg_mask (Type Value Value) Gpr)
+(rule (sbb_neg_mask ty l r)
+      (let ((g Gpr (put_in_gpr l)))
+        (gpr_new
+          (with_flags_reg (x64_cmp ty l r)
+                          (asm_consumes_flags_returns_gpr
+                            (x64_sbb_raw $I64 g (gpr_to_gpr_mem_imm g)))))))
+
+;; `lea (x, mask << k)` — mask ∈ {0,-1} gives `x` or `x - 2^k`.
+(decl mask_lea (Value Gpr u8) Reg)
+(rule (mask_lea x m k)
+      (gpr_to_reg
+        (x64_lea $I64
+          (amode_to_synthetic_amode
+            (Amode.ImmRegRegShift 0 x m k (mem_flags_trusted_data))))))
+
+;; The CC dispatch shared by the `isub`/`iadd` rules below; `y` is the
+;; un-lowered shl/imul operand for the fallback path.
+(decl isub_mask_ucmp (Type IntCC Value Value Value Value u8) Reg)
+(rule 1 (isub_mask_ucmp ty (IntCC.UnsignedLessThan) a b x _ k)
+      (mask_lea x (sbb_neg_mask ty a b) k))
+(rule 1 (isub_mask_ucmp ty (IntCC.UnsignedGreaterThan) a b x _ k)
+      (mask_lea x (sbb_neg_mask ty b a) k))
+(rule 1 (isub_mask_ucmp ty (IntCC.UnsignedLessThanOrEqual) a b x _ k)
+      (mask_lea x (x64_not $I64 (sbb_neg_mask ty b a)) k))
+(rule 1 (isub_mask_ucmp ty (IntCC.UnsignedGreaterThanOrEqual) a b x _ k)
+      (mask_lea x (x64_not $I64 (sbb_neg_mask ty a b)) k))
+;; Non-unsigned compares can't ride CF — `x - y` via the shl result.
+(rule 0 (isub_mask_ucmp ty _ _ _ x y _)
+      (x64_sub ty x y))
+
+;; Same dispatch for `x + (-bool) << k` — the neg already rides inside
+;; the operand, so the same mask+lea pair covers it (the neg-through-
+;; mul clifpeep leaves this shape when the shift is multi-use).
+(decl iadd_mask_ucmp (Type IntCC Value Value Value Value u8) Reg)
+(rule 1 (iadd_mask_ucmp ty (IntCC.UnsignedLessThan) a b x _ k)
+      (mask_lea x (sbb_neg_mask ty a b) k))
+(rule 1 (iadd_mask_ucmp ty (IntCC.UnsignedGreaterThan) a b x _ k)
+      (mask_lea x (sbb_neg_mask ty b a) k))
+(rule 1 (iadd_mask_ucmp ty (IntCC.UnsignedLessThanOrEqual) a b x _ k)
+      (mask_lea x (x64_not $I64 (sbb_neg_mask ty b a)) k))
+(rule 1 (iadd_mask_ucmp ty (IntCC.UnsignedGreaterThanOrEqual) a b x _ k)
+      (mask_lea x (x64_not $I64 (sbb_neg_mask ty a b)) k))
+(rule 0 (iadd_mask_ucmp ty _ _ _ x y _)
+      (x64_add ty x y))
+
+(rule 3 (lower (isub $I64 x y @ (ishl _ (uextend _ (icmp $I8 cc
+                                          a @ (value_type (fits_in_64 cty)) b))
+                                     (iconst _ (uimm8 k)))))
+      (if-let true (u32_lt_eq k 3))
+      (isub_mask_ucmp cty cc a b x y k))
+
+(rule 3 (lower (isub $I64 x y @ (imul _ (uextend _ (icmp $I8 cc
+                                          a @ (value_type (fits_in_64 cty)) b))
+                                     (iconst _ (imm64_power_of_two k64)))))
+      (if-let true (u64_lt_eq k64 3))
+      (isub_mask_ucmp cty cc a b x y (u64_unwrap_into_u8 k64)))
+
+(rule 4 (lower (iadd $I64 x y @ (ishl _ (isub _ (iconst _ (uimm8 0))
+                                           (uextend _ (icmp $I8 cc
+                                              a @ (value_type (fits_in_64 cty)) b)))
+                                     (iconst _ (uimm8 k)))))
+      (if-let true (u32_lt_eq k 3))
+      (iadd_mask_ucmp cty cc a b x y k))
+
+(rule 4 (lower (iadd $I64 x y @ (imul _ (isub _ (iconst _ (uimm8 0))
+                                           (uextend _ (icmp $I8 cc
+                                              a @ (value_type (fits_in_64 cty)) b)))
+                                     (iconst _ (imm64_power_of_two k64)))))
+      (if-let true (u64_lt_eq k64 3))
+      (iadd_mask_ucmp cty cc a b x y (u64_unwrap_into_u8 k64)))
+
 ;; SSE.
 
 (rule (lower (isub (multi_lane 8 16) x y))
