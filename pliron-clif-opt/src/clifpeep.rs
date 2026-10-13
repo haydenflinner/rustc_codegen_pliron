@@ -2055,7 +2055,7 @@ fn cparm_round(func: &mut Function) -> usize {
 /// Shared commit for `sameargs_round`/`cparm_round`: flatten aliases,
 /// chase replacements to survivors, rewrite all uses, strip the dropped
 /// arg slots off every edge, drop the params.
-fn apply_param_drops(
+pub(crate) fn apply_param_drops(
     func: &mut Function,
     mut pmap: FxHashMap<Value, Value>,
     mut arg_drops: Vec<(Inst, usize, Vec<usize>)>,

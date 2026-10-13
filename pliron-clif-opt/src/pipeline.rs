@@ -1551,6 +1551,14 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = indvars::relparm(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("relparm");
+    }
+    k
+}
+
 // Loop count tests against a wide constant rematerialize it per
 // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
 // a non-constant preheader value codegen pins in a register. Runs
@@ -2034,6 +2042,10 @@ pub static DEFAULT: &[Step] = &[
         s_postinc,
     )
     .needs(shape::LOOPS),
+    // Symbolic-offset param pairs `p_j = p_i - B` (B loop-invariant) —
+    // tokenize's `pos` shadowing `cur - base`. Drops a live register and
+    // an edge copy per backedge.
+    step("relparm", "relparm", Gate::Env("PLIRON_RELPARM"), s_relparm).needs(shape::LOOPS),
     // `icmp CC (select c,K,x), K` folds to `c`/`!c` when the live arm's
     // compare is provable — a pure fold, so it gets first crack at the
     // niche dispatch; `seltest` below handles the unprovable cases by
