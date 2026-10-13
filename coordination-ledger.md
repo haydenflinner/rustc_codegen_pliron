@@ -1390,3 +1390,34 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
 - sieve 13.5ms vs llvm 12.1 (1.12x): u128work is verbose (i128 mul via
   cset/uxtb carry chains, not adds/adc) but only 1K iters — the delta
   is the marking loop / noise, deprioritized.
+
+## rangefold (uncommitted, in progress)
+
+- New pass `rangefold`: branch-chained `[lo,hi)` interval tests become
+  `brif (x-lo u< hi-lo)` (bound_pairs), and same-width ranges a pow2
+  apart union to `(x|d)-k_hi u<w` with an exactness check on the bit-d
+  mod-2d windows (LLVM's `x|0x20` case-fold for a-z|A-Z).
+- chars_alpha MIXED input regressed ~60% with union on (7.5ms vs 4.8)
+  though union is faster on all-miss (3.47 vs 5.74) — bypassing the
+  hi-test block hoists the HIT-edge arg store (mov;stur flag) into the
+  unconditional pred. Made range_unions OPT-IN (PLIRON_RF2=1);
+  bound_pairs default-on (PLIRON_RF1=0 disables, debug PLIRON_RF_DEBUG).
+- tests/rangefold exercises exact/inexact unions + boundaries; wired
+  into test.sh as `want rangefold`.
+- selfold (icmp-of-select niche fold) removed: inert on all 10 benches
+  (byte-identical codegen) — the provable-collapse case needs nonnull
+  facts the lattice doesn't produce for these shapes.
+
+## aarch64 post-index isel + clifpeep sgntest (subagent work, uncommitted)
+
+- `try_postindex` (lower.rs): `vN = iadd/isub base, C` fused with the
+  most recent load/store on `base` when `base` has no observable use
+  after the writeback — `MInst::LoadPost`/`StorePost` +
+  `AMode::PostIndex`, full operand/emit plumbing. `PLIRON_POSTIDX=0`.
+  Emits real `ldrb [x], #k!`/`ldr [x], #k!` (42 sites in tokenize).
+- `clifpeep::sgntest`: `brif (icmp cc x, K)` where the compare is a
+  one-bit test (`ult byte,0x80`, `slt x,0`) → `brif (band v, 1<<b)` →
+  aarch64 `tbz/tbnz` (`tbnz w22,#0x7` fires on tokenize's UTF-8 lead
+  byte). `PLIRON_SGNTEST`, late step.
+- tokenize main: 608 → 469 insts, wall-time flat (~7.7ms vs llvm 5.8):
+  the residual is regalloc/param-shuffle, not isel breadth.

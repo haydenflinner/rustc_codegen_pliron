@@ -31,6 +31,7 @@ pub mod loopvec;
 pub mod pipeline;
 pub mod proots;
 pub mod punroll;
+pub mod rangefold;
 pub mod revnorm;
 pub mod slotmerge;
 pub mod slotprom;

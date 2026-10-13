@@ -116,6 +116,10 @@ t_icmpfold() {
   rustc $BE --edition 2021 -O -C codegen-units=1 tests/icmpfold/main.rs -o $out/icmpfold$exe && $out/icmpfold$exe
 }
 
+t_rangefold() {
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/rangefold/main.rs -o $out/rangefold$exe && $out/rangefold$exe
+}
+
 t_coldargs() {
   # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
   # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
@@ -354,6 +358,7 @@ want cparm && t_cparm
 want celim && t_celim
 want punroll && t_punroll
 want icmpfold && t_icmpfold
+want rangefold && t_rangefold
 want coldargs && t_coldargs
 want bcheck && t_bcheck
 want unswitch && t_unswitch

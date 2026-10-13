@@ -1204,6 +1204,12 @@ fn s_csweep2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::const_sweep(&mut p.clctx.func)
 }
 
+// `brif (icmp x <u 0x80)` / `brif (icmp x <s 0)` sign-bit tests →
+// `brif (band v, 1<<b)` — see `clifpeep::sgntest`.
+fn s_sgntest(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::sgntest(&mut p.clctx.func)
+}
+
 // Complementary `load (select)` pairs → two speculative loads + value
 // selects. The diamonds only collapse into selects late (fuse/
 // sameargs), so this runs near the end rather than in `clifpeep`'s
@@ -1319,6 +1325,10 @@ fn s_deadrec(p: &mut Pipe, an: &mut Analysis) -> usize {
 // (the vectorizer's separate load/store address streams,
 // rustc's repeated index math) collapse to one value before
 // sameargs merges the now-identical edge args.
+fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    rangefold::run(&mut p.clctx.func)
+}
+
 fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::lcse(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -1909,6 +1919,20 @@ pub static DEFAULT: &[Step] = &[
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
+    // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
+    // range unions `(x|d)-k_hi u<w` — rustc's char classification
+    // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
+    // branch each and the union merges the pair, LLVM's `c|0x20`.
+    step("rangefold", "rangefold", Gate::Env("PLIRON_RANGEFOLD"), s_rangefold)
+        .needs(shape::CONDBR),
+    // One-bit compares feeding a `brif` — `byte <u 0x80` (the UTF-8
+    // ASCII/continuation test in tokenize/chars_*), `x <s 0` — become
+    // `brif (band v, 1<<b)` (targets swapped for the clear-polarity
+    // case), which isel fuses into a single `tbnz`/`tbz` on aarch64 and
+    // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
+    // every earlier pass.
+    step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest)
+        .needs(shape::CONDBR),
     Step {
         name: "coldret",
         bisect: Some("coldret"),
