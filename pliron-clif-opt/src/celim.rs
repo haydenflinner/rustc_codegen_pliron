@@ -95,42 +95,60 @@ type Cmp = (IntCC, Op, Op);
 /// `K`. Offsets beyond +/-1 only fold through the nowrap-gated rules in
 /// `decide`, so emitting them is safe.
 fn decomp(func: &Function, v: Value) -> Op {
-    let v = func.dfg.resolve_aliases(v);
-    if let Some(k) = known(func, v) {
-        return Op::K(k);
-    }
-    if let Some(i) = func.dfg.value_def(v).inst()
-        && let InstructionData::Binary {
+    let v0 = func.dfg.resolve_aliases(v);
+    let w = bits(func, v0).unwrap_or(64);
+    let mut cur = v0;
+    let mut off = 0i64;
+    // Peel `x +/- k` chains into `Op::V(base, acc)`: `v1894+1+1` and
+    // `v1894+2` normalize to the same operand, which is what lets a
+    // dominating-edge fact reach the unrolled copies of a check.
+    for _ in 0..8 {
+        cur = func.dfg.resolve_aliases(cur);
+        if let Some(k) = known(func, cur) {
+            let m = if w < 64 { (1u64 << w) - 1 } else { u64::MAX };
+            return Op::K(k.wrapping_add(off as u64) & m);
+        }
+        let Some(i) = func.dfg.value_def(cur).inst() else {
+            break;
+        };
+        let InstructionData::Binary {
             opcode: opcode @ (Opcode::Iadd | Opcode::Isub),
             args,
         } = func.dfg.insts[i]
-    {
+        else {
+            break;
+        };
         let (a, b) = (
             func.dfg.resolve_aliases(args[0]),
             func.dfg.resolve_aliases(args[1]),
         );
-        let w = bits(func, v).unwrap_or(64);
         if let Some(k) = known(func, b) {
-            let off = if opcode == Opcode::Isub {
+            let d = if opcode == Opcode::Isub {
                 sext(k, w).wrapping_neg()
             } else {
                 sext(k, w)
             };
             // `i64::MIN` is ambiguous (x - MIN == x + MIN mod 2^64) and
-            // would break `-d` arithmetic; leave it unpeeled.
-            if off != i64::MIN {
-                return Op::V(a, off);
+            // would break `-d` arithmetic; leave the rest unpeeled.
+            if d == i64::MIN {
+                break;
             }
+            off = off.wrapping_add(d);
+            cur = a;
         } else if opcode == Opcode::Iadd
             && let Some(k) = known(func, a)
         {
-            let off = sext(k, w);
-            if off != i64::MIN {
-                return Op::V(b, off);
+            let d = sext(k, w);
+            if d == i64::MIN {
+                break;
             }
+            off = off.wrapping_add(d);
+            cur = b;
+        } else {
+            break;
         }
     }
-    Op::V(v, 0)
+    Op::V(cur, off)
 }
 
 /// `v` without offset peeling: `Op::V(v, 0)` or `K`.
@@ -536,6 +554,24 @@ fn urange(func: &Function, fs: &[&Cmp], v: Value, depth: u32) -> Option<(u64, u6
     let half = 1u64 << (w - 1);
     let (mut lo, mut hi) = (0u64, full);
     for &&(cc, a, b) in fs {
+        // `x u< v` forces `v >= 1` (x >= 0 always); `x u> v` caps
+        // `v <= full - 1`. Weak bounds, but they seed nowrap proofs for
+        // `v - 1`-style decrements that constant facts can't reach.
+        match (cc, a, b) {
+            (IntCC::UnsignedLessThan, Op::V(_, 0), Op::V(y, 0)) if y == v => {
+                lo = lo.max(1);
+            }
+            (IntCC::UnsignedGreaterThan, Op::V(y, 0), Op::V(_, 0)) if y == v => {
+                lo = lo.max(1);
+            }
+            (IntCC::UnsignedLessThan, Op::V(y, 0), Op::V(_, 0)) if y == v => {
+                hi = hi.min(full - 1);
+            }
+            (IntCC::UnsignedGreaterThan, Op::V(_, 0), Op::V(y, 0)) if y == v => {
+                hi = hi.min(full - 1);
+            }
+            _ => {}
+        }
         let (cc, k, d) = match (a, b) {
             (Op::V(x, d), Op::K(k)) if x == v => (cc, shift_k(cc, k, d, full), d),
             (Op::K(k), Op::V(y, d)) if y == v => {
@@ -1239,8 +1275,99 @@ fn offset_decide(func: &Function, fs: &[&Cmp], f: Cmp, q: Cmp) -> Option<bool> {
     delta_implied(fc, fsh, qsh, qc)
 }
 
-/// Decide the query `q` from the dominating facts `fs`.
-fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<bool> {
+/// `(y - k - i) cc y` for `k >= 1` — the reversed-index bounds check
+/// `v[len - 1 - i]`. `y - k - i` wraps iff `i > y - k`, so when `i <= y - k`
+/// is provable the result lies in `[0, y - k]` and is `< y` (unsigned).
+/// The `lo(y) >= k` gate rejects wrapped `y - k` bounds (a wrapped huge
+/// bound would make the `i` subquery trivially true while the result can
+/// still be `>= y`).
+fn isub_index_decide(
+    func: &Function,
+    fs: &[&Cmp],
+    q: Cmp,
+    srcs: &FxHashMap<Value, Value>,
+    depth: u32,
+) -> Option<bool> {
+    if depth >= 4 || !ucc(q.0) {
+        return None;
+    }
+    for &(cc, lhs, rhs) in &[(q.0, q.1, q.2), (q.0.swap_args(), q.2, q.1)] {
+        let (Op::V(z, 0), Op::V(y, 0)) = (lhs, rhs) else {
+            continue;
+        };
+        let Some(zi) = func.dfg.value_def(z).inst() else {
+            continue;
+        };
+        let InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args,
+        } = func.dfg.insts[zi]
+        else {
+            continue;
+        };
+        let Op::V(yb, fk) = decomp(func, args[0]) else {
+            continue;
+        };
+        let i = func.dfg.resolve_aliases(args[1]);
+        if yb != y || fk >= 0 || i == y {
+            continue;
+        }
+        if urange(func, fs, y, 0).is_none_or(|(l, _)| l < fk.unsigned_abs()) {
+            continue;
+        }
+        // Facts are stated in the predecessor's arg namespace, so try the
+        // local name and every name along `i`'s uniform in-edge arg chain.
+        let mut cand = vec![i];
+        for _ in 0..8 {
+            let Some(&a) = srcs.get(cand.last().unwrap()) else {
+                break;
+            };
+            let a = func.dfg.resolve_aliases(a);
+            if a == *cand.last().unwrap() {
+                break;
+            }
+            cand.push(a);
+        }
+        for &i2 in &cand {
+            let sq = (
+                IntCC::UnsignedLessThanOrEqual,
+                decomp(func, i2),
+                Op::V(y, fk),
+            );
+            // `raw.1` is the `y + fk` result so `urange` ranges the right
+            // value on the `(K, V)` path; `(V, V)` matching uses the Ops.
+            if let Some(true) = decide_d(func, fs, sq, (i2, args[0]), srcs, depth + 1) {
+                return Some(matches!(
+                    cc,
+                    IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Decide the query `q` from the dominating facts `fs`. `srcs` maps block
+/// params to their uniform in-edge arg, bridging the arg namespace facts
+/// are stated in.
+fn decide(
+    func: &Function,
+    fs: &[&Cmp],
+    q: Cmp,
+    raw: (Value, Value),
+    srcs: &FxHashMap<Value, Value>,
+) -> Option<bool> {
+    decide_d(func, fs, q, raw, srcs, 0)
+}
+
+fn decide_d(
+    func: &Function,
+    fs: &[&Cmp],
+    q: Cmp,
+    raw: (Value, Value),
+    srcs: &FxHashMap<Value, Value>,
+    depth: u32,
+) -> Option<bool> {
     // `x == y` facts let the query match on either name.
     let eqs: Vec<(Value, Value)> = fs
         .iter()
@@ -1293,6 +1420,49 @@ fn decide(func: &Function, fs: &[&Cmp], q: Cmp, raw: (Value, Value)) -> Option<b
             if let Some(r) = offset_decide(func, fs, f, q) {
                 return Some(r);
             }
+        }
+        // Same-base self-compare `(x + a) cc (x + b)` — the shape
+        // `x - k < x` a decrementing index check takes. `==`/`!=` are
+        // exact (`a ≡ b mod 2^w`); orders reduce to the integer offset
+        // compare when both adds provably nowrap (so `x - k < x` needs
+        // `x >= k`, which loop guards/trip tests typically supply).
+        if let (Op::V(x, qa), Op::V(y, qb)) = (q.1, q.2)
+            && x == y
+        {
+            let w = bits(func, x).unwrap_or(64);
+            let eq = mask(qa.wrapping_sub(qb) as u64, w) == 0;
+            match q.0 {
+                IntCC::Equal => return Some(eq),
+                IntCC::NotEqual => return Some(!eq),
+                cc => {
+                    let ord = match cc {
+                        IntCC::UnsignedLessThan | IntCC::SignedLessThan => Some(qa < qb),
+                        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => {
+                            Some(qa <= qb)
+                        }
+                        IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => Some(qa > qb),
+                        IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedGreaterThanOrEqual => {
+                            Some(qa >= qb)
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = ord {
+                        let nw = |d: i64| {
+                            if scc(cc) {
+                                snnowrap(func, fs, x, d)
+                            } else {
+                                unowrap(func, fs, x, d)
+                            }
+                        };
+                        if qa == qb || (nw(qa) && nw(qb)) {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(r) = isub_index_decide(func, fs, q, srcs, depth) {
+            return Some(r);
         }
         // Transitivity: `x R1 m` and `m R2 z` decide `x R3 z` (z may be a
         // constant on the query's right).
@@ -1496,6 +1666,7 @@ pub fn run(func: &mut Function) -> usize {
     let fact = edge_facts(func, &cfg, &domtree);
     let mut folds: Vec<(Inst, bool)> = Vec::new();
     if !fact.is_empty() {
+        let srcs = crate::proots::alias_map(func);
         for b in func.layout.blocks() {
             let fs = facts_at(&domtree, &fact, b);
             if fs.is_empty() {
@@ -1505,7 +1676,7 @@ pub fn run(func: &mut Function) -> usize {
                 let Some((q, raw)) = norm_icmp(func, i, true) else {
                     continue;
                 };
-                let mut r = decide(func, &fs, q, raw);
+                let mut r = decide(func, &fs, q, raw, &srcs);
                 if r.is_none()
                     && let Some((qp, qraw)) = norm_icmp(func, i, false)
                     && qp != q
@@ -1515,7 +1686,7 @@ pub fn run(func: &mut Function) -> usize {
                     // pairing `qp`'s base values with the peeled `raw`
                     // ranges the wrong value (`x-1 != 0` got decided from
                     // `x != 0`, breaking BTreeMap's leaf-edge walk).
-                    r = decide(func, &fs, qp, qraw);
+                    r = decide(func, &fs, qp, qraw, &srcs);
                 }
                 if let Some(k) = r {
                     if crate::env_set("PLIRON_CELIM_DEBUG") {
