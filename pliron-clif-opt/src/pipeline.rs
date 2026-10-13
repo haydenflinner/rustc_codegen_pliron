@@ -2040,6 +2040,21 @@ pub static DEFAULT: &[Step] = &[
         Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG3")]),
         s_sameargs,
     ),
+    // Late dead-param drop: sameargs/paramsink retargeting can close a
+    // param-flow cycle that was live at jtround time (tokenize's token
+    // (start,end) pair — `count()` discards it, so the four-block
+    // carry chain is pure cargo for regalloc).
+    Step {
+        name: "deadp",
+        bisect: Some("deadp"),
+        stat: "deadp",
+        verify: true,
+        mutates: true,
+        cached: false,
+        shape: 0,
+        gate: Gate::Env("PLIRON_DEADP"),
+        run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
+    },
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
