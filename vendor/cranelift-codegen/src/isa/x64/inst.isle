@@ -2492,6 +2492,23 @@
 (rule 0 (x64_test ty @ $I32 src1 (is_gpr_mem src2)) (x64_testl_mr (gpr_mem_32_for_ty ty src2) src1))
 (rule 0 (x64_test ty @ $I64 src1 (is_gpr_mem src2)) (x64_testq_mr (gpr_mem_64_for_ty ty src2) src1))
 
+;; Helper for `cmp` with a memory first operand (`cmp r/m, imm`). x64 has no
+;; mem,mem encodings, so the second operand is restricted to immediates; the
+;; `Type` is the width the comparison reads (the sunk load's own width), so
+;; signed and unsigned condition codes are both exact.
+(decl x64_cmp_mem (Type GprMem GprMemImm) ProducesFlags)
+
+;; Match 8-bit immediates first; allows a smaller instruction encoding.
+(rule 1 (x64_cmp_mem $I16 src1 (is_simm8 src2)) (x64_cmpw_mi_sxb (gpr_mem_16_for_ty $I16 src1) src2))
+(rule 1 (x64_cmp_mem $I32 src1 (is_simm8 src2)) (x64_cmpl_mi_sxb (gpr_mem_32_for_ty $I32 src1) src2))
+(rule 1 (x64_cmp_mem $I64 src1 (is_simm8 src2)) (x64_cmpq_mi_sxb (gpr_mem_64_for_ty $I64 src1) src2))
+
+;; Match the remaining immediates.
+(rule 0 (x64_cmp_mem $I8  src1 (is_imm8 src2))   (x64_cmpb_mi (gpr_mem_8_for_ty  $I8  src1) src2))
+(rule 0 (x64_cmp_mem $I16 src1 (is_imm16 src2)) (x64_cmpw_mi (gpr_mem_16_for_ty $I16 src1) src2))
+(rule 0 (x64_cmp_mem $I32 src1 (is_imm32 src2)) (x64_cmpl_mi (gpr_mem_32_for_ty $I32 src1) src2))
+(rule 0 (x64_cmp_mem $I64 src1 (is_simm32 src2))(x64_cmpq_mi (gpr_mem_64_for_ty $I64 src1) src2))
+
 ;; Helper for creating `ptest` instructions.
 (decl x64_ptest (Xmm XmmMem128) ProducesFlags)
 (rule (x64_ptest src1 src2) (x64_ptest_rm_or_avx src1 src2))
@@ -3894,6 +3911,21 @@
 (rule 2 (is_nonzero (band _ a @ (value_type (ty_int (fits_in_64 ty))) b))
       (is_nonzero_band ty a b))
 
+;; A non-zero test of a sinkable load reads memory directly — `cmp $0, mem`
+;; — instead of materializing the value into a register for `test`. The
+;; `uextend` form covers `icmp ne (uextend byte), 0`: zero-extension means
+;; the extended value is nonzero exactly when the loaded bytes are.
+(rule 3 (is_nonzero (and (value_type (ty_int (fits_in_64 ty)))
+                         (sinkable_load_exact sl)))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl)
+                                   (RegMemImm.Imm 0))
+                     (CC.NZ)))
+(rule 4 (is_nonzero (uextend _ (and (value_type (ty_int (fits_in_64 ty)))
+                                    (sinkable_load_exact sl))))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl)
+                                   (RegMemImm.Imm 0))
+                     (CC.NZ)))
+
 ;; Like `is_nonzero` but with additional specializations for compare
 ;; operators. We break this out from `is_nonzero` because we want to
 ;; avoid unbounded recursion.
@@ -4003,12 +4035,22 @@
 ;; Kept above the `is_nonzero` rewrites in priority but guarded so `b` stays
 ;; in the RMI/imm slot when it's a constant (`cmp reg, imm` / `test` wins
 ;; there); `i128` is excluded by `fits_in_64`.
-(rule 7 (emit_cmp cc a @ (and (sinkable_load sl)
+(rule 7 (emit_cmp cc a @ (and (sinkable_load_exact sl)
                             (value_type (ty_int (fits_in_64 ty))))
                   b)
       (if-let true (pliron_not_iconst b))
       (CondResult.CC (x64_cmp ty (put_in_gpr b) (sink_load_to_gpr_mem_imm sl))
                      (intcc_swap_args cc)))
+
+;; pliron: against a constant the swapped form isn't needed — `cmp r/m, imm`
+;; compares the memory operand directly at the icmp's own width (the
+;; condition code stays put: `mem - imm` produces the same flags as the
+;; loaded value would). Constants too wide for the encoding fall through to
+;; the register form.
+(rule 8 (emit_cmp cc a @ (and (sinkable_load_exact sl)
+                            (value_type (ty_int (fits_in_64 ty))))
+                  b @ (simm32_from_value b_imm))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl) b_imm) cc))
 
 ;; For I128 values (held in two GPRs), the instruction sequences depend on what
 ;; kind of condition is tested.

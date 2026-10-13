@@ -160,3 +160,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     alignment — the buffer minimum is usually 1, so without it functions
     land at arbitrary offsets and buffer-relative 16-alignment means
     nothing in the final image.
+
+17. x64 `icmp` memory-operand compares (`src/isa/x64/inst.isle`): a
+    sinkable `load` on the LHS of `icmp` is swapped to the RHS (`cmp reg,
+    [mem]` + `intcc_swap_args`); against a constant it instead lowers to
+    `cmp r/m, imm` via new `x64_cmp_mem` helper; `is_nonzero` of a sinkable
+    load (or `uextend` of one) lowers to `cmp $0, mem` instead of
+    materializing for `test reg, reg`. Both forms use
+    `sinkable_load_exact` (narrow loads read at their own width) so byte
+    scans like `is[i]`/`cmpb $0, mem; jne` fold to a single memory compare.
