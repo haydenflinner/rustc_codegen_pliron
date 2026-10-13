@@ -781,7 +781,11 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // block388 -> block935 disc) need follow-up rounds.
     for i in 0..8 {
         let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
-        let n = jumpthread::round(&mut p.clctx.func, &nn, crate::pass_enabled("PLIRON_DOMCOND"));
+        let n = jumpthread::round(
+            &mut p.clctx.func,
+            &nn,
+            crate::pass_enabled("PLIRON_DOMCOND"),
+        );
         total += n;
         if p.dump {
             p.dump(&format!("jtr{i}"));
@@ -1342,8 +1346,7 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Same-shape edge args hoisted into the target block; the pred-side
 // arg insts they orphaned get swept.
 fn s_arghoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    clifpeep::arghoist(&mut p.clctx.func)
-        + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
+    clifpeep::arghoist(&mut p.clctx.func) + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
 }
 
 // A merge param's pure use-chain sunk onto the incoming edges (the
@@ -1363,8 +1366,8 @@ fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `mov 0; cmp; csel; cmp` tail sequence.
 fn s_niche(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
-    let k = niche::run(&mut p.clctx.func, &nn)
-        + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+    let k =
+        niche::run(&mut p.clctx.func, &nn) + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {
         p.dump("niche");
     }
@@ -1954,21 +1957,21 @@ pub static DEFAULT: &[Step] = &[
     // on the flag (tokenize's block388/block859 discriminant chain —
     // only pays off once jtround can repair multi-pred targets, so this
     // sits right before the looping jtround).
-    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain)
-        .needs(shape::CONDBR),
-    step("jtround", "threaded", Gate::Env("PLIRON_JTROUND"), s_jtround).needs(shape::CONDBR),
+    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::CONDBR),
+    step(
+        "jtround",
+        "threaded",
+        Gate::Env("PLIRON_JTROUND"),
+        s_jtround,
+    )
+    .needs(shape::CONDBR),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
     step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
     // Fold constants any earlier pass left behind — late value folds
     // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
     // `ishl` chains the early clifpeep round never saw (matmul's
     // `((-(-216))>>3)<<6` vector-trip bound recomputed per iteration).
-    step(
-        "csweep2",
-        "",
-        Gate::Env("PLIRON_CSWEEP2"),
-        s_csweep2,
-    ),
+    step("csweep2", "", Gate::Env("PLIRON_CSWEEP2"), s_csweep2),
     // `jtround`/`mergechain` threading leaves `isub(isub e,a),(isub e,b)`
     // telescopes on the new edges (`end-front` vs `end-ptr'` lengths —
     // the token-len recomputes in tokenize's block303). lcse2 already
@@ -1997,7 +2000,12 @@ pub static DEFAULT: &[Step] = &[
     // Same-shape edge args (`iadd v4215,v4300` cloned into seven
     // tokenize preds) hoisted into the target — deletes the param
     // slot and its regalloc edge copies outright.
-    step("arghoist", "arghoist", Gate::Env("PLIRON_ARGHOIST"), s_arghoist),
+    step(
+        "arghoist",
+        "arghoist",
+        Gate::Env("PLIRON_ARGHOIST"),
+        s_arghoist,
+    ),
     step(
         "paramsink",
         "paramsink",
@@ -2015,8 +2023,7 @@ pub static DEFAULT: &[Step] = &[
     // `select c,·,·` args fold to arms and the cmov cluster dies
     // (`Chars::next`/`split_terminator` per-element cost). Runs late:
     // the select form only exists after ifconv/merge retargeting.
-    step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest)
-        .needs(shape::CONDBR),
+    step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest).needs(shape::CONDBR),
     // `(x >= lo) && (x < hi)` merged to `(x - lo) <u w` — select/band
     // scalar forms plus loopvec's `bitselect(masked cmp, cmp, 0)` —
     // after sameargs folds the bounds to `iconst`/`splat(iconst)` the
@@ -2037,16 +2044,25 @@ pub static DEFAULT: &[Step] = &[
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
     // branch each and the union merges the pair, LLVM's `c|0x20`.
-    step("rangefold", "rangefold", Gate::Env("PLIRON_RANGEFOLD"), s_rangefold)
-        .needs(shape::CONDBR),
+    step(
+        "rangefold",
+        "rangefold",
+        Gate::Env("PLIRON_RANGEFOLD"),
+        s_rangefold,
+    )
+    .needs(shape::CONDBR),
     // One-bit compares feeding a `brif` — `byte <u 0x80` (the UTF-8
     // ASCII/continuation test in tokenize/chars_*), `x <s 0` — become
     // `brif (band v, 1<<b)` (targets swapped for the clear-polarity
     // case), which isel fuses into a single `tbnz`/`tbz` on aarch64 and
     // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
     // every earlier pass.
-    step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest)
-        .needs(shape::CONDBR),
+    step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
+    // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
+    // shrink under MAX_INSTS after the late folds — clone them last so the
+    // loop's hot tail lands on the fallthrough edge instead of a `jmp`
+    // per iteration (chars_*/tokenize dispatch).
+    step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
     Step {
         name: "coldret",
         bisect: Some("coldret"),

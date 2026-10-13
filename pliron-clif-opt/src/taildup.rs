@@ -7,9 +7,11 @@
 //! predecessor feeds its own branch.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, InstructionData, Opcode, Value, ValueDef,
+    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -85,6 +87,55 @@ fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Bloc
             .all(|i| func.dfg.inst_results(i).iter().all(ok))
 }
 
+/// The `icmp` behind `t`'s `brif` condition when it is the branch's only
+/// use — complementing it is a free condition inversion (edge args keep
+/// the un-complemented value, so any other use disqualifies it).
+fn flip_inst(
+    func: &Function,
+    uses: &FxHashMap<Value, Option<Block>>,
+    p: Block,
+    t: Inst,
+) -> Option<Inst> {
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else {
+        return None;
+    };
+    let arg = match func.dfg.value_alias_dest_for_serialization(arg) {
+        Some(d) if d != Value::reserved_value() => d,
+        Some(_) => return None,
+        None => arg,
+    };
+    if uses.get(&arg) != Some(&Some(p)) {
+        return None;
+    }
+    let ValueDef::Result(i, 0) = func.dfg.value_def(arg) else {
+        return None;
+    };
+    if !matches!(
+        func.dfg.insts[i],
+        InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let mut n = 0;
+    for j in func.layout.block_insts(p) {
+        n += func
+            .dfg
+            .inst_values(j)
+            .filter(|&v| {
+                func.dfg
+                    .value_alias_dest_for_serialization(v)
+                    .filter(|&d| d != Value::reserved_value())
+                    .unwrap_or(v)
+                    == arg
+            })
+            .count();
+    }
+    (n == 1).then_some(i)
+}
+
 /// Every value `r` uses from outside `r` is available at the end of `p`.
 fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) -> bool {
     func.layout.block_insts(r).all(|i| {
@@ -139,6 +190,7 @@ pub fn run(func: &mut Function) -> usize {
         // A `jump` pred gets the copy in place; a `brif` pred gets one clone
         // block per edge to a candidate (the flag merge it feeds, e.g.
         // `is_alphabetic`'s bool param, then never materialises as a value).
+        let is_brif = matches!(func.dfg.insts[t], InstructionData::Brif { .. });
         let dests: Vec<BlockCall> = match func.dfg.insts[t] {
             InstructionData::Jump { destination, .. } => vec![destination],
             InstructionData::Brif { blocks, .. } if crate::pass_enabled("PLIRON_TAILDUP_EDGE") => {
@@ -146,10 +198,39 @@ pub fn run(func: &mut Function) -> usize {
             }
             _ => continue,
         };
+        // Edges whose target loops back through a dominator of `p` — latch
+        // merges, worth cloning even without foldable args: the copy moves
+        // the loop's hot tail onto the branch's fallthrough edge instead of
+        // a `jmp` per iteration.
+        let latches: Vec<bool> = dests
+            .iter()
+            .map(|d| {
+                let r = d.block(&func.dfg.value_lists);
+                is_brif
+                    && r != p
+                    && func.layout.last_inst(r).is_some_and(|rt| {
+                        func.dfg.insts[rt]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                            .iter()
+                            .any(|bc| domtree.block_dominates(bc.block(&func.dfg.value_lists), p))
+                    })
+            })
+            .collect();
+        // Compare to complement when an edge-0 latch clone must be moved
+        // to the second edge to land next in emitted order.
+        let mut flip0 = None;
         for (di, &dest) in dests.iter().enumerate() {
+            let r = dest.block(&func.dfg.value_lists);
+            let latch = latches[di];
+            // When the second edge's latch clone will take the fallthrough
+            // slot anyway, an edge-0 clone is pure duplication — skip it.
+            if latch && di == 0 && latches.get(1) == Some(&true) {
+                continue;
+            }
             // Brif-edge clones only pay when an arg is a constant the cloned
             // body can fold — otherwise it's pure dispatch-chain duplication.
-            if matches!(func.dfg.insts[t], InstructionData::Brif { .. })
+            if is_brif
+                && !latch
                 && !dest.args(&func.dfg.value_lists).any(|a| {
                     matches!(a, BlockArg::Value(v)
                         if func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
@@ -158,7 +239,13 @@ pub fn run(func: &mut Function) -> usize {
             {
                 continue;
             }
-            let r = dest.block(&func.dfg.value_lists);
+            // The clone lands next in emitted order only as the brif's
+            // second successor, so an edge-0 latch clone needs a freely
+            // invertible compare to swap onto it.
+            let flip = latch.then(|| flip_inst(func, &uses, p, t)).flatten();
+            if latch && di == 0 && flip.is_none() {
+                continue;
+            }
             let why = if r == p {
                 "self"
             } else if !rets.contains(&r) {
@@ -248,7 +335,23 @@ pub fn run(func: &mut Function) -> usize {
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
                     BlockCall::new(nb, std::iter::empty(), &mut dfg.value_lists);
             }
+            if latch && di == 0 {
+                flip0 = flip;
+            }
             n += 1;
+        }
+        if let Some(cmp) = flip0 {
+            // Swap the clone onto the second edge so it is next in emitted
+            // order: complement the (single-use) compare, swap targets.
+            let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[cmp] else {
+                continue;
+            };
+            *cond = cond.complement();
+            let mut data = func.dfg.insts[t];
+            let dfg = &mut func.dfg;
+            data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                .swap(0, 1);
+            dfg.insts[t] = data;
         }
     }
     // Return blocks left without predecessors would fail dominance checks.
