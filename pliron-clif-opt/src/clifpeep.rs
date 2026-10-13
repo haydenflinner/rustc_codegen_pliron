@@ -3009,8 +3009,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 // i64 unsigned-`icmp` bools instead fold into
                 // `cmp`+`adc`/`sbb` off CF at isel — rewriting to a
                 // select would hide that pattern.
-                let sel = sel
-                    .filter(|(c, ..)| ty != types::I64 || !ucmp_bool(pos.func, *c));
+                let sel = sel.filter(|(c, ..)| ty != types::I64 || !ucmp_bool(pos.func, *c));
                 if let Some((c, x, d)) = sel {
                     let inc = pos.ins().iadd_imm_s(x, d);
                     pos.func.replace(inst).select(c, inc, x);

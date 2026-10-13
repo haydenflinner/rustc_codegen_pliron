@@ -34,6 +34,7 @@ use crate::loopidiom::{
     edge_dest, emit, gather, guard_dead, guard_pred, iconst, ins_eval, outv, param_kinds,
     trips_idx, trips_ptr,
 };
+use crate::proots;
 
 const MAX_LOOPS: usize = 16;
 const MAX_CONV: usize = 4;
@@ -510,8 +511,7 @@ fn stream_base(
 /// interior-block param, non-affine op, …).
 fn param_coeffs(
     func: &Function,
-    cfg: &ControlFlowGraph,
-    dt: &DominatorTree,
+    ps: &FxHashMap<Value, Value>,
     info: &Info,
     kinds: &[Param],
     v: Value,
@@ -534,35 +534,18 @@ fn param_coeffs(
         },
         // Params of other blocks: invariant when defined outside the loop,
         // non-affine when carried inside it — except a param every in-edge
-        // feeds the same value, which is just an alias of that value.
+        // feeds the same value (`proots::alias`), which is just that value.
         ValueDef::Param(b, _) if !info.body.contains(&b) => Some(()),
-        ValueDef::Param(b, j) => {
-            let mut first: Option<Value> = None;
-            for p in cfg.pred_iter(b) {
-                if !dt.is_reachable(p.block) {
-                    continue;
-                }
-                for bc in func.dfg.insts[p.inst]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                {
-                    if bc.block(&func.dfg.value_lists) != b {
-                        continue;
-                    }
-                    let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(j) else {
-                        return None;
-                    };
-                    let a = func.dfg.resolve_aliases(a);
-                    if let Some(f) = first {
-                        if f != a {
-                            return None;
-                        }
-                    } else {
-                        first = Some(a);
-                    }
-                }
-            }
-            param_coeffs(func, cfg, dt, info, kinds, first?, mul, out, depth + 1)
-        }
+        ValueDef::Param(..) => param_coeffs(
+            func,
+            ps,
+            info,
+            kinds,
+            ps.get(&v).copied()?,
+            mul,
+            out,
+            depth + 1,
+        ),
         ValueDef::Result(i, _)
             if func
                 .layout
@@ -576,18 +559,18 @@ fn param_coeffs(
                     args: [a, b],
                 } => match opcode {
                     Opcode::Iadd => {
-                        param_coeffs(func, cfg, dt, info, kinds, a, mul, out, d)?;
-                        param_coeffs(func, cfg, dt, info, kinds, b, mul, out, d)
+                        param_coeffs(func, ps, info, kinds, a, mul, out, d)?;
+                        param_coeffs(func, ps, info, kinds, b, mul, out, d)
                     }
                     Opcode::Isub => {
-                        param_coeffs(func, cfg, dt, info, kinds, a, mul, out, d)?;
-                        param_coeffs(func, cfg, dt, info, kinds, b, -mul, out, d)
+                        param_coeffs(func, ps, info, kinds, a, mul, out, d)?;
+                        param_coeffs(func, ps, info, kinds, b, -mul, out, d)
                     }
                     Opcode::Imul => {
                         if let Some(k) = iconst(func, b) {
-                            param_coeffs(func, cfg, dt, info, kinds, a, mul.wrapping_mul(k), out, d)
+                            param_coeffs(func, ps, info, kinds, a, mul.wrapping_mul(k), out, d)
                         } else if let Some(k) = iconst(func, a) {
-                            param_coeffs(func, cfg, dt, info, kinds, b, mul.wrapping_mul(k), out, d)
+                            param_coeffs(func, ps, info, kinds, b, mul.wrapping_mul(k), out, d)
                         } else {
                             None
                         }
@@ -597,24 +580,14 @@ fn param_coeffs(
                         if !(0..32).contains(&k) {
                             return None;
                         }
-                        param_coeffs(
-                            func,
-                            cfg,
-                            dt,
-                            info,
-                            kinds,
-                            a,
-                            mul.wrapping_shl(k as u32),
-                            out,
-                            d,
-                        )
+                        param_coeffs(func, ps, info, kinds, a, mul.wrapping_shl(k as u32), out, d)
                     }
                     _ => None,
                 },
                 InstructionData::Unary { opcode, arg } => match opcode {
-                    Opcode::Ineg => param_coeffs(func, cfg, dt, info, kinds, arg, -mul, out, d),
+                    Opcode::Ineg => param_coeffs(func, ps, info, kinds, arg, -mul, out, d),
                     Opcode::Uextend | Opcode::Sextend => {
-                        param_coeffs(func, cfg, dt, info, kinds, arg, mul, out, d)
+                        param_coeffs(func, ps, info, kinds, arg, mul, out, d)
                     }
                     _ => None,
                 },
@@ -634,8 +607,7 @@ fn param_coeffs(
 /// `entry + s*done` for `Step` reproduces the deferred value exactly.
 fn upgrade_lagged(
     func: &Function,
-    cfg: &ControlFlowGraph,
-    dt: &DominatorTree,
+    ps: &FxHashMap<Value, Value>,
     info: &Info,
     kinds: &mut Vec<Param>,
 ) {
@@ -655,9 +627,7 @@ fn upgrade_lagged(
                 continue;
             }
             let mut cs: FxHashMap<usize, i64> = FxHashMap::default();
-            if param_coeffs(func, cfg, dt, info, kinds, bv, 1, &mut cs, 0).is_none()
-                || cs.is_empty()
-            {
+            if param_coeffs(func, ps, info, kinds, bv, 1, &mut cs, 0).is_none() || cs.is_empty() {
                 continue;
             }
             let step: i64 = cs
@@ -684,78 +654,72 @@ fn upgrade_lagged(
 /// Acc-resolution context for one `Param::Other` header param `p`: the
 /// accumulator may reach a use or a latch through interior block params
 /// (`if c { acc += d }` keeps its merge phi inside the loop; iterator
-/// chains forward `acc` through forwarder-block params). `like` collects
-/// params proven to carry exactly `p` — every reachable in-edge supplies
-/// an acc value — and `pass` collects edge terminators that deliver an
-/// acc value, so both sets can answer the "is `acc` read here" checks.
+/// chains forward `acc` through forwarder-block params). `like` is the
+/// `proots` fixpoint of interior params provably carrying `p` on every
+/// reachable in-edge, and `pass` collects edge terminators that deliver
+/// an acc value, so both sets can answer the "is `acc` read here" checks.
 struct AccCx<'f> {
     func: &'f Function,
-    cfg: &'f ControlFlowGraph,
-    dt: &'f DominatorTree,
+    facts: &'f proots::Facts,
     info: &'f Info,
     p: Value,
     like: FxHashSet<Value>,
+    blocked: FxHashSet<Value>,
     pass: FxHashSet<Inst>,
+    seen: FxHashSet<Value>,
 }
 
-impl AccCx<'_> {
-    /// (edge terminator, slot, edge source block, arg at param `j`) for
-    /// every reachable edge into `b`.
-    fn in_args(&self, b: Block, j: usize) -> Vec<(Inst, usize, Block, Value)> {
-        let mut out = Vec::new();
-        for pred in self.cfg.pred_iter(b) {
-            if !self.dt.is_reachable(pred.block) {
-                continue;
-            }
-            for (slot, bc) in self.func.dfg.insts[pred.inst]
-                .branch_destination(&self.func.dfg.jump_tables, &self.func.dfg.exception_tables)
-                .iter()
-                .enumerate()
-            {
-                if bc.block(&self.func.dfg.value_lists) != b {
-                    continue;
-                }
-                let a = match bc.args(&self.func.dfg.value_lists).nth(j) {
-                    Some(BlockArg::Value(a)) => self.func.dfg.resolve_aliases(a),
-                    _ => return Vec::new(),
-                };
-                out.push((pred.inst, slot, pred.block, a));
-            }
+impl<'f> AccCx<'f> {
+    fn new(func: &'f Function, facts: &'f proots::Facts, info: &'f Info, p: Value) -> Self {
+        let interior = info
+            .body
+            .iter()
+            .filter(|&&b| b != info.h)
+            .flat_map(|&b| func.dfg.block_params(b).iter().copied());
+        AccCx {
+            func,
+            facts,
+            info,
+            p,
+            like: proots::like_map(facts, interior, p),
+            blocked: facts.blocked.iter().copied().collect(),
+            pass: FxHashSet::default(),
+            seen: FxHashSet::default(),
         }
-        out
     }
 
-    /// `v` always carries the acc: `p` itself, or an interior block param
-    /// whose every reachable in-edge supplies an acc value (transitively).
-    /// Depth-bounded: a phi cycle that never bottoms out at `p` fails, as
-    /// does any non-acc leaf arg.
-    fn is_acc(&mut self, v: Value, depth: u8) -> bool {
+    /// `v` always carries the acc: `p` itself, or an interior param in
+    /// the fixpoint `like` set. Also walks `v`'s interior-param edge
+    /// graph so `pass` sees the same terminators the old recursive
+    /// descent visited (a superset is fine — `pass` only excuses
+    /// branch-arg reads; the receiving param's own uses are checked
+    /// separately).
+    fn is_acc(&mut self, v: Value) -> bool {
         let v = self.func.dfg.resolve_aliases(v);
-        if v == self.p || self.like.contains(&v) {
-            return true;
-        }
-        if depth > 8 {
-            return false;
-        }
-        let ValueDef::Param(b, j) = self.func.dfg.value_def(v) else {
-            return false;
+        self.collect_pass(v);
+        v == self.p || self.like.contains(&v)
+    }
+
+    /// Record the edge terminators feeding every interior param
+    /// reachable from `v` through `facts`' edge graph, memoized by
+    /// `seen`. Params with an opaque in-edge arg (`blocked`) are not
+    /// descended, matching the old `in_args` bail.
+    fn collect_pass(&mut self, v: Value) {
+        let ValueDef::Param(b, _) = self.func.dfg.value_def(v) else {
+            return;
         };
-        if b == self.info.h || !self.info.body.contains(&b) {
-            return false;
+        if b == self.info.h
+            || !self.info.body.contains(&b)
+            || self.blocked.contains(&v)
+            || !self.seen.insert(v)
+        {
+            return;
         }
-        let args = self.in_args(b, j);
-        if args.is_empty() {
-            return false;
+        let args = self.facts.detail.get(&v).cloned().unwrap_or_default();
+        for (i, .., a) in args {
+            self.pass.insert(i);
+            self.collect_pass(a);
         }
-        // Edge terminators delivering here may read an acc value — allow
-        // them wholesale (a wrong guess only excuses a branch-arg read;
-        // the receiving param's own uses are checked separately).
-        self.pass.extend(args.iter().map(|&(i, ..)| i));
-        let ok = args.iter().all(|&(.., a)| self.is_acc(a, depth + 1));
-        if ok {
-            self.like.insert(v);
-        }
-        ok
     }
 
     /// Decompose the value fed to `p` on one latch into leaf arms: `p`
@@ -773,7 +737,7 @@ impl AccCx<'_> {
         out: &mut Vec<(Value, (Inst, usize, Block))>,
     ) {
         let v = self.func.dfg.resolve_aliases(v);
-        if v == self.p || self.is_acc(v, depth) {
+        if v == self.p || self.like.contains(&v) {
             out.push((self.p, e));
             return;
         }
@@ -781,15 +745,15 @@ impl AccCx<'_> {
             out.push((v, e));
             return;
         }
-        let ValueDef::Param(b, j) = self.func.dfg.value_def(v) else {
+        let ValueDef::Param(b, _) = self.func.dfg.value_def(v) else {
             out.push((v, e));
             return;
         };
-        if b == self.info.h || !self.info.body.contains(&b) {
+        if b == self.info.h || !self.info.body.contains(&b) || self.blocked.contains(&v) {
             out.push((v, e));
             return;
         }
-        let args = self.in_args(b, j);
+        let args = self.facts.detail.get(&v).cloned().unwrap_or_default();
         if args.is_empty() {
             out.push((v, e));
             return;
@@ -968,7 +932,7 @@ fn upd_decomp(
                 func.dfg.resolve_aliases(args[0]),
                 func.dfg.resolve_aliases(args[1]),
             );
-            let (xa, ya) = (cx.is_acc(x, 0), cx.is_acc(y, 0));
+            let (xa, ya) = (cx.is_acc(x), cx.is_acc(y));
             let d = if xa && !ya {
                 y
             } else if ya && !xa {
@@ -998,10 +962,10 @@ fn upd_decomp(
                 );
                 // Both the icmp and the select pair `acc` with the
                 // same single delta value.
-                let (aa, ba) = (cx.is_acc(a, 0), cx.is_acc(b, 0));
-                let (xa, ya) = (cx.is_acc(x, 0), cx.is_acc(y, 0));
+                let (aa, ba) = (cx.is_acc(a), cx.is_acc(b));
+                let (xa, ya) = (cx.is_acc(x), cx.is_acc(y));
                 let (da, dx) = (if aa { b } else { a }, if xa { y } else { x });
-                if aa != ba && xa != ya && da == dx && !cx.is_acc(da, 0) {
+                if aa != ba && xa != ya && da == dx && !cx.is_acc(da) {
                     let d = da;
                     // `select(a cc b, x, y)`: picking the same operand
                     // the comparison favors is min, the other is max.
@@ -1034,7 +998,7 @@ fn upd_decomp(
             // not read `acc` (checked in `cond_tree`). The update arm
             // may nest another conditional select — the delta then
             // needs every level's mask (see `upd_decomp`'s doc).
-            let (xa, ya) = (cx.is_acc(x, 0), cx.is_acc(y, 0));
+            let (xa, ya) = (cx.is_acc(x), cx.is_acc(y));
             let (inner, invert) = if ya && !xa {
                 (x, false)
             } else if xa && !ya {
@@ -1049,8 +1013,8 @@ fn upd_decomp(
             // Only zero-identity ops mask this way — a nested min/max
             // or fadd select can't be a conditional update's inner.
             if !matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor)
-                || cx.is_acc(d, 0)
-                || cx.is_acc(c, 0)
+                || cx.is_acc(d)
+                || cx.is_acc(c)
             {
                 return None;
             }
@@ -1094,6 +1058,7 @@ fn reaches_avoiding(func: &Function, from: Block, to: Block, avoid: Block) -> bo
 fn plan(
     func: &mut Function,
     ps: &FxHashMap<Value, Value>,
+    facts: &proots::Facts,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1107,7 +1072,7 @@ fn plan(
         why!(fname; "gather loop {:?}", lp);
     };
     let mut kinds = param_kinds(func, &info);
-    upgrade_lagged(func, cfg, dt, &info, &mut kinds);
+    upgrade_lagged(func, ps, &info, &mut kinds);
     if crate::env_set("PLIRON_VEC_DEBUG") {
         eprintln!(
             "vec kinds {} {:?}: {:?}",
@@ -1148,15 +1113,7 @@ fn plan(
         // — `filter`-style folds, masked lane-wise). `aux` is an extra inst
         // allowed to read `acc`; `cond` carries (predicate, invert) for the
         // conditional form.
-        let mut cx = AccCx {
-            func,
-            cfg,
-            dt,
-            info: &info,
-            p,
-            like: FxHashSet::default(),
-            pass: FxHashSet::default(),
-        };
+        let mut cx = AccCx::new(func, facts, &info, p);
         let mut upd: Option<(Inst, Opcode, Value, Vec<Inst>, Vec<(Value, bool)>)> = None;
         // Leaf arms of the value fed back on every latch: `(src, passes
         // acc unchanged, delivering edge)`. A `filter`-style conditional
@@ -4486,8 +4443,11 @@ pub fn run(
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        let ps = crate::loadfwd::param_src(func);
-        let Some(p) = plan(func, &ps, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64) else {
+        let facts = proots::facts(func);
+        let ps = proots::alias_of(&facts);
+        let Some(p) = plan(
+            func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64,
+        ) else {
             continue;
         };
         if debug {

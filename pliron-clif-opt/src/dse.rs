@@ -230,8 +230,8 @@ pub fn run(
         return 0;
     };
     let cfg = ControlFlowGraph::with_function(func);
-    let ps = loadfwd::param_src(func);
-    let iso = loadfwd::isolated(func, noalias, &ps, cfrozen);
+    let ps = &loadfwd::param_src(func);
+    let iso = loadfwd::isolated(func, noalias, ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut order = Vec::new();
     let mut seen: FxHashSet<Block> = FxHashSet::default();
@@ -274,7 +274,7 @@ pub fn run(
                 changed = true;
             }
             let mut din = d;
-            transfer(func, &ps, noalias, b, &mut din, &iso, nw, eh, None);
+            transfer(func, ps, noalias, b, &mut din, &iso, nw, eh, None);
             if inn.get(&b) != Some(&din) {
                 inn.insert(b, din);
                 changed = true;
@@ -291,7 +291,7 @@ pub fn run(
     let mut dead = Vec::new();
     for &b in &order {
         let mut d = out.get(&b).cloned().unwrap_or_default();
-        transfer(func, &ps, noalias, b, &mut d, &iso, nw, eh, Some(&mut dead));
+        transfer(func, ps, noalias, b, &mut d, &iso, nw, eh, Some(&mut dead));
     }
     for i in &dead {
         func.layout.remove_inst(*i);

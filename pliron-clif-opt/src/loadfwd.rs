@@ -12,7 +12,7 @@ use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
+    Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -57,48 +57,10 @@ pub fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) 
 /// same argument (or the param itself — a loop-carried passthrough, like
 /// `partition`'s `pivot` threaded through the scan loop). Such a param is
 /// that value for analysis purposes. Maps param → that value.
+/// `proots::alias_map` computes the relation (reachable edges only —
+/// args on unreachable edges are indistinguishable from absent ones).
 pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
-    let mut src: FxHashMap<Value, Option<Value>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for bc in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                let dst = bc.block(&func.dfg.value_lists);
-                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
-                let params = func.dfg.block_params(dst);
-                for (k, a) in args.into_iter().enumerate() {
-                    let Some(&p) = params.get(k) else {
-                        break;
-                    };
-                    let v = match a {
-                        BlockArg::Value(v) => func.dfg.resolve_aliases(v),
-                        // Pseudo-args (try_call ret/exn) can't be read here.
-                        _ => {
-                            src.insert(p, None);
-                            continue;
-                        }
-                    };
-                    if v == p {
-                        continue;
-                    }
-                    match src.entry(p) {
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(Some(v));
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            if *e.get() != Some(v) {
-                                e.insert(None);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    src.into_iter()
-        .filter_map(|(p, s)| s.map(|s| (p, s)))
-        .collect()
+    crate::proots::alias_map(func)
 }
 
 /// Chase `param_src` links (plus value aliases) to the value `v` provably
@@ -382,6 +344,13 @@ pub fn isolated_escapes(
                 if !cand.contains(&r) {
                     continue;
                 }
+                // Benign iff the fed param itself peels to `r` — then
+                // `root` keys its memory ops under `r` and the pointer
+                // stays inside the tracked class. (A param whose in-edge
+                // args merely root at `r` — `base + k` cursors — is not
+                // enough: `root` would key them under `V(param)`, their
+                // stores would dodge the same-root kill, and the param's
+                // own uses would escape scanning entirely.)
                 let fwd = |j: usize| {
                     fwd_arg(func, i, j).is_some_and(|(dst, pos)| {
                         Root::V(psrc(ps, noalias, func, func.dfg.block_params(dst)[pos])) == r
@@ -661,18 +630,18 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
-    let ps = param_src(func);
+    let ps = &param_src(func);
     // Root-resolution stop set: real `noalias` plus frozen operands —
     // either way the value names its own memory scope. `isolated` keeps
     // the real set so operand values don't get function-wide immunity.
     let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
-    let iso = isolated(func, noalias, &ps, cfrozen);
+    let iso = isolated(func, noalias, ps, cfrozen);
     if crate::pass_enabled("PLIRON_LOADPRE") {
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
-        n += pre(func, &ps, &stop, &cfg, &rpo, entry, &iso);
+        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -709,7 +678,7 @@ pub fn run(
             };
             transfer(
                 func,
-                &ps,
+                ps,
                 &stop,
                 b,
                 &mut av,
@@ -742,7 +711,7 @@ pub fn run(
         if let Some(mut av) = input(&out, b) {
             transfer(
                 func,
-                &ps,
+                ps,
                 &stop,
                 b,
                 &mut av,
@@ -1008,7 +977,7 @@ fn pre(
                 .collect();
             transfer(
                 func,
-                &ps,
+                ps,
                 na,
                 b,
                 &mut av,

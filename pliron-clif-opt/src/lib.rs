@@ -29,6 +29,7 @@ pub mod loopidiom;
 pub mod looprot;
 pub mod loopvec;
 pub mod pipeline;
+pub mod proots;
 pub mod punroll;
 pub mod revnorm;
 pub mod slotmerge;
