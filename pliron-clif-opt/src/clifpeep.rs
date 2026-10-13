@@ -20,8 +20,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
-    ValueDef, types,
+    Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData, LibCall,
+    MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
@@ -4685,11 +4685,165 @@ pub fn vecslot(func: &mut Function) -> usize {
     n
 }
 
+/// `call %Mem{cpy,move,set}(dst, src, iconst n)` for small `n` expands into
+/// unaligned load/store chunks — a few `movq`-scale ops instead of a libc
+/// call inside a hot loop (rustc emits `ptr::copy_nonoverlapping(_, _, 1)`
+/// as a runtime-size `llvm.memcpy`; the len folds to `iconst` only at CLIF
+/// level, so lower.rs's const-size inlining can't see it).
+///
+/// Every load precedes every store, so the same expansion is also correct
+/// for overlapping `memmove` (all source bytes are buffered in registers
+/// first); the `memset` fill must be an `iconst` so it splats into wider
+/// chunk constants. The result value (the dst pointer) aliases the dst arg.
+pub fn memcall(func: &mut Function) -> usize {
+    /// Largest byte count expanded inline — caps the expansion at eight
+    /// 8-byte chunks plus remainders.
+    const MAX: u64 = 64;
+    let mut done = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            if func.dfg.insts[i].opcode() != Opcode::Call {
+                continue;
+            }
+            let InstructionData::Call { func_ref: fref, .. } = func.dfg.insts[i] else {
+                continue;
+            };
+            let ExternalName::LibCall(lc) = func.dfg.ext_funcs[fref].name else {
+                continue;
+            };
+            if !matches!(lc, LibCall::Memcpy | LibCall::Memmove | LibCall::Memset) {
+                continue;
+            }
+            let args = func.dfg.inst_args(i).to_vec();
+            if args.len() != 3 {
+                continue;
+            }
+            let Some(n) = iconst(func, args[2]).and_then(|k| u64::try_from(k).ok()) else {
+                continue;
+            };
+            if n > MAX {
+                continue;
+            }
+            let (dst, src) = (args[0], args[1]);
+            let fill = if lc == LibCall::Memset {
+                // Only the low byte is the fill value.
+                let Some(f) = iconst(func, src) else { continue };
+                (f as u8) as u64
+            } else {
+                0
+            };
+            let mut pos = FuncCursor::new(func).at_inst(i);
+            let flags = MemFlagsData::new();
+            let mut rem = n;
+            let mut off = 0i32;
+            let mut vals = Vec::new();
+            // Decompose into 8/4/2/1-byte chunks.
+            let chunks = [
+                (8u64, types::I64),
+                (4u64, types::I32),
+                (2u64, types::I16),
+                (1u64, types::I8),
+            ];
+            while rem > 0 {
+                let (sz, ty) = chunks
+                    .iter()
+                    .copied()
+                    .find(|&(sz, _)| sz <= rem)
+                    .unwrap();
+                let v = if lc == LibCall::Memset {
+                    let splat = match sz {
+                        8 => 0x0101_0101_0101_0101u64,
+                        4 => 0x0101_0101u64,
+                        2 => 0x0101u64,
+                        _ => 0x01u64,
+                    };
+                    // Replicate the byte, then sign-extend to the iconst's
+                    // expected imm form.
+                    let bits = fill * splat;
+                    let bits = ((bits << (64 - sz * 8)) as i64) >> (64 - sz * 8);
+                    pos.ins().iconst(ty, bits)
+                } else {
+                    pos.ins().load(ty, flags, src, off)
+                };
+                vals.push((v, sz));
+                rem -= sz;
+                off += sz as i32;
+            }
+            let mut off = 0i32;
+            for (v, sz) in vals {
+                pos.ins().store(flags, v, dst, off);
+                off += sz as i32;
+            }
+            let res = pos.func.dfg.inst_results(i).to_vec();
+            pos.func.dfg.clear_results(i);
+            if let Some(r) = res.first() {
+                pos.func.dfg.change_to_alias(*r, dst);
+            }
+            pos.func.layout.remove_inst(i);
+            done += 1;
+        }
+    }
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+    use cranelift_codegen::ir::{AbiParam, ExtFuncData, Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
+
+    /// `call %Memcpy(dst, src, iconst 8)` becomes `load.i64; store.i64`
+    /// with the dst pointer aliased to the call's result.
+    #[test]
+    fn memcall_inlines_const_copy() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let dst = func.dfg.append_block_param(entry, types::I64);
+        let src = func.dfg.append_block_param(entry, types::I64);
+
+        let mut msig = Signature::new(CallConv::Fast);
+        msig.params = vec![AbiParam::new(types::I64); 3];
+        msig.returns.push(AbiParam::new(types::I64));
+        let sref = func.import_signature(msig);
+        let fref = func.import_function(ExtFuncData {
+            name: ExternalName::LibCall(LibCall::Memcpy),
+            signature: sref,
+            colocated: false,
+            patchable: false,
+        });
+
+        let ci = {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+            let n = cur.ins().iconst(types::I64, 8);
+            cur.ins().call(fref, &[dst, src, n])
+        };
+        let r = func.dfg.first_result(ci);
+        FuncCursor::new(&mut func).at_bottom(entry).ins().return_(&[r]);
+
+        assert_eq!(memcall(&mut func), 1);
+        let insts: Vec<Inst> = func.layout.block_insts(entry).collect();
+        assert_eq!(
+            insts
+                .iter()
+                .map(|&i| func.dfg.insts[i].opcode())
+                .collect::<Vec<_>>(),
+            [
+                Opcode::Iconst,
+                Opcode::Load,
+                Opcode::Store,
+                Opcode::Return
+            ]
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("memcall produced invalid IR: {e}\n{}", func.display());
+        }
+    }
 
     /// `a`'s only edge feeds it `b`'s param and `b`'s only edge feeds it
     /// `a`'s: dropping both maps each param onto the other, a replacement

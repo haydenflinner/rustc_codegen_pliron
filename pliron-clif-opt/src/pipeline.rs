@@ -1424,6 +1424,17 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// `call %Mem{cpy,move,set}(dst, src, iconst n)` for small n becomes inline
+// unaligned load/store chunks — rustc's element-wise copy intrinsics reach
+// CLIF with a runtime len that only folds to `iconst` here.
+fn s_memcall(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::memcall(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("memcall");
+    }
+    k
+}
+
 // Leaf `return` blocks that share a `brif` with a loop header are
 // colder than the loop: mark them cold so the emitted RPO order puts
 // them last and the loop arm falls through. Runs last — it's pure
@@ -1739,6 +1750,7 @@ pub static DEFAULT: &[Step] = &[
     // single `movi`/`dup` at the use.
     step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
+    step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
     Step {
         name: "coldret",
         bisect: Some("coldret"),
