@@ -4111,7 +4111,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         && !p.mems[first_store..]
             .iter()
             .any(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Load { .. }));
-    let mut pending_stores: Vec<(Value, Value, i64)> = Vec::new();
+    let mut pending_stores: Vec<(usize, Value, Value, i64)> = Vec::new();
     if crate::env_set("PLIRON_LOOPVEC_DEBUG") {
         eprintln!(
             "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
@@ -4166,7 +4166,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                         vv = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vv);
                     }
                     if batch_stores {
-                        pending_stores.push((vv, addrs[j].0, addrs[j].1));
+                        pending_stores.push((j, vv, addrs[j].0, addrs[j].1));
                     } else {
                         pos.ins().store(
                             MemFlagsData::new().with_notrap(),
@@ -4365,7 +4365,14 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         }
     }
     let mut pos = FuncCursor::new(pos.func).at_bottom(*vbs.last().unwrap());
-    for (vv, a, off) in pending_stores {
+    // Group each stream's stores consecutively (stable within a stream):
+    // the lo/hi interleave produced by program order measurably stalls
+    // store drain on converging streams (the `slice::reverse` swap loop),
+    // and same-stream adjacency is what `stp` pair fusion needs on
+    // aarch64. Streams were proven disjoint at plan time, so reordering
+    // stores across streams is unobservable.
+    pending_stores.sort_by_key(|&(j, ..)| j);
+    for (_, vv, a, off) in pending_stores {
         pos.ins()
             .store(MemFlagsData::new().with_notrap(), vv, a, off as i32);
     }
