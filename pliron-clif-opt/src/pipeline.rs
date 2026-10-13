@@ -1118,6 +1118,12 @@ fn s_sublea(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::sublea(&mut p.clctx.func)
 }
 
+// Constant folding for insts the loop passes emit after `clifpeep`'s
+// early round — see the `csweep2` step.
+fn s_csweep2(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::const_sweep(&mut p.clctx.func)
+}
+
 // Complementary `load (select)` pairs → two speculative loads + value
 // selects. The diamonds only collapse into selects late (fuse/
 // sameargs), so this runs near the end rather than in `clifpeep`'s
@@ -1665,6 +1671,16 @@ pub static DEFAULT: &[Step] = &[
         "constdedup",
         Gate::Env("PLIRON_CSTDEDUP"),
         s_constdedup,
+    ),
+    // Fold constants emitted by the loop passes — loopvec's trip-bound
+    // and addressing math lands inside enclosing loops where only
+    // `ineg`/`ushr`/`ishl`-on-`iconst` chains remain (matmul recomputed
+    // `((-(-216))>>3)<<6` every k-iteration).
+    step(
+        "csweep2",
+        "",
+        Gate::Env("PLIRON_CSWEEP2"),
+        s_csweep2,
     ),
     Step {
         name: "frozen_loads",

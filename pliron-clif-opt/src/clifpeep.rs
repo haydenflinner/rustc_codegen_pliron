@@ -1946,7 +1946,7 @@ fn apply_param_drops(
 /// chains on literal tags (`Chars`'s `Option<char>` flag), and `eval`
 /// walks them transitively. Constant `brif`s become `jump`s via
 /// `fold_const_branches`, then dead blocks are swept.
-fn const_sweep(func: &mut Function) -> usize {
+pub fn const_sweep(func: &mut Function) -> usize {
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     let mut hits = Vec::new();
     let nz = |_: Value| false;
