@@ -1365,3 +1365,28 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   (cursor nonnull unproven — INBOUNDSNN territory), uxtb+cmp#0x80 vs
   stock ldrsb+tbnz sign dispatch, per-edge param movs (post-index
   amode territory), a-z|A-Z as two range checks vs stock case-fold.
+
+## jtround merge-block threading (aabbeb8, subagent work)
+
+- jumpthread::round threads `brif` merge blocks even when the bypassed
+  block's values are used downstream of the thread target: exports
+  become new params on `s`, repaired on `s`'s other preds. Post-edit
+  dominance is re-checked against the planned-edge graph (reach_avoid)
+  because a new edge can open a def-bypassing path (print_num
+  verifier failure was exactly this); const_env remat covers values
+  that lose dominance.
+- brif_not + brif_argspec (clifpeep): `brif` on a select/icmp chain
+  folds to the raw flag, and edge args built from the branch's own
+  decided condition fold per edge — kills the tokenize discriminant
+  re-materialization.
+- `mergechain` late step (merge_chains + edgespec + brif_fold) now
+  default-on; tokenize 11.2ms -> 7.7ms vs llvm 5.98 (1.9x -> 1.28x).
+- Also in the batch: isub telescoping in lcse (PLIRON_SUBSUB), bittab
+  brif-on-band direct (tbnz, PLIRON_BITBRIF), jtround loops to
+  quiescence (8 max), PLIRON_EDGESPEC_DEBUG cone tracing.
+- chars_alpha ~4.8ms stable (llvm 2.09, 2.3x) — the subagent batch is
+  neutral there; residual is still isel-level (post-index ldr, sign-bit
+  dispatch, case-fold trick).
+- sieve 13.5ms vs llvm 12.1 (1.12x): u128work is verbose (i128 mul via
+  cset/uxtb carry chains, not adds/adc) but only 1K iters — the delta
+  is the marking loop / noise, deprioritized.
