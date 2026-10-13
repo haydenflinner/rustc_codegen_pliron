@@ -146,27 +146,59 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
     {
         return None;
     }
+    let f = ctx.f;
+    if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+        if let InstructionData::Binary { opcode, .. } = ctx.data(ir_inst) {
+            if matches!(opcode, Opcode::Iadd | Opcode::Isub) {
+                eprintln!(
+                    "postidx {} {}@{:?}: seen pending={}",
+                    f.name,
+                    f.dfg.display_inst(ir_inst),
+                    f.layout.inst_block(ir_inst),
+                    ctx.has_pending_postindex()
+                );
+            }
+        }
+    }
     if ctx.has_pending_postindex() {
         return None;
     }
-    let f = ctx.f;
 
     // `vN = iadd vB, C` / `isub vB, C`, 64-bit only.
-    let (base, wb) = match ctx.data(ir_inst) {
+    let pair = match ctx.data(ir_inst) {
         &InstructionData::Binary {
             opcode: Opcode::Iadd,
             args,
         } => postindex_const(f, args[1])
             .map(|k| (args[0], k))
-            .or_else(|| postindex_const(f, args[0]).map(|k| (args[1], k)))?,
+            .or_else(|| postindex_const(f, args[0]).map(|k| (args[1], k))),
         &InstructionData::Binary {
             opcode: Opcode::Isub,
             args,
-        } => (args[0], postindex_const(f, args[1])?.checked_neg()?),
-        _ => return None,
+        } => postindex_const(f, args[1])
+            .and_then(|k| k.checked_neg())
+            .map(|k| (args[0], k)),
+        _ => None,
     };
+    let Some((base, wb)) = pair else {
+        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+            if let InstructionData::Binary { args, .. } = ctx.data(ir_inst) {
+                eprintln!(
+                    "postidx {} {ir_inst}: no const in args {:?} ({:?})",
+                    f.name,
+                    args,
+                    args.map(|a| f.dfg.value_def(f.dfg.resolve_aliases(a)))
+                );
+            }
+        }
+        return None;
+    };
+    let debug = std::env::var("PLIRON_POSTIDX_DEBUG").is_ok();
     if wb == 0 || !(-256..=255).contains(&wb) {
         return None;
+    }
+    if debug {
+        eprintln!("postidx {} {ir_inst}: iadd base {base} wb {wb}", f.name);
     }
     if f.dfg.inst_results(ir_inst).len() != 1
         || f.dfg.value_type(f.dfg.inst_results(ir_inst)[0]) != types::I64
@@ -277,6 +309,9 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
     }
 
+    if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+        eprintln!("postidx {} {ir_inst}@{block:?}: FUSED cand {cand}", f.name);
+    }
     let flags = match f.dfg.insts[cand] {
         InstructionData::Load { flags, .. }
         | InstructionData::LoadNoOffset { flags, .. }

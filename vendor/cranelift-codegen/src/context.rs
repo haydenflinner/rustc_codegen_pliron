@@ -199,11 +199,25 @@ impl Context {
             self.egraph_pass(isa, ctrl_plane)?;
         }
 
+        // PLIRON: cursor-bump hoisting (see below). Runs after the
+        // egraph because its elaborator sinks pure insts toward their
+        // uses and would undo the placement.
+        self.bump_hoist();
+
         // PLIRON: reorder pure insts so a shared operand's last use lands
         // on a destructive two-address op; elaboration's DFS arg order can
         // strand a later use past a `rotl`-like op, forcing a live-range
         // copy at codegen.
         self.lastuse_schedule();
+
+        if std::env::var_os("PLIRON_POSTOPT").is_some() {
+            eprintln!(
+                "==== clif {} postopt ====\n{}",
+                self.func.name,
+                self.func.display()
+            );
+        }
+
         self.verify_if(isa)?;
 
         Ok(())
@@ -406,6 +420,345 @@ impl Context {
                 }
             }
         }
+    }
+
+    /// PLIRON: cursor-bump hoisting for post-index fusion.
+    ///
+    /// In a split-block loop the `iadd p, k` advancing a cursor often
+    /// sits in the latch while `p` — a block param of the header — is
+    /// the load/store base there. The bump is the base's only use past
+    /// the memory op, so the base stays live across the edge and
+    /// `ldr [x],#k` can't fire. Pulling the bump to just before the
+    /// header's terminator makes the base dead after the memory op.
+    /// The inst is pure and `p` dominates its original site, so the
+    /// move is semantics-preserving whenever the header dominates the
+    /// site — which also keeps the result dominating all of its uses
+    /// (they're dominated by the original block). Runs after the
+    /// egraph because its elaborator sinks pure insts toward their
+    /// uses and would undo the placement.
+    fn bump_hoist(&mut self) {
+        use crate::ir::{Block, Inst, InstructionData, Opcode, Value, ValueDef};
+        use crate::{FxHashMap, FxHashSet};
+
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("PLIRON_BUMPHOIST").is_none_or(|v| v != "0")
+        }) {
+            return;
+        }
+
+        // Params used as a load/store base in their own block.
+        let mut membase: FxHashMap<crate::ir::Value, crate::ir::Block> = FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            let params = self.func.dfg.block_params(b);
+            if params.is_empty() {
+                continue;
+            }
+            for i in self.func.layout.block_insts(b) {
+                let a = match self.func.dfg.insts[i] {
+                    InstructionData::Load { arg, .. }
+                    | InstructionData::LoadNoOffset { arg, .. } => Some(arg),
+                    InstructionData::Store { args, .. }
+                    | InstructionData::StoreNoOffset { args, .. } => Some(args[1]),
+                    _ => None,
+                };
+                let Some(a) = a else { continue };
+                let a = self.func.dfg.resolve_aliases(a);
+                if params.contains(&a) {
+                    membase.insert(a, b);
+                }
+            }
+        }
+        if membase.is_empty() {
+            return;
+        }
+        // Bump candidates: `iadd p,k`/`isub p,k` outside `p`'s block,
+        // `k` a small constant that fits the post-index immediate.
+        let mut cand: Vec<(crate::ir::Inst, crate::ir::Block)> = Vec::new();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                let InstructionData::Binary { opcode, args } = self.func.dfg.insts[i] else {
+                    continue;
+                };
+                let comm = opcode == Opcode::Iadd;
+                if !comm && opcode != Opcode::Isub {
+                    continue;
+                }
+                for side in 0..2 {
+                    if side == 1 && !comm {
+                        break;
+                    }
+                    let x = self.func.dfg.resolve_aliases(args[side]);
+                    let Some(&h) = membase.get(&x) else { continue };
+                    let okc = self
+                        .func
+                        .dfg
+                        .value_def(self.func.dfg.resolve_aliases(args[1 - side]))
+                        .inst()
+                        .is_some_and(|ci| {
+                            matches!(
+                                self.func.dfg.insts[ci],
+                                InstructionData::UnaryImm {
+                                    opcode: Opcode::Iconst,
+                                    imm,
+                                } if (-256..=255).contains(&imm.bits())
+                            )
+                        });
+                    if h == b || !okc {
+                        continue;
+                    }
+                    cand.push((i, h));
+                    break;
+                }
+            }
+        }
+        if cand.is_empty() {
+            return;
+        }
+        let mut moved = 0;
+        for (i, h) in cand {
+            let b = self.func.layout.inst_block(i).unwrap();
+            // `h` must dominate the site so the moved read of `p` sees
+            // the same value; `h` then also dominates every use of the
+            // result.
+            if !self.domtree.block_dominates(h, b) {
+                continue;
+            }
+            // The constant operand must reach the new position too.
+            let InstructionData::Binary { args, .. } = self.func.dfg.insts[i] else {
+                continue;
+            };
+            let c = if membase.contains_key(&self.func.dfg.resolve_aliases(args[0])) {
+                args[1]
+            } else {
+                args[0]
+            };
+            let okc = match self.func.dfg.value_def(self.func.dfg.resolve_aliases(c)) {
+                ValueDef::Result(ci, _) => self
+                    .func
+                    .layout
+                    .inst_block(ci)
+                    .is_some_and(|cb| cb == h || self.domtree.block_dominates(cb, h)),
+                ValueDef::Param(cb, _) => self.domtree.block_dominates(cb, h),
+                _ => false,
+            };
+            if !okc {
+                continue;
+            }
+            let Some(t) = self.func.layout.last_inst(h) else {
+                continue;
+            };
+            self.func.layout.remove_inst(i);
+            self.func.layout.insert_inst(i, t);
+            moved += 1;
+        }
+
+        // Phase 2: leave the base param dead after its memory op.
+        //
+        // The fused `ldr [x],#k` only pays off when nothing else still
+        // needs the pre-bump value: any later use in `h` or in another
+        // block keeps the base's vreg live and blocks fusion. The
+        // egraph tends to place its own copy of `iadd p,k` in `h` (its
+        // result feeds cold successors), so first fold duplicate bumps
+        // into one. Then rewrite every other use of `p` to a remat
+        // `isub q,k`/`iadd q,k` placed in the using block — an extra
+        // `sub x,#k` on paths that leave the loop, in exchange for
+        // dropping a live range from the whole loop.
+        let mut remats = 0;
+        let mut aliased = false;
+        for (&p, &h) in membase.iter() {
+            let mut kept: Option<(Inst, Value, i64, bool)> = None;
+            let mut dups: Vec<Inst> = Vec::new();
+            for i in self.func.layout.block_insts(h) {
+                let InstructionData::Binary { opcode, args } = self.func.dfg.insts[i]
+                else {
+                    continue;
+                };
+                let is_sub = match opcode {
+                    Opcode::Iadd => false,
+                    Opcode::Isub => true,
+                    _ => continue,
+                };
+                for side in 0..2 {
+                    if is_sub && side == 1 {
+                        break;
+                    }
+                    if self.func.dfg.resolve_aliases(args[side]) != p {
+                        continue;
+                    }
+                    let k = self
+                        .func
+                        .dfg
+                        .value_def(self.func.dfg.resolve_aliases(args[1 - side]))
+                        .inst()
+                        .and_then(|ci| match self.func.dfg.insts[ci] {
+                            InstructionData::UnaryImm {
+                                opcode: Opcode::Iconst,
+                                imm,
+                            } => Some(imm.bits()),
+                            _ => None,
+                        });
+                    let Some(k) = k else { break };
+                    if let Some((_, _, qk, qsub)) = kept {
+                        if qk == k && qsub == is_sub {
+                            dups.push(i);
+                        } else {
+                            // A second distinct step on the same base:
+                            // it reads `p` too, so it stands between the
+                            // memory op and `kept` in the liveness window
+                            // only if placed later; leave it — remat
+                            // below rewrites its operand like any other
+                            // use, and dominance of `kept` is unaffected.
+                        }
+                    } else {
+                        kept = Some((i, self.func.dfg.first_result(i), k, is_sub));
+                    }
+                    break;
+                }
+            }
+            let Some((binst, qres, k, is_sub)) = kept else {
+                continue;
+            };
+            for d in dups {
+                let dres = self.func.dfg.first_result(d);
+                self.func.layout.remove_inst(d);
+                self.func.dfg.detach_inst_results(d);
+                self.func.dfg.change_to_alias(dres, qres);
+                moved += 1;
+                aliased = true;
+            }
+            // Uses of `p` that would keep it live: any inst in another
+            // block, plus insts in `h` strictly after the kept bump.
+            // (Uses between the memory op and the bump can't be remated
+            // — `ploc` needs the bump result — but those make fusion
+            // fail anyway.)
+            let mut per_block: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
+            let mut h_uses: Vec<Inst> = Vec::new();
+            let mut seen_bump = false;
+            let mut raw_set: FxHashSet<Value> = FxHashSet::default();
+            for i in self.func.layout.block_insts(h) {
+                if i == binst {
+                    seen_bump = true;
+                    continue;
+                }
+                if !seen_bump {
+                    continue;
+                }
+                for v in self.func.dfg.inst_values(i) {
+                    if self.func.dfg.resolve_aliases(v) == p {
+                        h_uses.push(i);
+                        raw_set.insert(v);
+                        break;
+                    }
+                }
+            }
+            for bb in self.func.layout.blocks() {
+                if bb == h {
+                    continue;
+                }
+                for i in self.func.layout.block_insts(bb) {
+                    for v in self.func.dfg.inst_values(i) {
+                        if self.func.dfg.resolve_aliases(v) == p {
+                            per_block.entry(bb).or_default().push(i);
+                            raw_set.insert(v);
+                            break;
+                        }
+                    }
+                }
+            }
+            if per_block.is_empty() && h_uses.is_empty() {
+                continue;
+            }
+            let ty = self.func.dfg.value_type(qres);
+            let rop = if is_sub { Opcode::Iadd } else { Opcode::Isub };
+            let h_loc = if h_uses.is_empty() {
+                None
+            } else {
+                let nx = self.func.layout.next_inst(binst);
+                Some(self.bump_remat(h, nx, qres, k, rop, ty))
+            };
+            for (&x, us) in per_block.iter() {
+                let ploc = self.bump_remat(x, None, qres, k, rop, ty);
+                for &u in us {
+                    let dfg = &mut self.func.dfg;
+                    dfg.insts[u].map_values(
+                        &mut dfg.value_lists,
+                        &mut dfg.jump_tables,
+                        &mut dfg.exception_tables,
+                        |v| if raw_set.contains(&v) { ploc } else { v },
+                    );
+                }
+                remats += 1;
+            }
+            if let Some(h_loc) = h_loc {
+                for &u in h_uses.iter() {
+                    let dfg = &mut self.func.dfg;
+                    dfg.insts[u].map_values(
+                        &mut dfg.value_lists,
+                        &mut dfg.jump_tables,
+                        &mut dfg.exception_tables,
+                        |v| if raw_set.contains(&v) { h_loc } else { v },
+                    );
+                }
+                remats += 1;
+            }
+        }
+        if aliased {
+            // Lowering tracks per-value use counts and vregs by the
+            // raw arg Value, so a detached alias would count on the
+            // wrong slot; splice every use to the kept result now.
+            self.func.dfg.resolve_all_aliases();
+        }
+        if moved > 0 && std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some() {
+            eprintln!(
+                "bumphoist {}: moved {} remat {}",
+                self.func.name, moved, remats
+            );
+        }
+    }
+
+    /// Emit `iconst k; <rop> qres, ck` at the top of `x` (or before
+    /// `after` when set) and return the subtraction's result — the
+    /// pre-bump value of a cursor param, rematerialized so the cursor
+    /// itself can die at its memory op.
+    fn bump_remat(
+        &mut self,
+        x: crate::ir::Block,
+        after: Option<crate::ir::Inst>,
+        qres: crate::ir::Value,
+        k: i64,
+        rop: crate::ir::Opcode,
+        ty: crate::ir::Type,
+    ) -> crate::ir::Value {
+        use crate::ir::{InstructionData, Opcode};
+        let ck = self.func.dfg.make_inst(InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm: k.into(),
+        });
+        self.func.dfg.make_inst_results(ck, ty);
+        let ckv = self.func.dfg.first_result(ck);
+        let ploc = self.func.dfg.make_inst(InstructionData::Binary {
+            opcode: rop,
+            args: [qres, ckv],
+        });
+        self.func.dfg.make_inst_results(ploc, ty);
+        match after {
+            Some(nx) => {
+                self.func.layout.insert_inst(ck, nx);
+                self.func.layout.insert_inst(ploc, nx);
+            }
+            None => match self.func.layout.first_inst(x) {
+                Some(fi) => {
+                    self.func.layout.insert_inst(ck, fi);
+                    self.func.layout.insert_inst(ploc, fi);
+                }
+                None => {
+                    self.func.layout.append_inst(ck, x);
+                    self.func.layout.append_inst(ploc, x);
+                }
+            },
+        }
+        self.func.dfg.first_result(ploc)
     }
 
     /// Perform function call inlining.

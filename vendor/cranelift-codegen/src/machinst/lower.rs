@@ -794,6 +794,21 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // (otherwise we want to keep using the earlier label instead).
             self.emit_value_label_live_range_start_for_inst(inst, has_side_effect || value_needed);
 
+            if std::env::var_os("PLIRON_LOWER_DEBUG").is_some() {
+                if matches!(
+                    self.f.dfg.insts[inst].opcode(),
+                    crate::ir::Opcode::Iadd | crate::ir::Opcode::Isub
+                ) {
+                    eprintln!(
+                        "lower {} {inst}@{block:?}: {} side_effect={} needed={} sunk={}",
+                        self.f.name,
+                        self.f.dfg.display_inst(inst),
+                        has_side_effect,
+                        value_needed,
+                        self.is_inst_sunk(inst)
+                    );
+                }
+            }
             // Normal instruction: codegen if the instruction is side-effecting
             // or any of its outputs is used.
             if has_side_effect || value_needed {
