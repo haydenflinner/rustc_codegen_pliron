@@ -784,7 +784,10 @@ impl<I: VCodeInst> VCode<I> {
             for (pred, range) in self.block_succ_range.iter() {
                 for succ in &self.block_succs[range] {
                     let s = succ.index();
-                    if s < self.num_blocks() && order_of[s] <= order_of[pred] {
+                    if s < self.num_blocks()
+                        && order_of[s] <= order_of[pred]
+                        && self.block_order.is_back_edge_target(BlockIndex::new(s))
+                    {
                         loop_head[s] = true;
                     }
                 }

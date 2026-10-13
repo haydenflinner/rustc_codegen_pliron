@@ -189,8 +189,22 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
             cand = Some(inst);
         }
     }
-    let cand = cand?;
-    let kind = postindex_mem(f, cand, base)?;
+    let Some(cand) = cand else {
+        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+            eprintln!(
+                "postidx {} {ir_inst}@{:?}: no cand on base {base}",
+                f.name,
+                f.layout.inst_block(ir_inst)
+            );
+        }
+        return None;
+    };
+    let Some(kind) = postindex_mem(f, cand, base) else {
+        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+            eprintln!("postidx {} {ir_inst}: cand {cand} not mem", f.name);
+        }
+        return None;
+    };
 
     // The writeback is modeled as a use of `base`'s vreg plus a
     // reuse-def tied to it, so the register allocator preserves `base`'s
@@ -208,6 +222,9 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
             continue;
         }
         if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
+            if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+                eprintln!("postidx {} {ir_inst}: base live at {inst}", f.name);
+            }
             return None;
         }
     }
@@ -217,6 +234,9 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
         for inst in f.layout.block_insts(bb) {
             if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
+                if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+                    eprintln!("postidx {} {ir_inst}: base live in {bb} at {inst}", f.name);
+                }
                 return None;
             }
         }
@@ -235,6 +255,9 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         .map(|v| f.dfg.resolve_aliases(*v));
     if let Some(v) = ld_result {
         if !ctx.value_has_multiple_uses(v) {
+            if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+                eprintln!("postidx {} {ir_inst}: cand {cand} single-use result {v}", f.name);
+            }
             let mut in_range = false;
             for inst in f.layout.block_insts(block) {
                 if inst == cand {

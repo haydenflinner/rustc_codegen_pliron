@@ -88,6 +88,12 @@ pub struct BlockLoweringOrder {
     /// which is used by VCode emission to sink the blocks at the last
     /// moment (when we actually emit bytes into the MachBuffer).
     cold_blocks: FxHashSet<BlockIndex>,
+    /// PLIRON: targets of true dominance back-edges (loop headers, and
+    /// the critical-edge blocks materialized for such edges). Edges
+    /// that merely point backward in emission order — e.g. merge
+    /// blocks pulled early by hot-path chaining — are excluded so
+    /// their padding doesn't execute on the fallthrough path.
+    back_edge_targets: FxHashSet<BlockIndex>,
     /// Lowered blocks that are indirect branch targets.
     indirect_branch_targets: FxHashSet<BlockIndex>,
 }
@@ -199,9 +205,70 @@ impl BlockLoweringOrder {
         // Step 2: walk the postorder from the domtree in reverse to produce our desired node
         // lowering order, identifying critical edges to split along the way.
 
+        // PLIRON: walk a chained order instead of plain RPO. The
+        // domtree's `.rev()` DFS heuristic posts a brif's *second*
+        // successor first, which lands its subtree at the far end of
+        // the emitted order — in rustc-style dispatch code
+        // (`brif unusual, common`) that's the hot edge, so every
+        // iteration pays an unconditional branch. Instead, start
+        // chains at RPO positions and greedily extend each block with
+        // its preferred fallthrough successor: a non-cold forward edge
+        // whose idom dominates-or-equals this block (preserving the
+        // dominator-before-block property lowering relies on),
+        // preferring merge points — dispatch preds converge on the hot
+        // continuation. `PLIRON_BCHAIN=0` disables.
+        static BCHAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bchain = *BCHAIN
+            .get_or_init(|| std::env::var("PLIRON_BCHAIN").map_or(true, |v| v != "0"));
+
+        let mut orig_order: Vec<Block> = Vec::new();
+        if bchain {
+            let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
+            let mut best_succ = SecondaryMap::with_default(
+                crate::packed_option::PackedOption::<Block>::default(),
+            );
+            for &block in &rpo {
+                let range = block_succ_range[block].clone();
+                let mut pick: Option<Block> = None;
+                let mut pick_in = 0;
+                for lb in &block_succs[range] {
+                    let succ = lb.orig_block().unwrap();
+                    if f.is_effectively_cold(succ) || domtree.block_dominates(succ, block) {
+                        continue;
+                    }
+                    match domtree.idom(succ) {
+                        Some(d) if domtree.block_dominates(d, block) => {}
+                        _ => continue,
+                    }
+                    // On ties prefer the later successor: dispatch
+                    // brifs list the unusual target first.
+                    if pick.is_none() || block_in_count[succ] >= pick_in {
+                        pick = Some(succ);
+                        pick_in = block_in_count[succ];
+                    }
+                }
+                if let Some(s) = pick {
+                    best_succ[block] = s.into();
+                }
+            }
+            let mut emitted = FxHashSet::default();
+            for &block in &rpo {
+                let mut cur = block;
+                while emitted.insert(cur) {
+                    orig_order.push(cur);
+                    cur = match best_succ[cur].expand() {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+        } else {
+            orig_order.extend(domtree.cfg_rpo().copied());
+        }
+
         let mut lowered_order = Vec::new();
         let mut blockindex_by_block = SecondaryMap::with_default(BlockIndex::invalid());
-        for &block in domtree.cfg_rpo() {
+        for &block in &orig_order {
             let idx = BlockIndex::new(lowered_order.len());
             lowered_order.push(LoweredBlock::Orig { block });
             blockindex_by_block[block] = idx;
@@ -245,6 +312,7 @@ impl BlockLoweringOrder {
         let mut lowered_succ_indices = Vec::new();
         let mut cold_blocks = FxHashSet::default();
         let mut indirect_branch_targets = FxHashSet::default();
+        let mut back_edge_targets = FxHashSet::default();
         let lowered_succ_ranges =
             Vec::from_iter(lowered_order.iter().enumerate().map(|(ix, lb)| {
                 let bindex = BlockIndex::new(ix);
@@ -254,8 +322,18 @@ impl BlockLoweringOrder {
                     // determining the block order already.
                     &LoweredBlock::Orig { block } => {
                         let range = block_succ_range[block].clone();
-                        lowered_succ_indices
-                            .extend(block_succs[range].iter().map(|lb| lb_to_bindex[lb]));
+                        lowered_succ_indices.extend(block_succs[range].iter().map(|lb| {
+                            // PLIRON: tag dominance back-edge targets —
+                            // the succ's CLIF block dominates this pred.
+                            let s = match lb {
+                                LoweredBlock::Orig { block: s } => *s,
+                                LoweredBlock::CriticalEdge { succ, .. } => *succ,
+                            };
+                            if domtree.block_dominates(s, block) {
+                                back_edge_targets.insert(lb_to_bindex[lb]);
+                            }
+                            lb_to_bindex[lb]
+                        }));
 
                         if f.is_effectively_cold(block) {
                             cold_blocks.insert(bindex);
@@ -275,9 +353,12 @@ impl BlockLoweringOrder {
 
                     // Critical edges won't have successor information in block_succ_range, but
                     // they only have a single known successor to record anyway.
-                    &LoweredBlock::CriticalEdge { succ, .. } => {
+                    &LoweredBlock::CriticalEdge { pred, succ, .. } => {
                         let succ_index = lb_to_bindex[&LoweredBlock::Orig { block: succ }];
                         lowered_succ_indices.push(succ_index);
+                        if domtree.block_dominates(succ, pred) {
+                            back_edge_targets.insert(succ_index);
+                        }
 
                         // Edges inherit indirect branch and cold block metadata from their
                         // successor.
@@ -303,6 +384,7 @@ impl BlockLoweringOrder {
             lowered_succ_ranges,
             blockindex_by_block,
             cold_blocks,
+            back_edge_targets,
             indirect_branch_targets,
         };
 
@@ -333,6 +415,13 @@ impl BlockLoweringOrder {
     /// Determine whether the given lowered-block index is cold.
     pub fn is_cold(&self, block: BlockIndex) -> bool {
         self.cold_blocks.contains(&block)
+    }
+
+    /// PLIRON: whether the given lowered-block index is the target of
+    /// a dominance back-edge (a loop header, or the critical-edge
+    /// block materialized for such an edge).
+    pub fn is_back_edge_target(&self, block: BlockIndex) -> bool {
+        self.back_edge_targets.contains(&block)
     }
 
     /// Determine whether the given lowered block index is an indirect branch
