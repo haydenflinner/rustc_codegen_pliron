@@ -18,7 +18,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::packed_option::ReservedValue;
-use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData, LibCall,
     MemFlagsData, Opcode, Type, Value, ValueDef, types,
@@ -3855,97 +3855,101 @@ fn hoist_frozen(
     }
 }
 
-/// Per-block CSE: duplicate pure insts collapse to the earliest value
-/// computing them, so redundant chains — the vectorizer's separate
-/// c-load/c-store address streams, rustc's repeated index math — become
-/// one block arg where `sameargs` can merge the params. Keyed on
-/// (opcode, result type, resolved args, imm/cond) within each block:
-/// later insts alias the earliest equivalent def, which dominates them.
-pub fn lcse(func: &mut Function) -> usize {
-    #[derive(PartialEq, Eq, Hash)]
-    enum K {
-        U(Opcode, Type, Value),
-        UI(Opcode, Type, i64),
-        F32(Type, u32),
-        F64(Type, u64),
-        B(Opcode, Type, Value, Value),
-        B8(Opcode, Type, Value, u8),
-        IC(IntCC, Type, Value, Value),
-        FC(FloatCC, Type, Value, Value),
-        T(Opcode, Type, Value, Value, Value),
-    }
-    use cranelift_codegen::ir::condcodes::FloatCC;
-    // Commutative integer ops get sorted args; fadd/fmul are bitwise
-    // commutative too (same NaN semantics both ways).
-    fn comm(op: Opcode) -> bool {
-        matches!(
-            op,
-            Opcode::Iadd
-                | Opcode::Imul
-                | Opcode::Band
-                | Opcode::Bor
-                | Opcode::Bxor
-                | Opcode::Umin
-                | Opcode::Umax
-                | Opcode::Smin
-                | Opcode::Smax
-                | Opcode::Fadd
-                | Opcode::Fmul
-        )
-    }
-    let r = |func: &Function, v: Value| func.dfg.resolve_aliases(v);
-    let key = |func: &Function, i: Inst| -> Option<K> {
-        let t = func.dfg.value_type(func.dfg.first_result(i));
-        match func.dfg.insts[i] {
-            InstructionData::Unary { opcode, arg } => Some(K::U(opcode, t, r(func, arg))),
-            InstructionData::UnaryImm { opcode, imm } => Some(K::UI(opcode, t, imm.bits())),
-            InstructionData::UnaryIeee32 { opcode: _, imm } => Some(K::F32(t, imm.bits())),
-            InstructionData::UnaryIeee64 { opcode: _, imm } => Some(K::F64(t, imm.bits())),
-            InstructionData::Binary { opcode, args } => {
-                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
-                if comm(opcode) && a > b {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                Some(K::B(opcode, t, a, b))
+/// Shared value-numbering key for `lcse`/`dgvn`: duplicate pure insts
+/// collapse to the earliest value computing them, so redundant chains —
+/// the vectorizer's separate c-load/c-store address streams, rustc's
+/// repeated index math — become one block arg where `sameargs` can merge
+/// the params. Keyed on (opcode, result type, resolved args, imm/cond).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CseKey {
+    U(Opcode, Type, Value),
+    UI(Opcode, Type, i64),
+    F32(Type, u32),
+    F64(Type, u64),
+    B(Opcode, Type, Value, Value),
+    B8(Opcode, Type, Value, u8),
+    IC(IntCC, Type, Value, Value),
+    FC(FloatCC, Type, Value, Value),
+    T(Opcode, Type, Value, Value, Value),
+}
+
+// Commutative integer ops get sorted args; fadd/fmul are bitwise
+// commutative too (same NaN semantics both ways).
+fn cse_comm(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Iadd
+            | Opcode::Imul
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Umin
+            | Opcode::Umax
+            | Opcode::Smin
+            | Opcode::Smax
+            | Opcode::Fadd
+            | Opcode::Fmul
+    )
+}
+
+fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
+    let r = |v: Value| func.dfg.resolve_aliases(v);
+    let t = func.dfg.value_type(func.dfg.first_result(i));
+    match func.dfg.insts[i] {
+        InstructionData::Unary { opcode, arg } => Some(CseKey::U(opcode, t, r(arg))),
+        InstructionData::UnaryImm { opcode, imm } => Some(CseKey::UI(opcode, t, imm.bits())),
+        InstructionData::UnaryIeee32 { opcode: _, imm } => Some(CseKey::F32(t, imm.bits())),
+        InstructionData::UnaryIeee64 { opcode: _, imm } => Some(CseKey::F64(t, imm.bits())),
+        InstructionData::Binary { opcode, args } => {
+            let (mut a, mut b) = (r(args[0]), r(args[1]));
+            if cse_comm(opcode) && a > b {
+                std::mem::swap(&mut a, &mut b);
             }
-            InstructionData::BinaryImm8 { opcode, arg, imm } => {
-                Some(K::B8(opcode, t, r(func, arg), imm))
-            }
-            InstructionData::IntCompare {
-                opcode: _,
-                cond: mut cc,
-                args,
-            } => {
-                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
-                if a > b {
-                    std::mem::swap(&mut a, &mut b);
-                    cc = cc.swap_args();
-                }
-                Some(K::IC(cc, t, a, b))
-            }
-            InstructionData::FloatCompare {
-                opcode: _,
-                cond: mut cc,
-                args,
-            } => {
-                let (mut a, mut b) = (r(func, args[0]), r(func, args[1]));
-                if a > b {
-                    std::mem::swap(&mut a, &mut b);
-                    cc = cc.swap_args();
-                }
-                Some(K::FC(cc, t, a, b))
-            }
-            InstructionData::Ternary { opcode, args } => Some(K::T(
-                opcode,
-                t,
-                r(func, args[0]),
-                r(func, args[1]),
-                r(func, args[2]),
-            )),
-            _ => None,
+            Some(CseKey::B(opcode, t, a, b))
         }
-    };
-    type Seen = FxHashMap<K, Value>;
+        InstructionData::BinaryImm8 { opcode, arg, imm } => {
+            Some(CseKey::B8(opcode, t, r(arg), imm))
+        }
+        InstructionData::IntCompare {
+            opcode: _,
+            cond: mut cc,
+            args,
+        } => {
+            let (mut a, mut b) = (r(args[0]), r(args[1]));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+                cc = cc.swap_args();
+            }
+            Some(CseKey::IC(cc, t, a, b))
+        }
+        InstructionData::FloatCompare {
+            opcode: _,
+            cond: mut cc,
+            args,
+        } => {
+            let (mut a, mut b) = (r(args[0]), r(args[1]));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+                cc = cc.swap_args();
+            }
+            Some(CseKey::FC(cc, t, a, b))
+        }
+        InstructionData::Ternary { opcode, args } => Some(CseKey::T(
+            opcode,
+            t,
+            r(args[0]),
+            r(args[1]),
+            r(args[2]),
+        )),
+        _ => None,
+    }
+}
+
+/// Per-block CSE with the shared keying: later insts in a block alias
+/// the earliest equivalent def, which dominates them.
+pub fn lcse(func: &mut Function) -> usize {
+    let key = cse_key;
+    type Seen = FxHashMap<CseKey, Value>;
     // In-place arg mutation (memoff reassociation, `neg`'s imul peel)
     // changes what `d`'s result computes, but `seen` may already map its old
     // key to it — a later identical inst would then alias to a value that no
@@ -4213,6 +4217,73 @@ pub fn lcse(func: &mut Function) -> usize {
                     n += 1;
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(res);
+                }
+            }
+        }
+        for i in dead {
+            func.layout.remove_inst(i);
+        }
+    }
+    n
+}
+
+/// Dominator-scoped value numbering. `lcse` clears its table per block,
+/// so an identical pure inst in a *dominated* block never merges — a
+/// diamond that recomputes `i+1`/`p+4` on each edge keeps every copy and
+/// the merge block passes them through as params. Walk the domtree with
+/// a scoped table: every visible entry dominates the current block, so a
+/// repeat can alias the in-scope def directly. `sameargs` then sees
+/// uniform edge args, drops the param, and the shared computation lives
+/// once above the branch instead of once per arm.
+pub fn dgvn(func: &mut Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let Some(entry) = func.layout.entry_block() else {
+        return 0;
+    };
+    let mut seen: FxHashMap<CseKey, Value> = FxHashMap::default();
+    // DFS over the domtree; `undo` restores `seen` when a block's subtree
+    // completes so entries never leak to sibling subtrees.
+    let mut undo: Vec<CseKey> = Vec::new();
+    let mut marks: Vec<usize> = Vec::new();
+    let mut stack = vec![(entry, false)];
+    let mut n = 0;
+    while let Some((b, exit)) = stack.pop() {
+        if exit {
+            let mark = marks.pop().unwrap();
+            while undo.len() > mark {
+                seen.remove(&undo.pop().unwrap());
+            }
+            continue;
+        }
+        marks.push(undo.len());
+        stack.push((b, true));
+        for c in dt.children(b).collect::<Vec<_>>() {
+            stack.push((c, false));
+        }
+        let mut dead = Vec::new();
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            if func.dfg.inst_results(i).len() != 1 {
+                continue;
+            }
+            let res = func.dfg.first_result(i);
+            if func.dfg.resolve_aliases(res) != res {
+                continue;
+            }
+            let Some(k) = cse_key(func, i) else { continue };
+            match seen.entry(k) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let v = func.dfg.resolve_aliases(*e.get());
+                    func.dfg.clear_results(i);
+                    func.dfg.change_to_alias(res, v);
+                    dead.push(i);
+                    n += 1;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    undo.push(e.key().clone());
                     e.insert(res);
                 }
             }
@@ -5080,5 +5151,60 @@ mod tests {
                 func.display()
             );
         }
+    }
+
+    /// A dominated diamond arm recomputing an inst its dominator already
+    /// emitted aliases the dominating def (`i+1` on each looprot/punroll
+    /// edge); a sibling-arm copy with no dominator must be left alone.
+    #[test]
+    fn dgvn_aliases_dominated_dup_only() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let head = func.dfg.make_block();
+        let taken = func.dfg.make_block();
+        let merge = func.dfg.make_block();
+        for b in [head, taken, merge] {
+            func.layout.append_block(b);
+        }
+        let i = func.dfg.append_block_param(head, types::I64);
+        let p = func.dfg.append_block_param(head, types::I64);
+        let acc = func.dfg.append_block_param(merge, types::I64);
+
+        let (cond, i1) = {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+            let one = cur.ins().iconst(types::I64, 1);
+            let i1 = cur.ins().iadd(i, one);
+            let p1 = cur.ins().iadd(p, one);
+            let cond = cur.ins().icmp(IntCC::UnsignedLessThan, i1, p1);
+            cur.ins().brif(cond, taken, &[], merge, &[i1.into()]);
+            (cond, i1)
+        };
+        let _ = cond;
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(taken);
+            let one = cur.ins().iconst(types::I64, 1);
+            let i1dup = cur.ins().iadd(i, one);
+            cur.ins().jump(merge, &[i1dup.into()]);
+        }
+        FuncCursor::new(&mut func)
+            .at_bottom(merge)
+            .ins()
+            .return_(&[acc]);
+
+        // Both the `iconst 1` copy and the `iadd` copy alias away.
+        assert_eq!(dgvn(&mut func), 2);
+        // The dominated copy's result now resolves to `i1`.
+        let arg = func.dfg.insts[func.layout.last_inst(taken).unwrap()]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[0]
+            .args(&func.dfg.value_lists)
+            .next()
+            .and_then(|a| match a {
+                BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+                _ => None,
+            });
+        assert_eq!(arg, Some(i1));
     }
 }

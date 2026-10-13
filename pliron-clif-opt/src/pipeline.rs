@@ -1233,6 +1233,20 @@ fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// Dominator-scoped value numbering. lcse is per-block, so the
+// duplicated increments looprot/punroll leave on sibling diamond
+// edges (`i+1` recomputed per arm, then passed as merge params)
+// never unify. dgvn aliases the dominated copies to the
+// dominating def; sameargs then drops the now-uniform params and
+// the increment materializes once above the branch.
+fn s_dgvn(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::dgvn(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("dgvn");
+    }
+    k
+}
+
 // Drop block params that receive the same value on every
 // incoming edge (and merge duplicate params): each surviving
 // param costs a regalloc parallel copy per conditional pred —
@@ -1707,6 +1721,7 @@ pub static DEFAULT: &[Step] = &[
     .needs(shape::LOOPS),
     cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec).needs(shape::LOOPS),
     cstep("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
+    cstep("dgvn", "dgvn", Gate::Env("PLIRON_DGVN"), s_dgvn),
     cstep(
         "sameargs",
         "sameargs",
