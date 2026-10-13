@@ -1374,6 +1374,17 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// `brif (icmp cc (select c, K, x), K)` niche-select dispatch →
+// `brif c` + a middle block testing `x` — see
+// `jumpthread::split_niche_tests`.
+fn s_seltest(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = jumpthread::split_niche_tests(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("seltest");
+    }
+    k
+}
+
 // Second load-forwarding pass. sameargs' param drops (esp. affparm's
 // `p_j = p_i + k` collapse) turn formerly opaque param addresses into
 // `iadd` chains that `concrete` peels to exact (root, offset) locs —
@@ -1940,6 +1951,13 @@ pub static DEFAULT: &[Step] = &[
     // tokenize preds) hoisted into the target — deletes the param
     // slot and its regalloc edge copies outright.
     step("arghoist", "arghoist", Gate::Env("PLIRON_ARGHOIST"), s_arghoist),
+    // `brif (icmp (select c,K,x), K)` niche dispatch → `brif c` +
+    // `icmp x,K` middle block — every edge knows `c`'s side, so the
+    // `select c,·,·` args fold to arms and the cmov cluster dies
+    // (`Chars::next`/`split_terminator` per-element cost). Runs late:
+    // the select form only exists after ifconv/merge retargeting.
+    step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest)
+        .needs(shape::CONDBR),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one

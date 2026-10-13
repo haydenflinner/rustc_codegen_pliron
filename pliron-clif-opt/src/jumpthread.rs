@@ -899,6 +899,318 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
     n
 }
 
+/// `brif (icmp cc (select c, K, x), K)` where `x` isn't provably `!= K`
+/// (`fold_null_tests` can't collapse the icmp — no `NonNull` on the arm).
+/// Splitting the branch on `c` still kills the select, because every
+/// rewritten edge knows which side of `c` it is on:
+///
+/// ```text
+/// b:   brif c, K_target{sel→k_op, sel2→sentinel arm, …}, mid
+/// mid: brif (icmp cc x, k_op), T{sel→x, sel2→x-side arm, …},
+///                            F{same}
+/// ```
+///
+/// `K_target` is the edge the original brif took when `sel == K` (`T` for
+/// `eq`, `F` for `ne`). On the `mid` edges `sel` is `x`, so the original
+/// compare survives verbatim as `icmp cc x, K`; on the direct edge `sel`
+/// is `K`, so no test is needed at all. Every `select c,·,·` appearing in
+/// a rewritten edge arg folds to the arm that edge's `c`-side picks, which
+/// is what removes the whole `cmov`-cluster `Chars::next()`/
+/// `split_terminator` iterators emit per element.
+///
+/// `sel` uses inside an outcome block can fold too: `K_target` sees
+/// `sel == K` on every path into it (`x == K` on the mid edge is the same
+/// value), `X_target` sees `sel == x` — provided the block had no other
+/// preds, so `b`/`mid` alone decide entry.
+pub fn split_niche_tests(func: &mut Function) -> usize {
+    let none = FxHashMap::default();
+    let mut changed = 0usize;
+    'outer: loop {
+        // Alias-resolved operand → every inst (incl. edge args) using it.
+        let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    uses.entry(func.dfg.resolve_aliases(v))
+                        .or_default()
+                        .push(i);
+                }
+            }
+        }
+        let cfg = ControlFlowGraph::with_function(func);
+        for b in func.layout.blocks() {
+            let Some(term) = func.layout.last_inst(b) else {
+                continue;
+            };
+            let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[term] else {
+                continue;
+            };
+            let Some(icmp_inst) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+            else {
+                continue;
+            };
+            let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond,
+                args: iargs,
+            } = func.dfg.insts[icmp_inst]
+            else {
+                continue;
+            };
+            if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
+                || func.dfg.value_type(iargs[0]).is_vector()
+            {
+                continue;
+            }
+            // The icmp must be a single-use test feeding this brif; a
+            // shared compare would keep `sel` alive for its other use.
+            if !matches!(
+                uses.get(&func.dfg.resolve_aliases(arg))
+                    .map(|v| v.as_slice()),
+                Some([t]) if *t == term
+            ) {
+                continue;
+            }
+            // Normalize `x` to the select and `k` to the const arm.
+            let (x, k) = match (known(func, &none, iargs[0]), known(func, &none, iargs[1])) {
+                (Some(k), None) => (iargs[1], k),
+                (None, Some(k)) => (iargs[0], k),
+                _ => continue,
+            };
+            let sel = func.dfg.resolve_aliases(x);
+            let Some(sel_inst) = func.dfg.value_def(sel).inst() else {
+                continue;
+            };
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: sa,
+            } = func.dfg.insts[sel_inst]
+            else {
+                continue;
+            };
+            let Some(w) = bits(func, sel) else {
+                continue;
+            };
+            let k = mask(k, w);
+            // Which select arm is the sentinel constant? `sel == K` on
+            // that side of `c`; `x` is the other arm.
+            let sent = if known(func, &none, sa[1]) == Some(k) {
+                1
+            } else if known(func, &none, sa[2]) == Some(k) {
+                2
+            } else {
+                continue;
+            };
+            let (c, k_op, xop) = (sa[0], sa[sent], sa[3 - sent]);
+            // Nested niche selects (`select (icmp sel,0), K, sel` — the
+            // `Option<Option>` chains in `split_terminator`) would just
+            // re-create this test one level down in `mid`: the inner
+            // select stays, we add a block, and the next iteration splits
+            // again. Require `x` to be a plain value.
+            if let Some(xi) = func.dfg.value_def(func.dfg.resolve_aliases(xop)).inst()
+                && matches!(
+                    func.dfg.insts[xi],
+                    InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            // `K_target`: original edge taken when `sel == K`.
+            let (k_call, x_call) = if cond == IntCC::Equal {
+                (&blocks[0], &blocks[1])
+            } else {
+                (&blocks[1], &blocks[0])
+            };
+            let (k_target, x_target) = (
+                k_call.block(&func.dfg.value_lists),
+                x_call.block(&func.dfg.value_lists),
+            );
+            if k_target == x_target || k_target == b || x_target == b {
+                continue;
+            }
+            // `sel` may only be used by the icmp, by this brif's edge
+            // args, or inside an outcome block whose only pred is `b`
+            // (so the rewrite leaves `b`/`mid` as its sole deciders).
+            let mut in_k = Vec::new();
+            let mut in_x = Vec::new();
+            let mut ok = true;
+            for &u in uses.get(&sel).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if u == icmp_inst || u == term {
+                    continue;
+                }
+                let Some(ub) = func.layout.inst_block(u) else {
+                    ok = false;
+                    break;
+                };
+                if ub == k_target {
+                    in_k.push(u);
+                } else if ub == x_target {
+                    in_x.push(u);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let sole_pred = |d: Block| {
+                let mut n = 0;
+                for p in cfg.pred_iter(d) {
+                    if p.block != b {
+                        return false;
+                    }
+                    n += 1;
+                }
+                n == 1
+            };
+            if (!in_k.is_empty() && !sole_pred(k_target))
+                || (!in_x.is_empty() && !sole_pred(x_target))
+            {
+                continue;
+            }
+            // Measured: splitting pays when `sel` is purely test+dispatch
+            // (chars_*/str iterators — the select only existed to encode
+            // `None`, so every use folds and the cmov cluster dies). When
+            // `sel` feeds real work inside an outcome block (tokenize's
+            // `uload8`), the extra block boundary on the hot path costs
+            // more than the removed cmov saves (~35% regression). Opt back
+            // in with `PLIRON_SELTEST_INUSE=1`.
+            if (!in_k.is_empty() || !in_x.is_empty())
+                && !crate::config::config().is("PLIRON_SELTEST_INUSE", "1")
+            {
+                continue;
+            }
+            // `k_op`/`xop` must dominate their new use sites: both are
+            // operands of the select in `b`'s test chain — defined at or
+            // before the select, so they reach `mid` and both targets.
+            // Build the rewritten edges.
+            let kargs: Vec<BlockArg> = k_call
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, sent))
+                .collect();
+            let xargs_t: Vec<BlockArg> = blocks[0]
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, 3 - sent))
+                .collect();
+            let xargs_f: Vec<BlockArg> = blocks[1]
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, 3 - sent))
+                .collect();
+            // Rewrite in-block uses before touching edges: `k_target`
+            // sees `sel == k_op`, `x_target` sees `sel == xop`.
+            for (us, repl) in [(&in_k, k_op), (&in_x, xop)] {
+                for &u in us {
+                    let repl_map: FxHashMap<Value, Value> = func
+                        .dfg
+                        .inst_values(u)
+                        .filter(|&v| func.dfg.resolve_aliases(v) == sel)
+                        .map(|v| (v, repl))
+                        .collect();
+                    func.dfg
+                        .map_inst_values(u, |v| repl_map.get(&v).copied().unwrap_or(v));
+                }
+            }
+            if crate::env_set("PLIRON_SELTEST_DBG") {
+                eprintln!(
+                    "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
+                    in_k.len(),
+                    in_x.len(),
+                    kargs.len(),
+                    xargs_t.len(),
+                    xargs_f.len()
+                );
+            }
+            // Splice `mid` in and re-point `b`'s brif at it.
+            let (t_blk, f_blk) = (
+                blocks[0].block(&func.dfg.value_lists),
+                blocks[1].block(&func.dfg.value_lists),
+            );
+            let mid = func.dfg.make_block();
+            func.layout.insert_block_after(mid, b);
+            {
+                let mut pos = FuncCursor::new(func).at_bottom(mid);
+                let t = pos.ins().icmp(cond, xop, k_op);
+                pos.ins().brif(t, t_blk, &xargs_t, f_blk, &xargs_f);
+            }
+            func.layout.remove_inst(term);
+            let mut pos = FuncCursor::new(func).at_bottom(b);
+            if sent == 1 {
+                pos.ins().brif(c, k_target, &kargs, mid, &[]);
+            } else {
+                pos.ins().brif(c, mid, &[], k_target, &kargs);
+            }
+            // `sel`/icmp are dead now (all uses rewritten); the other
+            // `select c`s folded out of the edge args may be too — sweep
+            // any of `b`'s selects whose uses all vanished.
+            func.dfg.clear_results(icmp_inst);
+            func.layout.remove_inst(icmp_inst);
+            let mut dead = vec![sel_inst];
+            for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+                if i == sel_inst {
+                    continue;
+                }
+                if let InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } = func.dfg.insts[i]
+                {
+                    if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(c) {
+                        dead.push(i);
+                    }
+                }
+            }
+            'sweep: for di in dead {
+                let r = func.dfg.first_result(di);
+                for bb in func.layout.blocks() {
+                    for i in func.layout.block_insts(bb) {
+                        if func
+                            .dfg
+                            .inst_values(i)
+                            .any(|v| func.dfg.resolve_aliases(v) == r)
+                        {
+                            continue 'sweep;
+                        }
+                    }
+                }
+                func.dfg.clear_results(di);
+                func.layout.remove_inst(di);
+            }
+            changed += 1;
+            continue 'outer;
+        }
+        break;
+    }
+    changed
+}
+
+/// On a rewritten niche-split edge `c`'s side is known: any
+/// `select c, a, b` in the args folds to arm `side` (1 or 2).
+fn fold_sel_arg(func: &Function, a: BlockArg, c: Value, side: usize) -> BlockArg {
+    let BlockArg::Value(a) = a else {
+        return a;
+    };
+    let r = func.dfg.resolve_aliases(a);
+    let Some(i) = func.dfg.value_def(r).inst() else {
+        return BlockArg::Value(a);
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: sa,
+    } = func.dfg.insts[i]
+    else {
+        return BlockArg::Value(a);
+    };
+    if func.dfg.resolve_aliases(sa[0]) == func.dfg.resolve_aliases(c) {
+        BlockArg::Value(sa[side])
+    } else {
+        BlockArg::Value(a)
+    }
+}
+
 enum Arg {
     V(Value),
     K(u64, Type),
