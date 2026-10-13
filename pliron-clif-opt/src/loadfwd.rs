@@ -107,10 +107,30 @@ fn fwd_arg(func: &Function, i: Inst, mut j: usize) -> Option<(Block, usize)> {
     None
 }
 
+/// Bounds below this are "small": `base + x` can't wrap a real
+/// pointer, so `x`'s contribution to the byte offset is provably `≥ 0`.
+const BND_CAP: u64 = 1 << 32;
+
 pub fn root(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    v: Value,
+) -> (Root, i64) {
+    root_min(func, ps, na, None, v)
+}
+
+/// `root` with a lower-bound result: when `bnd` is given, an `iadd`
+/// also peels through an operand `bnd` proves `< BND_CAP` (provably
+/// nonneg and wrap-safe — `bnd` bounds unsigned values). The returned
+/// offset is then only a *minimum*: the value may sit further into
+/// `(Root, ...)`'s object. Callers may rely on "addr ≥ root + off",
+/// never on exact byte equality.
+fn root_min(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    bnd: Option<&FxHashMap<Value, u64>>,
     v: Value,
 ) -> (Root, i64) {
     // Check the un-resolved value too: a scope root may itself be an
@@ -163,6 +183,23 @@ pub fn root(
                 } else if let Some(k) = c(a) {
                     off = off.wrapping_add(k);
                     v = b;
+                } else if let Some(bd) = bnd {
+                    // `x + small`: the bounded operand is provably
+                    // nonneg, so the result's offset only grows. Check
+                    // the raw arg too — a bounded param's bound lives
+                    // under the param, not the resolved source.
+                    let small = |raw: Value, res: Value| {
+                        [func.dfg.resolve_aliases(raw), res]
+                            .into_iter()
+                            .any(|x| bd.get(&x).is_some_and(|&u| u < BND_CAP))
+                    };
+                    if small(args[1], b) {
+                        v = a;
+                    } else if small(args[0], a) {
+                        v = b;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -171,6 +208,78 @@ pub fn root(
         }
     }
     (Root::V(v), off)
+}
+
+/// Param-level `root_min`: `p`'s bound in `(root, min offset)` when
+/// every reachable in-edge source lower-bounds into the same root.
+/// `p + k` self-feeds with `k ≥ 0` are skipped — they can only push the
+/// cursor further in (a `k < 0` self-feed fails the param: it would
+/// slide the bound back under the entry edge's base). Unlike the
+/// `param`-class checks in `isolated`, the result is used *only* to
+/// prove a store's disjointness in `kill` — never as a loc key — so a
+/// `base + k` cursor posing as its base is harmless here.
+fn pmroots(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    bnd: &FxHashMap<Value, u64>,
+    pf: &crate::proots::Facts,
+) -> FxHashMap<Value, (Root, i64)> {
+    let blocked: FxHashSet<Value> = pf.blocked.iter().copied().collect();
+    let mut byp: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    for &(p, a) in &pf.edge {
+        byp.entry(p).or_default().push(a);
+    }
+    let mut pm: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
+    loop {
+        let mut changed = false;
+        for (&p, srcs) in &byp {
+            if pm.contains_key(&p) || blocked.contains(&p) {
+                continue;
+            }
+            let mut acc: Option<(Root, i64)> = None;
+            let mut ok = true;
+            for &a in srcs {
+                let (mut r, mut k) = root_min(func, ps, na, Some(bnd), a);
+                // A `V(q)` root for an unsolved param `q` is a fine
+                // terminal root — `p ≥ q + k` is still a true bound; it
+                // just won't match locs keyed under q's deeper root.
+                if let Root::V(q) = r
+                    && q != p
+                    && let Some(&(qr, qo)) = pm.get(&q)
+                {
+                    r = qr;
+                    k = k.wrapping_add(qo);
+                }
+                if r == Root::V(p) {
+                    // `p` fed by `p + k`: preserves `p ≥ base` iff `k ≥ 0`.
+                    if k < 0 {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                match &mut acc {
+                    None => acc = Some((r, k)),
+                    Some((ar, am)) if *ar == r => *am = (*am).min(k),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok
+                && let Some((r, m)) = acc
+            {
+                pm.insert(p, (r, m));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    pm
 }
 
 pub fn notrap(func: &Function, i: Inst) -> bool {
@@ -222,12 +331,17 @@ pub fn root_pair(
     ((r, o), n)
 }
 
-/// Kill the locations a store of `ty` at `(r, o)` may overwrite.
+/// Kill the locations a store of `ty` at `(r, o)` may overwrite. `ms`,
+/// when set, is a proven `(root, minimum offset)` for the store's
+/// address (from `root_min` through bounded addends): the store then
+/// also can't reach any loc in that root ending at or below `ms`'s
+/// offset — `base + 8 + 8*i` can't hit `base + 0` when `i ≥ 0`.
 pub fn kill(
     av: &mut Avail,
     r: Root,
     o: i64,
     ty: Type,
+    ms: Option<(Root, i64)>,
     iso: &FxHashSet<Root>,
     invs: &FxHashSet<Loc>,
     cur: Option<Region>,
@@ -256,7 +370,13 @@ pub fn kill(
         match (r, r2) {
             _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
             (Root::S(_), Root::S(_)) => true,
-            _ => iso.contains(&r) || iso.contains(&r2),
+            _ => {
+                iso.contains(&r)
+                    || iso.contains(&r2)
+                    || ms.is_some_and(|(mr, mo)| {
+                        mr == r2 && mo >= o2 + i64::from(t2.bytes())
+                    })
+            }
         }
     });
 }
@@ -453,9 +573,30 @@ fn transfer(
     invreg: &mut FxHashMap<Loc, Vec<Region>>,
     rpar: &FxHashMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
+    bnd: &FxHashMap<Value, u64>,
+    pm: &FxHashMap<Value, (Root, i64)>,
     eh: bool,
 ) {
     let mut rw = rw;
+    // A proven `(root, min offset)` for an address `root` left opaque —
+    // `root_min` through bounded addends, then a `pm` hop through a
+    // solved param (a `base + 8` cursor posing as `base`). Lets `kill`
+    // keep locs the store provably writes above. `off` is the caller's
+    // exact offset from the opaque root value.
+    let ms_of = |rv: Value, off: i64| {
+        let (mr, mo) = root_min(func, ps, na, Some(bnd), rv);
+        let (mr, mo) = match mr {
+            Root::V(q) => match pm.get(&q) {
+                Some(&(qr, qo)) => (qr, mo.wrapping_add(qo)),
+                None => (mr, mo),
+            },
+            _ => (mr, mo),
+        };
+        match mo.wrapping_add(off) {
+            mo if mo != 0 => Some((mr, mo)),
+            _ => None,
+        }
+    };
     for i in func.layout.block_insts(b) {
         let op = func.dfg.insts[i].opcode();
         match func.dfg.insts[i] {
@@ -526,7 +667,11 @@ fn transfer(
                 let ty = func.dfg.value_type(val);
                 let (r, o) = norm_root(func, ps, na, args[1]);
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
-                kill(av, r, o, ty, iso, invs, cur, invreg, rpar);
+                let ms = match r {
+                    Root::V(rv) => ms_of(rv, o),
+                    _ => None,
+                };
+                kill(av, r, o, ty, ms, iso, invs, cur, invreg, rpar);
                 // A store through `select c, pa, pb` may write either
                 // arm's location — kill both so kept locs don't forward
                 // stale values (the select's own root is opaque `V`).
@@ -539,7 +684,12 @@ fn transfer(
                 {
                     for &a in &sargs[1..] {
                         let (ra, oa) = norm_root(func, ps, na, a);
-                        kill(av, ra, oa.wrapping_add(o), ty, iso, invs, cur, invreg, rpar);
+                        let oa = oa.wrapping_add(o);
+                        let ms = match ra {
+                            Root::V(arv) => ms_of(arv, oa),
+                            _ => None,
+                        };
+                        kill(av, ra, oa, ty, ms, iso, invs, cur, invreg, rpar);
                     }
                 }
                 if av.len() < MAX_ENTRIES {
@@ -630,18 +780,47 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
-    let ps = &param_src(func);
+    let pf = crate::proots::facts(func);
+    let ps = &crate::proots::alias_of(&pf);
+    // `ms` disjointness pays off in `pre` (more locs survive → more
+    // redundancy hoisting — fewer loads execute) but not in the plain
+    // forwarding pass: there it only swaps a load for a value defined
+    // earlier, lengthening live ranges into regalloc pressure (measured
+    // ~10% on hashmap's probe loop vs ~0 on sortw's pivot reloads). The
+    // fwd half stays behind a flag for now.
+    let pre_ms = crate::pass_enabled("PLIRON_MINROOT_PRE");
+    let fwd_ms = crate::env_set("PLIRON_MINROOT_FWD");
+    let bnd = if pre_ms || fwd_ms {
+        crate::proots::bounds(func, &pf)
+    } else {
+        FxHashMap::default()
+    };
     // Root-resolution stop set: real `noalias` plus frozen operands —
     // either way the value names its own memory scope. `isolated` keeps
     // the real set so operand values don't get function-wide immunity.
     let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
+    let pm = if pre_ms || fwd_ms {
+        pmroots(func, ps, &stop, &bnd, &pf)
+    } else {
+        FxHashMap::default()
+    };
+    let (pbnd, ppm): (&FxHashMap<Value, u64>, &FxHashMap<Value, (Root, i64)>) = if pre_ms {
+        (&bnd, &pm)
+    } else {
+        (&FxHashMap::default(), &FxHashMap::default())
+    };
+    let (fbnd, fpm) = if fwd_ms {
+        (&bnd, &pm)
+    } else {
+        (&FxHashMap::default(), &FxHashMap::default())
+    };
     let iso = isolated(func, noalias, ps, cfrozen);
     if crate::pass_enabled("PLIRON_LOADPRE") {
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
-        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso);
+        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso, pbnd, ppm);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -691,6 +870,8 @@ pub fn run(
                 &mut invreg,
                 rpar,
                 nw,
+                fbnd,
+                fpm,
                 eh,
             );
             if out.get(&b) != Some(&av) {
@@ -724,6 +905,8 @@ pub fn run(
                 &mut invreg,
                 rpar,
                 nw,
+                fbnd,
+                fpm,
                 eh,
             );
         }
@@ -804,7 +987,14 @@ fn end_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Value {
     }
 }
 
-fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type, iso: &FxHashSet<Root>) {
+fn kill_st(
+    st: &mut FxHashMap<Loc, St>,
+    r: Root,
+    o: i64,
+    ty: Type,
+    ms: Option<(Root, i64)>,
+    iso: &FxHashSet<Root>,
+) {
     let n = i64::from(ty.bytes());
     // Same retain rule as `kill` (minus the invariant sets `pre` doesn't
     // track): `st` must agree with the `out` availability sets or
@@ -812,19 +1002,24 @@ fn kill_st(st: &mut FxHashMap<Loc, St>, r: Root, o: i64, ty: Type, iso: &FxHashS
     st.retain(|&(r2, o2, t2), _| match (r, r2) {
         _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
         (Root::S(_), Root::S(_)) => true,
-        _ => iso.contains(&r) || iso.contains(&r2),
+        _ => {
+            iso.contains(&r)
+                || iso.contains(&r2)
+                || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes()))
+        }
     });
 }
 
 /// Whether a store footprint `w = (root, offset, type)` may clobber `l` —
-/// the complement of `kill_st`'s keep rule.
-fn may_write(w: Loc, l: Loc) -> bool {
+/// the complement of `kill_st`'s keep rule. `ms` is the store address's
+/// proven `(root, min offset)`, as in `kill`.
+fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     let (r, o, ty) = w;
     let (r2, o2, t2) = l;
     match (r, r2) {
         _ if r == r2 => !(o2 >= o + i64::from(ty.bytes()) || o >= o2 + i64::from(t2.bytes())),
         (Root::S(_), Root::S(_)) => false,
-        _ => true,
+        _ => !ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes())),
     }
 }
 
@@ -944,6 +1139,8 @@ fn pre(
     rpo: &[Block],
     entry: Block,
     iso: &FxHashSet<Root>,
+    bnd: &FxHashMap<Value, u64>,
+    pm: &FxHashMap<Value, (Root, i64)>,
 ) -> usize {
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;
@@ -995,6 +1192,8 @@ fn pre(
                 &mut FxHashMap::default(),
                 &FxHashMap::default(),
                 nw,
+                bnd,
+                pm,
                 eh,
             );
             let ks: FxHashSet<Loc> = av.into_keys().collect();
@@ -1030,7 +1229,7 @@ fn pre(
         // so a load miss can tell "never tracked — it still reads
         // block-start memory" from "clobbered on the way" (edge PRE would
         // then feed it the stale end-of-pred value).
-        let mut writes: Vec<Loc> = Vec::new();
+        let mut writes: Vec<(Loc, Option<(Root, i64)>)> = Vec::new();
         let mut clobbered = false;
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for i in insts {
@@ -1054,7 +1253,7 @@ fn pre(
                         fwd.push((i, v));
                         st.insert(loc, St::Local(v));
                     } else if !clobbered
-                        && writes.iter().all(|&w| !may_write(w, loc))
+                        && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
                         && let Some(v) =
                             edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc)
                     {
@@ -1074,8 +1273,26 @@ fn pre(
                     let ty = func.dfg.value_type(val);
                     let (r, o) = norm_root(func, ps, na, args[1]);
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
-                    kill_st(&mut st, r, o, ty, &iso);
-                    writes.push((r, o, ty));
+                    let ms_of = |rv: Value, off: i64| {
+                        let (mr, mo) = root_min(func, ps, na, Some(bnd), rv);
+                        let (mr, mo) = match mr {
+                            Root::V(q) => match pm.get(&q) {
+                                Some(&(qr, qo)) => (qr, mo.wrapping_add(qo)),
+                                None => (mr, mo),
+                            },
+                            _ => (mr, mo),
+                        };
+                        match mo.wrapping_add(off) {
+                            mo if mo != 0 => Some((mr, mo)),
+                            _ => None,
+                        }
+                    };
+                    let ms = match r {
+                        Root::V(rv) => ms_of(rv, o),
+                        _ => None,
+                    };
+                    kill_st(&mut st, r, o, ty, ms, &iso);
+                    writes.push(((r, o, ty), ms));
                     // A store through `select c, pa, pb` may write either
                     // arm's location — kill both, mirroring `transfer` (a
                     // stale `St` here would forward values the store
@@ -1089,9 +1306,14 @@ fn pre(
                     {
                         for &a in &sargs[1..] {
                             let (ra, oa) = norm_root(func, ps, na, a);
-                            let a = (ra, oa.wrapping_add(o), ty);
-                            kill_st(&mut st, a.0, a.1, a.2, &iso);
-                            writes.push(a);
+                            let oa = oa.wrapping_add(o);
+                            let a = (ra, oa, ty);
+                            let ms = match ra {
+                                Root::V(arv) => ms_of(arv, oa),
+                                _ => None,
+                            };
+                            kill_st(&mut st, a.0, a.1, a.2, ms, &iso);
+                            writes.push((a, ms));
                         }
                     }
                     if st.len() < MAX_ENTRIES {
@@ -1197,4 +1419,72 @@ pub fn dead_slot_stores(func: &mut Function) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+    use cranelift_codegen::ir::InstBuilder;
+    use cranelift_codegen::isa::CallConv;
+
+    /// `p` fed `base + 8` on the entry edge and `p + 16` on the back
+    /// edge bounds as `≥ base + 8` (the self-feed only raises the
+    /// bound); `q` fed a foreign pointer on one edge stays unsolved.
+    /// `pmroots` feeds `kill`'s disjointness check only, so a wrong
+    /// bound here would clobber a loc that a store could reach — the
+    /// assertions pin the exact claim the pass may make.
+    #[test]
+    fn pmroots_cursor_bounds_and_foreign_source_fails() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let head = func.dfg.make_block();
+        let tail = func.dfg.make_block();
+        for b in [entry, head, tail] {
+            func.layout.append_block(b);
+        }
+        let base = func.dfg.append_block_param(entry, types::I64);
+        let other = func.dfg.append_block_param(entry, types::I64);
+        let p = func.dfg.append_block_param(head, types::I64);
+        let q = func.dfg.append_block_param(head, types::I64);
+        let r = func.dfg.append_block_param(tail, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let e = cur.ins().iconst(types::I64, 8);
+        let p0 = cur.ins().iadd(base, e);
+        cur.ins().jump(head, &[p0.into(), p0.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+        let e1 = cur.ins().iconst(types::I64, 8);
+        let p1 = cur.ins().iadd(p, e1);
+        let e2 = cur.ins().iconst(types::I64, 8);
+        let p2 = cur.ins().iadd(p1, e2);
+        let done = cur.ins().icmp(IntCC::Equal, p2, q);
+        // `q`'s back edge carries a foreign root — `q` must stay
+        // unsolved even though its other edge matches `p`'s bound.
+        cur.ins().brif(
+            done,
+            tail,
+            &[q.into()],
+            head,
+            &[p2.into(), other.into()],
+        );
+
+        FuncCursor::new(&mut func).at_bottom(tail).ins().return_(&[r]);
+
+        let pf = crate::proots::facts(&func);
+        let ps = crate::proots::alias_of(&pf);
+        let bnd = crate::proots::bounds(&func, &pf);
+        let na: FxHashSet<Value> = FxHashSet::default();
+        let pm = pmroots(&func, &ps, &na, &bnd, &pf);
+        assert_eq!(pm.get(&p), Some(&(Root::V(base), 8)));
+        assert!(!pm.contains_key(&q));
+    }
 }

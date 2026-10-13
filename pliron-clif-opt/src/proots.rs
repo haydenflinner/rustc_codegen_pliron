@@ -12,8 +12,10 @@
 //! predecessors contribute nothing.
 
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, Value};
+use cranelift_codegen::ir::InstructionData;
+use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, Opcode, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 
 /// Extracted edge facts for one function. `detail[p]` mirrors the
 /// `(terminator, dest slot, source block, arg)` tuples `AccCx::in_args`
@@ -164,4 +166,212 @@ pub fn like_map(f: &Facts, interior: impl Iterator<Item = Value>, acc: Value) ->
     p.accv = vec![(acc,)];
     p.run();
     p.like.into_iter().map(|(v,)| v).collect()
+}
+
+/// Sound unsigned upper bounds, `Value → v ≤ bound`. `loadfwd` peels an
+/// `iadd` whose other operand has a small bound: the addend is then
+/// provably `≥ 0` and too small to wrap a real pointer, so the sum's
+/// byte offset in the pointer side's root can't shrink. A store
+/// through such an address provably starts at or above the inner
+/// offset — that kills the "opaque scatter store invalidates the
+/// pivot" problem in partition loops (`8*i + base + 8` can't reach
+/// `base + 0`).
+///
+/// Seeds: `iconst c ≥ 0` → c; every int-typed value of bits < 64 →
+/// `2^bits - 1`; `uextend` → `2^srcbits - 1`. Rules: `iadd`/`imul`
+/// (saturating), `band`/`umin` (min), `bor`/`bxor` (≤ a+b), `ushr` by a
+/// const, `select`/`umax` (max of data arms), and block params — every
+/// non-`blocked` in-edge source bounded → their max (self-carry
+/// doesn't change the value, so `edge`'s skipping is exact here too).
+/// Bounds only tighten on update, so a worklist over def→use edges
+/// reaches the least fixpoint directly.
+pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
+    let ra = |v: Value| func.dfg.resolve_aliases(v);
+    let tbound = |v: Value| {
+        let b = func.dfg.value_type(v).bits();
+        (b < 64).then(|| (1u64 << b) - 1)
+    };
+    let mut bnd: FxHashMap<Value, u64> = FxHashMap::default();
+    // `users[a]` = values whose bound can tighten when `a`'s does.
+    let mut users: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let Some(&res) = func.dfg.inst_results(i).first() else {
+                continue;
+            };
+            for &a in func.dfg.inst_args(i) {
+                users.entry(ra(a)).or_default().push(res);
+            }
+        }
+    }
+    // Param sources: `f.edge` grouped by param, minus `blocked` params
+    // (their edge list is partial — a `non-Value` source is unbounded).
+    let mut pargs: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    for &(p, a) in &f.edge {
+        pargs.entry(p).or_default().push(a);
+        users.entry(a).or_default().push(p);
+    }
+    let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
+    let konst = |v: Value| {
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => u64::try_from(imm.bits()).ok(),
+            _ => None,
+        }
+    };
+    // One bound candidate for `v` from its definition; `None` when the
+    // def can't bound it. Param candidates come from the edge group.
+    let eval = |bnd: &FxHashMap<Value, u64>, v: Value| -> Option<u64> {
+        if let Some(srcs) = pargs.get(&v) {
+            if blocked.contains(&v) {
+                return None;
+            }
+            let mut m = None;
+            for &a in srcs {
+                m = Some(m.unwrap_or(0).max(*bnd.get(&a)?));
+            }
+            return m;
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::Binary { opcode, args } => {
+                let (x, y) = (*bnd.get(&ra(args[0]))?, *bnd.get(&ra(args[1]))?);
+                Some(match opcode {
+                    Opcode::Iadd | Opcode::Bor | Opcode::Bxor => x.saturating_add(y),
+                    Opcode::Imul => x.saturating_mul(y),
+                    Opcode::Band | Opcode::Umin => x.min(y),
+                    Opcode::Umax => x.max(y),
+                    Opcode::Ushr => return konst(ra(args[1])).map(|k| x >> (k % 64)),
+                    _ => return None,
+                })
+            }
+            InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } => Some((*bnd.get(&ra(args[1]))?).max(*bnd.get(&ra(args[2]))?)),
+            _ => None,
+        }
+    };
+    // Seeds.
+    let mut wl: VecDeque<Value> = VecDeque::new();
+    for b in func.layout.blocks() {
+        for &p in func.dfg.block_params(b) {
+            if let Some(t) = tbound(p) {
+                bnd.entry(ra(p)).or_insert(t);
+            }
+        }
+        for i in func.layout.block_insts(b) {
+            for &res in func.dfg.inst_results(i) {
+                let v = ra(res);
+                let mut seed = tbound(v);
+                match func.dfg.insts[i] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => {
+                        if let Ok(c) = u64::try_from(imm.bits()) {
+                            seed = Some(seed.unwrap_or(u64::MAX).min(c));
+                        }
+                    }
+                    InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg,
+                    } => {
+                        let src = func.dfg.value_type(arg).bits();
+                        if src < 64 {
+                            seed = Some(seed.unwrap_or(u64::MAX).min((1u64 << src) - 1));
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(c) = seed {
+                    bnd.insert(v, c);
+                }
+            }
+        }
+    }
+    wl.extend(bnd.keys().copied());
+    while let Some(x) = wl.pop_front() {
+        let Some(us) = users.get(&x) else { continue };
+        for &u in us {
+            // `eval` needs the raw value (its def/param group); `bnd` is
+            // keyed resolved like the seeds and all lookups.
+            let ru = ra(u);
+            if let Some(c) = eval(&bnd, u)
+                && bnd.get(&ru).is_none_or(|&b| c < b)
+            {
+                bnd.insert(ru, c);
+                wl.push_back(ru);
+            }
+        }
+    }
+    bnd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::ir::{AbiParam, Function, Signature, UserFuncName};
+    use cranelift_codegen::ir::InstBuilder;
+    use cranelift_codegen::isa::CallConv;
+
+    /// `uextend`/`imul`/`iadd`/`select` chains bound; an i64 param fed a
+    /// bounded edge takes the source max; a self-incrementing loop
+    /// counter stays unbounded (its bound is a cyclic equation with no
+    /// finite solution — the honest answer).
+    #[test]
+    fn bounds_propagates_and_counters_stay_unbounded() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let head = func.dfg.make_block();
+        let tail = func.dfg.make_block();
+        for b in [entry, head, tail] {
+            func.layout.append_block(b);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let cnt = func.dfg.append_block_param(head, types::I64);
+        let small = func.dfg.append_block_param(head, types::I64);
+        let r = func.dfg.append_block_param(tail, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let b8 = cur.ins().iconst(types::I8, 7);
+        let w = cur.ins().uextend(types::I64, b8);
+        let e = cur.ins().iconst(types::I64, 8);
+        let m = cur.ins().imul(w, e);
+        let two = cur.ins().iconst(types::I64, 2);
+        let s = cur.ins().iadd(m, two);
+        cur.ins().jump(head, &[x.into(), s.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
+        let e2 = cur.ins().iconst(types::I64, 8);
+        let c2 = cur.ins().iadd(cnt, e2);
+        let done = cur.ins().icmp(IntCC::Equal, c2, small);
+        cur.ins().brif(
+            done,
+            head,
+            &[c2.into(), small.into()],
+            tail,
+            &[small.into()],
+        );
+
+        FuncCursor::new(&mut func).at_bottom(tail).ins().return_(&[r]);
+
+        let f = facts(&func);
+        let bnd = bounds(&func, &f);
+        assert_eq!(bnd[&w], 255);
+        assert_eq!(bnd[&m], 2040);
+        assert_eq!(bnd[&s], 2042);
+        assert_eq!(bnd[&small], 2042);
+        assert!(!bnd.contains_key(&cnt));
+        assert!(!bnd.contains_key(&c2));
+    }
 }
