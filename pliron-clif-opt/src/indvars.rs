@@ -747,6 +747,92 @@ fn rot_edge_ok(func: &Function, dt: &DominatorTree, dec: &Dec, e: &Edge) -> bool
     })
 }
 
+/// `dec`'s seed address — the first-iteration `Σ terms + koff` — in
+/// `loadfwd`'s `(root, offset, type)` form, when it's a single unit term
+/// (`v + koff`); multi-term seeds can't name one location.
+fn seed_loc(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    (terms, _, koff): &Dec,
+    ty: Type,
+) -> Option<crate::loadfwd::Loc> {
+    let &[(v, 1)] = &terms[..] else {
+        return None;
+    };
+    let (r, o) = crate::loadfwd::norm_root(func, ps, na, v);
+    Some((r, o.wrapping_add(*koff), ty))
+}
+
+/// The value `loc` provably holds at edge `e`, found by walking up the
+/// dominator tree from the branch: the nearest dominating access wins —
+/// a load of exactly `loc` gives its result, an exact-loc store gives
+/// the stored value — while any other may-write to `loc`, or a
+/// call/fence/atomic, ends the search. Seeding `prev` from an existing
+/// access introduces no speculation, so the rotated load needn't run on
+/// every iteration.
+fn edge_avail(
+    func: &Function,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
+    dt: &DominatorTree,
+    loc: crate::loadfwd::Loc,
+    e: &Edge,
+) -> Option<Value> {
+    let mut b = func.layout.inst_block(e.inst)?;
+    let mut upto = Some(e.inst);
+    for _ in 0..64 {
+        let insts: Vec<Inst> = func
+            .layout
+            .block_insts(b)
+            .take_while(|&i| Some(i) != upto)
+            .collect();
+        for &i in insts.iter().rev() {
+            match func.dfg.insts[i] {
+                // A load's result is usable even if it could trap: the
+                // edge is only reached when it didn't.
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    arg,
+                    offset,
+                    ..
+                } => {
+                    let (r2, o2) = crate::loadfwd::norm_root(func, ps, na, arg);
+                    if (r2, o2.wrapping_add(i64::from(i32::from(offset)))) == (loc.0, loc.1)
+                        && func.dfg.value_type(func.dfg.first_result(i)) == loc.2
+                    {
+                        return Some(func.dfg.first_result(i));
+                    }
+                }
+                InstructionData::Store { args, offset, .. } => {
+                    let val = func.dfg.resolve_aliases(args[0]);
+                    let (r2, o2) = crate::loadfwd::norm_root(func, ps, na, args[1]);
+                    let w = (
+                        r2,
+                        o2.wrapping_add(i64::from(i32::from(offset))),
+                        func.dfg.value_type(val),
+                    );
+                    if w == loc {
+                        return Some(val);
+                    }
+                    if crate::loadfwd::may_write(w, None, loc) {
+                        return None;
+                    }
+                }
+                _ => {
+                    let op = func.dfg.insts[i].opcode();
+                    if op.can_store() || op.is_call() || op.other_side_effects() {
+                        return None;
+                    }
+                }
+            }
+        }
+        upto = None;
+        b = dt.idom(b)?;
+    }
+    None
+}
+
 /// Whether `i` runs on every iteration that starts, so the entry edges may
 /// load its first-iteration address up front: its block dominates every
 /// backedge and every way out of the loop (exit edges, traps, returns).
@@ -809,12 +895,21 @@ fn emit_rot_load(func: &mut Function, dec: &Dec, ty: Type, flags: MemFlagsData, 
     pos.ins().load(ty, flags, a, 0)
 }
 
+/// One entry edge's `prev` seed: reuse a value already materialized at
+/// the edge, or emit the first-iteration load at the edge.
+enum Seed {
+    V(Value),
+    Load,
+}
+
 fn rot_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
+    ps: &FxHashMap<Value, Value>,
+    na: &FxHashSet<Value>,
     debug: bool,
 ) -> usize {
     let h = la.loop_header(lp);
@@ -998,7 +1093,7 @@ fn rot_loop(
             if rot >= MAX_ROT {
                 break;
             }
-            if removed.contains(&bi) || !runs_every_iteration(func, cfg, dt, &body, &edges, bi) {
+            if removed.contains(&bi) {
                 continue;
             }
             let want = koff.wrapping_add(*shift);
@@ -1020,15 +1115,23 @@ fn rot_loop(
             };
             let flags = func.dfg.mem_flags[flags];
             let bdec = decs[&bi].clone();
-            // Every entry edge must be able to evaluate B's first-iteration
-            // address — checked upfront since the param can't be un-added.
+            // `prev`'s entry-edge seed: reuse the value `bdec`'s loc
+            // already holds at the edge when it's avail — no speculation,
+            // so `bi` needn't run every iteration — else emit the
+            // first-iteration load, which is sound only when it does.
+            let every = runs_every_iteration(func, cfg, dt, &body, &edges, bi);
+            let sloc = seed_loc(func, ps, na, &bdec, bty);
             let mut es = Vec::new();
             let mut ok = true;
             for e in &edges {
                 if inb(func, e) {
                     es.push(None);
-                } else if rot_edge_ok(func, dt, &bdec, e) {
-                    es.push(Some(()));
+                } else if let Some(v) =
+                    sloc.and_then(|l| edge_avail(func, ps, na, dt, l, e))
+                {
+                    es.push(Some(Seed::V(v)));
+                } else if every && rot_edge_ok(func, dt, &bdec, e) {
+                    es.push(Some(Seed::Load));
                 } else {
                     ok = false;
                     break;
@@ -1037,11 +1140,12 @@ fn rot_loop(
             if !ok {
                 continue;
             }
-            // `prev` = phi{entry load at B's first-iteration addr, A}.
+            // `prev` = phi{entry: B's iteration-0 value, backedge: A}.
             let prev = func.dfg.append_block_param(h, bty);
             for (e, seed) in edges.iter().zip(es) {
                 let v = match seed {
-                    Some(()) => emit_rot_load(func, &bdec, bty, flags, e),
+                    Some(Seed::V(v)) => v,
+                    Some(Seed::Load) => emit_rot_load(func, &bdec, bty, flags, e),
                     None => ares,
                 };
                 let dfg = &mut func.dfg;
@@ -1068,10 +1172,12 @@ fn rot_loop(
 pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_LDROT_DEBUG");
+    let ps = crate::loadfwd::param_src(func);
+    let na = FxHashSet::default();
     let loops = deepest_first(la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += rot_loop(func, cfg, dt, la, lp, debug);
+        n += rot_loop(func, cfg, dt, la, lp, &ps, &na, debug);
     }
     n
 }
@@ -1383,4 +1489,100 @@ fn bounded(
         dom = dt.idom(d);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{
+        AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
+    };
+    use cranelift_codegen::isa::CallConv;
+
+    /// ipnsort's run-detection scan: the `i < len` guard exits `head`
+    /// before `body`, so `body`'s `v[i-1]` load fails
+    /// `runs_every_iteration` — yet `v[i0-1]` (seed `i0 = 2`, i.e.
+    /// `v[1]` at `base + 8`) was already loaded on the entry path, so
+    /// `prev` can seed from that value and the rotation is still sound.
+    #[test]
+    fn ldrot_seeds_prev_from_available_loc() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [entry, h, body, latch, done] {
+            func.layout.append_block(b);
+        }
+        let base = func.dfg.append_block_param(entry, types::I64);
+        let len = func.dfg.append_block_param(entry, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+
+        // `v[1]` is already read on the entry path; `prev` seeds from it.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), base, 8);
+        let two = cur.ins().iconst(types::I64, 2);
+        cur.ins().jump(h, &[two.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let g = cur.ins().icmp(IntCC::UnsignedLessThan, i, len);
+        cur.ins().brif(g, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let eight = cur.ins().iconst(types::I64, 8);
+        let off = cur.ins().imul(i, eight);
+        let a_cur = cur.ins().iadd(base, off);
+        let one = cur.ins().iconst(types::I64, 1);
+        let im1 = cur.ins().isub(i, one);
+        let off2 = cur.ins().imul(im1, eight);
+        let a_prev = cur.ins().iadd(base, off2);
+        let la = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_cur, 0);
+        let lb = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_prev, 0);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, la, lb);
+        cur.ins().brif(c, latch, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        let i2 = cur.ins().iadd(i, one);
+        cur.ins().jump(h, &[i2.into()]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(done)
+            .ins()
+            .return_(&[]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(rotld(&mut func, &mut an), 1);
+        // `h` gained the `prev` param; `lb` folded into it, leaving the
+        // entry seed load and `la` as the only loads.
+        assert_eq!(func.dfg.block_params(h).len(), 2);
+        let nloads = func
+            .layout
+            .blocks()
+            .map(|b| {
+                func.layout
+                    .block_insts(b)
+                    .filter(|&i| {
+                        matches!(func.dfg.insts[i], InstructionData::Load { .. })
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(nloads, 2);
+        let flags = cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        );
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("ldrot produced invalid IR: {e}\n{}", func.display());
+        }
+    }
 }

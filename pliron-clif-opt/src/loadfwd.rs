@@ -1013,7 +1013,7 @@ fn kill_st(
 /// Whether a store footprint `w = (root, offset, type)` may clobber `l` —
 /// the complement of `kill_st`'s keep rule. `ms` is the store address's
 /// proven `(root, min offset)`, as in `kill`.
-fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
+pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     let (r, o, ty) = w;
     let (r2, o2, t2) = l;
     match (r, r2) {
