@@ -984,7 +984,14 @@ pub fn run(func: &mut Function) -> usize {
             break;
         };
         let xty = func.dfg.value_type(pl.x);
+        // Two branches, one per condition: `d <= msb(mask)` rejects every
+        // index that cannot hit a set bit (and every `d >= 64`, which would
+        // wrap the shift), so out-of-window `x` pays a single compare —
+        // `cmp;ja` then `bt;jae` on x64, `cmp;b.hi`+`tbz` on AArch64.
+        let msb = 63 - pl.mask.leading_zeros() as i64;
+        let tb = func.dfg.make_block();
         func.layout.remove_inst(rterm);
+        func.layout.insert_block_after(tb, pl.root);
         let mut cur = FuncCursor::new(func).at_bottom(pl.root);
         let emit_args = |cur: &mut FuncCursor, args: &[A]| -> Vec<BlockArg> {
             args.iter()
@@ -1009,19 +1016,18 @@ pub fn run(func: &mut Function) -> usize {
         } else {
             pl.x
         };
-        let g = cur.ins().iconst(xty, 64);
-        let ig = cur.ins().icmp(IntCC::UnsignedLessThan, d, g);
+        let g = cur.ins().iconst(xty, msb);
+        let ig = cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, d, g);
+        cur.ins().brif(ig, tb, &[], pl.miss.0, &ma);
+        let mut cur = FuncCursor::new(func).at_bottom(tb);
         let dx = if xty == I64 {
             d
         } else {
             cur.ins().uextend(I64, d)
         };
-        // `select in, mask, 0` keeps the guard and the test value in one
-        // register: `lsr` after `csel` instead of `ushr`+`and`+`uextend`.
         let m = cur.ins().iconst(I64, pl.mask as i64);
         let z = cur.ins().iconst(I64, 0);
-        let mg = cur.ins().select(ig, m, z);
-        let sh = cur.ins().ushr(mg, dx);
+        let sh = cur.ins().ushr(m, dx);
         // Bit `d` of the mask lands at bit 0 of `sh`: test it, not the
         // whole shifted value — `sh != 0` would accept every `x` at or
         // below the mask's highest set bit, i.e. the interval's holes.

@@ -3976,15 +3976,16 @@
 (rule 2 (is_nonzero_band ty a b @ (i32_from_iconst _))
   (CondResult.CC (x64_test ty a b) (CC.NZ)))
 
-;; pliron: bit-table probe — `(bitmap >> x) & 1` with a constant bitmap.
-;; `bt` puts bit `x` of the bitmap operand into CF (the index is taken
-;; mod operand-width, matching CLIF's masked `ushr`), so the whole
-;; movabs+shr+test chain becomes one `bt`. LLVM uses this for
-;; `char::is_whitespace`-style small tables. Gated by pliron_bittab.
-(rule 3 (is_nonzero_band (ty_32_or_64 ty) (ushr _ k @ (u64_from_iconst _) x) (u64_from_iconst 1))
+;; pliron: bit-table probe — `(bitmap >> x) & 1`. `bt` puts bit `x`
+;; of the bitmap operand into CF (the index is taken mod operand-
+;; width, matching CLIF's masked `ushr`), so the whole shr+test
+;; chain becomes one `bt` for any base — a constant table or the
+;; `select`-guarded form `is_whitespace` emits. Gated by
+;; pliron_bittab.
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (ushr _ k x) (u64_from_iconst 1))
   (if-let true (pliron_bittab))
   (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
-(rule 3 (is_nonzero_band (ty_32_or_64 ty) (u64_from_iconst 1) (ushr _ k @ (u64_from_iconst _) x))
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (u64_from_iconst 1) (ushr _ k x))
   (if-let true (pliron_bittab))
   (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
 

@@ -37,6 +37,15 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+fn sext(v: u64, bits: u32) -> i64 {
+    if bits >= 64 {
+        v as i64
+    } else {
+        let s = 64 - bits;
+        ((v << s) as i64) >> s
+    }
+}
+
 /// Tight unsigned ceiling on `v` — its proven maximum value. Defaults to the
 /// type's max; narrower through `uextend` (a `u8` index extended to i64 is at
 /// most 255), `band` masks, `ushr`, `urem`, and narrow `uload*`. Used to fold
@@ -3628,6 +3637,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
         n += uloads(func);
     }
     let mut uses = None;
+    let mut dead_sel: Vec<(Inst, Value, Value)> = Vec::new();
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -3813,6 +3823,30 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 pos.func.dfg.insts[inst].opcode(),
                 Opcode::Select | Opcode::Bitselect
             ) {
+                // `select c, x, x` → `x` (later GVN rounds unify equivalent
+                // defs into identical arms) and `select k, a, b` → the
+                // constant's arm. Defer the removal — `pos` points at the
+                // inst until `next_inst` advances.
+                if let InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } = pos.func.dfg.insts[inst]
+                {
+                    let arm = if pos.func.dfg.resolve_aliases(args[1])
+                        == pos.func.dfg.resolve_aliases(args[2])
+                    {
+                        Some(args[1])
+                    } else {
+                        iconst(pos.func, args[0]).map(|c| args[if c != 0 { 1 } else { 2 }])
+                    };
+                    if let Some(a) = arm {
+                        let a = pos.func.dfg.resolve_aliases(a);
+                        let r = pos.func.dfg.first_result(inst);
+                        dead_sel.push((inst, r, a));
+                        n += 1;
+                        continue;
+                    }
+                }
                 if crate::pass_enabled("PLIRON_SELNOT") && sel_not(pos.func, inst) {
                     n += 1;
                 }
@@ -3893,6 +3927,34 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         n += 1;
                         continue;
                     }
+                    // `icmp cc (select c, ka, kb), k` with constant arms:
+                    // evaluate `ka cc k` / `kb cc k` — equal results fold
+                    // the compare to a flag constant; split results make it
+                    // `c` or `!c`. Looking through one `uextend`/`ireduce`
+                    // wrapper is just arm masking to the compare width
+                    // (`x8 == (x64 (select c, 0, 1))` is `c == 1`).
+                    if let Some(f) = icmp_selfold(pos.func, x, cc, ku, bits) {
+                        match f {
+                            SelFold::K(b) => {
+                                pos.func.replace(inst).iconst(types::I8, b as i64);
+                            }
+                            SelFold::C(c, inv) => {
+                                let cty = pos.func.dfg.value_type(c);
+                                let z = pos.ins().iconst(cty, 0);
+                                pos.func.replace(inst).icmp(
+                                    if inv {
+                                        IntCC::Equal
+                                    } else {
+                                        IntCC::NotEqual
+                                    },
+                                    c,
+                                    z,
+                                );
+                            }
+                        }
+                        n += 1;
+                        continue;
+                    }
                     // `x <=u C` → `x <u C+1`, `x >u C` → `x >=u C+1` —
                     // the strict/swapped-bound forms keep the constant
                     // in the compare's immediate-capable rhs so isel's
@@ -3921,6 +3983,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         }
                     }
                 }
+            }
+            if crate::pass_enabled("PLIRON_BITTAB")
+                && cond == IntCC::NotEqual
+                && bittab(&mut pos, inst, args)
+            {
+                n += 1;
+                continue;
             }
             if crate::pass_enabled("PLIRON_ICMPEQFOLD")
                 && icmp_eqfold(&mut pos, inst, cond, args, ty, &mut uses)
@@ -3975,6 +4044,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             pos.func.replace(inst).icmp(cond, b, zero);
             n += 1;
         }
+    }
+    for (inst, res, arm) in dead_sel {
+        pos.func.dfg.clear_results(inst);
+        pos.func.layout.remove_inst(inst);
+        pos.func.dfg.change_to_alias(res, arm);
     }
     // Region collapse after `brif_not` has normalised `brif` args to the
     // underlying conditions.
@@ -4431,6 +4505,207 @@ fn use_counts(func: &Function) -> FxHashMap<Value, usize> {
         }
     }
     m
+}
+
+/// What `icmp cc (select c, ka, kb), k` reduced to.
+enum SelFold {
+    /// The compare is constant regardless of `c`.
+    K(bool),
+    /// The compare is `c`'s truth value, or its negation.
+    C(Value, bool),
+}
+
+/// `icmp cc (select c, ka, kb), k` with `ka`/`kb` constants: evaluate
+/// `ka cc k` and `kb cc k` at the compare width — equal results make the
+/// compare a flag constant, a split makes it `c` (`K(false)`) or `!c`
+/// (`K(true)`). One `uextend`/`ireduce` around the `select` is just arm
+/// masking to the compare width, so it looks through a single wrapper.
+fn icmp_selfold(func: &Function, x: Value, cc: IntCC, k: u64, w: u32) -> Option<SelFold> {
+    let mut v = func.dfg.resolve_aliases(x);
+    if let Some(d) = func.dfg.value_def(v).inst()
+        && let InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce,
+            arg,
+        } = func.dfg.insts[d]
+    {
+        v = func.dfg.resolve_aliases(arg);
+    }
+    let d = func.dfg.value_def(v).inst()?;
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: [c, a, b],
+    } = func.dfg.insts[d]
+    else {
+        return None;
+    };
+    let (Some(ka), Some(kb)) = (iconst(func, a), iconst(func, b)) else {
+        return None;
+    };
+    if w > 64 {
+        return None;
+    }
+    // Arm values at the compare width: `ireduce` truncates them to `w`
+    // bits, `uextend` zero-pads from the select's own (narrower) width —
+    // masking to `min(aw, w)` covers both.
+    let aw = func.dfg.value_type(func.dfg.first_result(d)).bits();
+    let am = if aw.min(w) == 64 {
+        u64::MAX
+    } else {
+        (1u64 << aw.min(w)) - 1
+    };
+    let m = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let s = |v: i64| (v as u64) & am;
+    let (sa, sb, sk) = (s(ka), s(kb), k & m);
+    let sx = |a: u64| {
+        let (x, y) = (sext(a, w), sext(sk, w));
+        match cc {
+            IntCC::Equal => a == sk,
+            IntCC::NotEqual => a != sk,
+            IntCC::SignedLessThan => x < y,
+            IntCC::SignedGreaterThanOrEqual => x >= y,
+            IntCC::SignedGreaterThan => x > y,
+            IntCC::SignedLessThanOrEqual => x <= y,
+            IntCC::UnsignedLessThan => a < sk,
+            IntCC::UnsignedGreaterThanOrEqual => a >= sk,
+            IntCC::UnsignedGreaterThan => a > sk,
+            IntCC::UnsignedLessThanOrEqual => a <= sk,
+        }
+    };
+    let c = func.dfg.resolve_aliases(c);
+    match (sx(sa), sx(sb)) {
+        (t, f) if t == f => Some(SelFold::K(t)),
+        (true, false) => Some(SelFold::C(c, false)),
+        (false, true) => Some(SelFold::C(c, true)),
+        _ => unreachable!(),
+    }
+}
+
+/// Guarded bit-table probe: `icmp ne (band (ushr s, c), 1), 0` where
+/// `s = select(icmp ult c, N), K, 0` — rustc's unicode tables emit this
+/// (`char::is_whitespace` picks `K` when `c < 64` so the shift can't
+/// wrap). The probe is nonzero only when bit `c` of `K` is set, which
+/// requires `c <= msb(K)` anyway — so the `select` collapses into a
+/// tightened bound: `(c <=u msb(K)) && (K >> c) & 1`. Drops the `cmov`
+/// `select` and lets `K` ride a register/`bt` index directly — LLVM's
+/// `cmp c,msb+1; ja; bt` shape.
+fn bittab(pos: &mut FuncCursor, inst: Inst, args: [Value; 2]) -> bool {
+    // `icmp ne x, 0` (const on either side).
+    let x = if iconst(pos.func, args[1]) == Some(0) {
+        args[0]
+    } else if iconst(pos.func, args[0]) == Some(0) {
+        args[1]
+    } else {
+        return false;
+    };
+    // `x` must be `(ushr s, e) & 1`.
+    let Some((u, 1)) = bin_k(pos.func, x, Opcode::Band) else {
+        return false;
+    };
+    let u = pos.func.dfg.resolve_aliases(u);
+    let Some(ui) = pos.func.dfg.value_def(u).inst() else {
+        return false;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Ushr,
+        args: ua,
+    } = pos.func.dfg.insts[ui]
+    else {
+        return false;
+    };
+    // `s` must be `select g, K, 0`.
+    let s = pos.func.dfg.resolve_aliases(ua[0]);
+    let Some(si) = pos.func.dfg.value_def(s).inst() else {
+        return false;
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: sa,
+    } = pos.func.dfg.insts[si]
+    else {
+        return false;
+    };
+    let Some(kv) = iconst(pos.func, sa[1]) else {
+        return false;
+    };
+    if kv == 0 || iconst(pos.func, sa[2]) != Some(0) {
+        return false;
+    }
+    // `g` must be `icmp ult c, N` (either operand order) with `msb(K) < N`.
+    let g = pos.func.dfg.resolve_aliases(sa[0]);
+    let Some(gi) = pos.func.dfg.value_def(g).inst() else {
+        return false;
+    };
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond: gcc,
+        args: ga,
+    } = pos.func.dfg.insts[gi]
+    else {
+        return false;
+    };
+    let (c, n, gty) = if iconst(pos.func, ga[1]).is_some() {
+        (
+            pos.func.dfg.resolve_aliases(ga[0]),
+            iconst(pos.func, ga[1]).unwrap(),
+            gcc,
+        )
+    } else if iconst(pos.func, ga[0]).is_some() {
+        (
+            pos.func.dfg.resolve_aliases(ga[1]),
+            iconst(pos.func, ga[0]).unwrap(),
+            gcc.swap_args(),
+        )
+    } else {
+        return false;
+    };
+    if gty != IntCC::UnsignedLessThan {
+        return false;
+    }
+    let gbits = pos.func.dfg.value_type(c).bits();
+    if gbits > 64 || n <= 0 || (gbits < 64 && n as u64 >= 1u64 << gbits) {
+        return false;
+    }
+    // `n` past the mask's shift width would let `c >= width` reach the
+    // `ushr`, which wraps its index mod width — the tightened
+    // `c <= msb` guard must cut every such `c`, so `n <= width`.
+    let sbits = pos.func.dfg.value_type(s).bits();
+    if n > sbits as i64 {
+        return false;
+    }
+    let msb = 63 - (kv as u64).leading_zeros() as i64;
+    if msb < 0 || msb >= n {
+        return false;
+    }
+    // The shift index must be `c` itself or `uextend c`.
+    let e = pos.func.dfg.resolve_aliases(ua[1]);
+    let e_ok = e == c
+        || pos
+            .func
+            .dfg
+            .value_def(e)
+            .inst()
+            .is_some_and(|d| match pos.func.dfg.insts[d] {
+                InstructionData::Unary {
+                    opcode: Opcode::Uextend,
+                    arg,
+                } => pos.func.dfg.resolve_aliases(arg) == c,
+                _ => false,
+            });
+    if !e_ok {
+        return false;
+    }
+    // `c <=u msb(K) && (K >> e) & 1 != 0`.
+    let cty = pos.func.dfg.value_type(c);
+    let lim = pos.ins().iconst(cty, msb);
+    let g2 = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, c, lim);
+    let sty = pos.func.dfg.value_type(s);
+    let sh = pos.ins().ushr(sa[1], e);
+    let one = pos.ins().iconst(sty, 1);
+    let m = pos.ins().band(sh, one);
+    let z = pos.ins().iconst(sty, 0);
+    let b = pos.ins().icmp(IntCC::NotEqual, m, z);
+    pos.func.replace(inst).band(g2, b);
+    true
 }
 
 /// `x >=u 1`, `x >u 0`, `x <=u 0`, `x <u 1` are equality tests;
@@ -5190,6 +5465,21 @@ pub fn dgvn(func: &mut Function) -> usize {
             }
             let res = func.dfg.first_result(i);
             if func.dfg.resolve_aliases(res) != res {
+                continue;
+            }
+            // `select c, x, x` → `x`: an earlier CSE round can unify two
+            // formerly-distinct arm defs into aliases of one value.
+            if let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } = func.dfg.insts[i]
+                && func.dfg.resolve_aliases(args[1]) == func.dfg.resolve_aliases(args[2])
+            {
+                let a = func.dfg.resolve_aliases(args[1]);
+                func.dfg.clear_results(i);
+                func.dfg.change_to_alias(res, a);
+                dead.push(i);
+                n += 1;
                 continue;
             }
             let Some(k) = cse_key(func, i) else { continue };
