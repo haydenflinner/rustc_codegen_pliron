@@ -1672,16 +1672,6 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_CSTDEDUP"),
         s_constdedup,
     ),
-    // Fold constants emitted by the loop passes — loopvec's trip-bound
-    // and addressing math lands inside enclosing loops where only
-    // `ineg`/`ushr`/`ishl`-on-`iconst` chains remain (matmul recomputed
-    // `((-(-216))>>3)<<6` every k-iteration).
-    step(
-        "csweep2",
-        "",
-        Gate::Env("PLIRON_CSWEEP2"),
-        s_csweep2,
-    ),
     Step {
         name: "frozen_loads",
         bisect: None,
@@ -1803,6 +1793,16 @@ pub static DEFAULT: &[Step] = &[
     step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
     cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
     step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
+    // Fold constants any earlier pass left behind — late value folds
+    // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
+    // `ishl` chains the early clifpeep round never saw (matmul's
+    // `((-(-216))>>3)<<6` vector-trip bound recomputed per iteration).
+    step(
+        "csweep2",
+        "",
+        Gate::Env("PLIRON_CSWEEP2"),
+        s_csweep2,
+    ),
     Step {
         name: "coldret",
         bisect: Some("coldret"),

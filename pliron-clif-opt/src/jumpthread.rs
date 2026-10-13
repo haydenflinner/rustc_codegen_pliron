@@ -131,6 +131,7 @@ pub fn eval(
                 Opcode::Uextend | Opcode::Ireduce => a,
                 Opcode::Sextend => sext(a, aw) as u64,
                 Opcode::Bnot => !a,
+                Opcode::Ineg => a.wrapping_neg(),
                 _ => return None,
             }
         }

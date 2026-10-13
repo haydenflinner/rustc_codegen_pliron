@@ -1382,14 +1382,15 @@ fn run_loop(
     info.g = Some(g);
 
     // A loop-invariant value usable at g: constants are rematerialized, an
-    // unchanged header param becomes its entry value (g's param).
+    // unchanged header param becomes its entry value (the uniform entry
+    // arg when known — it dominates g — else g's opaque param).
     let gval = |info: &LoopInfo, gp: &[Value], pos: &mut FuncCursor, v: Value| -> Value {
         let v = pos.func.dfg.resolve_aliases(v);
         let v = if let Some(b) = def_block(pos.func, v)
             && b == info.h
             && let cranelift_codegen::ir::ValueDef::Param(_, n) = pos.func.dfg.value_def(v)
         {
-            gp[n]
+            info.eargs.get(n).copied().flatten().unwrap_or(gp[n])
         } else {
             v
         };
@@ -1407,27 +1408,6 @@ fn run_loop(
         }
     };
     let boundv = gval(&info, &gp, &mut pos, info.bound);
-    // Trip-count terms are only needed by affine checks. `t` is the last
-    // counter value, in the index type; the wide path zextends it.
-    let need_affine = checks.iter().any(|c| c.bsub.is_none());
-    let t = if need_affine {
-        let iv0v = gp[info.iv0];
-        let d = pos.ins().isub(boundv, iv0v);
-        Some(match info.adj.cmp(&0) {
-            core::cmp::Ordering::Equal => d,
-            core::cmp::Ordering::Greater => {
-                let k = pos.ins().iconst(ity, info.adj);
-                pos.ins().isub(d, k)
-            }
-            core::cmp::Ordering::Less => {
-                let k = pos.ins().iconst(ity, -info.adj);
-                pos.ins().iadd(d, k)
-            }
-        })
-    } else {
-        None
-    };
-
     // When every contribution to `hi` is a non-negative unsigned quantity,
     // the wrap-catching semantics of the wide guard fall out of native
     // add/sub/mul carry flags: emit it in `ity` and AND in `!carry` — a
@@ -1438,6 +1418,79 @@ fn run_loop(
         u64::MAX
     };
     let kfits = |k: i64| k >= 0 && (k as u64) <= umax;
+    // Trip-count terms are only needed by affine checks. `t` is the last
+    // counter value, in the index type; the wide path zextends it. `t_k`
+    // is `t` when `bound`/`iv0` are entry constants — an `m*t` extremal
+    // then folds to a literal and the `hi + s` combine needs no runtime
+    // overflow flag (`s + C < len` ⇔ `s < len.saturating_sub(C)`).
+    let need_affine = checks.iter().any(|c| c.bsub.is_none());
+    let (t, t_k) = if need_affine {
+        let iv0v = gval(&info, &gp, &mut pos, info.iv);
+        let d = pos.ins().isub(boundv, iv0v);
+        let t = match info.adj.cmp(&0) {
+            core::cmp::Ordering::Equal => d,
+            core::cmp::Ordering::Greater => {
+                let k = pos.ins().iconst(ity, info.adj);
+                pos.ins().isub(d, k)
+            }
+            core::cmp::Ordering::Less => {
+                let k = pos.ins().iconst(ity, -info.adj);
+                pos.ins().iadd(d, k)
+            }
+        };
+        let tk = match (iconst(pos.func, boundv), iconst(pos.func, iv0v)) {
+            (Some(b), Some(i)) => {
+                Some((b.wrapping_sub(i).wrapping_sub(info.adj)) as u64 & umax)
+            }
+            _ => None,
+        };
+        (Some(t), tk)
+    } else {
+        (None, None)
+    };
+
+    // `x < len.saturating_sub(k)` for each `x + k < len` check: `len > k`
+    // makes it `len - k`, `len <= k` makes the check fail unconditionally
+    // just like `!of && x + k < len` (the sum can then only be < len by
+    // wrapping). Emitted once at the outermost enclosing loop's preheader
+    // when `len` dominates it — the alternative is a fresh usub+select in
+    // the guard per inner-loop entry (matmul's k-loop head).
+    let lim_pre = {
+        let mut outer = None;
+        let mut cur = la.loop_parent(lp);
+        while let Some(p) = cur {
+            outer = Some(p);
+            cur = la.loop_parent(p);
+        }
+        outer.and_then(|o| {
+            let oh = la.loop_header(o);
+            edges_to(pos.func, cfg, oh)
+                .iter()
+                .map(|e| pos.func.layout.inst_block(e.inst).unwrap())
+                .find(|&b| !la.is_in_loop(b, o))
+        })
+    };
+    let mut lims: FxHashMap<(Value, u64), Value> = FxHashMap::default();
+    let mut lim_of = |func: &mut Function, lenv: Value, k: u64| -> Value {
+        *lims.entry((lenv, k)).or_insert_with(|| {
+            let term = lim_pre
+                .filter(|&pre| {
+                    def_block(func, lenv)
+                        .is_some_and(|lb| dt.dominates(lb, pre, &func.layout))
+                })
+                .and_then(|pre| func.layout.last_inst(pre));
+            let mut at = match term {
+                Some(t) => FuncCursor::new(func).at_inst(t),
+                None => FuncCursor::new(func).at_bottom(g),
+            };
+            // `umax(len, k) - k` — saturating-sub without the select's
+            // flag result to keep live across the inner loop.
+            let kk = iconst_masked(&mut at, ity, k as i64);
+            let hi = at.ins().umax(lenv, kk);
+            at.ins().isub(hi, kk)
+        })
+    };
+
     let narrowable = |c: &Chk| -> bool {
         if ity == types::I128 {
             return false;
@@ -1523,8 +1576,18 @@ fn run_loop(
         }
         if narrowable(c) {
             let t = t.unwrap();
+            // `m*t` as a machine constant: `s + C < len` then needs no
+            // overflow flag — it's `s < len.saturating_sub(C)` — and the
+            // multiply drops out entirely.
+            let hi_k = t_k.and_then(|tk| match c.aff.m {
+                Lin::K(m) => (m as u64).checked_mul(tk),
+                _ => None,
+            });
             let mut hi = match c.aff.m {
                 Lin::K(0) => iconst_masked(&mut pos, ity, 0),
+                Lin::K(_) if hi_k.is_some() => {
+                    iconst_masked(&mut pos, ity, hi_k.unwrap() as i64)
+                }
                 Lin::K(1) => t,
                 Lin::K(k) => {
                     let kv = iconst_masked(&mut pos, ity, k);
@@ -1593,12 +1656,24 @@ fn run_loop(
                     }
                 });
             }
-            if let Some(s) = sum_b {
-                let (r, of) = pos.ins().uadd_overflow(hi, s);
-                flags.push(of);
-                hi = r;
-            }
-            let g = pos.ins().icmp(cc, hi, lenv);
+            let g = match (sum_b, hi_k) {
+                // `s + 0 <cmp> len` — the add is identity, no flag.
+                (Some(s), Some(0)) => pos.ins().icmp(cc, s, lenv),
+                // `s + C < len` ⇔ `s < len.saturating_sub(C)`; `ule` folds
+                // into the limit: `s + C <= len` ⇔ `s < len - (C - 1)`.
+                (Some(s), Some(ck)) => {
+                    let lim = lim_of(&mut pos.func, lenv, ck - u64::from(c.le));
+                    pos.ins().icmp(IntCC::UnsignedLessThan, s, lim)
+                }
+                _ => {
+                    if let Some(s) = sum_b {
+                        let (r, of) = pos.ins().uadd_overflow(hi, s);
+                        flags.push(of);
+                        hi = r;
+                    }
+                    pos.ins().icmp(cc, hi, lenv)
+                }
+            };
             ok = Some(match ok {
                 None => g,
                 Some(o) => pos.ins().band(o, g),
