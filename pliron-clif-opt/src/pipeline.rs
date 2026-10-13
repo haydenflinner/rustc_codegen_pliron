@@ -182,6 +182,91 @@ pub enum Gate {
     All(&'static [Gate]),
 }
 
+/// Cheap function-shape facts used to skip steps that cannot apply to
+/// the current function. One pass over the instructions computes all of
+/// them; `Analysis::shape_bits` caches the result per IR version. Each
+/// bit is a *necessary* condition for the steps that require it — never
+/// sufficient, so the bits may over-report (a false `LOOPS` just runs a
+/// pass that finds nothing).
+pub mod shape {
+    /// At least one CFG edge — a lone block with a self-edge counts:
+    /// its edge still carries block-param args `sameargs` can fold.
+    pub const MULTI: u32 = 1 << 0;
+    /// A cycle exists — in any block linearization, every cycle contains
+    /// an edge to a block at an earlier-or-equal position.
+    pub const LOOPS: u32 = 1 << 1;
+    /// A conditional terminator exists (`brif` or `br_table`) — required
+    /// by anything that consumes branch conditions.
+    pub const CONDBR: u32 = 1 << 2;
+    /// A `br_table` exists specifically — the switch-shape passes.
+    pub const SWITCH: u32 = 1 << 3;
+    /// Any memory access: load/store, stack, atomic ops.
+    pub const MEM: u32 = 1 << 4;
+    /// Any call.
+    pub const CALL: u32 = 1 << 5;
+    /// `slp` seeds: a block with ≥2 scalar stores, or ≥2 same-opcode
+    /// vectorizable insts (the xpack seed shape).
+    pub const SLP: u32 = 1 << 6;
+    /// Any integer div/rem — `divconst` rewrites the constant-divisor
+    /// cases and loopvec treats the opcodes as side effects.
+    pub const DIVREM: u32 = 1 << 7;
+}
+
+/// Computes the `shape` bits in one pass over the function.
+fn shape_of(func: &Function) -> u32 {
+    use cranelift_codegen::ir::Opcode as Op;
+    let mut bits = 0u32;
+    // Layout-order index per block for the back-edge test.
+    let mut idx: FxHashMap<Block, u32> = FxHashMap::default();
+    for (i, b) in func.layout.blocks().enumerate() {
+        idx.insert(b, i as u32);
+    }
+    for (i, b) in func.layout.blocks().enumerate() {
+        let mut stores = 0u32;
+        let mut vecops: FxHashMap<Op, u32> = FxHashMap::default();
+        for inst in func.layout.block_insts(b) {
+            let op = func.dfg.insts[inst].opcode();
+            // `stack_addr` reports neither load nor store but marks a
+            // slot the memory passes walk (slotprom/slotmerge).
+            if op.can_load() || op.can_store() || op == Op::StackAddr {
+                bits |= shape::MEM;
+            }
+            if op.is_call() {
+                bits |= shape::CALL;
+            }
+            match op {
+                Op::Brif => bits |= shape::CONDBR,
+                Op::BrTable => bits |= shape::CONDBR | shape::SWITCH,
+                Op::Sdiv | Op::Udiv | Op::Srem | Op::Urem => bits |= shape::DIVREM,
+                Op::Store => stores += 1,
+                _ => {}
+            }
+            if crate::slp::vecable(op) {
+                let c = vecops.entry(op).or_insert(0);
+                *c += 1;
+                if *c >= 2 {
+                    bits |= shape::SLP;
+                }
+            }
+            if op.is_terminator() {
+                let pool = &func.dfg.value_lists;
+                for bc in func.dfg.insts[inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    bits |= shape::MULTI;
+                    if idx[&bc.block(pool)] <= i as u32 {
+                        bits |= shape::LOOPS;
+                    }
+                }
+            }
+        }
+        if stores >= 2 {
+            bits |= shape::SLP;
+        }
+    }
+    bits
+}
+
 impl Gate {
     fn ok(&self, p: &Pipe) -> bool {
         match self {
@@ -220,6 +305,9 @@ pub struct Analysis {
     pub(crate) pk: Option<[u8; 32]>,
     pub(crate) stepfile: Option<Vec<crate::stepcache::StepEntry>>,
     pub(crate) stepfile_dirty: bool,
+    /// `shape_of` result and the `ver` it was computed at; recomputed
+    /// lazily after any mutating step.
+    fshape: Option<(u64, u32)>,
 }
 
 /// One borrow of the three structural analyses (`&self` tuple).
@@ -302,6 +390,19 @@ impl Analysis {
     pub fn version(&self) -> u64 {
         self.ver
     }
+
+    /// The function's `shape` bits, computed once and held until the
+    /// next `bump()`.
+    pub fn shape_bits(&mut self, func: &Function) -> u32 {
+        match self.fshape {
+            Some((v, s)) if v == self.ver => s,
+            _ => {
+                let s = shape_of(func);
+                self.fshape = Some((self.ver, s));
+                s
+            }
+        }
+    }
 }
 
 pub struct Step {
@@ -321,8 +422,20 @@ pub struct Step {
     /// expensive passes. Cheap steps recompute on a partial miss —
     /// a file read + stencil deserialize costs more than they do.
     pub cached: bool,
+    /// `shape` bits the function must have for this step to possibly
+    /// apply. Checked per function at run time (not selection time):
+    /// earlier steps can create the shape a later step needs.
+    pub shape: u32,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
+}
+
+impl Step {
+    /// `shape` requirement, builder-style: `step(..).needs(shape::LOOPS)`.
+    const fn needs(mut self, mask: u32) -> Step {
+        self.shape |= mask;
+        self
+    }
 }
 
 const fn step(
@@ -338,6 +451,7 @@ const fn step(
         verify: true,
         mutates: true,
         cached: false,
+        shape: 0,
         gate,
         run,
     }
@@ -358,6 +472,7 @@ const fn cstep(
         verify: true,
         mutates: true,
         cached: true,
+        shape: 0,
         gate,
         run,
     }
@@ -537,6 +652,40 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         return;
     }
     let t0 = std::time::Instant::now();
+    // A step whose required shape bits are absent cannot apply — skip it
+    // before any cache lookup. Evaluated on the current state rather than
+    // at selection time: earlier steps can create a later step's shape
+    // (unrolled bodies seed `slp` pairs, rotations create back edges).
+    // `PLIRON_NOSHAPE` disables the skip for A/B debugging;
+    // `PLIRON_SHAPE_ONLY=<hex>` masks which bits gate (bisecting).
+    let mask = config()
+        .get("PLIRON_SHAPE_ONLY")
+        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(u32::MAX);
+    let req = s.shape & mask;
+    if req != 0 && !env_set("PLIRON_NOSHAPE") && an.shape_bits(&p.clctx.func) & req != req {
+        if env_set("PLIRON_SHAPE_DEBUG") {
+            eprintln!("shape skip: {} lacks {req:04x} on {}", s.name, p.fname);
+        }
+        // `PLIRON_SHAPE_CHECK`: run the step anyway and report if it
+        // changed the function — the bits are supposed to be necessary
+        // conditions, so any mutation means the gate is wrong. The
+        // function is restored so the pipeline keeps gated semantics.
+        if env_set("PLIRON_SHAPE_CHECK") {
+            let before = p.clctx.func.clone();
+            let before_text = before.display().to_string();
+            let derived0 = p.derived.clone();
+            let k = (s.run)(p, an);
+            if k > 0 || p.clctx.func.display().to_string() != before_text {
+                eprintln!("SHAPE-GATE VIOLATION: {} fired on {}", s.name, p.fname);
+            }
+            p.clctx.func = before;
+            *p.derived = derived0;
+            an.invalidate();
+        }
+        *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
+        return;
+    }
     let k = if s.cached {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
@@ -552,6 +701,8 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     };
     *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
     if s.mutates {
+        // Not conditional on `k`: a pass that removes blocks but
+        // reports 0 would leave cfg/domtree stale for the next step.
         an.bump();
     }
     p.log(s.stat, k);
@@ -1316,7 +1467,10 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: true,
         mutates: true,
+        // Ungated on shape: beyond edge threading it also merges
+        // identical exit blocks, which needs no edges at all.
         cached: true,
+        shape: 0,
         gate: JT,
         run: s_jumpthread,
     },
@@ -1325,7 +1479,8 @@ pub static DEFAULT: &[Step] = &[
         "constbr",
         Gate::All(&[JT, Gate::Env("PLIRON_CONSTBR")]),
         s_constbr,
-    ),
+    )
+    .needs(shape::CONDBR),
     Step {
         name: "unroll",
         bisect: Some("unroll"),
@@ -1333,6 +1488,7 @@ pub static DEFAULT: &[Step] = &[
         verify: true,
         mutates: true,
         cached: true,
+        shape: shape::LOOPS,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
     },
@@ -1344,12 +1500,13 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: true,
+        shape: 0,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
     },
     step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge),
     step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup),
-    step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec),
+    step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),
     Step {
         name: "loadfwd",
         bisect: Some("loadfwd"),
@@ -1357,6 +1514,9 @@ pub static DEFAULT: &[Step] = &[
         verify: true,
         mutates: true,
         cached: true,
+        // Fires on mem-free functions too (arg/result forwarding in
+        // e.g. alloc shims), so no shape gate.
+        shape: 0,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
@@ -1367,8 +1527,9 @@ pub static DEFAULT: &[Step] = &[
         "slotprom",
         Gate::Env("PLIRON_SLOTPROM"),
         s_slotprom,
-    ),
-    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse),
+    )
+    .needs(shape::MEM),
+    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::MEM),
     Step {
         name: "egraph",
         bisect: Some("egraph"),
@@ -1376,37 +1537,42 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: true,
+        shape: 0,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
     },
-    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars),
+    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars).needs(shape::LOOPS),
     step(
         "ldrot",
         "ldrot",
         Gate::All(&[Gate::Flag(FlagId::Indvars), Gate::Env("PLIRON_LDROT")]),
         s_ldrot,
-    ),
-    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm),
-    step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm),
+    )
+    .needs(shape::LOOPS | shape::MEM),
+    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
+    step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
     step(
         "loopidiom",
         "idiom",
         Gate::Flag(FlagId::Loopidiom),
         s_loopidiom,
-    ),
+    )
+    .needs(shape::LOOPS | shape::MEM),
     cstep(
         "ifconv2",
         "ifconv2",
         Gate::All(&[Gate::Flag(FlagId::Loopvec), Gate::Env("PLIRON_IFCONV2")]),
         s_ifconv2,
-    ),
+    )
+    .needs(shape::CONDBR),
     cstep(
         "unswitch",
         "unswitch",
         Gate::Env("PLIRON_UNSWITCH"),
         s_unswitch,
-    ),
-    cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck),
+    )
+    .needs(shape::LOOPS),
+    cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck).needs(shape::CONDBR),
     // `x / k` / `x % k` → magic-multiply + shift sequences. The div/rem
     // ops are `can_trap` side effects to loopvec, so expanding here is
     // what lets a `x % 3 != 0` filter predicate vectorize at all — and
@@ -1416,10 +1582,11 @@ pub static DEFAULT: &[Step] = &[
         "divconst",
         Gate::Env("PLIRON_DIVCONST"),
         s_divconst,
-    ),
-    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec),
-    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp),
-    step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap),
+    )
+    .needs(shape::DIVREM),
+    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec).needs(shape::LOOPS),
+    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp).needs(shape::SLP),
+    step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap).needs(shape::SWITCH),
     Step {
         name: "constbr2",
         bisect: Some("constbr"),
@@ -1427,6 +1594,7 @@ pub static DEFAULT: &[Step] = &[
         verify: true,
         mutates: true,
         cached: false,
+        shape: shape::CONDBR,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
     },
@@ -1435,8 +1603,9 @@ pub static DEFAULT: &[Step] = &[
         "loopdel",
         Gate::All(&[JT, Gate::Env("PLIRON_LOOPDEL")]),
         s_loopdel,
-    ),
-    cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot),
+    )
+    .needs(shape::LOOPS),
+    cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
     // Scalar unroll of linear counted loops (e.g. ordered float
     // reductions that can't vectorize): K bodies per branch.
     cstep(
@@ -1444,7 +1613,8 @@ pub static DEFAULT: &[Step] = &[
         "punroll",
         Gate::All(&[JT, Gate::Env("PLIRON_PUNROLL")]),
         s_punroll,
-    ),
+    )
+    .needs(shape::LOOPS),
     // Merge identical constants across dominated blocks — unroll/clone
     // passes stamp fresh `iconst`s per copy, and each one is a `mov`
     // downstream instead of a shared register (or `wzr`).
@@ -1461,6 +1631,7 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::Always,
         run: s_frozen_loads,
     },
@@ -1477,6 +1648,7 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
     },
@@ -1487,6 +1659,7 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::Always,
         run: s_wide_minmax,
     },
@@ -1497,20 +1670,22 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
     },
-    step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse),
+    step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse).needs(shape::MULTI),
     cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd),
     step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf),
-    cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim),
+    cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
     cstep(
         "ivrefold",
         "ivrefold",
         Gate::Env("PLIRON_IVREFOLD"),
         s_ivrefold,
-    ),
-    cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec),
+    )
+    .needs(shape::LOOPS),
+    cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec).needs(shape::LOOPS),
     cstep("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
     cstep(
         "sameargs",
@@ -1523,7 +1698,8 @@ pub static DEFAULT: &[Step] = &[
         "loadfwd2",
         Gate::Flag(FlagId::Loadfwd),
         s_loadfwd2,
-    ),
+    )
+    .needs(shape::MEM),
     step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
     cstep(
         "edgespec",
@@ -1531,15 +1707,15 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_EDGESPEC"),
         s_edgespec,
     ),
-    cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab),
+    cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab).needs(shape::CONDBR),
     step(
         "coldedge",
         "coldedge",
         Gate::Env("PLIRON_COLDEDGE"),
         s_coldedge,
     ),
-    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2),
-    step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot),
+    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2).needs(shape::MEM),
+    step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot).needs(shape::MEM),
     // Late value numbering: the edge transforms and vecslot leave
     // identical insts in one block; also drives the mem-offset and
     // neg folds on late-introduced addressing.
@@ -1550,18 +1726,19 @@ pub static DEFAULT: &[Step] = &[
         verify: true,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
-    step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32),
-    step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp),
+    step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::MEM),
+    step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp).needs(shape::LOOPS),
     step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
-    step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain),
+    step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain).needs(shape::SWITCH),
     // Sink `splat(const)` defs into their use blocks: a cross-region live
     // splat becomes a spill reload per loop iteration; a local one is a
     // single `movi`/`dup` at the use.
     step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
-    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge),
+    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
     Step {
         name: "coldret",
         bisect: Some("coldret"),
@@ -1569,6 +1746,7 @@ pub static DEFAULT: &[Step] = &[
         verify: false,
         mutates: true,
         cached: false,
+        shape: 0,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
     },

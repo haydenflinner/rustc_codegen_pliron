@@ -4922,7 +4922,10 @@ mod tests {
         assert_eq!(sels(&f2), 0);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("bool_add select produced invalid IR: {e}\n{}", func.display());
+            panic!(
+                "bool_add select produced invalid IR: {e}\n{}",
+                func.display()
+            );
         }
     }
 }

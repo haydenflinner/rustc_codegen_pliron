@@ -36,7 +36,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MAX_DEPTH: usize = 6;
 
 /// Lane-wise opcodes that map to a vector form of the same opcode.
-fn vecable(op: Opcode) -> bool {
+pub(crate) fn vecable(op: Opcode) -> bool {
     matches!(
         op,
         Opcode::Fadd
@@ -123,9 +123,9 @@ struct Ctx<'a> {
     func: &'a Function,
     domtree: &'a DominatorTree,
     /// Layout-order index of insts in the current block.
-    pos: FxHashMap<Inst, usize>,
+    pos: &'a FxHashMap<Inst, usize>,
     /// Insts of the current block in layout order.
-    insts: Vec<Inst>,
+    insts: &'a [Inst],
     block: Block,
     /// Emit point: position of the group's first member store.
     emit: usize,
@@ -425,26 +425,19 @@ struct StoreInfo {
 }
 
 /// Find groups of stores to `base + i*esz` in one block and pack them.
+/// `uses` is the whole-function use map built once in `run()`; applied
+/// packs remove their member insts' entries so later blocks see a fresh
+/// map. Newly emitted pack insts are *not* added — an unrecorded use can
+/// only keep a scalar lane def alive longer than needed, never corrupt
+/// the plan (lane defs stay unless `remove_dead_insts` proves them dead).
 fn try_block(
     func: &mut Function,
     domtree: &DominatorTree,
+    uses: &mut FxHashMap<Value, FxHashSet<Inst>>,
     _na: &FxHashSet<Value>,
     block: Block,
 ) -> usize {
-    let _ps = crate::loadfwd::param_src(func);
     let insts: Vec<Inst> = func.layout.block_insts(block).collect();
-    let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-    // Use map over the whole function.
-    let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
-    for b2 in func.layout.blocks() {
-        for i in func.layout.block_insts(b2) {
-            for v in func.dfg.inst_values(i) {
-                uses.entry(func.dfg.resolve_aliases(v))
-                    .or_default()
-                    .insert(i);
-            }
-        }
-    }
     // Collect scalar stores.
     let mut stores: Vec<StoreInfo> = Vec::new();
     for &i in &insts {
@@ -469,7 +462,7 @@ fn try_block(
         let (base, off) = base_off(func, args[1]);
         stores.push(StoreInfo {
             inst: i,
-            pos: pos[&i],
+            pos: 0, // filled below
             val,
             base,
             off: off + i64::from(offset),
@@ -479,6 +472,10 @@ fn try_block(
     }
     if stores.len() < 2 {
         return 0;
+    }
+    let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+    for s in &mut stores {
+        s.pos = pos[&s.inst];
     }
     // Group by (base, elem type, flags); within each, find consecutive-offset
     // runs of exactly `16/esz` or `8/esz` lanes.
@@ -515,12 +512,12 @@ fn try_block(
                     let plan = Ctx {
                         func: &*func,
                         domtree,
-                        pos: pos.clone(),
-                        insts: insts.clone(),
+                        pos: &pos,
+                        insts: &insts,
                         block,
                         emit,
                         min_load: usize::MAX,
-                        uses: &uses,
+                        uses,
                         members: run.iter().map(|s| s.inst).collect(),
                     }
                     .analyze(&run);
@@ -535,6 +532,14 @@ fn try_block(
                             run[0].off as i32, // checked above
                         );
                         for s in &run {
+                            // Drop the removed store's use entries so the
+                            // map stays fresh for later blocks.
+                            for v in cur.func.dfg.inst_values(s.inst) {
+                                let v = cur.func.dfg.resolve_aliases(v);
+                                if let Some(us) = uses.get_mut(&v) {
+                                    us.remove(&s.inst);
+                                }
+                            }
                             cur.func.layout.remove_inst(s.inst);
                             cur.func.dfg.clear_results(s.inst);
                         }
@@ -604,10 +609,22 @@ pub fn run(
     if !simd {
         return 0;
     }
+    // One use map for the whole function, shared by every block's store
+    // grouping — building it per block made this pass O(blocks × insts).
+    let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
+    for b2 in func.layout.blocks() {
+        for i in func.layout.block_insts(b2) {
+            for v in func.dfg.inst_values(i) {
+                uses.entry(func.dfg.resolve_aliases(v))
+                    .or_default()
+                    .insert(i);
+            }
+        }
+    }
     let (_, domtree) = an.cfg_dt(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, domtree, na, block);
+        changed += try_block(func, domtree, &mut uses, na, block);
     }
     if crate::pass_enabled("PLIRON_XPACK") {
         for block in func.layout.blocks().collect::<Vec<_>>() {
@@ -1744,6 +1761,28 @@ fn xpack_block(
     let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
     loop {
         let insts: Vec<Inst> = func.layout.block_insts(block).collect();
+        // Seed check: xpack pairs need ≥2 stores or ≥2 same-opcode
+        // vecable insts among the remaining insts. Skip the
+        // whole-function use-map build when no pair can form.
+        let mut nstores = 0u32;
+        let mut dup = false;
+        let mut vecops: FxHashMap<Opcode, u32> = FxHashMap::default();
+        for &i in &insts {
+            if taken.contains(&i) {
+                continue;
+            }
+            let op = func.dfg.insts[i].opcode();
+            if op == Opcode::Store {
+                nstores += 1;
+            } else if vecable(op) && res_of(func, i).is_some() {
+                let c = vecops.entry(op).or_insert(0);
+                *c += 1;
+                dup |= *c >= 2;
+            }
+        }
+        if nstores < 2 && !dup {
+            return total;
+        }
         let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
         let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
         for b2 in func.layout.blocks() {
