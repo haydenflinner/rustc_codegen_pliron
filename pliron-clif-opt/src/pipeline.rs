@@ -1894,6 +1894,21 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_CSWEEP2"),
         s_csweep2,
     ),
+    // `jtround`/`mergechain` threading leaves `isub(isub e,a),(isub e,b)`
+    // telescopes on the new edges (`end-front` vs `end-ptr'` lengths —
+    // the token-len recomputes in tokenize's block303). lcse2 already
+    // ran, so one more local pass here.
+    Step {
+        name: "lcse3",
+        bisect: Some("lcse"),
+        stat: "lcse",
+        verify: true,
+        mutates: true,
+        cached: false,
+        shape: 0,
+        gate: Gate::Env("PLIRON_LCSE"),
+        run: s_lcse,
+    },
     Step {
         name: "coldret",
         bisect: Some("coldret"),
