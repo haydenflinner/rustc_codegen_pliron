@@ -2058,6 +2058,20 @@ pub static DEFAULT: &[Step] = &[
     // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
     // every earlier pass.
     step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
+    // sameargs3/paramsink substitute edge args into isub uses, leaving
+    // `isub (iadd x, k), x` cursor deltas that only now have visible iadd
+    // defs (tokenize's per-path byte lengths) — one more local fold.
+    Step {
+        name: "lcse4",
+        bisect: Some("lcse"),
+        stat: "lcse",
+        verify: true,
+        mutates: true,
+        cached: false,
+        shape: 0,
+        gate: Gate::Env("PLIRON_LCSE"),
+        run: s_lcse,
+    },
     // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
     // shrink under MAX_INSTS after the late folds — clone them last so the
     // loop's hot tail lands on the fallthrough edge instead of a `jmp`

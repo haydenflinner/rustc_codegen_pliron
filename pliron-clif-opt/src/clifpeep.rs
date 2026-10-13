@@ -5764,6 +5764,29 @@ pub fn lcse(func: &mut Function) -> usize {
                 }
             }
             Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => (kb == Some(0)).then_some(a),
+            Opcode::Isub => {
+                // `isub (iadd x, y), x` → `y` — cursor deltas like
+                // `(cur + len) - cur` collapse to the byte length. Only
+                // the single-step case produces an alias; constant chains
+                // (`+2`/`+3`/`+4` decode paths) fold in the main loop.
+                let d = func.dfg.value_def(a).inst()?;
+                let InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [x, y],
+                } = func.dfg.insts[d]
+                else {
+                    return None;
+                };
+                let (x, y) = (
+                    func.dfg.resolve_aliases(x),
+                    func.dfg.resolve_aliases(y),
+                );
+                if b == x {
+                    Some(y)
+                } else {
+                    (b == y).then_some(x)
+                }
+            }
             _ => None,
         }
     };
@@ -5937,7 +5960,53 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Binary {
                     opcode: Opcode::Isub,
                     args,
-                } if crate::pass_enabled("PLIRON_SUBSUB") => {
+                } => {
+                    // `isub (iadd ..(iadd b, c₁)..cₙ), b` → `iconst Σcᵢ`:
+                    // cursor deltas like `(cur + len) - cur` collapse to
+                    // the byte length once late passes substitute edge
+                    // args and expose the iadd chain (`x - x` folds too,
+                    // as the k=0 case).
+                    let b = func.dfg.resolve_aliases(args[1]);
+                    let mut v = func.dfg.resolve_aliases(args[0]);
+                    let mut k: i64 = 0;
+                    let mut folded = false;
+                    for _ in 0..8 {
+                        if v == b {
+                            func.dfg.insts[i] = InstructionData::UnaryImm {
+                                opcode: Opcode::Iconst,
+                                imm: k.into(),
+                            };
+                            folded = true;
+                            break;
+                        }
+                        let Some(d) = func.dfg.value_def(v).inst() else {
+                            break;
+                        };
+                        let InstructionData::Binary {
+                            opcode: Opcode::Iadd,
+                            args: ia,
+                        } = func.dfg.insts[d]
+                        else {
+                            break;
+                        };
+                        let (x, y) = (
+                            func.dfg.resolve_aliases(ia[0]),
+                            func.dfg.resolve_aliases(ia[1]),
+                        );
+                        if let Some(c) = iconst(func, y) {
+                            k = k.wrapping_add(c);
+                            v = x;
+                        } else if let Some(c) = iconst(func, x) {
+                            k = k.wrapping_add(c);
+                            v = y;
+                        } else {
+                            break;
+                        }
+                    }
+                    if folded {
+                        n += 1;
+                        continue;
+                    }
                     // `isub (isub e, a), (isub e, b)` → `isub b, a`: the
                     // shared minuend telescopes —
                     // `(e - a) - (e - b) = b - a` in wrapping arithmetic —
@@ -5947,6 +6016,9 @@ pub fn lcse(func: &mut Function) -> usize {
                     // single-use and shortening the dep chain off `e`.
                     // Each rewrite drops the result a def-level deeper in
                     // the DAG, so repeat applications terminate.
+                    if !crate::pass_enabled("PLIRON_SUBSUB") {
+                        continue;
+                    }
                     let sub_of = |func: &Function, v: Value| -> Option<(Value, Value)> {
                         let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
                         if let InstructionData::Binary {
@@ -5962,13 +6034,13 @@ pub fn lcse(func: &mut Function) -> usize {
                             None
                         }
                     };
-                    if let (Some((e0, a)), Some((e1, b))) =
+                    if let (Some((e0, a)), Some((e1, bb))) =
                         (sub_of(func, args[0]), sub_of(func, args[1]))
                         && e0 == e1
                     {
                         func.dfg.insts[i] = InstructionData::Binary {
                             opcode: Opcode::Isub,
-                            args: [b, a],
+                            args: [bb, a],
                         };
                         n += 1;
                         continue;
