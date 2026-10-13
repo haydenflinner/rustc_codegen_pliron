@@ -948,6 +948,13 @@ fn exit_continuations_ok(
 /// must cover copies 0..K-2's entry tests (i.e. `a_{K-2} cc bound`),
 /// evaluated wide so it can't wrap. Branches to `uf` (unrolled body) on
 /// success and `h` (scalar remainder) otherwise.
+///
+/// For unsigned counters the whole budget test folds to one compare:
+/// `a0 < bound && bound - a0 > L` ⟺ `a0 < bound - min(bound, L)` where
+/// `L = (K-2)*step` (`L-1` for `<=` latches — `a0 <= bound - L` ⟺
+/// `a0 < bound - (L-1)`). `stop` is loop-invariant, so it arrives as a
+/// trailing `hu` param materialized on each entry edge — matching the
+/// `cmp; jb` guard LLVM emits against a precomputed bound.
 fn emit_trip_guard(
     func: &mut Function,
     hu: Block,
@@ -957,6 +964,7 @@ fn emit_trip_guard(
     ity: Type,
     wty: Type,
     k: i64,
+    stop: Option<Value>,
 ) {
     let huparams = func.dfg.block_params(hu).to_vec();
     let mut pos = FuncCursor::new(func).at_bottom(hu);
@@ -977,6 +985,17 @@ fn emit_trip_guard(
     } else {
         (cnt.le, cnt.signed)
     };
+    // The `stop` param rides the backedge unchanged; the uf/h edges get
+    // only the original params.
+    let args: Vec<BlockArg> = huparams[..huparams.len() - stop.is_some() as usize]
+        .iter()
+        .map(|&v| v.into())
+        .collect();
+    if !signed && let Some(sv) = stop {
+        let ok = pos.ins().icmp(IntCC::UnsignedLessThan, a0, sv);
+        pos.ins().brif(ok, uf, &args, h, &args);
+        return;
+    }
     let cc = match (signed, le) {
         (true, true) => IntCC::SignedLessThanOrEqual,
         (true, false) => IntCC::SignedLessThan,
@@ -1003,17 +1022,20 @@ fn emit_trip_guard(
         lim,
     );
     let ok = pos.ins().band(ok1, ok2);
-    let args: Vec<BlockArg> = huparams.iter().map(|&v| v.into()).collect();
     pos.ins().brif(ok, uf, &args, h, &args);
 }
 
-/// Redirect every outside-the-loop entry edge from `h` to `hu`.
+/// Redirect every outside-the-loop entry edge from `h` to `hu`. When the
+/// guard uses a `stop` param, the edge gains `bound - umin(bound, C)`
+/// materialized ahead of the branch — loop-invariant, so the unrolled
+/// header tests it once per group instead of re-deriving the budget.
 fn redirect_entries(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     body: &FxHashSet<Block>,
     h: Block,
     hu: Block,
+    stop: Option<(&Cnt, i64, Type)>,
 ) {
     let entries: Vec<(Block, Inst)> = cfg
         .pred_iter(h)
@@ -1026,13 +1048,41 @@ fn redirect_entries(
             .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
             .len();
         for slot in 0..ndest {
+            let retarget = func.dfg.insts[pi]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot]
+                .block(&func.dfg.value_lists)
+                == h;
+            if !retarget {
+                continue;
+            }
+            let mut args: Vec<BlockArg> = func.dfg.insts[pi]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot]
+                .args(&func.dfg.value_lists)
+                .collect();
+            if let Some((cnt, k, ity)) = stop {
+                // `bound`'s def dominates `h`, so it dominates every entry
+                // pred — materializing here is always legal.
+                let bv = match cnt.bpidx {
+                    Some(q) => match args[q] {
+                        BlockArg::Value(v) => func.dfg.resolve_aliases(v),
+                        _ => continue,
+                    },
+                    None => func.dfg.resolve_aliases(cnt.bound),
+                };
+                // `<=` latches need `a0 <= bound - L` ⟺ `a0 < bound - (L-1)`.
+                let c = (k - 2) * cnt.step - (cnt.le && !cnt.eq) as i64;
+                let sv = {
+                    let mut pos = FuncCursor::new(&mut *func).at_inst(pi);
+                    let cc = pos.ins().iconst(ity, c);
+                    let mn = pos.ins().umin(bv, cc);
+                    pos.ins().isub(bv, mn)
+                };
+                args.push(sv.into());
+            }
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[pi]
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
-            if bc.block(&dfg.value_lists) == h {
-                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
-                *bc = BlockCall::new(hu, args.iter().copied(), &mut dfg.value_lists);
-            }
+            *bc = BlockCall::new(hu, args.iter().copied(), &mut dfg.value_lists);
         }
     }
 }
@@ -1264,6 +1314,12 @@ fn run_loop(
         let ty = func.dfg.value_type(p);
         func.dfg.append_block_param(hu, ty);
     }
+    // Unsigned counters fold the trip guard to `a0 < stop` — a
+    // loop-invariant bound carried as a trailing param (see
+    // emit_trip_guard). Signed counters keep the two-icmp budget test:
+    // their wraparound doesn't survive the fold.
+    let stop = (!cnt.signed && crate::pass_enabled("PLIRON_PRSTOP"))
+        .then(|| func.dfg.append_block_param(hu, ity));
     func.layout.insert_block(hu, h);
     // Segments: `usegs[kk][j]` is segment j of copy kk. A mid-chain side
     // exit ends a segment (the brif needs a real target); otherwise copies
@@ -1296,7 +1352,7 @@ fn run_loop(
     }
     let ufparams = func.dfg.block_params(uf).to_vec();
 
-    emit_trip_guard(func, hu, uf, h, &cnt, ity, wty, k);
+    emit_trip_guard(func, hu, uf, h, &cnt, ity, wty, k, stop);
 
     // When the exit cone references loop values, the unrolled loop's exit
     // clones the whole cone. Create the clone blocks now (the last copy's
@@ -1426,10 +1482,13 @@ fn run_loop(
                             curseg = usegs[kk + 1][0];
                         }
                     } else {
-                        let cont: Vec<BlockArg> = bc
+                        let mut cont: Vec<BlockArg> = bc
                             .args(&func.dfg.value_lists)
                             .map(|a| mv(func, a))
                             .collect();
+                        if let Some(sv) = stop {
+                            cont.push(sv.into());
+                        }
                         let mut pos = FuncCursor::new(func).at_bottom(curseg);
                         pos.ins().jump(hu, &cont);
                     }
@@ -1521,7 +1580,7 @@ fn run_loop(
                             curseg = usegs[kk + 1][0];
                         }
                     } else {
-                        let cont: Vec<BlockArg> = back_bc
+                        let mut cont: Vec<BlockArg> = back_bc
                             .args(&func.dfg.value_lists)
                             .map(|a| mv(func, a))
                             .collect();
@@ -1529,6 +1588,9 @@ fn run_loop(
                             .args(&func.dfg.value_lists)
                             .map(|a| mv(func, a))
                             .collect();
+                        if let Some(sv) = stop {
+                            cont.push(sv.into());
+                        }
                         let mut pos = FuncCursor::new(func).at_bottom(curseg);
                         if tcpos == 0 {
                             pos.ins().brif(carg, hu, &cont, eu, &exit);
@@ -1550,7 +1612,7 @@ fn run_loop(
         emit_cone_clone(func, &corder, &cmap, &mut lastmap);
     }
 
-    redirect_entries(func, cfg, &body, h, hu);
+    redirect_entries(func, cfg, &body, h, hu, stop.map(|_| (&cnt, k, ity)));
     Some(())
 }
 
@@ -2013,6 +2075,8 @@ fn run_region(
         let ty = func.dfg.value_type(p);
         func.dfg.append_block_param(hu, ty);
     }
+    let stop = (!cnt.signed && crate::pass_enabled("PLIRON_PRSTOP"))
+        .then(|| func.dfg.append_block_param(hu, ity));
     func.layout.insert_block(hu, h);
     let mut cmaps: Vec<FxHashMap<Block, Block>> = Vec::with_capacity(k as usize);
     for _ in 0..k {
@@ -2029,7 +2093,7 @@ fn run_region(
         cmaps.push(cm);
     }
     emit_exit_cones(func, h, &mut exits.iter_mut().collect::<Vec<_>>());
-    emit_trip_guard(func, hu, cmaps[0][&h], h, &cnt, ity, wty, k);
+    emit_trip_guard(func, hu, cmaps[0][&h], h, &cnt, ity, wty, k, stop);
 
     // `seblk` → its clone root (or itself when the cone needed no clone).
     let etgt = |d: Block| -> Block {
@@ -2109,6 +2173,11 @@ fn run_region(
                     }
                     t
                 };
+                // `hu` carries the invariant `stop` as a trailing param —
+                // the backedge passes it through unchanged.
+                if t == hu && let Some(sv) = stop {
+                    args.push(sv.into());
+                }
                 (t, args)
             };
             let t = *insts.last().unwrap();
@@ -2147,7 +2216,7 @@ fn run_region(
     if debug() {
         eprintln!("punroll {name} block{}: region unrolled k={k}", h.as_u32());
     }
-    redirect_entries(func, cfg, &body, h, hu);
+    redirect_entries(func, cfg, &body, h, hu, stop.map(|_| (&cnt, k, ity)));
     Some(())
 }
 
