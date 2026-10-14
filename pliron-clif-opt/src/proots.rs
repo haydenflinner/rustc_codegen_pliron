@@ -111,6 +111,17 @@ ascent::ascent! {
     /// Every in-edge delivers the same value — `param_src`'s relation.
     relation alias(Value, Value);
     alias(p, a) <-- edge_arg(p, a), !diffs(p), !blocked(p);
+
+    /// Canonical member of a param's equivalence web: chase uniform
+    /// sources transitively until a value with no uniform source (a
+    /// param's source that is itself merged is not the web's root —
+    /// `q` feeding `p` everywhere makes `q` `p`'s representative, and
+    /// if `q` is uniform-sourced too, *its* root is). Cyclic webs emit
+    /// no row, which is sound — a self-sustaining alias cycle has no
+    /// entry seed anyway.
+    relation canon(Value, Value);
+    canon(p, a) <-- alias(p, a), !alias(a, _);
+    canon(p, r) <-- alias(p, m), canon(m, r);
 }
 
 /// The alias relation over pre-extracted `facts` — `param_src`'s job.
@@ -125,6 +136,19 @@ pub fn alias_of(f: &Facts) -> FxHashMap<Value, Value> {
 /// The alias relation alone — `param_src`'s job.
 pub fn alias_map(func: &Function) -> FxHashMap<Value, Value> {
     alias_of(&facts(func))
+}
+
+/// Param → its web's canonical representative (the transitive uniform
+/// source). Used to normalize `Key::V` leaves in `key_of` so params on
+/// different in-edge paths that provably carry the same value compare
+/// congruent.
+pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
+    let f = facts(func);
+    let mut p = Proots::default();
+    p.edge_arg = f.edge.clone();
+    p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
+    p.run();
+    p.canon.into_iter().collect()
 }
 
 /// `v = base + k` definitions: `iadd base, iconst k` (either operand
@@ -198,6 +222,56 @@ pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
     p.off.into_iter().map(|(v, r, k)| (v, (r, k))).collect()
 }
 
+/// `affine_nf` lifted through params — the phi web proper: a param whose
+/// reachable in-edge args all land in one `(root, k)` class *is* `root+k`
+/// at its block's entry, so it takes that class too (a downstream edge
+/// passing `p` then keys through `p`'s class — multi-hop congruence).
+/// This is genuinely a fixpoint over params but not expressible as one
+/// monotone Ascent rule — "all edges agree" is a negation through the
+/// `off` recursion — so it runs as a bounded Rust fixpoint instead:
+/// rows are only ever added (`p ↦ (r,k)` where `r != p`), one row per
+/// param, so the loop terminates. Self-edge args of the form `p + d`
+/// correctly keep `p` out of any class rooted at `p` itself, and a
+/// self-carry edge contributes no fact at all — under induction the
+/// carried value stays in the class the other edges established.
+pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+    let mut nf = affine_nf(func);
+    let f = facts(func);
+    let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
+    loop {
+        let mut grew = false;
+        for (&p, es) in &f.detail {
+            if es.is_empty() || blocked.contains(&p) || nf.contains_key(&p) {
+                continue;
+            }
+            let mut cls: Option<(Value, i64)> = None;
+            let mut uniform = true;
+            for &(_, _, _, a) in es {
+                let c = nf.get(&a).copied().unwrap_or((a, 0));
+                match cls {
+                    None => cls = Some(c),
+                    Some(t) if t != c => {
+                        uniform = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if uniform
+                && let Some((r, k)) = cls
+                && r != p
+            {
+                nf.insert(p, (r, k));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    nf
+}
+
 /// Congruence key for the phi-web merges: two values with equal `Key`s
 /// compute the same thing. `V` is an opaque leaf (param or non-pure
 /// result — identity only), `K` a materializable `iconst`, `A` an
@@ -215,16 +289,33 @@ pub enum Key {
 }
 
 /// `v`'s congruence key: aliases resolved, affine chains collapsed via
-/// `off`, pure ops keyed structurally on their operands' keys. Recursion
-/// bottoms out at params/`V` leaves — SSA def chains are finite.
-pub fn key_of(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value) -> Key {
-    fn go(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value, d: usize) -> Key {
+/// `off`, pure ops keyed structurally on their operands' keys, and `V`
+/// leaves normalized through `canon` — a param's leaf is its web's
+/// representative, so the same logical value arriving through different
+/// merged-away params still keys equal. Recursion bottoms out at
+/// params/`V` leaves — SSA def chains are finite.
+pub fn key_of(
+    func: &Function,
+    nf: &FxHashMap<Value, (Value, i64)>,
+    canon: &FxHashMap<Value, Value>,
+    v: Value,
+) -> Key {
+    fn go(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        v: Value,
+        d: usize,
+    ) -> Key {
         let v = func.dfg.resolve_aliases(v);
+        let v = canon.get(&v).copied().unwrap_or(v);
         if d > 64 {
             return Key::V(v);
         }
-        if let Some(&(r, k)) = nf.get(&v) {
-            let rk = go(func, nf, r, d + 1);
+        if let Some(&(r, k)) = nf.get(&v)
+            && r != v
+        {
+            let rk = go(func, nf, canon, r, d + 1);
             let ty = func.dfg.value_type(v);
             return if k == 0 {
                 rk
@@ -239,7 +330,7 @@ pub fn key_of(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value) ->
             vs.iter()
                 .map(|&a| {
                     let a = func.dfg.resolve_aliases(a);
-                    go(func, nf, a, d + 1)
+                    go(func, nf, canon, a, d + 1)
                 })
                 .collect()
         };
@@ -296,7 +387,7 @@ pub fn key_of(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value) ->
             _ => Key::V(v),
         }
     }
-    go(func, nf, v, 0)
+    go(func, nf, canon, v, 0)
 }
 
 ascent::ascent! {

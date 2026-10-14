@@ -2598,7 +2598,8 @@ pub fn webmerge(func: &mut Function) -> usize {
     use crate::proots::Key;
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
-    let nf = crate::proots::affine_nf(func);
+    let nf = crate::proots::web_nf(func);
+    let canon = crate::proots::canon_map(func);
     let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -2657,7 +2658,7 @@ pub fn webmerge(func: &mut Function) -> usize {
                 if v == p {
                     continue;
                 }
-                let k = crate::proots::key_of(func, &nf, v);
+                let k = crate::proots::key_of(func, &nf, &canon, v);
                 match &class {
                     None => {
                         class = Some(k);
@@ -2738,10 +2739,9 @@ pub fn webmerge(func: &mut Function) -> usize {
 
 /// Can `key` be materialized at `b`'s head? Every `V` leaf must dominate
 /// `b`'s entry (the same rule that rejects back-edge roots — a leaf
-/// defined *in* `b` is next-iteration's value). `N` operands stay
-/// shallow — `V`/`K`/`A`-of-leaf — so emission never needs a nested
-/// `N`'s results; deeper congruence is still sound to *detect*, the
-/// class just can't be rebuilt, and the param survives.
+/// defined *in* `b` is next-iteration's value). `N` nests freely —
+/// `emit_key` rebuilds operand trees recursively — so the only
+/// un-materializable class is one rooted at a non-dominating leaf.
 fn mat_ok(
     func: &Function,
     dom: &cranelift_codegen::dominator_tree::DominatorTree,
@@ -2749,19 +2749,11 @@ fn mat_ok(
     key: &crate::proots::Key,
 ) -> bool {
     use crate::proots::Key;
-    fn leaf(func: &Function, dom: &cranelift_codegen::dominator_tree::DominatorTree, b: Block, k: &Key) -> bool {
-        match k {
-            Key::V(w) => dominates_entry(func, dom, *w, b),
-            Key::K(..) => true,
-            Key::A(_, rk, _) => leaf(func, dom, b, rk),
-            Key::N(..) => false,
-        }
-    }
     match key {
         Key::V(w) => dominates_entry(func, dom, *w, b),
         Key::K(..) => true,
-        Key::A(_, rk, _) => leaf(func, dom, b, rk),
-        Key::N(_, _, args, _) => args.iter().all(|a| leaf(func, dom, b, a)),
+        Key::A(_, rk, _) => mat_ok(func, dom, b, rk),
+        Key::N(_, _, args, _) => args.iter().all(|a| mat_ok(func, dom, b, a)),
     }
 }
 
@@ -2809,9 +2801,13 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
             ))
         }
         Key::N(op, ty, args, extra) => {
+            // StackAddr's key arg is the slot offset — a literal to fold
+            // back into the instruction, not a value to emit.
             let mut vals = [Value::reserved_value(); 3];
-            for (i, a) in args.iter().enumerate() {
-                vals[i] = emit_key(func, order, a)?;
+            if *op != Opcode::StackAddr {
+                for (i, a) in args.iter().enumerate() {
+                    vals[i] = emit_key(func, order, a)?;
+                }
             }
             let data = match *op {
                 Opcode::Icmp => InstructionData::IntCompare {
