@@ -32,7 +32,7 @@ if [ -n "${PLIRON_PGO:-}" ] && [ -f "$RS" ]; then
             cd "$T" || exit 1
             ar x "$RS" &&
             for o in pliron_prof_rt-*.o; do
-                objcopy -L '*rust_begin_unwind*' -L 'rust_eh_personality' "$o" 2>/dev/null
+                objcopy -N '*rust_begin_unwind*' -N 'rust_eh_personality' "$o" 2>/dev/null
             done &&
             ar rcs "$R.tmp" pliron_prof_rt-*.o &&
             mv "$R.tmp" "$R"
