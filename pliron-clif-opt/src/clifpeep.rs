@@ -5885,6 +5885,20 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
 pub fn lcse(func: &mut Function) -> usize {
     let key = cse_key;
     type Seen = FxHashMap<CseKey, Value>;
+    // `uses`/`dec`/`inc` maintain an exact use tally (`usecnt` below) —
+    // `uses_of`'s whole-function scan per query is quadratic here, where
+    // the memoff/neg guards run it per candidate.
+    let uses = |func: &Function, cnt: &FxHashMap<Value, u32>, v: Value| -> u32 {
+        cnt.get(&func.dfg.resolve_aliases(v)).copied().unwrap_or(0)
+    };
+    let dec = |func: &Function, cnt: &mut FxHashMap<Value, u32>, v: Value| {
+        if let Some(c) = cnt.get_mut(&func.dfg.resolve_aliases(v)) {
+            *c = c.saturating_sub(1);
+        }
+    };
+    let inc = |func: &Function, cnt: &mut FxHashMap<Value, u32>, v: Value| {
+        *cnt.entry(func.dfg.resolve_aliases(v)).or_default() += 1;
+    };
     // In-place arg mutation (memoff reassociation, `neg`'s imul peel)
     // changes what `d`'s result computes, but `seen` may already map its old
     // key to it — a later identical inst would then alias to a value that no
@@ -6021,7 +6035,12 @@ pub fn lcse(func: &mut Function) -> usize {
     // `(a + k) + x` chains: rewrite the outer add's args to
     // `(a, x)` — in-place, so its operands still dominate it — and
     // carry `k` into the offset too (outer add must be single-use).
-    let memoff = |func: &mut Function, v: &mut Value, off: &mut i64, seen: &mut Seen| -> usize {
+    let memoff = |func: &mut Function,
+                  v: &mut Value,
+                  off: &mut i64,
+                  seen: &mut Seen,
+                  cnt: &mut FxHashMap<Value, u32>|
+     -> usize {
         if !crate::pass_enabled("PLIRON_MEMOFF") {
             return 0;
         }
@@ -6062,7 +6081,7 @@ pub fn lcse(func: &mut Function) -> usize {
             let Some((ix, b, k)) = inner else {
                 break;
             };
-            if uses_of(func, a) != 1 {
+            if uses(func, cnt, a) != 1 {
                 break;
             }
             let Some(no) = off.checked_add(k).and_then(|x| i32::try_from(x).ok()) else {
@@ -6075,12 +6094,35 @@ pub fn lcse(func: &mut Function) -> usize {
                 opcode: Opcode::Iadd,
                 args: [b, other],
             };
+            dec(func, cnt, args[ix]);
+            inc(func, cnt, b);
             depth += 1;
         }
         depth
     };
     let mut n = 0;
     let mut seen: Seen = FxHashMap::default();
+    // A `uses_of` query scans the whole function — quadratic when the
+    // memoff/neg guards run it per candidate (stage2 hit a function where
+    // lcse dominated for hours). Count every use once, then keep the
+    // tally exact at each in-place arg swap and alias fold below.
+    let mut usecnt: FxHashMap<Value, u32> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                *usecnt.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(x) = a {
+                        *usecnt.entry(func.dfg.resolve_aliases(x)).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
     for b in func.layout.blocks().collect::<Vec<_>>() {
         seen.clear();
         let mut dead = Vec::new();
@@ -6090,11 +6132,13 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Load { arg, offset, .. } => {
                     let mut a = arg;
                     let mut off = i64::from(offset);
-                    if memoff(func, &mut a, &mut off, &mut seen) > 0 {
+                    if memoff(func, &mut a, &mut off, &mut seen, &mut usecnt) > 0 {
                         if let InstructionData::Load { arg, offset, .. } = &mut func.dfg.insts[i] {
                             *arg = a;
                             *offset = (off as i32).into();
                         }
+                        dec(func, &mut usecnt, arg);
+                        inc(func, &mut usecnt, a);
                         n += 1;
                         continue;
                     }
@@ -6102,12 +6146,14 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Store { args, offset, .. } => {
                     let mut a = args[1];
                     let mut off = i64::from(offset);
-                    if memoff(func, &mut a, &mut off, &mut seen) > 0 {
+                    if memoff(func, &mut a, &mut off, &mut seen, &mut usecnt) > 0 {
                         if let InstructionData::Store { args, offset, .. } = &mut func.dfg.insts[i]
                         {
                             args[1] = a;
                             *offset = (off as i32).into();
                         }
+                        dec(func, &mut usecnt, args[1]);
+                        inc(func, &mut usecnt, a);
                         n += 1;
                         continue;
                     }
@@ -6140,7 +6186,9 @@ pub fn lcse(func: &mut Function) -> usize {
                             _ => None,
                         }
                     };
-                    let mut neg = |v: Value, seen: &mut Seen| {
+                    let mut neg = |v: Value,
+                                   seen: &mut Seen,
+                                   cnt: &mut FxHashMap<Value, u32>| {
                         if let Some(x) = negdef(func, v) {
                             return Some(x);
                         }
@@ -6159,25 +6207,31 @@ pub fn lcse(func: &mut Function) -> usize {
                             .iter()
                             .enumerate()
                             .find_map(|(ix, &m)| negdef(func, m).map(|x| (ix, x)))?;
-                        if uses_of(func, func.dfg.first_result(mi)) != 1 {
+                        if uses(func, cnt, func.dfg.first_result(mi)) != 1 {
                             return None;
                         }
                         untrack(func, seen, mi);
                         if let InstructionData::Binary { args, .. } = &mut func.dfg.insts[mi] {
                             args[ix] = inner;
                         }
+                        dec(func, cnt, margs[ix]);
+                        inc(func, cnt, inner);
                         Some(func.dfg.first_result(mi))
                     };
-                    let sub = if let Some(x) = neg(ra, &mut seen) {
+                    let sub = if let Some(x) = neg(ra, &mut seen, &mut usecnt) {
                         Some([rb, x])
                     } else {
-                        neg(rb, &mut seen).map(|x| [ra, x])
+                        neg(rb, &mut seen, &mut usecnt).map(|x| [ra, x])
                     };
-                    if let Some(args) = sub {
+                    if let Some(newargs) = sub {
                         func.dfg.insts[i] = InstructionData::Binary {
                             opcode: Opcode::Isub,
-                            args,
+                            args: newargs,
                         };
+                        dec(func, &mut usecnt, args[0]);
+                        dec(func, &mut usecnt, args[1]);
+                        inc(func, &mut usecnt, newargs[0]);
+                        inc(func, &mut usecnt, newargs[1]);
                         n += 1;
                         continue;
                     }
@@ -6201,6 +6255,8 @@ pub fn lcse(func: &mut Function) -> usize {
                                 opcode: Opcode::Iconst,
                                 imm: k.into(),
                             };
+                            dec(func, &mut usecnt, args[0]);
+                            dec(func, &mut usecnt, args[1]);
                             folded = true;
                             break;
                         }
@@ -6267,6 +6323,10 @@ pub fn lcse(func: &mut Function) -> usize {
                             opcode: Opcode::Isub,
                             args: [bb, a],
                         };
+                        dec(func, &mut usecnt, args[0]);
+                        dec(func, &mut usecnt, args[1]);
+                        inc(func, &mut usecnt, bb);
+                        inc(func, &mut usecnt, a);
                         n += 1;
                         continue;
                     }
@@ -6293,8 +6353,12 @@ pub fn lcse(func: &mut Function) -> usize {
                     || matches!(def_block(func, x), Some(xb) if xb == b)
                     || def_block(func, x).is_none())
             {
+                // `res`'s uses now resolve to `x` — move its tally over.
+                let nu = uses(func, &usecnt, res);
+                usecnt.insert(res, 0);
                 func.dfg.clear_results(i);
                 func.dfg.change_to_alias(res, x);
+                *usecnt.entry(func.dfg.resolve_aliases(x)).or_default() += nu;
                 dead.push(i);
                 n += 1;
                 continue;
@@ -6305,8 +6369,11 @@ pub fn lcse(func: &mut Function) -> usize {
                     // Alias eagerly so later insts in this block key on the
                     // resolved args (an iconst dedup must unblock the imul
                     // dedup that feeds it); only the layout removal defers.
+                    let nu = uses(func, &usecnt, res);
+                    usecnt.insert(res, 0);
                     func.dfg.clear_results(i);
                     func.dfg.change_to_alias(res, *e.get());
+                    *usecnt.entry(func.dfg.resolve_aliases(*e.get())).or_default() += nu;
                     dead.push(i);
                     n += 1;
                 }
@@ -6316,6 +6383,9 @@ pub fn lcse(func: &mut Function) -> usize {
             }
         }
         for i in dead {
+            for a in func.dfg.inst_args(i).to_vec() {
+                dec(func, &mut usecnt, a);
+            }
             func.layout.remove_inst(i);
         }
     }
