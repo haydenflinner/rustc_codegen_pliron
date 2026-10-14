@@ -1,0 +1,13 @@
+[package]
+name = "pliron-prof-rt"
+version = "0.1.0"
+edition = "2021"
+description = "no_std PGO runtime for rustc_codegen_pliron instrumented binaries (docs/pgo.md)."
+
+[lib]
+crate-type = ["staticlib"]
+
+[workspace]
+
+[profile.release]
+panic = "abort"

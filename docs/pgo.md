@@ -81,18 +81,26 @@ and loop trip counts.
 
 ## Runtime (`tools/pliron-prof`)
 
-Pure Rust, `std`, ~200 lines, no deps beyond `libc::atexit`.
+Pure Rust, `no_std`, ~150 lines, libc externs only
+(`tools/pliron-prof-rt`). It must not link std: the archive is pulled
+into links that already carry a Rust std (rustc itself, proc-macro
+.so's) and bundled std objects collide on `__rdl_*`/`__rust_*` symbols
+— the same reason it can't reference `core`/`compiler_builtins`
+members, so the code is raw-pointer only (no indexing, no allocation).
 
-- `__pliron_prof_register(hdr)` — appends the CGU's `{recs, ctrs}` range
-  to a static list and installs `atexit(flush)` once.
-- `flush` — reads `PLIRON_PROFILE_FILE` (default
-  `pliron-<pid>.prof`), merges counts into matching `(sym, fingerprint)`
-  records, writes back via temp+rename.
-- `pliron-prof` bin — `merge`/`dump` for host-side inspection and for
+- `__pliron_prof_register(hdr)` — appends the CGU header pointer to a
+  static table and installs `atexit(flush)` once.
+- `flush` — writes a raw dump (`PLRAW01`: per-CGU `len | hdr | recs |
+  ctrs`) to `PLIRON_PROFILE_FILE` (default `pliron-<pid>.prof`).
+  Merging lives in the CLI so the runtime never allocates.
+- `pliron-prof` bin — `merge`/`dump` fold raw dumps (and `.prof`
+  files) into a `pliron.prof`, for host-side inspection and for
   profiles pulled out of wasm guests.
 
-The gen build links it via `-Clink-arg=<path>/libpliron_prof.a`
-(test.sh and compat scripts wire this automatically).
+The gen build links it via `-Clink-arg=<path>/libpliron_prof_rt.a`
+(test.sh and compat scripts wire this automatically); cc-wild thins
+the archive to the runtime object before linking it under
+`PLIRON_PGO`.
 
 ## Consumption (`PLIRON_PGO_USE=<file>`)
 

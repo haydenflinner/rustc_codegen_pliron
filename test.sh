@@ -305,7 +305,13 @@ t_pgo() {
   # a .prof at exit, the pliron-prof CLI reads it, and a PGO_USE build
   # matches every function back and runs identically.
   (cd tools/pliron-prof && cargo build --release) &&
-  local rt=$PWD/tools/pliron-prof/target/release/libpliron_prof.a
+  (cd tools/pliron-prof-rt && cargo build --release) &&
+  # thin .a: only the runtime object (bundled core/compiler_builtins
+  # members' __rustc shims collide with the link's own std)
+  local rt=$out/libpliron_prof_rt.a &&
+  local rt_full=$PWD/tools/pliron-prof-rt/target/release/libpliron_prof_rt.a &&
+  (mkdir -p $out/pga && cd $out/pga &&
+    ar x $rt_full && ar rcs $rt pliron_prof_rt-*.o) &&
   local cli=$PWD/tools/pliron-prof/target/release/pliron-prof
   local prof=$out/pgo.prof
   rm -f $prof
