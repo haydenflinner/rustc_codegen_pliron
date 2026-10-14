@@ -28,6 +28,20 @@ Checksums verified identical on every kernel.
 
 **11/17 kernels at or beating parity** (6 strictly faster). Worst
 remaining: tokenize 1.14, strwork 1.10, hmget 1.07, matmul/hashmap 1.06.
+(hashmap swings 1.06–1.21 across runs on this box — load-dependent;
+quiet-box best-of-5 lands ~1.06.)
+
+### The lcse/tokenize interaction
+
+`PLIRON_LCSE=0` buys ~12% on tokenize but loses ~16% on sortw and ~8%
+on parse_only — no global win. Bisecting the four `lcse*` pipeline
+positions plus `ident`'s internal arms isolated the dominant harm to
+the select-cond identity (`select (x==0), 0, x → x`, added in
+`0d9a60f`): its aliases merge distinct in-loop values onto cross-block
+arms, extending live ranges where ra2 cannot rematerialize. The arm
+is removed (`00b05a2`); the residual tokenize gap is the aggregate of
+lcse's legitimate transforms feeding a pressure-bound loop — the same
+ra2 wall as everything else, not a wrong fold.
 
 ## Compile time (ms, whole `rustc -O` invocation)
 
