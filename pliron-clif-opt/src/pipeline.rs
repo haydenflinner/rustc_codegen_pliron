@@ -1695,12 +1695,15 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         let valid = |v: Value| {
             v != Value::reserved_value() && (v.as_u32() as usize) < f.dfg.num_values()
         };
-        let blk = |v: Value| match valid(v).then(|| f.dfg.value_def(f.dfg.resolve_aliases(v))) {
+        // `resolve_aliases` itself indexes unchecked and panics on alias
+        // chains ending at a reserved value — don't call it; an alias def
+        // just falls through to no-carry.
+        let blk = |v: Value| match valid(v).then(|| f.dfg.value_def(v)) {
             Some(ValueDef::Result(i, _)) => f.layout.inst_block(i),
             Some(ValueDef::Param(b, _)) => Some(b),
             _ => None,
         };
-        let pos = |v: Value| match valid(v).then(|| f.dfg.value_def(f.dfg.resolve_aliases(v))) {
+        let pos = |v: Value| match valid(v).then(|| f.dfg.value_def(v)) {
             Some(ValueDef::Param(..)) => Some(0usize),
             Some(ValueDef::Result(i, _)) => {
                 f.layout.block_insts(blk(v)?).position(|x| x == i)
