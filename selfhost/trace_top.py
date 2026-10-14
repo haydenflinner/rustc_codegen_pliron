@@ -17,7 +17,13 @@ def scan(path):
                 p = line.split()
                 if len(p) < 5 or p[0] != 'trace':
                     continue
-                _, pid, step, ms, name = p[0], p[1], p[2], float(p[3]), p[4]
+                # step names may contain spaces ('emit:VCode emission'):
+                # ms is the second-to-last field, fname the last.
+                pid, step, ms, name = p[1], ' '.join(p[2:-2]), p[-2], p[-1]
+                try:
+                    ms = float(ms)
+                except ValueError:
+                    continue
                 tot[step] += ms
                 last[pid] = (step, name)
                 if step.startswith('*'):
