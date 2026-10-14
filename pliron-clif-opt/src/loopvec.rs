@@ -4445,10 +4445,18 @@ pub fn run(
     simd: bool,
     x64: bool,
     cmp64: bool,
+    prof: &FxHashMap<Block, u64>,
 ) -> usize {
     if !simd {
         return 0;
     }
+    // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
+    let empty_prof = FxHashMap::default();
+    let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
+        prof
+    } else {
+        &empty_prof
+    };
     // Bisection gate: PLIRON_VEC_SKIP=foo,bar skips vectorizing matching fns.
     if let Some(skip) = crate::env_get("PLIRON_VEC_SKIP")
         && !skip.is_empty()
@@ -4464,6 +4472,10 @@ pub fn run(
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
+        // PGO: measured-dead loop — vector clones are pure code size.
+        if prof.get(&la.loop_header(lp)) == Some(&0) {
+            continue;
+        }
         let facts = proots::facts(func);
         let ps = proots::alias_of(&facts);
         let Some(p) = plan(
@@ -4555,6 +4567,7 @@ mod tests {
             true,
             false,
             true,
+            &FxHashMap::default(),
         );
     }
 
@@ -4625,6 +4638,7 @@ mod tests {
             true,
             true,
             true,
+            &FxHashMap::default(),
         );
         assert_eq!(n, 0);
     }
@@ -4646,6 +4660,7 @@ mod tests {
             true,
             false,
             true,
+            &FxHashMap::default(),
         );
         assert_eq!(n, 1);
     }

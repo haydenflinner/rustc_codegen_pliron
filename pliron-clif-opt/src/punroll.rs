@@ -276,7 +276,51 @@ pub(crate) struct Cnt {
     pub(crate) eq: bool,
 }
 
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
+/// Measured average trip count: header executions per loop entry (the
+/// header runs once per iteration plus the exit check, so the ratio is
+/// within one of the real mean). `None` without `PLIRON_PGO_USE`.
+fn trip_est(
+    cfg: &ControlFlowGraph,
+    la: &LoopAnalysis,
+    lp: cranelift_codegen::loop_analysis::Loop,
+    h: Block,
+    prof: &FxHashMap<Block, u64>,
+) -> Option<u64> {
+    let hc = *prof.get(&h)?;
+    let entry: u64 = cfg
+        .pred_iter(h)
+        .map(|p| p.block)
+        .filter(|&p| !la.is_in_loop(p, lp))
+        .filter_map(|p| prof.get(&p))
+        .sum();
+    Some(hc.max(1) / entry.max(1))
+}
+
+/// Largest unroll width the profile justifies: the group guard only
+/// fires when `rem >= K`, so a K above the measured average trips makes
+/// the unrolled clone dead weight — cap at the largest power of two
+/// below it. `None` => no measured bound, keep `k`.
+fn cap_unroll(k: i64, trip: Option<u64>) -> Option<i64> {
+    let t = trip?;
+    if t < 2 {
+        return None;
+    }
+    Some(k.min(t.next_power_of_two() as i64 / 2).max(2))
+}
+
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    name: &str,
+    prof: &FxHashMap<Block, u64>,
+) -> usize {
+    // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
+    let empty_prof = FxHashMap::default();
+    let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
+        prof
+    } else {
+        &empty_prof
+    };
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
@@ -322,6 +366,9 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) 
                         continue;
                     }
                     tried.insert(h);
+                    if prof.get(&h) == Some(&0) {
+                        continue;
+                    }
                     let r = if nch == 2 {
                         run_jam_chooser(func, cfg, dt, la, lp, h, name)
                     } else {
@@ -344,6 +391,12 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) 
                     continue;
                 }
                 tried.insert(h);
+                // PGO: a header measured at 0 executions never runs — every
+                // copy peel/unroll/jam clones is pure code size.
+                if prof.get(&h) == Some(&0) {
+                    continue;
+                }
+                let trip = trip_est(cfg, la, lp, h, prof);
                 if debug() {
                     eprintln!("punroll {name} try block{}", h.as_u32());
                 }
@@ -354,8 +407,8 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) 
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
-                if run_loop(func, cfg, dt, la, lp, h, name).is_some()
-                    || run_region(func, cfg, dt, la, lp, h, name).is_some()
+                if run_loop(func, cfg, dt, la, lp, h, name, trip).is_some()
+                    || run_region(func, cfg, dt, la, lp, h, name, trip).is_some()
                 {
                     n += 1;
                     hit = true;
@@ -1095,6 +1148,7 @@ fn run_loop(
     lp: cranelift_codegen::loop_analysis::Loop,
     h: Block,
     name: &str,
+    trip: Option<u64>,
 ) -> Option<()> {
     macro_rules! bail {
         ($why:expr) => {{
@@ -1117,6 +1171,9 @@ fn run_loop(
     let n_insts = body_insts(func, &chain);
     let Some(k) = unroll_width(n_insts) else {
         bail!("body too big");
+    };
+    let Some(k) = cap_unroll(k, trip) else {
+        bail!("measured trip below 2");
     };
     if !body_insts_clonable(func, &chain) {
         bail!("unclonable inst");
@@ -1887,6 +1944,7 @@ fn run_region(
     lp: cranelift_codegen::loop_analysis::Loop,
     h: Block,
     name: &str,
+    trip: Option<u64>,
 ) -> Option<()> {
     macro_rules! bail {
         ($why:expr) => {{
@@ -2076,6 +2134,9 @@ fn run_region(
     let n_insts = body_insts(func, &rpo);
     let Some(k) = unroll_width(n_insts) else {
         bail!("body too big");
+    };
+    let Some(k) = cap_unroll(k, trip) else {
+        bail!("measured trip below 2");
     };
     let ity = func.dfg.value_type(hparams[cnt.pidx]);
     let wty = if ity.bits() <= 32 { types::I64 } else { ity };

@@ -309,6 +309,9 @@ pub fn lower_to_object(
         invariant: FxHashSet<ir::Inst>,
         operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
         block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
+        // PGO: CLIF block -> executed count (from st.prof_bcount via
+        // block_region); CLIF passes read it through Pipe.prof.
+        prof: FxHashMap<ir::Block, u64>,
         lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>,
         nocap: FxHashSet<(ir::Inst, u32)>,
         stubs: rustc_hash::FxHashSet<&'static str>,
@@ -354,6 +357,7 @@ pub fn lower_to_object(
         let invariant: FxHashSet<ir::Inst>;
         let operand_frozen: FxHashMap<cranelift_codegen::ir::Value, Vec<(u64, Ptr<BasicBlock>)>>;
         let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
+        let prof: FxHashMap<ir::Block, u64>;
         let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
         let nocap: FxHashSet<(ir::Inst, u32)>;
         let stubs: rustc_hash::FxHashSet<&'static str>;
@@ -440,6 +444,10 @@ pub fn lower_to_object(
             }
             operand_frozen = ofz;
             stubs = std::mem::take(&mut fl.stubs);
+            prof = block_region
+                .iter()
+                .filter_map(|(&cb, &rb)| st.prof_bcount.get(&rb).map(|&c| (cb, c)))
+                .collect();
         }
         jobs.push(FnJob {
             name: n,
@@ -456,6 +464,7 @@ pub fn lower_to_object(
             invariant,
             operand_frozen,
             block_region,
+            prof,
             lifetimes,
             nocap,
             stubs,
@@ -520,6 +529,7 @@ pub fn lower_to_object(
                     invariant: &j.invariant,
                     operand_frozen: &mut j.operand_frozen,
                     block_region: &j.block_region,
+                    prof: &j.prof,
                     region_parent: sh.region_parent,
                     lifetimes: &mut j.lifetimes,
                     nocap: &j.nocap,

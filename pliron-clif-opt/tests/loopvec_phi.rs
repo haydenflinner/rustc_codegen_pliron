@@ -7,7 +7,7 @@ use cranelift_codegen::ir::{Function, Opcode};
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
 use pliron_clif_opt::pipeline::Analysis;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use target_lexicon::PointerWidth;
 
 fn parse(src: &str) -> Function {
@@ -32,6 +32,7 @@ fn run_vec(f: &mut Function, name: &str) -> usize {
         true,
         false,
         true,
+        &FxHashMap::default(),
     )
 }
 

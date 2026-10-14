@@ -135,6 +135,9 @@ pub struct Pipe<'a> {
     pub invariant: &'a FxHashSet<Inst>,
     pub operand_frozen: &'a mut FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     pub block_region: &'a FxHashMap<Block, Ptr<BasicBlock>>,
+    /// PGO: CLIF block -> executed count (empty without PLIRON_PGO_USE).
+    /// Loop passes scale budgets off it; `block_count` is the read path.
+    pub prof: &'a FxHashMap<Block, u64>,
     pub region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     pub lifetimes: &'a mut Vec<(Value, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
@@ -874,7 +877,7 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = unroll::run(&mut p.clctx.func, an, p.nonnull, p.derived);
+    let k = unroll::run(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof);
     // The skipped loop is now unreachable, and its trip count still
     // flows into dead params/branches; dropping them frees the slot
     // address arithmetic so slot DSE can see the slot doesn't escape.
@@ -1149,6 +1152,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.simd,
         p.x64,
         p.cmp64,
+        p.prof,
     );
     // loopvec emits `base + iv*esize` addressing fresh each iteration;
     // a second indvars round turns them into stepped pointers.
@@ -1203,7 +1207,7 @@ fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = punroll::run(&mut p.clctx.func, an, p.fname);
+    let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof);
     if k > 0 && p.dump {
         p.dump("punroll");
     }

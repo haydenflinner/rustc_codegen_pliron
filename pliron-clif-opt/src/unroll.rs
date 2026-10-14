@@ -42,7 +42,15 @@ pub fn run(
     an: &mut crate::pipeline::Analysis,
     loads: &FxHashSet<Value>,
     derived: &FxHashMap<Value, Value>,
+    prof: &FxHashMap<Block, u64>,
 ) -> usize {
+    // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
+    let empty_prof = FxHashMap::default();
+    let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
+        prof
+    } else {
+        &empty_prof
+    };
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
     'outer: while n < MAX_LOOPS {
@@ -51,6 +59,11 @@ pub fn run(
         let blocks: Vec<Block> = func.layout.blocks().collect();
         for h in blocks {
             if !tried.insert(h) {
+                continue;
+            }
+            // PGO: measured-dead loop — the straight-line clone is pure
+            // code size.
+            if prof.get(&h) == Some(&0) {
                 continue;
             }
             let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, h) else {
