@@ -2585,20 +2585,20 @@ pub fn arghoist(func: &mut Function) -> usize {
     n
 }
 
-/// Phi merge through affine congruence: every in-edge of param `p`
-/// carries a value in the same `root + k` class — the args may be
-/// distinct SSA values (`taildup` clones an `iadd` per edge, the egraph
-/// later duplicates bumps) that literal-equality `sameargs` and
-/// same-shape `arghoist` both miss. When `root` dominates the target,
-/// drop the param and rebind its uses to `root` (k=0) or a single
-/// `root + k` materialized at the block head. The Ascent `off` relation
-/// collapses `iadd`/`isub`-const chains transitively, so the classes
-/// see through bumps no matter how deep the def chain runs.
-pub fn affmerge(func: &mut Function) -> usize {
+/// Phi merge through shared-successor congruence — the phi-web merge.
+/// Every in-edge of param `p` supplies a value with the same
+/// `proots::Key`: a literal (`sameargs`' value case), a const (its K
+/// case), a `root + k` affine image (affmerge's class), or a pure-op
+/// tree congruent by construction — `key_of` normalizes operands through
+/// the `off` web, so `icmp (iadd x, 8), c` edges whose adds are per-edge
+/// clones still land in one class (a transitive `arghoist`). The param
+/// drops and its uses rebind to a class member that dominates the head
+/// when one exists, else to the key re-materialized there (`emit_key`).
+pub fn webmerge(func: &mut Function) -> usize {
+    use crate::proots::Key;
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
     let nf = crate::proots::affine_nf(func);
-    let normal = |v: Value| nf.get(&v).copied().unwrap_or((v, 0));
     let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -2617,9 +2617,9 @@ pub fn affmerge(func: &mut Function) -> usize {
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
-    // (target block, ty, root, k, param to rebind) — the `root + k`
-    // materialization is created after the scan so `Value`s stay valid.
-    let mut inserts: Vec<(Block, Type, Value, i64, Value)> = vec![];
+    // (target block, class key, param to rebind) — emission happens after
+    // the scan so `Value`s stay valid and insertions keep operand order.
+    let mut inserts: Vec<(Block, Key, Value)> = vec![];
     for (&b, es) in &edges {
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
@@ -2639,7 +2639,8 @@ pub fn affmerge(func: &mut Function) -> usize {
             if pmap.contains_key(&p) {
                 continue;
             }
-            let mut class: Option<(Value, i64)> = None;
+            let mut class: Option<Key> = None;
+            let mut member: Option<Value> = None;
             let mut uniform = false;
             for &(i, d) in es {
                 let a = func.dfg.insts[i]
@@ -2656,36 +2657,40 @@ pub fn affmerge(func: &mut Function) -> usize {
                 if v == p {
                     continue;
                 }
-                let c = normal(v);
-                match class {
+                let k = crate::proots::key_of(func, &nf, v);
+                match &class {
                     None => {
-                        class = Some(c);
+                        class = Some(k);
                         uniform = true;
                     }
-                    Some(t) if t != c => {
+                    Some(t) if *t != k => {
                         uniform = false;
                         break;
                     }
                     _ => {}
                 }
+                // Reuse beats re-materialization: an edge arg already
+                // defined above `b`'s head is a free carrier.
+                if member.is_none() && dominates_entry(func, &dom, v, b) {
+                    member = Some(v);
+                }
             }
-            let Some((root, k)) = class.filter(|_| uniform) else {
+            let Some(key) = class.filter(|_| uniform) else {
                 continue;
             };
-            // The carrier must be usable at `b`'s head: defined in a
-            // strictly dominating block. An in-`b` root would be
-            // next-iteration's value on a back-edge, not the value on
-            // entry — `dominates_entry` rules it out.
-            if func.dfg.value_type(root) != func.dfg.value_type(p)
-                || !dominates_entry(func, &dom, root, b)
-            {
-                continue;
+            match member {
+                Some(w) => {
+                    pmap.insert(p, w);
+                }
+                None => {
+                    // No member reaches `b`'s head — only mergeable when
+                    // the class's shape can be rebuilt there.
+                    if !mat_ok(func, &dom, b, &key) {
+                        continue;
+                    }
+                    inserts.push((b, key, p));
+                }
             }
-            if k != 0 {
-                let ty = func.dfg.value_type(p);
-                inserts.push((b, ty, root, k, p));
-            }
-            pmap.insert(p, root);
             param_drops.push(p);
             for &(i, d) in es {
                 drop_ixs.entry((i, d)).or_default().push(ix);
@@ -2695,16 +2700,29 @@ pub fn affmerge(func: &mut Function) -> usize {
     if param_drops.is_empty() {
         return 0;
     }
-    // Materialize `root + k` at the head of each block that needs it and
-    // rebind those params onto the new inst (the `root` pmap entry was a
-    // placeholder — without the delta the rebind would be off by `k`).
-    for &(b, ty, root, k, p) in &inserts {
-        // One cursor for both insts — a fresh `at_first_insertion_point`
-        // per ins() would land the `iadd` *before* its `iconst` operand.
-        let mut cur = FuncCursor::new(&mut *func).at_first_insertion_point(b);
-        let c = cur.ins().iconst(ty, k);
-        let v = cur.ins().iadd(root, c);
-        pmap.insert(p, v);
+    // Materialize each non-member class at its block's head, operands
+    // before users, then insert the run before the original first inst.
+    let mut orders: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
+    for (b, key, p) in inserts {
+        let mut order = vec![];
+        if let Some(v) = emit_key(func, &mut order, &key) {
+            pmap.insert(p, v);
+            orders.entry(b).or_default().extend(order);
+        }
+    }
+    for (b, insts) in orders {
+        match func.layout.first_inst(b) {
+            Some(fi) => {
+                for ni in insts {
+                    func.layout.insert_inst(ni, fi);
+                }
+            }
+            None => {
+                for ni in insts {
+                    func.layout.append_inst(ni, b);
+                }
+            }
+        }
     }
     let arg_drops: Vec<(Inst, usize, Vec<usize>)> = drop_ixs
         .into_iter()
@@ -2716,6 +2734,124 @@ pub fn affmerge(func: &mut Function) -> usize {
     let n = param_drops.len();
     apply_param_drops(func, pmap, arg_drops, param_drops);
     n
+}
+
+/// Can `key` be materialized at `b`'s head? Every `V` leaf must dominate
+/// `b`'s entry (the same rule that rejects back-edge roots — a leaf
+/// defined *in* `b` is next-iteration's value). `N` operands stay
+/// shallow — `V`/`K`/`A`-of-leaf — so emission never needs a nested
+/// `N`'s results; deeper congruence is still sound to *detect*, the
+/// class just can't be rebuilt, and the param survives.
+fn mat_ok(
+    func: &Function,
+    dom: &cranelift_codegen::dominator_tree::DominatorTree,
+    b: Block,
+    key: &crate::proots::Key,
+) -> bool {
+    use crate::proots::Key;
+    fn leaf(func: &Function, dom: &cranelift_codegen::dominator_tree::DominatorTree, b: Block, k: &Key) -> bool {
+        match k {
+            Key::V(w) => dominates_entry(func, dom, *w, b),
+            Key::K(..) => true,
+            Key::A(_, rk, _) => leaf(func, dom, b, rk),
+            Key::N(..) => false,
+        }
+    }
+    match key {
+        Key::V(w) => dominates_entry(func, dom, *w, b),
+        Key::K(..) => true,
+        Key::A(_, rk, _) => leaf(func, dom, b, rk),
+        Key::N(_, _, args, _) => args.iter().all(|a| leaf(func, dom, b, a)),
+    }
+}
+
+/// Re-create `key`'s shape at `b`'s head, operand insts pushed before
+/// their users into `order`. Reachable only after `mat_ok` passed, so
+/// every `V` leaf is a dominating value and no `N` nests inside `N` args.
+fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key) -> Option<Value> {
+    use crate::proots::Key;
+    let new = |func: &mut Function, order: &mut Vec<Inst>, data: InstructionData, ty: Type| {
+        let ni = func.dfg.make_inst(data);
+        func.dfg.make_inst_results(ni, ty);
+        order.push(ni);
+        func.dfg.first_result(ni)
+    };
+    match key {
+        Key::V(w) => Some(*w),
+        Key::K(ty, bits) => Some(new(
+            func,
+            order,
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm: cranelift_codegen::ir::immediates::Imm64::new(*bits),
+            },
+            *ty,
+        )),
+        Key::A(ty, rk, k) => {
+            let r = emit_key(func, order, rk)?;
+            let c = new(
+                func,
+                order,
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm: cranelift_codegen::ir::immediates::Imm64::new(*k),
+                },
+                *ty,
+            );
+            Some(new(
+                func,
+                order,
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [r, c],
+                },
+                *ty,
+            ))
+        }
+        Key::N(op, ty, args, extra) => {
+            let mut vals = [Value::reserved_value(); 3];
+            for (i, a) in args.iter().enumerate() {
+                vals[i] = emit_key(func, order, a)?;
+            }
+            let data = match *op {
+                Opcode::Icmp => InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond: IntCC::all()[*extra as usize],
+                    args: [vals[0], vals[1]],
+                },
+                Opcode::Select => InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: [vals[0], vals[1], vals[2]],
+                },
+                Opcode::StackAddr => {
+                    let Key::K(_, off) = args[0] else { return None };
+                    InstructionData::StackAddr {
+                        opcode: Opcode::StackAddr,
+                        stack_slot: cranelift_codegen::ir::StackSlot::from_u32(*extra as u32),
+                        offset: cranelift_codegen::ir::immediates::Offset32::from(off as i32),
+                    }
+                }
+                Opcode::Band
+                | Opcode::Bor
+                | Opcode::Bxor
+                | Opcode::Iadd
+                | Opcode::Isub
+                | Opcode::Ishl
+                | Opcode::Ushr => InstructionData::Binary {
+                    opcode: *op,
+                    args: [vals[0], vals[1]],
+                },
+                Opcode::Bnot | Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce => {
+                    InstructionData::Unary {
+                        opcode: *op,
+                        arg: vals[0],
+                    }
+                }
+                _ => return None,
+            };
+            Some(new(func, order, data, *ty))
+        }
+    }
 }
 
 /// `brif c` edge args `select(c, a, b)` resolve to a single arm on each
@@ -7568,7 +7704,7 @@ mod tests {
     /// `arg_shape` `arghoist` can see it. The param drops and `x + 8` is
     /// materialized once at the merge head.
     #[test]
-    fn affmerge_congruent_deltas() {
+    fn webmerge_congruent_deltas() {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
@@ -7607,18 +7743,18 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(affmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func), 1);
         assert!(func.dfg.block_params(s).is_empty());
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
         }
     }
 
     /// `k = 0` collapse: one edge passes `x`, the other `iadd x, 0` —
     /// same class, param rebinds to `x` directly (no materialization).
     #[test]
-    fn affmerge_zero_delta() {
+    fn webmerge_zero_delta() {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
@@ -7647,21 +7783,21 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(affmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func), 1);
         assert!(func.dfg.block_params(s).is_empty());
         // No `x + 0` rematerialization — `ps`'s use bound straight to
         // `x`, so `s` still holds exactly the three original insts.
         assert_eq!(func.layout.block_insts(s).count(), 3);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
         }
     }
 
     /// Mismatched deltas — `x + 8` vs `x + 4` — are a real phi; the
     /// param must survive.
     #[test]
-    fn affmerge_rejects_mismatched_delta() {
+    fn webmerge_rejects_mismatched_delta() {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
@@ -7696,11 +7832,102 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(affmerge(&mut func), 0);
+        assert_eq!(webmerge(&mut func), 0);
         assert_eq!(func.dfg.block_params(s).len(), 1);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Congruent `icmp`s: each edge passes `x + 8 < 5` but the `iadd` and
+    /// the `icmp` are cloned per edge — `arghoist` can't fire (operand
+    /// values differ) and `affmerge` can't see a compare. The uniform
+    /// `N` key re-materializes both insts at `s`'s head.
+    #[test]
+    fn webmerge_congruent_op() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I8));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let ps = func.dfg.append_block_param(s, types::I8);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        for p in [p1, p2] {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(p);
+            let e8 = cur.ins().iconst(types::I64, 8);
+            let j = cur.ins().iadd(x, e8);
+            let e5 = cur.ins().iconst(types::I64, 5);
+            let cmp = cur.ins().icmp(IntCC::UnsignedLessThan, j, e5);
+            cur.ins().jump(s, &[cmp.into()]);
+        }
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        cur.ins().return_(&[ps]);
+
+        assert_eq!(webmerge(&mut func), 1);
+        assert!(func.dfg.block_params(s).is_empty());
+        // Head of `s` = iconst 8, iadd, iconst 5, icmp, then the return.
+        assert_eq!(func.layout.block_insts(s).count(), 5);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// When a class member already dominates the merge — `j` computed in
+    /// `entry`, one edge passing it directly, the other passing a clone —
+    /// the param rebinds to it with no new insts.
+    #[test]
+    fn webmerge_member_reuse() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let ps = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let e8 = cur.ins().iconst(types::I64, 8);
+        let j = cur.ins().iadd(x, e8);
+        let c = cur.ins().icmp(IntCC::Equal, x, e8);
+        cur.ins().brif(c, p1, &[], s, &[j.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let e8b = cur.ins().iconst(types::I64, 8);
+        let jb = cur.ins().iadd(x, e8b);
+        cur.ins().jump(s, &[jb.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().iadd(ps, one);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func), 1);
+        assert!(func.dfg.block_params(s).is_empty());
+        // `ps` rebound to entry's `j` — `s` keeps only iconst+iadd+ret.
+        assert_eq!(func.layout.block_insts(s).count(), 3);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
         }
     }
 }

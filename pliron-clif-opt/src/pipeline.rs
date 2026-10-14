@@ -1580,10 +1580,10 @@ fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
-fn s_affmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::affmerge(&mut p.clctx.func);
+fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::webmerge(&mut p.clctx.func);
     if k > 0 && p.dump {
-        p.dump("affmerge");
+        p.dump("webmerge");
     }
     k
 }
@@ -2128,7 +2128,7 @@ pub static DEFAULT: &[Step] = &[
     // so distinct SSA values that are transposed copies of one carrier
     // still merge. Catches the shapes `taildup`'s per-edge clones and
     // jumpthread's copied `iadd`s leave behind.
-    step("affmerge", "affmerge", Gate::Env("PLIRON_AFFMERGE"), s_affmerge)
+    step("webmerge", "webmerge", Gate::Env("PLIRON_WEBMERGE"), s_webmerge)
         .needs(shape::MULTI),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
@@ -2180,10 +2180,10 @@ pub static DEFAULT: &[Step] = &[
     // taildup's per-edge clones leave congruent `iadd`/`isub` args on a
     // shared successor — one more merge round after the last clone step.
     step(
-        "affmerge2",
-        "affmerge",
-        Gate::Env("PLIRON_AFFMERGE"),
-        s_affmerge,
+        "webmerge2",
+        "webmerge",
+        Gate::Env("PLIRON_WEBMERGE"),
+        s_webmerge,
     )
     .needs(shape::MULTI),
     Step {

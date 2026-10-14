@@ -198,6 +198,107 @@ pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
     p.off.into_iter().map(|(v, r, k)| (v, (r, k))).collect()
 }
 
+/// Congruence key for the phi-web merges: two values with equal `Key`s
+/// compute the same thing. `V` is an opaque leaf (param or non-pure
+/// result — identity only), `K` a materializable `iconst`, `A` an
+/// `iadd`/`isub`-const chain collapsed by `off` (`root + k`, k ≠ 0),
+/// `N` a pure inst node keyed on its operands' keys — so congruence is
+/// transitive through arbitrary depth, not the one-level `arg_shape`
+/// check `arghoist` makes. `extra` carries the discriminator fields
+/// (`icmp`'s cond, `stack_addr`'s slot) that opcode alone doesn't pin.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum Key {
+    V(Value),
+    K(cranelift_codegen::ir::Type, i64),
+    A(cranelift_codegen::ir::Type, Box<Key>, i64),
+    N(Opcode, cranelift_codegen::ir::Type, Box<[Key]>, u64),
+}
+
+/// `v`'s congruence key: aliases resolved, affine chains collapsed via
+/// `off`, pure ops keyed structurally on their operands' keys. Recursion
+/// bottoms out at params/`V` leaves — SSA def chains are finite.
+pub fn key_of(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value) -> Key {
+    fn go(func: &Function, nf: &FxHashMap<Value, (Value, i64)>, v: Value, d: usize) -> Key {
+        let v = func.dfg.resolve_aliases(v);
+        if d > 64 {
+            return Key::V(v);
+        }
+        if let Some(&(r, k)) = nf.get(&v) {
+            let rk = go(func, nf, r, d + 1);
+            let ty = func.dfg.value_type(v);
+            return if k == 0 {
+                rk
+            } else {
+                Key::A(ty, Box::new(rk), k)
+            };
+        }
+        let Some(di) = func.dfg.value_def(v).inst() else {
+            return Key::V(v);
+        };
+        let args = |vs: &[Value]| -> Box<[Key]> {
+            vs.iter()
+                .map(|&a| {
+                    let a = func.dfg.resolve_aliases(a);
+                    go(func, nf, a, d + 1)
+                })
+                .collect()
+        };
+        let rty = func.dfg.value_type(v);
+        match func.dfg.insts[di] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Key::K(rty, imm.bits()),
+            InstructionData::Binary { opcode, args: a }
+                if matches!(
+                    opcode,
+                    Opcode::Band
+                        | Opcode::Bor
+                        | Opcode::Bxor
+                        | Opcode::Iadd
+                        | Opcode::Isub
+                        | Opcode::Ishl
+                        | Opcode::Ushr
+                ) =>
+            {
+                Key::N(opcode, rty, args(&a), 0)
+            }
+            InstructionData::Unary { opcode, arg }
+                if matches!(
+                    opcode,
+                    Opcode::Bnot | Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce
+                ) =>
+            {
+                Key::N(opcode, rty, args(&[arg]), 0)
+            }
+            InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                args: a,
+                cond,
+            } => Key::N(Opcode::Icmp, rty, args(&a), cond as u64),
+            InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: a,
+            } => Key::N(Opcode::Select, rty, args(&a), 0),
+            InstructionData::StackAddr {
+                stack_slot,
+                offset,
+                ..
+            } => Key::N(
+                Opcode::StackAddr,
+                rty,
+                Box::new([Key::K(
+                    cranelift_codegen::ir::types::I32,
+                    i32::from(offset) as i64,
+                )]),
+                stack_slot.as_u32() as u64,
+            ),
+            _ => Key::V(v),
+        }
+    }
+    go(func, nf, v, 0)
+}
+
 ascent::ascent! {
     /// "Always carries `acc`" for one acc candidate — loopvec's `AccCx`
     /// is_acc as a stratified fixpoint: an interior param is `bad` when a
