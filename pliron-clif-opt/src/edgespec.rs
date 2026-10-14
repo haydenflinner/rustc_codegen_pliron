@@ -1460,18 +1460,6 @@ fn splices(func: &mut Function) -> usize {
         {
             continue;
         }
-        // Uses of values outside their def block: v -> blocks containing a
-        // use. Built lazily per candidate (the splice mutates them).
-        let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
-        for b in func.layout.blocks() {
-            for i in func.layout.block_insts(b) {
-                for v in func.dfg.inst_values(i) {
-                    uses.entry(func.dfg.resolve_aliases(v))
-                        .or_default()
-                        .insert(b);
-                }
-            }
-        }
         let rpjs: Vec<Value> = params
             .iter()
             .map(|&p| func.dfg.resolve_aliases(p))
@@ -1487,47 +1475,77 @@ fn splices(func: &mut Function) -> usize {
                     .collect::<Vec<_>>()
             }))
             .collect();
-        let all_edges = collect_edges(func);
-        // Edges into J and which successor each one decides (if any).
+        // Edges into J and which successor each one decides (if any). Taken
+        // from J's cfg preds — the function-wide edge list and use-map are
+        // O(function) and only needed past this point, so they build lazily
+        // below for the few candidates that get here.
         let mut decided: Vec<(Block, Inst, usize, Vec<BlockArg>, Block, Vec<BlockArg>)> =
             Vec::new();
-        for (p, pt, di, _, args) in all_edges.iter().filter(|e| e.3 == j) {
-            if *p == j || args.len() != params.len() {
+        for bpred in cfg.pred_iter(j) {
+            let (p, pt) = (bpred.block, bpred.inst);
+            if p == j {
                 continue;
             }
-            let mut env: FxHashMap<Value, E> = FxHashMap::default();
-            let sub: FxHashMap<Value, Value> = FxHashMap::default();
-            // Evaluate every arg before binding any param: an edge from
-            // inside a loop may pass J's own params, meaning their old values.
-            let es: Option<Vec<E>> = args
-                .iter()
-                .map(|a| match a {
-                    BlockArg::Value(a) => Some(eval(func, &mut env, &sub, *a, 0)),
-                    _ => None,
-                })
-                .collect();
-            let Some(es) = es else {
-                continue;
-            };
-            for (&rpj, e) in rpjs.iter().zip(es) {
-                env.insert(rpj, e);
+            for (di, bc) in func.dfg.insts[pt]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .enumerate()
+            {
+                if bc.block(&func.dfg.value_lists) != j {
+                    continue;
+                }
+                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                if args.len() != params.len() {
+                    continue;
+                }
+                let mut env: FxHashMap<Value, E> = FxHashMap::default();
+                let sub: FxHashMap<Value, Value> = FxHashMap::default();
+                // Evaluate every arg before binding any param: an edge from
+                // inside a loop may pass J's own params, meaning their old
+                // values.
+                let es: Option<Vec<E>> = args
+                    .iter()
+                    .map(|a| match a {
+                        BlockArg::Value(a) => Some(eval(func, &mut env, &sub, *a, 0)),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(es) = es else {
+                    continue;
+                };
+                for (&rpj, e) in rpjs.iter().zip(es) {
+                    env.insert(rpj, e);
+                }
+                let E::K(k) = eval(func, &mut env, &sub, c, 0) else {
+                    continue;
+                };
+                let bc = blocks[usize::from(k == 0)];
+                decided.push((
+                    p,
+                    pt,
+                    di,
+                    args,
+                    bc.block(&func.dfg.value_lists),
+                    bc.args(&func.dfg.value_lists).collect(),
+                ));
             }
-            let E::K(k) = eval(func, &mut env, &sub, c, 0) else {
-                continue;
-            };
-            let bc = blocks[usize::from(k == 0)];
-            decided.push((
-                *p,
-                *pt,
-                *di,
-                args.clone(),
-                bc.block(&func.dfg.value_lists),
-                bc.args(&func.dfg.value_lists).collect(),
-            ));
         }
         if decided.is_empty() {
             continue;
         }
+        // Uses of values outside their def block: v -> blocks containing a
+        // use. Rebuilt per candidate (the splice mutates them).
+        let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    uses.entry(func.dfg.resolve_aliases(v))
+                        .or_default()
+                        .insert(b);
+                }
+            }
+        }
+        let all_edges = collect_edges(func);
         // Successor set decided edges need.
         let sset: FxHashSet<Block> = decided.iter().map(|d| d.4).collect();
         let mut ok = !sset.contains(&j);
