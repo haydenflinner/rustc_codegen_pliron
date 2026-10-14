@@ -124,19 +124,19 @@ pub struct Pipe<'a> {
     pub isa: &'a dyn TargetIsa,
     pub fname: &'a str,
     pub func_id: FuncId,
-    pub nonnull: &'a FxHashSet<Value>,
+    pub nonnull: &'a mut FxHashSet<Value>,
     pub derived: &'a mut FxHashMap<Value, Value>,
-    pub frozen: &'a FxHashMap<Value, u64>,
-    pub noalias: &'a FxHashSet<Value>,
-    pub deref: &'a FxHashMap<Value, (u64, bool)>,
+    pub frozen: &'a mut FxHashMap<Value, u64>,
+    pub noalias: &'a mut FxHashSet<Value>,
+    pub deref: &'a mut FxHashMap<Value, (u64, bool)>,
     pub nowrite: &'a FxHashMap<FuncRef, bool>,
     pub call_frozen: &'a FxHashMap<FuncRef, u64>,
     pub scoped: &'a FxHashMap<Inst, Ptr<BasicBlock>>,
     pub invariant: &'a FxHashSet<Inst>,
-    pub operand_frozen: &'a FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    pub operand_frozen: &'a mut FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     pub block_region: &'a FxHashMap<Block, Ptr<BasicBlock>>,
     pub region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-    pub lifetimes: &'a [(Value, Option<Inst>, Block, bool)],
+    pub lifetimes: &'a mut Vec<(Value, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
     pub tcfg: TargetFrontendConfig,
     pub simd: bool,
@@ -1578,8 +1578,13 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 // carrier chains.
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     let chase = |mut v: Value| {
+        let mut n = pmap.len() + 1;
         while let Some(&w) = pmap.get(&v) {
             v = w;
+            n -= 1;
+            if n == 0 {
+                break;
+            }
         }
         v
     };
@@ -1590,9 +1595,41 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
             p.derived.insert(x, b);
         }
     }
+    // `pmap[d] = w` makes `w` `d`'s value on every path — the merge
+    // invariant — so `d`'s recorded facts hold of `w` too, whatever the
+    // merge kind (a phase-A carrier, a deduped sibling, or a
+    // materialized `f(siblings)` tree).
     for (&d, &w) in pmap {
+        let w = chase(w);
         if let Some(&b) = p.derived.get(&d) {
-            p.derived.insert(chase(w), b);
+            p.derived.insert(w, b);
+        }
+        if p.nonnull.contains(&d) {
+            p.nonnull.insert(w);
+            if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
+                eprintln!("carry nonnull {d} -> {w}");
+            }
+        }
+        if p.noalias.contains(&d) {
+            p.noalias.insert(w);
+            if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
+                eprintln!("carry noalias {d} -> {w}");
+            }
+        }
+        if let Some(&f) = p.frozen.get(&d) {
+            p.frozen.insert(w, f);
+        }
+        if let Some(&x) = p.deref.get(&d) {
+            p.deref.insert(w, x);
+        }
+        if let Some(v) = p.operand_frozen.get(&d) {
+            let v = v.clone();
+            p.operand_frozen.insert(w, v);
+        }
+        for lt in p.lifetimes.iter_mut() {
+            if lt.0 == d {
+                lt.0 = w;
+            }
         }
     }
 }
