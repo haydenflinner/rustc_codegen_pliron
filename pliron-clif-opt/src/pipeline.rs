@@ -792,12 +792,21 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
 // discriminant in the pred then folds to `brif` on the raw flag via
 // `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
 fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
+    let mut tt = |name: &str, t0: std::time::Instant| {
+        if prof2 {
+            eprintln!("    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    };
     let mut n = 0;
     if crate::pass_enabled("PLIRON_CHAINMERGE") {
+        let t0 = std::time::Instant::now();
         jumpthread::merge_chains(&mut p.clctx.func);
+        tt("chains", t0);
     }
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
     if crate::pass_enabled("PLIRON_DISPATCHDUP") {
+        let t0 = std::time::Instant::now();
         // Duplicating a dispatch into a jump pred rewires that pred's own
         // jump-preds onto the dispatch — run to fixpoint so multi-hop
         // chains (851/853/854 -> 388 -> 859) fully collapse.
@@ -816,14 +825,20 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
             }
             cd = None;
         }
+        tt("dup1", t0);
     }
     if crate::pass_enabled("PLIRON_EDGESPEC2") {
         cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
+            let t0 = std::time::Instant::now();
             n += jumpthread::rebind_exports(&mut p.clctx.func);
+            tt("rebind", t0);
         }
+        let t0 = std::time::Instant::now();
         n += edgespec::run(&mut p.clctx.func);
+        tt("espec", t0);
         if crate::pass_enabled("PLIRON_DISPATCHDUP") {
+            let t0 = std::time::Instant::now();
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
                 let k = {
@@ -840,13 +855,18 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 }
                 cd = None;
             }
+            tt("dup2", t0);
         }
     }
+    let t0 = std::time::Instant::now();
     let k = clifpeep::brif_fold(&mut p.clctx.func);
+    tt("brifold", t0);
     n += k;
     if n > 0 {
+        let t0 = std::time::Instant::now();
         jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
         edgespec::sweep_dead(&mut p.clctx.func);
+        tt("sweep", t0);
     }
     if p.dump {
         p.dump("mergechain");

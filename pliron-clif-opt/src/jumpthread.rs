@@ -2355,11 +2355,20 @@ pub fn merge_chains(func: &mut Function) {
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
 pub fn rebind_exports(func: &mut Function) -> usize {
+    let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
+    let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     // Resolved use index — one O(fn) scan shared by every (y, s) cone
     // walk instead of re-walking `inst_values` per use.
     let uses = crate::uses::Uses::new(func);
+    if prof2 {
+        eprintln!(
+            "    rebind setup {:.3}ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t0 = std::time::Instant::now();
     let mut edits = Vec::new();
     for y in func.layout.blocks().collect::<Vec<_>>() {
         // Params then inst results — deterministic order.
@@ -2447,8 +2456,19 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             edits.push((y, term, s, needed, insts));
         }
     }
+    if prof2 {
+        eprintln!(
+            "    rebind scan {:.3}ms (edits={})",
+            t0.elapsed().as_secs_f64() * 1e3,
+            edits.len()
+        );
+    }
+    let t0 = std::time::Instant::now();
     let n = edits.len();
-    for (y, term, s, needed, insts) in edits {
+    // Edge args grouped by term — a giant dispatch has an edit per arm,
+    // and a full destination rescan per edit is O(arms²).
+    let mut appends: FxHashMap<Inst, Vec<(Block, Vec<Value>)>> = FxHashMap::default();
+    for (_y, term, s, needed, insts) in edits {
         let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
         for &w in &needed {
             let ty = func.dfg.value_type(w);
@@ -2473,16 +2493,25 @@ pub fn rebind_exports(func: &mut Function) -> usize {
                     .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
             }
         }
+        appends.entry(term).or_default().push((s, needed));
+    }
+    for (term, ss) in appends {
+        // Per-call arg order is `ss`'s edit order for this block — each
+        // successor appears once, so a lookup keeps it O(1) per call.
+        let map: FxHashMap<Block, Vec<Value>> = ss.into_iter().collect();
         let dfg = &mut func.dfg;
         for bc in
             dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
         {
-            if bc.block(&dfg.value_lists) == s {
-                for &w in &needed {
+            if let Some(needed) = map.get(&bc.block(&dfg.value_lists)) {
+                for &w in needed {
                     bc.append_argument(w, &mut dfg.value_lists);
                 }
             }
         }
+    }
+    if prof2 {
+        eprintln!("    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
     }
     n
 }
