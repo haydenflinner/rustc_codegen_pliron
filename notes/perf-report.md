@@ -63,9 +63,19 @@ harms, both fixed:
 | typical   | ~190 |   ~420 | ~2.2x |
 
 Pass-level breakdown (`PLIRON_TIMING`, hashmap CGU): the pliron CLIF
-pipeline is ~290ms of the ~950ms total; cranelift+emit itself is ~30ms.
-Top steps: `slp` 75ms (was 100ms — lazy use-map below), `jumpthread`
-70ms, `mergechain` 31ms, `edgespec` 17ms. Everything else ≤ 12ms.
+pipeline is ~250ms of the total; cranelift+emit itself is ~30ms.
+Top steps: `jumpthread` ~60ms, `mergechain` ~30ms, `slp` ~21ms,
+`edgespec` ~18ms. Everything else ≤ 12ms.
+
+Update (post-`4987364`/`dd77ec0`/`52dca45`): the `webmerge`/`sameargs`
+family briefly dominated at ~570ms × 7 call sites when `key_of`
+inlined SipHash rounds into ~370K-node keys and every phase paid
+O(nodes) per (edge, slot) cell. Local fix attempt (cap oversized keys,
+`Rc`-shared `key_eq`, lazy phase-C sigs) measured 4.4s→375ms, but
+upstream's deeper rewrite — lazy value-level key hashing, `skeys` as a
+`OnceCell` matrix, subsumed passes retired — lands at ~250ms with the
+redundant pipeline positions gone, so the local patch was dropped in
+favor of theirs.
 
 ## Code size (.text bytes)
 
