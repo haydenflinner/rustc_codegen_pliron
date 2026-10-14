@@ -25,12 +25,19 @@
 //! overwritten stores drop out). `PLIRON_XPACK=0` disables this half.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
     ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+
+/// `v.index() -> insts that use v` (alias-resolved at build). Dense: the
+/// map is rebuilt after every xpack apply, so per-value hashing/set
+/// allocation dominated pass time as a `FxHashMap<Value, FxHashSet>`.
+type Uses = Vec<SmallVec<[Inst; 4]>>;
 
 /// Max recursion depth when packing operand trees.
 const MAX_DEPTH: usize = 6;
@@ -132,7 +139,7 @@ struct Ctx<'a> {
     /// Earliest position among all packed loads (writer-span check).
     min_load: usize,
     /// Whole-function uses: `v -> set of using insts`.
-    uses: &'a FxHashMap<Value, FxHashSet<Inst>>,
+    uses: &'a Uses,
     /// Members of the current store group (allowed inside the store span).
     members: FxHashSet<Inst>,
 }
@@ -430,12 +437,12 @@ struct StoreInfo {
 /// map. Newly emitted pack insts are *not* added — an unrecorded use can
 /// only keep a scalar lane def alive longer than needed, never corrupt
 /// the plan (lane defs stay unless `remove_dead_insts` proves them dead).
-fn build_uses(func: &Function) -> FxHashMap<Value, FxHashSet<Inst>> {
-    let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
+fn build_uses(func: &Function) -> Uses {
+    let mut uses: Uses = vec![SmallVec::new(); func.dfg.num_values()];
     for b2 in func.layout.blocks() {
         for i in func.layout.block_insts(b2) {
             for v in func.dfg.inst_values(i) {
-                uses.entry(func.dfg.resolve_aliases(v)).or_default().insert(i);
+                uses[func.dfg.resolve_aliases(v).index()].push(i);
             }
         }
     }
@@ -445,7 +452,7 @@ fn build_uses(func: &Function) -> FxHashMap<Value, FxHashSet<Inst>> {
 fn try_block(
     func: &mut Function,
     domtree: &DominatorTree,
-    uses: &mut Option<FxHashMap<Value, FxHashSet<Inst>>>,
+    uses: &mut Option<Uses>,
     _na: &FxHashSet<Value>,
     block: Block,
 ) -> usize {
@@ -550,9 +557,9 @@ fn try_block(
                             for v in cur.func.dfg.inst_values(s.inst) {
                                 let v = cur.func.dfg.resolve_aliases(v);
                                 if let Some(us) =
-                                    uses.as_mut().unwrap().get_mut(&v)
+                                    uses.as_mut().unwrap().get_mut(v.index())
                                 {
-                                    us.remove(&s.inst);
+                                    us.retain(|u| *u != s.inst);
                                 }
                             }
                             cur.func.layout.remove_inst(s.inst);
@@ -589,7 +596,7 @@ impl Ctx<'_> {
         for &v in &vals {
             if !self
                 .uses
-                .get(&v)
+                .get(v.index())
                 .is_some_and(|us| us.iter().all(|u| self.members.contains(u)))
             {
                 return None;
@@ -629,7 +636,7 @@ pub fn run(
     // Built lazily on the first candidate run: most functions have no
     // adjacent-store group at all, so map construction — the pass's
     // dominant cost — is skipped entirely there.
-    let mut uses: Option<FxHashMap<Value, FxHashSet<Inst>>> = None;
+    let mut uses: Option<Uses> = None;
     let (_, domtree) = an.cfg_dt(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
@@ -643,8 +650,12 @@ pub fn run(
         uses = None;
     }
     if crate::pass_enabled("PLIRON_XPACK") {
+        // `param_src` walks the whole function (CFG + param alias
+        // facts); xpack's applies never touch block params, so one
+        // map serves every block.
+        let ps = crate::loadfwd::param_src(func);
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            changed += xpack_block(func, &domtree, na, block, &mut uses);
+            changed += xpack_block(func, &domtree, na, block, &mut uses, &ps);
         }
     }
     if changed > 0 {
@@ -1199,7 +1210,7 @@ fn plan_pair(
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
     domtree: &DominatorTree,
-    uses: &FxHashMap<Value, FxHashSet<Inst>>,
+    uses: &Uses,
     insts: &[Inst],
     pos: &FxHashMap<Inst, usize>,
     block: Block,
@@ -1286,7 +1297,7 @@ fn finish_plan(
     x: &mut X<'_>,
     mut root: Pack,
     vt: Type,
-    uses: &FxHashMap<Value, FxHashSet<Inst>>,
+    uses: &Uses,
     tag: (Inst, Inst),
 ) -> Option<(
     Pack,
@@ -1455,7 +1466,7 @@ fn finish_plan(
             }
             let v = func.dfg.inst_results(l)[0];
             let mut need = false;
-            if let Some(us) = uses.get(&ra_fix(func, v)) {
+            if let Some(us) = uses.get(ra_fix(func, v).index()) {
                 for &u in us {
                     if x.members.contains(&u) {
                         continue;
@@ -1491,7 +1502,7 @@ fn finish_plan(
                 sink.push(u);
                 for &ru in func.dfg.inst_results(u) {
                     let ru = ra_fix(func, ru);
-                    if let Some(us) = uses.get(&ru) {
+                    if let Some(us) = uses.get(ru.index()) {
                         for &u2 in us {
                             if !x.members.contains(&u2) && !ext_ok(&x, u2) {
                                 work.push(u2);
@@ -1579,7 +1590,7 @@ fn plan_store(
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
     domtree: &DominatorTree,
-    uses: &FxHashMap<Value, FxHashSet<Inst>>,
+    uses: &Uses,
     insts: &[Inst],
     pos: &FxHashMap<Inst, usize>,
     block: Block,
@@ -1771,13 +1782,22 @@ fn xpack_block(
     domtree: &DominatorTree,
     na: &FxHashSet<Value>,
     block: Block,
-    uses: &mut Option<FxHashMap<Value, FxHashSet<Inst>>>,
+    uses: &mut Option<Uses>,
+    ps: &FxHashMap<Value, Value>,
 ) -> usize {
-    let ps = crate::loadfwd::param_src(func);
     let mut total = 0;
     let mut tried = 0usize;
     let mut taken: FxHashSet<Inst> = FxHashSet::default();
+    // Pairs whose plan failed, → span at failure (current-frame
+    // positions, refreshed each iteration so apply-time edits compare
+    // in the same frame). A rescan after each apply only ever finds new
+    // packs where the apply moved insts, so a failed pair is retried
+    // only when the apply edited inside its span, moved an endpoint, or
+    // changed an operand/result's uses — checked in `failed.retain`
+    // below. Cached failures don't consume a candidate slot.
+    let mut failed: FxHashMap<(Inst, Inst), (usize, usize)> = FxHashMap::default();
     let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
+    let nocache = crate::env_set("PLIRON_XPACK_NOCACHE");
     loop {
         let insts: Vec<Inst> = func.layout.block_insts(block).collect();
         // Seed check: xpack pairs need ≥2 stores or ≥2 same-opcode
@@ -1806,6 +1826,17 @@ fn xpack_block(
         // The map is function-wide and shared across blocks; an apply
         // mutates the IR, so it's rebuilt on the next loop iteration.
         let us = &*uses.get_or_insert_with(|| build_uses(func));
+        if !failed.is_empty() {
+            failed.retain(|&(x, y), span| {
+                match (pos.get(&x), pos.get(&y)) {
+                    (Some(&a), Some(&b)) => {
+                        *span = (a.min(b), a.max(b));
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        }
         if crate::env_set("PLIRON_XPACK_DEBUG") && total > 0 {
             for (p, &i) in insts.iter().enumerate() {
                 let d = &func.dfg.insts[i];
@@ -1829,8 +1860,8 @@ fn xpack_block(
                 );
             }
         }
-        let mut applied = false;
-        for (p, &ia) in insts.iter().enumerate() {
+        let mut applied = None;
+        'scan: for (p, &ia) in insts.iter().enumerate() {
             if taken.contains(&ia) {
                 continue;
             }
@@ -1847,97 +1878,161 @@ fn xpack_block(
                 if taken.contains(&ib) || func.dfg.insts[ib].opcode() != op {
                     continue;
                 }
-                if is_store {
-                    cands += 1;
-                    tried += 1;
-                    if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan_store(
-                        func, &ps, na, domtree, us, &insts, &pos, block, &taken, ia, ib,
-                    ) {
-                        let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
-                        let n = apply_pair(
-                            func,
-                            &insts,
-                            pos[&ib].max(pos[&ia]),
-                            &root,
-                            vt,
-                            &kept,
-                            n_rows,
-                            &sink,
-                            &dead,
-                            &extracts,
-                            &keep,
-                        );
-                        total += n;
-                        if dbg {
-                            eprintln!(
-                                "xpack APPLY Store {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
-                                kept.len()
-                            );
-                        }
-                        for &(_, (la, lb)) in &kept {
-                            taken.insert(la);
-                            taken.insert(lb);
-                        }
-                        applied = true;
-                        break;
-                    }
-                    continue;
-                }
                 cands += 1;
-                tried += 1;
+                let mut try_plan = |a: Inst, b: Inst| {
+                    // Store-pair plans resolve memory footprints through
+                    // upstream address chains that eviction can't cheaply
+                    // track, and they're rare — always re-plan them.
+                    if !is_store && !nocache && failed.contains_key(&(a, b)) {
+                        return None;
+                    }
+                    tried += 1;
+                    let plan = if is_store {
+                        plan_store(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b)
+                    } else {
+                        plan_pair(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b)
+                    };
+                    if plan.is_none() && !is_store {
+                        if let (Some(&a1), Some(&b1)) = (pos.get(&a), pos.get(&b)) {
+                            failed.insert((a, b), (a1.min(b1), a1.max(b1)));
+                        }
+                    }
+                    plan
+                };
                 // Both lane orders: swapping lanes changes column order,
                 // which decides whether adjacent loads merge.
-                let plan = plan_pair(
-                    func, &ps, na, domtree, us, &insts, &pos, block, &taken, ia, ib,
-                )
-                .or_else(|| {
-                    tried += 1;
-                    plan_pair(
-                        func, &ps, na, domtree, us, &insts, &pos, block, &taken, ib, ia,
-                    )
-                });
+                let plan = try_plan(ia, ib).or_else(|| try_plan(ib, ia));
                 if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
-                    let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
-                    let n = apply_pair(
-                        func,
-                        &insts,
-                        pos[&ib].max(pos[&ia]),
-                        &root,
-                        vt,
-                        &kept,
-                        n_rows,
-                        &sink,
-                        &dead,
-                        &extracts,
-                        &keep,
-                    );
-                    total += n;
-                    if dbg {
-                        eprintln!(
-                            "xpack APPLY {:?} {ia:?}/{ib:?}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
-                            func.dfg.insts[ia].opcode(),
-                            kept.len()
-                        );
-                    }
-                    for &(_, (la, lb)) in &kept {
-                        taken.insert(la);
-                        taken.insert(lb);
-                    }
-                    applied = true;
-                    break;
+                    let emit_at = pos[&ib].max(pos[&ia]);
+                    applied = Some((emit_at, root, vt, kept, sink, dead, extracts, keep));
+                    break 'scan;
                 }
             }
-            if applied {
-                break;
-            }
         }
-        if !applied {
+        let Some((emit_at, root, vt, kept, sink, dead, extracts, keep)) = applied else {
             if dbg && (tried > 0 || total > 0) {
                 eprintln!("xpack block{block:?}: {total} rows packed, {tried} plans tried");
             }
             return total;
+        };
+        // Apply, tracking every edit in `pos` coordinates so cached
+        // failures that could now succeed get evicted below.
+        let mut changed_pos: Vec<usize> = vec![emit_at];
+        let mut changed_insts: FxHashSet<Inst> = FxHashSet::default();
+        let mut changed_vals: FxHashSet<Value> = FxHashSet::default();
+        for &(_, (la, lb)) in &kept {
+            for l in [la, lb] {
+                changed_insts.insert(l);
+                if !keep.contains(&l) {
+                    for &v in func.dfg.inst_args(l) {
+                        changed_vals.insert(func.dfg.resolve_aliases(v));
+                    }
+                }
+            }
+            taken.insert(la);
+            taken.insert(lb);
+        }
+        for &u in sink.iter().chain(dead.iter()) {
+            changed_insts.insert(u);
+            if let Some(&d) = pos.get(&u) {
+                changed_pos.push(d);
+            }
+            for &v in func.dfg.inst_args(u) {
+                changed_vals.insert(func.dfg.resolve_aliases(v));
+            }
+        }
+        for &(v, _, _) in &extracts {
+            changed_vals.insert(v);
+        }
+        pack_vals(&root, func, &mut changed_vals);
+        let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
+        let n = apply_pair(
+            func, &insts, emit_at, &root, vt, &kept, n_rows, &sink, &dead, &extracts, &keep,
+        );
+        // Operands that resolved through an extracted value now resolve
+        // to the fresh extractlane result — record the post-apply
+        // targets so alias-chain users get evicted.
+        for &(v, _, _) in &extracts {
+            changed_vals.insert(func.dfg.resolve_aliases(v));
+        }
+        total += n;
+        if dbg {
+            eprintln!(
+                "xpack APPLY @{emit_at}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
+                kept.len()
+            );
+        }
+        // Evict failed pairs whose span the apply edited (inst moved or
+        // deleted inside, or emit landed inside), whose endpoint moved,
+        // or whose operands/results had uses or aliases change. `affected`
+        // = values transitively feeding a changed inst: plans consult
+        // use-sets along the whole consumer chain, so a lane result is
+        // stale whenever any downstream user moved, died, or re-aliased.
+        if !failed.is_empty() {
+            changed_pos.sort_unstable();
+            changed_pos.dedup();
+            let mut affected: FxHashSet<Value> = FxHashSet::default();
+            let mut stack: Vec<Value> = changed_vals.iter().copied().collect();
+            while let Some(v) = stack.pop() {
+                if !affected.insert(v) {
+                    continue;
+                }
+                if let ValueDef::Result(i, _) = func.dfg.value_def(v) {
+                    for &a in func.dfg.inst_args(i) {
+                        stack.push(func.dfg.resolve_aliases(a));
+                    }
+                }
+            }
+            let hit = |i: Inst| {
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .any(|&v| affected.contains(&func.dfg.resolve_aliases(v)))
+                    || func
+                        .dfg
+                        .inst_results(i)
+                        .iter()
+                        .any(|v| affected.contains(v))
+            };
+            failed.retain(|&(x, y), &mut (a, b)| {
+                if changed_insts.contains(&x) || changed_insts.contains(&y) {
+                    return false;
+                }
+                let i = changed_pos.partition_point(|&d| d <= a);
+                if i < changed_pos.len() && changed_pos[i] < b {
+                    return false;
+                }
+                !(hit(x) || hit(y))
+            });
         }
         // apply_pair moved/added insts — the shared map is stale.
         *uses = None;
+    }
+}
+
+/// All scalar values a pack's emitted insts will read.
+fn pack_vals(p: &Pack, func: &Function, out: &mut FxHashSet<Value>) {
+    match p {
+        Pack::Splat(v) | Pack::Vec(v) => {
+            out.insert(func.dfg.resolve_aliases(*v));
+        }
+        Pack::Load { base, .. } => {
+            out.insert(func.dfg.resolve_aliases(*base));
+        }
+        Pack::Op { args, .. } => {
+            for a in args {
+                pack_vals(a, func, out);
+            }
+        }
+        Pack::Gather(vs) => {
+            for &v in vs {
+                out.insert(func.dfg.resolve_aliases(v));
+            }
+        }
+        Pack::Dup(_) => {}
+        Pack::Store2 { data, base, .. } => {
+            pack_vals(data, func, out);
+            out.insert(func.dfg.resolve_aliases(*base));
+        }
     }
 }
