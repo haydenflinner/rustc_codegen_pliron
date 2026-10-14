@@ -496,6 +496,287 @@ pub fn key_of(
     go(func, nf, canon, memo, v, 0)
 }
 
+/// `v`'s structural hash — exactly `khash_m(key_of(v))` would produce,
+/// computed without materializing the `Key`: same alias/canon/nf
+/// normalization, same tag packing, same `K` immediates. Callers use it
+/// to gate *whether* a slot's keys are worth building at all — the
+/// uniform-arg check and the size caps answer from hashes and capped
+/// value-walks instead of building 10⁵-node trees that never merge.
+/// Because it is by-construction the `khash_m` of the key, `hmap`
+/// probes inside `paramize` stay consistent.
+pub fn vhash(
+    func: &Function,
+    nf: &FxHashMap<Value, (Value, i64)>,
+    canon: &FxHashMap<Value, Value>,
+    memo: &mut FxHashMap<Value, u64>,
+    v: Value,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn hv(v: Value) -> u64 {
+        // khash_m's leaf arm: discriminant + fields.
+        let mut h = rustc_hash::FxHasher::default();
+        std::mem::discriminant(&Key::V(v)).hash(&mut h);
+        v.hash(&mut h);
+        h.finish()
+    }
+    fn hk(t: cranelift_codegen::ir::Type, i: i64) -> u64 {
+        let mut h = rustc_hash::FxHasher::default();
+        std::mem::discriminant(&Key::K(t, i)).hash(&mut h);
+        t.hash(&mut h);
+        i.hash(&mut h);
+        h.finish()
+    }
+    fn go(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, u64>,
+        v: Value,
+        d: usize,
+    ) -> u64 {
+        let v = func.dfg.resolve_aliases(v);
+        let v = canon.get(&v).copied().unwrap_or(v);
+        if d > 64 {
+            return hv(v);
+        }
+        if let Some(&h) = memo.get(&v) {
+            return h;
+        }
+        let h = go_uncached(func, nf, canon, memo, v, d);
+        memo.insert(v, h);
+        h
+    }
+    fn go_uncached(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, u64>,
+        v: Value,
+        d: usize,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        if let Some(&(r, k)) = nf.get(&v)
+            && r != v
+        {
+            let rh = go(func, nf, canon, memo, r, d + 1);
+            let ty = func.dfg.value_type(v);
+            if k == 0 {
+                return rh;
+            }
+            // Key::A arm
+            0u8.hash(&mut h);
+            ty.hash(&mut h);
+            rh.hash(&mut h);
+            k.hash(&mut h);
+            return h.finish();
+        }
+        let Some(di) = func.dfg.value_def(v).inst() else {
+            return hv(v);
+        };
+        let rty = func.dfg.value_type(v);
+        let op = func.dfg.insts[di].opcode();
+        let pure_load = match func.dfg.insts[di] {
+            InstructionData::Load { flags, .. }
+            | InstructionData::LoadNoOffset { flags, .. } => {
+                let f = func.dfg.mem_flags[flags];
+                f.readonly() && f.notrap() && f.can_move()
+            }
+            _ => false,
+        };
+        if func.dfg.inst_results(di).len() != 1
+            || !(pure_load
+                || (!op.can_load()
+                    && !(op.is_call()
+                        || op.is_branch()
+                        || op.is_terminator()
+                        || op.is_return()
+                        || op.can_trap()
+                        || op.other_side_effects()
+                        || op.can_store())))
+        {
+            return hv(v);
+        }
+        // Key::N arm: 1u8 + op + ty + args + extra — args are value
+        // hashes followed by `K` immediates (each carrying its key type).
+        let mut n = |extra: u64, vals: &[Value], imms: &[(cranelift_codegen::ir::Type, i64)]| {
+            1u8.hash(&mut h);
+            op.hash(&mut h);
+            rty.hash(&mut h);
+            for &a in vals {
+                let a = func.dfg.resolve_aliases(a);
+                go(func, nf, canon, memo, a, d + 1).hash(&mut h);
+            }
+            for &(t, i) in imms {
+                hk(t, i).hash(&mut h);
+            }
+            extra.hash(&mut h);
+            h.finish()
+        };
+        let i64t = cranelift_codegen::ir::types::I64;
+        let i32t = cranelift_codegen::ir::types::I32;
+        match func.dfg.insts[di] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => hk(rty, imm.bits()),
+            InstructionData::Binary { args: a, .. } => n(tag::BIN, &a, &[]),
+            InstructionData::Unary { arg, .. } => n(tag::UNARY, &[arg], &[]),
+            InstructionData::Ternary { args: a, .. } => n(tag::TERN, &a, &[]),
+            InstructionData::BinaryImm8 { arg, imm, .. } => {
+                n(tag::BIMM8 | (imm as u64) << 8, &[arg], &[])
+            }
+            InstructionData::IntCompare { args: a, cond, .. } => {
+                n(tag::ICMP | (cond as u64) << 8, &a, &[])
+            }
+            InstructionData::FloatCompare { args: a, cond, .. } => {
+                n(tag::FCMP | (cond as u64) << 8, &a, &[])
+            }
+            InstructionData::StackAddr {
+                stack_slot, offset, ..
+            } => n(
+                tag::SADDR | (stack_slot.as_u32() as u64) << 8,
+                &[],
+                &[(i32t, i32::from(offset) as i64)],
+            ),
+            InstructionData::Load {
+                arg, flags, offset, ..
+            } => n(
+                tag::LOAD | (flags.as_u32() as u64) << 8,
+                &[arg],
+                &[(i32t, i32::from(offset) as i64)],
+            ),
+            InstructionData::LoadNoOffset { arg, flags, .. } => {
+                n(tag::LOADNOFF | (flags.as_u32() as u64) << 8, &[arg], &[])
+            }
+            InstructionData::UnaryIeee16 { imm, .. } => {
+                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+            }
+            InstructionData::UnaryIeee32 { imm, .. } => {
+                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+            }
+            InstructionData::UnaryIeee64 { imm, .. } => {
+                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+            }
+            _ => hv(v),
+        }
+    }
+    go(func, nf, canon, memo, v, 0)
+}
+
+/// `k`'s node count were it built — `nodes(key_of(v))` without the
+/// allocation. Same traversal as `vhash`: the `within` caps that gate
+/// relational probing must see the key's size, not the def-DAG's.
+pub fn vnodes(
+    func: &Function,
+    nf: &FxHashMap<Value, (Value, i64)>,
+    canon: &FxHashMap<Value, Value>,
+    memo: &mut FxHashMap<Value, usize>,
+    v: Value,
+) -> usize {
+    fn go(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, usize>,
+        v: Value,
+        d: usize,
+    ) -> usize {
+        let v = func.dfg.resolve_aliases(v);
+        let v = canon.get(&v).copied().unwrap_or(v);
+        if d > 64 {
+            return 1;
+        }
+        if let Some(&n) = memo.get(&v) {
+            return n;
+        }
+        let n = unc(func, nf, canon, memo, v, d);
+        memo.insert(v, n);
+        n
+    }
+    fn unc(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, usize>,
+        v: Value,
+        d: usize,
+    ) -> usize {
+        if let Some(&(r, k)) = nf.get(&v)
+            && r != v
+        {
+            let n = go(func, nf, canon, memo, r, d + 1);
+            return if k == 0 { n } else { n + 1 };
+        }
+        let Some(di) = func.dfg.value_def(v).inst() else {
+            return 1;
+        };
+        let op = func.dfg.insts[di].opcode();
+        let pure_load = match func.dfg.insts[di] {
+            InstructionData::Load { flags, .. }
+            | InstructionData::LoadNoOffset { flags, .. } => {
+                let f = func.dfg.mem_flags[flags];
+                f.readonly() && f.notrap() && f.can_move()
+            }
+            _ => false,
+        };
+        if func.dfg.inst_results(di).len() != 1
+            || !(pure_load
+                || (!op.can_load()
+                    && !(op.is_call()
+                        || op.is_branch()
+                        || op.is_terminator()
+                        || op.is_return()
+                        || op.can_trap()
+                        || op.other_side_effects()
+                        || op.can_store())))
+        {
+            return 1;
+        }
+        match func.dfg.insts[di] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                ..
+            } => 1,
+            InstructionData::Binary { args, .. }
+            | InstructionData::IntCompare { args, .. }
+            | InstructionData::FloatCompare { args, .. } => {
+                let a0 = func.dfg.resolve_aliases(args[0]);
+                let a1 = func.dfg.resolve_aliases(args[1]);
+                1 + go(func, nf, canon, memo, a0, d + 1)
+                    + go(func, nf, canon, memo, a1, d + 1)
+            }
+            InstructionData::Ternary { args, .. } => {
+                let a0 = func.dfg.resolve_aliases(args[0]);
+                let a1 = func.dfg.resolve_aliases(args[1]);
+                let a2 = func.dfg.resolve_aliases(args[2]);
+                1 + go(func, nf, canon, memo, a0, d + 1)
+                    + go(func, nf, canon, memo, a1, d + 1)
+                    + go(func, nf, canon, memo, a2, d + 1)
+            }
+            InstructionData::Unary { arg, .. } | InstructionData::BinaryImm8 { arg, .. } => {
+                let a = func.dfg.resolve_aliases(arg);
+                1 + go(func, nf, canon, memo, a, d + 1)
+            }
+            // `K` imm pseudo-args each count as a node.
+            InstructionData::StackAddr { .. }
+            | InstructionData::UnaryIeee16 { .. }
+            | InstructionData::UnaryIeee32 { .. }
+            | InstructionData::UnaryIeee64 { .. } => 2,
+            InstructionData::Load { arg, .. } => {
+                let a = func.dfg.resolve_aliases(arg);
+                2 + go(func, nf, canon, memo, a, d + 1)
+            }
+            InstructionData::LoadNoOffset { arg, .. } => {
+                let a = func.dfg.resolve_aliases(arg);
+                1 + go(func, nf, canon, memo, a, d + 1)
+            }
+            _ => 1,
+        }
+    }
+    go(func, nf, canon, memo, v, 0)
+}
+
 /// `Key::N`'s `extra` low byte — which `InstructionData` variant the
 /// node was. `emit_key` needs the exact variant to rebuild; fields that
 /// don't fit in args (cond codes, mem flags, lane indices) ride in the
@@ -526,9 +807,10 @@ pub mod tag {
 /// trivially equals itself). `kmap`/`vmap` are the O(1) lookup forms
 /// of `slots`/`ps` — the linear scans with deep `Key` equality this
 /// replaces were the pass's dominant cost on param-heavy blocks.
-pub fn paramize(
+pub fn paramize<'k>(
     k: &Key,
-    slots: &[Key],
+    nslots: usize,
+    slotk: &dyn Fn(usize) -> &'k Key,
     ps: &[Value],
     skip: usize,
     hmap: &FxHashMap<u64, u32>,
@@ -543,12 +825,14 @@ pub fn paramize(
     // (shared `Rc` subtrees hit the cache); a hash hit is verified
     // with `==` before rewriting, so stale entries from recycled
     // `Rc` addresses can only miss a match, never make a wrong one.
+    // `slotk` materializes sibling keys lazily — a hit is the only
+    // point they're needed.
     if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
         let mut i = i as usize;
-        if i == skip || slots[i] != *k {
+        if i == skip || slotk(i) != k {
             // The first-match slot is the one being keyed, or the hash
             // collided — rescan for another slot with an equal key.
-            match (0..slots.len()).find(|&j| j != skip && slots.get(j) == Some(k)) {
+            match (0..nslots).find(|&j| j != skip && slotk(j) == k) {
                 Some(j) => i = j,
                 None => i = usize::MAX,
             }
@@ -565,19 +849,29 @@ pub fn paramize(
     match k {
         Key::A(t, rk, off) => Key::A(
             *t,
-            std::rc::Rc::new(paramize(rk, slots, ps, skip, hmap, vmap, hmemo)),
+            std::rc::Rc::new(paramize(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)),
             *off,
         ),
         Key::N(op, t, args, extra) => Key::N(
             *op,
             *t,
             args.iter()
-                .map(|a| paramize(a, slots, ps, skip, hmap, vmap, hmemo))
+                .map(|a| paramize(a, nslots, slotk, ps, skip, hmap, vmap, hmemo))
                 .collect(),
             *extra,
         ),
         _ => k.clone(),
     }
+}
+
+/// Hash of an `O` pseudo-arg key — matches `khash_m(&Key::O(x))`, for
+/// callers building hash maps without materializing the key.
+pub fn ohash(x: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    std::mem::discriminant(&Key::O(x)).hash(&mut h);
+    x.hash(&mut h);
+    h.finish()
 }
 
 /// Memoized structural hash — `Rc`-shared subtrees hash once, so
@@ -665,6 +959,25 @@ pub fn nodes(k: &Key) -> usize {
         Key::N(_, _, args, _) => 1 + args.iter().map(nodes).sum::<usize>(),
         _ => 1,
     }
+}
+
+/// `nodes(k) <= cap`, but bails the moment the running count passes
+/// `cap` — callers gating on a size bound don't pay to count the rest
+/// of a huge key.
+pub fn within(k: &Key, cap: usize) -> bool {
+    fn go(k: &Key, left: &mut usize) -> bool {
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match k {
+            Key::A(_, b, _) => go(b, left),
+            Key::N(_, _, args, _) => args.iter().all(|a| go(a, left)),
+            _ => true,
+        }
+    }
+    let mut left = cap + 1;
+    go(k, &mut left)
 }
 
 /// The set of slot indices `k` references — `P` and `Q` leaves both

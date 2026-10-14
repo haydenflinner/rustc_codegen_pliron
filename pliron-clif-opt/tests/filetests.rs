@@ -22,8 +22,6 @@ type Pass = fn(&mut Function) -> usize;
 
 fn pass(name: &str) -> Pass {
     match name {
-        "affparm" => clifpeep::affparm,
-        "arghoist" => clifpeep::arghoist,
         "brif_fold" => clifpeep::brif_fold,
         "celim" => celim::run,
         "coldargs" => clifpeep::coldargs,
@@ -42,7 +40,6 @@ fn pass(name: &str) -> Pass {
         "memcall" => clifpeep::memcall,
         "ovkill" => clifpeep::ovkill,
         "paramsink" => paramsink::run,
-        "phimerge" => clifpeep::phimerge,
         "rangefold" => rangefold::run,
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => clifpeep::sameargs,

@@ -2415,26 +2415,6 @@ fn sameargs_round(func: &mut Function) -> usize {
     apply_param_drops(func, pmap, arg_drops, param_drops)
 }
 
-/// Structural key of a pure arg inst: two insts on different edges
-/// compute the same value iff opcode, resolved operands and the extra
-/// field (icmp's cond, iadd_imm's imm) all match.
-fn arg_shape(func: &Function, di: Inst) -> Option<(Opcode, Vec<Value>, u64)> {
-    let rv = |v: &Value| func.dfg.resolve_aliases(*v);
-    Some(match func.dfg.insts[di] {
-        InstructionData::Binary { opcode, args } => (opcode, args.iter().map(rv).collect(), 0),
-        InstructionData::Unary { opcode, arg } => (opcode, vec![rv(&arg)], 0),
-        InstructionData::IntCompare { opcode, args, cond } => {
-            (opcode, args.iter().map(rv).collect(), cond as u64)
-        }
-        InstructionData::Ternary { opcode, args }
-            if opcode == Opcode::Select =>
-        {
-            (opcode, args.iter().map(rv).collect(), 0)
-        }
-        _ => return None,
-    })
-}
-
 /// `v` usable at the top of `b`: defined in a block strictly dominating
 /// `b`. Excluding `b` itself also excludes self-edge operands bound by
 /// `b`'s params — `iadd p1, x` as a self-edge arg is next-iteration's
@@ -2451,148 +2431,6 @@ fn dominates_entry(
         ValueDef::Union(_, _) => None,
     };
     matches!(db, Some(db) if db != b && dom.block_dominates(db, b))
-}
-
-/// When every edge supplies `op(x, y)` for a param slot — jumpthread
-/// copies `iadd ptr, off` into each pred of a forwarding block — the
-/// param can be the op itself, computed once at the top of the target:
-/// the per-edge materialization and its regalloc copies disappear
-/// entirely (the `iadd v4215, v4300` cloned into seven tokenize preds).
-/// Dead arg insts left in preds get swept by `remove_dead_insts`.
-pub fn arghoist(func: &mut Function) -> usize {
-    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
-    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for (d, bc) in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .iter()
-                .enumerate()
-            {
-                edges
-                    .entry(bc.block(&func.dfg.value_lists))
-                    .or_default()
-                    .push((i, d));
-            }
-        }
-    }
-    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
-    let mut param_drops: Vec<Value> = vec![];
-    let mut inserts: Vec<(Block, Inst)> = vec![];
-    // Drop indices per edge — all of a block call's drops must apply
-    // together, descending: `bc.remove(1)` renumbers index 3 to 2, so
-    // per-param entries would chase slots that already moved.
-    let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
-    for (&b, es) in &edges {
-        let ps = func.dfg.block_params(b).to_vec();
-        if ps.is_empty() {
-            continue;
-        }
-        let arity_ok = es.iter().all(|&(i, d)| {
-            func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                .args(&func.dfg.value_lists)
-                .len()
-                == ps.len()
-        });
-        if !arity_ok {
-            continue;
-        }
-        for (ix, &p) in ps.iter().enumerate() {
-            if pmap.contains_key(&p) {
-                continue;
-            }
-            let mut shape = None;
-            let mut ok = true;
-            for &(i, d) in es {
-                let a = func.dfg.insts[i]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                    .args(&func.dfg.value_lists)
-                    .nth(ix);
-                let Some(BlockArg::Value(v)) = a else {
-                    ok = false;
-                    break;
-                };
-                let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
-                    ok = false;
-                    break;
-                };
-                let Some(s) = arg_shape(func, di) else {
-                    ok = false;
-                    break;
-                };
-                if !crate::jumpthread::pure_op(func, di) {
-                    ok = false;
-                    break;
-                }
-                match shape {
-                    None => shape = Some(s),
-                    Some(ref t) if *t != s => {
-                        ok = false;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            let Some((_, ops, _)) = shape.filter(|_| ok) else {
-                continue;
-            };
-            if !ops
-                .iter()
-                .all(|&o| dominates_entry(func, &dom, o, b))
-            {
-                continue;
-            }
-            // Clone the first edge's arg inst into `b`'s head — its
-            // operands dominate, so placement is legal and identical on
-            // every entry.
-            let di = es
-                .iter()
-                .find_map(|&(i, d)| {
-                    match func.dfg.insts[i]
-                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                        .args(&func.dfg.value_lists)
-                        .nth(ix)
-                    {
-                        Some(BlockArg::Value(v)) => {
-                            func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
-                        }
-                        _ => None,
-                    }
-                })
-                .unwrap();
-            let data = func.dfg.insts[di];
-            let ty = func.dfg.value_type(func.dfg.first_result(di));
-            let ni = func.dfg.make_inst(data);
-            func.dfg.make_inst_results(ni, ty);
-            inserts.push((b, ni));
-            pmap.insert(p, func.dfg.first_result(ni));
-            param_drops.push(p);
-            for &(i, d) in es {
-                drop_ixs.entry((i, d)).or_default().push(ix);
-            }
-        }
-    }
-    if param_drops.is_empty() {
-        return 0;
-    }
-    let arg_drops: Vec<(Inst, usize, Vec<usize>)> = drop_ixs
-        .into_iter()
-        .map(|((i, d), mut ixs)| {
-            ixs.sort_unstable_by(|a, b| b.cmp(a));
-            (i, d, ixs)
-        })
-        .collect();
-    for (b, ni) in inserts {
-        match func.layout.first_inst(b) {
-            Some(fi) => func.layout.insert_inst(ni, fi),
-            None => func.layout.append_inst(ni, b),
-        }
-    }
-    let n = param_drops.len();
-    apply_param_drops(func, pmap, arg_drops, param_drops);
-    n
 }
 
 /// Phi merge through shared-successor congruence — the phi-web merge.
@@ -2627,7 +2465,11 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         );
     }
     // Keys memoize across args — shared operand trees key once.
-    let mut memo: FxHashMap<Value, crate::proots::Key> = FxHashMap::default();
+    // `RefCell` because `skey_of`/`pk_of` materialize lazily from inside
+    // immutable borrows of the cell matrices.
+    let memo = std::cell::RefCell::new(FxHashMap::<Value, crate::proots::Key>::default());
+    let mut vhmemo: FxHashMap<Value, u64> = FxHashMap::default();
+    let vnmemo = std::cell::RefCell::new(FxHashMap::<Value, usize>::default());
     let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -2658,17 +2500,19 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             continue;
         }
         // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
-        // `skeys[e][ix]` for congruence keys — pseudo-args (`TryCallRet`/
-        // `TryCallExn`) are `None` in `eargs` but key as `O`, so two
-        // slots fed the same pseudo-arg dedup via `P` while the feeding
-        // inst in the key keeps distinct `try_call`s distinct.
+        // `svh[e][ix]` for their structural hash — pseudo-args
+        // (`TryCallRet`/`TryCallExn`) are `None` in `eargs` but key as
+        // `O`, so two slots fed the same pseudo-arg dedup via `P` while
+        // the feeding inst in the key keeps distinct `try_call`s
+        // distinct. Congruence keys themselves stay *lazy* — `skey_of`
+        // materializes on demand: hashing the def-DAG directly via
+        // `vhash` skips building ~10⁵-node `Key` trees for slots that
+        // never merge (unrolled hash kernels reach ~877k nodes).
         let tkeys = std::time::Instant::now();
         let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
-        let mut skeys: Vec<Vec<Key>> = Vec::with_capacity(es.len());
-        // `shk[e][ix]` — the key's hash, computed once next to the key
-        // itself so phase A's `O(slots × edges)` compares only pay a
-        // structural walk when hashes actually agree.
-        let mut shk: Vec<Vec<u64>> = Vec::with_capacity(es.len());
+        let mut svh: Vec<Vec<u64>> = Vec::with_capacity(es.len());
+        // O-payload per pseudo-arg cell for `skey_of` to reconstruct.
+        let mut okey: Vec<Vec<Option<u64>>> = Vec::with_capacity(es.len());
         let mut arity_ok = true;
         for &(i, d) in es {
             let args: Vec<BlockArg> = func.dfg.insts[i]
@@ -2684,39 +2528,56 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v)))
                     .collect(),
             );
-            let row: Vec<Key> = args
-                .iter()
-                .map(|a| match a {
-                    BlockArg::Value(v) => crate::proots::key_of(
-                        func,
-                        &nf,
-                        &canon,
-                        &mut memo,
-                        func.dfg.resolve_aliases(*v),
-                    ),
-                    // `(inst, tag, payload)` — same `BlockCall` arg
-                    // is the same value, anything else differs.
-                    BlockArg::TryCallRet(x) => {
-                        Key::O((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                    }
-                    BlockArg::TryCallExn(x) => {
-                        Key::O((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                    }
-                })
-                .collect();
-            shk.push(
-                row.iter()
-                    .map(|k| {
-                        let mut h = rustc_hash::FxHasher::default();
-                        std::hash::Hash::hash(k, &mut h);
-                        std::hash::Hasher::finish(&h)
+            // `(inst, tag, payload)` — same `BlockCall` arg is the same
+            // value, anything else differs.
+            svh.push(
+                args.iter()
+                    .map(|a| match a {
+                        BlockArg::Value(v) => crate::proots::vhash(
+                            func,
+                            &nf,
+                            &canon,
+                            &mut vhmemo,
+                            func.dfg.resolve_aliases(*v),
+                        ),
+                        BlockArg::TryCallRet(x) => {
+                            crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                        }
+                        BlockArg::TryCallExn(x) => {
+                            crate::proots::ohash((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                        }
                     })
                     .collect(),
             );
-            skeys.push(row);
+            okey.push(
+                args.iter()
+                    .map(|a| match a {
+                        BlockArg::Value(_) => None,
+                        BlockArg::TryCallRet(x) => {
+                            Some((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                        }
+                        BlockArg::TryCallExn(x) => {
+                            Some((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                        }
+                    })
+                    .collect(),
+            );
         }
         if !arity_ok {
             continue;
+        }
+        if std::env::var_os("PLIRON_WM_SIZES").is_some() {
+            for (ix, _) in ps.iter().enumerate() {
+                let sz: Vec<usize> = eargs
+                    .iter()
+                    .map(|r| {
+                        r[ix].map_or(1, |v| {
+                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                        })
+                    })
+                    .collect();
+                eprintln!("wmsz {b} slot{ix} {sz:?}");
+            }
         }
         let no_phased = std::env::var_os("PLIRON_WM_NOPHASED").is_some();
         let no_phasec = std::env::var_os("PLIRON_WM_NOPHASEC").is_some();
@@ -2731,16 +2592,31 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             .enumerate()
             .map(|(i, &p)| (p, i as u32))
             .collect();
-        // `hmaps[e]`: slot-key hash → first slot index, for `paramize`'s
-        // subtree probe. `hmemo` memoizes per-node hashes — `Rc` sharing
-        // makes most lookups O(1); see `khash_m`.
-        let mut hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
-        let hmaps: Vec<FxHashMap<u64, u32>> = skeys
+        // Keys stay lazy: `skey_of` materializes `skc[e][ix]` on demand
+        // — the hash gates above decide most slots never need one.
+        let skc: Vec<Vec<std::cell::OnceCell<Key>>> = (0..es.len())
+            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
+            .collect();
+        let skey_of = |e: usize, ix: usize| -> &Key {
+            skc[e][ix].get_or_init(|| match (eargs[e][ix], okey[e][ix]) {
+                (Some(v), _) => {
+                    crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v)
+                }
+                (None, Some(o)) => Key::O(o),
+                (None, None) => unreachable!("non-value arg carries an O payload"),
+            })
+        };
+        // `hmaps[e]`: arg hash → first slot index, for `paramize`'s
+        // subtree probe — `vhash` is `khash_m`-equivalent by
+        // construction, so probes on `Key` nodes hit. `hmemo` memoizes
+        // per-node key hashes (`Rc` sharing → O(1) amortized).
+        let hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
+        let hmaps: Vec<FxHashMap<u64, u32>> = svh
             .iter()
             .map(|row| {
                 let mut m = FxHashMap::default();
-                for (i, k) in row.iter().enumerate() {
-                    m.entry(crate::proots::khash_m(k, &mut hmemo)).or_insert(i as u32);
+                for (i, &h) in row.iter().enumerate() {
+                    m.entry(h).or_insert(i as u32);
                 }
                 m
             })
@@ -2748,22 +2624,19 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // Each cell carries the key's hash alongside — the scan
         // compares keys `O(slots × edges)` times and a failed
         // structural `==` on a 10⁴-node key costs as much as computing
-        // the hash once, so comparisons go through `pkh` first. Node
-        // counts (`pkn`) stay lazily separate — only the relational
-        // oracle's size cap needs them.
+        // the hash once, so comparisons go through `pkh` first.
         let hmemo = std::cell::RefCell::new(hmemo);
         let pk: Vec<Vec<std::cell::OnceCell<(Key, u64)>>> = (0..es.len())
-            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
-            .collect();
-        let pkn_: Vec<Vec<std::cell::OnceCell<usize>>> = (0..es.len())
             .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
             .collect();
         let pkm = |e: usize, i: usize| -> &(Key, u64) {
             pk[e][i].get_or_init(|| {
                 let mut hm = hmemo.borrow_mut();
+                let slotk = |j: usize| -> &Key { skey_of(e, j) };
                 let k = crate::proots::paramize(
-                    &skeys[e][i],
-                    &skeys[e],
+                    skey_of(e, i),
+                    ps.len(),
+                    &slotk,
                     &ps,
                     i,
                     &hmaps[e],
@@ -2776,8 +2649,6 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         };
         let pk_of = |e: usize, i: usize| -> &Key { &pkm(e, i).0 };
         let pkh = |e: usize, i: usize| pkm(e, i).1;
-        let pkn =
-            |e: usize, i: usize| *pkn_[e][i].get_or_init(|| crate::proots::nodes(pk_of(e, i)));
         // Slot -> merge key pending materialization in this block. Phase-A
         // keys are `P`-free; phase-B candidates keep `P` leaves until
         // `resolve_p` inlines them.
@@ -2801,7 +2672,10 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             if pmap.contains_key(&p) {
                 continue;
             }
-            let mut class: Option<(u64, &Key)> = None;
+            // `seed` — the first edge establishing the class hash;
+            // hashes gate so structural `==` (and key materialization)
+            // only runs when hashes actually agree.
+            let mut seed: Option<usize> = None;
             let mut member: Option<Value> = None;
             let mut uniform = false;
             for (e, _) in es.iter().enumerate() {
@@ -2814,13 +2688,15 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 if v == p {
                     continue;
                 }
-                let k = &skeys[e][ix];
-                match class {
+                match seed {
                     None => {
-                        class = Some((shk[e][ix], k));
+                        seed = Some(e);
                         uniform = true;
                     }
-                    Some((h, t)) if h != shk[e][ix] || t != k => {
+                    Some(se)
+                        if svh[se][ix] != svh[e][ix]
+                            || skey_of(se, ix) != skey_of(e, ix) =>
+                    {
                         uniform = false;
                         break;
                     }
@@ -2832,7 +2708,8 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     member = Some(v);
                 }
             }
-            if let Some((_, key)) = class.filter(|_| uniform) {
+            if let Some(se) = seed.filter(|_| uniform) {
+                let key = skey_of(se, ix);
                 match member {
                     Some(w) => {
                         pmap.insert(p, w);
@@ -2854,6 +2731,21 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 continue;
             }
             if no_phaseb {
+                continue;
+            }
+            // Huge keys can still merge at phase A (identical trees
+            // hash-compare fine), but nothing relational pays: every
+            // cell a probe touches costs an O(size) `paramize`/hash/
+            // walk, and a `P`-leafed tree 10⁵ nodes deep is never a
+            // mergeable slot. `vnodes` counts the *would-be* key —
+            // capped traversal over the def-DAG, no key built.
+            const REL_PROBES_CAP: usize = 2048;
+            if !(0..es.len()).all(|e| {
+                eargs[e][ix].is_none_or(|v| {
+                    crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                        <= REL_PROBES_CAP
+                })
+            }) {
                 continue;
             }
             // Phase B — sibling-slot congruence: `p_j` drops when every
@@ -3015,16 +2907,33 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     // pass's dominant cost, and a diff needing keys that
                     // big is never a relation worth materializing.
                     const REL_KEY_CAP: usize = 512;
-                    let ki = pk_of(e, i);
-                    if pkn(e, i) <= REL_KEY_CAP && pkn(e, ix) <= REL_KEY_CAP
-                        && let Some(d) = crate::proots::key_sub(ki, kj, ty, 8)
-                            .map(|d| mk(i, Opcode::Isub, d))
-                            .or_else(|| {
-                                crate::proots::key_sub(kj, ki, ty, 8)
-                                    .map(|d| mk(i, Opcode::Iadd, d))
-                            })
-                    {
-                        return Some(Some(d));
+                    // Check the *raw* sizes first: `pk_of` materializes
+                    // the paramized key, an O(size) walk that a cap on
+                    // the result can't preempt.
+                    let vwithin = |v: Option<Value>| {
+                        v.is_some_and(|v| {
+                            crate::proots::vnodes(
+                                func,
+                                &nf,
+                                &canon,
+                                &mut vnmemo.borrow_mut(),
+                                v,
+                            ) <= REL_KEY_CAP
+                        })
+                    };
+                    if vwithin(eargs[e][i]) && vwithin(eargs[e][ix]) {
+                        let ki = pk_of(e, i);
+                        if crate::proots::within(ki, REL_KEY_CAP)
+                            && crate::proots::within(kj, REL_KEY_CAP)
+                            && let Some(d) = crate::proots::key_sub(ki, kj, ty, 8)
+                                .map(|d| mk(i, Opcode::Isub, d))
+                                .or_else(|| {
+                                    crate::proots::key_sub(kj, ki, ty, 8)
+                                        .map(|d| mk(i, Opcode::Iadd, d))
+                                })
+                        {
+                            return Some(Some(d));
+                        }
                     }
                     // `diff_b`'s param-pair chase reaches where keys
                     // can't: args that are params of the same
@@ -3206,11 +3115,27 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         if no_phasec {
             continue;
         }
+        // Survivors, capped by key size: `key_rep` rebuilds a whole
+        // signature tree per (slot, edge, round), so slots carrying
+        // 10⁴-node expression keys make refinement quadratic-by-
+        // allocation. Coinductive pairs in real code are tiny (`P(i)`,
+        // `V` refs, small steps) — a giant key is never worth refining.
+        const BISIM_KEY_CAP: usize = 256;
         let surv: Vec<usize> = (0..ps.len())
             .filter(|&i| {
                 !pmap.contains_key(&ps[i])
                     && !param_drops.contains(&ps[i])
-                    && skeys.iter().all(|row| !matches!(row[i], Key::O(_)))
+                    && (0..es.len()).all(|e| {
+                        eargs[e][i].is_some_and(|v| {
+                            crate::proots::vnodes(
+                                func,
+                                &nf,
+                                &canon,
+                                &mut vnmemo.borrow_mut(),
+                                v,
+                            ) <= BISIM_KEY_CAP
+                        })
+                    })
             })
             .collect();
         if surv.len() >= 2 {
@@ -3241,11 +3166,8 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     .map(|&i| {
                         (
                             i,
-                            skeys
-                                .iter()
-                                .map(|row| {
-                                    crate::proots::key_rep(&row[i], &ps, &leaf)
-                                })
+                            (0..es.len())
+                                .map(|e| crate::proots::key_rep(skey_of(e, i), &ps, &leaf))
                                 .collect(),
                         )
                     })
@@ -3619,473 +3541,6 @@ pub fn selargs(func: &mut Function) -> usize {
         }
     }
     n
-}
-
-/// Merge same-block param pairs that are equal by coinduction: the edge
-/// args agree outright on non-recursive edges and are congruent — same
-/// pure op applied to assumed-equal args — on recursive ones. This is the
-/// mutually-inductive case sameargs' literal equality can't see: the
-/// vectorizer's separate c-load/c-store address streams stay equal iff
-/// each other's params do (`p' = q' = p + 64`), so no pair proves first.
-///
-/// Partition refinement: start with every same-typed param pair pending,
-/// drop any pair an edge disproves under the pending assumption, repeat
-/// to fixpoint. Surviving pairs are coinductively sound — assume all of
-/// them equal at block entry, congruent ops preserve it along every edge.
-/// The later param drops to the earlier, as in sameargs.
-pub fn phimerge(func: &mut Function) -> usize {
-    // Edge target -> [(inst, dest index)].
-    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for (d, bc) in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .iter()
-                .enumerate()
-            {
-                edges
-                    .entry(bc.block(&func.dfg.value_lists))
-                    .or_default()
-                    .push((i, d));
-            }
-        }
-    }
-    // Candidate pairs (pi < pj) per block: same type, uniform edge arity.
-    let mut pending: Vec<(Block, usize, usize)> = Vec::new();
-    for (&b, es) in &edges {
-        let ps = func.dfg.block_params(b);
-        if ps.len() < 2 || ps.len() > 24 {
-            continue;
-        }
-        let arity_ok = es.iter().all(|&(i, d)| {
-            func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                [d]
-                .args(&func.dfg.value_lists)
-                .len()
-                == ps.len()
-        });
-        if !arity_ok {
-            continue;
-        }
-        for ix in 0..ps.len() {
-            for jx in ix + 1..ps.len() {
-                if func.dfg.value_type(ps[ix]) == func.dfg.value_type(ps[jx]) {
-                    pending.push((b, ix, jx));
-                }
-            }
-        }
-    }
-    if pending.is_empty() {
-        return 0;
-    }
-    // uf rep for the pending-pair assumption: pi -> pi, pj -> pi.
-    let mut uf: FxHashMap<Value, Value> = FxHashMap::default();
-    let find = |uf: &FxHashMap<Value, Value>, mut v: Value| {
-        while let Some(&p) = uf.get(&v) {
-            if p == v {
-                break;
-            }
-            v = p;
-        }
-        v
-    };
-    let mut alive = vec![true; pending.len()];
-    loop {
-        uf.clear();
-        for (k, &(b, ix, jx)) in pending.iter().enumerate() {
-            if !alive[k] {
-                continue;
-            }
-            let ps = func.dfg.block_params(b);
-            uf.entry(ps[ix]).or_insert(ps[ix]);
-            let r = find(&uf, ps[ix]);
-            uf.insert(ps[jx], r);
-        }
-        let mut changed = false;
-        for (k, &(b, ix, jx)) in pending.iter().enumerate() {
-            if !alive[k] {
-                continue;
-            }
-            let ok = edges[&b].iter().all(|&(i, d)| {
-                let bc = &func.dfg.insts[i]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
-                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
-                match (args.get(ix), args.get(jx)) {
-                    (Some(&BlockArg::Value(x)), Some(&BlockArg::Value(y))) => {
-                        phi_cong(func, x, y, &uf, &find, 4)
-                    }
-                    _ => false,
-                }
-            });
-            if !ok {
-                alive[k] = false;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // Survivors -> pmap/param_drops/arg_drops, grouped per block (later
-    // slots first so earlier indices stay valid).
-    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
-    let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = vec![];
-    let mut param_drops: Vec<Value> = vec![];
-    let mut per_block: FxHashMap<Block, Vec<(usize, usize)>> = FxHashMap::default();
-    for (k, &(b, ix, jx)) in pending.iter().enumerate() {
-        if alive[k] {
-            per_block.entry(b).or_default().push((ix, jx));
-        }
-    }
-    for (b, mut prs) in per_block {
-        let ps = func.dfg.block_params(b).to_vec();
-        prs.sort_unstable_by_key(|&(ix, jx)| (ix, jx));
-        let mut drops: Vec<usize> = Vec::new();
-        for (ix, jx) in prs {
-            // pj may already be mapped through an earlier merge.
-            let t = pmap.get(&ps[ix]).copied().unwrap_or(ps[ix]);
-            pmap.insert(ps[jx], t);
-            drops.push(jx);
-        }
-        drops.sort_unstable_by(|x, y| y.cmp(x));
-        drops.dedup();
-        for &(i, d) in &edges[&b] {
-            arg_drops.push((i, d, drops.clone()));
-        }
-        for &jx in &drops {
-            param_drops.push(ps[jx]);
-        }
-    }
-    if param_drops.is_empty() {
-        return 0;
-    }
-    apply_param_drops(func, pmap, arg_drops, param_drops)
-}
-
-/// A block param that equals a sibling param plus a constant on every
-/// in-edge is redundant: `p_j = p_i + k`. Replace `p_j`'s uses with an
-/// `iadd p_i, k` at the block head and drop the slot from every edge —
-/// phimerge's `k = 0` special case, but with an offset. ipnsort's
-/// branchless scatter carries `dest = src - 8` through the loop as a
-/// param; as an `iadd` the constant offset is visible to `root`'s
-/// location keys, so the swap's store and the next element's load come
-/// out provably disjoint instead of forcing a reload.
-pub fn affparm(func: &mut Function) -> usize {
-    // Edge target -> [(inst, dest index)], as phimerge builds it.
-    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for (d, bc) in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .iter()
-                .enumerate()
-            {
-                edges
-                    .entry(bc.block(&func.dfg.value_lists))
-                    .or_default()
-                    .push((i, d));
-            }
-        }
-    }
-    if edges.is_empty() {
-        return 0;
-    }
-    // `concrete` peels to exact (base, offset) equalities: equal roots at
-    // offsets `k` apart prove the integer relation `arg_j = arg_i + k`
-    // regardless of what the unresolved base is.
-    let ps = crate::loadfwd::param_src(func);
-    let rt = |func: &Function, v: Value| crate::loadfwd::concrete(func, &ps, v);
-    // Per block: dropped param indices plus (p_j, base param, k) triples.
-    let mut rels: Vec<(Block, Vec<usize>, Vec<(Value, Value, i64, bool)>)> = Vec::new();
-    for (&b, es) in &edges {
-        let params = func.dfg.block_params(b);
-        if params.len() < 2 || params.len() > 24 {
-            continue;
-        }
-        // Per-edge args as plain values; a non-Value arg or arity mismatch
-        // disqualifies the block.
-        let mut eargs: Vec<Vec<Value>> = Vec::with_capacity(es.len());
-        for &(i, d) in es {
-            let bc = &func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
-            let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
-            if args.len() != params.len() {
-                eargs.clear();
-                break;
-            }
-            let mut vs = Vec::with_capacity(args.len());
-            for a in args {
-                let BlockArg::Value(v) = a else {
-                    vs.clear();
-                    break;
-                };
-                vs.push(v);
-            }
-            if vs.len() != params.len() {
-                eargs.clear();
-                break;
-            }
-            eargs.push(vs);
-        }
-        if eargs.len() != es.len() {
-            continue;
-        }
-        // Params used as a load/store address inside `b`: when the
-        // affine relation holds both ways, keeping such a param alive
-        // as the source lets the emitted `iadd` fuse with its memory
-        // op as a post-index access (`[x], #k` on aarch64). Dropping
-        // the base instead buries the load as `[x, -k]` plus a
-        // separate add.
-        let mut membase: FxHashSet<usize> = FxHashSet::default();
-        for i in func.layout.block_insts(b) {
-            let a = match func.dfg.insts[i] {
-                InstructionData::Load { arg, .. }
-                | InstructionData::LoadNoOffset { arg, .. } => Some(arg),
-                InstructionData::Store { args, .. }
-                | InstructionData::StoreNoOffset { args, .. } => Some(args[1]),
-                _ => None,
-            };
-            if let Some(a) = a {
-                let a = func.dfg.resolve_aliases(a);
-                for (ix, &p) in params.iter().enumerate() {
-                    if p == a {
-                        membase.insert(ix);
-                    }
-                }
-            }
-        }
-        // `concrete` results cached per arg value: params^2 x edges root
-        // calls otherwise dominate compile time in param-heavy fns.
-        let mut rc: FxHashMap<Value, (crate::loadfwd::Root, i64)> = FxHashMap::default();
-        let mut drops: Vec<usize> = Vec::new();
-        let mut triples: Vec<(Value, Value, i64, bool)> = Vec::new();
-        'jx: for jx in 0..params.len() {
-            if drops.contains(&jx) {
-                continue;
-            }
-            let pj = params[jx];
-            let ty = func.dfg.value_type(pj);
-            if !ty.is_int() || ty.is_vector() {
-                continue;
-            }
-            for ix in 0..params.len() {
-                // Sources are never themselves dropped: a mutual pair
-                // (p_a = p_b + 8, p_b = p_a - 8) would otherwise produce
-                // cyclic replacements, and a chain (p3 = p2 + k with p2
-                // already dropped) folds to the surviving source directly
-                // since the composed relation is detected the same way.
-                if ix == jx || func.dfg.value_type(params[ix]) != ty || drops.contains(&ix) {
-                    continue;
-                }
-                let mut dk = None;
-                let ok = eargs.iter().all(|args| {
-                    let (rj, oj) = *rc.entry(args[jx]).or_insert_with(|| rt(func, args[jx]));
-                    let (ri, oi) = *rc.entry(args[ix]).or_insert_with(|| rt(func, args[ix]));
-                    if rj != ri {
-                        return false;
-                    }
-                    let d = oj.wrapping_sub(oi);
-                    match dk {
-                        None => {
-                            dk = Some(d);
-                            true
-                        }
-                        Some(k) => k == d,
-                    }
-                });
-                if ok && let Some(k) = dk {
-                    // Both directions of `p_j = p_i + k` are provable
-                    // here. When p_j is a memory base and p_i is not,
-                    // drop p_i instead and derive it late: the emitted
-                    // `iadd p_j, -k` then sits right after the load on
-                    // p_j and fuses into a post-index access.
-                    if k != 0 && membase.contains(&jx) && !membase.contains(&ix) {
-                        drops.push(ix);
-                        triples.push((params[ix], pj, k.wrapping_neg(), true));
-                    } else {
-                        drops.push(jx);
-                        triples.push((pj, params[ix], k, false));
-                    }
-                    continue 'jx;
-                }
-            }
-        }
-        if !drops.is_empty() {
-            rels.push((b, drops, triples));
-        }
-    }
-    if rels.is_empty() {
-        return 0;
-    }
-    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
-    let mut arg_drops: Vec<(Inst, usize, Vec<usize>)> = Vec::new();
-    let mut param_drops: Vec<Value> = Vec::new();
-    for (b, mut drops, triples) in rels {
-        let params = func.dfg.block_params(b).to_vec();
-        for (pj, pi, k, late) in triples {
-            let w = if k == 0 {
-                pi
-            } else {
-                // Post-index fusion needs `load base` before
-                // `iadd base, k` in program order: when keeping the
-                // memory-base param, emit the derived add just ahead of
-                // the terminator. Only legal when the dropped param has
-                // no in-block uses before the terminator itself.
-                let last = func.layout.last_inst(b);
-                let early = !late
-                    || func.layout.block_insts(b).any(|i| {
-                        Some(i) != last
-                            && func
-                                .dfg
-                                .inst_values(i)
-                                .any(|v| func.dfg.resolve_aliases(v) == pj)
-                    });
-                if early {
-                    FuncCursor::new(func)
-                        .at_first_insertion_point(b)
-                        .ins()
-                        .iadd_imm_s(pi, k)
-                } else {
-                    FuncCursor::new(func)
-                        .at_inst(last.unwrap())
-                        .ins()
-                        .iadd_imm_s(pi, k)
-                }
-            };
-            pmap.insert(pj, w);
-        }
-        drops.sort_unstable_by(|x, y| y.cmp(x));
-        drops.dedup();
-        for &(i, d) in &edges[&b] {
-            arg_drops.push((i, d, drops.clone()));
-        }
-        for &jx in &drops {
-            param_drops.push(params[jx]);
-        }
-    }
-    apply_param_drops(func, pmap, arg_drops, param_drops)
-}
-
-/// Congruence under the pending-param assumption `uf`: resolved-equal,
-/// uf-equal, same constant, or same pure inst shape applied to
-/// pointwise-congruent args.
-fn phi_cong(
-    func: &Function,
-    x: Value,
-    y: Value,
-    uf: &FxHashMap<Value, Value>,
-    find: &dyn Fn(&FxHashMap<Value, Value>, Value) -> Value,
-    depth: u32,
-) -> bool {
-    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
-    if x == y || find(uf, x) == find(uf, y) {
-        return true;
-    }
-    let (Some(di), Some(dj)) = (func.dfg.value_def(x).inst(), func.dfg.value_def(y).inst()) else {
-        return false;
-    };
-    if func.dfg.value_type(x) != func.dfg.value_type(y) || depth == 0 {
-        return false;
-    }
-    let c = |x: Value, y: Value, d: u32| phi_cong(func, x, y, uf, find, d - 1);
-    match (func.dfg.insts[di], func.dfg.insts[dj]) {
-        (
-            InstructionData::Unary {
-                opcode: o1,
-                arg: a1,
-            },
-            InstructionData::Unary {
-                opcode: o2,
-                arg: a2,
-            },
-        ) => o1 == o2 && c(a1, a2, depth),
-        (
-            InstructionData::UnaryImm {
-                opcode: o1,
-                imm: i1,
-            },
-            InstructionData::UnaryImm {
-                opcode: o2,
-                imm: i2,
-            },
-        ) => o1 == o2 && i1 == i2,
-        (
-            InstructionData::Binary {
-                opcode: o1,
-                args: s1,
-            },
-            InstructionData::Binary {
-                opcode: o2,
-                args: s2,
-            },
-        ) => {
-            o1 == o2
-                && ((c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
-                    || (phi_comm(o1) && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth)))
-        }
-        (
-            InstructionData::BinaryImm8 {
-                opcode: o1,
-                arg: a1,
-                imm: m1,
-            },
-            InstructionData::BinaryImm8 {
-                opcode: o2,
-                arg: a2,
-                imm: m2,
-            },
-        ) => o1 == o2 && m1 == m2 && c(a1, a2, depth),
-        (
-            InstructionData::IntCompare {
-                cond: c1, args: s1, ..
-            },
-            InstructionData::IntCompare {
-                cond: c2, args: s2, ..
-            },
-        ) => {
-            (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
-                || (c1 == c2.swap_args() && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth))
-        }
-        (
-            InstructionData::FloatCompare {
-                cond: c1, args: s1, ..
-            },
-            InstructionData::FloatCompare {
-                cond: c2, args: s2, ..
-            },
-        ) => {
-            (c1 == c2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth))
-                || (c1 == c2.swap_args() && c(s1[0], s2[1], depth) && c(s1[1], s2[0], depth))
-        }
-        (
-            InstructionData::Ternary {
-                opcode: o1,
-                args: s1,
-            },
-            InstructionData::Ternary {
-                opcode: o2,
-                args: s2,
-            },
-        ) => o1 == o2 && c(s1[0], s2[0], depth) && c(s1[1], s2[1], depth) && c(s1[2], s2[2], depth),
-        _ => false,
-    }
-}
-
-fn phi_comm(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::Iadd
-            | Opcode::Imul
-            | Opcode::Band
-            | Opcode::Bor
-            | Opcode::Bxor
-            | Opcode::Umin
-            | Opcode::Umax
-            | Opcode::Smin
-            | Opcode::Smax
-            | Opcode::Fadd
-            | Opcode::Fmul
-    )
 }
 
 /// `band v, M` where `v`'s bits already fit `M` (rustc's i1 normalization
@@ -7901,153 +7356,6 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("sameargs produced invalid IR: {e}\n{}", func.display());
-        }
-    }
-
-    /// Loop header params `p, q` fed `(x, x)` on entry and
-    /// `(iadd p, 8)`/`(iadd q, 8)` on the back edge are equal by
-    /// coinduction — literal-equality sameargs can't merge either without
-    /// the other, so phimerge's partition refinement collapses them.
-    #[test]
-    fn phimerge_inductive_param_pair() {
-        let mut sig = Signature::new(CallConv::Fast);
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
-        let entry = func.dfg.make_block();
-        let head = func.dfg.make_block();
-        let exit = func.dfg.make_block();
-        for blk in [entry, head, exit] {
-            func.layout.append_block(blk);
-        }
-        let p = func.dfg.append_block_param(head, types::I64);
-        let q = func.dfg.append_block_param(head, types::I64);
-        let n = func.dfg.append_block_param(head, types::I64);
-
-        let x = func.dfg.append_block_param(entry, types::I64);
-        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
-        cur.ins().jump(head, &[x.into(), x.into(), x.into()]);
-
-        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
-        let eight = cur.ins().iconst(types::I64, 8);
-        let p2 = cur.ins().iadd(p, eight);
-        let q2 = cur.ins().iadd(q, eight);
-        let one = cur.ins().iconst(types::I64, 1);
-        let n2 = cur.ins().isub(n, one);
-        let z = cur.ins().iconst(types::I64, 0);
-        let done = cur.ins().icmp(IntCC::Equal, n2, z);
-        cur.ins().brif(
-            done,
-            exit,
-            &[p2.into()],
-            head,
-            &[p2.into(), q2.into(), n2.into()],
-        );
-
-        let r = func.dfg.append_block_param(exit, types::I64);
-        FuncCursor::new(&mut func)
-            .at_bottom(exit)
-            .ins()
-            .return_(&[r]);
-
-        assert_eq!(phimerge(&mut func), 1);
-        assert_eq!(func.dfg.block_params(head).len(), 2);
-        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
-        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("phimerge produced invalid IR: {e}\n{}", func.display());
-        }
-    }
-
-    /// Head params `p, q` fed `(x, x + 8)` on entry and `(p + 16,
-    /// p + 24)` on the back edge: `q = p + 8` holds on every edge, so
-    /// affparm drops `q` and its uses become `iadd p, 8` — the collapse
-    /// that lets loadfwd prove the ipnsort scatter store disjoint from
-    /// the next element's load.
-    #[test]
-    fn affparm_collapses_offset_param() {
-        let mut sig = Signature::new(CallConv::Fast);
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
-        let entry = func.dfg.make_block();
-        let head = func.dfg.make_block();
-        let exit = func.dfg.make_block();
-        for blk in [entry, head, exit] {
-            func.layout.append_block(blk);
-        }
-        let p = func.dfg.append_block_param(head, types::I64);
-        let q = func.dfg.append_block_param(head, types::I64);
-
-        let x = func.dfg.append_block_param(entry, types::I64);
-        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
-        let eight = cur.ins().iconst(types::I64, 8);
-        let xp8 = cur.ins().iadd(x, eight);
-        cur.ins().jump(head, &[x.into(), xp8.into()]);
-
-        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
-        let c = cur.ins().icmp(IntCC::UnsignedLessThan, q, p);
-        let p2 = cur.ins().iadd_imm_s(p, 16);
-        let q2 = cur.ins().iadd_imm_s(p2, 8);
-        cur.ins()
-            .brif(c, exit, &[q.into()], head, &[p2.into(), q2.into()]);
-
-        let r = func.dfg.append_block_param(exit, types::I64);
-        FuncCursor::new(&mut func)
-            .at_bottom(exit)
-            .ins()
-            .return_(&[r]);
-
-        assert_eq!(affparm(&mut func), 1);
-        assert_eq!(func.dfg.block_params(head), &[q]);
-        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
-        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("affparm produced invalid IR: {e}\n{}", func.display());
-        }
-    }
-
-    /// `q = p + 8` and `p = q - 8` are the same relation: both direction
-    /// checks pass, so a naive per-param drop replaces `p` with `q - 8`
-    /// and `q` with `p + 8` — cyclic SSA (`w = iadd v, -8` / `v = iadd
-    /// w, 8`) that sent `root`'s iadd peel into unbounded recursion.
-    /// Sources are never dropped, so exactly one survives.
-    #[test]
-    fn affparm_mutual_pair_keeps_one_source() {
-        let mut sig = Signature::new(CallConv::Fast);
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
-        let entry = func.dfg.make_block();
-        let head = func.dfg.make_block();
-        let exit = func.dfg.make_block();
-        for blk in [entry, head, exit] {
-            func.layout.append_block(blk);
-        }
-        let p = func.dfg.append_block_param(head, types::I64);
-        let q = func.dfg.append_block_param(head, types::I64);
-
-        let x = func.dfg.append_block_param(entry, types::I64);
-        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
-        let xp8 = cur.ins().iadd_imm_s(x, 8);
-        cur.ins().jump(head, &[x.into(), xp8.into()]);
-
-        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
-        let c = cur.ins().icmp(IntCC::UnsignedLessThan, q, p);
-        let p2 = cur.ins().iadd_imm_s(p, 16);
-        let q2 = cur.ins().iadd_imm_s(p2, 8);
-        cur.ins()
-            .brif(c, exit, &[q.into()], head, &[p2.into(), q2.into()]);
-
-        let r = func.dfg.append_block_param(exit, types::I64);
-        FuncCursor::new(&mut func)
-            .at_bottom(exit)
-            .ins()
-            .return_(&[r]);
-
-        assert_eq!(affparm(&mut func), 1);
-        assert_eq!(func.dfg.block_params(head).len(), 1);
-        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
-        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
-            panic!("affparm produced invalid IR: {e}\n{}", func.display());
         }
     }
 
