@@ -151,3 +151,33 @@ Secondary, smaller: code layout — our hot paths scatter over ~1.8KB
 with interposed cold blocks vs LLVM's ~440B compact loops (extra
 unconditional-jump trampolines per iteration), and residual diffuse
 bloat (+1-3% .text) on non-hash kernels.
+
+## slp/xpack compile-time work (9331bc1)
+
+`xpack` rescanned every seed after every apply — nbody block63 ran
+~38k plan tries for 76 packs (~143ms in `slp`). Landed fixes:
+
+- Lazy, function-wide `uses` map shared across blocks, rebuilt only
+  after an apply (4f5050f), dense `Vec<SmallVec>` keyed by value index,
+  and `param_src` hoisted to `run()` (its applies never touch block
+  params). hashmap slp 76→19ms.
+- Failed-pair cache: a pair whose plan fails is retried only when a
+  later apply could have unblocked it (edit inside the pair's span,
+  moved/deleted endpoint, changed operand/result use chain — tracked
+  via an upstream-closure `affected` set). Store pairs are never
+  cached: `plan_store` resolves footprints through upstream address
+  chains the eviction can't cheaply track. nbody slp 143→117ms,
+  identical pack output.
+
+Dead ends along the way, measured and reverted:
+
+- Resume cursor (continue scan past the last apply): 135→17ms but
+  missed 44 of 76 packs — sunk consumers land near the emit point and
+  pair with *earlier* seeds — cost nbody ~14% runtime.
+- Batch plan collection (apply all non-conflicting plans per scan):
+  converged in ~6 waves but each wave re-tried every failed pair —
+  28k tries, ~170ms, 61 rows; the dirty/span conflict checks plus
+  re-tries cost more than sequential+cache.
+- Aggressive eviction (positions of all users of affected values):
+  recovered some stale store packs but the per-wave bookkeeping ran
+  ~80ms by itself.
