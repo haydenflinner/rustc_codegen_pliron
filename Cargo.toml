@@ -29,7 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]
-members = ["pliron-clif-opt", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg"]
+members = ["pliron-clif-opt", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "bench"]
 exclude = ["vendor"]
 
 [profile.dev]

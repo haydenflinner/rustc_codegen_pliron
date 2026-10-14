@@ -1,9 +1,7 @@
-use std::hint::black_box;
-use std::time::Instant;
-
 const N: usize = 5;
 
-struct Body { x: [f64; 3], v: [f64; 3], m: f64 }
+#[derive(Clone, Copy)]
+pub struct Body { x: [f64; 3], v: [f64; 3], m: f64 }
 
 #[inline(never)]
 fn advance(bodies: &mut [Body; N], dt: f64) {
@@ -30,18 +28,19 @@ fn advance(bodies: &mut [Body; N], dt: f64) {
     }
 }
 
-fn main() {
-    let mut bodies = [
+pub fn setup() -> [Body; N] {
+    [
         Body { x: [0.0; 3], v: [0.0; 3], m: 39.478 },
         Body { x: [4.84, -1.62, -0.09], v: [0.0007, 0.0035, 0.0], m: 0.016 },
         Body { x: [8.34, 4.12, -0.40], v: [-0.0017, 0.0016, 0.0], m: 0.0037 },
         Body { x: [12.89, -15.11, -0.22], v: [0.0013, 0.0015, 0.0], m: 0.0008 },
         Body { x: [15.37, 25.35, -0.22], v: [-0.0024, 0.0004, 0.0], m: 0.00007 },
-    ];
-    let t = Instant::now();
-    for _ in 0..black_box(2_000_000) {
-        advance(&mut bodies, 0.01);
+    ]
+}
+
+pub fn run(bodies: &mut [Body; N]) -> f64 {
+    for _ in 0..2_000_000 {
+        advance(bodies, 0.01);
     }
-    let d = t.elapsed();
-    println!("{:.3} {:.6}", d.as_secs_f64() * 1e3, bodies[0].x[0]);
+    bodies[0].x[0]
 }

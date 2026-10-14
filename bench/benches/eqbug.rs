@@ -44,9 +44,9 @@ fn fu8(x: u8, k: u8) -> u64 {
     a
 }
 
-fn main() {
+pub fn run() -> u64 {
     let mut acc = 0u64;
-    for i in 0..1000i64 {
+    for i in 0..50_000i64 {
         let x = black_box(i as i8);
         let k = black_box((i * 3) as i8);
         acc = acc.wrapping_add(f8(x, k));
@@ -57,5 +57,5 @@ fn main() {
         let k = black_box((i * 5) as u8);
         acc = acc.wrapping_add(fu8(x, k));
     }
-    println!("{}", acc);
+    acc
 }

@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::time::Instant;
 
-fn main() {
+pub fn setup() -> HashMap<u64, u32> {
     let mut m: HashMap<u64, u32> = HashMap::with_capacity(8192);
     let mut x = 1u64;
     for _ in 0..5000u64 {
@@ -11,7 +10,10 @@ fn main() {
         x ^= x << 17;
         m.insert(x, 1);
     }
-    let t = Instant::now();
+    m
+}
+
+pub fn run(m: &HashMap<u64, u32>) -> u64 {
     let mut total = 0u64;
     for round in 0..black_box(300u32) {
         for i in 0..5000u64 {
@@ -21,6 +23,5 @@ fn main() {
             }
         }
     }
-    let d = t.elapsed();
-    println!("{:.3} {}", d.as_secs_f64() * 1e3, total);
+    total
 }

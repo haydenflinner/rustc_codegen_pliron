@@ -1,31 +1,50 @@
 #!/usr/bin/env bash
-# bench/run.sh [REPS] — build each bench kernel with stock rustc and with the
-# pliron backend, run each REPS times (default 3), print best-of times in ms.
-set -uo pipefail
+# bench/run.sh — build the criterion bench target with stock rustc (LLVM) and
+# with the pliron backend, then compare the two. The LLVM numbers are saved as
+# the 'llvm' baseline and the pliron binary is run against it, so criterion
+# prints per-kernel change and significance instead of a best-of-N table.
+#
+# Extra args are forwarded to both criterion binaries, e.g.
+#   bench/run.sh tokenize        # run a subset by name filter
+#   bench/run.sh --verbose
+set -euo pipefail
 cd "$(dirname "$0")/.."
-REPS=${1:-3}
+
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll; exe=.exe ;;
-  Darwin)               lib=librustc_codegen_pliron.dylib; exe= ;;
-  *)                    lib=librustc_codegen_pliron.so; exe= ;;
+  MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll ;;
+  Darwin)               lib=librustc_codegen_pliron.dylib ;;
+  *)                    lib=librustc_codegen_pliron.so ;;
 esac
-BE="-Zcodegen-backend=$PWD/target/debug/$lib"
-out=target/bench; mkdir -p "$out"
-best() { local b=999999 t
-  for _ in $(seq "$REPS"); do
-    t=$("$1" 2>/dev/null | awk '{print $1; exit}')
-    awk -v a="${t:-999999}" -v b="$b" 'BEGIN{exit !(a+0<b)}' && b=$t
-  done; echo "$b"; }
-printf '%-10s %10s %10s %8s %12s %12s\n' kernel llvm-ms pliron-ms ratio compile-llvm compile-plir
-for src in bench/*.rs; do
-  k=$(basename "$src" .rs)
-  rm -f "$out/$k.llvm$exe" "$out/$k.plir$exe"
-  llvm_t=$( { time rustc -O "$src" -o "$out/$k.llvm$exe" 2>/dev/null; } 2>&1 | awk '/real/{print $2}' )
-  plir_t=$( { time rustc -O $BE "$src" -o "$out/$k.plir$exe" 2>/dev/null; } 2>&1 | awk '/real/{print $2}' )
-  # Skip timing if a compile failed — a stale binary would report phantom numbers.
-  L=-; P=-
-  [ -x "$out/$k.llvm$exe" ] && L=$(best "$out/$k.llvm$exe")
-  [ -x "$out/$k.plir$exe" ] && P=$(best "$out/$k.plir$exe")
-  r=$(awk -v l="$L" -v p="$P" 'BEGIN{if(l+0>0&&p+0>0)printf "%.2f", p/l; else print "-"}')
-  printf '%-10s %10s %10s %8s %12s %12s\n' "$k" "$L" "$P" "$r" "$llvm_t" "$plir_t"
-done
+
+cargo build  # the backend dylib
+
+# Compile the bench target and print the resulting binary path. Args after the
+# cargo options go to the bench crate's rustc invocation only, so
+# -Zcodegen-backend covers the kernels without rebuilding criterion.
+bench_bin() {
+  cargo rustc -p pliron-bench --bench kernels --profile bench \
+      --message-format json-render-diagnostics -- "$@" \
+    | python3 -c '
+import json, sys
+exe = ""
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    if msg.get("reason") == "compiler-artifact" and msg.get("executable"):
+        exe = msg["executable"]
+if not exe:
+    sys.exit("bench_bin: no executable in cargo output")
+print(exe)'
+}
+
+llvm_bin=$(bench_bin)
+"$llvm_bin" --bench --save-baseline llvm "$@"
+
+# Cargo's fingerprint does not cover the backend dylib, so without this the
+# flag-identical second build would reuse the stale artifact. `cargo rustc`
+# args are fingerprinted though, so only the bench crate itself is removed.
+cargo clean -p pliron-bench
+plir_bin=$(bench_bin -Z "codegen-backend=$PWD/target/debug/$lib")
+"$plir_bin" --bench --baseline llvm "$@"

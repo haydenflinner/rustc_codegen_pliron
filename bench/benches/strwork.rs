@@ -1,8 +1,6 @@
 use std::hint::black_box;
-use std::time::Instant;
 
-fn main() {
-    let t = Instant::now();
+pub fn run() -> u64 {
     let mut acc = 0u64;
     let mut buf = String::new();
     for i in 0..black_box(40_000u32) {
@@ -16,6 +14,5 @@ fn main() {
             }
         }
     }
-    let d = t.elapsed();
-    println!("{:.3} {}", d.as_secs_f64() * 1e3, acc);
+    acc
 }

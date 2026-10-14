@@ -1,5 +1,4 @@
 use std::hint::black_box;
-use std::time::Instant;
 
 #[inline(never)]
 fn sieve(n: usize) -> u64 {
@@ -28,10 +27,8 @@ fn u128work(x: u128) -> u128 {
     v
 }
 
-fn main() {
-    let t = Instant::now();
+pub fn run() -> u64 {
     let mut acc = sieve(black_box(5_000_000));
     acc = acc.wrapping_add(u128work(black_box(0x9e3779b97f4a7c15)) as u64);
-    let d = t.elapsed();
-    println!("{:.3} {}", d.as_secs_f64() * 1e3, acc);
+    acc
 }

@@ -9,6 +9,21 @@ rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranel
 [pliron](https://github.com/vaivaswatha/pliron) is vendored in `vendor/` with its LLVM (llvm-sys) features disabled.
 `src/lower.rs` lowers the pliron LLVM dialect to Cranelift IR.
 
+## Usage
+```
+cargo build
+rustc -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.{so,dylib} main.rs
+./test.sh            # nostd/std/asm/unwind tests against the prebuilt sysroot
+./test.sh --sysroot  # also rebuild core/alloc/std with this backend
+```
+Uses the nightly pinned in `rust-toolchain.toml`. It needs `rustc-dev` because the backend links against rustc_private crates.
+```
+PLIRON_DIFFCHECK=1 rustc ...   # differentially check every CLIF optimization (see AGENTS.md)
+tests/ui_run_pass.py           # rustc UI run-pass slice (needs a rust checkout, default ~/work/rust)
+bench/run.sh                   # criterion kernels: LLVM baseline vs pliron, with significance stats
+examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game
+```
+
 ## Status (x86_64 Linux)
 - `no_std` and `std` programs compile and run.
 - `-Zbuild-std=std,panic_unwind`: core, alloc and std build with this backend, and the resulting binaries run.
@@ -46,17 +61,3 @@ rlibs into one module (wasm-ld is LLVM, so it is not used).
 
 `tests/wasm/run.sh` builds core, compiler_builtins and a test crate this way
 and runs it in node. Not done yet: std, unwinding, rustc itself as wasm.
-
-## Usage
-```
-cargo build
-rustc -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.so main.rs
-./test.sh            # nostd/std/asm/unwind tests against the prebuilt sysroot
-./test.sh --sysroot  # also rebuild core/alloc/std with this backend
-```
-Uses the nightly pinned in `rust-toolchain.toml`. It needs `rustc-dev` because the backend links against rustc_private crates.
-```
-PLIRON_DIFFCHECK=1 rustc ...   # differentially check every CLIF optimization (see AGENTS.md)
-tests/ui_run_pass.py           # rustc UI run-pass slice (needs a rust checkout, default ~/work/rust)
-examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game
-```

@@ -1,6 +1,4 @@
-use std::hint::black_box;
-use std::time::Instant;
-fn main() {
+pub fn setup() -> Vec<u32> {
     let mut v: Vec<u32> = Vec::with_capacity(1_000_000);
     let mut x = 1u64;
     for _ in 0..1_000_000u64 {
@@ -9,12 +7,13 @@ fn main() {
         x ^= x << 17;
         v.push((x & 0xffff) as u32);
     }
-    let lo = black_box(100u32);
-    let hi = black_box(60_000u32);
-    let t = Instant::now();
+    v
+}
+
+pub fn run(v: &[u32], lo: u32, hi: u32) -> usize {
     let mut n = 0usize;
     for _ in 0..10 {
         n += v.iter().filter(|&&i| (lo..=hi).contains(&i)).count();
     }
-    println!("{:.3} {}", t.elapsed().as_secs_f64() * 1e3, n);
+    n
 }
