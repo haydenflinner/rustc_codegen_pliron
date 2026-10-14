@@ -356,59 +356,148 @@ pub fn key_of(
                 .collect()
         };
         let rty = func.dfg.value_type(v);
+        // Non-pure insts — side effects, multi-results, defined-trapping
+        // ops — stay opaque `V` leaves. Everything pure keys
+        // structurally, with non-value fields packed into `extra` (tag
+        // byte low, discriminator high) and >32-bit immediates as
+        // trailing `K` pseudo-args. Purity mirrors
+        // `inst_predicates::is_pure_for_egraph` (private upstream).
+        let op = func.dfg.insts[di].opcode();
+        let pure_load = match func.dfg.insts[di] {
+            InstructionData::Load { flags, .. }
+            | InstructionData::LoadNoOffset { flags, .. } => {
+                let f = func.dfg.mem_flags[flags];
+                f.readonly() && f.notrap() && f.can_move()
+            }
+            _ => false,
+        };
+        if func.dfg.inst_results(di).len() != 1
+            || !(pure_load
+                || (!op.can_load()
+                    && !(op.is_call()
+                        || op.is_branch()
+                        || op.is_terminator()
+                        || op.is_return()
+                        || op.can_trap()
+                        || op.other_side_effects()
+                        || op.can_store())))
+        {
+            return Key::V(v);
+        }
         match func.dfg.insts[di] {
             InstructionData::UnaryImm {
                 opcode: Opcode::Iconst,
                 imm,
             } => Key::K(rty, imm.bits()),
-            InstructionData::Binary { opcode, args: a }
-                if matches!(
-                    opcode,
-                    Opcode::Band
-                        | Opcode::Bor
-                        | Opcode::Bxor
-                        | Opcode::Iadd
-                        | Opcode::Isub
-                        | Opcode::Ishl
-                        | Opcode::Ushr
-                ) =>
-            {
-                Key::N(opcode, rty, args(&a), 0)
+            InstructionData::Binary { opcode, args: a } => {
+                Key::N(opcode, rty, args(&a), tag::BIN)
             }
-            InstructionData::Unary { opcode, arg }
-                if matches!(
-                    opcode,
-                    Opcode::Bnot | Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce
-                ) =>
-            {
-                Key::N(opcode, rty, args(&[arg]), 0)
+            InstructionData::Unary { opcode, arg } => {
+                Key::N(opcode, rty, args(&[arg]), tag::UNARY)
             }
-            InstructionData::IntCompare {
-                opcode: Opcode::Icmp,
-                args: a,
-                cond,
-            } => Key::N(Opcode::Icmp, rty, args(&a), cond as u64),
-            InstructionData::Ternary {
-                opcode: Opcode::Select,
-                args: a,
-            } => Key::N(Opcode::Select, rty, args(&a), 0),
+            InstructionData::Ternary { opcode, args: a } => {
+                Key::N(opcode, rty, args(&a), tag::TERN)
+            }
+            InstructionData::BinaryImm8 { opcode, arg, imm } => Key::N(
+                opcode,
+                rty,
+                args(&[arg]),
+                tag::BIMM8 | (imm as u64) << 8,
+            ),
+            InstructionData::IntCompare { opcode, args: a, cond } => Key::N(
+                opcode,
+                rty,
+                args(&a),
+                tag::ICMP | (cond as u64) << 8,
+            ),
+            InstructionData::FloatCompare { opcode, args: a, cond } => Key::N(
+                opcode,
+                rty,
+                args(&a),
+                tag::FCMP | (cond as u64) << 8,
+            ),
             InstructionData::StackAddr {
+                opcode,
                 stack_slot,
                 offset,
-                ..
             } => Key::N(
-                Opcode::StackAddr,
+                opcode,
                 rty,
                 Box::new([Key::K(
                     cranelift_codegen::ir::types::I32,
                     i32::from(offset) as i64,
                 )]),
-                stack_slot.as_u32() as u64,
+                tag::SADDR | (stack_slot.as_u32() as u64) << 8,
+            ),
+            InstructionData::Load {
+                opcode,
+                arg,
+                flags,
+                offset,
+            } => {
+                let mut a = args(&[arg]).into_vec();
+                a.push(Key::K(
+                    cranelift_codegen::ir::types::I32,
+                    i32::from(offset) as i64,
+                ));
+                Key::N(
+                    opcode,
+                    rty,
+                    a.into_boxed_slice(),
+                    tag::LOAD | (flags.as_u32() as u64) << 8,
+                )
+            }
+            InstructionData::LoadNoOffset { opcode, arg, flags } => Key::N(
+                opcode,
+                rty,
+                args(&[arg]),
+                tag::LOADNOFF | (flags.as_u32() as u64) << 8,
+            ),
+            InstructionData::UnaryIeee16 { opcode, imm } => Key::N(
+                opcode,
+                rty,
+                Box::new([Key::K(
+                    cranelift_codegen::ir::types::I64,
+                    imm.bits() as i64,
+                )]),
+                tag::UIEEE,
+            ),
+            InstructionData::UnaryIeee32 { opcode, imm } => Key::N(
+                opcode,
+                rty,
+                Box::new([Key::K(
+                    cranelift_codegen::ir::types::I64,
+                    imm.bits() as i64,
+                )]),
+                tag::UIEEE,
+            ),
+            InstructionData::UnaryIeee64 { opcode, imm } => Key::N(
+                opcode,
+                rty,
+                Box::new([Key::K(cranelift_codegen::ir::types::I64, imm.bits() as i64)]),
+                tag::UIEEE,
             ),
             _ => Key::V(v),
         }
     }
     go(func, nf, canon, memo, v, 0)
+}
+
+/// `Key::N`'s `extra` low byte — which `InstructionData` variant the
+/// node was. `emit_key` needs the exact variant to rebuild; fields that
+/// don't fit in args (cond codes, mem flags, lane indices) ride in the
+/// remaining bits.
+pub mod tag {
+    pub const BIN: u64 = 0;
+    pub const UNARY: u64 = 1;
+    pub const TERN: u64 = 2;
+    pub const ICMP: u64 = 3;
+    pub const FCMP: u64 = 4;
+    pub const BIMM8: u64 = 5;
+    pub const SADDR: u64 = 8;
+    pub const LOAD: u64 = 9;
+    pub const UIEEE: u64 = 10;
+    pub const LOADNOFF: u64 = 11;
 }
 
 /// Rewrite `k` slot-relative: any subtree equal to `slots[i]`'s key

@@ -3053,39 +3053,82 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
             ))
         }
         Key::N(op, ty, args, extra) => {
-            // StackAddr's key arg is the slot offset — a literal to fold
-            // back into the instruction, not a value to emit.
-            let mut vals = [Value::reserved_value(); 3];
-            if *op != Opcode::StackAddr {
-                for (i, a) in args.iter().enumerate() {
-                    vals[i] = emit_key(func, order, a)?;
-                }
+            use crate::proots::tag;
+            let t = extra & 0xff;
+            let field = extra >> 8;
+            // Value args lead; trailing `K` pseudo-args carry literals
+            // (immediates, offsets) that fold back into the inst's
+            // fields rather than materializing as SSA values.
+            let nvals = match t {
+                tag::SADDR | tag::UIEEE => 0,
+                tag::LOAD => args.len() - 1,
+                _ => args.len(),
+            };
+            let mut vals = [Value::reserved_value(); 4];
+            for (i, a) in args.iter().enumerate().take(nvals) {
+                vals[i] = emit_key(func, order, a)?;
             }
-            let data = match *op {
-                Opcode::Icmp => InstructionData::IntCompare {
-                    opcode: Opcode::Icmp,
-                    cond: IntCC::all()[*extra as usize],
+            let lit = |i: usize| -> Option<i64> {
+                match &args[i] {
+                    Key::K(_, b) => Some(*b),
+                    _ => None,
+                }
+            };
+            let data = match t {
+                tag::ICMP => InstructionData::IntCompare {
+                    opcode: *op,
+                    cond: IntCC::all()[field as usize],
                     args: [vals[0], vals[1]],
                 },
-                Opcode::Select => InstructionData::Ternary {
-                    opcode: Opcode::Select,
+                tag::FCMP => InstructionData::FloatCompare {
+                    opcode: *op,
+                    cond: cranelift_codegen::ir::condcodes::FloatCC::all()[field as usize],
+                    args: [vals[0], vals[1]],
+                },
+                tag::TERN => InstructionData::Ternary {
+                    opcode: *op,
                     args: [vals[0], vals[1], vals[2]],
                 },
-                Opcode::StackAddr => {
-                    let Key::K(_, off) = args[0] else { return None };
-                    InstructionData::StackAddr {
-                        opcode: Opcode::StackAddr,
-                        stack_slot: cranelift_codegen::ir::StackSlot::from_u32(*extra as u32),
-                        offset: cranelift_codegen::ir::immediates::Offset32::from(off as i32),
+                tag::SADDR => InstructionData::StackAddr {
+                    opcode: *op,
+                    stack_slot: cranelift_codegen::ir::StackSlot::from_u32(field as u32),
+                    offset: cranelift_codegen::ir::immediates::Offset32::from(lit(0)? as i32),
+                },
+                tag::BIMM8 => InstructionData::BinaryImm8 {
+                    opcode: *op,
+                    arg: vals[0],
+                    imm: field as u8,
+                },
+                tag::LOAD => InstructionData::Load {
+                    opcode: *op,
+                    arg: vals[0],
+                    flags: cranelift_codegen::ir::MemFlags::from_u32(field as u32),
+                    offset: cranelift_codegen::ir::immediates::Offset32::from(lit(1)? as i32),
+                },
+                tag::LOADNOFF => InstructionData::LoadNoOffset {
+                    opcode: *op,
+                    arg: vals[0],
+                    flags: cranelift_codegen::ir::MemFlags::from_u32(field as u32),
+                },
+                tag::UIEEE => {
+                    let bits = lit(0)?;
+                    match *op {
+                        Opcode::F16const => InstructionData::UnaryIeee16 {
+                            opcode: *op,
+                            imm: cranelift_codegen::ir::immediates::Ieee16::with_bits(bits as u16),
+                        },
+                        Opcode::F32const => InstructionData::UnaryIeee32 {
+                            opcode: *op,
+                            imm: cranelift_codegen::ir::immediates::Ieee32::with_bits(bits as u32),
+                        },
+                        Opcode::F64const => InstructionData::UnaryIeee64 {
+                            opcode: *op,
+                            imm: cranelift_codegen::ir::immediates::Ieee64::with_bits(bits as u64),
+                        },
+                        _ => return None,
                     }
                 }
-                Opcode::Band
-                | Opcode::Bor
-                | Opcode::Bxor
-                | Opcode::Iadd
-                | Opcode::Isub
-                | Opcode::Ishl
-                | Opcode::Ushr => {
+                tag::BIN => {
                     // Identity/annihilator folds for source shapes like
                     // `iadd 0, x` (the egraph and edge clones produce
                     // them): emitting the shape verbatim is redundant —
@@ -3096,7 +3139,10 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                     let comm = matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor);
                     match (op, k0) {
                         (Opcode::Band, Some(i)) => return Some(vals[i]),
-                        (_, Some(1)) if comm || matches!(op, Opcode::Isub | Opcode::Ishl | Opcode::Ushr) => {
+                        (_, Some(1))
+                            if comm
+                                || matches!(op, Opcode::Isub | Opcode::Ishl | Opcode::Ushr) =>
+                        {
                             return Some(vals[0]);
                         }
                         (_, Some(0)) if comm => return Some(vals[1]),
@@ -3107,12 +3153,10 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                         args: [vals[0], vals[1]],
                     }
                 }
-                Opcode::Bnot | Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce => {
-                    InstructionData::Unary {
-                        opcode: *op,
-                        arg: vals[0],
-                    }
-                }
+                tag::UNARY => InstructionData::Unary {
+                    opcode: *op,
+                    arg: vals[0],
+                },
                 _ => return None,
             };
             Some(new(func, order, data, *ty))
