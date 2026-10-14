@@ -3167,6 +3167,10 @@ pub(crate) fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<B
 fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<(Value, u64)>> {
     let mut m: FxHashMap<Block, Vec<(Value, u64)>> = FxHashMap::default();
     let pool = &func.dfg.value_lists;
+    // Arms grouped by their dispatch inst — per-arm jump-table scans are
+    // O(arms²), so each table is walked once and per-target hits counted.
+    let mut by_inst: FxHashMap<Inst, Vec<(Block, cranelift_codegen::ir::JumpTable)>> =
+        FxHashMap::default();
     for b in func.layout.blocks() {
         let mut preds = cfg.pred_iter(b);
         let (Some(p), None) = (preds.next(), preds.next()) else {
@@ -3175,43 +3179,53 @@ fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<
         if p.block == b {
             continue;
         }
-        let InstructionData::BranchTable { arg, table, .. } = func.dfg.insts[p.inst] else {
+        let InstructionData::BranchTable { table, .. } = func.dfg.insts[p.inst] else {
             continue;
         };
         let jt = &func.dfg.jump_tables[table];
         if jt.default_block().block(pool) == b {
             continue;
         }
-        let mut hits = jt
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.block(pool) == b);
-        let (Some((k, _)), None) = (hits.next(), hits.next()) else {
+        by_inst.entry(p.inst).or_default().push((b, table));
+    }
+    for (pinst, arms) in by_inst {
+        let InstructionData::BranchTable { arg, .. } = func.dfg.insts[pinst] else {
             continue;
         };
         let arg = func.dfg.resolve_aliases(arg);
-        let mut v = vec![(arg, k as u64)];
-        if let Some(i) = func.dfg.value_def(arg).inst()
-            && let InstructionData::Unary {
-                opcode: Opcode::Ireduce,
-                arg: x,
-            } = func.dfg.insts[i]
-        {
-            let x = func.dfg.resolve_aliases(x);
-            if let Some(j) = func.dfg.value_def(x).inst()
-                && let InstructionData::Unary {
-                    opcode: Opcode::Uextend,
-                    arg: n,
-                } = func.dfg.insts[j]
-                && bits(func, n)
-                    .zip(bits(func, arg))
-                    .is_some_and(|(n, a)| n <= a)
-            {
-                v.push((x, k as u64));
-            }
+        // One pass over the shared table: target -> (count, first index).
+        let mut cnt: FxHashMap<Block, (u32, u64)> = FxHashMap::default();
+        for (k, c) in func.dfg.jump_tables[arms[0].1].as_slice().iter().enumerate() {
+            let e = cnt.entry(c.block(pool)).or_default();
+            e.0 += 1;
+            e.1 = k as u64;
         }
-        m.insert(b, v);
+        for (b, _) in arms {
+            let Some(&(1, k)) = cnt.get(&b) else {
+                continue;
+            };
+            let mut v = vec![(arg, k)];
+            if let Some(i) = func.dfg.value_def(arg).inst()
+                && let InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    arg: x,
+                } = func.dfg.insts[i]
+            {
+                let x = func.dfg.resolve_aliases(x);
+                if let Some(j) = func.dfg.value_def(x).inst()
+                    && let InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg: n,
+                    } = func.dfg.insts[j]
+                    && bits(func, n)
+                        .zip(bits(func, arg))
+                        .is_some_and(|(n, a)| n <= a)
+                {
+                    v.push((x, k));
+                }
+            }
+            m.insert(b, v);
+        }
     }
     m
 }
