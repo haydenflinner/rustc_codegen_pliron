@@ -1731,26 +1731,26 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // only where `d`'s definition still covers `w`'s — same block, `d`
     // first (a param "def" is the block head).
     let covered = {
+        use cranelift_codegen::ir::ProgramPoint;
         let f = &p.clctx.func;
         // `try_value_def` skips reserved/stale values and doesn't chase
         // aliases (`value_def` resolves unchecked and panics on chains
         // ending at a tombstone); an alias def just falls through to
-        // no-carry.
-        let blk = |v: Value| match f.dfg.try_value_def(v) {
-            Some(ValueDef::Result(i, _)) => f.layout.inst_block(i),
-            Some(ValueDef::Param(b, _)) => Some(b),
+        // no-carry. Program points compare in O(1): a param's point is
+        // its block head, which orders before every inst in the block —
+        // the same ordering the old inst-index scan gave.
+        let pp = |v: Value| match f.dfg.try_value_def(v) {
+            Some(ValueDef::Result(i, _)) => Some(ProgramPoint::Inst(i)),
+            Some(ValueDef::Param(b, _)) => Some(ProgramPoint::Block(b)),
             _ => None,
         };
-        let pos = |v: Value| match f.dfg.try_value_def(v) {
-            Some(ValueDef::Param(..)) => Some(0usize),
-            Some(ValueDef::Result(i, _)) => {
-                f.layout.block_insts(blk(v)?).position(|x| x == i)
+        match (pp(d), pp(w)) {
+            (Some(a), Some(b)) => {
+                f.layout.pp_block(a) == f.layout.pp_block(b)
+                    && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
             }
-            _ => None,
-        };
-        blk(d).is_some()
-            && blk(d) == blk(w)
-            && matches!((pos(d), pos(w)), (Some(a), Some(b)) if a <= b)
+            _ => false,
+        }
     };
     if covered
         && let Some(&b) = p.derived.get(&d)
@@ -1798,23 +1798,40 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
 }
 
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
-    let chase = |mut v: Value| {
-        let mut n = pmap.len() + 1;
-        while let Some(&w) = pmap.get(&v) {
-            v = w;
-            n -= 1;
-            if n == 0 {
-                break;
-            }
+    // Resolve each pmap link once: chasing per `derived` key walked the
+    // chain O(|pmap|) per key — quadratic on functions that drop many
+    // params. Memoized resolution is O(|pmap| + |derived|).
+    let resolve = |start: Value, memo: &mut FxHashMap<Value, Value>| -> Value {
+        if let Some(&r) = memo.get(&start) {
+            return r;
         }
-        v
+        let mut v = start;
+        let mut path = Vec::new();
+        let r = loop {
+            if let Some(&r) = memo.get(&v) {
+                break r;
+            }
+            match pmap.get(&v) {
+                Some(&w) if path.len() <= pmap.len() => {
+                    path.push(v);
+                    v = w;
+                }
+                _ => break v,
+            }
+        };
+        for &x in &path {
+            memo.insert(x, r);
+        }
+        memo.insert(start, r);
+        r
     };
+    let mut memo: FxHashMap<Value, Value> = FxHashMap::default();
     // `x` derived from a dropped param is derived from its carrier, and
     // a dropped param's own base moves to the carrier too.
     let keys: Vec<Value> = p.derived.keys().copied().collect();
     for x in keys {
         if let Some(&b) = p.derived.get(&x) {
-            let b = chase(b);
+            let b = resolve(b, &mut memo);
             p.derived.insert(x, b);
         }
     }
@@ -1823,7 +1840,8 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     // merge kind (a phase-A carrier, a deduped sibling, or a
     // materialized `f(siblings)` tree).
     for (&d, &w) in pmap {
-        carry_one(p, d, chase(w));
+        let w = resolve(w, &mut memo);
+        carry_one(p, d, w);
     }
 }
 
