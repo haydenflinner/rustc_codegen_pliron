@@ -3611,6 +3611,11 @@
       (side_effect
        (a64_sequence_point)))
 
+;; PLIRON: `black_box` is a pure optimization barrier — alias the result vreg
+;; to the input's and emit no machine code (like a same-class `bitcast`).
+(rule (lower (black_box _ x))
+      x)
+
 ;;;; Additional verification terms ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (attr aarch64_fpustore32 (veri chain))

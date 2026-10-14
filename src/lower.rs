@@ -3704,6 +3704,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
             csrc.extend(std::iter::repeat_n(ai, vs.len()));
             cargs.extend(vs);
         }
+        // `black_box` barriers arrive as calls to never-defined
+        // `__pliron_bb*`/`__pliron_bbm` symbols (flagged in CallInfo by
+        // `call_bb`); emit the zero-instruction CLIF `black_box` op
+        // instead of a real call. One op per leaf covers scalars, pairs
+        // and multi-leaf vectors; `__pliron_bbm`'s pointer arg carries
+        // the `~{memory}` clobber.
+        if info.bb {
+            let mut rs = Vals::new();
+            for &a in &cargs {
+                rs.push(self.b.ins().black_box(a));
+            }
+            if op.deref(ctx).get_num_results() > 0 {
+                self.set(op, rs);
+            }
+            return;
+        }
         // C variadic: fn_ty only has the fixed params. Foreign callees get the
         // real SysV ABI (extra args passed like ordinary arguments); callees
         // compiled by this backend get the args packed in a buffer whose

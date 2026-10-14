@@ -3556,4 +3556,33 @@ pub(crate) fn define(
         )
         .other_side_effects(),
     );
+
+    // PLIRON: opaque value barrier for rustc's `black_box` — the CLIF
+    // equivalent of LLVM's `asm("" : "r,~{memory}" :: v)`. Optimization
+    // passes cannot look through it (not eliminable, not foldable, and
+    // `can_store` gives the `~{memory}` clobber), but ISAs lower it to
+    // zero machine instructions: the result vreg aliases the input.
+    ig.push(
+        Inst::new(
+            "black_box",
+            r#"
+        Optimization barrier: `a` is `x`, but the compiler must not assume that.
+
+        The result is opaque to every optimization — it cannot be folded back to
+        the input, and the instruction is a memory clobber, so loads and stores
+        cannot be forwarded or moved across it. Models LLVM's
+        `asm("" : "r,~{memory}" :: v)`. Emits no machine code; lowering aliases
+        the result to the input's register.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![
+            Operand::new("x", Any).with_doc("Value to make opaque"),
+        ])
+        .operands_out(vec![
+            Operand::new("a", Any).with_doc("The same value, opaque to the optimizer"),
+        ])
+        .can_store()
+        .other_side_effects(),
+    );
 }

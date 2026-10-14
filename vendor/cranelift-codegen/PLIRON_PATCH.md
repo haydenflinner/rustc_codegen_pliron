@@ -217,3 +217,16 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     A/B). Upstream's per-use-block cloning is already the pressure-
     optimal placement; remat wins have to come from *what* gets marked
     (patch 20's encodability gate), not *where* clones land.
+
+22. `black_box` instruction (`cranelift-codegen-meta` shared
+    `instructions.rs` + a `lower.isle` rule per ISA): a unary op over any
+    scalar/vector type marked `can_store` + `other_side_effects`, so no
+    optimization may fold `a` back to `x`, eliminate it, or move memory
+    ops across it — the CLIF equivalent of LLVM's
+    `asm("" : "r,~{memory}" :: v)` used for `core::hint::black_box`.
+    Each ISA lowers `(black_box x)` to `x`, aliasing the result vreg to
+    the input's: zero machine instructions emitted. The vendored
+    interpreter evaluates it as the identity. pliron's `black_box`
+    intrinsic lowering emits `call __pliron_bb*`/`__pliron_bbm` ops that
+    `src/lower.rs` rewrites into this instruction (the call shape keeps
+    pliron's own IR opts opaque); wasm keeps a volatile load fallback.

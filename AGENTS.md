@@ -33,14 +33,19 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   the destination's binary format, so flags/relocs pass through verbatim
 - `src/asm.rs` — emits ELF- or Mach-O-flavored assembly per target
 - `src/hot.rs` — PLIRON_HOT thunks, x86-64 ELF asm only
-- `src/intrinsic.rs` — `black_box` is a real barrier: scalars round-trip
-  an alloca + volatile load; Refs and ZSTs call `__pliron_bbm`, a
-  `ret`-only asm stub (`bb_mem_stub` in `src/asm.rs`) whose escape of
-  the place pointer is the `~{memory}` clobber. cg_clif's pass-through
-  is cheaper but lets the optimizer see through the barrier — do not
-  "simplify" it back. A register round-trip call stub was measured
-  slower than the volatile load (call-site spills + clobber), so
-  scalars deliberately do not use it.
+- `src/intrinsic.rs` — `black_box` is a real barrier: it emits a call to
+  a never-defined `__pliron_bbv_<ty>` (values) / `__pliron_bbm` (Refs and
+  ZSTs) via `call_bb`, which flags the `CallInfo`; `lower.rs` rewrites
+  those calls into the CLIF `black_box` op (vendored Cranelift patch 22 —
+  `can_store` + `other_side_effects`, i.e. LLVM's `r,~{memory}` asm, and
+  each ISA lowers it to zero instructions). The bodiless callee keeps
+  pliron's own IR passes opaque (nowrite/nocapture/retarg are all
+  conservative), so the IR-level call is never folded away before it can
+  become the CLIF op. wasm has no CLIF path,
+  so it keeps the alloca + volatile-load fallback — do not "simplify"
+  `black_box` back to a pass-through; cg_clif's FIXME is not a model.
+- `vendor/cranelift-codegen` — patched upstream tree; every local change
+  is marked `PLIRON:` in source and numbered in `PLIRON_PATCH.md`.
 
 ## Build / test
 

@@ -117,6 +117,9 @@ pub struct CallInfo {
     /// proven copyable, letting the rest of the object promote (LLVM's
     /// partition-pinning equivalent).
     pub arg_extent: Option<Box<[(u64, u64)]>>,
+    /// `black_box` barrier: the callee is a never-defined `__pliron_bb*`
+    /// symbol; lowering emits the CLIF `black_box` op instead of a call.
+    pub bb: bool,
 }
 
 #[derive(Default)]

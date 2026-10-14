@@ -242,6 +242,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 tail: false,
                 nocap: None,
                 arg_extent: None,
+                bb: false,
             },
         );
         self.st.borrow_mut().last_call = Some(p);
@@ -258,6 +259,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.declare_fn_sym(sym, fty, cranelift_module::Linkage::Import, Exts::default());
         let f = self.sym_addr(sym);
         self.call_raw(fty, f, args, Exts::default())
+    }
+
+    /// `call_sym` to a never-defined `__pliron_bb*` barrier symbol. The
+    /// bodiless callee is opaque to every pliron pass (nowrite marks the
+    /// caller writing, nocapture captures the args, retarg can't fold the
+    /// result); `lower.rs` sees the flag and emits the CLIF `black_box`
+    /// op — a `~{memory}` clobber emitting zero machine instructions —
+    /// instead of a call. wasm lowers CallOps to real wasm calls, so it
+    /// must not take this path.
+    pub fn call_bb(&mut self, sym: &str, ret: TypeHandle, args: &[Value]) -> Value {
+        let v = self.call_sym(sym, ret, args);
+        let mut st = self.st.borrow_mut();
+        if let Some(p) = st.last_call {
+            st.calls.get_mut(&p).unwrap().bb = true;
+        }
+        v
     }
 
     fn parent_fn(&self) -> Ptr<Operation> {

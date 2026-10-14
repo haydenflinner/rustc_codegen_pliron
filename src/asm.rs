@@ -187,50 +187,11 @@ impl<'tcx> CodegenCx<'tcx> {
         push_stub(&mut st.asm, fmt, x86, &sym, &body);
         sym
     }
-
-    /// `black_box` memory-clobber stub: an identity body rustc never
-    /// sees, so a call to it is opaque to every pass — nowrite marks
-    /// the caller writing (the `~{memory}` half of LLVM's
-    /// `asm("" : "r,~{memory}" :: ptr)`), nocapture captures its pointer
-    /// arg (an aggregate's contents become unknown), and nothing can
-    /// inline or fold it away. `None` where the asm-stub machinery
-    /// doesn't exist.
-    pub fn bb_mem_stub(&self) -> Option<String> {
-        use rustc_target::spec::BinaryFormat::*;
-        let fmt = self.tcx.sess.target.options.binary_format;
-        let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
-        if !x86 && self.tcx.sess.asm_arch != Some(InlineAsmArch::AArch64) {
-            return None;
-        }
-        let mut st = self.st.borrow_mut();
-        // COFF has no weak-symbol dedup, so like the `llvm.*` stubs this
-        // gets a per-module-unique name.
-        let sfx = if fmt == Coff {
-            let cgu: String = st
-                .cgu
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            format!(
-                "_{:x}_{cgu}",
-                self.tcx
-                    .stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
-                    .as_u64()
-            )
-        } else {
-            String::new()
-        };
-        let sym = format!("__pliron_bbm{sfx}");
-        if st.llvm_stubs.insert(sym.clone()) {
-            push_stub(&mut st.asm, fmt, x86, &sym, "    ret\n");
-        }
-        Some(sym)
-    }
 }
 
-/// Weak hidden asm stub shared by `llvm.*` intrinsics, `black_box`
-/// barriers, etc. `body` is arch syntax (Intel flavor on x86 — the
-/// wrappers toggle `noprefix`/`att` around it).
+/// Weak hidden asm stub shared by `llvm.*` intrinsics etc. `body` is
+/// arch syntax (Intel flavor on x86 — the wrappers toggle
+/// `noprefix`/`att` around it).
 fn push_stub(
     asm: &mut String,
     fmt: rustc_target::spec::BinaryFormat,

@@ -14,6 +14,7 @@ use rustc_middle::ty::{self, Instance};
 use rustc_span::{Span, sym};
 
 use crate::builder::Builder;
+use crate::types::TyK;
 
 /// Or-reduced xor of `pa[0..n]` vs `pb[0..n]` in word chunks — nonzero
 /// iff the byte ranges differ. LLVM expands small constant-size
@@ -259,28 +260,40 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::black_box => {
                 let layout = args[0].layout;
                 // Opaque optimization barrier — LLVM's
-                // `asm("" : "r,~{memory}" :: ptr)`. Scalars round-trip a
-                // store + volatile load below: the volatile load cannot
-                // forward to the stored value, so users of the result
-                // cannot see the input — cheaper than a call, which
-                // spills registers and clobbers memory in hot loops.
-                // Refs and ZSTs instead call `__pliron_bbm`, a `ret`-only
-                // stub rustc never sees: nowrite marks the caller
-                // writing (`~{memory}`), nocapture captures the pointer
-                // (the pointee's contents become unknown), and nothing
-                // can inline or fold it away.
+                // `asm("" : "r,~{memory}" :: v)`. Native targets emit a
+                // call to a never-defined `__pliron_bb*`/`__pliron_bbm`
+                // symbol (`call_bb`): the bodiless callee is opaque to
+                // every pliron pass — nowrite marks the caller writing
+                // (the `~{memory}` clobber), nocapture captures the args
+                // (a place's contents become unknown), retarg can't fold
+                // — and lower.rs rewrites the call into the CLIF
+                // `black_box` op, which emits zero machine instructions.
+                // wasm lowers CallOps to real calls, so it keeps the
+                // alloca + volatile round-trip below.
+                let clif_bb = !self.tcx.sess.target.is_like_wasm;
                 if layout.is_zst() {
-                    if let Some(mem) = &self.cx.bb_mem_stub() {
+                    if clif_bb {
                         let p = self.const_null(self.type_ptr());
-                        self.call_sym(mem, self.type_void(), &[p]);
+                        self.call_bb("__pliron_bbm", self.type_void(), &[p]);
                     }
                     return IntrinsicResult::Operand(OperandValue::ZeroSized);
                 }
-                if let &OperandValue::Ref(p) = &args[0].val
-                    && let Some(mem) = &self.cx.bb_mem_stub()
-                {
-                    self.call_sym(mem, self.type_void(), &[p.llval]);
-                    return IntrinsicResult::Operand(OperandValue::Ref(p));
+                match &args[0].val {
+                    &OperandValue::Ref(p) if clif_bb => {
+                        self.call_bb("__pliron_bbm", self.type_void(), &[p.llval]);
+                        return IntrinsicResult::Operand(OperandValue::Ref(p));
+                    }
+                    &OperandValue::Immediate(v) if clif_bb => {
+                        return IntrinsicResult::Operand(OperandValue::Immediate(
+                            bb_val(self, v),
+                        ));
+                    }
+                    &OperandValue::Pair(a, b) if clif_bb => {
+                        let a = bb_val(self, a);
+                        let b = bb_val(self, b);
+                        return IntrinsicResult::Operand(OperandValue::Pair(a, b));
+                    }
+                    _ => {}
                 }
                 let src = PlaceRef::new_sized(self.alloca_with_ty(layout), layout);
                 args[0].val.store(self, src);
@@ -527,5 +540,28 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         self.store(buf, p8, Align::EIGHT);
         let p16 = self.gep(i8t, val, &[self.const_usize(16)]);
         self.store(buf, p16, Align::EIGHT);
+    }
+}
+
+/// `call_bb` round-trip for one scalar/vector value. `__pliron_bbv_<tag>`
+/// is declared `fn(T) -> T`; the per-type suffix keeps each signature's
+/// FuncOp decl distinct (`declare_fn_sym` dedups by name). `lower.rs`
+/// turns the call into the CLIF `black_box` op, so this is zero-cost.
+fn bb_val(b: &mut Builder<'_, '_>, v: Value) -> Value {
+    let ty = b.ty_of(v);
+    let sym = format!("__pliron_bbv_{}", bb_ty_tag(b, ty));
+    b.call_bb(&sym, ty, &[v])
+}
+
+fn bb_ty_tag(b: &Builder<'_, '_>, ty: TypeHandle) -> String {
+    match b.kind(ty) {
+        TyK::Int(w) => format!("i{w}"),
+        TyK::F16 => "f16".into(),
+        TyK::F32 => "f32".into(),
+        TyK::F64 => "f64".into(),
+        TyK::F128 => "f128".into(),
+        TyK::Ptr => "p".into(),
+        TyK::Vector(e, n) => format!("v{n}x{}", bb_ty_tag(b, e)),
+        _ => "o".into(),
     }
 }

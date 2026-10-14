@@ -763,6 +763,9 @@ where
         Opcode::Bor => binary(DataValueExt::or, arg(0), arg(1))?,
         Opcode::Bxor => binary(DataValueExt::xor, arg(0), arg(1))?,
         Opcode::Bnot => unary(DataValueExt::not, arg(0))?,
+        // PLIRON: `black_box` is the identity at run time; its opacity only
+        // exists for the optimizer.
+        Opcode::BlackBox => assign(arg(0)),
         Opcode::Rotl => binary(DataValueExt::rotl, arg(0), shift_amt(ctrl_ty, arg(1))?)?,
         Opcode::Rotr => binary(DataValueExt::rotr, arg(0), shift_amt(ctrl_ty, arg(1))?)?,
         Opcode::Ishl => binary(DataValueExt::shl, arg(0), shift_amt(ctrl_ty, arg(1))?)?,

@@ -5435,3 +5435,8 @@
 (rule (lower (sequence_point))
       (side_effect
        (x64_sequence_point)))
+
+;; PLIRON: `black_box` is a pure optimization barrier — alias the result vreg
+;; to the input's and emit no machine code (like a same-class `bitcast`).
+(rule (lower (black_box _ x))
+      x)

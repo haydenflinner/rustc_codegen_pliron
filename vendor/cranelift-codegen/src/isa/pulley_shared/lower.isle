@@ -1927,8 +1927,7 @@
       (let ((succ_label MachLabel (block_exn_successor_label block idx)))
         (pulley_label_address succ_label)))
 
-;; Rules for `sequence_point` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (sequence_point))
-      (side_effect
-       (pulley_sequence_point)))
+;; PLIRON: `black_box` is a pure optimization barrier — alias the result vreg
+;; to the input's and emit no machine code (like a same-class `bitcast`).
+(rule (lower (black_box _ x))
+      x)

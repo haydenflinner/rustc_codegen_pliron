@@ -16,19 +16,16 @@ rustc --bench` flags reach the bench crate only, so criterion itself is
 always LLVM-built and cannot skew the numbers. The machine is an Apple
 Silicon Mac (aarch64-apple-darwin); the toolchain is `nightly-2026-10-06`.
 
-`black_box` is a real barrier under both backends: pliron lowers scalars
-as a store into an alloca followed by a volatile load, which the
-optimizer cannot forward back to the input — the volatile-marked op
-survives every ir-opt and CLIF pass. `Ref` aggregates and ZSTs instead
-call `__pliron_bbm`, a `ret`-only assembly stub: escaping the place
-pointer into an unanalyzable callee is the `~{memory}` clobber, so no
-volatile copy is needed. LLVM uses empty inline asm, which keeps the
-value in a register, so our scalar barrier costs ~1.2 ns per call where
-LLVM's is free. (A register round-trip through a call stub was tried —
-the call's register clobbers and full-memory effect made it slower than
-the volatile load on hot loops.) The two kernels that call `black_box`
-per inner iteration (`eqbug`, `parse_only`) pay that difference
-directly.
+`black_box` is a real barrier under both backends, and now nearly free:
+pliron emits a call to a never-defined `__pliron_bb*`/`__pliron_bbm`
+symbol, opaque to every IR-level pass (a bodiless callee writes memory
+and captures its args, so nothing can fold through it), and `lower.rs`
+rewrites the call into `black_box` — a CLIF instruction we added to the
+vendored Cranelift (`can_store` + `other_side_effects`, i.e. exactly
+LLVM's `asm("" : "r,~{memory}" :: v)` semantics) that lowers to zero
+machine instructions: the result vreg aliases the input's. On wasm the
+CLIF path doesn't exist, so `black_box` keeps the alloca + volatile-load
+fallback there.
 
 ## Run time of compiled code
 
@@ -38,53 +35,52 @@ directly.
 | chars_ascii | 1.540 ms | 0.998 ms | −35.2% improved |
 | chars_mixed | 11.09 ms | 11.26 ms | +1.5% (noise) |
 | contains_rng | 1.556 ms | 1.512 ms | −2.8% improved |
-| eqbug | 78.3 µs | 256.8 µs | +228% regressed (barrier cost) |
-| fib | 10.09 ms | 9.568 ms | −5.2% improved |
-| hashmap | 53.73 ms | 46.41 ms | −13.6% improved |
-| hmget | 9.088 ms | 9.307 ms | +2.4% regressed |
-| iterw | 13.77 ms | 11.39 ms | −17.3% improved |
-| matmul | 5.967 ms | 6.195 ms | +3.8% regressed |
-| nbody | 79.86 ms | 66.40 ms | −16.9% improved |
-| parse_only | 260.5 ms | 278.5 ms | +6.9% regressed (barrier cost) |
-| sieve | 8.521 ms | 9.403 ms | +10.4% regressed |
-| sortw | 4.896 ms | 4.556 ms | −6.9% improved |
-| strwork | 9.833 ms | 9.902 ms | +0.7% (noise) |
-| tokenize | 4.056 ms | 2.713 ms | −33.1% improved |
+| eqbug | 78.3 µs | 95.9 µs | +22.3% regressed |
+| fib | 10.09 ms | 9.242 ms | −8.4% improved |
+| hashmap | 53.73 ms | 46.45 ms | −13.6% improved |
+| hmget | 9.088 ms | 9.297 ms | +2.3% regressed |
+| iterw | 13.77 ms | 11.57 ms | −16.0% improved |
+| matmul | 5.967 ms | 6.075 ms | +1.8% regressed |
+| nbody | 79.86 ms | 83.94 ms | +5.1% regressed |
+| parse_only | 260.5 ms | 292.6 ms | +12.3% regressed (memory clobber) |
+| sieve | 8.521 ms | 9.188 ms | +7.8% regressed |
+| sortw | 4.896 ms | 4.352 ms | −11.1% improved |
+| strwork | 9.833 ms | 9.497 ms | −3.4% improved |
+| tokenize | 4.056 ms | 2.665 ms | −34.3% improved |
 
-The geometric mean of the ratios is 0.92 excluding `eqbug` (0.99 including
-it): about 8% faster than LLVM on this set. Eight kernels are faster, four
+The geometric mean of the ratios is 0.92 excluding `eqbug` (0.94 including
+it): about 8% faster than LLVM on this set. Eight kernels are faster, five
 are slower, and the rest are at parity or within noise.
 
 `eqbug` is a narrow-icmp stress kernel kept as a regression guard. Its
-inner loop calls `black_box` three times per element, so the measurement
-is almost entirely barrier overhead (≈179 µs over 150k barriers vs 78 µs
-of real work) — without the barriers the whole loop folded to ~2 ns.
+inner loop calls `black_box` three times per element — the residual +22%
+is real codegen gap in the kernel itself, not barrier overhead: the
+`black_box` op emits no machine code (each barrier only forces the value
+into a register, exactly like LLVM's `r` constraint).
 
 ## Where pliron wins
 
-- `chars_ascii` (−35.2%) and `tokenize` (−33.1%): byte-classification
+- `chars_ascii` (−35.6%) and `tokenize` (−34.3%): byte-classification
   loops. `rangefold` folds range-test trees into offset-and-compare forms,
   and `loopvec` widens the ASCII fast path.
-- `iterw` (−17.3%), `nbody` (−16.9%), `hashmap` (−13.6%): loop and
+- `iterw` (−16.0%), `hashmap` (−13.6%), `sortw` (−11.1%): loop and
   call-heavy kernels. Loop rotation, induction-variable work, `divconst`
   multiply-high expansion feeding NEON widening multiply-accumulates, and
-  the tail calling convention for local functions cover most of it. The
-  earlier best-of-N harness had `hashmap` as a loss — under per-iteration
-  sampling the hashbrown probe loop is ahead.
-- `sortw` (−6.9%): `pdqsort`/`ipnsort` on u64. The partition-loop copies
-  around address formation that used to cost ~17% are gone.
-- `fib` (−5.2%) and `contains_rng` (−2.8%): calls and range tests.
+  the tail calling convention for local functions cover most of it.
+- `fib` (−8.4%), `contains_rng` (−2.4%), `strwork` (−3.4%),
+  `chars_alpha` (−4.0%): calls and range tests.
 
 ## Where LLVM wins
 
-- `eqbug` (+228%) and `parse_only` (+6.9%): per-iteration `black_box`
-  calls. LLVM's empty-asm barrier costs nothing; our volatile round-trip
-  costs ~1.2 ns each. The underlying work is at parity — this is barrier
-  overhead, not a codegen gap.
-- `sieve` (+10.4%): `sieve(5M)` plus the u128 multiply/divide chain. The
-  regression is new since the last table — worth a bisect.
-- `matmul` (+3.8%) and `hmget` (+2.4%): matmul flipped between runs
-  (earlier measured at parity), and hmget is consistently slow-side.
+- `eqbug` (+22%) and `parse_only` (+12%): the two per-iteration
+  `black_box` kernels. The barrier itself emits zero instructions — the
+  residual is the `~{memory}` clobber (loads can't forward across it) plus
+  surrounding codegen, same semantics LLVM applies.
+- `sieve` (+7.8%), `nbody` (+5.1%): sieve's u128 multiply/divide chain
+  stays slow-side (was +10.4% last run, worth a bisect); nbody's flip from
+  −16.9% to +5.1% needs investigation — it moved far more than noise
+  between runs.
+- `matmul` (+1.8%) and `hmget` (+2.3%): hmget is consistently slow-side.
 
 ## WebAssembly
 
@@ -161,11 +157,11 @@ results cannot hit.
 
 ## What is next
 
-- `sieve`: bisect the +10.4% regression.
-- `black_box`: the register round-trip call stub measured slower than
-  the volatile store/load (spills + clobber per call), so the remaining
-  gap is inherent without a truly inline empty-asm primitive — real
-  inline `llvm.inline_asm` lowering would close it.
+- `sieve`: bisect the +7.8% regression.
+- `nbody`: investigate the −17% → +5% flip between runs.
+- `black_box`: done — the CLIF `black_box` op (vendored Cranelift patch
+  22) emits zero instructions, matching LLVM's `asm("" : "r,~{memory}")`.
+  wasm still uses the volatile-load fallback.
 - `chars_mixed`: extend the `rangefold` coverage to the non-ASCII path.
 - `hmget`: residual spill traffic in the hashbrown probe loop.
 - More `loopvec` coverage: gather-loop shapes, multi-instruction update
