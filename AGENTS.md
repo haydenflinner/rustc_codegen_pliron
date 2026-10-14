@@ -136,8 +136,10 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
 
 - Never call a `layout.blocks()`/`inst_values` whole-function scan (or
   CFG/domtree rebuild) inside a per-inst/per-edge/per-candidate loop.
-  Build the index once (`use_index`, `block_uses`, count maps) and
-  decrement it incrementally — see `memspec`, `reap_dead`, `rebind_exports`.
+  "Who uses `v`" is `uses::Uses` (`sites`/`by_block`/`is_used`/
+  `escapes`/`in_block`, `Uses::build` shares the walk with extra
+  per-use tables); mutation-aware loops use incremental count maps —
+  see `memspec`, `reap_dead`, `rebind_exports`.
 - `resolve_aliases`/`value_def` walk alias chains linearly; passes that
   re-alias (merges, `change_to_alias`) extend them. `compact_aliases`
   runs after every mutating step — new passes should still prefer

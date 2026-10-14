@@ -9,7 +9,6 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};

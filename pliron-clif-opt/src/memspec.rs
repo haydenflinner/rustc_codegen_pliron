@@ -195,36 +195,28 @@ fn edge_candidate(func: &Function, p: Block, t: Inst) -> Option<(Block, Vec<Inst
 }
 
 /// One O(fn) scan producing the two indexes the per-candidate checks
-/// would otherwise rebuild per candidate: which blocks use each value,
-/// and for each block the resolved def `(program point, def block)` of
-/// every value it references (`None` when the def isn't an inst result
-/// or block param, which fails `succs_ok`).
-fn use_index(
+/// would otherwise rebuild per candidate: the shared `Uses` index, and
+/// per block the resolved def `(program point, def block)` of every
+/// value it references (`None` when the def isn't an inst result or
+/// block param, which fails `succs_ok`).
+fn mem_indexes(
     func: &Function,
 ) -> (
-    FxHashMap<Value, FxHashSet<Block>>,
+    crate::uses::Uses,
     FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>>,
 ) {
-    let mut used_by: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
     let mut ext: FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>> =
         FxHashMap::default();
-    for b in func.layout.blocks() {
-        let entries = ext.entry(b).or_default();
-        for i in func.layout.block_insts(b) {
-            for v in func.dfg.inst_values(i) {
-                let v = func.dfg.resolve_aliases(v);
-                used_by.entry(v).or_default().insert(b);
-                entries.push(match func.dfg.value_def(v) {
-                    ValueDef::Result(d, _) => {
-                        Some((ProgramPoint::Inst(d), func.layout.inst_block(d)))
-                    }
-                    ValueDef::Param(b2, _) => Some((ProgramPoint::Block(b2), Some(b2))),
-                    _ => None,
-                });
+    let uses = crate::uses::Uses::build(func, |v, b, _| {
+        ext.entry(b).or_default().push(match func.dfg.value_def(v) {
+            ValueDef::Result(d, _) => {
+                Some((ProgramPoint::Inst(d), func.layout.inst_block(d)))
             }
-        }
-    }
-    (used_by, ext)
+            ValueDef::Param(b2, _) => Some((ProgramPoint::Block(b2), Some(b2))),
+            _ => None,
+        });
+    });
+    (uses, ext)
 }
 
 pub fn run(
@@ -269,7 +261,7 @@ pub fn run(
     // address, so a pointer loaded from memory can't reach its region.
     // Same rule licm's `iso_l` applies per loop, scoped to the edge.
     let mut reachers: FxHashSet<Block> = FxHashSet::default();
-    let (mut used_by, mut ext) = use_index(func);
+    let (mut uses, mut ext) = mem_indexes(func);
     let mut n = 0;
     'blocks: for (p, t, (r, body)) in cands {
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
@@ -298,13 +290,7 @@ pub fn run(
             .flat_map(|&i| func.dfg.inst_results(i).iter().copied())
             .filter(|&v| func.dfg.resolve_aliases(v) == v)
             .collect();
-        if !defs.is_empty()
-            && defs.iter().any(|v| {
-                used_by
-                    .get(v)
-                    .is_some_and(|bs| bs.iter().any(|&b| b != r))
-            })
-        {
+        if !defs.is_empty() && defs.iter().any(|v| uses.escapes(*v, r)) {
             if dbg {
                 eprintln!("memspec: {p}->{r} skip escaping def (fn {})", func.name);
             }
@@ -474,7 +460,7 @@ pub fn run(
         n += 1;
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
-        (used_by, ext) = use_index(func);
+        (uses, ext) = mem_indexes(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
             loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());

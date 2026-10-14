@@ -1353,23 +1353,14 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                     }
                 }
             }
-            // One use-set for the whole sweep: removals only delete uses,
-            // so a stale entry just skips a removal the next outer round
-            // catches — a per-inst whole-function scan was O(dead × fn).
-            let used: FxHashSet<Value> = func
-                .layout
-                .blocks()
-                .flat_map(|bb| {
-                    func.layout
-                        .block_insts(bb)
-                        .flat_map(|i| func.dfg.inst_values(i))
-                        .collect::<Vec<_>>()
-                })
-                .map(|v| func.dfg.resolve_aliases(v))
-                .collect();
+            // One use index for the whole sweep: removals only delete
+            // uses, so a stale entry just skips a removal the next
+            // outer round catches — a per-inst whole-function scan
+            // was O(dead × fn).
+            let uses = crate::uses::Uses::new(func);
             'sweep: for di in dead {
-                let r = func.dfg.first_result(di);
-                if used.contains(&func.dfg.resolve_aliases(r)) {
+                let r = func.dfg.resolve_aliases(func.dfg.first_result(di));
+                if uses.is_used(r) {
                     continue 'sweep;
                 }
                 func.dfg.clear_results(di);
@@ -2124,22 +2115,9 @@ pub fn merge_chains(func: &mut Function) {
 pub fn rebind_exports(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
-    // Resolved use-set per block — one O(fn) scan shared by every
-    // (y, s) cone walk instead of re-walking `inst_values` per use.
-    let block_uses: FxHashMap<Block, FxHashSet<Value>> = func
-        .layout
-        .blocks()
-        .map(|b| {
-            (
-                b,
-                func.layout
-                    .block_insts(b)
-                    .flat_map(|i| func.dfg.inst_values(i))
-                    .map(|v| func.dfg.resolve_aliases(v))
-                    .collect(),
-            )
-        })
-        .collect();
+    // Resolved use index — one O(fn) scan shared by every (y, s) cone
+    // walk instead of re-walking `inst_values` per use.
+    let uses = crate::uses::Uses::new(func);
     let mut edits = Vec::new();
     for y in func.layout.blocks().collect::<Vec<_>>() {
         let mut exports: FxHashSet<Value> = func.dfg.block_params(y).iter().copied().collect();
@@ -2174,13 +2152,13 @@ pub fn rebind_exports(func: &mut Function) -> usize {
                 if b == y || (b != s && !dom.block_dominates(s, b)) {
                     continue;
                 }
-                for v in &block_uses[&b] {
-                    if exports.contains(v) && !needed.contains(v) {
+                for v in uses.in_block(b) {
+                    if exports.contains(&v) && !needed.contains(&v) {
                         if needed.len() >= 8 {
                             bail = true;
                             break 'cone;
                         }
-                        needed.push(*v);
+                        needed.push(v);
                     }
                 }
             }
