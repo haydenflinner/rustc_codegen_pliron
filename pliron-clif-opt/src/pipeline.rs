@@ -1740,8 +1740,15 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         // its block head, which orders before every inst in the block —
         // the same ordering the old inst-index scan gave.
         let pp = |v: Value| match f.dfg.try_value_def(v) {
-            Some(ValueDef::Result(i, _)) => Some(ProgramPoint::Inst(i)),
-            Some(ValueDef::Param(b, _)) => Some(ProgramPoint::Block(b)),
+            // A def may be detached (removed from the layout) while its
+            // value still exists — `pp_block`/`pp_cmp` panic on those,
+            // where the old position scan returned `None`.
+            Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
+                Some(ProgramPoint::Inst(i))
+            }
+            Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
+                Some(ProgramPoint::Block(b))
+            }
             _ => None,
         };
         match (pp(d), pp(w)) {
