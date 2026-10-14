@@ -1394,4 +1394,65 @@ mod tests {
         assert!(!bnd.contains_key(&cnt));
         assert!(!bnd.contains_key(&c2));
     }
+
+    /// `vhash` must equal `khash_m(key_of(v))` — the lazy gates in
+    /// `webmerge` only ever *miss* merges on a mismatch (soundness is
+    /// re-verified structurally), but a drifted normalization would
+    /// silently degrade every `hmap` probe. Cross-check both paths on a
+    /// function touching every keyed variant.
+    #[test]
+    fn vhash_matches_key_hash() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let y = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        // Iconst / Binary / BinaryImm8 / Unary / Ternary / compares /
+        // imm pseudo-args all get exercised.
+        let k7 = cur.ins().iconst(types::I64, 7);
+        let a = cur.ins().iadd(x, y);
+        let s = cur.ins().isub(a, k7);
+        let m = cur.ins().imul(s, x);
+        let three = cur.ins().iconst(types::I64, 3);
+        let sh = cur.ins().ushr(m, three);
+        let n = cur.ins().ineg(sh);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, m, k7);
+        let sel = cur.ins().select(c, n, a);
+        let band = cur.ins().band(sel, m);
+        let fc = cur.ins().f64const(1.5);
+        cur.ins().return_(&[band]);
+        let _ = fc;
+
+        let nf = web_nf(&func);
+        let canon = canon_map(&func);
+        let mut km: FxHashMap<Value, Key> = FxHashMap::default();
+        let mut hm: FxHashMap<Value, u64> = FxHashMap::default();
+        let mut nm: FxHashMap<Value, usize> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    let v = func.dfg.resolve_aliases(v);
+                    let k = key_of(&func, &nf, &canon, &mut km, v);
+                    // `k` is a stack temp — `khash_m`'s pointer-keyed
+                    // memo would alias its reused address, so hash with
+                    // a fresh memo (children's `Rc` targets are stable).
+                    assert_eq!(
+                        vhash(&func, &nf, &canon, &mut hm, v),
+                        khash_m(&k, &mut FxHashMap::default()),
+                        "vhash drifted from key_of on {v}"
+                    );
+                    assert_eq!(
+                        vnodes(&func, &nf, &canon, &mut nm, v),
+                        nodes(&k),
+                        "vnodes drifted on {v}"
+                    );
+                }
+            }
+        }
+    }
 }
