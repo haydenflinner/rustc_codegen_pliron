@@ -388,6 +388,10 @@ fn conv_table(
     reach: &mut FxHashSet<Block>,
     mset_cache: &mut FxHashMap<Block, FxHashSet<Block>>,
     dirty: &mut bool,
+    preds: &mut (
+        FxHashMap<Block, FxHashSet<Block>>,
+        FxHashMap<Block, FxHashSet<Block>>,
+    ),
     b: Block,
     term: Inst,
     derived: &mut FxHashMap<Value, Value>,
@@ -503,15 +507,15 @@ fn conv_table(
             }
         }
     }
-    if *dirty {
-        cfg.compute(func);
-        domtree.compute(func, &cfg);
-        mset_cache.clear();
-        *dirty = false;
-    }
     // Multi-hop arms only pay off when the fold leaves its loop
     // branch-free (see `flat_loop`).
     if arms.iter().any(|a| a.chained) {
+        if *dirty {
+            cfg.compute(func);
+            domtree.compute(func, &cfg);
+            mset_cache.clear();
+            *dirty = false;
+        }
         la.compute(func, cfg, domtree);
         *reach = reachable(func, cfg);
         if !flat_loop(func, la, reach, b) {
@@ -519,12 +523,26 @@ fn conv_table(
         }
     }
     // The synthesized values live in `b`; every path into `m` must come
-    // from this table.
+    // from this table. Folds already applied this pass make `cfg`'s pred
+    // list stale: a folded block now jumps straight to `m` (new pred) and
+    // drops its arm-target edges (lost preds). `preds` tracks both deltas
+    // exactly, so no per-fold CFG recompute is needed here.
     let sides: FxHashSet<Block> = arms.iter().filter_map(|a| a.side).collect();
-    let ok = cfg.pred_iter(m).all(|p| {
-        let pb = func.layout.inst_block(p.inst).unwrap_or(m);
-        pb == b || sides.contains(&pb)
-    });
+    let ok = {
+        let mut fresh: FxHashSet<Block> = cfg
+            .pred_iter(m)
+            .map(|p| func.layout.inst_block(p.inst).unwrap_or(m))
+            .collect();
+        if let Some(ls) = preds.1.get(&m) {
+            for &l in ls {
+                fresh.remove(&l);
+            }
+        }
+        if let Some(gs) = preds.0.get(&m) {
+            fresh.extend(gs.iter().copied());
+        }
+        fresh.iter().all(|&pb| pb == b || sides.contains(&pb))
+    };
     if !ok {
         return false;
     }
@@ -573,6 +591,13 @@ fn conv_table(
         }
     }
     *dirty = true;
+    for d in &dests {
+        let db = d.block(&func.dfg.value_lists);
+        if db != m {
+            preds.1.entry(db).or_default().insert(b);
+        }
+    }
+    preds.0.entry(m).or_default().insert(b);
     let avals: Vec<Vec<Value>> = arms
         .iter()
         .map(|a| emit_arm(func, term, a, derived))
@@ -628,6 +653,15 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
     let mut reach: FxHashSet<Block> = FxHashSet::default();
     let mut mset_cache: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
     let mut dirty = false;
+    // Exact pred deltas for applied folds — (gained direct preds, lost
+    // preds) per block — so checks that need fresh pred sets don't pay a
+    // full CFG recompute per conversion. Dominance can only strengthen
+    // under edge removal, so the stale `domtree` stays a conservative
+    // under-approximation for the `dominates`-required checks.
+    let mut preds: (
+        FxHashMap<Block, FxHashSet<Block>>,
+        FxHashMap<Block, FxHashSet<Block>>,
+    ) = (FxHashMap::default(), FxHashMap::default());
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         let Some(term) = func.layout.last_inst(b) else {
@@ -643,6 +677,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                     &mut reach,
                     &mut mset_cache,
                     &mut dirty,
+                    &mut preds,
                     b,
                     term,
                     derived,
@@ -714,15 +749,15 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         {
             continue;
         }
-        if dirty {
-            cfg.compute(func);
-            domtree.compute(func, &cfg);
-            mset_cache.clear();
-            dirty = false;
-        }
         // Multi-hop arms only pay off when the fold leaves its loop
         // branch-free (see `flat_loop`).
         if ta.chained || ea.chained {
+            if dirty {
+                cfg.compute(func);
+                domtree.compute(func, &cfg);
+                mset_cache.clear();
+                dirty = false;
+            }
             la.compute(func, &cfg, &domtree);
             reach = reachable(func, &cfg);
             if !flat_loop(func, &la, &reach, b) {
@@ -740,6 +775,12 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             continue;
         }
         dirty = true;
+        for d in [t, e] {
+            if d != m {
+                preds.1.entry(d).or_default().insert(b);
+            }
+        }
+        preds.0.entry(m).or_default().insert(b);
         let targs = emit_arm(func, term, &ta, derived);
         let eargs = emit_arm(func, term, &ea, derived);
         let cond = func.dfg.resolve_aliases(cond);

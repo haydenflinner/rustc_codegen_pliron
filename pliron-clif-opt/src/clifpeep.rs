@@ -1650,6 +1650,10 @@ pub fn fusechains(func: &mut Function) -> usize {
 pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut n = 0;
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    // `webmerge` rounds only rewrite values — topology-derived state
+    // (cfg/dom/edges) is round-invariant, so it is built once here
+    // rather than per call.
+    let mut wctx = WmCtx::new(func);
     for _ in 0..8 {
         // `webmerge` subsumes the old `sameargs_round`/`phimerge`/
         // `affparm` trio: phase A is the uniform-arg merge (with
@@ -1657,7 +1661,7 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // phase B the duplicate-param merge, phases C/D the rest.
         // Looping webmerge alone still reaches the cross-block fixpoint
         // — each drop can expose uniform args in successor blocks.
-        let (k, pm) = webmerge(func);
+        let (k, pm) = webmerge_ctx(func, &mut wctx);
         n += k;
         if !pm.is_empty() {
             // Compose into the accumulated map: old carriers may
@@ -1869,11 +1873,15 @@ pub fn coldrets(func: &mut Function) -> usize {
 pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut n = 0;
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    // Topology-derived `webmerge` state is round-invariant, but
+    // `const_sweep` inside the loop folds `brif`s to `jump`s — rebuild
+    // it whenever a sweep changes the edge list.
+    let mut wctx = WmCtx::new(func);
     for _ in 0..8 {
         // `cparm_round`'s carried-const chase is `webmerge` iterated:
         // each uniform-param link drops via phase A (the const leaf
         // materializes through `emit_key`), exposing the next link.
-        let (k, pm) = webmerge(func);
+        let (k, pm) = webmerge_ctx(func, &mut wctx);
         n += k;
         for v in pmap.values_mut() {
             while let Some(&w) = pm.get(v) {
@@ -1891,7 +1899,11 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             break;
         }
         if crate::pass_enabled("PLIRON_CSWEEP") {
-            n += const_sweep(func);
+            let cs = const_sweep(func);
+            n += cs;
+            if cs > 0 {
+                wctx = WmCtx::new(func);
+            }
         }
     }
     (n, pmap)
@@ -2096,22 +2108,59 @@ fn dominates_entry(
 /// Returns `(merges, pmap)` — `pmap` maps each dropped param to the
 /// carrier its uses rebound to. The pipeline uses it to carry
 /// `derived`-pointer facts across the merge.
+/// Topology-derived state shared across `webmerge` rounds. A round only
+/// rewrites values — drops args, drops block params, inserts
+/// non-terminator insts — so block succ/pred structure and the
+/// inst→dest edge list are round-invariant. Fixpoint loops (`sameargs`,
+/// `cparm`) build this once instead of paying O(E) per round.
+pub struct WmCtx {
+    cfg: cranelift_codegen::flowgraph::ControlFlowGraph,
+    dom: cranelift_codegen::dominator_tree::DominatorTree,
+    edges: FxHashMap<Block, Vec<(Inst, usize)>>,
+}
+
+impl WmCtx {
+    pub fn new(func: &Function) -> Self {
+        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+        let dom =
+            cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+        let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for (d, bc) in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .enumerate()
+                {
+                    edges
+                        .entry(bc.block(&func.dfg.value_lists))
+                        .or_default()
+                        .push((i, d));
+                }
+            }
+        }
+        WmCtx { cfg, dom, edges }
+    }
+}
+
 pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
+    let mut ctx = WmCtx::new(func);
+    webmerge_ctx(func, &mut ctx)
+}
+
+pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<Value, Value>) {
     use crate::proots::Key;
     let t0 = std::time::Instant::now();
-    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
-    let t1 = std::time::Instant::now();
+    let WmCtx { cfg, dom, edges } = ctx;
     let nf = crate::proots::web_nf(func);
     let t2 = std::time::Instant::now();
     let canon = crate::proots::canon_map(func);
     let t3 = std::time::Instant::now();
     if std::env::var_os("PLIRON_WM_PROF").is_some() {
         eprintln!(
-            "webmerge {}: cfg+dom {:?} web_nf {:?} canon {:?}",
+            "webmerge {}: web_nf {:?} canon {:?}",
             func.name,
-            t1 - t0,
-            t2 - t1,
+            t2 - t0,
             t3 - t2
         );
     }
@@ -2121,21 +2170,6 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let memo = std::cell::RefCell::new(FxHashMap::<Value, crate::proots::Key>::default());
     let mut vhmemo: FxHashMap<Value, u64> = FxHashMap::default();
     let vnmemo = std::cell::RefCell::new(FxHashMap::<Value, usize>::default());
-    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for (d, bc) in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .iter()
-                .enumerate()
-            {
-                edges
-                    .entry(bc.block(&func.dfg.value_lists))
-                    .or_default()
-                    .push((i, d));
-            }
-        }
-    }
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
@@ -2152,7 +2186,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let wmprof = std::env::var_os("PLIRON_WM_PROF").is_some();
     let wm_nodiffb = std::env::var_os("PLIRON_WM_NODIFFB").is_some();
     let wm_rel = std::env::var_os("PLIRON_WEBMERGE_REL").is_some();
-    for (&b, es) in &edges {
+    for (&b, es) in edges.iter() {
         let tb0 = std::time::Instant::now();
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
