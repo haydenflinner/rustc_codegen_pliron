@@ -296,6 +296,13 @@ pub enum Key {
     /// same pseudo-arg dedup via `P`; a uniform-`O` slot can never
     /// materialize, so `mat_ok`/`emit_key` reject it.
     O(u64),
+    /// "The value param `i` holds at this edge's source" — distinct
+    /// from `P(i)` (the value *passed into* slot `i` on this edge):
+    /// they coincide only when the edge echoes the param back. An arg
+    /// computed from `p_i` keys with `Q(i)` leaves, which is how the
+    /// relational merge recognizes recurrence steps like `p_j + 8` on
+    /// a back-edge.
+    Q(u32),
 }
 
 /// `v`'s congruence key: aliases resolved, affine chains collapsed via
@@ -506,27 +513,35 @@ pub mod tag {
     pub const LOADNOFF: u64 = 11;
 }
 
-/// Rewrite `k` slot-relative: any subtree equal to `slots[i]`'s key
-/// becomes `P(i)` — "this value is whatever slot `i` carried on this
-/// edge". Subtrees are matched on keys, not values, so an edge arg like
-/// `imul (iadd x,8), 2` paramizes against a sibling slot carrying
-/// `iadd x,8` even though the SSA names differ. `skip` excludes the
-/// slot being keyed (a `p_j` referencing itself is a real phi).
-pub fn paramize(k: &Key, slots: &[Key], skip: usize) -> Key {
-    if let Some(i) = slots
-        .iter()
-        .enumerate()
-        .find(|(i, s)| *i != skip && *s == k)
-        .map(|(i, _)| i)
+/// Rewrite `k` slot-relative: any subtree equal to `slots[i]`'s key —
+/// or naming `ps[i]` itself, a param *is* its slot's value — becomes
+/// `P(i)`, "whatever arrived in slot `i` on this edge". Subtrees match
+/// on keys, not values, so an edge arg like `imul (iadd x,8), 2`
+/// paramizes against a sibling slot carrying `iadd x,8` even though
+/// the SSA names differ. `skip` excludes the slot being keyed from
+/// *arg-key* matching only (slot `j`'s own key trivially equals
+/// itself); a `V(p_j)` leaf maps to `Q(j)` — it resolves through
+/// `pend[j]` and the `resolve_p` stack cycle-rejects it, so a merge
+/// keyed on its own param can never commit an emitted tree that would
+/// dangle once `p_j` is gone.
+pub fn paramize(k: &Key, slots: &[Key], ps: &[Value], skip: usize) -> Key {
+    let n = slots.len().max(ps.len());
+    for i in 0..n {
+        if i != skip && slots.get(i) == Some(k) {
+            return Key::P(i as u32);
+        }
+    }
+    if let Key::V(w) = k
+        && let Some(i) = (0..n).find(|&i| ps.get(i) == Some(w))
     {
-        return Key::P(i as u32);
+        return Key::Q(i as u32);
     }
     match k {
-        Key::A(t, rk, off) => Key::A(*t, Box::new(paramize(rk, slots, skip)), *off),
+        Key::A(t, rk, off) => Key::A(*t, Box::new(paramize(rk, slots, ps, skip)), *off),
         Key::N(op, t, args, extra) => Key::N(
             *op,
             *t,
-            args.iter().map(|a| paramize(a, slots, skip)).collect(),
+            args.iter().map(|a| paramize(a, slots, ps, skip)).collect(),
             *extra,
         ),
         _ => k.clone(),
@@ -551,6 +566,61 @@ pub fn key_rep(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Key {
     }
 }
 
+/// Peel an `A`-chain to (base, total offset). Non-`A` keys peel to
+/// `(k, 0)`.
+pub fn peel_off(k: &Key) -> (&Key, i64) {
+    match k {
+        Key::A(_, b, o) => {
+            let (r, o2) = peel_off(b);
+            (r, o + o2)
+        }
+        _ => (k, 0),
+    }
+}
+
+/// The set of slot indices `k` references — `P` and `Q` leaves both
+/// name slot `i`'s incoming value, so both count.
+pub fn pset(k: &Key) -> FxHashSet<u32> {
+    let mut s = FxHashSet::default();
+    fn go(k: &Key, s: &mut FxHashSet<u32>) {
+        match k {
+            Key::P(i) | Key::Q(i) => {
+                s.insert(*i);
+            }
+            Key::A(_, b, _) => go(b, s),
+            Key::N(_, _, args, _) => args.iter().for_each(|a| go(a, s)),
+            _ => {}
+        }
+    }
+    go(k, &mut s);
+    s
+}
+
+/// The affine slope of `k` with respect to slot `i` — `Some(c)` when
+/// `k` is linear in `i`'s incoming value (`P(i)`/`Q(i)` → 1, other
+/// leaves → 0, `iadd`/`isub`/`A` combine pointwise). `None` when slot
+/// `i` appears under a non-affine op where no constant slope exists.
+pub fn slope(k: &Key, i: u32) -> Option<i64> {
+    match k {
+        Key::P(x) | Key::Q(x) => Some((*x == i) as i64),
+        Key::A(_, b, _) => slope(b, i),
+        Key::N(op, _, args, _) => {
+            if !pset(k).contains(&i) {
+                Some(0)
+            } else if args.len() == 2 {
+                match op {
+                    Opcode::Iadd => Some(slope(&args[0], i)? + slope(&args[1], i)?),
+                    Opcode::Isub => Some(slope(&args[0], i)? - slope(&args[1], i)?),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => Some(0),
+    }
+}
+
 /// Expand every `P(i)` leaf via `resolve(i)`, which returns the slot's
 /// materialized form: a carrier `V`, or the slot's own key (already
 /// `P`-free or resolved recursively) — `None` if the slot can't be
@@ -562,7 +632,7 @@ pub fn resolve_p(
     stack: &mut Vec<u32>,
 ) -> Option<Key> {
     Some(match k {
-        Key::P(i) => {
+        Key::P(i) | Key::Q(i) => {
             if stack.contains(i) {
                 return None;
             }

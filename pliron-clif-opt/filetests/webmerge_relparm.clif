@@ -1,0 +1,29 @@
+; test webmerge
+; Loop-invariant gap (relparm's Lit/Head case): entry feeds
+; `p_j = p_i - 16`; the latch steps both params by +8, preserving the
+; gap — slope-weighted sum 1·8 = 8 matches the step. `p_j` drops to
+; `isub p_i, 16` materialized at the header.
+; check: block1(v4: i64):
+; check-not: block1(v4: i64, v5: i64)
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 16
+    v2 = isub v0, v1
+    jump block1(v0, v2)
+
+block1(v4: i64, v5: i64):
+    v6 = iconst.i64 0
+    v7 = icmp eq v4, v6
+    brif v7, block3, block2
+
+block2:
+    v8 = iconst.i64 8
+    v9 = iadd v4, v8
+    v10 = iadd v5, v8
+    jump block1(v9, v10)
+
+block3:
+    v11 = isub v4, v5
+    return v11
+}

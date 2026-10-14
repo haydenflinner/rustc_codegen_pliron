@@ -2763,7 +2763,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             let mut uni = true;
             for (e, _) in es.iter().enumerate() {
                 let kj = &skeys[e][ix];
-                let rk = crate::proots::paramize(kj, &skeys[e], ix);
+                let rk = crate::proots::paramize(kj, &skeys[e], &ps, ix);
                 match &rel {
                     None => rel = Some(rk),
                     Some(t) if *t != rk => {
@@ -2777,6 +2777,80 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 && let Some(rk) = rel
                 && has_p(&rk)
             {
+                cands.push((ix, rk));
+                continue;
+            }
+            // Phase D — relational merging with deferral, subsuming
+            // relparm's loop-invariant-gap case. `p_j = R(slots)` holds
+            // when every edge either supplies an `R`-shaped arg or is a
+            // recurrence step that preserves `R`: `arg_j = p_j + o_j`
+            // with every referenced slot `arg_i = p_i + o_i` and
+            // `Σ slope_i·o_i = o_j` (the relation shifts by exactly its
+            // total slope). The seed `R` comes from a concrete edge —
+            // e.g. `arg_j = arg_i - B` paramizes to `isub(P(i), B)` —
+            // while a back-edge stepping both params by `c` contributes
+            // `iadd(P(j), c)` and defers.
+            let mut kjs: Vec<Key> = Vec::with_capacity(es.len());
+            let mut seed: Option<Key> = None;
+            for e in 0..es.len() {
+                let kj = crate::proots::paramize(&skeys[e][ix], &skeys[e], &ps, ix);
+                // A `p_j + o` self-step (`Q(ix)` base — the param's old
+                // value) can only be a deferral — it can never seed `R`
+                // (it would resolve `Q(ix)` cyclically).
+                let selfstep =
+                    matches!(crate::proots::peel_off(&kj).0, Key::Q(x) if *x == ix as u32);
+                if !selfstep {
+                    match &seed {
+                        None => seed = Some(kj.clone()),
+                        Some(s) if *s != kj => {
+                            seed = None;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                kjs.push(kj);
+            }
+            let Some(rk) = seed.filter(|_| kjs.len() == es.len()) else {
+                continue;
+            };
+            // Every non-seed edge must defer: `arg_j` peels to
+            // `Q(ix) + o_j` (the old `p_j` stepped) and each slot `i`
+            // referenced by `R` is fed `arg_i = p_i + o_i` — a `Q(i)`
+            // base — with the slope-weighted sum equal to `o_j`.
+            let refs = crate::proots::pset(&rk);
+            let mut holds = has_p(&rk);
+            for (e, kj) in kjs.iter().enumerate() {
+                if *kj == rk {
+                    continue;
+                }
+                let (bj, oj) = crate::proots::peel_off(kj);
+                if !matches!(bj, Key::Q(x) if *x == ix as u32) {
+                    holds = false;
+                    break;
+                }
+                let mut sum = 0i64;
+                let mut ok = true;
+                for &i in &refs {
+                    let ki =
+                        crate::proots::paramize(&skeys[e][i as usize], &skeys[e], &ps, i as usize);
+                    let (bi, oi) = crate::proots::peel_off(&ki);
+                    let Some(s) = crate::proots::slope(&rk, i) else {
+                        ok = false;
+                        break;
+                    };
+                    if !matches!(bi, Key::Q(x) if *x == i) {
+                        ok = false;
+                        break;
+                    }
+                    sum += s * oi;
+                }
+                if !ok || sum != oj {
+                    holds = false;
+                    break;
+                }
+            }
+            if holds {
                 cands.push((ix, rk));
             }
         }
@@ -2963,7 +3037,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
 fn has_p(key: &crate::proots::Key) -> bool {
     use crate::proots::Key;
     match key {
-        Key::P(_) => true,
+        Key::P(_) | Key::Q(_) => true,
         Key::A(_, rk, _) => has_p(rk),
         Key::N(_, _, args, _) => args.iter().any(has_p),
         _ => false,
@@ -3011,10 +3085,10 @@ fn mat_ok(
     match key {
         Key::V(w) => params.contains(w) || dominates_entry(func, dom, *w, b),
         Key::K(..) => true,
-        // `P` must be resolved before this runs — an unresolved leaf is
-        // not materializable. `O` is edge-scoped: it exists only as the
-        // arg on a `BlockCall`, never as an in-block value.
-        Key::P(_) | Key::O(_) => false,
+        // `P`/`Q` must be resolved before this runs — an unresolved
+        // leaf is not materializable. `O` is edge-scoped: it exists
+        // only as the arg on a `BlockCall`, never as an in-block value.
+        Key::P(_) | Key::Q(_) | Key::O(_) => false,
         Key::A(_, rk, _) => mat_ok(func, dom, b, rk, params),
         Key::N(_, _, args, _) => args.iter().all(|a| mat_ok(func, dom, b, a, params)),
     }
@@ -3033,11 +3107,11 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
     };
     match key {
         Key::V(w) => Some(*w),
-        // `P` must be gone by here — `resolve_p` ran at scan time; a
-        // survivor means a bug, and dropping the merge is safer than
+        // `P`/`Q` must be gone by here — `resolve_p` ran at scan time;
+        // a survivor means a bug, and dropping the merge is safer than
         // emitting a key referencing a phantom slot. `O` is edge-scoped
         // — nothing in-block materializes it.
-        Key::P(_) | Key::O(_) => return None,
+        Key::P(_) | Key::Q(_) | Key::O(_) => return None,
         Key::K(ty, bits) => Some(new(
             func,
             order,
