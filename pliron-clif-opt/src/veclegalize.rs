@@ -9,7 +9,7 @@
 //!                        bitcast back
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::ir::MemFlagsData;
+use cranelift_codegen::ir::{Endianness, MemFlagsData};
 use cranelift_codegen::ir::{self, InstBuilder, InstructionData, Opcode, Type, Value};
 
 fn int_ty(bits: u16) -> Type {
@@ -77,26 +77,25 @@ pub fn run(func: &mut ir::Function, max_bits: u32) -> usize {
         let esz = lt.bits() as u64;
         let sh = lane * esz;
         // Mutate phase: build the scalar sequence before `inst`.
-        let le = MemFlagsData::trusted();
+        let le = MemFlagsData::new().with_endianness(Endianness::Little);
         let mut pos = FuncCursor::new(func).at_inst(inst);
         match op {
             Opcode::Extractlane => {
                 let v = pos.ins().bitcast(it, le, args[0]);
                 let v = if sh > 0 { pos.ins().ushr_imm(v, sh as i64) } else { v };
-                let out = if lt.is_float() {
+                // Last op in place so `res` stays attached.
+                if lt.is_float() {
                     let t = if it.bits() > lt.bits() {
                         pos.ins().ireduce(int_ty(lt.bits() as u16), v)
                     } else {
                         v
                     };
-                    pos.ins().bitcast(lt, le, t)
+                    pos.func.replace(inst).bitcast(lt, le, t);
                 } else if it.bits() > lt.bits() {
-                    pos.ins().ireduce(lt, v)
+                    pos.func.replace(inst).ireduce(lt, v);
                 } else {
-                    v
-                };
-                pos.func.dfg.change_to_alias(res.unwrap(), out);
-                pos.func.layout.remove_inst(inst);
+                    pos.func.replace(inst).iadd_imm(v, 0);
+                }
             }
             Opcode::Insertlane => {
                 // Splice the lane's bits into the vector's integer view.
@@ -119,9 +118,7 @@ pub fn run(func: &mut ir::Function, max_bits: u32) -> usize {
                 let masked = pos.ins().band(v, mc);
                 let sin = if sh > 0 { pos.ins().ishl_imm_u(s, sh as i64) } else { s };
                 let r = pos.ins().bor(masked, sin);
-                let out = pos.ins().bitcast(vt, le, r);
-                pos.func.dfg.change_to_alias(res.unwrap(), out);
-                pos.func.layout.remove_inst(inst);
+                pos.func.replace(inst).bitcast(vt, le, r);
             }
             Opcode::Store => {
                 let flags = pos.func.dfg.mem_flags[mf.unwrap()];
@@ -132,9 +129,7 @@ pub fn run(func: &mut ir::Function, max_bits: u32) -> usize {
             Opcode::Load => {
                 let flags = pos.func.dfg.mem_flags[mf.unwrap()];
                 let w = pos.ins().load(it, flags, args[0], off);
-                let out = pos.ins().bitcast(vt, le, w);
-                pos.func.dfg.change_to_alias(res.unwrap(), out);
-                pos.func.layout.remove_inst(inst);
+                pos.func.replace(inst).bitcast(vt, le, w);
             }
             _ => unreachable!(),
         }
