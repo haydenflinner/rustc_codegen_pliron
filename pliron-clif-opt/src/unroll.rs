@@ -61,7 +61,13 @@ pub fn run(
             }
             match trip(func, &nn, &body, h, entry.clone(), None) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
-                _ => continue,
+                _ => {
+                    if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+                        let ub = bound_ub(func, cfg, dt, h, &body, pred, pinst);
+                        eprintln!("unroll: candidate {h} undecidable, bound_ub={ub:?}");
+                    }
+                    continue;
+                }
             }
             let nb = func.dfg.make_block();
             func.layout.insert_block_after(nb, pred);
@@ -653,4 +659,147 @@ fn addr_step(
         }
         _ => None,
     }
+}
+
+/// Upper bound on trips when the loop's exit test is a counted
+/// `a cc bound` (punroll's `Cnt`) and dominating facts bound `bound`.
+/// The entry edge's own `brif` fact plus facts of `pred`'s dominators
+/// apply. `None` when undecidable without the const environment.
+fn bound_ub(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    body: &FxHashSet<Block>,
+    pred: Block,
+    pinst: Inst,
+) -> Option<i64> {
+    use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
+    let pool = &func.dfg.value_lists;
+    let hparams: Vec<Value> = func.dfg.block_params(h).iter().copied().collect();
+    let mut backedges = Vec::new();
+    for p in cfg.pred_iter(h) {
+        if !body.contains(&p.block) {
+            continue;
+        }
+        for bc in func
+            .dfg
+            .insts[p.inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            if bc.block(pool) == h {
+                backedges.push(*bc);
+            }
+        }
+    }
+    if backedges.is_empty() {
+        return None;
+    }
+    // The counted exit test: a body brif with one successor outside.
+    let mut cnt = None;
+    'scan: for &b in body {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        let out = [blocks[0], blocks[1]]
+            .iter()
+            .filter(|bc| !body.contains(&bc.block(pool)))
+            .count();
+        if out == 0 {
+            continue;
+        }
+        let Some(i) = crate::jumpthread::cond_icmp(func, arg) else {
+            continue;
+        };
+        let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] else {
+            continue;
+        };
+        if let Some(c) = crate::punroll::latch_count(
+            func, h, body, cfg, dt, args[0], args[1], cond, &hparams, &backedges,
+        ) {
+            cnt = Some(c);
+            break 'scan;
+        }
+    }
+    let Some(cnt) = cnt else {
+        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+            eprintln!("unroll: candidate {h} no latch_count");
+        }
+        return None;
+    };
+    if cnt.signed || cnt.eq {
+        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+            eprintln!("unroll: candidate {h} cnt signed/eq");
+        }
+        return None;
+    }
+    // Facts on the edge pred -> h plus dominated facts at pred.
+    let mut facts = crate::jumpthread::facts_at(
+        dt,
+        &crate::jumpthread::edge_facts(func, cfg),
+        pred,
+    );
+    if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[pinst]
+        && let Some(i) = crate::jumpthread::cond_icmp(func, arg)
+        && let Some(mut c) = crate::jumpthread::norm_icmp(func, i)
+    {
+        if blocks[1].block(pool) == h {
+            c.0 = c.0.complement();
+        }
+        facts.push(c);
+    }
+    // bound <= K from a fact `bound cc K` (or mirrored).
+    let mut ub = None;
+    for (cc, x, y) in facts {
+        let x = func.dfg.resolve_aliases(x);
+        let y = func.dfg.resolve_aliases(y);
+        let k = match cc {
+            IntCC::UnsignedLessThan if x == cnt.bound => crate::punroll::iconst(func, y).map(|k| k - 1),
+            IntCC::UnsignedLessThanOrEqual if x == cnt.bound => crate::punroll::iconst(func, y),
+            IntCC::UnsignedGreaterThan if y == cnt.bound => crate::punroll::iconst(func, x).map(|k| k - 1),
+            IntCC::UnsignedGreaterThanOrEqual if y == cnt.bound => crate::punroll::iconst(func, x),
+            _ => None,
+        };
+        if let Some(k) = k
+            && ub.is_none_or(|u| k < u)
+        {
+            ub = Some(k);
+        }
+    }
+    // `umin`/`umin`-ish bounds are self-proving.
+    if ub.is_none()
+        && let Some(bi) = func.dfg.value_def(cnt.bound).inst()
+    {
+        match func.dfg.insts[bi] {
+            InstructionData::Binary {
+                opcode: Opcode::Umin,
+                args: [x, y],
+            } => {
+                for c in [x, y] {
+                    if let Some(k) = crate::punroll::iconst(func, c) {
+                        ub = Some(k);
+                    }
+                }
+            }
+            _ => {
+                if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+                    eprintln!("unroll: {h} bound inst {:?}", func.dfg.insts[bi].opcode());
+                }
+            }
+        }
+    }
+    let Some(k) = ub else {
+        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+            eprintln!("unroll: candidate {h} cnt ok, no bound fact (bound={:?})", cnt.bound);
+        }
+        return None;
+    };
+    // a = p + d steps +s while `a cc bound`; worst case p starts at 0,
+    // so trips <= (K - d + s - 1 + le) / s when d <= K, else unbounded.
+    let k = k.checked_sub(cnt.d)?;
+    if k < 0 {
+        return Some(0);
+    }
+    Some(k / cnt.step + i64::from(cnt.le) + 1)
 }

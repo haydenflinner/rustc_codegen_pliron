@@ -2516,7 +2516,7 @@ fn bypass_forwarders(func: &mut Function) -> usize {
 }
 
 /// The icmp a branch condition tests, through `band 1` and extends of its 0/1 result.
-fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
+pub(crate) fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
     let env = FxHashMap::default();
     let mut v = func.dfg.resolve_aliases(v);
     for _ in 0..6 {
@@ -2552,10 +2552,10 @@ fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
     None
 }
 
-type Cmp = (IntCC, Value, Value);
+pub(crate) type Cmp = (IntCC, Value, Value);
 
 /// A scalar icmp as `(cc, x, y)`; `(x - y) ==/!= 0` becomes `x ==/!= y`.
-fn norm_icmp(func: &Function, i: Inst) -> Option<Cmp> {
+pub(crate) fn norm_icmp(func: &Function, i: Inst) -> Option<Cmp> {
     let InstructionData::IntCompare {
         opcode: Opcode::Icmp,
         cond,
@@ -2845,7 +2845,7 @@ fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32, range2: bool) -> Op
 
 /// The condition known on entry to each block whose only predecessor ends
 /// in `brif c` (`c` or its complement).
-fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Cmp> {
+pub(crate) fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Cmp> {
     let mut fact: FxHashMap<Block, Cmp> = FxHashMap::default();
     for b in func.layout.blocks() {
         let mut preds = cfg.pred_iter(b);
@@ -2926,7 +2926,7 @@ fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<
 }
 
 /// Facts holding throughout `b`: those of `b` and its dominators.
-fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> Vec<Cmp> {
+pub(crate) fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> Vec<Cmp> {
     let mut fs = Vec::new();
     if fact.is_empty() {
         return fs;

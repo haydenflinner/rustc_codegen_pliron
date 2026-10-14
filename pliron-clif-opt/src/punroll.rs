@@ -211,7 +211,7 @@ fn emit_cone_clone(
     }
 }
 
-fn iconst(func: &Function, v: Value) -> Option<i64> {
+pub(crate) fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
     let i = func.dfg.value_def(v).inst()?;
     if let InstructionData::UnaryImm {
@@ -225,7 +225,7 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
-fn param_idx(func: &Function, h: Block, v: Value) -> Option<usize> {
+pub(crate) fn param_idx(func: &Function, h: Block, v: Value) -> Option<usize> {
     let v = func.dfg.resolve_aliases(v);
     if let cranelift_codegen::ir::ValueDef::Param(b, i) = func.dfg.value_def(v)
         && b == h
@@ -262,18 +262,18 @@ fn affine_param(func: &Function, h: Block, v: Value) -> Option<(usize, i64)> {
 /// param stepping `+s` along the backedge, `bound` loop-invariant. `bound`
 /// is either a plain value usable anywhere the header is reachable or a
 /// header param index (`bpidx`) passed back unchanged on the backedge.
-struct Cnt {
-    pidx: usize,
-    d: i64,
-    step: i64,
-    bound: Value,
-    bpidx: Option<usize>,
-    le: bool,
-    signed: bool,
+pub(crate) struct Cnt {
+    pub(crate) pidx: usize,
+    pub(crate) d: i64,
+    pub(crate) step: i64,
+    pub(crate) bound: Value,
+    pub(crate) bpidx: Option<usize>,
+    pub(crate) le: bool,
+    pub(crate) signed: bool,
     /// Exit-on-`a == bound` (a `!=` continue test): the guard's strict
     /// `a_{K-2} < bound` check is the same — a monotone counter that
     /// hasn't reached `bound` can't equal it.
-    eq: bool,
+    pub(crate) eq: bool,
 }
 
 pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
@@ -1709,7 +1709,7 @@ struct Latch {
 /// an in-body block resolves to whatever its forward pred edges bind
 /// (all must agree — a real merge can't be affine). Fuel caps the
 /// recursion against degenerate param cycles.
-fn resolve_affine(
+pub(crate) fn resolve_affine(
     func: &Function,
     cfg: &ControlFlowGraph,
     h: Block,
@@ -1777,7 +1777,7 @@ fn resolve_affine(
 /// *every* backedge in `backedges`, `bound` loop-invariant. Also accepts
 /// exit-on-`a == bound` (a `!=` continue test) — under a monotone
 /// counter it drops to the same strict `< bound` guard.
-fn latch_count(
+pub(crate) fn latch_count(
     func: &Function,
     h: Block,
     body: &FxHashSet<Block>,
