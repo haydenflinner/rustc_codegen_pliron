@@ -1019,6 +1019,7 @@ fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let t = std::time::Instant::now();
     p.stats.forwarded += loadfwd::run(
         &mut p.clctx.func,
         p.noalias,
@@ -1030,17 +1031,32 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
         p.call_frozen,
         p.nocap,
     );
+    if crate::env_get("PLIRON_JT_PROF2").is_some() {
+        eprintln!("    lf-run {:?}", t.elapsed());
+    }
     if p.flags.slot_dse {
+        let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
         // A load whose only user was a removed dead store keeps its own
         // slot alive, so alternate the two until nothing changes.
-        for _ in 0..4 {
+        for i in 0..4 {
+            let t = std::time::Instant::now();
             p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
-            if !config().enabled("PLIRON_DEAD_LOADS")
-                || jumpthread::remove_dead_insts(
+            if prof2 {
+                eprintln!("    lf-dss[{i}] {:?}", t.elapsed());
+            }
+            let t = std::time::Instant::now();
+            let n = if config().enabled("PLIRON_DEAD_LOADS") {
+                jumpthread::remove_dead_insts(
                     &mut p.clctx.func,
                     config().enabled("PLIRON_DEAD_PURE"),
-                ) == 0
-            {
+                )
+            } else {
+                0
+            };
+            if prof2 {
+                eprintln!("    lf-rdi[{i}] {n} {:?}", t.elapsed());
+            }
+            if n == 0 {
                 break;
             }
         }
