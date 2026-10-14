@@ -195,7 +195,7 @@ impl Context {
 
         self.func.dfg.resolve_all_aliases();
 
-        if opt_level != OptLevel::None {
+        if opt_level != OptLevel::None && self.egraph_safe() {
             self.egraph_pass(isa, ctrl_plane)?;
         }
 
@@ -918,6 +918,17 @@ impl Context {
     ) -> CodegenResult<()> {
         do_souper_harvest(&self.func, out);
         Ok(())
+    }
+
+    /// PLIRON: the egraph's ISLE prelude computes masks/min/max as u64
+    /// (`ty_smin`, `ty_smax`, `ty_mask`, `ty_lane_mask` all `expect`
+    /// ≤64), so a >64-bit scalar or >64-lane vector anywhere in the
+    /// function panics the whole pass. rustc emits i128 routinely.
+    pub fn egraph_safe(&self) -> bool {
+        self.func.dfg.values().all(|v| {
+            let ty = self.func.dfg.value_type(v);
+            (ty.is_vector() || ty.bits() <= 64) && ty.lane_count() <= 64
+        })
     }
 
     /// Run optimizations via the egraph infrastructure.

@@ -169,3 +169,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     materializing for `test reg, reg`. Both forms use
     `sinkable_load_exact` (narrow loads read at their own width) so byte
     scans like `is[i]`/`cmpb $0, mem; jne` fold to a single memory compare.
+
+18. Alias-chain hardening (`src/ir/dfg.rs`): `compact_aliases` rewrites
+    each alias to point at its fully-resolved terminal (skipping chains
+    that dead-end at reserved/tombstoned targets) so per-use
+    `resolve_aliases`/`value_def` calls stay O(1) after merge-heavy
+    passes. `try_value_def` returns the shallow def without chasing
+    aliases and `None` for invalid/reserved entries; `try_resolve_aliases`
+    returns `None` on invalid, tombstone-ended, or cyclic chains instead
+    of panicking — pipeline carry logic iterates all values and must not
+    panic on stale pairs.
+
+19. `Context::egraph_safe` (`src/context.rs`): the ISLE prelude's
+    `ty_smin`/`ty_smax`/`ty_mask`/`ty_lane_mask` `expect` ≤64 — any
+    >64-bit scalar (rustc's routine i128) or >64-lane vector panics the
+    whole egraph pass. `optimize` and the pipeline's opt-in egraph step
+    skip functions containing such values.

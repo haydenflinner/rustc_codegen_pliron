@@ -1049,7 +1049,7 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
         .blocks()
         .flat_map(|b| p.clctx.func.layout.block_insts(b))
         .any(|i| p.clctx.func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::TryCall);
-    if has_try_call {
+    if has_try_call || !p.clctx.egraph_safe() {
         return 0;
     }
     let mut cp = ControlPlane::default();
