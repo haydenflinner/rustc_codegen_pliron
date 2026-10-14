@@ -122,7 +122,11 @@ fn put(
     func.dfg.first_result(ni)
 }
 
-pub fn run(func: &mut Function) -> usize {
+/// Sink single-use chains into their preds; returns (params sunk,
+/// dropped param → its replacement param). The new param carries the
+/// sunk value, so it equals the dropped param — the pipeline carries
+/// the old param's facts across.
+pub fn run(func: &mut Function) -> (usize, Vec<(Value, Value)>) {
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     let uses = use_blocks(func);
@@ -145,6 +149,7 @@ pub fn run(func: &mut Function) -> usize {
     let nz: &dyn Fn(Value) -> bool = &|_| false;
     let rg: &dyn Fn(Value) -> Option<(u64, u64)> = &|_| None;
     let mut total = 0;
+    let mut moved: Vec<(Value, Value)> = Vec::new();
     'blocks: for (&b, es) in &edges {
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty()
@@ -386,9 +391,10 @@ pub fn run(func: &mut Function) -> usize {
                 func.layout.remove_inst(ci);
             }
             func.dfg.remove_block_param(p);
+            moved.push((p, np));
             total += 1;
             continue 'blocks;
         }
     }
-    total
+    (total, moved)
 }

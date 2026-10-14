@@ -186,6 +186,7 @@ fn refold_header(
     edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
     h: Block,
     debug: bool,
+    pmap_out: &mut FxHashMap<Value, Value>,
 ) -> usize {
     let params = func.dfg.block_params(h).to_vec();
     if params.len() < 2 {
@@ -780,6 +781,9 @@ fn refold_header(
             break;
         }
     }
+    // Dropped params' replacements are value-equal (`pmap` rewrites uses),
+    // so the pipeline can move their facts onto the carriers.
+    pmap_out.extend(pmap);
     n
 }
 
@@ -1001,17 +1005,21 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
 }
 
 /// Refold carried affine params; returns slots eliminated.
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+) -> (usize, FxHashMap<Value, Value>) {
     let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
     let debug = crate::env_set("PLIRON_IVREFOLD_DEBUG");
     let mut n = 0;
+    let mut pmap = FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {
-        n += refold_header(func, domtree, &edges, h, debug);
+        n += refold_header(func, domtree, &edges, h, debug, &mut pmap);
     }
     if n > 0 {
         // The stripped increments (`p + step` edge args) are usually dead now.
         crate::jumpthread::remove_dead_insts(func, true);
     }
-    n
+    (n, pmap)
 }

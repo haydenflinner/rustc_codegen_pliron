@@ -39,7 +39,7 @@ fn pass(name: &str) -> Pass {
         "mask01" => clifpeep::mask01,
         "memcall" => clifpeep::memcall,
         "ovkill" => clifpeep::ovkill,
-        "paramsink" => paramsink::run,
+        "paramsink" => |f| paramsink::run(f).0,
         "rangefold" => rangefold::run,
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,

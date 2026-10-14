@@ -704,6 +704,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.
         an.bump();
+        if k > 0 {
+            carry_aliases(p);
+        }
     }
     p.log(s.stat, k);
     if s.verify
@@ -804,7 +807,10 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let (n, dead, folds) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
+    let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
+    if !pmap.is_empty() {
+        carry_pmap(p, &pmap);
+    }
     p.stats.threaded += n;
     p.stats.dead_params += dead;
     p.stats.dominated_folds += folds;
@@ -1318,7 +1324,10 @@ fn s_celim(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // address math materializes; constant-trip counters fold their
 // exit test onto the anchor's step value and die with deadrecs.
 fn s_ivrefold(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = ivrefold::run(&mut p.clctx.func, an);
+    let (k, pmap) = ivrefold::run(&mut p.clctx.func, an);
+    if !pmap.is_empty() {
+        carry_pmap(p, &pmap);
+    }
     if k > 0 && p.dump {
         p.dump("ivrefold");
     }
@@ -1351,7 +1360,11 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // becomes per-edge `count+1` / `count+ret0` — the flag's merge slot
 // (a spill in regalloc) disappears.
 fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = paramsink::run(&mut p.clctx.func);
+    let (k, moved) = paramsink::run(&mut p.clctx.func);
+    if !moved.is_empty() {
+        let pmap: FxHashMap<Value, Value> = moved.into_iter().collect();
+        carry_pmap(p, &pmap);
+    }
     if k > 0 {
         p.dump("paramsink");
     }
@@ -1572,10 +1585,39 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
-// Carry derived-pointer facts across a param merge: `x` derived from a
-// dropped param is derived from its carrier, and a dropped param's own
-// base moves to the carrier too. One chase through `pmap` flattens
-// carrier chains.
+// Carry `d`'s recorded facts onto `w` when `w` is `d`'s value
+// everywhere — a merge carrier, an alias target, or a sunk/rebased
+// replacement.
+fn carry_one(p: &mut Pipe, d: Value, w: Value) {
+    if let Some(&b) = p.derived.get(&d) {
+        p.derived.insert(w, b);
+    }
+    if p.nonnull.contains(&d) {
+        p.nonnull.insert(w);
+    }
+    if p.noalias.contains(&d) {
+        p.noalias.insert(w);
+    }
+    if let Some(&f) = p.frozen.get(&d) {
+        p.frozen.insert(w, f);
+    }
+    if let Some(&x) = p.deref.get(&d) {
+        p.deref.insert(w, x);
+    }
+    if let Some(v) = p.operand_frozen.get(&d) {
+        let v = v.clone();
+        p.operand_frozen.insert(w, v);
+    }
+    for lt in p.lifetimes.iter_mut() {
+        if lt.0 == d {
+            lt.0 = w;
+        }
+    }
+    if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
+        eprintln!("carry {d} -> {w}");
+    }
+}
+
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     let chase = |mut v: Value| {
         let mut n = pmap.len() + 1;
@@ -1588,6 +1630,8 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
         }
         v
     };
+    // `x` derived from a dropped param is derived from its carrier, and
+    // a dropped param's own base moves to the carrier too.
     let keys: Vec<Value> = p.derived.keys().copied().collect();
     for x in keys {
         if let Some(&b) = p.derived.get(&x) {
@@ -1600,37 +1644,26 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     // merge kind (a phase-A carrier, a deduped sibling, or a
     // materialized `f(siblings)` tree).
     for (&d, &w) in pmap {
-        let w = chase(w);
-        if let Some(&b) = p.derived.get(&d) {
-            p.derived.insert(w, b);
-        }
-        if p.nonnull.contains(&d) {
-            p.nonnull.insert(w);
-            if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
-                eprintln!("carry nonnull {d} -> {w}");
-            }
-        }
-        if p.noalias.contains(&d) {
-            p.noalias.insert(w);
-            if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
-                eprintln!("carry noalias {d} -> {w}");
-            }
-        }
-        if let Some(&f) = p.frozen.get(&d) {
-            p.frozen.insert(w, f);
-        }
-        if let Some(&x) = p.deref.get(&d) {
-            p.deref.insert(w, x);
-        }
-        if let Some(v) = p.operand_frozen.get(&d) {
-            let v = v.clone();
-            p.operand_frozen.insert(w, v);
-        }
-        for lt in p.lifetimes.iter_mut() {
-            if lt.0 == d {
-                lt.0 = w;
-            }
-        }
+        carry_one(p, d, chase(w));
+    }
+}
+
+/// `change_to_alias(d, w)` makes `w` `d`'s value everywhere, so facts
+/// keyed on `d` transfer to `w`. Two dozen passes alias values; rather
+/// than plumbing a merge map out of each, scan the alias table after
+/// mutating steps — re-carrying an already-carried pair is idempotent.
+fn carry_aliases(p: &mut Pipe) {
+    let func = &p.clctx.func;
+    let pairs: Vec<(Value, Value)> = func
+        .dfg
+        .values()
+        .filter_map(|v| {
+            let r = func.dfg.resolve_aliases(v);
+            (r != v).then_some((v, r))
+        })
+        .collect();
+    for (d, w) in pairs {
+        carry_one(p, d, w);
     }
 }
 

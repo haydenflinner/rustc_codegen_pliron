@@ -3057,7 +3057,7 @@ fn dominated_conds(func: &Function) -> Vec<(Inst, bool)> {
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
 /// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(func: &mut Function) -> usize {
+pub fn remove_trivial_params(func: &mut Function) -> Vec<(Value, Value)> {
     #[derive(Clone, Copy, PartialEq)]
     enum In {
         Unset,
@@ -3132,7 +3132,7 @@ pub fn remove_trivial_params(func: &mut Function) -> usize {
     let gone: FxHashSet<Value> = rm.iter().map(|r| r.2).collect();
     rm.retain(|r| !gone.contains(&r.3));
     if rm.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut idx: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
     for r in &rm {
@@ -3160,11 +3160,12 @@ pub fn remove_trivial_params(func: &mut Function) -> usize {
             }
         }
     }
+    let aliases: Vec<(Value, Value)> = rm.iter().map(|&(_, _, p, v)| (p, v)).collect();
     for &(_, _, p, v) in &rm {
         func.dfg.remove_block_param(p);
         func.dfg.change_to_alias(p, v);
     }
-    rm.len()
+    aliases
 }
 
 fn mark_live_param(
@@ -3450,7 +3451,7 @@ pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, FxHashMap<Value, Value>) {
     merge_chains(func);
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
@@ -3470,9 +3471,12 @@ pub fn run(
             panic!("jt step {tag}: {e}\n{}", func.display());
         }
     };
+    // `change_to_alias` merges reported so the pipeline can carry the
+    // dropped params' facts (nonnull/deref/…) onto their carriers.
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     for _ in 0..8 {
         if trivp {
-            remove_trivial_params(func);
+            pmap.extend(remove_trivial_params(func));
             check(func, "trivp");
         }
         if deadp {
@@ -3520,6 +3524,7 @@ pub fn run(
         total + fold_null_tests(func, &nn),
         dead_params,
         dominated_folds,
+        pmap,
     )
 }
 
