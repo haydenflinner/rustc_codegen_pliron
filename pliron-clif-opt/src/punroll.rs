@@ -1116,8 +1116,12 @@ fn redirect_entries(
                 // `bound`'s def dominates `h`, so it dominates every entry
                 // pred — materializing here is always legal.
                 let bv = match cnt.bpidx {
-                    Some(q) => match args[q] {
-                        BlockArg::Value(v) => func.dfg.resolve_aliases(v),
+                    Some(q) => match args.get(q) {
+                        Some(BlockArg::Value(v)) => func.dfg.resolve_aliases(*v),
+                        // Edge doesn't bind bound-param q (a stale or
+                        // narrowed edge). `h` still exists and handles
+                        // entries the group guard didn't cover, so
+                        // leaving this one pointed at `h` stays correct.
                         _ => continue,
                     },
                     None => func.dfg.resolve_aliases(cnt.bound),
