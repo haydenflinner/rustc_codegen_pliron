@@ -875,13 +875,16 @@ fn pd(
 /// a pure-inst chain whose results end up only as the back-edge arg
 /// for `v`'s own slot. Edge-arg uses elsewhere or any impure use
 /// makes it live. Recursive (SSA def-use is a DAG; the only cycle is
-/// through `v`'s own slot, treated as a dead sink).
+/// through `v`'s own slot, treated as a dead sink). `seen` holds values
+/// already accepted by this query, so shared sub-chains are walked once.
 fn self_feeding(
     func: &Function,
+    uses: &crate::uses::Uses,
     h: Block,
     ix: usize,
     v: Value,
     alias_targets: &FxHashSet<Value>,
+    seen: &mut FxHashSet<Value>,
     depth: usize,
 ) -> bool {
     if depth > 32 {
@@ -892,45 +895,52 @@ fn self_feeding(
     if alias_targets.contains(&v) {
         return false;
     }
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            // All inst args except branch-destination args (call args are
-            // variable-length, so `inst_fixed_args` would miss them).
-            for &a in func.dfg.inst_args(i) {
-                if func.dfg.resolve_aliases(a) != v {
-                    continue;
-                }
-                if !crate::jumpthread::removable(func, i, true) {
-                    return false;
-                }
-                for &r in func.dfg.inst_results(i) {
-                    if !self_feeding(func, h, ix, r, alias_targets, depth + 1) {
-                        return false;
-                    }
-                }
-            }
-            // Edge args: only the self-slot is a dead sink.
-            for bc in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                let dst = bc.block(&func.dfg.value_lists);
-                for (s, a) in bc.args(&func.dfg.value_lists).enumerate() {
-                    if let BlockArg::Value(x) = a
-                        && func.dfg.resolve_aliases(x) == v
-                        && !(dst == h && s == ix)
-                    {
-                        return false;
-                    }
-                }
-            }
-            // Exception contexts are always real uses.
-            if let Some(et) = func.dfg.insts[i].exception_table()
-                && func.dfg.exception_tables[et]
-                    .items()
-                    .any(|x| matches!(x, ExceptionTableItem::Context(x) if func.dfg.resolve_aliases(x) == v))
-            {
+    if !seen.insert(v) {
+        return true;
+    }
+    let Some(sites) = uses.sites.get(&v) else {
+        return true;
+    };
+    let mut last = None;
+    for &(_, i) in sites {
+        // An inst using `v` twice is listed twice.
+        if last == Some(i) || !func.layout.inst_block(i).is_some() {
+            continue;
+        }
+        last = Some(i);
+        // All inst args except branch-destination args (call args are
+        // variable-length, so `inst_fixed_args` would miss them).
+        if func.dfg.inst_args(i).iter().any(|&a| func.dfg.resolve_aliases(a) == v) {
+            if !crate::jumpthread::removable(func, i, true) {
                 return false;
             }
+            for &r in func.dfg.inst_results(i) {
+                if !self_feeding(func, uses, h, ix, r, alias_targets, seen, depth + 1) {
+                    return false;
+                }
+            }
+        }
+        // Edge args: only the self-slot is a dead sink.
+        for bc in func.dfg.insts[i]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let dst = bc.block(&func.dfg.value_lists);
+            for (s, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                if let BlockArg::Value(x) = a
+                    && func.dfg.resolve_aliases(x) == v
+                    && !(dst == h && s == ix)
+                {
+                    return false;
+                }
+            }
+        }
+        // Exception contexts are always real uses.
+        if let Some(et) = func.dfg.insts[i].exception_table()
+            && func.dfg.exception_tables[et]
+                .items()
+                .any(|x| matches!(x, ExceptionTableItem::Context(x) if func.dfg.resolve_aliases(x) == v))
+        {
+            return false;
         }
     }
     true
@@ -958,6 +968,9 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
         })
         .map(|v| func.dfg.resolve_aliases(v))
         .collect();
+    // One use index for the whole pass: removals below only delete uses,
+    // so stale sites are re-read from the IR and never hide a live use.
+    let uses = crate::uses::Uses::new(func);
     let mut n = 0;
     for h in func.layout.blocks().collect::<Vec<_>>() {
         let params = func.dfg.block_params(h).to_vec();
@@ -977,7 +990,8 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
         }
         let mut ixs = vec![];
         for (ix, &p) in params.iter().enumerate() {
-            if self_feeding(func, h, ix, p, &alias_targets, 0) {
+            let mut seen = FxHashSet::default();
+            if self_feeding(func, &uses, h, ix, p, &alias_targets, &mut seen, 0) {
                 ixs.push(ix);
             }
         }
