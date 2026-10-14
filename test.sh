@@ -308,12 +308,19 @@ t_pgo() {
   (cd tools/pliron-prof-rt && cargo build --release) &&
   # thin .a: only the runtime object (bundled core/compiler_builtins
   # members' __rustc shims collide with the link's own std)
-  local rt=$out/libpliron_prof_rt.a &&
-  local rt_full=$PWD/tools/pliron-prof-rt/target/release/libpliron_prof_rt.a &&
-  (mkdir -p $out/pga && cd $out/pga &&
-    ar x $rt_full && ar rcs $rt pliron_prof_rt-*.o) &&
+  local rt=$PWD/$out/libpliron_prof_rt.a
+  local rt_full=$PWD/tools/pliron-prof-rt/target/release/libpliron_prof_rt.a
   local cli=$PWD/tools/pliron-prof/target/release/pliron-prof
   local prof=$out/pgo.prof
+  (mkdir -p $out/pga && cd $out/pga &&
+    ar x $rt_full &&
+    for o in pliron_prof_rt-*.o; do
+      for s in $(nm -g --defined-only "$o" | awk '{print $3}' |
+        grep -E 'rust_begin_unwind|rust_eh_personality'); do
+        objcopy --redefine-sym "$s=__pliron_rt_shim_$s" "$o"
+      done
+    done &&
+    ar rcs $rt pliron_prof_rt-*.o) &&
   rm -f $prof
   PLIRON_PGO=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
     -o $out/pgo_i$exe -Clink-arg="$rt" &&
