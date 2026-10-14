@@ -490,7 +490,9 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn ty_32_or_64(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() == 32 || ty.bits() == 64 {
+            // Vectors can be 32/64 bits wide too (i8x4, i16x4, i8x8,
+            // i32x2, ...) but these rules all emit scalar GPR code.
+            if (ty.bits() == 32 || ty.bits() == 64) && !ty.is_vector() {
                 Some(ty)
             } else {
                 None
@@ -499,7 +501,8 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn ty_8_or_16(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() == 8 || ty.bits() == 16 {
+            // Same scalar-vs-vector trap as ty_32_or_64 (i8x2 is 16 bits).
+            if (ty.bits() == 8 || ty.bits() == 16) && !ty.is_vector() {
                 Some(ty)
             } else {
                 None
