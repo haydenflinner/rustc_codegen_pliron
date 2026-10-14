@@ -2146,6 +2146,14 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         if ps.is_empty() {
             continue;
         }
+        // The `skc`/`pk`/`eargs` matrices below are edges × params —
+        // ~50B/cell even while the `Key`s stay lazy, so a megafunction
+        // block (thousands of wide params × thousands of preds) spills
+        // to tens of GB and OOMs (stage1 `test::shuffle_tests`). The
+        // widest joins are also the least valuable merges; skip them.
+        if es.len().saturating_mul(ps.len()) > 4_000_000 {
+            continue;
+        }
         // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
         // `svh[e][ix]` for their structural hash — pseudo-args
         // (`TryCallRet`/`TryCallExn`) are `None` in `eargs` but key as
