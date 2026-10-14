@@ -1675,14 +1675,15 @@ pub fn fusechains(func: &mut Function) -> usize {
 pub fn sameargs(func: &mut Function) -> usize {
     let mut n = 0;
     for _ in 0..8 {
-        let k = sameargs_round(func) + phimerge(func) + affparm(func);
+        let k = sameargs_round(func);
         if k != 0 {
             n += k;
             continue;
         }
-        // Cheap merges exhausted — webmerge's keyed congruence catches
-        // what per-edge identity checks miss, then the cheap round can
-        // cascade on the removals.
+        // Cheap merges exhausted — webmerge's keyed congruence covers
+        // phimerge (phase C bisimulation), affparm (phase B sibling
+        // slots) and the structural cases none of them see, then the
+        // cheap round cascades on the removals.
         let k = webmerge(func).0;
         n += k;
         if k == 0 {
