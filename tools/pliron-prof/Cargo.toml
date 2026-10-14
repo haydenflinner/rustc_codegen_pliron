@@ -1,0 +1,13 @@
+[package]
+name = "pliron-prof"
+version = "0.1.0"
+edition = "2021"
+description = "PGO runtime + profile tool for rustc_codegen_pliron instrumented builds (docs/pgo.md)."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[workspace]
+
+[profile.release]
+panic = "abort"

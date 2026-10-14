@@ -42,7 +42,7 @@ mod xcgu;
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
     address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
-    nounwind, nowrite, phisimp, retarg, spec, sroa,
+    nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
 };
 
 use std::any::Any;
@@ -280,6 +280,30 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         inline::run(ctx, st, true, None, true);
         domcheck::run(ctx, st, "always-inline");
         inline::dead_fns(ctx, st);
+    }
+    // PGO: `PLIRON_PGO=<dir>` instruments every body (source-level
+    // attribution — the inliner clones counters, keeping counts on the
+    // callee), `PLIRON_PGO_USE=<file>` loads a profile before the
+    // pipeline. Both run after the O0 always-inline round so
+    // fingerprints are computed at the same CFG stage in gen and use
+    // builds.
+    if crate::env_set("PLIRON_PGO") || crate::env_set("PLIRON_PGO_USE") {
+        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+        let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
+        if crate::env_set("PLIRON_PGO") {
+            let (hdr, ctor, _) = pgo::instrument(ctx, st, name, wasm);
+            if !wasm
+                && let Some(a) = pgo::ctor_asm(&hdr, &ctor, matches!(
+                    cx.tcx.sess.target.arch,
+                    rustc_target::spec::Arch::AArch64
+                ))
+            {
+                st.asm.push_str(&a);
+            }
+        }
+        if let Some(f) = crate::env_get("PLIRON_PGO_USE") {
+            pgo::load(ctx, st, f);
+        }
     }
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());

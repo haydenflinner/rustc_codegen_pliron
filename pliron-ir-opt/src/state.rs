@@ -254,6 +254,17 @@ pub struct State {
     pub expect: FxHashMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
     pub wasm_imports: FxHashMap<String, (String, String)>,
+    /// Loaded PGO profile (`PLIRON_PGO_USE`): FuncOp → function record.
+    /// Only functions whose CFG fingerprint matched are present.
+    pub prof: FxHashMap<Ptr<Operation>, crate::pgo::ProfFn>,
+    /// Block → entry count (loaded profile). The inliner propagates it
+    /// to cloned blocks (scaled by callsite/callee-entry ratio), so
+    /// inlined code carries the callee's counts into the caller.
+    pub prof_bcount: FxHashMap<Ptr<BasicBlock>, u64>,
+    /// Terminator → count per successor slot (from edge counters and
+    /// single-pred block counts); drives profile-weighted block layout
+    /// and `expect` seeding.
+    pub prof_edges: FxHashMap<Ptr<Operation>, Vec<u64>>,
 }
 
 pub fn mask(bits: u128, w: u32) -> u128 {

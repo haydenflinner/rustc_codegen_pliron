@@ -4297,7 +4297,7 @@ fn cold_blocks(
             Operation::is_op::<UnreachableOp>(op, ctx)
                 || crate::inline::direct_callee(ctx, st, op)
                     .is_some_and(|s| st.funcs.get(s).is_some_and(|f| f.cold))
-        });
+        }) || crate::pgo::block_count(st, b).is_some_and(|c| c == 0);
         if hit {
             cold.insert(b);
         }
@@ -4345,6 +4345,13 @@ fn rpo_split(
             .iter(ctx)
             .flat_map(|op| {
                 let mut v: Vec<_> = op.deref(ctx).successors().collect();
+                // Profile-weighted order: hottest successor first, so RPO
+                // places hot blocks earlier in the function's layout.
+                if let Some(cs) = st.prof_edges.get(&op) {
+                    let mut ord: Vec<usize> = (0..v.len()).collect();
+                    ord.sort_by_key(|&i| std::cmp::Reverse(cs.get(i).copied().unwrap_or(0)));
+                    v = ord.into_iter().map(|i| v[i]).collect();
+                }
                 v.extend(st.invokes.get(&op).map(|&(l, _)| l));
                 v
             })

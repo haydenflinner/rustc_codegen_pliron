@@ -599,6 +599,19 @@ pub fn run(
                         continue;
                     };
                     let f = &st.funcs[cs];
+                    // PGO: a callsite the profile says never ran isn't
+                    // worth growing the caller for (`always_inline` is a
+                    // semantic requirement and still fires).
+                    let site_count = crate::pgo::block_count(st, b);
+                    if !f.always_inline && site_count == Some(0) {
+                        if verbose {
+                            eprintln!(
+                                "inline {}: {sym} -> {cs}: reject (cold callsite)",
+                                st.cgu
+                            );
+                        }
+                        continue;
+                    }
                     // Free inlines: the out-of-line copy disappears
                     // (single-callsite locals) or rustc demanded it.
                     let free = f.always_inline || (once && single.contains(cs));
@@ -632,6 +645,11 @@ pub fn run(
                     }
                     if hint > 1 && f.inline_hint {
                         t = t.max(limit.saturating_mul(hint));
+                    }
+                    // PGO: a callsite the profile proves runs is worth
+                    // more code growth than a static guess.
+                    if site_count.is_some_and(|c| c >= 4) {
+                        t = t.saturating_add(limit.saturating_mul(2));
                     }
                     let mut cost = ci.n;
                     if model {
@@ -1688,6 +1706,17 @@ fn inline_call(
     let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(0));
     let unwind = st.invokes.remove(&call);
     let cont = rw.split_block(ctx, block, OpInsertionPoint::AfterOperation(call), None);
+    // PGO: scale the callee's counts by callsite/entry so cloned blocks
+    // carry an honest count into the caller (LLVM's scaling rule).
+    let callsite_c = st.prof_bcount.get(&block).copied();
+    if let Some(c) = callsite_c {
+        st.prof_bcount.insert(cont, c);
+    }
+    let callee_entry = st.prof.get(&callee).and_then(|p| p.blocks.first().copied());
+    let scale = |x: u64| match (callsite_c, callee_entry) {
+        (Some(c), Some(e)) => ((x as u128 * c as u128) / e.max(1) as u128) as u64,
+        _ => x,
+    };
 
     let src = blocks(ctx, callee);
     let mut map = IrMapping::new();
@@ -1705,6 +1734,9 @@ fn inline_call(
         }
         if let Some(&pp) = st.region_parent.get(&b) {
             st.region_parent.insert(nb, remap(pp));
+        }
+        if let Some(&c) = st.prof_bcount.get(&b) {
+            st.prof_bcount.insert(nb, scale(c));
         }
         for (a, na) in b.deref(ctx).arguments().zip(nb.deref(ctx).arguments()) {
             if let Some(f) = st.region_frozen.get(&a).cloned() {
@@ -1739,6 +1771,10 @@ fn inline_call(
             }
             if let Some(e) = st.expect.get(&op).copied() {
                 st.expect.insert(new, e);
+            }
+            if let Some(cs) = st.prof_edges.get(&op).cloned() {
+                st.prof_edges
+                    .insert(new, cs.iter().map(|&c| scale(c)).collect());
             }
             if st.volatile.contains(&op) {
                 st.volatile.insert(new);
