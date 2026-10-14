@@ -53,9 +53,14 @@ pub fn run(
     };
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
+    // Facts on pre-existing values are invariant across unrolls (the
+    // transform only clones into `nb` and rewrites uses); a fresh clone
+    // simply has no entry — `nn` treats it as unknown, which is the
+    // conservative answer. One build serves all rounds instead of an
+    // O(E) fixpoint per unrolled loop.
+    let nn = NonNull::new(func, loads, derived);
     'outer: while n < MAX_LOOPS {
         let (cfg, dt) = an.cfg_dt(func);
-        let nn = NonNull::new(func, loads, derived);
         let blocks: Vec<Block> = func.layout.blocks().collect();
         for h in blocks {
             if !tried.insert(h) {
