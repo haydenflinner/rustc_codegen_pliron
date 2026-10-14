@@ -18,6 +18,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::packed_option::ReservedValue;
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData, LibCall,
@@ -2640,38 +2641,53 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         if ps.is_empty() {
             continue;
         }
-        // Per-edge resolved args: `eargs[e][ix]`. A non-`Value` arg makes
-        // that slot opaque — `None` flows through both phases as a bail.
+        // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
+        // `skeys[e][ix]` for congruence keys — pseudo-args (`TryCallRet`/
+        // `TryCallExn`) are `None` in `eargs` but key as `O`, so two
+        // slots fed the same pseudo-arg dedup via `P` while the feeding
+        // inst in the key keeps distinct `try_call`s distinct.
         let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
+        let mut skeys: Vec<Vec<Key>> = Vec::with_capacity(es.len());
         let mut arity_ok = true;
         for &(i, d) in es {
-            let args = func.dfg.insts[i]
+            let args: Vec<BlockArg> = func.dfg.insts[i]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                .args(&func.dfg.value_lists);
+                .args(&func.dfg.value_lists)
+                .collect();
             if args.len() != ps.len() {
                 arity_ok = false;
                 break;
             }
             eargs.push(
-                args.map(|a| {
-                    a.as_value()
-                        .map(|v| func.dfg.resolve_aliases(v))
-                })
-                .collect(),
+                args.iter()
+                    .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v)))
+                    .collect(),
+            );
+            skeys.push(
+                args.iter()
+                    .map(|a| match a {
+                        BlockArg::Value(v) => crate::proots::key_of(
+                            func,
+                            &nf,
+                            &canon,
+                            &mut memo,
+                            func.dfg.resolve_aliases(*v),
+                        ),
+                        // `(inst, tag, payload)` — same `BlockCall` arg
+                        // is the same value, anything else differs.
+                        BlockArg::TryCallRet(x) => {
+                            Key::O((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                        }
+                        BlockArg::TryCallExn(x) => {
+                            Key::O((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                        }
+                    })
+                    .collect(),
             );
         }
         if !arity_ok {
             continue;
         }
-        // Slot keys per edge — one `key_of` per (edge, slot), memo-shared.
-        let skeys: Vec<Vec<Option<Key>>> = eargs
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&v| v.map(|v| crate::proots::key_of(func, &nf, &canon, &mut memo, v)))
-                    .collect()
-            })
-            .collect();
         // Slot -> merge key pending materialization in this block. Phase-A
         // keys are `P`-free; phase-B candidates keep `P` leaves until
         // `resolve_p` inlines them.
@@ -2695,7 +2711,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 if v == p {
                     continue;
                 }
-                let k = skeys[e][ix].clone().unwrap();
+                let k = skeys[e][ix].clone();
                 match &class {
                     None => {
                         class = Some(k);
@@ -2746,10 +2762,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             let mut rel: Option<Key> = None;
             let mut uni = true;
             for (e, _) in es.iter().enumerate() {
-                let Some(kj) = &skeys[e][ix] else {
-                    uni = false;
-                    break;
-                };
+                let kj = &skeys[e][ix];
                 let rk = crate::proots::paramize(kj, &skeys[e], ix);
                 match &rel {
                     None => rel = Some(rk),
@@ -2821,7 +2834,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             .filter(|&i| {
                 !pmap.contains_key(&ps[i])
                     && !param_drops.contains(&ps[i])
-                    && skeys.iter().all(|row| row[i].is_some())
+                    && skeys.iter().all(|row| !matches!(row[i], Key::O(_)))
             })
             .collect();
         if surv.len() >= 2 {
@@ -2855,7 +2868,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                             skeys
                                 .iter()
                                 .map(|row| {
-                                    crate::proots::key_rep(row[i].as_ref().unwrap(), &ps, &leaf)
+                                    crate::proots::key_rep(&row[i], &ps, &leaf)
                                 })
                                 .collect(),
                         )
@@ -2999,8 +3012,9 @@ fn mat_ok(
         Key::V(w) => params.contains(w) || dominates_entry(func, dom, *w, b),
         Key::K(..) => true,
         // `P` must be resolved before this runs — an unresolved leaf is
-        // not materializable.
-        Key::P(_) => false,
+        // not materializable. `O` is edge-scoped: it exists only as the
+        // arg on a `BlockCall`, never as an in-block value.
+        Key::P(_) | Key::O(_) => false,
         Key::A(_, rk, _) => mat_ok(func, dom, b, rk, params),
         Key::N(_, _, args, _) => args.iter().all(|a| mat_ok(func, dom, b, a, params)),
     }
@@ -3021,8 +3035,9 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
         Key::V(w) => Some(*w),
         // `P` must be gone by here — `resolve_p` ran at scan time; a
         // survivor means a bug, and dropping the merge is safer than
-        // emitting a key referencing a phantom slot.
-        Key::P(_) => return None,
+        // emitting a key referencing a phantom slot. `O` is edge-scoped
+        // — nothing in-block materializes it.
+        Key::P(_) | Key::O(_) => return None,
         Key::K(ty, bits) => Some(new(
             func,
             order,

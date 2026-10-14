@@ -290,6 +290,12 @@ pub enum Key {
     /// sibling-slot congruence (`paramize`), so `p_j = f(p_i)` merges
     /// key as `f`'s tree over `P(i)` on every edge.
     P(u32),
+    /// Opaque non-`Value` edge arg (`TryCallRet`/`TryCallExn`), keyed by
+    /// `(feeding inst, tag, payload)` — edge-scoped, so identity holds
+    /// only for args carried by the same `BlockCall`. Two slots fed the
+    /// same pseudo-arg dedup via `P`; a uniform-`O` slot can never
+    /// materialize, so `mat_ok`/`emit_key` reject it.
+    O(u64),
 }
 
 /// `v`'s congruence key: aliases resolved, affine chains collapsed via
@@ -505,13 +511,12 @@ pub mod tag {
 /// edge". Subtrees are matched on keys, not values, so an edge arg like
 /// `imul (iadd x,8), 2` paramizes against a sibling slot carrying
 /// `iadd x,8` even though the SSA names differ. `skip` excludes the
-/// slot being keyed (a `p_j` referencing itself is a real phi). `None`
-/// slots — edge args that aren't SSA values — never produce a `P` leaf.
-pub fn paramize(k: &Key, slots: &[Option<Key>], skip: usize) -> Key {
+/// slot being keyed (a `p_j` referencing itself is a real phi).
+pub fn paramize(k: &Key, slots: &[Key], skip: usize) -> Key {
     if let Some(i) = slots
         .iter()
         .enumerate()
-        .find(|(i, s)| *i != skip && s.as_ref() == Some(k))
+        .find(|(i, s)| *i != skip && *s == k)
         .map(|(i, _)| i)
     {
         return Key::P(i as u32);
