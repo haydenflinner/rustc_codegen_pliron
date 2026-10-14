@@ -2603,6 +2603,8 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
     let nf = crate::proots::web_nf(func);
     let canon = crate::proots::canon_map(func);
+    // Keys memoize across args — shared operand trees key once.
+    let mut memo: FxHashMap<Value, crate::proots::Key> = FxHashMap::default();
     let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -2629,16 +2631,44 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         if ps.is_empty() {
             continue;
         }
-        let arity_ok = es.iter().all(|&(i, d)| {
-            func.dfg.insts[i]
+        // Per-edge resolved args: `eargs[e][ix]`. A non-`Value` arg makes
+        // that slot opaque — `None` flows through both phases as a bail.
+        let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
+        let mut arity_ok = true;
+        for &(i, d) in es {
+            let args = func.dfg.insts[i]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                .args(&func.dfg.value_lists)
-                .len()
-                == ps.len()
-        });
+                .args(&func.dfg.value_lists);
+            if args.len() != ps.len() {
+                arity_ok = false;
+                break;
+            }
+            eargs.push(
+                args.map(|a| {
+                    a.as_value()
+                        .map(|v| func.dfg.resolve_aliases(v))
+                })
+                .collect(),
+            );
+        }
         if !arity_ok {
             continue;
         }
+        // Slot keys per edge — one `key_of` per (edge, slot), memo-shared.
+        let skeys: Vec<Vec<Option<Key>>> = eargs
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&v| v.map(|v| crate::proots::key_of(func, &nf, &canon, &mut memo, v)))
+                    .collect()
+            })
+            .collect();
+        // Slot -> merge key pending materialization in this block. Phase-A
+        // keys are `P`-free; phase-B candidates keep `P` leaves until
+        // `resolve_p` inlines them.
+        let mut pend: FxHashMap<usize, Key> = FxHashMap::default();
+        let mut cands: Vec<(usize, Key)> = vec![];
+
         for (ix, &p) in ps.iter().enumerate() {
             if pmap.contains_key(&p) {
                 continue;
@@ -2646,22 +2676,17 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             let mut class: Option<Key> = None;
             let mut member: Option<Value> = None;
             let mut uniform = false;
-            for &(i, d) in es {
-                let a = func.dfg.insts[i]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                    .args(&func.dfg.value_lists)
-                    .nth(ix);
-                let Some(BlockArg::Value(v)) = a else {
+            for (e, _) in es.iter().enumerate() {
+                let Some(v) = eargs[e][ix] else {
                     uniform = false;
                     break;
                 };
-                let v = func.dfg.resolve_aliases(v);
                 // A self-edge echoing the param preserves whatever the
                 // other edges supplied — it can't break uniformity.
                 if v == p {
                     continue;
                 }
-                let k = crate::proots::key_of(func, &nf, &canon, v);
+                let k = skeys[e][ix].clone().unwrap();
                 match &class {
                     None => {
                         class = Some(k);
@@ -2679,25 +2704,98 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     member = Some(v);
                 }
             }
-            let Some(key) = class.filter(|_| uniform) else {
-                continue;
-            };
-            match member {
-                Some(w) => {
-                    pmap.insert(p, w);
-                }
-                None => {
-                    // No member reaches `b`'s head — only mergeable when
-                    // the class's shape can be rebuilt there.
-                    if !mat_ok(func, &dom, b, &key) {
-                        continue;
+            if let Some(key) = class.filter(|_| uniform) {
+                match member {
+                    Some(w) => {
+                        pmap.insert(p, w);
                     }
-                    inserts.push((b, key, p));
+                    None => {
+                        // No member reaches `b`'s head — only mergeable
+                        // when the class's shape can be rebuilt there.
+                        if !mat_ok(func, &dom, b, &key, &ps) {
+                            continue;
+                        }
+                        pend.insert(ix, key.clone());
+                        inserts.push((b, key, p));
+                    }
+                }
+                param_drops.push(p);
+                for e in 0..es.len() {
+                    drop_ixs.entry((es[e].0, es[e].1)).or_default().push(ix);
+                }
+                continue;
+            }
+            // Phase B — sibling-slot congruence: `p_j` drops when every
+            // edge's slot-j arg keys to one tree over `P(i)` leaves —
+            // `p_j = f(p_i)` at the head, uniformly across edges. This
+            // subsumes affparm/relparm (`p_j = p_i ± B`) and covers
+            // arbitrary pure `f`, multi-slot trees (`f(p_i, p_k)`), and
+            // plain param dedup (`p_j ≡ p_i`).
+            if ps.len() < 2 {
+                continue;
+            }
+            let mut rel: Option<Key> = None;
+            let mut uni = true;
+            for (e, _) in es.iter().enumerate() {
+                let Some(kj) = &skeys[e][ix] else {
+                    uni = false;
+                    break;
+                };
+                let rk = crate::proots::paramize(kj, &skeys[e], ix);
+                match &rel {
+                    None => rel = Some(rk),
+                    Some(t) if *t != rk => {
+                        uni = false;
+                        break;
+                    }
+                    _ => {}
                 }
             }
+            if uni
+                && let Some(rk) = rel
+                && has_p(&rk)
+            {
+                cands.push((ix, rk));
+            }
+        }
+
+        // Resolve phase-B candidates now that every slot's fate in `b`
+        // is known: `P(i)` inlines the carrier value (member merge), the
+        // slot's own pending key (recursive via `pend`), or the surviving
+        // param itself. Seed `pend` with the raw `P`-keys *first* —
+        // otherwise `p0 = f(p1)` / `p1 = g(p0)` resolves `P(1)` as a
+        // surviving param and the emitted tree dangles off the dropped
+        // `p1`; with seeds in place the shared `stack` catches the cycle
+        // and both resolve to `None`.
+        for &(ix, ref rk) in &cands {
+            pend.insert(ix, rk.clone());
+        }
+        for (ix, rk) in cands {
+            let p = ps[ix];
+            if pmap.contains_key(&p) {
+                continue;
+            }
+            let resolved = crate::proots::resolve_p(
+                &rk,
+                &mut |i, stack| resolve_slot(i, stack, &ps, &pmap, &pend),
+                &mut Vec::new(),
+            );
+            let Some(k2) = resolved else {
+                pend.remove(&ix);
+                continue;
+            };
+            if !mat_ok(func, &dom, b, &k2, &ps) {
+                pend.remove(&ix);
+                continue;
+            }
+            if std::env::var_os("PLIRON_WEBMERGE_REL").is_some() {
+                eprintln!("webmerge-rel {:?} slot{} {:?}", b, ix, k2);
+            }
+            pend.insert(ix, k2.clone());
+            inserts.push((b, k2, p));
             param_drops.push(p);
-            for &(i, d) in es {
-                drop_ixs.entry((i, d)).or_default().push(ix);
+            for e in 0..es.len() {
+                drop_ixs.entry((es[e].0, es[e].1)).or_default().push(ix);
             }
         }
     }
@@ -2707,12 +2805,28 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // Materialize each non-member class at its block's head, operands
     // before users, then insert the run before the original first inst.
     let mut orders: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
+    let mut failed = FxHashSet::<Value>::default();
     for (b, key, p) in inserts {
         let mut order = vec![];
         if let Some(v) = emit_key(func, &mut order, &key) {
             pmap.insert(p, v);
             orders.entry(b).or_default().extend(order);
+        } else {
+            // Emission failed despite `mat_ok` — un-commit the drop so
+            // the param keeps its slots and uses instead of dangling.
+            failed.insert(p);
         }
+    }
+    if !failed.is_empty() {
+        param_drops.retain(|p| !failed.contains(p));
+        drop_ixs.retain(|(i, d), ixs| {
+            let b = func.dfg.insts[*i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[*d]
+                .block(&func.dfg.value_lists);
+            let ps = func.dfg.block_params(b);
+            ixs.retain(|&ix| !failed.contains(&ps[ix]));
+            !ixs.is_empty()
+        });
     }
     for (b, insts) in orders {
         match func.layout.first_inst(b) {
@@ -2740,23 +2854,63 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     (n, pmap)
 }
 
+/// Does `key` contain a `P` leaf — i.e. is it a slot-relative shape?
+fn has_p(key: &crate::proots::Key) -> bool {
+    use crate::proots::Key;
+    match key {
+        Key::P(_) => true,
+        Key::A(_, rk, _) => has_p(rk),
+        Key::N(_, _, args, _) => args.iter().any(has_p),
+        _ => false,
+    }
+}
+
+/// `resolve_p`'s slot resolver for `webmerge`: a slot merged to a
+/// dominating member resolves to that carrier `V`; a slot pending
+/// materialization inlines its own key (resolved recursively through
+/// the shared `stack`); a surviving param resolves to itself.
+fn resolve_slot(
+    i: u32,
+    stack: &mut Vec<u32>,
+    ps: &[Value],
+    pmap: &FxHashMap<Value, Value>,
+    pend: &FxHashMap<usize, crate::proots::Key>,
+) -> Option<crate::proots::Key> {
+    use crate::proots::Key;
+    let q = ps[i as usize];
+    if let Some(&w) = pmap.get(&q) {
+        return Some(Key::V(w));
+    }
+    if let Some(k) = pend.get(&(i as usize)) {
+        let mut rs = |j: u32, st: &mut Vec<u32>| resolve_slot(j, st, ps, pmap, pend);
+        return crate::proots::resolve_p(k, &mut rs, stack);
+    }
+    Some(Key::V(q))
+}
+
 /// Can `key` be materialized at `b`'s head? Every `V` leaf must dominate
 /// `b`'s entry (the same rule that rejects back-edge roots — a leaf
-/// defined *in* `b` is next-iteration's value). `N` nests freely —
-/// `emit_key` rebuilds operand trees recursively — so the only
-/// un-materializable class is one rooted at a non-dominating leaf.
+/// defined *in* `b` is next-iteration's value) unless it is one of `b`'s
+/// own params — a param is definitionally available at the head. `N`
+/// nests freely — `emit_key` rebuilds operand trees recursively — so
+/// the only un-materializable class is one rooted at a non-dominating
+/// leaf.
 fn mat_ok(
     func: &Function,
     dom: &cranelift_codegen::dominator_tree::DominatorTree,
     b: Block,
     key: &crate::proots::Key,
+    params: &[Value],
 ) -> bool {
     use crate::proots::Key;
     match key {
-        Key::V(w) => dominates_entry(func, dom, *w, b),
+        Key::V(w) => params.contains(w) || dominates_entry(func, dom, *w, b),
         Key::K(..) => true,
-        Key::A(_, rk, _) => mat_ok(func, dom, b, rk),
-        Key::N(_, _, args, _) => args.iter().all(|a| mat_ok(func, dom, b, a)),
+        // `P` must be resolved before this runs — an unresolved leaf is
+        // not materializable.
+        Key::P(_) => false,
+        Key::A(_, rk, _) => mat_ok(func, dom, b, rk, params),
+        Key::N(_, _, args, _) => args.iter().all(|a| mat_ok(func, dom, b, a, params)),
     }
 }
 
@@ -2773,6 +2927,10 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
     };
     match key {
         Key::V(w) => Some(*w),
+        // `P` must be gone by here — `resolve_p` ran at scan time; a
+        // survivor means a bug, and dropping the merge is safer than
+        // emitting a key referencing a phantom slot.
+        Key::P(_) => return None,
         Key::K(ty, bits) => Some(new(
             func,
             order,
@@ -7942,6 +8100,153 @@ mod tests {
         assert!(func.dfg.block_params(s).is_empty());
         // `ps` rebound to entry's `j` — `s` keeps only iconst+iadd+ret.
         assert_eq!(func.layout.block_insts(s).count(), 3);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Sibling-slot congruence: both edges pass `(a, a + 8)` but `a`
+    /// differs per edge — no uniform key for slot 1, yet `p1 = p0 + 8`
+    /// holds slot-relatively. `paramize` turns each arg-1 key into
+    /// `A(P(0), 8)`; `p1` drops and `p0 + 8` materializes at the head.
+    #[test]
+    fn webmerge_sibling_slot_affine() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let s0 = func.dfg.append_block_param(s, types::I64);
+        let s1 = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let e8 = cur.ins().iconst(types::I64, 8);
+        let j1 = cur.ins().iadd(x, e8);
+        cur.ins().jump(s, &[x.into(), j1.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p2);
+        let three = cur.ins().iconst(types::I64, 3);
+        let z = cur.ins().imul(x, three);
+        let e8b = cur.ins().iconst(types::I64, 8);
+        let j2 = cur.ins().iadd(z, e8b);
+        cur.ins().jump(s, &[z.into(), j2.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let r = cur.ins().iadd(s0, s1);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func).0, 1);
+        // `s1` dropped: one param survives, and the head carries the
+        // reconstructed `s0 + 8` (iconst + iadd) feeding `iadd s0, s1'`.
+        assert_eq!(func.dfg.block_params(s).len(), 1);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Param dedup as the degenerate sibling relation: both slots carry
+    /// the same value on every edge — each slot paramizes to `P(other)`,
+    /// the seeded `pend` resolves one to a real `V` leaf and the merge
+    /// picks a survivor.
+    #[test]
+    fn webmerge_sibling_slot_dedup() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let s0 = func.dfg.append_block_param(s, types::I64);
+        let s1 = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        cur.ins().jump(s, &[x.into(), x.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p2);
+        let three = cur.ins().iconst(types::I64, 3);
+        let z = cur.ins().imul(x, three);
+        cur.ins().jump(s, &[z.into(), z.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let r = cur.ins().iadd(s0, s1);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func).0, 1);
+        assert_eq!(func.dfg.block_params(s).len(), 1);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Negative: sibling relation differs across edges — edge `p1` has
+    /// `arg1 = arg0 + 8` but edge `p2` has `arg1 = arg0 + 4`. The
+    /// parameterized keys disagree, nothing merges.
+    #[test]
+    fn webmerge_sibling_slot_mismatch() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let s0 = func.dfg.append_block_param(s, types::I64);
+        let s1 = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let e8 = cur.ins().iconst(types::I64, 8);
+        let j1 = cur.ins().iadd(x, e8);
+        cur.ins().jump(s, &[x.into(), j1.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p2);
+        let three = cur.ins().iconst(types::I64, 3);
+        let z = cur.ins().imul(x, three);
+        let e4 = cur.ins().iconst(types::I64, 4);
+        let j2 = cur.ins().iadd(z, e4);
+        cur.ins().jump(s, &[z.into(), j2.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let r = cur.ins().iadd(s0, s1);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func).0, 0);
+        assert_eq!(func.dfg.block_params(s).len(), 2);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("webmerge produced invalid IR: {e}\n{}", func.display());

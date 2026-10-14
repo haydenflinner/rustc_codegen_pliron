@@ -280,12 +280,16 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 /// transitive through arbitrary depth, not the one-level `arg_shape`
 /// check `arghoist` makes. `extra` carries the discriminator fields
 /// (`icmp`'s cond, `stack_addr`'s slot) that opcode alone doesn't pin.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     V(Value),
     K(cranelift_codegen::ir::Type, i64),
     A(cranelift_codegen::ir::Type, Box<Key>, i64),
     N(Opcode, cranelift_codegen::ir::Type, Box<[Key]>, u64),
+    /// "Whatever arrived in param slot `i` on this edge" — a leaf for
+    /// sibling-slot congruence (`paramize`), so `p_j = f(p_i)` merges
+    /// key as `f`'s tree over `P(i)` on every edge.
+    P(u32),
 }
 
 /// `v`'s congruence key: aliases resolved, affine chains collapsed via
@@ -298,12 +302,14 @@ pub fn key_of(
     func: &Function,
     nf: &FxHashMap<Value, (Value, i64)>,
     canon: &FxHashMap<Value, Value>,
+    memo: &mut FxHashMap<Value, Key>,
     v: Value,
 ) -> Key {
     fn go(
         func: &Function,
         nf: &FxHashMap<Value, (Value, i64)>,
         canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, Key>,
         v: Value,
         d: usize,
     ) -> Key {
@@ -312,10 +318,25 @@ pub fn key_of(
         if d > 64 {
             return Key::V(v);
         }
+        if let Some(k) = memo.get(&v) {
+            return k.clone();
+        }
+        let k = go_uncached(func, nf, canon, memo, v, d);
+        memo.insert(v, k.clone());
+        return k;
+    }
+    fn go_uncached(
+        func: &Function,
+        nf: &FxHashMap<Value, (Value, i64)>,
+        canon: &FxHashMap<Value, Value>,
+        memo: &mut FxHashMap<Value, Key>,
+        v: Value,
+        d: usize,
+    ) -> Key {
         if let Some(&(r, k)) = nf.get(&v)
             && r != v
         {
-            let rk = go(func, nf, canon, r, d + 1);
+            let rk = go(func, nf, canon, memo, r, d + 1);
             let ty = func.dfg.value_type(v);
             return if k == 0 {
                 rk
@@ -326,11 +347,11 @@ pub fn key_of(
         let Some(di) = func.dfg.value_def(v).inst() else {
             return Key::V(v);
         };
-        let args = |vs: &[Value]| -> Box<[Key]> {
+        let mut args = |vs: &[Value]| -> Box<[Key]> {
             vs.iter()
                 .map(|&a| {
                     let a = func.dfg.resolve_aliases(a);
-                    go(func, nf, canon, a, d + 1)
+                    go(func, nf, canon, memo, a, d + 1)
                 })
                 .collect()
         };
@@ -387,7 +408,67 @@ pub fn key_of(
             _ => Key::V(v),
         }
     }
-    go(func, nf, canon, v, 0)
+    go(func, nf, canon, memo, v, 0)
+}
+
+/// Rewrite `k` slot-relative: any subtree equal to `slots[i]`'s key
+/// becomes `P(i)` — "this value is whatever slot `i` carried on this
+/// edge". Subtrees are matched on keys, not values, so an edge arg like
+/// `imul (iadd x,8), 2` paramizes against a sibling slot carrying
+/// `iadd x,8` even though the SSA names differ. `skip` excludes the
+/// slot being keyed (a `p_j` referencing itself is a real phi). `None`
+/// slots — edge args that aren't SSA values — never produce a `P` leaf.
+pub fn paramize(k: &Key, slots: &[Option<Key>], skip: usize) -> Key {
+    if let Some(i) = slots
+        .iter()
+        .enumerate()
+        .find(|(i, s)| *i != skip && s.as_ref() == Some(k))
+        .map(|(i, _)| i)
+    {
+        return Key::P(i as u32);
+    }
+    match k {
+        Key::A(t, rk, off) => Key::A(*t, Box::new(paramize(rk, slots, skip)), *off),
+        Key::N(op, t, args, extra) => Key::N(
+            *op,
+            *t,
+            args.iter().map(|a| paramize(a, slots, skip)).collect(),
+            *extra,
+        ),
+        _ => k.clone(),
+    }
+}
+
+/// Expand every `P(i)` leaf via `resolve(i)`, which returns the slot's
+/// materialized form: a carrier `V`, or the slot's own key (already
+/// `P`-free or resolved recursively) — `None` if the slot can't be
+/// used. The `stack` guard breaks `P`-cycles (`p_i = f(p_j)` while
+/// `p_j = g(p_i)`): revisiting an in-progress slot fails the resolve.
+pub fn resolve_p(
+    k: &Key,
+    resolve: &mut dyn FnMut(u32, &mut Vec<u32>) -> Option<Key>,
+    stack: &mut Vec<u32>,
+) -> Option<Key> {
+    Some(match k {
+        Key::P(i) => {
+            if stack.contains(i) {
+                return None;
+            }
+            stack.push(*i);
+            let r = resolve(*i, stack);
+            stack.pop();
+            r?
+        }
+        Key::A(t, rk, off) => Key::A(*t, Box::new(resolve_p(rk, resolve, stack)?), *off),
+        Key::N(op, t, args, extra) => {
+            let mut as_ = Vec::with_capacity(args.len());
+            for a in args.iter() {
+                as_.push(resolve_p(a, resolve, stack)?);
+            }
+            Key::N(*op, *t, as_.into_boxed_slice(), *extra)
+        }
+        _ => k.clone(),
+    })
 }
 
 ascent::ascent! {
