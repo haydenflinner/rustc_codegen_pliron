@@ -1030,7 +1030,10 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // the dispatch arms they drive die before flattening
     // (`PLIRON_CPARM`).
     if config().enabled("PLIRON_CPARM") {
-        let k = clifpeep::cparm(&mut p.clctx.func);
+        let (k, pmap) = clifpeep::cparm(&mut p.clctx.func);
+        if !pmap.is_empty() {
+            carry_pmap(p, &pmap);
+        }
         if k > 0 {
             // Const folds leave dead `iconst`s inside the arm
             // chains; `resolve_arm`'s speculation cap counts
@@ -1343,13 +1346,6 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
     rangefold::run(&mut p.clctx.func)
 }
 
-// Same-shape edge args hoisted into the target block; the pred-side
-// arg insts they orphaned get swept.
-fn s_arghoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    clifpeep::webmerge(&mut p.clctx.func).0
-        + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
-}
-
 // A merge param's pure use-chain sunk onto the incoming edges (the
 // inverse of arghoist): `count + flag` where flag merges as 1/0/ret
 // becomes per-edge `count+1` / `count+ret0` — the flag's merge slot
@@ -1418,9 +1414,12 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if env_set("PLIRON_SA_DEBUG") || env_set("PLIRON_PHI_DEBUG") {
         eprintln!("--- sameargs {}", p.fname);
     }
-    let k = clifpeep::sameargs(&mut p.clctx.func);
-    if k > 0 && p.dump {
-        p.dump("sameargs");
+    let (k, pmap) = clifpeep::sameargs(&mut p.clctx.func);
+    if k > 0 {
+        carry_pmap(p, &pmap);
+        if p.dump {
+            p.dump("sameargs");
+        }
     }
     k
 }
@@ -1573,39 +1572,35 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
-fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = s_webmerge(p, an);
-    if k > 0 && p.dump {
-        p.dump("relparm");
+// Carry derived-pointer facts across a param merge: `x` derived from a
+// dropped param is derived from its carrier, and a dropped param's own
+// base moves to the carrier too. One chase through `pmap` flattens
+// carrier chains.
+fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
+    let chase = |mut v: Value| {
+        while let Some(&w) = pmap.get(&v) {
+            v = w;
+        }
+        v
+    };
+    let keys: Vec<Value> = p.derived.keys().copied().collect();
+    for x in keys {
+        if let Some(&b) = p.derived.get(&x) {
+            let b = chase(b);
+            p.derived.insert(x, b);
+        }
     }
-    k
+    for (&d, &w) in pmap {
+        if let Some(&b) = p.derived.get(&d) {
+            p.derived.insert(chase(w), b);
+        }
+    }
 }
 
 fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let (k, pmap) = clifpeep::webmerge(&mut p.clctx.func);
     if k > 0 {
-        // Carry derived-pointer facts across the merge: `x` derived from
-        // a dropped param is derived from its carrier, and a dropped
-        // param's own base moves to the carrier too. One chase through
-        // `pmap` flattens carrier chains.
-        let chase = |mut v: Value| {
-            while let Some(&w) = pmap.get(&v) {
-                v = w;
-            }
-            v
-        };
-        let keys: Vec<Value> = p.derived.keys().copied().collect();
-        for x in keys {
-            if let Some(&b) = p.derived.get(&x) {
-                let b = chase(b);
-                p.derived.insert(x, b);
-            }
-        }
-        for (&d, &w) in &pmap {
-            if let Some(&b) = p.derived.get(&d) {
-                p.derived.insert(chase(w), b);
-            }
-        }
+        carry_pmap(p, &pmap);
         if p.dump {
             p.dump("webmerge");
         }
@@ -2076,15 +2071,9 @@ pub static DEFAULT: &[Step] = &[
         Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
         s_sameargs,
     ),
-    // Same-shape edge args (`iadd v4215,v4300` cloned into seven
-    // tokenize preds) hoisted into the target — deletes the param
-    // slot and its regalloc edge copies outright.
-    step(
-        "arghoist",
-        "arghoist",
-        Gate::Env("PLIRON_ARGHOIST"),
-        s_arghoist,
-    ),
+    // (The old `arghoist` position was a second webmerge call right
+    // after sameargs2's fixpoint — webmerge now hoists same-shape edge
+    // args via phase-B `P`-keys, so nothing was left for it.)
     step(
         "paramsink",
         "paramsink",
@@ -2101,10 +2090,9 @@ pub static DEFAULT: &[Step] = &[
         s_postinc,
     )
     .needs(shape::LOOPS),
-    // Symbolic-offset param pairs `p_j = p_i - B` (B loop-invariant) —
-    // tokenize's `pos` shadowing `cur - base`. Drops a live register and
-    // an edge copy per backedge.
-    step("relparm", "relparm", Gate::Env("PLIRON_RELPARM"), s_relparm).needs(shape::LOOPS),
+    // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
+    // — are phase-D relational merges; the later sameargs3/webmerge
+    // positions cover anything this extra call found.)
     // `icmp CC (select c,K,x), K` folds to `c`/`!c` when the live arm's
     // compare is provable — a pure fold, so it gets first crack at the
     // niche dispatch; `seltest` below handles the unprovable cases by

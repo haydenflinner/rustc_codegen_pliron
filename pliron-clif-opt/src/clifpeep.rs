@@ -1673,8 +1673,9 @@ pub fn fusechains(func: &mut Function) -> usize {
 /// needs no split at all. Duplicate params (the same arg value on every
 /// edge) merge the same way. Jumpthread/merge-shaped CFGs leave thousands
 /// of these; iterate to a fixpoint since each drop can expose more.
-pub fn sameargs(func: &mut Function) -> usize {
+pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut n = 0;
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     for _ in 0..8 {
         // `webmerge` subsumes the old `sameargs_round`/`phimerge`/
         // `affparm` trio: phase A is the uniform-arg merge (with
@@ -1682,8 +1683,30 @@ pub fn sameargs(func: &mut Function) -> usize {
         // phase B the duplicate-param merge, phases C/D the rest.
         // Looping webmerge alone still reaches the cross-block fixpoint
         // — each drop can expose uniform args in successor blocks.
-        let k = webmerge(func).0;
+        let (k, pm) = webmerge(func);
         n += k;
+        // Compose into the accumulated map: old carriers may re-drop in
+        // this round (chase through `pm`), new carriers may already be
+        // drops (chase through `pmap`). Bounded by the map sizes — a
+        // cyclic web (`a→b` here, `b→a` earlier) must not spin.
+        for v in pmap.values_mut() {
+            for _ in 0..pm.len() {
+                match pm.get(v) {
+                    Some(&w) => *v = w,
+                    None => break,
+                }
+            }
+        }
+        for (&x, &v) in &pm {
+            let mut v = v;
+            for _ in 0..pm.len() + pmap.len() {
+                match pm.get(&v).or_else(|| pmap.get(&v)) {
+                    Some(&w) => v = w,
+                    None => break,
+                }
+            }
+            pmap.insert(x, v);
+        }
         if k == 0 {
             break;
         }
@@ -1691,7 +1714,7 @@ pub fn sameargs(func: &mut Function) -> usize {
     if crate::pass_enabled("PLIRON_CSWEEP") {
         n += const_sweep(func);
     }
-    n
+    (n, pmap)
 }
 
 /// A `brif` arm to a small `return` block whose sibling arm is a loop header
@@ -1839,14 +1862,27 @@ pub fn coldrets(func: &mut Function) -> usize {
 /// header's) are resolved transitively for the constness check and
 /// rewritten to the constant, but keep their edge args — no arity
 /// changes outside the folded headers.
-pub fn cparm(func: &mut Function) -> usize {
+pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut n = 0;
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     for _ in 0..8 {
         // `cparm_round`'s carried-const chase is `webmerge` iterated:
         // each uniform-param link drops via phase A (the const leaf
         // materializes through `emit_key`), exposing the next link.
-        let k = webmerge(func).0;
+        let (k, pm) = webmerge(func);
         n += k;
+        for v in pmap.values_mut() {
+            while let Some(&w) = pm.get(v) {
+                *v = w;
+            }
+        }
+        for (&x, &v) in &pm {
+            let mut v = v;
+            while let Some(&w) = pm.get(&v).or_else(|| pmap.get(&v)) {
+                v = w;
+            }
+            pmap.insert(x, v);
+        }
         if k == 0 {
             break;
         }
@@ -1854,7 +1890,7 @@ pub fn cparm(func: &mut Function) -> usize {
             n += const_sweep(func);
         }
     }
-    n
+    (n, pmap)
 }
 
 /// Shared commit for the param-merge passes: flatten aliases,
