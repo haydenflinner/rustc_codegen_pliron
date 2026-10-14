@@ -71,25 +71,64 @@ fn split(ctx: &mut Context, op: Ptr<Operation>, ety: TypeHandle, n: u32) {
             }
         }
         let s = clone_operation(op, ctx, &mut rw, &mut map);
-        s.deref(ctx).get_result(0).set_type(ctx, ety);
-        s.insert_before(ctx, op);
         let lane = s.deref(ctx).get_result(0);
+        lane.set_type(ctx, ety);
+        s.insert_before(ctx, op);
         let ins = InsertElementOp::new(ctx, acc, lane, ix).get_operation();
         ins.insert_before(ctx, op);
         acc = ins.deref(ctx).get_result(0);
     }
-    op.deref(ctx).get_result(0).replace_all_uses_with(ctx, &acc);
+    let old = op.deref(ctx).get_result(0);
+    old.replace_all_uses_with(ctx, &acc);
+    Operation::erase(op, ctx);
+}
+
+/// `shufflevector a, b, mask` -> per-lane extract from `a ++ b` + insert;
+/// negative mask entries are poison lanes and stay poison.
+fn shuffle(ctx: &mut Context, op: Ptr<Operation>) {
+    let sv = Operation::get_op::<ShuffleVectorOp>(op, ctx).unwrap();
+    let mask = sv.get_attr_llvm_shuffle_vector_mask(ctx).unwrap().0.clone();
+    let (a, b) = {
+        let o = op.deref(ctx);
+        (o.get_operand(0), o.get_operand(1))
+    };
+    let na = vec_of(ctx, a.get_type(ctx)).unwrap().1 as i32;
+    let vty = op.deref(ctx).get_result(0).get_type(ctx);
+    let p = PoisonOp::new(ctx, vty).get_operation();
+    p.insert_before(ctx, op);
+    let mut acc = p.deref(ctx).get_result(0);
+    for (i, &m) in mask.iter().enumerate() {
+        if m < 0 {
+            continue;
+        }
+        let (src, j) = if m < na { (a, m) } else { (b, m - na) };
+        let jx = idx(ctx, j as u32, op);
+        let e = ExtractElementOp::new(ctx, src, jx).get_operation();
+        e.insert_before(ctx, op);
+        let lane = e.deref(ctx).get_result(0);
+        let ix = idx(ctx, i as u32, op);
+        let ins = InsertElementOp::new(ctx, acc, lane, ix).get_operation();
+        ins.insert_before(ctx, op);
+        acc = ins.deref(ctx).get_result(0);
+    }
+    let old = op.deref(ctx).get_result(0);
+    old.replace_all_uses_with(ctx, &acc);
     Operation::erase(op, ctx);
 }
 
 /// Scalarize every elementwise vector op in `func`'s body.
 pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     let mut todo = Vec::new();
+    let mut shuffles = Vec::new();
     let regions: Vec<_> = func.deref(ctx).regions().collect();
     for r in regions {
         for b in r.deref(ctx).iter(ctx) {
             for op in b.deref(ctx).iter(ctx) {
                 let o = op.deref(ctx);
+                if Operation::get_op::<ShuffleVectorOp>(op, ctx).is_some() {
+                    shuffles.push(op);
+                    continue;
+                }
                 if o.get_num_results() != 1 {
                     continue;
                 }
@@ -100,6 +139,9 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
                 }
             }
         }
+    }
+    for op in shuffles {
+        shuffle(ctx, op);
     }
     for (op, e, n) in todo {
         split(ctx, op, e, n);

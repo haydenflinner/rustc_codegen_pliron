@@ -3127,6 +3127,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .map(|(o, t)| {
                     if atomic && self.needs_atomic_stub(t) {
                         self.atomic_load_stub(p, o)
+                    } else if atomic && t.is_float() {
+                        let it = ClType::int(t.bits() as u16).unwrap();
+                        let x = self.b.ins().atomic_load(it, MemFlagsData::trusted(), p);
+                        self.b.ins().bitcast(t, MemFlagsData::new(), x)
                     } else if atomic {
                         self.b.ins().atomic_load(t, MemFlagsData::trusted(), p)
                     } else {
@@ -3177,6 +3181,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
                 } else if is!(AtomicStoreOp) {
+                    let v = if t.is_float() {
+                        let it = ClType::int(t.bits() as u16).unwrap();
+                        self.b.ins().bitcast(it, MemFlagsData::new(), v)
+                    } else {
+                        v
+                    };
                     self.b.ins().atomic_store(MemFlagsData::trusted(), v, p);
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
@@ -3190,6 +3200,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let p = self.get1(opnds[0]);
             let v = self.get1(opnds[1]);
             use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
+            let kind = &self.st.rmw[&op];
+            if self.b.func.dfg.value_type(v).is_float()
+                || matches!(kind, KA::FAdd | KA::FSub | KA::FMax | KA::FMin)
+            {
+                let r = self.float_rmw(kind.clone(), p, v);
+                return self.set1(op, r);
+            }
             let k = match self.st.rmw[&op] {
                 KA::Xchg => R::Xchg,
                 KA::Add => R::Add,
@@ -4140,6 +4157,153 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.switch_to_block(done);
     }
 
+    /// Every scalar lane of `v`, across its leaves.
+    fn lanes_of(&mut self, v: Value) -> Vec<ir::Value> {
+        let mut out = Vec::new();
+        for x in self.get(v) {
+            let t = self.b.func.dfg.value_type(x);
+            if t.is_vector() {
+                for i in 0..t.lane_count() {
+                    out.push(self.b.ins().extractlane(x, i as u8));
+                }
+            } else {
+                out.push(x);
+            }
+        }
+        out
+    }
+
+    /// `llvm.vector.reduce.<k>`: sequential fold (the ordered form for fadd/fmul).
+    fn vec_reduce(&mut self, op: Ptr<Operation>, k: &str, opnds: &[Value]) {
+        let ordered = matches!(k, "fadd" | "fmul");
+        let mut acc = ordered.then(|| self.get1(opnds[0]));
+        for x in self.lanes_of(opnds[ordered as usize]) {
+            let Some(a) = acc else {
+                acc = Some(x);
+                continue;
+            };
+            let i = self.b.ins();
+            acc = Some(match k {
+                "add" => i.iadd(a, x),
+                "mul" => i.imul(a, x),
+                "and" => i.band(a, x),
+                "or" => i.bor(a, x),
+                "xor" => i.bxor(a, x),
+                "smax" => i.smax(a, x),
+                "smin" => i.smin(a, x),
+                "umax" => i.umax(a, x),
+                "umin" => i.umin(a, x),
+                "fadd" => i.fadd(a, x),
+                "fmul" => i.fmul(a, x),
+                "fmax" => i.fmax(a, x),
+                "fmin" => i.fmin(a, x),
+                _ => panic!("pliron->cranelift: unsupported intrinsic llvm.vector.reduce.{k}"),
+            });
+        }
+        let r = acc.expect("llvm.vector.reduce of an empty vector");
+        self.set1(op, r);
+    }
+
+    /// `llvm.is.fpclass(x, mask)` on the IEEE bit pattern; mask bits are
+    /// snan, qnan, -inf, -normal, -subnormal, -0, +0, +subnormal, +normal, +inf.
+    fn is_fpclass(&mut self, x: ir::Value, m: u32) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let mb: u32 = match t {
+            clt::F16 => 10,
+            clt::F32 => 23,
+            clt::F64 => 52,
+            _ => panic!("pliron->cranelift: llvm.is.fpclass on {t}"),
+        };
+        let it = ClType::int(t.bits() as u16).unwrap();
+        let w = t.bits();
+        let bits = self.b.ins().bitcast(it, MemFlagsData::new(), x);
+        let absm = (1u128 << (w - 1)) - 1;
+        let inf = ((1u128 << (w - 1 - mb)) - 1) << mb;
+        let quiet = 1u128 << (mb - 1);
+        let minnorm = 1u128 << mb;
+        let c = |s: &mut Self, v: u128| s.iconst_any(it, v);
+        let am = c(self, absm);
+        let abs = self.b.ins().band(bits, am);
+        let (ci, cq, cm, z) = (c(self, inf), c(self, inf | quiet), c(self, minnorm), c(self, 0));
+        let ins = |s: &mut Self, cc, a, b| s.b.ins().icmp(cc, a, b);
+        let nan = ins(self, IntCC::UnsignedGreaterThan, abs, ci);
+        let notq = ins(self, IntCC::UnsignedLessThan, abs, cq);
+        let snan = self.b.ins().band(nan, notq);
+        let qnan = ins(self, IntCC::UnsignedGreaterThanOrEqual, abs, cq);
+        let isinf = ins(self, IntCC::Equal, abs, ci);
+        let zero = ins(self, IntCC::Equal, abs, z);
+        let nz = ins(self, IntCC::NotEqual, abs, z);
+        let lt_min = ins(self, IntCC::UnsignedLessThan, abs, cm);
+        let sub = self.b.ins().band(nz, lt_min);
+        let ge_min = ins(self, IntCC::UnsignedGreaterThanOrEqual, abs, cm);
+        let lt_inf = ins(self, IntCC::UnsignedLessThan, abs, ci);
+        let norm = self.b.ins().band(ge_min, lt_inf);
+        let neg = ins(self, IntCC::SignedLessThan, bits, z);
+        let pos = ins(self, IntCC::SignedGreaterThanOrEqual, bits, z);
+        let classes = [
+            (snan, None),
+            (qnan, None),
+            (isinf, Some(neg)),
+            (norm, Some(neg)),
+            (sub, Some(neg)),
+            (zero, Some(neg)),
+            (zero, Some(pos)),
+            (sub, Some(pos)),
+            (norm, Some(pos)),
+            (isinf, Some(pos)),
+        ];
+        let mut r = self.b.ins().iconst(clt::I8, 0);
+        for (bit, (cls, sign)) in classes.into_iter().enumerate() {
+            if m & (1 << bit) == 0 {
+                continue;
+            }
+            let v = match sign {
+                Some(sg) => self.b.ins().band(cls, sg),
+                None => cls,
+            };
+            r = self.b.ins().bor(r, v);
+        }
+        r
+    }
+
+    /// Float `atomicrmw` via the same-width integer: xchg directly, the
+    /// arithmetic kinds as a load + compare-and-swap retry loop.
+    fn float_rmw(
+        &mut self,
+        k: pliron_llvm::attributes::AtomicRmwKindAttr,
+        p: ir::Value,
+        v: ir::Value,
+    ) -> ir::Value {
+        use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
+        let t = self.b.func.dfg.value_type(v);
+        let it = ClType::int(t.bits() as u16).unwrap();
+        let (mf, tr) = (MemFlagsData::new(), MemFlagsData::trusted());
+        if matches!(k, KA::Xchg) {
+            let vi = self.b.ins().bitcast(it, mf, v);
+            let r = self.b.ins().atomic_rmw(it, tr, ir::AtomicRmwOp::Xchg, p, vi);
+            return self.b.ins().bitcast(t, mf, r);
+        }
+        let retry = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().jump(retry, &[]);
+        self.b.switch_to_block(retry);
+        let old = self.b.ins().atomic_load(it, tr, p);
+        let of = self.b.ins().bitcast(t, mf, old);
+        let nf = match k {
+            KA::FAdd => self.b.ins().fadd(of, v),
+            KA::FSub => self.b.ins().fsub(of, v),
+            KA::FMax => self.b.ins().fmax(of, v),
+            KA::FMin => self.b.ins().fmin(of, v),
+            k => panic!("pliron->cranelift: atomicrmw {k:?} on {t}"),
+        };
+        let ni = self.b.ins().bitcast(it, mf, nf);
+        let got = self.b.ins().atomic_cas(tr, p, old, ni);
+        let ok = self.b.ins().icmp(IntCC::Equal, got, old);
+        self.b.ins().brif(ok, done, &[], retry, &[]);
+        self.b.switch_to_block(done);
+        of
+    }
+
     fn lower_intrinsic(&mut self, op: Ptr<Operation>, opnds: &[Value]) {
         let name = self.st.intrinsics[&op].as_str();
         if name.starts_with("pliron.v") {
@@ -4151,6 +4315,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if k > 1 {
                 return self.split_vec_op(op, name, opnds, k);
             }
+        }
+        if let Some(k) = name.strip_prefix("llvm.vector.reduce.") {
+            return self.vec_reduce(op, k, opnds);
+        }
+        if name == "llvm.is.fpclass" {
+            let x = self.get1(opnds[0]);
+            let m = self.const_int(opnds[1]).expect("llvm.is.fpclass: non-constant mask");
+            let r = self.is_fpclass(x, m as u32);
+            return self.set1(op, r);
         }
         if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
             // Not code — a storage-liveness marker. Record where it lands:
@@ -4443,6 +4616,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     "maxnum" => "fmax",
                     b => b,
                 };
+                if t == clt::F16 && n != "llvm.round" {
+                    // No f16 libm on most hosts: widen, call the f32 form, narrow.
+                    let w: Vec<_> = a
+                        .iter()
+                        .map(|&x| self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0])
+                        .collect();
+                    let ps = vec![clt::F32; w.len()];
+                    let m = self.libcall(&format!("{base}f"), &ps, &[clt::F32], &w)[0];
+                    let r = self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[m])[0];
+                    return self.set1(op, r);
+                }
                 let f = match t {
                     clt::F32 => format!("{base}f"),
                     clt::F64 => base.to_string(),
