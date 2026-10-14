@@ -28,6 +28,7 @@ pub mod loopdel;
 pub mod loopidiom;
 pub mod looprot;
 pub mod loopvec;
+pub mod memspec;
 pub mod niche;
 pub mod paramsink;
 pub mod pipeline;

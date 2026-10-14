@@ -1526,6 +1526,19 @@ fn s_dse3(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// Edge-specialize a `jump` continuation whose param-bound loads a pred
+// just stored: `entry(k).or_insert(0)`'s `*v += 1` continuation reads the
+// `0` the fresh-insert edge wrote — clone the small block onto the edge
+// and alias the load to the stored value so lcse/dse fold `store 0` +
+// `load;+1;store` into `store 1`.
+fn s_memspec(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = memspec::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+    if k > 0 && p.dump {
+        p.dump("memspec");
+    }
+    k
+}
+
 // Lane-by-lane constant stores into a stack slot that whole-vector
 // loads read back (rustc's `Simd` const materialization, e.g.
 // hashbrown's `u8x8` special-byte checks in `reserve_rehash`) fold
@@ -2115,6 +2128,10 @@ pub static DEFAULT: &[Step] = &[
     // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
     // every earlier pass.
     step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
+    // `jump`-edge continuations whose param-bound loads a pred just
+    // stored (or_insert's `*v += 1` reading its own `0`) get cloned onto
+    // the edge so lcse4 can fold the RMW to a direct store.
+    step("memspec", "memspec", Gate::Env("PLIRON_MEMSPEC"), s_memspec).needs(shape::MEM),
     // sameargs3/paramsink substitute edge args into isub uses, leaving
     // `isub (iadd x, k), x` cursor deltas that only now have visible iadd
     // defs (tokenize's per-path byte lengths) — one more local fold.

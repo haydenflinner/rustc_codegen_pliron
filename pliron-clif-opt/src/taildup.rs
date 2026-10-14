@@ -137,7 +137,12 @@ fn flip_inst(
 }
 
 /// Every value `r` uses from outside `r` is available at the end of `p`.
-fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) -> bool {
+pub(crate) fn outer_dominate(
+    func: &Function,
+    domtree: &DominatorTree,
+    r: Block,
+    p: Block,
+) -> bool {
     func.layout.block_insts(r).all(|i| {
         func.dfg.inst_values(i).all(|v| {
             let def = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
