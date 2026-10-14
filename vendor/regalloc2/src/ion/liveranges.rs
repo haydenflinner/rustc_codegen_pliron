@@ -353,11 +353,34 @@ impl<'a, F: Function> Env<'a, F> {
 
         // Check that there are no liveins to the entry block.
         if !self.liveins[self.func.entry_block().index()].is_empty() {
-            trace!(
-                "non-empty liveins to entry block: {:?}",
-                self.liveins[self.func.entry_block().index()]
-            );
-            return Err(RegAllocError::EntryLivein);
+            let mut vs = alloc::vec::Vec::new();
+            for i in self.liveins[self.func.entry_block().index()].iter() {
+                vs.push(i);
+            }
+            let mut sites = alloc::vec::Vec::new();
+            for bi in 0..self.func.num_blocks() {
+                let blk = Block::new(bi);
+                let insns = self.func.block_insns(blk);
+                if self.func.is_branch(insns.last()) {
+                    for si in 0..self.func.block_succs(blk).len() {
+                        for &p in self.func.branch_blockparams(blk, insns.last(), si) {
+                            if vs.contains(&p.vreg()) {
+                                sites.push(alloc::format!(
+                                    "edge {blk:?}->succ{si} arg {p:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                for ins in insns.iter() {
+                    for op in self.func.inst_operands(ins) {
+                        if vs.contains(&op.vreg().vreg()) {
+                            sites.push(alloc::format!("ins {ins:?} {:?} {op:?}", op.kind()));
+                        }
+                    }
+                }
+            }
+            panic!("EntryLivein vregs: {:?} sites: {:?}", vs, sites);
         }
 
         self.ctx.scratch_workqueue = workqueue;

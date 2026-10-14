@@ -760,6 +760,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
             // If  inst has been sunk to another location, skip it.
             if self.is_inst_sunk(inst) {
+                // PLIRON: if a pending post-index fusion claimed this
+                // inst, the fused inst still has to emit so that its
+                // writeback result is defined. The sunk copy already
+                // produced the load/store's value for its user, so the
+                // fused inst's own result regs are dead here.
+                if let Some((mi, _out)) = self.take_pending_postindex(inst) {
+                    self.emit(mi);
+                    let loc = self.srcloc(inst);
+                    self.finish_ir_inst(loc);
+                }
                 continue;
             }
 
@@ -850,6 +860,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                         self.vregs.set_vreg_alias(dst, temp);
                     }
                 }
+            } else if let Some((mi, _out)) = self.take_pending_postindex(inst) {
+                // PLIRON: this inst is the cand of a pending post-index
+                // fusion; its normal lowering is skipped as dead, but
+                // the fused inst still has to emit to define the
+                // writeback result.
+                self.emit(mi);
             }
 
             let start = self.vcode.vcode.num_insts();
@@ -1765,6 +1781,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 None
             }
         }
+    }
+
+    /// PLIRON: is `ir_inst` the load/store claimed by a pending
+    /// post-index fusion?
+    pub fn is_pending_postindex_cand(&self, ir_inst: Inst) -> bool {
+        matches!(self.pending_postindex, Some((cand, _, _)) if cand == ir_inst)
     }
 
     /// PLIRON: is a pending post-index fusion still in flight?

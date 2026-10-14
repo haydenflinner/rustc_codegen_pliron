@@ -542,6 +542,7 @@ pub fn lower_to_object(
                     dump: j.dump,
                     verify_full,
                     stats: &mut j.stats,
+                    carry_log: Vec::new(),
                 };
                 crate::pipeline::run_pipeline(&mut pipe);
             }

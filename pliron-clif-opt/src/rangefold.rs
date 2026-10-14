@@ -69,6 +69,28 @@ fn iconst(func: &Function, v: Value) -> Option<u64> {
     }
 }
 
+/// Every value `hdest`'s insts use must still dominate them once `at`'s
+/// block becomes a direct predecessor: defs inside `hdest` and `hdest`'s
+/// own params are unaffected, but a def that only dominated `hdest`'s
+/// old preds — like an iconst in the bypassed lo-block — would dangle.
+fn body_avail(func: &Function, dom: &DominatorTree, hdest: Block, at: Inst) -> bool {
+    func.layout.block_insts(hdest).all(|i| {
+        func.dfg.inst_values(i).all(|v| {
+            let v = func.dfg.resolve_aliases(v);
+            match func.dfg.value_def(v) {
+                ValueDef::Result(di, _) => {
+                    func.layout.inst_block(di) == Some(hdest)
+                        || dom.dominates(ProgramPoint::Inst(di), at, &func.layout)
+                }
+                ValueDef::Param(b, _) => {
+                    b == hdest || dom.dominates(ProgramPoint::Block(b), at, &func.layout)
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
 /// `lo(k)` means `x >= k`; `hi(k)` means `x < k` — so a `[lo, hi)`
 /// check is `x - lo u< hi - lo`.
 #[derive(Clone, Copy)]
@@ -291,99 +313,111 @@ fn bypassable(func: &Function, b: Block) -> bool {
 
 /// Rule 1: `brif (x >= lo) → [brif (x < hi) → HIT else MISS] else MISS`
 /// becomes `brif (x-lo u< hi-lo) → HIT else MISS`.
-fn bound_pairs(func: &mut Function, dom: &DominatorTree) -> usize {
+fn bound_pairs(func: &mut Function) -> usize {
     let dbg = crate::config::env_set("PLIRON_RF_DEBUG");
     let uses = use_blocks(func);
-    let mut rewrites = Vec::new();
-    for b in func.layout.blocks().collect::<Vec<_>>() {
-        let Some(term) = func.layout.last_inst(b) else {
-            continue;
-        };
-        let InstructionData::Brif {
-            arg: c, blocks, ..
-        } = func.dfg.insts[term]
-        else {
-            continue;
-        };
-        let (tbc, fbc) = (blocks[0], blocks[1]);
-        let Some((x, Half::Lo(lo))) = half_bound(func, c) else {
-            continue;
-        };
-        if dbg {
-            eprintln!("rf: block{b} lo-test x={x} lo={lo}");
-        }
-        let hi_b = dest_block(func, tbc);
-        if hi_b == b {
-            continue;
-        }
-        // The taken arm must be a bare upper-bound test sharing the
-        // same miss edge — we bypass it entirely.
-        if !bypassable(func, hi_b) || !defs_local(func, &uses, hi_b) {
+    let mut n = 0;
+    // Bypassing moves edges, and a stale dominator tree could let a
+    // later rewrite in the same batch accept a value that only
+    // dominated through the just-removed edge — apply one fold per
+    // dominator rebuild.
+    loop {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dom = DominatorTree::with_function(func, &cfg);
+        let mut found = None;
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            let Some(term) = func.layout.last_inst(b) else {
+                continue;
+            };
+            let InstructionData::Brif {
+                arg: c, blocks, ..
+            } = func.dfg.insts[term]
+            else {
+                continue;
+            };
+            let (tbc, fbc) = (blocks[0], blocks[1]);
+            let Some((x, Half::Lo(lo))) = half_bound(func, c) else {
+                continue;
+            };
             if dbg {
-                eprintln!("rf:   hi_b{hi_b} impure or escaping");
+                eprintln!("rf: block{b} lo-test x={x} lo={lo}");
             }
-            continue;
+            let hi_b = dest_block(func, tbc);
+            if hi_b == b {
+                continue;
+            }
+            // The taken arm must be a bare upper-bound test sharing the
+            // same miss edge — we bypass it entirely.
+            if !bypassable(func, hi_b) || !defs_local(func, &uses, hi_b) {
+                if dbg {
+                    eprintln!("rf:   hi_b{hi_b} impure or escaping");
+                }
+                continue;
+            }
+            let Some(hterm) = func.layout.last_inst(hi_b) else {
+                continue;
+            };
+            let InstructionData::Brif {
+                arg: c2,
+                blocks: hblocks,
+                ..
+            } = func.dfg.insts[hterm]
+            else {
+                continue;
+            };
+            let (hbc, mbc) = (hblocks[0], hblocks[1]);
+            let Some((x2, Half::Hi(hi))) = half_bound(func, c2) else {
+                continue;
+            };
+            // Merging the tests moves the hit edge's args to this block.
+            // Values that dominate reuse; a pure inst paramsink sunk
+            // (`iadd count,1`) or a const re-emits. Unmaterializable args
+            // — defs that stay inside the bypassed block — would dangle or
+            // hoist unconditionally: the `mov;stur` flag regression shape.
+            let Some(hit_mats) = hbc
+                .args(&func.dfg.value_lists)
+                .map(|a| mat_of(func, &dom, a, term))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let ok = func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2)
+                && hi > lo
+                && same_edge(func, fbc, mbc)
+                && body_avail(func, &dom, dest_block(func, hbc), term);
+            if dbg {
+                eprintln!(
+                    "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
+                    func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
+                    hi > lo,
+                    same_edge(func, fbc, mbc),
+                    hit_mats.len()
+                );
+            }
+            if !ok {
+                continue;
+            }
+            found = Some((term, x, lo, hi - lo, dest_block(func, hbc), fbc, hit_mats));
+            break;
         }
-        let Some(hterm) = func.layout.last_inst(hi_b) else {
-            continue;
+        let Some((term, x, lo, w, hdest, fbc, mats)) = found else {
+            return n;
         };
-        let InstructionData::Brif {
-            arg: c2,
-            blocks: hblocks,
-            ..
-        } = func.dfg.insts[hterm]
-        else {
-            continue;
-        };
-        let (hbc, mbc) = (hblocks[0], hblocks[1]);
-        let Some((x2, Half::Hi(hi))) = half_bound(func, c2) else {
-            continue;
-        };
-        // Merging the tests moves the hit edge's args to this block.
-        // Values that dominate reuse; a pure inst paramsink sunk
-        // (`iadd count,1`) or a const re-emits. Unmaterializable args
-        // — defs that stay inside the bypassed block — would dangle or
-        // hoist unconditionally: the `mov;stur` flag regression shape.
-        let Some(hit_mats) = hbc
-            .args(&func.dfg.value_lists)
-            .map(|a| mat_of(func, dom, a, term))
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let ok = func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2)
-            && hi > lo
-            && same_edge(func, fbc, mbc);
-        if dbg {
-            eprintln!(
-                "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
-                func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
-                hi > lo,
-                same_edge(func, fbc, mbc),
-                hit_mats.len()
-            );
-        }
-        if !ok {
-            continue;
-        }
-        rewrites.push((term, x, lo, hi - lo, dest_block(func, hbc), fbc, hit_mats));
-    }
-    for (term, x, lo, w, hdest, fbc, mats) in &rewrites {
-        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, *term, m)).collect();
-        let hbc = BlockCall::new(*hdest, hargs, &mut func.dfg.value_lists);
-        let ty = func.dfg.value_type(*x);
-        let mut pos = FuncCursor::new(func).at_inst(*term);
-        let k = pos.ins().iconst(ty, *lo as i64);
-        let t = pos.ins().isub(*x, k);
-        let wv = pos.ins().iconst(ty, *w as i64);
+        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, term, m)).collect();
+        let hbc = BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+        let ty = func.dfg.value_type(x);
+        let mut pos = FuncCursor::new(func).at_inst(term);
+        let k = pos.ins().iconst(ty, lo as i64);
+        let t = pos.ins().isub(x, k);
+        let wv = pos.ins().iconst(ty, w as i64);
         let c = pos.ins().icmp(IntCC::UnsignedLessThan, t, wv);
-        let InstructionData::Brif { arg, blocks, .. } = &mut func.dfg.insts[*term] else {
-            continue;
+        let InstructionData::Brif { arg, blocks, .. } = &mut func.dfg.insts[term] else {
+            return n;
         };
         *arg = c;
-        *blocks = [hbc, *fbc].into();
+        *blocks = [hbc, fbc].into();
+        n += 1;
     }
-    rewrites.len()
 }
 
 /// Operand-equality for clone shape checks: same resolved value, or
@@ -446,86 +480,105 @@ fn shared_args(
 /// Rule 2: `brif (x-k1 u<w) → HIT else [brif (x-k2 u<w) → HIT else MISS]`
 /// becomes `brif ((x|d)-k_hi u<w) → HIT else MISS` when the bit-d
 /// partition is exact.
-fn range_unions(func: &mut Function, dom: &DominatorTree) -> usize {
-    let mut rewrites = Vec::new();
-    for b in func.layout.blocks().collect::<Vec<_>>() {
-        let Some(term) = func.layout.last_inst(b) else {
-            continue;
-        };
-        let InstructionData::Brif {
-            arg: c, blocks, ..
-        } = func.dfg.insts[term]
-        else {
-            continue;
-        };
-        let (tbc, fbc) = (blocks[0], blocks[1]);
-        let Some((x1, k1, w1)) = offset_test(func, c) else {
-            continue;
-        };
-        let nb = dest_block(func, fbc);
-        if nb == b {
-            continue;
+fn range_unions(func: &mut Function) -> usize {
+    let uses = use_blocks(func);
+    let mut n = 0;
+    // Same one-fold-per-dominator-rebuild discipline as bound_pairs:
+    // the miss edge gains `b` as a new pred of nb's old miss dest.
+    loop {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dom = DominatorTree::with_function(func, &cfg);
+        let mut found = None;
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            let Some(term) = func.layout.last_inst(b) else {
+                continue;
+            };
+            let InstructionData::Brif {
+                arg: c, blocks, ..
+            } = func.dfg.insts[term]
+            else {
+                continue;
+            };
+            let (tbc, fbc) = (blocks[0], blocks[1]);
+            let Some((x1, k1, w1)) = offset_test(func, c) else {
+                continue;
+            };
+            let nb = dest_block(func, fbc);
+            if nb == b {
+                continue;
+            }
+            if !bypassable(func, nb) || !defs_local(func, &uses, nb) {
+                continue;
+            }
+            let Some(nterm) = func.layout.last_inst(nb) else {
+                continue;
+            };
+            let InstructionData::Brif {
+                arg: c2,
+                blocks: nblocks,
+                ..
+            } = func.dfg.insts[nterm]
+            else {
+                continue;
+            };
+            let (tbc2, fbc2) = (nblocks[0], nblocks[1]);
+            let Some((x2, k2, w2)) = offset_test(func, c2) else {
+                continue;
+            };
+            if x1 != x2
+                || w1 != w2
+                || k1 == k2
+                || dest_block(func, tbc) != dest_block(func, tbc2)
+            {
+                continue;
+            }
+            // The hit edges must agree on args: identical values, or the
+            // same sunk computation on each arm (`iadd count,1`), which
+            // re-emits once at the merged edge.
+            let Some(hit_mats) = shared_args(func, &dom, tbc, tbc2, term) else {
+                continue;
+            };
+            let (k_lo, k_hi) = (k1.min(k2), k1.max(k2));
+            let d = k_hi - k_lo;
+            if !d.is_power_of_two() {
+                continue;
+            }
+            // Exactness: lo range entirely inside a bit-d-clear mod-2d
+            // window, hi range entirely inside a bit-d-set one.
+            if (k_lo % (2 * d)) + w1 > d
+                || (k_hi % (2 * d)) + w1 > 2 * d
+                || (k_hi % (2 * d)) < d
+            {
+                continue;
+            }
+            if !args_avail(func, &dom, fbc2, term)
+                || !body_avail(func, &dom, dest_block(func, fbc2), term)
+            {
+                continue;
+            }
+            found = Some((term, x1, k_hi, d, w1, dest_block(func, tbc), fbc2, hit_mats));
+            break;
         }
-        if !bypassable(func, nb) {
-            continue;
-        }
-        let Some(nterm) = func.layout.last_inst(nb) else {
-            continue;
+        let Some((term, x, k_hi, d, w, hdest, fbc, mats)) = found else {
+            return n;
         };
-        let InstructionData::Brif {
-            arg: c2,
-            blocks: nblocks,
-            ..
-        } = func.dfg.insts[nterm]
-        else {
-            continue;
-        };
-        let (tbc2, fbc2) = (nblocks[0], nblocks[1]);
-        let Some((x2, k2, w2)) = offset_test(func, c2) else {
-            continue;
-        };
-        if x1 != x2 || w1 != w2 || k1 == k2 || dest_block(func, tbc) != dest_block(func, tbc2) {
-            continue;
-        }
-        // The hit edges must agree on args: identical values, or the
-        // same sunk computation on each arm (`iadd count,1`), which
-        // re-emits once at the merged edge.
-        let Some(hit_mats) = shared_args(func, dom, tbc, tbc2, term) else {
-            continue;
-        };
-        let (k_lo, k_hi) = (k1.min(k2), k1.max(k2));
-        let d = k_hi - k_lo;
-        if !d.is_power_of_two() {
-            continue;
-        }
-        // Exactness: lo range entirely inside a bit-d-clear mod-2d
-        // window, hi range entirely inside a bit-d-set one.
-        if (k_lo % (2 * d)) + w1 > d || (k_hi % (2 * d)) + w1 > 2 * d || (k_hi % (2 * d)) < d {
-            continue;
-        }
-        if !args_avail(func, dom, fbc2, term) {
-            continue;
-        }
-        rewrites.push((term, x1, k_hi, d, w1, dest_block(func, tbc), fbc2, hit_mats));
-    }
-    for (term, x, k_hi, d, w, hdest, fbc, mats) in &rewrites {
-        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, *term, m)).collect();
-        let hbc = BlockCall::new(*hdest, hargs, &mut func.dfg.value_lists);
-        let ty = func.dfg.value_type(*x);
-        let mut pos = FuncCursor::new(func).at_inst(*term);
-        let dv = pos.ins().iconst(ty, *d as i64);
-        let u = pos.ins().bor(*x, dv);
-        let k = pos.ins().iconst(ty, *k_hi as i64);
+        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, term, m)).collect();
+        let hbc = BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+        let ty = func.dfg.value_type(x);
+        let mut pos = FuncCursor::new(func).at_inst(term);
+        let dv = pos.ins().iconst(ty, d as i64);
+        let u = pos.ins().bor(x, dv);
+        let k = pos.ins().iconst(ty, k_hi as i64);
         let s = pos.ins().isub(u, k);
-        let wv = pos.ins().iconst(ty, *w as i64);
+        let wv = pos.ins().iconst(ty, w as i64);
         let c = pos.ins().icmp(IntCC::UnsignedLessThan, s, wv);
-        let InstructionData::Brif { arg, blocks, .. } = &mut func.dfg.insts[*term] else {
-            continue;
+        let InstructionData::Brif { arg, blocks, .. } = &mut func.dfg.insts[term] else {
+            return n;
         };
         *arg = c;
-        *blocks = [hbc, *fbc].into();
+        *blocks = [hbc, fbc].into();
+        n += 1;
     }
-    rewrites.len()
 }
 
 pub fn run(func: &mut Function) -> usize {
@@ -539,10 +592,8 @@ pub fn run(func: &mut Function) -> usize {
     // neutral elsewhere — default on; PLIRON_RF2=0 disables.
     let r2 = crate::config::config().enabled("PLIRON_RF2");
     for _ in 0..4 {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dom = DominatorTree::with_function(func, &cfg);
-        let k = (if r1 { bound_pairs(func, &dom) } else { 0 })
-            + (if r2 { range_unions(func, &dom) } else { 0 });
+        let k = (if r1 { bound_pairs(func) } else { 0 })
+            + (if r2 { range_unions(func) } else { 0 });
         n += k;
         if k == 0 {
             break;

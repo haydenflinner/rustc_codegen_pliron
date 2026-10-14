@@ -20,7 +20,8 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, Value,
+    Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, ProgramPoint, Value,
+    ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -215,10 +216,13 @@ pub fn run(
     if cands.is_empty() {
         return 0;
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
-    let ps = loadfwd::param_src(func);
-    let (iso, escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
+    // Each accepted clone replaces `p`'s jump with `r`'s body — edges
+    // out of `p` change, so cfg/domtree/param_src/escapes all go stale
+    // and must be rebuilt before the next candidate is judged.
+    let mut cfg = ControlFlowGraph::with_function(func);
+    let mut domtree = DominatorTree::with_function(func, &cfg);
+    let mut ps = loadfwd::param_src(func);
+    let (mut iso, mut escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     // Roots that only escape on blocks that can't reach `p` are still
     // isolated *at* `p`: before the first escaping use can run (the cold
@@ -228,6 +232,43 @@ pub fn run(
     let mut reachers: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
     'blocks: for (p, t, (r, body)) in cands {
+        // The clone gives every block `r` (or an embedded try_call
+        // edge) targets a new predecessor `p`. A value used inside that
+        // target's dominated region whose def sits outside it only
+        // dominated the region's old entry paths — it must also
+        // dominate `p` or the use dangles.
+        let succs_ok = body.iter().all(|&i| {
+            func.dfg
+                .insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .all(|bc| {
+                    let s = bc.block(&func.dfg.value_lists);
+                    func.layout.blocks().filter(|&b| {
+                        b == s || domtree.block_dominates(s, b)
+                    }).all(|b| {
+                        func.layout.block_insts(b).all(|i2| {
+                            func.dfg.inst_values(i2).all(|v| {
+                                let v = func.dfg.resolve_aliases(v);
+                                let (pp, db) = match func.dfg.value_def(v) {
+                                    ValueDef::Result(d, _) => {
+                                        (ProgramPoint::Inst(d), func.layout.inst_block(d))
+                                    }
+                                    ValueDef::Param(b2, _) => {
+                                        (ProgramPoint::Block(b2), Some(b2))
+                                    }
+                                    _ => return false,
+                                };
+                                db.is_some_and(|db| domtree.block_dominates(s, db))
+                                    || domtree.dominates(pp, t, &func.layout)
+                            })
+                        })
+                    })
+                })
+        });
+        if !succs_ok {
+            continue;
+        }
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
             continue;
         };
@@ -402,6 +443,10 @@ pub fn run(
             func.dfg.change_to_alias(res, sv);
         }
         n += 1;
+        cfg = ControlFlowGraph::with_function(func);
+        domtree = DominatorTree::with_function(func, &cfg);
+        ps = loadfwd::param_src(func);
+        (iso, escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
     }
     n
 }

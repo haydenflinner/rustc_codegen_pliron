@@ -152,6 +152,10 @@ pub struct Pipe<'a> {
     /// `PLIRON_VERIFY=full` (or the verify-failure retry pass).
     pub verify_full: bool,
     pub stats: &'a mut Stats,
+    /// Every `(d, w)` pair `carry_one` applied, in order — the
+    /// stepcache's fact-delta record (replaying the pairs reproduces
+    /// the inserts and lifetime rewrites exactly).
+    pub carry_log: Vec<(Value, Value)>,
 }
 
 impl Pipe<'_> {
@@ -1626,7 +1630,8 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Carry `d`'s recorded facts onto `w` when `w` is `d`'s value
 // everywhere — a merge carrier, an alias target, or a sunk/rebased
 // replacement.
-fn carry_one(p: &mut Pipe, d: Value, w: Value) {
+pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
+    p.carry_log.push((d, w));
     if let Some(&b) = p.derived.get(&d) {
         p.derived.insert(w, b);
     }

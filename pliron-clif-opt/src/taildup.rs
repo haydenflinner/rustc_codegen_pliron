@@ -361,12 +361,33 @@ pub fn run(func: &mut Function) -> usize {
     }
     // Return blocks left without predecessors would fail dominance checks.
     let cfg = ControlFlowGraph::with_function(func);
+    let mut removed = false;
     for r in rets {
         if cfg.pred_iter(r).next().is_none() {
             while let Some(i) = func.layout.first_inst(r) {
                 func.layout.remove_inst(i);
             }
             func.layout.remove_block(r);
+            removed = true;
+        }
+    }
+    // Removing a candidate strands the blocks it dominated: they lose
+    // their entry path but keep references to the removed defs. They are
+    // unreachable, so sweep them too. `cfg` still carries the removed
+    // blocks' out-edges; rebuild it before judging reachability.
+    if removed {
+        let cfg = ControlFlowGraph::with_function(func);
+        let domtree = DominatorTree::with_function(func, &cfg);
+        for b in func
+            .layout
+            .blocks()
+            .filter(|&b| !domtree.is_reachable(b))
+            .collect::<Vec<_>>()
+        {
+            while let Some(i) = func.layout.first_inst(b) {
+                func.layout.remove_inst(i);
+            }
+            func.layout.remove_block(b);
         }
     }
     n

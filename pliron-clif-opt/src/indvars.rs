@@ -941,12 +941,29 @@ fn run_loop(
 }
 
 pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale: bool) -> usize {
-    let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
-    let loops = deepest_first(la);
     let mut n = 0;
-    for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += run_loop(func, cfg, dt, la, lp, debug, amode_scale);
+    let mut done: FxHashSet<Block> = FxHashSet::default();
+    // `elim_shadowed`'s exit shims create edges into headers processed
+    // later, so a stale `edges_to` snapshot would append/remove args on
+    // only some of a header's preds. `Loop` entities don't survive a
+    // LoopAnalysis recompute — enumerate by header and re-materialize
+    // the analyses whenever a loop mutated the function.
+    loop {
+        let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
+        let Some(lp) = deepest_first(la)
+            .into_iter()
+            .take(MAX_LOOPS)
+            .find(|&lp| !done.contains(&la.loop_header(lp)))
+        else {
+            break;
+        };
+        done.insert(la.loop_header(lp));
+        let m = run_loop(func, cfg, dt, la, lp, debug, amode_scale);
+        n += m;
+        if m > 0 {
+            an.invalidate();
+        }
     }
     n
 }

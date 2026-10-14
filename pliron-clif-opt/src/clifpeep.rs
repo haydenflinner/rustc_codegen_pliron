@@ -2982,9 +2982,24 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
     use crate::proots::Key;
     let new = |func: &mut Function, order: &mut Vec<Inst>, data: InstructionData, ty: Type| {
         let ni = func.dfg.make_inst(data);
-        func.dfg.make_inst_results(ni, ty);
+        // A key missing operands leaves `reserved_value` args — an
+        // INVALID typevar would panic constraint resolution, so drop
+        // the key rather than emit it. `ni` stays detached (never
+        // laid out), which is harmless.
+        if func.dfg.inst_args(ni).contains(&Value::reserved_value()) {
+            return None;
+        }
+        // `ty` is the key's result type, but ops like `iconcat` derive
+        // their result from an *operand* typevar — feeding the result
+        // type as ctrl makes `double_width(i128)` panic.
+        let ctrl = if data.opcode().constraints().requires_typevar_operand() {
+            func.dfg.ctrl_typevar(ni)
+        } else {
+            ty
+        };
+        func.dfg.make_inst_results(ni, ctrl);
         order.push(ni);
-        func.dfg.first_result(ni)
+        Some(func.dfg.first_result(ni))
     };
     match key {
         Key::V(w) => Some(*w),
@@ -2993,7 +3008,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
         // emitting a key referencing a phantom slot. `O` is edge-scoped
         // — nothing in-block materializes it.
         Key::P(_) | Key::Q(_) | Key::O(_) => return None,
-        Key::K(ty, bits) => Some(new(
+        Key::K(ty, bits) => new(
             func,
             order,
             InstructionData::UnaryImm {
@@ -3001,7 +3016,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                 imm: cranelift_codegen::ir::immediates::Imm64::new(*bits),
             },
             *ty,
-        )),
+        ),
         Key::A(ty, rk, k) => {
             let r = emit_key(func, order, rk)?;
             let c = new(
@@ -3012,8 +3027,8 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                     imm: cranelift_codegen::ir::immediates::Imm64::new(*k),
                 },
                 *ty,
-            );
-            Some(new(
+            )?;
+            new(
                 func,
                 order,
                 InstructionData::Binary {
@@ -3021,7 +3036,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                     args: [r, c],
                 },
                 *ty,
-            ))
+            )
         }
         Key::N(op, ty, args, extra) => {
             use crate::proots::tag;
@@ -3130,7 +3145,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                 },
                 _ => return None,
             };
-            Some(new(func, order, data, *ty))
+            new(func, order, data, *ty)
         }
     }
 }

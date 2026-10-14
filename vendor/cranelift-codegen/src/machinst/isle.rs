@@ -584,6 +584,12 @@ macro_rules! isle_lower_prelude_methods {
             let input = self.lower_ctx.get_value_as_source_or_const(val);
 
             if let InputSourceInst::UniqueUse(inst, _) = input.inst {
+                // A pending post-index fusion claims this inst: its
+                // writeback result is defined by the fused emit at the
+                // inst's own position, so it must not be sunk into us.
+                if self.lower_ctx.is_pending_postindex_cand(inst) {
+                    return None;
+                }
                 Some(inst)
             } else {
                 None

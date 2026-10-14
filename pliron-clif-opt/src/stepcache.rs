@@ -60,6 +60,13 @@ struct Variant {
     func: Option<(FunctionStencil, FunctionParameters)>,
     /// Whole post-step `derived` map (only ifconv writes it today).
     derived: Vec<(Value, Value)>,
+    /// `(d, w)` pairs `carry_one` applied during the step. Replayed on
+    /// hit so carried facts land exactly as the real run left them.
+    /// Never needed in `in_hash`: fact entries are claims about the
+    /// identical func state the hash already covers — a variant made
+    /// under a different fact set still produces a valid output (the
+    /// run's facts stayed true, unused extra facts only cost opts).
+    facts: Vec<(Value, Value)>,
     stats: StatDelta,
     k: usize,
 }
@@ -83,6 +90,8 @@ struct PipeVariant {
     ran: Vec<String>,
     func: (FunctionStencil, FunctionParameters),
     derived: Vec<(Value, Value)>,
+    /// Carry pairs applied across the pipeline (see `Variant::facts`).
+    facts: Vec<(Value, Value)>,
     stats: StatDelta,
     /// `bisect` units this function drew — replayed on hit so
     /// `PLIRON_OPT_BISECT` numbering matches an uncached run.
@@ -353,6 +362,9 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
     };
     log("pipe-hit");
     apply_func(p, v.func.clone(), &v.derived);
+    for &(d, w) in &v.facts {
+        crate::pipeline::carry_one(p, d, w);
+    }
     v.stats.apply(p.stats);
     crate::config::bisect_skip(v.draws);
     PipeLookup::Hit
@@ -377,6 +389,7 @@ pub fn pipeline_store(
         ran: ran.map(str::to_string).collect(),
         func: (p.clctx.func.stencil.clone(), p.clctx.func.params.clone()),
         derived: p.derived.iter().map(|(a, b)| (*a, *b)).collect(),
+        facts: p.carry_log.clone(),
         stats: StatDelta::delta(before, p.stats),
         draws,
     };
@@ -410,17 +423,27 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
         return None;
     }
     let cur = cur_hash(p, an);
-    let (func, derived, stats, out_hash, k) = {
+    let (func, derived, facts, stats, out_hash, k) = {
         let ent = stepfile(an)?
             .iter()
             .find(|e| e.step == s.name && e.in_hash == cur)?;
         let v = ent.variants.iter().find(|v| reads_ok(&v.reads))?;
-        (v.func.clone(), v.derived.clone(), v.stats, v.out_hash, v.k)
+        (
+            v.func.clone(),
+            v.derived.clone(),
+            v.facts.clone(),
+            v.stats,
+            v.out_hash,
+            v.k,
+        )
     };
     if let Some(func) = func {
         apply_func(p, func, &derived);
     } else {
         *p.derived = derived.iter().copied().collect();
+    }
+    for (d, w) in facts {
+        crate::pipeline::carry_one(p, d, w);
     }
     stats.apply(p.stats);
     an.clif_hash = Some(out_hash);
@@ -436,6 +459,7 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
     }
     let in_hash = cur_hash(p, an);
     let before = p.stats.clone();
+    let cmark = p.carry_log.len();
     let armed = reads_begin();
     let k = (s.run)(p, an);
     let reads = reads_take();
@@ -451,6 +475,7 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
         out_hash,
         func,
         derived: p.derived.iter().map(|(a, b)| (*a, *b)).collect(),
+        facts: p.carry_log[cmark..].to_vec(),
         stats: StatDelta::delta(&before, p.stats),
         k,
     };
