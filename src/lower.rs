@@ -4377,7 +4377,15 @@ fn cold_blocks(
         }
         let t = term(b);
         if let Some(&e) = st.expect.get(&t) {
-            cold.insert(t.deref(ctx).get_successor(if e { 1 } else { 0 }));
+            let s = t.deref(ctx).get_successor(if e { 1 } else { 0 });
+            // An expect hint that marks a loop arm cold (hashbrown's
+            // `likely(match_empty)` marks the probe-advance latch
+            // "unlikely") banishes a back-edge that runs once per
+            // iteration — as hot as the loop itself. Skip the mark when
+            // `s` can reach `b` back: the edge is part of a cycle.
+            if !reaches(ctx, s, b) {
+                cold.insert(s);
+            }
         }
     }
     loop {
@@ -4399,6 +4407,25 @@ fn cold_blocks(
     }
     cold.remove(&pblocks[0]);
     cold
+}
+
+/// Can `from` reach `to` through terminator successors? Used to keep
+/// expect-hinted cold marks off cycle edges.
+fn reaches(ctx: &Context, from: Ptr<BasicBlock>, to: Ptr<BasicBlock>) -> bool {
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut stack = vec![from];
+    while let Some(b) = stack.pop() {
+        if b == to {
+            return true;
+        }
+        if !seen.insert(b) {
+            continue;
+        }
+        for op in b.deref(ctx).iter(ctx) {
+            stack.extend(op.deref(ctx).successors());
+        }
+    }
+    false
 }
 
 pub(crate) fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
