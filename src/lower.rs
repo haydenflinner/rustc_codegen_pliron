@@ -333,8 +333,10 @@ pub fn lower_to_object(
         fn_flags: &'a crate::pipeline::FnFlags,
         region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     }
+    let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
+    let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -476,6 +478,7 @@ pub fn lower_to_object(
         m.clear_context(&mut clctx);
     }
 
+    drop(_sfl);
     // Phase (B): CLIF pipeline + cranelift compile per function. Each job
     // is fully self-contained, so workers can run them in any order;
     // results are applied in declaration order in phase (C), keeping the
@@ -510,7 +513,9 @@ pub fn lower_to_object(
         if crate::env_set("PLIRON_FROZEN_DEBUG") {
             eprintln!("==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
         }
+        let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
         let tpipe = std::time::Instant::now();
+        let _spipe = tracing::info_span!(target: "pliron::pipeline", "pipeline").entered();
         'retry: loop {
             {
                 let mut pipe = crate::pipeline::Pipe {
@@ -563,6 +568,7 @@ pub fn lower_to_object(
             }
             break 'retry;
         }
+        drop(_spipe);
         // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
         // per-function total for the tier-1 cache sizing question.
         *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
@@ -576,6 +582,7 @@ pub fn lower_to_object(
         // 128-bit ops. When emit names an unsupported vector type,
         // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
+        let _scomp = tracing::info_span!(target: "pliron::pipeline", "compile").entered();
         let mut vec_retry = 0;
         let defr = loop {
             let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -613,6 +620,7 @@ pub fn lower_to_object(
             }
             break defr;
         };
+        drop(_scomp);
         *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
         match defr {
             Ok(Ok(_)) => {}
@@ -670,6 +678,7 @@ pub fn lower_to_object(
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
     // compiling each function serially.
+    let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
@@ -876,6 +885,7 @@ pub fn lower_to_object(
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
         crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
+    drop(_spc);
     product.emit().unwrap()
 }
 

@@ -14,3 +14,4 @@ indexmap = "2"
 egg = "0.10"
 rustc-hash = "2"
 ascent = { version = "0.8", default-features = false }
+tracing = "0.1"

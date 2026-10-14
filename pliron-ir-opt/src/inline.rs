@@ -252,19 +252,65 @@ fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>>
 
 /// Blocks of `f` that can reach themselves: the callsite-context "in a loop"
 /// signal (an inlined body there runs once per iteration, so a little extra
-/// code is worth it).
+/// code is worth it). One Tarjan pass — a block loops iff its SCC has more
+/// than one member or it has a self-edge; the quadratic per-block DFS this
+/// replaces took ~100ms per rebuild on a post-inline `main`.
 fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+    let mut index = FxHashMap::default();
+    let mut low = FxHashMap::default();
+    let mut onstack = FxHashSet::default();
+    let mut selfedge = FxHashSet::default();
+    let mut tstack: Vec<Ptr<BasicBlock>> = Vec::new();
     let mut out = FxHashSet::default();
-    for b in blocks(ctx, f) {
-        let mut seen = FxHashSet::default();
-        let mut stack = bsuccs(ctx, st, b);
-        while let Some(x) = stack.pop() {
-            if x == b {
-                out.insert(b);
-                break;
-            }
-            if seen.insert(x) {
-                stack.extend(bsuccs(ctx, st, x));
+    let mut next = 0u32;
+    for &root in &blocks(ctx, f) {
+        if index.contains_key(&root) {
+            continue;
+        }
+        let mut work: Vec<(Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>)> = Vec::new();
+        index.insert(root, next);
+        low.insert(root, next);
+        next += 1;
+        tstack.push(root);
+        onstack.insert(root);
+        work.push((root, bsuccs(ctx, st, root)));
+        while let Some((v, succs)) = work.last_mut() {
+            let v = *v;
+            let Some(w) = succs.pop() else {
+                work.pop();
+                if low[&v] == index[&v] {
+                    let mut scc = Vec::new();
+                    while let Some(w) = tstack.pop() {
+                        onstack.remove(&w);
+                        scc.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    if scc.len() > 1 {
+                        out.extend(scc);
+                    } else if selfedge.contains(&scc[0]) {
+                        out.insert(scc[0]);
+                    }
+                }
+                if let Some(&(u, _)) = work.last() {
+                    let lv = low[&v];
+                    low.entry(u).and_modify(|l| *l = (*l).min(lv));
+                }
+                continue;
+            };
+            if w == v {
+                selfedge.insert(v);
+            } else if !index.contains_key(&w) {
+                index.insert(w, next);
+                low.insert(w, next);
+                next += 1;
+                tstack.push(w);
+                onstack.insert(w);
+                work.push((w, bsuccs(ctx, st, w)));
+            } else if onstack.contains(&w) {
+                let lw = low[&w];
+                low.entry(v).and_modify(|l| *l = (*l).min(lw));
             }
         }
     }
@@ -375,6 +421,66 @@ fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
     n
 }
 
+/// Callee -> callsite-owner syms adjacency plus the `single`-inline inputs,
+/// built once and kept exact across the runs that share it: inlining
+/// `caller -> callee` removes one entry from `callers_of[callee]` and adds
+/// `caller` to every callee the inlined body brought with it (`taken` is a
+/// `st.consts` fact — a body can't introduce a new use of a symbol it
+/// didn't already reference, so it needs no maintenance here).
+pub struct Adj {
+    /// One entry per direct-call site (a caller holding two sites to the
+    /// same callee appears twice, like `call_counts`).
+    pub callers_of: FxHashMap<String, Vec<String>>,
+    /// Symbols whose address is referenced outside calls.
+    taken: FxHashSet<String>,
+}
+
+impl Adj {
+    fn build(ctx: &Context, st: &State) -> Self {
+        let mut callers_of: FxHashMap<String, Vec<String>> = FxHashMap::default();
+        for (sym, f) in &st.funcs {
+            if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
+                continue;
+            }
+            for b in blocks(ctx, f.op) {
+                for op in ops(ctx, b) {
+                    if let Some(c) = direct_callee(ctx, st, op) {
+                        callers_of.entry(c.clone()).or_default().push(sym.clone());
+                    }
+                }
+            }
+        }
+        Adj {
+            callers_of,
+            taken: crate::address_taken(ctx, st),
+        }
+    }
+
+    /// `call` (`sym -> cs`) was inlined: the site is gone, and `cs`'s own
+    /// calls now live in `sym` (its out-of-line copy still exists — its
+    /// calls stay).
+    fn inlined(&mut self, ctx: &Context, st: &State, sym: &str, cs: &str) {
+        if let Some(v) = self.callers_of.get_mut(cs) {
+            if let Some(p) = v.iter().position(|x| x == sym) {
+                v.swap_remove(p);
+            }
+        }
+        for m in callees(ctx, st, cs) {
+            self.callers_of.entry(m).or_default().push(sym.to_string());
+        }
+    }
+}
+
+/// What a `run` changed, for driving the next round's caller filter.
+#[derive(Default)]
+pub struct Delta {
+    /// Callers that received inlined code.
+    pub callers: FxHashSet<String>,
+    /// Callees that lost a callsite — their remaining callers may now see
+    /// the single-callsite free inline.
+    pub callees: FxHashSet<String>,
+}
+
 /// Marks local fns that nothing references any more (typically fully inlined)
 /// so lowering skips them. Iterates because a dead fn's calls don't count.
 /// `PLIRON_DEADFN=0` disables it.
@@ -410,10 +516,16 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
 }
 
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
-fn post_order(ctx: &Context, st: &State) -> Vec<String> {
+/// `filter` restricts both the roots and which callees the DFS descends
+/// into — a restricted run still orders its callees before their callers.
+fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> Vec<String> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut out = Vec::new();
-    for root in st.funcs.keys() {
+    let roots: Vec<&String> = match filter {
+        Some(f) => f.iter().collect(),
+        None => st.funcs.keys().collect(),
+    };
+    for root in roots {
         if !has_body(ctx, st.funcs[root].op) || !seen.insert(root.clone()) {
             continue;
         }
@@ -421,7 +533,10 @@ fn post_order(ctx: &Context, st: &State) -> Vec<String> {
         while let Some((sym, cs, i)) = stack.last_mut() {
             if let Some(c) = cs.get(*i).cloned() {
                 *i += 1;
-                if has_body(ctx, st.funcs[&c].op) && seen.insert(c.clone()) {
+                if filter.is_none_or(|f| f.contains(&c))
+                    && has_body(ctx, st.funcs[&c].op)
+                    && seen.insert(c.clone())
+                {
                     let cc = callees(ctx, st, &c);
                     stack.push((c, cc, 0));
                 }
@@ -461,13 +576,22 @@ fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
 /// - `PLIRON_INLINE_GROWTH` (default `GROWTH_MULT`x the base) caps the
 ///   non-free ops one caller may absorb; `PLIRON_INLINE_CALLER_MAX` still
 ///   bounds total size. `small` disables every bonus and the budget.
+/// `callers` restricts which callers get (re)scored: the incremental
+/// rounds pass the callers previous runs/devirt touched instead of
+/// rescanning the whole module. A caller outside the filter can't inline
+/// anything anyway — `only` still gates which of its *pre-existing* sites
+/// may go. `adj` is the callsite adjacency, reused across back-to-back
+/// rounds; pass an empty `Option` to force a rebuild when other passes ran
+/// in between. Returns the `Delta` the next round's filter is built from.
 pub fn run(
     ctx: &mut Context,
     st: &mut State,
     small: bool,
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
-) {
+    callers: Option<&FxHashSet<String>>,
+    adj: &mut Option<Adj>,
+) -> Delta {
     let limit = crate::env_get("PLIRON_INLINE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { SMALL_LIMIT } else { DEFAULT_LIMIT });
@@ -475,20 +599,25 @@ pub fn run(
     // needs its describe markers inlined into each monomorphised shim.
     let limit = if always_only { usize::MAX / 16 } else { limit };
     if limit == 0 {
-        return;
+        return Delta::default();
     }
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    if once || callers.is_some() {
+        adj.get_or_insert_with(|| Adj::build(ctx, st));
+    }
     let single: FxHashSet<String> = if once {
-        let taken = crate::address_taken(ctx, st);
-        let counts = call_counts(ctx, st);
+        let adj = adj.as_ref().unwrap();
         st.funcs
             .iter()
             .filter(|(n, f)| {
                 f.linkage == Linkage::Local
-                    && !taken.contains(n.as_str())
-                    && counts.get(n.as_str()) == Some(&1)
+                    && !adj.taken.contains(n.as_str())
+                    && adj
+                        .callers_of
+                        .get(n.as_str())
+                        .is_some_and(|v| v.len() == 1)
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -531,30 +660,32 @@ pub fn run(
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
-    let mut infos: FxHashMap<String, CInfo> = FxHashMap::default();
+    // Callee infos are computed lazily at first use — a filtered round
+    // profiles only the callees its callers actually reference.
+    let mut infos: FxHashMap<String, Option<CInfo>> = FxHashMap::default();
     macro_rules! add_info {
         ($sym:expr) => {
-            if let Some(ci) = callee_info(ctx, st, $sym, model, limit, bonus, fold) {
-                infos.insert($sym.to_string(), ci);
-            }
+            infos.insert(
+                $sym.to_string(),
+                callee_info(ctx, st, $sym, model, limit, bonus, fold),
+            );
         };
     }
     let order: Vec<String> = if bottom_up {
-        post_order(ctx, st)
+        post_order(ctx, st, callers)
     } else {
-        for sym in st.funcs.keys() {
-            if always_only && !st.funcs[sym].always_inline {
-                continue;
-            }
-            add_info!(sym);
-        }
         st.funcs
             .iter()
             .filter(|(_, f)| has_body(ctx, f.op))
+            .filter(|(s, _)| callers.is_none_or(|c| c.contains(*s)))
             .map(|(s, _)| s.clone())
             .collect()
     };
+    let mut delta = Delta::default();
     let mut rw = IRRewriter::<DummyListener>::default();
+    let _setup_end = tracing::info_span!(target: "pliron::iropt", "inline-prep").entered();
+    drop(_setup_end);
+    let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
     for sym in order {
         let caller = st.funcs[&sym].op;
         let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
@@ -592,7 +723,15 @@ pub fn run(
                     let Some(cs) = direct_callee(ctx, st, op) else {
                         continue;
                     };
-                    let Some(ci) = infos.get(cs) else {
+                    // `always_only` profiles `#[inline(always)]` callees
+                    // only — the old upfront profiling skipped the rest.
+                    if always_only && !st.funcs[cs].always_inline {
+                        continue;
+                    }
+                    let ci = infos
+                        .entry(cs.clone())
+                        .or_insert_with(|| callee_info(ctx, st, cs, model, limit, bonus, fold));
+                    let Some(ci) = ci.as_ref() else {
                         if verbose {
                             eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
                         }
@@ -716,7 +855,7 @@ pub fn run(
                             grown += ci.n;
                         }
                         size += ci.n;
-                        sites.push((op, ci.op));
+                        sites.push((op, ci.op, cs.clone()));
                         "accept"
                     };
                     if verbose {
@@ -730,8 +869,13 @@ pub fn run(
             if sites.is_empty() {
                 break;
             }
-            for (call, callee) in sites {
+            for (call, callee, cs) in sites {
                 inline_call(ctx, st, &mut rw, call, callee);
+                if let Some(a) = adj.as_mut() {
+                    a.inlined(ctx, st, &sym, &cs);
+                }
+                delta.callers.insert(sym.clone());
+                delta.callees.insert(cs);
             }
         }
         if bottom_up {
@@ -739,22 +883,28 @@ pub fn run(
         }
     }
     if crate::env_set("PLIRON_STATS") {
-        left_stats(ctx, st, &infos);
+        left_stats(ctx, st, &mut infos, model, limit, bonus, fold);
     }
+    delta
 }
 
 /// Indirect calls whose callee is a constant function address (a vtable slot
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
-/// become direct calls. Returns the rewritten calls, for a second inline round.
-pub fn devirt(ctx: &mut Context, st: &mut State) -> FxHashSet<Ptr<Operation>> {
+/// become direct calls. Returns the rewritten calls plus the callers owning
+/// them, so the next inline round can restrict itself to those callers.
+pub fn devirt(
+    ctx: &mut Context,
+    st: &mut State,
+) -> (FxHashSet<Ptr<Operation>>, FxHashSet<String>) {
     let mut out = FxHashSet::default();
-    let fns: Vec<_> = st
+    let mut owners = FxHashSet::default();
+    let fns: Vec<(String, _)> = st
         .funcs
-        .values()
-        .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .iter()
+        .filter(|(_, f)| has_body(ctx, f.op))
+        .map(|(n, f)| (n.clone(), f.op))
         .collect();
-    for f in fns {
+    for (fname, f) in fns {
         for b in blocks(ctx, f) {
             for c in ops(ctx, b) {
                 let Some(call) = Operation::get_op::<CallOp>(c, ctx) else {
@@ -798,13 +948,9 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> FxHashSet<Ptr<Operation>> {
                 }
                 Operation::erase(c, ctx);
                 out.insert(nc);
+                owners.insert(fname.clone());
                 if crate::env_set("PLIRON_STATS_DEVIRT") {
-                    let caller = st
-                        .funcs
-                        .iter()
-                        .find(|(_, x)| x.op == f)
-                        .map(|(n, _)| n.clone());
-                    eprintln!("devirt {caller:?} -> {sym}");
+                    eprintln!("devirt {fname:?} -> {sym}");
                 }
             }
         }
@@ -812,11 +958,21 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> FxHashSet<Ptr<Operation>> {
     if crate::env_set("PLIRON_STATS") {
         eprintln!("devirt {}: {} calls", st.cgu, out.len());
     }
-    out
+    (out, owners)
 }
 
 /// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
-fn left_stats(ctx: &Context, st: &State, infos: &FxHashMap<String, CInfo>) {
+/// Fills unqueried callee infos on demand so filtered rounds report right.
+#[allow(clippy::too_many_arguments)]
+fn left_stats(
+    ctx: &Context,
+    st: &State,
+    infos: &mut FxHashMap<String, Option<CInfo>>,
+    model: bool,
+    limit: usize,
+    bonus: usize,
+    fold: usize,
+) {
     let mut why: FxHashMap<&str, usize> = FxHashMap::default();
     for (sym, f) in &st.funcs {
         if !has_body(ctx, f.op) {
@@ -836,7 +992,11 @@ fn left_stats(ctx: &Context, st: &State, infos: &FxHashMap<String, CInfo>) {
                     "preemptible"
                 } else if cs == sym {
                     "self"
-                } else if let Some(ci) = infos.get(cs) {
+                } else if let Some(ci) = infos
+                    .entry(cs.clone())
+                    .or_insert_with(|| callee_info(ctx, st, cs, model, limit, bonus, fold))
+                    .as_ref()
+                {
                     if ci.eh && st.invokes.contains_key(&op) {
                         "eh callee at invoke (catch pad / EH_INVOKE=0)"
                     } else if st.calls[&op].fn_ty != g.ty {

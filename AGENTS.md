@@ -139,11 +139,23 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   budget, `PLIRON_OPT_BISECT_DEBUG=1` logs gate decisions,
   `PLIRON_PIPELINE=a,b` selects/orders pipeline steps, `PLIRON_PAR=0`
   serializes codegen (also forced by OPT_BISECT).
+  `PLIRON_INSTCOMBINE=egg` runs the legacy e-graph instcombine for A/B
+  (default is the worklist peephole, ~50x faster with identical folds).
 - `PLIRON_STATS=1` — per-pass rewrite counts per function.
 - `PLIRON_FACTS=<substr>` — print what nowrite/nocapture/nnret/retarg/
   nounwind inferred for functions whose symbol contains the substring
   (`./test.sh --only facts` checks a few against `tests/facts/main.rs`).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
+- `PLIRON_TRACE=<env-filter>` — tracing spans with `time.busy` on close
+  (stderr). Targets: `pliron::module`/`pliron::phase` (per-CGU phases:
+  define, iropt, fnlower, phasec, lowerobj), `pliron::iropt` (each ir-opt
+  pass), `pliron::fn` (per function), `pliron::pipeline` (pipeline and
+  cranelift-compile halves), `pliron::step` (every pipeline step, span
+  name = step name). `pliron` enables all of them; narrow further with
+  `grep 'INFO slp:'` or `grep 'fn="hashmap'`. (EnvFilter's `[{field=x}]`
+  syntax only gates events *inside* a matching span — it cannot suppress
+  a span's own close line.) Unset = no subscriber installed; each span
+  site costs one hash lookup + atomic load.
 - `PLIRON_STEPCACHE=1` — content-addressed pipeline cache in
   `$PLIRON_CACHE_DIR` (default `~/.cache/pliron-steps`). Two levels per
   function: a whole-pipeline entry (warm reruns are ~50x faster) and

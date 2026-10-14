@@ -45,6 +45,7 @@ pub mod switchmap;
 pub mod taildup;
 pub mod tailmerge;
 pub mod tailrec;
+pub(crate) mod trace;
 pub mod unreach;
 pub mod unroll;
 pub mod veclegalize;

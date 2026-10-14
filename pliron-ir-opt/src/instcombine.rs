@@ -1,9 +1,11 @@
-//! instcombine over integer ops via equality saturation (`egg`). Each function's pure
-//! integer ops (add/sub/mul/and/or/xor/shifts/icmp/select) go into one e-graph with a
-//! constant-folding analysis and algebraic identities. A result is replaced when its
-//! class proves it constant, or equal to one of its own operands (which dominates it).
-//! Cranelift folds the same algebra later; this runs first so SROA/memcpyopt and the
-//! branch structure see the folded values. `PLIRON_INSTCOMBINE=0` disables it.
+//! instcombine over integer ops. Default: a worklist peephole — a union-find
+//! over SSA values plus constant propagation covering the same identities the
+//! old `egg` equality-saturation pass did (operands canonicalize through
+//! folded chains, so e.g. `sub (add x y) y` still folds to `x`). Constants
+//! come from `st.consts`; a result is replaced when its canonical form is a
+//! constant or another value that transitively was an operand of it (and so
+//! dominates it). `PLIRON_INSTCOMBINE=egg` runs the e-graph version for A/B,
+//! `=0` disables the pass.
 
 use egg::{
     Analysis, Applier, DidMerge, EGraph, Id, Language, PatternAst, Rewrite, Runner, Subst, Symbol,
@@ -18,7 +20,7 @@ use pliron::{
     value::Value,
 };
 use pliron_llvm::{attributes::ICmpPredicateAttr as P, ops::*};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
 use crate::state::{ConstVal, State};
@@ -269,7 +271,7 @@ fn int_width(ctx: &Context, v: Value) -> Option<u32> {
 
 const MAX_OPS: usize = 20_000;
 
-fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
+fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
     let mut eg: EGraph<IC, Fold> = EGraph::new(Fold::default());
     let mut ids: FxHashMap<Value, Id> = FxHashMap::default();
     let mut leaves: FxHashMap<Symbol, Value> = FxHashMap::default();
@@ -376,6 +378,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) {
+    let egg = crate::env_get("PLIRON_INSTCOMBINE").as_deref() == Some("egg");
     let (mut nc, mut nv) = (0, 0);
     let funcs: Vec<_> = st
         .funcs
@@ -384,7 +387,11 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
-        let (c, v) = run_fn(ctx, st, f);
+        let (c, v) = if egg {
+            run_fn_egg(ctx, st, f)
+        } else {
+            run_fn(ctx, st, f)
+        };
         nc += c;
         nv += v;
     }
@@ -394,4 +401,480 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             st.cgu
         );
     }
+}
+
+// ============================ worklist peephole ============================
+//
+// The default engine. `egg` explored the same identities ~50x slower: it kept
+// every variant node so `sub (add x y) y` could match through an `add` still
+// resident in the class. A union-find over canonical values reaches the same
+// fixpoint: each fold makes the result's canonical its fold target, operands
+// are read through `find`, and the only patterns that must look through one
+// op — the self-cancelling add/sub and xor chains — consult the defining
+// op's node via `defop`.
+
+/// A canonical value: an SSA value or a width-masked constant.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum K {
+    V(Value),
+    C(u128),
+}
+
+/// Union-find over `K` with path compression.
+struct Uf {
+    parent: FxHashMap<K, K>,
+}
+
+impl Uf {
+    fn find(&mut self, k: K) -> K {
+        let mut root = k;
+        while let Some(&p) = self.parent.get(&root) {
+            root = p;
+        }
+        let mut cur = k;
+        while let Some(&p) = self.parent.get(&cur) {
+            self.parent.insert(cur, root);
+            cur = p;
+        }
+        root
+    }
+}
+
+/// An op in the covered set, for the worklist.
+struct POp {
+    result: Value,
+    /// Covered op kind; `nargs` of `args` are live.
+    ic: Pk,
+    args: [Value; 3],
+    /// Each operand's integer width — `select` mixes i1 and data widths,
+    /// and `icmp` operands are wider than its i1 result.
+    aws: [u32; 3],
+    /// Result integer width.
+    rw: u32,
+}
+
+/// Covered op kinds. `Cmp` holds the canonicalized predicate (`pk_of`
+/// swaps operand order for `UGT/UGE/SGT/SGE`, so the fold code sees only
+/// the </<= forms).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pk {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+    Cmp(Ck),
+    Select,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ck {
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    Slt,
+    Sle,
+}
+
+impl POp {
+    fn nargs(&self) -> usize {
+        if self.ic == Pk::Select {
+            3
+        } else {
+            2
+        }
+    }
+}
+
+fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
+    // Collect the covered ops in layout order.
+    let mut ops: Vec<POp> = Vec::new();
+    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+        for op in b.deref(ctx).iter(ctx) {
+            if ops.len() > MAX_OPS || op.deref(ctx).get_num_results() != 1 {
+                continue;
+            }
+            let r = op.deref(ctx).get_result(0);
+            let Some(rw) = int_width(ctx, r) else {
+                continue;
+            };
+            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            if !(2..=3).contains(&opnds.len()) {
+                continue;
+            }
+            let mut aws = [rw; 3];
+            for (i, &v) in opnds.iter().enumerate() {
+                let Some(w) = int_width(ctx, v) else {
+                    aws = [0; 3];
+                    break;
+                };
+                aws[i] = w;
+            }
+            if aws[0] == 0 {
+                continue;
+            }
+            let Some((ic, swap)) = pk_of(ctx, op, opnds.len()) else {
+                continue;
+            };
+            let mut args = [r; 3];
+            for (i, &v) in opnds.iter().enumerate() {
+                args[i] = v;
+            }
+            if swap {
+                args.swap(0, 1);
+                aws.swap(0, 1);
+            }
+            ops.push(POp {
+                result: r,
+                ic,
+                args,
+                aws,
+                rw,
+            });
+        }
+    }
+    if ops.is_empty() {
+        return (0, 0);
+    }
+
+    let mut uf = Uf {
+        parent: FxHashMap::default(),
+    };
+    // Result value -> op index, for looking through one still-live op in
+    // the self-cancelling chains below.
+    let defop: FxHashMap<Value, usize> =
+        ops.iter().enumerate().map(|(i, o)| (o.result, i)).collect();
+
+    // Reverse uses: canonical key -> ops reading it. A union moves the
+    // list to the new root so those ops re-evaluate.
+    let mut uses: FxHashMap<K, Vec<u32>> = FxHashMap::default();
+    for (i, o) in ops.iter().enumerate() {
+        for (j, &a) in o.args.iter().take(o.nargs()).enumerate() {
+            uses.entry(canon(&mut uf, st, a, o.aws[j]))
+                .or_default()
+                .push(i as u32);
+        }
+    }
+
+    let mut work: Vec<u32> = (0..ops.len() as u32).rev().collect();
+    let mut inw = vec![true; ops.len()];
+    while let Some(i) = work.pop() {
+        let i = i as usize;
+        inw[i] = false;
+        let o = &ops[i];
+        let mut a = [K::C(0); 3];
+        for (j, &v) in o.args.iter().take(o.nargs()).enumerate() {
+            a[j] = canon(&mut uf, st, v, o.aws[j]);
+        }
+        if let Some(t) = fold_op(&mut uf, st, &defop, &ops, o.ic, o.aws[0], o.rw, &a) {
+            let rk = uf.find(key(st, o.result, o.rw));
+            if rk != t {
+                // Result canonical joins the fold target's class; ops that
+                // read the old canonical re-evaluate.
+                uf.parent.insert(rk, t);
+                if let Some(us) = uses.remove(&rk) {
+                    let l = uses.entry(t).or_default();
+                    l.extend_from_slice(&us);
+                    for &u in &us {
+                        if !inw[u as usize] {
+                            inw[u as usize] = true;
+                            work.push(u);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Replace uses: result -> canonical constant or the class's leaf value.
+    let (mut nc, mut nv) = (0, 0);
+    for (i, o) in ops.iter().enumerate() {
+        let r = o.result;
+        if r.uses(ctx).is_empty() {
+            continue;
+        }
+        let k = uf.find(key(st, r, o.rw));
+        let new = match k {
+            K::C(c) => {
+                nc += 1;
+                let ty = r.get_type(ctx);
+                let kv = UndefOp::new(ctx, ty).get_operation();
+                let kv = kv.deref(ctx).get_result(0);
+                st.consts.insert(
+                    kv,
+                    if c == 0 {
+                        ConstVal::Zero
+                    } else {
+                        ConstVal::Bits(c)
+                    },
+                );
+                kv
+            }
+            // A `K::V` canonical may only replace results it dominates —
+            // i.e. values transitively operand to this op through covered
+            // defs (operand defs dominate their uses). Class unions can
+            // join results whose canonicals share no dominance domain, so
+            // membership in the class alone isn't proof.
+            K::V(v) if v != r && safe_leaf(&ops, &defop, i, v) => {
+                nv += 1;
+                v
+            }
+            _ => continue,
+        };
+        r.replace_all_uses_with(ctx, &new);
+    }
+    (nc, nv)
+}
+
+/// Is `v` among the values that transitively fed `ops[i]`'s operands
+/// through covered defs? Every such value dominates the op's def — and
+/// therefore all uses of its result — so it's always a sound replacement
+/// target. Bounded DFS: give up (conservatively) past a depth of operand
+/// chains no real fold needs.
+fn safe_leaf(
+    ops: &[POp],
+    defop: &FxHashMap<Value, usize>,
+    i: usize,
+    v: Value,
+) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut stack: Vec<Value> = ops[i].args[..ops[i].nargs()].to_vec();
+    while let Some(a) = stack.pop() {
+        if a == v {
+            return true;
+        }
+        if !seen.insert(a) || seen.len() > 256 {
+            return false;
+        }
+        if let Some(&d) = defop.get(&a) {
+            stack.extend(ops[d].args[..ops[d].nargs()].iter().copied());
+        }
+    }
+    false
+}
+
+/// Canonical key for a value: `st.consts` constants key by masked value,
+/// everything else by SSA name.
+fn key(st: &State, v: Value, w: u32) -> K {
+    match st.consts.get(&v) {
+        Some(ConstVal::Bits(c)) => K::C(mask(*c, w)),
+        Some(ConstVal::Zero) => K::C(0),
+        _ => K::V(v),
+    }
+}
+
+fn canon(uf: &mut Uf, st: &State, v: Value, w: u32) -> K {
+    uf.find(key(st, v, w))
+}
+
+/// The fold rules on canonical operands — the same set the egg `rules()`
+/// covered, except `sel-not` (the e-graph's node-shuffling made it cheap;
+/// here it would need a `seen` table for a rare rewrite). Returns the
+/// canonical the result should join. `aw` is the shared operand width
+/// (icmp compares at operand width but folds to i1).
+fn fold_op(
+    uf: &mut Uf,
+    st: &State,
+    defop: &FxHashMap<Value, usize>,
+    ops: &[POp],
+    ic: Pk,
+    aw: u32,
+    rw: u32,
+    a: &[K; 3],
+) -> Option<K> {
+    let c = |v: u128| Some(K::C(mask(v, rw)));
+    let (x, y) = (a[0], a[1]);
+    // Look through a still-live defining op for the self-cancelling
+    // chains: if `k`'s producer is itself a covered op, yield its kind
+    // and canonical operands.
+    let mut inner = |k: K| -> Option<(Pk, [K; 2])> {
+        let K::V(v) = k else { return None };
+        let d = &ops[*defop.get(&v)?];
+        Some((
+            d.ic,
+            [
+                canon(uf, st, d.args[0], d.aws[0]),
+                canon(uf, st, d.args[1], d.aws[1]),
+            ],
+        ))
+    };
+    match ic {
+        Pk::Add => match (x, y) {
+            (K::C(v), K::C(w)) => c(v.wrapping_add(w)),
+            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            _ => {
+                // (add (sub p q) q) -> p, on either operand position.
+                for (i, o) in [(x, y), (y, x)] {
+                    if let Some((Pk::Sub, [p, q])) = inner(i) {
+                        if q == o {
+                            return Some(p);
+                        }
+                    }
+                }
+                None
+            }
+        },
+        Pk::Sub => match (x, y) {
+            (K::C(v), K::C(w)) => c(v.wrapping_sub(w)),
+            (o, K::C(0)) => Some(o),
+            _ if x == y => c(0),
+            _ => {
+                // (sub (add p q) q) -> p and (sub (add p q) p) -> q.
+                if let Some((Pk::Add, [p, q])) = inner(x) {
+                    if q == y {
+                        return Some(p);
+                    }
+                    if p == y {
+                        return Some(q);
+                    }
+                }
+                None
+            }
+        },
+        Pk::Mul => match (x, y) {
+            (K::C(v), K::C(w)) => c(v.wrapping_mul(w)),
+            (K::C(1), o) | (o, K::C(1)) => Some(o),
+            _ => None,
+        },
+        Pk::And => match (x, y) {
+            (K::C(v), K::C(w)) => c(v & w),
+            _ if x == y => Some(x),
+            (K::C(v), o) | (o, K::C(v)) if v == mask(!0, aw) => Some(o),
+            _ => None,
+        },
+        Pk::Or => match (x, y) {
+            (K::C(v), K::C(w)) => c(v | w),
+            _ if x == y => Some(x),
+            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            _ => None,
+        },
+        Pk::Xor => match (x, y) {
+            (K::C(v), K::C(w)) => c(v ^ w),
+            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            _ if x == y => c(0),
+            _ => {
+                // (xor (xor p q) q) -> p, on either operand position and
+                // either inner operand (`xor` is commutative).
+                for (i, o) in [(x, y), (y, x)] {
+                    if let Some((Pk::Xor, [p, q])) = inner(i) {
+                        if q == o {
+                            return Some(p);
+                        }
+                        if p == o {
+                            return Some(q);
+                        }
+                    }
+                }
+                None
+            }
+        },
+        // Out-of-range shift amounts are poison in LLVM; the Cranelift
+        // lowering wraps them, so the folds do too.
+        Pk::Shl => match (x, y) {
+            (K::C(v), K::C(w)) => c(v << (w % aw as u128)),
+            (o, K::C(0)) => Some(o),
+            _ => None,
+        },
+        Pk::LShr => match (x, y) {
+            (K::C(v), K::C(w)) => c(v >> (w % aw as u128)),
+            (o, K::C(0)) => Some(o),
+            _ => None,
+        },
+        Pk::AShr => match (x, y) {
+            (K::C(v), K::C(w)) => c((sext(v, aw) >> (w % aw as u128)) as u128),
+            (o, K::C(0)) => Some(o),
+            _ => None,
+        },
+        Pk::Cmp(p) => {
+            let (tr, fl) = (c(1), c(0));
+            match p {
+                Ck::Eq => match (x, y) {
+                    (K::C(v), K::C(w)) => c((v == w) as u128),
+                    _ if x == y => tr,
+                    _ => None,
+                },
+                Ck::Ne => match (x, y) {
+                    (K::C(v), K::C(w)) => c((v != w) as u128),
+                    _ if x == y => fl,
+                    (K::C(0), o) | (o, K::C(0)) if aw == 1 => Some(o),
+                    _ => None,
+                },
+                Ck::Ult => match (x, y) {
+                    (K::C(v), K::C(w)) => c((v < w) as u128),
+                    _ if x == y => fl,
+                    (_, K::C(0)) => fl,
+                    _ => None,
+                },
+                Ck::Ule => match (x, y) {
+                    (K::C(v), K::C(w)) => c((v <= w) as u128),
+                    _ if x == y => tr,
+                    _ => None,
+                },
+                Ck::Slt => match (x, y) {
+                    (K::C(v), K::C(w)) => c((sext(v, aw) < sext(w, aw)) as u128),
+                    _ if x == y => fl,
+                    _ => None,
+                },
+                Ck::Sle => match (x, y) {
+                    (K::C(v), K::C(w)) => c((sext(v, aw) <= sext(w, aw)) as u128),
+                    _ if x == y => tr,
+                    _ => None,
+                },
+            }
+        }
+        Pk::Select => match a[0] {
+            K::C(0) => Some(a[2]),
+            K::C(_) => Some(a[1]),
+            _ if a[1] == a[2] => Some(a[1]),
+            _ => None,
+        },
+    }
+}
+
+/// Covered-op kind plus whether operands were reordered to canonicalize a
+/// `>/>=` predicate into its `</<=` form.
+fn pk_of(ctx: &Context, op: Ptr<Operation>, nargs: usize) -> Option<(Pk, bool)> {
+    let (pk, swap) = if Operation::is_op::<AddOp>(op, ctx) {
+        (Pk::Add, false)
+    } else if Operation::is_op::<SubOp>(op, ctx) {
+        (Pk::Sub, false)
+    } else if Operation::is_op::<MulOp>(op, ctx) {
+        (Pk::Mul, false)
+    } else if Operation::is_op::<AndOp>(op, ctx) {
+        (Pk::And, false)
+    } else if Operation::is_op::<OrOp>(op, ctx) {
+        (Pk::Or, false)
+    } else if Operation::is_op::<XorOp>(op, ctx) {
+        (Pk::Xor, false)
+    } else if Operation::is_op::<ShlOp>(op, ctx) {
+        (Pk::Shl, false)
+    } else if Operation::is_op::<LShrOp>(op, ctx) {
+        (Pk::LShr, false)
+    } else if Operation::is_op::<AShrOp>(op, ctx) {
+        (Pk::AShr, false)
+    } else if Operation::is_op::<SelectOp>(op, ctx) {
+        (Pk::Select, false)
+    } else if let Some(c) = Operation::get_op::<ICmpOp>(op, ctx) {
+        match c.predicate(ctx) {
+            P::EQ => (Pk::Cmp(Ck::Eq), false),
+            P::NE => (Pk::Cmp(Ck::Ne), false),
+            P::ULT => (Pk::Cmp(Ck::Ult), false),
+            P::UGT => (Pk::Cmp(Ck::Ult), true),
+            P::ULE => (Pk::Cmp(Ck::Ule), false),
+            P::UGE => (Pk::Cmp(Ck::Ule), true),
+            P::SLT => (Pk::Cmp(Ck::Slt), false),
+            P::SGT => (Pk::Cmp(Ck::Slt), true),
+            P::SLE => (Pk::Cmp(Ck::Sle), false),
+            P::SGE => (Pk::Cmp(Ck::Sle), true),
+        }
+    } else {
+        return None;
+    };
+    let want = if pk == Pk::Select { 3 } else { 2 };
+    (nargs == want).then_some((pk, swap))
 }

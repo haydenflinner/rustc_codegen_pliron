@@ -280,7 +280,7 @@ impl Ctx<'_> {
 
 /// Split `ptr` into `(base, const_off)` — walks short `iadd(ptr, iconst)`
 /// chains. The inst's immediate offset is added by the caller.
-fn base_off(func: &Function, ptr: Value) -> (Value, i64) {
+pub(crate) fn base_off(func: &Function, ptr: Value) -> (Value, i64) {
     let mut base = func.dfg.resolve_aliases(ptr);
     let mut off = 0i64;
     for _ in 0..4 {
@@ -1350,6 +1350,22 @@ fn finish_plan(
     if x.members.len() < 2 {
         bail!("empty");
     }
+    // Upper bound on the final score: extracts and keep-pins only lower
+    // `net`, so when `2·kept + 5·heavy − emit` already falls short the
+    // leaf/consumer/scheduler analysis below cannot change the verdict.
+    // Most planned pairs end here (scalar kernels seed thousands of
+    // same-opcode pairs whose columns all gather).
+    let heavy = kept
+        .iter()
+        .filter(|&&(_, (i, _))| matches!(func.dfg.insts[i].opcode(), Opcode::Sqrt | Opcode::Fdiv))
+        .count();
+    let min_net = match &root {
+        Pack::Store2 { .. } => 1 - kept.len() as i32,
+        _ => 1,
+    };
+    if (2 * kept.len() as i32 + 5 * heavy as i32 - emit_cost as i32) < min_net {
+        bail!("cost-bound");
+    }
     // Leaf operands (gather/splat scalars, load/store bases) may read a value
     // whose def became a member *after* the leaf was built — too late for the
     // in-`col` keep marking to catch. Collect every leaf-operand def: member
@@ -1543,10 +1559,6 @@ fn finish_plan(
     // count extra — halving a ~13–20-cycle op is worth many simple insts,
     // and deep trees around them are what unlocks the packed sqrt/div at
     // all (nbody's `dt/(d2·sqrt d2)` pairs).
-    let heavy = kept
-        .iter()
-        .filter(|&&(_, (i, _))| matches!(func.dfg.insts[i].opcode(), Opcode::Sqrt | Opcode::Fdiv))
-        .count();
     let n_keep = x.members.iter().filter(|m| x.keep.contains(m)).count() as i32;
     let net = 2 * kept.len() as i32 + 5 * heavy as i32
         - emit_cost as i32
@@ -1561,17 +1573,6 @@ fn finish_plan(
             sink.len()
         );
     }
-    // Store-seeded packs: a `Gather` data column (splat+insertlane+store) is a
-    // pure loss against two scalar stores. Deeper store trees get slack —
-    // their extracts feed sibling stores that later packs reuse for free via
-    // `Pack::Vec`, refunding the overhead once dce runs.
-    let min_net = match &root {
-        // Deep store trees get slack — their extracts feed sibling stores
-        // that later packs reuse for free via `Pack::Vec`, refunding the
-        // overhead once dce runs.
-        Pack::Store2 { .. } => 1 - kept.len() as i32,
-        _ => 1,
-    };
     if net < min_net {
         bail!("cost");
     }

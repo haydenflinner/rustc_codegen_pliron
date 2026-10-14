@@ -211,8 +211,11 @@ pub mod shape {
     pub const MEM: u32 = 1 << 4;
     /// Any call.
     pub const CALL: u32 = 1 << 5;
-    /// `slp` seeds: a block with ≥2 scalar stores, or ≥2 same-opcode
-    /// vectorizable insts (the xpack seed shape).
+    /// `slp` seeds: a block with ≥2 notrap scalar stores of the same
+    /// element size to one resolved base (every pack path — the
+    /// consecutive-offset runs and xpack's `plan_store` — merges only
+    /// same-base adjacent stores), or ≥2 same-opcode vectorizable insts
+    /// (the xpack op-pair shape).
     pub const SLP: u32 = 1 << 6;
     /// Any integer div/rem — `divconst` rewrites the constant-divisor
     /// cases and loopvec treats the opcodes as side effects.
@@ -229,7 +232,13 @@ fn shape_of(func: &Function) -> u32 {
         idx.insert(b, i as u32);
     }
     for (i, b) in func.layout.blocks().enumerate() {
-        let mut stores = 0u32;
+        // (base, elem bytes) → store count: a pair in one group is the
+        // cheap necessary shape for every store-pack path.
+        let mut stores: FxHashMap<(Value, u32), u32> = FxHashMap::default();
+        // Same-op float-inst count → xpack op-pair seed. Integer dups are
+        // excluded on purpose: two `iadd`s in a block is ambient pointer
+        // arithmetic (every address computation), while float dups are
+        // the unrolled-math shape xpack actually packs.
         let mut vecops: FxHashMap<Op, u32> = FxHashMap::default();
         for inst in func.layout.block_insts(b) {
             let op = func.dfg.insts[inst].opcode();
@@ -245,15 +254,42 @@ fn shape_of(func: &Function) -> u32 {
                 Op::Brif => bits |= shape::CONDBR,
                 Op::BrTable => bits |= shape::CONDBR | shape::SWITCH,
                 Op::Sdiv | Op::Udiv | Op::Srem | Op::Urem => bits |= shape::DIVREM,
-                Op::Store => stores += 1,
+                Op::Store => {
+                    let fl = func.dfg.mem_flags[func.dfg.insts[inst].memflags().unwrap()];
+                    let args = func.dfg.inst_args(inst);
+                    let val = func.dfg.resolve_aliases(args[0]);
+                    let ty = func.dfg.value_type(val);
+                    if fl.notrap() && !ty.is_vector() && matches!(ty.bytes(), 1 | 2 | 4 | 8) {
+                        let base = crate::slp::base_off(func, args[1]).0;
+                        let c = stores.entry((base, ty.bytes())).or_insert(0);
+                        *c += 1;
+                        if *c >= 2 {
+                            bits |= shape::SLP;
+                        }
+                    }
+                }
                 _ => {}
             }
-            if crate::slp::vecable(op) {
-                let c = vecops.entry(op).or_insert(0);
-                *c += 1;
-                if *c >= 2 {
-                    bits |= shape::SLP;
+            match op {
+                Op::Fadd | Op::Fsub | Op::Fmul | Op::Fdiv | Op::Fmin | Op::Fmax | Op::Fneg
+                | Op::Fabs | Op::Sqrt => {
+                    let c = vecops.entry(op).or_insert(0);
+                    *c += 1;
+                    if *c >= 2 {
+                        bits |= shape::SLP;
+                    }
                 }
+                _ => {}
+            }
+            // Vector-typed results (a function loopvec already rewrote)
+            // leave scalar leftovers worth packing.
+            if func
+                .dfg
+                .inst_results(inst)
+                .first()
+                .is_some_and(|&r| func.dfg.value_type(r).is_vector())
+            {
+                bits |= shape::SLP;
             }
             if op.is_terminator() {
                 let pool = &func.dfg.value_lists;
@@ -266,9 +302,6 @@ fn shape_of(func: &Function) -> u32 {
                     }
                 }
             }
-        }
-        if stores >= 2 {
-            bits |= shape::SLP;
         }
     }
     bits
@@ -661,6 +694,11 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     {
         return;
     }
+    // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
+    // span close; the step's real name is the span name (see trace.rs).
+    let _s = crate::trace::dyn_site("pliron::step", &["fn"], s.name)
+        .span_with("fn", p.fname)
+        .entered();
     let t0 = std::time::Instant::now();
     // A step whose required shape bits are absent cannot apply — skip it
     // before any cache lookup. Evaluated on the current state rather than
