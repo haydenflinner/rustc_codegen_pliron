@@ -345,15 +345,23 @@ impl<'a, F: Function> Env<'a, F> {
             }
 
             if self.ctx.bundles[bundle].prio > 0 {
-                // rustc_codegen_pliron: normalize by 4*sqrt(length) instead of length, so a
+                // rustc_codegen_pliron: normalize by 8*sqrt(length) instead of length, so a
                 // long-lived value with many uses (e.g. `self` across a large inlined
                 // function) wins a callee-saved register instead of being reloaded at
-                // every use. `RA2_LINEAR` at build time restores upstream behavior.
+                // every use. The sqrt favor is capped at upstream weight so short hot
+                // ranges are never penalized more than upstream, and only long ranges
+                // (prio > 64) get the boost — measured best on the bench suite vs plain
+                // linear (hashmap, sortw) and plain 4*sqrt (over-keeps sparse long ranges
+                // like SipHash key state, starving short temporaries).
+                // `RA2_LINEAR` at build time restores upstream; `RA2_SQRT4` restores the
+                // original uncapped tweak.
                 let prio = self.ctx.bundles[bundle].prio;
                 let div = if option_env!("RA2_LINEAR").is_some() {
                     prio
-                } else {
+                } else if option_env!("RA2_SQRT4").is_some() {
                     prio.isqrt().max(1) * 4
+                } else {
+                    core::cmp::min(prio, prio.isqrt().max(1) * 8)
                 };
                 let final_weight = (total.to_f32() as u32) / div;
                 trace!(
