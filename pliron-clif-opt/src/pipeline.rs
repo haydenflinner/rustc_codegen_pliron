@@ -1837,6 +1837,11 @@ pub static DEFAULT: &[Step] = &[
     .needs(shape::DIVREM),
     cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec).needs(shape::LOOPS),
     cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp).needs(shape::SLP),
+    // bcheck's per-loop version guards sit at the inner loop's entry —
+    // their len/min/carry parts are invariant in every enclosing loop
+    // but the only licm already ran. matmul's guard re-evaluates
+    // `min(n-1, len)` and the offset chain ~n² times; hoist it.
+    cstep("licm2", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
     step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap).needs(shape::SWITCH),
     Step {
         name: "constbr2",
