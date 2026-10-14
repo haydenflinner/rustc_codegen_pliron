@@ -569,21 +569,50 @@ pub fn lower_to_object(
         if j.dump {
             eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
         }
-        if sh.x64 {
-            // ISLE only lowers 128-bit vector ops; scalarize narrow
-            // extractlane/insertlane (core_simd masks emit i8x8).
-            crate::veclegalize::run(&mut clctx.func, 128);
-        }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.
+        // Narrow vectors (i8x8 from core_simd masks): ISLE lowers only
+        // 128-bit ops. When emit names an unsupported vector type,
+        // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
-        let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            clctx
-                .compile(sh.isa, &mut ControlPlane::default())
-                .map(|_| ())
-                .map_err(|e| e.inner)
-        }));
+        let mut vec_retry = 0;
+        let defr = loop {
+            let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                clctx
+                    .compile(sh.isa, &mut ControlPlane::default())
+                    .map(|_| ())
+                    .map_err(|e| e.inner)
+            }));
+            let msg = match &defr {
+                Ok(Err(e)) => format!("{e}"),
+                Ok(_) => break defr,
+                Err(p) => p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+            };
+            // Look for a fixed vector type in the message
+            // ("`v3 = iadd.i8x8 v0, v1`", "value of type i8x8").
+            let vt = {
+                use ir::types::*;
+                let re: [(&str, ir::Type); 7] = [
+                    ("i8x8", I8X8), ("i16x4", I16X4), ("i32x2", I32X2),
+                    ("f32x2", F32X2), ("i8x4", I8X4), ("i16x2", I16X2),
+                    ("i8x2", I8X2),
+                ];
+                re.iter().find(|(t, _)| msg.contains(&format!(".{t}")) || msg.contains(&format!(" {t}"))).map(|(_, ty)| *ty)
+            };
+            if let Some(t) = vt.filter(|t| t.is_vector() && t.bits() < 128 && sh.x64) {
+                if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t) == 0 {
+                    break defr;
+                }
+                vec_retry += 1;
+                continue;
+            }
+            break defr;
+        };
         *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
         match defr {
             Ok(Ok(_)) => {}
