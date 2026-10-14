@@ -1721,6 +1721,23 @@ pub(crate) fn round(
                     None if !kenv.is_empty() && kbits(func, &env, &kenv, cond, 0).1 != 0 => true,
                     None => continue,
                 };
+                if dbg {
+                    eprintln!(
+                        "jt take {pblock}->{b}->{s_tag} cond={cond} env={env:?} pn={pn:?} kenv={kenv:?} prange={prange:?} taken={taken}",
+                        s_tag = if taken { "T" } else { "F" }
+                    );
+                    if let Some(di) = func.dfg.value_def(cond).inst() {
+                        for v in func.dfg.inst_args(di) {
+                            let r = func.dfg.resolve_aliases(*v);
+                            eprintln!(
+                                "  jt arg {r}: loads={} params={} derived={:?}",
+                                nn.loads.contains(&r),
+                                nn.params.contains(&r),
+                                nn.derived.get(&r),
+                            );
+                        }
+                    }
+                }
                 let ti = if taken { 0 } else { 1 };
                 let t = targets[ti];
                 let s = t.block(&func.dfg.value_lists);

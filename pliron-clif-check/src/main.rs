@@ -203,6 +203,7 @@ fn with_pipe<R>(
         operand_frozen: &mut e4,
         block_region: &e5,
         prof: &e8,
+        prof_hook: None,
         region_parent: &e6,
         lifetimes: &mut lifetimes,
         nocap: &e7,
@@ -216,6 +217,7 @@ fn with_pipe<R>(
         verify_full: false,
         stats: &mut stats,
         carry_log: Vec::new(),
+        cur_step: "",
     };
     k(&mut p)
 }

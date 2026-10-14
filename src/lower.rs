@@ -531,6 +531,7 @@ pub fn lower_to_object(
                     Box::new(sh.prof.generic_activity(nm))
                 };
                 let mut pipe = crate::pipeline::Pipe {
+                    cur_step: "",
                     clctx,
                     isa: sh.isa,
                     fname: n,
@@ -3046,6 +3047,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.b.ins().fence();
             }
             if r.len() == 1 && self.st.nonnull.contains(&op) {
+                if std::env::var_os("PLIRON_NNDBG").is_some() {
+                    eprintln!("nndbg seed {} <- op {:?}", r[0], op);
+                }
                 self.nonnull.insert(r[0]);
             }
             if r.len() == 1 && self.st.bool01.contains(&op) {

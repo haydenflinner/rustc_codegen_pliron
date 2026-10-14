@@ -10,7 +10,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value};
+use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_module::FuncId;
@@ -156,6 +156,8 @@ pub struct Pipe<'a> {
     /// stepcache's fact-delta record (replaying the pairs reproduces
     /// the inserts and lifetime rewrites exactly).
     pub carry_log: Vec<(Value, Value)>,
+    /// Step currently executing, for debug attribution prints.
+    pub cur_step: &'static str,
     /// Self-profile hook wired by `src/` to rustc's `sess.prof`: calling
     /// it starts a `generic_activity` event for the step; the returned
     /// guard records the interval when it drops. `None` in tests.
@@ -740,6 +742,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
         return;
     }
+    p.cur_step = s.name;
     let k = if s.cached {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
@@ -1678,10 +1681,55 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 // replacement.
 pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     p.carry_log.push((d, w));
-    if let Some(&b) = p.derived.get(&d) {
+    // `nonnull` and `derived` are site facts — `!nonnull`/inbounds mark a
+    // load result as non-null *or poison* at the point that justified it.
+    // Carrying them to a value defined outside that site leaks the
+    // guarantee into code the fact never covered: a `!nonnull` `Some`-arm
+    // payload read unified with an unguarded `Option` niche load made
+    // `jtround` fold a real null test (serde_derive `get_member`). Carry
+    // only where `d`'s definition still covers `w`'s — same block, `d`
+    // first (a param "def" is the block head).
+    let covered = {
+        let f = &p.clctx.func;
+        let blk = |v: Value| match f.dfg.value_def(v) {
+            ValueDef::Result(i, _) => f.layout.inst_block(i),
+            ValueDef::Param(b, _) => Some(b),
+            _ => None,
+        };
+        let pos = |v: Value| match f.dfg.value_def(v) {
+            ValueDef::Param(..) => Some(0usize),
+            ValueDef::Result(i, _) => {
+                f.layout.block_insts(blk(v)?).position(|x| x == i)
+            }
+            _ => None,
+        };
+        blk(d).is_some()
+            && blk(d) == blk(w)
+            && matches!((pos(d), pos(w)), (Some(a), Some(b)) if a <= b)
+    };
+    if covered
+        && let Some(&b) = p.derived.get(&d)
+    {
         p.derived.insert(w, b);
     }
-    if p.nonnull.contains(&d) {
+    if covered && p.nonnull.contains(&d) {
+        if std::env::var_os("PLIRON_NNDBG").is_some() {
+            let dd = p
+                .clctx
+                .func
+                .dfg
+                .value_def(d)
+                .inst()
+                .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+            let wd = p
+                .clctx
+                .func
+                .dfg
+                .value_def(w)
+                .inst()
+                .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+            eprintln!("nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step);
+        }
         p.nonnull.insert(w);
     }
     if p.noalias.contains(&d) {
