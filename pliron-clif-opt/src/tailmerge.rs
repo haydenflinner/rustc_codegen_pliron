@@ -1,27 +1,51 @@
-//! Merge identical exit blocks on Cranelift IR (LLVM's tail merging in
+//! Merge identical blocks on Cranelift IR (LLVM's tail merging in
 //! BranchFolding, restricted to whole blocks). After inlining, each bounds
 //! check or `unwrap` site gets its own copy of the same panic call + trap;
-//! blocks without params and without successors whose instructions print
-//! identically (internal results renamed) are redirected to one copy.
+//! blocks without params whose instructions print identically (internal
+//! results renamed) are redirected to one copy. A block with successors
+//! merges only when every value it defines stays inside it — the printed
+//! terminator already pins identical destinations, and a local def used in
+//! a sibling would dangle after retargeting. Duplicate *test* blocks are
+//! the payload here: `is_alphabetic`-style chains emit the same
+//! `x < 170` check per arm, and merging them lets rangefold see the
+//! shared miss edge its union rule needs.
 
 use cranelift_codegen::ir::{Block, Function, Opcode, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 32;
 
-fn key(func: &Function, b: Block) -> Option<String> {
+/// Block each value is used in (None when used in several) — the
+/// defs-local check for successor-bearing merges.
+fn use_blocks(func: &Function) -> FxHashMap<Value, Option<Block>> {
+    let mut m: FxHashMap<Value, Option<Block>> = Default::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let e = m.entry(func.dfg.resolve_aliases(v)).or_insert(Some(b));
+                if *e != Some(b) {
+                    *e = None;
+                }
+            }
+        }
+    }
+    m
+}
+
+pub(crate) fn key(func: &Function, b: Block) -> Option<String> {
     let insts: Vec<_> = func.layout.block_insts(b).collect();
     let &last = insts.last()?;
     if insts.len() > MAX_INSTS
         || !func.dfg.block_params(b).is_empty()
         || !func.dfg.insts[last].opcode().is_terminator()
-        || func.dfg.insts[last]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .len()
-            != 0
     {
         return None;
     }
+    let mut s = if func.layout.is_cold(b) {
+        String::from("cold\n")
+    } else {
+        String::new()
+    };
     let mut local: FxHashMap<Value, usize> = FxHashMap::default();
     for &i in &insts {
         for &r in func.dfg.inst_results(i) {
@@ -29,7 +53,6 @@ fn key(func: &Function, b: Block) -> Option<String> {
             local.insert(r, n);
         }
     }
-    let mut s = String::new();
     for &i in &insts {
         let text = func.dfg.display_inst(i).to_string();
         let mut tok = String::new();
@@ -127,10 +150,43 @@ pub fn run(func: &mut Function) -> usize {
     let entry = func.layout.entry_block();
     let mut canon: FxHashMap<String, Block> = FxHashMap::default();
     let mut map: FxHashMap<Block, Block> = FxHashMap::default();
+    let uses = use_blocks(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for &b in &blocks {
         if Some(b) == entry {
             continue;
+        }
+        // A block with successors merges only when it is a pure
+        // test-shape block and every result it defines stays inside —
+        // a value escaping to a sibling would be stranded once preds
+        // retarget to the canonical block, and merging anything wider
+        // than a test collapses copies later passes specialize per arm
+        // (the parse_only digit loop regressed ~25% without this).
+        let Some(last) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let has_succs = !func
+            .dfg
+            .insts[last]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .is_empty();
+        if has_succs {
+            let insts: Vec<_> = func.layout.block_insts(b).collect();
+            let pure_test = insts.len() <= 8
+                && insts.iter().all(|&i| {
+                    let op = func.dfg.insts[i].opcode();
+                    !(op.can_store() || op.can_trap() || op.is_call() || op.other_side_effects())
+                });
+            if !pure_test
+                || !insts.iter().all(|&i| {
+                    func.dfg
+                        .inst_results(i)
+                        .iter()
+                        .all(|v| uses.get(v).is_none_or(|&u| u == Some(b)))
+                })
+            {
+                continue;
+            }
         }
         if let Some(k) = key(func, b) {
             match canon.get(&k) {

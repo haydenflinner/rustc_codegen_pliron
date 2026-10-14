@@ -151,6 +151,29 @@ fn same_edge(func: &Function, a: BlockCall, b: BlockCall) -> bool {
     }
 }
 
+/// Miss edges `a`/`b` landing on different blocks whose bodies are
+/// congruent — `is_alphabetic`'s match arms duplicate the `c < 170`
+/// test per arm, so the chain's shared miss is two twins. Returning
+/// true keeps `a`'s edge; the twin loses its last pred and is swept.
+fn miss_twin(func: &Function, a: BlockCall, b: BlockCall) -> bool {
+    let (da, db) = (dest_block(func, a), dest_block(func, b));
+    if da == db {
+        return false;
+    }
+    // Both edges must be arg-free — congruent bodies can still compute
+    // different outgoing args, and picking `a`'s dest would misroute them.
+    let bare = |bc: BlockCall| {
+        bc.args(&func.dfg.value_lists)
+            .all(|arg| arg.as_value().is_none())
+    };
+    bare(a)
+        && bare(b)
+        && func.dfg.block_params(da).is_empty()
+        && func.dfg.block_params(db).is_empty()
+        && crate::tailmerge::key(func, da) == crate::tailmerge::key(func, db)
+        && crate::tailmerge::key(func, da).is_some()
+}
+
 /// Every `BlockArg::Value` on `bc` must be usable at `inst` — an edge
 /// moved from its origin block carries args evaluated there, and a def
 /// inside the bypassed block (or anywhere not dominating `inst`) would
@@ -336,13 +359,18 @@ fn bound_pairs(func: &mut Function) -> usize {
                 continue;
             };
             let (tbc, fbc) = (blocks[0], blocks[1]);
-            let Some((x, Half::Lo(lo))) = half_bound(func, c) else {
-                continue;
+            // The pass edge is "x >= lo" either way: a `Lo` test takes
+            // it on true, an `x < lo` (`Hi`) test takes it on false —
+            // MIR emits both polarities (`ugt 97,c` in chars_alpha).
+            let (x, lo, pass_bc, miss_bc) = match half_bound(func, c) {
+                Some((x, Half::Lo(lo))) => (x, lo, tbc, fbc),
+                Some((x, Half::Hi(lo))) => (x, lo, fbc, tbc),
+                _ => continue,
             };
             if dbg {
                 eprintln!("rf: block{b} lo-test x={x} lo={lo}");
             }
-            let hi_b = dest_block(func, tbc);
+            let hi_b = dest_block(func, pass_bc);
             if hi_b == b {
                 continue;
             }
@@ -381,23 +409,24 @@ fn bound_pairs(func: &mut Function) -> usize {
             else {
                 continue;
             };
+            let miss_eq = same_edge(func, miss_bc, mbc) || miss_twin(func, miss_bc, mbc);
             let ok = func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2)
                 && hi > lo
-                && same_edge(func, fbc, mbc)
+                && miss_eq
                 && body_avail(func, &dom, dest_block(func, hbc), term);
             if dbg {
                 eprintln!(
                     "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
                     func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
                     hi > lo,
-                    same_edge(func, fbc, mbc),
+                    miss_eq,
                     hit_mats.len()
                 );
             }
             if !ok {
                 continue;
             }
-            found = Some((term, x, lo, hi - lo, dest_block(func, hbc), fbc, hit_mats));
+            found = Some((term, x, lo, hi - lo, dest_block(func, hbc), miss_bc, hit_mats));
             break;
         }
         let Some((term, x, lo, w, hdest, fbc, mats)) = found else {
