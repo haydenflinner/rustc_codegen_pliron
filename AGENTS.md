@@ -129,6 +129,27 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   rustc stuck idle (miscompiled-rustc deadlocks). Run it after optimizer
   changes that touch stage2 codegen.
 
+## Optimizer complexity rules
+
+Stage2 rustc functions are large enough that any O(item × fn) pass
+becomes a multi-minute blowup. Invariants that keep passes linear:
+
+- Never call a `layout.blocks()`/`inst_values` whole-function scan (or
+  CFG/domtree rebuild) inside a per-inst/per-edge/per-candidate loop.
+  Build the index once (`use_index`, `block_uses`, count maps) and
+  decrement it incrementally — see `memspec`, `reap_dead`, `rebind_exports`.
+- `resolve_aliases`/`value_def` walk alias chains linearly; passes that
+  re-alias (merges, `change_to_alias`) extend them. `compact_aliases`
+  runs after every mutating step — new passes should still prefer
+  resolved lookups batched over per-use resolves.
+- Alias chains can dead-end at reserved/tombstoned targets;
+  `resolve_aliases`/`value_def` panic on them (unchecked index).
+  Iterating `dfg.values()` or consuming stale pairs must use
+  `try_resolve_aliases`/`try_value_def`.
+- Fixpoint loops need an explicit progress bound or budget
+  (`MAX_ACC_WALK`, `MAX_OPS`, `MAX_REGION_EXTRA`, `seen` sets) — a
+  conservative bail leaves the function unoptimized, never wrong.
+
 ## Fast iteration / debugging knobs
 
 - `./test.sh --only a,b,c` — run a subset (names in the test.sh header:
