@@ -194,6 +194,39 @@ fn edge_candidate(func: &Function, p: Block, t: Inst) -> Option<(Block, Vec<Inst
     param_load.then_some((r, body))
 }
 
+/// One O(fn) scan producing the two indexes the per-candidate checks
+/// would otherwise rebuild per candidate: which blocks use each value,
+/// and for each block the resolved def `(program point, def block)` of
+/// every value it references (`None` when the def isn't an inst result
+/// or block param, which fails `succs_ok`).
+fn use_index(
+    func: &Function,
+) -> (
+    FxHashMap<Value, FxHashSet<Block>>,
+    FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>>,
+) {
+    let mut used_by: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+    let mut ext: FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>> =
+        FxHashMap::default();
+    for b in func.layout.blocks() {
+        let entries = ext.entry(b).or_default();
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                used_by.entry(v).or_default().insert(b);
+                entries.push(match func.dfg.value_def(v) {
+                    ValueDef::Result(d, _) => {
+                        Some((ProgramPoint::Inst(d), func.layout.inst_block(d)))
+                    }
+                    ValueDef::Param(b2, _) => Some((ProgramPoint::Block(b2), Some(b2))),
+                    _ => None,
+                });
+            }
+        }
+    }
+    (used_by, ext)
+}
+
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
@@ -236,45 +269,9 @@ pub fn run(
     // address, so a pointer loaded from memory can't reach its region.
     // Same rule licm's `iso_l` applies per loop, scoped to the edge.
     let mut reachers: FxHashSet<Block> = FxHashSet::default();
+    let (mut used_by, mut ext) = use_index(func);
     let mut n = 0;
     'blocks: for (p, t, (r, body)) in cands {
-        // The clone gives every block `r` (or an embedded try_call
-        // edge) targets a new predecessor `p`. A value used inside that
-        // target's dominated region whose def sits outside it only
-        // dominated the region's old entry paths — it must also
-        // dominate `p` or the use dangles.
-        let succs_ok = body.iter().all(|&i| {
-            func.dfg
-                .insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .into_iter()
-                .all(|bc| {
-                    let s = bc.block(&func.dfg.value_lists);
-                    func.layout.blocks().filter(|&b| {
-                        b == s || domtree.block_dominates(s, b)
-                    }).all(|b| {
-                        func.layout.block_insts(b).all(|i2| {
-                            func.dfg.inst_values(i2).all(|v| {
-                                let v = func.dfg.resolve_aliases(v);
-                                let (pp, db) = match func.dfg.value_def(v) {
-                                    ValueDef::Result(d, _) => {
-                                        (ProgramPoint::Inst(d), func.layout.inst_block(d))
-                                    }
-                                    ValueDef::Param(b2, _) => {
-                                        (ProgramPoint::Block(b2), Some(b2))
-                                    }
-                                    _ => return false,
-                                };
-                                db.is_some_and(|db| domtree.block_dominates(s, db))
-                                    || domtree.dominates(pp, t, &func.layout)
-                            })
-                        })
-                    })
-                })
-        });
-        if !succs_ok {
-            continue;
-        }
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
             continue;
         };
@@ -302,17 +299,43 @@ pub fn run(
             .filter(|&v| func.dfg.resolve_aliases(v) == v)
             .collect();
         if !defs.is_empty()
-            && func.layout.blocks().filter(|&b| b != r).any(|b| {
-                func.layout.block_insts(b).any(|i| {
-                    func.dfg
-                        .inst_values(i)
-                        .any(|v| defs.contains(&func.dfg.resolve_aliases(v)))
-                })
+            && defs.iter().any(|v| {
+                used_by
+                    .get(v)
+                    .is_some_and(|bs| bs.iter().any(|&b| b != r))
             })
         {
             if dbg {
                 eprintln!("memspec: {p}->{r} skip escaping def (fn {})", func.name);
             }
+            continue;
+        }
+        // The clone gives every block `r` (or an embedded try_call
+        // edge) targets a new predecessor `p`. A value used inside that
+        // target's dominated region whose def sits outside it only
+        // dominated the region's old entry paths — it must also
+        // dominate `p` or the use dangles.
+        let succs_ok = body.iter().all(|&i| {
+            func.dfg
+                .insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .all(|bc| {
+                    let s = bc.block(&func.dfg.value_lists);
+                    func.layout.blocks().filter(|&b| {
+                        b == s || domtree.block_dominates(s, b)
+                    }).all(|b| {
+                        ext.get(&b).map(Vec::as_slice).unwrap_or(&[]).iter().all(|e| {
+                            let Some((pp, db)) = *e else {
+                                return false;
+                            };
+                            db.is_some_and(|db| domtree.block_dominates(s, db))
+                                || domtree.dominates(pp, t, &func.layout)
+                        })
+                    })
+                })
+        });
+        if !succs_ok {
             continue;
         }
         // `iso` widened to roots whose escapes can't reach `p`.
@@ -451,6 +474,7 @@ pub fn run(
         n += 1;
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
+        (used_by, ext) = use_index(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
             loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());

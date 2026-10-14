@@ -237,6 +237,13 @@ fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
 /// Deepest `store *q <- p` chain the flow walk will chase (a pointer stored
 /// into a temp, loaded back, then stored into another temp, ...).
 const MAX_FLOW_DEPTH: u32 = 6;
+/// Total (value, offset, flow) states one `accesses` walk may visit.
+/// A flow-dense graph — a temp slot stored through K offsets, each
+/// store pushing every load of its copy-out closure under that base —
+/// otherwise re-walks the same use-subgraphs per base (the stage2
+/// `aho_corasick` build spent 20+ minutes here). Past the cap the
+/// alloca simply stays unpromoted.
+const MAX_ACC_WALK: usize = 1 << 14;
 
 /// `accesses` results shared across one analysis pass's nested walks: a
 /// `store *q <- p` use runs `accesses` on `q`, and K stores into `q` (or a
@@ -248,7 +255,13 @@ const MAX_FLOW_DEPTH: u32 = 6;
 /// each `accesses` call gets a fresh memo; pure passes like `nocapture`
 /// may share one for the whole body).
 #[derive(Default)]
-pub(crate) struct AccMemo(FxHashMap<(Value, u32), Option<(Vec<Access>, Vec<Ptr<Operation>>)>>);
+pub(crate) struct AccMemo {
+    acc: FxHashMap<(Value, u32), Option<(Vec<Access>, Vec<Ptr<Operation>>)>>,
+    /// `slot_loads` results per (resolved alloca, depth) — a hot temp
+    /// slot otherwise re-walks its whole copy-out closure for every
+    /// `store *q <- p` use.
+    loads: FxHashMap<(Value, u32), Option<Vec<Value>>>,
+}
 
 /// `dst` is the address operand of `store *dst <- p` that carried a pointer
 /// derived from the alloca being collected. If `dst` resolves to a temp
@@ -273,6 +286,21 @@ pub(crate) fn slot_loads(
         }
         q = op.deref(ctx).get_operand(0);
     }
+    if let Some(r) = memo.loads.get(&(q, depth)) {
+        return r.clone();
+    }
+    let r = slot_loads_inner(ctx, st, q, depth, memo);
+    memo.loads.insert((q, depth), r.clone());
+    r
+}
+
+fn slot_loads_inner(
+    ctx: &Context,
+    st: &State,
+    q: Value,
+    depth: u32,
+    memo: &mut AccMemo,
+) -> Option<Vec<Value>> {
     let &(qsize, _) = st.allocas.get(&q)?;
     let (qacc, _) = accesses_m(ctx, st, q, qsize, depth + 1, memo)?;
     let mut loads = Vec::new();
@@ -327,11 +355,11 @@ fn accesses_m(
     depth: u32,
     memo: &mut AccMemo,
 ) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
-    if let Some(r) = memo.0.get(&(a, depth)) {
+    if let Some(r) = memo.acc.get(&(a, depth)) {
         return r.clone();
     }
     let r = accesses_inner(ctx, st, a, size, depth, memo);
-    memo.0.insert((a, depth), r.clone());
+    memo.acc.insert((a, depth), r.clone());
     r
 }
 
@@ -353,6 +381,9 @@ fn accesses_inner(
     while let Some((p, base, flow)) = work.pop() {
         if !visited.insert((p, base, flow)) {
             continue;
+        }
+        if visited.len() > MAX_ACC_WALK {
+            return None;
         }
         for u in p.uses(ctx) {
             let op = u.user_op();

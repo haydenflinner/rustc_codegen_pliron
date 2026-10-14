@@ -18,6 +18,7 @@ use core::mem;
 use core::ops::{Index, IndexMut};
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -556,6 +557,60 @@ impl DataFlowGraph {
         debug_assert_ne!(ty, types::INVALID);
 
         self.values[dest] = ValueData::Alias { ty, original }.into();
+    }
+
+    /// PLIRON: flatten every alias so its `original` is the chain's final
+    /// target. `change_to_alias` resolves its target at creation, but the
+    /// target can itself be turned into an alias later — each such event
+    /// grows chains a hop, and per-inst `resolve_aliases`/`value_def`
+    /// calls in passes then go quadratic (stage2 `unic_langid_impl`
+    /// spent minutes resolving hundreds-deep chains in lcse). Rewriting
+    /// `original` in place keeps every later resolve O(1).
+    pub fn compact_aliases(&mut self) {
+        let mut memo: crate::FxHashMap<Value, Value> = Default::default();
+        for i in 0..self.values.len() {
+            let v = Value::from_u32(i as u32);
+            let ValueData::Alias { original, .. } = ValueData::from(self.values[v])
+            else {
+                continue;
+            };
+            if original == Value::reserved_value() {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut w = v;
+            let target = loop {
+                if let Some(&t) = memo.get(&w) {
+                    break t;
+                }
+                if w == Value::reserved_value() || !self.values.is_valid(w) {
+                    break w;
+                }
+                match ValueData::from(self.values[w]) {
+                    ValueData::Alias { original, .. } => {
+                        path.push(w);
+                        w = original;
+                    }
+                    _ => break w,
+                }
+                // Same guard as `maybe_resolve_aliases`: a cycle (only
+                // reachable via the parser's unchecked alias path)
+                // stops instead of looping.
+                if path.len() > self.values.len() {
+                    break w;
+                }
+            };
+            for &x in &path {
+                memo.insert(x, target);
+                if let ValueData::Alias { ty, .. } = ValueData::from(self.values[x]) {
+                    self.values[x] = ValueData::Alias {
+                        ty,
+                        original: target,
+                    }
+                    .into();
+                }
+            }
+        }
     }
 
     /// Replace the results of one instruction with aliases to the results of another.

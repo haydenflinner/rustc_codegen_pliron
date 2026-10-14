@@ -763,6 +763,10 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // reports 0 would leave cfg/domtree stale for the next step.
         an.bump();
         if k > 0 {
+            // Alias targets can themselves be aliased later, so chains
+            // grow a hop per re-alias — flatten before the next step's
+            // per-inst resolves multiply by the depth.
+            p.clctx.func.dfg.compact_aliases();
             carry_aliases(p, an);
         }
     }

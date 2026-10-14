@@ -395,32 +395,6 @@ fn bin_k_data(func: &Function, args: [Value; 2]) -> Option<(Value, i64)> {
         .or_else(|| iconst(func, a[0]).map(|k| (a[1], k)))
 }
 
-/// Number of uses of `v` as an inst arg or branch-edge arg.
-fn uses_of(func: &Function, v: Value) -> usize {
-    let mut c = 0;
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            c += func
-                .dfg
-                .inst_args(i)
-                .iter()
-                .filter(|&&a| func.dfg.resolve_aliases(a) == v)
-                .count();
-            for bc in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                c += bc
-                    .args(&func.dfg.value_lists)
-                    .filter(
-                        |a| matches!(a, BlockArg::Value(x) if func.dfg.resolve_aliases(*x) == v),
-                    )
-                    .count();
-            }
-        }
-    }
-    c
-}
-
 /// `v` as `uextend b` where `b` is an i8 provably in {0,1} — returns `b`,
 /// usable as a `select` condition.
 fn uext01(func: &Function, v: Value) -> Option<Value> {
@@ -3508,6 +3482,43 @@ fn bit_probe(func: &Function, x: Value, mut b: u32, peeled: &mut Vec<Inst>) -> P
 /// their `iconst` operand defs back into the worklist so the compare's
 /// constant dies with it.
 fn reap_dead(func: &mut Function, insts: &[Inst]) {
+    // One tally over the function — a whole-function use scan per
+    // candidate made this fixpoint O(wl × iters × fn) before.
+    let mut cnt: FxHashMap<Value, u32> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                *cnt.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(x) = a {
+                        *cnt.entry(func.dfg.resolve_aliases(x)).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    let dec = |func: &Function, cnt: &mut FxHashMap<Value, u32>, d: Inst| {
+        for &a in func.dfg.inst_args(d) {
+            if let Some(c) = cnt.get_mut(&func.dfg.resolve_aliases(a)) {
+                *c = c.saturating_sub(1);
+            }
+        }
+        for bc in func.dfg.insts[d]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            for a in bc.args(&func.dfg.value_lists) {
+                if let BlockArg::Value(x) = a
+                    && let Some(c) = cnt.get_mut(&func.dfg.resolve_aliases(x))
+                {
+                    *c = c.saturating_sub(1);
+                }
+            }
+        }
+    };
     let mut wl: Vec<Inst> = insts.to_vec();
     let mut seen: FxHashSet<Inst> = wl.iter().copied().collect();
     // Fixpoint: each removal can free a candidate seen earlier (the
@@ -3524,7 +3535,12 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
                 continue;
             }
             let r = func.dfg.first_result(d);
-            if uses_of(func, r) != 0 {
+            if cnt
+                .get(&func.dfg.resolve_aliases(r))
+                .copied()
+                .unwrap_or(0)
+                != 0
+            {
                 continue;
             }
             for dd in func
@@ -3537,6 +3553,7 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
                     wl.push(dd);
                 }
             }
+            dec(func, &mut cnt, d);
             func.dfg.clear_results(d);
             func.layout.remove_inst(d);
             progress = true;
