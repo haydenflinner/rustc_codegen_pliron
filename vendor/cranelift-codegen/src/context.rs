@@ -195,7 +195,13 @@ impl Context {
 
         self.func.dfg.resolve_all_aliases();
 
-        if opt_level != OptLevel::None && self.egraph_safe() {
+        // PLIRON: `PLIRON_COMPILE_EGRAPH=0` skips the compile-path
+        // egraph entirely — the pliron pipeline already covers its
+        // rewrites, and this measures what it still buys.
+        if opt_level != OptLevel::None
+            && self.egraph_safe()
+            && std::env::var("PLIRON_COMPILE_EGRAPH").as_deref() != Ok("0")
+        {
             self.egraph_pass(isa, ctrl_plane)?;
         }
 

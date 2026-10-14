@@ -184,4 +184,7 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `ty_smin`/`ty_smax`/`ty_mask`/`ty_lane_mask` `expect` ≤64 — any
     >64-bit scalar (rustc's routine i128) or >64-lane vector panics the
     whole egraph pass. `optimize` and the pipeline's opt-in egraph step
-    skip functions containing such values.
+    skip functions containing such values. `PLIRON_COMPILE_EGRAPH=0`
+    disables the compile-path egraph entirely for A/B measurement —
+    it still earns ~7-13% runtime on hash/string kernels as of the
+    last benchmark, so it stays on by default.
