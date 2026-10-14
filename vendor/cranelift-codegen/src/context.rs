@@ -965,6 +965,11 @@ impl Context {
         );
         pass.run();
         log::debug!("egraph stats: {:?}", pass.stats);
+        if std::env::var_os("PLIRON_STATS").is_some() {
+            let stats = pass.stats.clone();
+            drop(pass);
+            eprintln!("egraph stats {:?}: {:?}", self.func.name, stats);
+        }
         trace!("After egraph optimization:\n{}", self.func.display());
 
         // Branch optimizations can invalidate these; recompute them.

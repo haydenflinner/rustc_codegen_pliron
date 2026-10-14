@@ -202,3 +202,18 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     element pattern that is one cyclic run of set bits). Conservative
     on targets with wider immediate fields — only a neutral remat is
     lost.
+
+21. `PLIRON_STATS=1` also prints per-function `EgraphPass` stats in
+    `egraph_pass` (`src/context.rs`; previously only reachable via
+    `log::debug!`). Used to size egraph's contribution: scoped-GVN hits,
+    alias-eliminated loads (~0 — nothing emits `alias_region` metadata),
+    licm hoists, and `elaborate_remat` clone counts.
+
+    A loop-aware variant of `maybe_remat_arg` (pin outer-loop constants /
+    redirect in-loop constant clones to the preheader) was implemented
+    and benchmarked, then reverted: the eliminated per-iteration `movz`s
+    were ~free while the pinned live ranges spilled measurably worse
+    (hashmap `main`: 96 → 121-178 stack ops; upstream won or tied every
+    A/B). Upstream's per-use-block cloning is already the pressure-
+    optimal placement; remat wins have to come from *what* gets marked
+    (patch 20's encodability gate), not *where* clones land.
