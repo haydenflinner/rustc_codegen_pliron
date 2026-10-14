@@ -9,6 +9,7 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
@@ -1691,14 +1692,17 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // first (a param "def" is the block head).
     let covered = {
         let f = &p.clctx.func;
-        let blk = |v: Value| match f.dfg.value_def(v) {
-            ValueDef::Result(i, _) => f.layout.inst_block(i),
-            ValueDef::Param(b, _) => Some(b),
+        let valid = |v: Value| {
+            v != Value::reserved_value() && (v.as_u32() as usize) < f.dfg.num_values()
+        };
+        let blk = |v: Value| match valid(v).then(|| f.dfg.value_def(f.dfg.resolve_aliases(v))) {
+            Some(ValueDef::Result(i, _)) => f.layout.inst_block(i),
+            Some(ValueDef::Param(b, _)) => Some(b),
             _ => None,
         };
-        let pos = |v: Value| match f.dfg.value_def(v) {
-            ValueDef::Param(..) => Some(0usize),
-            ValueDef::Result(i, _) => {
+        let pos = |v: Value| match valid(v).then(|| f.dfg.value_def(f.dfg.resolve_aliases(v))) {
+            Some(ValueDef::Param(..)) => Some(0usize),
+            Some(ValueDef::Result(i, _)) => {
                 f.layout.block_insts(blk(v)?).position(|x| x == i)
             }
             _ => None,
