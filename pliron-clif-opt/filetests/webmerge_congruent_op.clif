@@ -1,0 +1,34 @@
+; test webmerge
+; Congruent pure-op trees: both edges feed `icmp slt (v0 + 8), v0` built
+; from per-edge iconsts — structural keys collapse the trees and the
+; compare is materialized once at block3's head. `arghoist` misses this
+; (its shape check requires the same root value on the primary operand
+; path); the key congruence catches it.
+; check: block3:
+; check-not: block3(v
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i64 8
+    v4 = iadd v0, v3
+    v5 = icmp slt v4, v0
+    v6 = uextend.i64 v5
+    jump block3(v6)
+
+block2:
+    v7 = iconst.i64 4
+    v8 = iadd v0, v7
+    v9 = iadd v8, v7
+    v10 = icmp slt v9, v0
+    v11 = uextend.i64 v10
+    jump block3(v11)
+
+block3(v12: i64):
+    v13 = iadd v12, v0
+    return v13
+}

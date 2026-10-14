@@ -1,0 +1,29 @@
+; test webmerge
+; Affine congruence: edge1 feeds `v0 + 8` directly, edge2 feeds the same
+; class through a collapsed chain `(v0 + 4) + 4`. The param drops and
+; `v0 + 8` is materialized once at block3's head.
+; check: block3:
+; check-not: block3(v
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i64 8
+    v4 = iadd v0, v3
+    jump block3(v4)
+
+block2:
+    v5 = iconst.i64 4
+    v6 = iadd v0, v5
+    v7 = iadd v6, v5
+    jump block3(v7)
+
+block3(v8: i64):
+    v9 = iconst.i64 7
+    v10 = iadd v8, v9
+    return v10
+}

@@ -1,0 +1,22 @@
+; test webmerge
+; Negative bisimulation: same rotation `(p1, p2, p0)` on the back-edge
+; but the entry edge passes `(x, x, y)` — p2 starts distinct. Round two
+; sees slot1's back-arg resolve to the p2 class, the {p0,p1} hypothesis
+; splits, and nothing merges.
+; check: block1(v2: i64, v3: i64, v4: i64):
+function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    jump block1(v0, v0, v1)
+
+block1(v2: i64, v3: i64, v4: i64):
+    v5 = iconst.i64 0
+    v6 = icmp eq v2, v5
+    brif v6, block3, block2
+
+block2:
+    jump block1(v3, v4, v2)
+
+block3:
+    v7 = iadd v3, v4
+    return v7
+}

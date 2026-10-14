@@ -1,0 +1,26 @@
+; test webmerge
+; Param dedup as degenerate sibling congruence: every edge passes its
+; slot-0 arg again in slot 1. Both slots paramize to `P(other)`; the
+; seeded pending keys resolve `P(0)` to the surviving `V(p0)` for the
+; second candidate while the first's own `P(1)` cycle is rejected.
+; check: block3(v9: i64):
+; check-not: block3(v9: i64, v10: i64)
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    jump block3(v0, v0)
+
+block2:
+    v5 = iconst.i64 3
+    v6 = imul v0, v5
+    jump block3(v6, v6)
+
+block3(v9: i64, v10: i64):
+    v11 = iadd v9, v10
+    return v11
+}

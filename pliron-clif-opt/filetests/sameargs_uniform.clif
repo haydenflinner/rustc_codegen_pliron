@@ -1,0 +1,24 @@
+; test sameargs
+; Uniform edge args: both edges feed the same SSA value and the same
+; iconst — both slots drop, the const rematerializes at the head.
+; check: block3:
+; check-not: block3(v
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i64 42
+    jump block3(v0, v3)
+
+block2:
+    v4 = iconst.i64 42
+    jump block3(v0, v4)
+
+block3(v5: i64, v6: i64):
+    v7 = iadd v5, v6
+    return v7
+}
