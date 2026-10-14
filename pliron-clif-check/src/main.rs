@@ -213,7 +213,6 @@ fn with_pipe<R>(
         cmp64: true,
         has_eh: false,
         flags: &flags,
-        prof_hook: None,
         dump: false,
         verify_full: false,
         stats: &mut stats,
