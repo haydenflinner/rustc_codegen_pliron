@@ -1346,7 +1346,8 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Same-shape edge args hoisted into the target block; the pred-side
 // arg insts they orphaned get swept.
 fn s_arghoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    clifpeep::arghoist(&mut p.clctx.func) + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
+    clifpeep::webmerge(&mut p.clctx.func).0
+        + jumpthread::remove_dead_insts(&mut p.clctx.func, true)
 }
 
 // A merge param's pure use-chain sunk onto the incoming edges (the
