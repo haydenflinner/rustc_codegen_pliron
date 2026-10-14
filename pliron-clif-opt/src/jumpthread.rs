@@ -359,37 +359,83 @@ impl<'a> NonNull<'a> {
                 );
             }
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in func.layout.blocks() {
-                let Some(t) = func.layout.last_inst(b) else {
-                    continue;
-                };
-                for (ei, bc) in func
-                    .dfg
-                    .insts[t]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let d = bc.block(&func.dfg.value_lists);
-                    let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
-                    for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
-                        if nn.params.contains(&p)
-                            && !matches!(args.get(i), Some(&BlockArg::Value(v))
-                                if nn.is_edge(func, t, ei, v))
-                        {
-                            if std::env::var_os("PLIRON_NN_DEBUG").is_some() {
-                                eprintln!(
-                                    "nn evict {p} via b{b} i{t} ei{ei} arg{:?}",
-                                    args.get(i)
-                                );
-                            }
-                            nn.params.remove(&p);
-                            changed = true;
-                        }
+        // Each seeded param survives iff every edge arg feeding it
+        // proves non-null on that edge. Evaluate each (param, edge)
+        // check once and record which params the proof relied on;
+        // evictions then propagate only to dependent checks instead of
+        // rescanning every terminator per fixpoint round. `params`
+        // only shrinks, so a positive `params` hit is the only kind of
+        // dependence — a miss can never become a hit.
+        struct Chk {
+            p: Value,
+            t: Inst,
+            ei: usize,
+            v: Value,
+            deps: Vec<Value>,
+        }
+        let mut checks: Vec<Chk> = Vec::new();
+        let mut dependents: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
+        let mut evict: Vec<Value> = Vec::new();
+        for b in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(b) else {
+                continue;
+            };
+            for (ei, bc) in func
+                .dfg
+                .insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .enumerate()
+            {
+                let d = bc.block(&func.dfg.value_lists);
+                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
+                    if !nn.params.contains(&p) {
+                        continue;
                     }
+                    let Some(&BlockArg::Value(v)) = args.get(i) else {
+                        evict.push(p);
+                        continue;
+                    };
+                    let v = func.dfg.resolve_aliases(v);
+                    let mut deps = FxHashSet::default();
+                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps)
+                    {
+                        dependents_entry(&mut dependents, &deps, checks.len());
+                        checks.push(Chk {
+                            p,
+                            t,
+                            ei,
+                            v,
+                            deps: deps.into_iter().collect(),
+                        });
+                    } else {
+                        evict.push(p);
+                    }
+                }
+            }
+        }
+        let mut dead: FxHashSet<Value> = FxHashSet::default();
+        while let Some(q) = evict.pop() {
+            if std::env::var_os("PLIRON_NN_DEBUG").is_some() {
+                eprintln!("nn evict {q}");
+            }
+            nn.params.remove(&q);
+            dead.insert(q);
+            for ci in dependents.get(&q).into_iter().flatten().copied().collect::<Vec<_>>() {
+                let c = &mut checks[ci];
+                if dead.contains(&c.p) {
+                    continue;
+                }
+                let mut deps = FxHashSet::default();
+                if nn.edge_aux_deps(func, c.t, c.ei, c.v, 0, &mut deps) {
+                    // Still proven — the dep set may have moved, so
+                    // re-point the check at what it now relies on.
+                    c.deps = deps.iter().copied().collect();
+                    dependents_entry(&mut dependents, &deps, ci);
+                } else {
+                    dead.insert(c.p);
+                    evict.push(c.p);
                 }
             }
         }
@@ -397,6 +443,10 @@ impl<'a> NonNull<'a> {
     }
 
     pub fn is(&self, func: &Function, v: Value) -> bool {
+        self.is_deps(func, v, &mut FxHashSet::default())
+    }
+
+    fn is_deps(&self, func: &Function, v: Value, deps: &mut FxHashSet<Value>) -> bool {
         // `select c, a, b` is non-null iff both arms are; every term on
         // the worklist must justify itself (a `!nonnull` load, a param
         // the fixpoint kept, a symbol/stack address, or an `inbounds`
@@ -408,9 +458,12 @@ impl<'a> NonNull<'a> {
                 continue;
             }
             for _ in 0..8 {
-                if self.loads.contains(&v) || self.params.contains(&v) || addr_of_symbol(func, v)
-                    || non_zero_const(func, v)
+                if self.loads.contains(&v) || addr_of_symbol(func, v) || non_zero_const(func, v)
                 {
+                    continue 'terms;
+                }
+                if self.params.contains(&v) {
+                    deps.insert(v);
                     continue 'terms;
                 }
                 if let Some(i) = func.dfg.value_def(v).inst()
@@ -435,6 +488,19 @@ impl<'a> NonNull<'a> {
             return false;
         }
         true
+    }
+}
+
+fn dependents_entry(
+    dependents: &mut FxHashMap<Value, Vec<usize>>,
+    deps: &FxHashSet<Value>,
+    ci: usize,
+) {
+    for &q in deps {
+        let l = dependents.entry(q).or_default();
+        if !l.contains(&ci) {
+            l.push(ci);
+        }
     }
 }
 
@@ -523,11 +589,19 @@ impl NonNull<'_> {
     /// niche select `select(k,0,x)` it also means `!k` and `x != 0`
     /// — the shape `Option::is_none` produces at loop tails.
     pub fn is_edge(&self, func: &Function, t: Inst, ei: usize, v: Value) -> bool {
-        self.edge_aux(func, t, ei, func.dfg.resolve_aliases(v), 0)
+        self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(v), 0, &mut FxHashSet::default())
     }
 
-    fn edge_aux(&self, func: &Function, t: Inst, ei: usize, v: Value, d: usize) -> bool {
-        if self.is(func, v) {
+    fn edge_aux_deps(
+        &self,
+        func: &Function,
+        t: Inst,
+        ei: usize,
+        v: Value,
+        d: usize,
+        deps: &mut FxHashSet<Value>,
+    ) -> bool {
+        if self.is_deps(func, v, deps) {
             return true;
         }
         if d > 6 {
@@ -591,11 +665,11 @@ impl NonNull<'_> {
             } = func.dfg.insts[vi]
             && func.dfg.resolve_aliases(va[0]) == func.dfg.resolve_aliases(sa[0])
         {
-            return self.edge_aux(func, t, ei, func.dfg.resolve_aliases(va[2]), d + 1);
+            return self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(va[2]), d + 1, deps);
         }
         // `v` an inbounds offset of a base that is nn on this edge.
         if let Some(base) = self.derived_base(func, v) {
-            return self.edge_aux(func, t, ei, func.dfg.resolve_aliases(base), d + 1);
+            return self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(base), d + 1, deps);
         }
         false
     }
@@ -702,6 +776,18 @@ fn ne_const(
     k: u64,
     depth: u32,
 ) -> bool {
+    ne_const_deps(func, env, cand, v, k, depth, &mut FxHashSet::default())
+}
+
+fn ne_const_deps(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    cand: &FxHashSet<Value>,
+    v: Value,
+    k: u64,
+    depth: u32,
+    deps: &mut FxHashSet<Value>,
+) -> bool {
     if depth >= 8 {
         return false;
     }
@@ -714,7 +800,13 @@ fn ne_const(
         return c != k;
     }
     match func.dfg.value_def(v) {
-        ValueDef::Param(..) => cand.contains(&v),
+        ValueDef::Param(..) => {
+            let ok = cand.contains(&v);
+            if ok {
+                deps.insert(v);
+            }
+            ok
+        }
         ValueDef::Result(i, _) => match func.dfg.insts[i].opcode() {
             // Zero-extend loads clear every bit above the load width.
             Opcode::Uload8 => k >> 8 != 0,
@@ -724,8 +816,8 @@ fn ne_const(
                 let InstructionData::Ternary { args: sa, .. } = func.dfg.insts[i] else {
                     return false;
                 };
-                ne_const(func, env, cand, sa[1], k, depth + 1)
-                    && ne_const(func, env, cand, sa[2], k, depth + 1)
+                ne_const_deps(func, env, cand, sa[1], k, depth + 1, deps)
+                    && ne_const_deps(func, env, cand, sa[2], k, depth + 1, deps)
             }
             _ => {
                 let kenv = FxHashMap::default();
@@ -810,18 +902,37 @@ fn ne_params(
             }
         }
     }
-    loop {
-        let mut drop = Vec::new();
-        for (&p, args) in &args_of {
-            if cand.contains(&p) && args.iter().any(|&a| !ne_const(func, env, &cand, a, k, 0)) {
-                drop.push(p);
+    // Evaluate every candidate's args once. A param arg is proven only
+    // by its own candidacy (`ValueDef::Param => cand.contains`), so the
+    // deps a check recorded are exactly the params whose eviction
+    // re-fails it — the fixpoint is worklist propagation, not rescans.
+    let mut dependents: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut work: Vec<Value> = Vec::new();
+    for (&p, args) in &args_of {
+        let mut fail = false;
+        let mut pd: Vec<Value> = Vec::new();
+        for &a in args {
+            let mut deps = FxHashSet::default();
+            if !ne_const_deps(func, env, &cand, a, k, 0, &mut deps) {
+                fail = true;
+                break;
+            }
+            pd.extend(deps);
+        }
+        if fail {
+            work.push(p);
+        } else {
+            for q in pd {
+                dependents.entry(q).or_default().push(p);
             }
         }
-        if drop.is_empty() {
-            break;
+    }
+    while let Some(q) = work.pop() {
+        if !cand.remove(&q) {
+            continue;
         }
-        for p in drop {
-            cand.remove(&p);
+        for &p in dependents.get(&q).into_iter().flatten() {
+            work.push(p);
         }
     }
     cand
@@ -1113,9 +1224,28 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
 /// value), `X_target` sees `sel == x` — provided the block had no other
 /// preds, so `b`/`mid` alone decide entry.
 pub fn split_niche_tests(func: &mut Function) -> usize {
+    struct Plan {
+        b: Block,
+        term: Inst,
+        icmp_inst: Inst,
+        sel: Value,
+        sel_inst: Inst,
+        cond: IntCC,
+        c: Value,
+        k_op: Value,
+        xop: Value,
+        sent: usize,
+        k_target: Block,
+        x_target: Block,
+        in_k: Vec<Inst>,
+        in_x: Vec<Inst>,
+        kargs: Vec<BlockArg>,
+        xargs_t: Vec<BlockArg>,
+        xargs_f: Vec<BlockArg>,
+    }
     let none = FxHashMap::default();
     let mut changed = 0usize;
-    'outer: loop {
+    loop {
         // Alias-resolved operand → every inst (incl. edge args) using it.
         let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
         for b in func.layout.blocks() {
@@ -1128,6 +1258,13 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
             }
         }
         let cfg = ControlFlowGraph::with_function(func);
+        // Collect every viable split against the pre-apply state, then
+        // apply them in a batch — the old loop rebuilt `uses` and the
+        // cfg per accepted split. A plan goes stale if an earlier apply
+        // rewrote one of its insts or gave a target block a new `mid`
+        // pred its `sole_pred` check can't see, so those are deferred to
+        // the next `outer` round.
+        let mut plans: Vec<Plan> = Vec::new();
         for b in func.layout.blocks() {
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
@@ -1290,6 +1427,68 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                 .args(&func.dfg.value_lists)
                 .map(|a| fold_sel_arg(func, a, c, 3 - sent))
                 .collect();
+            plans.push(Plan {
+                b,
+                term,
+                icmp_inst,
+                sel,
+                sel_inst,
+                cond,
+                c,
+                k_op,
+                xop,
+                sent,
+                k_target,
+                x_target,
+                in_k,
+                in_x,
+                kargs,
+                xargs_t,
+                xargs_f,
+            });
+        }
+        // Defer any plan whose key insts an earlier apply rewrote or
+        // removed, or whose targets gained a `mid` pred — both make the
+        // plan's collected facts stale. `Uses::new` is fresh each plan
+        // anyway for the dead-select sweep; here it needs one build for
+        // all of them.
+        let mut mutated: FxHashSet<Inst> = FxHashSet::default();
+        let mut claimed: FxHashSet<Block> = FxHashSet::default();
+        let mut dead_sweep: Vec<Inst> = Vec::new();
+        let prev = changed;
+        for pl in plans {
+            if claimed.contains(&pl.k_target)
+                || claimed.contains(&pl.x_target)
+                || [pl.term, pl.icmp_inst, pl.sel_inst]
+                    .into_iter()
+                    .chain(pl.in_k.iter().copied())
+                    .chain(pl.in_x.iter().copied())
+                    .any(|i| mutated.contains(&i))
+            {
+                continue;
+            }
+            claimed.extend([pl.k_target, pl.x_target]);
+            mutated.extend(pl.in_k.iter().copied().chain(pl.in_x.iter().copied()));
+            mutated.extend([pl.term, pl.icmp_inst, pl.sel_inst]);
+            let Plan {
+                b,
+                term,
+                icmp_inst,
+                sel,
+                sel_inst,
+                cond,
+                c,
+                k_op,
+                xop,
+                sent,
+                k_target,
+                x_target,
+                in_k,
+                in_x,
+                kargs,
+                xargs_t,
+                xargs_f,
+            } = pl;
             // Rewrite in-block uses before touching edges: `k_target`
             // sees `sel == k_op`, `x_target` sees `sel == xop`.
             for (us, repl) in [(&in_k, k_op), (&in_x, xop)] {
@@ -1314,11 +1513,13 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                     xargs_f.len()
                 );
             }
-            // Splice `mid` in and re-point `b`'s brif at it.
-            let (t_blk, f_blk) = (
-                blocks[0].block(&func.dfg.value_lists),
-                blocks[1].block(&func.dfg.value_lists),
-            );
+            // Splice `mid` in and re-point `b`'s brif at it. `blocks[0]`
+            // is the cond-true arm: `k_target` when `cond == Equal`.
+            let (t_blk, f_blk) = if cond == IntCC::Equal {
+                (k_target, x_target)
+            } else {
+                (x_target, k_target)
+            };
             let mid = func.dfg.make_block();
             func.layout.insert_block_after(mid, b);
             {
@@ -1334,11 +1535,11 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                 pos.ins().brif(c, mid, &[], k_target, &kargs);
             }
             // `sel`/icmp are dead now (all uses rewritten); the other
-            // `select c`s folded out of the edge args may be too — sweep
-            // any of `b`'s selects whose uses all vanished.
+            // `select c`s folded out of the edge args may be too — queue
+            // them for the batched sweep below.
             func.dfg.clear_results(icmp_inst);
             func.layout.remove_inst(icmp_inst);
-            let mut dead = vec![sel_inst];
+            dead_sweep.push(sel_inst);
             for i in func.layout.block_insts(b).collect::<Vec<_>>() {
                 if i == sel_inst {
                     continue;
@@ -1349,27 +1550,31 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                 } = func.dfg.insts[i]
                 {
                     if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(c) {
-                        dead.push(i);
+                        dead_sweep.push(i);
                     }
                 }
             }
-            // One use index for the whole sweep: removals only delete
-            // uses, so a stale entry just skips a removal the next
-            // outer round catches — a per-inst whole-function scan
-            // was O(dead × fn).
-            let uses = crate::uses::Uses::new(func);
-            'sweep: for di in dead {
-                let r = func.dfg.resolve_aliases(func.dfg.first_result(di));
-                if uses.is_used(r) {
-                    continue 'sweep;
-                }
-                func.dfg.clear_results(di);
-                func.layout.remove_inst(di);
-            }
             changed += 1;
-            continue 'outer;
         }
-        break;
+        if changed == prev {
+            break;
+        }
+        // One use index for the whole sweep: removals only delete
+        // uses, so a stale entry just skips a removal the next
+        // outer round catches — a per-inst whole-function scan
+        // was O(dead × fn).
+        let uses = crate::uses::Uses::new(func);
+        for di in dead_sweep {
+            if func.layout.inst_block(di).is_none() {
+                continue;
+            }
+            let r = func.dfg.resolve_aliases(func.dfg.first_result(di));
+            if uses.is_used(r) {
+                continue;
+            }
+            func.dfg.clear_results(di);
+            func.layout.remove_inst(di);
+        }
     }
     changed
 }
@@ -1597,6 +1802,12 @@ pub(crate) fn round(
     // Blocks taking part in any edit, and blocks no later edit may touch.
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     let mut locked: FxHashSet<Block> = FxHashSet::default();
+    // `region(b, s)` and `facts_at(pblock)` are stable for the whole edit-
+    // collection phase (the cfg is immutable until edits apply below), but
+    // were being recomputed per predecessor edge — a merge block has only
+    // two `s` candidates yet one walk per pred. Memoize per round.
+    let mut regions: FxHashMap<(Block, Block), Option<Vec<Block>>> = FxHashMap::default();
+    let mut fact_memo: FxHashMap<Block, Vec<Cmp>> = FxHashMap::default();
     for b in func.layout.blocks() {
         if Some(b) == entry || locked.contains(&b) {
             continue;
@@ -1694,7 +1905,10 @@ pub(crate) fn round(
                 };
                 // Ranges of the incoming args implied by branches dominating the pred.
                 let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
-                let fs = facts_at(&domtree, &facts, pblock);
+                let fs = fact_memo
+                    .entry(pblock)
+                    .or_insert_with(|| facts_at(&domtree, &facts, pblock))
+                    .clone();
                 if !fs.is_empty() {
                     for (&p, &v) in &argv {
                         if !env.contains_key(&p)
@@ -1744,7 +1958,11 @@ pub(crate) fn round(
                     }
                     continue;
                 }
-                let Some(reg) = region(&cfg, b, s) else {
+                let Some(reg) = regions
+                    .entry((b, s))
+                    .or_insert_with(|| region(&cfg, b, s))
+                    .clone()
+                else {
                     if dbg {
                         eprintln!("jt skip {b}->{s}: region>MAX_WALK");
                     }
@@ -2120,11 +2338,10 @@ pub fn rebind_exports(func: &mut Function) -> usize {
     let uses = crate::uses::Uses::new(func);
     let mut edits = Vec::new();
     for y in func.layout.blocks().collect::<Vec<_>>() {
-        let mut exports: FxHashSet<Value> = func.dfg.block_params(y).iter().copied().collect();
+        // Params then inst results — deterministic order.
+        let mut exports: Vec<Value> = func.dfg.block_params(y).to_vec();
         for i in func.layout.block_insts(y) {
-            for r in func.dfg.inst_results(i).iter() {
-                exports.insert(*r);
-            }
+            exports.extend(func.dfg.inst_results(i).iter().copied());
         }
         let Some(term) = func.layout.last_inst(y) else {
             continue;
@@ -2145,21 +2362,22 @@ pub fn rebind_exports(func: &mut Function) -> usize {
                 continue;
             }
             // `y` values consumed from `s`'s dominated cone — `s` owns the
-            // only path there, so a param can carry each.
+            // only path there, so a param can carry each. The use index
+            // answers "does anything in the cone use `w`" per export
+            // (O(#exports × sites)) instead of rescanning every dominated
+            // block per (y, s) pair.
             let mut needed: Vec<Value> = Vec::new();
             let mut bail = false;
-            'cone: for b in func.layout.blocks() {
-                if b == y || (b != s && !dom.block_dominates(s, b)) {
-                    continue;
-                }
-                for v in uses.in_block(b) {
-                    if exports.contains(&v) && !needed.contains(&v) {
-                        if needed.len() >= 8 {
-                            bail = true;
-                            break 'cone;
-                        }
-                        needed.push(v);
+            for &w in &exports {
+                if uses.sites.get(&w).is_some_and(|ss| {
+                    ss.iter()
+                        .any(|&(b, _)| b == s || (b != y && dom.block_dominates(s, b)))
+                }) {
+                    if needed.len() >= 8 {
+                        bail = true;
+                        break;
                     }
+                    needed.push(w);
                 }
             }
             if bail || needed.is_empty() {
@@ -2176,24 +2394,30 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             let p = func.dfg.append_block_param(s, ty);
             repl.insert(w, p);
         }
-        for b in func.layout.blocks().collect::<Vec<_>>() {
-            if b == y || (b != s && !dom.block_dominates(s, b)) {
-                continue;
-            }
-            let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-            for i in insts {
-                let to: FxHashMap<Value, Value> = func
-                    .dfg
-                    .inst_values(i)
-                    .filter_map(|v| {
-                        repl.get(&func.dfg.resolve_aliases(v))
-                            .map(|&n| (v, n))
-                    })
-                    .collect();
-                if !to.is_empty() {
-                    func.dfg
-                        .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
+        // Rewrite only the insts that reference a `needed` value inside
+        // the cone — the site index says exactly where they are (a site
+        // rewired by an earlier edit just produces an empty remap).
+        let mut insts: FxHashSet<Inst> = FxHashSet::default();
+        for &w in &needed {
+            for &(b, i) in uses.sites.get(&w).into_iter().flatten() {
+                if b == y || (b != s && !dom.block_dominates(s, b)) {
+                    continue;
                 }
+                insts.insert(i);
+            }
+        }
+        for i in insts {
+            let to: FxHashMap<Value, Value> = func
+                .dfg
+                .inst_values(i)
+                .filter_map(|v| {
+                    repl.get(&func.dfg.resolve_aliases(v))
+                        .map(|&n| (v, n))
+                })
+                .collect();
+            if !to.is_empty() {
+                func.dfg
+                    .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
             }
         }
         let dfg = &mut func.dfg;
@@ -3017,21 +3241,59 @@ fn dominated_conds(
     if !range2 && fact.is_empty() && tfact.is_empty() {
         return Vec::new();
     }
-    let mut folds = Vec::new();
+    // One domtree DFS carries the inherited facts into each block
+    // instead of two ≤64-hop idom walks per block: `fs` is the chain
+    // nearest-first (stack top = the block itself), and `env` keeps the
+    // original furthest-ancestor-wins precedence — entries are only
+    // filled when an ancestor didn't already set them, and an undo log
+    // restores them on exit.
+    let mut children: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
     for b in func.layout.blocks() {
-        let fs = facts_at(&domtree, &fact, b);
-        let mut env: FxHashMap<Value, u64> = FxHashMap::default();
-        let mut cur = Some(b);
-        for _ in 0..64 {
-            let Some(c) = cur else { break };
-            for &(v, k) in tfact.get(&c).into_iter().flatten() {
-                env.insert(v, k);
+        if let Some(p) = domtree.idom(b) {
+            children.entry(p).or_default().push(b);
+        }
+    }
+    let mut fs: Vec<Cmp> = Vec::new();
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut undo: Vec<Value> = Vec::new();
+    let mut folds = Vec::new();
+    // (block, fs_mark, undo_mark, exiting) — enter pushes the block's
+    // own facts after recording marks, exit truncates back to them.
+    let mut stack: Vec<(Block, usize, usize, bool)> = func
+        .layout
+        .blocks()
+        .filter(|&b| domtree.idom(b).is_none())
+        .map(|b| (b, 0, 0, false))
+        .collect();
+    while let Some((b, fmark, umark, exit)) = stack.pop() {
+        if exit {
+            for &v in undo[umark..].iter() {
+                env.remove(&v);
             }
-            cur = domtree.idom(c);
+            undo.truncate(umark);
+            fs.truncate(fmark);
+            continue;
+        }
+        let (fmark, umark) = (fs.len(), undo.len());
+        if let Some(&f) = fact.get(&b) {
+            fs.push(f);
+        }
+        for &(v, k) in tfact.get(&b).into_iter().flatten() {
+            if !env.contains_key(&v) {
+                env.insert(v, k);
+                undo.push(v);
+            }
+        }
+        stack.push((b, fmark, umark, true));
+        for &c in children.get(&b).into_iter().flatten() {
+            stack.push((c, 0, 0, false));
         }
         if !range2 && fs.is_empty() && env.is_empty() {
             continue;
         }
+        // Nearest-ancestor-first, as `facts_at` produced.
+        let fsv: Vec<Cmp> = fs.iter().rev().copied().collect();
+        let fs = fsv.as_slice();
         // `x == y` facts let a query on `y` be decided through `x`.
         let eqs: Vec<(Value, Value)> = fs
             .iter()
@@ -3062,8 +3324,8 @@ fn dominated_conds(
                 q.0,
                 ka,
                 kb,
-                urange(func, &fs, q.1, 0, range2),
-                urange(func, &fs, q.2, 0, range2),
+                urange(func, fs, q.1, 0, range2),
+                urange(func, fs, q.2, 0, range2),
                 w,
             )
         };
@@ -3440,41 +3702,12 @@ pub fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
 }
 
 /// Delete instructions whose results are all unused (see `removable`),
-/// repeating until nothing changes. Returns the number deleted.
+/// propagating kills through operand use-counts until nothing dies.
+/// Returns the number deleted.
 pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
-    let mut n = 0;
-    loop {
-        let mut used: FxHashSet<Value> = FxHashSet::default();
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                for value in func.dfg.inst_values(inst) {
-                    used.insert(func.dfg.resolve_aliases(value));
-                }
-            }
-        }
-
-        let dead: Vec<Inst> = func
-            .layout
-            .blocks()
-            .flat_map(|block| func.layout.block_insts(block))
-            .filter(|&inst| {
-                let results = func.dfg.inst_results(inst);
-                !results.is_empty()
-                    && results
-                        .iter()
-                        .all(|&r| !used.contains(&func.dfg.resolve_aliases(r)))
-                    && removable(func, inst, pure)
-            })
-            .collect();
-        if dead.is_empty() {
-            return n;
-        }
-        n += dead.len();
-        for inst in dead {
-            func.layout.remove_inst(inst);
-            func.dfg.clear_results(inst);
-        }
-    }
+    crate::uses::worklist_dce(func, |f, i| {
+        !f.dfg.inst_results(i).is_empty() && removable(f, i, pure)
+    })
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.

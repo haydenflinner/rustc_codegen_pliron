@@ -428,21 +428,15 @@ struct W<'a> {
     dom: &'a DominatorTree,
     p: Block,
     pterm: Inst,
+    /// Blocks whose non-terminator insts are all side-effect-free —
+    /// computed once per `run`; `resolve` queried this per hop per edge.
+    pure_blocks: &'a FxHashSet<Block>,
 }
 
 impl<'a> W<'a> {
     /// Every non-terminator inst in `b` is side-effect-free.
     fn pure(&self, b: Block) -> bool {
-        let insts: Vec<Inst> = self.func.layout.block_insts(b).collect();
-        for (n, &i) in insts.iter().enumerate() {
-            if n + 1 == insts.len() {
-                break;
-            }
-            if !crate::jumpthread::pure_op(self.func, i) {
-                return false;
-            }
-        }
-        true
+        self.pure_blocks.contains(&b)
     }
 
     /// Substitute walked-block params in a call's args with pred values.
@@ -852,6 +846,7 @@ fn plan(
     func: &Function,
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
+    pure_blocks: &FxHashSet<Block>,
     p: Block,
     pterm: Inst,
 ) -> Option<NewTerm> {
@@ -861,6 +856,7 @@ fn plan(
         dom,
         p,
         pterm,
+        pure_blocks,
     };
     match func.dfg.insts[pterm] {
         InstructionData::Jump { destination, .. } => {
@@ -1039,50 +1035,27 @@ pub fn sweep_blocks(func: &mut Function) {
 /// Remove dead pure insts left by the rewrites (selects/extends/icmps whose
 /// results no longer feed anything).
 pub fn sweep_dead(func: &mut Function) {
-    let mut uses: FxHashMap<Value, u32> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        for i in func.layout.block_insts(b) {
-            for v in func.dfg.inst_values(i) {
-                *uses.entry(func.dfg.resolve_aliases(v)).or_default() += 1;
-            }
-        }
-    }
-    loop {
-        let insts: Vec<Inst> = func
-            .layout
-            .blocks()
-            .flat_map(|b| func.layout.block_insts(b).collect::<Vec<_>>())
-            .collect();
-        let mut killed = false;
-        for i in insts {
-            if func.dfg.insts[i].opcode().is_terminator()
-                || !crate::jumpthread::pure_op(func, i)
-                || func.dfg.inst_results(i).iter().any(|r| {
-                    uses.get(&func.dfg.resolve_aliases(*r))
-                        .copied()
-                        .unwrap_or(0)
-                        > 0
-                })
-            {
-                continue;
-            }
-            for v in func.dfg.inst_values(i).collect::<Vec<_>>() {
-                if let Some(u) = uses.get_mut(&func.dfg.resolve_aliases(v)) {
-                    *u = u.saturating_sub(1);
-                }
-            }
-            func.layout.remove_inst(i);
-            killed = true;
-        }
-        if !killed {
-            break;
-        }
-    }
+    crate::uses::worklist_dce(func, |f, i| {
+        !f.dfg.insts[i].opcode().is_terminator() && crate::jumpthread::pure_op(f, i)
+    });
 }
 
 pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
+    // All-pure blocks — plans are collected before any apply, so this
+    // stays valid for every `plan` below.
+    let mut pure_blocks: FxHashSet<Block> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        if insts
+            .iter()
+            .take(insts.len().saturating_sub(1))
+            .all(|&i| crate::jumpthread::pure_op(func, i))
+        {
+            pure_blocks.insert(b);
+        }
+    }
     let mut plans = Vec::new();
     for p in func.layout.blocks() {
         if !dom.is_reachable(p) {
@@ -1094,7 +1067,7 @@ pub fn run(func: &mut Function) -> usize {
         if matches!(
             func.dfg.insts[t],
             InstructionData::Jump { .. } | InstructionData::Brif { .. }
-        ) && let Some(nt) = plan(func, &cfg, &dom, p, t)
+        ) && let Some(nt) = plan(func, &cfg, &dom, &pure_blocks, p, t)
         {
             plans.push((p, t, nt));
         }
@@ -1275,20 +1248,79 @@ fn deadbits(func: &mut Function) -> usize {
     }
 
     let mut need: FxHashMap<Value, u64> = FxHashMap::default();
-    // Param of each block, by index — edge args feed param needs back.
-    let mut n = 0;
-    loop {
-        let mut changed = false;
-        for b in func.layout.blocks().collect::<Vec<_>>() {
-            for i in func.layout.block_insts(b).collect::<Vec<_>>() {
-                // Result need -> operand demand (all results — a
-                // multi-result inst keeps every operand it computes for).
+    // param -> resolved edge args feeding it: one terminator walk instead
+    // of every block's calls being re-scanned per fixpoint round.
+    let mut inargs: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        for bc in func
+            .dfg
+            .insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let d = bc.block(&func.dfg.value_lists);
+            for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                let Some(&p) = func.dfg.block_params(d).get(k) else {
+                    break;
+                };
+                let BlockArg::Value(av) = a else { continue };
+                inargs
+                    .entry(func.dfg.resolve_aliases(p))
+                    .or_default()
+                    .push(func.dfg.resolve_aliases(av));
+            }
+        }
+    }
+    // Worklist fixpoint: `need` only grows, so propagate a grown value's
+    // demand once — a result wakes its def inst (operand demand), a param
+    // wakes the edge args that feed it. No per-round function rescans.
+    enum Work {
+        Inst(Inst),
+        Param(Value),
+    }
+    let mut work: Vec<Work> = Vec::new();
+    let grow = |need: &mut FxHashMap<Value, u64>,
+                    work: &mut Vec<Work>,
+                    func: &Function,
+                    v: Value,
+                    d: u64| {
+        if d & !need.get(&v).copied().unwrap_or(0) == 0 {
+            return;
+        }
+        *need.entry(v).or_default() |= d;
+        match func.dfg.value_def(v) {
+            ValueDef::Result(i, _) => work.push(Work::Inst(i)),
+            ValueDef::Param(..) => work.push(Work::Param(v)),
+            _ => {}
+        }
+    };
+    for i in func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .collect::<Vec<_>>()
+    {
+        work.push(Work::Inst(i));
+    }
+    let mut seen_inst: FxHashSet<Inst> = FxHashSet::default();
+    while let Some(w) = work.pop() {
+        match w {
+            Work::Inst(i) => {
+                // One evaluation per enqueue; seeds dedupe via the set.
+                if func.layout.inst_block(i).is_none() {
+                    continue;
+                }
                 let out_need = func.dfg.inst_results(i).iter().fold(0u64, |m, r| {
                     m | need
                         .get(&func.dfg.resolve_aliases(*r))
                         .copied()
                         .unwrap_or(0)
                 });
+                if !seen_inst.insert(i) && out_need == 0 {
+                    continue;
+                }
                 let ds = demand(func, i, out_need);
                 let av: Vec<Value> = func.dfg.inst_args(i).to_vec();
                 for (k, &a) in av.iter().enumerate() {
@@ -1297,10 +1329,7 @@ fn deadbits(func: &mut Function) -> usize {
                         .copied()
                         .unwrap_or_else(|| mask(u64::MAX, bits(func, a).unwrap_or(64)));
                     let a = func.dfg.resolve_aliases(a);
-                    if d & !need.get(&a).copied().unwrap_or(0) != 0 {
-                        *need.entry(a).or_default() |= d;
-                        changed = true;
-                    }
+                    grow(&mut need, &mut work, func, a, d);
                 }
                 // Exception contexts are opaque reads: demand all bits.
                 if let Some(et) = func.dfg.insts[i].exception_table() {
@@ -1310,40 +1339,17 @@ fn deadbits(func: &mut Function) -> usize {
                         };
                         let v = func.dfg.resolve_aliases(ctx);
                         let d = mask(u64::MAX, bits(func, v).unwrap_or(64));
-                        if d & !need.get(&v).copied().unwrap_or(0) != 0 {
-                            *need.entry(v).or_default() |= d;
-                            changed = true;
-                        }
-                    }
-                }
-                // Edge args inherit the bound param's need.
-                for bc in func.dfg.insts[i]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                {
-                    let t = bc.block(&func.dfg.value_lists);
-                    for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
-                        let Some(&p) = func.dfg.block_params(t).get(k) else {
-                            break;
-                        };
-                        let BlockArg::Value(av) = a else { continue };
-                        let av = func.dfg.resolve_aliases(av);
-                        let p = func.dfg.resolve_aliases(p);
-                        let pn = need.get(&p).copied().unwrap_or(0);
-                        let d = pn & mask(u64::MAX, bits(func, av).unwrap_or(64));
-                        if d & !need.get(&av).copied().unwrap_or(0) != 0 {
-                            *need.entry(av).or_default() |= d;
-                            changed = true;
-                        }
+                        grow(&mut need, &mut work, func, v, d);
                     }
                 }
             }
-        }
-        if !changed {
-            break;
-        }
-        n += 1;
-        if n > 32 {
-            break;
+            Work::Param(p) => {
+                let pn = need.get(&p).copied().unwrap_or(0);
+                for &av in inargs.get(&p).into_iter().flatten() {
+                    let d = pn & mask(u64::MAX, bits(func, av).unwrap_or(64));
+                    grow(&mut need, &mut work, func, av, d);
+                }
+            }
         }
     }
     // Params with empty need are unconstrained: replace their uses with a
@@ -1410,30 +1416,18 @@ fn splices(func: &mut Function) -> usize {
     // built — recompute it so dominance answers match the current graph.
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
-    // Every edge in the function: (pred block, terminator, dest index,
-    // target, args). Rebuilt after each splice since it mutates calls.
-    let collect_edges = |func: &Function| -> Vec<(Block, Inst, usize, Block, Vec<BlockArg>)> {
-        let mut out = Vec::new();
-        for p in func.layout.blocks() {
-            let Some(t) = func.layout.last_inst(p) else {
-                continue;
-            };
-            for (di, bc) in func.dfg.insts[t]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .into_iter()
-                .enumerate()
-            {
-                out.push((
-                    p,
-                    t,
-                    di,
-                    bc.block(&func.dfg.value_lists),
-                    bc.args(&func.dfg.value_lists).collect(),
-                ));
-            }
-        }
-        out
-    };
+    // Function-wide indexes, O(fn) each: value → blocks containing a use,
+    // and block → its predecessor blocks. Built lazily past the cheap
+    // rejections (they used to be rebuilt per candidate — O(candidates ×
+    // fn)) and invalidated only when a splice actually mutates the
+    // function. Within one candidate's apply, splices to other
+    // successors cannot change the queries these answer here (which
+    // J-params `s` uses; whether only J feeds `s`), so a single
+    // post-apply invalidation is enough — and a splice doesn't remove
+    // preds from cfg/j's path or add dominators, so the stale `dom` is
+    // conservative in the safe direction.
+    let mut uses: Option<FxHashMap<Value, FxHashSet<Block>>> = None;
+    let mut preds: Option<FxHashMap<Block, FxHashSet<Block>>> = None;
     let mut n = 0;
     for j in func.layout.blocks().collect::<Vec<_>>() {
         if !dom.is_reachable(j) {
@@ -1534,18 +1528,40 @@ fn splices(func: &mut Function) -> usize {
             continue;
         }
         // Uses of values outside their def block: v -> blocks containing a
-        // use. Rebuilt per candidate (the splice mutates them).
-        let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
-        for b in func.layout.blocks() {
-            for i in func.layout.block_insts(b) {
-                for v in func.dfg.inst_values(i) {
-                    uses.entry(func.dfg.resolve_aliases(v))
-                        .or_default()
-                        .insert(b);
+        // use.
+        if uses.is_none() {
+            let mut u: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
+            for b in func.layout.blocks() {
+                for i in func.layout.block_insts(b) {
+                    for v in func.dfg.inst_values(i) {
+                        u.entry(func.dfg.resolve_aliases(v))
+                            .or_default()
+                            .insert(b);
+                    }
                 }
             }
+            uses = Some(u);
         }
-        let all_edges = collect_edges(func);
+        if preds.is_none() {
+            let mut m: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+            for p in func.layout.blocks() {
+                let Some(t) = func.layout.last_inst(p) else {
+                    continue;
+                };
+                for bc in func
+                    .dfg
+                    .insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    m.entry(bc.block(&func.dfg.value_lists))
+                        .or_default()
+                        .insert(p);
+                }
+            }
+            preds = Some(m);
+        }
+        let uses_map = uses.as_ref().unwrap();
+        let preds_map = preds.as_ref().unwrap();
         // Successor set decided edges need.
         let sset: FxHashSet<Block> = decided.iter().map(|d| d.4).collect();
         let mut ok = !sset.contains(&j);
@@ -1556,12 +1572,12 @@ fn splices(func: &mut Function) -> usize {
             if !ok {
                 break;
             }
-            ok &= all_edges.iter().all(|e| e.3 != s || e.0 == j);
+            ok &= preds_map.get(&s).is_none_or(|ps| ps.iter().all(|&p| p == j));
         }
         if ok {
             'defs: for (di, &d) in jdefs.iter().enumerate() {
                 let is_param = di < params.len();
-                for &u in uses.get(&d).into_iter().flatten() {
+                for &u in uses_map.get(&d).into_iter().flatten() {
                     if u == j || (is_param && sset.contains(&u)) {
                         continue;
                     }
@@ -1575,31 +1591,42 @@ fn splices(func: &mut Function) -> usize {
         }
         // Splice J's params onto each needed successor: append one param per
         // used J-param, remap the upward-exposed uses, grow J's calls to it.
+        let mut mutated = false;
         for &s in &sset {
-            let mut added: Vec<usize> = Vec::new();
-            for (k, (&pj, &rpj)) in params.iter().zip(&rpjs).enumerate() {
-                if !uses.get(&rpj).is_some_and(|u| u.contains(&s)) {
-                    continue;
+            // Raw operand values in s by the value they resolve to — one
+            // scan serves every used-param remap below.
+            let mut raw_by_res: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+            for i in func.layout.block_insts(s) {
+                for v in func.dfg.inst_values(i) {
+                    raw_by_res
+                        .entry(func.dfg.resolve_aliases(v))
+                        .or_default()
+                        .push(v);
                 }
-                // Raw arg values in s naming this param (aliases resolve
-                // to it): remap every one to the new param.
-                let mut targets: FxHashSet<Value> = FxHashSet::default();
-                for i in func.layout.block_insts(s) {
-                    for v in func.dfg.inst_values(i) {
-                        if func.dfg.resolve_aliases(v) == rpj {
-                            targets.insert(v);
-                        }
-                    }
+            }
+            let mut added: Vec<usize> = Vec::new();
+            let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
+            for (k, (&pj, &rpj)) in params.iter().zip(&rpjs).enumerate() {
+                if !uses_map.get(&rpj).is_some_and(|u| u.contains(&s)) {
+                    continue;
                 }
                 let np = {
                     let ty = func.dfg.value_type(pj);
                     func.dfg.append_block_param(s, ty)
                 };
-                for i in func.layout.block_insts(s).collect::<Vec<_>>() {
-                    func.dfg
-                        .map_inst_values(i, |v| if targets.contains(&v) { np } else { v });
+                if let Some(raws) = raw_by_res.get(&rpj) {
+                    for &rv in raws {
+                        remap.insert(rv, np);
+                    }
                 }
                 added.push(k);
+            }
+            if !remap.is_empty() {
+                for i in func.layout.block_insts(s).collect::<Vec<_>>() {
+                    func.dfg
+                        .map_inst_values(i, |v| remap.get(&v).copied().unwrap_or(v));
+                }
+                mutated = true;
             }
             if !added.is_empty() {
                 // J's own calls to s grow by the same params.
@@ -1674,7 +1701,15 @@ fn splices(func: &mut Function) -> usize {
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[*di] =
                     nbc;
                 n += 1;
+                mutated = true;
             }
+        }
+        // An applied splice rewrote edge args, inst operands, and block
+        // signatures — the lazily-built indexes are stale for the next
+        // candidate.
+        if mutated {
+            uses = None;
+            preds = None;
         }
         // J may now be unreachable; leave it for sweep_blocks.
     }
