@@ -241,7 +241,13 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
     loop {
         let mut grew = false;
         for (&p, es) in &f.detail {
-            if es.is_empty() || blocked.contains(&p) || nf.contains_key(&p) {
+            // A self-row `(p, p, 0)` from `affine_nf` — p used as an
+            // `iadd`/`isub` base anywhere — is no class at all; only a
+            // real row (`r != p`) settles p's membership.
+            if es.is_empty()
+                || blocked.contains(&p)
+                || nf.get(&p).is_some_and(|&(r, _)| r != p)
+            {
                 continue;
             }
             let mut cls: Option<(Value, i64)> = None;
@@ -266,6 +272,34 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
             }
         }
         if !grew {
+            break;
+        }
+    }
+    // A row `p ↦ (r,k)` inserted while `r` was still its own leaf stays
+    // unnormalized when `r` later gains a row — equal values would key
+    // differently. Chase roots through `nf` until each row names the
+    // final root; cycles (p ↦ r ↦ p) keep the last true equivalence.
+    for _ in 0..nf.len().max(1) {
+        let mut moved = false;
+        let keys: Vec<Value> = nf.keys().copied().collect();
+        for p in keys {
+            let (mut r, mut k) = nf[&p];
+            let mut seen: FxHashSet<Value> = [p].into_iter().collect();
+            while seen.insert(r) {
+                match nf.get(&r) {
+                    Some(&(r2, k2)) if r2 != r => {
+                        k = k.wrapping_add(k2);
+                        r = r2;
+                    }
+                    _ => break,
+                }
+            }
+            if r != p && nf[&p] != (r, k) {
+                nf.insert(p, (r, k));
+                moved = true;
+            }
+        }
+        if !moved {
             break;
         }
     }
