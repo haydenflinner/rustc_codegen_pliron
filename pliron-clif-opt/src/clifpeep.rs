@@ -6140,6 +6140,12 @@ pub fn lcse(func: &mut Function) -> usize {
         }
         let mut depth = 0;
         loop {
+            // A single-use `iadd` chain costs O(len) per inst — O(N²) on
+            // encoder-style fns (stage2's `FileEncoder` spent ~75s here).
+            // Chains this deep are rare; cap the peel.
+            if depth >= 64 {
+                break;
+            }
             let a = func.dfg.resolve_aliases(*v);
             if let Some((b, k)) = bin_k(func, a, Opcode::Iadd) {
                 match off.checked_add(k).and_then(|x| i32::try_from(x).ok()) {

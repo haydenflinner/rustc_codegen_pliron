@@ -104,9 +104,9 @@ ascent::ascent! {
     /// param with an opaque (non-`Value`) edge arg.
     relation blocked(Value);
 
-    /// param fed ≥2 distinct values.
+    /// param fed ≥2 distinct values — computed in Rust (`alias_of`),
+    /// an O(E) scan instead of the O(E_p²) self-join.
     relation diffs(Value);
-    diffs(p) <-- edge_arg(p, a1), edge_arg(p, a2), if a1 != a2;
 
     /// Every in-edge delivers the same value — `param_src`'s relation.
     relation alias(Value, Value);
@@ -124,11 +124,33 @@ ascent::ascent! {
     canon(p, r) <-- alias(p, m), canon(m, r);
 }
 
+/// `diffs` as a datalog join costs Σ E_p² comparisons (all arg pairs
+/// per param) just to prove existence; a single scan is O(E). Every
+/// `Proots` run must seed it as an input.
+fn diffs_rows(f: &Facts) -> Vec<(Value,)> {
+    let mut first: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut diffs: Vec<(Value,)> = Vec::new();
+    for &(p, v) in &f.edge {
+        match first.entry(p) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if *e.get() != v {
+                    diffs.push((p,));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(v);
+            }
+        }
+    }
+    diffs
+}
+
 /// The alias relation over pre-extracted `facts` — `param_src`'s job.
 pub fn alias_of(f: &Facts) -> FxHashMap<Value, Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
+    p.diffs = diffs_rows(f);
     p.run();
     p.alias.into_iter().collect()
 }
@@ -147,6 +169,7 @@ pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
+    p.diffs = diffs_rows(&f);
     p.run();
     p.canon.into_iter().collect()
 }
