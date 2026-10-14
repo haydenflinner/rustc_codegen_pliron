@@ -1573,9 +1573,13 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
-pub(crate) fn round(func: &mut Function, nn: &NonNull, domcond: bool) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+pub(crate) fn round(
+    func: &mut Function,
+    nn: &NonNull,
+    domcond: bool,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> usize {
     let users = users(func);
     let facts = if domcond {
         edge_facts(func, &cfg)
@@ -2198,9 +2202,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
 /// raw `brif`). Legal only while every def of `y` is used inside `y` —
 /// `rebind_exports` creates exactly that shape by moving shared uses
 /// onto successor params.
-pub fn dispatch_dup(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
     let entry = func.layout.entry_block();
     // Values with any use outside their def block: a `y` whose defs all
     // stay internal can be cloned without stranding downstream uses.
@@ -2945,7 +2947,17 @@ fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> 
 /// dominates; equal operands or a constant against a known range decide it.
 /// Returns the icmps folded.
 pub fn fold_dominated_conds(func: &mut Function) -> usize {
-    let folds = dominated_conds(func);
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    fold_dominated_conds_at(func, &cfg, &domtree)
+}
+
+fn fold_dominated_conds_at(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> usize {
+    let folds = dominated_conds(func, cfg, domtree);
     for &(i, k) in &folds {
         let ty = func.dfg.value_type(func.dfg.first_result(i));
         func.replace(i).iconst(ty, i64::from(k));
@@ -2955,7 +2967,9 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
 
 /// The values of `fold_dominated_conds` and `fold_const_branches` without rewriting `func`.
 pub fn known_values(func: &Function) -> FxHashMap<Value, u64> {
-    let mut env: FxHashMap<Value, u64> = dominated_conds(func)
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let mut env: FxHashMap<Value, u64> = dominated_conds(func, &cfg, &domtree)
         .into_iter()
         .map(|(i, k)| (func.dfg.first_result(i), u64::from(k)))
         .collect();
@@ -2978,9 +2992,11 @@ pub fn known_value(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Op
     known(func, env, v)
 }
 
-fn dominated_conds(func: &Function) -> Vec<(Inst, bool)> {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+fn dominated_conds(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> Vec<(Inst, bool)> {
     let fact = edge_facts(func, &cfg);
     let tfact = table_facts(func, &cfg);
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
@@ -3057,7 +3073,10 @@ fn dominated_conds(func: &Function) -> Vec<(Inst, bool)> {
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
 /// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(func: &mut Function) -> Vec<(Value, Value)> {
+pub fn remove_trivial_params(
+    func: &mut Function,
+    dt: &DominatorTree,
+) -> Vec<(Value, Value)> {
     #[derive(Clone, Copy, PartialEq)]
     enum In {
         Unset,
@@ -3110,8 +3129,6 @@ pub fn remove_trivial_params(func: &mut Function) -> Vec<(Value, Value)> {
     // `v` must dominate `b`: an edge passing the param itself (e.g. a loop
     // latch) does not constrain `v`'s position, so without this check the
     // alias can put `v` in scopes its def doesn't dominate.
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
     let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
     for (&b, st) in &inc {
         if Some(b) == entry {
@@ -3452,7 +3469,13 @@ pub fn run(
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    let prof = crate::env_set("PLIRON_JT_PROF");
+    let mut tp = std::time::Instant::now();
     merge_chains(func);
+    if prof {
+        eprintln!("  merge_chains {:?}", tp.elapsed());
+        tp = std::time::Instant::now();
+    }
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
     let deadp = crate::pass_enabled("PLIRON_DEADPARAM");
@@ -3474,10 +3497,28 @@ pub fn run(
     // `change_to_alias` merges reported so the pipeline can carry the
     // dropped params' facts (nonnull/deref/…) onto their carriers.
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    // One CFG + domtree per "graph epoch": param/alias/value rewrites
+    // (trivp, deadp, domcond, inst sweeps) leave block adjacency intact,
+    // while ifconv/bypass/round retarget edges and force a rebuild.
+    let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
+    let cfg_dt = |func: &Function| {
+        let c = ControlFlowGraph::with_function(func);
+        let d = DominatorTree::with_function(func, &c);
+        (c, d)
+    };
     for _ in 0..8 {
+        let prof = crate::env_set("PLIRON_JT_PROF");
+        let mut tp = std::time::Instant::now();
         if trivp {
-            pmap.extend(remove_trivial_params(func));
+            {
+                let (_, d) = cd.get_or_insert_with(|| cfg_dt(func));
+                pmap.extend(remove_trivial_params(func, d));
+            }
             check(func, "trivp");
+        }
+        if prof {
+            eprintln!("  trivp {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
         }
         if deadp {
             let removed = remove_dead_params(func);
@@ -3487,13 +3528,22 @@ pub fn run(
             }
             check(func, "deadp");
         }
+        if prof {
+            eprintln!("  deadp {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
         let dc = if domcond {
-            fold_dominated_conds(func)
+            let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+            fold_dominated_conds_at(func, c, d)
         } else {
             0
         };
         dominated_folds += dc;
         check(func, "domcond");
+        if prof {
+            eprintln!("  domcond {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
         // Select-diamond if-conversion feeds back: folded forwarders expose
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
@@ -3505,27 +3555,45 @@ pub fn run(
         };
         check(func, "ifconv");
         if ic > 0 {
+            cd = None;
             remove_unreachable_blocks(func);
         }
         check(func, "unreach");
-        let n = dc + ic + bypass_forwarders(func);
+        let bpn = bypass_forwarders(func);
         check(func, "bypass");
+        if prof {
+            eprintln!("  ifconv+bypass {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
         // Rebuild after `ifconv` so cloned `inbounds` offsets are seen.
         let nn = NonNull::new(func, loads, derived);
-        let n = n + round(func, &nn, domcond);
+        let rn = {
+            let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+            round(func, &nn, domcond, c, d)
+        };
         check(func, "round");
+        if prof {
+            eprintln!("  nn+round {:?}", tp.elapsed());
+        }
+        if bpn + rn > 0 {
+            cd = None;
+        }
+        let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
             break;
         }
     }
+    if prof {
+        eprintln!("  loop-total {:?}", tp.elapsed());
+        tp = std::time::Instant::now();
+    }
     let nn = NonNull::new(func, loads, derived);
-    (
-        total + fold_null_tests(func, &nn),
-        dead_params,
-        dominated_folds,
-        pmap,
-    )
+    let fnn = fold_null_tests(func, &nn);
+    if prof {
+        eprintln!("  fold_null_tests {:?}", tp.elapsed());
+    }
+    (total + fnn, dead_params, dominated_folds, pmap)
 }
 
 #[cfg(test)]

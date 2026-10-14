@@ -734,19 +734,29 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if crate::pass_enabled("PLIRON_CHAINMERGE") {
         jumpthread::merge_chains(&mut p.clctx.func);
     }
+    let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
     if crate::pass_enabled("PLIRON_DISPATCHDUP") {
         // Duplicating a dispatch into a jump pred rewires that pred's own
         // jump-preds onto the dispatch — run to fixpoint so multi-hop
         // chains (851/853/854 -> 388 -> 859) fully collapse.
         for _ in 0..6 {
-            let k = jumpthread::dispatch_dup(&mut p.clctx.func);
+            let k = {
+                let (_, d) = cd.get_or_insert_with(|| {
+                    let c = ControlFlowGraph::with_function(&p.clctx.func);
+                    let d = DominatorTree::with_function(&p.clctx.func, &c);
+                    (c, d)
+                });
+                jumpthread::dispatch_dup(&mut p.clctx.func, d)
+            };
             n += k;
             if k == 0 {
                 break;
             }
+            cd = None;
         }
     }
     if crate::pass_enabled("PLIRON_EDGESPEC2") {
+        cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
             n += jumpthread::rebind_exports(&mut p.clctx.func);
         }
@@ -754,11 +764,19 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
         if crate::pass_enabled("PLIRON_DISPATCHDUP") {
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
-                let k = jumpthread::dispatch_dup(&mut p.clctx.func);
+                let k = {
+                    let (_, d) = cd.get_or_insert_with(|| {
+                        let c = ControlFlowGraph::with_function(&p.clctx.func);
+                        let d = DominatorTree::with_function(&p.clctx.func, &c);
+                        (c, d)
+                    });
+                    jumpthread::dispatch_dup(&mut p.clctx.func, d)
+                };
                 n += k;
                 if k == 0 {
                     break;
                 }
+                cd = None;
             }
         }
     }
@@ -782,13 +800,26 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // (the `seen`/`locked` guards), and every repair locks the region it
     // touched. Later dispatch-dup edges decided by constants (the
     // block388 -> block935 disc) need follow-up rounds.
+    let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
     for i in 0..8 {
         let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
-        let n = jumpthread::round(
-            &mut p.clctx.func,
-            &nn,
-            crate::pass_enabled("PLIRON_DOMCOND"),
-        );
+        let n = {
+            let (c, d) = cd.get_or_insert_with(|| {
+                let c = ControlFlowGraph::with_function(&p.clctx.func);
+                let d = DominatorTree::with_function(&p.clctx.func, &c);
+                (c, d)
+            });
+            jumpthread::round(
+                &mut p.clctx.func,
+                &nn,
+                crate::pass_enabled("PLIRON_DOMCOND"),
+                c,
+                d,
+            )
+        };
+        if n > 0 {
+            cd = None;
+        }
         total += n;
         if p.dump {
             p.dump(&format!("jtr{i}"));
