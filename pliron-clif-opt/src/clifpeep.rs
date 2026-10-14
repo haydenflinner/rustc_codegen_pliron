@@ -4791,7 +4791,12 @@ pub fn ovkill(func: &mut Function) -> usize {
             }
             // Single-pred: the `icmp` edge fact also bounds `x` itself in
             // this block (`brif (ult d, 10)` → `d <= 9` on the taken edge).
-            if preds.len() == 1 {
+            // Skip the destination scan unless the pred is a `brif` —
+            // `edge_fact` only reads those, and a `br_table` pred lists
+            // every arm (O(arms²) on a giant dispatch).
+            if preds.len() == 1
+                && matches!(func.dfg.insts[preds[0].inst], InstructionData::Brif { .. })
+            {
                 let pi = preds[0].inst;
                 let dests = func.dfg.insts[pi]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
