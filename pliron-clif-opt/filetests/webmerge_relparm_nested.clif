@@ -1,0 +1,32 @@
+; test webmerge
+; Nested-diff relational merge: the entry edge feeds slot1
+; `c + (x - d)` where `d = c + bv`, so `arg0 - arg1 = d - c = bv` —
+; provable only through the `y0 + (x - d)` rewrite, not a literal
+; `isub(arg0, bv)`. `key_sub` chases it to the bound `bv = v2`;
+; `p_j` drops to `isub p_i, bv` at the header. The latch steps both
+; params by +8, preserving the gap.
+; check: block1(v4: i64):
+; check-not: block1(v4: i64, v5: i64)
+; diffcheck
+function %f(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    v10 = iadd v1, v2
+    v11 = isub v0, v10
+    v12 = iadd v1, v11
+    jump block1(v0, v12)
+
+block1(v4: i64, v5: i64):
+    v6 = iconst.i64 0
+    v7 = icmp eq v4, v6
+    brif v7, block3, block2
+
+block2:
+    v8 = iconst.i64 8
+    v9 = iadd v4, v8
+    v13 = iadd v5, v8
+    jump block1(v9, v13)
+
+block3:
+    v14 = isub v4, v5
+    return v14
+}

@@ -2609,10 +2609,23 @@ pub fn arghoist(func: &mut Function) -> usize {
 /// `derived`-pointer facts across the merge.
 pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     use crate::proots::Key;
+    let t0 = std::time::Instant::now();
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+    let t1 = std::time::Instant::now();
     let nf = crate::proots::web_nf(func);
+    let t2 = std::time::Instant::now();
     let canon = crate::proots::canon_map(func);
+    let t3 = std::time::Instant::now();
+    if std::env::var_os("PLIRON_WM_PROF").is_some() {
+        eprintln!(
+            "webmerge {}: cfg+dom {:?} web_nf {:?} canon {:?}",
+            func.name,
+            t1 - t0,
+            t2 - t1,
+            t3 - t2
+        );
+    }
     // Keys memoize across args — shared operand trees key once.
     let mut memo: FxHashMap<Value, crate::proots::Key> = FxHashMap::default();
     let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
@@ -2633,6 +2646,9 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
+    let mut nblk = 0usize;
+    let mut tkeys_sum = std::time::Duration::ZERO;
+    let mut tblk_sum = std::time::Duration::ZERO;
     // (target block, class key, param to rebind) — emission happens after
     // the scan so `Value`s stay valid and insertions keep operand order.
     let mut inserts: Vec<(Block, Key, Value)> = vec![];
@@ -2646,8 +2662,13 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // `TryCallExn`) are `None` in `eargs` but key as `O`, so two
         // slots fed the same pseudo-arg dedup via `P` while the feeding
         // inst in the key keeps distinct `try_call`s distinct.
+        let tkeys = std::time::Instant::now();
         let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
         let mut skeys: Vec<Vec<Key>> = Vec::with_capacity(es.len());
+        // `shk[e][ix]` — the key's hash, computed once next to the key
+        // itself so phase A's `O(slots × edges)` compares only pay a
+        // structural walk when hashes actually agree.
+        let mut shk: Vec<Vec<u64>> = Vec::with_capacity(es.len());
         let mut arity_ok = true;
         for &(i, d) in es {
             let args: Vec<BlockArg> = func.dfg.insts[i]
@@ -2663,42 +2684,124 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v)))
                     .collect(),
             );
-            skeys.push(
-                args.iter()
-                    .map(|a| match a {
-                        BlockArg::Value(v) => crate::proots::key_of(
-                            func,
-                            &nf,
-                            &canon,
-                            &mut memo,
-                            func.dfg.resolve_aliases(*v),
-                        ),
-                        // `(inst, tag, payload)` — same `BlockCall` arg
-                        // is the same value, anything else differs.
-                        BlockArg::TryCallRet(x) => {
-                            Key::O((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                        }
-                        BlockArg::TryCallExn(x) => {
-                            Key::O((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                        }
+            let row: Vec<Key> = args
+                .iter()
+                .map(|a| match a {
+                    BlockArg::Value(v) => crate::proots::key_of(
+                        func,
+                        &nf,
+                        &canon,
+                        &mut memo,
+                        func.dfg.resolve_aliases(*v),
+                    ),
+                    // `(inst, tag, payload)` — same `BlockCall` arg
+                    // is the same value, anything else differs.
+                    BlockArg::TryCallRet(x) => {
+                        Key::O((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                    }
+                    BlockArg::TryCallExn(x) => {
+                        Key::O((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                    }
+                })
+                .collect();
+            shk.push(
+                row.iter()
+                    .map(|k| {
+                        let mut h = rustc_hash::FxHasher::default();
+                        std::hash::Hash::hash(k, &mut h);
+                        std::hash::Hasher::finish(&h)
                     })
                     .collect(),
             );
+            skeys.push(row);
         }
         if !arity_ok {
             continue;
         }
+        let no_phased = std::env::var_os("PLIRON_WM_NOPHASED").is_some();
+        let no_phasec = std::env::var_os("PLIRON_WM_NOPHASEC").is_some();
+        let no_phaseb = std::env::var_os("PLIRON_WM_NOPHASEB").is_some();
+        // `pk[e][i]` — slot `i`'s key on edge `e`, paramized relative to
+        // the block's slots (skip = i), computed lazily: most slots
+        // either merge at phase A or are never a viable sibling, so an
+        // eager `edges × slots` matrix of deep `Key` clones dominated
+        // the pass on param-heavy blocks.
+        let vmap: FxHashMap<Value, u32> = ps
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p, i as u32))
+            .collect();
+        // `hmaps[e]`: slot-key hash → first slot index, for `paramize`'s
+        // subtree probe. `hmemo` memoizes per-node hashes — `Rc` sharing
+        // makes most lookups O(1); see `khash_m`.
+        let mut hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
+        let hmaps: Vec<FxHashMap<u64, u32>> = skeys
+            .iter()
+            .map(|row| {
+                let mut m = FxHashMap::default();
+                for (i, k) in row.iter().enumerate() {
+                    m.entry(crate::proots::khash_m(k, &mut hmemo)).or_insert(i as u32);
+                }
+                m
+            })
+            .collect();
+        // Each cell carries the key's hash alongside — the scan
+        // compares keys `O(slots × edges)` times and a failed
+        // structural `==` on a 10⁴-node key costs as much as computing
+        // the hash once, so comparisons go through `pkh` first. Node
+        // counts (`pkn`) stay lazily separate — only the relational
+        // oracle's size cap needs them.
+        let hmemo = std::cell::RefCell::new(hmemo);
+        let pk: Vec<Vec<std::cell::OnceCell<(Key, u64)>>> = (0..es.len())
+            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
+            .collect();
+        let pkn_: Vec<Vec<std::cell::OnceCell<usize>>> = (0..es.len())
+            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
+            .collect();
+        let pkm = |e: usize, i: usize| -> &(Key, u64) {
+            pk[e][i].get_or_init(|| {
+                let mut hm = hmemo.borrow_mut();
+                let k = crate::proots::paramize(
+                    &skeys[e][i],
+                    &skeys[e],
+                    &ps,
+                    i,
+                    &hmaps[e],
+                    &vmap,
+                    &mut hm,
+                );
+                let h = crate::proots::khash_m(&k, &mut hm);
+                (k, h)
+            })
+        };
+        let pk_of = |e: usize, i: usize| -> &Key { &pkm(e, i).0 };
+        let pkh = |e: usize, i: usize| pkm(e, i).1;
+        let pkn =
+            |e: usize, i: usize| *pkn_[e][i].get_or_init(|| crate::proots::nodes(pk_of(e, i)));
         // Slot -> merge key pending materialization in this block. Phase-A
         // keys are `P`-free; phase-B candidates keep `P` leaves until
         // `resolve_p` inlines them.
         let mut pend: FxHashMap<usize, Key> = FxHashMap::default();
         let mut cands: Vec<(usize, Key)> = vec![];
+        let tblk = std::time::Instant::now();
+        let dkeys = tblk - tkeys;
+        nblk += 1;
+        tkeys_sum += dkeys;
+        if std::env::var_os("PLIRON_WM_PROF").is_some() && dkeys.as_micros() > 200 {
+            eprintln!(
+                "webmerge {} {b}: {} slots {} edges keying {:?}",
+                func.name,
+                ps.len(),
+                es.len(),
+                dkeys
+            );
+        }
 
         for (ix, &p) in ps.iter().enumerate() {
             if pmap.contains_key(&p) {
                 continue;
             }
-            let mut class: Option<Key> = None;
+            let mut class: Option<(u64, &Key)> = None;
             let mut member: Option<Value> = None;
             let mut uniform = false;
             for (e, _) in es.iter().enumerate() {
@@ -2711,13 +2814,13 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 if v == p {
                     continue;
                 }
-                let k = skeys[e][ix].clone();
-                match &class {
+                let k = &skeys[e][ix];
+                match class {
                     None => {
-                        class = Some(k);
+                        class = Some((shk[e][ix], k));
                         uniform = true;
                     }
-                    Some(t) if *t != k => {
+                    Some((h, t)) if h != shk[e][ix] || t != k => {
                         uniform = false;
                         break;
                     }
@@ -2729,7 +2832,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     member = Some(v);
                 }
             }
-            if let Some(key) = class.filter(|_| uniform) {
+            if let Some((_, key)) = class.filter(|_| uniform) {
                 match member {
                     Some(w) => {
                         pmap.insert(p, w);
@@ -2737,17 +2840,20 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     None => {
                         // No member reaches `b`'s head — only mergeable
                         // when the class's shape can be rebuilt there.
-                        if !mat_ok(func, &dom, b, &key, &ps) {
+                        if !mat_ok(func, &dom, b, key, &ps) {
                             continue;
                         }
                         pend.insert(ix, key.clone());
-                        inserts.push((b, key, p));
+                        inserts.push((b, key.clone(), p));
                     }
                 }
                 param_drops.push(p);
                 for e in 0..es.len() {
                     drop_ixs.entry((es[e].0, es[e].1)).or_default().push(ix);
                 }
+                continue;
+            }
+            if no_phaseb {
                 continue;
             }
             // Phase B — sibling-slot congruence: `p_j` drops when every
@@ -2759,14 +2865,13 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             if ps.len() < 2 {
                 continue;
             }
-            let mut rel: Option<Key> = None;
+            let mut rel: Option<(usize, &Key)> = None;
             let mut uni = true;
             for (e, _) in es.iter().enumerate() {
-                let kj = &skeys[e][ix];
-                let rk = crate::proots::paramize(kj, &skeys[e], &ps, ix);
-                match &rel {
-                    None => rel = Some(rk),
-                    Some(t) if *t != rk => {
+                let rk = pk_of(e, ix);
+                match rel {
+                    None => rel = Some((e, rk)),
+                    Some((se, t)) if pkh(se, ix) != pkh(e, ix) || t != rk => {
                         uni = false;
                         break;
                     }
@@ -2774,84 +2879,255 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 }
             }
             if uni
-                && let Some(rk) = rel
-                && has_p(&rk)
+                && let Some((_, rk)) = rel
+                && has_p(rk)
             {
-                cands.push((ix, rk));
+                cands.push((ix, rk.clone()));
                 continue;
             }
-            // Phase D — relational merging with deferral, subsuming
+            // Phase D — deferral-tolerant relational merging, subsuming
             // relparm's loop-invariant-gap case. `p_j = R(slots)` holds
             // when every edge either supplies an `R`-shaped arg or is a
-            // recurrence step that preserves `R`: `arg_j = p_j + o_j`
-            // with every referenced slot `arg_i = p_i + o_i` and
-            // `Σ slope_i·o_i = o_j` (the relation shifts by exactly its
-            // total slope). The seed `R` comes from a concrete edge —
-            // e.g. `arg_j = arg_i - B` paramizes to `isub(P(i), B)` —
-            // while a back-edge stepping both params by `c` contributes
-            // `iadd(P(j), c)` and defers.
-            let mut kjs: Vec<Key> = Vec::with_capacity(es.len());
-            let mut seed: Option<Key> = None;
-            for e in 0..es.len() {
-                let kj = crate::proots::paramize(&skeys[e][ix], &skeys[e], &ps, ix);
-                // A `p_j + o` self-step (`Q(ix)` base — the param's old
-                // value) can only be a deferral — it can never seed `R`
-                // (it would resolve `Q(ix)` cyclically).
-                let selfstep =
-                    matches!(crate::proots::peel_off(&kj).0, Key::Q(x) if *x == ix as u32);
-                if !selfstep {
-                    match &seed {
-                        None => seed = Some(kj.clone()),
-                        Some(s) if *s != kj => {
-                            seed = None;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                kjs.push(kj);
-            }
-            let Some(rk) = seed.filter(|_| kjs.len() == es.len()) else {
+            // recurrence step preserving `R`: `arg_j = p_j + o_j` with
+            // each slot `i` referenced by `R` fed `arg_i = p_i + o_i`
+            // and `Σ slope_i·o_i = o_j` (the relation shifts by exactly
+            // its total slope). Seeds come two ways: a uniform `R`
+            // among non-self-step edges, or `key_sub` proving
+            // `arg_j = arg_i - D` uniformly — the latter is `isub(P(i),
+            // D)`, catching diffs established through rewrite chains
+            // (`y0 + (x - d)` et al) a literal match misses.
+            if no_phased {
                 continue;
+            }
+            let kjs: Vec<&Key> = es
+                .iter()
+                .enumerate()
+                .map(|(e, _)| pk_of(e, ix))
+                .collect();
+            let selfstep = |k: &Key| {
+                // A `p_j + o` self-step (`Q(ix)` base — the param's old
+                // value) can only defer — it can never seed `R` (the
+                // `Q(ix)` leaf would resolve cyclically).
+                matches!(crate::proots::peel_off(k).0, Key::Q(x) if *x == ix as u32)
             };
-            // Every non-seed edge must defer: `arg_j` peels to
-            // `Q(ix) + o_j` (the old `p_j` stepped) and each slot `i`
-            // referenced by `R` is fed `arg_i = p_i + o_i` — a `Q(i)`
-            // base — with the slope-weighted sum equal to `o_j`.
-            let refs = crate::proots::pset(&rk);
-            let mut holds = has_p(&rk);
-            for (e, kj) in kjs.iter().enumerate() {
-                if *kj == rk {
-                    continue;
+            // Does edge `e` defer under hypothesis `r`? Either it
+            // supplies `r` verbatim, or it is a preserving step:
+            // `arg_j = p_j + o_j` while every slot `i` in `r`'s
+            // reference set steps `arg_i = p_i + o_i` with
+            // `Σ slope_i·o_i = o_j`.
+            let defers = |e: usize, r: &Key, rh: u64, proven: &FxHashSet<usize>| -> bool {
+                let kj = &kjs[e];
+                if (pkh(e, ix) == rh && **kj == *r) || proven.contains(&e) {
+                    return true;
                 }
                 let (bj, oj) = crate::proots::peel_off(kj);
                 if !matches!(bj, Key::Q(x) if *x == ix as u32) {
-                    holds = false;
-                    break;
+                    return false;
                 }
                 let mut sum = 0i64;
-                let mut ok = true;
-                for &i in &refs {
-                    let ki =
-                        crate::proots::paramize(&skeys[e][i as usize], &skeys[e], &ps, i as usize);
-                    let (bi, oi) = crate::proots::peel_off(&ki);
-                    let Some(s) = crate::proots::slope(&rk, i) else {
-                        ok = false;
-                        break;
+                for &i in &crate::proots::pset(r) {
+                    let (bi, oi) = crate::proots::peel_off(pk_of(e, i as usize));
+                    let Some(s) = crate::proots::slope(r, i) else {
+                        return false;
                     };
                     if !matches!(bi, Key::Q(x) if *x == i) {
-                        ok = false;
-                        break;
+                        return false;
                     }
                     sum += s * oi;
                 }
-                if !ok || sum != oj {
-                    holds = false;
-                    break;
+                sum == oj
+            };
+            // (1) Uniform `R` among non-self-step edges.
+            let mut seed: Option<usize> = None;
+            let mut ok = true;
+            for (e, kj) in kjs.iter().enumerate() {
+                if selfstep(kj) {
+                    continue;
+                }
+                match seed {
+                    None => seed = Some(e),
+                    Some(se) if pkh(se, ix) != pkh(e, ix) || *kjs[se] != **kj => {
+                        ok = false;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            if holds {
-                cands.push((ix, rk));
+            // A seed with no `P`/`Q` leaves is a uniform absolute class —
+            // phase A already judged it — so it can't seed a relation.
+            // Each candidate carries the edges its oracle *proved*: for a
+            // diff-seeded rel those edges satisfy `arg_i - arg_j = D`
+            // without `arg_j` being textually `isub`-shaped, so `defers`
+            // can't re-derive them from `kj` alone.
+            let khash = |k: &Key| crate::proots::khash_m(k, &mut hmemo.borrow_mut());
+            let mut rels: Vec<(Key, FxHashSet<usize>)> = vec![];
+            if ok
+                && let Some(se) = seed
+                && has_p(kjs[se])
+            {
+                rels.push((
+                    kjs[se].clone(),
+                    kjs.iter()
+                        .enumerate()
+                        .filter(|(e, k)| pkh(*e, ix) == pkh(se, ix) && ***k == *kjs[se])
+                        .map(|(e, _)| e)
+                        .collect(),
+                ));
+            }
+            // (2) Diff-seeded: `arg_j = arg_i ∓ D` uniformly per sibling
+            // slot `i` over non-self-step edges — `isub(P(i), D)` /
+            // `iadd(P(i), D)`. Two oracles, tried per slot: `key_sub`
+            // on the paramized keys (its diffs may themselves reference
+            // slots via `P`), then `diff_b` on the raw values — whose
+            // param-pair chase proves diffs across whole chains of
+            // echoing predecessors (tokenize's `pos = cur - base`).
+            // The diff-seeded path only pays on loop headers — a
+            // deferring edge must reach back into the head's dominance
+            // region anyway — and the `O(slots × edges)` oracle probes
+            // are too hot to run on every non-loop block.
+            let is_header = es.iter().any(|&(i, _)| {
+                func.layout
+                    .inst_block(i)
+                    .is_some_and(|eb| dom.dominates(b, eb, &func.layout))
+            });
+            if !rels
+                .iter()
+                .any(|(r, pr)| (0..es.len()).all(|e| defers(e, r, khash(r), pr)))
+                && is_header
+                && func.dfg.value_type(ps[ix]).is_int()
+            {
+                let ty = func.dfg.value_type(ps[ix]);
+                let mk = |i: usize, op: Opcode, d: Key| {
+                    Key::N(
+                        op,
+                        ty,
+                        std::rc::Rc::from([Key::P(i as u32), d]),
+                        crate::proots::tag::BIN,
+                    )
+                };
+                // `oracle(e, kj, i)` is tri-state: `Some(Some(r))` proves
+                // edge `e` supplies `r`; `Some(None)` is a deferring step
+                // (`defers` re-verifies structurally); `None` means slot
+                // `i` can't explain edge `e` at all.
+                let oracle = |e: usize, kj: &Key, i: usize| -> Option<Option<Key>> {
+                    // `key_sub`'s algebraic probes each pay a structural
+                    // `==` — on 10⁴-node expression keys that's the
+                    // pass's dominant cost, and a diff needing keys that
+                    // big is never a relation worth materializing.
+                    const REL_KEY_CAP: usize = 512;
+                    let ki = pk_of(e, i);
+                    if pkn(e, i) <= REL_KEY_CAP && pkn(e, ix) <= REL_KEY_CAP
+                        && let Some(d) = crate::proots::key_sub(ki, kj, ty, 8)
+                            .map(|d| mk(i, Opcode::Isub, d))
+                            .or_else(|| {
+                                crate::proots::key_sub(kj, ki, ty, 8)
+                                    .map(|d| mk(i, Opcode::Iadd, d))
+                            })
+                    {
+                        return Some(Some(d));
+                    }
+                    // `diff_b`'s param-pair chase reaches where keys
+                    // can't: args that are params of the same
+                    // predecessor, diffed through *that* block's
+                    // in-edges (tokenize's `pos = cur - base` web).
+                    // Calling it on arbitrary value pairs is a
+                    // quadratic-with-fanout oracle — far too hot for
+                    // this inner loop, so it runs only on the
+                    // same-block-param shape.
+                    if std::env::var_os("PLIRON_WM_NODIFFB").is_some() {
+                        return None;
+                    }
+                    let (Some(ai), Some(aj)) = (eargs[e][i], eargs[e][ix])
+                    else {
+                        return None;
+                    };
+                    if !matches!(
+                        (func.dfg.value_def(ai), func.dfg.value_def(aj)),
+                        (ValueDef::Param(q1, _), ValueDef::Param(q2, _))
+                            if q1 == q2
+                    ) {
+                        return None;
+                    }
+                    match crate::indvars::diff_b(
+                        func, &cfg, ps[i], ps[ix], ai, aj, 8, false,
+                    ) {
+                        Some(crate::indvars::Diff::Lit(bv)) => {
+                            // A bound that is itself a param of `b`
+                            // was read at the edge source — `Q(k)`,
+                            // not `P(k)` — so deferral accounts for
+                            // slot `k` stepping.
+                            let d = match ps.iter().position(|&p| p == bv) {
+                                Some(k) => Key::Q(k as u32),
+                                None => Key::V(bv),
+                            };
+                            Some(Some(mk(i, Opcode::Isub, d)))
+                        }
+                        // `Head` — this edge preserves the pair's own
+                        // diff (echoed or uniformly stepped params) —
+                        // `defers` verifies it.
+                        Some(crate::indvars::Diff::Head) => Some(None),
+                        _ => None,
+                    }
+                };
+                // Only siblings that work on the first non-self-step
+                // edge can hold on all of them — probe that edge per
+                // slot before paying `O(edges)` scans, so the loop
+                // costs `O(slots)` + `viable × edges`, not
+                // `slots² × edges`.
+                let e0 = match (0..es.len()).find(|&e| !selfstep(&kjs[e])) {
+                    Some(e0) => e0,
+                    None => continue,
+                };
+                for i in 0..ps.len() {
+                    if i == ix || func.dfg.value_type(ps[i]) != ty {
+                        continue;
+                    }
+                    if oracle(e0, &kjs[e0], i).is_none() {
+                        continue;
+                    }
+                    let mut rel: Option<Key> = None;
+                    let mut proven: FxHashSet<usize> = FxHashSet::default();
+                    let mut uni_ok = true;
+                    for (e, kj) in kjs.iter().enumerate() {
+                        if selfstep(kj) {
+                            continue;
+                        }
+                        let Some(r) = oracle(e, kj, i) else {
+                            uni_ok = false;
+                            break;
+                        };
+                        // Oracle-deferred (`Head`): the chase proved
+                        // this edge preserves the pair invariant even
+                        // when `kj` isn't structurally `Q(ix)`-based —
+                        // count it as proven.
+                        let Some(r) = r else {
+                            proven.insert(e);
+                            continue;
+                        };
+                        match &rel {
+                            None => rel = Some(r),
+                            Some(t) if *t == r => {}
+                            _ => {
+                                uni_ok = false;
+                                break;
+                            }
+                        }
+                        proven.insert(e);
+                    }
+                    if uni_ok && let Some(r) = rel {
+                        rels.push((r, proven));
+                    }
+                }
+            }
+            for (rk, pr) in rels {
+                let hold = has_p(&rk) && (0..es.len()).all(|e| defers(e, &rk, khash(&rk), &pr));
+                if std::env::var_os("PLIRON_WEBMERGE_REL").is_some() {
+                    eprintln!("webmerge-rel {b} slot{ix} cand {rk:?} hold={hold}");
+                }
+                if hold {
+                    cands.push((ix, rk));
+                    break;
+                }
             }
         }
 
@@ -2863,6 +3139,18 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // surviving param and the emitted tree dangles off the dropped
         // `p1`; with seeds in place the shared `stack` catches the cycle
         // and both resolve to `None`.
+        if std::env::var_os("PLIRON_WM_PROF").is_some() {
+            let d = tblk.elapsed();
+            if d.as_micros() > 200 {
+                eprintln!(
+                    "webmerge {} {b}: {} slots {} edges ixl {:?}",
+                    func.name,
+                    ps.len(),
+                    es.len(),
+                    d
+                );
+            }
+        }
         for &(ix, ref rk) in &cands {
             pend.insert(ix, rk.clone());
         }
@@ -2895,6 +3183,17 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             }
         }
 
+        let dblk = tblk.elapsed();
+        tblk_sum += dblk;
+        if std::env::var_os("PLIRON_WM_PROF").is_some() && dblk.as_micros() > 200 {
+            eprintln!(
+                "webmerge {} {b}: {} slots {} edges scan {:?}",
+                func.name,
+                ps.len(),
+                es.len(),
+                dblk
+            );
+        }
         // Phase C — coinductive bisimulation over the surviving params
         // (phimerge, lifted into key space): hypothesize same-type
         // params equivalent, then refine classes by each slot's
@@ -2904,6 +3203,9 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // the leader drop. Unlike phase B's structural `P` matching this
         // closes over self-reference: `(p_i, p_j)` carried identically
         // on the back-edge merge even when no syntactic relation holds.
+        if no_phasec {
+            continue;
+        }
         let surv: Vec<usize> = (0..ps.len())
             .filter(|&i| {
                 !pmap.contains_key(&ps[i])
@@ -2928,9 +3230,9 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     while let Some(&c) = pmap.get(&w) {
                         w = c;
                     }
-                    ps.iter()
-                        .position(|&q| q == w)
-                        .and_then(|i| cls.get(&i))
+                    vmap
+                        .get(&w)
+                        .and_then(|&i| cls.get(&(i as usize)))
                         .map(|&l| ps[l])
                         .unwrap_or(w)
                 };
@@ -3030,6 +3332,16 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         .collect();
     let n = param_drops.len();
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
+    if std::env::var_os("PLIRON_WM_PROF").is_some() {
+        eprintln!(
+            "webmerge {}: total {:?} keying {:?} ixscan {:?} blocks {}",
+            func.name,
+            t0.elapsed(),
+            tkeys_sum,
+            tblk_sum,
+            nblk
+        );
+    }
     (n, pmap)
 }
 

@@ -1574,7 +1574,7 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = indvars::relparm(&mut p.clctx.func, an);
+    let k = s_webmerge(p, an);
     if k > 0 && p.dump {
         p.dump("relparm");
     }

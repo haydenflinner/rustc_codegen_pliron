@@ -284,8 +284,8 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 pub enum Key {
     V(Value),
     K(cranelift_codegen::ir::Type, i64),
-    A(cranelift_codegen::ir::Type, Box<Key>, i64),
-    N(Opcode, cranelift_codegen::ir::Type, Box<[Key]>, u64),
+    A(cranelift_codegen::ir::Type, std::rc::Rc<Key>, i64),
+    N(Opcode, cranelift_codegen::ir::Type, std::rc::Rc<[Key]>, u64),
     /// "Whatever arrived in param slot `i` on this edge" — a leaf for
     /// sibling-slot congruence (`paramize`), so `p_j = f(p_i)` merges
     /// key as `f`'s tree over `P(i)` on every edge.
@@ -354,13 +354,13 @@ pub fn key_of(
             return if k == 0 {
                 rk
             } else {
-                Key::A(ty, Box::new(rk), k)
+                Key::A(ty, std::rc::Rc::new(rk), k)
             };
         }
         let Some(di) = func.dfg.value_def(v).inst() else {
             return Key::V(v);
         };
-        let mut args = |vs: &[Value]| -> Box<[Key]> {
+        let mut args = |vs: &[Value]| -> std::rc::Rc<[Key]> {
             vs.iter()
                 .map(|&a| {
                     let a = func.dfg.resolve_aliases(a);
@@ -436,7 +436,7 @@ pub fn key_of(
             } => Key::N(
                 opcode,
                 rty,
-                Box::new([Key::K(
+                std::rc::Rc::new([Key::K(
                     cranelift_codegen::ir::types::I32,
                     i32::from(offset) as i64,
                 )]),
@@ -448,7 +448,7 @@ pub fn key_of(
                 flags,
                 offset,
             } => {
-                let mut a = args(&[arg]).into_vec();
+                let mut a = args(&[arg]).to_vec();
                 a.push(Key::K(
                     cranelift_codegen::ir::types::I32,
                     i32::from(offset) as i64,
@@ -456,7 +456,7 @@ pub fn key_of(
                 Key::N(
                     opcode,
                     rty,
-                    a.into_boxed_slice(),
+                    std::rc::Rc::from(a),
                     tag::LOAD | (flags.as_u32() as u64) << 8,
                 )
             }
@@ -469,7 +469,7 @@ pub fn key_of(
             InstructionData::UnaryIeee16 { opcode, imm } => Key::N(
                 opcode,
                 rty,
-                Box::new([Key::K(
+                std::rc::Rc::new([Key::K(
                     cranelift_codegen::ir::types::I64,
                     imm.bits() as i64,
                 )]),
@@ -478,7 +478,7 @@ pub fn key_of(
             InstructionData::UnaryIeee32 { opcode, imm } => Key::N(
                 opcode,
                 rty,
-                Box::new([Key::K(
+                std::rc::Rc::new([Key::K(
                     cranelift_codegen::ir::types::I64,
                     imm.bits() as i64,
                 )]),
@@ -487,7 +487,7 @@ pub fn key_of(
             InstructionData::UnaryIeee64 { opcode, imm } => Key::N(
                 opcode,
                 rty,
-                Box::new([Key::K(cranelift_codegen::ir::types::I64, imm.bits() as i64)]),
+                std::rc::Rc::new([Key::K(cranelift_codegen::ir::types::I64, imm.bits() as i64)]),
                 tag::UIEEE,
             ),
             _ => Key::V(v),
@@ -514,38 +514,115 @@ pub mod tag {
 }
 
 /// Rewrite `k` slot-relative: any subtree equal to `slots[i]`'s key —
-/// or naming `ps[i]` itself, a param *is* its slot's value — becomes
-/// `P(i)`, "whatever arrived in slot `i` on this edge". Subtrees match
-/// on keys, not values, so an edge arg like `imul (iadd x,8), 2`
-/// paramizes against a sibling slot carrying `iadd x,8` even though
-/// the SSA names differ. `skip` excludes the slot being keyed from
-/// *arg-key* matching only (slot `j`'s own key trivially equals
-/// itself); a `V(p_j)` leaf maps to `Q(j)` — it resolves through
-/// `pend[j]` and the `resolve_p` stack cycle-rejects it, so a merge
-/// keyed on its own param can never commit an emitted tree that would
-/// dangle once `p_j` is gone.
-pub fn paramize(k: &Key, slots: &[Key], ps: &[Value], skip: usize) -> Key {
-    let n = slots.len().max(ps.len());
-    for i in 0..n {
-        if i != skip && slots.get(i) == Some(k) {
+/// or naming `ps[i]` itself — becomes `P(i)`, "whatever arrived in slot
+/// `i` on this edge"; a `V(p_i)` leaf becomes `Q(i)`, the param's
+/// *source* value — it resolves through `pend[i]` and the `resolve_p`
+/// stack cycle-rejects it, so a merge keyed on its own param can never
+/// commit an emitted tree that would dangle once `p_i` is gone.
+/// Subtrees match on keys, not values, so an edge arg like
+/// `imul (iadd x,8), 2` paramizes against a sibling slot carrying
+/// `iadd x,8` even though the SSA names differ. `skip` excludes the
+/// slot being keyed from *arg-key* matching only (slot `i`'s own key
+/// trivially equals itself). `kmap`/`vmap` are the O(1) lookup forms
+/// of `slots`/`ps` — the linear scans with deep `Key` equality this
+/// replaces were the pass's dominant cost on param-heavy blocks.
+pub fn paramize(
+    k: &Key,
+    slots: &[Key],
+    ps: &[Value],
+    skip: usize,
+    hmap: &FxHashMap<u64, u32>,
+    vmap: &FxHashMap<Value, u32>,
+    hmemo: &mut FxHashMap<*const Key, u64>,
+) -> Key {
+    // A subtree equal to a sibling slot's whole key is that slot's
+    // incoming value — `P(i)`. `hmap` is keyed on *hashes* because a
+    // `FxHashMap<&Key, _>` lookup hashes `k` — an O(subtree) walk
+    // repeated at every recursion level made paramize quadratic on
+    // deep keys. `hmemo` gives per-node hashing in O(1) amortized
+    // (shared `Rc` subtrees hit the cache); a hash hit is verified
+    // with `==` before rewriting, so stale entries from recycled
+    // `Rc` addresses can only miss a match, never make a wrong one.
+    if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
+        let mut i = i as usize;
+        if i == skip || slots[i] != *k {
+            // The first-match slot is the one being keyed, or the hash
+            // collided — rescan for another slot with an equal key.
+            match (0..slots.len()).find(|&j| j != skip && slots.get(j) == Some(k)) {
+                Some(j) => i = j,
+                None => i = usize::MAX,
+            }
+        }
+        if i != usize::MAX {
             return Key::P(i as u32);
         }
     }
     if let Key::V(w) = k
-        && let Some(i) = (0..n).find(|&i| ps.get(i) == Some(w))
+        && let Some(&i) = vmap.get(w)
     {
-        return Key::Q(i as u32);
+        return Key::Q(i);
     }
     match k {
-        Key::A(t, rk, off) => Key::A(*t, Box::new(paramize(rk, slots, ps, skip)), *off),
+        Key::A(t, rk, off) => Key::A(
+            *t,
+            std::rc::Rc::new(paramize(rk, slots, ps, skip, hmap, vmap, hmemo)),
+            *off,
+        ),
         Key::N(op, t, args, extra) => Key::N(
             *op,
             *t,
-            args.iter().map(|a| paramize(a, slots, ps, skip)).collect(),
+            args.iter()
+                .map(|a| paramize(a, slots, ps, skip, hmap, vmap, hmemo))
+                .collect(),
             *extra,
         ),
         _ => k.clone(),
     }
+}
+
+/// Memoized structural hash — `Rc`-shared subtrees hash once, so
+/// `paramize`'s per-node slot probe is O(nodes) total instead of
+/// O(nodes × depth). Keyed on node address; callers treat hits as
+/// candidates and confirm with `==`.
+pub fn khash_m(k: &Key, memo: &mut FxHashMap<*const Key, u64>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if let Some(&h) = memo.get(&(k as *const Key)) {
+        return h;
+    }
+    let mut h = rustc_hash::FxHasher::default();
+    match k {
+        Key::A(t, b, off) => {
+            0u8.hash(&mut h);
+            t.hash(&mut h);
+            khash_m(b, memo).hash(&mut h);
+            off.hash(&mut h);
+        }
+        Key::N(op, t, args, extra) => {
+            1u8.hash(&mut h);
+            op.hash(&mut h);
+            t.hash(&mut h);
+            for a in args.iter() {
+                khash_m(a, memo).hash(&mut h);
+            }
+            extra.hash(&mut h);
+        }
+        _ => {
+            std::mem::discriminant(k).hash(&mut h);
+            match k {
+                Key::V(v) => v.hash(&mut h),
+                Key::K(t, i) => {
+                    t.hash(&mut h);
+                    i.hash(&mut h);
+                }
+                Key::P(i) | Key::Q(i) => i.hash(&mut h),
+                Key::O(x) => x.hash(&mut h),
+                _ => {}
+            }
+        }
+    }
+    let h = h.finish();
+    memo.insert(k as *const Key, h);
+    h
 }
 
 /// Rewrite `V` leaves naming `ps` members through `rep` — under a
@@ -555,7 +632,7 @@ pub fn paramize(k: &Key, slots: &[Key], ps: &[Value], skip: usize) -> Key {
 pub fn key_rep(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Key {
     match k {
         Key::V(w) if ps.contains(w) => Key::V(rep(*w)),
-        Key::A(t, rk, o) => Key::A(*t, Box::new(key_rep(rk, ps, rep)), *o),
+        Key::A(t, rk, o) => Key::A(*t, std::rc::Rc::new(key_rep(rk, ps, rep)), *o),
         Key::N(op, t, args, x) => Key::N(
             *op,
             *t,
@@ -575,6 +652,18 @@ pub fn peel_off(k: &Key) -> (&Key, i64) {
             (r, o + o2)
         }
         _ => (k, 0),
+    }
+}
+
+/// Structural size — `Key` nodes, shared `Rc` subtrees counted per
+/// reference (the same measure `==` and `key_sub` pay per visit). Used
+/// to gate the relational oracles: relations worth materializing are
+/// small, and walking 10⁴-node keys quadratically per edge is not.
+pub fn nodes(k: &Key) -> usize {
+    match k {
+        Key::A(_, b, _) => 1 + nodes(b),
+        Key::N(_, _, args, _) => 1 + args.iter().map(nodes).sum::<usize>(),
+        _ => 1,
     }
 }
 
@@ -621,6 +710,98 @@ pub fn slope(k: &Key, i: u32) -> Option<i64> {
     }
 }
 
+/// `x - y` as a key: the semantic-difference oracle relparm's `diff_b`
+/// implements over SSA values, lifted to key space. Recognizes the
+/// algebraic shapes — `y = x - d`, `x = y + d`, the nested
+/// `y0 + (x - d)` byte-length form, affine cancellation, and
+/// shared-operand strips `f(a, c) - f(b, c) = a - b` — through equal
+/// *keys*, so congruent-but-distinct SSA names cancel too. `ty` types
+/// the zero/const results; `depth` bounds the rewrite recursion.
+pub fn key_sub(x: &Key, y: &Key, ty: cranelift_codegen::ir::Type, depth: u32) -> Option<Key> {
+    let k0 = || Some(Key::K(ty, 0));
+    if x == y {
+        return k0();
+    }
+    if depth == 0 {
+        return None;
+    }
+    fn isub(k: &Key) -> Option<(&Key, &Key)> {
+        match k {
+            Key::N(Opcode::Isub, _, a, _) => Some((&a[0], &a[1])),
+            _ => None,
+        }
+    }
+    fn iadd(k: &Key) -> Option<(&Key, &Key)> {
+        match k {
+            Key::N(Opcode::Iadd, _, a, _) => Some((&a[0], &a[1])),
+            _ => None,
+        }
+    }
+    // `y = 0` ⇒ x - y = x.
+    if matches!(y, Key::K(_, 0)) {
+        return Some(x.clone());
+    }
+    // `y = x - d` ⇒ x - y = d.
+    if let Some((a, d)) = isub(y)
+        && a == x
+    {
+        return Some(d.clone());
+    }
+    // `x = y + d` ⇒ x - y = d.
+    if let Some((a, d)) = iadd(x) {
+        if a == y {
+            return Some(d.clone());
+        }
+        if d == y {
+            return Some(a.clone());
+        }
+    }
+    // `y = y0 + (x - d)` ⇒ x - y = d - y0; `x = x0 + (y - d)` ⇒ x - y = x0 - d.
+    for (o, m) in iadd(y).into_iter().flat_map(|(o, m)| [(o, m), (m, o)]) {
+        if let Some((a, d)) = isub(m)
+            && a == x
+        {
+            return key_sub(d, o, ty, depth - 1);
+        }
+    }
+    for (o, m) in iadd(x).into_iter().flat_map(|(o, m)| [(o, m), (m, o)]) {
+        if let Some((a, d)) = isub(m)
+            && a == y
+        {
+            return key_sub(o, d, ty, depth - 1);
+        }
+    }
+    // Affine cancellation: matching roots drop to the offset difference.
+    let (bx, ox) = peel_off(x);
+    let (by, oy) = peel_off(y);
+    if bx == by && (ox != 0 || oy != 0) {
+        return Some(Key::K(ty, ox - oy));
+    }
+    // Shared-operand strip: `(a + c) - (b + c) = a - b`,
+    // `(a - c) - (b - c) = a - b`.
+    match (x, y) {
+        (Key::N(Opcode::Iadd, _, xa, _), Key::N(Opcode::Iadd, _, ya, _)) => {
+            for ((a, c), (b, c2)) in [
+                ((xa[0].clone(), xa[1].clone()), (ya[0].clone(), ya[1].clone())),
+                ((xa[0].clone(), xa[1].clone()), (ya[1].clone(), ya[0].clone())),
+                ((xa[1].clone(), xa[0].clone()), (ya[0].clone(), ya[1].clone())),
+                ((xa[1].clone(), xa[0].clone()), (ya[1].clone(), ya[0].clone())),
+            ] {
+                if c == c2 {
+                    return key_sub(&a, &b, ty, depth - 1);
+                }
+            }
+        }
+        (Key::N(Opcode::Isub, _, xa, _), Key::N(Opcode::Isub, _, ya, _))
+            if xa[1] == ya[1] =>
+        {
+            return key_sub(&xa[0], &ya[0], ty, depth - 1);
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Expand every `P(i)` leaf via `resolve(i)`, which returns the slot's
 /// materialized form: a carrier `V`, or the slot's own key (already
 /// `P`-free or resolved recursively) — `None` if the slot can't be
@@ -641,13 +822,13 @@ pub fn resolve_p(
             stack.pop();
             r?
         }
-        Key::A(t, rk, off) => Key::A(*t, Box::new(resolve_p(rk, resolve, stack)?), *off),
+        Key::A(t, rk, off) => Key::A(*t, std::rc::Rc::new(resolve_p(rk, resolve, stack)?), *off),
         Key::N(op, t, args, extra) => {
             let mut as_ = Vec::with_capacity(args.len());
             for a in args.iter() {
                 as_.push(resolve_p(a, resolve, stack)?);
             }
-            Key::N(*op, *t, as_.into_boxed_slice(), *extra)
+            Key::N(*op, *t, std::rc::Rc::from(as_), *extra)
         }
         _ => k.clone(),
     })

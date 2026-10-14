@@ -1,0 +1,29 @@
+; test webmerge
+; Trans-block diff chase: block2's in-edge passes block1's params
+; verbatim — `(va, vb)` — so `wa - wb` isn't textually a difference.
+; `diff_b`'s param-pair chase recurses through block1's in-edge, where
+; `vb = va - 16` pins the bound; `wb` drops to `isub wa, 16`. The
+; merge cascades: block1's own params are edge passthroughs, so the
+; whole web collapses to `isub v0, v2` in block2.
+; check: block2:
+; check-not: block2(v8: i64, v9: i64)
+; diffcheck
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 16
+    v2 = isub v0, v1
+    jump block1(v0, v2)
+
+block1(v3: i64, v4: i64):
+    v5 = iconst.i64 0
+    v6 = icmp eq v3, v5
+    brif v6, block3, block2(v3, v4)
+
+block2(v8: i64, v9: i64):
+    v10 = isub v8, v9
+    return v10
+
+block3:
+    v7 = iconst.i64 7
+    return v7
+}

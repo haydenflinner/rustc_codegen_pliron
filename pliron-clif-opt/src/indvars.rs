@@ -2186,7 +2186,7 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
 
 /// What `x - y` provably equals at a program point, for `relparm`'s
 /// diff proofs.
-enum Diff {
+pub(crate) enum Diff {
     /// `x - y = v` for a concrete value `v`.
     Lit(Value),
     /// `x - y = p_i - p_j` — the loop-head pair's own diff. Valid only
@@ -2206,7 +2206,7 @@ enum Diff {
 /// - `x`, `y` params of the same block `q` -> the diff at `q`'s exits
 ///   is the join of every in-edge's arg diff; recurse per edge and
 ///   require agreement (`Head` edges defer to the established `B`)
-fn diff_b(
+pub(crate) fn diff_b(
     func: &Function,
     cfg: &ControlFlowGraph,
     pi: Value,
