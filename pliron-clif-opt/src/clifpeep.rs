@@ -2585,6 +2585,139 @@ pub fn arghoist(func: &mut Function) -> usize {
     n
 }
 
+/// Phi merge through affine congruence: every in-edge of param `p`
+/// carries a value in the same `root + k` class — the args may be
+/// distinct SSA values (`taildup` clones an `iadd` per edge, the egraph
+/// later duplicates bumps) that literal-equality `sameargs` and
+/// same-shape `arghoist` both miss. When `root` dominates the target,
+/// drop the param and rebind its uses to `root` (k=0) or a single
+/// `root + k` materialized at the block head. The Ascent `off` relation
+/// collapses `iadd`/`isub`-const chains transitively, so the classes
+/// see through bumps no matter how deep the def chain runs.
+pub fn affmerge(func: &mut Function) -> usize {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+    let nf = crate::proots::affine_nf(func);
+    let normal = |v: Value| nf.get(&v).copied().unwrap_or((v, 0));
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for (d, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                edges
+                    .entry(bc.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push((i, d));
+            }
+        }
+    }
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut param_drops: Vec<Value> = vec![];
+    let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
+    // (target block, ty, root, k, param to rebind) — the `root + k`
+    // materialization is created after the scan so `Value`s stay valid.
+    let mut inserts: Vec<(Block, Type, Value, i64, Value)> = vec![];
+    for (&b, es) in &edges {
+        let ps = func.dfg.block_params(b).to_vec();
+        if ps.is_empty() {
+            continue;
+        }
+        let arity_ok = es.iter().all(|&(i, d)| {
+            func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                .args(&func.dfg.value_lists)
+                .len()
+                == ps.len()
+        });
+        if !arity_ok {
+            continue;
+        }
+        for (ix, &p) in ps.iter().enumerate() {
+            if pmap.contains_key(&p) {
+                continue;
+            }
+            let mut class: Option<(Value, i64)> = None;
+            let mut uniform = false;
+            for &(i, d) in es {
+                let a = func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                    .args(&func.dfg.value_lists)
+                    .nth(ix);
+                let Some(BlockArg::Value(v)) = a else {
+                    uniform = false;
+                    break;
+                };
+                let v = func.dfg.resolve_aliases(v);
+                // A self-edge echoing the param preserves whatever the
+                // other edges supplied — it can't break uniformity.
+                if v == p {
+                    continue;
+                }
+                let c = normal(v);
+                match class {
+                    None => {
+                        class = Some(c);
+                        uniform = true;
+                    }
+                    Some(t) if t != c => {
+                        uniform = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some((root, k)) = class.filter(|_| uniform) else {
+                continue;
+            };
+            // The carrier must be usable at `b`'s head: defined in a
+            // strictly dominating block. An in-`b` root would be
+            // next-iteration's value on a back-edge, not the value on
+            // entry — `dominates_entry` rules it out.
+            if func.dfg.value_type(root) != func.dfg.value_type(p)
+                || !dominates_entry(func, &dom, root, b)
+            {
+                continue;
+            }
+            if k != 0 {
+                let ty = func.dfg.value_type(p);
+                inserts.push((b, ty, root, k, p));
+            }
+            pmap.insert(p, root);
+            param_drops.push(p);
+            for &(i, d) in es {
+                drop_ixs.entry((i, d)).or_default().push(ix);
+            }
+        }
+    }
+    if param_drops.is_empty() {
+        return 0;
+    }
+    // Materialize `root + k` at the head of each block that needs it and
+    // rebind those params onto the new inst (the `root` pmap entry was a
+    // placeholder — without the delta the rebind would be off by `k`).
+    for &(b, ty, root, k, p) in &inserts {
+        // One cursor for both insts — a fresh `at_first_insertion_point`
+        // per ins() would land the `iadd` *before* its `iconst` operand.
+        let mut cur = FuncCursor::new(&mut *func).at_first_insertion_point(b);
+        let c = cur.ins().iconst(ty, k);
+        let v = cur.ins().iadd(root, c);
+        pmap.insert(p, v);
+    }
+    let arg_drops: Vec<(Inst, usize, Vec<usize>)> = drop_ixs
+        .into_iter()
+        .map(|((i, d), mut ixs)| {
+            ixs.sort_unstable_by(|a, b| b.cmp(a));
+            (i, d, ixs)
+        })
+        .collect();
+    let n = param_drops.len();
+    apply_param_drops(func, pmap, arg_drops, param_drops);
+    n
+}
+
 /// `brif c` edge args `select(c, a, b)` resolve to a single arm on each
 /// edge: `a` taken, `b` otherwise. Niche-select loop tails pass
 /// `select(end?, 0, cursor)` on the continue edge where `end?` is
@@ -7396,5 +7529,147 @@ mod tests {
             cur.ins().return_(&[r]);
         }
         assert_eq!(sgntest(&mut func), 0);
+    }
+
+    /// Two preds pass `x + 8` to a merge param, but through different
+    /// def chains (`iadd x,8` vs `iadd(isub x,4),12`). The congruence is
+    /// transitive, so neither literal-equality `sameargs` nor one-level
+    /// `arg_shape` `arghoist` can see it. The param drops and `x + 8` is
+    /// materialized once at the merge head.
+    #[test]
+    fn affmerge_congruent_deltas() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let ps = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let k1 = cur.ins().iconst(types::I64, 8);
+        let j1 = cur.ins().iadd(x, k1);
+        cur.ins().jump(s, &[j1.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p2);
+        // A different def chain — `iadd(isub x, 4), 12` — same class
+        // (x, 8). `arghoist`'s shape key can't see through it.
+        let four = cur.ins().iconst(types::I64, 4);
+        let m1 = cur.ins().isub(x, four);
+        let twelve = cur.ins().iconst(types::I64, 12);
+        let j2 = cur.ins().iadd(m1, twelve);
+        cur.ins().jump(s, &[j2.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().iadd(ps, one);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(affmerge(&mut func), 1);
+        assert!(func.dfg.block_params(s).is_empty());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `k = 0` collapse: one edge passes `x`, the other `iadd x, 0` —
+    /// same class, param rebinds to `x` directly (no materialization).
+    #[test]
+    fn affmerge_zero_delta() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let ps = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], s, &[x.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let k0 = cur.ins().iconst(types::I64, 0);
+        let j = cur.ins().iadd(x, k0);
+        cur.ins().jump(s, &[j.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().iadd(ps, one);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(affmerge(&mut func), 1);
+        assert!(func.dfg.block_params(s).is_empty());
+        // No `x + 0` rematerialization — `ps`'s use bound straight to
+        // `x`, so `s` still holds exactly the three original insts.
+        assert_eq!(func.layout.block_insts(s).count(), 3);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Mismatched deltas — `x + 8` vs `x + 4` — are a real phi; the
+    /// param must survive.
+    #[test]
+    fn affmerge_rejects_mismatched_delta() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let p1 = func.dfg.make_block();
+        let p2 = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        for blk in [entry, p1, p2, s] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let ps = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, zero);
+        cur.ins().brif(c, p1, &[], p2, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p1);
+        let e8 = cur.ins().iconst(types::I64, 8);
+        let j1 = cur.ins().iadd(x, e8);
+        cur.ins().jump(s, &[j1.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p2);
+        let e4 = cur.ins().iconst(types::I64, 4);
+        let j2 = cur.ins().iadd(x, e4);
+        cur.ins().jump(s, &[j2.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().iadd(ps, one);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(affmerge(&mut func), 0);
+        assert_eq!(func.dfg.block_params(s).len(), 1);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("affmerge produced invalid IR: {e}\n{}", func.display());
+        }
     }
 }

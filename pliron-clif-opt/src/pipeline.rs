@@ -1580,6 +1580,14 @@ fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_affmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::affmerge(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("affmerge");
+    }
+    k
+}
+
 // Loop count tests against a wide constant rematerialize it per
 // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
 // a non-constant preheader value codegen pins in a register. Runs
@@ -2110,6 +2118,13 @@ pub static DEFAULT: &[Step] = &[
         gate: Gate::Env("PLIRON_DEADP"),
         run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
     },
+    // Phi merge through affine congruence: every in-edge of a param
+    // carries the same `root + k` class (`proots::affine_nf` — Ascent),
+    // so distinct SSA values that are transposed copies of one carrier
+    // still merge. Catches the shapes `taildup`'s per-edge clones and
+    // jumpthread's copied `iadd`s leave behind.
+    step("affmerge", "affmerge", Gate::Env("PLIRON_AFFMERGE"), s_affmerge)
+        .needs(shape::MULTI),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
@@ -2157,6 +2172,15 @@ pub static DEFAULT: &[Step] = &[
     // loop's hot tail lands on the fallthrough edge instead of a `jmp`
     // per iteration (chars_*/tokenize dispatch).
     step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
+    // taildup's per-edge clones leave congruent `iadd`/`isub` args on a
+    // shared successor — one more merge round after the last clone step.
+    step(
+        "affmerge2",
+        "affmerge",
+        Gate::Env("PLIRON_AFFMERGE"),
+        s_affmerge,
+    )
+    .needs(shape::MULTI),
     Step {
         name: "coldret",
         bisect: Some("coldret"),

@@ -127,6 +127,77 @@ pub fn alias_map(func: &Function) -> FxHashMap<Value, Value> {
     alias_of(&facts(func))
 }
 
+/// `v = base + k` definitions: `iadd base, iconst k` (either operand
+/// order), `isub base, iconst k` → `k` negated. Operands are
+/// alias-resolved; the result must be single (it always is for these).
+pub fn aff_facts(func: &Function) -> Vec<(Value, Value, i64)> {
+    let mut f = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+                continue;
+            };
+            let kof = |v: Value| {
+                let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                match func.dfg.insts[d] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => Some(imm.bits()),
+                    _ => None,
+                }
+            };
+            let (base, k) = match opcode {
+                Opcode::Iadd => match (kof(args[1]), kof(args[0])) {
+                    (Some(k), _) => (args[0], k),
+                    (None, Some(k)) => (args[1], k),
+                    _ => continue,
+                },
+                Opcode::Isub => match kof(args[1]) {
+                    Some(k) => (args[0], k.wrapping_neg()),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let Some(&res) = func.dfg.inst_results(i).first() else {
+                continue;
+            };
+            f.push((res, func.dfg.resolve_aliases(base), k));
+        }
+    }
+    f
+}
+
+ascent::ascent! {
+    /// Affine normal forms for phi-merge: `off(v, r, k)` reads
+    /// "`v ≡ r + k` (wrapping)" where `r` is not itself an
+    /// `iadd`/`isub`-by-const result. Values, params and non-affine defs
+    /// have no `off` row and act as their own `(v, 0)` root. A chain
+    /// `iadd(iadd x, 8), 4` collapses to `off(·, x, 12)`: two syntactically
+    /// distinct values in one `(r, k)` class are interchangeable, which is
+    /// what makes taildup's per-edge arg clones mergeable again.
+    struct AffN;
+
+    /// `v = base + k`.
+    relation aff(Value, Value, i64);
+    /// `v = root + k` collapsed transitively.
+    relation off(Value, Value, i64);
+
+    // Non-affine bases are their own roots; chain heads extend by the
+    // child's collapsed offset. One `aff` row per `v` (SSA) keeps `off`
+    // functional: a value has exactly one normal form.
+    off(m, m, 0i64) <-- aff(_, m, _), !aff(m, _, _);
+    off(v, r, km.wrapping_add(*kr)) <-- aff(v, m, km), off(m, r, kr);
+}
+
+/// `v ↦ (root, k)` affine normal form over the whole function.
+pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+    let mut p = AffN::default();
+    p.aff = aff_facts(func);
+    p.run();
+    p.off.into_iter().map(|(v, r, k)| (v, (r, k))).collect()
+}
+
 ascent::ascent! {
     /// "Always carries `acc`" for one acc candidate — loopvec's `AccCx`
     /// is_acc as a stratified fixpoint: an interior param is `bad` when a
