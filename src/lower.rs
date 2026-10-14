@@ -639,6 +639,17 @@ pub fn lower_to_object(
         drop(_scomp);
         *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
         pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);
+        // Cranelift's own pass profiler: `emit:<pass>` pseudo-steps show
+        // where inside `compile` (vcode lower/emit, regalloc) time goes.
+        if pliron_cfg::env_set("PLIRON_TIMING") || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
+        {
+            for (d, t) in cranelift_codegen::timing::take_current().self_times() {
+                *j.stats.timing.entry(format!("emit:{d}").leak()).or_default() += t;
+                pliron_cfg::trace(&format!("emit:{d}"), t.as_secs_f64() * 1e3, n);
+            }
+        } else {
+            let _ = cranelift_codegen::timing::take_current();
+        }
         match defr {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => j.err = Some(e),

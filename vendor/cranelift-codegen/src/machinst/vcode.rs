@@ -802,6 +802,7 @@ impl<I: VCodeInst> VCode<I> {
         // mutate `VCode`. The info it usually carries prior to
         // setting clobbers is fairly minimal so this should be
         // relatively cheap.
+        let ti = std::time::Instant::now();
         let (clobbers, function_calls) = self.compute_clobbers_and_function_calls(regalloc);
         self.abi.compute_frame_layout(
             &self.sigs,
@@ -809,6 +810,7 @@ impl<I: VCodeInst> VCode<I> {
             clobbers,
             function_calls,
         )?;
+        let t_frame = ti.elapsed();
 
         // Emit blocks.
         let mut cur_srcloc = None;
@@ -850,6 +852,27 @@ impl<I: VCodeInst> VCode<I> {
         };
         let mut total_bb_padding = 0;
 
+        // PLIRON: hoisted out of the per-block loop — a fresh
+        // `insts.len()`-sized table per block is quadratic
+        // (block_count × inst_count memset) on functions with many
+        // blocks. Entries for a block's insts are repopulated by the
+        // eager `apply_allocs` pass below before any hazard check
+        // reads them, so cross-block leftovers are unreachable.
+        let mut preg_ops: Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)> =
+            vec![(smallvec![], smallvec![]); self.insts.len()];
+
+        static EPROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let eprof = *EPROF.get_or_init(|| std::env::var_os("PLIRON_EPROF").is_some());
+        let mut t_inst = std::time::Duration::ZERO;
+        let mut t_island = std::time::Duration::ZERO;
+        let mut t_allocs = std::time::Duration::ZERO;
+        let mut t_loop = std::time::Duration::ZERO;
+        let mut t_items = std::time::Duration::ZERO;
+        let mut t_apply = std::time::Duration::ZERO;
+        let mut t_fuse = std::time::Duration::ZERO;
+        let mut n_islands = 0u32;
+
+        let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
             trace!("emitting block {:?}", block);
 
@@ -869,7 +892,7 @@ impl<I: VCodeInst> VCode<I> {
             }
             assert_eq!(buffer.cur_offset(), new_offset);
 
-            let do_emit = |inst: &I,
+            let mut do_emit = |inst: &I,
                            disasm: &mut String,
                            buffer: &mut MachBuffer<I>,
                            state: &mut I::State| {
@@ -877,13 +900,29 @@ impl<I: VCodeInst> VCode<I> {
                     let mut s = state.clone();
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
                 }
-                inst.emit(buffer, &self.emit_info, state);
+                if eprof {
+                    let ti = std::time::Instant::now();
+                    inst.emit(buffer, &self.emit_info, state);
+                    t_inst += ti.elapsed();
+                } else {
+                    inst.emit(buffer, &self.emit_info, state);
+                }
                 // The buffer maintains its deadline invariant per-`MachInst`:
                 // after each instruction, ensure that the worst-case end of
                 // any island the buffer might emit lies before the soonest
                 // deadline, even after the next instruction.
                 let lookahead = I::worst_case_size() + I::worst_case_island_growth();
-                if buffer.island_needed(lookahead) {
+                if eprof {
+                    let ti = std::time::Instant::now();
+                    if buffer.island_needed(lookahead) {
+                        n_islands += 1;
+                        let jump_around = buffer.get_label();
+                        I::gen_jump(jump_around).emit(buffer, &self.emit_info, state);
+                        buffer.emit_island(0, state.ctrl_plane_mut());
+                        buffer.bind_label(jump_around, state.ctrl_plane_mut());
+                    }
+                    t_island += ti.elapsed();
+                } else if buffer.island_needed(lookahead) {
                     let jump_around = buffer.get_label();
                     I::gen_jump(jump_around).emit(buffer, &self.emit_info, state);
                     buffer.emit_island(0, state.ctrl_plane_mut());
@@ -936,9 +975,6 @@ impl<I: VCodeInst> VCode<I> {
             // `apply_allocs` below: `get_operands` skips operands that
             // are already physical regs, so they can't be collected
             // after the fact. Needed by pair-fusion hazard checks.
-            let mut preg_ops: Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)> =
-                vec![(smallvec![], smallvec![]); self.insts.len()];
-
             let apply_allocs = |insts: &mut Vec<I>,
                                 preg_ops: &mut Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)>,
                                 iix: InsnIndex| {
@@ -972,8 +1008,10 @@ impl<I: VCodeInst> VCode<I> {
                 debug_assert!(allocs.next().is_none());
             };
 
+            let ti = std::time::Instant::now();
             let items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
+            t_items += ti.elapsed();
 
             // PLIRON: when this block unconditionally branches to the next
             // emitted block and that block is a loop header, skip the jump
@@ -1000,6 +1038,7 @@ impl<I: VCodeInst> VCode<I> {
             // Apply allocations eagerly: the peepholes below inspect
             // physical registers, and `preg_ops` must be fully
             // populated before their hazard checks run.
+            let ti = std::time::Instant::now();
             for it in &items {
                 if let &InstOrEdit::Inst(iix) = it {
                     if !applied[iix.index()] {
@@ -1008,6 +1047,8 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
+            t_apply += ti.elapsed();
+            let ti = std::time::Instant::now();
 
             // Pair fusion (e.g. `ldp`/`stp`): the partner must follow
             // with no regalloc edit between them — a move there could
@@ -1259,6 +1300,7 @@ impl<I: VCodeInst> VCode<I> {
                 squashed[add_ix.index()] = true;
             }
 
+            t_fuse += ti.elapsed();
             let mut k = 0usize;
             while k < items.len() {
                 match items[k].clone() {
@@ -1379,7 +1421,9 @@ impl<I: VCodeInst> VCode<I> {
                             }
                         } else {
                             if !applied[iix.index()] {
+                                let ti = std::time::Instant::now();
                                 apply_allocs(&mut self.insts, &mut preg_ops, iix);
+                                t_allocs += ti.elapsed();
                                 applied[iix.index()] = true;
                             }
 
@@ -1497,7 +1541,10 @@ impl<I: VCodeInst> VCode<I> {
 
         // Do any optimizations on branches at tail of buffer, as if we had
         // bound one last label.
+        t_loop += t_loop0.elapsed();
+        let ti = std::time::Instant::now();
         buffer.optimize_branches(ctrl_plane);
+        let t_obr = ti.elapsed();
 
         // emission state is not needed anymore, move control plane back out
         *ctrl_plane = state.take_ctrl_plane();
@@ -1532,8 +1579,17 @@ impl<I: VCodeInst> VCode<I> {
         // Store metadata about frame layout in the MachBuffer.
         buffer.set_frame_layout(self.abi.frame_slot_metadata());
 
+        let ti = std::time::Instant::now();
+        let buf = buffer.finish(&self.constants, ctrl_plane);
+        let t_fin = ti.elapsed();
+        if eprof {
+            eprintln!(
+                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?}"
+            );
+        }
+
         Ok(EmitResult {
-            buffer: buffer.finish(&self.constants, ctrl_plane),
+            buffer: buf,
             bb_offsets,
             bb_edges,
             disasm: if want_disasm { Some(disasm) } else { None },

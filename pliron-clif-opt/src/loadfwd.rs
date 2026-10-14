@@ -824,6 +824,8 @@ pub fn run(
         post.reverse();
         post
     };
+    let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
+    let t0 = std::time::Instant::now();
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
@@ -862,12 +864,22 @@ pub fn run(
         (&FxHashMap::default(), &FxHashMap::default())
     };
     let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
+    if prof2 {
+        eprintln!("    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let tt = |name: &str, t0: std::time::Instant| {
+        if prof2 {
+            eprintln!("    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    };
     if crate::pass_enabled("PLIRON_LOADPRE") {
+        let t0 = std::time::Instant::now();
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
         n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm);
+        tt("pre", t0);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -896,7 +908,10 @@ pub fn run(
         acc
     };
     let mut stable = false;
+    let t0 = std::time::Instant::now();
+    let mut iters = 0;
     for _ in 0..MAX_ITERS {
+        iters += 1;
         let mut changed = false;
         for &b in &rpo {
             let Some(mut av) = input(&out, b) else {
@@ -932,9 +947,16 @@ pub fn run(
             break;
         }
     }
+    if prof2 {
+        eprintln!(
+            "    lf-fxpt {:.3}ms (iters={iters})",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+    }
     if !stable {
         return 0;
     }
+    let t0 = std::time::Instant::now();
     let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
@@ -960,6 +982,7 @@ pub fn run(
             );
         }
     }
+    tt("apply", t0);
     let fwd_cnt = fwd.len();
     for (i, f) in fwd {
         let r = func.dfg.first_result(i);
@@ -1202,16 +1225,30 @@ fn pre(
         if b == entry || cfg.pred_iter(b).any(|p| !reach.contains(&p.block)) {
             return Some(FxHashSet::default());
         }
-        let mut acc: Option<FxHashSet<Loc>> = None;
+        // Seed from the smallest pred set: the intersection can't
+        // outgrow it, so a 16k-pred merge pays O(min) per pred instead
+        // of O(first-set × preds).
+        let mut min: Option<&FxHashSet<Loc>> = None;
         for p in cfg.pred_iter(b) {
-            if let Some(o) = out.get(&p.block) {
-                match &mut acc {
-                    None => acc = Some(o.clone()),
-                    Some(a) => a.retain(|k| o.contains(k)),
-                }
+            if let Some(o) = out.get(&p.block)
+                && min.is_none_or(|m| o.len() < m.len())
+            {
+                min = Some(o);
             }
         }
-        acc
+        let m = min?;
+        let mut acc = m.clone();
+        for p in cfg.pred_iter(b) {
+            if acc.is_empty() {
+                break;
+            }
+            if let Some(o) = out.get(&p.block)
+                && !std::ptr::eq(o, m)
+            {
+                acc.retain(|k| o.contains(k));
+            }
+        }
+        Some(acc)
     };
     let mut stable = false;
     for _ in 0..MAX_ITERS {

@@ -173,6 +173,16 @@ mod enabled {
         pub fn total(&self) -> Duration {
             self.pass.iter().map(|p| p.total - p.child).sum()
         }
+
+        /// Per-pass `(name, self-time)` pairs, skipping passes that did
+        /// not run. `self` time excludes nested child passes.
+        pub fn self_times(&self) -> impl Iterator<Item = (&'static str, Duration)> + '_ {
+            self.pass
+                .iter()
+                .zip(&DESCRIPTIONS[..])
+                .filter(|(t, _)| t.total != Duration::default())
+                .map(|(t, d)| (*d, t.total - t.child))
+        }
     }
 
     impl Default for PassTimes {

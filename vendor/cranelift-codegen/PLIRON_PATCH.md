@@ -230,3 +230,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     intrinsic lowering emits `call __pliron_bb*`/`__pliron_bbm` ops that
     `src/lower.rs` rewrites into this instruction (the call shape keeps
     pliron's own IR opts opaque); wasm keeps a volatile load fallback.
+
+23. `VCode::emit` `preg_ops` table hoisted out of the per-block loop
+    (`machinst/vcode.rs`): it was allocated `insts.len()`-sized per
+    block, making emit O(blocks × insts) memset on many-block
+    functions (16k-block match dispatch: 6.3s in `VCode emission`
+    → ~0.1s). Entries for a block's insts are repopulated by the
+    eager `apply_allocs` pass before hazard checks read them, so
+    cross-block leftovers are unreachable. Also adds the
+    `PLIRON_EPROF=1` per-function emit-phase timers
+    (`eprof frame=/loop=/items=/apply=/fuse=/inst=/allocs=/island=/obr=/fin=`),
+    gated so no `Instant` calls run when unset, and a `self_times()`
+    accessor on `timing::PassTimes` plus the `timing` feature enabled
+    in `Cargo.toml` so `src/lower.rs` can report `emit:<pass>`
+    pseudo-steps under `PLIRON_TIMING`/`PLIRON_TRACE_FILE`.
