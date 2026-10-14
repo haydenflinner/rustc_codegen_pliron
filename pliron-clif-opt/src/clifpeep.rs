@@ -2115,9 +2115,13 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // (target block, class key, param to rebind) — emission happens after
     // the scan so `Value`s stay valid and insertions keep operand order.
     let mut inserts: Vec<(Block, Key, Value)> = vec![];
+    let twloop = std::time::Instant::now();
+    let mut tpre_sum = std::time::Duration::ZERO;
     for (&b, es) in &edges {
+        let tb0 = std::time::Instant::now();
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
+            tpre_sum += tb0.elapsed();
             continue;
         }
         // The `skc`/`pk`/`eargs` matrices below are edges × params —
@@ -2139,8 +2143,10 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             );
         }
         if es.len().saturating_mul(ps.len()) > 4_000_000 {
+            tpre_sum += tb0.elapsed();
             continue;
         }
+        tpre_sum += tb0.elapsed();
         // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
         // `svh[e][ix]` for their structural hash — pseudo-args
         // (`TryCallRet`/`TryCallExn`) are `None` in `eargs` but key as
@@ -2782,6 +2788,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         if no_phasec {
             continue;
         }
+        let tphasec = std::time::Instant::now();
         // Survivors, capped by key size: `key_rep` rebuilds a whole
         // signature tree per (slot, edge, round), so slots carrying
         // 10⁴-node expression keys make refinement quadratic-by-
@@ -2806,6 +2813,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             })
             .collect();
         if surv.len() >= 2 {
+            let tbis = std::time::Instant::now();
             // Initial partition: one class per value type.
             let mut cls: FxHashMap<usize, usize> = FxHashMap::default();
             for &i in &surv {
@@ -2816,7 +2824,9 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     .unwrap();
                 cls.insert(i, leader);
             }
+            let mut rounds = 0;
             loop {
+                rounds += 1;
                 let leaf = |w: Value| -> Value {
                     let mut w = w;
                     while let Some(&c) = pmap.get(&w) {
@@ -2855,6 +2865,16 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 }
                 cls = next;
             }
+            if std::env::var_os("PLIRON_WM_PROF").is_some() && tbis.elapsed().as_micros() > 200 {
+                eprintln!(
+                    "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
+                    func.name,
+                    surv.len(),
+                    es.len(),
+                    rounds,
+                    tbis.elapsed()
+                );
+            }
             // Stable partition: non-leader members drop to their leader.
             for &i in &surv {
                 let l = cls[&i];
@@ -2868,10 +2888,22 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 }
             }
         }
+        if std::env::var_os("PLIRON_WM_PROF").is_some()
+            && tphasec.elapsed().as_micros() > 200
+        {
+            eprintln!(
+                "webmerge {} {b}: phaseC P={} E={} {:?}",
+                func.name,
+                ps.len(),
+                es.len(),
+                tphasec.elapsed()
+            );
+        }
     }
     if param_drops.is_empty() {
         return (0, pmap);
     }
+    let tprep = std::time::Instant::now();
     // Materialize each non-member class at its block's head, operands
     // before users, then insert the run before the original first inst.
     let mut orders: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
@@ -2920,14 +2952,20 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         })
         .collect();
     let n = param_drops.len();
+    let temit = std::time::Instant::now();
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
+    let demit = temit.elapsed();
     if std::env::var_os("PLIRON_WM_PROF").is_some() {
         eprintln!(
-            "webmerge {}: total {:?} keying {:?} ixscan {:?} blocks {}",
+            "webmerge {}: total {:?} wloop {:?} pre {:?} keying {:?} ixscan {:?} prep {:?} emit {:?} blocks {}",
             func.name,
             t0.elapsed(),
+            twloop.elapsed(),
+            tpre_sum,
             tkeys_sum,
             tblk_sum,
+            tprep.elapsed(),
+            demit,
             nblk
         );
     }
