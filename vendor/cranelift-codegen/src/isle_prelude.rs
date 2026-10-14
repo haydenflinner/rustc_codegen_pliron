@@ -418,7 +418,7 @@ macro_rules! isle_common_prelude_methods {
         }
 
         fn fits_in_16(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() <= 16 && !ty.is_dynamic_vector() {
+            if ty.bits() <= 16 && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
                 None
@@ -427,7 +427,7 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn fits_in_32(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() <= 32 && !ty.is_dynamic_vector() {
+            if ty.bits() <= 32 && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
                 None
@@ -447,7 +447,9 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn fits_in_64(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() <= 64 && !ty.is_dynamic_vector() {
+            // Fixed vectors share these bit widths (i8x8 = 64 bits) but
+            // must route to SIMD lanes, not scalar GPR constructors.
+            if ty.bits() <= 64 && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
                 None
