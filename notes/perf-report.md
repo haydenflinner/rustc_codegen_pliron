@@ -121,6 +121,12 @@ bloat — more inlined helper specializations survive our pipeline.
 - `PLIRON_X64_VEX`: VEX encodings aren't wired for regular SSE ops in
   the vendored lowering (`has_avx` used in only 2 rules).
 - Depth-weight bump (`4.0→8.0` loop bonus): miscompiled, reverted.
+- `dgvn` loop-depth guard (keep cheap-ALU in-loop dups as ra2 remat
+  points instead of merging onto shallower defs, mirroring the lcse
+  `ident` guard): wash on tokenize/hashmap/hmget/sortw/strwork/iterw,
+  consistently ~4% worse on matmul — reverted. Unlike lcse's identity
+  folds, dgvn's merges don't fire on the harmful pattern often enough
+  to matter.
 
 ## The remaining wall
 
