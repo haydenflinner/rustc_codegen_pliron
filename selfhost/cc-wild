@@ -18,4 +18,11 @@ for a in "$@"; do
     esac
     args+=("$a")
 done
+# PGO instrumentation links every binary against the pliron-prof runtime
+# (the .init_array ctor registers its counters) when the backend's
+# PLIRON_PGO flag is live.
+R="$(cd "$(dirname "$0")/.." && pwd)/tools/pliron-prof/target/release/libpliron_prof.a"
+if [ -n "${PLIRON_PGO:-}" ] && [ -f "$R" ]; then
+    args+=("$R")
+fi
 exec cc -B"$D" "${args[@]}"
