@@ -595,14 +595,24 @@ pub fn run(
 
     // Rewrite `stack_addr`s onto representatives; grow each rep to its
     // largest member and zero the absorbed slots. Slots with no live
-    // interval (no `stack_addr` references at all) are just zeroed.
+    // interval may still be referenced by `stack_addr` insts whose
+    // derived uses we failed to track — keep their size unless no
+    // `stack_addr` in the function names them at all.
+    let mut addr_refs: FxHashSet<StackSlot> = FxHashSet::default();
+    for &b in &order {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::StackAddr { stack_slot, .. } = func.dfg.insts[i] {
+                addr_refs.insert(stack_slot);
+            }
+        }
+    }
     let mut merged = 0;
     let mut grown: Vec<(StackSlot, u32, u8)> = Vec::new();
     for s in 0..nslots {
         let s = StackSlot::from_u32(s as u32);
         match rep.get(&s).copied() {
             None => {
-                if iv[s.index()].0 == u32::MAX {
+                if iv[s.index()].0 == u32::MAX && !addr_refs.contains(&s) {
                     func.sized_stack_slots[s].size = 0;
                 }
             }

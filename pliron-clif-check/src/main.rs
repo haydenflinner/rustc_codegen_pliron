@@ -177,25 +177,34 @@ fn with_pipe<R>(
         .map(FuncId::from_u32)
         .unwrap_or(FuncId::from_u32(0));
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-    let (e1, e2, e3, e4, e5, e6, e7) = Default::default();
+    let (e1, e2, e3, e5, e6, e7, e8) = Default::default();
+    let (mut nonnull, mut frozen, mut noalias, mut deref, mut e4, mut lifetimes) = (
+        facts.nonnull.clone(),
+        facts.frozen.clone(),
+        facts.noalias.clone(),
+        facts.deref.clone(),
+        Default::default(),
+        Vec::new(),
+    );
     let mut p = Pipe {
         clctx: &mut clctx,
         isa,
         fname: "clif-check",
         func_id,
-        nonnull: &facts.nonnull,
+        nonnull: &mut nonnull,
         derived: &mut derived,
-        frozen: &facts.frozen,
-        noalias: &facts.noalias,
-        deref: &facts.deref,
+        frozen: &mut frozen,
+        noalias: &mut noalias,
+        deref: &mut deref,
         nowrite: &facts.nowrite,
         call_frozen: &e1,
         scoped: &e2,
         invariant: &e3,
-        operand_frozen: &e4,
+        operand_frozen: &mut e4,
         block_region: &e5,
+        prof: &e8,
         region_parent: &e6,
-        lifetimes: &[],
+        lifetimes: &mut lifetimes,
         nocap: &e7,
         tcfg: isa.frontend_config(),
         simd: true,
@@ -206,6 +215,7 @@ fn with_pipe<R>(
         dump: false,
         verify_full: false,
         stats: &mut stats,
+        carry_log: Vec::new(),
     };
     k(&mut p)
 }

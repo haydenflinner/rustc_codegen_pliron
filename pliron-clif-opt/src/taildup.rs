@@ -268,6 +268,44 @@ pub fn run(func: &mut Function) -> usize {
             if !why.is_empty() {
                 continue;
             }
+            // `p` must not use `r`'s own defs anywhere — the clone (or a
+            // surviving sibling edge arg) would keep them referenced after
+            // `r` loses its last pred and is removed (quicksort's
+            // `brif .., block68(a,b), block1191(param68,param68)` case).
+            let uses_r_defs = {
+                let mut defs: FxHashSet<Value> =
+                    func.dfg.block_params(r).iter().copied().collect();
+                defs.extend(func.layout.block_insts(r).flat_map(|i| {
+                    func.dfg.inst_results(i).iter().copied().collect::<Vec<_>>()
+                }));
+                func.layout.block_insts(p).any(|i| {
+                    func.dfg
+                        .inst_values(i)
+                        .any(|v| defs.contains(&func.dfg.resolve_aliases(v)))
+                })
+            };
+            if uses_r_defs {
+                continue;
+            }
+            // Edge args defined inside any candidate are likewise unsafe:
+            // that candidate may lose its last pred and be removed,
+            // stranding the clone's reference (the `isub v3588, v3593`
+            // clone of block1191 carried block68's params).
+            let arg_in_candidate = dest.args(&func.dfg.value_lists).any(|a| {
+                if let BlockArg::Value(v) = a {
+                    let b = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+                        ValueDef::Result(d, _) => func.layout.inst_block(d),
+                        ValueDef::Param(b, _) => Some(b),
+                        _ => None,
+                    };
+                    b.is_some_and(|b| rets.contains(&b))
+                } else {
+                    false
+                }
+            });
+            if arg_in_candidate {
+                continue;
+            }
             let mut map: FxHashMap<Value, Value> = FxHashMap::default();
             let args: Vec<BlockArg> = dest.args(&func.dfg.value_lists).collect();
             let mut ok = true;

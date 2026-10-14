@@ -132,7 +132,7 @@ fn describe(o: &Outcome) -> String {
                 let _ = write!(s, ", calls {calls:?}");
             }
             if !writes.is_empty() {
-                let shown: Vec<_> = writes.iter().take(16).collect();
+                let shown: Vec<_> = writes.iter().take(64).collect();
                 let _ = write!(s, ", {} bytes written {shown:x?}", writes.len());
             }
             s
@@ -876,14 +876,16 @@ fn run_inner(
     check_nonnull: bool,
 ) -> Outcome {
     let no_facts = FxHashSet::default();
-    // Stack frame: slots laid out in order, aligned, seeded with a pattern.
+    // Stack frame: one fixed-stride page per slot. Packing by declared
+    // size would let a pass that shrinks a dead slot (slotmerge) shift
+    // every later slot's seeded bytes — bytes the function never wrote
+    // but may read back (e.g. after a callee fills them through an
+    // escaped pointer) — a false mismatch.
     let mut slot_off = FxHashMap::default();
     let mut off = 0u64;
-    for (slot, d) in f.sized_stack_slots.iter() {
-        let align = 1u64 << d.align_shift;
-        off = off.next_multiple_of(align.max(1));
+    for (slot, _d) in f.sized_stack_slots.iter() {
         slot_off.insert(slot, off);
-        off += d.size as u64;
+        off += 0x1000;
     }
     let mut s = Sandbox {
         func: f,
