@@ -159,7 +159,7 @@ differs is how counts leave the guest:
 | --- | --- |
 | `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |
-| `PLIRON_PGO_COUNTERS=block,edge` | which counters to place (default both) |
+| `PLIRON_PGO_COUNTERS=block` | block counters only (edge counters are additive); default is block+edge |
 | `PLIRON_PGO_ATOMIC=1` | `atomicrmw` counter ops instead of load/add/store (races lose counts by default, same as LLVM) |
 
 ## Non-goals (for now)

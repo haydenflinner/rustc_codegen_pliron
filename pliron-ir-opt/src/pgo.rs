@@ -273,11 +273,18 @@ pub fn instrument(
 
     // ---- counters ----
     let mut recs = Vec::new(); // serialized record bytes
+    // `PLIRON_PGO_COUNTERS=block` skips edge counters entirely (the CFG
+    // layout still feeds the fingerprint, so a block-only profile keeps
+    // matching); edge counts alone can't disambiguate block counts, so
+    // any other value means block+edge.
+    let edges_on = crate::env_get("PLIRON_PGO_COUNTERS")
+        .is_none_or(|c| c != "block");
     let mut names = Vec::new(); // sym_hash -> name blob
     let mut nctrs = 0u32;
     for (sym, fop) in funcs {
         let bs = blocks(ctx, fop);
-        let (fp, edges) = fingerprint(ctx, fop);
+        let (fp, all_edges) = fingerprint(ctx, fop);
+        let edges = if edges_on { all_edges } else { Vec::new() };
         let sh = sym_hash(&sym);
         let base = nctrs;
         // Block-entry counters, then edge counters in `edges` order.
