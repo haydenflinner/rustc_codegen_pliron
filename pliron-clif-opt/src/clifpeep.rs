@@ -2147,6 +2147,11 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut inserts: Vec<(Block, Key, Value)> = vec![];
     let twloop = std::time::Instant::now();
     let mut tpre_sum = std::time::Duration::ZERO;
+    // `var_os` reads /proc-level state per call — hoisted out of the
+    // per-block loop (16k lookups per webmerge round otherwise).
+    let wmprof = std::env::var_os("PLIRON_WM_PROF").is_some();
+    let wm_nodiffb = std::env::var_os("PLIRON_WM_NODIFFB").is_some();
+    let wm_rel = std::env::var_os("PLIRON_WEBMERGE_REL").is_some();
     for (&b, es) in &edges {
         let tb0 = std::time::Instant::now();
         let ps = func.dfg.block_params(b).to_vec();
@@ -2159,7 +2164,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // block (thousands of wide params × thousands of preds) spills
         // to tens of GB and OOMs (stage1 `test::shuffle_tests`). The
         // widest joins are also the least valuable merges; skip them.
-        if std::env::var_os("PLIRON_WM_PROF").is_some() {
+        if wmprof {
             let rss = std::fs::read_to_string("/proc/self/statm")
                 .ok()
                 .and_then(|s| s.split_whitespace().nth(1).map(|x| x.to_string()))
@@ -2361,7 +2366,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         let dkeys = tblk - tkeys;
         nblk += 1;
         tkeys_sum += dkeys;
-        if std::env::var_os("PLIRON_WM_PROF").is_some() && dkeys.as_micros() > 200 {
+        if wmprof && dkeys.as_micros() > 200 {
             eprintln!(
                 "webmerge {} {b}: {} slots {} edges keying {:?}",
                 func.name,
@@ -2646,7 +2651,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                     // quadratic-with-fanout oracle — far too hot for
                     // this inner loop, so it runs only on the
                     // same-block-param shape.
-                    if std::env::var_os("PLIRON_WM_NODIFFB").is_some() {
+                    if wm_nodiffb {
                         return None;
                     }
                     let (Some(ai), Some(aj)) = (eargs[e][i], eargs[e][ix])
@@ -2733,7 +2738,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             }
             for (rk, pr) in rels {
                 let hold = has_p(&rk) && (0..es.len()).all(|e| defers(e, &rk, khash(&rk), &pr));
-                if std::env::var_os("PLIRON_WEBMERGE_REL").is_some() {
+                if wm_rel {
                     eprintln!("webmerge-rel {b} slot{ix} cand {rk:?} hold={hold}");
                 }
                 if hold {
@@ -2751,7 +2756,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // surviving param and the emitted tree dangles off the dropped
         // `p1`; with seeds in place the shared `stack` catches the cycle
         // and both resolve to `None`.
-        if std::env::var_os("PLIRON_WM_PROF").is_some() {
+        if wmprof {
             let d = tblk.elapsed();
             if d.as_micros() > 200 {
                 eprintln!(
@@ -2784,7 +2789,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 pend.remove(&ix);
                 continue;
             }
-            if std::env::var_os("PLIRON_WEBMERGE_REL").is_some() {
+            if wm_rel {
                 eprintln!("webmerge-rel {:?} slot{} {:?}", b, ix, k2);
             }
             pend.insert(ix, k2.clone());
@@ -2797,7 +2802,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
 
         let dblk = tblk.elapsed();
         tblk_sum += dblk;
-        if std::env::var_os("PLIRON_WM_PROF").is_some() && dblk.as_micros() > 200 {
+        if wmprof && dblk.as_micros() > 200 {
             eprintln!(
                 "webmerge {} {b}: {} slots {} edges scan {:?}",
                 func.name,
@@ -2895,7 +2900,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 }
                 cls = next;
             }
-            if std::env::var_os("PLIRON_WM_PROF").is_some() && tbis.elapsed().as_micros() > 200 {
+            if wmprof && tbis.elapsed().as_micros() > 200 {
                 eprintln!(
                     "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
                     func.name,
@@ -2918,8 +2923,7 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 }
             }
         }
-        if std::env::var_os("PLIRON_WM_PROF").is_some()
-            && tphasec.elapsed().as_micros() > 200
+        if wmprof && tphasec.elapsed().as_micros() > 200
         {
             eprintln!(
                 "webmerge {} {b}: phaseC P={} E={} {:?}",
