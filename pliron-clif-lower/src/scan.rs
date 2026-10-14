@@ -74,6 +74,28 @@ fn const_of(ctx: &Context, op: &ConstantOp) -> Option<ConstVal> {
     Some(ConstVal::Bits(bits))
 }
 
+/// `llvm.fabs.v4f32` -> `llvm.fabs`: the lowerer keys intrinsics by base
+/// name and reads types from the operands, like the rustc builder emits.
+fn base_intrinsic(n: &str) -> String {
+    fn is_ty(s: &str) -> bool {
+        let s = match s.strip_prefix('v') {
+            Some(r) if r.starts_with(|c: char| c.is_ascii_digit()) => {
+                r.trim_start_matches(|c: char| c.is_ascii_digit())
+            }
+            _ => s,
+        };
+        matches!(s, "f16" | "bf16" | "f32" | "f64" | "f128")
+            || (s.len() > 1
+                && (s.starts_with('i') || s.starts_with('p'))
+                && s[1..].bytes().all(|c| c.is_ascii_digit()))
+    }
+    let mut parts: Vec<&str> = n.split('.').collect();
+    while parts.len() > 2 && is_ty(parts[parts.len() - 1]) {
+        parts.pop();
+    }
+    parts.join(".")
+}
+
 fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
     let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
     for op in ops {
@@ -111,7 +133,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
             );
         } else if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {
             let n = c.get_attr_llvm_intrinsic_name(ctx).unwrap();
-            st.intrinsics.insert(op, String::from(n.clone()));
+            st.intrinsics.insert(op, base_intrinsic(&String::from(n.clone())));
         } else if let Some(r) = Operation::get_op::<AtomicRmwOp>(op, ctx) {
             st.rmw
                 .insert(op, r.get_attr_llvm_rmw_kind(ctx).unwrap().clone());
@@ -186,6 +208,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
             st.ident_to_sym.insert(name.clone(), name.clone());
             st.sym_to_ident.insert(name, id);
             if defined {
+                crate::scalarize::run(ctx, op);
                 let regions: Vec<_> = op.deref(ctx).regions().collect();
                 for r in regions {
                     let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();

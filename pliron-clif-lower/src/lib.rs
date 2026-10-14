@@ -6,6 +6,7 @@ pub mod eh;
 pub mod hot;
 pub mod lower;
 pub mod objmerge;
+pub mod scalarize;
 pub mod scan;
 
 pub mod context {
