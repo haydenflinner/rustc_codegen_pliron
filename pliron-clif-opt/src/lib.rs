@@ -20,6 +20,7 @@ pub mod edgefwd;
 pub mod edgespec;
 pub mod ifconv;
 pub mod indvars;
+pub mod ivalign;
 pub mod ivrefold;
 pub mod jumpthread;
 pub mod licm;

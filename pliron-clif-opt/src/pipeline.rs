@@ -2011,6 +2011,14 @@ fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
     loopdel::run(&mut p.clctx.func, an)
 }
 
+fn s_ivalign(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = ivalign::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("ivalign");
+    }
+    k
+}
+
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = looprot::run(&mut p.clctx.func, an, p.derived);
     p.dump("looprot");
@@ -2170,6 +2178,15 @@ pub static DEFAULT: &[Step] = &[
     )
     .needs(shape::LOOPS),
     cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
+    // Re-time rotated loops that test the pre-increment IV so the latch
+    // tests `iadd p, s` directly — drops the backedge register copy.
+    step(
+        "ivalign",
+        "ivalign",
+        Gate::Env("PLIRON_IVALIGN"),
+        s_ivalign,
+    )
+    .needs(shape::LOOPS),
     // Scalar unroll of linear counted loops (e.g. ordered float
     // reductions that can't vectorize): K bodies per branch.
     cstep(
@@ -2376,6 +2393,18 @@ pub static DEFAULT: &[Step] = &[
         "postinc",
         Gate::Env("PLIRON_POSTINC"),
         s_postinc,
+    )
+    .needs(shape::LOOPS),
+    // Second ivalign slot: paramsink is what re-times loop params into
+    // the `icmp p, bound` / `iadd p, s` backedge shape (sieve's marking
+    // loop), so the pattern rarely exists at the post-looprot position.
+    // postinc covers only constant bounds — a runtime bound needs the
+    // edge retiming.
+    step(
+        "ivalign2",
+        "ivalign",
+        Gate::Env("PLIRON_IVALIGN"),
+        s_ivalign,
     )
     .needs(shape::LOOPS),
     // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
