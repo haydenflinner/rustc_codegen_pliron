@@ -64,8 +64,15 @@ harms, both fixed:
 
 Pass-level breakdown (`PLIRON_TIMING`, hashmap CGU): the pliron CLIF
 pipeline is ~250ms of the total; cranelift+emit itself is ~30ms.
-Top steps: `jumpthread` ~60ms, `mergechain` ~30ms, `slp` ~21ms,
-`edgespec` ~18ms. Everything else ≤ 12ms.
+Top steps: `jumpthread` ~55ms, `mergechain` ~18ms, `slp` ~20ms,
+`edgespec` ~13ms. Everything else ≤ 12ms.
+
+`mergechain` attribution: `edgespec::run` ~23ms of it, mostly `splices`,
+which rebuilt a function-wide use-map and edge list per candidate
+dispatch join. Both are only needed once an in-edge provably decides the
+join's `brif` — `decided` now collects from `cfg.pred_iter(j)` and the
+O(function) maps build lazily behind it (`fb51cfa`; mergechain
+~35→18ms).
 
 Update (post-`4987364`/`dd77ec0`/`52dca45`): the `webmerge`/`sameargs`
 family briefly dominated at ~570ms × 7 call sites when `key_of`
