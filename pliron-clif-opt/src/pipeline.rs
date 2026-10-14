@@ -308,6 +308,9 @@ pub struct Analysis {
     /// `shape_of` result and the `ver` it was computed at; recomputed
     /// lazily after any mutating step.
     fshape: Option<(u64, u32)>,
+    /// Alias pairs already carried onto their targets; facts are inputs
+    /// and aliases are permanent, so a pair never needs carrying twice.
+    carried: FxHashSet<(Value, Value)>,
 }
 
 /// One borrow of the three structural analyses (`&self` tuple).
@@ -705,7 +708,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // reports 0 would leave cfg/domtree stale for the next step.
         an.bump();
         if k > 0 {
-            carry_aliases(p);
+            carry_aliases(p, an);
         }
     }
     p.log(s.stat, k);
@@ -1682,18 +1685,30 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
 /// `change_to_alias(d, w)` makes `w` `d`'s value everywhere, so facts
 /// keyed on `d` transfer to `w`. Two dozen passes alias values; rather
 /// than plumbing a merge map out of each, scan the alias table after
-/// mutating steps — re-carrying an already-carried pair is idempotent.
-fn carry_aliases(p: &mut Pipe) {
+/// mutating steps — re-carrying an already-carried pair is idempotent,
+/// and `an.carried` skips pairs already handled.
+fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
+    if p.derived.is_empty()
+        && p.nonnull.is_empty()
+        && p.noalias.is_empty()
+        && p.frozen.is_empty()
+        && p.deref.is_empty()
+        && p.operand_frozen.is_empty()
+        && p.lifetimes.is_empty()
+    {
+        return;
+    }
     let func = &p.clctx.func;
     let pairs: Vec<(Value, Value)> = func
         .dfg
         .values()
         .filter_map(|v| {
             let r = func.dfg.resolve_aliases(v);
-            (r != v).then_some((v, r))
+            (r != v && !an.carried.contains(&(v, r))).then_some((v, r))
         })
         .collect();
     for (d, w) in pairs {
+        an.carried.insert((d, w));
         carry_one(p, d, w);
     }
 }
