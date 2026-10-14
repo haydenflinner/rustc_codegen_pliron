@@ -2791,10 +2791,17 @@ fn bypass_forwarders(func: &mut Function) -> usize {
             {
                 continue;
             }
-            let dests: Vec<BlockCall> = func.dfg.insts[pinst]
+            // Index dests in place — `to_vec()` materializes every arm
+            // of a br_table (16k entries per pred on giant dispatch fns)
+            // though only the ones targeting `b` matter.
+            let ndest = func.dfg.insts[pinst]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .to_vec();
-            for (di, bc) in dests.into_iter().enumerate() {
+                .len();
+            for di in 0..ndest {
+                let bc = &func.dfg.insts[pinst].branch_destination(
+                    &func.dfg.jump_tables,
+                    &func.dfg.exception_tables,
+                )[di];
                 if bc.block(&func.dfg.value_lists) != b {
                     continue;
                 }
@@ -3850,7 +3857,6 @@ pub fn run(
         (c, d)
     };
     for _ in 0..8 {
-        let prof = crate::env_set("PLIRON_JT_PROF");
         let mut tp = std::time::Instant::now();
         if trivp {
             {

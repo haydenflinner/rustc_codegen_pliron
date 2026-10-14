@@ -1659,27 +1659,57 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // — each drop can expose uniform args in successor blocks.
         let (k, pm) = webmerge(func);
         n += k;
-        // Compose into the accumulated map: old carriers may re-drop in
-        // this round (chase through `pm`), new carriers may already be
-        // drops (chase through `pmap`). Bounded by the map sizes — a
-        // cyclic web (`a→b` here, `b→a` earlier) must not spin.
-        for v in pmap.values_mut() {
-            for _ in 0..pm.len() {
-                match pm.get(v) {
-                    Some(&w) => *v = w,
-                    None => break,
-                }
+        if !pm.is_empty() {
+            // Compose into the accumulated map: old carriers may
+            // re-drop in this round (chase through `pm`), new carriers
+            // may already be drops (chase through `pmap`). Memoized
+            // resolution — the per-entry bounded walks made this
+            // O(|pm|·|pmap|) per round on functions that drop many
+            // params. A cyclic web (`a→b` here, `b→a` earlier) still
+            // terminates: an on-path revisit stops the chase.
+            let mut memo: FxHashMap<Value, Value> = FxHashMap::default();
+            let mut onpath: FxHashSet<Value> = FxHashSet::default();
+            let mut path: Vec<Value> = Vec::new();
+            let mut resolve =
+                |v0: Value, pmap: &FxHashMap<Value, Value>| -> Value {
+                    if let Some(&r) = memo.get(&v0) {
+                        return r;
+                    }
+                    let mut v = v0;
+                    let r = loop {
+                        if let Some(&r) = memo.get(&v) {
+                            break r;
+                        }
+                        if onpath.contains(&v) {
+                            break v;
+                        }
+                        match pm.get(&v).or_else(|| pmap.get(&v)) {
+                            Some(&w) => {
+                                onpath.insert(v);
+                                path.push(v);
+                                v = w;
+                            }
+                            None => break v,
+                        }
+                    };
+                    for &x in &path {
+                        onpath.remove(&x);
+                        memo.insert(x, r);
+                    }
+                    path.clear();
+                    memo.insert(v0, r);
+                    r
+                };
+            let pairs: Vec<(Value, Value)> =
+                pmap.iter().map(|(&x, &v)| (x, v)).collect();
+            for (x, v0) in pairs {
+                let w = resolve(v0, &pmap);
+                pmap.insert(x, w);
             }
-        }
-        for (&x, &v) in &pm {
-            let mut v = v;
-            for _ in 0..pm.len() + pmap.len() {
-                match pm.get(&v).or_else(|| pmap.get(&v)) {
-                    Some(&w) => v = w,
-                    None => break,
-                }
+            for (&x, &v) in &pm {
+                let w = resolve(v, &pmap);
+                pmap.insert(x, w);
             }
-            pmap.insert(x, v);
         }
         if k == 0 {
             break;

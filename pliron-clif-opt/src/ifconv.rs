@@ -401,14 +401,14 @@ fn conv_table(
         return false;
     }
     // `all_branches` lists the default first; entry i is index i+1.
-    let dests: Vec<BlockCall> = func
-        .dfg
-        .jump_tables
-        .get(table)
-        .unwrap()
-        .all_branches()
-        .to_vec();
-    let nidx = dests.len() - 1;
+    // Cheap bounds first: a giant dispatch table (16k arms) would burn
+    // a `resolve_arm` per entry only to fail `nidx > 64` afterwards.
+    let all = func.dfg.jump_tables.get(table).unwrap().all_branches();
+    let nidx = all.len() - 1;
+    if nidx > 64 {
+        return false;
+    }
+    let dests: Vec<BlockCall> = all.to_vec();
     // Compare at the pre-extension width: `extend(x) == k` for
     // `0 <= k < 2^(bits-1)` is bit-exact, and narrow compares vectorize.
     let (idx, ity) = match func.dfg.value_def(idx) {
@@ -438,6 +438,15 @@ fn conv_table(
             return false;
         };
         if a.m == b {
+            return false;
+        }
+        // The `arms.len() > 8` bound below would reject this anyway —
+        // stop resolving further arms once it's already exceeded.
+        if arms.len() >= 8
+            && !arms
+                .iter()
+                .any(|prev| prev.m == a.m && prev.side == a.side && prev.args == a.args)
+        {
             return false;
         }
         for (ai, prev) in arms.iter().enumerate() {
