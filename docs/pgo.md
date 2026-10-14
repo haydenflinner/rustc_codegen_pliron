@@ -97,9 +97,9 @@ The gen build links it via `-Clink-arg=<path>/libpliron_prof.a`
 ## Consumption (`PLIRON_PGO_USE=<file>`)
 
 Loaded in `optimize_cgu` before the pipeline; each function's record is
-matched by `(sym_hash, fingerprint)` and stored in `st.prof`. Block
-lineage is tracked in `st.prof_bidx` (`block -> (fn, idx)`), which the
-inliner's clone path propagates to clones.
+matched by `(sym_hash, fingerprint)` and stored in `st.prof`. Per-block
+counts land in `st.prof_bcount` and per-successor edge counts in
+`st.prof_edges`; the inliner's clone path scales both into clones.
 
 Consumers, roughly in win-per-line order:
 
@@ -126,6 +126,8 @@ Phase 2 consumers (design only for now):
   hot path, not uniformly smallest.
 - **Cross-crate profiles**: counts stored in rlib metadata so consumers
   inline callees with real frequencies without a ThinLTO-style import.
+- **Sampling mode**: a PC→block map so periodic PC samples approximate
+  counts with zero instrumentation overhead.
 
 ## Wasm
 
