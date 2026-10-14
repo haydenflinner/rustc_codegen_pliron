@@ -15,7 +15,7 @@ cd "$HOME/work/rust-sh"
 B=build/x86_64-unknown-linux-gnu
 RC=$B/stage2/bin/rustc
 MERGED=$PWD/pgo-merged.prof
-PROF=$HOME/repos/rustc-codegen-pliron/target/release/pliron-prof
+PROF=$HOME/repos/rustc-codegen-pliron/tools/pliron-prof/target/release/pliron-prof
 
 case "${1:?phase}" in
 base)
@@ -23,7 +23,9 @@ base)
     ;;
 instr)
     rm -rf "$B/stage2-rustc" pgo-profs
-    PLIRON_PGO=1 ./x build --stage 2 compiler
+    # PLIRON_TIMING records per-CGU per-step wall time on stderr —
+    # answers "which pass is slow on the giant crates" for free.
+    PLIRON_PGO=1 PLIRON_TIMING=1 ./x build --stage 2 compiler
     mkdir -p pgo-profs && find . -name 'pliron-*.prof' -exec mv {} pgo-profs/ \; \
         && ls pgo-profs | wc -l
     ;;
