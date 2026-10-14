@@ -3561,6 +3561,11 @@ pub fn run(
         check(func, "unreach");
         let bpn = bypass_forwarders(func);
         check(func, "bypass");
+        if bpn > 0 {
+            // Edge retargets invalidate the cached graph before `round`
+            // reads it.
+            cd = None;
+        }
         if prof {
             eprintln!("  ifconv+bypass {:?}", tp.elapsed());
             tp = std::time::Instant::now();
@@ -3575,7 +3580,7 @@ pub fn run(
         if prof {
             eprintln!("  nn+round {:?}", tp.elapsed());
         }
-        if bpn + rn > 0 {
+        if rn > 0 {
             cd = None;
         }
         let n = dc + ic + bpn + rn;
