@@ -267,6 +267,9 @@ fn report(label: &str, before: &Function, after: &Function, facts: &OwnedFacts, 
         &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
     ) {
         println!("{label}: VERIFIER ERROR\n{e}");
+        if o.print {
+            println!("=== after ===\n{}", after.display());
+        }
         return false;
     }
     match diffcheck::check(before, after, &facts.facts(), &o.cfg) {

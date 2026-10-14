@@ -1335,18 +1335,87 @@ fn pre(
         }
         pre.end.insert(b, st);
     }
+    // Feed every new block param one edge arg per predecessor, resolved
+    // from `inserted` or the pred's `end` state. Resolve before mutating:
+    // the `st` scan above can disagree with the `out` fixpoint on rare
+    // shapes (cap-order divergence, lazy `edge_pre` inserts), leaving a loc
+    // out of a pred's `end` — poison those pairs (and, transitively, pairs
+    // whose arg would be a poisoned param) and roll their params back out
+    // rather than violate edge-arg arity.
+    let mut resolved: FxHashMap<(Block, Loc), Vec<(Block, Inst, Value)>> =
+        FxHashMap::default();
+    let mut dead: FxHashSet<(Block, Loc)> = FxHashSet::default();
     let mut k = 0;
     while k < pre.pending.len() {
         let (b, loc) = pre.pending[k];
         k += 1;
-        let mut pinsts: Vec<(Block, Inst)> = cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
+        if resolved.contains_key(&(b, loc)) {
+            continue;
+        }
+        let mut pinsts: Vec<(Block, Inst)> =
+            cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
         pinsts.sort_unstable();
         pinsts.dedup();
+        let mut args: Vec<(Block, Inst, Value)> = Vec::with_capacity(pinsts.len());
+        let mut bad = false;
         for (pb, pinst) in pinsts {
             let v = match pre.inserted.get(&(b, loc, pb)) {
-                Some(&v) => v,
-                None => end_val(func, &mut pre, pb, loc),
+                Some(&v) => Some(v),
+                None => match pre.end.get(&pb).and_then(|e| e.get(&loc)) {
+                    Some(&St::Local(v)) => Some(v),
+                    Some(&St::In) => Some(start_val(func, &mut pre, pb, loc)),
+                    _ => None,
+                },
             };
+            match v {
+                Some(v) => args.push((pb, pinst, v)),
+                None => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            dead.insert((b, loc));
+        } else {
+            resolved.insert((b, loc), args);
+        }
+    }
+    // A pair dies if it failed to resolve or if an arg is a dead pair's
+    // param; propagate the latter to fixpoint (dep order is not guaranteed).
+    let mut dead_vals: FxHashSet<Value> = FxHashSet::default();
+    let param_of: FxHashMap<Value, (Block, Loc)> =
+        pre.start.iter().map(|(&k, &v)| (v, k)).collect();
+    loop {
+        let mut grown = false;
+        for (k, args) in &resolved {
+            if dead.contains(k) {
+                continue;
+            }
+            if args
+                .iter()
+                .any(|&(_, _, v)| param_of.get(&v).is_some_and(|d| dead.contains(d)))
+            {
+                dead.insert(*k);
+                grown = true;
+            }
+        }
+        if !grown {
+            break;
+        }
+    }
+    for &k in &dead {
+        if let Some(&v) = pre.start.get(&k) {
+            dead_vals.insert(v);
+            func.dfg.remove_block_param(v);
+        }
+    }
+    for (b, loc) in pre.pending.iter().copied() {
+        let Some(args) = resolved.get(&(b, loc)) else {
+            continue;
+        };
+        for &(pb, pinst, v) in args {
+            let _ = pb;
             let dfg = &mut func.dfg;
             for bc in dfg.insts[pinst]
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
@@ -1357,13 +1426,18 @@ fn pre(
             }
         }
     }
+    let mut n = 0;
     for &(i, v) in &fwd {
+        if dead_vals.contains(&v) {
+            continue;
+        }
         let r = func.dfg.first_result(i);
         func.layout.remove_inst(i);
         func.dfg.clear_results(i);
         func.dfg.change_to_alias(r, v);
+        n += 1;
     }
-    fwd.len()
+    n
 }
 
 /// Remove stores into stack slots that nothing reads and whose address never

@@ -10,7 +10,9 @@
 //! `x < 170` check per arm, and merging them lets rangefold see the
 //! shared miss edge its union rule needs.
 
-use cranelift_codegen::ir::{Block, Function, Opcode, Value};
+use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::{Block, BlockArg, Function, Opcode, Value, ValueDef};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 32;
@@ -199,6 +201,61 @@ pub fn run(func: &mut Function) -> usize {
             }
         }
     }
+    if map.is_empty() {
+        return 0;
+    }
+    // Redirecting a dead block's preds into its canonical block opens a
+    // path into `canon` that may bypass the blocks `canon`'s used values
+    // are defined in — `jump T(v)` where `v` was defined only on `canon`'s
+    // original in-paths becomes an undominated edge arg. Keep a merge only
+    // when every external def `canon` uses dominates all of the dead
+    // block's preds.
+    let cfg = ControlFlowGraph::with_function(func);
+    let dom = DominatorTree::with_function(func, &cfg);
+    let mut needs: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+    for &c in map.values() {
+        needs.entry(c).or_insert_with(|| {
+            let mut s = FxHashSet::default();
+            let mut note = |v: Value, s: &mut FxHashSet<Block>| match func
+                .dfg
+                .value_def(func.dfg.resolve_aliases(v))
+            {
+                ValueDef::Result(d, _) => {
+                    if let Some(db) = func.layout.inst_block(d)
+                        && db != c
+                    {
+                        s.insert(db);
+                    }
+                }
+                ValueDef::Param(d, _) if d != c => {
+                    s.insert(d);
+                }
+                _ => {}
+            };
+            for i in func.layout.block_insts(c) {
+                for &v in func.dfg.inst_args(i) {
+                    note(v, &mut s);
+                }
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a {
+                            note(v, &mut s);
+                        }
+                    }
+                }
+            }
+            s
+        });
+    }
+    map.retain(|&d, &mut c| {
+        let Some(nd) = needs.get(&c) else {
+            return true;
+        };
+        cfg.pred_iter(d)
+            .all(|p| nd.iter().all(|&dv| dom.block_dominates(dv, p.block)))
+    });
     if map.is_empty() {
         return 0;
     }
