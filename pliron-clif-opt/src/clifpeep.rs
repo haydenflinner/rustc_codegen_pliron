@@ -5885,6 +5885,26 @@ pub fn lcse(func: &mut Function) -> usize {
             seen.remove(&k);
         }
     };
+    // Def block of a value: the inst's block for results, the param's own
+    // block for block params, `None` for unions.
+    let def_block = |func: &Function, v: Value| -> Option<Block> {
+        match func.dfg.value_def(v) {
+            ValueDef::Result(d, _) => func.layout.inst_block(d),
+            ValueDef::Param(p, _) => Some(p),
+            ValueDef::Union(_, _) => None,
+        }
+    };
+    // Loop structure for the ident-alias guard at the fold site below.
+    let la = {
+        use cranelift_codegen::dominator_tree::DominatorTree;
+        use cranelift_codegen::flowgraph::ControlFlowGraph;
+        use cranelift_codegen::loop_analysis::LoopAnalysis;
+        let cfg = ControlFlowGraph::with_function(func);
+        let dt = DominatorTree::with_function(func, &cfg);
+        let mut la = LoopAnalysis::new();
+        la.compute(func, &cfg, &dt);
+        la
+    };
     // `x*1` / `x+0` / `x|0` / `x^0` / `x&-1` / `x<<0` / `x>>0` -> `x`: these
     // survive GVN when rustc's `index*elemsize` idiom degenerates to *1.
     let ident = |func: &Function, data: InstructionData, res_ty: Type| -> Option<Value> {
@@ -6250,7 +6270,18 @@ pub fn lcse(func: &mut Function) -> usize {
             if func.dfg.resolve_aliases(res) != res {
                 continue;
             }
-            if let Some(x) = ident(func, data, func.dfg.value_type(res)) {
+            if let Some(x) = ident(func, data, func.dfg.value_type(res))
+                // An identity alias deletes `i` and moves `res`'s uses
+                // onto `x`, stretching `x`'s live range from `i` to
+                // `res`'s last use. Inside a loop that merge drops the
+                // copy ra2 could have rematerialized at the use —
+                // forcing `x` live-through where an in-loop recompute
+                // would do (`tokenize`'s scan loop). Same-block copies
+                // still fold; `Union` defs (no single block) fold too.
+                && (la.loop_level(b).level() == 0
+                    || matches!(def_block(func, x), Some(xb) if xb == b)
+                    || def_block(func, x).is_none())
+            {
                 func.dfg.clear_results(i);
                 func.dfg.change_to_alias(res, x);
                 dead.push(i);
