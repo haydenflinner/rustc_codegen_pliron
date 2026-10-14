@@ -1673,7 +1673,11 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = indvars::postinc(&mut p.clctx.func, an, 1024);
+    let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
+    if k > 0 {
+        an.invalidate();
+    }
+    k += indvars::postinc_ne(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("postinc");
     }
