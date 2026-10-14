@@ -16,6 +16,7 @@
 //!
 //! `PLIRON_DIVCONST=0` disables; `PLIRON_DIVCONST_DEBUG` logs expansions.
 
+use crate::clifpeep;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
     ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
@@ -78,16 +79,23 @@ fn magic_signed(d: u64, w: u32) -> Option<(u64, u32)> {
 }
 
 /// `(magic, is_add, shift)` for unsigned division by `d` (`d >= 2`), per
-/// LLVM's `UnsignedDivisionByConstantInfo::get` with `LeadingZeros = 0` and
-/// neither the even-divisor pre-shift nor the widened-magic variant.
-/// `is_add` marks the W+1-bit magic case: the extra bit is folded into the
-/// emitted `(x - q) >>> 1 + q` step instead of the constant.
-fn magic_unsigned(d: u64, w: u32) -> (u64, bool, u32) {
+/// LLVM's `UnsignedDivisionByConstantInfo::get` with neither the
+/// even-divisor pre-shift nor the widened-magic variant. `is_add` marks
+/// the W+1-bit magic case: the extra bit is folded into the emitted
+/// `(x - q) >>> 1 + q` step instead of the constant. `lz` is a proven
+/// bound of the dividend's leading zeros — LLVM's `LeadingZeros`
+/// parameter: a smaller `nc` lets the search settle at a magic that fits
+/// `w` bits where the full-width search needed `is_add` (`/7` with
+/// `lz=2` gives `0x4924…925 >> 1` instead of the fixup).
+pub fn magic_unsigned_lz(d: u64, w: u32, lz: u32) -> (u64, bool, u32) {
+    debug_assert!(lz < w);
     let m = mask(w);
+    let ones = mask(w - lz);
     let signed_min = 1u64 << (w - 1);
     let signed_max = signed_min - 1;
-    // NC: largest dividend with NC % d == d - 1; (all_ones + 1) wraps to 0.
-    let nc = m.wrapping_sub(m.wrapping_add(1).wrapping_sub(d) % d);
+    // NC: largest dividend with NC % d == d - 1; (all_ones + 1 - d) is a
+    // w-bit wrap (d can exceed the bounded dividend), so mask it back.
+    let nc = ones.wrapping_sub((ones.wrapping_add(1).wrapping_sub(d) & m) % d) & m;
     debug_assert!(nc % d == d - 1);
     let mut p = w - 1;
     let (mut q1, mut r1) = (signed_min / nc, signed_min % nc);
@@ -202,6 +210,7 @@ fn quotient(
     x: Value,
     d: u64,
     signed: bool,
+    lz: u32,
 ) -> Option<Value> {
     let ad = sext(d, w).unsigned_abs();
     Some(if signed {
@@ -244,7 +253,7 @@ fn quotient(
             let c = scst(pos, ty, w, d.trailing_zeros() as u64);
             pos.ins().ushr(x, c)
         } else {
-            let (magic, is_add, shift) = magic_unsigned(d, w);
+            let (magic, is_add, shift) = magic_unsigned_lz(d, w, lz);
             let mc = cst(pos, ty, w, magic);
             let mut q = mulhi(pos, ty, false, x, mc);
             if is_add {
@@ -265,7 +274,14 @@ fn quotient(
 
 /// Expand one matched inst at the cursor; returns the value its result
 /// aliases to. `None` only if the magic search declined.
-fn expand(pos: &mut FuncCursor, ty: Type, x: Value, d: u64, op: Opcode) -> Option<Value> {
+fn expand(
+    pos: &mut FuncCursor,
+    ty: Type,
+    x: Value,
+    d: u64,
+    op: Opcode,
+    lz: u32,
+) -> Option<Value> {
     let w = ty.lane_type().bits();
     let m = mask(w);
     let signed = matches!(op, Opcode::Sdiv | Opcode::Srem);
@@ -304,7 +320,7 @@ fn expand(pos: &mut FuncCursor, ty: Type, x: Value, d: u64, op: Opcode) -> Optio
         pos.ins().ineg(x)
     } else {
         // `x % d = x - (x/d)*d` once the quotient is built.
-        let q = quotient(pos, ty, w, x, d, signed)?;
+        let q = quotient(pos, ty, w, x, d, signed, lz)?;
         if rem {
             let dc = cst(pos, ty, w, d);
             let qd = pos.ins().imul(q, dc);
@@ -373,7 +389,17 @@ pub fn run(func: &mut Function) -> usize {
     for (i, ty, x, d, op) in hits {
         pos.goto_inst(i);
         let res = pos.func.dfg.first_result(i);
-        let Some(v) = expand(&mut pos, ty, x, d, op) else {
+        // Proven leading zeros on the dividend shrink `nc`, often
+        // replacing the `(x - q) >>> 1 + q` fixup with a plain shift.
+        // Only when the bound still exceeds the divisor — `x % d = x`
+        // outright for `d > max(x)` but that's a fold elsewhere.
+        let vm = clifpeep::vmax(pos.func, x);
+        let lz = if vm >= d {
+            (ty.bits() as u32).saturating_sub(64 - (vm | 1).leading_zeros())
+        } else {
+            0
+        };
+        let Some(v) = expand(&mut pos, ty, x, d, op, lz) else {
             continue;
         };
         pos.func.dfg.clear_results(i);

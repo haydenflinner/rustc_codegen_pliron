@@ -19,7 +19,7 @@ use pliron::{
     r#type::Typed,
     value::Value,
 };
-use pliron_llvm::{attributes::ICmpPredicateAttr as P, ops::*};
+use pliron_llvm::{attributes::ICmpPredicateAttr as P, op_interfaces::BinArithOp, ops::*};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
@@ -387,6 +387,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
+        nv += fold_divmul(ctx, st, f);
         let (c, v) = if egg {
             run_fn_egg(ctx, st, f)
         } else {
@@ -401,6 +402,84 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             st.cgu
         );
     }
+}
+
+/// `(x / d) * d` → `x - x % d`, LLVM InstCombine's truncating-division
+/// identity — `q*d` is always exactly `x - r`, so a multiply that rebuilds
+/// the quotient's product is paying for a division only to undo it. The
+/// win is outsized on i128, where the quotient is a ~30-inst expansion and
+/// the remainder folds at the limb level. The mul is rewritten even when
+/// the quotient feeds other uses; a div that loses its last use is erased.
+fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
+    let mut hits: Vec<(Ptr<Operation>, Value, Value, bool, Ptr<Operation>)> = Vec::new();
+    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+        for op in b.deref(ctx).iter(ctx) {
+            if !Operation::is_op::<MulOp>(op, ctx) {
+                continue;
+            }
+            if int_width(ctx, op.deref(ctx).get_result(0)).is_none() {
+                continue;
+            }
+            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            for i in 0..2 {
+                let Some(dop) = opnds[i].defining_op() else {
+                    continue;
+                };
+                let signed = Operation::is_op::<SDivOp>(dop, ctx);
+                if !signed && !Operation::is_op::<UDivOp>(dop, ctx) {
+                    continue;
+                }
+                let dopnds: Vec<Value> = dop.deref(ctx).operands().collect();
+                // Constants are per-use `undef` values, so two `7`s only
+                // match through `st.consts`, not `Value` identity.
+                if canon_eq(st, dopnds[1], opnds[1 - i]) {
+                    hits.push((op, dopnds[0], dopnds[1], signed, dop));
+                    break;
+                }
+            }
+        }
+    }
+    // One `rem` per distinct (x, d) pair shared by all the matching muls;
+    // a quotient that loses its last use gets erased with the mul.
+    let mut rems: FxHashMap<(Value, Value), Value> = FxHashMap::default();
+    let mut divs: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+    for (op, x, d, signed, dop) in &hits {
+        let rem = *rems.entry((*x, *d)).or_insert_with(|| {
+            let rop = if *signed {
+                SRemOp::new(ctx, *x, *d).get_operation()
+            } else {
+                URemOp::new(ctx, *x, *d).get_operation()
+            };
+            rop.insert_before(ctx, *op);
+            rop.deref(ctx).get_result(0)
+        });
+        let sub = SubOp::new(ctx, *x, rem).get_operation();
+        sub.insert_before(ctx, *op);
+        let sub_r = sub.deref(ctx).get_result(0);
+        let r = op.deref(ctx).get_result(0);
+        r.replace_all_uses_with(ctx, &sub_r);
+        Operation::erase(*op, ctx);
+        divs.insert(*dop);
+    }
+    for dop in divs {
+        if !dop.deref(ctx).get_result(0).is_used(ctx) {
+            Operation::erase(dop, ctx);
+        }
+    }
+    hits.len()
+}
+
+/// Value identity modulo the constant table — every use of a literal is a
+/// distinct `undef` result sharing a `ConstVal`.
+fn canon_eq(st: &State, a: Value, b: Value) -> bool {
+    a == b
+        || match (st.consts.get(&a), st.consts.get(&b)) {
+            (Some(ConstVal::Zero), Some(ConstVal::Zero)) => true,
+            (Some(ConstVal::Bits(x)), Some(ConstVal::Bits(y))) => x == y,
+            (Some(ConstVal::Zero), Some(ConstVal::Bits(y)))
+            | (Some(ConstVal::Bits(y)), Some(ConstVal::Zero)) => *y == 0,
+            _ => false,
+        }
 }
 
 // ============================ worklist peephole ============================

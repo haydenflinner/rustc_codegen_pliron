@@ -2203,6 +2203,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// 64-bit limb multiplies (LLVM's `BuildUDIV`): powers of two shift,
     /// otherwise `q = mulhi(x, M) >> s` with the `(x - q)/2 + q` fixup when
     /// the magic needs a 129th bit. `None` asks the caller to libcall.
+    ///
+    /// Small odd divisors take a cheaper route first (LLVM's own choice on
+    /// aarch64): fold `x`'s width-`w` limbs into a u64 congruent mod `d`
+    /// (`2^w ≡ 1 (mod d)`), one `urem.i64` finishes the remainder, and the
+    /// quotient is `(x - r)·d⁻¹ mod 2^128` — a plain `imul` — instead of the
+    /// four-`umulhi` carry chain a full 128×128 magic multiply costs.
     fn div_u128_const(&mut self, x: ir::Value, d: u128, rem: bool) -> Option<ir::Value> {
         if d == 0 {
             return None;
@@ -2211,6 +2217,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let pre = d.trailing_zeros();
         let d_odd = d >> pre;
         let xs = if pre > 0 { self.ushr128_imm(x, pre) } else { x };
+        if d_odd > 1 && fold_width(d_odd).is_some() {
+            let r = self.rem_u128_fold(xs, d_odd);
+            if rem && pre == 0 {
+                return Some(self.b.ins().uextend(clt::I128, r));
+            }
+            // `xs - r` is exactly `q·d`, so one wrap-multiply by the
+            // inverse mod 2^128 yields the quotient.
+            let r128 = self.b.ins().uextend(clt::I128, r);
+            let xr = self.b.ins().isub(xs, r128);
+            let inv = self.iconst_any(clt::I128, modinv_u128(d_odd));
+            let q = self.b.ins().imul(xr, inv);
+            if !rem {
+                return Some(q);
+            }
+            let dc = self.iconst_any(clt::I128, d);
+            let qd = self.b.ins().imul(q, dc);
+            return Some(self.b.ins().isub(x, qd));
+        }
         let mut q = xs;
         if d_odd > 1 {
             let (m, s, add) = magicu128(d_odd);
@@ -2235,6 +2259,57 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let dc = self.iconst_any(clt::I128, d);
         let qd = self.b.ins().imul(q, dc);
         Some(self.b.ins().isub(x, qd))
+    }
+
+    /// `x mod d` as a u64, for odd `d` with `fold_width(d) = Some(w)`:
+    /// `x ≡ Σ` limbs of `x` at width `w` `(mod d)` because `2^w ≡ 1`.
+    /// The sum is below `2^64` for every legal `w`; `urem.i64` shrinks it
+    /// to `[0, d)` unless `d ≥ 2^64` already bounds it.
+    fn rem_u128_fold(&mut self, x: ir::Value, d: u128) -> ir::Value {
+        let w = fold_width(d).expect("fold_width checked by caller");
+        let (lo, hi) = self.b.ins().isplit(x);
+        let n = 128usize.div_ceil(w as usize);
+        let mut acc = self.limb64(lo, hi, 0, w);
+        for i in 1..n as u32 {
+            let l = self.limb64(lo, hi, i * w, w);
+            acc = self.b.ins().iadd(acc, l);
+        }
+        if d > u64::MAX as u128 {
+            acc
+        } else {
+            let dc = self.b.ins().iconst(clt::I64, d as u64 as i64);
+            self.b.ins().urem(acc, dc)
+        }
+    }
+
+    /// Bits `[j, j+w)` of the i128 `(lo, hi)` pair as a u64 — an `extr`
+    /// pair for limbs straddling the limb boundary, a masked shift for
+    /// the rest. `w ≤ 62` keeps the mask and the shifted-out top legal.
+    fn limb64(&mut self, lo: ir::Value, hi: ir::Value, j: u32, w: u32) -> ir::Value {
+        let mask = (1u64 << w) - 1;
+        let v = if j >= 64 {
+            self.b.ins().ushr_imm_u(hi, (j - 64) as i64)
+        } else if j + w <= 64 {
+            let l = self.b.ins().ushr_imm_u(lo, j as i64);
+            if j + w == 64 {
+                l
+            } else {
+                let m = self.b.ins().iconst(clt::I64, mask as i64);
+                self.b.ins().band(l, m)
+            }
+        } else {
+            let l = self.b.ins().ushr_imm_u(lo, j as i64);
+            let h = self.b.ins().ishl_imm_u(hi, (64 - j) as i64);
+            let v = self.b.ins().bor(l, h);
+            let m = self.b.ins().iconst(clt::I64, mask as i64);
+            self.b.ins().band(v, m)
+        };
+        if j >= 64 && j + w < 128 {
+            let m = self.b.ins().iconst(clt::I64, mask as i64);
+            self.b.ins().band(v, m)
+        } else {
+            v
+        }
     }
 
     /// High 128 bits of the 256-bit product of two u128s given as (lo, hi)
@@ -4545,6 +4620,35 @@ fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
 /// `x / d == mulhi128(x, magic) >> post_shift` for all `x < 2^128`, or with
 /// `is_add`, `q = (mulhi128(x, magic) + ((x - mulhi128(x, magic)) >> 1))`
 /// then `>> post_shift`. All arithmetic wraps mod 2^128 like a W-bit APInt.
+/// Fold width for `rem_u128_fold`: the largest `w ≤ 62` with
+/// `2^w ≡ 1 (mod d)` — a multiple of `ord_d(2)` that leaves ≥ 32 bits per
+/// limb so the limb sum always fits u64. `None` when the order exceeds 62
+/// (e.g. `u64::MAX`-scale divisors), which falls back to magic multiply.
+fn fold_width(d: u128) -> Option<u32> {
+    debug_assert!(d > 1 && d % 2 == 1);
+    let mut p = 1u128;
+    for ord in 1..=62u32 {
+        // `2p mod d` without the `2p` overflow when `d > 2^127`.
+        p = if p >= d - p { p - (d - p) } else { p + p };
+        if p == 1 {
+            return Some(ord * (62 / ord));
+        }
+    }
+    None
+}
+
+/// `d⁻¹ mod 2^128` for odd `d` via Newton iteration — `inv = d` is exact
+/// to 3 bits and each step doubles them (3→6→12→24→48→96→192).
+fn modinv_u128(d: u128) -> u128 {
+    debug_assert!(d % 2 == 1);
+    let mut inv = d;
+    for _ in 0..6 {
+        inv = inv.wrapping_mul(2u128.wrapping_sub(d.wrapping_mul(inv)));
+    }
+    debug_assert_eq!(d.wrapping_mul(inv), 1);
+    inv
+}
+
 fn magicu128(d: u128) -> (u128, u32, bool) {
     debug_assert!(d > 1);
     let all_ones = u128::MAX;

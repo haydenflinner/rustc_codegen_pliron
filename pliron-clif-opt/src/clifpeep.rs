@@ -121,6 +121,17 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
                 hi = hi.min(d as u64 - 1);
             }
         }
+        // `a + b` is at most the sum of the operand bounds — the u128
+        // div/rem fold's limb sum (`band`-masked chunks) lands a tight
+        // bound on its `urem` dividend, unlocking divconst's lz-magic.
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } => {
+            let m = vmax_d(func, args[0], depth - 1)
+                .saturating_add(vmax_d(func, args[1], depth - 1));
+            hi = hi.min(m);
+        }
         // `icmp` yields 0/1; `a ^ b` sets no bit clear in both operands.
         InstructionData::IntCompare { .. } => hi = hi.min(1),
         InstructionData::Unary { opcode, .. }
@@ -4410,6 +4421,46 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     let inc = pos.ins().iadd_imm_s(x, d);
                     pos.func.replace(inst).select(c, inc, x);
                     n += 1;
+                }
+                continue;
+            }
+            // `imul.i128 x, iconcat(k, 0)` → a 64×128 limb product:
+            // `hi' = x_hi·k + umulhi(x_lo, k)` (one `madd` at isel) and
+            // `lo' = x_lo·k`. The generic 128×128 legalization multiplies
+            // x's limbs by the constant's dead zero high limb as well.
+            if let InstructionData::Binary {
+                opcode: Opcode::Imul,
+                args,
+            } = pos.func.dfg.insts[inst]
+            {
+                let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                if ty == types::I128 {
+                    for i in 0..2 {
+                        let x = pos.func.dfg.resolve_aliases(args[i]);
+                        let kv = pos.func.dfg.resolve_aliases(args[1 - i]);
+                        let Some(kd) = pos.func.dfg.value_def(kv).inst() else {
+                            continue;
+                        };
+                        let InstructionData::Binary {
+                            opcode: Opcode::Iconcat,
+                            args: kargs,
+                        } = pos.func.dfg.insts[kd]
+                        else {
+                            continue;
+                        };
+                        if iconst(pos.func, kargs[1]) != Some(0) {
+                            continue;
+                        }
+                        let kl = kargs[0];
+                        let (xl, xh) = pos.ins().isplit(x);
+                        let h1 = pos.ins().umulhi(xl, kl);
+                        let h2 = pos.ins().imul(xh, kl);
+                        let h = pos.ins().iadd(h1, h2);
+                        let l = pos.ins().imul(xl, kl);
+                        pos.func.replace(inst).iconcat(l, h);
+                        n += 1;
+                        break;
+                    }
                 }
                 continue;
             }
