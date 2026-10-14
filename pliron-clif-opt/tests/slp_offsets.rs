@@ -20,6 +20,7 @@ fn slp_is_sound(src: &str) {
         &mut Analysis::default(),
         &FxHashSet::default(),
         true,
+        false,
     );
     assert!(
         n > 0,

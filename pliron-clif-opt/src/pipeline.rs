@@ -1169,7 +1169,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_slp(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = slp::run(&mut p.clctx.func, an, p.noalias, p.simd);
+    let k = slp::run(&mut p.clctx.func, an, p.noalias, p.simd, p.x64);
     if env_set("PLIRON_XPACK_CLIF") {
         eprintln!(
             "==== clif {} after slp ====\n{}",

@@ -162,10 +162,15 @@ pub fn bisect_in(name: &str, func: &str) -> bool {
     let n = BISECT_COUNT.fetch_add(1, Ordering::Relaxed);
     let ok = n < limit;
     if env_is("PLIRON_OPT_BISECT_DEBUG", "1") {
+        let rss = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1).map(|x| x.to_string()))
+            .unwrap_or_default();
         eprintln!(
-            "bisect {} {name} {} {func}",
+            "bisect {} {name} {} {func} rss={}",
             n + 1,
-            if ok { "run" } else { "skip" }
+            if ok { "run" } else { "skip" },
+            rss
         );
     }
     ok

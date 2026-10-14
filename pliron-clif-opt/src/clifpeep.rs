@@ -2151,6 +2151,19 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // block (thousands of wide params × thousands of preds) spills
         // to tens of GB and OOMs (stage1 `test::shuffle_tests`). The
         // widest joins are also the least valuable merges; skip them.
+        if std::env::var_os("PLIRON_WM_PROF").is_some() {
+            let rss = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1).map(|x| x.to_string()))
+                .unwrap_or_default();
+            eprintln!(
+                "wmb {} {b} E={} P={} rss={}",
+                func.name,
+                es.len(),
+                ps.len(),
+                rss
+            );
+        }
         if es.len().saturating_mul(ps.len()) > 4_000_000 {
             continue;
         }
@@ -2219,6 +2232,31 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             );
         }
         if !arity_ok {
+            continue;
+        }
+        // `skey_of`/`pk_of`/`paramize` materialize `Key` trees ~`vnodes`
+        // nodes deep per (edge, slot) cell — on megafunction operand
+        // DAGs (stage1 `test::shuffle_tests`) that turns the lazy
+        // matrices into tens of GB of keys. Cap the block's total arg
+        // tree size; `vnodes` is memoized so the scan is cheap.
+        let mut arg_nodes = 0usize;
+        'cap: for r in &eargs {
+            for c in r {
+                if let Some(v) = c {
+                    arg_nodes += crate::proots::vnodes(
+                        func,
+                        &nf,
+                        &canon,
+                        &mut vnmemo.borrow_mut(),
+                        *v,
+                    );
+                    if arg_nodes > 2_000_000 {
+                        break 'cap;
+                    }
+                }
+            }
+        }
+        if arg_nodes > 2_000_000 {
             continue;
         }
         if std::env::var_os("PLIRON_WM_SIZES").is_some() {

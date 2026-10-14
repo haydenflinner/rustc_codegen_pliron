@@ -455,6 +455,7 @@ fn try_block(
     uses: &mut Option<Uses>,
     _na: &FxHashSet<Value>,
     block: Block,
+    x64: bool,
 ) -> usize {
     let insts: Vec<Inst> = func.layout.block_insts(block).collect();
     // Collect scalar stores.
@@ -510,6 +511,11 @@ fn try_block(
         let esz = i64::from(g[0].ty.bytes());
         for &lanes in &[16 / esz, 8 / esz] {
             if lanes < 2 || lanes > 16 {
+                continue;
+            }
+            // x64 ISLE only lowers 128-bit vectors — 8-byte packs
+            // (i32x2, f32x2, i8x8, ...) reach emit as `unimplemented`.
+            if x64 && lanes * esz != 16 {
                 continue;
             }
             let mut run: Vec<&StoreInfo> = Vec::new();
@@ -627,6 +633,7 @@ pub fn run(
     an: &mut crate::pipeline::Analysis,
     na: &FxHashSet<Value>,
     simd: bool,
+    x64: bool,
 ) -> usize {
     if !simd {
         return 0;
@@ -640,7 +647,7 @@ pub fn run(
     let (_, domtree) = an.cfg_dt(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, domtree, &mut uses, na, block);
+        changed += try_block(func, domtree, &mut uses, na, block, x64);
     }
     // try_block's emits aren't recorded in the map (its own checks never
     // consult them — lane values are scalars it could re-pack, bases are
@@ -655,7 +662,7 @@ pub fn run(
         // map serves every block.
         let ps = crate::loadfwd::param_src(func);
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            changed += xpack_block(func, &domtree, na, block, &mut uses, &ps);
+            changed += xpack_block(func, &domtree, na, block, &mut uses, &ps, x64);
         }
     }
     if changed > 0 {
@@ -1217,6 +1224,7 @@ fn plan_pair(
     taken: &FxHashSet<Inst>,
     ia: Inst,
     ib: Inst,
+    x64: bool,
 ) -> Option<(
     Pack,
     Type,
@@ -1254,7 +1262,9 @@ fn plan_pair(
     if func.dfg.inst_args(ia).len() != func.dfg.inst_args(ib).len() {
         return None;
     }
-    let vt = ty.by(2)?;
+    // x64 lowers only 128-bit vectors: i32/f32 pairs (i32x2/f32x2) are
+    // legal CLIF but reach ISLE as `unimplemented`.
+    let vt = ty.by(2).filter(|v| !x64 || v.bits() == 128)?;
     let mut x = X {
         func,
         ps: &ps,
@@ -1597,6 +1607,7 @@ fn plan_store(
     taken: &FxHashSet<Inst>,
     i1: Inst,
     i2: Inst,
+    x64: bool,
 ) -> Option<(
     Pack,
     Type,
@@ -1654,7 +1665,7 @@ fn plan_store(
     if ty.is_vector() || ty != func.dfg.value_type(db) || ty.bytes() != r1.2 {
         return None;
     }
-    let vt = ty.by(2)?;
+    let vt = ty.by(2).filter(|v| !x64 || v.bits() == 128)?;
     // The store earlier in layout re-emits its write at the emit point, so
     // nothing in between may touch its bytes (or be an opaque side effect).
     let (first, last) = if pos[&sa] < pos[&sb] {
@@ -1784,6 +1795,7 @@ fn xpack_block(
     block: Block,
     uses: &mut Option<Uses>,
     ps: &FxHashMap<Value, Value>,
+    x64: bool,
 ) -> usize {
     let mut total = 0;
     let mut tried = 0usize;
@@ -1888,9 +1900,9 @@ fn xpack_block(
                     }
                     tried += 1;
                     let plan = if is_store {
-                        plan_store(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b)
+                        plan_store(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64)
                     } else {
-                        plan_pair(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b)
+                        plan_pair(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64)
                     };
                     if plan.is_none() && !is_store {
                         if let (Some(&a1), Some(&b1)) = (pos.get(&a), pos.get(&b)) {
