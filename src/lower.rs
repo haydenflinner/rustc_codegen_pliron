@@ -569,6 +569,11 @@ pub fn lower_to_object(
         if j.dump {
             eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
         }
+        if sh.x64 {
+            // ISLE only lowers 128-bit vector ops; scalarize narrow
+            // extractlane/insertlane (core_simd masks emit i8x8).
+            crate::veclegalize::run(&mut clctx.func, 128);
+        }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
         // carries the function name and final CLIF for reproduction.

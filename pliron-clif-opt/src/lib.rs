@@ -47,5 +47,6 @@ pub mod tailmerge;
 pub mod tailrec;
 pub mod unreach;
 pub mod unroll;
+pub mod veclegalize;
 
 pub use config::{bisect, env_get, env_is, env_set, pass_enabled};
