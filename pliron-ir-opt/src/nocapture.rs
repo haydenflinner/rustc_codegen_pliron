@@ -187,6 +187,10 @@ pub fn run(ctx: &Context, st: &mut State) {
     let dbg = crate::env_get("PLIRON_NOCAPDBG");
     let mut dbgrets: Vec<(String, Value, String)> = Vec::new();
     let mut dbgargs: Vec<(String, Value, String)> = Vec::new();
+    // `slot_loads`'s nested `accesses` walks — one memo for the whole
+    // pass: the analysis never mutates the function, and the same temp
+    // slot is typically the destination of many stores.
+    let mut accmemo = crate::sroa::AccMemo::default();
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -269,7 +273,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // that slot's load results, so flow to them instead.
                     // Anything else retains — the pointer can roam.
                     let (sv, dp) = (d.get_operand(0), d.get_operand(1));
-                    match crate::sroa::slot_loads(ctx, st, dp, 0) {
+                    match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
                         Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
                         None => retain(sv),
                     }

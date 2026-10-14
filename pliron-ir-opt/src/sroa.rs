@@ -23,7 +23,7 @@ use pliron_llvm::ops::{
     PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
 use pliron_llvm::types::ArrayType;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
 use crate::state::{ConstVal, State, mask};
@@ -238,6 +238,18 @@ fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
 /// into a temp, loaded back, then stored into another temp, ...).
 const MAX_FLOW_DEPTH: u32 = 6;
 
+/// `accesses` results shared across one analysis pass's nested walks: a
+/// `store *q <- p` use runs `accesses` on `q`, and K stores into `q` (or a
+/// load-back store chain) would otherwise re-walk `q`'s whole use graph K
+/// times — the failure mode that made stage2's `aho_corasick` spin for
+/// hours. Keyed `(root, depth)` so results computed at different flow
+/// depths don't mix. Valid only while the function's use-lists are
+/// untouched — never carry it across a rewrite (sroa's `split` mutates, so
+/// each `accesses` call gets a fresh memo; pure passes like `nocapture`
+/// may share one for the whole body).
+#[derive(Default)]
+pub(crate) struct AccMemo(FxHashMap<(Value, u32), Option<(Vec<Access>, Vec<Ptr<Operation>>)>>);
+
 /// `dst` is the address operand of `store *dst <- p` that carried a pointer
 /// derived from the alloca being collected. If `dst` resolves to a temp
 /// slot whose bytes never leave this walk — every use is a load, a store
@@ -251,6 +263,7 @@ pub(crate) fn slot_loads(
     st: &State,
     dst: Value,
     depth: u32,
+    memo: &mut AccMemo,
 ) -> Option<Vec<Value>> {
     let mut q = dst;
     while !st.allocas.contains_key(&q) {
@@ -261,7 +274,7 @@ pub(crate) fn slot_loads(
         q = op.deref(ctx).get_operand(0);
     }
     let &(qsize, _) = st.allocas.get(&q)?;
-    let (qacc, _) = accesses(ctx, st, q, qsize, depth + 1)?;
+    let (qacc, _) = accesses_m(ctx, st, q, qsize, depth + 1, memo)?;
     let mut loads = Vec::new();
     for qa in &qacc {
         match qa.kind {
@@ -285,7 +298,7 @@ pub(crate) fn slot_loads(
                 // The bytes were memcpy'd into another slot — the stored
                 // pointer may come back at the destination's loads.
                 let d = qa.op.deref(ctx).get_operand(0);
-                loads.extend(slot_loads(ctx, st, d, depth + 1)?);
+                loads.extend(slot_loads(ctx, st, d, depth + 1, memo)?);
             }
             _ => return None,
         }
@@ -300,6 +313,35 @@ fn accesses(
     a: Value,
     size: u64,
     depth: u32,
+) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
+    // `split` mutates use-lists between `run`'s per-alloca calls — the
+    // memo's scope is one top-level walk.
+    accesses_m(ctx, st, a, size, depth, &mut AccMemo::default())
+}
+
+fn accesses_m(
+    ctx: &Context,
+    st: &State,
+    a: Value,
+    size: u64,
+    depth: u32,
+    memo: &mut AccMemo,
+) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
+    if let Some(r) = memo.0.get(&(a, depth)) {
+        return r.clone();
+    }
+    let r = accesses_inner(ctx, st, a, size, depth, memo);
+    memo.0.insert((a, depth), r.clone());
+    r
+}
+
+fn accesses_inner(
+    ctx: &Context,
+    st: &State,
+    a: Value,
+    size: u64,
+    depth: u32,
+    memo: &mut AccMemo,
 ) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
     if depth > MAX_FLOW_DEPTH {
         return None;
@@ -361,7 +403,7 @@ fn accesses(
                 // `store *q <- p`: the pointer itself goes through memory.
                 // Sound to chase only if `q`'s bytes stay inside this walk;
                 // the loaded-back value keeps this pointer's offset.
-                let loads = slot_loads(ctx, st, op.deref(ctx).get_operand(1), depth)?;
+                let loads = slot_loads(ctx, st, op.deref(ctx).get_operand(1), depth, memo)?;
                 if !flow {
                     out.push(Access {
                         op,
@@ -1164,6 +1206,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
 
 /// First use that blocks promotion of alloca `a` (PLIRON_STATS_WHY).
 fn why(ctx: &Context, st: &State, a: Value) -> String {
+    let mut memo = AccMemo::default();
     let mut work = vec![a];
     let mut uses = Vec::new();
     while let Some(p) = work.pop() {
@@ -1180,7 +1223,7 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 0 {
-                match slot_loads(ctx, st, op.deref(ctx).get_operand(1), 0) {
+                match slot_loads(ctx, st, op.deref(ctx).get_operand(1), 0, &mut memo) {
                     Some(ls) => work.extend(ls),
                     None => return "store-ptr escapes".into(),
                 }
