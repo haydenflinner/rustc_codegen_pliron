@@ -65,7 +65,7 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
 fn simd_leaves(ctx: &Context, t: TypeHandle) -> bool {
     vec_of(ctx, t).is_none() || {
         let l = crate::types::leaves(ctx, t);
-        !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() == 128)
+        !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() >= 128)
     }
 }
 
@@ -310,4 +310,53 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     for op in bf {
         promote_bf16(ctx, op);
     }
+}
+
+/// Whether `op` has a ymm/zmm lowering for every wide `<n x f32>` it touches.
+fn wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let id = Operation::get_opid(op, ctx);
+    macro_rules! any {
+        ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
+    }
+    any!(
+        LoadOp, StoreOp, InsertElementOp, ExtractElementOp, PoisonOp, UndefOp, ZeroOp, FreezeOp,
+        ConstantOp, FAddOp, FSubOp, FMulOp, FDivOp, BrOp, CondBrOp
+    ) || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+        let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+        ["llvm.fma", "llvm.fmuladd"]
+            .iter()
+            .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+    })
+}
+
+/// CubeCL: give `<n x f32>` types ymm/zmm leaves when every op on them (in
+/// all of `funcs`, after [`run`]) lowers natively at that width; the rest keep
+/// 128-bit leaves. Function parameters stay narrow (ABI).
+pub fn plan_wide(ctx: &Context, funcs: &[Ptr<Operation>]) {
+    use crate::types::{set_wide_f32, wide_f32_candidate};
+    let mut ok: std::collections::HashMap<(TypeHandle, u64), bool> = Default::default();
+    let mut note = |ctx: &Context, t: TypeHandle, good: bool| {
+        if let Some((e, n)) = vec_of(ctx, t) {
+            if wide_f32_candidate(ctx, e, n as u64) {
+                *ok.entry((e, n as u64)).or_insert(true) &= good;
+            }
+        }
+    };
+    for &f in funcs {
+        for r in f.deref(ctx).regions() {
+            for (i, b) in r.deref(ctx).iter(ctx).enumerate() {
+                for a in b.deref(ctx).arguments() {
+                    note(ctx, a.get_type(ctx), i != 0);
+                }
+                for op in b.deref(ctx).iter(ctx) {
+                    let good = wide_op(ctx, op);
+                    let o = op.deref(ctx);
+                    for v in o.operands().chain(o.results()) {
+                        note(ctx, v.get_type(ctx), good);
+                    }
+                }
+            }
+        }
+    }
+    set_wide_f32(ok.into_iter().filter(|x| x.1).map(|x| x.0).collect());
 }

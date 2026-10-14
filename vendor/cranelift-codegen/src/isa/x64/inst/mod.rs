@@ -322,6 +322,12 @@ impl Inst {
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_a::new(to_reg, from_addr).into()
                     }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(to_reg, from_addr).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(to_reg, from_addr).into()
+                    }
                     _ => unimplemented!("unable to load type: {}", ty),
                 };
                 Inst::External { inst }
@@ -361,6 +367,12 @@ impl Inst {
                     types::F64X2 => asm::inst::movupd_b::new(to_addr, from_reg).into(),
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_b::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_yb::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_zb::new(to_addr, from_reg).into()
                     }
                     _ => unimplemented!("unable to store type: {}", ty),
                 }
@@ -1232,6 +1244,18 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
 //=============================================================================
 // Instructions: misc functions and external interface
 
+/// pliron: widest vector (bits) held in float-class registers: 128, or
+/// 256/512 when a JIT host emits ymm/zmm values. Register moves and spills of
+/// the float class use this width, so set it before compiling and only on
+/// CPUs with AVX (256) / AVX-512F (512).
+pub static WIDE_VECTOR_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(128);
+
+/// See [`WIDE_VECTOR_BITS`].
+pub fn wide_vector_bits() -> u32 {
+    WIDE_VECTOR_BITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl MachInst for Inst {
     type ABIMachineSpec = X64ABIMachineSpec;
 
@@ -1411,6 +1435,12 @@ impl MachInst for Inst {
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() <= 128 => {
                         asm::inst::movdqa_a::new(dst_reg, src_reg).into()
                     }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(dst_reg, src_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(dst_reg, src_reg).into()
+                    }
                     _ => unimplemented!("unable to move type: {}", ty),
                 }
             }
@@ -1443,8 +1473,15 @@ impl MachInst for Inst {
             types::F64 => Ok((&[RegClass::Float], &[types::F64])),
             types::F128 => Ok((&[RegClass::Float], &[types::F128])),
             types::I128 => Ok((&[RegClass::Int, RegClass::Int], &[types::I64, types::I64])),
-            _ if ty.is_vector() && ty.bits() <= 128 => {
-                let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
+            _ if ty.is_vector() && ty.bits() <= 512 => {
+                let types = &[
+                    types::I8X2,
+                    types::I8X4,
+                    types::I8X8,
+                    types::I8X16,
+                    types::I8X32,
+                    types::I8X64,
+                ];
                 Ok((
                     &[RegClass::Float],
                     slice::from_ref(&types[ty.bytes().ilog2() as usize - 1]),
@@ -1458,7 +1495,11 @@ impl MachInst for Inst {
 
     fn canonical_type_for_rc(rc: RegClass) -> Type {
         match rc {
-            RegClass::Float => types::I8X16,
+            RegClass::Float => match wide_vector_bits() {
+                512 => types::I8X64,
+                256 => types::I8X32,
+                _ => types::I8X16,
+            },
             RegClass::Int => types::I64,
             RegClass::Vector => unreachable!(),
         }

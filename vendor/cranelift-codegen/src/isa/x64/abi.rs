@@ -895,7 +895,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // We allocate in terms of 8-byte slots.
         match rc {
             RegClass::Int => 1,
-            RegClass::Float => vector_scale / 8,
+            RegClass::Float => vector_scale.max(super::inst::wide_vector_bits() / 8) / 8,
             RegClass::Vector => unreachable!(),
         }
     }

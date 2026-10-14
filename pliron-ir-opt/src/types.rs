@@ -169,7 +169,7 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
         }
         TyK::Vector(e, n) => {
             if let Some((t, k)) = vec_parts(ctx, e, n as u64) {
-                return out.extend((0..k).map(|i| (base + i * 16, t)));
+                return out.extend((0..k).map(|i| (base + i * t.bytes() as u64, t)));
             }
             let (s, _) = size_align(ctx, e);
             for i in 0..n as u64 {
@@ -217,9 +217,43 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
 /// reach 128 lanes). Off for rustc, whose SIMD lowering assumes <= 2 parts.
 pub static WIDE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// CubeCL: widest `f32` vector leaf (256 = ymm, 512 = zmm); 0 disables.
+pub static WIDE_F32_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+thread_local! {
+    static WIDE_F32: std::cell::RefCell<std::collections::HashSet<(TypeHandle, u64)>> =
+        Default::default();
+}
+
+/// `<n x f32>` types (element, count) whose leaves are ymm/zmm vectors; the
+/// caller guarantees every op on them has a wide Cranelift lowering.
+pub fn set_wide_f32(types: std::collections::HashSet<(TypeHandle, u64)>) {
+    WIDE_F32.with(|w| *w.borrow_mut() = types);
+}
+
+/// Whether `<n x e>` could use wide leaves (before eligibility is known).
+pub fn wide_f32_candidate(ctx: &Context, e: TypeHandle, n: u64) -> bool {
+    let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    bits >= 256 && matches!(classify(ctx, e), TyK::F32) && (n * 32) % 256 == 0
+}
+
+fn wide_f32_parts(e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    if bits < 256 || !WIDE_F32.with(|w| w.borrow().contains(&(e, n))) {
+        return None;
+    }
+    [512u64, 256]
+        .into_iter()
+        .find(|&w| w <= bits && (n * 32) % w == 0)
+        .and_then(|w| Some((clt::F32.by((w / 32) as u32)?, n * 32 / w)))
+}
+
 /// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
 /// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
 pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    if let Some(p) = wide_f32_parts(e, n) {
+        return Some(p);
+    }
     if let Some(t) = native_vec(ctx, e, n) {
         return Some((t, 1));
     }

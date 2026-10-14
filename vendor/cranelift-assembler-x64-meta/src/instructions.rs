@@ -32,6 +32,7 @@ mod sqrt;
 mod stack;
 mod sub;
 mod unpack;
+mod wide;
 mod xor;
 
 use crate::dsl::{Feature, Inst, Mutability, OperandKind};
@@ -72,6 +73,7 @@ pub fn list() -> Vec<Inst> {
     all.extend(stack::list());
     all.extend(sub::list());
     all.extend(unpack::list());
+    all.extend(wide::list());
     all.extend(xor::list());
 
     check_avx_alternates(&mut all);

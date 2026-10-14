@@ -1357,12 +1357,20 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     );
 
     #[inline]
+    fn wide_lane_chunk(&mut self, lane: u8) -> u8 {
+        lane / 4
+    }
+
+    fn wide_lane_sub(&mut self, lane: u8) -> u8 {
+        lane % 4
+    }
+
     fn type_register_class(&mut self, ty: Type) -> Option<RegisterClass> {
         if is_int_or_ref_ty(ty) || ty == I128 {
             Some(RegisterClass::Gpr {
                 single_register: ty != I128,
             })
-        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 128) {
+        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 512) {
             Some(RegisterClass::Xmm)
         } else {
             None

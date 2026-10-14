@@ -1977,7 +1977,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
         if t.is_vector() {
-            let bytes = bits.to_le_bytes()[..t.bytes() as usize].to_vec();
+            let mut bytes = bits.to_le_bytes().to_vec();
+            debug_assert!(t.bytes() <= 16 || bits == 0, "wide non-zero iconst {t}");
+            bytes.resize(t.bytes() as usize, 0);
             let c = self.b.func.dfg.constants.insert(bytes.into());
             return self.b.ins().vconst(t, c);
         }
@@ -4474,7 +4476,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name) {
             let ls: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
-            if ls[0].iter().all(|x| self.b.func.dfg.value_type(*x).bits() == 128) {
+            if ls[0].iter().all(|x| self.b.func.dfg.value_type(*x).bits() >= 128) {
                 let r: Vals = (0..ls[0].len())
                     .map(|j| {
                         let x: Vec<_> = ls.iter().map(|l| l[j]).collect();
