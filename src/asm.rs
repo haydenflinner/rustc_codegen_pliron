@@ -157,6 +157,7 @@ impl<'tcx> CodegenCx<'tcx> {
         // Win64 integer args: rcx, rdx, r8 (SysV: rdi, rsi, rdx).
         let win64 = x86
             && self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+        let fmt = self.tcx.sess.target.options.binary_format;
         let body = match name {
             "llvm.x86.xgetbv" if x86 && win64 => {
                 "    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n".to_string()
@@ -183,25 +184,77 @@ impl<'tcx> CodegenCx<'tcx> {
             _ if x86 => "    ud2\n".into(),
             _ => aarch64_stub_body(name).unwrap_or_else(|| "    brk #0x1\n".to_string()),
         };
-        let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
-        let back = if x86 { ".att_syntax\n" } else { "" };
-        let fmt = self.tcx.sess.target.options.binary_format;
-        if fmt == rustc_target::spec::BinaryFormat::MachO {
-            write!(
-                st.asm,
-                ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{syntax}{body}{back}"
-            )
-            .unwrap();
-        } else if fmt == rustc_target::spec::BinaryFormat::Coff {
-            write!(st.asm, ".text\n.globl {sym}\n{sym}:\n{syntax}{body}{back}").unwrap();
-        } else {
-            write!(
-                st.asm,
-                ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
-            )
-            .unwrap();
-        }
+        push_stub(&mut st.asm, fmt, x86, &sym, &body);
         sym
+    }
+
+    /// `black_box` memory-clobber stub: an identity body rustc never
+    /// sees, so a call to it is opaque to every pass — nowrite marks
+    /// the caller writing (the `~{memory}` half of LLVM's
+    /// `asm("" : "r,~{memory}" :: ptr)`), nocapture captures its pointer
+    /// arg (an aggregate's contents become unknown), and nothing can
+    /// inline or fold it away. `None` where the asm-stub machinery
+    /// doesn't exist.
+    pub fn bb_mem_stub(&self) -> Option<String> {
+        use rustc_target::spec::BinaryFormat::*;
+        let fmt = self.tcx.sess.target.options.binary_format;
+        let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
+        if !x86 && self.tcx.sess.asm_arch != Some(InlineAsmArch::AArch64) {
+            return None;
+        }
+        let mut st = self.st.borrow_mut();
+        // COFF has no weak-symbol dedup, so like the `llvm.*` stubs this
+        // gets a per-module-unique name.
+        let sfx = if fmt == Coff {
+            let cgu: String = st
+                .cgu
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!(
+                "_{:x}_{cgu}",
+                self.tcx
+                    .stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+                    .as_u64()
+            )
+        } else {
+            String::new()
+        };
+        let sym = format!("__pliron_bbm{sfx}");
+        if st.llvm_stubs.insert(sym.clone()) {
+            push_stub(&mut st.asm, fmt, x86, &sym, "    ret\n");
+        }
+        Some(sym)
+    }
+}
+
+/// Weak hidden asm stub shared by `llvm.*` intrinsics, `black_box`
+/// barriers, etc. `body` is arch syntax (Intel flavor on x86 — the
+/// wrappers toggle `noprefix`/`att` around it).
+fn push_stub(
+    asm: &mut String,
+    fmt: rustc_target::spec::BinaryFormat,
+    x86: bool,
+    sym: &str,
+    body: &str,
+) {
+    use rustc_target::spec::BinaryFormat::*;
+    let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
+    let back = if x86 { ".att_syntax\n" } else { "" };
+    if fmt == MachO {
+        write!(
+            asm,
+            ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{syntax}{body}{back}"
+        )
+        .unwrap();
+    } else if fmt == Coff {
+        write!(asm, ".text\n.globl {sym}\n{sym}:\n{syntax}{body}{back}").unwrap();
+    } else {
+        write!(
+            asm,
+            ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
+        )
+        .unwrap();
     }
 }
 

@@ -2,7 +2,8 @@
 
 use pliron::r#type::TypeHandle;
 use pliron::value::Value;
-use rustc_abi::Align;
+use rustc_abi::{Align, BackendRepr};
+use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
@@ -255,7 +256,64 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 };
                 self.select(of, sat, r)
             }
-            sym::black_box => return IntrinsicResult::Operand(args[0].val),
+            sym::black_box => {
+                let layout = args[0].layout;
+                // Opaque optimization barrier — LLVM's
+                // `asm("" : "r,~{memory}" :: ptr)`. Scalars round-trip a
+                // store + volatile load below: the volatile load cannot
+                // forward to the stored value, so users of the result
+                // cannot see the input — cheaper than a call, which
+                // spills registers and clobbers memory in hot loops.
+                // Refs and ZSTs instead call `__pliron_bbm`, a `ret`-only
+                // stub rustc never sees: nowrite marks the caller
+                // writing (`~{memory}`), nocapture captures the pointer
+                // (the pointee's contents become unknown), and nothing
+                // can inline or fold it away.
+                if layout.is_zst() {
+                    if let Some(mem) = &self.cx.bb_mem_stub() {
+                        let p = self.const_null(self.type_ptr());
+                        self.call_sym(mem, self.type_void(), &[p]);
+                    }
+                    return IntrinsicResult::Operand(OperandValue::ZeroSized);
+                }
+                if let &OperandValue::Ref(p) = &args[0].val
+                    && let Some(mem) = &self.cx.bb_mem_stub()
+                {
+                    self.call_sym(mem, self.type_void(), &[p.llval]);
+                    return IntrinsicResult::Operand(OperandValue::Ref(p));
+                }
+                let src = PlaceRef::new_sized(self.alloca_with_ty(layout), layout);
+                args[0].val.store(self, src);
+                let v = if matches!(
+                    layout.backend_repr,
+                    BackendRepr::Scalar(_)
+                        | BackendRepr::ScalarPair { .. }
+                        | BackendRepr::SimdVector { .. }
+                ) {
+                    let prev = self.tail_op();
+                    let v = self.load_operand(src).val;
+                    self.mark_ops_volatile(prev);
+                    v
+                } else {
+                    // Aggregates load as a place ref, which has no ops to
+                    // mark volatile. A second volatile copy keeps the
+                    // returned ref opaque — reads through it see unknown
+                    // memory, not a forwardable store.
+                    let dst = PlaceRef::new_sized(self.alloca_with_ty(layout), layout);
+                    let sz = self.const_usize(layout.size.bytes());
+                    self.memcpy(
+                        dst.val.llval,
+                        dst.val.align,
+                        src.val.llval,
+                        src.val.align,
+                        sz,
+                        MemFlags::VOLATILE,
+                        None,
+                    );
+                    OperandValue::Ref(dst.val)
+                };
+                return IntrinsicResult::Operand(v);
+            }
             sym::volatile_load | sym::unaligned_volatile_load => {
                 let place = PlaceRef::new_sized(a(0), result_layout);
                 // `load_operand` goes through plain `load`: mark every op it

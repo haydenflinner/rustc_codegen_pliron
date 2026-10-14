@@ -33,6 +33,14 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   the destination's binary format, so flags/relocs pass through verbatim
 - `src/asm.rs` — emits ELF- or Mach-O-flavored assembly per target
 - `src/hot.rs` — PLIRON_HOT thunks, x86-64 ELF asm only
+- `src/intrinsic.rs` — `black_box` is a real barrier: scalars round-trip
+  an alloca + volatile load; Refs and ZSTs call `__pliron_bbm`, a
+  `ret`-only asm stub (`bb_mem_stub` in `src/asm.rs`) whose escape of
+  the place pointer is the `~{memory}` clobber. cg_clif's pass-through
+  is cheaper but lets the optimizer see through the barrier — do not
+  "simplify" it back. A register round-trip call stub was measured
+  slower than the volatile load (call-site spills + clobber), so
+  scalars deliberately do not use it.
 
 ## Build / test
 
@@ -53,6 +61,20 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 - `harness/run.py [--tier 0|1] [--accept]` — runs suites (smoke with
   stock-rustc output diff, object determinism, ui) and fails on regressions
   against `harness/expectations/`; plan and status in `test-harness.md`
+- `bench/run.sh [criterion args]` — builds the `pliron-bench` criterion
+  target (`bench/benches/kernels.rs`) with stock rustc and with the pliron
+  backend (`cargo rustc --bench`, flag scoped to the bench crate), saves
+  the LLVM run as the `llvm` baseline, then prints per-kernel significance
+  stats. Args forward to both criterion binaries (a name filter selects a
+  subset). Results table: `docs/performance.md`.
+- `bench/wasm/run.sh [name-filter]` — wasm leg: compiles the same kernels
+  (`#[path]`-included into `bench/wasm/lib.rs`, cdylib) to
+  wasm32-unknown-unknown twice — stock rustc + wasm-ld, and the pliron
+  backend + `tools/pliron-wasm-ld` with `-Zbuild-std` — then times both
+  modules in node (`bench/wasm/run.mjs`). Criterion can't run on wasm (it
+  re-execs the bench binary per benchmark), so run.mjs does its own
+  warmup/calibration/sampling and prints the same kernel/LLVM/pliron/
+  change table.
 - Pushing: this is a personal fork that may never be upstreamed — commit
   and push completed work freely; no confirmation or personal-diff-review
   protocol applies. Do not add `Co-Authored-By` trailers.
