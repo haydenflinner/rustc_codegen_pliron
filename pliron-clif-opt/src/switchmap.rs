@@ -77,6 +77,7 @@ fn resolve(
     cfg: &ControlFlowGraph,
     src: Block,
     bc: BlockCall,
+    unconfined: &FxHashMap<Block, bool>,
 ) -> Option<Option<(Target, Vec<(Arg, Type)>)>> {
     let t = bc.block(&func.dfg.value_lists);
     let direct = values(func, bc)?;
@@ -94,7 +95,7 @@ fn resolve(
     if direct.is_empty()
         && func.dfg.num_block_params(t) == 0
         && cfg.pred_iter(t).all(|p| p.block == src)
-        && confined(func, t)
+        && !unconfined.get(&t).copied().unwrap_or(false)
     {
         let mut local = FxHashMap::default();
         for i in func.layout.block_insts(t) {
@@ -134,29 +135,26 @@ fn resolve(
     )))
 }
 
-/// True when every value defined by `b`'s insts is used only inside `b`.
-/// Required before resolving through `b`: edges retargeted past it must not
-/// orphan uses that relied on `b` dominating them.
-fn confined(func: &Function, b: Block) -> bool {
-    let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-    let mut def = FxHashMap::default();
-    for &i in &insts {
-        for &r in func.dfg.inst_results(i) {
-            def.insert(func.dfg.resolve_aliases(r), i);
+/// Per-block: true when some value defined in the block is used outside it.
+/// One whole-function pass — a per-block scan would be O(blocks x insts),
+/// which is quadratic on giant `br_table` dispatch functions.
+fn unconfined_blocks(func: &Function) -> FxHashMap<Block, bool> {
+    let mut def_blk: FxHashMap<Value, Block> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &r in func.dfg.inst_results(i) {
+                def_blk.insert(func.dfg.resolve_aliases(r), b);
+            }
         }
     }
-    if def.is_empty() {
-        return true;
-    }
-    for bb in func.layout.blocks() {
-        for i in func.layout.block_insts(bb) {
-            if def.values().any(|&t| t == i) {
-                continue;
-            }
-            let mut escaped = false;
+    let mut out = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
             let mut note = |v: Value| {
-                if def.contains_key(&func.dfg.resolve_aliases(v)) {
-                    escaped = true;
+                if let Some(&d) = def_blk.get(&func.dfg.resolve_aliases(v)) {
+                    if d != b {
+                        out.insert(d, true);
+                    }
                 }
             };
             func.dfg.inst_args(i).iter().for_each(|&v| note(v));
@@ -169,12 +167,9 @@ fn confined(func: &Function, b: Block) -> bool {
                     }
                 }
             }
-            if escaped {
-                return false;
-            }
         }
     }
-    true
+    out
 }
 
 fn plan(
@@ -182,10 +177,11 @@ fn plan(
     cfg: &ControlFlowGraph,
     src: Block,
     entries: &[BlockCall],
+    unconfined: &FxHashMap<Block, bool>,
 ) -> Option<(Target, Vec<(Lin, Type)>)> {
     let mut care: Vec<(u64, Target, Vec<(Arg, Type)>)> = Vec::new();
     for (i, &bc) in entries.iter().enumerate() {
-        if let Some((b, a)) = resolve(func, cfg, src, bc)? {
+        if let Some((b, a)) = resolve(func, cfg, src, bc, unconfined)? {
             care.push((i as u64, b, a));
         }
     }
@@ -334,6 +330,7 @@ fn rewrite(
 
 pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
+    let mut unconfined: Option<FxHashMap<Block, bool>> = None;
     let mut todo = Vec::new();
     for src in func.layout.blocks() {
         let Some(term) = func.layout.last_inst(src) else {
@@ -347,7 +344,8 @@ pub fn run(func: &mut Function) -> usize {
         if entries.len() < 2 {
             continue;
         }
-        if let Some((dest, lins)) = plan(func, &cfg, src, &entries) {
+        let unconfined = unconfined.get_or_insert_with(|| unconfined_blocks(func));
+        if let Some((dest, lins)) = plan(func, &cfg, src, &entries, unconfined) {
             todo.push((term, arg, entries.len(), dest, lins, jt.default_block()));
         }
     }

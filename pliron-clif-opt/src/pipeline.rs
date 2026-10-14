@@ -18,7 +18,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::context::Ptr;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::config::{bisect, bisect_count, config, env_set, reads_begin, reads_take};
+use crate::config::{bisect, bisect_count, config, env_set, reads_begin, reads_take, trace};
 use crate::*;
 
 /// Per-CGU pass categories, mirroring the `State::*` flags in the
@@ -757,6 +757,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         k
     };
     *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
+    trace(s.name, t0.elapsed().as_secs_f64() * 1e3, p.fname);
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.

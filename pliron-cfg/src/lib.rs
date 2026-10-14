@@ -142,6 +142,25 @@ pub fn env_get(var: &str) -> Option<&'static str> {
     config().get(var)
 }
 
+/// `PLIRON_TRACE_FILE=<path>`: append one timing line per pipeline step (and per
+/// `*pipeline*`/`*compile*` CGU summary) the moment it is measured, so a
+/// watcher can read live progress instead of waiting for the process to
+/// exit. Line: `trace <pid> <step> <ms> <name>`.
+pub fn trace(step: &str, ms: f64, name: &str) {
+    let Some(path) = env_get("PLIRON_TRACE_FILE") else {
+        return;
+    };
+    use std::io::Write;
+    let line = format!("trace {} {step} {ms:.3} {name}\n", std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
 /// applications (across all passes and functions), like LLVM's
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var

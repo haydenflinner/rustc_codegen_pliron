@@ -586,6 +586,7 @@ pub fn lower_to_object(
         // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
         // per-function total for the tier-1 cache sizing question.
         *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
+        pliron_cfg::trace("*pipeline*", tpipe.elapsed().as_secs_f64() * 1e3, n);
         if j.dump {
             eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
         }
@@ -637,6 +638,7 @@ pub fn lower_to_object(
         };
         drop(_scomp);
         *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
+        pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);
         match defr {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => j.err = Some(e),
