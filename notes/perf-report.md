@@ -27,7 +27,8 @@ Checksums verified identical on every kernel.
 | tokenize     |  2.521 |  2.885 | 1.144 | regalloc-bound  |
 
 **11/17 kernels at or beating parity** (6 strictly faster). Worst
-remaining: tokenize 1.14, strwork 1.10, hmget 1.07, matmul/hashmap 1.06.
+remaining: strwork 1.10, hmget 1.07, matmul/hashmap 1.06. tokenize
+|reached ~1.0 after the lcse ident guard (`972c932`).
 (hashmap swings 1.06–1.21 across runs on this box — load-dependent;
 quiet-box best-of-5 lands ~1.06.)
 
@@ -35,13 +36,20 @@ quiet-box best-of-5 lands ~1.06.)
 
 `PLIRON_LCSE=0` buys ~12% on tokenize but loses ~16% on sortw and ~8%
 on parse_only — no global win. Bisecting the four `lcse*` pipeline
-positions plus `ident`'s internal arms isolated the dominant harm to
-the select-cond identity (`select (x==0), 0, x → x`, added in
-`0d9a60f`): its aliases merge distinct in-loop values onto cross-block
-arms, extending live ranges where ra2 cannot rematerialize. The arm
-is removed (`00b05a2`); the residual tokenize gap is the aggregate of
-lcse's legitimate transforms feeding a pressure-bound loop — the same
-ra2 wall as everything else, not a wrong fold.
+positions plus `ident`'s internal arms isolated two live-range-merge
+harms, both fixed:
+
+- `00b05a2` — the select-cond identity (`select (x==0), 0, x → x`,
+  added in `0d9a60f`) aliased a distinct in-loop value onto a
+  cross-block arm, deleting the in-loop def ra2 could rematerialize.
+  Removed outright: no scoping variant recovered the win, and the
+  fold never had a measured benefit.
+- `972c932` — lcse's `ident` aliases generally (`x*1`/`x+0`/
+  `uextend(ireduce)`) now skip in-loop copies whose surviving value
+  is defined in a different block: the copy is ra2's only in-loop
+  remat point, and merging forces the outer value live-through into
+  a spill home. tokenize 2.90→2.53 (≈1.0 vs LLVM); rest of suite
+  unchanged within noise.
 
 ## Compile time (ms, whole `rustc -O` invocation)
 
