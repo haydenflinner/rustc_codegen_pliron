@@ -32,7 +32,12 @@ if [ -n "${PLIRON_PGO:-}" ] && [ -f "$RS" ]; then
             cd "$T" || exit 1
             ar x "$RS" &&
             for o in pliron_prof_rt-*.o; do
-                objcopy -N '*rust_begin_unwind*' -N 'rust_eh_personality' "$o" 2>/dev/null
+                # hide the rt's panic shim so it can't collide with the
+                # link's own std (`-N` can't drop a reloc-referenced sym)
+                for s in $(nm -g --defined-only "$o" | awk '{print $3}' |
+                    grep -E 'rust_begin_unwind|rust_eh_personality'); do
+                    objcopy --redefine-sym "$s=__pliron_rt_shim_$s" "$o"
+                done
             done &&
             ar rcs "$R.tmp" pliron_prof_rt-*.o &&
             mv "$R.tmp" "$R"
