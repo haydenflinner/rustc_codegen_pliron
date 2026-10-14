@@ -1225,6 +1225,7 @@ dependencies = [
  "pliron-llvm",
  "rsasm",
  "rustc-hash",
+ "rustc_apfloat",
  "smallvec",
  "target-lexicon",
  "tracing",

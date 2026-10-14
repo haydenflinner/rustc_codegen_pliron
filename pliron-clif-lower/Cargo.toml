@@ -22,3 +22,4 @@ pliron-ir-opt = { path = "../pliron-ir-opt" }
 pliron-cfg = { path = "../pliron-cfg" }
 rustc-hash = "2"
 tracing = "0.1"
+rustc_apfloat = "0.2"

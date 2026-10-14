@@ -3331,6 +3331,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
             }
             self.set(op, a);
+        } else if is!(ConstantOp) || is!(AddressOfOp) {
+            // Values come from `st.consts` (filled by `scan::scan`) at each use.
+        } else if let Some(a) = Operation::get_op::<InlineAsmOp>(op, self.ctx) {
+            // Operand-free spin hints (cubecl's `pause`/`yield`) have no
+            // observable effect; anything else must go through rsasm.
+            let t = String::from(a.get_attr_llvm_inline_asm_template(self.ctx).unwrap().clone());
+            assert!(
+                opnds.is_empty() && matches!(t.trim(), "" | "pause" | "yield" | "isb"),
+                "pliron->cranelift: unsupported inline asm {t:?}"
+            );
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
             let r = self
                 .ty_leaves(self.res_ty(op))
@@ -4414,11 +4424,25 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     | "llvm.log2"
                     | "llvm.log10"
                     | "llvm.pow"
+                    | "llvm.tan"
+                    | "llvm.sinh"
+                    | "llvm.cosh"
+                    | "llvm.tanh"
+                    | "llvm.asin"
+                    | "llvm.acos"
+                    | "llvm.atan"
+                    | "llvm.atan2"
+                    | "llvm.minnum"
+                    | "llvm.maxnum"
             ) =>
             {
                 // No Cranelift instruction: call libm, like cg_llvm does on x86.
                 let t = self.b.func.dfg.value_type(a[0]);
-                let base = &n["llvm.".len()..];
+                let base = match &n["llvm.".len()..] {
+                    "minnum" => "fmin",
+                    "maxnum" => "fmax",
+                    b => b,
+                };
                 let f = match t {
                     clt::F32 => format!("{base}f"),
                     clt::F64 => base.to_string(),
@@ -4429,6 +4453,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 };
                 let ps = vec![t; a.len()];
                 self.libcall(&f, &ps, &[t], &a)[0]
+            }
+            "llvm.abs" => {
+                let x = self.get1(opnds[0]);
+                self.b.ins().iabs(x)
+            }
+            "llvm.umax" | "llvm.umin" | "llvm.smax" | "llvm.smin" => {
+                let (x, y) = (self.get1(opnds[0]), self.get1(opnds[1]));
+                match name {
+                    "llvm.umax" => self.b.ins().umax(x, y),
+                    "llvm.umin" => self.b.ins().umin(x, y),
+                    "llvm.smax" => self.b.ins().smax(x, y),
+                    _ => self.b.ins().smin(x, y),
+                }
             }
             "pliron.eh.rethrow" if self.eh_data.is_some() => {
                 // Emulated rethrow (`cleanup_ret` with no unwind dest):
