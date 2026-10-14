@@ -1578,6 +1578,45 @@ fn rot_loop(
     if groups.is_empty() {
         return 0;
     }
+    // Adjacent-pair scans (`icmp` fed by two loads from the same affine
+    // group one step apart, the `v[i] vs v[i+1]` is_sorted shape):
+    // rotating one load into a `prev` param hides the pair from
+    // loopvec's elementwise compare, trading a per-iteration saved
+    // scalar load for a lost SIMD pass (~17% on sortw's run scan).
+    // Keep both loads scalar-visible; same-address reuse above still
+    // applies.
+    let mut paired: FxHashSet<Inst> = FxHashSet::default();
+    for b in func.layout.blocks().filter(|b| body.contains(b)) {
+        for i in func.layout.block_insts(b) {
+            if func.dfg.insts[i].opcode() != Opcode::Icmp {
+                continue;
+            }
+            let mut ls: Vec<Inst> = Vec::with_capacity(2);
+            for &a in func.dfg.inst_args(i) {
+                if let ValueDef::Result(li, _) =
+                    func.dfg.value_def(func.dfg.resolve_aliases(a))
+                    && decs.contains_key(&li)
+                {
+                    ls.push(li);
+                }
+            }
+            for x in 0..ls.len() {
+                for y in (x + 1)..ls.len() {
+                    let (dx, dy) = (&decs[&ls[x]], &decs[&ls[y]]);
+                    // Same group and the two loads are one drift step
+                    // apart — adjacent lanes, i.e. what `cmhi.2d`-style
+                    // vector compares consume.
+                    if dx.0 == dy.0
+                        && dx.1 == dy.1
+                        && dx.1 != 0
+                        && dx.2.wrapping_sub(dy.2).unsigned_abs() == dx.1.unsigned_abs()
+                    {
+                        paired.extend([ls[x], ls[y]]);
+                    }
+                }
+            }
+        }
+    }
     let mut removed = FxHashSet::default();
     let mut rot = 0;
     let mut n = 0;
@@ -1614,7 +1653,7 @@ fn rot_loop(
             if rot >= MAX_ROT {
                 break;
             }
-            if removed.contains(&bi) {
+            if removed.contains(&bi) || paired.contains(&bi) {
                 continue;
             }
             let want = koff.wrapping_add(*shift);
@@ -2456,7 +2495,10 @@ mod tests {
         let lb = cur
             .ins()
             .load(types::I64, MemFlagsData::new().with_notrap(), a_prev, 0);
-        let c = cur.ins().icmp(IntCC::UnsignedLessThan, la, lb);
+        // Compare `lb` against `i`, not `la`: an icmp fed by two loads
+        // from the same affine group one step apart is the adjacent-pair
+        // scan loopvec vectorizes, and rotld leaves it alone.
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, lb, i);
         cur.ins().brif(c, latch, &[], done, &[]);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
@@ -2492,6 +2534,68 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("ldrot produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// The same scan with `icmp v[i], v[i-1]` — the adjacent-pair shape
+    /// loopvec turns into vector compares — must NOT rotate: hiding one
+    /// load behind `prev` blocks vectorization (sortw's run scan).
+    #[test]
+    fn ldrot_skips_adjacent_pair_scan() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [entry, h, body, latch, done] {
+            func.layout.append_block(b);
+        }
+        let base = func.dfg.append_block_param(entry, types::I64);
+        let len = func.dfg.append_block_param(entry, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), base, 8);
+        let two = cur.ins().iconst(types::I64, 2);
+        cur.ins().jump(h, &[two.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let g = cur.ins().icmp(IntCC::UnsignedLessThan, i, len);
+        cur.ins().brif(g, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let eight = cur.ins().iconst(types::I64, 8);
+        let off = cur.ins().imul(i, eight);
+        let a_cur = cur.ins().iadd(base, off);
+        let one = cur.ins().iconst(types::I64, 1);
+        let im1 = cur.ins().isub(i, one);
+        let off2 = cur.ins().imul(im1, eight);
+        let a_prev = cur.ins().iadd(base, off2);
+        let la = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_cur, 0);
+        let lb = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_prev, 0);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, la, lb);
+        cur.ins().brif(c, latch, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        let i2 = cur.ins().iadd(i, one);
+        cur.ins().jump(h, &[i2.into()]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(done)
+            .ins()
+            .return_(&[]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(rotld(&mut func, &mut an), 0);
+        assert_eq!(func.dfg.block_params(h).len(), 1);
     }
 
     /// `icmp p, K` where the backedge arg `p + s` is defined *after* the
