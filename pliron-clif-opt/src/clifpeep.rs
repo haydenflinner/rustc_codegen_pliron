@@ -2798,6 +2798,89 @@ pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
                 drop_ixs.entry((es[e].0, es[e].1)).or_default().push(ix);
             }
         }
+
+        // Phase C — coinductive bisimulation over the surviving params
+        // (phimerge, lifted into key space): hypothesize same-type
+        // params equivalent, then refine classes by each slot's
+        // per-edge key signature with `V` leaves normalized through the
+        // partition. A stable multi-member class is a bisimulation —
+        // its members are interchangeable on every edge — so all but
+        // the leader drop. Unlike phase B's structural `P` matching this
+        // closes over self-reference: `(p_i, p_j)` carried identically
+        // on the back-edge merge even when no syntactic relation holds.
+        let surv: Vec<usize> = (0..ps.len())
+            .filter(|&i| {
+                !pmap.contains_key(&ps[i])
+                    && !param_drops.contains(&ps[i])
+                    && skeys.iter().all(|row| row[i].is_some())
+            })
+            .collect();
+        if surv.len() >= 2 {
+            // Initial partition: one class per value type.
+            let mut cls: FxHashMap<usize, usize> = FxHashMap::default();
+            for &i in &surv {
+                let ty = func.dfg.value_type(ps[i]);
+                let leader = *surv
+                    .iter()
+                    .find(|&&j| func.dfg.value_type(ps[j]) == ty)
+                    .unwrap();
+                cls.insert(i, leader);
+            }
+            loop {
+                let leaf = |w: Value| -> Value {
+                    let mut w = w;
+                    while let Some(&c) = pmap.get(&w) {
+                        w = c;
+                    }
+                    ps.iter()
+                        .position(|&q| q == w)
+                        .and_then(|i| cls.get(&i))
+                        .map(|&l| ps[l])
+                        .unwrap_or(w)
+                };
+                let sigs: FxHashMap<usize, Vec<Key>> = surv
+                    .iter()
+                    .map(|&i| {
+                        (
+                            i,
+                            skeys
+                                .iter()
+                                .map(|row| {
+                                    crate::proots::key_rep(row[i].as_ref().unwrap(), &ps, &leaf)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let mut next: FxHashMap<usize, usize> = FxHashMap::default();
+                for &i in &surv {
+                    let ty = func.dfg.value_type(ps[i]);
+                    let leader = surv
+                        .iter()
+                        .filter(|&&j| func.dfg.value_type(ps[j]) == ty && sigs[&j] == sigs[&i])
+                        .min()
+                        .copied()
+                        .unwrap();
+                    next.insert(i, leader);
+                }
+                if next == cls {
+                    break;
+                }
+                cls = next;
+            }
+            // Stable partition: non-leader members drop to their leader.
+            for &i in &surv {
+                let l = cls[&i];
+                if l == i {
+                    continue;
+                }
+                pmap.insert(ps[i], ps[l]);
+                param_drops.push(ps[i]);
+                for e in 0..es.len() {
+                    drop_ixs.entry((es[e].0, es[e].1)).or_default().push(i);
+                }
+            }
+        }
     }
     if param_drops.is_empty() {
         return (0, pmap);
@@ -8247,6 +8330,101 @@ mod tests {
 
         assert_eq!(webmerge(&mut func).0, 0);
         assert_eq!(func.dfg.block_params(s).len(), 2);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Coinductive merge: a 3-param rotation `(p0,p1,p2) <- (p1,p2,p0)`
+    /// on the back-edge. No slot has a uniform key (phase A misses —
+    /// `x` vs `p_j` disagree), and no slot's arg keys to a sibling's
+    /// arg (phase B misses — the back-edge args are *params*, not
+    /// structural functions of them). Under the all-equal hypothesis
+    /// every slot's signature is `[V(x), V(rep)]` — a bisimulation —
+    /// so `p1`/`p2` drop to `p0`.
+    #[test]
+    fn webmerge_bisim_rotation() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for blk in [entry, s, latch, exit] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let p0 = func.dfg.append_block_param(s, types::I64);
+        let p1 = func.dfg.append_block_param(s, types::I64);
+        let p2 = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().jump(s, &[x.into(), x.into(), x.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, p0, zero);
+        cur.ins().brif(c, exit, &[], latch, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        cur.ins().jump(s, &[p1.into(), p2.into(), p0.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(exit);
+        let r = cur.ins().iadd(p1, p2);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func).0, 2);
+        assert_eq!(func.dfg.block_params(s).len(), 1);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Bisimulation rejects a false hypothesis: same rotation but the
+    /// entry edge passes `(x, x, y)` — `p2` starts distinct. Round two
+    /// sees `p1`'s back-arg resolve to the `p2` class, splits
+    /// `{p0,p1}`, nothing merges.
+    #[test]
+    fn webmerge_bisim_rejects_divergent() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for blk in [entry, s, latch, exit] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let y = func.dfg.append_block_param(entry, types::I64);
+        let p0 = func.dfg.append_block_param(s, types::I64);
+        let p1 = func.dfg.append_block_param(s, types::I64);
+        let p2 = func.dfg.append_block_param(s, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().jump(s, &[x.into(), x.into(), y.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, p0, zero);
+        cur.ins().brif(c, exit, &[], latch, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        cur.ins().jump(s, &[p1.into(), p2.into(), p0.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(exit);
+        let r = cur.ins().iadd(p1, p2);
+        cur.ins().return_(&[r]);
+
+        assert_eq!(webmerge(&mut func).0, 0);
+        assert_eq!(func.dfg.block_params(s).len(), 3);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("webmerge produced invalid IR: {e}\n{}", func.display());

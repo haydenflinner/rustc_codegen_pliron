@@ -439,6 +439,24 @@ pub fn paramize(k: &Key, slots: &[Option<Key>], skip: usize) -> Key {
     }
 }
 
+/// Rewrite `V` leaves naming `ps` members through `rep` — under a
+/// param bisimulation hypothesis a leaf referencing slot `i` becomes
+/// its class leader's leaf, so per-edge signatures compare structurally
+/// (a back-edge arg `p_j` keys as `V(rep)` just like `p_i`'s does).
+pub fn key_rep(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Key {
+    match k {
+        Key::V(w) if ps.contains(w) => Key::V(rep(*w)),
+        Key::A(t, rk, o) => Key::A(*t, Box::new(key_rep(rk, ps, rep)), *o),
+        Key::N(op, t, args, x) => Key::N(
+            *op,
+            *t,
+            args.iter().map(|a| key_rep(a, ps, rep)).collect(),
+            *x,
+        ),
+        _ => k.clone(),
+    }
+}
+
 /// Expand every `P(i)` leaf via `resolve(i)`, which returns the slot's
 /// materialized form: a carrier `V`, or the slot's own key (already
 /// `P`-free or resolved recursively) — `None` if the slot can't be
