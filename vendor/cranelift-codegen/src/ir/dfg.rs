@@ -411,6 +411,51 @@ impl DataFlowGraph {
         }
     }
 
+    /// PLIRON: `resolve_aliases` that yields `None` instead of panicking
+    /// on chains ending at a reserved/invalid target or on a cycle.
+    /// Passes iterating every value (`carry_aliases`) meet tombstone
+    /// chains from deleted defs — an unrecoverable panic is the wrong
+    /// answer there.
+    pub fn try_resolve_aliases(&self, v: Value) -> Option<Value> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => {
+                    if original == Value::reserved_value()
+                        || !self.values.is_valid(original)
+                    {
+                        return None;
+                    }
+                    v = original;
+                }
+                _ => return Some(v),
+            }
+        }
+        None
+    }
+
+    /// PLIRON: `value_def` without the alias chase or indexing hazards.
+    /// `value_def` resolves an alias's chain unconditionally and
+    /// `resolve_aliases` indexes `values` unchecked — a chain ending at
+    /// a reserved/tombstoned target panics (stage2 `std` build via
+    /// `carry_pmap`'s stale pairs). Reserved, out-of-range, and aliased
+    /// values yield `None`; callers that only need the def *kind* skip
+    /// the resolve entirely.
+    pub fn try_value_def(&self, v: Value) -> Option<ValueDef> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        match ValueData::from(self.values[v]) {
+            ValueData::Inst { inst, num, .. } => Some(ValueDef::Result(inst, num as usize)),
+            ValueData::Param { block, num, .. } => Some(ValueDef::Param(block, num as usize)),
+            ValueData::Union { x, y, .. } => Some(ValueDef::Union(x, y)),
+            ValueData::Alias { .. } => None,
+        }
+    }
+
     /// Determine if `v` is an attached instruction result / block parameter.
     ///
     /// An attached value can't be attached to something else without first being detached.
@@ -600,9 +645,17 @@ impl DataFlowGraph {
                     break w;
                 }
             };
+            // A chain dead-ending at a reserved/invalid target keeps its
+            // shape — writing `reserved` into a live alias's `original`
+            // wouldn't change `resolve_aliases` (it panics either way)
+            // and only obscures the chain for inspection.
+            let dead_end =
+                target == Value::reserved_value() || !self.values.is_valid(target);
             for &x in &path {
                 memo.insert(x, target);
-                if let ValueData::Alias { ty, .. } = ValueData::from(self.values[x]) {
+                if !dead_end
+                    && let ValueData::Alias { ty, .. } = ValueData::from(self.values[x])
+                {
                     self.values[x] = ValueData::Alias {
                         ty,
                         original: target,

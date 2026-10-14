@@ -1696,18 +1696,16 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // first (a param "def" is the block head).
     let covered = {
         let f = &p.clctx.func;
-        let valid = |v: Value| {
-            v != Value::reserved_value() && (v.as_u32() as usize) < f.dfg.num_values()
-        };
-        // `resolve_aliases` itself indexes unchecked and panics on alias
-        // chains ending at a reserved value — don't call it; an alias def
-        // just falls through to no-carry.
-        let blk = |v: Value| match valid(v).then(|| f.dfg.value_def(v)) {
+        // `try_value_def` skips reserved/stale values and doesn't chase
+        // aliases (`value_def` resolves unchecked and panics on chains
+        // ending at a tombstone); an alias def just falls through to
+        // no-carry.
+        let blk = |v: Value| match f.dfg.try_value_def(v) {
             Some(ValueDef::Result(i, _)) => f.layout.inst_block(i),
             Some(ValueDef::Param(b, _)) => Some(b),
             _ => None,
         };
-        let pos = |v: Value| match valid(v).then(|| f.dfg.value_def(v)) {
+        let pos = |v: Value| match f.dfg.try_value_def(v) {
             Some(ValueDef::Param(..)) => Some(0usize),
             Some(ValueDef::Result(i, _)) => {
                 f.layout.block_insts(blk(v)?).position(|x| x == i)
@@ -1814,7 +1812,9 @@ fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
         .dfg
         .values()
         .filter_map(|v| {
-            let r = func.dfg.resolve_aliases(v);
+            // Tombstone chains from deleted defs dead-end at reserved
+            // targets — `resolve_aliases` panics there; just skip them.
+            let r = func.dfg.try_resolve_aliases(v)?;
             (r != v && !an.carried.contains(&(v, r))).then_some((v, r))
         })
         .collect();
