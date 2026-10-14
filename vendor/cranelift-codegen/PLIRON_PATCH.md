@@ -188,3 +188,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     disables the compile-path egraph entirely for A/B measurement —
     it still earns ~7-13% runtime on hash/string kernels as of the
     last benchmark, so it stays on by default.
+
+20. Encoding-aware ALU-immediate remat (`src/opts/remat.isle`,
+    `src/opts.rs`, `src/prelude_opt.isle`): the ALU-op-with-`iconst`
+    remat rules fired unconditionally, marking e.g. `bxor v, 0x7465...`
+    for re-emission at every use block. A remat only pays when the
+    immediate folds into the target operand — otherwise the constant
+    still needs a register *and* the op re-executes per use (hmget's
+    lookup loop re-xored a hasher key with a full-width constant every
+    iteration). `imm64_addsub_imm` gates iadd/isub on the 12-bit
+    (optionally shifted) add/sub immediate form; `imm64_logic_imm`
+    gates band/bor/bxor on logical-immediate encodability (replicated
+    element pattern that is one cyclic run of set bits). Conservative
+    on targets with wider immediate fields — only a neutral remat is
+    lost.
