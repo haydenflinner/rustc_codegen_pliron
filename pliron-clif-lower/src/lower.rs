@@ -4410,6 +4410,29 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             return;
         }
+        if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name) {
+            let ls: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
+            if ls[0].iter().all(|x| self.b.func.dfg.value_type(*x).bits() == 128) {
+                let r: Vals = (0..ls[0].len())
+                    .map(|j| {
+                        let x: Vec<_> = ls.iter().map(|l| l[j]).collect();
+                        let i = self.b.ins();
+                        match name {
+                            "llvm.fma" | "llvm.fmuladd" => i.fma(x[0], x[1], x[2]),
+                            "llvm.sqrt" => i.sqrt(x[0]),
+                            "llvm.fabs" => i.fabs(x[0]),
+                            "llvm.floor" => i.floor(x[0]),
+                            "llvm.ceil" => i.ceil(x[0]),
+                            "llvm.trunc" => i.trunc(x[0]),
+                            "llvm.roundeven" => i.nearest(x[0]),
+                            "llvm.minimum" => i.fmin(x[0], x[1]),
+                            _ => i.fmax(x[0], x[1]),
+                        }
+                    })
+                    .collect();
+                return self.set(op, r);
+            }
+        }
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
             "pliron.eh.exn" => {

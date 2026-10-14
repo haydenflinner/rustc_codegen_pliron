@@ -205,11 +205,24 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     lane.by(n as u32)
 }
 
+/// Also split vectors wider than 256 bits into 128-bit parts (CubeCL lines
+/// reach 128 lanes). Off for rustc, whose SIMD lowering assumes <= 2 parts.
+pub static WIDE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
 /// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
 pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
     if let Some(t) = native_vec(ctx, e, n) {
         return Some((t, 1));
+    }
+    if WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed) {
+        for k in [4u64, 8, 16, 32, 64, 128] {
+            if n % k == 0 {
+                if let Some(t) = native_vec(ctx, e, n / k).filter(|t| t.bits() == 128) {
+                    return Some((t, k));
+                }
+            }
+        }
     }
     (n % 2 == 0)
         .then(|| native_vec(ctx, e, n / 2))?

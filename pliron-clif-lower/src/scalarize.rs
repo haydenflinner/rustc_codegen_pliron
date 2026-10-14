@@ -46,6 +46,40 @@ fn elementwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     false
 }
 
+/// Ops the lowerer applies per native SIMD leaf, when every vector they touch
+/// is all 128-bit SIMD leaves (`types::leaves`); splitting those would only
+/// lose SIMD. 64-bit vectors (`f32x2`) stay split: x64 mis-lowers some of them.
+fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
+    if !crate::types::WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let id = Operation::get_opid(op, ctx);
+    macro_rules! any {
+        ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
+    }
+    let ok = any!(AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp)
+        || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+            let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+            LEAFWISE_INTRINSICS
+                .iter()
+                .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+        });
+    let o = op.deref(ctx);
+    ok && o.operands().chain([o.get_result(0)]).all(|v| {
+        let t = v.get_type(ctx);
+        vec_of(ctx, t).is_none() || {
+            let l = crate::types::leaves(ctx, t);
+            !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() == 128)
+        }
+    })
+}
+
+/// Float intrinsics `lower_intrinsic` maps over SIMD leaves.
+pub const LEAFWISE_INTRINSICS: [&str; 10] = [
+    "llvm.fma", "llvm.fmuladd", "llvm.sqrt", "llvm.fabs", "llvm.floor", "llvm.ceil",
+    "llvm.trunc", "llvm.roundeven", "llvm.minimum", "llvm.maximum",
+];
+
 fn idx(ctx: &mut Context, i: u32, before: Ptr<Operation>) -> pliron::value::Value {
     let t = IntegerType::get(ctx, 32, Signedness::Signless);
     let a = IntegerAttr::new(t, APInt::from_u64(i.into(), 32.try_into().unwrap()));
@@ -187,7 +221,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
                     continue;
                 }
                 if let Some((e, n)) = vec_of(ctx, o.get_result(0).get_type(ctx)) {
-                    if elementwise(ctx, op) {
+                    if elementwise(ctx, op) && !native_leafwise(ctx, op) {
                         todo.push((op, e, n));
                     }
                 }
