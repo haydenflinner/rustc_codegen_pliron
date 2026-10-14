@@ -2594,7 +2594,10 @@ pub fn arghoist(func: &mut Function) -> usize {
 /// clones still land in one class (a transitive `arghoist`). The param
 /// drops and its uses rebind to a class member that dominates the head
 /// when one exists, else to the key re-materialized there (`emit_key`).
-pub fn webmerge(func: &mut Function) -> usize {
+/// Returns `(merges, pmap)` — `pmap` maps each dropped param to the
+/// carrier its uses rebound to. The pipeline uses it to carry
+/// `derived`-pointer facts across the merge.
+pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     use crate::proots::Key;
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
@@ -2699,7 +2702,7 @@ pub fn webmerge(func: &mut Function) -> usize {
         }
     }
     if param_drops.is_empty() {
-        return 0;
+        return (0, pmap);
     }
     // Materialize each non-member class at its block's head, operands
     // before users, then insert the run before the original first inst.
@@ -2733,8 +2736,8 @@ pub fn webmerge(func: &mut Function) -> usize {
         })
         .collect();
     let n = param_drops.len();
-    apply_param_drops(func, pmap, arg_drops, param_drops);
-    n
+    apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
+    (n, pmap)
 }
 
 /// Can `key` be materialized at `b`'s head? Every `V` leaf must dominate
@@ -2833,10 +2836,28 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                 | Opcode::Iadd
                 | Opcode::Isub
                 | Opcode::Ishl
-                | Opcode::Ushr => InstructionData::Binary {
-                    opcode: *op,
-                    args: [vals[0], vals[1]],
-                },
+                | Opcode::Ushr => {
+                    // Identity/annihilator folds for source shapes like
+                    // `iadd 0, x` (the egraph and edge clones produce
+                    // them): emitting the shape verbatim is redundant —
+                    // emit the simplified operand instead.
+                    let k0 = args
+                        .iter()
+                        .position(|a| matches!(a, Key::K(_, 0)));
+                    let comm = matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor);
+                    match (op, k0) {
+                        (Opcode::Band, Some(i)) => return Some(vals[i]),
+                        (_, Some(1)) if comm || matches!(op, Opcode::Isub | Opcode::Ishl | Opcode::Ushr) => {
+                            return Some(vals[0]);
+                        }
+                        (_, Some(0)) if comm => return Some(vals[1]),
+                        _ => {}
+                    }
+                    InstructionData::Binary {
+                        opcode: *op,
+                        args: [vals[0], vals[1]],
+                    }
+                }
                 Opcode::Bnot | Opcode::Uextend | Opcode::Sextend | Opcode::Ireduce => {
                     InstructionData::Unary {
                         opcode: *op,
@@ -7739,7 +7760,7 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(webmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func).0, 1);
         assert!(func.dfg.block_params(s).is_empty());
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
@@ -7779,7 +7800,7 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(webmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func).0, 1);
         assert!(func.dfg.block_params(s).is_empty());
         // No `x + 0` rematerialization — `ps`'s use bound straight to
         // `x`, so `s` still holds exactly the three original insts.
@@ -7828,7 +7849,7 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(webmerge(&mut func), 0);
+        assert_eq!(webmerge(&mut func).0, 0);
         assert_eq!(func.dfg.block_params(s).len(), 1);
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
@@ -7873,7 +7894,7 @@ mod tests {
         let mut cur = FuncCursor::new(&mut func).at_bottom(s);
         cur.ins().return_(&[ps]);
 
-        assert_eq!(webmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func).0, 1);
         assert!(func.dfg.block_params(s).is_empty());
         // Head of `s` = iconst 8, iadd, iconst 5, icmp, then the return.
         assert_eq!(func.layout.block_insts(s).count(), 5);
@@ -7917,7 +7938,7 @@ mod tests {
         let r = cur.ins().iadd(ps, one);
         cur.ins().return_(&[r]);
 
-        assert_eq!(webmerge(&mut func), 1);
+        assert_eq!(webmerge(&mut func).0, 1);
         assert!(func.dfg.block_params(s).is_empty());
         // `ps` rebound to entry's `j` — `s` keeps only iconst+iadd+ret.
         assert_eq!(func.layout.block_insts(s).count(), 3);

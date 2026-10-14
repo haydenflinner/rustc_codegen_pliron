@@ -1581,9 +1581,33 @@ fn s_relparm(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::webmerge(&mut p.clctx.func);
-    if k > 0 && p.dump {
-        p.dump("webmerge");
+    let (k, pmap) = clifpeep::webmerge(&mut p.clctx.func);
+    if k > 0 {
+        // Carry derived-pointer facts across the merge: `x` derived from
+        // a dropped param is derived from its carrier, and a dropped
+        // param's own base moves to the carrier too. One chase through
+        // `pmap` flattens carrier chains.
+        let chase = |mut v: Value| {
+            while let Some(&w) = pmap.get(&v) {
+                v = w;
+            }
+            v
+        };
+        let keys: Vec<Value> = p.derived.keys().copied().collect();
+        for x in keys {
+            if let Some(&b) = p.derived.get(&x) {
+                let b = chase(b);
+                p.derived.insert(x, b);
+            }
+        }
+        for (&d, &w) in &pmap {
+            if let Some(&b) = p.derived.get(&d) {
+                p.derived.insert(chase(w), b);
+            }
+        }
+        if p.dump {
+            p.dump("webmerge");
+        }
     }
     k
 }
