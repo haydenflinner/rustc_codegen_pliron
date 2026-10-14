@@ -5928,6 +5928,37 @@ pub fn lcse(func: &mut Function) -> usize {
             if t == f {
                 return Some(t);
             }
+            // `select (x == 0), 0, x` / `select (x != 0), x, 0` → `x`,
+            // `select (x == 0), x, 0` / `select (x != 0), 0, x` → `0` —
+            // Option-chain residue where the condition tests the value
+            // being selected (`block183` in tokenize's `count` loop).
+            if let ValueDef::Result(ci, _) = func.dfg.value_def(func.dfg.resolve_aliases(args[0]))
+                && let InstructionData::IntCompare {
+                    cond,
+                    args: cargs,
+                    ..
+                } = func.dfg.insts[ci]
+            {
+                let (cx, ck) = (
+                    func.dfg.resolve_aliases(cargs[0]),
+                    func.dfg.resolve_aliases(cargs[1]),
+                );
+                let cx = if iconst(func, ck) == Some(0) {
+                    cx
+                } else if iconst(func, cx) == Some(0) {
+                    ck
+                } else {
+                    return None;
+                };
+                let (zt, zf) = (iconst(func, args[1]) == Some(0), iconst(func, args[2]) == Some(0));
+                return match cond {
+                    IntCC::Equal if zt && f == cx => Some(f),
+                    IntCC::NotEqual if t == cx && zf => Some(t),
+                    IntCC::Equal if t == cx && zf => Some(args[2]),
+                    IntCC::NotEqual if zt && f == cx => Some(args[1]),
+                    _ => None,
+                };
+            }
             return None;
         }
         let InstructionData::Binary { opcode, args } = data else {
