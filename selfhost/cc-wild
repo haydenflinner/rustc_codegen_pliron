@@ -25,4 +25,11 @@ R="$(cd "$(dirname "$0")/.." && pwd)/tools/pliron-prof/target/release/libpliron_
 if [ -n "${PLIRON_PGO:-}" ] && [ -f "$R" ]; then
     args+=("$R")
 fi
+# Cranelift x86 libcalls (__cranelift_x86_pshufb) — build once, always link.
+S="$(dirname "$0")/clif_stubs.c"
+A="$(dirname "$0")/libclif_stubs.a"
+if [ ! -f "$A" ] && [ -f "$S" ]; then
+    cc -O2 -c "$S" -o "$A.tmp.o" && ar rcs "$A.tmp" "$A.tmp.o" && mv "$A.tmp" "$A" && rm -f "$A.tmp.o"
+fi
+[ -f "$A" ] && args+=("$A")
 exec cc -B"$D" "${args[@]}"
