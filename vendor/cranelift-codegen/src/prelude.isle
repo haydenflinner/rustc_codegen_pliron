@@ -431,6 +431,12 @@
 (decl fits_in_64 (Type) Type)
 (extern extractor fits_in_64 fits_in_64)
 
+;; Like fits_in_64 but also accepts fixed vectors (i8x8, i32x2) — the
+;; aarch64 SIMD&FP => GPR bitcast rule needs vector acceptance that the
+;; scalar-only fits_in_64 deliberately excludes.
+(decl fits_in_64_allow_vec (Type) Type)
+(extern extractor fits_in_64_allow_vec fits_in_64_allow_vec)
+
 ;; An extractor that only matches types that fit in exactly 16 bits.
 (decl ty_16 (Type) Type)
 (extern extractor ty_16 ty_16)

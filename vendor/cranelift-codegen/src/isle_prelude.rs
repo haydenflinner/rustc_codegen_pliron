@@ -457,6 +457,18 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn fits_in_64_allow_vec(&mut self, ty: Type) -> Option<Type> {
+            // The SIMD&FP -> GPR `bitcast` rule genuinely wants <=64-bit
+            // vectors (i8x8, i32x2, f32x2); `fits_in_64` itself excludes
+            // them so scalar-only rules can't pick up a vector operand.
+            if ty.bits() <= 64 && !ty.is_dynamic_vector() {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
         fn ty_int_ref_scalar_64(&mut self, ty: Type) -> Option<Type> {
             if ty.bits() <= 64 && !ty.is_float() && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)

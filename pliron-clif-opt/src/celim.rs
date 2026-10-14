@@ -488,6 +488,93 @@ fn edge_conds(func: &Function, inst: Inst, s: Block) -> Vec<Cmp> {
     out
 }
 
+/// Meet-over-edges facts for multi-predecessor `s`: a condition every
+/// in-edge establishes, restated on `s`'s params, holds on every entry —
+/// no dominance requirement. An unrolled loop's exits all carry
+/// `iv + k >= n` spelled differently per copy (`v1844+2` on one edge,
+/// `v1860+1` on the next); through each edge's own args they collapse to
+/// the same `param + d >= n`. That is how a `len` recomputed from a
+/// memset loop's exit index still proves `j < len` under a `j < n`
+/// dominator.
+///
+/// Translation: an edge arg `a` decomposing to `V(x, c)` maps fact
+/// operand `V(x, d)` to `V(param, d - c)` — machine-exact modular
+/// arithmetic (the `i' = i + 1` backedge is the `c = 1` case). A base
+/// mapping twice at different offsets is ambiguous and is dropped.
+fn join_facts(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+    fact: &mut FxHashMap<Block, Vec<Cmp>>,
+) {
+    const MAX_PREDS: usize = 12;
+    for s in func.layout.blocks() {
+        let params = func.dfg.block_params(s);
+        if params.is_empty() {
+            continue;
+        }
+        let preds: Vec<_> = cfg.pred_iter(s).take(MAX_PREDS + 1).collect();
+        if preds.len() < 2 || preds.len() > MAX_PREDS {
+            continue;
+        }
+        let mut acc: Option<Vec<Cmp>> = None;
+        for q in preds {
+            if !domtree.is_reachable(q.block) {
+                continue;
+            }
+            // arg-base -> (param, arg's offset from that base)
+            let mut xlat: FxHashMap<Value, (Value, i64)> = FxHashMap::default();
+            let mut bad: FxHashSet<Value> = FxHashSet::default();
+            for bc in func.dfg.insts[q.inst].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                if bc.block(&func.dfg.value_lists) != s {
+                    continue;
+                }
+                for (i, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let (Some(&p), cranelift_codegen::ir::BlockArg::Value(v)) =
+                        (params.get(i), a)
+                        && let Op::V(x, c) = decomp(func, func.dfg.resolve_aliases(v))
+                    {
+                        match xlat.get(&x) {
+                            Some(&(_, c2)) if c2 != c => {
+                                xlat.remove(&x);
+                                bad.insert(x);
+                            }
+                            None if !bad.contains(&x) => {
+                                xlat.insert(x, (p, c));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let xop = |m: &FxHashMap<Value, (Value, i64)>, o: Op| match o {
+                Op::V(x, d) => m
+                    .get(&x)
+                    .map(|&(p, c)| Op::V(p, d.wrapping_sub(c)))
+                    .unwrap_or(o),
+                k => k,
+            };
+            let cs: Vec<Cmp> = edge_conds(func, q.inst, s)
+                .into_iter()
+                .map(|(cc, a, b)| (cc, xop(&xlat, a), xop(&xlat, b)))
+                .collect();
+            acc = Some(match acc {
+                None => cs,
+                Some(prev) => prev.into_iter().filter(|c| cs.contains(c)).collect(),
+            });
+            if acc.as_deref().is_some_and(|a| a.is_empty()) {
+                break;
+            }
+        }
+        if let Some(cs) = acc {
+            fact.entry(s).or_default().extend(cs);
+        }
+    }
+}
+
 /// Facts provable on every arrival at a loop header. A candidate stated
 /// on the header's params holds inductively when each in-edge's source
 /// proves the candidate restated on that edge's own args: entry edges
@@ -1638,20 +1725,23 @@ fn decide_d(
             return Some(r);
         }
         // Transitivity: `x R1 m` and `m R2 z` decide `x R3 z` (z may be a
-        // constant on the query's right).
+        // constant on the query's right). The middle `m` may itself be a
+        // constant — `x < n` under a dominating `n <= y` decides `x < y`,
+        // which is how a `j < n` loop guard kills `j < len` bounds checks
+        // when `len` decomposes to the same operand as `n`.
         if let Op::V(x, 0) = q.1 {
             for &&f1 in fs {
                 let Some((r1, m)) = (match (f1.1, f1.2) {
-                    (Op::V(a, 0), Op::V(m, 0)) if a == x => Some((f1.0, m)),
-                    (Op::V(m, 0), Op::V(a, 0)) if a == x => Some((f1.0.swap_args(), m)),
+                    (Op::V(a, 0), m) if a == x => Some((f1.0, m)),
+                    (m, Op::V(a, 0)) if a == x => Some((f1.0.swap_args(), m)),
                     _ => None,
                 }) else {
                     continue;
                 };
                 for &&f2 in fs {
                     let r2 = match (f2.1, f2.2) {
-                        (Op::V(a, 0), b) if a == m && b == q.2 => Some(f2.0),
-                        (b, Op::V(a, 0)) if a == m && b == q.2 => Some(f2.0.swap_args()),
+                        (a, b) if a == m && b == q.2 => Some(f2.0),
+                        (b, a) if a == m && b == q.2 => Some(f2.0.swap_args()),
                         _ => None,
                     };
                     if let Some(r3) = r2.and_then(|r2| transit(r1, r2))
@@ -1896,6 +1986,7 @@ pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let mut fact = edge_facts(func, &cfg, &domtree);
+    join_facts(func, &cfg, &domtree, &mut fact);
     let mut folds: Vec<(Inst, bool)> = Vec::new();
     let srcs = crate::proots::alias_map(func);
     for (h, fs) in induction_facts(func, &cfg, &domtree, &fact, &srcs) {

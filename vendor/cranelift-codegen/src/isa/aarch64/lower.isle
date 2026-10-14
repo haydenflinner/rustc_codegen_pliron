@@ -3154,7 +3154,7 @@
       (mov_to_fpu x (scalar_size in_ty)))
 
 ; SIMD&FP => GPR
-(rule 3 (lower (bitcast out_ty _ x @ (value_type (fits_in_64 (ty_float_or_vec _)))))
+(rule 3 (lower (bitcast out_ty _ x @ (value_type (fits_in_64_allow_vec (ty_float_or_vec _)))))
       (if (ty_int_ref_scalar_64 out_ty))
       (mov_from_vec x 0 (scalar_size out_ty)))
 
