@@ -14,6 +14,7 @@ pub mod context {
 }
 
 pub use pliron_clif_opt::*;
+pub use pliron_ir_opt as iropt;
 pub use pliron_ir_opt::types;
 pub use pliron_ir_opt::{
     address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
