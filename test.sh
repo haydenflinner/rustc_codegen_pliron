@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm
+#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm pgo
 #   (sysroot/mold still need their flags)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -300,6 +300,45 @@ t_loopvec() {
   fi
 }
 
+t_pgo() {
+  # gen -> run -> use -> verify (docs/pgo.md): an instrumented build dumps
+  # a .prof at exit, the pliron-prof CLI reads it, and a PGO_USE build
+  # matches every function back and runs identically.
+  (cd tools/pliron-prof && cargo build --release) &&
+  local rt=$PWD/tools/pliron-prof/target/release/libpliron_prof.a
+  local cli=$PWD/tools/pliron-prof/target/release/pliron-prof
+  local prof=$out/pgo.prof
+  rm -f $prof
+  PLIRON_PGO=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
+    -o $out/pgo_i$exe -Clink-arg="$rt" &&
+    PLIRON_PROFILE_FILE=$prof $out/pgo_i$exe > $out/pgo_i.out &&
+    $cli dump $prof > $out/pgo.dump &&
+    grep -q 'functions' $out/pgo.dump &&
+    PLIRON_PGO_USE=$prof rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
+      -o $out/pgo_u$exe 2> $out/pgo_use.txt &&
+    ! grep -q ': 0 functions matched' $out/pgo_use.txt &&
+    $out/pgo_u$exe | diff - $out/pgo_i.out
+  # wasm leg: the instrumented module carries no runtime; the host pulls
+  # the same .prof out of linear memory via __pliron_prof_hdrs.
+  if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
+    local wdir=$PWD/$out/wasm-pgo
+    local wld=$PWD/tools/pliron-wasm-ld/target/release/pliron-wasm-ld
+    cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml &&
+    (cd tests/wasm &&
+      RUSTFLAGS="$BE -Clinker=$wld" \
+        CARGO_TARGET_DIR=$wdir PLIRON_PGO=1 \
+        cargo build -q --release --target wasm32-unknown-unknown \
+        -Zbuild-std=core,compiler_builtins \
+        -Zbuild-std-features=compiler-builtins-mem) &&
+    node tests/wasm/run.mjs \
+      $wdir/wasm32-unknown-unknown/release/wasmtest.wasm &&
+    node tests/wasm/pgo_extract.mjs \
+      $wdir/wasm32-unknown-unknown/release/wasmtest.wasm $out/pgo-wasm.prof &&
+    $cli dump $out/pgo-wasm.prof > $out/pgo-wasm.dump &&
+    grep -q 'functions' $out/pgo-wasm.dump
+  fi
+}
+
 t_proc_macro() {
   # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
   rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
@@ -375,6 +414,7 @@ want commute && t_commute
 want xpack && t_xpack
 want loopvec && t_loopvec
 want proc_macro && t_proc_macro
+want pgo && t_pgo
 [[ -n "$sysroot" ]] && want sysroot && t_sysroot
 [[ -n "$mold" ]] && want mold && t_mold
 if want wasm && command -v node >/dev/null \

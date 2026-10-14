@@ -349,12 +349,16 @@ pub fn instrument(
             },
         );
     }
-    // header+records: {magic, ctrs ptr, nctrs, recs_len, recs bytes}
+    // header+records: {magic, ctrs ptr, nctrs, recs_len, recs bytes}.
+    // One wire layout everywhere: wasm writes only the low 4 bytes of the
+    // ctrs reloc (linear addr), so it uses an i64-typed field there too
+    // and the offsets stay {0,8,16,24} on both targets.
+    let ctrs_t = if wasm { i64t } else { ptr_t };
     let recs_ty = ArrayType::get(ctx, i8t, recs.len() as u64).into();
     let hdr_ty = StructType::get_unnamed(
         ctx,
         (
-            vec![i64t, ptr_t, i64t, i64t, recs_ty],
+            vec![i64t, ctrs_t, i64t, i64t, recs_ty],
             StructLayout::Unpacked,
         ),
     )
@@ -363,7 +367,7 @@ pub fn instrument(
     let f1 = mk(
         ctx,
         st,
-        ptr_t,
+        ctrs_t,
         ConstVal::Sym {
             sym: ctrs_sym.clone(),
             off: 0,

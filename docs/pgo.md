@@ -134,14 +134,19 @@ waffle like anything else — so gen mode emits identical globals. What
 differs is how counts leave the guest:
 
 - The counter arrays and records land in linear memory via the normal
-  data-segment path; `pliron-wasm-ld` synthesizes and exports
-  `__pliron_prof_start`/`__pliron_prof_end` globals bounding the
-  `pliron_prof` regions (same mechanism as `__pliron_eh`/`__stack_pointer`).
-- No wasm-side runtime at all: the host (node/JS) reads the region after
-  the run and hands it to `pliron-prof merge`. Browser demo: the
-  examples/browser worker downloads a `.prof` after compiling/running —
-  this makes browser-native JIT feedback ("which functions did the user
-  actually run") trivially collectible.
+  data-segment path; `pliron-wasm-ld` roots every `__pliron_prof_*`
+  data object (they'd otherwise be GC'd), and synthesizes a
+  `[count][u32 addrs...]` table of all `__pliron_prof_hdr.*` objects,
+  exported as the i32 global `__pliron_prof_hdrs`.
+- No wasm-side runtime at all: the host (node/JS) reads the table after
+  the run, walks each header, and writes the same `.prof` format —
+  `tests/wasm/pgo_extract.mjs` is the reference extractor. The `ctrs`
+  field is a 4-byte linear-address reloc in an i64 slot (upper bytes
+  stay zero), so the `{u64 magic, u64 ctrs, u64 nctrs, u64 recs_len}`
+  wire layout is identical to native.
+- This makes browser-native JIT feedback ("which functions did the user
+  actually run") trivially collectible — something LLVM instrumentation
+  PGO cannot do on wasm at all.
 - `.init_array` ctor objects still work on wasm (`__wasm_call_ctors`
   exists), so a wasm-side flush function can be added later for
   long-running guests that want periodic snapshotted profiles.

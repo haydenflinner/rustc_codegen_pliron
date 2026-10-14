@@ -472,7 +472,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
-            if d.flags & INIT_ARRAY != 0 || (d.flags & GLOBAL != 0 && !blobs[oi].2) {
+            if d.flags & INIT_ARRAY != 0
+                || (d.flags & GLOBAL != 0 && !blobs[oi].2)
+                || d.name.starts_with("__pliron_prof_")
+            {
                 wl.push(Def::Data(oi, di));
             }
         }
@@ -624,6 +627,32 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             cur += d.bytes.len() as u32;
         }
     }
+    // `__pliron_prof_hdrs`: a synthesized `[count][u32 addrs...]` table of
+    // every live `__pliron_prof_hdr.*` data object, exported as an i32
+    // global — a PGO-instrumented wasm module has no runtime; the host
+    // reads this table + the counters out of linear memory after running
+    // (docs/pgo.md).
+    let prof_hdrs: Vec<u32> = included
+        .iter()
+        .flat_map(|&oi| {
+            objs[oi]
+                .data
+                .iter()
+                .enumerate()
+                .map(move |(di, d)| (oi, di, d))
+        })
+        .filter(|&(oi, di, d)| {
+            d.name.starts_with("__pliron_prof_hdr.") && live_d.contains(&(oi, di))
+        })
+        .map(|(oi, di, _)| addr[&(oi, di)])
+        .collect();
+    let prof_tab = if prof_hdrs.is_empty() {
+        0
+    } else {
+        let a = cur.next_multiple_of(4);
+        cur = a + 4 + 4 * prof_hdrs.len() as u32;
+        a
+    };
     // `__pliron_eh`: flag (+0) and exception pointer (+4) for the backend's
     // emulated unwinding; zero-initialized, so no segment is emitted.
     let eh = cur.next_multiple_of(8);
@@ -746,6 +775,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                 segs.push((addr[&(oi, di)], bytes));
             }
         }
+    }
+    if !prof_hdrs.is_empty() {
+        let mut b = Vec::with_capacity(4 + 4 * prof_hdrs.len());
+        b.extend_from_slice(&(prof_hdrs.len() as u32).to_le_bytes());
+        for a in &prof_hdrs {
+            b.extend_from_slice(&a.to_le_bytes());
+        }
+        segs.push((prof_tab, b));
     }
 
     // Constructors: every pointer in an `.init_array` entry, in link order.
@@ -890,9 +927,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             &we::ConstExpr::i32_const(*v as i32),
         );
     }
+    if !prof_hdrs.is_empty() {
+        gs.global(
+            we::GlobalType {
+                val_type: we::ValType::I32,
+                mutable: false,
+                shared: false,
+            },
+            &we::ConstExpr::i32_const(prof_tab as i32),
+        );
+    }
     module.section(&gs);
     let mut es = we::ExportSection::new();
     es.export("memory", we::ExportKind::Memory, 0);
+    if !prof_hdrs.is_empty() {
+        // stack + trip + GOT values precede it in the global section.
+        es.export(
+            "__pliron_prof_hdrs",
+            we::ExportKind::Global,
+            n_synth + 1 + gvals.len() as u32,
+        );
+    }
     for (n, f) in &ex {
         es.export(n, we::ExportKind::Func, *f);
     }
