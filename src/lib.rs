@@ -26,11 +26,7 @@ mod asm;
 mod builder;
 mod consts;
 mod context;
-mod eh;
-mod hot;
 mod intrinsic;
-mod lower;
-mod objmerge;
 mod simd;
 mod type_of;
 mod types;
@@ -40,6 +36,7 @@ mod xcgu;
 // CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
+pub use pliron_clif_lower::{eh, hot, lower, obj_sym, objmerge};
 pub use pliron_ir_opt::{
     address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
     nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
@@ -253,10 +250,37 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
 }
 
-/// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
-/// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
-pub(crate) fn obj_sym(n: &str) -> &str {
-    n.strip_prefix('\u{1}').unwrap_or(n)
+/// [`lower::Host`] over rustc's session: self-profile activities,
+/// diagnostics, and target features.
+struct RustcHost<'a> {
+    sess: &'a Session,
+    prof: RustcProf<'a>,
+}
+
+/// `Session` is not `Sync`; worker threads only see the profiler.
+struct RustcProf<'a>(&'a SelfProfilerRef);
+
+impl lower::Prof for RustcProf<'_> {
+    fn activity(&self, nm: &'static str, arg: Option<&str>) -> Box<dyn Send + '_> {
+        match arg {
+            Some(a) => Box::new(self.0.generic_activity_with_arg(nm, a)),
+            None => Box::new(self.0.generic_activity(nm)),
+        }
+    }
+}
+
+impl lower::Host for RustcHost<'_> {
+    fn prof(&self) -> &dyn lower::Prof {
+        &self.prof
+    }
+    fn fatal(&self, msg: String) -> ! {
+        self.sess.dcx().fatal(msg)
+    }
+    fn sse42(&self) -> bool {
+        self.sess
+            .internal_target_features
+            .contains(&Symbol::intern("sse4.2"))
+    }
 }
 
 /// Install the tracing subscriber when `PLIRON_TRACE` is set. The env var
@@ -559,7 +583,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         &cx.st.borrow(),
         isa,
         name,
-        cx.tcx.sess,
+        &RustcHost {
+            sess: cx.tcx.sess,
+            prof: RustcProf(&cx.tcx.sess.prof),
+        },
     );
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }

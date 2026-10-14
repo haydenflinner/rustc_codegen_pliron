@@ -110,7 +110,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// Local, non-variadic functions whose address never escapes and that are
 /// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
 /// 8 int + 8 float return registers instead of SysV's 2+2).
-pub(crate) fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
+pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();
@@ -136,6 +136,81 @@ pub(crate) fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<S
         .collect()
 }
 
+/// Profiler hook, shared with the codegen worker threads.
+pub trait Prof: Sync {
+    /// Guard for phase/step `nm` (optionally per function `arg`).
+    fn activity(&self, _nm: &'static str, _arg: Option<&str>) -> Box<dyn Send + '_> {
+        Box::new(())
+    }
+}
+
+/// What lowering needs from its embedder: rustc's `Session`, or a JIT.
+pub trait Host {
+    fn prof(&self) -> &dyn Prof;
+    /// Clean user-facing error (capacity limits), not an ICE.
+    fn fatal(&self, msg: String) -> ! {
+        panic!("{msg}")
+    }
+    /// x86-64 `sse4.2` (`pcmpgtq`) is available.
+    fn sse42(&self) -> bool {
+        false
+    }
+}
+
+/// Default host: no profiler, panicking `fatal`, baseline x86-64.
+pub struct NoHost;
+impl Prof for NoHost {}
+impl Host for NoHost {
+    fn prof(&self) -> &dyn Prof {
+        self
+    }
+}
+
+/// (name, bytes, align, relocs, writable, used, section name, linkage)
+type CustomSec = (
+    String,
+    Vec<u8>,
+    u64,
+    Vec<(u64, String, i64)>,
+    bool,
+    bool,
+    String,
+    Linkage,
+);
+
+/// Result of [`lower_module`]: everything defined in the module, plus the
+/// pieces only an object file can carry.
+pub struct Lowered {
+    pub eh: crate::eh::UnwindContext,
+    ids: FxHashMap<String, Sym>,
+    verbatim_syms: Vec<String>,
+    custom_secs: Vec<CustomSec>,
+    asm_stubs: rustc_hash::FxHashSet<&'static str>,
+    hot_asm: String,
+}
+
+impl Lowered {
+    /// The module function declared for symbol `n`.
+    pub fn func_id(&self, n: &str) -> Option<FuncId> {
+        match self.ids.get(n)? {
+            Sym::F(id, _) => Some(*id),
+            Sym::D(..) => None,
+        }
+    }
+
+    /// Assembly the module still needs (`asm!`, hot thunks, atomic stubs,
+    /// va trampolines): object emitters splice it in, a JIT must provide
+    /// these symbols itself or reject the module.
+    pub fn pending_asm(&self, st: &State, macho: bool) -> String {
+        let va_asm: String = VA_TRAMPS.with(|v| v.borrow_mut().drain().collect());
+        let mut asm = format!("{}\n{}\n{va_asm}", st.asm, self.hot_asm);
+        for s in &self.asm_stubs {
+            asm.push_str(&atomic_stub_asm(s, macho));
+        }
+        asm
+    }
+}
+
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
@@ -143,7 +218,7 @@ pub fn lower_to_object(
     st: &State,
     isa: Arc<dyn TargetIsa>,
     name: &str,
-    sess: &rustc_session::Session,
+    host: &dyn Host,
 ) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     // Mach-O symbols index sections with a u8 (max 255): per-symbol sections
@@ -152,6 +227,89 @@ pub fn lower_to_object(
     b.per_function_section(!macho);
     b.per_data_object_section(!macho);
     let mut m = ObjectModule::new(b);
+    let lw = lower_module(&mut m, unwind, hot, ctx, st, &isa, name, host);
+    let mut product = m.finish();
+    let asm = lw.pending_asm(st, macho);
+    let Lowered {
+        eh,
+        ids,
+        verbatim_syms,
+        custom_secs,
+        ..
+    } = lw;
+    // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
+    // declaration, so the stored name is `name` or `_name` — drop the
+    // platform prefix (e.g. `_`) that add_symbol prepended.
+    let prefix = product.object.mangling().global_prefix();
+    for n in &verbatim_syms {
+        let sid = product
+            .object
+            .symbol_id(crate::obj_sym(n).as_bytes())
+            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
+        let name = &mut product.object.symbol_mut(sid).name;
+        if let Some(p) = prefix
+            && name.starts_with(&[p])
+        {
+            name.remove(0);
+        }
+    }
+    if !custom_secs.is_empty() {
+        emit_merged_custom_sections(&mut product.object, custom_secs);
+    }
+    eh.emit(&mut product);
+    for (alias, target, weak) in &st.aliases {
+        let tsym = match ids.get(target).copied() {
+            Some(Sym::F(id, _)) => product.function_symbol(id),
+            Some(Sym::D(id, _)) => product.data_symbol(id),
+            None => continue,
+        };
+        let t = product.object.symbol(tsym);
+        let (value, size, kind, section) = (t.value, t.size, t.kind, t.section);
+        if !matches!(section, object::write::SymbolSection::Section(_)) {
+            continue;
+        }
+        let scope = match t.scope {
+            object::SymbolScope::Compilation => object::SymbolScope::Linkage,
+            s => s,
+        };
+        let obj = &mut product.object;
+        let id = obj.symbol_id(alias.as_bytes()).unwrap_or_else(|| {
+            obj.add_symbol(object::write::Symbol {
+                name: alias.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind,
+                scope,
+                weak: *weak,
+                section: object::write::SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            })
+        });
+        let s = obj.symbol_mut(id);
+        (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
+            (value, size, kind, scope, *weak, section);
+    }
+    if !asm.trim().is_empty() {
+        let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
+    }
+    product.emit().unwrap()
+}
+
+/// Declare and define every function and global of `ctx`'s module in `m`
+/// (an `ObjectModule`, a `JITModule`, ...).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_module(
+    m: &mut dyn Module,
+    unwind: bool,
+    hot: bool,
+    ctx: &Context,
+    st: &State,
+    isa: &Arc<dyn TargetIsa>,
+    name: &str,
+    host: &dyn Host,
+) -> Lowered {
+    let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
     let cc = isa.default_call_conv();
     let mut internal = internal_fns(ctx, st);
     if matches!(
@@ -250,7 +408,7 @@ pub fn lower_to_object(
         None
     };
 
-    let mut eh = crate::eh::UnwindContext::new(&mut m, true, unwind);
+    let mut eh = crate::eh::UnwindContext::new(m, true, unwind);
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
@@ -281,9 +439,7 @@ pub fn lower_to_object(
     // 64-bit vector compares are cheap on aarch64 and with sse4.2
     // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
     let cmp64 = !x64
-        || sess
-            .internal_target_features
-            .contains(&rustc_span::Symbol::intern("sse4.2"));
+        || host.sse42();
     // `PLIRON_VERIFY=full` verifies after every pass. Any other truthy
     // value verifies once after the pipeline: on failure the function is
     // restored from a pre-pipeline snapshot and re-run with per-pass
@@ -332,14 +488,14 @@ pub fn lower_to_object(
         verify_full_env: bool,
         fn_flags: &'a crate::pipeline::FnFlags,
         region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-        prof: &'a rustc_data_structures::profiling::SelfProfilerRef,
+        prof: &'a dyn Prof,
     }
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
-    let _pglo = sess.prof.generic_activity("pliron_lowerobj");
+    let _pglo = host.prof().activity("pliron_lowerobj", None);
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
-    let _pgfl = sess.prof.generic_activity("pliron_fnlower");
+    let _pgfl = host.prof().activity("pliron_fnlower", None);
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -371,7 +527,7 @@ pub fn lower_to_object(
             let mut fl = FnLower {
                 ctx,
                 st,
-                m: &mut m,
+                m: &mut *m,
                 ids: &ids,
                 b,
                 vals: FxHashMap::default(),
@@ -489,7 +645,7 @@ pub fn lower_to_object(
     // bisect counter must number pass applications deterministically) or
     // `PLIRON_PAR=0` / `PLIRON_PAR=N` overrides the thread count.
     let shared = JobShared {
-        isa: &*isa,
+        isa: &**isa,
         tcfg: cfg,
         simd,
         x64,
@@ -499,7 +655,7 @@ pub fn lower_to_object(
         verify_full_env,
         fn_flags: &fn_flags,
         region_parent: &st.region_parent,
-        prof: &sess.prof,
+        prof: host.prof(),
     };
     fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
         CUR_FN.with(|c| {
@@ -520,7 +676,7 @@ pub fn lower_to_object(
         let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
         let tpipe = std::time::Instant::now();
         let _spipe = tracing::info_span!(target: "pliron::pipeline", "pipeline").entered();
-        let _pgpipe = sh.prof.generic_activity_with_arg("pliron_pipeline", n);
+        let _pgpipe = sh.prof.activity("pliron_pipeline", Some(n));
         'retry: loop {
             {
                 // Per-step self-profile events ride `sess.prof` through
@@ -528,7 +684,7 @@ pub fn lower_to_object(
                 // LLVM's `LLVM_passes` activities on the same clock.
                 // Scoped to the block so Pipe's borrow set stays per-try.
                 let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
-                    Box::new(sh.prof.generic_activity(nm))
+                    sh.prof.activity(nm, None)
                 };
                 let mut pipe = crate::pipeline::Pipe {
                     cur_step: "",
@@ -597,7 +753,7 @@ pub fn lower_to_object(
         // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
         let _scomp = tracing::info_span!(target: "pliron::pipeline", "compile").entered();
-        let _pgcomp = sh.prof.generic_activity_with_arg("pliron_compile", n);
+        let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
         let mut vec_retry = 0;
         let defr = loop {
             let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -694,7 +850,7 @@ pub fn lower_to_object(
     // function order — identical to what `define_function` did after
     // compiling each function serially.
     let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
-    let _pgpc = sess.prof.generic_activity("pliron_phasec");
+    let _pgpc = host.prof().activity("pliron_phasec", None);
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
@@ -708,7 +864,7 @@ pub fn lower_to_object(
                 | cranelift_codegen::CodegenError::CodeTooLarge),
             ) = &j.err
             {
-                sess.dcx().fatal(format!("function `{n}` too large: {e}"));
+                host.fatal(format!("function `{n}` too large: {e}"));
             }
             panic!(
                 "cranelift rejected `{n}`: {:?}\n{}",
@@ -732,7 +888,7 @@ pub fn lower_to_object(
             &relocs,
         )
         .unwrap_or_else(|e| panic!("define {}: {e}", j.name));
-        eh.add_function(&mut m, j.id, code);
+        eh.add_function(m, j.id, code);
     }
 
     if crate::env_set("PLIRON_TIMING") {
@@ -765,16 +921,7 @@ pub fn lower_to_object(
         );
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
-    let mut custom_secs: Vec<(
-        String,
-        Vec<u8>,
-        u64,
-        Vec<(u64, String, i64)>,
-        bool,
-        bool,
-        String,
-        Linkage,
-    )> = Vec::new();
+    let mut custom_secs: Vec<CustomSec> = Vec::new();
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else {
@@ -839,70 +986,14 @@ pub fn lower_to_object(
         m.define_data(id, &desc)
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
-    let mut product = m.finish();
-    // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
-    // declaration, so the stored name is `name` or `_name` — drop the
-    // platform prefix (e.g. `_`) that add_symbol prepended.
-    let prefix = product.object.mangling().global_prefix();
-    for n in &verbatim_syms {
-        let sid = product
-            .object
-            .symbol_id(crate::obj_sym(n).as_bytes())
-            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
-        let name = &mut product.object.symbol_mut(sid).name;
-        if let Some(p) = prefix
-            && name.starts_with(&[p])
-        {
-            name.remove(0);
-        }
+    Lowered {
+        eh,
+        ids,
+        verbatim_syms,
+        custom_secs,
+        asm_stubs,
+        hot_asm,
     }
-    if !custom_secs.is_empty() {
-        emit_merged_custom_sections(&mut product.object, custom_secs);
-    }
-    eh.emit(&mut product);
-    for (alias, target, weak) in &st.aliases {
-        let tsym = match ids.get(target).copied() {
-            Some(Sym::F(id, _)) => product.function_symbol(id),
-            Some(Sym::D(id, _)) => product.data_symbol(id),
-            None => continue,
-        };
-        let t = product.object.symbol(tsym);
-        let (value, size, kind, section) = (t.value, t.size, t.kind, t.section);
-        if !matches!(section, object::write::SymbolSection::Section(_)) {
-            continue;
-        }
-        let scope = match t.scope {
-            object::SymbolScope::Compilation => object::SymbolScope::Linkage,
-            s => s,
-        };
-        let obj = &mut product.object;
-        let id = obj.symbol_id(alias.as_bytes()).unwrap_or_else(|| {
-            obj.add_symbol(object::write::Symbol {
-                name: alias.as_bytes().to_vec(),
-                value: 0,
-                size: 0,
-                kind,
-                scope,
-                weak: *weak,
-                section: object::write::SymbolSection::Undefined,
-                flags: object::SymbolFlags::None,
-            })
-        });
-        let s = obj.symbol_mut(id);
-        (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
-            (value, size, kind, scope, *weak, section);
-    }
-    let va_asm: String = VA_TRAMPS.with(|v| v.borrow_mut().drain().collect());
-    let mut asm = format!("{}\n{hot_asm}\n{va_asm}", st.asm);
-    for s in &asm_stubs {
-        asm.push_str(&atomic_stub_asm(s, macho));
-    }
-    if !asm.trim().is_empty() {
-        let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
-    }
-    drop(_spc);
-    product.emit().unwrap()
 }
 
 /// Mach-O caps section ordinals at 255 (n_sect is a u8), so all globals that
@@ -1112,7 +1203,7 @@ fn atomic_stub_asm(name: &str, macho: bool) -> String {
     }
 }
 
-pub(crate) fn write_const(
+pub fn write_const(
     ctx: &Context,
     st: &State,
     v: Value,
@@ -1192,7 +1283,7 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
 struct FnLower<'a, 'b> {
     ctx: &'a Context,
     st: &'a State,
-    m: &'a mut ObjectModule,
+    m: &'a mut dyn Module,
     ids: &'a FxHashMap<String, Sym>,
     b: FunctionBuilder<'b>,
     vals: FxHashMap<Value, Vals>,
@@ -4428,7 +4519,7 @@ fn reaches(ctx: &Context, from: Ptr<BasicBlock>, to: Ptr<BasicBlock>) -> bool {
     false
 }
 
-pub(crate) fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+pub fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     rpo_split(ctx, st, blocks).0
 }
 
