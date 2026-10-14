@@ -213,6 +213,7 @@ fn with_pipe<R>(
         cmp64: true,
         has_eh: false,
         flags: &flags,
+        prof_hook: None,
         dump: false,
         verify_full: false,
         stats: &mut stats,
@@ -236,11 +237,19 @@ fn run_one(
             eprintln!("unknown step `{name}` (see `clif-check steps`)");
             std::process::exit(2);
         }
+        if o.print {
+            for (d, w) in &p.carry_log {
+                eprintln!("carry@{name} {d} -> {w}");
+            }
+        }
         p.clctx.func.clone()
     });
     if after.display().to_string() == before.display().to_string() {
         println!("{name}: unchanged");
         return (true, after);
+    }
+    if o.print {
+        println!("=== after {name} ===\n{}", after.display());
     }
     let ok = report(name, &before, &after, facts, o);
     (ok, after)

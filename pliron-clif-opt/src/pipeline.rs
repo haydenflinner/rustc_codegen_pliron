@@ -1757,9 +1757,6 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
             lt.0 = w;
         }
     }
-    if std::env::var("PLIRON_CARRY_DEBUG").is_ok() {
-        eprintln!("carry {d} -> {w}");
-    }
 }
 
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
@@ -2437,3 +2434,123 @@ pub static DEFAULT: &[Step] = &[
         run: s_coldret,
     },
 ];
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::isa::TargetIsa;
+    use cranelift_codegen::settings;
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    fn host_isa() -> std::sync::Arc<dyn TargetIsa> {
+        let flags = settings::Flags::new(settings::builder());
+        cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
+            .expect("host ISA")
+            .finish(flags)
+            .expect("ISA flags")
+    }
+
+    /// `v1 = call f(v0)`; `block1` takes `v1` as its param — the shape a
+    /// promoted load leaves behind when only one guarded path reaches
+    /// it. `v2` is a second result for the dedup-carry case.
+    const OPT_PTR: &str = "function %f(i64) -> i64 {
+        sig0 = (i64) -> i64
+        fn0 = %g sig0
+    block0(v0: i64):
+        v1 = call fn0(v0)
+        v2 = iconst.i64 7
+        v5 = iconst.i64 0
+        v3 = icmp eq v0, v5
+        brif v3, block0(v1), block1(v1)
+    block1(v4: i64):
+        return v4
+    }";
+
+    /// A block param's `nonnull` is true only on paths into its block;
+    /// a uniform-feed merge (`pmap[param] = carrier`) makes the carrier
+    /// the param's value *at those merge points*, not on paths that
+    /// skip the block — so the fact must not spread to the carrier
+    /// (`serde_derive`'s `Attr::get`: jtround folded the call result's
+    /// null check and threaded `None` into `Some` code). Result→result
+    /// dedups are universal equalities and still carry.
+    #[test]
+    fn carry_keeps_param_facts_scoped() {
+        let func = cranelift_reader::parse_functions(OPT_PTR).unwrap().remove(0);
+        let v = |n: u32| Value::from_u32(n);
+        let (v1, v2, v4) = (v(1), v(2), v(4));
+        assert!(matches!(func.dfg.value_def(v1), ValueDef::Result(..)));
+        assert!(matches!(func.dfg.value_def(v2), ValueDef::Result(..)));
+        assert!(matches!(func.dfg.value_def(v4), ValueDef::Param(..)));
+
+        let isa = host_isa();
+        let mut clctx = Context::for_function(func);
+        let nowrite: FxHashMap<FuncRef, bool> = Default::default();
+        let call_frozen: FxHashMap<FuncRef, u64> = Default::default();
+        let scoped: FxHashMap<Inst, Ptr<BasicBlock>> = Default::default();
+        let invariant: FxHashSet<Inst> = Default::default();
+        let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
+        let prof: FxHashMap<Block, u64> = Default::default();
+        let region_parent: FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>> = Default::default();
+        let nocap: FxHashSet<(Inst, u32)> = Default::default();
+        let mut nonnull = FxHashSet::default();
+        nonnull.insert(v4);
+        let mut derived = FxHashMap::default();
+        let mut frozen = FxHashMap::default();
+        let mut noalias = FxHashSet::default();
+        let mut deref = FxHashMap::default();
+        let mut operand_frozen = FxHashMap::default();
+        let mut lifetimes = Vec::new();
+        let mut stats = Stats::default();
+        let flags = FnFlags::default();
+        let mut p = Pipe {
+            clctx: &mut clctx,
+            isa: &*isa,
+            fname: "carry_keeps_param_facts_scoped",
+            func_id: FuncId::from_u32(0),
+            nonnull: &mut nonnull,
+            derived: &mut derived,
+            frozen: &mut frozen,
+            noalias: &mut noalias,
+            deref: &mut deref,
+            nowrite: &nowrite,
+            call_frozen: &call_frozen,
+            scoped: &scoped,
+            invariant: &invariant,
+            operand_frozen: &mut operand_frozen,
+            block_region: &block_region,
+            prof: &prof,
+            region_parent: &region_parent,
+            lifetimes: &mut lifetimes,
+            nocap: &nocap,
+            tcfg: isa.frontend_config(),
+            simd: true,
+            x64: false,
+            cmp64: true,
+            has_eh: false,
+            flags: &flags,
+            prof_hook: None,
+            dump: false,
+            verify_full: false,
+            stats: &mut stats,
+            carry_log: Vec::new(),
+            cur_step: "",
+        };
+        // The buggy pair: a param's guarded nonnull onto the wider-scope
+        // call result — must not transfer (different blocks: v4's site
+        // doesn't cover v1's def).
+        carry_one(&mut p, v4, v1);
+        assert!(
+            !p.nonnull.contains(&v1),
+            "param-scoped nonnull poisoned the merge carrier"
+        );
+        // Dedup carries still work: a result's mark reaches its
+        // later-defined twin in the same block.
+        p.nonnull.insert(v1);
+        carry_one(&mut p, v1, v2);
+        assert!(
+            p.nonnull.contains(&v2),
+            "same-block result->result carry dropped a covered fact"
+        );
+    }
+}
