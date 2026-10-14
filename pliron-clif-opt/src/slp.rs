@@ -430,10 +430,22 @@ struct StoreInfo {
 /// map. Newly emitted pack insts are *not* added — an unrecorded use can
 /// only keep a scalar lane def alive longer than needed, never corrupt
 /// the plan (lane defs stay unless `remove_dead_insts` proves them dead).
+fn build_uses(func: &Function) -> FxHashMap<Value, FxHashSet<Inst>> {
+    let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
+    for b2 in func.layout.blocks() {
+        for i in func.layout.block_insts(b2) {
+            for v in func.dfg.inst_values(i) {
+                uses.entry(func.dfg.resolve_aliases(v)).or_default().insert(i);
+            }
+        }
+    }
+    uses
+}
+
 fn try_block(
     func: &mut Function,
     domtree: &DominatorTree,
-    uses: &mut FxHashMap<Value, FxHashSet<Inst>>,
+    uses: &mut Option<FxHashMap<Value, FxHashSet<Inst>>>,
     _na: &FxHashSet<Value>,
     block: Block,
 ) -> usize {
@@ -509,6 +521,7 @@ fn try_block(
                 }
                 if run.len() == lanes as usize && i32::try_from(run[0].off).is_ok() {
                     let emit = run.iter().map(|s| s.pos).min().unwrap();
+                    let us = uses.get_or_insert_with(|| build_uses(func));
                     let plan = Ctx {
                         func: &*func,
                         domtree,
@@ -517,7 +530,7 @@ fn try_block(
                         block,
                         emit,
                         min_load: usize::MAX,
-                        uses,
+                        uses: &*us,
                         members: run.iter().map(|s| s.inst).collect(),
                     }
                     .analyze(&run);
@@ -536,7 +549,9 @@ fn try_block(
                             // map stays fresh for later blocks.
                             for v in cur.func.dfg.inst_values(s.inst) {
                                 let v = cur.func.dfg.resolve_aliases(v);
-                                if let Some(us) = uses.get_mut(&v) {
+                                if let Some(us) =
+                                    uses.as_mut().unwrap().get_mut(&v)
+                                {
                                     us.remove(&s.inst);
                                 }
                             }
@@ -611,24 +626,25 @@ pub fn run(
     }
     // One use map for the whole function, shared by every block's store
     // grouping — building it per block made this pass O(blocks × insts).
-    let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
-    for b2 in func.layout.blocks() {
-        for i in func.layout.block_insts(b2) {
-            for v in func.dfg.inst_values(i) {
-                uses.entry(func.dfg.resolve_aliases(v))
-                    .or_default()
-                    .insert(i);
-            }
-        }
-    }
+    // Built lazily on the first candidate run: most functions have no
+    // adjacent-store group at all, so map construction — the pass's
+    // dominant cost — is skipped entirely there.
+    let mut uses: Option<FxHashMap<Value, FxHashSet<Inst>>> = None;
     let (_, domtree) = an.cfg_dt(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
         changed += try_block(func, domtree, &mut uses, na, block);
     }
+    // try_block's emits aren't recorded in the map (its own checks never
+    // consult them — lane values are scalars it could re-pack, bases are
+    // checked by domination, not use lists). xpack's plans *do* consult
+    // uses of arbitrary values, so it must not see try_block's stale map.
+    if changed > 0 {
+        uses = None;
+    }
     if crate::pass_enabled("PLIRON_XPACK") {
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            changed += xpack_block(func, &domtree, na, block);
+            changed += xpack_block(func, &domtree, na, block, &mut uses);
         }
     }
     if changed > 0 {
@@ -1755,6 +1771,7 @@ fn xpack_block(
     domtree: &DominatorTree,
     na: &FxHashSet<Value>,
     block: Block,
+    uses: &mut Option<FxHashMap<Value, FxHashSet<Inst>>>,
 ) -> usize {
     let ps = crate::loadfwd::param_src(func);
     let mut total = 0;
@@ -1786,16 +1803,9 @@ fn xpack_block(
             return total;
         }
         let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-        let mut uses: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
-        for b2 in func.layout.blocks() {
-            for i in func.layout.block_insts(b2) {
-                for v in func.dfg.inst_values(i) {
-                    uses.entry(func.dfg.resolve_aliases(v))
-                        .or_default()
-                        .insert(i);
-                }
-            }
-        }
+        // The map is function-wide and shared across blocks; an apply
+        // mutates the IR, so it's rebuilt on the next loop iteration.
+        let us = &*uses.get_or_insert_with(|| build_uses(func));
         if crate::env_set("PLIRON_XPACK_DEBUG") && total > 0 {
             for (p, &i) in insts.iter().enumerate() {
                 let d = &func.dfg.insts[i];
@@ -1841,7 +1851,7 @@ fn xpack_block(
                     cands += 1;
                     tried += 1;
                     if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan_store(
-                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                        func, &ps, na, domtree, us, &insts, &pos, block, &taken, ia, ib,
                     ) {
                         let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
                         let n = apply_pair(
@@ -1878,12 +1888,12 @@ fn xpack_block(
                 // Both lane orders: swapping lanes changes column order,
                 // which decides whether adjacent loads merge.
                 let plan = plan_pair(
-                    func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ia, ib,
+                    func, &ps, na, domtree, us, &insts, &pos, block, &taken, ia, ib,
                 )
                 .or_else(|| {
                     tried += 1;
                     plan_pair(
-                        func, &ps, na, domtree, &uses, &insts, &pos, block, &taken, ib, ia,
+                        func, &ps, na, domtree, us, &insts, &pos, block, &taken, ib, ia,
                     )
                 });
                 if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
@@ -1927,5 +1937,7 @@ fn xpack_block(
             }
             return total;
         }
+        // apply_pair moved/added insts — the shared map is stale.
+        *uses = None;
     }
 }
