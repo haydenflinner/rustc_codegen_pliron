@@ -151,6 +151,13 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
 - Fixpoint loops need an explicit progress bound or budget
   (`MAX_ACC_WALK`, `MAX_OPS`, `MAX_REGION_EXTRA`, `seen` sets) — a
   conservative bail leaves the function unoptimized, never wrong.
+  They must also converge incrementally: seed a worklist and update
+  counts/reachability per insertion (`closed_region`'s `pending`
+  pred-counts) — never rescan the whole function per round.
+- Overlapping per-item walks are one walk: N forward cones through the
+  same blocks = one backward cone from the interesting nodes
+  (`closed_region`'s leak check); K nested subgraph queries = one
+  memoized walk with a shared budget (`AccMemo`).
 
 ## Fast iteration / debugging knobs
 

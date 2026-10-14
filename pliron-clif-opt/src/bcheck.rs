@@ -670,105 +670,134 @@ fn closed_region(
     body: &FxHashSet<Block>,
 ) -> Option<FxHashSet<Block>> {
     let mut region: FxHashSet<Block> = body.clone();
+    // "All preds in region" as a decremental count + worklist rather
+    // than rescanning every block per growth round: `pending[b]` is the
+    // number of b's preds still outside the region and each edge is
+    // decremented once for the whole call — O(edges) total, not
+    // O(rounds * blocks). Zero-pred blocks are never absorbed.
+    let mut pending: FxHashMap<Block, usize> = FxHashMap::default();
+    let mut ready: Vec<Block> = Vec::new();
+    for b in func.layout.blocks() {
+        if region.contains(&b) || cfg.pred_iter(b).next().is_none() {
+            continue;
+        }
+        let n = cfg
+            .pred_iter(b)
+            .filter(|p| !region.contains(&p.block))
+            .count();
+        if n == 0 {
+            ready.push(b);
+        }
+        pending.insert(b, n);
+    }
     loop {
-        let mut grew = false;
-        for b in func.layout.blocks() {
-            let mut it = cfg.pred_iter(b);
-            if region.contains(&b) || it.next().is_none() {
+        while let Some(x) = ready.pop() {
+            if !region.insert(x) {
                 continue;
             }
-            if cfg.pred_iter(b).all(|p| region.contains(&p.block)) {
-                region.insert(b);
-                grew = true;
-            }
-        }
-        if !grew {
-            let mut rvals: FxHashSet<Value> = FxHashSet::default();
-            for &r in &region {
-                rvals.extend(func.dfg.block_params(r).iter().copied());
-                for i in func.layout.block_insts(r) {
-                    rvals.extend(func.dfg.inst_results(i).iter().copied());
-                }
-            }
-            let uses_region = |func: &Function, x: Block| {
-                for i in func.layout.block_insts(x) {
-                    if func
-                        .dfg
-                        .inst_args(i)
-                        .iter()
-                        .any(|&v| rvals.contains(&func.dfg.resolve_aliases(v)))
-                    {
-                        return true;
-                    }
-                    for bc in func.dfg.insts[i]
-                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                    {
-                        if bc.args(&func.dfg.value_lists).any(|a| {
-                            matches!(a, BlockArg::Value(v) if {
-                                rvals.contains(&func.dfg.resolve_aliases(v))
-                            })
-                        }) {
-                            return true;
-                        }
-                    }
-                    if let InstructionData::TryCall { exception, .. }
-                    | InstructionData::TryCallIndirect { exception, .. } = func.dfg.insts[i]
-                        && func.dfg.exception_tables[exception].items().any(|it| {
-                            matches!(it, ExceptionTableItem::Context(v) if {
-                                rvals.contains(&func.dfg.resolve_aliases(v))
-                            })
-                        })
-                    {
-                        return true;
-                    }
-                }
-                false
-            };
-            let mut targets: Vec<Block> = Vec::new();
-            for &r in &region {
-                let Some(t) = func.layout.last_inst(r) else {
+            for s in cfg.succ_iter(x) {
+                if region.contains(&s) {
                     continue;
-                };
-                for bc in func.dfg.insts[t]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                {
-                    let d = bc.block(&func.dfg.value_lists);
-                    if !region.contains(&d) && !targets.contains(&d) {
-                        targets.push(d);
+                }
+                if let Some(c) = pending.get_mut(&s) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        ready.push(s);
                     }
                 }
-            }
-            for t in targets {
-                let mut seen: FxHashSet<Block> = FxHashSet::default();
-                let mut stack = vec![t];
-                let mut leak = false;
-                while let Some(x) = stack.pop() {
-                    if region.contains(&x) || !seen.insert(x) {
-                        continue;
-                    }
-                    if uses_region(func, x) {
-                        leak = true;
-                        break;
-                    }
-                    if let Some(t) = func.layout.last_inst(x) {
-                        for bc in func.dfg.insts[t]
-                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                        {
-                            stack.push(bc.block(&func.dfg.value_lists));
-                        }
-                    }
-                }
-                if leak {
-                    region.insert(t);
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
             }
         }
         if region.len() - body.len() > MAX_REGION_EXTRA {
             return None;
+        }
+        let mut rvals: FxHashSet<Value> = FxHashSet::default();
+        for &r in &region {
+            rvals.extend(func.dfg.block_params(r).iter().copied());
+            for i in func.layout.block_insts(r) {
+                rvals.extend(func.dfg.inst_results(i).iter().copied());
+            }
+        }
+        let uses_region = |func: &Function, x: Block| {
+            for i in func.layout.block_insts(x) {
+                if func
+                    .dfg
+                    .inst_args(i)
+                    .iter()
+                    .any(|&v| rvals.contains(&func.dfg.resolve_aliases(v)))
+                {
+                    return true;
+                }
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if bc.args(&func.dfg.value_lists).any(|a| {
+                        matches!(a, BlockArg::Value(v) if {
+                            rvals.contains(&func.dfg.resolve_aliases(v))
+                        })
+                    }) {
+                        return true;
+                    }
+                }
+                if let InstructionData::TryCall { exception, .. }
+                | InstructionData::TryCallIndirect { exception, .. } = func.dfg.insts[i]
+                    && func.dfg.exception_tables[exception].items().any(|it| {
+                        matches!(it, ExceptionTableItem::Context(v) if {
+                            rvals.contains(&func.dfg.resolve_aliases(v))
+                        })
+                    })
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        // Leak check, batched: the original walked each boundary
+        // target's forward cone separately and the cones overlap, so
+        // the round cost O(targets * blocks). One backward walk from
+        // every non-region block that uses a region value marks exactly
+        // the blocks that can reach such a use — a target leaks iff it
+        // is marked. This absorbs every leaking target in one pass
+        // (the original absorbed one at a time and could prune a later
+        // target's cone through an earlier absorb), so the result is a
+        // superset of the old fixpoint — conservative, and may hit the
+        // region cap one round sooner.
+        let mut reached: FxHashSet<Block> = FxHashSet::default();
+        let mut stack: Vec<Block> = Vec::new();
+        for b in func.layout.blocks() {
+            if !region.contains(&b) && uses_region(func, b) && reached.insert(b) {
+                stack.push(b);
+            }
+        }
+        let mut targets: FxHashSet<Block> = FxHashSet::default();
+        for &r in &region {
+            let Some(t) = func.layout.last_inst(r) else {
+                continue;
+            };
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let d = bc.block(&func.dfg.value_lists);
+                if !region.contains(&d) {
+                    targets.insert(d);
+                }
+            }
+        }
+        while let Some(x) = stack.pop() {
+            for p in cfg.pred_iter(x) {
+                if !region.contains(&p.block) && reached.insert(p.block) {
+                    stack.push(p.block);
+                }
+            }
+        }
+        let mut grew = false;
+        for t in targets {
+            if reached.contains(&t) {
+                ready.push(t);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
         }
     }
     Some(region)

@@ -44,11 +44,6 @@ impl Uses {
         Self { sites, by_block }
     }
 
-    /// (block, inst) of each use of `v`; empty when unused.
-    pub fn of(&self, v: Value) -> &[(Block, Inst)] {
-        self.sites.get(&v).map(Vec::as_slice).unwrap_or(&[])
-    }
-
     /// `v` still referenced anywhere. Removals only delete uses, so a
     /// snapshot taken before a dead-code sweep stays conservative.
     pub fn is_used(&self, v: Value) -> bool {

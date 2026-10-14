@@ -254,13 +254,29 @@ const MAX_ACC_WALK: usize = 1 << 14;
 /// untouched — never carry it across a rewrite (sroa's `split` mutates, so
 /// each `accesses` call gets a fresh memo; pure passes like `nocapture`
 /// may share one for the whole body).
-#[derive(Default)]
 pub(crate) struct AccMemo {
     acc: FxHashMap<(Value, u32), Option<(Vec<Access>, Vec<Ptr<Operation>>)>>,
     /// `slot_loads` results per (resolved alloca, depth) — a hot temp
     /// slot otherwise re-walks its whole copy-out closure for every
     /// `store *q <- p` use.
     loads: FxHashMap<(Value, u32), Option<Vec<Value>>>,
+    /// Shared exploration budget across the memo's nested walks: the
+    /// per-walk `visited` cap alone still lets K distinct (root,depth)
+    /// subgraphs each burn `MAX_ACC_WALK`. `accesses` caps one
+    /// top-level query's total work at `MAX_ACC_WALK`; long-lived memos
+    /// (nocapture's whole-body pass) keep the default unbounded budget
+    /// and rely on the per-walk cap as before.
+    budget: usize,
+}
+
+impl Default for AccMemo {
+    fn default() -> Self {
+        Self {
+            acc: Default::default(),
+            loads: Default::default(),
+            budget: usize::MAX,
+        }
+    }
 }
 
 /// `dst` is the address operand of `store *dst <- p` that carried a pointer
@@ -344,7 +360,17 @@ fn accesses(
 ) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
     // `split` mutates use-lists between `run`'s per-alloca calls — the
     // memo's scope is one top-level walk.
-    accesses_m(ctx, st, a, size, depth, &mut AccMemo::default())
+    accesses_m(
+        ctx,
+        st,
+        a,
+        size,
+        depth,
+        &mut AccMemo {
+            budget: MAX_ACC_WALK,
+            ..Default::default()
+        },
+    )
 }
 
 fn accesses_m(
@@ -382,7 +408,8 @@ fn accesses_inner(
         if !visited.insert((p, base, flow)) {
             continue;
         }
-        if visited.len() > MAX_ACC_WALK {
+        memo.budget = memo.budget.saturating_sub(1);
+        if memo.budget == 0 || visited.len() > MAX_ACC_WALK {
             return None;
         }
         for u in p.uses(ctx) {
