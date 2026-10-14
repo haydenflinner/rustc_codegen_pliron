@@ -2966,7 +2966,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let x = self.get1(opnds[0]);
             let t = self.ty_leaves(self.res_ty(op))[0].1;
             let from = self.b.func.dfg.value_type(x);
-            let r = if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
+            let bf = |ty: TypeHandle| ty.deref(self.ctx).is::<pliron::builtin::types::BF16Type>();
+            let r = if is!(FPExtOp) && bf(opnds[0].get_type(self.ctx)) {
+                let f = self.bf16_to_f32(x);
+                if t == clt::F32 { f } else { self.b.ins().fpromote(t, f) }
+            } else if is!(FPTruncOp) && bf(self.res_ty(op)) {
+                let f = if from == clt::F32 { x } else { self.b.ins().fdemote(clt::F32, x) };
+                self.f32_to_bf16(f)
+            } else if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
                 // Cranelift x64 can't convert f16/f128; use compiler-builtins.
                 let l = |t: ClType| match t {
                     clt::F16 => "hf",
@@ -4157,6 +4164,57 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.switch_to_block(done);
     }
 
+    /// bf16 (carried as f16 bits) is the top half of an f32.
+    fn bf16_to_f32(&mut self, x: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new();
+        let h = self.b.ins().bitcast(clt::I16, mf, x);
+        let w = self.b.ins().uextend(clt::I32, h);
+        let w = self.b.ins().ishl_imm_u(w, 16);
+        self.b.ins().bitcast(clt::F32, mf, w)
+    }
+
+    /// f32 -> bf16, round-to-nearest-even; NaN stays a quiet NaN.
+    fn f32_to_bf16(&mut self, f: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new();
+        let w = self.b.ins().bitcast(clt::I32, mf, f);
+        let hi = self.b.ins().ushr_imm_u(w, 16);
+        let odd = self.b.ins().band_imm_u(hi, 1);
+        let r = self.b.ins().iadd_imm_u(w, 0x7fff);
+        let r = self.b.ins().iadd(r, odd);
+        let r = self.b.ins().ushr_imm_u(r, 16);
+        let nan = self.b.ins().fcmp(FloatCC::Unordered, f, f);
+        let q = self.b.ins().bor_imm_u(hi, 0x40);
+        let r = self.b.ins().select(nan, q, r);
+        let h = self.b.ins().ireduce(clt::I16, r);
+        self.b.ins().bitcast(clt::F16, mf, h)
+    }
+
+    /// Float binop by name; f16 widens to f32 like `float_binop!`.
+    fn fbin(&mut self, k: &str, x: ir::Value, y: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let h = t == clt::F16;
+        let (x, y) = if h {
+            let x = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[x])[0];
+            let y = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[y])[0];
+            (x, y)
+        } else {
+            (x, y)
+        };
+        let i = self.b.ins();
+        let r = match k {
+            "fadd" => i.fadd(x, y),
+            "fsub" => i.fsub(x, y),
+            "fmul" => i.fmul(x, y),
+            "fmax" => i.fmax(x, y),
+            _ => i.fmin(x, y),
+        };
+        if h {
+            self.libcall("__truncsfhf2", &[clt::F32], &[t], &[r])[0]
+        } else {
+            r
+        }
+    }
+
     /// Every scalar lane of `v`, across its leaves.
     fn lanes_of(&mut self, v: Value) -> Vec<ir::Value> {
         let mut out = Vec::new();
@@ -4176,8 +4234,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// `llvm.vector.reduce.<k>`: sequential fold (the ordered form for fadd/fmul).
     fn vec_reduce(&mut self, op: Ptr<Operation>, k: &str, opnds: &[Value]) {
         let ordered = matches!(k, "fadd" | "fmul");
+        let vt = opnds[ordered as usize].get_type(self.ctx);
+        let bf = vt
+            .deref(self.ctx)
+            .downcast_ref::<pliron_llvm::types::VectorType>()
+            .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>());
         let mut acc = ordered.then(|| self.get1(opnds[0]));
-        for x in self.lanes_of(opnds[ordered as usize]) {
+        let mut lanes = self.lanes_of(opnds[ordered as usize]);
+        if bf {
+            // Reduce in f32, round once.
+            acc = acc.map(|a| self.bf16_to_f32(a));
+            lanes = lanes.into_iter().map(|x| self.bf16_to_f32(x)).collect();
+        }
+        for x in lanes {
             let Some(a) = acc else {
                 acc = Some(x);
                 continue;
@@ -4193,14 +4262,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 "smin" => i.smin(a, x),
                 "umax" => i.umax(a, x),
                 "umin" => i.umin(a, x),
-                "fadd" => i.fadd(a, x),
-                "fmul" => i.fmul(a, x),
-                "fmax" => i.fmax(a, x),
-                "fmin" => i.fmin(a, x),
+                "fadd" | "fmul" | "fmax" | "fmin" => {
+                    acc = Some(self.fbin(k, a, x));
+                    continue;
+                }
                 _ => panic!("pliron->cranelift: unsupported intrinsic llvm.vector.reduce.{k}"),
             });
         }
         let r = acc.expect("llvm.vector.reduce of an empty vector");
+        let r = if bf { self.f32_to_bf16(r) } else { r };
         self.set1(op, r);
     }
 
@@ -4290,10 +4360,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let old = self.b.ins().atomic_load(it, tr, p);
         let of = self.b.ins().bitcast(t, mf, old);
         let nf = match k {
-            KA::FAdd => self.b.ins().fadd(of, v),
-            KA::FSub => self.b.ins().fsub(of, v),
-            KA::FMax => self.b.ins().fmax(of, v),
-            KA::FMin => self.b.ins().fmin(of, v),
+            KA::FAdd => self.fbin("fadd", of, v),
+            KA::FSub => self.fbin("fsub", of, v),
+            KA::FMax => self.fbin("fmax", of, v),
+            KA::FMin => self.fbin("fmin", of, v),
             k => panic!("pliron->cranelift: atomicrmw {k:?} on {t}"),
         };
         let ni = self.b.ins().bitcast(it, mf, nf);
@@ -4557,9 +4627,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
             n @ ("llvm.sqrt" | "llvm.floor" | "llvm.ceil" | "llvm.trunc" | "llvm.roundeven"
             | "llvm.fma" | "llvm.fmuladd" | "llvm.minimum" | "llvm.maximum") => {
                 let t = self.b.func.dfg.value_type(a[0]);
-                if t == clt::F16 || t == clt::F128 {
+                let h = t == clt::F16;
+                let a: Vec<_> = if h {
+                    // f16 widens to f32: exact for these (sqrt/rounding are
+                    // innocuous under double rounding at 11 -> 24 bits).
+                    a.iter()
+                        .map(|&x| self.libcall("__extendhfsf2", &[t], &[clt::F32], &[x])[0])
+                        .collect()
+                } else {
+                    a.to_vec()
+                };
+                let r = if t == clt::F128 {
                     // No Cranelift lowering; compiler-builtins' libm port
-                    // exports e.g. sqrtf16 / fmaf128.
+                    // exports e.g. fmaf128.
                     let base = match n {
                         "llvm.sqrt" => "sqrt",
                         "llvm.floor" => "floor",
@@ -4570,7 +4650,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.maximum" => "fmaximum",
                         _ => "fma",
                     };
-                    let f = format!("{base}f{}", if t == clt::F16 { "16" } else { "128" });
+                    let f = format!("{base}f128");
                     let ps = vec![t; a.len()];
                     self.libcall(&f, &ps, &[t], &a)[0]
                 } else {
@@ -4584,6 +4664,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.maximum" => self.b.ins().fmax(a[0], a[1]),
                         _ => self.b.ins().fma(a[0], a[1], a[2]),
                     }
+                };
+                if h {
+                    self.libcall("__truncsfhf2", &[clt::F32], &[t], &[r])[0]
+                } else {
+                    r
                 }
             }
             n if matches!(

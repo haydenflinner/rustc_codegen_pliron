@@ -5,7 +5,7 @@
 //! extract/insertelement with constant indices, which lower to lane moves.
 
 use pliron::builtin::attributes::IntegerAttr;
-use pliron::builtin::types::{IntegerType, Signedness};
+use pliron::builtin::types::{BF16Type, FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::cloning::{IrMapping, clone_operation};
 use pliron::irbuild::listener::DummyListener;
@@ -15,6 +15,7 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
+use pliron_llvm::op_interfaces::CastOpInterface;
 use pliron_llvm::ops::*;
 use pliron_llvm::types::VectorType;
 
@@ -117,6 +118,59 @@ fn shuffle(ctx: &mut Context, op: Ptr<Operation>) {
 }
 
 /// Scalarize every elementwise vector op in `func`'s body.
+fn is_bf16(ctx: &Context, t: TypeHandle) -> bool {
+    t.deref(ctx).is::<BF16Type>()
+}
+
+/// Ops whose bf16 semantics differ from the f16 bits the lowerer sees.
+fn bf16_arith(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let id = Operation::get_opid(op, ctx);
+    macro_rules! any {
+        ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
+    }
+    if any!(
+        FAddOp, FSubOp, FMulOp, FDivOp, FRemOp, FNegOp, FCmpOp, FPToUIOp, FPToSIOp, UIToFPOp,
+        SIToFPOp
+    ) {
+        return true;
+    }
+    Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+        let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+        // Reductions take a bf16 vector; the lowerer widens their lanes.
+        !n.contains("lifetime") && !n.contains("vector.reduce")
+    })
+}
+
+/// The lowerer carries bf16 as f16 bits (types.rs), so bf16 arithmetic is
+/// rewritten to `fpext` -> f32 op -> `fptrunc`; the lowerer expands those
+/// two casts as bit operations.
+fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
+    let f32t: TypeHandle = FP32Type::get(ctx).into();
+    let opnds: Vec<_> = op.deref(ctx).operands().collect();
+    let mut map = IrMapping::new();
+    for &v in &opnds {
+        if is_bf16(ctx, v.get_type(ctx)) {
+            let e = FPExtOp::new(ctx, v, f32t).get_operation();
+            e.insert_before(ctx, op);
+            map.map_value(v, e.deref(ctx).get_result(0));
+        }
+    }
+    let mut rw = IRRewriter::<DummyListener>::default();
+    let s = clone_operation(op, ctx, &mut rw, &mut map);
+    s.insert_before(ctx, op);
+    let old = op.deref(ctx).get_result(0);
+    let mut new = s.deref(ctx).get_result(0);
+    let rt = old.get_type(ctx);
+    if is_bf16(ctx, rt) {
+        new.set_type(ctx, f32t);
+        let t = FPTruncOp::new(ctx, new, rt).get_operation();
+        t.insert_before(ctx, op);
+        new = t.deref(ctx).get_result(0);
+    }
+    old.replace_all_uses_with(ctx, &new);
+    Operation::erase(op, ctx);
+}
+
 pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
@@ -145,5 +199,23 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     }
     for (op, e, n) in todo {
         split(ctx, op, e, n);
+    }
+    let mut bf = Vec::new();
+    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    for r in regions {
+        for b in r.deref(ctx).iter(ctx) {
+            for op in b.deref(ctx).iter(ctx) {
+                let o = op.deref(ctx);
+                if o.get_num_results() != 1 || !bf16_arith(ctx, op) {
+                    continue;
+                }
+                if o.operands().chain([o.get_result(0)]).any(|v| is_bf16(ctx, v.get_type(ctx))) {
+                    bf.push(op);
+                }
+            }
+        }
+    }
+    for op in bf {
+        promote_bf16(ctx, op);
     }
 }
