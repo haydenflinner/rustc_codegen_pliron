@@ -2147,8 +2147,25 @@ pub(crate) fn apply_param_drops(
 pub fn const_sweep(func: &mut Function) -> usize {
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     let mut hits = Vec::new();
-    let nz = |_: Value| false;
+    // `stack_addr`/`dynamic_stack_addr` are never null — hashbrown's
+    // `ctrl.is_null()` empty-table guard on a `&RawTable` local compares
+    // the `stack_addr` against 0, and the surviving `select c, 0, p`
+    // keeps the slot's memory ops keyed under a second, opaque root.
+    // (`func_addr`/`symbol_value` are not counted: weak externs resolve
+    // to 0.)
+    let nz = |v: Value| {
+        func.dfg
+            .value_def(func.dfg.resolve_aliases(v))
+            .inst()
+            .is_some_and(|d| {
+                matches!(
+                    func.dfg.insts[d].opcode(),
+                    Opcode::StackAddr | Opcode::DynamicStackAddr
+                )
+            })
+    };
     let rg = |_: Value| None;
+    let mut sels = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let rs = func.dfg.inst_results(i);
@@ -2169,12 +2186,29 @@ pub fn const_sweep(func: &mut Function) -> usize {
                 };
                 hits.push((i, ty, s));
                 env.insert(rs[0], k);
+                continue;
+            }
+            // `select (const c), a, b` → the decided arm, when the arm
+            // itself isn't a constant `eval` can reach.
+            if let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } = func.dfg.insts[i]
+                && let Some(c) = crate::jumpthread::known(func, &env, args[0])
+            {
+                sels.push((i, rs[0], args[if c != 0 { 1 } else { 2 }]));
             }
         }
     }
-    let mut n = hits.len();
+    let mut n = hits.len() + sels.len();
     for (i, ty, k) in hits {
         func.replace(i).iconst(ty, k);
+    }
+    for (i, res, arm) in sels {
+        let arm = func.dfg.resolve_aliases(arm);
+        func.dfg.clear_results(i);
+        func.layout.remove_inst(i);
+        func.dfg.change_to_alias(res, arm);
     }
     if n > 0 {
         // Replacements can expose constant branch conditions.
@@ -4203,6 +4237,33 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     let smin = (-1i128 << (bits - 1)) as i64;
                     let smax = ((1i128 << (bits - 1)) - 1) as i64;
                     let ku = k as u64 & umax;
+                    // `icmp eq/ne (stack_addr ..), 0` → `0`/`1`: a stack
+                    // slot's address is never null — hashbrown's
+                    // `ctrl.is_null()` empty-table guard on a `&RawTable`
+                    // local compares the `stack_addr` directly, and the
+                    // surviving `select c, 0, p` keeps the slot's memory
+                    // ops keyed under a second, opaque root. (`func_addr`/
+                    // `symbol_value` are not folded: weak externs resolve
+                    // to 0.)
+                    if ku == 0
+                        && matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                        && pos
+                            .func
+                            .dfg
+                            .value_def(pos.func.dfg.resolve_aliases(x))
+                            .inst()
+                            .is_some_and(|d| {
+                                matches!(
+                                    pos.func.dfg.insts[d].opcode(),
+                                    Opcode::StackAddr | Opcode::DynamicStackAddr
+                                )
+                            })
+                    {
+                        let c = i64::from(cc == IntCC::NotEqual);
+                        pos.func.replace(inst).iconst(types::I8, c);
+                        n += 1;
+                        continue;
+                    }
                     // `mx`: proven unsigned ceiling on the non-const operand;
                     // `nn`: x's range stays in the signed-positive half, so
                     // signed compares against `k` behave like unsigned ones.
