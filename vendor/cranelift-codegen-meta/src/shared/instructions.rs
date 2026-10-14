@@ -3135,6 +3135,41 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", FloatScalar)]),
     );
 
+    let F32Vec = &TypeVar::new(
+        "F32Vec",
+        "A SIMD vector of 32-bit floats",
+        TypeSetBuilder::new().floats(32..32).simd_lanes(4..16).build(),
+    );
+    let F16Vec = &TypeVar::new(
+        "F16Vec",
+        "A SIMD vector of 16-bit floats",
+        TypeSetBuilder::new().floats(16..16).simd_lanes(4..16).build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvpromote_f16",
+            r#"
+        Convert each f16 lane of `x` to f32 (exact).
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F32Vec.half_width())])
+        .operands_out(vec![Operand::new("a", F32Vec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvdemote_f16",
+            r#"
+        Convert each f32 lane of `x` to f16, rounding to nearest, ties to even.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F16Vec.double_width())])
+        .operands_out(vec![Operand::new("a", F16Vec)]),
+    );
+
     let F64x2 = &TypeVar::new(
         "F64x2",
         "A SIMD vector type consisting of 2 lanes of 64-bit floats",

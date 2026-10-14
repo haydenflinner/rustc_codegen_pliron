@@ -237,7 +237,7 @@ pub fn wide_f32_candidate(ctx: &Context, e: TypeHandle, n: u64) -> bool {
     bits >= 256 && matches!(classify(ctx, e), TyK::F32) && (n * 32) % 256 == 0
 }
 
-fn wide_f32_parts(e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+fn wide_f32_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
     let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
     if bits < 256 || !WIDE_F32.with(|w| w.borrow().contains(&(e, n))) {
         return None;
@@ -245,13 +245,17 @@ fn wide_f32_parts(e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
     [512u64, 256]
         .into_iter()
         .find(|&w| w <= bits && (n * 32) % w == 0)
-        .and_then(|w| Some((clt::F32.by((w / 32) as u32)?, n * 32 / w)))
+        .and_then(|w| {
+            // Packed f16 twin of a wide f32 vector: half-width leaves, same count.
+            let lane = if e.deref(ctx).is::<FP16Type>() { clt::F16 } else { clt::F32 };
+            Some((lane.by((w / 32) as u32)?, n * 32 / w))
+        })
 }
 
 /// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
 /// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
 pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
-    if let Some(p) = wide_f32_parts(e, n) {
+    if let Some(p) = wide_f32_parts(ctx, e, n) {
         return Some(p);
     }
     if let Some(t) = native_vec(ctx, e, n) {

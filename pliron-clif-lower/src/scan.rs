@@ -179,6 +179,14 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
         .get_body(ctx, 0);
     let top: Vec<_> = body.deref(ctx).iter(ctx).collect();
     let mut wide_funcs = Vec::new();
+    for &op in &top {
+        if Operation::get_op::<FuncOp>(op, ctx).is_some() && crate::has_body(ctx, op) {
+            crate::scalarize::promote(ctx, op);
+            wide_funcs.push(op);
+        }
+    }
+    // Before splitting, so ops on wide types keep their vector form.
+    crate::scalarize::plan_wide(ctx, &wide_funcs);
     for op in top {
         if let Some(f) = Operation::get_op::<FuncOp>(op, ctx) {
             let id = f.get_symbol_name(ctx);
@@ -210,7 +218,6 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
             st.sym_to_ident.insert(name, id);
             if defined {
                 crate::scalarize::run(ctx, op);
-                wide_funcs.push(op);
                 let regions: Vec<_> = op.deref(ctx).regions().collect();
                 for r in regions {
                     let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
@@ -250,6 +257,5 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
         }
     }
     pass_flags(&mut st);
-    crate::scalarize::plan_wide(ctx, &wide_funcs);
     st
 }

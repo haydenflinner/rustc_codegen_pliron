@@ -5,7 +5,7 @@
 //! extract/insertelement with constant indices, which lower to lane moves.
 
 use pliron::builtin::attributes::IntegerAttr;
-use pliron::builtin::types::{BF16Type, FP32Type, IntegerType, Signedness};
+use pliron::builtin::types::{BF16Type, FP16Type, FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::cloning::{IrMapping, clone_operation};
 use pliron::irbuild::listener::DummyListener;
@@ -58,7 +58,12 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     let bfv = tys.iter().filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| is_bf16(ctx, e))).count();
     // bf16 vector leaves are i16 bit patterns: only the f32 casts are native.
     let cast = Operation::get_op::<FPExtOp>(op, ctx).is_some() || Operation::get_op::<FPTruncOp>(op, ctx).is_some();
-    let ok = if bfv == 0 { leafwise_kind(ctx, op) } else { cast && bfv == 1 };
+    // Packed f16 vectors (wide f32 twins): likewise only the casts are native.
+    let hfv = tys
+        .iter()
+        .filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| e.deref(ctx).is::<FP16Type>()) && simd_leaves(ctx, t))
+        .count();
+    let ok = if bfv + hfv == 0 { leafwise_kind(ctx, op) } else { cast && bfv + hfv == 1 };
     ok && tys.iter().all(|&t| simd_leaves(ctx, t))
 }
 
@@ -223,6 +228,56 @@ fn has_bf16(ctx: &Context, t: TypeHandle) -> bool {
 }
 
 fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
+    promote_with(ctx, op, has_bf16, widen_bf16)
+}
+
+fn is_f16_vec(ctx: &Context, t: TypeHandle) -> bool {
+    vec_of(ctx, t).is_some_and(|(e, _)| e.deref(ctx).is::<FP16Type>())
+}
+
+/// `<n x half>` -> `<n x f32>`; anything else unchanged.
+fn widen_f16_vec(ctx: &mut Context, t: TypeHandle) -> TypeHandle {
+    match vec_of(ctx, t) {
+        Some((e, n)) if e.deref(ctx).is::<FP16Type>() => {
+            let f32t: TypeHandle = FP32Type::get(ctx).into();
+            VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into()
+        }
+        _ => t,
+    }
+}
+
+fn is_f16_any(ctx: &Context, t: TypeHandle) -> bool {
+    t.deref(ctx).is::<FP16Type>() || is_f16_vec(ctx, t)
+}
+
+fn widen_f16_any(ctx: &mut Context, t: TypeHandle) -> TypeHandle {
+    if t.deref(ctx).is::<FP16Type>() { FP32Type::get(ctx).into() } else { widen_f16_vec(ctx, t) }
+}
+
+/// f16 vector arithmetic (and lane building) whose `<n x f32>` twin may get wide leaves: compute
+/// it in f32 (as the per-lane path does) so the f16 side is just F16C casts.
+fn f16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
+    let lane_op = Operation::get_op::<InsertElementOp>(op, ctx).is_some()
+        || Operation::get_op::<ShuffleVectorOp>(op, ctx).is_some();
+    if op.deref(ctx).get_num_results() != 1 || !(lane_op || leafwise_kind(ctx, op)) {
+        return false;
+    }
+    let t = op.deref(ctx).get_result(0).get_type(ctx);
+    match vec_of(ctx, t) {
+        Some((e, n)) if e.deref(ctx).is::<FP16Type>() => {
+            let f32t: TypeHandle = FP32Type::get(ctx).into();
+            crate::types::wide_f32_candidate(ctx, f32t, n as u64)
+        }
+        _ => false,
+    }
+}
+
+fn promote_with(
+    ctx: &mut Context,
+    op: Ptr<Operation>,
+    has_bf16: fn(&Context, TypeHandle) -> bool,
+    widen_bf16: fn(&mut Context, TypeHandle) -> TypeHandle,
+) {
     let opnds: Vec<_> = op.deref(ctx).operands().collect();
     let mut map = IrMapping::new();
     for &v in &opnds {
@@ -251,7 +306,20 @@ fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
     Operation::erase(op, ctx);
 }
 
-pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
+/// Vector bf16/f16 arithmetic -> f32 twins (before [`plan_wide`]).
+pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
+    let mut hfv = Vec::new();
+    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    for &r in &regions {
+        let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
+        for b in blocks {
+            let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
+            hfv.extend(ops.into_iter().filter(|&op| f16_vec_promotable(ctx, op)));
+        }
+    }
+    for op in hfv {
+        promote_with(ctx, op, is_f16_any, widen_f16_any);
+    }
     let mut bfv = Vec::new();
     let regions: Vec<_> = func.deref(ctx).regions().collect();
     for &r in &regions {
@@ -264,6 +332,10 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     for op in bfv {
         promote_bf16(ctx, op);
     }
+}
+
+pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
+    promote(ctx, func);
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
     let regions: Vec<_> = func.deref(ctx).regions().collect();
@@ -320,7 +392,7 @@ fn wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
     }
     any!(
         LoadOp, StoreOp, InsertElementOp, ExtractElementOp, PoisonOp, UndefOp, ZeroOp, FreezeOp,
-        ConstantOp, FAddOp, FSubOp, FMulOp, FDivOp, BrOp, CondBrOp
+        ConstantOp, FAddOp, FSubOp, FMulOp, FDivOp, BrOp, CondBrOp, FPExtOp, FPTruncOp
     ) || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
         let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
         ["llvm.fma", "llvm.fmuladd"]
@@ -332,12 +404,17 @@ fn wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
 /// CubeCL: give `<n x f32>` types ymm/zmm leaves when every op on them (in
 /// all of `funcs`, after [`run`]) lowers natively at that width; the rest keep
 /// 128-bit leaves. Function parameters stay narrow (ABI).
-pub fn plan_wide(ctx: &Context, funcs: &[Ptr<Operation>]) {
+pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     use crate::types::{set_wide_f32, wide_f32_candidate};
+    let f32h: TypeHandle = FP32Type::get(ctx).into();
+    let f16h: TypeHandle = FP16Type::get(ctx).into();
+    let ctx: &Context = ctx;
     let mut ok: std::collections::HashMap<(TypeHandle, u64), bool> = Default::default();
-    let mut note = |ctx: &Context, t: TypeHandle, good: bool| {
+    // A packed `<n x half>` (half-width leaves) stands or falls with its f32 twin.
+    let mut note = |ctx: &Context, t: TypeHandle, good: bool, good16: bool| {
         if let Some((e, n)) = vec_of(ctx, t) {
-            if wide_f32_candidate(ctx, e, n as u64) {
+            let (twin, good) = if e == f16h { (f32h, good16) } else { (e, good) };
+            if wide_f32_candidate(ctx, twin, n as u64) {
                 *ok.entry((e, n as u64)).or_insert(true) &= good;
             }
         }
@@ -346,17 +423,49 @@ pub fn plan_wide(ctx: &Context, funcs: &[Ptr<Operation>]) {
         for r in f.deref(ctx).regions() {
             for (i, b) in r.deref(ctx).iter(ctx).enumerate() {
                 for a in b.deref(ctx).arguments() {
-                    note(ctx, a.get_type(ctx), i != 0);
+                    note(ctx, a.get_type(ctx), i != 0, i != 0);
                 }
                 for op in b.deref(ctx).iter(ctx) {
-                    let good = wide_op(ctx, op);
+                    // Planned before `run` splits: shuffles and split ops become
+                    // extract/insert, which are wide.
+                    let good = wide_op(ctx, op) || will_split(ctx, op);
+                    let good16 = half_wide_op(ctx, op);
+                    if !good16
+                        && std::env::var_os("PLIRON_WIDE_DEBUG").is_some()
+                        && op.deref(ctx).operands().chain(op.deref(ctx).results()).any(|v| vec_of(ctx, v.get_type(ctx)).is_some_and(|(e, _)| e == f16h))
+                    {
+                        eprintln!("wide-f16 reject: {}", Operation::get_opid(op, ctx));
+                    }
                     let o = op.deref(ctx);
                     for v in o.operands().chain(o.results()) {
-                        note(ctx, v.get_type(ctx), good);
+                        note(ctx, v.get_type(ctx), good, good16);
                     }
                 }
             }
         }
     }
-    set_wide_f32(ok.into_iter().filter(|x| x.1).map(|x| x.0).collect());
+    // A packed f16 vector needs its f32 twin wide too (casts map leaf to leaf).
+    let wide: std::collections::HashSet<_> = ok
+        .iter()
+        .filter(|&(&(e, n), &g)| g && (e != f16h || ok.get(&(f32h, n)) == Some(&true)))
+        .map(|x| *x.0)
+        .collect();
+    set_wide_f32(wide);
+}
+
+fn will_split(ctx: &Context, op: Ptr<Operation>) -> bool {
+    Operation::get_op::<ShuffleVectorOp>(op, ctx).is_some()
+        || (op.deref(ctx).get_num_results() == 1
+            && vec_of(ctx, op.deref(ctx).get_result(0).get_type(ctx)).is_some()
+            && elementwise(ctx, op)
+            && !native_leafwise(ctx, op))
+}
+
+/// Ops with an x64 lowering on packed f16 (`F16X8`/`F16X16`) leaves.
+fn half_wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let id = Operation::get_opid(op, ctx);
+    macro_rules! any {
+        ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
+    }
+    any!(LoadOp, StoreOp, FreezeOp, BrOp, CondBrOp, FPExtOp, FPTruncOp, ConstantOp, ZeroOp, PoisonOp, UndefOp)
 }

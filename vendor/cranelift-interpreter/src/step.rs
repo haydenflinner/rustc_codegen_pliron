@@ -1164,6 +1164,7 @@ where
                 ctrl_ty,
             )?)
         }
+        Opcode::FvpromoteF16 | Opcode::FvdemoteF16 => unimplemented!("f16 vector casts"),
         Opcode::FvpromoteLow => {
             let in_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
             assert_eq!(in_ty, types::F32X4);

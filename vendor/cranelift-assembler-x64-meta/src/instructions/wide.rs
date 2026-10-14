@@ -33,5 +33,13 @@ pub fn list() -> Vec<Inst> {
         inst("vinsertf128", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128), r(imm8)]), y()._66()._0f3a().w0().op(0x18).r().ib(), (_64b | compat) & avx),
         inst("vextractf32x4", fmt("Z", [w(xmm_m128), r(xmm1), r(imm8)]), z(Mem128)._66()._0f3a().w0().op(0x19).r().ib(), (_64b | compat) & avx512f),
         inst("vinsertf32x4", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128), r(imm8)]), z(Mem128)._66()._0f3a().w0().op(0x18).r().ib(), (_64b | compat) & avx512f),
+        inst("vcvtph2ps", fmt("Y", [w(xmm1), r(xmm_m128)]),
+             y()._66()._0f38().w0().op(0x13).r(), (_64b | compat) & avx),
+        inst("vcvtph2ps", fmt("Z", [w(xmm1), r(xmm_m128)]),
+             z(HalfMem)._66()._0f38().w0().op(0x13).r(), (_64b | compat) & avx512f),
+        inst("vcvtps2ph", fmt("Y", [w(xmm_m128), r(xmm1), r(imm8)]),
+             y()._66()._0f3a().w0().op(0x1D).r().ib(), (_64b | compat) & avx),
+        inst("vcvtps2ph", fmt("Z", [w(xmm_m128), r(xmm1), r(imm8)]),
+             z(HalfMem)._66()._0f3a().w0().op(0x1D).r().ib(), (_64b | compat) & avx512f),
     ]
 }

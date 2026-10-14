@@ -2968,9 +2968,23 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if (is!(FPTruncOp) || is!(FPExtOp))
             && self.ty_leaves(opnds[0].get_type(self.ctx))[0].1.is_vector()
         {
-            // Only bf16 <-> f32 vectors reach here unsplit (scalarize).
+            // Only bf16/packed-f16 <-> f32 vectors reach here unsplit (scalarize).
             let xs = self.get(opnds[0]);
-            let r = self.vcast_bf16(is!(FPExtOp), &xs);
+            let rts: Vec<ClType> = self.ty_leaves(self.res_ty(op)).iter().map(|l| l.1).collect();
+            let half = |t: ClType| t.lane_type() == clt::F16;
+            let r = if half(rts[0]) || half(self.b.func.dfg.value_type(xs[0])) {
+                let mut r = Vals::new();
+                for (&x, &t) in xs.iter().zip(&rts) {
+                    r.push(if is!(FPExtOp) {
+                        self.b.ins().fvpromote_f16(t, x)
+                    } else {
+                        self.b.ins().fvdemote_f16(t, x)
+                    });
+                }
+                r
+            } else {
+                self.vcast_bf16(is!(FPExtOp), &xs)
+            };
             self.set(op, r);
         } else if is!(FPTruncOp) || is!(FPExtOp) {
             let x = self.get1(opnds[0]);
