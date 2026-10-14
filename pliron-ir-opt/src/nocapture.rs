@@ -3,11 +3,13 @@
 //! returned, or passed to a callee that might retain it. Uses of the pointer
 //! — loads, stores *through* it, GEPs, compares, math — are not captures.
 //!
-//! Every result derives from its operands' params (an integer result can
-//! still encode a pointer via `ptrtoint`), except comparisons, which encode
-//! nothing, so `p == q` doesn't capture `p`. A store of a derived value
-//! anywhere — even into the callee's own frame — counts as a capture, so no
-//! intra-frame alias tracking is needed.
+//! A result derives from its operands' params where its type can encode a
+//! pointer (a `ptrtoint`/`inttoptr` is the sole int<->ptr bridge), except
+//! comparisons, which encode nothing, so `p == q` doesn't capture `p`. A
+//! store of a derived value counts as a capture unless the destination is a
+//! frame-confined temp — `slot_loads`'s purity test — in which case the
+//! pointer can only come back through that slot's load results, which the
+//! flow relation tracks like any other derived value.
 //!
 //! rustc's `DeducedParamAttrs` covers only `PassMode::Indirect` params — its
 //! MIR analysis ignores `*_k` uses and `move`/`copy` of a param, so it is
@@ -15,16 +17,20 @@
 //! where the pointer is a value like any other, and covers every param of
 //! every bodied function in the CGU.
 
-use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpInterface};
+use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::Context;
 use pliron::op::op_cast;
-use pliron::operation::Operation;
+use pliron::operation::{OpDbg, Operation};
+use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{
     AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp, FCmpOp,
-    ICmpOp, InlineAsmOp, LoadOp, ReturnOp, StoreOp,
+    GetElementPtrOp, ICmpOp, InlineAsmOp, IntToPtrOp, LoadOp, PtrToIntOp, ReturnOp, StoreOp,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::state::ConstVal;
+use crate::types::{TyK, classify};
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::nowrite::PURE;
@@ -97,10 +103,90 @@ ascent::ascent! {
     captured(f, i) <-- arg(f, c, k, v), keeps(c, k), der(v, m), for i in bits(*m);
 }
 
+/// `c` is the callee of an indirect call. If it is a load from a
+/// frame-confined slot — every use a load, a store *into* it, a GEP or a
+/// lifetime marker — all writes are visible `store`s, and each stored
+/// value must be a known function address for the callee set to be
+/// resolved. Anything else (a memcpy of opaque bytes, the slot passed to a
+/// call, no stores at all) leaves the callee unknown.
+fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> {
+    let dbg = crate::env_get("PLIRON_NOCAPDBG").is_some();
+    macro_rules! bail {
+        ($m:expr) => {
+            if dbg {
+                eprintln!("NOCAPDBG resolve: {} at {}", $m, OpDbg { op: c.defining_op().unwrap_or_else(|| panic!()), ctx });
+            }
+            return None;
+        };
+    }
+    let Some(op) = c.defining_op() else {
+        return None;
+    };
+    if !Operation::is_op::<LoadOp>(op, ctx) {
+        bail!("callee not a load");
+    }
+    let mut work = vec![op.deref(ctx).get_operand(0)];
+    let mut seen = FxHashSet::default();
+    let mut stored = Vec::new();
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        if !st.allocas.contains_key(&v) {
+            let Some(d) = v.defining_op() else {
+                bail!("non-alloca non-gep ptr (block arg)");
+            };
+            if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+                bail!("non-alloca ptr from non-gep");
+            }
+            work.push(d.deref(ctx).get_operand(0));
+            continue;
+        }
+        for u in v.uses(ctx) {
+            let o = u.user_op();
+            if st.volatile.contains(&o) {
+                bail!("volatile use");
+            }
+            if Operation::is_op::<GetElementPtrOp>(o, ctx) {
+                work.push(o.deref(ctx).get_result(0));
+            } else if Operation::is_op::<LoadOp>(o, ctx) {
+            } else if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
+                stored.push(o.deref(ctx).get_operand(0));
+            } else if !Operation::is_op::<CallIntrinsicOp>(o, ctx)
+                || !matches!(
+                    st.intrinsics.get(&o).map(|s| s.as_str()),
+                    Some(n) if n.starts_with("llvm.lifetime.")
+                )
+            {
+                bail!("impure slot use");
+            }
+        }
+    }
+    if stored.is_empty() {
+        bail!("no stores into slot");
+    }
+    let mut syms = Vec::new();
+    for v in stored {
+        match st.consts.get(&v) {
+            Some(ConstVal::Sym { sym, off: 0 }) => syms.push(sym.clone()),
+            _ => {
+                if dbg {
+                    eprintln!("NOCAPDBG resolve: stored value not a const sym");
+                }
+                return None;
+            }
+        }
+    }
+    Some(syms)
+}
+
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();
     let mut p = Capture::default();
+    let dbg = crate::env_get("PLIRON_NOCAPDBG");
+    let mut dbgrets: Vec<(String, Value, String)> = Vec::new();
+    let mut dbgargs: Vec<(String, Value, String)> = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -127,8 +213,28 @@ pub fn run(ctx: &Context, st: &mut State) {
                 // pointer if a store put it there, which is a capture
                 // already (or the caller's, as in LLVM's CaptureTracking).
                 if !(is!(ICmpOp) || is!(FCmpOp) || is!(LoadOp) || is!(AtomicLoadOp)) {
+                    // A value only carries a param's mask if it can encode
+                    // a pointer derived from it: `ptrtoint`/`inttoptr` are
+                    // the sole int<->ptr bridges, so e.g. an i64 call result
+                    // can't be the ptr arg (no `store i8 (hash)` capture).
+                    let ptrish = |v: Value| {
+                        matches!(
+                            classify(ctx, v.get_type(ctx)),
+                            TyK::Ptr | TyK::Func(..)
+                        )
+                    };
+                    let intish = |v: Value| {
+                        matches!(classify(ctx, v.get_type(ctx)), TyK::Int(_))
+                    };
+                    let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
                     for r in d.results() {
-                        p.flow.extend(d.operands().map(|v| (v, r)));
+                        let rp = ptrish(r);
+                        let ri = intish(r);
+                        for v in d.operands() {
+                            if bridge || !(ptrish(v) && ri) && !(intish(v) && rp) {
+                                p.flow.push((v, r));
+                            }
+                        }
                     }
                 }
                 if d.successors().next().is_some()
@@ -148,10 +254,26 @@ pub fn run(ctx: &Context, st: &mut State) {
                 {
                     p.flow.extend(d.operands().map(|v| (v, x)));
                 }
-                let mut retain = |v: Value| p.retain.push((f, v));
+                let mut retain = |v: Value| {
+                    p.retain.push((f, v));
+                    if dbg.is_some_and(|d| s.contains(d)) {
+                        dbgrets.push((s.clone(), v, OpDbg { op, ctx }.to_string()));
+                    }
+                };
                 // Stored operands: (value, ptr), (ptr, value) and
                 // (ptr, expected, new).
-                if is!(StoreOp) || is!(AtomicStoreOp) {
+                if is!(StoreOp) {
+                    // A store into a frame-confined temp (loads, stores and
+                    // memcpy *into* it only — `slot_loads`'s purity test) is
+                    // not a capture: the pointer can only come back through
+                    // that slot's load results, so flow to them instead.
+                    // Anything else retains — the pointer can roam.
+                    let (sv, dp) = (d.get_operand(0), d.get_operand(1));
+                    match crate::sroa::slot_loads(ctx, st, dp, 0) {
+                        Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
+                        None => retain(sv),
+                    }
+                } else if is!(AtomicStoreOp) {
                     retain(d.get_operand(0));
                 } else if is!(AtomicRmwOp) {
                     retain(d.get_operand(1));
@@ -164,17 +286,43 @@ pub fn run(ctx: &Context, st: &mut State) {
                             let c = ids.id(c);
                             for (k, a) in args.into_iter().enumerate() {
                                 p.arg.push((f, c, k as u32, a));
+                                if dbg.is_some_and(|d| s.contains(d)) {
+                                    dbgargs.push((s.clone(), a, OpDbg { op, ctx }.to_string()));
+                                }
                             }
                         }
-                        None => args.into_iter().for_each(retain),
+                        None => {
+                            // A fn-ptr loaded from a frame-confined slot
+                            // whose stores are all visible resolves to its
+                            // possible callees — arg-typed like a direct
+                            // call to each of them.
+                            let cop = Operation::get_op::<CallOp>(op, ctx).unwrap();
+                            let resolved =
+                                if let CallOpCallable::Indirect(c) = cop.callee(ctx) {
+                                    indirect_callees(ctx, st, c)
+                                } else {
+                                    None
+                                };
+                            match resolved {
+                                Some(cs) => {
+                                    for c in cs {
+                                        let c = ids.id(&c);
+                                        for (k, a) in args.clone().into_iter().enumerate() {
+                                            p.arg.push((f, c, k as u32, a));
+                                        }
+                                    }
+                                }
+                                None => args.into_iter().for_each(retain),
+                            }
+                        }
                     }
                 } else if is!(CallIntrinsicOp) {
                     match st.intrinsics.get(&op).map(|s| s.as_str()) {
-                        // Copies the src region out; its contents may hold
-                        // pointers into it. dst is a region write.
-                        Some("llvm.memcpy") | Some("llvm.memmove") => retain(d.get_operand(1)),
-                        // Writes the dst region; nothing retained.
-                        Some("llvm.memset") => {}
+                        // A bulk read+region write: neither operand is
+                        // retained — the bytes move, but every derived
+                        // pointer inside was already retained by the store
+                        // (or memcpy chain head) that put it in memory.
+                        Some("llvm.memcpy") | Some("llvm.memmove") | Some("llvm.memset") => {}
                         Some(n)
                             if n.starts_with("llvm.lifetime.")
                                 || n.starts_with("llvm.dbg.")
@@ -189,6 +337,19 @@ pub fn run(ctx: &Context, st: &mut State) {
         }
     }
     p.run();
+    if dbg.is_some() {
+        let der: FxHashMap<Value, Mask> = p.der.iter().map(|(v, m)| (*v, *m)).collect();
+        for (s, v, o) in &dbgrets {
+            for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
+                eprintln!("NOCAPDBG {s}: param{i} retained via {v:?} at {o}");
+            }
+        }
+        for (s, v, o) in &dbgargs {
+            for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
+                eprintln!("NOCAPDBG {s}: param{i} via call-arg {v:?} at {o}");
+            }
+        }
+    }
     let mut nc: FxHashMap<String, FxHashSet<u32>> = FxHashMap::default();
     let cap: FxHashSet<(u32, u32)> = p.captured.iter().copied().collect();
     for s in &bodied {

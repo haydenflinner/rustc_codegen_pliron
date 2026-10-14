@@ -1000,6 +1000,7 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
         p.region_parent,
         p.nowrite,
         p.call_frozen,
+        p.nocap,
     );
     if p.flags.slot_dse {
         // A load whose only user was a removed dead store keeps its own
@@ -1548,6 +1549,7 @@ fn s_loadfwd2(p: &mut Pipe, _an: &mut Analysis) -> usize {
         p.region_parent,
         p.nowrite,
         p.call_frozen,
+        p.nocap,
     );
     if k > 0 && p.dump {
         p.dump("loadfwd2");

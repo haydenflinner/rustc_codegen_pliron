@@ -222,7 +222,13 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
     let mut ps = loadfwd::param_src(func);
-    let (mut iso, mut escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
+    let (mut iso, mut escapes, _) = loadfwd::isolated_escapes(
+        func,
+        noalias,
+        &ps,
+        cfrozen,
+        &FxHashSet::default(),
+    );
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     // Roots that only escape on blocks that can't reach `p` are still
     // isolated *at* `p`: before the first escaping use can run (the cold
@@ -446,7 +452,8 @@ pub fn run(
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
         ps = loadfwd::param_src(func);
-        (iso, escapes) = loadfwd::isolated_escapes(func, noalias, &ps, cfrozen);
+        (iso, escapes, _) =
+            loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());
     }
     n
 }

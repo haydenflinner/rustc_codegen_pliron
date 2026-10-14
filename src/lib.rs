@@ -487,6 +487,13 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 }
             }
         }
+        // Re-run capture inference now that devirt/constload have made
+        // callee sets final: indirect calls through fn-ptr slots resolve to
+        // `arg` edges, and params those callees don't keep go non-capturing.
+        // The earlier run stays for sroa's `copyable_arg` check.
+        if pass_enabled("PLIRON_NOCAP") {
+            pt!(cx, "nocap2", nocapture::run(ctx, st));
+        }
         // IPO return-value attributes, after inlining/devirt so remaining
         // direct calls are the final set. `nnret` is consumed at lowering
         // (nonnull call results feed jumpthread); `retarg` folds call

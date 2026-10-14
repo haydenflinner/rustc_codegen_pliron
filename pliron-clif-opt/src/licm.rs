@@ -1278,7 +1278,13 @@ pub fn run(
     let (cfg, dt) = an.cfg_dt(func);
     la.compute(func, cfg, dt);
     let ps = &loadfwd::param_src(func);
-    let (iso, escapes) = loadfwd::isolated_escapes(func, noalias, ps, cfrozen);
+    let (iso, escapes, _) = loadfwd::isolated_escapes(
+        func,
+        noalias,
+        ps,
+        cfrozen,
+        &FxHashSet::default(),
+    );
     // Operand-frozen values name their own scope roots (same merged set
     // loadfwd uses): peeling past one would lose the `ofz` claim before the
     // region check can apply it.

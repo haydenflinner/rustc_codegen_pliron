@@ -246,7 +246,7 @@ const MAX_FLOW_DEPTH: u32 = 6;
 /// original alloca. Anything else (a call handed the bytes, a memcpy *out*
 /// of them, a nested pointer store) means the pointer can roam where this
 /// pass can't see — the escape stands.
-fn slot_loads(
+pub(crate) fn slot_loads(
     ctx: &Context,
     st: &State,
     dst: Value,

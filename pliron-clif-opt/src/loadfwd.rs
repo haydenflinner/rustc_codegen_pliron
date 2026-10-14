@@ -343,12 +343,19 @@ pub fn kill(
     ty: Type,
     ms: Option<(Root, i64)>,
     iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
     invs: &FxHashSet<Loc>,
     cur: Option<Region>,
     invreg: &FxHashMap<Loc, Vec<Region>>,
     rpar: &FxHashMap<Region, Region>,
 ) {
     let n = i64::from(ty.bytes());
+    // `iso` roots can't be reached by untracked pointers at all; `ncc`
+    // roots only escape through `nocapture` call operands, so no
+    // *lasting* untracked alias exists — for a store's kill set the two
+    // are equivalent (calls that receive the root still clobber it —
+    // that's the call arm's job, not the store rule's).
+    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
     av.retain(|&(r2, o2, t2), _| {
         // An `!invariant.load` location holds the same value for the
         // load's whole scope: a write to it would be UB, so no store can
@@ -371,8 +378,8 @@ pub fn kill(
             _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
             (Root::S(_), Root::S(_)) => true,
             _ => {
-                iso.contains(&r)
-                    || iso.contains(&r2)
+                shel(&r)
+                    || shel(&r2)
                     || ms.is_some_and(|(mr, mo)| {
                         mr == r2 && mo >= o2 + i64::from(t2.bytes())
                     })
@@ -428,29 +435,40 @@ pub fn isolated(
     ps: &FxHashMap<Value, Value>,
     cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> FxHashSet<Root> {
-    isolated_escapes(func, noalias, ps, cfrozen).0
+    isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default()).0
 }
 
 /// `isolated` plus, for every rejected root, the blocks holding its
-/// non-benign uses. A root escapes only where the pointer value leaves the
-/// tracked load/store-address pattern (stored elsewhere, passed to a call,
-/// feeding an untracked op, ...). Loop consumers can treat a root as
-/// isolated for the duration of a loop when none of its escape blocks can
-/// reach the header: the pointer can't have leaked before the first
-/// iteration nor during any iteration.
+/// non-benign uses, plus the set of roots whose *only* escapes are
+/// `nocapture` call operands (`nocap`: `(inst, arg index)` — arg indices
+/// count real args, so the `*Indirect` callee at operand 0 is skipped).
+/// A nocap-arg escape is bounded: the callee may read/write the pointee
+/// but can't retain the pointer, so no untracked alias outlives the call.
+/// Such roots stay reachable memory — calls that receive them must still
+/// kill their locs — but stores rooted elsewhere can't reach them.
+/// Escapes are recorded for them exactly as for any other escape, so
+/// consumers reading only `(iso, escapes)` see no change.
 pub fn isolated_escapes(
     func: &Function,
     noalias: &FxHashSet<Value>,
     ps: &FxHashMap<Value, Value>,
     _cfrozen: &FxHashMap<FuncRef, u64>,
-) -> (FxHashSet<Root>, FxHashMap<Root, Vec<Block>>) {
+    nocap: &FxHashSet<(Inst, u32)>,
+) -> (
+    FxHashSet<Root>,
+    FxHashMap<Root, Vec<Block>>,
+    FxHashSet<Root>,
+) {
     let mut cand: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
     if crate::pass_enabled("PLIRON_FWD_SLOTS") {
         cand.extend(func.sized_stack_slots.keys().map(Root::S));
     }
     let mut escapes: FxHashMap<Root, Vec<Block>> = FxHashMap::default();
+    // Escaped roots with at least one *unbounded* escape — every use we
+    // can't prove leaves no lasting alias.
+    let mut ncc_bad: FxHashSet<Root> = FxHashSet::default();
     if cand.is_empty() {
-        return (cand, escapes);
+        return (cand, escapes, ncc_bad);
     }
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -500,15 +518,30 @@ pub fn isolated_escapes(
                 };
                 if !ok {
                     escapes.entry(r).or_default().push(b);
+                    let bounded = data.opcode().is_call()
+                        && match data {
+                            InstructionData::CallIndirect { .. }
+                            | InstructionData::TryCallIndirect { .. } => k.checked_sub(1),
+                            _ => Some(k),
+                        }
+                        .is_some_and(|ai| nocap.contains(&(i, ai as u32)));
+                    if !bounded {
+                        ncc_bad.insert(r);
+                    }
                 }
             }
         }
     }
+    let ncc: FxHashSet<Root> = escapes
+        .keys()
+        .filter(|r| !ncc_bad.contains(r))
+        .copied()
+        .collect();
     let iso: FxHashSet<Root> = cand
         .into_iter()
         .filter(|r| !escapes.contains_key(r))
         .collect();
-    (iso, escapes)
+    (iso, escapes, ncc)
 }
 
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
@@ -566,6 +599,7 @@ fn transfer(
     av: &mut Avail,
     rw: Option<&mut Vec<(Inst, Fwd)>>,
     iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
     inv_insts: &FxHashSet<Inst>,
     invs: &mut FxHashSet<Loc>,
     cur: Option<Region>,
@@ -671,7 +705,7 @@ fn transfer(
                     Root::V(rv) => ms_of(rv, o),
                     _ => None,
                 };
-                kill(av, r, o, ty, ms, iso, invs, cur, invreg, rpar);
+                kill(av, r, o, ty, ms, iso, ncc, invs, cur, invreg, rpar);
                 // A store through `select c, pa, pb` may write either
                 // arm's location — kill both so kept locs don't forward
                 // stale values (the select's own root is opaque `V`).
@@ -689,7 +723,7 @@ fn transfer(
                             Root::V(arv) => ms_of(arv, oa),
                             _ => None,
                         };
-                        kill(av, ra, oa, ty, ms, iso, invs, cur, invreg, rpar);
+                        kill(av, ra, oa, ty, ms, iso, ncc, invs, cur, invreg, rpar);
                     }
                 }
                 if av.len() < MAX_ENTRIES {
@@ -698,8 +732,20 @@ fn transfer(
             }
             _ if op.is_call() => {
                 if !write_free(func, i, nw, eh) {
+                    // Roots this call can reach through its args: a
+                    // `nocapture` callee can't stash the pointer, but it
+                    // may still write the pointee — drop `ncc` locs the
+                    // call is actually handed (other `ncc` locs survive:
+                    // no lasting alias exists for it to write through).
+                    // For `*Indirect` insts the callee value rides arg 0 —
+                    // a fn pointer, harmless to include.
+                    let mut reach: FxHashSet<Root> = FxHashSet::default();
+                    for v in func.dfg.inst_values(i) {
+                        reach.insert(norm_root(func, ps, na, v).0);
+                    }
                     av.retain(|&(r, o, t), _| {
                         iso.contains(&r)
+                            || (ncc.contains(&r) && !reach.contains(&r))
                             || invs.contains(&(r, o, t))
                             || cur.is_some_and(|cur| {
                                 invreg
@@ -750,6 +796,7 @@ pub fn run(
     rpar: &FxHashMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
+    nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
@@ -814,13 +861,13 @@ pub fn run(
     } else {
         (&FxHashMap::default(), &FxHashMap::default())
     };
-    let iso = isolated(func, noalias, ps, cfrozen);
+    let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
     if crate::pass_enabled("PLIRON_LOADPRE") {
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
-        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso, pbnd, ppm);
+        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&cfg);
@@ -863,6 +910,7 @@ pub fn run(
                 &mut av,
                 None,
                 &iso,
+                &ncc,
                 inv_insts,
                 &mut invs,
                 breg.get(&b).copied(),
@@ -898,6 +946,7 @@ pub fn run(
                 &mut av,
                 Some(&mut fwd),
                 &iso,
+                &ncc,
                 inv_insts,
                 &mut invs,
                 breg.get(&b).copied(),
@@ -994,17 +1043,19 @@ fn kill_st(
     ty: Type,
     ms: Option<(Root, i64)>,
     iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
 ) {
     let n = i64::from(ty.bytes());
     // Same retain rule as `kill` (minus the invariant sets `pre` doesn't
     // track): `st` must agree with the `out` availability sets or
     // `end_val`'s `St::In` lookup finds a loc `st` dropped.
+    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
     st.retain(|&(r2, o2, t2), _| match (r, r2) {
         _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
         (Root::S(_), Root::S(_)) => true,
         _ => {
-            iso.contains(&r)
-                || iso.contains(&r2)
+            shel(&r)
+                || shel(&r2)
                 || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes()))
         }
     });
@@ -1139,6 +1190,7 @@ fn pre(
     rpo: &[Block],
     entry: Block,
     iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
     bnd: &FxHashMap<Value, u64>,
     pm: &FxHashMap<Value, (Root, i64)>,
 ) -> usize {
@@ -1180,6 +1232,7 @@ fn pre(
                 &mut av,
                 None,
                 iso,
+                ncc,
                 // `out` must agree with the `st` scan below, which tracks
                 // no invariant immunity — pass empty sets so `transfer`
                 // marks and retains nothing extra here. `iso` is real:
@@ -1291,7 +1344,7 @@ fn pre(
                         Root::V(rv) => ms_of(rv, o),
                         _ => None,
                     };
-                    kill_st(&mut st, r, o, ty, ms, &iso);
+                    kill_st(&mut st, r, o, ty, ms, &iso, ncc);
                     writes.push(((r, o, ty), ms));
                     // A store through `select c, pa, pb` may write either
                     // arm's location — kill both, mirroring `transfer` (a
@@ -1312,7 +1365,7 @@ fn pre(
                                 Root::V(arv) => ms_of(arv, oa),
                                 _ => None,
                             };
-                            kill_st(&mut st, a.0, a.1, a.2, ms, &iso);
+                            kill_st(&mut st, a.0, a.1, a.2, ms, &iso, ncc);
                             writes.push((a, ms));
                         }
                     }
@@ -1325,9 +1378,16 @@ fn pre(
                     || op.other_side_effects()
                     || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
                 {
-                    // `transfer`'s call arm keeps `iso` roots — retain the
-                    // same set here or `st` disagrees with `out`.
-                    st.retain(|&(r, _, _), _| iso.contains(&r));
+                    // `transfer`'s call arm keeps `iso` roots plus `ncc`
+                    // roots the call can't reach — retain the same set
+                    // here or `st` disagrees with `out`.
+                    let mut reach: FxHashSet<Root> = FxHashSet::default();
+                    for v in func.dfg.inst_values(i) {
+                        reach.insert(norm_root(func, ps, na, v).0);
+                    }
+                    st.retain(|&(r, _, _), _| {
+                        iso.contains(&r) || (ncc.contains(&r) && !reach.contains(&r))
+                    });
                     clobbered = true;
                 }
                 _ => {}
