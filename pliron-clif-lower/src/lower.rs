@@ -2039,6 +2039,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if !all_const {
             for (i, e) in elems.iter().enumerate() {
                 let x = self.get1(*e);
+                let x = self.as_lane(x, t.lane_type());
                 v = self.b.ins().insertlane(v, x, i as u8);
             }
         }
@@ -2962,6 +2963,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 r.push(v);
             }
             self.set(op, r);
+        } else if (is!(FPTruncOp) || is!(FPExtOp))
+            && self.ty_leaves(opnds[0].get_type(self.ctx))[0].1.is_vector()
+        {
+            // Only bf16 <-> f32 vectors reach here unsplit (scalarize).
+            let xs = self.get(opnds[0]);
+            let r = self.vcast_bf16(is!(FPExtOp), &xs);
+            self.set(op, r);
         } else if is!(FPTruncOp) || is!(FPExtOp) {
             let x = self.get1(opnds[0]);
             let t = self.ty_leaves(self.res_ty(op))[0].1;
@@ -3289,17 +3297,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let a = self.get(opnds[0]);
             let vt = self.b.func.dfg.value_type(a[0]);
             let r = if vt.is_vector() {
+                let et = self.ty_leaves(self.res_ty(op))[0].1;
                 match self.const_int(opnds[1]) {
                     Some(i) => {
                         let n = vt.lane_count() as i128;
-                        self.b.ins().extractlane(a[(i / n) as usize], (i % n) as u8)
+                        let x = self.b.ins().extractlane(a[(i / n) as usize], (i % n) as u8);
+                        self.as_lane(x, et)
                     }
                     None => {
                         let (p, es) = self.spill_vec(opnds[0], &a);
                         let addr = self.dyn_index(p, opnds[1], es);
-                        self.b
-                            .ins()
-                            .load(vt.lane_type(), MemFlagsData::trusted(), addr, 0)
+                        self.b.ins().load(et, MemFlagsData::trusted(), addr, 0)
                     }
                 }
             } else {
@@ -3323,6 +3331,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     Some(i) => {
                         let n = vt.lane_count() as i128;
                         let j = (i / n) as usize;
+                        let e = self.as_lane(e, vt.lane_type());
                         a[j] = self.b.ins().insertlane(a[j], e, (i % n) as u8);
                     }
                     None => {
@@ -4173,6 +4182,54 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().bitcast(clt::F32, mf, w)
     }
 
+    /// `i16x8` bf16 leaves <-> `f32x4` leaves (two per bf16 leaf, low lanes first).
+    fn vcast_bf16(&mut self, ext: bool, xs: &[ir::Value]) -> Vals {
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let mut out = Vals::new();
+        if ext {
+            for &x in xs {
+                for hi in [false, true] {
+                    let w = if hi { self.b.ins().uwiden_high(x) } else { self.b.ins().uwiden_low(x) };
+                    let w = self.b.ins().ishl_imm_u(w, 16);
+                    out.push(self.b.ins().bitcast(clt::F32X4, mf, w));
+                }
+            }
+        } else {
+            for p in xs.chunks(2) {
+                let lo = self.f32x4_to_bf16_bits(p[0]);
+                let hi = self.f32x4_to_bf16_bits(p[1]);
+                out.push(self.b.ins().unarrow(lo, hi));
+            }
+        }
+        out
+    }
+
+    /// `f32_to_bf16` on four lanes, leaving each result in the low half of an i32.
+    fn f32x4_to_bf16_bits(&mut self, f: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let mut k = |b: &mut Self, c: i64| {
+            let c = b.b.ins().iconst(clt::I32, c);
+            b.b.ins().splat(clt::I32X4, c)
+        };
+        let (one, half, quiet) = (k(self, 1), k(self, 0x7fff), k(self, 0x40));
+        let w = self.b.ins().bitcast(clt::I32X4, mf, f);
+        let hi = self.b.ins().ushr_imm_u(w, 16);
+        let odd = self.b.ins().band(hi, one);
+        let r = self.b.ins().iadd(w, half);
+        let r = self.b.ins().iadd(r, odd);
+        let r = self.b.ins().ushr_imm_u(r, 16);
+        let nan = self.b.ins().fcmp(FloatCC::Unordered, f, f);
+        let q = self.b.ins().bor(hi, quiet);
+        self.b.ins().bitselect(nan, q, r)
+    }
+
+    /// Reinterpret a lane between same-width int/float types (bf16 lanes of
+    /// `i16x8` leaves are F16 scalars).
+    fn as_lane(&mut self, x: ir::Value, want: ClType) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        if t != want && t.bits() == want.bits() { self.bitcast_to(want, x) } else { x }
+    }
+
     /// f32 -> bf16, round-to-nearest-even; NaN stays a quiet NaN.
     fn f32_to_bf16(&mut self, f: ir::Value) -> ir::Value {
         let mf = MemFlagsData::new();
@@ -4218,11 +4275,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Every scalar lane of `v`, across its leaves.
     fn lanes_of(&mut self, v: Value) -> Vec<ir::Value> {
         let mut out = Vec::new();
+        let et = match classify(self.ctx, v.get_type(self.ctx)) {
+            TyK::Vector(e, _) => self.ty_leaves(e).first().map(|x| x.1),
+            _ => None,
+        };
         for x in self.get(v) {
             let t = self.b.func.dfg.value_type(x);
             if t.is_vector() {
                 for i in 0..t.lane_count() {
-                    out.push(self.b.ins().extractlane(x, i as u8));
+                    let l = self.b.ins().extractlane(x, i as u8);
+                    out.push(et.map_or(l, |et| self.as_lane(l, et)));
                 }
             } else {
                 out.push(x);

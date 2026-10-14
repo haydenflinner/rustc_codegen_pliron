@@ -17,7 +17,7 @@ use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 use pliron_llvm::op_interfaces::CastOpInterface;
 use pliron_llvm::ops::*;
-use pliron_llvm::types::VectorType;
+use pliron_llvm::types::{VectorType, VectorTypeKind};
 
 fn vec_of(ctx: &Context, t: TypeHandle) -> Option<(TypeHandle, u32)> {
     t.deref(ctx)
@@ -53,25 +53,53 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     if !crate::types::WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
+    let o = op.deref(ctx);
+    let tys: Vec<_> = o.operands().chain([o.get_result(0)]).map(|v| v.get_type(ctx)).collect();
+    let bfv = tys.iter().filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| is_bf16(ctx, e))).count();
+    // bf16 vector leaves are i16 bit patterns: only the f32 casts are native.
+    let cast = Operation::get_op::<FPExtOp>(op, ctx).is_some() || Operation::get_op::<FPTruncOp>(op, ctx).is_some();
+    let ok = if bfv == 0 { leafwise_kind(ctx, op) } else { cast && bfv == 1 };
+    ok && tys.iter().all(|&t| simd_leaves(ctx, t))
+}
+
+fn simd_leaves(ctx: &Context, t: TypeHandle) -> bool {
+    vec_of(ctx, t).is_none() || {
+        let l = crate::types::leaves(ctx, t);
+        !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() == 128)
+    }
+}
+
+fn leafwise_kind(ctx: &Context, op: Ptr<Operation>) -> bool {
     let id = Operation::get_opid(op, ctx);
     macro_rules! any {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
-    let ok = any!(AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp)
+    any!(AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp)
         || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
             let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
             LEAFWISE_INTRINSICS
                 .iter()
                 .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
-        });
-    let o = op.deref(ctx);
-    ok && o.operands().chain([o.get_result(0)]).all(|v| {
-        let t = v.get_type(ctx);
-        vec_of(ctx, t).is_none() || {
-            let l = crate::types::leaves(ctx, t);
-            !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() == 128)
+        })
+}
+
+/// bf16 vector arithmetic whose `<n x f32>` twin is all SIMD leaves: promote
+/// the whole vector so only the (cheap, bitwise) casts are split per lane.
+fn bf16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
+    if !crate::types::WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed)
+        || op.deref(ctx).get_num_results() != 1
+        || !leafwise_kind(ctx, op)
+    {
+        return false;
+    }
+    let t = op.deref(ctx).get_result(0).get_type(ctx);
+    match vec_of(ctx, t) {
+        Some((e, _)) if is_bf16(ctx, e) => {
+            let w = widen_bf16(ctx, t);
+            simd_leaves(ctx, w)
         }
-    })
+        _ => false,
+    }
 }
 
 /// Float intrinsics `lower_intrinsic` maps over SIMD leaves.
@@ -178,12 +206,29 @@ fn bf16_arith(ctx: &Context, op: Ptr<Operation>) -> bool {
 /// The lowerer carries bf16 as f16 bits (types.rs), so bf16 arithmetic is
 /// rewritten to `fpext` -> f32 op -> `fptrunc`; the lowerer expands those
 /// two casts as bit operations.
-fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
+/// bf16 -> f32, `<n x bf16>` -> `<n x f32>`; anything else unchanged.
+fn widen_bf16(ctx: &mut Context, t: TypeHandle) -> TypeHandle {
     let f32t: TypeHandle = FP32Type::get(ctx).into();
+    if is_bf16(ctx, t) {
+        return f32t;
+    }
+    match vec_of(ctx, t) {
+        Some((e, n)) if is_bf16(ctx, e) => VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into(),
+        _ => t,
+    }
+}
+
+fn has_bf16(ctx: &Context, t: TypeHandle) -> bool {
+    is_bf16(ctx, t) || vec_of(ctx, t).is_some_and(|(e, _)| is_bf16(ctx, e))
+}
+
+fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
     let opnds: Vec<_> = op.deref(ctx).operands().collect();
     let mut map = IrMapping::new();
     for &v in &opnds {
-        if is_bf16(ctx, v.get_type(ctx)) {
+        let t = v.get_type(ctx);
+        if has_bf16(ctx, t) {
+            let f32t = widen_bf16(ctx, t);
             let e = FPExtOp::new(ctx, v, f32t).get_operation();
             e.insert_before(ctx, op);
             map.map_value(v, e.deref(ctx).get_result(0));
@@ -195,7 +240,8 @@ fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
     let old = op.deref(ctx).get_result(0);
     let mut new = s.deref(ctx).get_result(0);
     let rt = old.get_type(ctx);
-    if is_bf16(ctx, rt) {
+    if has_bf16(ctx, rt) {
+        let f32t = widen_bf16(ctx, rt);
         new.set_type(ctx, f32t);
         let t = FPTruncOp::new(ctx, new, rt).get_operation();
         t.insert_before(ctx, op);
@@ -206,6 +252,18 @@ fn promote_bf16(ctx: &mut Context, op: Ptr<Operation>) {
 }
 
 pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
+    let mut bfv = Vec::new();
+    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    for &r in &regions {
+        let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
+        for b in blocks {
+            let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
+            bfv.extend(ops.into_iter().filter(|&op| bf16_vec_promotable(ctx, op)));
+        }
+    }
+    for op in bfv {
+        promote_bf16(ctx, op);
+    }
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
     let regions: Vec<_> = func.deref(ctx).regions().collect();

@@ -193,6 +193,14 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
         return None;
     }
+    // CubeCL: 128-bit bf16 vectors are `i16x8` bit patterns; the lowerer
+    // converts them to/from f32x4 with SIMD shifts.
+    if n == 8
+        && e.deref(ctx).is::<BF16Type>()
+        && WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Some(clt::I16X8);
+    }
     let lane = match classify(ctx, e) {
         TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,
         TyK::F32 => clt::F32,
