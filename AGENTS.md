@@ -146,6 +146,10 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   nounwind inferred for functions whose symbol contains the substring
   (`./test.sh --only facts` checks a few against `tests/facts/main.rs`).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
+- `-Zself-profile` records the backend's work as `pliron_*` generic
+  activities (`pliron_iropt`, `pliron_ir_<pass>`, `pliron_pipeline`/
+  `pliron_compile` per fn, one event per pipeline step name) — the same
+  clock and viewer as rustc's own `LLVM_*` activities.
 - `PLIRON_TRACE=<env-filter>` — tracing spans with `time.busy` on close
   (stderr). Targets: `pliron::module`/`pliron::phase` (per-CGU phases:
   define, iropt, fnlower, phasec, lowerobj), `pliron::iropt` (each ir-opt

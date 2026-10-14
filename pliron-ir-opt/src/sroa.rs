@@ -19,8 +19,8 @@ use pliron_llvm::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
 use pliron_llvm::ops::{
-    AllocaOp, AndOp, CallOp, GepIndex, GetElementPtrOp, LShrOp, LoadOp, OrOp, ShlOp, StoreOp,
-    TruncOp, UndefOp, UnreachableOp, ZExtOp,
+    AllocaOp, AndOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp, LShrOp, LoadOp, OrOp,
+    PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
 use pliron_llvm::types::ArrayType;
 use rustc_hash::FxHashSet;
@@ -59,6 +59,14 @@ enum Kind {
         idx: usize,
         n: u64,
     },
+    /// The pointer value itself escapes as an operand — `store *q <- p`,
+    /// `ptrtoint p`, `icmp p, x`: its target byte must stay a real stack
+    /// address (`off` inside the pin span), and operand `idx` is retargeted
+    /// into `pin_a`. Accesses discovered downstream of a loaded-back
+    /// pointer are only *maybe* ours, so they pin instead of rewriting.
+    Flow {
+        idx: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +74,10 @@ struct Access {
     op: Ptr<Operation>,
     off: u64,
     kind: Kind,
+    /// Reached through a pointer read back out of a temp slot: the op's
+    /// operand isn't provably a pointer into this alloca, so it isn't
+    /// rewritten — it just pins the bytes it may touch.
+    flow: bool,
 }
 
 struct Slice {
@@ -197,16 +209,88 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         return None;
     }
     let ai = idx - usize::from(matches!(c.callee(ctx), CallOpCallable::Indirect(_)));
-    st.calls
+    let r = st
+        .calls
         .get(&op)
         .and_then(|i| i.arg_extent.as_ref())
         .and_then(|e| e.get(ai))
         .copied()
-        .filter(|&e| e.0 > 0)
+        .filter(|&e| e.0 > 0);
+    if r.is_none()
+        && crate::env_set("PLIRON_PINMISS")
+        && let CallOpCallable::Direct(id) = c.callee(ctx)
+    {
+        let got = st
+            .calls
+            .get(&op)
+            .map(|i| format!("extent={:?}", i.arg_extent))
+            .unwrap_or_else(|| "no CallInfo".into());
+        eprintln!("pinmiss {id} #{idx}: {got}");
+    }
+    r
 }
 
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(&op).map(|s| s.as_str())
+}
+
+/// Deepest `store *q <- p` chain the flow walk will chase (a pointer stored
+/// into a temp, loaded back, then stored into another temp, ...).
+const MAX_FLOW_DEPTH: u32 = 6;
+
+/// `dst` is the address operand of `store *dst <- p` that carried a pointer
+/// derived from the alloca being collected. If `dst` resolves to a temp
+/// slot whose bytes never leave this walk — every use is a load, a store
+/// into it, or a memset/copy *into* it — return the results of its loads:
+/// each may carry `p` again, so their uses are walked as accesses on the
+/// original alloca. Anything else (a call handed the bytes, a memcpy *out*
+/// of them, a nested pointer store) means the pointer can roam where this
+/// pass can't see — the escape stands.
+fn slot_loads(
+    ctx: &Context,
+    st: &State,
+    dst: Value,
+    depth: u32,
+) -> Option<Vec<Value>> {
+    let mut q = dst;
+    while !st.allocas.contains_key(&q) {
+        let op = q.defining_op()?;
+        if !Operation::is_op::<GetElementPtrOp>(op, ctx) {
+            return None;
+        }
+        q = op.deref(ctx).get_operand(0);
+    }
+    let &(qsize, _) = st.allocas.get(&q)?;
+    let (qacc, _) = accesses(ctx, st, q, qsize, depth + 1)?;
+    let mut loads = Vec::new();
+    for qa in &qacc {
+        match qa.kind {
+            Kind::Load => {
+                let r = qa.op.deref(ctx).get_result(0);
+                if matches!(classify(ctx, r.get_type(ctx)), TyK::Ptr) {
+                    loads.push(r);
+                } else if r
+                    .uses(ctx)
+                    .iter()
+                    .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
+                {
+                    // A load of the pointer bytes as an integer fed to
+                    // inttoptr would re-materialize the pointer unseen.
+                    return None;
+                }
+            }
+            Kind::Store | Kind::Set { .. } => {}
+            Kind::Copy { dst: true, .. } => {}
+            Kind::Copy { dst: false, .. } => {
+                // The bytes were memcpy'd into another slot — the stored
+                // pointer may come back at the destination's loads.
+                let d = qa.op.deref(ctx).get_operand(0);
+                loads.extend(slot_loads(ctx, st, d, depth + 1)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(loads)
 }
 
 /// Collect every access to `a` (through constant-offset GEPs), or None if it escapes.
@@ -215,11 +299,19 @@ fn accesses(
     st: &State,
     a: Value,
     size: u64,
+    depth: u32,
 ) -> Option<(Vec<Access>, Vec<Ptr<Operation>>)> {
+    if depth > MAX_FLOW_DEPTH {
+        return None;
+    }
     let mut out = Vec::new();
     let mut geps = Vec::new();
-    let mut work = vec![(a, 0i64)];
-    while let Some((p, base)) = work.pop() {
+    let mut work = vec![(a, 0i64, false)];
+    let mut visited = FxHashSet::default();
+    while let Some((p, base, flow)) = work.pop() {
+        if !visited.insert((p, base, flow)) {
+            continue;
+        }
         for u in p.uses(ctx) {
             let op = u.user_op();
             let idx = u.find_index(ctx);
@@ -234,8 +326,10 @@ fn accesses(
                     return None;
                 }
                 let o = base.checked_add(gep_offset(ctx, st, op)?)?;
-                geps.push(op);
-                work.push((op.deref(ctx).get_result(0), o));
+                if !flow {
+                    geps.push(op);
+                }
+                work.push((op.deref(ctx).get_result(0), o, flow));
             } else if Operation::is_op::<LoadOp>(op, ctx) {
                 let ty = op.deref(ctx).get_result(0).get_type(ctx);
                 if !in_range(base, size_align(ctx, ty).0) {
@@ -245,17 +339,65 @@ fn accesses(
                     op,
                     off: base as u64,
                     kind: Kind::Load,
+                    flow,
                 });
             } else if Operation::is_op::<StoreOp>(op, ctx) {
                 let ty = op.deref(ctx).get_operand(0).get_type(ctx);
-                if idx != 1 || !in_range(base, size_align(ctx, ty).0) {
+                if idx == 1 {
+                    if !in_range(base, size_align(ctx, ty).0) {
+                        return None;
+                    }
+                    out.push(Access {
+                        op,
+                        off: base as u64,
+                        kind: Kind::Store,
+                        flow,
+                    });
+                    continue;
+                }
+                if idx != 0 {
                     return None;
                 }
-                out.push(Access {
-                    op,
-                    off: base as u64,
-                    kind: Kind::Store,
-                });
+                // `store *q <- p`: the pointer itself goes through memory.
+                // Sound to chase only if `q`'s bytes stay inside this walk;
+                // the loaded-back value keeps this pointer's offset.
+                let loads = slot_loads(ctx, st, op.deref(ctx).get_operand(1), depth)?;
+                if !flow {
+                    out.push(Access {
+                        op,
+                        off: base as u64,
+                        kind: Kind::Flow { idx },
+                        flow: false,
+                    });
+                }
+                for l in loads {
+                    work.push((l, base, true));
+                }
+            } else if Operation::is_op::<PtrToIntOp>(op, ctx)
+                || Operation::is_op::<ICmpOp>(op, ctx)
+            {
+                // The pointer is only observed as a number or compared —
+                // sound as long as the int never becomes a pointer again.
+                // The operand still needs a live address, so a direct use
+                // retargets into `pin_a` like a flow store.
+                if !flow {
+                    out.push(Access {
+                        op,
+                        off: base as u64,
+                        kind: Kind::Flow { idx },
+                        flow: false,
+                    });
+                }
+                if Operation::is_op::<PtrToIntOp>(op, ctx)
+                    && op
+                        .deref(ctx)
+                        .get_result(0)
+                        .uses(ctx)
+                        .iter()
+                        .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
+                {
+                    return None;
+                }
             } else if let Some(name) = intrinsic(st, op) {
                 // Liveness markers touch no bytes — neither an access nor an escape.
                 if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
@@ -291,6 +433,7 @@ fn accesses(
                     op,
                     off: base as u64,
                     kind,
+                    flow,
                 });
             } else if (diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx))
                 && in_range(base, 0)
@@ -299,6 +442,7 @@ fn accesses(
                     op,
                     off: base as u64,
                     kind: Kind::Escape { idx },
+                    flow,
                 });
             } else if let Some((n, _)) = pin_extent(ctx, st, op, idx)
                 && in_range(base, n)
@@ -307,6 +451,7 @@ fn accesses(
                     op,
                     off: base as u64,
                     kind: Kind::Pin { idx, n },
+                    flow,
                 });
             } else {
                 return None;
@@ -453,9 +598,16 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
     }
     let pins: Vec<(u64, u64)> = acc
         .iter()
-        .filter_map(|a| match a.kind {
-            Kind::Pin { n, .. } if n > 0 => Some((a.off, a.off + n)),
-            _ => None,
+        .filter_map(|a| {
+            let n = match a.kind {
+                Kind::Pin { n, .. } => n,
+                Kind::Copy { n, .. } | Kind::Set { n, .. } if a.flow => n,
+                Kind::Load | Kind::Store if a.flow => {
+                    size_align(ctx, access_ty(ctx, a)?).0
+                }
+                _ => return None,
+            };
+            (n > 0).then_some((a.off, a.off + n))
         })
         .collect();
     for s in &mut typed {
@@ -556,7 +708,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     if size == 0 || size > MAX_SIZE {
         return false;
     }
-    let Some((acc, geps)) = accesses(ctx, st, a, size) else {
+    let Some((acc, geps)) = accesses(ctx, st, a, size, 0) else {
         return false;
     };
     if acc.is_empty() {
@@ -580,10 +732,20 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     // not just the ranges themselves.
     let (mut pin_lo, mut pin_hi, mut pin_al) = (u64::MAX, 0u64, 1u64);
     for x in &acc {
-        if let Kind::Pin { idx, .. } = x.kind
-            && let Some((_, al)) = pin_extent(ctx, st, x.op, idx)
-        {
-            pin_al = pin_al.max(al);
+        match x.kind {
+            Kind::Pin { idx, .. } => {
+                if let Some((_, al)) = pin_extent(ctx, st, x.op, idx) {
+                    pin_al = pin_al.max(al);
+                }
+            }
+            // The flow-stored pointer keeps `a + x.off`'s alignment only if
+            // `x.off - pin_lo` preserves its low bits — fold its alignment
+            // into the pin_lo rounding below.
+            Kind::Flow { .. } => {
+                let low = 1u64 << x.off.trailing_zeros().min(6);
+                pin_al = pin_al.max(low.min(align));
+            }
+            _ => {}
         }
     }
     for s in &sl {
@@ -597,6 +759,14 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     // keeps `x.off - pin_lo` a multiple of it too, so the retargeted
     // pointer into `pin_a` stays correctly aligned for the callee.
     pin_lo &= !(pin_al - 1);
+    // A `store *q <- ptr` (Flow) retargets the stored value to `pin_a`, so
+    // the pointer's target offset must land inside the pinned span.
+    if acc
+        .iter()
+        .any(|x| matches!(x.kind, Kind::Flow { .. }) && !(x.off >= pin_lo && x.off < pin_hi))
+    {
+        return false;
+    }
     let pin_a = if pin_lo < pin_hi {
         let arr = ArrayType::get(ctx, i8t, pin_hi - pin_lo).into();
         let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
@@ -636,6 +806,12 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             .unwrap()
     };
     for x in &acc {
+        if x.flow {
+            // Reached through a loaded-back pointer: keep the operand (it
+            // resolves to a `pin_a` address once the temp slot promotes)
+            // and only pin the touched slice.
+            continue;
+        }
         match x.kind {
             Kind::Load | Kind::Store => {
                 let (i, ty) = (find(x.off), access_ty(ctx, x).unwrap());
@@ -752,6 +928,13 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 // memory exactly covering its pointee extent.
                 let i = find(x.off);
                 let p = ptr_plus(ctx, st, new[i], x.off - sl[i].off, x.op);
+                Operation::replace_operand(x.op, ctx, idx, p);
+            }
+            Kind::Flow { idx } => {
+                // The operand was `a + x.off`; its target byte moved
+                // to `pin_a`, so the pointer value becomes a pin_a
+                // address (`x.off - pin_lo` is nonneg — checked above).
+                let p = ptr_plus(ctx, st, pin_a.unwrap(), x.off - pin_lo, x.op);
                 Operation::replace_operand(x.op, ctx, idx, p);
             }
         }
@@ -996,6 +1179,24 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                 uses.push("load");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
+            } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 0 {
+                match slot_loads(ctx, st, op.deref(ctx).get_operand(1), 0) {
+                    Some(ls) => work.extend(ls),
+                    None => return "store-ptr escapes".into(),
+                }
+            } else if Operation::is_op::<PtrToIntOp>(op, ctx) {
+                if op
+                    .deref(ctx)
+                    .get_result(0)
+                    .uses(ctx)
+                    .iter()
+                    .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
+                {
+                    return "ptrtoint roundtrip".into();
+                }
+                uses.push("ptrtoint");
+            } else if Operation::is_op::<ICmpOp>(op, ctx) {
+                uses.push("icmp");
             } else if matches!(
                 intrinsic(st, op),
                 Some("llvm.lifetime.start" | "llvm.lifetime.end")
@@ -1018,7 +1219,13 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                     .get(&op)
                     .cloned()
                     .unwrap_or_else(|| Operation::get_opid(op, ctx).to_string());
-                return format!("{n} #{idx}");
+                let callee = Operation::get_op::<CallOp>(op, ctx)
+                    .and_then(|c| match c.callee(ctx) {
+                        CallOpCallable::Direct(id) => Some(format!("({id})")),
+                        CallOpCallable::Indirect(_) => Some("(indirect)".into()),
+                    })
+                    .unwrap_or_default();
+                return format!("{n} #{idx}{callee}");
             }
         }
     }
@@ -1037,7 +1244,7 @@ fn why2(ctx: &mut Context, st: &State, a: Value) -> String {
     if size == 0 || size > MAX_SIZE {
         return format!("size {}", if size == 0 { "0" } else { "> MAX_SIZE" });
     }
-    let Some((acc, _)) = accesses(ctx, st, a, size) else {
+    let Some((acc, _)) = accesses(ctx, st, a, size, 0) else {
         return "accesses: out of range / self-copy".into();
     };
     if acc.is_empty() {

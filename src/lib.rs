@@ -291,8 +291,15 @@ fn tracing_init() {
 /// Wrap an ir-opt pass call in a tracing span: `PLIRON_TRACE=pliron::iropt`
 /// prints each pass's `time.busy` on span close (see `tracing_init`).
 macro_rules! pt {
-    ($n:literal, $e:expr) => {{
+    ($cx:expr, $n:literal, $e:expr) => {{
         let _s = tracing::info_span!(target: "pliron::iropt", $n).entered();
+        // Same interval in rustc's self-profile: `-Zself-profile` shows
+        // `pliron_ir_<pass>` next to LLVM's own `LLVM_*` activities.
+        let _pg = $cx
+            .tcx
+            .sess
+            .prof
+            .generic_activity(concat!("pliron_ir_", $n));
         $e
     }};
 }
@@ -344,6 +351,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
     }
     let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
+    let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
@@ -352,19 +360,19 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 OptLevel::Size | OptLevel::SizeMin
             );
         if pass_enabled("PLIRON_FROZEN") {
-            pt!("frozen", st.frozen = context::frozen_values(ctx, st).into_iter().collect());
+            pt!(cx, "frozen", st.frozen = context::frozen_values(ctx, st).into_iter().collect());
         }
         if pass_enabled("PLIRON_NOALIAS_FWD") {
-            pt!("noalias", st.noalias = context::noalias_values(ctx, st)
+            pt!(cx, "noalias", st.noalias = context::noalias_values(ctx, st)
                 .into_iter()
                 .map(|(v, d, w)| (v, (d, w)))
                 .collect());
         }
         if pass_enabled("PLIRON_NNARGS") {
-            pt!("nnargs", st.nnargs = context::nonnull_values(ctx, st).into_iter().collect());
+            pt!(cx, "nnargs", st.nnargs = context::nonnull_values(ctx, st).into_iter().collect());
         }
         let mut adj = None;
-        let d1 = pt!(
+        let d1 = pt!(cx, 
             "inline",
             inline::run(ctx, st, small, None, false, None, &mut adj)
         );
@@ -383,15 +391,15 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     }
                 }
             }
-            pt!(
+            pt!(cx, 
                 "inline2",
                 inline::run(ctx, st, small, None, false, Some(&touched), &mut adj)
             );
         }
-        pt!("domcheck:inline", domcheck::run(ctx, st, "inline"));
+        pt!(cx, "domcheck:inline", domcheck::run(ctx, st, "inline"));
         if pass_enabled("PLIRON_SPEC") {
-            pt!("spec", spec::run(ctx, st));
-            pt!("domcheck:spec", domcheck::run(ctx, st, "spec"));
+            pt!(cx, "spec", spec::run(ctx, st));
+            pt!(cx, "domcheck:spec", domcheck::run(ctx, st, "spec"));
         }
         // Opt-in: unsound on wasm emulated EH, which unwinds through ordinary
         // calls (llvm.wasm.throw / __pliron_eh) the body scan can't see. On
@@ -402,56 +410,56 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             == rustc_target::spec::BinaryFormat::Coff
             && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
         if crate::env_is("PLIRON_NOUNWIND", "1") || (coff_eh && pass_enabled("PLIRON_NOUNWIND")) {
-            pt!("nounwind", nounwind::run(ctx, st));
+            pt!(cx, "nounwind", nounwind::run(ctx, st));
         }
         if pass_enabled("PLIRON_SRET2REG") {
-            pt!("sret2reg", abi::run(ctx, st));
-            pt!("domcheck:abi", domcheck::run(ctx, st, "abi"));
+            pt!(cx, "sret2reg", abi::run(ctx, st));
+            pt!(cx, "domcheck:abi", domcheck::run(ctx, st, "abi"));
         }
         if crate::env_is("PLIRON_DEADARG", "1") {
-            pt!("deadarg", abi::dead_args(ctx, st));
+            pt!(cx, "deadarg", abi::dead_args(ctx, st));
         }
         if pass_enabled("PLIRON_INSTCOMBINE") {
-            pt!("instcombine", instcombine::run(ctx, st));
-            pt!("domcheck:ic", domcheck::run(ctx, st, "instcombine"));
+            pt!(cx, "instcombine", instcombine::run(ctx, st));
+            pt!(cx, "domcheck:ic", domcheck::run(ctx, st, "instcombine"));
         }
         if pass_enabled("PLIRON_MEMCPYOPT") {
-            pt!("memcpyopt", memcpyopt::run(ctx, st));
-            pt!("domcheck:mc", domcheck::run(ctx, st, "memcpyopt"));
+            pt!(cx, "memcpyopt", memcpyopt::run(ctx, st));
+            pt!(cx, "domcheck:mc", domcheck::run(ctx, st, "memcpyopt"));
         }
         if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-            pt!("sroa-fwd", sroa::forward(ctx, st));
-            pt!("domcheck:sf", domcheck::run(ctx, st, "sroa-fwd"));
+            pt!(cx, "sroa-fwd", sroa::forward(ctx, st));
+            pt!(cx, "domcheck:sf", domcheck::run(ctx, st, "sroa-fwd"));
         }
         if pass_enabled("PLIRON_PHISIMP") {
-            pt!("phisimp", phisimp::run(ctx, st));
-            pt!("domcheck:ps", domcheck::run(ctx, st, "phisimp"));
+            pt!(cx, "phisimp", phisimp::run(ctx, st));
+            pt!(cx, "domcheck:ps", domcheck::run(ctx, st, "phisimp"));
         }
         // Run ahead of sroa: its `copyable_arg` check consults `st.nowrite`
         // and `st.nocapture` to decide which call args can take a fresh copy.
         if pass_enabled("PLIRON_NOWRITE") {
-            pt!("nowrite", nowrite::run(ctx, st));
+            pt!(cx, "nowrite", nowrite::run(ctx, st));
         }
         if pass_enabled("PLIRON_NOCAP") {
-            pt!("nocap", nocapture::run(ctx, st));
+            pt!(cx, "nocap", nocapture::run(ctx, st));
         }
         if pass_enabled("PLIRON_SROA") {
-            pt!("sroa", sroa::run(ctx, st));
-            pt!("domcheck:sroa", domcheck::run(ctx, st, "sroa"));
+            pt!(cx, "sroa", sroa::run(ctx, st));
+            pt!(cx, "domcheck:sroa", domcheck::run(ctx, st, "sroa"));
         }
         if pass_enabled("PLIRON_CONSTLOAD") {
-            pt!("constload", constload::run(ctx, st));
-            pt!("domcheck:cl", domcheck::run(ctx, st, "constload"));
+            pt!(cx, "constload", constload::run(ctx, st));
+            pt!(cx, "domcheck:cl", domcheck::run(ctx, st, "constload"));
             // Inlining + SROA make vtable pointers constant: call those slots
             // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
             if pass_enabled("PLIRON_DEVIRT") {
-                let (sites, owners) = pt!("devirt", inline::devirt(ctx, st));
-                pt!("domcheck:dv", domcheck::run(ctx, st, "devirt"));
+                let (sites, owners) = pt!(cx, "devirt", inline::devirt(ctx, st));
+                pt!(cx, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
                     // Passes since the inline rounds may have moved calls —
                     // rebuild the adjacency fresh.
                     adj = None;
-                    pt!(
+                    pt!(cx, 
                         "devirt-inline",
                         inline::run(
                             ctx,
@@ -463,18 +471,18 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                             &mut adj
                         )
                     );
-                    pt!("domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
+                    pt!(cx, "domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-                        pt!("sroa-fwd2", sroa::forward(ctx, st));
+                        pt!(cx, "sroa-fwd2", sroa::forward(ctx, st));
                     }
                     if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
-                        pt!("phisimp2", phisimp::run(ctx, st));
+                        pt!(cx, "phisimp2", phisimp::run(ctx, st));
                     }
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_DEVIRT_SROA") {
-                        pt!("sroa2", sroa::run(ctx, st));
+                        pt!(cx, "sroa2", sroa::run(ctx, st));
                     }
                     if pass_enabled("PLIRON_DEVIRT_CL") {
-                        pt!("constload2", constload::run(ctx, st));
+                        pt!(cx, "constload2", constload::run(ctx, st));
                     }
                 }
             }
@@ -484,11 +492,11 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         // (nonnull call results feed jumpthread); `retarg` folds call
         // results to the returned argument in place.
         if pass_enabled("PLIRON_NNRET") {
-            pt!("nnret", nnret::run(ctx, st));
+            pt!(cx, "nnret", nnret::run(ctx, st));
         }
         if pass_enabled("PLIRON_RETARG") {
-            pt!("retarg", retarg::run(ctx, st));
-            pt!("domcheck:ra", domcheck::run(ctx, st, "retarg"));
+            pt!(cx, "retarg", retarg::run(ctx, st));
+            pt!(cx, "domcheck:ra", domcheck::run(ctx, st, "retarg"));
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
@@ -880,6 +888,10 @@ impl ExtraBackendMethods for PlironCodegenBackend {
 
 fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
     let _smod = tracing::info_span!(target: "pliron::module", "module", cgu = %cgu_name).entered();
+    let _pgmod = tcx
+        .sess
+        .prof
+        .generic_activity_with_arg("pliron_module", cgu_name.as_str());
     let cgu = tcx.codegen_unit(cgu_name);
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
@@ -913,6 +925,7 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
         );
     }
     let _sdef = tracing::info_span!(target: "pliron::phase", "define").entered();
+    let _pgdef = tcx.sess.prof.generic_activity("pliron_define");
     for &(mono_item, data) in &mono_items {
         mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
     }

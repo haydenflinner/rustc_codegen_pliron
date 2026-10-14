@@ -156,6 +156,11 @@ pub struct Pipe<'a> {
     /// stepcache's fact-delta record (replaying the pairs reproduces
     /// the inserts and lifetime rewrites exactly).
     pub carry_log: Vec<(Value, Value)>,
+    /// Self-profile hook wired by `src/` to rustc's `sess.prof`: calling
+    /// it starts a `generic_activity` event for the step; the returned
+    /// guard records the interval when it drops. `None` in tests.
+    /// Type-erased so this crate stays free of `rustc_private`.
+    pub prof_hook: Option<&'a (dyn Fn(&'static str) -> Box<dyn Send + 'a> + 'a)>,
 }
 
 impl Pipe<'_> {
@@ -699,6 +704,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     let _s = crate::trace::dyn_site("pliron::step", &["fn"], s.name)
         .span_with("fn", p.fname)
         .entered();
+    let _pg = p.prof_hook.map(|h| h(s.name));
     let t0 = std::time::Instant::now();
     // A step whose required shape bits are absent cannot apply — skip it
     // before any cache lookup. Evaluated on the current state rather than

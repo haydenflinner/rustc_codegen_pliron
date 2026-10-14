@@ -332,11 +332,14 @@ pub fn lower_to_object(
         verify_full_env: bool,
         fn_flags: &'a crate::pipeline::FnFlags,
         region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+        prof: &'a rustc_data_structures::profiling::SelfProfilerRef,
     }
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
+    let _pglo = sess.prof.generic_activity("pliron_lowerobj");
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
+    let _pgfl = sess.prof.generic_activity("pliron_fnlower");
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -496,6 +499,7 @@ pub fn lower_to_object(
         verify_full_env,
         fn_flags: &fn_flags,
         region_parent: &st.region_parent,
+        prof: &sess.prof,
     };
     fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
         CUR_FN.with(|c| {
@@ -516,8 +520,16 @@ pub fn lower_to_object(
         let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
         let tpipe = std::time::Instant::now();
         let _spipe = tracing::info_span!(target: "pliron::pipeline", "pipeline").entered();
+        let _pgpipe = sh.prof.generic_activity_with_arg("pliron_pipeline", n);
         'retry: loop {
             {
+                // Per-step self-profile events ride `sess.prof` through
+                // this hook — `-Zself-profile` shows each step next to
+                // LLVM's `LLVM_passes` activities on the same clock.
+                // Scoped to the block so Pipe's borrow set stays per-try.
+                let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
+                    Box::new(sh.prof.generic_activity(nm))
+                };
                 let mut pipe = crate::pipeline::Pipe {
                     clctx,
                     isa: sh.isa,
@@ -548,6 +560,7 @@ pub fn lower_to_object(
                     verify_full,
                     stats: &mut j.stats,
                     carry_log: Vec::new(),
+                    prof_hook: Some(&prof_hook),
                 };
                 crate::pipeline::run_pipeline(&mut pipe);
             }
@@ -583,6 +596,7 @@ pub fn lower_to_object(
         // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
         let _scomp = tracing::info_span!(target: "pliron::pipeline", "compile").entered();
+        let _pgcomp = sh.prof.generic_activity_with_arg("pliron_compile", n);
         let mut vec_retry = 0;
         let defr = loop {
             let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -679,6 +693,7 @@ pub fn lower_to_object(
     // function order — identical to what `define_function` did after
     // compiling each function serially.
     let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
+    let _pgpc = sess.prof.generic_activity("pliron_phasec");
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());

@@ -1157,6 +1157,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if let Some(abi) = fn_abi {
             use rustc_target::callconv::PassMode;
             let mut j = usize::from(return_slot.is_indirect());
+            // The sret out-pointer's reachable range is the return layout —
+            // what LLVM's `sret` attr encodes (dereferenceable size/align).
+            if return_slot.is_indirect() {
+                let e = (abi.ret.layout.size.bytes(), abi.ret.layout.align.abi.bytes());
+                exts[0] = e;
+                any_ex |= e.0 > 0;
+            }
             for (ai, a) in abi.args.iter().enumerate() {
                 let n = match &a.mode {
                     PassMode::Ignore => 0,
@@ -1175,14 +1182,26 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 // `slice.as_mut_ptr()` legally covers the whole buffer,
                 // not `size_of::<u8>()`. SROA pins just this range of a
                 // caller alloca, keeping the arg pointer's alignment.
+                //
+                // For `Direct` args rustc already computes `pointee_size`/
+                // `pointee_align` — what LLVM's `dereferenceable` gets —
+                // which also covers niche-wrapped refs (`Option<&mut T>`)
+                // and scalar-ABI'd single-pointer structs like
+                // `{&RandomState}` closure envs. Raw pointers and plain
+                // scalars keep `Size(0)` and are filtered out.
                 let ext = match &a.mode {
                     PassMode::Indirect { meta_attrs, .. } if meta_attrs.is_none() => {
                         Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
                     }
-                    PassMode::Direct(_) if matches!(a.layout.ty.kind(), ty::Ref(..)) => {
-                        a.layout.ty.builtin_deref(true).and_then(|t| {
-                            let l = self.cx.layout_of(t);
-                            l.is_sized().then(|| (l.size.bytes(), l.align.abi.bytes()))
+                    PassMode::Direct(attrs) => {
+                        let n = attrs.pointee_size.bytes();
+                        (n > 0).then(|| {
+                            (
+                                n,
+                                attrs
+                                    .pointee_align
+                                    .map_or(1, |a| a.bytes()),
+                            )
                         })
                     }
                     _ => None,
