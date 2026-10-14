@@ -268,6 +268,12 @@ fn edge_args(
     s: Block,
 ) -> FxHashMap<Value, Value> {
     let mut m = FxHashMap::default();
+    // No params, nothing to restate — skip the destination scan entirely
+    // (a `br_table` terminator lists every arm, so this scan per target
+    // is O(arms²) on giant dispatches).
+    if func.dfg.num_block_params(s) == 0 {
+        return m;
+    }
     for bc in
         func.dfg.insts[inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
     {
@@ -393,18 +399,18 @@ fn edge_facts(
                     }
                 }
                 let def = jt.default_block().block(&func.dfg.value_lists);
+                // One pass over the entries for per-target counts — a
+                // per-entry rescan is O(arms²) on giant dispatch tables.
+                let mut counts: FxHashMap<Block, usize> = FxHashMap::default();
+                for c in jt.as_slice() {
+                    *counts.entry(c.block(&func.dfg.value_lists)).or_default() += 1;
+                }
                 for (k, c) in jt.as_slice().iter().enumerate() {
                     let s = c.block(&func.dfg.value_lists);
                     if s == def {
                         continue;
                     }
-                    if jt
-                        .as_slice()
-                        .iter()
-                        .filter(|c| c.block(&func.dfg.value_lists) == s)
-                        .count()
-                        != 1
-                    {
+                    if counts.get(&s).copied().unwrap_or(0) != 1 {
                         continue;
                     }
                     if !edge_dominates(func, domtree, cfg, b, s) {
@@ -1979,6 +1985,8 @@ fn fold_guard_bands(func: &mut Function) -> usize {
 /// Fold `icmp`s decided by dominating branch conditions; returns the folds.
 /// Counts guard-band collapses separately under `PLIRON_STATS`.
 pub fn run(func: &mut Function) -> usize {
+    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let t0 = std::time::Instant::now();
     let guards = fold_guard_bands(func);
     if guards > 0 && crate::env_set("PLIRON_STATS") {
         eprintln!("celim-guard {guards}");
@@ -1986,13 +1994,20 @@ pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let mut fact = edge_facts(func, &cfg, &domtree);
+    let t_setup = t0.elapsed();
+    let mut tp = std::time::Instant::now();
     join_facts(func, &cfg, &domtree, &mut fact);
+    let t_join = tp.elapsed();
     let mut folds: Vec<(Inst, bool)> = Vec::new();
     let srcs = crate::proots::alias_map(func);
+    tp = std::time::Instant::now();
     for (h, fs) in induction_facts(func, &cfg, &domtree, &fact, &srcs) {
         fact.entry(h).or_default().extend(fs);
     }
+    let t_induct = tp.elapsed();
+    let mut t_scan = std::time::Duration::ZERO;
     if !fact.is_empty() {
+        tp = std::time::Instant::now();
         for b in func.layout.blocks() {
             let fs = facts_at(&domtree, &fact, b);
             if fs.is_empty() {
@@ -2022,15 +2037,29 @@ pub fn run(func: &mut Function) -> usize {
                 }
             }
         }
+        t_scan = tp.elapsed();
         for &(i, k) in &folds {
             let ty = func.dfg.value_type(func.dfg.first_result(i));
             func.replace(i).iconst(ty, i64::from(k));
         }
     }
+    tp = std::time::Instant::now();
     if !folds.is_empty() || guards > 0 {
         // A folded check leaves a constant `brif`; retarget it so the dead
         // successor's edge args drop away for the remaining passes.
         crate::jumpthread::fold_const_branches(func);
+    }
+    if prof {
+        eprintln!(
+            "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
+            t0.elapsed(),
+            guards,
+            t_setup,
+            t_join,
+            t_induct,
+            t_scan,
+            tp.elapsed()
+        );
     }
     folds.len()
 }

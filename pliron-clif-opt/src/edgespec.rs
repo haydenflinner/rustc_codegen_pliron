@@ -1041,6 +1041,8 @@ pub fn sweep_dead(func: &mut Function) {
 }
 
 pub fn run(func: &mut Function) -> usize {
+    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     // All-pure blocks — plans are collected before any apply, so this
@@ -1056,6 +1058,10 @@ pub fn run(func: &mut Function) -> usize {
             pure_blocks.insert(b);
         }
     }
+    if prof {
+        eprintln!("  edgespec setup {:?}", t0.elapsed());
+    }
+    let tp = std::time::Instant::now();
     let mut plans = Vec::new();
     for p in func.layout.blocks() {
         if !dom.is_reachable(p) {
@@ -1072,6 +1078,10 @@ pub fn run(func: &mut Function) -> usize {
             plans.push((p, t, nt));
         }
     }
+    if prof {
+        eprintln!("  edgespec plans({}) {:?}", plans.len(), tp.elapsed());
+    }
+    let tp = std::time::Instant::now();
     let mut n = 0;
     let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT").and_then(|s| s.parse::<usize>().ok());
     for (p, t, nt) in plans {
@@ -1118,6 +1128,10 @@ pub fn run(func: &mut Function) -> usize {
         }
         n += 1;
     }
+    if prof {
+        eprintln!("  edgespec apply({n}) {:?}", tp.elapsed());
+    }
+    let tp = std::time::Instant::now();
     if n > 0 {
         sweep_blocks(func);
         sweep_dead(func);
@@ -1127,12 +1141,19 @@ pub fn run(func: &mut Function) -> usize {
         sweep_blocks(func);
         sweep_dead(func);
     }
+    if prof {
+        eprintln!("  edgespec splices(n={n}) {:?}", tp.elapsed());
+    }
+    let tp = std::time::Instant::now();
     let d = deadbits(func);
     if d > 0 {
         crate::jumpthread::remove_dead_params(func);
         sweep_dead(func);
         sweep_blocks(func);
         n += d;
+    }
+    if prof {
+        eprintln!("  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed());
     }
     n
 }

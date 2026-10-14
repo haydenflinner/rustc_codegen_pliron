@@ -2270,10 +2270,14 @@ pub(crate) fn round(
 /// Splice `jump`-only successors that have no other predecessor into their
 /// predecessor, so a merge block and its test end up in one block.
 pub fn merge_chains(func: &mut Function) {
+    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut gone: FxHashSet<Block> = FxHashSet::default();
+    let (mut merges, mut moves) = (0usize, 0usize);
+    let (mut t_cfg, mut t_alias, mut t_move) = (0u128, 0u128, 0u128);
     for x in blocks {
         if gone.contains(&x) {
             continue;
@@ -2283,9 +2287,14 @@ pub fn merge_chains(func: &mut Function) {
                 break;
             };
             let y = destination.block(&func.dfg.value_lists);
-            if y == x || Some(y) == entry || cfg.pred_iter(y).count() != 1 {
+            let tp = std::time::Instant::now();
+            // `take(2)`, not `count()`: a shared merge block can have one
+            // predecessor list entry per dispatch arm, and counting them
+            // all per arm is O(arms x preds) on giant `br_table` fns.
+            if y == x || Some(y) == entry || cfg.pred_iter(y).take(2).count() != 1 {
                 break;
             }
+            t_cfg += tp.elapsed().as_nanos();
             let args: Vec<Value> = destination
                 .args(&func.dfg.value_lists)
                 .filter_map(|a| match a {
@@ -2306,20 +2315,35 @@ pub fn merge_chains(func: &mut Function) {
             {
                 break;
             }
+            let tp = std::time::Instant::now();
             let params = func.dfg.detach_block_params(y);
             let params: Vec<Value> = params.as_slice(&func.dfg.value_lists).to_vec();
             for (p, a) in params.into_iter().zip(args) {
                 func.dfg.change_to_alias(p, a);
             }
+            t_alias += tp.elapsed().as_nanos();
             func.layout.remove_inst(term);
+            let tp = std::time::Instant::now();
             let insts: Vec<Inst> = func.layout.block_insts(y).collect();
             for i in insts {
                 func.layout.remove_inst(i);
                 func.layout.append_inst(i, x);
+                moves += 1;
             }
             func.layout.remove_block(y);
+            t_move += tp.elapsed().as_nanos();
+            merges += 1;
             gone.insert(y);
         }
+    }
+    if prof {
+        eprintln!(
+            "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
+            t0.elapsed(),
+            t_cfg / 1_000_000,
+            t_alias / 1_000_000,
+            t_move / 1_000_000
+        );
     }
 }
 
@@ -2349,6 +2373,14 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         let dests = func.dfg.insts[term]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             .to_vec();
+        // Qualifying successors: `s`'s only pred edges must come from `y`'s
+        // own terminator — which also means idom(s) == y, so `s` dominates a
+        // site iff `s` is the node directly below `y` on the site's
+        // dominator chain. Attribute each export use-site to that arm with
+        // one idom walk; the old per-(succ, export, site)
+        // `block_dominates` product was quadratic on giant dispatches
+        // (arms × exports × sites × dom depth).
+        let mut quals: Vec<Block> = Vec::new();
         let mut done: FxHashSet<Block> = FxHashSet::default();
         for bc in &dests {
             let s = bc.block(&func.dfg.value_lists);
@@ -2361,33 +2393,62 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             {
                 continue;
             }
-            // `y` values consumed from `s`'s dominated cone — `s` owns the
-            // only path there, so a param can carry each. The use index
-            // answers "does anything in the cone use `w`" per export
-            // (O(#exports × sites)) instead of rescanning every dominated
-            // block per (y, s) pair.
-            let mut needed: Vec<Value> = Vec::new();
-            let mut bail = false;
-            for &w in &exports {
-                if uses.sites.get(&w).is_some_and(|ss| {
-                    ss.iter()
-                        .any(|&(b, _)| b == s || (b != y && dom.block_dominates(s, b)))
-                }) {
-                    if needed.len() >= 8 {
-                        bail = true;
-                        break;
-                    }
-                    needed.push(w);
+            quals.push(s);
+        }
+        if quals.is_empty() {
+            continue;
+        }
+        let qual: FxHashSet<Block> = quals.iter().copied().collect();
+        // s -> w -> insts inside s's cone that use w.
+        let mut cone: FxHashMap<Block, FxHashMap<Value, Vec<Inst>>> = FxHashMap::default();
+        for &w in &exports {
+            let Some(ss) = uses.sites.get(&w) else {
+                continue;
+            };
+            for &(b, i) in ss {
+                if b == y {
+                    continue;
                 }
+                let mut cur = b;
+                let arm = loop {
+                    match dom.idom(cur) {
+                        Some(d) if d == y => break Some(cur),
+                        Some(d) => cur = d,
+                        None => break None,
+                    }
+                };
+                let Some(s) = arm else {
+                    continue;
+                };
+                if !qual.contains(&s) {
+                    continue;
+                }
+                cone.entry(s).or_default().entry(w).or_default().push(i);
             }
-            if bail || needed.is_empty() {
+        }
+        for s in quals {
+            let Some(ws) = cone.get(&s) else {
+                continue;
+            };
+            // `y` values consumed from `s`'s dominated cone — `s` owns the
+            // only path there, so a param can carry each.
+            let needed: Vec<Value> = exports
+                .iter()
+                .copied()
+                .filter(|w| ws.contains_key(w))
+                .collect();
+            if needed.len() > 8 {
                 continue;
             }
-            edits.push((y, term, s, needed));
+            let insts: Vec<Inst> = needed
+                .iter()
+                .flat_map(|w| ws[w].iter().copied())
+                .collect();
+            edits.push((y, term, s, needed, insts));
         }
     }
     let n = edits.len();
-    for (y, term, s, needed) in edits {
+    for (y, term, s, needed, insts) in edits {
         let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
         for &w in &needed {
             let ty = func.dfg.value_type(w);
@@ -2397,15 +2458,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         // Rewrite only the insts that reference a `needed` value inside
         // the cone — the site index says exactly where they are (a site
         // rewired by an earlier edit just produces an empty remap).
-        let mut insts: FxHashSet<Inst> = FxHashSet::default();
-        for &w in &needed {
-            for &(b, i) in uses.sites.get(&w).into_iter().flatten() {
-                if b == y || (b != s && !dom.block_dominates(s, b)) {
-                    continue;
-                }
-                insts.insert(i);
-            }
-        }
+        let insts: FxHashSet<Inst> = insts.into_iter().collect();
         for i in insts {
             let to: FxHashMap<Value, Value> = func
                 .dfg
