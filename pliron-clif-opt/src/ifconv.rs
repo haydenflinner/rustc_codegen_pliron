@@ -334,6 +334,32 @@ fn term_block(func: &Function, term: Inst) -> Block {
     func.layout.inst_block(term).unwrap()
 }
 
+/// `m`'s dominated subtree, capped. `edge_ok` pays an inst scan over the
+/// whole region per candidate, and a region this large isn't a profitable
+/// conversion anyway — the empty set marks "too big, skip the candidate".
+/// (`m` always dominates itself, so a legal set is never empty.)
+const MAX_MSET: usize = 1024;
+fn bounded_mset<'a>(
+    func: &Function,
+    domtree: &DominatorTree,
+    cache: &'a mut FxHashMap<Block, FxHashSet<Block>>,
+    m: Block,
+) -> &'a FxHashSet<Block> {
+    cache.entry(m).or_insert_with(|| {
+        let mut s = FxHashSet::default();
+        for x in func.layout.blocks() {
+            if domtree.block_dominates(m, x) {
+                s.insert(x);
+                if s.len() > MAX_MSET {
+                    s.clear();
+                    break;
+                }
+            }
+        }
+        s
+    })
+}
+
 /// Blocks reachable from the entry over the current CFG (orphans left by
 /// earlier folds aren't).
 fn reachable(func: &Function, cfg: &ControlFlowGraph) -> FxHashSet<Block> {
@@ -547,13 +573,8 @@ fn conv_table(
         return false;
     }
     let chains: FxHashSet<Block> = arms.iter().flat_map(|a| a.chain.iter().copied()).collect();
-    let mset = mset_cache.entry(m).or_insert_with(|| {
-        func.layout
-            .blocks()
-            .filter(|&x| domtree.block_dominates(m, x))
-            .collect()
-    });
-    if !edge_ok(func, domtree, m, mset, &chains, term) {
+    let mset = bounded_mset(func, domtree, mset_cache, m);
+    if mset.is_empty() || !edge_ok(func, domtree, m, mset, &chains, term) {
         return false;
     }
     // Arm args that aren't cloned chain results or chain params must
@@ -765,13 +786,8 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             }
         }
         let chains: FxHashSet<Block> = ta.chain.iter().chain(ea.chain.iter()).copied().collect();
-        let mset = mset_cache.entry(m).or_insert_with(|| {
-            func.layout
-                .blocks()
-                .filter(|&x| domtree.block_dominates(m, x))
-                .collect()
-        });
-        if !edge_ok(func, &domtree, m, mset, &chains, term) {
+        let mset = bounded_mset(func, &domtree, &mut mset_cache, m);
+        if mset.is_empty() || !edge_ok(func, &domtree, m, mset, &chains, term) {
             continue;
         }
         dirty = true;
