@@ -46,10 +46,42 @@ use crate::inline::{blocks, direct_callee, ops};
 use crate::nowrite::{PURE, frame_local};
 use crate::state::State;
 
-/// `op` may change memory a caller can observe: non-frame-local stores,
-/// atomics/fences/asm/va_arg, volatile ops, non-pure intrinsics, and calls
-/// to anything not proven write-free. Mirrors `nowrite.rs`'s body scan.
-pub(crate) fn writes(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+/// The alloca a pointer derives from (same walk as `frame_local`), as a
+/// `Value` — the AllocaOp's result.
+fn base_alloca(ctx: &Context, mut p: Value) -> Option<Value> {
+    loop {
+        match p.defining_op() {
+            Some(d) if Operation::is_op::<pliron_llvm::ops::AllocaOp>(d, ctx) => return Some(p),
+            Some(d) if Operation::is_op::<pliron_llvm::ops::GetElementPtrOp>(d, ctx) => {
+                p = d.deref(ctx).get_operand(0)
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `op` may change memory a dedup/hoist partner can observe: non-frame-local
+/// stores, atomics/fences/asm/va_arg, volatile ops, non-pure intrinsics,
+/// calls to anything not proven write-free — and frame-local stores whose
+/// alloca is handed to a call as a pointer arg (`arg_allocas`): the callee
+/// reads through it, so the store is observable there. Mirrors
+/// `nowrite.rs`'s body scan.
+fn writes(ctx: &Context, st: &State, op: Ptr<Operation>, arg_allocas: &FxHashSet<Value>) -> bool {
+    writes_impl(ctx, st, op, arg_allocas)
+}
+
+/// `writes` without escaped-alloca awareness — shared with passes (xoridem)
+/// that only need "does this op write at all".
+pub(crate) fn writes_plain(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+    writes_impl(ctx, st, op, &FxHashSet::default())
+}
+
+fn writes_impl(
+    ctx: &Context,
+    st: &State,
+    op: Ptr<Operation>,
+    arg_allocas: &FxHashSet<Value>,
+) -> bool {
     if st.volatile.contains(&op) {
         return true;
     }
@@ -66,8 +98,10 @@ pub(crate) fn writes(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
             None => true,
         };
     }
-    (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
-        || is!(AtomicRmwOp)
+    (is!(StoreOp) && {
+        let a = op.deref(ctx).get_operand(1);
+        !frame_local(ctx, a) || base_alloca(ctx, a).is_some_and(|b| arg_allocas.contains(&b))
+    }) || is!(AtomicRmwOp)
         || is!(AtomicCmpxchgOp)
         || is!(FenceOp)
         || is!(AtomicLoadOp)
@@ -130,6 +164,8 @@ fn cone_args(
     cone: &mut Vec<Ptr<Operation>>,
     seen_v: &mut FxHashSet<Value>,
     fuel: &mut u32,
+    arg_allocas: &FxHashSet<Value>,
+    stored_allocas: &FxHashSet<Value>,
 ) -> bool {
     if *fuel == 0 {
         return false;
@@ -148,11 +184,24 @@ fn cone_args(
     let Some(d) = v.defining_op() else {
         return false; // phi of a body block
     };
-    if writes(ctx, st, d) || d.deref(ctx).successors().next().is_some() {
+    if writes(ctx, st, d, arg_allocas) || d.deref(ctx).successors().next().is_some() {
+        return false;
+    }
+    // A read that reaches the preheader must not look at memory the loop
+    // body still stores into. `writes` skips frame-local stores, so they
+    // leave a write-free loop eligible — catch the aliasing reads here:
+    // a load of a stored alloca, or a movable call taking its pointer.
+    let mem_reads = |a: Value| base_alloca(ctx, a).is_some_and(|b| stored_allocas.contains(&b));
+    if (Operation::is_op::<pliron_llvm::ops::LoadOp>(d, ctx)
+        && mem_reads(d.deref(ctx).get_operand(0)))
+        || (Operation::is_op::<CallOp>(d, ctx)
+            && d.deref(ctx).operands().any(|a| mem_reads(a)))
+    {
         return false;
     }
     for a in d.deref(ctx).operands() {
-        if !cone_args(ctx, st, dom, body, ph, a, cone, seen_v, fuel) {
+        if !cone_args(ctx, st, dom, body, ph, a, cone, seen_v, fuel, arg_allocas, stored_allocas)
+        {
             return false;
         }
     }
@@ -161,8 +210,17 @@ fn cone_args(
 }
 
 /// Any write in `os[lo..hi]`?
-fn writes_between(ctx: &Context, st: &State, os: &[Ptr<Operation>], lo: usize, hi: usize) -> bool {
-    os[lo..hi].iter().any(|&o| writes(ctx, st, o))
+fn writes_between(
+    ctx: &Context,
+    st: &State,
+    os: &[Ptr<Operation>],
+    lo: usize,
+    hi: usize,
+    arg_allocas: &FxHashSet<Value>,
+) -> bool {
+    os[lo..hi]
+        .iter()
+        .any(|&o| writes(ctx, st, o, arg_allocas))
 }
 
 /// Every path from `src`'s block to `dst`'s (distinct, dominated-by-src)
@@ -275,11 +333,27 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
         bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Write-flag per block plus succ/pred edges for the path & loop walks.
+    // Allocas handed to a call anywhere in the function: a callee reads
+    // through pointer args, so a store into one of these is an observable
+    // write for dedup/hoist purposes even though `frame_local` hides it
+    // from `nowrite`'s callee classification.
+    let mut arg_allocas = FxHashSet::default();
+    for &b in &bs {
+        for &op in &bops[&b] {
+            if Operation::is_op::<CallOp>(op, ctx) {
+                for a in op.deref(ctx).operands() {
+                    if let Some(ba) = base_alloca(ctx, a) {
+                        arg_allocas.insert(ba);
+                    }
+                }
+            }
+        }
+    }
     let mut writes_blk = FxHashSet::default();
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     let mut succ: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     for &b in &bs {
-        if bops[&b].iter().any(|&o| writes(ctx, st, o)) {
+        if bops[&b].iter().any(|&o| writes(ctx, st, o, &arg_allocas)) {
             writes_blk.insert(b);
         }
         for op in &bops[&b] {
@@ -302,7 +376,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         let mut seen: FxHashMap<(String, Vec<Value>), Value> = FxHashMap::default();
         let os = &bops[&b];
         for (i, &op) in os.iter().enumerate() {
-            if writes(ctx, st, op) {
+            if writes(ctx, st, op, &arg_allocas) {
                 seen.clear();
             }
             if crate::env_set("PLIRON_CGDBG") && Operation::is_op::<CallOp>(op, ctx) {
@@ -372,8 +446,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
-                if writes_between(ctx, st, &bops[&cb], ci + 1, bops[&cb].len())
-                    || writes_between(ctx, st, os, 0, i)
+                if writes_between(ctx, st, &bops[&cb], ci + 1, bops[&cb].len(), &arg_allocas)
+                    || writes_between(ctx, st, os, 0, i, &arg_allocas)
                     || !path_write_free(&preds, &writes_blk, cb, b)
                 {
                     continue;
@@ -422,6 +496,18 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 eprintln!("callgvn   header doesn't dominate body");
             }
             continue;
+        }
+        // Allocas the body still writes: a hoisted cone must not read
+        // them before their last store ran.
+        let mut stored_allocas = FxHashSet::default();
+        for &b in &body {
+            for &op in &bops[&b] {
+                if Operation::is_op::<StoreOp>(op, ctx)
+                    && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(1))
+                {
+                    stored_allocas.insert(ba);
+                }
+            }
         }
         for &b in &body {
             for &op in &bops[&b] {
@@ -484,9 +570,26 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 let mut cone: Vec<Ptr<Operation>> = Vec::new();
                 let mut seen_v = FxHashSet::default();
                 let mut fuel = 128;
-                let ok = args
-                    .iter()
-                    .all(|&a| cone_args(ctx, st, &dom, &body, ph, a, &mut cone, &mut seen_v, &mut fuel));
+                // The call's own pointer args must not reach into an
+                // alloca the body still stores — cone_args only screens
+                // ops *inside* the cone.
+                let ok = args.iter().all(|&a| {
+                    base_alloca(ctx, a).is_none_or(|b| !stored_allocas.contains(&b))
+                }) && args.iter().all(|&a| {
+                    cone_args(
+                        ctx,
+                        st,
+                        &dom,
+                        &body,
+                        ph,
+                        a,
+                        &mut cone,
+                        &mut seen_v,
+                        &mut fuel,
+                        &arg_allocas,
+                        &stored_allocas,
+                    )
+                });
                 if dbg {
                     eprintln!("callgvn   {c} hoistable={ok} cone={}", cone.len());
                 }

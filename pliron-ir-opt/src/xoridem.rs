@@ -115,7 +115,7 @@ fn arg_inv(
                     d.deref(ctx).get_operand(0),
                 )
         } else {
-            !crate::callgvn::writes(ctx, st, d)
+            !crate::callgvn::writes_plain(ctx, st, d)
                 && d.deref(ctx).successors().next().is_none()
                 && (0..d.deref(ctx).get_num_operands()).all(|i| {
                     arg_inv(ctx, st, lset, sbases, memo, fuel, d.deref(ctx).get_operand(i))
@@ -402,7 +402,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                     ok = false;
                     break 'scan;
                 }
-                if crate::callgvn::writes(ctx, st, op) {
+                if crate::callgvn::writes_plain(ctx, st, op) {
                     ok = false;
                     break 'scan;
                 }
