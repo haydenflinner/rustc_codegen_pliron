@@ -387,3 +387,21 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     (avx512f); pri 7 keeps them disjoint from the pri-4 128-bit
     concrete-type rules (same-priority rules with disjoint extractors
     still collide in this ISLE).
+
+32. x64 wide-vector register-class gate (`src/isa/x64/inst/mod.rs`):
+    `rc_for_type` now rejects a vector type wider than
+    `WIDE_VECTOR_BITS` with `CodegenError::Unsupported`. Previously a
+    >128-bit value reaching codegen with the atomic at its 128 default
+    compiled "successfully": the ISLE wide rules emit ymm/zmm ops at the
+    operand's full width, but the vreg's Float class stayed xmm-canonical,
+    so class moves (`gen_move`) and spill slots kept only the low 128
+    bits — a silent low-lane-only miscompile for `bnot`/`bitselect`/
+    `band`/`bor`/`bxor` et al. Now the unsupported combination fails at
+    vreg allocation like any other unexpected SSA type. `src/lib.rs`
+    raises the ceiling in step with `X64_WIDE_VECTOR_BITS` when the
+    target has AVX2/AVX512F, so real compiles are unaffected; the gate
+    catches stray users that emit wide CLIF without the flag (test
+    harnesses, the `clif-check` replayer, or an out-of-sync mirror).
+    Regression test: `pliron-clif-opt/tests/widevec_gate.rs` asserts the
+    loud error at ceiling 128 and (on non-x86 hosts, where no wide ISA
+    exists) that wide `bnot`/`bitselect` never compile silently.

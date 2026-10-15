@@ -1535,7 +1535,21 @@ impl MachInst for Inst {
             types::F64 => Ok((&[RegClass::Float], &[types::F64])),
             types::F128 => Ok((&[RegClass::Float], &[types::F128])),
             types::I128 => Ok((&[RegClass::Int, RegClass::Int], &[types::I64, types::I64])),
+            // PLIRON: a vector wider than `WIDE_VECTOR_BITS` has no usable
+            // register class — the ISLE lowerings emit ymm/zmm ops at the
+            // operand's full width while regalloc would treat the vreg as
+            // xmm-width, so class moves and spill slots would keep only the
+            // low 128 bits and leave the upper lanes garbage. Reject loudly
+            // instead of silently miscompiling; `src/lib.rs` raises the
+            // ceiling to 256/512 when AVX2/AVX512F is enabled.
             _ if ty.is_vector() && ty.bits() <= 512 => {
+                if ty.bits() > wide_vector_bits() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "SSA-value type {ty} exceeds the x64 wide-vector ceiling \
+                         ({} bits)",
+                        wide_vector_bits()
+                    )));
+                }
                 let types = &[
                     types::I8X2,
                     types::I8X4,
