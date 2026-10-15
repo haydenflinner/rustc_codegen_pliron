@@ -3170,6 +3170,30 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", F16Vec)]),
     );
 
+    ig.push(
+        Inst::new(
+            "fvpromote_bf16",
+            r#"
+        Convert each bf16 lane of `x` (carried as f16 bits) to f32 (exact).
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F32Vec.half_width())])
+        .operands_out(vec![Operand::new("a", F32Vec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvdemote_bf16",
+            r#"
+        Convert each f32 lane of `x` to bf16 (as f16 bits), round to nearest even.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F16Vec.double_width())])
+        .operands_out(vec![Operand::new("a", F16Vec)]),
+    );
+
     for (name, half) in [("fvpromote_f16_lo", "low"), ("fvpromote_f16_hi", "high")] {
         ig.push(
             Inst::new(

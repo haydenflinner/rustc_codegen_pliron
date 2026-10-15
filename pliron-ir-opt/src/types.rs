@@ -222,6 +222,8 @@ pub static WIDE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub static NATIVE_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Scalar f16<->f32 casts as F16C `vcvtph2ps`/`vcvtps2ph` instead of libcalls (host opt-in).
 pub static F16C: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Wide bf16 vectors as packed 16-bit leaves converted with AVX512-BF16 (host opt-in).
+pub static NATIVE_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub static WIDE_F32_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -260,7 +262,8 @@ fn wide_f32_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)>
         .find(|&w| w <= bits && (n * 32) % w == 0)
         .and_then(|w| {
             // Packed f16 twin of a wide f32 vector: half-width leaves, same count.
-            let lane = if e.deref(ctx).is::<FP16Type>() { clt::F16 } else { clt::F32 };
+            let half = e.deref(ctx).is::<FP16Type>() || e.deref(ctx).is::<pliron::builtin::types::BF16Type>();
+            let lane = if half { clt::F16 } else { clt::F32 };
             Some((lane.by((w / 32) as u32)?, n * 32 / w))
         })
 }

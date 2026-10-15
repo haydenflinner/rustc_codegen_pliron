@@ -46,6 +46,13 @@ pub fn list() -> Vec<Inst> {
         // F16C on xmm: scalar f16 <-> f32 casts use lane 0.
         inst("vcvtph2ps", fmt("X", [w(xmm1), r(xmm_m128)]), vex(L128)._66()._0f38().w0().op(0x13).r(), (_64b | compat) & avx),
         inst("vcvtps2ph", fmt("X", [w(xmm_m128), r(xmm1), r(imm8)]), vex(L128)._66()._0f3a().w0().op(0x1D).r().ib(), (_64b | compat) & avx),
+        // bf16 (carried as f16 bits): f32 -> bf16 via AVX512-BF16, bf16 -> f32 by widening + shift.
+        inst("vcvtneps2bf16", fmt("Y", [w(xmm1), r(xmm_m128)]), evex(L256, Full)._f3()._0f38().w0().op(0x72).r(), (_64b | compat) & avx512bf16),
+        inst("vcvtneps2bf16", fmt("Z", [w(xmm1), r(xmm_m128)]), z(Full)._f3()._0f38().w0().op(0x72).r(), (_64b | compat) & avx512bf16),
+        inst("vpmovzxwd", fmt("Y", [w(xmm1), r(xmm_m128)]), y()._66()._0f38().op(0x33).r(), (_64b | compat) & avx2),
+        inst("vpmovzxwd", fmt("Z", [w(xmm1), r(xmm_m128)]), z(HalfMem)._66()._0f38().w0().op(0x33).r(), (_64b | compat) & avx512f),
+        inst("vpslld", fmt("YI", [w(xmm1), r(xmm2), r(imm8)]), y()._66()._0f().op(0x72).digit(6).ib(), (_64b | compat) & avx2),
+        inst("vpslld", fmt("ZI", [w(xmm1), r(xmm_m128), r(imm8)]), z(Full)._66()._0f().w0().op(0x72).digit(6).ib(), (_64b | compat) & avx512f),
         // AVX512-FP16 (+VL) on ymm: 16 half lanes.
         inst("vaddph", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), h()._map5().w0().op(0x58).r(), (_64b | compat) & avx512fp16),
         inst("vsubph", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), h()._map5().w0().op(0x5C).r(), (_64b | compat) & avx512fp16),

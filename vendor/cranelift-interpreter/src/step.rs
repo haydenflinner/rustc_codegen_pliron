@@ -1168,7 +1168,9 @@ where
         | Opcode::FvdemoteF16
         | Opcode::FvpromoteF16Lo
         | Opcode::FvpromoteF16Hi
-        | Opcode::FvdemoteF16Pair => unimplemented!("f16 vector casts"),
+        | Opcode::FvdemoteF16Pair
+        | Opcode::FvpromoteBf16
+        | Opcode::FvdemoteBf16 => unimplemented!("f16 vector casts"),
         Opcode::FvpromoteLow => {
             let in_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
             assert_eq!(in_ty, types::F32X4);

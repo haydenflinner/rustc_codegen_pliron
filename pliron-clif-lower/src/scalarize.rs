@@ -95,15 +95,23 @@ fn leafwise_kind(ctx: &Context, op: Ptr<Operation>) -> bool {
 /// bf16 vector arithmetic whose `<n x f32>` twin is all SIMD leaves: promote
 /// the whole vector so only the (cheap, bitwise) casts are split per lane.
 fn bf16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
+    // With native bf16 casts, lane building also moves to the f32 twin (like f16).
+    let lane_op = crate::types::NATIVE_BF16.load(std::sync::atomic::Ordering::Relaxed)
+        && (Operation::get_op::<InsertElementOp>(op, ctx).is_some()
+            || Operation::get_op::<ShuffleVectorOp>(op, ctx).is_some());
     if !crate::types::WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed)
         || op.deref(ctx).get_num_results() != 1
-        || !leafwise_kind(ctx, op)
+        || !(lane_op || leafwise_kind(ctx, op))
     {
         return false;
     }
     let t = op.deref(ctx).get_result(0).get_type(ctx);
     match vec_of(ctx, t) {
-        Some((e, _)) if is_bf16(ctx, e) => {
+        Some((e, n)) if is_bf16(ctx, e) => {
+            if lane_op {
+                let f32t: TypeHandle = FP32Type::get(ctx).into();
+                return crate::types::wide_f32_candidate(ctx, f32t, n as u64);
+            }
             let w = widen_bf16(ctx, t);
             simd_leaves(ctx, w)
         }
@@ -415,12 +423,15 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     use crate::types::{set_wide_f32, wide_f32_candidate};
     let f32h: TypeHandle = FP32Type::get(ctx).into();
     let f16h: TypeHandle = FP16Type::get(ctx).into();
+    let bf16h: TypeHandle = BF16Type::get(ctx).into();
+    let nbf = crate::types::NATIVE_BF16.load(std::sync::atomic::Ordering::Relaxed);
     let ctx: &Context = ctx;
     let mut ok: std::collections::HashMap<(TypeHandle, u64), bool> = Default::default();
     // A packed `<n x half>` (half-width leaves) stands or falls with its f32 twin.
     let mut note = |ctx: &Context, t: TypeHandle, good: bool, good16: bool| {
         if let Some((e, n)) = vec_of(ctx, t) {
-            let (twin, good) = if e == f16h { (f32h, good16) } else { (e, good) };
+            let half = e == f16h || (nbf && e == bf16h);
+            let (twin, good) = if half { (f32h, good16) } else { (e, good) };
             if wide_f32_candidate(ctx, twin, n as u64) {
                 *ok.entry((e, n as u64)).or_insert(true) &= good;
             }
@@ -439,7 +450,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                     let good16 = half_wide_op(ctx, op);
                     if !good16
                         && std::env::var_os("PLIRON_WIDE_DEBUG").is_some()
-                        && op.deref(ctx).operands().chain(op.deref(ctx).results()).any(|v| vec_of(ctx, v.get_type(ctx)).is_some_and(|(e, _)| e == f16h))
+                        && op.deref(ctx).operands().chain(op.deref(ctx).results()).any(|v| vec_of(ctx, v.get_type(ctx)).is_some_and(|(e, _)| e == f16h || e == bf16h))
                     {
                         eprintln!("wide-f16 reject: {}", Operation::get_opid(op, ctx));
                     }
@@ -454,7 +465,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     // A packed f16 vector needs its f32 twin wide too (casts map leaf to leaf).
     let wide: std::collections::HashSet<_> = ok
         .iter()
-        .filter(|&(&(e, n), &g)| g && (e != f16h || ok.get(&(f32h, n)) != Some(&false)))
+        .filter(|&(&(e, n), &g)| g && ((e != f16h && e != bf16h) || ok.get(&(f32h, n)) != Some(&false)))
         .map(|x| *x.0)
         .collect();
     set_wide_f32(wide);

@@ -1297,6 +1297,9 @@ fn x64_get_operands_inner(inst: &mut Inst, collector: &mut impl OperandVisitor) 
 /// Host-detected AVX512-FP16 (+VL); no isa flag exists for it upstream.
 pub static NATIVE_FP16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Host has AVX512-BF16 (+BW/VL): `vcvtneps2bf16` is available.
+pub static NATIVE_BF16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Widest vector register class pliron may use (128 / 256 / 512 bits).
 pub static WIDE_VECTOR_BITS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(128);
@@ -1694,6 +1697,10 @@ impl asm::AvailableFeatures for &EmitInfo {
 
     fn avx512fp16(&self) -> bool {
         NATIVE_FP16.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn avx512bf16(&self) -> bool {
+        NATIVE_BF16.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     fn avx512vl(&self) -> bool {

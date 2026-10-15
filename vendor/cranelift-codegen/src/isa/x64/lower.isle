@@ -5467,6 +5467,13 @@
 (rule (lower (fvpromote_f16 $F32X16 x)) (x64_vcvtph2ps_z (xmm_to_xmm_mem_128 x)))
 (rule (lower (fvdemote_f16 $F16X8 x)) (x64_vcvtps2ph_y x 0))
 (rule (lower (fvdemote_f16 $F16X16 x)) (x64_vcvtps2ph_z x 0))
+;; bf16 as f16 bits (host sets NATIVE_BF16): shift into the f32 high half / AVX512-BF16 round.
+(rule (lower (fvpromote_bf16 $F32X8 x))
+      (x64_vpslld_yi (x64_vpmovzxwd_y (xmm_to_xmm_mem_128 x)) 16))
+(rule (lower (fvpromote_bf16 $F32X16 x))
+      (x64_vpslld_zi (xmm_to_xmm_mem_128 (x64_vpmovzxwd_z (xmm_to_xmm_mem_128 x))) 16))
+(rule (lower (fvdemote_bf16 $F16X8 x)) (x64_vcvtneps2bf16_y (xmm_to_xmm_mem_128 x)))
+(rule (lower (fvdemote_bf16 $F16X16 x)) (x64_vcvtneps2bf16_z (xmm_to_xmm_mem_128 x)))
 ;; Native AVX512-FP16 (host sets NATIVE_FP16).
 (rule 6 (lower (fadd $F16X16 x y)) (x64_vaddph_y x (xmm_to_xmm_mem_128 y)))
 (rule 6 (lower (fsub $F16X16 x y)) (x64_vsubph_y x (xmm_to_xmm_mem_128 y)))

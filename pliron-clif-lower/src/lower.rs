@@ -2975,14 +2975,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let xs = self.get(opnds[0]);
             let rts: Vec<ClType> = self.ty_leaves(self.res_ty(op)).iter().map(|l| l.1).collect();
             let half = |t: ClType| t.lane_type() == clt::F16;
+            // Wide bf16 leaves (NATIVE_BF16) are f16-bit containers too.
+            let bfv = |ty: TypeHandle| {
+                ty.deref(self.ctx)
+                    .downcast_ref::<pliron_llvm::types::VectorType>()
+                    .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>())
+            };
+            let bf = bfv(if is!(FPExtOp) { opnds[0].get_type(self.ctx) } else { self.res_ty(op) });
             let r = if half(rts[0]) || half(self.b.func.dfg.value_type(xs[0])) {
                 let mut r = Vals::new();
                 if xs.len() == rts.len() {
                     for (&x, &t) in xs.iter().zip(&rts) {
-                        r.push(if is!(FPExtOp) {
-                            self.b.ins().fvpromote_f16(t, x)
-                        } else {
-                            self.b.ins().fvdemote_f16(t, x)
+                        r.push(match (is!(FPExtOp), bf) {
+                            (true, false) => self.b.ins().fvpromote_f16(t, x),
+                            (false, false) => self.b.ins().fvdemote_f16(t, x),
+                            (true, true) => self.b.ins().fvpromote_bf16(t, x),
+                            (false, true) => self.b.ins().fvdemote_bf16(t, x),
                         });
                     }
                 } else if is!(FPExtOp) {
