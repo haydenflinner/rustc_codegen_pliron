@@ -208,7 +208,10 @@ pub fn run(func: &mut Function, nn: &NonNull) -> usize {
         // for a bit-flag cond). A canonical bool can be aliased directly,
         // which also keeps edge-cond folds (`selargs`) matching.
         match f {
-            Fold::C(c) if canonical_bool(func, c) => {
+            Fold::C(c)
+                if canonical_bool(func, c)
+                    && func.dfg.value_type(c) == func.dfg.value_type(res) =>
+            {
                 func.dfg.clear_results(i);
                 func.layout.remove_inst(i);
                 func.dfg.change_to_alias(res, c);

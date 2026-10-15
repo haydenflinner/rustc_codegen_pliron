@@ -6739,6 +6739,9 @@ pub fn lcse(func: &mut Function) -> usize {
                 continue;
             }
             if let Some(x) = ident(func, data, func.dfg.value_type(res))
+                // `x` must be `res`-typed for the alias — resolved args
+                // can drift across types on malformed or stale chains.
+                && func.dfg.value_type(x) == func.dfg.value_type(res)
                 // An identity alias deletes `i` and moves `res`'s uses
                 // onto `x`, stretching `x`'s live range from `i` to
                 // `res`'s last use. Inside a loop that merge drops the
