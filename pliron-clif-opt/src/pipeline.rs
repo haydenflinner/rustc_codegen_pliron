@@ -373,6 +373,14 @@ pub struct Analysis {
     /// Alias pairs already carried onto their targets; facts are inputs
     /// and aliases are permanent, so a pair never needs carrying twice.
     carried: FxHashSet<(Value, Value)>,
+    /// `proots::alias_map_cfg` for the current `ver` — the param-alias
+    /// relation every memory pass needs (dse runs three times).
+    amap: Option<FxHashMap<Value, Value>>,
+    /// `loadfwd::isolated` (empty-`nocap` variant) for the current `ver`,
+    /// paired with the `noalias.len()` it was computed against:
+    /// `carry_aliases` can grow `Pipe::noalias` inside a version, and the
+    /// set never shrinks.
+    iso: Option<(usize, FxHashSet<crate::loadfwd::Root>)>,
 }
 
 /// One borrow of the three structural analyses (`&self` tuple).
@@ -387,6 +395,8 @@ impl Analysis {
         self.cfg = None;
         self.dt = None;
         self.la = None;
+        self.amap = None;
+        self.iso = None;
     }
 
     /// The pipeline advanced the IR version (a step declared `mutates`).
@@ -405,6 +415,8 @@ impl Analysis {
         func.dfg.num_insts()
     }
 
+    /// Lazily fills the CFG only — `dt`/`la` build in their own
+    /// accessors, so a cfg-only consumer doesn't pay for domtree+loops.
     fn materialize(&mut self, func: &Function) {
         let shape = Self::shape(func);
         if self.cfg.is_some() {
@@ -416,6 +428,11 @@ impl Analysis {
             self.shape = shape;
             self.cfg = Some(ControlFlowGraph::with_function(func));
         }
+    }
+
+    /// Recompute whatever is missing, then borrow all three.
+    pub fn cfg_dt_la<'a>(&'a mut self, func: &Function) -> CfgDtLa<'a> {
+        self.materialize(func);
         if self.dt.is_none() {
             self.dt = Some(DominatorTree::with_function(
                 func,
@@ -427,11 +444,6 @@ impl Analysis {
             la.compute(func, self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap());
             self.la = Some(la);
         }
-    }
-
-    /// Recompute whatever is missing, then borrow all three.
-    pub fn cfg_dt_la<'a>(&'a mut self, func: &Function) -> CfgDtLa<'a> {
-        self.materialize(func);
         CfgDtLa {
             cfg: self.cfg.as_ref().unwrap(),
             dt: self.dt.as_ref().unwrap(),
@@ -442,12 +454,65 @@ impl Analysis {
     /// Recompute whatever is missing, then borrow cfg+domtree.
     pub fn cfg_dt<'a>(&'a mut self, func: &Function) -> (&'a ControlFlowGraph, &'a DominatorTree) {
         self.materialize(func);
+        if self.dt.is_none() {
+            self.dt = Some(DominatorTree::with_function(
+                func,
+                self.cfg.as_ref().unwrap(),
+            ));
+        }
         (self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap())
     }
 
     pub fn cfg<'a>(&'a mut self, func: &Function) -> &'a ControlFlowGraph {
         self.materialize(func);
         self.cfg.as_ref().unwrap()
+    }
+
+    /// Everything `dse::run` reads before mutating — `(cfg, param-src
+    /// alias map, isolated roots)` — with the alias map and isolation
+    /// set cached per `ver` so dse's three pipeline runs compute them at
+    /// most once per IR state. The returned durations are the
+    /// (possibly cache-hit) `amap`/`iso` build times, reported by
+    /// `dseprof` as `ps`/`iso`.
+    ///
+    /// `iso` keys on `noalias.len()` in addition to `ver`:
+    /// `carry_aliases` can grow `Pipe::noalias` inside a version, and
+    /// the set never shrinks.
+    pub fn dse_inputs<'a>(
+        &'a mut self,
+        func: &Function,
+        noalias: &FxHashSet<Value>,
+        cfrozen: &FxHashMap<FuncRef, u64>,
+    ) -> (
+        &'a ControlFlowGraph,
+        &'a FxHashMap<Value, Value>,
+        &'a FxHashSet<crate::loadfwd::Root>,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
+        let t = std::time::Instant::now();
+        self.materialize(func);
+        if self.amap.is_none() {
+            self.amap = Some(crate::proots::alias_map_cfg(
+                func,
+                self.cfg.as_ref().unwrap(),
+            ));
+        }
+        let t_ps = t.elapsed();
+        let t = std::time::Instant::now();
+        if self.iso.as_ref().is_none_or(|&(n, _)| n != noalias.len()) {
+            self.iso = Some((
+                noalias.len(),
+                crate::loadfwd::isolated(func, noalias, self.amap.as_ref().unwrap(), cfrozen),
+            ));
+        }
+        (
+            self.cfg.as_ref().unwrap(),
+            self.amap.as_ref().unwrap(),
+            &self.iso.as_ref().unwrap().1,
+            t_ps,
+            t.elapsed(),
+        )
     }
 
     /// `ver` counter — bumping it is how the driver invalidates the
@@ -1137,8 +1202,16 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
     0
 }
 
-fn s_dse(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = dse::run(
+        &mut p.clctx.func,
+        p.noalias,
+        p.nowrite,
+        p.call_frozen,
+        an,
+        p.cur_step,
+        p.fname,
+    );
     if k > 0 && p.dump {
         p.dump("dse");
     }
@@ -1753,16 +1826,32 @@ fn s_coldedge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // leaving stores the early dse saw live (e.g. the `&key` slot
 // materialized for `HashMap::get`, dead once `hash_one`'s byte
 // loads forward from the key value itself).
-fn s_dse2(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+fn s_dse2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = dse::run(
+        &mut p.clctx.func,
+        p.noalias,
+        p.nowrite,
+        p.call_frozen,
+        an,
+        p.cur_step,
+        p.fname,
+    );
     if k > 0 && p.dump {
         p.dump("dse2");
     }
     k
 }
 
-fn s_dse3(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = dse::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = dse::run(
+        &mut p.clctx.func,
+        p.noalias,
+        p.nowrite,
+        p.call_frozen,
+        an,
+        p.cur_step,
+        p.fname,
+    );
     if k > 0 && p.dump {
         p.dump("dse3");
     }

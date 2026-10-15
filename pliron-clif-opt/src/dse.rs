@@ -22,7 +22,6 @@
 //! (they just can't be removed).
 
 use cranelift_codegen::entity::SecondaryMap;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, InstructionData, Opcode, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -65,7 +64,11 @@ fn isect(a: &mut FxHashMap<Root, Ranges>, b: &FxHashMap<Root, Ranges>) {
 }
 
 const MAX_LOCS: usize = 256;
-const MAX_ITERS: usize = 32;
+/// Fixpoint pop budget as a multiple of the reachable block count.
+/// Convergence is ~1.8 pops/block on real code; the far tail (~6-12x,
+/// giant stage2 functions) is merge-point churn that almost never kills
+/// a store, and bailing is conservative — the function keeps them.
+const MAX_POP_ROUNDS: usize = 6;
 
 /// Locations a later read may observe before an intervening write. Two
 /// "top" flags distinguish who can still observe memory:
@@ -273,6 +276,8 @@ enum Op {
 }
 
 /// Resolve every inst's demand effect in `order`'s reachable blocks.
+/// `store_blks` collects the blocks holding a killable store — the only
+/// blocks the kill sweep can produce dead insts in.
 fn decode(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
@@ -280,11 +285,13 @@ fn decode(
     nw: &FxHashMap<FuncRef, bool>,
     eh: bool,
     order: &[Block],
-) -> SecondaryMap<Block, Vec<Op>> {
+) -> (SecondaryMap<Block, Vec<Op>>, Vec<Block>) {
     let mut ops: SecondaryMap<Block, Vec<Op>> = SecondaryMap::new();
     let mut memo: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
+    let mut store_blks = Vec::new();
     for &b in order {
         let mut v = Vec::new();
+        let mut killable = false;
         for i in func.layout.block_insts(b) {
             match func.dfg.insts[i] {
                 InstructionData::Load { .. } => match mem_loc(func, ps, na, &mut memo, i) {
@@ -293,18 +300,18 @@ fn decode(
                 },
                 InstructionData::Store { opcode, .. } => {
                     match mem_loc(func, ps, na, &mut memo, i) {
-                        Some(l) => v.push(Op::Store(
-                            i,
-                            l,
-                            loadfwd::notrap(func, i)
+                        Some(l) => {
+                            let k = loadfwd::notrap(func, i)
                                 && matches!(
                                     opcode,
                                     Opcode::Store
                                         | Opcode::Istore8
                                         | Opcode::Istore16
                                         | Opcode::Istore32
-                                ),
-                        )),
+                                );
+                            killable |= k;
+                            v.push(Op::Store(i, l, k));
+                        }
                         None => v.push(Op::RwAll),
                     }
                 }
@@ -328,9 +335,12 @@ fn decode(
                 }
             }
         }
+        if killable {
+            store_blks.push(b);
+        }
         ops[b] = v;
     }
-    ops
+    (ops, store_blks)
 }
 
 /// Backward transfer through `b`'s decoded ops given `d` = demands at
@@ -361,24 +371,49 @@ fn transfer(ops: &[Op], d: &mut Demands, iso: &FxHashSet<Root>, mut dead: Option
     }
 }
 
-/// Remove dead stores in `func`; returns the number removed.
+/// Remove dead stores in `func`; returns the number removed. `step` and
+/// `fname` label the `PLIRON_DSE_PROF` line (the pipeline step that
+/// invoked us and the function's real symbol — `func.name` is just
+/// `u0:0` for every function we build).
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
+    an: &mut crate::pipeline::Analysis,
+    step: &str,
+    fname: &str,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
     let prof = crate::env_set("PLIRON_DSE_PROF");
-    let t0 = std::time::Instant::now();
-    let cfg = ControlFlowGraph::with_function(func);
-    let ps = &crate::proots::alias_map_cfg(func, &cfg);
-    let t_ps = t0.elapsed();
-    let iso = loadfwd::isolated(func, noalias, ps, cfrozen);
-    let t_iso = t0.elapsed();
+    // Only a plain notrap store is killable, and `decode` can only
+    // demote candidates to `RwAll`, never create them — a function with
+    // no candidate skips the whole CFG/alias/iso setup and the dataflow.
+    let mut candidate = false;
+    'scan: for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::Store { opcode, .. } = func.dfg.insts[i]
+                && matches!(
+                    opcode,
+                    Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32
+                )
+                && loadfwd::notrap(func, i)
+            {
+                candidate = true;
+                break 'scan;
+            }
+        }
+    }
+    if !candidate {
+        return 0;
+    }
+    // Shared per-`ver` inputs: the three pipeline runs (and any other
+    // pass wired to `Analysis`) build these at most once per IR state.
+    let (cfg, ps, iso, t_ps, t_iso) = an.dse_inputs(func, noalias, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
+    let t = std::time::Instant::now();
     let mut order = Vec::new();
     let mut seen: SecondaryMap<Block, bool> = SecondaryMap::new();
     let mut stack = vec![entry];
@@ -395,8 +430,20 @@ pub fn run(
     // Decode each inst's demand effect once: the fixpoint and the kill
     // sweep then replay `Demands` ops instead of re-reading the DFG and
     // re-peeling `root` chains.
-    let ops = decode(func, ps, noalias, nw, eh, &order);
-    let t_dec = t0.elapsed();
+    let (ops, store_blks) = decode(func, ps, noalias, nw, eh, &order);
+    let t_dec = t.elapsed();
+    if store_blks.is_empty() {
+        // Every candidate's address failed `mem_loc` — the fixpoint and
+        // sweep can only ever report `dead = []`.
+        if prof {
+            let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
+            eprintln!(
+                "dseprof {step} {fname} blocks={} ops={ninst} pops=0 ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix=0ns sweep=0ns dead=0",
+                order.len(),
+            );
+        }
+        return 0;
+    }
     // Caller-observable memory at function exits: returns demand every
     // `Root::V` — including isolated noalias params, whose pointee is
     // caller memory — but not stack slots, which die with the frame.
@@ -419,7 +466,7 @@ pub fn run(
         inq[b] = true;
     }
     let mut pops = 0usize;
-    let mut budget = MAX_ITERS * order.len();
+    let mut budget = MAX_POP_ROUNDS * order.len();
     let mut stable = true;
     while let Some(b) = stack.pop() {
         inq[b] = false;
@@ -464,7 +511,7 @@ pub fn run(
             continue;
         }
         let mut din = d.clone();
-        transfer(&ops[b], &mut din, &iso, None);
+        transfer(&ops[b], &mut din, iso, None);
         // `done` is also "inn[b] was computed": only then does the old
         // state widen this result — the flip-flop guard. A first visit
         // keeps its coverage whole, else `∩ empty` would erase it.
@@ -488,31 +535,28 @@ pub fn run(
     if !stable {
         if crate::env_set("PLIRON_DSE_DEBUG") {
             eprintln!(
-                "dse: fixpoint unstable after {MAX_ITERS} iters, bailing ({:?})",
-                func.name
+                "dse: fixpoint over pop budget ({MAX_POP_ROUNDS}x blocks), bailing ({fname})"
             );
         }
         return 0;
     }
-    let t_fix = t0.elapsed();
+    let t_fix = t.elapsed() - t_dec;
     let mut dead = Vec::new();
-    for &b in &order {
+    // Only a block holding a killable store can produce a dead inst —
+    // skip the re-transfer for every other reachable block.
+    for &b in &store_blks {
         let mut d = out[b].clone();
-        transfer(&ops[b], &mut d, &iso, Some(&mut dead));
+        transfer(&ops[b], &mut d, iso, Some(&mut dead));
     }
     for i in &dead {
         func.layout.remove_inst(*i);
     }
     if prof {
+        let t_sweep = t.elapsed() - t_fix - t_dec;
         let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
         eprintln!(
-            "dseprof {} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={:?} dec={:?} fix={:?} sweep={:?} dead={}",
-            func.name,
+            "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
             order.len(),
-            t_iso - t_ps,
-            t_dec - t_iso,
-            t_fix - t_dec,
-            t0.elapsed() - t_fix,
             dead.len(),
         );
     }
@@ -549,6 +593,9 @@ mod tests {
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &mut crate::pipeline::Analysis::default(),
+            "dse",
+            "t",
         )
     }
 
