@@ -308,6 +308,8 @@ fn edge_ok(
     chains: &FxHashSet<Block>,
     term: Inst,
 ) -> bool {
+    // Early-exit matters: most candidates reject on a use within the
+    // first few insts, so scanning beats any precomputed def set.
     mset.iter().all(|&x| {
         func.layout.block_insts(x).all(|i| {
             func.dfg
@@ -339,25 +341,55 @@ fn term_block(func: &Function, term: Inst) -> Block {
 /// conversion anyway — the empty set marks "too big, skip the candidate".
 /// (`m` always dominates itself, so a legal set is never empty.)
 const MAX_MSET: usize = 1024;
-fn bounded_mset<'a>(
-    func: &Function,
-    domtree: &DominatorTree,
-    cache: &'a mut FxHashMap<Block, FxHashSet<Block>>,
-    m: Block,
-) -> &'a FxHashSet<Block> {
-    cache.entry(m).or_insert_with(|| {
-        let mut s = FxHashSet::default();
-        for x in func.layout.blocks() {
-            if domtree.block_dominates(m, x) {
-                s.insert(x);
-                if s.len() > MAX_MSET {
-                    s.clear();
-                    break;
-                }
+
+/// idom children + memoized dominated-subtree sets. Subtree enumeration
+/// costs O(|subtree|) per query instead of an all-blocks dominance scan.
+/// `recompute` must run whenever the domtree is rebuilt — the children
+/// come from `idom`, so a stale domtree means stale children.
+struct Msets {
+    children: FxHashMap<Block, Vec<Block>>,
+    sets: FxHashMap<Block, FxHashSet<Block>>,
+}
+
+impl Msets {
+    fn new(func: &Function, domtree: &DominatorTree) -> Self {
+        let mut m = Self {
+            children: FxHashMap::default(),
+            sets: FxHashMap::default(),
+        };
+        m.recompute(func, domtree);
+        m
+    }
+
+    fn recompute(&mut self, func: &Function, domtree: &DominatorTree) {
+        self.children.clear();
+        for b in func.layout.blocks() {
+            if let Some(p) = domtree.idom(b) {
+                self.children.entry(p).or_default().push(b);
             }
         }
-        s
-    })
+        self.sets.clear();
+    }
+
+    fn get(&mut self, m: Block) -> &FxHashSet<Block> {
+        if !self.sets.contains_key(&m) {
+            let mut s = FxHashSet::default();
+            let mut st = vec![m];
+            while let Some(x) = st.pop() {
+                if s.insert(x) {
+                    if s.len() > MAX_MSET {
+                        s.clear();
+                        break;
+                    }
+                    if let Some(cs) = self.children.get(&x) {
+                        st.extend_from_slice(cs);
+                    }
+                }
+            }
+            self.sets.insert(m, s);
+        }
+        &self.sets[&m]
+    }
 }
 
 /// Blocks reachable from the entry over the current CFG (orphans left by
@@ -412,7 +444,7 @@ fn conv_table(
     domtree: &mut DominatorTree,
     la: &mut LoopAnalysis,
     reach: &mut FxHashSet<Block>,
-    mset_cache: &mut FxHashMap<Block, FxHashSet<Block>>,
+    msets: &mut Msets,
     dirty: &mut bool,
     preds: &mut (
         FxHashMap<Block, FxHashSet<Block>>,
@@ -539,7 +571,7 @@ fn conv_table(
         if *dirty {
             cfg.compute(func);
             domtree.compute(func, &cfg);
-            mset_cache.clear();
+            msets.recompute(func, domtree);
             *dirty = false;
         }
         la.compute(func, cfg, domtree);
@@ -573,8 +605,11 @@ fn conv_table(
         return false;
     }
     let chains: FxHashSet<Block> = arms.iter().flat_map(|a| a.chain.iter().copied()).collect();
-    let mset = bounded_mset(func, domtree, mset_cache, m);
-    if mset.is_empty() || !edge_ok(func, domtree, m, mset, &chains, term) {
+    let mset = msets.get(m);
+    let t0 = std::time::Instant::now();
+    let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
+    EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+    if !ok {
         return false;
     }
     // Arm args that aren't cloned chain results or chain params must
@@ -667,12 +702,17 @@ fn conv_table(
     true
 }
 
+thread_local! {
+    static EDGE_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+}
+
 pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize {
+    EDGE_NS.set(0);
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
     let mut la = LoopAnalysis::new();
     let mut reach: FxHashSet<Block> = FxHashSet::default();
-    let mut mset_cache: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+    let mut msets = Msets::new(func, &domtree);
     let mut dirty = false;
     // Exact pred deltas for applied folds — (gained direct preds, lost
     // preds) per block — so checks that need fresh pred sets don't pay a
@@ -696,7 +736,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                     &mut domtree,
                     &mut la,
                     &mut reach,
-                    &mut mset_cache,
+                    &mut msets,
                     &mut dirty,
                     &mut preds,
                     b,
@@ -776,7 +816,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             if dirty {
                 cfg.compute(func);
                 domtree.compute(func, &cfg);
-                mset_cache.clear();
+                msets.recompute(func, &domtree);
                 dirty = false;
             }
             la.compute(func, &cfg, &domtree);
@@ -786,8 +826,11 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             }
         }
         let chains: FxHashSet<Block> = ta.chain.iter().chain(ea.chain.iter()).copied().collect();
-        let mset = bounded_mset(func, &domtree, &mut mset_cache, m);
-        if mset.is_empty() || !edge_ok(func, &domtree, m, mset, &chains, term) {
+        let mset = msets.get(m);
+        let t0 = std::time::Instant::now();
+        let ok = !mset.is_empty() && edge_ok(func, &domtree, m, mset, &chains, term);
+        EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+        if !ok {
             continue;
         }
         dirty = true;
@@ -825,6 +868,9 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             eprintln!("ifconv {b} -> jump {m} (arms {t:?} {e:?})");
         }
         n += 1;
+    }
+    if crate::env_set("PLIRON_ICPROF") {
+        EDGE_NS.with(|c| eprintln!("ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
     }
     n
 }
