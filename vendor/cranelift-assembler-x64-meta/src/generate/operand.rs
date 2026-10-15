@@ -29,7 +29,7 @@ impl dsl::Operand {
             xmm1 | xmm2 | xmm3 => {
                 format!("Xmm<R::{mut_}Xmm>")
             }
-            xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 => {
+            xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 | xmm_m256 | xmm_m512 => {
                 format!("XmmMem<R::{mut_}Xmm, R::ReadGpr>")
             }
             m8 | m16 | m32 | m64 | m128 => format!("Amode<R::ReadGpr>"),
@@ -64,7 +64,8 @@ impl dsl::Location {
                     None => format!("self.{self}.to_string(None)"),
                 }
             }
-            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 | m8 | m16
+            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128
+            | xmm_m256 | xmm_m512 | m8 | m16
             | m32 | m64 | m128 => {
                 format!("self.{self}.to_string()")
             }
@@ -81,7 +82,7 @@ impl dsl::Location {
                 let size = self.generate_size().expect("r/m operands have a size");
                 Some(format!("self.{self}.to_string_xed({size})"))
             }
-            xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 => {
+            xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 | xmm_m256 | xmm_m512 => {
                 Some(format!("self.{self}.to_string_xed()"))
             }
             m8 | m16 | m32 | m64 | m128 => Some(format!("alloc::format!(\"{{:#}}\", self.{self})")),
@@ -102,7 +103,8 @@ impl dsl::Location {
             m8 | m16 | m32 | m64 | m128 => {
                 panic!("no need to generate a size for memory-only access")
             }
-            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 | xmm0 => None,
+            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128
+            | xmm_m256 | xmm_m512 | xmm0 => None,
         }
     }
 }

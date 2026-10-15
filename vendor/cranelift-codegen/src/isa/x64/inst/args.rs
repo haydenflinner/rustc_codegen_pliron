@@ -376,6 +376,8 @@ newtype_of_reg!(
               XmmMem32         size:32,
               XmmMem64         size:64,
               XmmMem128        size:128,
+              XmmMem256        size:256,
+              XmmMem512        size:512,
               XmmMemAligned                    aligned:true,
               XmmMemAligned8   size:8          aligned:true,
               XmmMemAligned16  size:16         aligned:true,

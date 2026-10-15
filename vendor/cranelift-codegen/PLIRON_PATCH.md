@@ -233,3 +233,24 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `ty_bits` (`src/isle_prelude.rs`) saturates at `u8::MAX` for
     >255-bit types instead of panicking. Covered by
     `pliron-clif-opt/tests/widevec_lower.rs`.
+
+23. x64 wide-operand types (`src/isa/x64/inst/args.rs`,
+    `src/isa/x64/inst.isle`, `src/isa/x64/lower/isle.rs`,
+    `src/isa/x64/lower.isle`,
+    `cranelift-assembler-x64-meta/src/dsl/format.rs`,
+    `cranelift-assembler-x64-meta/src/generate/operand.rs`,
+    `cranelift-assembler-x64-meta/src/instructions/wide.rs`):
+    new `xmm_m256`/`xmm_m512` DSL locations generating `XmmMem256`/
+    `XmmMem512` ISLE operand types (`size:256`/`512` in
+    `newtype_of_reg!`), with `xmm_to_xmm_mem_*`,
+    `synthetic_amode_to_xmm_mem_*`, `writable_xmm_to_xmm_mem_*` and
+    `xmm_mem_*_to_xmm_mem` converters. Every wide instruction in
+    `wide.rs` now takes an operand of its true access width — ymm
+    instructions take `xmm_m256`, zmm `xmm_m512` — while 128-bit
+    lane-chunk ops (`vextractf128`/`vinsertf128`/`vextractf32x4`/
+    `vinsertf32x4`, `vcvtph2ps`/`vcvtps2ph`/`vpmovzxwd` at Y, the
+    `*ph` X forms) keep `xmm_m128`. This closes the latent hole where
+    a 128-bit `RegMem` operand could be passed to a ymm/zmm
+    instruction and read out of bounds. All wide `lower.isle` rules
+    use the matching-width converter. `widevec_lower.rs`
+    `float_ops_*` covers the sibling's vmovups/fadd/fmul/fma path.

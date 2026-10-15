@@ -338,6 +338,8 @@ pub enum Location {
     xmm_m32,
     xmm_m64,
     xmm_m128,
+    xmm_m256,
+    xmm_m512,
 
     // Memory-only locations.
     m8,
@@ -358,6 +360,8 @@ impl Location {
             eax | edx | imm32 | r32 | r32a | r32b | rm32 | m32 | xmm_m32 => 32,
             rax | rbx | rcx | rdx | imm64 | r64 | r64a | r64b | rm64 | m64 | xmm_m64 => 64,
             xmm1 | xmm2 | xmm3 | xmm_m128 | xmm0 | m128 => 128,
+            xmm_m256 => 256,
+            xmm_m512 => 512,
         }
     }
 
@@ -407,9 +411,8 @@ impl Location {
             r8 | r16 | r32 | r32a | r32b | r64 | r64a | r64b | xmm1 | xmm2 | xmm3 => {
                 OperandKind::Reg(*self)
             }
-            rm8 | rm16 | rm32 | rm64 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 => {
-                OperandKind::RegMem(*self)
-            }
+            rm8 | rm16 | rm32 | rm64 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128
+            | xmm_m256 | xmm_m512 => OperandKind::RegMem(*self),
             m8 | m16 | m32 | m64 | m128 => OperandKind::Mem(*self),
         }
     }
@@ -425,9 +428,8 @@ impl Location {
             imm8 | imm16 | imm32 | imm64 | m8 | m16 | m32 | m64 | m128 => None,
             al | ax | eax | rax | rbx | cl | rcx | dx | edx | rdx | r8 | r16 | r32 | r32a
             | r32b | r64 | r64a | r64b | rm8 | rm16 | rm32 | rm64 => Some(RegClass::Gpr),
-            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128 | xmm0 => {
-                Some(RegClass::Xmm)
-            }
+            xmm1 | xmm2 | xmm3 | xmm_m8 | xmm_m16 | xmm_m32 | xmm_m64 | xmm_m128
+            | xmm_m256 | xmm_m512 | xmm0 => Some(RegClass::Xmm),
         }
     }
 }
@@ -474,6 +476,8 @@ impl core::fmt::Display for Location {
             xmm_m32 => write!(f, "xmm_m32"),
             xmm_m64 => write!(f, "xmm_m64"),
             xmm_m128 => write!(f, "xmm_m128"),
+            xmm_m256 => write!(f, "xmm_m256"),
+            xmm_m512 => write!(f, "xmm_m512"),
 
             m8 => write!(f, "m8"),
             m16 => write!(f, "m16"),

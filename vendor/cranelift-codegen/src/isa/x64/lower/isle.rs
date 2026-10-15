@@ -789,6 +789,48 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         XmmMem128::unwrap_new(RegMem::mem(amode.clone()))
     }
 
+    // PLIRON: 256/512-bit xmm-or-mem operand helpers for the wide-vector
+    // lowering rules — keeps wide operand widths type-checked end to end.
+    #[inline]
+    fn xmm_to_xmm_mem_256(&mut self, xmm: Xmm) -> XmmMem256 {
+        XmmMem256::from(xmm)
+    }
+
+    #[inline]
+    fn xmm_to_xmm_mem_512(&mut self, xmm: Xmm) -> XmmMem512 {
+        XmmMem512::from(xmm)
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_256(&mut self, amode: &SyntheticAmode) -> XmmMem256 {
+        XmmMem256::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_512(&mut self, amode: &SyntheticAmode) -> XmmMem512 {
+        XmmMem512::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn xmm_mem_256_to_xmm_mem(&mut self, x: &XmmMem256) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn xmm_mem_512_to_xmm_mem(&mut self, x: &XmmMem512) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_256(&mut self, r: WritableXmm) -> XmmMem256 {
+        XmmMem256::from(r.to_reg())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_512(&mut self, r: WritableXmm) -> XmmMem512 {
+        XmmMem512::from(r.to_reg())
+    }
+
     /// Wrap a `SyntheticAmode` as a 64-bit XMM memory operand.
     #[inline]
     fn synthetic_amode_to_xmm_mem_64(&mut self, amode: &SyntheticAmode) -> XmmMem64 {

@@ -17,7 +17,9 @@ fn isa() -> std::sync::Arc<dyn TargetIsa> {
     b.set("opt_level", "speed").unwrap();
     let flags = settings::Flags::new(b);
     let mut isa_b = cranelift_codegen::isa::lookup_by_name("x86_64").unwrap();
+    isa_b.enable("has_avx").unwrap();
     isa_b.enable("has_avx2").unwrap();
+    isa_b.enable("has_fma").unwrap();
     isa_b.enable("has_avx512f").unwrap();
     isa_b.finish(flags).unwrap()
 }
@@ -82,6 +84,26 @@ block0(v0: i32x8, v1: i32x8, v2: i32x8, v3: i32x8):
     return v6
 }";
 
+const FLOAT_OPS: &str = "
+function %fops(i64, f32x8, f32x8, f32x8) -> f32x8 {
+block0(v0: i64, v1: f32x8, v2: f32x8, v3: f32x8):
+    v4 = load.f32x8 v0
+    v5 = fadd v1, v4
+    v6 = fmul v5, v2
+    v7 = fma v6, v1, v3
+    return v7
+}";
+
+const FLOAT_OPS_512: &str = "
+function %fops(i64, f32x16, f32x16, f32x16) -> f32x16 {
+block0(v0: i64, v1: f32x16, v2: f32x16, v3: f32x16):
+    v4 = load.f32x16 v0
+    v5 = fadd v1, v4
+    v6 = fmul v5, v2
+    v7 = fma v6, v1, v3
+    return v7
+}";
+
 const BITSELECT_512: &str = "
 function %bs(i32x16, i32x16, i32x16) -> i32x16 {
 block0(v0: i32x16, v1: i32x16, v2: i32x16):
@@ -128,6 +150,26 @@ fn boolean_ops_256() {
         !has_legacy_op(&code, &[0xDB, 0xEB, 0xEF]),
         "xmm-width boolean op: {code:02x?}"
     );
+}
+
+#[test]
+fn float_ops_256() {
+    // load (vmovups 0x10), vaddps 0x58, vmulps 0x59, vfmadd213ps 0xA8 — all
+    // operand types went through the XmmMem256 retag.
+    let code = compile(256, FLOAT_OPS);
+    assert!(has_wide_op(&code, &[0x10]), "no vmovups ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x58]), "no vaddps ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x59]), "no vmulps ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xA8]), "no vfmadd ymm: {code:02x?}");
+}
+
+#[test]
+fn float_ops_512() {
+    let code = compile(512, FLOAT_OPS_512);
+    assert!(has_wide_op(&code, &[0x10]), "no vmovups zmm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x58]), "no vaddps zmm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x59]), "no vmulps zmm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xA8]), "no vfmadd zmm: {code:02x?}");
 }
 
 #[test]

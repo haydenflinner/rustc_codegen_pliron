@@ -755,6 +755,8 @@
 (type XmmMem32 extern (enum))
 (type XmmMem64 extern (enum))
 (type XmmMem128 extern (enum))
+(type XmmMem256 extern (enum))
+(type XmmMem512 extern (enum))
 (type XmmMemAligned extern (enum))
 (type XmmMemAligned8 extern (enum))
 (type XmmMemAligned16 extern (enum))
@@ -1157,6 +1159,26 @@
 (extern constructor xmm_mem_imm_128_to_xmm_mem_imm xmm_mem_imm_128_to_xmm_mem_imm)
 (decl xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm (XmmMemAlignedImm128) XmmMemAlignedImm)
 (extern constructor xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm)
+
+;; PLIRON: sized xmm-or-mem operand types for 256/512-bit wide-vector
+;; operands — the type system, not convention, keeps a 128-bit mem
+;; operand out of a ymm/zmm instruction.
+(decl xmm_to_xmm_mem_256 (Xmm) XmmMem256)
+(extern constructor xmm_to_xmm_mem_256 xmm_to_xmm_mem_256)
+(decl xmm_to_xmm_mem_512 (Xmm) XmmMem512)
+(extern constructor xmm_to_xmm_mem_512 xmm_to_xmm_mem_512)
+(decl synthetic_amode_to_xmm_mem_256 (SyntheticAmode) XmmMem256)
+(extern constructor synthetic_amode_to_xmm_mem_256 synthetic_amode_to_xmm_mem_256)
+(decl synthetic_amode_to_xmm_mem_512 (SyntheticAmode) XmmMem512)
+(extern constructor synthetic_amode_to_xmm_mem_512 synthetic_amode_to_xmm_mem_512)
+(decl xmm_mem_256_to_xmm_mem (XmmMem256) XmmMem)
+(extern constructor xmm_mem_256_to_xmm_mem xmm_mem_256_to_xmm_mem)
+(decl xmm_mem_512_to_xmm_mem (XmmMem512) XmmMem)
+(extern constructor xmm_mem_512_to_xmm_mem xmm_mem_512_to_xmm_mem)
+(decl writable_xmm_to_xmm_mem_256 (WritableXmm) XmmMem256)
+(extern constructor writable_xmm_to_xmm_mem_256 writable_xmm_to_xmm_mem_256)
+(decl writable_xmm_to_xmm_mem_512 (WritableXmm) XmmMem512)
+(extern constructor writable_xmm_to_xmm_mem_512 writable_xmm_to_xmm_mem_512)
 
 ;; Put a value into a XMM.
 ;;
@@ -4611,6 +4633,8 @@
 (convert Xmm XmmMem32    xmm_to_xmm_mem_32)
 (convert Xmm XmmMem64    xmm_to_xmm_mem_64)
 (convert Xmm XmmMem128   xmm_to_xmm_mem_128)
+(convert Xmm XmmMem256   xmm_to_xmm_mem_256)
+(convert Xmm XmmMem512   xmm_to_xmm_mem_512)
 (convert Xmm XmmMemAligned8   xmm_to_xmm_mem_aligned_8)
 (convert Xmm XmmMemAligned16  xmm_to_xmm_mem_aligned_16)
 (convert Xmm XmmMemAligned32  xmm_to_xmm_mem_aligned_32)
@@ -4632,6 +4656,8 @@
 (convert XmmMem32    XmmMem xmm_mem_32_to_xmm_mem)
 (convert XmmMem64    XmmMem xmm_mem_64_to_xmm_mem)
 (convert XmmMem128   XmmMem xmm_mem_128_to_xmm_mem)
+(convert XmmMem256   XmmMem xmm_mem_256_to_xmm_mem)
+(convert XmmMem512   XmmMem xmm_mem_512_to_xmm_mem)
 (convert XmmMemAligned8   XmmMemAligned xmm_mem_aligned_8_to_xmm_mem_aligned)
 (convert XmmMemAligned16  XmmMemAligned xmm_mem_aligned_16_to_xmm_mem_aligned)
 (convert XmmMemAligned32  XmmMemAligned xmm_mem_aligned_32_to_xmm_mem_aligned)
@@ -4709,6 +4735,8 @@
 (convert SyntheticAmode XmmMem32          synthetic_amode_to_xmm_mem_32)
 (convert SyntheticAmode XmmMem64          synthetic_amode_to_xmm_mem_64)
 (convert SyntheticAmode XmmMem128         synthetic_amode_to_xmm_mem_128)
+(convert SyntheticAmode XmmMem256         synthetic_amode_to_xmm_mem_256)
+(convert SyntheticAmode XmmMem512         synthetic_amode_to_xmm_mem_512)
 (convert SyntheticAmode XmmMemAligned128  synthetic_amode_to_xmm_mem_aligned_128)
 
 (convert Amode GprMem8           amode_to_gpr_mem_8)
@@ -4732,6 +4760,8 @@
 (convert WritableGpr GprMem32 writable_gpr_to_gpr_mem_32)
 (convert WritableGpr GprMem64 writable_gpr_to_gpr_mem_64)
 (convert WritableXmm XmmMem128         writable_xmm_to_xmm_mem_128)
+(convert WritableXmm XmmMem256         writable_xmm_to_xmm_mem_256)
+(convert WritableXmm XmmMem512         writable_xmm_to_xmm_mem_512)
 (convert WritableXmm XmmMemAligned128  writable_xmm_to_xmm_mem_aligned_128)
 
 ;; Sized `XmmMem{N} -> XmmMemAligned{N}` bridges: if the operand is a
