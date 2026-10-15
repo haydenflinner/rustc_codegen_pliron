@@ -1468,3 +1468,27 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   `CARGO_TARGET_DIR` for `cargo test/check -p pliron-*-opt`. Scratch
   deps cost ~2min once, then incremental is fast. This avoids both lock
   stalls and target-dir cache thrash.
+
+## guardelim demand-driven fixpoint (Devin 2, 2026-10-15, commit 9118201)
+
+- Bench microbench compile time (`cargo rustc --bench kernels`, scratch
+  `/tmp/cgbuild/target`, PLIRON_PAR=0): guardelim was 14.9s of 21.4s
+  iropt; now 0.2s. Bench wall 34.7s -> 17.7s.
+- Prescan: functions with no foldable cond_br (provable icmp pred +
+  unreachable-terminated succ) skip domtree+scan+fixpoint (87% of bench
+  fns). Dom::new moved after the prescan.
+- `relevant` intersected with the needed-slot closure (slots reachable
+  from candidate icmp operands through the atom source graph;
+  over-approximates a Slot's reaching set with all stores to the slot).
+  Untracked slots -> opaque V atoms = weaker proofs only, never unsound.
+  Fold count on bench: 48 vs 49 before (one lost through an untracked
+  slot) — acceptable; revisit if a suite regression traces here.
+- `PLIRON_GE_PROF=1` prints `geprof <cgu> blocks= cands= rel= fix= prove=
+  folds=` per fn.
+- Remaining bench codegen (~11s): CLIF pipeline 9.7s (jumpthread 2.1s,
+  slp 1.5s, ifconv2 0.43, loadfwd 0.36, mergechain 0.35, unroll 0.31,
+  sameargs* 0.63, edgespec 0.30, compile 0.78) + iropt 5.6s
+  (inline+scan ~2.6s, sroa 0.67, callgvn* 0.68, nocap* 0.58,
+  phisimp 0.30) + fnlower 0.85s.
+- Gotcha reconfirmed: cargo does not rebuild on PLIRON_* flips —
+  `touch` a bench source or expect 0.1s "Finished" no-ops.
