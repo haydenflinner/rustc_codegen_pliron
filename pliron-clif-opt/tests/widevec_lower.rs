@@ -477,7 +477,7 @@ fn has_wide_op38(code: &[u8], ops: &[u8]) -> bool {
     code.windows(4).any(|w| {
         w[0] == 0xC4 && (w[1] & 0x1F) == 0x02 && (w[2] & 0x04) != 0 && ops.contains(&w[3])
     }) || code.windows(5).any(|w| {
-        w[0] == 0x62 && (w[2] & 0x03) == 0x02 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
+        w[0] == 0x62 && (w[1] & 0x03) == 0x02 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
     })
 }
 
@@ -546,4 +546,49 @@ fn udot_acc_256() {
 fn udot_acc_512() {
     let code = compile(512, UDOT_ACC);
     assert!(has_wide_op38(&code, &[0x50]), "no vpdpbusd zmm: {code:02x?}");
+}
+
+const VSWIZZLE: &str = "
+function %vsw(i32x8, i32x8) -> i32x8 {
+block0(v0: i32x8, v1: i32x8):
+    v2 = vswizzle.i32x8 v0, v1
+    return v2
+}";
+
+const VSWIZZLE_F64: &str = "
+function %vswf(f64x8, i64x8) -> f64x8 {
+block0(v0: f64x8, v1: i64x8):
+    v2 = vswizzle.f64x8 v0, v1
+    return v2
+}";
+
+const VSWIZZLE2: &str = "
+function %vsw2(i32x16, i32x16, i32x16) -> i32x16 {
+block0(v0: i32x16, v1: i32x16, v2: i32x16):
+    v3 = vswizzle2.i32x16 v0, v1, v2
+    return v3
+}";
+
+#[test]
+fn vswizzle_256() {
+    let code = compile(256, VSWIZZLE);
+    assert!(has_wide_op38(&code, &[0x36]), "no vpermd ymm: {code:02x?}");
+}
+
+#[test]
+fn vswizzle_512() {
+    let code = compile(512, VSWIZZLE);
+    assert!(has_wide_op38(&code, &[0x36]), "no vpermd zmm: {code:02x?}");
+}
+
+#[test]
+fn vswizzle_f64_512() {
+    let code = compile(512, VSWIZZLE_F64);
+    assert!(has_wide_op38(&code, &[0x16]), "no vpermpd zmm: {code:02x?}");
+}
+
+#[test]
+fn vswizzle2_512() {
+    let code = compile(512, VSWIZZLE2);
+    assert!(has_wide_op38(&code, &[0x7E]), "no vpermt2d zmm: {code:02x?}");
 }

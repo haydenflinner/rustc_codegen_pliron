@@ -339,5 +339,31 @@ pub fn list() -> Vec<Inst> {
         inst("vpdpbusd", fmt("Y", [rw(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx_vnni),
         inst("vpdpbusd", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx512vnni),
         inst("vpdpbusd", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx512vnni & avx512vl),
+        // PLIRON: vswizzle/vswizzle2 — runtime-index crossbar permutes.
+        // Single-source: vperm{ps,d,q,pd} index in xmm2, data in xmm_m.
+        inst("vpermd", fmt("X", [w(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w0().op(0x36).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermd", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x36).r(), (_64b | compat) & avx512f),
+        inst("vpermps", fmt("X", [w(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w0().op(0x16).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermps", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x16).r(), (_64b | compat) & avx512f),
+        inst("vpermq", fmt("X", [w(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w1().op(0x36).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermq", fmt("H", [w(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w1().op(0x36).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermq", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w1().op(0x36).r(), (_64b | compat) & avx512f),
+        inst("vpermpd", fmt("X", [w(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w1().op(0x16).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermpd", fmt("H", [w(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w1().op(0x16).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermpd", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w1().op(0x16).r(), (_64b | compat) & avx512f),
+        // Two-source: vpermt2* — xmm1 is the index (read-write),
+        // xmm2 the low table, xmm_m the high table.
+        inst("vpermt2d", fmt("X", [rw(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w0().op(0x7E).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2d", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w0().op(0x7E).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2d", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x7E).r(), (_64b | compat) & avx512f),
+        inst("vpermt2q", fmt("X", [rw(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w1().op(0x7E).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2q", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w1().op(0x7E).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2q", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w1().op(0x7E).r(), (_64b | compat) & avx512f),
+        inst("vpermt2ps", fmt("X", [rw(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w0().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2ps", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w0().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2ps", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x7F).r(), (_64b | compat) & avx512f),
+        inst("vpermt2pd", fmt("X", [rw(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2pd", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
+        inst("vpermt2pd", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f),
 ]
 }

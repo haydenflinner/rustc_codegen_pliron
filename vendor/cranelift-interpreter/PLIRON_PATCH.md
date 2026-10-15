@@ -2,7 +2,7 @@
 
 Vendored from crates.io cranelift-interpreter 0.135.5 because its `step`
 matches `Opcode` exhaustively, and the vendored cranelift-codegen adds
-`x86_psadbw`, `ctz_nonzero` and `sdot`/`udot`/`udot_acc`.
+`x86_psadbw`, `ctz_nonzero`, `sdot`/`udot`/`udot_acc` and `vswizzle`/`vswizzle2`.
 Changes, all in `src/step.rs`:
 
 - arms for those opcodes (marked `PLIRON:`); the dot-product arms

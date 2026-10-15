@@ -21,3 +21,10 @@ Submit upstream once proven, then drop this copy.
    Y (avx2) and Z (avx512bw), `vpdpbusd` Y (avx_vnni), H (avx512vnni+vl),
    Z (avx512vnni). Feeds the `sdot`/`udot`/`udot_acc` CLIF opcodes
    (cranelift-codegen patch 26).
+
+4. `src/instructions/wide.rs`: runtime-index permutes — `vpermd`/
+   `vpermps` X/Z (avx512f, +vl at 128), `vpermq`/`vpermpd` X/H/Z
+   (EVEX reg-index qword permute; avx512f, +vl at 128/256), and
+   `vpermt2d`/`vpermt2q`/`vpermt2ps`/`vpermt2pd` X/H/Z two-source
+   forms (index is the read-write first operand). Feeds
+   `vswizzle`/`vswizzle2` (cranelift-codegen patch 27).

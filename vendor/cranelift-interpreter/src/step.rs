@@ -1351,6 +1351,36 @@ where
                 .collect::<ValueResult<SimdVec<DataValue>>>()?;
             assign(vectorizelanes(&out, ctrl_ty)?)
         }
+        Opcode::Vswizzle => {
+            // PLIRON: a[i] = x[idx[i] mod N].
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let idxs = extractlanes(&arg(1), arg(1).ty())?;
+            let n = xs.len() as u128;
+            let out = idxs
+                .into_iter()
+                .map(|i| {
+                    let j = (i.into_int_unsigned()? % n) as usize;
+                    Ok(xs[j].clone())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::Vswizzle2 => {
+            // PLIRON: idx selects across x ++ y (vpermt2* semantics).
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let ys = extractlanes(&arg(1), ctrl_ty)?;
+            let idxs = extractlanes(&arg(2), arg(2).ty())?;
+            let table: Vec<DataValue> = xs.into_iter().chain(ys).collect();
+            let n = table.len() as u128;
+            let out = idxs
+                .into_iter()
+                .map(|i| {
+                    let j = (i.into_int_unsigned()? % n) as usize;
+                    Ok(table[j].clone())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
         Opcode::UdotAcc => {
             let accs = extractlanes(&arg(0), ctrl_ty)?;
             let xs = extractlanes(&arg(1), arg(1).ty())?;

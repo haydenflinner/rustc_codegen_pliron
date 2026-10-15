@@ -321,3 +321,16 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `udot_acc` prefers the VEX AVX-VNNI form, falls back to the EVEX
     AVX512-VNNI(+VL) forms; byte/word 512-bit forms gate on
     `has_avx512bw`.
+
+27. x64 runtime-index swizzles (`src/isa/x64/lower.isle`): new CLIF
+    opcodes `vswizzle` (`a[i] = x[idx[i] mod N]` — a register-indexed
+    crossbar `shuffle`, sidestepping `shuffle`'s fixed `uimm128` mask)
+    and `vswizzle2` (`a[i] = (x++y)[idx[i] mod 2N]`, x86 `vpermt2*`
+    semantics — the index operand is the read-write register).
+    Definitions in `vendor/cranelift-codegen-meta` patch 2; index
+    operand is a free typevar (idx lane count/width relation to the
+    data vector is enforced by the concrete-type lowering rules).
+    Dword forms: `vpermd`/`vpermps` Y (avx2), X/Z (avx512f, +vl at
+    128); qword reg-index permutes are EVEX-only: `vpermq`/`vpermpd`
+    X/H/Z (avx512f, +vl at 128/256). `vswizzle2` X/H/Z `vpermt2d`/
+    `vpermt2q`/`vpermt2ps`/`vpermt2pd` (avx512f, +vl at 128/256).

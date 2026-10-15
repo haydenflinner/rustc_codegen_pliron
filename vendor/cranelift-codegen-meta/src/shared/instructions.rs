@@ -3146,6 +3146,72 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", I32xN)]),
     );
 
+    // PLIRON: runtime-index swizzles. `vswizzle` picks each result lane
+    // from one source vector by a per-lane index vector — a crossbar
+    // `shuffle` with the mask in a register (x86 `vperm*`), which
+    // sidesteps `shuffle`'s fixed `uimm128` mask entirely. `vswizzle2`
+    // selects across two concatenated sources (x86 `vpermt2*`).
+    let PermVec = &TypeVar::new(
+        "PermVec",
+        "A SIMD vector type with 32- or 64-bit lanes",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .floats(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let IdxVec = &TypeVar::new(
+        "IdxVec",
+        "An integer index vector for a runtime swizzle",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vswizzle",
+            r#"
+        Runtime-index vector swizzle.
+
+        `a[i] = x[idx[i]]`: each result lane takes the lane of `x` that
+        its `idx` lane selects (indices are interpreted modulo the lane
+        count). `idx` is an integer vector with the same lane count and
+        lane width as `x` — on x86 the permute index lives in lanes
+        matching the permuted element size.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", PermVec),
+            Operand::new("idx", IdxVec),
+        ])
+        .operands_out(vec![Operand::new("a", PermVec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "vswizzle2",
+            r#"
+        Runtime-index swizzle across two source vectors.
+
+        `a[i] = idx[i] < N ? x[idx[i]] : y[idx[i] - N]` where `N` is the
+        lane count: the index vector selects from `x` and `y`
+        concatenated (x86 `vpermt2*` semantics).
+        "#,
+            &formats.ternary,
+        )
+        .operands_in(vec![
+            Operand::new("x", PermVec),
+            Operand::new("y", PermVec),
+            Operand::new("idx", IdxVec),
+        ])
+        .operands_out(vec![Operand::new("a", PermVec)]),
+    );
+
     ig.push(
         Inst::new(
             "uextend",
