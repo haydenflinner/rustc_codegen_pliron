@@ -31,6 +31,39 @@ use crate::loadfwd::{self, Root};
 /// A read demand: root, byte offset, byte width.
 type DLoc = (Root, i64, i64);
 
+/// Byte ranges `(off, width)` under one root, kept sorted and deduped so
+/// `Demands`'s `PartialEq` is insensitive to union order.
+type Ranges = Vec<(i64, i64)>;
+
+/// Insert `(o, w)` into a sorted `Ranges`; false if already present.
+fn rput(v: &mut Ranges, o: i64, w: i64) -> bool {
+    match v.binary_search(&(o, w)) {
+        Ok(_) => false,
+        Err(i) => {
+            v.insert(i, (o, w));
+            true
+        }
+    }
+}
+
+/// Drop entries covered by a write of `[o, o+w)`; returns how many went.
+fn rkill(v: &mut Ranges, o: i64, w: i64) -> usize {
+    let n = v.len();
+    v.retain(|&(o2, w2)| o2 < o || o2 + w2 > o + w);
+    n - v.len()
+}
+
+/// `a ∩= b` on per-root range maps (entry-wise set intersection).
+fn isect(a: &mut FxHashMap<Root, Ranges>, b: &FxHashMap<Root, Ranges>) {
+    a.retain(|r, v| match b.get(r) {
+        Some(bv) => {
+            v.retain(|x| bv.binary_search(x).is_ok());
+            !v.is_empty()
+        }
+        None => false,
+    });
+}
+
 const MAX_LOCS: usize = 256;
 const MAX_ITERS: usize = 32;
 
@@ -47,18 +80,26 @@ const MAX_ITERS: usize = 32;
 /// definitely rewrites later: it satisfies the blanket top demands on
 /// exactly those bytes, so a store chain `st A; st A` collapses even when
 /// the only pending demand is a return or barrier.
+///
+/// `locs`/`cov` index ranges by root: stores consult only their own
+/// root's vec instead of scanning every pending demand, and the
+/// cross-root may-alias rule for non-isolated roots reduces to "any
+/// non-iso root key present". `nlocs`/`ncov` cache the entry counts for
+/// the `MAX_LOCS` overflow accounting.
 #[derive(Clone, PartialEq, Eq, Default)]
 struct Demands {
     top_non_iso: bool,
     top_non_stack: bool,
-    locs: FxHashSet<DLoc>,
+    locs: FxHashMap<Root, Ranges>,
+    nlocs: usize,
     /// Whole-root demands for when `locs` overflows: conservative, never
     /// cleared (a store covers one range, not a whole root).
     roots: FxHashSet<Root>,
     /// Bytes a live store provably rewrites before any still-pending read.
     /// Satisfies top demands per-range; `roots` demands stay unsatisfiable
     /// (the lost precision means the read may predate the covering store).
-    cov: FxHashSet<DLoc>,
+    cov: FxHashMap<Root, Ranges>,
+    ncov: usize,
 }
 
 impl Demands {
@@ -68,28 +109,38 @@ impl Demands {
     fn union(&mut self, o: &Demands) {
         self.top_non_iso |= o.top_non_iso;
         self.top_non_stack |= o.top_non_stack;
-        self.locs.extend(o.locs.iter().copied());
-        if self.locs.len() > MAX_LOCS {
-            self.roots.extend(self.locs.iter().map(|l| l.0));
+        for (r, v) in &o.locs {
+            for &(x, w) in v {
+                if rput(self.locs.entry(*r).or_default(), x, w) {
+                    self.nlocs += 1;
+                }
+            }
+        }
+        if self.nlocs > MAX_LOCS {
+            self.roots.extend(self.locs.keys().copied());
             self.locs.clear();
+            self.nlocs = 0;
         }
         self.roots.extend(o.roots.iter().copied());
     }
 
     /// Does some live read demand a byte of `[o, o+w)` on root `r`?
     fn read(&self, r: Root, o: i64, w: i64, iso: &FxHashSet<Root>) -> bool {
-        if self.locs.iter().any(|&(r2, o2, w2)| match (r, r2) {
-            _ if r == r2 => o < o2 + w2 && o2 < o + w,
-            _ => !iso.contains(&r) && !iso.contains(&r2),
-        }) || self.roots.contains(&r)
-        {
+        let overlap = |v: &Ranges| v.iter().any(|&(o2, w2)| o < o2 + w2 && o2 < o + w);
+        // Same-root ranges need the byte check; a non-isolated `r` also
+        // may-aliases any demand on another non-isolated root.
+        let hit = self.locs.get(&r).is_some_and(overlap)
+            || (!iso.contains(&r)
+                && self.locs.keys().any(|r2| *r2 != r && !iso.contains(r2)));
+        if hit || self.roots.contains(&r) {
             return true;
         }
         ((self.top_non_iso && !iso.contains(&r))
             || (self.top_non_stack && matches!(r, Root::V(_))))
-            && !self.cov.iter().any(|&(r2, o2, w2)| {
-                r2 == r && o2 <= o && o + w <= o2 + w2
-            })
+            && !self
+                .cov
+                .get(&r)
+                .is_some_and(|v| v.iter().any(|&(o2, w2)| o2 <= o && o + w <= o2 + w2))
     }
 
     /// A write of `[o, o+w)` on `r` satisfies the demands it provably
@@ -97,21 +148,31 @@ impl Demands {
     /// own range also joins `cov` so earlier stores under a blanket demand
     /// can die.
     fn written(&mut self, r: Root, o: i64, w: i64) {
-        self.locs
-            .retain(|&(r2, o2, w2)| r2 != r || o2 < o || o2 + w2 > o + w);
-        self.cov
-            .retain(|&(r2, o2, w2)| r2 != r || o2 < o || o2 + w2 > o + w);
-        if self.cov.len() < MAX_LOCS {
-            self.cov.insert((r, o, w));
+        if let Some(v) = self.locs.get_mut(&r) {
+            self.nlocs -= rkill(v, o, w);
+            if v.is_empty() {
+                self.locs.remove(&r);
+            }
+        }
+        if let Some(v) = self.cov.get_mut(&r) {
+            self.ncov -= rkill(v, o, w);
+            if v.is_empty() {
+                self.cov.remove(&r);
+            }
+        }
+        if self.ncov < MAX_LOCS
+            && rput(self.cov.entry(r).or_default(), o, w)
+        {
+            self.ncov += 1;
         }
     }
 
     /// Add a read of `[o, o+w)` on `r`.
     fn demand(&mut self, r: Root, o: i64, w: i64) {
-        if self.locs.len() >= MAX_LOCS {
+        if self.nlocs >= MAX_LOCS {
             self.roots.insert(r);
-        } else {
-            self.locs.insert((r, o, w));
+        } else if rput(self.locs.entry(r).or_default(), o, w) {
+            self.nlocs += 1;
         }
     }
 
@@ -123,8 +184,10 @@ impl Demands {
         self.top_non_iso = true;
         if iso.is_empty() {
             self.cov.clear();
+            self.ncov = 0;
         } else {
-            self.cov.retain(|&(r, _, _)| iso.contains(&r));
+            self.cov.retain(|r, _| iso.contains(r));
+            self.ncov = self.cov.values().map(Vec::len).sum();
         }
     }
 
@@ -136,9 +199,11 @@ impl Demands {
         self.read_barrier(iso);
         if iso.is_empty() {
             self.locs.clear();
+            self.nlocs = 0;
             self.roots.clear();
         } else {
-            self.locs.retain(|&(r, _, _)| iso.contains(&r));
+            self.locs.retain(|r, _| iso.contains(r));
+            self.nlocs = self.locs.values().map(Vec::len).sum();
             self.roots.retain(|r| iso.contains(r));
         }
     }
@@ -377,16 +442,17 @@ pub fn run(
         // counts covered only when every successor path rewrites it. A
         // successor with no recorded state claims no coverage — a
         // never-written `inn` entry is the empty `Demands`, same thing.
-        let mut cov: Option<FxHashSet<DLoc>> = None;
+        let mut cov: Option<FxHashMap<Root, Ranges>> = None;
         for s in cfg.succ_iter(b) {
             let i = &inn[s];
             match &mut cov {
                 None => cov = Some(i.cov.clone()),
-                Some(c) => c.retain(|l| i.cov.contains(l)),
+                Some(c) => isect(c, &i.cov),
             }
             d.union(i);
         }
         d.cov = cov.unwrap_or_default();
+        d.ncov = d.cov.values().map(Vec::len).sum();
         // The old sweep also unioned `out[b]` back in (widen demands,
         // intersect coverage) to stop a store-demand flip-flop from
         // oscillating (hashmap's loop-carried `&key` slot). The worklist
@@ -399,8 +465,14 @@ pub fn run(
         }
         let mut din = d.clone();
         transfer(&ops[b], &mut din, &iso, None);
-        din.union(&inn[b]);
-        din.cov.retain(|l| inn[b].cov.contains(l));
+        // `done` is also "inn[b] was computed": only then does the old
+        // state widen this result — the flip-flop guard. A first visit
+        // keeps its coverage whole, else `∩ empty` would erase it.
+        if done[b] {
+            din.union(&inn[b]);
+            isect(&mut din.cov, &inn[b].cov);
+            din.ncov = din.cov.values().map(Vec::len).sum();
+        }
         out[b] = d;
         done[b] = true;
         if din != inn[b] {
