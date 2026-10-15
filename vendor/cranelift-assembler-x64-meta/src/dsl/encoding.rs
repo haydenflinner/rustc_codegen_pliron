@@ -841,6 +841,9 @@ pub enum VexEscape {
     _0F,
     _0F3A,
     _0F38,
+    /// EVEX-only maps (AVX512-FP16).
+    _MAP5,
+    _MAP6,
 }
 
 impl VexEscape {
@@ -851,6 +854,8 @@ impl VexEscape {
             Self::_0F => 0b01,
             Self::_0F38 => 0b10,
             Self::_0F3A => 0b11,
+            Self::_MAP5 => 0b101,
+            Self::_MAP6 => 0b110,
         }
     }
 }
@@ -861,6 +866,8 @@ impl fmt::Display for VexEscape {
             Self::_0F => write!(f, "0F"),
             Self::_0F3A => write!(f, "0F3A"),
             Self::_0F38 => write!(f, "0F38"),
+            Self::_MAP5 => write!(f, "MAP5"),
+            Self::_MAP6 => write!(f, "MAP6"),
         }
     }
 }
@@ -1308,6 +1315,18 @@ impl Evex {
             mmm: Some(VexEscape::_0F38),
             ..self
         }
+    }
+
+    /// EVEX `MAP5` (AVX512-FP16 arithmetic).
+    pub fn _map5(self) -> Self {
+        assert!(self.mmm.is_none());
+        Self { mmm: Some(VexEscape::_MAP5), ..self }
+    }
+
+    /// EVEX `MAP6` (AVX512-FP16 FMA).
+    pub fn _map6(self) -> Self {
+        assert!(self.mmm.is_none());
+        Self { mmm: Some(VexEscape::_MAP6), ..self }
     }
 
     /// Set the `W` bit to `0`; equivalent to `.W0` in the manual.

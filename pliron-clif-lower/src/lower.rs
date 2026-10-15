@@ -874,6 +874,9 @@ pub fn lower_module(
         };
         if let Some(v) = &code.vcode {
             eprintln!("==== vcode {} ====\n{v}", j.name);
+            if let Some(d) = crate::env_get("PLIRON_CODEBIN") {
+                let _ = std::fs::write(format!("{d}/{}.bin", j.name), code.buffer.data());
+            }
         }
         let relocs: Vec<cranelift_module::ModuleReloc> = code
             .buffer
@@ -2605,10 +2608,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // missing), so f16 promotes to f32 — exact in, single
                     // rounding out — while f128 uses the quad helpers.
                     let v = if t == clt::F16 {
-                        let x = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*x])[0];
-                        let y = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*y])[0];
+                        let x = self.h2f(*x);
+                        let y = self.h2f(*y);
                         let v = self.b.ins().$m(x, y);
-                        self.libcall("__truncsfhf2", &[clt::F32], &[t], &[v])[0]
+                        self.f2h(v)
                     } else if t == clt::F128 {
                         self.libcall($tf, &[t, t], &[t], &[*x, *y])[0]
                     } else {
@@ -2882,8 +2885,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // Cranelift has no f16 compare either; promote both sides to
                 // f32 (lossless, preserves every predicate incl. NaN cases)
                 // via compiler-builtins and compare there.
-                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
-                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let a = self.h2f(a);
+                let b = self.h2f(b);
                 let r = self.b.ins().fcmp(cc, a, b);
                 return self.set1(op, r);
             }
@@ -2928,10 +2931,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let b = self.get1(opnds[1]);
             let t = self.b.func.dfg.value_type(a);
             let r = if t == clt::F16 {
-                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
-                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let a = self.h2f(a);
+                let b = self.h2f(b);
                 let m = self.libcall("fmodf", &[clt::F32, clt::F32], &[clt::F32], &[a, b])[0];
-                self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[m])[0]
+                self.f2h(m)
             } else if t == clt::F128 {
                 // compiler-builtins' libm port exports `fmodf128`.
                 self.libcall("fmodf128", &[t, t], &[t], &[a, b])[0]
@@ -2974,12 +2977,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let half = |t: ClType| t.lane_type() == clt::F16;
             let r = if half(rts[0]) || half(self.b.func.dfg.value_type(xs[0])) {
                 let mut r = Vals::new();
-                for (&x, &t) in xs.iter().zip(&rts) {
-                    r.push(if is!(FPExtOp) {
-                        self.b.ins().fvpromote_f16(t, x)
-                    } else {
-                        self.b.ins().fvdemote_f16(t, x)
-                    });
+                if xs.len() == rts.len() {
+                    for (&x, &t) in xs.iter().zip(&rts) {
+                        r.push(if is!(FPExtOp) {
+                            self.b.ins().fvpromote_f16(t, x)
+                        } else {
+                            self.b.ins().fvdemote_f16(t, x)
+                        });
+                    }
+                } else if is!(FPExtOp) {
+                    // f16x32 leaves (native FP16) <-> pairs of f32x16.
+                    for &x in xs.iter() {
+                        r.push(self.b.ins().fvpromote_f16_lo(rts[0], x));
+                        r.push(self.b.ins().fvpromote_f16_hi(rts[0], x));
+                    }
+                } else {
+                    for p in xs.chunks(2) {
+                        r.push(self.b.ins().fvdemote_f16_pair(p[0], p[1]));
+                    }
                 }
                 r
             } else {
@@ -2997,6 +3012,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
             } else if is!(FPTruncOp) && bf(self.res_ty(op)) {
                 let f = if from == clt::F32 { x } else { self.b.ins().fdemote(clt::F32, x) };
                 self.f32_to_bf16(f)
+            } else if from == clt::F16 && t == clt::F32 {
+                self.h2f(x)
+            } else if from == clt::F32 && t == clt::F16 {
+                self.f2h(x)
             } else if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
                 // Cranelift x64 can't convert f16/f128; use compiler-builtins.
                 let l = |t: ClType| match t {
@@ -3048,7 +3067,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 } else {
                     self.b.ins().fcvt_from_uint(clt::F32, x)
                 };
-                self.libcall("__truncsfhf2", &[clt::F32], &[t], &[f32v])[0]
+                self.f2h(f32v)
             } else if t == clt::F128 {
                 // No cranelift int->f128 conversion either; compiler-builtins.
                 let isx = match it.bits() {
@@ -3610,7 +3629,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if ft == clt::F16 {
             // compiler-builtins doesn't ship `__fix*hf*`; f16->f32 is exact,
             // so extending first preserves the saturating result.
-            let x = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0];
+            let x = self.h2f(x);
             return self.fcvt_sat(signed, t, x);
         }
         if t == clt::I128 || ft == clt::F128 {
@@ -4262,13 +4281,31 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().bitcast(clt::F16, mf, h)
     }
 
+    /// f16 -> f32: F16C `vcvtph2ps` when the host enables it, else compiler-builtins.
+    fn h2f(&mut self, x: ir::Value) -> ir::Value {
+        if crate::types::F16C.load(std::sync::atomic::Ordering::Relaxed) {
+            self.b.ins().fpromote(clt::F32, x)
+        } else {
+            self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0]
+        }
+    }
+
+    /// f32 -> f16 (round to nearest even), F16C `vcvtps2ph` when enabled.
+    fn f2h(&mut self, x: ir::Value) -> ir::Value {
+        if crate::types::F16C.load(std::sync::atomic::Ordering::Relaxed) {
+            self.b.ins().fdemote(clt::F16, x)
+        } else {
+            self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[x])[0]
+        }
+    }
+
     /// Float binop by name; f16 widens to f32 like `float_binop!`.
     fn fbin(&mut self, k: &str, x: ir::Value, y: ir::Value) -> ir::Value {
         let t = self.b.func.dfg.value_type(x);
         let h = t == clt::F16;
         let (x, y) = if h {
-            let x = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[x])[0];
-            let y = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[y])[0];
+            let x = self.h2f(x);
+            let y = self.h2f(y);
             (x, y)
         } else {
             (x, y)
@@ -4282,7 +4319,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             _ => i.fmin(x, y),
         };
         if h {
-            self.libcall("__truncsfhf2", &[clt::F32], &[t], &[r])[0]
+            self.f2h(r)
         } else {
             r
         }
@@ -4733,7 +4770,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // f16 widens to f32: exact for these (sqrt/rounding are
                     // innocuous under double rounding at 11 -> 24 bits).
                     a.iter()
-                        .map(|&x| self.libcall("__extendhfsf2", &[t], &[clt::F32], &[x])[0])
+                        .map(|&x| self.h2f(x))
                         .collect()
                 } else {
                     a.to_vec()
@@ -4767,7 +4804,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                 };
                 if h {
-                    self.libcall("__truncsfhf2", &[clt::F32], &[t], &[r])[0]
+                    self.f2h(r)
                 } else {
                     r
                 }
@@ -4806,11 +4843,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // No f16 libm on most hosts: widen, call the f32 form, narrow.
                     let w: Vec<_> = a
                         .iter()
-                        .map(|&x| self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0])
+                        .map(|&x| self.h2f(x))
                         .collect();
                     let ps = vec![clt::F32; w.len()];
                     let m = self.libcall(&format!("{base}f"), &ps, &[clt::F32], &w)[0];
-                    let r = self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[m])[0];
+                    let r = self.f2h(m);
                     return self.set1(op, r);
                 }
                 let f = match t {

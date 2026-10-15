@@ -1248,6 +1248,10 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
 /// 256/512 when a JIT host emits ymm/zmm values. Register moves and spills of
 /// the float class use this width, so set it before compiling and only on
 /// CPUs with AVX (256) / AVX-512F (512).
+/// Host-detected AVX512-FP16 (+VL); no isa flag exists for it upstream.
+pub static NATIVE_FP16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Widest vector register class pliron may use (128 / 256 / 512 bits).
 pub static WIDE_VECTOR_BITS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(128);
 
@@ -1631,6 +1635,10 @@ impl asm::AvailableFeatures for &EmitInfo {
 
     fn avx512f(&self) -> bool {
         self.isa_flags.has_avx512f()
+    }
+
+    fn avx512fp16(&self) -> bool {
+        NATIVE_FP16.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     fn avx512vl(&self) -> bool {

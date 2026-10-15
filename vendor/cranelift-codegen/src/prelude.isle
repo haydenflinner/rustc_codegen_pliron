@@ -271,6 +271,7 @@
 
 (extern const $F16X8 Type)
 (extern const $F16X16 Type)
+(extern const $F16X32 Type)
 (extern const $F32X4 Type)
 (extern const $F32X8 Type)
 (extern const $F32X16 Type)

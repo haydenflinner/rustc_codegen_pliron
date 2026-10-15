@@ -218,6 +218,11 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
 pub static WIDE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// CubeCL: widest `f32` vector leaf (256 = ymm, 512 = zmm); 0 disables.
+/// Host has AVX512-FP16: packed f16 arithmetic stays in f16 (no f32 twin).
+pub static NATIVE_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Scalar f16<->f32 casts as F16C `vcvtph2ps`/`vcvtps2ph` instead of libcalls (host opt-in).
+pub static F16C: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub static WIDE_F32_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 thread_local! {
@@ -241,6 +246,14 @@ fn wide_f32_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)>
     let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
     if bits < 256 || !WIDE_F32.with(|w| w.borrow().contains(&(e, n))) {
         return None;
+    }
+    if bits >= 512
+        && NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed)
+        && e.deref(ctx).is::<FP16Type>()
+        && n % 32 == 0
+    {
+        // Native FP16: full zmm of half lanes; casts split into two f32x16.
+        return Some((clt::F16X32, n / 32));
     }
     [512u64, 256]
         .into_iter()

@@ -2957,6 +2957,9 @@
 ;; Rules for `fpromote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (rule (lower (fpromote $F64 x))
       (x64_cvtss2sd (xmm_zero $F64X2) x))
+;; F16C scalar f16 -> f32 (only emitted when the host enables F16C).
+(rule (lower (fpromote $F32 x))
+      (x64_vcvtph2ps_x (xmm_to_xmm_mem_128 x)))
 
 ;; Rules for `fvpromote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (rule (lower (fvpromote_low $F64X2 x))
@@ -2965,6 +2968,9 @@
 ;; Rules for `fdemote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (rule (lower (fdemote $F32 x))
       (x64_cvtsd2ss (xmm_zero $F32X4) x))
+;; F16C scalar f32 -> f16, round to nearest even.
+(rule (lower (fdemote $F16 x @ (value_type $F32)))
+      (x64_vcvtps2ph_x x 0))
 
 ;; Rules for `fvdemote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (rule (lower (fvdemote $F32X4 x))
@@ -5461,6 +5467,32 @@
 (rule (lower (fvpromote_f16 $F32X16 x)) (x64_vcvtph2ps_z (xmm_to_xmm_mem_128 x)))
 (rule (lower (fvdemote_f16 $F16X8 x)) (x64_vcvtps2ph_y x 0))
 (rule (lower (fvdemote_f16 $F16X16 x)) (x64_vcvtps2ph_z x 0))
+;; Native AVX512-FP16 (host sets NATIVE_FP16).
+(rule 6 (lower (fadd $F16X16 x y)) (x64_vaddph_y x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fsub $F16X16 x y)) (x64_vsubph_y x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fmul $F16X16 x y)) (x64_vmulph_y x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fdiv $F16X16 x y)) (x64_vdivph_y x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fma $F16X16 x y z)) (x64_vfmadd213ph_y x y (xmm_to_xmm_mem_128 z)))
+(rule 6 (lower (load $F16X32 (little_or_native_endian flags) address offset))
+      (x64_vmovups_za (synthetic_amode_to_xmm_mem_128 (to_amode flags address offset))))
+(rule 6 (lower (store (little_or_native_endian flags) value @ (value_type $F16X32) address offset))
+      (side_effect (x64_vmovups_zb_mem (to_amode flags address offset) value)))
+(rule 6 (lower (vconst $F16X32 const))
+      (x64_vmovups_za (synthetic_amode_to_xmm_mem_128 (const_to_synthetic_amode (const_to_vconst const)))))
+(rule (lower (fvpromote_f16_lo $F32X16 x)) (x64_vcvtph2ps_z (xmm_to_xmm_mem_128 x)))
+(rule (lower (fvpromote_f16_hi $F32X16 x)) (x64_vcvtph2ps_z (xmm_to_xmm_mem_128 (x64_vextractf64x4_z x 1))))
+(rule (lower (fvdemote_f16_pair $F16X32 x y))
+      (x64_vinsertf64x4_z (x64_vcvtps2ph_z x 0) (xmm_to_xmm_mem_128 (x64_vcvtps2ph_z y 0)) 1))
+(rule 6 (lower (fadd $F16X32 x y)) (x64_vaddph_z x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fsub $F16X32 x y)) (x64_vsubph_z x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fmul $F16X32 x y)) (x64_vmulph_z x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fdiv $F16X32 x y)) (x64_vdivph_z x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fma $F16X32 x y z)) (x64_vfmadd213ph_z x y (xmm_to_xmm_mem_128 z)))
+(rule 6 (lower (fadd $F16X8 x y)) (x64_vaddph_x x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fsub $F16X8 x y)) (x64_vsubph_x x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fmul $F16X8 x y)) (x64_vmulph_x x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fdiv $F16X8 x y)) (x64_vdivph_x x (xmm_to_xmm_mem_128 y)))
+(rule 6 (lower (fma $F16X8 x y z)) (x64_vfmadd213ph_x x y (xmm_to_xmm_mem_128 z)))
 (rule 6 (lower (vconst $F16X16 const))
       (x64_vmovups_ya (synthetic_amode_to_xmm_mem_128 (const_to_synthetic_amode (const_to_vconst const)))))
 (rule 6 (lower (vconst $F32X8 const))

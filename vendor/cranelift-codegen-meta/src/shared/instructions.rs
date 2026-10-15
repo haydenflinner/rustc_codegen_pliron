@@ -3170,6 +3170,31 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", F16Vec)]),
     );
 
+    for (name, half) in [("fvpromote_f16_lo", "low"), ("fvpromote_f16_hi", "high")] {
+        ig.push(
+            Inst::new(
+                name,
+                &format!("Convert the {half} half of the f16 lanes of `x` to f32 (exact)."),
+                &formats.unary,
+            )
+            .operands_in(vec![Operand::new("x", &F32Vec.split_lanes())])
+            .operands_out(vec![Operand::new("a", F32Vec)]),
+        );
+    }
+
+    ig.push(
+        Inst::new(
+            "fvdemote_f16_pair",
+            r#"
+        Convert `x` (low half) and `y` (high half) to one f16 vector of twice the
+        lanes, rounding to nearest, ties to even.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![Operand::new("x", F32Vec), Operand::new("y", F32Vec)])
+        .operands_out(vec![Operand::new("a", &F32Vec.split_lanes())]),
+    );
+
     let F64x2 = &TypeVar::new(
         "F64x2",
         "A SIMD vector type consisting of 2 lanes of 64-bit floats",

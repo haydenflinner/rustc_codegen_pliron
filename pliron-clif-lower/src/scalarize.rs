@@ -63,7 +63,11 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
         .iter()
         .filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| e.deref(ctx).is::<FP16Type>()) && simd_leaves(ctx, t))
         .count();
-    let ok = if bfv + hfv == 0 { leafwise_kind(ctx, op) } else { cast && bfv + hfv == 1 };
+    let ok = if bfv + hfv == 0 {
+        leafwise_kind(ctx, op)
+    } else {
+        (cast && bfv + hfv == 1) || (bfv == 0 && native_f16() && f16_native_arith(ctx, op))
+    };
     ok && tys.iter().all(|&t| simd_leaves(ctx, t))
 }
 
@@ -262,6 +266,9 @@ fn f16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
     if op.deref(ctx).get_num_results() != 1 || !(lane_op || leafwise_kind(ctx, op)) {
         return false;
     }
+    if !lane_op && native_f16() && f16_native_arith(ctx, op) {
+        return false;
+    }
     let t = op.deref(ctx).get_result(0).get_type(ctx);
     match vec_of(ctx, t) {
         Some((e, n)) if e.deref(ctx).is::<FP16Type>() => {
@@ -447,7 +454,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     // A packed f16 vector needs its f32 twin wide too (casts map leaf to leaf).
     let wide: std::collections::HashSet<_> = ok
         .iter()
-        .filter(|&(&(e, n), &g)| g && (e != f16h || ok.get(&(f32h, n)) == Some(&true)))
+        .filter(|&(&(e, n), &g)| g && (e != f16h || ok.get(&(f32h, n)) != Some(&false)))
         .map(|x| *x.0)
         .collect();
     set_wide_f32(wide);
@@ -468,4 +475,24 @@ fn half_wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
     any!(LoadOp, StoreOp, FreezeOp, BrOp, CondBrOp, FPExtOp, FPTruncOp, ConstantOp, ZeroOp, PoisonOp, UndefOp)
+        || (native_f16() && f16_native_arith(ctx, op))
+}
+
+fn native_f16() -> bool {
+    crate::types::NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// f16 vector ops with an AVX512-FP16 lowering.
+fn f16_native_arith(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let id = Operation::get_opid(op, ctx);
+    macro_rules! any {
+        ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
+    }
+    any!(FAddOp, FSubOp, FMulOp, FDivOp)
+        || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+            let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+            ["llvm.fma", "llvm.fmuladd"]
+                .iter()
+                .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+        })
 }
