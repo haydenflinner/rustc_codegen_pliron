@@ -1,0 +1,284 @@
+; test bcheck
+; cobs::dec::decode_in_place: i8 iv + i64 stepped param and i64 len —
+; narrow guard must not emit mixed-width uadd_overflow/icmp; the check
+; goes the i128 wide path instead (was a verifier ICE at O3).
+
+function u0:0(i64 sret, i64, i64) apple_aarch64 {
+    ss0 = explicit_slot 24, align = 8
+    ss1 = explicit_slot 16, align = 8
+    ss2 = explicit_slot 16, align = 8
+    ss3 = explicit_slot 16, align = 8
+    ss4 = explicit_slot 16, align = 8
+    ss5 = explicit_slot 16, align = 8
+    ss6 = explicit_slot 16, align = 8
+    gv0 = symbol colocated userextname0
+    gv1 = symbol colocated userextname1
+    gv2 = symbol colocated userextname3
+    gv3 = symbol colocated userextname5
+    gv4 = symbol colocated userextname6
+    gv5 = symbol colocated userextname7
+    gv6 = symbol colocated userextname8
+    gv7 = symbol colocated userextname10
+    gv8 = symbol colocated userextname11
+    gv9 = symbol colocated userextname13
+    gv10 = symbol colocated userextname14
+    gv11 = symbol colocated userextname15
+    gv12 = symbol colocated userextname16
+    gv13 = symbol colocated userextname17
+    gv14 = symbol colocated userextname18
+    gv15 = symbol colocated userextname19
+    sig0 = (i64, i64, i8 uext, i64) apple_aarch64
+    sig1 = (i64, i64, i64) apple_aarch64
+    sig2 = (i64, i64, i64) apple_aarch64
+    sig3 = (i64) apple_aarch64
+    fn0 = colocated u0:24 sig0
+    fn1 = colocated u0:17 sig1
+    fn2 = colocated u0:22 sig2
+    fn3 = colocated u0:21 sig3
+
+block0(v0: i64, v1: i64, v2: i64):
+    v11 = iconst.i64 0
+    v12 = iconst.i64 0
+    v13 = iconst.i64 0
+    v14 = icmp eq v2, v13  ; v13 = 0
+    brif v14, block7, block8
+
+block8:
+    v23 = iconst.i64 1
+    v24 = imul.i64 v2, v23  ; v23 = 1
+    v25 = iadd.i64 v1, v24
+    v39 = icmp uge v25, v1
+    brif v39, block57, block82
+
+block82 cold:
+    v40 = symbol_value.i64 gv0
+    v49 = iconst.i64 403
+    v52 = iconst.i8 0
+    v53 = symbol_value.i64 gv1
+    call fn0(v40, v49, v52, v53)  ; v49 = 403, v52 = 0
+    trap user2
+
+block57:
+    v61 = isub.i64 v25, v1
+    v62 = iconst.i64 1
+    v63 = udiv v61, v62  ; v62 = 1
+    v73 = iconst.i64 1
+    v80 = iconst.i8 0
+    jump block59(v1)
+
+block59(v65: i64):
+    v305 = isub v65, v1
+    v72 = icmp eq v65, v25
+    brif v72, block62, block61
+
+block61:
+    v74 = iadd.i64 v65, v73  ; v73 = 1
+    v79 = load.i8 notrap v65
+    v81 = icmp eq v79, v80  ; v80 = 0
+    brif v81, block67, block66
+
+block66:
+    jump block59(v74)
+
+block67:
+    v86 = icmp.i64 ult v305, v63
+    brif v86, block87, block86
+
+block86 cold:
+    v87 = symbol_value.i64 gv3
+    v96 = iconst.i64 443
+    v99 = iconst.i8 0
+    v100 = symbol_value.i64 gv4
+    call fn0(v87, v96, v99, v100)  ; v96 = 443, v99 = 0
+    trap user2
+
+block87:
+    v102 = iconst.i64 1
+    jump block71(v102, v305)  ; v102 = 1
+
+block62:
+    v106 = iconst.i64 0
+    v107 = iconst.i64 0
+    jump block71(v106, v107)  ; v106 = 0, v107 = 0
+
+block71(v108: i64, v109: i64):
+    v112 = ireduce.i8 v108
+    v113 = iconst.i8 1
+    v114 = band v112, v113  ; v113 = 1
+    v294 = select v114, v109, v2
+    v194 = iconst.i64 1
+    v200 = iconst.i64 1
+    v299 = iconst.i8 -1
+    v134 = iconst.i8 1
+    v176 = iconst.i8 1
+    v160 = iconst.i64 1
+    v165 = iconst.i8 0
+    v167 = iconst.i64 1
+    v143 = iconst.i8 1
+    v124 = iconst.i64 1
+    v140 = iconst.i64 1
+    v302 = iconst.i64 1
+    v172 = iconst.i8 1
+    v181 = iconst.i64 1
+    jump block14(v11, v12)  ; v11 = 0, v12 = 0
+
+block14(v115: i64, v251: i64):
+    v117 = icmp ult v115, v294
+    brif v117, block16, block3
+
+block16:
+    v122 = icmp.i64 ult v115, v2
+    brif v122, block18, block19
+
+block19 cold:
+    v123 = symbol_value.i64 gv6
+    call fn2(v115, v2, v123)
+    trap user2
+
+block18:
+    v125 = imul.i64 v115, v124  ; v124 = 1
+    v126 = iadd.i64 v1, v125
+    v298 = uload8.i64 notrap v126
+    v127 = ireduce.i8 v298
+    v130 = iadd.i64 v115, v298
+    v131 = icmp ult v130, v115
+    brif v131, block21, block20
+
+block20:
+    v133 = icmp.i64 ugt v130, v294
+    brif v133, block23, block24
+
+block23:
+    v135 = icmp.i8 eq v127, v134  ; v134 = 1
+    brif v135, block24, block25
+
+block25:
+    v137 = iconst.i64 1
+    jump block2(v137, v251)  ; v137 = 1
+
+block24:
+    v141 = iadd.i64 v115, v140  ; v140 = 1
+    v142 = icmp ult v141, v115
+    brif v142, block27, block26
+
+block26:
+    jump block28(v143, v141, v251)  ; v143 = 1
+
+block28(v144: i8, v264: i64, v273: i64):
+    v145 = icmp ult v144, v127
+    brif v145, block30, block91
+
+block91:
+    v300 = icmp.i8 eq v127, v299  ; v299 = -1
+    brif v300, block14(v264, v273), block33
+
+block33:
+    v150 = icmp.i64 ult v264, v294
+    brif v150, block35, block14(v264, v273)
+
+block35:
+    v152 = icmp.i64 ult v273, v2
+    brif v152, block37, block36
+
+block36:
+    v156 = iconst.i64 2
+    v157 = iconst.i64 0
+    jump block2(v156, v157)  ; v156 = 2, v157 = 0
+
+block37:
+    v161 = imul.i64 v273, v160  ; v160 = 1
+    v162 = iadd.i64 v1, v161
+    store.i8 notrap v165, v162  ; v165 = 0
+    v168 = iadd.i64 v273, v167  ; v167 = 1
+    v169 = icmp ult v168, v273
+    brif v169, block40, block14(v264, v168)
+
+block40 cold:
+    v170 = symbol_value.i64 gv8
+    call fn3(v170)
+    trap user2
+
+block30:
+    v173 = iadd.i8 v144, v172  ; v172 = 1
+    v174 = icmp ult v173, v144
+    brif v174, block90, block89
+
+block89:
+    v177 = iadd.i8 v144, v176  ; v176 = 1
+    v179 = icmp.i64 ult v264, v2
+    brif v179, block41, block42
+
+block42 cold:
+    v180 = symbol_value.i64 gv9
+    call fn2(v264, v2, v180)
+    trap user2
+
+block41:
+    v182 = imul.i64 v264, v181  ; v181 = 1
+    v183 = iadd.i64 v1, v182
+    v184 = load.i8 notrap v183
+    v186 = icmp.i64 ult v273, v2
+    brif v186, block44, block36
+
+block44:
+    v195 = imul.i64 v273, v194  ; v194 = 1
+    v196 = iadd.i64 v1, v195
+    store.i8 notrap v184, v196
+    v201 = iadd.i64 v264, v200  ; v200 = 1
+    v202 = icmp ult v201, v264
+    brif v202, block46, block93
+
+block93:
+    v303 = iadd.i64 v273, v302  ; v302 = 1
+    v304 = icmp ult v303, v273
+    brif v304, block48, block28(v177, v201, v303)
+
+block48 cold:
+    v207 = symbol_value.i64 gv10
+    call fn3(v207)
+    trap user2
+
+block46 cold:
+    v208 = symbol_value.i64 gv11
+    call fn3(v208)
+    trap user2
+
+block90 cold:
+    v209 = symbol_value.i64 gv12
+    v218 = iconst.i64 367
+    v221 = iconst.i8 0
+    v222 = symbol_value.i64 gv13
+    call fn0(v209, v218, v221, v222)  ; v218 = 367, v221 = 0
+    trap user2
+
+block27 cold:
+    v223 = symbol_value.i64 gv14
+    call fn3(v223)
+    trap user2
+
+block21 cold:
+    v224 = symbol_value.i64 gv15
+    call fn3(v224)
+    trap user2
+
+block7:
+    v228 = iconst.i64 0
+    v229 = iconst.i64 0
+    jump block2(v228, v229)  ; v228 = 0, v229 = 0
+
+block3:
+    v236 = iconst.i64 8
+    v237 = iadd.i64 v0, v236  ; v236 = 8
+    store.i64 notrap v251, v237
+    v238 = iconst.i64 -1
+    store notrap v238, v0  ; v238 = -1
+    return
+
+block2(v296: i64, v297: i64):
+    store notrap v296, v0
+    v241 = iconst.i64 8
+    v242 = iadd.i64 v0, v241  ; v241 = 8
+    store notrap v297, v242
+    return
+}
+

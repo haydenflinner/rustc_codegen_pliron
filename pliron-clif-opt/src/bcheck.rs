@@ -1395,15 +1395,90 @@ fn run_loop(
     } else {
         types::I128
     };
-    let g = func.dfg.make_block();
-    let pb = func.layout.inst_block(entries[0].inst).unwrap();
-    func.layout.insert_block_after(g, pb);
     let gtys: Vec<Type> = func
         .dfg
         .block_params(h)
         .iter()
         .map(|&p| func.dfg.value_type(p))
         .collect();
+    // When every contribution to `hi` is a non-negative unsigned quantity,
+    // the wrap-catching semantics of the wide guard fall out of native
+    // add/sub/mul carry flags: emit it in `ity` and AND in `!carry` — a
+    // fraction of the i128 dependency chain.
+    let umax: u64 = if ity.bits() < 64 {
+        (1u64 << ity.bits()) - 1
+    } else {
+        u64::MAX
+    };
+    let kfits = |k: i64| k >= 0 && (k as u64) <= umax;
+    // `gval` rematerializes constants at the emit type but passes other
+    // loop-invariant operands through at their own type — which can be
+    // wider than the iv's when the check (or a stepped param) works in a
+    // wider index type. The narrow emission types every runtime operand
+    // `ity`; the wide one extends each to `wty`. A check whose operands
+    // fit neither can't be emitted — drop it before the guard exists (it
+    // stays counted in `total_checks`, so the partial-versioning
+    // accounting still treats it as residual).
+    let vty = |func: &Function, v: Value| func.dfg.value_type(func.dfg.resolve_aliases(v));
+    let narrowable = |func: &Function, c: &Chk| -> bool {
+        if ity == types::I128 {
+            return false;
+        }
+        let l_ok = |l: &Lin| match l {
+            Lin::K(_) => true,
+            // A constant term is rematerialized masked to `ity`; require
+            // it to fit so the emitted value equals the modeled one.
+            Lin::V(v) | Lin::N(v) => match iconst(func, *v) {
+                Some(k) => kfits(k),
+                None => vty(func, *v) == ity,
+            },
+            Lin::P(i) => gtys[*i] == ity,
+        };
+        // `len` is masked-const or compared at `ity` verbatim.
+        if iconst(func, c.len).is_none() && vty(func, c.len) != ity {
+            return false;
+        }
+        if c.bsub.is_some() {
+            return true;
+        }
+        let m_ok = match c.aff.m {
+            Lin::K(k) => kfits(k),
+            Lin::V(_) | Lin::P(_) => l_ok(&c.aff.m),
+            Lin::N(_) => false,
+        };
+        m_ok && c.aff.b.iter().all(|t| {
+            l_ok(&t.v)
+                && match t.v {
+                    Lin::K(kv) => kv
+                        .checked_mul(t.k)
+                        .is_some_and(|p| p >= 0 && (p as u64) <= umax),
+                    Lin::V(_) | Lin::P(_) => kfits(t.k),
+                    Lin::N(_) => false,
+                }
+        })
+    };
+    let fits_wide = |func: &Function, c: &Chk| -> bool {
+        let fits = |v: Value| {
+            iconst(func, v).is_some()
+                || {
+                    let t = vty(func, v);
+                    t.is_int() && !t.is_vector() && t.bits() <= wty.bits()
+                }
+        };
+        let l_fits = |l: &Lin| match l {
+            Lin::K(_) => true,
+            Lin::V(v) | Lin::N(v) => fits(*v),
+            Lin::P(i) => gtys[*i].is_int() && gtys[*i].bits() <= wty.bits(),
+        };
+        fits(c.len) && l_fits(&c.aff.m) && c.aff.b.iter().all(|t| l_fits(&t.v))
+    };
+    checks.retain(|c| narrowable(func, c) || fits_wide(func, c));
+    if checks.is_empty() {
+        bail!("no emit-compatible checks");
+    }
+    let g = func.dfg.make_block();
+    let pb = func.layout.inst_block(entries[0].inst).unwrap();
+    func.layout.insert_block_after(g, pb);
     let gp: Vec<Value> = gtys
         .iter()
         .map(|&t| func.dfg.append_block_param(g, t))
@@ -1430,23 +1505,15 @@ fn run_loop(
     };
     let mut pos = FuncCursor::new(func).at_bottom(g);
     let zext = |pos: &mut FuncCursor, v: Value| -> Value {
-        if ity == wty {
+        // `fits_wide` already capped operands at `wty`; a value already
+        // there passes through (`uextend` needs a strictly narrower src).
+        if pos.func.dfg.value_type(v) == wty {
             v
         } else {
             pos.ins().uextend(wty, v)
         }
     };
     let boundv = gval(&info, &gp, &mut pos, info.bound);
-    // When every contribution to `hi` is a non-negative unsigned quantity,
-    // the wrap-catching semantics of the wide guard fall out of native
-    // add/sub/mul carry flags: emit it in `ity` and AND in `!carry` — a
-    // fraction of the i128 dependency chain.
-    let umax: u64 = if ity.bits() < 64 {
-        (1u64 << ity.bits()) - 1
-    } else {
-        u64::MAX
-    };
-    let kfits = |k: i64| k >= 0 && (k as u64) <= umax;
     // Trip-count terms are only needed by affine checks. `t` is the last
     // counter value, in the index type; the wide path zextends it. `t_k`
     // is `t` when `bound`/`iv0` are entry constants — an `m*t` extremal
@@ -1520,28 +1587,8 @@ fn run_loop(
         })
     };
 
-    let narrowable = |c: &Chk| -> bool {
-        if ity == types::I128 {
-            return false;
-        }
-        if c.bsub.is_some() {
-            return true;
-        }
-        let m_ok = match c.aff.m {
-            Lin::K(k) => kfits(k),
-            Lin::V(_) | Lin::P(_) => true,
-            Lin::N(_) => false,
-        };
-        m_ok && c.aff.b.iter().all(|t| match t.v {
-            Lin::K(kv) => kv
-                .checked_mul(t.k)
-                .is_some_and(|p| p >= 0 && (p as u64) <= umax),
-            Lin::V(_) | Lin::P(_) => kfits(t.k),
-            Lin::N(_) => false,
-        })
-    };
     // Wide values are only needed when some check can't go narrow.
-    let any_wide = checks.iter().any(|c| !narrowable(c));
+    let any_wide = checks.iter().any(|c| !narrowable(pos.func, c));
     let (bw, tw, zero) = if any_wide {
         (
             Some(zext(&mut pos, boundv)),
@@ -1564,7 +1611,7 @@ fn run_loop(
             // `iv + k < len` is implied by `B - adj + k < len`; `wty`
             // keeps the bound arithmetic wrap-free.
             let d = info.adj.wrapping_sub(k);
-            let g = if narrowable(c) {
+            let g = if narrowable(pos.func, c) {
                 if let Some(bk) = iconst(pos.func, boundv) {
                     // Constant bound: the adjust is a fold — the compare
                     // alone remains (no overflow machinery to emit).
@@ -1603,7 +1650,7 @@ fn run_loop(
             });
             continue;
         }
-        if narrowable(c) {
+        if narrowable(pos.func, c) {
             let t = t.unwrap();
             // `m*t` as a machine constant: `s + C < len` then needs no
             // overflow flag — it's `s < len.saturating_sub(C)` — and the

@@ -22,6 +22,10 @@ type Pass = fn(&mut Function) -> usize;
 
 fn pass(name: &str) -> Pass {
     match name {
+        "bcheck" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::bcheck::run(f, &mut an, "filetest", true)
+        },
         "brif_fold" => clifpeep::brif_fold,
         "celim" => celim::run,
         "coldargs" => clifpeep::coldargs,
