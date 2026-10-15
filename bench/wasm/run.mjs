@@ -1,19 +1,23 @@
-// node run.mjs <llvm.wasm> <pliron.wasm> [name-filter]
+// node run.mjs <llvm.wasm> <pliron.wasm> [clif.wasm] [name-filter]
 //
-// Times every `k_<name>(iters)` export in both modules and prints a
+// Times every `k_<name>(iters)` export in the modules and prints a
 // comparison table, the wasm counterpart of bench/run.sh's criterion
 // run. `k_<name>_prep` (kernels whose input is consumed) is called
-// before each timed call and is not part of the timing.
+// before each timed call and is not part of the timing. With a third
+// module (the PLIRON_WASM_CLIF build) a second comparison column shows
+// what the CLIF pipeline buys over the dialect->waffle path.
 import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
-const [llvmPath, plirPath, filter = ""] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const filter = args.find((a) => !a.endsWith(".wasm")) ?? "";
+const [llvmPath, plirPath, clifPath] = args.filter((a) => a.endsWith(".wasm"));
 if (!llvmPath || !plirPath) {
-  console.error("usage: node run.mjs <llvm.wasm> <pliron.wasm> [name-filter]");
+  console.error("usage: node run.mjs <llvm.wasm> <pliron.wasm> [clif.wasm] [name-filter]");
   process.exit(2);
 }
 
-const SAMPLES = 5;
+const SAMPLES = 9;
 const TARGET_MS = 150; // per timed call
 
 async function load(p) {
@@ -22,8 +26,9 @@ async function load(p) {
   return { e: instance.exports, bytes: buf.length };
 }
 
+const mods = [{ tag: "pliron", path: plirPath, ...(await load(plirPath)) }];
+if (clifPath) mods.push({ tag: "clif", path: clifPath, ...(await load(clifPath)) });
 const L = await load(llvmPath);
-const P = await load(plirPath);
 
 // Call k_<name>_prep if present, then time e[k](iters).
 function timed(e, name, iters) {
@@ -33,22 +38,24 @@ function timed(e, name, iters) {
   return performance.now() - t0;
 }
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
-
-const kernels = Object.keys(L.e)
-  .filter((n) => n.startsWith("k_") && !n.endsWith("_prep") && typeof L.e[n] === "function")
-  .filter((n) => n.slice(2).includes(filter))
-  .sort();
+const ms = (t) => (t.toFixed(3) + "ms").padStart(9);
+const pct = (r) => (((r - 1) * 100).toFixed(1) + "%").padStart(8);
 
 console.log(`llvm   ${llvmPath} (${L.bytes} B)`);
-console.log(`pliron ${plirPath} (${P.bytes} B)`);
+for (const m of mods) console.log(`${m.tag.padEnd(7)}${m.path} (${m.bytes} B)`);
 console.log("");
-console.log(`${"kernel".padEnd(14)} ${"LLVM".padStart(9)} ${"pliron".padStart(9)} ${"change".padStart(8)}`);
+console.log(
+  `${"kernel".padEnd(14)} ${"LLVM".padStart(9)}${mods.map((m) => ` ${m.tag.padStart(9)} ${"change".padStart(8)}`).join("")}`,
+);
 
-const ratios = [];
-for (const name of kernels) {
+const ratios = mods.map(() => []);
+for (const name of Object.keys(L.e)
+  .filter((n) => n.startsWith("k_") && !n.endsWith("_prep") && typeof L.e[n] === "function")
+  .filter((n) => n.slice(2).includes(filter))
+  .sort()) {
   const tag = name.slice(2);
-  if (typeof P.e[name] !== "function") {
-    console.log(`${tag.padEnd(14)}  missing from pliron module`);
+  if (mods.some((m) => typeof m.e[name] !== "function")) {
+    console.log(`${tag.padEnd(14)}  missing from a pliron module`);
     continue;
   }
   // Correctness cross-check: one call's accumulator must agree.
@@ -56,37 +63,52 @@ for (const name of kernels) {
   try {
     L.e[`${name}_prep`]?.();
     const la = L.e[name](1);
-    P.e[`${name}_prep`]?.();
-    const pa = P.e[name](1);
-    if (la !== pa) note = `  (ret differs: ${la} vs ${pa})`;
+    for (const m of mods) {
+      m.e[`${name}_prep`]?.();
+      const pa = m.e[name](1);
+      if (la !== pa) note = `  (ret differs: ${la} vs ${pa})`;
+    }
   } catch (err) {
     console.log(`${tag.padEnd(14)}  trap: ${err.message}`);
     continue;
   }
   // Warm up (V8 Liftoff -> TurboFan tier-up), then pick iters for a
-  // ~TARGET_MS call on the slower of the two single-call times.
+  // ~TARGET_MS call on the slowest single-call time.
   timed(L.e, name, 1);
-  timed(P.e, name, 1);
-  const t1 = timed(L.e, name, 1);
-  const t2 = timed(P.e, name, 1);
-  const iters = Math.max(1, Math.min(200, Math.round(TARGET_MS / Math.max(t1, t2, 0.01))));
+  for (const m of mods) timed(m.e, name, 1);
+  const ts = [timed(L.e, name, 1), ...mods.map((m) => timed(m.e, name, 1))];
+  const iters = Math.max(1, Math.min(200, Math.round(TARGET_MS / Math.max(...ts, 0.01))));
   timed(L.e, name, iters);
-  timed(P.e, name, iters);
+  for (const m of mods) timed(m.e, name, iters);
+  // Interleave samples round-robin across modules: a load burst hits
+  // every column in the same round, so the per-round ratio stays
+  // meaningful even when absolute times inflate. Report the median
+  // round-ratio rather than the ratio of medians.
   const ls = [];
-  const ps = [];
+  const pss = mods.map(() => []);
+  const rrs = mods.map(() => []);
   for (let s = 0; s < SAMPLES; s++) {
-    ls.push(timed(L.e, name, iters) / iters);
-    ps.push(timed(P.e, name, iters) / iters);
+    const lt = timed(L.e, name, iters) / iters;
+    ls.push(lt);
+    mods.forEach((m, i) => {
+      const pt = timed(m.e, name, iters) / iters;
+      pss[i].push(pt);
+      rrs[i].push(pt / lt);
+    });
   }
   const lm = median(ls);
-  const pm = median(ps);
-  ratios.push(pm / lm);
-  const chg = ((pm / lm - 1) * 100).toFixed(1);
-  console.log(
-    `${tag.padEnd(14)} ${(lm.toFixed(3) + "ms").padStart(9)} ${(pm.toFixed(3) + "ms").padStart(9)} ${(chg + "%").padStart(8)}${note}`,
-  );
+  let row = `${tag.padEnd(14)} ${ms(lm)}`;
+  mods.forEach((m, i) => {
+    const pm = median(pss[i]);
+    const r = median(rrs[i]);
+    ratios[i].push(r);
+    row += ` ${ms(pm)} ${pct(r)}`;
+  });
+  console.log(`${row}${note}`);
 }
-if (ratios.length) {
-  const g = Math.exp(ratios.reduce((a, r) => a + Math.log(r), 0) / ratios.length);
-  console.log(`\ngeomean pliron/llvm = ${g.toFixed(3)} (${ratios.length} kernels)`);
+const geomean = (rs) => Math.exp(rs.reduce((a, r) => a + Math.log(r), 0) / rs.length);
+if (ratios[0].length) {
+  console.log(
+    `\n${mods.map((m, i) => `geomean ${m.tag}/llvm = ${geomean(ratios[i]).toFixed(3)}`).join("   ")} (${ratios[0].length} kernels)`,
+  );
 }

@@ -530,13 +530,24 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = wasm::lower_to_wasm(
-            &cx.pctx.borrow(),
-            &cx.st.borrow(),
-            name,
-            &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-            cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-        );
+        let obj = if crate::env_set("PLIRON_WASM_CLIF") {
+            wasm::lower_to_wasm_clif(
+                &cx.pctx.borrow(),
+                &cx.st.borrow(),
+                cx.tcx.sess,
+                name,
+                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+            )
+        } else {
+            wasm::lower_to_wasm(
+                &cx.pctx.borrow(),
+                &cx.st.borrow(),
+                name,
+                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+            )
+        };
         return PlironModule {
             obj,
             ir,

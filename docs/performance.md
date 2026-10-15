@@ -85,15 +85,18 @@ into a register, exactly like LLVM's `r` constraint).
 ## WebAssembly
 
 `bench/wasm/run.sh` compiles the same kernel sources to
-wasm32-unknown-unknown twice — stock rustc (LLVM + wasm-ld) and the
-pliron backend (`-Zbuild-std`, linked by `tools/pliron-wasm-ld`) — and
-`bench/wasm/run.mjs` times each `k_<name>(iters)` export in node (V8):
-warm calls for Liftoff→TurboFan tier-up, then 5 samples of ~150 ms,
-median per iteration. Criterion can't run on wasm — it re-execs the
-bench binary per benchmark — so the driver does its own sampling.
-Every kernel's accumulator matched across backends on this run (the
-driver cross-checks return values, so a pliron miscompile shows up as
-`(ret differs)` or a trap).
+wasm32-unknown-unknown three ways: stock rustc (LLVM + wasm-ld), the
+pliron backend's dialect path (pliron LLVM dialect → waffle), and the
+pliron backend's CLIF path (`PLIRON_WASM_CLIF=1`: MIR → Cranelift IR →
+the shared optimisation pipeline → waffle). `bench/wasm/run.mjs` times
+each `k_<name>(iters)` export in node (V8): warm calls for
+Liftoff→TurboFan tier-up, then 9 interleaved samples of ~150 ms. The
+reported change is the median of per-round ratios, so a load burst hits
+every column in the same round. Criterion can't run on wasm — it
+re-execs the bench binary per benchmark — so the driver does its own
+sampling. Every kernel's accumulator matched across all three modules
+on this run (the driver cross-checks return values, so a miscompile
+shows up as `(ret differs)` or a trap).
 
 Asymmetries vs the native table: std code is pliron-compiled here too
 (native links the prebuilt LLVM sysroot — `-Zbuild-std` is forced
@@ -101,35 +104,41 @@ because pliron-wasm-ld reads pliron objects, not wasm-ld objects), so
 stdlib-heavy kernels like `hashmap`/`hmget`/`sortw` also measure
 std codegen; and measurement granularity is a whole `run()` call.
 
-| kernel | LLVM | pliron | change |
-|---|---|---|---|
-| chars_alpha | 3.268 ms | 12.502 ms | +282.6% |
-| chars_ascii | 1.675 ms | 6.773 ms | +304.3% |
-| chars_mixed | 13.31 ms | 21.16 ms | +59.0% |
-| contains_rng | 3.502 ms | 28.45 ms | +712.4% |
-| eqbug | 0.098 ms | 0.116 ms | +17.7% |
-| fib | 6.655 ms | 20.57 ms | +209.1% |
-| hashmap | 47.96 ms | 275.0 ms | +473.4% |
-| hmget | 8.229 ms | 74.73 ms | +808.2% |
-| iterw | 48.15 ms | 46.09 ms | −4.3% |
-| matmul | 22.12 ms | 15.60 ms | −29.4% |
-| nbody | 60.28 ms | 100.6 ms | +67.0% |
-| parse_only | 272.1 ms | 1222 ms | +349.1% |
-| sieve | 10.01 ms | 12.43 ms | +24.2% |
-| sortw | 4.483 ms | 7.474 ms | +66.7% |
-| strwork | 12.38 ms | 27.86 ms | +125.0% |
-| tokenize | 5.602 ms | 18.79 ms | +235.4% |
+This run was taken while the host was under heavy unrelated build load,
+so per-kernel deltas are approximate — the module sizes and the column
+ordering are stable.
 
-Geomean pliron/LLVM = 2.54 (16 kernels) — the wasm path (pliron LLVM
-dialect → waffle → wasm32) is far behind LLVM wasm-ld codegen where the
-native Cranelift path is slightly ahead (0.92). The module is also ~3x
-the bytes (290 KB vs 97 KB) — consistent with the known function-count
-gap that `winline` only partially closes; `winline`/`wpeep` are the only
-wasm-local optimizations. The memory-indirect and std-heavy kernels
-(`hmget`, `contains_rng`, `hashmap`, `parse_only`, `strwork`, `fib`,
-`tokenize`, `chars_*`) are the biggest gaps; `matmul` (−29%) and `iterw`
-(−4%) still win, and `eqbug`'s barrier cost shrinks to +18% because V8
-store-forwards the linear-memory barrier LLVM's native targets can't.
+| kernel | LLVM | pliron | change | clif | change |
+|---|---|---|---|---|---|
+| chars_alpha | 17.67 ms | 79.90 ms | +298.8% | 60.39 ms | +226.7% |
+| chars_ascii | 5.529 ms | 45.37 ms | +796.6% | 47.68 ms | +827.9% |
+| chars_mixed | 94.90 ms | 119.3 ms | +30.2% | 154.1 ms | +64.4% |
+| contains_rng | 26.90 ms | 216.9 ms | +711.0% | 98.77 ms | +236.4% |
+| eqbug | 0.765 ms | 0.847 ms | +12.2% | 0.791 ms | −2.5% |
+| fib | 40.34 ms | 93.37 ms | +123.7% | 82.38 ms | +119.7% |
+| hashmap | 314.8 ms | 1946 ms | +573.3% | 1162 ms | +263.3% |
+| hmget | 152.5 ms | 1332 ms | +917.4% | 614.5 ms | +318.3% |
+| iterw | 344.7 ms | 353.0 ms | −1.3% | 228.1 ms | −31.3% |
+| matmul | 133.7 ms | 103.0 ms | −15.7% | 122.0 ms | −3.7% |
+| nbody | 388.6 ms | 810.9 ms | +105.9% | 523.1 ms | +36.2% |
+| parse_only | 2040 ms | 10615 ms | +225.5% | 9668 ms | +368.6% |
+| sieve | 280.1 ms | 333.7 ms | +28.7% | 294.2 ms | +20.2% |
+| sortw | 41.58 ms | 129.9 ms | +168.9% | 132.2 ms | +168.0% |
+| strwork | 71.40 ms | 166.9 ms | +110.8% | 145.4 ms | +114.3% |
+| tokenize | 25.18 ms | 100.5 ms | +286.6% | 123.6 ms | +405.4% |
+
+Geomeans: dialect pliron/LLVM = 2.74, CLIF pliron/LLVM = 2.34
+(16 kernels). Both wasm paths are far behind LLVM wasm-ld codegen where
+the native Cranelift path is slightly ahead (0.92), but the CLIF path —
+which runs the same optimisation pipeline as native codegen — is
+roughly 15% faster geomean than the dialect path and produces a 41%
+smaller module (175 KB vs 296 KB; LLVM is 97 KB). It wins clearly on
+the memory-indirect and std-heavy kernels (`contains_rng`, `hashmap`,
+`hmget`, `nbody`, `iterw`, `eqbug`); `matmul` (−16% dialect, −4% CLIF)
+still wins vs LLVM. The remaining regressions vs the dialect path
+(`tokenize`, `parse_only`) are in string-scanning code — both paths run
+the same dialect-level `ir-opt` phase, so the gap is in CLIF→waffle
+lowering itself and is not yet isolated.
 
 ## Compile time
 

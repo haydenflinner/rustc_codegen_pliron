@@ -11,6 +11,20 @@ fn main() {
     let mut kv: Vec<_> = m.into_iter().collect();
     kv.sort();
     println!("{kv:?}");
+    // `entry` returns a borrow that reaches back into the map's stack
+    // slot — sroa's pin sync must not promote past such calls.
+    let mut m: HashMap<u64, u32> = HashMap::with_capacity(64);
+    let mut x = 1u64;
+    for i in 0..2000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *m.entry(x).or_insert(0) += 1;
+        if m.get(&(i * 977)).is_some() {
+            x = x.wrapping_add(1);
+        }
+    }
+    println!("hashmap mix len = {} x = {}", m.len(), x);
     let s = format!("{:.3} {}", 1.5f64.sqrt(), String::from("owned"));
     println!("{s}");
     let r = std::panic::catch_unwind(|| 1 + 1);

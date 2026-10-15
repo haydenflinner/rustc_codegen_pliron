@@ -103,6 +103,23 @@ fn wleaf_range(ctx: &Context, mut ty: TypeHandle, idx: &[u32]) -> (usize, usize)
 
 thread_local!(static QUIET: Cell<bool> = const { Cell::new(false) });
 
+/// Diagnose malformed targets before waffle's optimizer ICEs on
+/// them: every branch's arg count must equal the target's params.
+fn check_targets(b: &FunctionBody, name: &str) {
+    for bi in b.blocks.iter() {
+        b.blocks[bi].terminator.visit_targets(|t| {
+            assert_eq!(
+                t.args.len(),
+                b.blocks[t.block].params.len(),
+                "{name}: block{bi:?} -> {:?} args {} != params {}",
+                t.block,
+                t.args.len(),
+                b.blocks[t.block].params.len()
+            );
+        });
+    }
+}
+
 /// Run `f`, turning a panic into `Err(message)` without printing it.
 fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     static HOOK: std::sync::Once = std::sync::Once::new();
@@ -184,6 +201,13 @@ impl<'a> Obj<'a> {
     /// `GOT.func.<sym>` (table index) or `GOT.mem.<sym>` (address).
     fn got(&mut self, sym: &str) -> Global {
         let func = self.st.funcs.contains_key(sym);
+        self.got_at(func, sym)
+    }
+
+    /// `got` with the func/data class explicit — the CLIF path knows it
+    /// from the reference namespace even when the name isn't in st.funcs
+    /// (`\x01` verbatim syms, libcalls, extern data).
+    fn got_at(&mut self, func: bool, sym: &str) -> Global {
         if let Some(g) = self.got.get(&(func, sym.to_string())) {
             return *g;
         }
@@ -350,7 +374,22 @@ pub fn lower_to_wasm(
         };
         o.funcs[i].body = Some(body);
     }
+    emit_obj(o, ctx, st, name, features, stubs, defined, verbose)
+}
 
+/// Shared module tail for both wasm paths: waffle-IR inlining, function
+/// index remap (imports first), per-body wasm emit with stub fallback,
+/// exports, and the `pliron.link`/`target_features`/custom sections.
+fn emit_obj(
+    mut o: Obj,
+    ctx: &Context,
+    st: &State,
+    name: &str,
+    features: &[String],
+    mut stubs: u32,
+    defined: u32,
+    verbose: bool,
+) -> Vec<u8> {
     // Waffle-IR inlining: splice small / single-callsite callees into
     // callers while `Call` targets still index `o.funcs`. Callees whose
     // last call edge disappears are dropped by wasm-ld's GC — this is
@@ -2541,6 +2580,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 let b = funcs[ci].body.as_mut().unwrap();
                 if wsel(b) {
                     fixup_edges(b);
+                    check_targets(b, &funcs[ci].name);
                     b.optimize(&waffle::OptOptions::default());
                 }
             }
@@ -2619,6 +2659,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 did = true;
                 for &(iv, fi) in &sites {
                     let callee = funcs[fi].body.clone().unwrap();
+                    check_targets(&callee, &funcs[fi].name);
                     let b = funcs[ci].body.as_mut().unwrap();
                     let blk = b.value_blocks[iv];
                     if !blk.is_valid() {
@@ -2626,11 +2667,13 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                     }
                     if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv) {
                         inline_site(b, blk, pos, iv, &callee, sp);
+                        check_targets(b, &funcs[fi].name);
                         inlined += 1;
                     }
                 }
                 let b = funcs[ci].body.as_mut().unwrap();
                 fixup_edges(b);
+                check_targets(b, &funcs[ci].name);
                 b.optimize(&waffle::OptOptions::default());
             }
         }
@@ -7674,3 +7717,2994 @@ fn clone_sink(
     b.set_terminator(nb, Terminator::Unreachable);
     nb
 }
+
+// ---------- CLIF -> waffle emit: the wasm path through the CLIF pipeline ----
+//
+// `lower_to_wasm_clif` runs FnLower + the pliron-clif-opt suite (same as the
+// native backend) via `lower::lower_clif_wasm`, then translates each
+// function's optimized CLIF to waffle SSA here. The dialect path above skips
+// all of that and goes straight to waffle; this path keeps the pipeline's
+// CSE/loop/idominate work (and, with `simd` on, loopvec->v128) in front of
+// the same waffle backend.
+mod clif_emit {
+use super::*;
+
+// FnLower runs with an explicit wasm32 `TargetFrontendConfig` (see
+// `lower_clif_wasm`): pointers are i32 throughout the bookkeeping CLIF, so
+// `func_addr`/`symbol_value`/`stack_addr`/`call` are internally consistent.
+// CX maps each CLIF value to one wasm value (two for i128/f128 leaves,
+// v128 for vectors), coercing where reps differ.
+
+use cranelift_codegen::ir::{
+    self, BlockArg, ExternalName, GlobalValueData, Inst as CInst, Opcode,
+    StackSlot as CSS,
+};
+
+/// wasm `v128` op for a CLIF vector lane type; unlisted lanes panic.
+macro_rules! vl {
+    ($lane:expr; $($lt:ident => $op:ident),+ $(,)?) => {
+        match $lane {
+            $(clt::$lt => O::$op,)+
+            l => panic!("unsupported vector lane {l}"),
+        }
+    };
+}
+
+fn cwtys(t: ClType, out: &mut Vec<WT>) {
+    match t {
+        clt::I128 | clt::F128 => {
+            out.push(WT::I64);
+            out.push(WT::I64);
+        }
+        t if t.is_vector() => out.push(WT::V128),
+        clt::F16 => out.push(WT::I32),
+        t => out.push(wty(t)),
+    }
+}
+
+/// CLIF signature -> wasm SignatureData (i128/f128 split into i64 pairs).
+fn cwsig(s: &ir::Signature) -> SignatureData {
+    let flat = |ps: &[ir::AbiParam]| -> Vec<WT> {
+        let mut v = Vec::new();
+        for p in ps {
+            cwtys(p.value_type, &mut v);
+        }
+        v
+    };
+    SignatureData {
+        params: flat(&s.params),
+        returns: flat(&s.returns),
+    }
+}
+
+/// Post-pipeline CLIF -> waffle `FunctionBody`.
+struct CX<'o, 'a> {
+    o: &'o mut Obj<'a>,
+    /// FuncId::index() -> symbol (the bookkeeping module's declarations).
+    fn_names: &'a [String],
+    /// DataId::index() -> symbol.
+    data_names: &'a [String],
+    b: FunctionBody,
+    cur: WBlock,
+    /// CLIF value -> wasm values (2 for i128/f128 leaves).
+    vals: FxHashMap<ir::Value, Vals>,
+    wbs: FxHashMap<ir::Block, WBlock>,
+    /// Frame layout: CLIF stack slot -> byte offset under `fp`.
+    slots: FxHashMap<CSS, u32>,
+    // Same frame machinery as FL: entry computes fp = (sp - frame) & mask,
+    // patched once `frame` is final.
+    sp0: WV,
+    fp: WV,
+    frame_c: WV,
+    mask_c: WV,
+    frame: u64,
+    frame_align: u64,
+    name: String,
+}
+
+impl<'o, 'a> CX<'o, 'a> {
+    fn new(o: &'o mut Obj<'a>, sig: Signature, fn_names: &'a [String], data_names: &'a [String]) -> Self {
+        let b = FunctionBody::new(&o.m, sig);
+        let mut cx = CX {
+            o,
+            fn_names,
+            data_names,
+            b,
+            cur: WBlock::invalid(),
+            vals: FxHashMap::default(),
+            wbs: FxHashMap::default(),
+            slots: FxHashMap::default(),
+            sp0: WV::invalid(),
+            fp: WV::invalid(),
+            frame_c: WV::invalid(),
+            mask_c: WV::invalid(),
+            frame: 0,
+            frame_align: 16,
+            name: String::new(),
+        };
+        let cur = cx.b.entry;
+        cx.cur = cur;
+        let sp = cx.o.sp;
+        cx.sp0 = cx.op(O::GlobalGet { global_index: sp }, &[], WT::I32);
+        cx.frame_c = cx.i32c(0);
+        let t = cx.op(O::I32Sub, &[cx.sp0, cx.frame_c], WT::I32);
+        cx.mask_c = cx.i32c(!15);
+        cx.fp = cx.op(O::I32And, &[t, cx.mask_c], WT::I32);
+        cx.op0(O::GlobalSet { global_index: sp }, &[cx.fp]);
+        cx
+    }
+
+    fn op(&mut self, o: O, args: &[WV], ty: WT) -> WV {
+        self.b.add_op(self.cur, o, args, &[ty])
+    }
+
+    fn op0(&mut self, o: O, args: &[WV]) {
+        self.b.add_op(self.cur, o, args, &[]);
+    }
+
+    fn opn(&mut self, o: O, args: &[WV], tys: &[WT]) -> Vals {
+        let v = self.b.add_op(self.cur, o, args, tys);
+        match tys.len() {
+            0 => Vals::new(),
+            1 => smallvec![v],
+            _ => tys
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let p = self.b.add_value(ValueDef::PickOutput(v, i as u32, *t));
+                    self.b.append_to_block(self.cur, p);
+                    p
+                })
+                .collect(),
+        }
+    }
+
+    fn i32c(&mut self, v: u32) -> WV {
+        self.op(O::I32Const { value: v }, &[], WT::I32)
+    }
+
+    fn i64c(&mut self, v: u64) -> WV {
+        self.op(O::I64Const { value: v }, &[], WT::I64)
+    }
+
+    fn ty_of(&self, v: WV) -> WT {
+        match &self.b.values[v] {
+            ValueDef::BlockParam(_, _, t)
+            | ValueDef::PickOutput(_, _, t)
+            | ValueDef::Placeholder(t) => *t,
+            ValueDef::Operator(_, _, tys) => self.b.type_pool[*tys][0],
+            ValueDef::Alias(a) => self.ty_of(*a),
+            _ => panic!("type of {v}"),
+        }
+    }
+
+    fn ma(&self, off: u64, bytes: u64) -> MemoryArg {
+        MemoryArg {
+            align: bytes.trailing_zeros(),
+            offset: off as u32,
+            memory: self.o.mem,
+        }
+    }
+
+    /// Coerce a wasm rep to `t`'s container. Only the pointer-width seams
+    /// need this: a 64-bit CLIF carrier holding a 32-bit address truncates
+    /// (wrap), a 32-bit leaf passed to a 64-bit-typed use zero-extends.
+    fn cvt(&mut self, v: WV, t: WT) -> WV {
+        let f = self.ty_of(v);
+        if f == t {
+            return v;
+        }
+        match (f, t) {
+            (WT::I64, WT::I32) => self.op(O::I32WrapI64, &[v], WT::I32),
+            (WT::I32, WT::I64) => self.op(O::I64ExtendI32U, &[v], WT::I64),
+            _ => panic!("cvt {f:?} -> {t:?}"),
+        }
+    }
+
+    /// The CLIF value's wasm values.
+    fn get(&self, v: ir::Value) -> &Vals {
+        self.vals
+            .get(&v)
+            .unwrap_or_else(|| panic!("undef clif value {v}"))
+    }
+
+    fn get1(&self, v: ir::Value) -> WV {
+        let vs = self.get(v);
+        assert_eq!(vs.len(), 1);
+        vs[0]
+    }
+
+    fn set(&mut self, v: ir::Value, wv: WV) {
+        self.vals.insert(v, smallvec![wv]);
+    }
+
+    fn setv(&mut self, v: ir::Value, vs: Vals) {
+        self.vals.insert(v, vs);
+    }
+
+    /// Result wasm types of a CLIF inst/declared type.
+    fn flat(&self, t: ClType) -> Vec<WT> {
+        let mut v = Vec::new();
+        cwtys(t, &mut v);
+        v
+    }
+
+    fn vty(&self, f: &ir::Function, v: ir::Value) -> ClType {
+        f.dfg.value_type(v)
+    }
+
+    /// Mask bits above `w` out of a canonical (zero-extended) narrow int.
+    fn norm(&mut self, v: WV, w: u32) -> WV {
+        match w {
+            32 | 64 => v,
+            w if w > 32 => {
+                let m = self.i64c((1u64 << w) - 1);
+                self.op(O::I64And, &[v, m], WT::I64)
+            }
+            w => {
+                let m = self.i32c(((1u64 << w) - 1) as u32);
+                self.op(O::I32And, &[v, m], WT::I32)
+            }
+        }
+    }
+
+    fn sext(&mut self, v: WV, w: u32) -> WV {
+        match w {
+            32 | 64 => v,
+            8 => self.op(O::I32Extend8S, &[v], WT::I32),
+            16 => self.op(O::I32Extend16S, &[v], WT::I32),
+            w if w > 32 => {
+                let s = self.i64c(64 - w as u64);
+                let x = self.op(O::I64Shl, &[v, s], WT::I64);
+                self.op(O::I64ShrS, &[x, s], WT::I64)
+            }
+            w => {
+                let s = self.i32c(32 - w);
+                let x = self.op(O::I32Shl, &[v, s], WT::I32);
+                self.op(O::I32ShrS, &[x, s], WT::I32)
+            }
+        }
+    }
+
+    /// Reserve `size`/`align` bytes in the frame; returns the i32 offset.
+    fn frame_slot(&mut self, size: u64, align: u64) -> u32 {
+        let align = align.max(1);
+        self.frame_align = self.frame_align.max(align);
+        let off = crate::types::align_to(self.frame, align);
+        self.frame = off + size;
+        off as u32
+    }
+
+    /// Address `fp + off` as an i32 pointer value.
+    fn addr(&mut self, off: i64) -> WV {
+        if off == 0 {
+            self.fp
+        } else {
+            let c = self.i32c(off as u32);
+            self.op(O::I32Add, &[self.fp, c], WT::I32)
+        }
+    }
+
+    /// `w` bit unsigned/signed helpers on canonical narrow reps.
+    fn binop(&mut self, t: ClType, o32: O, o64: O, a: WV, b: WV) -> WV {
+        match wty(t) {
+            WT::I64 => self.op(o64, &[a, b], WT::I64),
+            _ => self.op(o32, &[a, b], WT::I32),
+        }
+    }
+
+    /// Add `inst`'s results -> `vals` binding (split i128 into lo/hi).
+    fn bind(&mut self, f: &ir::Function, inst: CInst, vs: Vals) {
+        let rs = f.dfg.inst_results(inst);
+        match rs.len() {
+            0 => assert!(vs.is_empty()),
+            1 => {
+                let t = self.vty(f, rs[0]);
+                if self.flat(t).len() == 1 {
+                    assert_eq!(vs.len(), 1);
+                    self.set(rs[0], vs[0]);
+                } else {
+                    assert_eq!(vs.len(), 2);
+                    self.setv(rs[0], vs);
+                }
+            }
+            n => {
+                assert_eq!(vs.len(), n);
+                for (r, v) in rs.iter().zip(vs) {
+                    self.set(*r, v);
+                }
+            }
+        }
+    }
+
+    /// `symbol_value`/`func_addr`-style symbol resolution to a wasm value.
+    fn sym_got(&mut self, func: bool, name: &str, off: i64) -> WV {
+        let g = self.o.got_at(func, name);
+        let base = self.op(O::GlobalGet { global_index: g }, &[], WT::I32);
+        // Pointer values are i32 (wasm CLIF pointer width).
+        if off == 0 {
+            base
+        } else {
+            let c = self.i32c(off as u32);
+            self.op(O::I32Add, &[base, c], WT::I32)
+        }
+    }
+
+    /// The callee's symbol name (for `fidx` lookup and ABI checks).
+    fn func_name(&self, fr: ir::FuncRef, f: &ir::Function) -> String {
+        let efd = &f.dfg.ext_funcs[fr];
+        match &efd.name {
+            ExternalName::User(u) => {
+                let (_, idx) = self.user_name(f, *u);
+                self.fn_names
+                    .get(idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("bad funcref idx{idx}"))
+            }
+            ExternalName::LibCall(lc) => lc.to_string(),
+            n => panic!("func name {n:?}"),
+        }
+    }
+
+    fn func_idx(&mut self, fr: ir::FuncRef, f: &ir::Function) -> Func {
+        let efd = &f.dfg.ext_funcs[fr];
+        let name = self.func_name(fr, f);
+        match self.o.fidx.get(&name) {
+            Some(&i) => Func::new(i),
+            None => {
+                // Not one of this module's functions (a libcall stub like
+                // `__udivti3`): import it under the call's signature.
+                let sd = cwsig(&f.dfg.signatures[efd.signature]);
+                Func::new(self.o.libfunc(&name, sd))
+            }
+        }
+    }
+
+    /// Waffle signature for a `call_indirect`'s `SigRef`.
+    fn sig_of(&mut self, f: &ir::Function, sr: ir::SigRef) -> Signature {
+        self.o.sig(cwsig(&f.dfg.signatures[sr]))
+    }
+
+    fn block_target(&self, f: &ir::Function, bc: &ir::BlockCall) -> BlockTarget {
+        let block = *self
+            .wbs
+            .get(&bc.block(&f.dfg.value_lists))
+            .unwrap_or_else(|| panic!("unmapped block"));
+        let args: Vec<WV> = bc
+            .args(&f.dfg.value_lists)
+            .map(|a| match a {
+                BlockArg::Value(v) => v,
+                _ => panic!("try_call block args on wasm"),
+            })
+            .flat_map(|v| self.get(v).iter().copied())
+            .collect();
+        BlockTarget { block, args }
+    }
+
+    /// 32-bit memory base: truncate the CLIF carrier (i32 leaf or the
+    /// i64-typed ptr ops) down to i32.
+    fn base32(&mut self, v: ir::Value) -> WV {
+        self.cvt(self.get1(v), WT::I32)
+    }
+
+    fn load(&mut self, t: ClType, p: WV, off: u64) -> WV {
+        let memory = self.ma(off, t.bytes() as u64);
+        let (o, ty) = match t {
+            clt::I8 => (O::I32Load8U { memory }, WT::I32),
+            clt::I16 => (O::I32Load16U { memory }, WT::I32),
+            clt::I32 => (O::I32Load { memory }, WT::I32),
+            clt::I64 => (O::I64Load { memory }, WT::I64),
+            clt::F32 => (O::F32Load { memory }, WT::F32),
+            clt::F64 => (O::F64Load { memory }, WT::F64),
+            t if t.is_vector() && t.bits() == 128 => {
+                (O::V128Load { memory }, WT::V128)
+            }
+            t => panic!("load {t}"),
+        };
+        self.op(o, &[p], ty)
+    }
+
+    fn store(&mut self, t: ClType, v: WV, p: WV, off: u64) {
+        let memory = self.ma(off, t.bytes() as u64);
+        let o = match t {
+            clt::I8 => O::I32Store8 { memory },
+            clt::I16 => O::I32Store16 { memory },
+            clt::I32 => O::I32Store { memory },
+            clt::I64 => O::I64Store { memory },
+            clt::F32 => O::F32Store { memory },
+            clt::F64 => O::F64Store { memory },
+            t if t.is_vector() && t.bits() == 128 => O::V128Store { memory },
+            t => panic!("store {t}"),
+        };
+        self.op0(o, &[p, v]);
+    }
+
+    /// i128 `a` as (lo, hi).
+    fn pair(&self, v: ir::Value) -> (WV, WV) {
+        let vs = self.get(v);
+        assert_eq!(vs.len(), 2);
+        (vs[0], vs[1])
+    }
+
+    /// A signed-compare normalization: xor sign bit for unsigned-domain
+    /// comparison of i128 hi words.
+    fn icmp128(&mut self, cond: ir::condcodes::IntCC, a: ir::Value, b: ir::Value) -> WV {
+        use ir::condcodes::IntCC as CC;
+        let (al, ah) = self.pair(a);
+        let (bl, bh) = self.pair(b);
+        match cond {
+            CC::Equal => {
+                let l = self.op(O::I64Eq, &[al, bl], WT::I32);
+                let h = self.op(O::I64Eq, &[ah, bh], WT::I32);
+                self.op(O::I32And, &[l, h], WT::I32)
+            }
+            CC::NotEqual => {
+                let l = self.op(O::I64Ne, &[al, bl], WT::I32);
+                let h = self.op(O::I64Ne, &[ah, bh], WT::I32);
+                self.op(O::I32Or, &[l, h], WT::I32)
+            }
+            _ => {
+                // (ah, al) < (bh, bl): hi ordered compare, then lo when equal.
+                let sgn = |cx: &mut Self, x: WV| -> WV {
+                    let m = cx.i64c(1 << 63);
+                    cx.op(O::I64Xor, &[x, m], WT::I64)
+                };
+                let signed = matches!(
+                    cond,
+                    CC::SignedLessThan
+                        | CC::SignedGreaterThanOrEqual
+                        | CC::SignedLessThanOrEqual
+                        | CC::SignedGreaterThan
+                );
+                let (ah2, bh2) = if signed { (sgn(self, ah), sgn(self, bh)) } else { (ah, bh) };
+                let (hlt, hgt) = (O::I64LtU, O::I64GtU);
+                let hge = O::I64GeU;
+                let (llt, lle, lgt, lge) = (O::I64LtU, O::I64LeU, O::I64GtU, O::I64GeU);
+                let heq = self.op(O::I64Eq, &[ah2, bh2], WT::I32);
+                match cond {
+                    CC::UnsignedLessThan | CC::SignedLessThan => {
+                        let h = self.op(hlt, &[ah2, bh2], WT::I32);
+                        let l = self.op(llt, &[al, bl], WT::I32);
+                        let e = self.op(O::I32And, &[heq, l], WT::I32);
+                        self.op(O::I32Or, &[h, e], WT::I32)
+                    }
+                    CC::UnsignedLessThanOrEqual | CC::SignedLessThanOrEqual => {
+                        let h = self.op(hlt, &[ah2, bh2], WT::I32);
+                        let l = self.op(lle, &[al, bl], WT::I32);
+                        let e = self.op(O::I32And, &[heq, l], WT::I32);
+                        self.op(O::I32Or, &[h, e], WT::I32)
+                    }
+                    CC::UnsignedGreaterThan | CC::SignedGreaterThan => {
+                        let h = self.op(hgt, &[ah2, bh2], WT::I32);
+                        let l = self.op(lgt, &[al, bl], WT::I32);
+                        let e = self.op(O::I32And, &[heq, l], WT::I32);
+                        self.op(O::I32Or, &[h, e], WT::I32)
+                    }
+                    _ => {
+                        let h = self.op(hge, &[ah2, bh2], WT::I32);
+                        let l = self.op(lge, &[al, bl], WT::I32);
+                        let e = self.op(O::I32And, &[heq, l], WT::I32);
+                        self.op(O::I32Or, &[h, e], WT::I32)
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'o, 'a> CX<'o, 'a> {
+    /// Entry block waffle params -> CLIF function params (flattened).
+    fn map_entry(&mut self, f: &ir::Function) {
+        let entry = f.layout.entry_block().expect("no entry");
+        let wb = self.b.entry;
+        self.wbs.insert(entry, wb);
+        let mut wi = 0usize;
+        for &p in f.dfg.block_params(entry) {
+            let n = self.flat(self.vty(f, p)).len();
+            let vs: Vals = (0..n)
+                .map(|i| self.b.blocks[wb].params[wi + i].1)
+                .collect();
+            wi += n;
+            self.vals.insert(p, vs);
+        }
+        debug_assert_eq!(wi, self.b.blocks[wb].params.len());
+    }
+
+    /// Frame slot address as i64 CLIF carrier.
+    fn slot_addr(&mut self, f: &ir::Function, ss: CSS, off: i64) -> WV {
+        let o = if let Some(&o) = self.slots.get(&ss) {
+            o
+        } else {
+            let sd = &f.sized_stack_slots[ss];
+            let o = self.frame_slot(sd.size as u64, 1u64 << sd.align_shift);
+            self.slots.insert(ss, o);
+            o
+        };
+        self.addr(o as i64 + off)
+    }
+
+    /// A `code` trap: emit `unreachable` in a side block and continue.
+    fn cond_trap(&mut self, cond: WV) {
+        let trapb = self.b.add_block();
+        let cont = self.b.add_block();
+        let cur = self.cur;
+        self.b.set_terminator(
+            cur,
+            Terminator::CondBr {
+                cond,
+                if_true: BlockTarget { block: trapb, args: vec![] },
+                if_false: BlockTarget { block: cont, args: vec![] },
+            },
+        );
+        self.b.set_terminator(trapb, Terminator::Unreachable);
+        self.cur = cont;
+    }
+
+    /// Integer binary/imm op dispatch. `t` is the CLIF controlling type.
+    fn ibin(&mut self, op: Opcode, t: ClType, a: WV, b: WV) -> WV {
+        use Opcode as P;
+        let w = t.bits();
+        match op {
+            P::Iadd => {
+                let r = self.binop(t, O::I32Add, O::I64Add, a, b);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Isub => {
+                let r = self.binop(t, O::I32Sub, O::I64Sub, a, b);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Imul => {
+                let r = self.binop(t, O::I32Mul, O::I64Mul, a, b);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Udiv => self.binop(t, O::I32DivU, O::I64DivU, a, b),
+            P::Sdiv => {
+                if w < 32 {
+                    let (a, b) = (self.sext(a, w), self.sext(b, w));
+                    let r = self.op(O::I32DivS, &[a, b], WT::I32);
+                    self.norm(r, w)
+                } else {
+                    self.binop(t, O::I32DivS, O::I64DivS, a, b)
+                }
+            }
+            P::Urem => self.binop(t, O::I32RemU, O::I64RemU, a, b),
+            P::Srem => {
+                if w < 32 {
+                    let (a, b) = (self.sext(a, w), self.sext(b, w));
+                    let r = self.op(O::I32RemS, &[a, b], WT::I32);
+                    self.norm(r, w)
+                } else {
+                    self.binop(t, O::I32RemS, O::I64RemS, a, b)
+                }
+            }
+            P::Band => self.binop(t, O::I32And, O::I64And, a, b),
+            P::Bor => self.binop(t, O::I32Or, O::I64Or, a, b),
+            P::Bxor => self.binop(t, O::I32Xor, O::I64Xor, a, b),
+            P::Ishl => {
+                // CLIF masks the amount by the value's bit width; wasm masks
+                // mod the container width. Narrow types must mask themselves.
+                let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
+                let r = self.binop(t, O::I32Shl, O::I64Shl, a, b);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Ushr => {
+                let a = if w < 32 { self.norm(a, w) } else { a };
+                let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
+                self.binop(t, O::I32ShrU, O::I64ShrU, a, b)
+            }
+            P::Sshr => {
+                let a = if w < 32 { self.sext(a, w) } else { a };
+                let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
+                let r = self.binop(t, O::I32ShrS, O::I64ShrS, a, b);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Rotl => self.rot(t, a, b, true),
+            P::Rotr => self.rot(t, a, b, false),
+            P::Umin => self.minmax(t, a, b, O::I32LtU, O::I64LtU),
+            P::Umax => self.minmax(t, a, b, O::I32GtU, O::I64GtU),
+            P::Smin => self.minmax_s(t, a, b, true),
+            P::Smax => self.minmax_s(t, a, b, false),
+            P::Umulhi => self.umulhi(t, a, b, false),
+            P::Smulhi => self.umulhi(t, a, b, true),
+            _ => panic!("ibin {op}"),
+        }
+    }
+
+    fn bnot(&mut self, t: ClType, v: WV) -> WV {
+        let w = t.bits();
+        match wty(t) {
+            WT::I64 => {
+                let m = self.i64c(u64::MAX);
+                self.op(O::I64Xor, &[v, m], WT::I64)
+            }
+            _ => {
+                let m = self.i32c(if w < 32 { ((1u64 << w) - 1) as u32 } else { u32::MAX });
+                self.op(O::I32Xor, &[v, m], WT::I32)
+            }
+        }
+    }
+
+    fn rot(&mut self, t: ClType, a: WV, b: WV, left: bool) -> WV {
+        let w = t.bits();
+        match wty(t) {
+            WT::I64 => {
+                let c63 = self.i64c(63);
+                let amt = self.op(O::I64And, &[b, c63], WT::I64);
+                self.op(if left { O::I64Rotl } else { O::I64Rotr }, &[a, amt], WT::I64)
+            }
+            _ => {
+                let (o1, o2) = if left { (O::I32Rotl, O::I32Rotr) } else { (O::I32Rotr, O::I32Rotl) };
+                let _ = o2;
+                if w == 32 {
+                    return self.op(o1, &[a, b], WT::I32);
+                }
+                // Narrow rotate: canonical form, amount mod w.
+                let a = self.norm(a, w);
+                let m = w.ilog2();
+                let amt = self.norm(b, m);
+                let l = self.op(if left { O::I32Shl } else { O::I32ShrU }, &[a, amt], WT::I32);
+                let wm = self.i32c(w);
+                let r32 = self.op(O::I32Sub, &[wm, amt], WT::I32);
+                let r = self.op(if left { O::I32ShrU } else { O::I32Shl }, &[a, r32], WT::I32);
+                let v = self.op(O::I32Or, &[l, r], WT::I32);
+                self.norm(v, w)
+            }
+        }
+    }
+
+    fn minmax(&mut self, t: ClType, a: WV, b: WV, c32: O, c64: O) -> WV {
+        let c = self.binop(t, c32, c64, a, b);
+        self.sel(c, a, b)
+    }
+
+    fn minmax_s(&mut self, t: ClType, a: WV, b: WV, min: bool) -> WV {
+        let w = t.bits();
+        let (a2, b2) = if w < 32 { (self.sext(a, w), self.sext(b, w)) } else { (a, b) };
+        let c = self.binop(
+            t,
+            if min { O::I32LtS } else { O::I32GtS },
+            if min { O::I64LtS } else { O::I64GtS },
+            a2,
+            b2,
+        );
+        self.sel(c, a, b)
+    }
+
+    fn sel(&mut self, c: WV, x: WV, y: WV) -> WV {
+        let t = self.ty_of(x);
+        match t {
+            WT::V128 | WT::FuncRef => self.op(O::TypedSelect { ty: t }, &[x, y, c], t),
+            _ => self.op(O::Select, &[x, y, c], t),
+        }
+    }
+
+    /// `a * b` high half; unsigned `umulhi` or signed `smulhi`.
+    fn umulhi(&mut self, t: ClType, a: WV, b: WV, signed: bool) -> WV {
+        let w = t.bits();
+        match wty(t) {
+            WT::I32 if w <= 32 => {
+                // i64 mul of (sign|zero)-extended halves, take bits [w, 2w).
+                let (ea, eb) = if signed {
+                    let (a, b) = (self.sext(a, w), self.sext(b, w));
+                    (
+                        self.op(O::I64ExtendI32S, &[a], WT::I64),
+                        self.op(O::I64ExtendI32S, &[b], WT::I64),
+                    )
+                } else {
+                    (
+                        self.op(O::I64ExtendI32U, &[a], WT::I64),
+                        self.op(O::I64ExtendI32U, &[b], WT::I64),
+                    )
+                };
+                let p = self.op(O::I64Mul, &[ea, eb], WT::I64);
+                let wc = self.i64c(w as u64);
+                let sh = self.op(O::I64ShrU, &[p, wc], WT::I64);
+                let r = self.op(O::I32WrapI64, &[sh], WT::I32);
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            WT::I64 => {
+                // Standard mulh expansion on 32-bit halves.
+                let m32 = self.i64c(0xffff_ffff);
+                let c32 = self.i64c(32);
+                let lo = |cx: &mut Self, x: WV| cx.op(O::I64And, &[x, m32], WT::I64);
+                let hi = |cx: &mut Self, x: WV| cx.op(O::I64ShrU, &[x, c32], WT::I64);
+                let (al, ah) = (lo(self, a), hi(self, a));
+                let (bl, bh) = (lo(self, b), hi(self, b));
+                let p_ll = self.op(O::I64Mul, &[al, bl], WT::I64);
+                let p_lh = self.op(O::I64Mul, &[al, bh], WT::I64);
+                let p_hl = self.op(O::I64Mul, &[ah, bl], WT::I64);
+                let p_hh = self.op(O::I64Mul, &[ah, bh], WT::I64);
+                // hi = p_hh + hi(p_lh) + hi(p_hl) + carry(lo(p_lh)+lo(p_hl)+hi(p_ll))
+                let (lh_lo, hl_lo) = (lo(self, p_lh), lo(self, p_hl));
+                let lsum = self.op(O::I64Add, &[lh_lo, hl_lo], WT::I64);
+                let ll_hi = hi(self, p_ll);
+                let lsum = self.op(O::I64Add, &[lsum, ll_hi], WT::I64);
+                let carry = self.op(O::I64ShrU, &[lsum, c32], WT::I64);
+                let (lh_hi, hl_hi) = (hi(self, p_lh), hi(self, p_hl));
+                let hsum = self.op(O::I64Add, &[lh_hi, hl_hi], WT::I64);
+                let res = self.op(O::I64Add, &[hsum, carry], WT::I64);
+                let res = self.op(O::I64Add, &[p_hh, res], WT::I64);
+                if !signed {
+                    return res;
+                }
+                // signed: subtract a when b<0, b when a<0 (hi fixup).
+                let c63 = self.i64c(63);
+                let sa = self.op(O::I64ShrS, &[a, c63], WT::I64);
+                let sb = self.op(O::I64ShrS, &[b, c63], WT::I64);
+                let fix1 = self.op(O::I64And, &[sa, b], WT::I64);
+                let fix2 = self.op(O::I64And, &[sb, a], WT::I64);
+                let fix = self.op(O::I64Add, &[fix1, fix2], WT::I64);
+                self.op(O::I64Sub, &[res, fix], WT::I64)
+            }
+            _ => panic!("umulhi {t}"),
+        }
+    }
+
+    /// `iadd_cout`/`isub_bout` style carry: returns (sum, carry-out).
+    fn addc(&mut self, t: ClType, a: WV, b: WV, sub: bool) -> (WV, WV) {
+        let sum = self.binop(
+            t,
+            if sub { O::I32Sub } else { O::I32Add },
+            if sub { O::I64Sub } else { O::I64Add },
+            a,
+            b,
+        );
+        let sum = if t.bits() < 32 { self.norm(sum, t.bits()) } else { sum };
+        let c = self.binop(
+            t,
+            if sub { O::I32GtU } else { O::I32LtU },
+            if sub { O::I64GtU } else { O::I64LtU },
+            sum,
+            a,
+        );
+        (sum, c)
+    }
+
+    fn translate(mut self, f: &mut ir::Function) -> FunctionBody {
+        // The pipeline leaves `Value` aliases (`v24 -> v0`); resolve them
+        // so `get` never sees one.
+        f.dfg.resolve_all_aliases();
+        // Map all blocks first so forward branches resolve. Entry maps to
+        // the FunctionBody's entry block (its params already match the sig).
+        self.map_entry(f);
+        for b in f.layout.blocks() {
+            if self.wbs.contains_key(&b) {
+                continue;
+            }
+            self.wbs.insert(b, self.b.add_block());
+        }
+        // Block params for non-entry blocks (flattened like the sig).
+        for b in f.layout.blocks() {
+            if Some(b) == f.layout.entry_block() {
+                continue;
+            }
+            let wb = self.wbs[&b];
+            for &p in f.dfg.block_params(b) {
+                for t in self.flat(self.vty(f, p)) {
+                    let v = self.b.add_blockparam(wb, t);
+                    self.vals.entry(p).or_insert_with(Vals::new).push(v);
+                }
+            }
+        }
+        // Layout order can put a dominated (e.g. cold) block before its
+        // def block — walk in RPO so defs precede uses.
+        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+        let mut seen = FxHashSet::default();
+        let mut post = Vec::new();
+        let mut stack = vec![(f.layout.entry_block().unwrap(), false)];
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                post.push(b);
+                continue;
+            }
+            if !seen.insert(b) {
+                continue;
+            }
+            stack.push((b, true));
+            for s in cfg.succ_iter(b) {
+                if !seen.contains(&s) {
+                    stack.push((s, false));
+                }
+            }
+        }
+        post.reverse();
+        // Unreachable blocks aren't in RPO; emit them in layout order.
+        for b in f.layout.blocks() {
+            if !seen.contains(&b) {
+                post.push(b);
+            }
+        }
+        for b in post {
+            self.cur = self.wbs[&b];
+            for i in f.layout.block_insts(b) {
+                self.inst(f, i);
+            }
+        }
+        self.finish(f)
+    }
+
+    fn finish(mut self, _f: &ir::Function) -> FunctionBody {
+        // Patch frame placeholders (see FL::finish).
+        let frame = crate::types::align_to(self.frame, self.frame_align) as u32;
+        let mask = !(self.frame_align as u32 - 1);
+        let patch = vec![(self.frame_c, frame), (self.mask_c, mask)];
+        for (v, c) in patch {
+            if let ValueDef::Operator(op, ..) = &mut self.b.values[v] {
+                *op = O::I32Const { value: c };
+            }
+        }
+        wrange(&mut self.b);
+        waddr(&mut self.b);
+        check_targets(&self.b, &self.name);
+        self.b.optimize(&waffle::OptOptions::default());
+        self.b
+    }
+}
+
+impl<'o, 'a> CX<'o, 'a> {
+    /// One CLIF instruction. `cur` is the waffle block.
+    fn inst(&mut self, f: &ir::Function, i: CInst) {
+        use Opcode as P;
+        let data = f.dfg.insts[i];
+        let opc = data.opcode();
+        match data {
+            ir::InstructionData::UnaryImm { opcode: P::Iconst, imm } => {
+                let t = f.dfg.value_type(f.dfg.inst_results(i)[0]);
+                let v = match wty(t) {
+                    WT::I32 => self.i32c(imm.bits() as u32),
+                    WT::I64 => self.i64c(imm.bits() as u64),
+                    _ => panic!("iconst {t}"),
+                };
+                let v = if t.bits() < 32 { self.norm(v, t.bits()) } else { v };
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::UnaryIeee32 { imm, .. } => {
+                let v = self.op(O::F32Const { value: imm.bits() }, &[], WT::F32);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::UnaryIeee64 { imm, .. } => {
+                let v = self.op(O::F64Const { value: imm.bits() }, &[], WT::F64);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::Binary { opcode, args } => {
+                let t = self.vty(f, args[0]);
+                if opcode == P::Iconcat {
+                    let (lo, hi) = (self.get1(args[0]), self.get1(args[1]));
+                    self.setv(f.dfg.inst_results(i)[0], smallvec![lo, hi]);
+                    return;
+                }
+                if t == clt::I128 || t == clt::F128 {
+                    self.i128_bin(opcode, f, i, args[0], args[1]);
+                    return;
+                }
+                if t.is_vector() {
+                    self.vbin(opcode, t, f, i, args);
+                    return;
+                }
+                match opcode {
+                    P::Fadd | P::Fsub | P::Fmul | P::Fdiv | P::Fmin | P::Fmax => {
+                        self.fbin(opcode, t, f, i, args);
+                    }
+                    P::Fcopysign => {
+                        let a = self.get1(args[0]);
+                        let b = self.get1(args[1]);
+                        let (o, ty) = if wty(t) == WT::F64 {
+                            (O::F64Copysign, WT::F64)
+                        } else {
+                            (O::F32Copysign, WT::F32)
+                        };
+                        let v = self.op(o, &[a, b], ty);
+                        self.set(f.dfg.inst_results(i)[0], v);
+                    }
+                    P::UaddOverflow | P::SaddOverflow | P::UsubOverflow | P::SsubOverflow
+                    | P::UmulOverflow | P::SmulOverflow => {
+                        let vs = self.overflow(opcode, t, self.get1(args[0]), self.get1(args[1]));
+                        self.bind(f, i, vs);
+                    }
+                    P::UaddSat | P::SaddSat | P::UsubSat | P::SsubSat => {
+                        let v =
+                            self.sat_bin(opcode, t, self.get1(args[0]), self.get1(args[1]));
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    _ => {
+                        let a = self.get1(args[0]);
+                        let b = self.get1(args[1]);
+                        let v = self.ibin(opcode, t, a, b);
+                        self.bind(f, i, smallvec![v]);
+                    }
+                }
+            }
+            ir::InstructionData::BinaryImm8 { opcode: P::Extractlane, arg, imm } => {
+                let t = self.vty(f, arg);
+                let v = self.extract_lane(t, arg, imm.into());
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::IntCompare { cond, args, .. } => {
+                let t = self.vty(f, args[0]);
+                if t.is_vector() {
+                    let v = self.vicmp(cond, t, self.get1(args[0]), self.get1(args[1]));
+                    self.set(f.dfg.inst_results(i)[0], v);
+                    return;
+                }
+                let v = if t == clt::I128 {
+                    self.icmp128(cond, args[0], args[1])
+                } else {
+                    self.icmp(cond, t, self.get1(args[0]), self.get1(args[1]))
+                };
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::FloatCompare { cond, args, .. } => {
+                let t = self.vty(f, args[0]);
+                let v = if t.is_vector() {
+                    self.vfcmp(cond, t, self.get1(args[0]), self.get1(args[1]))
+                } else {
+                    self.fcmp(cond, t, self.get1(args[0]), self.get1(args[1]))
+                };
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::Ternary { opcode, args } => match opcode {
+                P::Bitselect => {
+                    // (x & c) | (y & ~c)
+                    let t = self.vty(f, args[0]);
+                    let (c, x, y) =
+                        (self.get1(args[0]), self.get1(args[1]), self.get1(args[2]));
+                    let v = if t.is_vector() {
+                        // wasm bitselect: (x & c) | (y & ~c); operand order
+                        // is (x, y, c).
+                        self.op(O::V128Bitselect, &[x, y, c], WT::V128)
+                    } else {
+                        let l = self.binop(t, O::I32And, O::I64And, x, c);
+                        let nc = self.bnot(t, c);
+                        let r = self.binop(t, O::I32And, O::I64And, y, nc);
+                        self.binop(t, O::I32Or, O::I64Or, l, r)
+                    };
+                    self.bind(f, i, smallvec![v]);
+                }
+                P::Select | P::SelectSpectreGuard => {
+                    // select c, x, y
+                    let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                    if rt.is_vector() {
+                        // select c, x, y on vectors: c holds per-lane
+                        // booleans (0/1) - turn into an all-ones mask and
+                        // bitselect. CLIF select has no bits-flipping
+                        // semantics; lane is truthy iff != 0.
+                        let ct = self.vty(f, args[0]);
+                        let c = self.get1(args[0]);
+                        let zero = self.vsplat_zero();
+                        let m =
+                            self.vicmp(ir::condcodes::IntCC::NotEqual, ct, c, zero);
+                        let x = self.get1(args[1]);
+                        let y = self.get1(args[2]);
+                        let v = self.op(O::V128Bitselect, &[x, y, m], WT::V128);
+                        self.set(f.dfg.inst_results(i)[0], v);
+                        return;
+                    }
+                    let flat = self.flat(rt);
+                    let c = self.cvt(self.get1(args[0]), WT::I32);
+                    if flat.len() == 1 {
+                        let x = self.cvt(self.get1(args[1]), flat[0]);
+                        let y = self.cvt(self.get1(args[2]), flat[0]);
+                        let v = self.sel(c, x, y);
+                        self.set(f.dfg.inst_results(i)[0], v);
+                    } else {
+                        let (x, y) = (self.get(args[1]).clone(), self.get(args[2]).clone());
+                        let vs: Vals = x
+                            .iter()
+                            .zip(y.iter())
+                            .map(|(&xv, &yv)| self.sel(c, xv, yv))
+                            .collect();
+                        self.setv(f.dfg.inst_results(i)[0], vs);
+                    }
+                }
+                P::Fma => {
+                    let t = self.vty(f, args[0]);
+                    let (a, b, c) =
+                        (self.get1(args[0]), self.get1(args[1]), self.get1(args[2]));
+                    let name = if wty(t) == WT::F64 { "fma" } else { "fmaf" };
+                    let vs = self.libcall1(name, &[t], &[t], &[a, b, c]);
+                    self.set(f.dfg.inst_results(i)[0], vs[0]);
+                }
+                P::SaddOverflowCin | P::UaddOverflowCin | P::SsubOverflowBin
+                | P::UsubOverflowBin => {
+                    let t = self.vty(f, args[0]);
+                    let vs = self.overflow_in(
+                        opcode,
+                        t,
+                        self.get1(args[0]),
+                        self.get1(args[1]),
+                        self.get1(args[2]),
+                    );
+                    self.bind(f, i, vs);
+                }
+                _ => panic!("ternary {opcode}"),
+            },
+            ir::InstructionData::Unary { opcode, arg } => {
+                let t = self.vty(f, arg);
+                let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                if t.is_vector() || rt.is_vector() {
+                    self.vun(opcode, t, rt, f, i, arg);
+                    return;
+                }
+                if (t == clt::I128 || t == clt::F128)
+                    && matches!(
+                        opcode,
+                        P::Bnot
+                            | P::Ineg
+                            | P::Iabs
+                            | P::Clz
+                            | P::Ctz
+                            | P::Popcnt
+                            | P::Bswap
+                            | P::Bitrev
+                            | P::Cls
+                            | P::Bitcast
+                    )
+                {
+                    self.i128_un(opcode, t, f, i, arg);
+                    return;
+                }
+                match opcode {
+                    P::Bnot => {
+                        let v = self.bnot(t, self.get1(arg));
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    P::Ineg => {
+                        let z = self.leaf_const(t, 0);
+                        let v = self.binop(t, O::I32Sub, O::I64Sub, z, self.get1(arg));
+                        let v = if t.bits() < 32 { self.norm(v, t.bits()) } else { v };
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    P::Iabs => {
+                        let a = self.get1(arg);
+                        let m = self.leaf_const(t, (t.bits() - 1) as u64);
+                        let s = self.binop(t, O::I32ShrS, O::I64ShrS, a, m);
+                        let x = self.binop(t, O::I32Xor, O::I64Xor, a, s);
+                        let v = self.binop(t, O::I32Sub, O::I64Sub, x, s);
+                        let v = if t.bits() < 32 { self.norm(v, t.bits()) } else { v };
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    P::Uextend => {
+                        let v = self.extend(f, arg, rt, false);
+                        self.bind(f, i, v);
+                    }
+                    P::Sextend => {
+                        let v = self.extend(f, arg, rt, true);
+                        self.bind(f, i, v);
+                    }
+                    P::Ireduce => {
+                        // i128 -> i64 keep low half; i64 -> i32 wrap; i32 ->
+                        // narrow keeps canonical (already masked) rep.
+                        let vs: Vals = self.get(arg).clone();
+                        let rt_ws = self.flat(rt);
+                        let out = if rt_ws.len() == 1 {
+                            let v = self.cvt(vs[0], rt_ws[0]);
+                            smallvec![if rt.bits() < 32 {
+                                self.norm(v, rt.bits())
+                            } else {
+                                v
+                            }]
+                        } else {
+                            Vals::from_vec(vs.iter().take(2).copied().collect())
+                        };
+                        self.bind(f, i, out);
+                    }
+                    P::Isplit => {
+                        // (lo, hi) split of an i128 already held as a pair.
+                        let vs = self.get(arg).clone();
+                        let rs = f.dfg.inst_results(i);
+                        self.set(rs[0], vs[0]);
+                        self.set(rs[1], vs[1]);
+                    }
+                    P::BlackBox => {
+                        // Identity marker.
+                        let vs = self.get(arg).clone();
+                        let rs = f.dfg.inst_results(i);
+                        for (r, &v) in rs.iter().zip(vs.iter()) {
+                            self.set(*r, v);
+                        }
+                    }
+                    P::Bitcast => {
+                        let a = self.get1(arg);
+                        let v = self.reinterp(a, t, rt);
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    P::Fpromote | P::Fdemote => {
+                        let a = self.get1(arg);
+                        let o = match (wty(t), wty(rt)) {
+                            (WT::F32, WT::F64) => O::F64PromoteF32,
+                            (WT::F64, WT::F32) => O::F32DemoteF64,
+                            _ => panic!("{opcode} {t}->{rt}"),
+                        };
+                        let v = self.op(o, &[a], wty(rt));
+                        self.set(f.dfg.inst_results(i)[0], v);
+                    }
+                    P::FcvtToUint | P::FcvtToSint | P::FcvtToUintSat | P::FcvtToSintSat => {
+                        let v = self.fcvt_to_int(opcode, t, rt, self.get1(arg));
+                        self.bind(f, i, v);
+                    }
+                    P::FcvtFromUint | P::FcvtFromSint => {
+                        let v = self.fcvt_from_int(opcode, t, rt, arg);
+                        self.bind(f, i, v);
+                    }
+                    P::Sqrt | P::Ceil | P::Floor | P::Trunc | P::Nearest | P::Fabs | P::Fneg => {
+                        let a = self.get1(arg);
+                        let wt = wty(t);
+                        let o = match (opcode, wt) {
+                            (P::Sqrt, WT::F32) => O::F32Sqrt,
+                            (P::Sqrt, WT::F64) => O::F64Sqrt,
+                            (P::Ceil, WT::F32) => O::F32Ceil,
+                            (P::Ceil, WT::F64) => O::F64Ceil,
+                            (P::Floor, WT::F32) => O::F32Floor,
+                            (P::Floor, WT::F64) => O::F64Floor,
+                            (P::Trunc, WT::F32) => O::F32Trunc,
+                            (P::Trunc, WT::F64) => O::F64Trunc,
+                            (P::Nearest, WT::F32) => O::F32Nearest,
+                            (P::Nearest, WT::F64) => O::F64Nearest,
+                            (P::Fabs, WT::F32) => O::F32Abs,
+                            (P::Fabs, WT::F64) => O::F64Abs,
+                            (P::Fneg, WT::F32) => O::F32Neg,
+                            (P::Fneg, WT::F64) => O::F64Neg,
+                            _ => panic!("{opcode} {t}"),
+                        };
+                        let v = self.op(o, &[a], wt);
+                        self.set(f.dfg.inst_results(i)[0], v);
+                    }
+                    P::Clz | P::Ctz | P::Popcnt | P::Bswap | P::Bitrev | P::Cls => {
+                        let a = self.get1(arg);
+                        let v = self.bitop(opcode, t, a);
+                        self.bind(f, i, smallvec![v]);
+                    }
+                    P::Splat | P::VhighBits | P::Swizzle | P::ScalarToVector
+                    | P::IaddPairwise | P::SwidenLow | P::SwidenHigh | P::UwidenLow
+                    | P::UwidenHigh | P::Bmask | P::Snarrow | P::Unarrow | P::Uunarrow
+                    | P::Fvdemote | P::FvpromoteLow | P::AvgRound | P::UaddSat
+                    | P::SaddSat | P::UsubSat | P::SsubSat => {
+                        panic!("vector/saturating op {opcode} on wasm clif path")
+                    }
+                    _ => panic!("unary {opcode}"),
+                }
+            }
+            // bitcast carries MemFlags (LoadNoOffset format) in this
+            // cranelift, not Unary.
+            ir::InstructionData::LoadNoOffset { opcode: P::Bitcast, arg, .. } => {
+                let t = self.vty(f, arg);
+                let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                if self.flat(t).len() == 2 && self.flat(rt).len() == 2 {
+                    // i128<->f128: same two-i64 bit pattern.
+                    let vs = self.get(arg).clone();
+                    self.setv(f.dfg.inst_results(i)[0], vs);
+                    return;
+                }
+                let v = self.reinterp(self.get1(arg), t, rt);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::Load { opcode, arg, .. }
+            | ir::InstructionData::LoadNoOffset { opcode, arg, .. }
+                if matches!(
+                    opcode,
+                    P::Load | P::AtomicLoad | P::Uload8 | P::Sload8 | P::Uload16
+                        | P::Sload16 | P::Uload32 | P::Sload32 | P::Uload8x8 | P::Sload8x8
+                        | P::Uload16x4 | P::Sload16x4 | P::Uload32x2 | P::Sload32x2
+                ) =>
+            {
+                let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                let off = match data {
+                    ir::InstructionData::Load { offset, .. } => i64::from(offset),
+                    _ => 0,
+                };
+                let p = self.base32(arg);
+                let vs = self.do_load(opcode, rt, p, off as u64);
+                self.bind(f, i, vs);
+            }
+            ir::InstructionData::Store { opcode, args, .. }
+            | ir::InstructionData::StoreNoOffset { opcode, args, .. }
+                if matches!(
+                    opcode,
+                    P::Store | P::AtomicStore | P::Istore8 | P::Istore16 | P::Istore32
+                ) =>
+            {
+                let st = self.vty(f, args[0]);
+                let off = match data {
+                    ir::InstructionData::Store { offset, .. } => i64::from(offset),
+                    _ => 0,
+                };
+                let p = self.base32(args[1]);
+                self.do_store(opcode, st, args[0], p, off as u64);
+            }
+            ir::InstructionData::StackAddr { stack_slot, offset, .. } => {
+                let v = self.slot_addr(f, stack_slot, i64::from(offset));
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::DynamicStackAddr { .. } => panic!("dynamic stack slot"),
+            ir::InstructionData::FuncAddr { func_ref, .. } => {
+                let name = self.fr_name(f, func_ref);
+                let v = self.sym_got(true, &name, 0);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::UnaryGlobalValue { opcode, global_value } => match opcode {
+                P::SymbolValue => {
+                    let (func, name, off) = self.gv_sym(f, global_value);
+                    let v = self.sym_got(func, &name, off);
+                    self.set(f.dfg.inst_results(i)[0], v);
+                }
+                P::TlsValue => panic!("tls on wasm"),
+                _ => panic!("gv op {opcode}"),
+            },
+            ir::InstructionData::Call { opcode, func_ref, .. } => {
+                let args = f.dfg.inst_args(i).to_vec();
+                // Memfuncs arrive as libcalls from the cranelift frontend;
+                // wasm bulk-memory ops cover them natively.
+                if let &ExternalName::LibCall(lc) = &f.dfg.ext_funcs[func_ref].name {
+                    use ir::LibCall as L;
+                    if matches!(lc, L::Memcpy | L::Memmove | L::Memset | L::Memcmp) {
+                        let mem = self.o.mem;
+                        let d = self.cvt(self.get1(args[0]), WT::I32);
+                        let s = self.cvt(self.get1(args[1]), WT::I32);
+                        let n = self.cvt(self.get1(args[2]), WT::I32);
+                        match lc {
+                            L::Memcpy | L::Memmove => self.op0(
+                                O::MemoryCopy {
+                                    dst_mem: mem,
+                                    src_mem: mem,
+                                },
+                                &[d, s, n],
+                            ),
+                            L::Memset => self.op0(O::MemoryFill { mem }, &[d, s, n]),
+                            _ => {
+                                // memcmp(d, s, n): bail to a helper below.
+                                panic!("memcmp libcall on wasm clif path")
+                            }
+                        }
+                        return;
+                    }
+                }
+                let sig = f.dfg.signatures[f.dfg.ext_funcs[func_ref].signature].clone();
+                // core::arch::wasm32 memory intrinsics are `llvm.*`
+                // link_name functions that surface as `__pliron_llvm_*`
+                // imports; wasm covers them natively.
+                if matches!(&f.dfg.ext_funcs[func_ref].name, ExternalName::User(_)) {
+                    let name = self.func_name(func_ref, f);
+                    if name.starts_with("__pliron_llvm_wasm_memory_grow") {
+                        let wargs = self.call_args(&sig, &args);
+                        let mem = self.o.mem;
+                        let v = self.op(O::MemoryGrow { mem }, &[wargs[1]], WT::I32);
+                        self.bind_call(f, i, smallvec![v]);
+                        return;
+                    }
+                    if name.starts_with("__pliron_llvm_wasm_memory_size") {
+                        let mem = self.o.mem;
+                        let v = self.op(O::MemorySize { mem }, &[], WT::I32);
+                        self.bind_call(f, i, smallvec![v]);
+                        return;
+                    }
+                }
+                // FnLower::libcall fabricates `(...)->i128/f128` call sigs
+                // for compiler-rt helpers (`__divti3`, `fmodf128`, ...), but
+                // their real wasm C ABI passes a 128-bit result through an
+                // sret pointer arg. Mangled (`_R`/`_Z`) callees are Rust-ABI
+                // and keep the flattened pair; a defined callee's own sig
+                // decides.
+                if opcode == P::Call
+                    && sig.returns.len() == 1
+                    && matches!(sig.returns[0].value_type, clt::I128 | clt::F128)
+                {
+                    let name = self.func_name(func_ref, f);
+                    let sret = match self.o.fidx.get(&name) {
+                        Some(&i) => {
+                            let sd = &self.o.m.signatures[self.o.funcs[i].sig];
+                            sd.returns.is_empty() && sd.params.first() == Some(&WT::I32)
+                        }
+                        None => {
+                            !(name.starts_with("_R")
+                                || name.starts_with("_ZN")
+                                || name.starts_with("_Z"))
+                        }
+                    };
+                    if sret {
+                        let ra = self.frame_slot(16, 16) as i64;
+                        let ret = self.addr(ra);
+                        let wargs = self.call_args(&sig, &args);
+                        let mut ps = vec![WT::I32];
+                        ps.extend(wargs.iter().map(|&x| self.ty_of(x)));
+                        let fi = self.o.libfunc(
+                            &name,
+                            SignatureData {
+                                params: ps,
+                                returns: vec![],
+                            },
+                        );
+                        let mut a: Vec<WV> = vec![ret];
+                        a.extend(wargs);
+                        self.opn(O::Call { function_index: Func::new(fi) }, &a, &[]);
+                        let vs = smallvec![
+                            self.load(clt::I64, ret, 0),
+                            self.load(clt::I64, ret, 8)
+                        ];
+                        self.bind_call(f, i, vs);
+                        return;
+                    }
+                }
+                let fi = self.func_idx(func_ref, f);
+                let wargs = self.call_args(&sig, &args);
+                let rtys = cwsig(&sig).returns;
+                let vs = self.opn(O::Call { function_index: fi }, &wargs, &rtys);
+                if opcode == P::ReturnCall {
+                    self.ret(&vs);
+                } else {
+                    self.bind_call(f, i, vs);
+                }
+            }
+            ir::InstructionData::CallIndirect { opcode, sig_ref, .. } => {
+                let args = f.dfg.inst_args(i).to_vec();
+                let sig = f.dfg.signatures[sig_ref].clone();
+                // call_indirect sig, callee, args... -- callee is first.
+                let (callee, cargs) = args.split_first().unwrap();
+                let callee = self.cvt(self.get1(*callee), WT::I32);
+                let mut wargs = self.call_args(&sig, cargs);
+                wargs.push(callee);
+                let rtys = cwsig(&sig).returns;
+                let sig_index = self.sig_of(f, sig_ref);
+                let table_index = self.o.table;
+                let vs = self.opn(
+                    O::CallIndirect { sig_index, table_index },
+                    &wargs,
+                    &rtys,
+                );
+                if opcode == P::ReturnCallIndirect {
+                    self.ret(&vs);
+                } else {
+                    self.bind_call(f, i, vs);
+                }
+            }
+            ir::InstructionData::TryCall { .. } | ir::InstructionData::TryCallIndirect { .. } => {
+                panic!("try_call on wasm (emulated EH not wired)")
+            }
+            ir::InstructionData::Jump { destination, .. } => {
+                let t = self.block_target(f, &destination);
+                self.b.set_terminator(self.cur, Terminator::Br { target: t });
+            }
+            ir::InstructionData::Brif { arg, blocks, .. } => {
+                let c = self.cvt(self.get1(arg), WT::I32);
+                let if_true = self.block_target(f, &blocks[0]);
+                let if_false = self.block_target(f, &blocks[1]);
+                self.b.set_terminator(
+                    self.cur,
+                    Terminator::CondBr { cond: c, if_true, if_false },
+                );
+            }
+            ir::InstructionData::BranchTable { arg, table, .. } => {
+                let c = self.cvt(self.get1(arg), WT::I32);
+                let all = f.dfg.jump_tables.get(table).unwrap().all_branches().to_vec();
+                let default = self.block_target(f, &all[0]);
+                let targets: Vec<BlockTarget> =
+                    all[1..].iter().map(|bc| self.block_target(f, bc)).collect();
+                self.b.set_terminator(
+                    self.cur,
+                    Terminator::Select { value: c, targets, default },
+                );
+            }
+            ir::InstructionData::MultiAry { opcode: P::Return, .. } => {
+                let args = f.dfg.inst_args(i).to_vec();
+                let vs = self.ret_vals(f, &args);
+                self.ret(&vs);
+            }
+            ir::InstructionData::Trap { .. } => {
+                self.b.set_terminator(self.cur, Terminator::Unreachable);
+            }
+            ir::InstructionData::CondTrap { arg, .. } => {
+                let c = self.cvt(self.get1(arg), WT::I32);
+                // trapnz traps when nonzero; trapz when zero.
+                let c = if opc == P::Trapz {
+                    let z = self.i32c(0);
+                    self.op(O::I32Eq, &[c, z], WT::I32)
+                } else {
+                    c
+                };
+                self.cond_trap(c);
+            }
+            ir::InstructionData::IntAddTrap { args, .. } => {
+                // uadd_overflow_trap / iadd_trap: emit the add, trap on carry.
+                let t = self.vty(f, args[0]);
+                let (sum, cout) = self.addc(t, self.get1(args[0]), self.get1(args[1]), false);
+                self.bind(f, i, smallvec![sum]);
+                self.cond_trap(cout);
+            }
+            ir::InstructionData::AtomicRmw { op, args, .. } => {
+                let t = self.vty(f, args[1]);
+                let p = self.base32(args[0]);
+                let x = self.get1(args[1]);
+                let old = self.load(t, p, 0);
+                let nv = self.atomic_op(op, t, old, x);
+                self.store(t, nv, p, 0);
+                self.bind(f, i, smallvec![old]);
+            }
+            ir::InstructionData::AtomicCas { args, .. } => {
+                let t = self.vty(f, args[1]);
+                let p = self.base32(args[0]);
+                let old = self.load(t, p, 0);
+                let ok = self.icmp(ir::condcodes::IntCC::Equal, t, old, self.get1(args[1]));
+                let nv = self.sel(ok, self.get1(args[2]), old);
+                self.store(t, nv, p, 0);
+                self.bind(f, i, smallvec![old]);
+            }
+            ir::InstructionData::NullAry { opcode } => match opcode {
+                P::GetStackPointer => {
+                    let g = self.op(O::GlobalGet { global_index: self.o.sp }, &[], WT::I32);
+                    let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                    let v = self.cvt(g, wty(rt));
+                    self.set(f.dfg.inst_results(i)[0], v);
+                }
+                P::GetFramePointer => {
+                    let rt = self.vty(f, f.dfg.inst_results(i)[0]);
+                    let v = self.cvt(self.fp, wty(rt));
+                    self.set(f.dfg.inst_results(i)[0], v);
+                }
+                P::GetReturnAddress => panic!("return address on wasm"),
+                // No-ops in a single-threaded wasm world.
+                P::Nop | P::Fence | P::Debugtrap | P::SequencePoint => {}
+                _ => panic!("nullary {opcode}"),
+            },
+            ir::InstructionData::TernaryImm8 { opcode: P::Insertlane, args, imm } => {
+                let t = self.vty(f, args[0]);
+                let v = self.insert_lane(t, args[0], args[1], imm.into());
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::Shuffle { opcode: P::Shuffle, args, imm } => {
+                let (a, b) = (self.get1(args[0]), self.get1(args[1]));
+                let bytes = f.dfg.immediates[imm].as_slice();
+                let lanes: [u8; 16] = bytes
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("shuffle mask {} bytes", bytes.len()));
+                let v = self.op(O::I8x16Shuffle { lanes }, &[a, b], WT::V128);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::UnaryConst { opcode: P::Vconst, constant_handle } => {
+                let bytes = f.dfg.constants.get(constant_handle).as_slice();
+                let value = u128::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .unwrap_or_else(|_| panic!("vconst {} bytes", bytes.len())),
+                );
+                let v = self.op(O::V128Const { value }, &[], WT::V128);
+                self.set(f.dfg.inst_results(i)[0], v);
+            }
+            ir::InstructionData::ExceptionHandlerAddress { .. } => panic!("eh on wasm"),
+            _ => panic!("untranslated clif opcode {opc}"),
+        }
+    }
+}
+
+impl<'o, 'a> CX<'o, 'a> {
+    /// Constant of CLIF type `t` holding `bits`.
+    fn leaf_const(&mut self, t: ClType, bits: u64) -> WV {
+        match wty(t) {
+            WT::I64 => {
+                let m = if t.bits() >= 64 { u64::MAX } else { (1u64 << t.bits()) - 1 };
+                self.i64c(bits & m)
+            }
+            _ => {
+                let m = if t.bits() >= 32 { u64::MAX } else { (1u64 << t.bits()) - 1 };
+                self.i32c((bits & m) as u32)
+            }
+        }
+    }
+
+    /// Resolve an `ExternalName::User` ref to (namespace, index).
+    fn user_name(&self, f: &ir::Function, u: ir::UserExternalNameRef) -> (u32, u32) {
+        let n = &f.params.user_named_funcs()[u];
+        (n.namespace, n.index)
+    }
+
+    fn fr_name(&self, f: &ir::Function, fr: ir::FuncRef) -> String {
+        match &f.dfg.ext_funcs[fr].name {
+            ExternalName::User(u) => {
+                let (ns, idx) = self.user_name(f, *u);
+                self.fn_names
+                    .get(idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("bad func ref ns{ns} idx{idx}"))
+            }
+            ExternalName::LibCall(lc) => format!("{lc:?}"),
+            n => panic!("non-user func ref {n:?}"),
+        }
+    }
+
+    /// GlobalValue -> (is_func, symbol, byte offset). Follows IAddImm chains.
+    fn gv_sym(&self, f: &ir::Function, gv: ir::GlobalValue) -> (bool, String, i64) {
+        match &f.global_values[gv] {
+            GlobalValueData::Symbol { name, offset, .. } => match name {
+                ExternalName::User(u) => {
+                    let (ns, idx) = self.user_name(f, *u);
+                    let names = if ns == 0 { self.fn_names } else { self.data_names };
+                    (
+                        ns == 0,
+                        names
+                            .get(idx as usize)
+                            .cloned()
+                            .unwrap_or_else(|| panic!("bad gv ns{ns} idx{idx}")),
+                        offset.bits(),
+                    )
+                }
+                n => panic!("non-user symbol gv {n:?}"),
+            },
+            GlobalValueData::IAddImm { base, offset, .. } => {
+                let (func, name, off) = self.gv_sym(f, *base);
+                (func, name, off + offset.bits())
+            }
+            g => panic!("global value {g:?}"),
+        }
+    }
+
+    /// icmp `a cond b` -> i32. `t` is the operand type.
+    fn icmp(&mut self, cond: ir::condcodes::IntCC, t: ClType, a: WV, b: WV) -> WV {
+        use ir::condcodes::IntCC as CC;
+        if t == clt::F32 || t == clt::F64 {
+            let (eq, ne, lt, le, gt, ge) = if t == clt::F64 {
+                (O::F64Eq, O::F64Ne, O::F64Lt, O::F64Le, O::F64Gt, O::F64Ge)
+            } else {
+                (O::F32Eq, O::F32Ne, O::F32Lt, O::F32Le, O::F32Gt, O::F32Ge)
+            };
+            // only ever reached via shenanigans; fcmp handles float conds.
+            let v = self.op(eq, &[a, b], WT::I32);
+            let _ = (ne, lt, le, gt, ge);
+            return v;
+        }
+        let w = t.bits();
+        let (a, b) = if w < 32 {
+            match cond {
+                CC::SignedLessThan
+                | CC::SignedGreaterThanOrEqual
+                | CC::SignedLessThanOrEqual
+                | CC::SignedGreaterThan => (self.sext(a, w), self.sext(b, w)),
+                _ => (self.norm(a, w), self.norm(b, w)),
+            }
+        } else {
+            (a, b)
+        };
+        let i64 = wty(t) == WT::I64;
+        let ops = |s: bool| -> [O; 8] {
+            if i64 {
+                if s {
+                    [O::I64Eq, O::I64Ne, O::I64LtS, O::I64GeS, O::I64LeS, O::I64GtS, O::I64LtS, O::I64GtS]
+                } else {
+                    [O::I64Eq, O::I64Ne, O::I64LtU, O::I64GeU, O::I64LeU, O::I64GtU, O::I64LtU, O::I64GtU]
+                }
+            } else if s {
+                [O::I32Eq, O::I32Ne, O::I32LtS, O::I32GeS, O::I32LeS, O::I32GtS, O::I32LtS, O::I32GtS]
+            } else {
+                [O::I32Eq, O::I32Ne, O::I32LtU, O::I32GeU, O::I32LeU, O::I32GtU, O::I32LtU, O::I32GtU]
+            }
+        };
+        let o = ops(matches!(
+            cond,
+            CC::SignedLessThan
+                | CC::SignedGreaterThanOrEqual
+                | CC::SignedLessThanOrEqual
+                | CC::SignedGreaterThan
+        ));
+        let (x, y, op) = match cond {
+            CC::Equal => (a, b, o[0]),
+            CC::NotEqual => (a, b, o[1]),
+            CC::SignedLessThan | CC::UnsignedLessThan => (a, b, o[2]),
+            CC::SignedGreaterThanOrEqual | CC::UnsignedGreaterThanOrEqual => (a, b, o[3]),
+            CC::SignedLessThanOrEqual | CC::UnsignedLessThanOrEqual => (a, b, o[4]),
+            CC::SignedGreaterThan | CC::UnsignedGreaterThan => (a, b, o[5]),
+        };
+        let _ = (o[6], o[7]);
+        self.op(op, &[x, y], WT::I32)
+    }
+
+    fn fcmp(&mut self, cond: ir::condcodes::FloatCC, t: ClType, a: WV, b: WV) -> WV {
+        use ir::condcodes::FloatCC as CC;
+        let f64 = wty(t) == WT::F64;
+        let (eq, ne, lt, le, gt, ge) = if f64 {
+            (O::F64Eq, O::F64Ne, O::F64Lt, O::F64Le, O::F64Gt, O::F64Ge)
+        } else {
+            (O::F32Eq, O::F32Ne, O::F32Lt, O::F32Le, O::F32Gt, O::F32Ge)
+        };
+        let ord = |cx: &mut Self| -> WV {
+            // !(a!=a) & !(b!=b)
+            let l = cx.op(ne, &[a, a], WT::I32);
+            let r = cx.op(ne, &[b, b], WT::I32);
+            let u = cx.op(O::I32Or, &[l, r], WT::I32);
+            let one = cx.i32c(1);
+            cx.op(O::I32Xor, &[u, one], WT::I32)
+        };
+        let uno = |cx: &mut Self| -> WV {
+            let l = cx.op(ne, &[a, a], WT::I32);
+            let r = cx.op(ne, &[b, b], WT::I32);
+            cx.op(O::I32Or, &[l, r], WT::I32)
+        };
+        match cond {
+            CC::Ordered => ord(self),
+            CC::Unordered => uno(self),
+            CC::Equal => self.op(eq, &[a, b], WT::I32),
+            CC::NotEqual => self.op(ne, &[a, b], WT::I32),
+            CC::LessThan => self.op(lt, &[a, b], WT::I32),
+            CC::LessThanOrEqual => self.op(le, &[a, b], WT::I32),
+            CC::GreaterThan => self.op(gt, &[a, b], WT::I32),
+            CC::GreaterThanOrEqual => self.op(ge, &[a, b], WT::I32),
+            CC::OrderedNotEqual => {
+                let x = self.op(ne, &[a, b], WT::I32);
+                let o = ord(self);
+                self.op(O::I32And, &[x, o], WT::I32)
+            }
+            CC::UnorderedOrEqual => {
+                let x = self.op(eq, &[a, b], WT::I32);
+                let u = uno(self);
+                self.op(O::I32Or, &[x, u], WT::I32)
+            }
+            CC::UnorderedOrLessThan => {
+                let x = self.op(lt, &[a, b], WT::I32);
+                let u = uno(self);
+                self.op(O::I32Or, &[x, u], WT::I32)
+            }
+            CC::UnorderedOrLessThanOrEqual => {
+                let x = self.op(le, &[a, b], WT::I32);
+                let u = uno(self);
+                self.op(O::I32Or, &[x, u], WT::I32)
+            }
+            CC::UnorderedOrGreaterThan => {
+                let x = self.op(gt, &[a, b], WT::I32);
+                let u = uno(self);
+                self.op(O::I32Or, &[x, u], WT::I32)
+            }
+            CC::UnorderedOrGreaterThanOrEqual => {
+                let x = self.op(ge, &[a, b], WT::I32);
+                let u = uno(self);
+                self.op(O::I32Or, &[x, u], WT::I32)
+            }
+        }
+    }
+
+    /// Float binary: fmin/fmax preserve NaN via libcall; others map 1:1.
+    fn fbin(&mut self, op: Opcode, t: ClType, f: &ir::Function, i: CInst, args: [ir::Value; 2]) {
+        use Opcode as P;
+        let wt = wty(t);
+        let a = self.get1(args[0]);
+        let b = self.get1(args[1]);
+        let o = match (op, wt) {
+            (P::Fadd, WT::F32) => O::F32Add,
+            (P::Fadd, WT::F64) => O::F64Add,
+            (P::Fsub, WT::F32) => O::F32Sub,
+            (P::Fsub, WT::F64) => O::F64Sub,
+            (P::Fmul, WT::F32) => O::F32Mul,
+            (P::Fmul, WT::F64) => O::F64Mul,
+            (P::Fdiv, WT::F32) => O::F32Div,
+            (P::Fdiv, WT::F64) => O::F64Div,
+            (P::Fmin, WT::F32) => O::F32Min,
+            (P::Fmin, WT::F64) => O::F64Min,
+            (P::Fmax, WT::F32) => O::F32Max,
+            (P::Fmax, WT::F64) => O::F64Max,
+            _ => panic!("fbin {op} {t}"),
+        };
+        let v = self.op(o, &[a, b], wt);
+        self.set(f.dfg.inst_results(i)[0], v);
+    }
+
+    /// Load CLIF type `t` at `p + off`, handling ext loads and i128.
+    fn do_load(&mut self, op: Opcode, t: ClType, p: WV, off: u64) -> Vals {
+        use Opcode as P;
+        if t == clt::I128 || t == clt::F128 {
+            let lo = self.load(clt::I64, p, off);
+            let hi = self.load(clt::I64, p, off + 8);
+            return smallvec![lo, hi];
+        }
+        let mem = self.o.mem;
+        let bytes = |b: u64| MemoryArg {
+            align: b.trailing_zeros(),
+            offset: off as u32,
+            memory: mem,
+        };
+        let (o, ty) = match op {
+            P::Load | P::AtomicLoad => {
+                return smallvec![self.load(t, p, off)];
+            }
+            // Vector widening loads.
+            P::Uload8x8 => (O::V128Load8x8U { memory: bytes(8) }, WT::V128),
+            P::Sload8x8 => (O::V128Load8x8S { memory: bytes(8) }, WT::V128),
+            P::Uload16x4 => (O::V128Load16x4U { memory: bytes(8) }, WT::V128),
+            P::Sload16x4 => (O::V128Load16x4S { memory: bytes(8) }, WT::V128),
+            P::Uload32x2 => (O::V128Load32x2U { memory: bytes(8) }, WT::V128),
+            P::Sload32x2 => (O::V128Load32x2S { memory: bytes(8) }, WT::V128),
+            _ => {
+                let i64 = wty(t) == WT::I64;
+                match op {
+                    P::Uload8 => (O::I32Load8U { memory: bytes(1) }, WT::I32),
+                    P::Sload8 => (O::I32Load8S { memory: bytes(1) }, WT::I32),
+                    P::Uload16 => (O::I32Load16U { memory: bytes(2) }, WT::I32),
+                    P::Sload16 => (O::I32Load16S { memory: bytes(2) }, WT::I32),
+                    P::Uload32 if i64 => {
+                        return smallvec![self.op(
+                            O::I64Load32U { memory: bytes(4) },
+                            &[p],
+                            WT::I64,
+                        )];
+                    }
+                    P::Sload32 => (O::I64Load32S { memory: bytes(4) }, WT::I64),
+                    _ => panic!("load op {op}"),
+                }
+            }
+        };
+        let i64 = !t.is_vector() && wty(t) == WT::I64;
+        let mut v = self.op(o, &[p], ty);
+        // Canonicalize narrow unsigned loads to the same rep as zext.
+        if matches!(op, P::Uload8 | P::Uload16) && i64 {
+            v = self.op(O::I64ExtendI32U, &[v], WT::I64);
+        }
+        smallvec![v]
+    }
+
+    fn do_store(&mut self, op: Opcode, t: ClType, v: ir::Value, p: WV, off: u64) {
+        use Opcode as P;
+        if t == clt::I128 || t == clt::F128 {
+            let (lo, hi) = self.pair(v);
+            self.store(clt::I64, lo, p, off);
+            self.store(clt::I64, hi, p, off + 8);
+            return;
+        }
+        let mem = self.o.mem;
+        let bytes = |b: u64| MemoryArg {
+            align: b.trailing_zeros(),
+            offset: off as u32,
+            memory: mem,
+        };
+        match op {
+            P::Store | P::AtomicStore => self.store(t, self.get1(v), p, off),
+            P::Istore8 | P::Istore16 | P::Istore32 => {
+                // Store the low bits; i64 carriers wrap to i32.
+                let v = self.cvt(self.get1(v), WT::I32);
+                let o = match op {
+                    P::Istore8 => O::I32Store8 { memory: bytes(1) },
+                    P::Istore16 => O::I32Store16 { memory: bytes(2) },
+                    _ => O::I32Store { memory: bytes(4) },
+                };
+                self.op0(o, &[p, v]);
+            }
+            _ => panic!("store op {op}"),
+        }
+    }
+
+    /// uextend/sextend `arg` -> `rt` (i64->i128 and narrow steps too).
+    fn extend(&mut self, f: &ir::Function, arg: ir::Value, rt: ClType, signed: bool) -> Vals {
+        let st = self.vty(f, arg);
+        if rt == clt::I128 || rt == clt::F128 {
+            let a = self.cvt(self.get1(arg), WT::I64);
+            let hi = if signed {
+                let s = self.i64c(63);
+                self.op(O::I64ShrS, &[a, s], WT::I64)
+            } else {
+                self.i64c(0)
+            };
+            return smallvec![a, hi];
+        }
+        let a = self.get1(arg);
+        let v = match (wty(st), wty(rt)) {
+            (WT::I32, WT::I64) => {
+                if signed {
+                    let a = if st.bits() < 32 { self.sext(a, st.bits()) } else { a };
+                    self.op(O::I64ExtendI32S, &[a], WT::I64)
+                } else {
+                    self.op(O::I64ExtendI32U, &[a], WT::I64)
+                }
+            }
+            (WT::I32, WT::I32) => {
+                let a = self.norm(a, st.bits());
+                if signed { self.sext(a, st.bits()) } else { a }
+            }
+            (WT::I64, WT::I64) => a,
+            _ => panic!("extend {st}->{rt}"),
+        };
+        smallvec![v]
+    }
+
+    /// CLIF bitcast: reinterpret scalar reps.
+    fn reinterp(&mut self, v: WV, st: ClType, rt: ClType) -> WV {
+        // v128<->v128 bitcasts are a free reinterpret; vector<->scalar
+        // bitcasts don't exist in CLIF.
+        if st.is_vector() || rt.is_vector() {
+            assert!(st.is_vector() && rt.is_vector(), "bitcast {st}->{rt}");
+            return v;
+        }
+        match (wty(st), wty(rt)) {
+            (a, b) if a == b => v,
+            (WT::I32, WT::F32) => self.op(O::F32ReinterpretI32, &[v], WT::F32),
+            (WT::F32, WT::I32) => self.op(O::I32ReinterpretF32, &[v], WT::I32),
+            (WT::I64, WT::F64) => self.op(O::F64ReinterpretI64, &[v], WT::F64),
+            (WT::F64, WT::I64) => self.op(O::I64ReinterpretF64, &[v], WT::I64),
+            (WT::I64, WT::I32) => self.op(O::I32WrapI64, &[v], WT::I32),
+            (WT::I32, WT::I64) => self.op(O::I64ExtendI32U, &[v], WT::I64),
+            _ => panic!("bitcast {st}->{rt}"),
+        }
+    }
+
+    /// fcvt_to_int(+sat); unsaturated wasm trap ops carry the CLIF flags.
+    fn fcvt_to_int(&mut self, op: Opcode, ft: ClType, rt: ClType, a: WV) -> Vals {
+        use Opcode as P;
+        let wf = wty(ft);
+        if rt == clt::I128 {
+            // Via libcall: compiler-rt `__fix*` helpers, keyed on ft.
+            let name = match (op, ft) {
+                (P::FcvtToSint | P::FcvtToSintSat, clt::F64) => "__fixdfti",
+                (P::FcvtToUint | P::FcvtToUintSat, clt::F64) => "__fixunsdfti",
+                (P::FcvtToSint | P::FcvtToSintSat, clt::F32) => "__fixsfti",
+                _ => "__fixunssfti",
+            };
+            let _ = wf;
+            return self.libcall1(name, &[clt::I128], &[ft], &[a]);
+        }
+        let o = match (op, wf, wty(rt)) {
+            (P::FcvtToSint, WT::F32, WT::I32) => O::I32TruncF32S,
+            (P::FcvtToSint, WT::F32, WT::I64) => O::I64TruncF32S,
+            (P::FcvtToSint, WT::F64, WT::I32) => O::I32TruncF64S,
+            (P::FcvtToSint, WT::F64, WT::I64) => O::I64TruncF64S,
+            (P::FcvtToUint, WT::F32, WT::I32) => O::I32TruncF32U,
+            (P::FcvtToUint, WT::F32, WT::I64) => O::I64TruncF32U,
+            (P::FcvtToUint, WT::F64, WT::I32) => O::I32TruncF64U,
+            (P::FcvtToUint, WT::F64, WT::I64) => O::I64TruncF64U,
+            (P::FcvtToSintSat, WT::F32, WT::I32) => O::I32TruncSatF32S,
+            (P::FcvtToSintSat, WT::F32, WT::I64) => O::I64TruncSatF32S,
+            (P::FcvtToSintSat, WT::F64, WT::I32) => O::I32TruncSatF64S,
+            (P::FcvtToSintSat, WT::F64, WT::I64) => O::I64TruncSatF64S,
+            (P::FcvtToUintSat, WT::F32, WT::I32) => O::I32TruncSatF32U,
+            (P::FcvtToUintSat, WT::F32, WT::I64) => O::I64TruncSatF32U,
+            (P::FcvtToUintSat, WT::F64, WT::I32) => O::I32TruncSatF64U,
+            (P::FcvtToUintSat, WT::F64, WT::I64) => O::I64TruncSatF64U,
+            _ => panic!("fcvt {op} {ft}->{rt}"),
+        };
+        let mut v = self.op(o, &[a], wty(rt));
+        if rt.bits() < 32 {
+            v = self.norm(v, rt.bits());
+        }
+        smallvec![v]
+    }
+
+    fn fcvt_from_int(&mut self, op: Opcode, st: ClType, rt: ClType, arg: ir::Value) -> Vals {
+        use Opcode as P;
+        if st == clt::I128 {
+            let name = match (op, rt) {
+                (P::FcvtFromSint, clt::F64) => "__floattidf",
+                (P::FcvtFromUint, clt::F64) => "__floatuntidf",
+                (P::FcvtFromSint, clt::F32) => "__floattisf",
+                _ => "__floatuntisf",
+            };
+            let (lo, hi) = self.pair(arg);
+            return self.libcall1(name, &[rt], &[clt::I128], &[lo, hi]);
+        }
+        let a = self.get1(arg);
+        let signed = op == P::FcvtFromSint;
+        let a = if signed { self.sext(a, st.bits()) } else { self.norm(a, st.bits()) };
+        let wi = wty(st);
+        let wr = wty(rt);
+        let o = match (signed, wi, wr) {
+            (true, WT::I32, WT::F32) => O::F32ConvertI32S,
+            (true, WT::I32, WT::F64) => O::F64ConvertI32S,
+            (true, WT::I64, WT::F32) => O::F32ConvertI64S,
+            (true, WT::I64, WT::F64) => O::F64ConvertI64S,
+            (false, WT::I32, WT::F32) => O::F32ConvertI32U,
+            (false, WT::I32, WT::F64) => O::F64ConvertI32U,
+            (false, WT::I64, WT::F32) => O::F32ConvertI64U,
+            (false, WT::I64, WT::F64) => O::F64ConvertI64U,
+            _ => panic!("fcvt {st}->{rt}"),
+        };
+        smallvec![self.op(o, &[a], wr)]
+    }
+
+    /// Import `name` under a signature built from the operand reps and call
+    /// it. Used for compiler-rt helpers (`__multi3`, `__udivti3`, ...).
+    /// i128/f128 results use the sret ABI (matching the helpers' real
+    /// signatures): a 16-byte frame slot as the first arg, loaded back.
+    fn libcall1(&mut self, name: &str, rets: &[ClType], _args: &[ClType], xs: &[WV]) -> Vals {
+        let mut rty = Vec::new();
+        for t in rets {
+            cwtys(*t, &mut rty);
+        }
+        if rty == [WT::I64, WT::I64] {
+            let off = self.frame_slot(16, 16);
+            let c = self.i32c(off);
+            let ret = self.op(O::I32Add, &[self.fp, c], WT::I32);
+            let mut ps = vec![WT::I32];
+            ps.extend(xs.iter().map(|&x| self.ty_of(x)));
+            let i = self.o.libfunc(name, SignatureData {
+                params: ps,
+                returns: vec![],
+            });
+            let mut a: Vec<WV> = vec![ret];
+            a.extend_from_slice(xs);
+            self.opn(O::Call { function_index: Func::new(i) }, &a, &[]);
+            return smallvec![
+                self.load(clt::I64, ret, 0),
+                self.load(clt::I64, ret, 8)
+            ];
+        }
+        let aty: Vec<WT> = xs.iter().map(|&x| self.ty_of(x)).collect();
+        let rtys = rty.clone();
+        let f = Func::new(self.o.libfunc(name, SignatureData { params: aty, returns: rty }));
+        self.opn(O::Call { function_index: f }, xs, &rtys)
+    }
+
+    /// clz/ctz/popcnt/bswap/cls/bitrev on canonical narrow ints.
+    fn bitop(&mut self, op: Opcode, t: ClType, a: WV) -> WV {
+        use Opcode as P;
+        let w = t.bits();
+        let i64 = wty(t) == WT::I64;
+        match op {
+            P::Popcnt => {
+                let r = if i64 {
+                    self.op(O::I64Popcnt, &[a], WT::I64)
+                } else {
+                    self.op(O::I32Popcnt, &[a], WT::I32)
+                };
+                if w < 32 { self.norm(r, w) } else { r }
+            }
+            P::Clz => {
+                if i64 {
+                    self.op(O::I64Clz, &[a], WT::I64)
+                } else if w == 32 {
+                    self.op(O::I32Clz, &[a], WT::I32)
+                } else {
+                    // clz(canonical) - (32 - w)
+                    let c = self.op(O::I32Clz, &[a], WT::I32);
+                    let off = self.i32c(32 - w);
+                    self.op(O::I32Sub, &[c, off], WT::I32)
+                }
+            }
+            P::Ctz => {
+                if i64 {
+                    self.op(O::I64Ctz, &[a], WT::I64)
+                } else if w == 32 {
+                    self.op(O::I32Ctz, &[a], WT::I32)
+                } else {
+                    // ctz(a | (1<<w))  -- sets a marker bit above w
+                    let hi = self.i32c(1 << w);
+                    let x = self.op(O::I32Or, &[a, hi], WT::I32);
+                    self.op(O::I32Ctz, &[x], WT::I32)
+                }
+            }
+            P::Bswap => {
+                let r = if i64 { self.bswap64(a) } else { self.bswap32(a) };
+                // narrow: byte-reverse in the container then pull the bytes
+                // down into place.
+                if w < 32 {
+                    let s = self.i32c(32 - w);
+                    self.op(O::I32ShrU, &[r, s], WT::I32)
+                } else {
+                    r
+                }
+            }
+            P::Cls => {
+                // cls x = clz((x << 1) ^ x) - 1 on the sign-extended rep.
+                let a = if w < 64 { self.sext(a, w) } else { a };
+                let one = self.leaf_const(t, 1);
+                let sh = self.binop(t, O::I32Shl, O::I64Shl, a, one);
+                let x = self.binop(t, O::I32Xor, O::I64Xor, sh, a);
+                let c = if i64 {
+                    self.op(O::I64Clz, &[x], WT::I64)
+                } else {
+                    self.op(O::I32Clz, &[x], WT::I32)
+                };
+                self.binop(t, O::I32Sub, O::I64Sub, c, one)
+            }
+            P::Bitrev => {
+                // Swap adjacent bits, then pairs, then nibbles; a final
+                // byte swap finishes the reversal.
+                let wt = wty(t);
+                let (shl, shr, and, or) = if i64 {
+                    (O::I64Shl, O::I64ShrU, O::I64And, O::I64Or)
+                } else {
+                    (O::I32Shl, O::I32ShrU, O::I32And, O::I32Or)
+                };
+                let mut x = a;
+                for (k, m) in [
+                    (1u64, 0x5555_5555_5555_5555u64),
+                    (2, 0x3333_3333_3333_3333),
+                    (4, 0x0f0f_0f0f_0f0f_0f0f),
+                ] {
+                    let m = if i64 { m } else { m & 0xffff_ffff };
+                    let c = self.leaf_const(t, k);
+                    let mm = self.leaf_const(t, m);
+                    let l = self.op(and, &[x, mm], wt);
+                    let l = self.op(shl, &[l, c], wt);
+                    let r = self.op(shr, &[x, c], wt);
+                    let r = self.op(and, &[r, mm], wt);
+                    x = self.op(or, &[l, r], wt);
+                }
+                if w == 8 {
+                    self.norm(x, 8)
+                } else {
+                    self.bitop(P::Bswap, t, x)
+                }
+            }
+            _ => panic!("bitop {op}"),
+        }
+    }
+
+    /// Byte-reverse a full i32.
+    fn bswap32(&mut self, x: WV) -> WV {
+        let m1 = self.i32c(0x00ff_00ff);
+        let m2 = self.i32c(0xff00_ff00);
+        let c8 = self.i32c(8);
+        let lo = self.op(O::I32And, &[x, m1], WT::I32);
+        let lo = self.op(O::I32Shl, &[lo, c8], WT::I32);
+        let hi = self.op(O::I32And, &[x, m2], WT::I32);
+        let hi = self.op(O::I32ShrU, &[hi, c8], WT::I32);
+        let y = self.op(O::I32Or, &[lo, hi], WT::I32);
+        let c16 = self.i32c(16);
+        self.op(O::I32Rotl, &[y, c16], WT::I32)
+    }
+
+    /// Byte-reverse a full i64 via two i32 reversals and a half swap.
+    fn bswap64(&mut self, x: WV) -> WV {
+        let c32 = self.i64c(32);
+        let lo = self.op(O::I32WrapI64, &[x], WT::I32);
+        let hi = self.op(O::I64ShrU, &[x, c32], WT::I64);
+        let hi = self.op(O::I32WrapI64, &[hi], WT::I32);
+        let (lo, hi) = (self.bswap32(hi), self.bswap32(lo));
+        let lo64 = self.op(O::I64ExtendI32U, &[lo], WT::I64);
+        let hi64 = self.op(O::I64ExtendI32U, &[hi], WT::I64);
+        let hi64 = self.op(O::I64Shl, &[hi64, c32], WT::I64);
+        self.op(O::I64Or, &[hi64, lo64], WT::I64)
+    }
+
+    /// (value, flag) for the `*_overflow` binary ops.
+    fn overflow(&mut self, op: Opcode, t: ClType, a: WV, b: WV) -> Vals {
+        use Opcode as P;
+        let w = t.bits();
+        let flag = |cx: &mut Self, x: WV, y: WV, o32: O, o64: O| cx.binop(t, o32, o64, x, y);
+        match op {
+            P::UaddOverflow => {
+                let s = self.ibin(P::Iadd, t, a, b);
+                let c = flag(self, s, a, O::I32LtU, O::I64LtU);
+                smallvec![s, c]
+            }
+            P::UsubOverflow => {
+                let d = self.ibin(P::Isub, t, a, b);
+                let c = flag(self, a, b, O::I32LtU, O::I64LtU);
+                smallvec![d, c]
+            }
+            P::SaddOverflow | P::SsubOverflow => {
+                let s = self.ibin(if op == P::SaddOverflow { P::Iadd } else { P::Isub }, t, a, b);
+                // of = sign bit of (a^s) & ((a^b)^~1 * sign) -- i.e.
+                // sadd: (a^s)&(b^s); ssub: (a^b)&(a^s)
+                let x1 = self.binop(t, O::I32Xor, O::I64Xor, a, s);
+                let x2 = if op == P::SaddOverflow {
+                    self.binop(t, O::I32Xor, O::I64Xor, b, s)
+                } else {
+                    self.binop(t, O::I32Xor, O::I64Xor, a, b)
+                };
+                let m = self.binop(t, O::I32And, O::I64And, x1, x2);
+                let m = if w < 32 { self.sext(m, w) } else { m };
+                let z = self.leaf_const(t, 0);
+                let c = self.binop(t, O::I32LtS, O::I64LtS, m, z);
+                smallvec![s, c]
+            }
+            P::UmulOverflow | P::SmulOverflow => {
+                let signed = op == P::SmulOverflow;
+                let prod = self.ibin(P::Imul, t, a, b);
+                let hi = self.umulhi(t, a, b, signed);
+                let c = if signed {
+                    // hi should equal the sign-extension of prod's top bit.
+                    let sh = self.leaf_const(t, w as u64 - 1);
+                    let e = self.binop(t, O::I32ShrS, O::I64ShrS, prod, sh);
+                    self.binop(t, O::I32Ne, O::I64Ne, hi, e)
+                } else {
+                    let z = self.leaf_const(t, 0);
+                    self.binop(t, O::I32Ne, O::I64Ne, hi, z)
+                };
+                smallvec![prod, c]
+            }
+            _ => panic!("overflow {op}"),
+        }
+    }
+
+    /// (value, flag) for `*_overflow_cin`/`_bin` -- the carry/borrow input
+    /// is a clif i8 in {0,1} folded into the first operand before the main op.
+    fn overflow_in(&mut self, op: Opcode, t: ClType, a: WV, b: WV, cin: WV) -> Vals {
+        use Opcode as P;
+        let cin = self.cvt(cin, wty(t));
+        // a (+|-) cin first; cin in {0,1} can only carry when a is at its
+        // boundary, which the main op's flag still catches for the pair.
+        let a2 = if matches!(op, P::UaddOverflowCin | P::SaddOverflowCin) {
+            self.binop(t, O::I32Add, O::I64Add, a, cin)
+        } else {
+            self.binop(t, O::I32Sub, O::I64Sub, a, cin)
+        };
+        let a2 = if t.bits() < 32 { self.norm(a2, t.bits()) } else { a2 };
+        self.overflow(
+            match op {
+                P::UaddOverflowCin => P::UaddOverflow,
+                P::SaddOverflowCin => P::SaddOverflow,
+                P::UsubOverflowBin => P::UsubOverflow,
+                _ => P::SsubOverflow,
+            },
+            t,
+            a2,
+            b,
+        )
+    }
+
+    /// Single-threaded atomic rmw: load, op, store. Returns the new value.
+    fn atomic_op(&mut self, op: ir::AtomicRmwOp, t: ClType, old: WV, x: WV) -> WV {
+        use ir::AtomicRmwOp as A;
+        match op {
+            A::Add => self.binop(t, O::I32Add, O::I64Add, old, x),
+            A::Sub => self.binop(t, O::I32Sub, O::I64Sub, old, x),
+            A::And => self.binop(t, O::I32And, O::I64And, old, x),
+            A::Or => self.binop(t, O::I32Or, O::I64Or, old, x),
+            A::Xor => self.binop(t, O::I32Xor, O::I64Xor, old, x),
+            A::Nand => {
+                let a = self.binop(t, O::I32And, O::I64And, old, x);
+                self.bnot(t, a)
+            }
+            A::Xchg => x,
+            A::Umax => self.minmax(t, old, x, O::I32GtU, O::I64GtU),
+            A::Umin => self.minmax(t, old, x, O::I32LtU, O::I64LtU),
+            A::Smax => self.minmax_s(t, old, x, false),
+            A::Smin => self.minmax_s(t, old, x, true),
+        }
+    }
+
+    /// Scalar saturating add/sub on canonical reps.
+    fn sat_bin(&mut self, op: Opcode, t: ClType, a: WV, b: WV) -> WV {
+        use Opcode as P;
+        let w = t.bits();
+        let signed = matches!(op, P::SaddSat | P::SsubSat);
+        if w < 64 {
+            // Widen to i64, clamp, wrap back to the canonical rep.
+            let a64 = match (signed, w == 32) {
+                (true, true) => self.op(O::I64ExtendI32S, &[a], WT::I64),
+                (false, true) => self.op(O::I64ExtendI32U, &[a], WT::I64),
+                (true, false) => {
+                    let x = self.sext(a, w);
+                    self.op(O::I64ExtendI32S, &[x], WT::I64)
+                }
+                (false, false) => self.op(O::I64ExtendI32U, &[a], WT::I64),
+            };
+            let b64 = match (signed, w == 32) {
+                (true, true) => self.op(O::I64ExtendI32S, &[b], WT::I64),
+                (false, true) => self.op(O::I64ExtendI32U, &[b], WT::I64),
+                (true, false) => {
+                    let x = self.sext(b, w);
+                    self.op(O::I64ExtendI32S, &[x], WT::I64)
+                }
+                (false, false) => self.op(O::I64ExtendI32U, &[b], WT::I64),
+            };
+            let r = if matches!(op, P::UaddSat | P::SaddSat) {
+                self.op(O::I64Add, &[a64, b64], WT::I64)
+            } else {
+                self.op(O::I64Sub, &[a64, b64], WT::I64)
+            };
+            let r = if signed {
+                let mx = self.i64c(((1i64 << (w - 1)) - 1) as u64);
+                let mn = self.i64c((-(1i64 << (w - 1))) as u64);
+                let gt = self.op(O::I64GtS, &[r, mx], WT::I32);
+                let r = self.sel(gt, mx, r);
+                let lt = self.op(O::I64LtS, &[r, mn], WT::I32);
+                self.sel(lt, mn, r)
+            } else {
+                let mx = self.i64c((1u64 << w) - 1);
+                let z = self.i64c(0);
+                if matches!(op, P::UaddSat) {
+                    let gt = self.op(O::I64GtU, &[r, mx], WT::I32);
+                    self.sel(gt, mx, r)
+                } else {
+                    let lt = self.op(O::I64LtS, &[r, z], WT::I32);
+                    self.sel(lt, z, r)
+                }
+            };
+            let v = self.op(O::I32WrapI64, &[r], WT::I32);
+            return if w < 32 { self.norm(v, w) } else { v };
+        }
+        let sub = matches!(op, P::UsubSat | P::SsubSat);
+        let r = if sub {
+            self.op(O::I64Sub, &[a, b], WT::I64)
+        } else {
+            self.op(O::I64Add, &[a, b], WT::I64)
+        };
+        if signed {
+            // add: (a^r)&(b^r) < 0; sub: (a^b)&(a^r) < 0.
+            let x = self.op(O::I64Xor, &[a, r], WT::I64);
+            let y = if sub {
+                self.op(O::I64Xor, &[a, b], WT::I64)
+            } else {
+                self.op(O::I64Xor, &[b, r], WT::I64)
+            };
+            let m = self.op(O::I64And, &[x, y], WT::I64);
+            let z = self.i64c(0);
+            let ovf = self.op(O::I64LtS, &[m, z], WT::I32);
+            // a < 0 ? MIN : MAX
+            let neg = self.op(O::I64LtS, &[a, z], WT::I32);
+            let mx = self.i64c(i64::MAX as u64);
+            let mn = self.i64c(i64::MIN as u64);
+            let sat = self.sel(neg, mn, mx);
+            self.sel(ovf, sat, r)
+        } else {
+            let ovf = if sub {
+                self.op(O::I64LtU, &[a, b], WT::I32)
+            } else {
+                self.op(O::I64LtU, &[r, a], WT::I32)
+            };
+            let sat = self.i64c(if sub { 0 } else { u64::MAX });
+            self.sel(ovf, sat, r)
+        }
+    }
+
+    /// i128/f128 unary ops on (lo,hi) pairs.
+    fn i128_un(&mut self, op: Opcode, t: ClType, f: &ir::Function, i: CInst, arg: ir::Value) {
+        use Opcode as P;
+        let (al, ah) = self.pair(arg);
+        let r0 = f.dfg.inst_results(i)[0];
+        match op {
+            // i128<->f128 reinterpret: identical pair.
+            P::Bitcast => self.setv(r0, smallvec![al, ah]),
+            P::Bnot => {
+                let m = self.i64c(u64::MAX);
+                let lo = self.op(O::I64Xor, &[al, m], WT::I64);
+                let m = self.i64c(u64::MAX);
+                let hi = self.op(O::I64Xor, &[ah, m], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Ineg => {
+                let z = self.i64c(0);
+                let lo = self.op(O::I64Sub, &[z, al], WT::I64);
+                let nz = self.op(O::I64Ne, &[al, z], WT::I32);
+                let b64 = self.op(O::I64ExtendI32U, &[nz], WT::I64);
+                let hi = self.op(O::I64Sub, &[z, ah], WT::I64);
+                let hi = self.op(O::I64Sub, &[hi, b64], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Iabs => {
+                // negated pair, selected by the sign of `ah`.
+                let z = self.i64c(0);
+                let neg = self.op(O::I64LtS, &[ah, z], WT::I32);
+                let lo = self.op(O::I64Sub, &[z, al], WT::I64);
+                let nz = self.op(O::I64Ne, &[al, z], WT::I32);
+                let b64 = self.op(O::I64ExtendI32U, &[nz], WT::I64);
+                let hi = self.op(O::I64Sub, &[z, ah], WT::I64);
+                let hi = self.op(O::I64Sub, &[hi, b64], WT::I64);
+                let lo = self.sel(neg, lo, al);
+                let hi = self.sel(neg, hi, ah);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Clz => {
+                let clh = self.op(O::I64Clz, &[ah], WT::I64);
+                let cll = self.op(O::I64Clz, &[al], WT::I64);
+                let p64 = self.i64c(64);
+                let lop = self.op(O::I64Add, &[cll, p64], WT::I64);
+                let z = self.i64c(0);
+                let h0 = self.op(O::I64Eq, &[ah, z], WT::I32);
+                let cnt = self.sel(h0, lop, clh);
+                let z = self.i64c(0);
+                self.setv(r0, smallvec![cnt, z]);
+            }
+            P::Ctz => {
+                let ctl = self.op(O::I64Ctz, &[al], WT::I64);
+                let cth = self.op(O::I64Ctz, &[ah], WT::I64);
+                let p64 = self.i64c(64);
+                let hip = self.op(O::I64Add, &[cth, p64], WT::I64);
+                let z = self.i64c(0);
+                let l0 = self.op(O::I64Eq, &[al, z], WT::I32);
+                let cnt = self.sel(l0, hip, ctl);
+                let z = self.i64c(0);
+                self.setv(r0, smallvec![cnt, z]);
+            }
+            P::Popcnt => {
+                let l = self.op(O::I64Popcnt, &[al], WT::I64);
+                let h = self.op(O::I64Popcnt, &[ah], WT::I64);
+                let cnt = self.op(O::I64Add, &[l, h], WT::I64);
+                let z = self.i64c(0);
+                self.setv(r0, smallvec![cnt, z]);
+            }
+            P::Bswap => {
+                let lo = self.bswap64(ah);
+                let hi = self.bswap64(al);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Bitrev => {
+                let lo = self.bitop(P::Bitrev, clt::I64, ah);
+                let hi = self.bitop(P::Bitrev, clt::I64, al);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Cls => {
+                // clz(x ^ sext(sign)) - 1.
+                let s63 = self.i64c(63);
+                let s = self.op(O::I64ShrS, &[ah, s63], WT::I64);
+                let yl = self.op(O::I64Xor, &[al, s], WT::I64);
+                let yh = self.op(O::I64Xor, &[ah, s], WT::I64);
+                let clh = self.op(O::I64Clz, &[yh], WT::I64);
+                let cll = self.op(O::I64Clz, &[yl], WT::I64);
+                let p64 = self.i64c(64);
+                let lop = self.op(O::I64Add, &[cll, p64], WT::I64);
+                let z = self.i64c(0);
+                let h0 = self.op(O::I64Eq, &[yh, z], WT::I32);
+                let cnt = self.sel(h0, lop, clh);
+                let one = self.i64c(1);
+                let cnt = self.op(O::I64Sub, &[cnt, one], WT::I64);
+                let z = self.i64c(0);
+                self.setv(r0, smallvec![cnt, z]);
+            }
+            _ => panic!("i128 unary {op} on {t}"),
+        }
+    }
+
+    /// 128-bit shift on a (lo,hi) pair; `amt` is an i64 count (masked
+    /// internally). `shl` selects left, `arith` the right-shift flavour.
+    /// Same construction as the dialect path's `shift128`.
+    fn sh128(&mut self, shl: bool, arith: bool, lo: WV, hi: WV, amt: WV) -> (WV, WV) {
+        let c63 = self.i64c(63);
+        let c64 = self.i64c(64);
+        let c1 = self.i64c(1);
+        let k = self.op(O::I64And, &[amt, c63], WT::I64);
+        let inv = self.op(O::I64Sub, &[c63, k], WT::I64);
+        let big = self.op(O::I64And, &[amt, c64], WT::I64);
+        let big = self.op(O::I64Eqz, &[big], WT::I32);
+        let big = self.op(O::I32Eqz, &[big], WT::I32);
+        if shl {
+            let lo_sh = self.op(O::I64Shl, &[lo, k], WT::I64);
+            let h = self.op(O::I64Shl, &[hi, k], WT::I64);
+            let c = self.op(O::I64ShrU, &[lo, c1], WT::I64);
+            let c = self.op(O::I64ShrU, &[c, inv], WT::I64);
+            let hi_sh = self.op(O::I64Or, &[h, c], WT::I64);
+            let z = self.i64c(0);
+            (self.sel(big, z, lo_sh), self.sel(big, lo_sh, hi_sh))
+        } else {
+            let l = self.op(O::I64ShrU, &[lo, k], WT::I64);
+            let c = self.op(O::I64Shl, &[hi, c1], WT::I64);
+            let c = self.op(O::I64Shl, &[c, inv], WT::I64);
+            let lo_sh = self.op(O::I64Or, &[l, c], WT::I64);
+            let hi_sh = self.op(
+                if arith { O::I64ShrS } else { O::I64ShrU },
+                &[hi, k],
+                WT::I64,
+            );
+            let fill = if arith {
+                self.op(O::I64ShrS, &[hi, c63], WT::I64)
+            } else {
+                self.i64c(0)
+            };
+            (self.sel(big, hi_sh, lo_sh), self.sel(big, fill, hi_sh))
+        }
+    }
+
+    /// (hi,lo)-ordered 128-bit unsigned less-than.
+    fn ltu128(&mut self, ah: WV, al: WV, bh: WV, bl: WV) -> WV {
+        let h = self.op(O::I64LtU, &[ah, bh], WT::I32);
+        let e = self.op(O::I64Eq, &[ah, bh], WT::I32);
+        let l = self.op(O::I64LtU, &[al, bl], WT::I32);
+        let el = self.op(O::I32And, &[e, l], WT::I32);
+        self.op(O::I32Or, &[h, el], WT::I32)
+    }
+
+    /// All-zero v128 constant.
+    fn vsplat_zero(&mut self) -> WV {
+        self.op(O::V128Const { value: 0 }, &[], WT::V128)
+    }
+
+    /// Vector binary ops: lane-wise wasm ops selected by the CLIF lane type.
+    fn vbin(&mut self, op: Opcode, t: ClType, f: &ir::Function, i: CInst, args: [ir::Value; 2]) {
+        use Opcode as P;
+        let lane = t.lane_type();
+        let (a, b) = (self.get1(args[0]), self.get1(args[1]));
+        if matches!(op, P::Ishl | P::Ushr | P::Sshr) {
+            let amt = self.cvt(b, WT::I32);
+            let o = match op {
+                P::Ishl => {
+                    vl!(lane; I8 => I8x16Shl, I16 => I16x8Shl, I32 => I32x4Shl, I64 => I64x2Shl)
+                }
+                P::Ushr => {
+                    vl!(lane; I8 => I8x16ShrU, I16 => I16x8ShrU, I32 => I32x4ShrU, I64 => I64x2ShrU)
+                }
+                _ => {
+                    vl!(lane; I8 => I8x16ShrS, I16 => I16x8ShrS, I32 => I32x4ShrS, I64 => I64x2ShrS)
+                }
+            };
+            let v = self.op(o, &[a, amt], WT::V128);
+            self.set(f.dfg.inst_results(i)[0], v);
+            return;
+        }
+        let o = match op {
+            P::Iadd => {
+                vl!(lane; I8 => I8x16Add, I16 => I16x8Add, I32 => I32x4Add, I64 => I64x2Add)
+            }
+            P::Fadd => vl!(lane; F32 => F32x4Add, F64 => F64x2Add),
+            P::Isub => {
+                vl!(lane; I8 => I8x16Sub, I16 => I16x8Sub, I32 => I32x4Sub, I64 => I64x2Sub)
+            }
+            P::Fsub => vl!(lane; F32 => F32x4Sub, F64 => F64x2Sub),
+            P::Imul => vl!(lane; I16 => I16x8Mul, I32 => I32x4Mul, I64 => I64x2Mul),
+            P::Fmul => vl!(lane; F32 => F32x4Mul, F64 => F64x2Mul),
+            P::Fdiv => vl!(lane; F32 => F32x4Div, F64 => F64x2Div),
+            P::Fmin => vl!(lane; F32 => F32x4Min, F64 => F64x2Min),
+            P::Fmax => vl!(lane; F32 => F32x4Max, F64 => F64x2Max),
+            P::Band => O::V128And,
+            P::Bor => O::V128Or,
+            P::Bxor => O::V128Xor,
+            P::Swizzle => O::I8x16Swizzle,
+            P::AvgRound => vl!(lane; I8 => I8x16AvgrU, I16 => I16x8AvgrU),
+            P::UaddSat => vl!(lane; I8 => I8x16AddSatU, I16 => I16x8AddSatU),
+            P::SaddSat => vl!(lane; I8 => I8x16AddSatS, I16 => I16x8AddSatS),
+            P::UsubSat => vl!(lane; I8 => I8x16SubSatU, I16 => I16x8SubSatU),
+            P::SsubSat => vl!(lane; I8 => I8x16SubSatS, I16 => I16x8SubSatS),
+            P::Smin => vl!(lane; I8 => I8x16MinS, I16 => I16x8MinS, I32 => I32x4MinS),
+            P::Smax => vl!(lane; I8 => I8x16MaxS, I16 => I16x8MaxS, I32 => I32x4MaxS),
+            P::Umin => vl!(lane; I8 => I8x16MinU, I16 => I16x8MinU, I32 => I32x4MinU),
+            P::Umax => vl!(lane; I8 => I8x16MaxU, I16 => I16x8MaxU, I32 => I32x4MaxU),
+            _ => panic!("vec bin {op} {t}"),
+        };
+        let v = self.op(o, &[a, b], WT::V128);
+        self.set(f.dfg.inst_results(i)[0], v);
+    }
+
+    /// Vector unary ops: splat, lane-wise arith, widen/narrow, converts.
+    fn vun(
+        &mut self,
+        op: Opcode,
+        t: ClType,
+        rt: ClType,
+        f: &ir::Function,
+        i: CInst,
+        arg: ir::Value,
+    ) {
+        use Opcode as P;
+        let a = self.get1(arg);
+        let r0 = f.dfg.inst_results(i)[0];
+        let v = match op {
+            // scalar_to_vector's other lanes are unspecified - splat is a
+            // legal (and cheaper than lane-insert) implementation.
+            P::Splat | P::ScalarToVector => {
+                let lane = rt.lane_type();
+                let x = self.cvt(a, wty(lane));
+                let o = vl!(lane; I8 => I8x16Splat, I16 => I16x8Splat,
+                            I32 => I32x4Splat, I64 => I64x2Splat,
+                            F32 => F32x4Splat, F64 => F64x2Splat);
+                self.op(o, &[x], WT::V128)
+            }
+            // v128-to-v128 bitcast is a reinterpret - same wasm value.
+            P::Bitcast if t.is_vector() && rt.is_vector() => a,
+            P::Bnot => self.op(O::V128Not, &[a], WT::V128),
+            P::Ineg => {
+                let lane = t.lane_type();
+                let o = vl!(lane; I8 => I8x16Neg, I16 => I16x8Neg,
+                            I32 => I32x4Neg, I64 => I64x2Neg);
+                self.op(o, &[a], WT::V128)
+            }
+            P::Iabs => {
+                let lane = t.lane_type();
+                let o = vl!(lane; I8 => I8x16Abs, I16 => I16x8Abs,
+                            I32 => I32x4Abs, I64 => I64x2Abs);
+                self.op(o, &[a], WT::V128)
+            }
+            P::Fabs => {
+                let o = vl!(t.lane_type(); F32 => F32x4Abs, F64 => F64x2Abs);
+                self.op(o, &[a], WT::V128)
+            }
+            P::Fneg => {
+                let o = vl!(t.lane_type(); F32 => F32x4Neg, F64 => F64x2Neg);
+                self.op(o, &[a], WT::V128)
+            }
+            P::Sqrt | P::Ceil | P::Floor | P::Trunc | P::Nearest => {
+                let o = match op {
+                    P::Sqrt => vl!(t.lane_type(); F32 => F32x4Sqrt, F64 => F64x2Sqrt),
+                    P::Ceil => vl!(t.lane_type(); F32 => F32x4Ceil, F64 => F64x2Ceil),
+                    P::Floor => vl!(t.lane_type(); F32 => F32x4Floor, F64 => F64x2Floor),
+                    P::Trunc => vl!(t.lane_type(); F32 => F32x4Trunc, F64 => F64x2Trunc),
+                    _ => vl!(t.lane_type(); F32 => F32x4Nearest, F64 => F64x2Nearest),
+                };
+                self.op(o, &[a], WT::V128)
+            }
+            P::Popcnt => {
+                let o = vl!(t.lane_type(); I8 => I8x16Popcnt);
+                self.op(o, &[a], WT::V128)
+            }
+            P::VhighBits => {
+                let o = vl!(t.lane_type(); I8 => I8x16Bitmask, I16 => I16x8Bitmask,
+                            I32 => I32x4Bitmask, I64 => I64x2Bitmask);
+                self.op(o, &[a], WT::I32)
+            }
+            P::SwidenLow | P::SwidenHigh | P::UwidenLow | P::UwidenHigh => {
+                let lane = t.lane_type();
+                let o = match op {
+                    P::SwidenLow => vl!(lane; I8 => I16x8ExtendLowI8x16S,
+                                        I16 => I32x4ExtendLowI16x8S,
+                                        I32 => I64x2ExtendLowI32x4S),
+                    P::SwidenHigh => vl!(lane; I8 => I16x8ExtendHighI8x16S,
+                                         I16 => I32x4ExtendHighI16x8S,
+                                         I32 => I64x2ExtendHighI32x4S),
+                    P::UwidenLow => vl!(lane; I8 => I16x8ExtendLowI8x16U,
+                                        I16 => I32x4ExtendLowI16x8U,
+                                        I32 => I64x2ExtendLowI32x4U),
+                    _ => vl!(lane; I8 => I16x8ExtendHighI8x16U,
+                             I16 => I32x4ExtendHighI16x8U,
+                             I32 => I64x2ExtendHighI32x4U),
+                };
+                self.op(o, &[a], WT::V128)
+            }
+            P::Snarrow | P::Unarrow | P::Uunarrow => {
+                let lane = rt.lane_type();
+                let o = if op == P::Snarrow {
+                    vl!(lane; I8 => I8x16NarrowI16x8S, I16 => I16x8NarrowI32x4S)
+                } else {
+                    vl!(lane; I8 => I8x16NarrowI16x8U, I16 => I16x8NarrowI32x4U)
+                };
+                self.op(o, &[a], WT::V128)
+            }
+            P::IaddPairwise => {
+                let o = vl!(rt.lane_type(); I16 => I16x8ExtAddPairwiseI8x16S,
+                            I32 => I32x4ExtAddPairwiseI16x8S);
+                self.op(o, &[a], WT::V128)
+            }
+            P::FcvtToSintSat | P::FcvtToUintSat => {
+                let o = match (op, t.lane_type(), rt.lane_type()) {
+                    (P::FcvtToSintSat, clt::F32, clt::I32) => O::I32x4TruncSatF32x4S,
+                    (P::FcvtToUintSat, clt::F32, clt::I32) => O::I32x4TruncSatF32x4U,
+                    (P::FcvtToSintSat, clt::F64, clt::I32) => O::I32x4TruncSatF64x2SZero,
+                    (P::FcvtToUintSat, clt::F64, clt::I32) => O::I32x4TruncSatF64x2UZero,
+                    _ => panic!("vec fcvt {op} {t}->{rt}"),
+                };
+                self.op(o, &[a], WT::V128)
+            }
+            P::FcvtFromSint | P::FcvtFromUint => {
+                let o = match (op, t.lane_type(), rt.lane_type()) {
+                    (P::FcvtFromSint, clt::I32, clt::F32) => O::F32x4ConvertI32x4S,
+                    (P::FcvtFromUint, clt::I32, clt::F32) => O::F32x4ConvertI32x4U,
+                    (P::FcvtFromSint, clt::I32, clt::F64) => O::F64x2ConvertLowI32x4S,
+                    (P::FcvtFromUint, clt::I32, clt::F64) => O::F64x2ConvertLowI32x4U,
+                    _ => panic!("vec fcvt {op} {t}->{rt}"),
+                };
+                self.op(o, &[a], WT::V128)
+            }
+            P::Fvdemote => self.op(O::F32x4DemoteF64x2Zero, &[a], WT::V128),
+            P::FvpromoteLow => self.op(O::F64x2PromoteLowF32x4, &[a], WT::V128),
+            _ => panic!("vec unary {op} {t}->{rt}"),
+        };
+        self.set(r0, v);
+    }
+
+    /// Vector lane-wise integer compare: `cond` on vector type `t`,
+    /// producing a v128 mask. i64x2 has no unsigned wasm compares.
+    fn vicmp(&mut self, cond: ir::condcodes::IntCC, t: ClType, a: WV, b: WV) -> WV {
+        use ir::condcodes::IntCC as CC;
+        let ops: [Option<O>; 10] = match t.lane_type() {
+            clt::I8 => [
+                O::I8x16Eq, O::I8x16Ne, O::I8x16LtS, O::I8x16LtU, O::I8x16GtS,
+                O::I8x16GtU, O::I8x16LeS, O::I8x16LeU, O::I8x16GeS, O::I8x16GeU,
+            ]
+            .map(Some),
+            clt::I16 => [
+                O::I16x8Eq, O::I16x8Ne, O::I16x8LtS, O::I16x8LtU, O::I16x8GtS,
+                O::I16x8GtU, O::I16x8LeS, O::I16x8LeU, O::I16x8GeS, O::I16x8GeU,
+            ]
+            .map(Some),
+            clt::I32 => [
+                O::I32x4Eq, O::I32x4Ne, O::I32x4LtS, O::I32x4LtU, O::I32x4GtS,
+                O::I32x4GtU, O::I32x4LeS, O::I32x4LeU, O::I32x4GeS, O::I32x4GeU,
+            ]
+            .map(Some),
+            clt::I64 => [
+                Some(O::I64x2Eq),
+                Some(O::I64x2Ne),
+                Some(O::I64x2LtS),
+                None,
+                Some(O::I64x2GtS),
+                None,
+                Some(O::I64x2LeS),
+                None,
+                Some(O::I64x2GeS),
+                None,
+            ],
+            l => panic!("vicmp lane {l}"),
+        };
+        let k = match cond {
+            CC::Equal => 0,
+            CC::NotEqual => 1,
+            CC::SignedLessThan => 2,
+            CC::UnsignedLessThan => 3,
+            CC::SignedGreaterThan => 4,
+            CC::UnsignedGreaterThan => 5,
+            CC::SignedLessThanOrEqual => 6,
+            CC::UnsignedLessThanOrEqual => 7,
+            CC::SignedGreaterThanOrEqual => 8,
+            CC::UnsignedGreaterThanOrEqual => 9,
+        };
+        let o = ops[k].unwrap_or_else(|| panic!("vec icmp {cond} on {t}"));
+        self.op(o, &[a, b], WT::V128)
+    }
+
+    /// Vector lane-wise float compare; NaN handling mirrors `fcmp` with
+    /// v128 logic ops.
+    fn vfcmp(&mut self, cond: ir::condcodes::FloatCC, t: ClType, a: WV, b: WV) -> WV {
+        use ir::condcodes::FloatCC as CC;
+        let (eq, ne, lt, le, gt, ge) = match t.lane_type() {
+            clt::F32 => (
+                O::F32x4Eq, O::F32x4Ne, O::F32x4Lt, O::F32x4Le, O::F32x4Gt, O::F32x4Ge,
+            ),
+            clt::F64 => (
+                O::F64x2Eq, O::F64x2Ne, O::F64x2Lt, O::F64x2Le, O::F64x2Gt, O::F64x2Ge,
+            ),
+            l => panic!("vfcmp lane {l}"),
+        };
+        let uno = |cx: &mut Self| -> WV {
+            let l = cx.op(ne, &[a, a], WT::V128);
+            let r = cx.op(ne, &[b, b], WT::V128);
+            cx.op(O::V128Or, &[l, r], WT::V128)
+        };
+        match cond {
+            CC::Ordered => {
+                let u = uno(self);
+                self.op(O::V128Not, &[u], WT::V128)
+            }
+            CC::Unordered => uno(self),
+            CC::Equal => self.op(eq, &[a, b], WT::V128),
+            CC::NotEqual => self.op(ne, &[a, b], WT::V128),
+            CC::LessThan => self.op(lt, &[a, b], WT::V128),
+            CC::LessThanOrEqual => self.op(le, &[a, b], WT::V128),
+            CC::GreaterThan => self.op(gt, &[a, b], WT::V128),
+            CC::GreaterThanOrEqual => self.op(ge, &[a, b], WT::V128),
+            CC::OrderedNotEqual => {
+                let x = self.op(ne, &[a, b], WT::V128);
+                let u = uno(self);
+                let o = self.op(O::V128Not, &[u], WT::V128);
+                self.op(O::V128And, &[x, o], WT::V128)
+            }
+            CC::UnorderedOrEqual | CC::UnorderedOrLessThan
+            | CC::UnorderedOrLessThanOrEqual | CC::UnorderedOrGreaterThan
+            | CC::UnorderedOrGreaterThanOrEqual => {
+                let o = match cond {
+                    CC::UnorderedOrEqual => eq,
+                    CC::UnorderedOrLessThan => lt,
+                    CC::UnorderedOrLessThanOrEqual => le,
+                    CC::UnorderedOrGreaterThan => gt,
+                    _ => ge,
+                };
+                let x = self.op(o, &[a, b], WT::V128);
+                let u = uno(self);
+                self.op(O::V128Or, &[x, u], WT::V128)
+            }
+        }
+    }
+
+    /// `extractlane`: wasm lane extract; int lanes produce a canonical
+    /// (zero-extended) narrow rep.
+    fn extract_lane(&mut self, t: ClType, arg: ir::Value, lane: u8) -> WV {
+        let a = self.get1(arg);
+        match t.lane_type() {
+            clt::I8 => self.op(O::I8x16ExtractLaneU { lane }, &[a], WT::I32),
+            clt::I16 => self.op(O::I16x8ExtractLaneU { lane }, &[a], WT::I32),
+            clt::I32 => self.op(O::I32x4ExtractLane { lane }, &[a], WT::I32),
+            clt::I64 => self.op(O::I64x2ExtractLane { lane }, &[a], WT::I64),
+            clt::F32 => self.op(O::F32x4ExtractLane { lane }, &[a], WT::F32),
+            clt::F64 => self.op(O::F64x2ExtractLane { lane }, &[a], WT::F64),
+            l => panic!("extractlane {l}"),
+        }
+    }
+
+    /// `insertlane x, y, idx`: wasm `replace_lane` truncates/wraps narrow
+    /// and wide scalars itself.
+    fn insert_lane(&mut self, t: ClType, x: ir::Value, y: ir::Value, lane: u8) -> WV {
+        let a = self.get1(x);
+        let v = self.get1(y);
+        let (v, o) = match t.lane_type() {
+            clt::I8 => (self.cvt(v, WT::I32), O::I8x16ReplaceLane { lane }),
+            clt::I16 => (self.cvt(v, WT::I32), O::I16x8ReplaceLane { lane }),
+            clt::I32 => (self.cvt(v, WT::I32), O::I32x4ReplaceLane { lane }),
+            clt::I64 => (self.cvt(v, WT::I64), O::I64x2ReplaceLane { lane }),
+            clt::F32 => (self.cvt(v, WT::F32), O::F32x4ReplaceLane { lane }),
+            clt::F64 => (self.cvt(v, WT::F64), O::F64x2ReplaceLane { lane }),
+            l => panic!("insertlane {l}"),
+        };
+        self.op(o, &[a, v], WT::V128)
+    }
+
+    /// i128 binary ops on (lo,hi) pairs.
+    fn i128_bin(&mut self, op: Opcode, f: &ir::Function, i: CInst, a: ir::Value, b: ir::Value) {
+        use Opcode as P;
+        let (al, ah) = self.pair(a);
+        // Shift ops may carry a narrow (non-i128) amount operand.
+        let bvs = self.get(b).clone();
+        let bl = bvs[0];
+        let bh = if bvs.len() > 1 { bvs[1] } else { bl };
+        let r0 = f.dfg.inst_results(i)[0];
+        match op {
+            P::Iadd => {
+                let lo = self.op(O::I64Add, &[al, bl], WT::I64);
+                let hi = self.op(O::I64Add, &[ah, bh], WT::I64);
+                let c = self.op(O::I64LtU, &[lo, al], WT::I32);
+                let c64 = self.op(O::I64ExtendI32U, &[c], WT::I64);
+                let hi = self.op(O::I64Add, &[hi, c64], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Isub => {
+                let lo = self.op(O::I64Sub, &[al, bl], WT::I64);
+                let bor = self.op(O::I64GtU, &[lo, al], WT::I32);
+                let bor = self.op(O::I64ExtendI32U, &[bor], WT::I64);
+                let hi = self.op(O::I64Sub, &[ah, bh], WT::I64);
+                let hi = self.op(O::I64Sub, &[hi, bor], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Imul | P::Udiv | P::Sdiv | P::Urem | P::Srem => {
+                let name = match op {
+                    P::Imul => "__multi3",
+                    P::Udiv => "__udivti3",
+                    P::Sdiv => "__divti3",
+                    P::Urem => "__umodti3",
+                    _ => "__modti3",
+                };
+                let vs = self.libcall1(
+                    name,
+                    &[clt::I128],
+                    &[clt::I128, clt::I128],
+                    &[al, ah, bl, bh],
+                );
+                self.setv(r0, vs);
+            }
+            P::Band => {
+                let lo = self.op(O::I64And, &[al, bl], WT::I64);
+                let hi = self.op(O::I64And, &[ah, bh], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Bor => {
+                let lo = self.op(O::I64Or, &[al, bl], WT::I64);
+                let hi = self.op(O::I64Or, &[ah, bh], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Bxor => {
+                let lo = self.op(O::I64Xor, &[al, bl], WT::I64);
+                let hi = self.op(O::I64Xor, &[ah, bh], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Ishl | P::Ushr | P::Sshr => {
+                // Inline (like the dialect path): the compiler-rt shift
+                // helpers themselves contain i128 shifts, so libcalling
+                // would recurse.
+                let amt = self.cvt(bl, WT::I64);
+                let (lo, hi) = self.sh128(op == P::Ishl, op == P::Sshr, al, ah, amt);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Rotl | P::Rotr => {
+                // rot(x,k) = shift(x,k) | shift(x,128-k), counts mod 128.
+                let m = self.i64c(127);
+                let amt64 = self.cvt(bl, WT::I64);
+                let amt = self.op(O::I64And, &[amt64, m], WT::I64);
+                let c128 = self.i64c(128);
+                let neg0 = self.op(O::I64Sub, &[c128, amt], WT::I64);
+                let m2 = self.i64c(127);
+                let neg = self.op(O::I64And, &[neg0, m2], WT::I64);
+                let rotl = op == P::Rotl;
+                let (x0, x1) = self.sh128(rotl, false, al, ah, amt);
+                let (y0, y1) = self.sh128(!rotl, false, al, ah, neg);
+                let lo = self.op(O::I64Or, &[x0, y0], WT::I64);
+                let hi = self.op(O::I64Or, &[x1, y1], WT::I64);
+                self.setv(r0, smallvec![lo, hi]);
+            }
+            P::Umulhi | P::Smulhi => panic!("i128 mulhi (no __umulh128)"),
+            P::UaddOverflow | P::SaddOverflow | P::UsubOverflow | P::SsubOverflow => {
+                // (result, flag): same high-word sign test as the dialect
+                // path. Flag is a canonical i8.
+                let r1 = f.dfg.inst_results(i)[1];
+                let is_add = matches!(op, P::UaddOverflow | P::SaddOverflow);
+                let signed = matches!(op, P::SaddOverflow | P::SsubOverflow);
+                let (lo, hi) = if is_add {
+                    let lo = self.op(O::I64Add, &[al, bl], WT::I64);
+                    let c = self.op(O::I64LtU, &[lo, al], WT::I32);
+                    let c64 = self.op(O::I64ExtendI32U, &[c], WT::I64);
+                    let hi = self.op(O::I64Add, &[ah, bh], WT::I64);
+                    let hi = self.op(O::I64Add, &[hi, c64], WT::I64);
+                    (lo, hi)
+                } else {
+                    let lo = self.op(O::I64Sub, &[al, bl], WT::I64);
+                    let bor = self.op(O::I64GtU, &[lo, al], WT::I32);
+                    let bor = self.op(O::I64ExtendI32U, &[bor], WT::I64);
+                    let hi = self.op(O::I64Sub, &[ah, bh], WT::I64);
+                    let hi = self.op(O::I64Sub, &[hi, bor], WT::I64);
+                    (lo, hi)
+                };
+                let flag = if signed {
+                    // add: (a^r)&(b^r) < 0; sub: (a^b)&(a^r) < 0.
+                    let x = self.op(O::I64Xor, &[ah, hi], WT::I64);
+                    let y = if is_add {
+                        self.op(O::I64Xor, &[bh, hi], WT::I64)
+                    } else {
+                        self.op(O::I64Xor, &[ah, bh], WT::I64)
+                    };
+                    let m = self.op(O::I64And, &[x, y], WT::I64);
+                    let z = self.i64c(0);
+                    self.op(O::I64LtS, &[m, z], WT::I32)
+                } else if is_add {
+                    self.ltu128(hi, lo, ah, al)
+                } else {
+                    self.ltu128(ah, al, bh, bl)
+                };
+                self.setv(r0, smallvec![lo, hi]);
+                self.set(r1, flag);
+            }
+            P::UmulOverflow | P::SmulOverflow => {
+                // __rust_{i,u}128_mulo(a, b, &mut flag) -> i128: sret slot,
+                // four i64 args, flag out-param slot.
+                let r1 = f.dfg.inst_results(i)[1];
+                let name = if op == P::SmulOverflow {
+                    "__rust_i128_mulo"
+                } else {
+                    "__rust_u128_mulo"
+                };
+                let so = self.frame_slot(16, 16);
+                let fo = self.frame_slot(4, 4);
+                let sc = self.i32c(so);
+                let sa = self.op(O::I32Add, &[self.fp, sc], WT::I32);
+                let fc = self.i32c(fo);
+                let fa = self.op(O::I32Add, &[self.fp, fc], WT::I32);
+                let idx = self.o.libfunc(
+                    name,
+                    SignatureData {
+                        params: vec![
+                            WT::I32, WT::I64, WT::I64, WT::I64, WT::I64, WT::I32,
+                        ],
+                        returns: vec![],
+                    },
+                );
+                self.opn(
+                    O::Call { function_index: Func::new(idx) },
+                    &[sa, al, ah, bl, bh, fa],
+                    &[],
+                );
+                let lo = self.load(clt::I64, sa, 0);
+                let hi = self.load(clt::I64, sa, 8);
+                let flag = self.load(clt::I32, fa, 0);
+                self.setv(r0, smallvec![lo, hi]);
+                self.set(r1, flag);
+            }
+            _ => panic!("i128 op {op}"),
+        }
+    }
+
+    /// Flattened, coercion-normalised wasm args for a call with `sig`.
+    fn call_args(&mut self, sig: &ir::Signature, args: &[ir::Value]) -> Vec<WV> {
+        let mut out = Vec::new();
+        for (p, v) in sig.params.iter().zip(args.iter()) {
+            let ws: Vals = self.get(*v).clone();
+            let mut want = Vec::new();
+            cwtys(p.value_type, &mut want);
+            out.extend(ws.iter().zip(want.iter()).map(|(&x, &t)| self.cvt(x, t)));
+        }
+        out
+    }
+
+    /// Multi-result `call` binding: results map 1:1 to wasm return values.
+    fn bind_call(&mut self, f: &ir::Function, i: CInst, vs: Vals) {
+        self.bind(f, i, vs);
+    }
+
+    /// Values for `return`/`return_call` in wasm return order.
+    fn ret_vals(&mut self, f: &ir::Function, args: &[ir::Value]) -> Vals {
+        let _ = f;
+        let mut out = Vals::new();
+        for a in args {
+            out.extend(self.get(*a).iter().copied());
+        }
+        out
+    }
+
+    /// Terminate the current block with a return of `vs`, then end the
+    /// function frame (stack pointer restore happens here).
+    fn ret(&mut self, vs: &[WV]) {
+        let cur = self.cur;
+        // Restore SP to the entry value (same shape as FL's epilogue):
+        // `inline_site`'s frame folding only drops restores whose value
+        // derives from the callee's folded frame chain — a `GlobalGet sp +
+        // frame` form would survive the splice and ratchet SP upward on
+        // every inlined call.
+        let (sp, sp0) = (self.o.sp, self.sp0);
+        self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
+        self.b.set_terminator(cur, Terminator::Return { values: vs.to_vec() });
+    }
+}
+
+/// The CLIF-pipeline wasm path (`PLIRON_WASM_CLIF=1`): lower_clif_wasm gives
+/// each defined function's optimized CLIF + FuncId/DataId symbol tables; CX
+/// translates them to waffle; `emit_obj` finishes the module identically to
+/// the dialect path.
+pub(crate) fn lower_to_wasm_clif(
+    ctx: &Context,
+    st: &State,
+    sess: &rustc_session::Session,
+    name: &str,
+    features: &[String],
+    unwind: bool,
+) -> Vec<u8> {
+    let mut wc = crate::lower::lower_clif_wasm(ctx, st, sess, name, unwind);
+    let mut m = Module::empty();
+    let mem = m.memories.push(MemoryData {
+        initial_pages: 0,
+        maximum_pages: None,
+        segments: vec![],
+    });
+    m.imports.push(Import {
+        module: "env".into(),
+        name: "memory".into(),
+        kind: ImportKind::Memory(mem),
+    });
+    let table = m.tables.push(TableData {
+        ty: WT::FuncRef,
+        initial: 0,
+        max: None,
+        func_elements: None,
+    });
+    m.imports.push(Import {
+        module: "env".into(),
+        name: "__indirect_function_table".into(),
+        kind: ImportKind::Table(table),
+    });
+    let mut o = Obj {
+        ctx,
+        st,
+        m,
+        sigs: FxHashMap::default(),
+        funcs: Vec::new(),
+        fidx: FxHashMap::default(),
+        got: FxHashMap::default(),
+        sp: Global::invalid(),
+        table,
+        mem,
+        unwind,
+        trip: waffle::Global::invalid(),
+    };
+    o.sp = o.import_global("env", "__stack_pointer", true);
+
+    for (n, f) in &st.funcs {
+        if st.dead_fns.contains(n) {
+            continue;
+        }
+        // Reuse the dialect leaf-flattening for the declared signature; the
+        // CLIF sig is the same leaf set in the same order.
+        let sig = o.sig(wsig(ctx, f.ty));
+        o.funcs.push(FDecl {
+            name: n.clone(),
+            sig,
+            ty: Some(f.ty),
+            body: None,
+            always: f.always_inline,
+            hint: f.inline_hint,
+            no_inline: f.no_inline,
+        });
+        o.fidx.insert(n.clone(), o.funcs.len() - 1);
+    }
+    let verbose = crate::env_set("PLIRON_WASM_VERBOSE");
+    let mut stubs = 0;
+    let mut defined = 0;
+    for (n, cf) in &mut wc.funcs {
+        defined += 1;
+        let i = o.fidx[n];
+        let sig = o.funcs[i].sig;
+        if verbose {
+            eprintln!("pliron-wasm: cx {n}");
+        }
+        let body = match guarded(|| {
+            let mut cx = CX::new(&mut o, sig, &wc.fn_names, &wc.data_names);
+            cx.name = n.clone();
+            cx.translate(cf)
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                stubs += 1;
+                if let Some(f) = crate::env_get("PLIRON_WASM_STUBLOG") {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    writeln!(s, "stub {n}: {e}").unwrap();
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(f)
+                        .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
+                }
+                if verbose {
+                    eprintln!("pliron-wasm: stub {n}: {e}");
+                }
+                stub(&o.m, sig)
+            }
+        };
+        o.funcs[i].body = Some(body);
+    }
+    emit_obj(o, ctx, st, name, features, stubs, defined, verbose)
+}
+}
+
+pub(crate) use clif_emit::lower_to_wasm_clif;

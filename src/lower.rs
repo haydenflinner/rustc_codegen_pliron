@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
@@ -382,8 +383,10 @@ pub fn lower_to_object(
                 gvs: FxHashMap::default(),
                 terminated: false,
                 cc,
+                tcfg: cfg,
                 internal: &internal,
                 own_tail: internal.contains(n),
+                wasm: false,
                 exn: None,
                 vars: FxHashMap::default(),
                 stubs: rustc_hash::FxHashSet::default(),
@@ -918,6 +921,345 @@ pub fn lower_to_object(
     product.emit().unwrap()
 }
 
+/// Result of running the wasm module through the CLIF pipeline: per-function
+/// optimized CLIF plus symbol tables for resolving FuncRef/GlobalValue.
+pub(crate) struct WasmClif {
+    /// (symbol name, optimized CLIF) — one per `st.funcs` entry with a body.
+    pub funcs: Vec<(String, ir::Function)>,
+    /// FuncId::index() -> declared symbol name.
+    pub fn_names: Vec<String>,
+    /// DataId::index() -> declared symbol name.
+    pub data_names: Vec<String>,
+}
+
+/// pliron -> CLIF -> pliron-clif-opt pipeline for the wasm backend
+/// (`wasm::lower_to_wasm_clif`). Serial and single-context: wasm objects are
+/// small enough that the worker pool buys little, and this reuses the same
+/// FnLower + run_pipeline code path as `lower_to_object` without it.
+///
+/// The `ObjectModule` is pure bookkeeping (it is never finished into an
+/// object): FnLower needs it for `declare_*_in_func`. It stays on the host
+/// ISA — wasm32 is not a Cranelift target — but `FnLower.tcfg` overrides
+/// the pointer width to 32 bits so `func_addr`/`symbol_value`/`stack_addr`
+/// produce i32 values matching the wasm32 leaf types. The CLIF is then
+/// internally consistent (all pointer values i32); the ISA-aware verifier
+/// checks (`verify_is_address`, `global_type`) don't apply, so
+/// `PLIRON_VERIFY` verifies with flags only, same as the pipeline's
+/// per-step checks.
+pub(crate) fn lower_clif_wasm(
+    ctx: &Context,
+    st: &State,
+    sess: &rustc_session::Session,
+    cgu: &str,
+    unwind: bool,
+) -> WasmClif {
+    // wasm32 is not a Cranelift target; the bookkeeping ObjectModule and
+    // FnLower run on the *host* ISA (see the doc comment). The ISA is never
+    // used to emit machine code, so flags/features do not matter beyond
+    // `enable_verifier` under debug builds.
+    use cranelift_codegen::settings::Configurable as _;
+    let mut fb = cranelift_codegen::settings::builder();
+    fb.set("is_pic", "true").unwrap();
+    fb.set(
+        "enable_verifier",
+        if cfg!(debug_assertions) { "true" } else { "false" },
+    )
+    .unwrap();
+    let flags = cranelift_codegen::settings::Flags::new(fb);
+    let isa = cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
+        .expect("cranelift host isa")
+        .finish(flags)
+        .expect("cranelift host isa flags");
+    let b = ObjectBuilder::new(isa.clone(), cgu.to_string(), default_libcall_names()).unwrap();
+    let mut m = ObjectModule::new(b);
+    // Emitted CLIF uses i32 pointers and the neutral SysV default callconv
+    // (not the host's AppleAarch64, which would pull in the Darwin variadic
+    // padding path).
+    let tcfg = TargetFrontendConfig {
+        default_call_conv: CallConv::SystemV,
+        pointer_width: target_lexicon::PointerWidth::U32,
+        page_size_align_log2: isa.page_size_align_log2(),
+    };
+    let cc = CallConv::SystemV;
+    let internal = internal_fns(ctx, st);
+    let cc_of = |n: &str| {
+        if internal.contains(n) {
+            CallConv::Tail
+        } else {
+            cc
+        }
+    };
+    let mut ids: FxHashMap<String, Sym> = FxHashMap::default();
+    for (n, f) in &st.funcs {
+        if st.dead_fns.contains(n) {
+            continue;
+        }
+        let sig = make_sig(ctx, f.ty, &f.exts, cc_of(n));
+        let mut l = f.linkage;
+        if l == Linkage::Import && has_body(ctx, f.op) {
+            l = Linkage::Export;
+        }
+        let id = m
+            .declare_function(crate::obj_sym(n), l, &sig)
+            .unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        ids.insert(n.clone(), Sym::F(id, f.ty));
+    }
+    for (n, g) in &st.globals {
+        if ids.contains_key(n) {
+            continue;
+        }
+        let l = if g.linkage == Linkage::Import && g.init.is_some() {
+            Linkage::Export
+        } else {
+            g.linkage
+        };
+        let id = m
+            .declare_data(crate::obj_sym(n), l, g.mutable, g.tls)
+            .unwrap_or_else(|e| panic!("declare {n}: {e}"));
+        ids.insert(n.clone(), Sym::D(id, g.tls));
+    }
+    // panic=unwind: emulated EH driven by `__pliron_eh`, an 8-byte
+    // {flag, exn} data word the wasm linker synthesizes (see FL::eh_addr).
+    let eh_data = if unwind {
+        Some(
+            m.declare_data("__pliron_eh", Linkage::Import, true, false)
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let cfg = tcfg;
+    let mut fbc = FunctionBuilderContext::new();
+    let mut clctx = m.make_context();
+    let fn_flags = crate::pipeline::FnFlags {
+        jumpthread: st.jumpthread,
+        unreach: st.unreach,
+        peep: st.peep,
+        tailmerge: st.tailmerge,
+        taildup: st.taildup,
+        tailrec: st.tailrec,
+        loadfwd: st.loadfwd,
+        slot_dse: st.slot_dse,
+        dse: st.dse,
+        indvars: st.indvars,
+        licm: st.licm,
+        loopidiom: st.loopidiom,
+        loopvec: st.loopvec,
+        bcheck: st.bcheck,
+        slp: st.slp,
+    };
+    let mut out = Vec::new();
+    for (n, f) in &st.funcs {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
+            continue;
+        }
+        CUR_FN.with(|c| c.borrow_mut().clone_from(n));
+        let Sym::F(id, _) = ids[n] else {
+            unreachable!()
+        };
+        clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
+        let (
+            nonnull,
+            derived,
+            frozen,
+            noalias,
+            deref,
+            nowrite,
+            call_frozen,
+            scoped,
+            invariant,
+            operand_frozen,
+            block_region,
+            prof,
+            lifetimes,
+            nocap,
+        ) = {
+            let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
+            let mut fl = FnLower {
+                ctx,
+                st,
+                m: &mut m,
+                ids: &ids,
+                b,
+                vals: FxHashMap::default(),
+                cconst: FxHashMap::default(),
+                blocks: FxHashMap::default(),
+                frefs: FxHashMap::default(),
+                cfrefs: FxHashMap::default(),
+                gvs: FxHashMap::default(),
+                terminated: false,
+                cc,
+                tcfg,
+                internal: &internal,
+                own_tail: internal.contains(n),
+                wasm: true,
+                exn: None,
+                vars: FxHashMap::default(),
+                stubs: rustc_hash::FxHashSet::default(),
+                nonnull: FxHashSet::default(),
+                bool01: FxHashSet::default(),
+                derived: FxHashMap::default(),
+                frozen: FxHashMap::default(),
+                noalias: FxHashSet::default(),
+                deref: FxHashMap::default(),
+                call_frozen: FxHashMap::default(),
+                scoped: FxHashMap::default(),
+                invariant: FxHashSet::default(),
+                block_region: FxHashMap::default(),
+                nowrite: FxHashMap::default(),
+                lifetimes: Vec::new(),
+                nocap: FxHashSet::default(),
+                va_buf: None,
+                va_fids: FxHashMap::default(),
+                eh_data,
+                eh_tls_v: None,
+                eject: None,
+            };
+            fl.lower(f.op);
+            fl.b.finalize(cfg);
+            let lifetimes = fl
+                .lifetimes
+                .into_iter()
+                .filter_map(|(p, anchor, b, start)| {
+                    fl.vals
+                        .get(&p)
+                        .or_else(|| fl.cconst.get(&p))
+                        .and_then(|vs| vs.first().copied())
+                        .map(|v| (v, anchor, b, start))
+                })
+                .collect();
+            let mut operand_frozen = FxHashMap::default();
+            for (&pv, rs) in &fl.st.region_frozen_op {
+                if let Some(&v) = fl
+                    .vals
+                    .get(&pv)
+                    .or_else(|| fl.cconst.get(&pv))
+                    .and_then(|vs| vs.first())
+                {
+                    operand_frozen
+                        .entry(v)
+                        .or_insert_with(Vec::new)
+                        .extend_from_slice(rs);
+                }
+            }
+            let prof = fl
+                .block_region
+                .iter()
+                .filter_map(|(&cb, &rb)| st.prof_bcount.get(&rb).map(|&c| (cb, c)))
+                .collect();
+            (
+                fl.nonnull,
+                fl.derived,
+                fl.frozen,
+                fl.noalias,
+                fl.deref,
+                fl.nowrite,
+                fl.call_frozen,
+                fl.scoped,
+                fl.invariant,
+                operand_frozen,
+                fl.block_region,
+                prof,
+                lifetimes,
+                fl.nocap,
+            )
+        };
+        let dump = crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s));
+        if dump {
+            eprintln!("==== clif {n} ====\n{}", clctx.func.display());
+        }
+        // Flags-only verify: the ISA-aware checks (pointer width, global
+        // value types) consult `isa.pointer_type()` — i64 on the host —
+        // while this CLIF deliberately uses i32 pointers (see `tcfg`).
+        if crate::env_set("PLIRON_VERIFY")
+            && let Err(e) =
+                cranelift_codegen::verifier::verify_function(&clctx.func, isa.flags())
+        {
+            panic!("bad clif {n}: {e}");
+        }
+        let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
+            Box::new(sess.prof.generic_activity(nm))
+        };
+        let mut stats = crate::pipeline::Stats::default();
+        let mut nonnull = nonnull;
+        let mut derived = derived;
+        let mut frozen = frozen;
+        let mut noalias = noalias;
+        let mut deref = deref;
+        let mut operand_frozen = operand_frozen;
+        let mut lifetimes = lifetimes;
+        let mut pipe = crate::pipeline::Pipe {
+            cur_step: "",
+            clctx: &mut clctx,
+            isa: &*isa,
+            fname: n,
+            func_id: id,
+            nonnull: &mut nonnull,
+            derived: &mut derived,
+            frozen: &mut frozen,
+            noalias: &mut noalias,
+            deref: &mut deref,
+            nowrite: &nowrite,
+            call_frozen: &call_frozen,
+            scoped: &scoped,
+            invariant: &invariant,
+            operand_frozen: &mut operand_frozen,
+            block_region: &block_region,
+            prof: &prof,
+            region_parent: &st.region_parent,
+            lifetimes: &mut lifetimes,
+            nocap: &nocap,
+            tcfg: cfg,
+            simd: false,
+            x64: false,
+            cmp64: false,
+            has_eh: false,
+            flags: &fn_flags,
+            dump,
+            verify_full: crate::env_is("PLIRON_VERIFY", "full"),
+            stats: &mut stats,
+            carry_log: Vec::new(),
+            prof_hook: Some(&prof_hook),
+        };
+        // Debug bisection: PLIRON_PIPEFN=<substr> runs the pipeline only on
+        // matching functions; PLIRON_PIPEFNX=<substr> skips matches.
+        let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
+            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
+        if run_pipe {
+            crate::pipeline::run_pipeline(&mut pipe);
+        }
+        drop(pipe);
+        if dump {
+            eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
+        }
+        out.push((n.clone(), std::mem::replace(&mut clctx.func, ir::Function::new())));
+        m.clear_context(&mut clctx);
+    }
+    CUR_FN.with(|c| c.borrow_mut().clear());
+    // FnLower can declare more symbols mid-lower (libcalls, va_fids, lazy
+    // data refs) — build the id->name tables last.
+    let decls = m.declarations();
+    let mut fn_names: Vec<String> = Vec::new();
+    for (id, d) in decls.get_functions() {
+        if fn_names.len() <= id.index() {
+            fn_names.resize(id.index() + 1, String::new());
+        }
+        fn_names[id.index()] = d.name.clone().unwrap_or_default();
+    }
+    let mut data_names: Vec<String> = Vec::new();
+    for (id, d) in decls.get_data_objects() {
+        if data_names.len() <= id.index() {
+            data_names.resize(id.index() + 1, String::new());
+        }
+        data_names[id.index()] = d.name.clone().unwrap_or_default();
+    }
+    WasmClif {
+        funcs: out,
+        fn_names,
+        data_names,
+    }
+}
+
 /// Mach-O caps section ordinals at 255 (n_sect is a u8), so all globals that
 /// share a `#[link_section]`/`linkme` name must land in one section. The
 /// module already declared their symbols (undefined); define them here in a
@@ -1218,11 +1560,20 @@ struct FnLower<'a, 'b> {
     gvs: FxHashMap<DataId, GlobalValue>,
     terminated: bool,
     cc: CallConv,
+    /// Frontend target config: pointer width and callconv for emitted CLIF.
+    /// The wasm path sets a 32-bit-pointer config so `func_addr`/
+    /// `symbol_value`/`stack_addr`/call sigs produce i32 values matching
+    /// the i32 leaf types (the bookkeeping `ObjectModule`'s ISA stays the
+    /// host's).
+    tcfg: TargetFrontendConfig,
     /// Local functions using our internal ABI (`CallConv::Tail`).
     internal: &'a rustc_hash::FxHashSet<String>,
     /// This function's own convention is `CallConv::Tail` (it is internal), so
     /// `return_call`/`return_call_indirect` are legal in its body.
     own_tail: bool,
+    /// Lowering for the wasm backend (i32 pointers, wasm32 C ABI): 128-bit
+    /// libcall results go through a hidden sret pointer arg.
+    wasm: bool,
     exn: Option<cranelift_frontend::Variable>,
     /// Promoted allocas (sroa.rs): one variable per scalar leaf.
     vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
@@ -1356,7 +1707,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.vals.insert(a, vs);
             }
         }
-        let pt = self.m.target_config().pointer_type();
+        let pt = self.tcfg.pointer_type();
         let exn = self.b.declare_var(pt);
         self.exn = Some(exn);
         for op in crate::sroa::allocas(ctx, f) {
@@ -1460,7 +1811,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     /// Address of `__pliron_eh`, the TLS slot driving emulated EH on COFF:
     /// `{ flag: i32, _pad: i32, exn: ptr, buf: [u8; 32] }` (defined by the
-    /// allocator module; see `codegen_allocator` in lib.rs).
+    /// allocator module; see `codegen_allocator` in lib.rs). On wasm the
+    /// slot is a plain data symbol the linker synthesizes —
+    /// `{ flag: i32, exn: ptr }` — reached via `symbol_value` instead.
     /// Entry-block-only — see `eh_tls_v`; all post-entry users read the
     /// hoisted address.
     fn eh_tls_addr(&mut self) -> ir::Value {
@@ -1469,7 +1822,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .gvs
             .entry(id)
             .or_insert_with(|| self.m.declare_data_in_func(id, self.b.func));
-        self.b.ins().tls_value(clt::I64, gv)
+        if self.wasm {
+            self.b.ins().symbol_value(self.tcfg.pointer_type(), gv)
+        } else {
+            self.b.ins().tls_value(self.tcfg.pointer_type(), gv)
+        }
     }
 
     fn eh_tls(&mut self) -> ir::Value {
@@ -2080,9 +2437,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn sym_addr(&mut self, sym: &str) -> ir::Value {
         let sym = self.va_sym(sym);
+        let pt = self.tcfg.pointer_type();
         if let Some(&id) = self.va_fids.get(&sym) {
             let fr = self.fref(id);
-            return self.b.ins().func_addr(clt::I64, fr);
+            return self.b.ins().func_addr(pt, fr);
         }
         match self
             .ids
@@ -2092,17 +2450,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
         {
             Sym::F(id, _) => {
                 let fr = self.fref(id);
-                self.b.ins().func_addr(clt::I64, fr)
+                self.b.ins().func_addr(pt, fr)
             }
             Sym::D(id, tls) => {
                 let gv = *self
                     .gvs
                     .entry(id)
                     .or_insert_with(|| self.m.declare_data_in_func(id, self.b.func));
-                if tls {
-                    self.b.ins().tls_value(clt::I64, gv)
+                if tls && !self.wasm {
+                    self.b.ins().tls_value(pt, gv)
                 } else {
-                    self.b.ins().symbol_value(clt::I64, gv)
+                    self.b.ins().symbol_value(pt, gv)
                 }
             }
         }
@@ -2128,7 +2486,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if wide && wideof(*t) {
                 let s = self.slot(16, 16);
                 self.b.ins().store(MemFlagsData::trusted(), *a, s, 0);
-                sig.params.push(AbiParam::new(clt::I64));
+                sig.params.push(AbiParam::new(self.tcfg.pointer_type()));
                 call_args.push(s);
             } else {
                 sig.params.push(AbiParam::new(*t));
@@ -2139,12 +2497,37 @@ impl<'a, 'b> FnLower<'a, 'b> {
             rets.iter()
                 .map(|t| AbiParam::new(if wide && wideof(*t) { clt::I8X16 } else { *t })),
         );
+        // wasm32's C ABI returns 128-bit scalars through a hidden sret
+        // pointer, so a declared `(i128,i128)->i128` sig would clash with the
+        // real compiler-rt definition. Pass a slot and load the result back.
+        let wsret = self.wasm && rets.iter().any(|t| *t == clt::I128 || *t == clt::F128);
+        let sret_slot = wsret.then(|| {
+            let s = self.slot(16 * rets.len() as u64, 16);
+            sig.params.insert(
+                0,
+                AbiParam::special(self.tcfg.pointer_type(), ArgumentPurpose::StructReturn),
+            );
+            call_args.insert(0, s);
+            sig.returns.clear();
+            s
+        });
         let id = self
             .m
             .declare_function(crate::obj_sym(name), Linkage::Import, &sig)
             .unwrap();
         let fr = self.call_fref(id);
         let c = self.b.ins().call(fr, &call_args);
+        if let Some(s) = sret_slot {
+            return rets
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    self.b
+                        .ins()
+                        .load(*t, MemFlagsData::trusted(), s, i as i32 * 16)
+                })
+                .collect();
+        }
         let results: Vec<ir::Value> = self.b.inst_results(c).to_vec();
         results
             .iter()
@@ -3349,7 +3732,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             (size + over) as u32,
             align.min(16).trailing_zeros() as u8,
         ));
-        let p = self.b.ins().stack_addr(clt::I64, ss, 0);
+        let p = self.b.ins().stack_addr(self.tcfg.pointer_type(), ss, 0);
         if over == 0 {
             return p;
         }
@@ -3538,7 +3921,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn dyn_index(&mut self, base: ir::Value, idx: Value, scale: u64) -> ir::Value {
         let x = self.get1(idx);
-        let x = self.resize(x, clt::I64, true);
+        // Index arithmetic happens at pointer width: `base + idx*scale`
+        // needs both operands at the pointer type.
+        let x = self.resize(x, self.tcfg.pointer_type(), true);
         let off = self.b.ins().imul_imm_s(x, scale as i64);
         self.b.ins().iadd(base, off)
     }
@@ -3748,7 +4133,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         };
         self.b.switch_to_block(pre);
         self.b.set_cold_block(pre);
-        let pt = self.m.target_config().pointer_type();
+        let pt = self.tcfg.pointer_type();
         let p = self.b.append_block_param(pre, pt);
         self.b.def_var(self.exn.unwrap(), p);
         let lp = self.blocks[&catch];
@@ -3819,17 +4204,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // variadic defs aren't distinguishable and would need a shim).
             // Direct calls whose sym is a foreign variadic get the real
             // convention too: sym_addr redirects them to the %al trampoline.
-            let foreign = info.foreign
-                || match call.callee(ctx) {
-                    CallOpCallable::Indirect(_) => true,
-                    CallOpCallable::Direct(ident) => {
-                        let sym = &self.st.ident_to_sym[&ident.to_string()];
-                        self.st.funcs.get(sym).is_some_and(|f| {
-                            !has_body(self.ctx, f.op)
-                                && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
-                        })
-                    }
-                };
+            // Wasm has no foreign ABIs: every callee is linked into the same
+            // module and its variadic def expects the packed-buffer param.
+            let foreign = !self.wasm
+                && (info.foreign
+                    || match call.callee(ctx) {
+                        CallOpCallable::Indirect(_) => true,
+                        CallOpCallable::Direct(ident) => {
+                            let sym = &self.st.ident_to_sym[&ident.to_string()];
+                            self.st.funcs.get(sym).is_some_and(|f| {
+                                !has_body(self.ctx, f.op)
+                                    && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
+                            })
+                        }
+                    });
             if foreign {
                 sig.params.pop();
                 let fixed = sig.params.len();
@@ -3974,7 +4362,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // register is computed positionally).
                     cargs.push(addr);
                     csrc.push(usize::MAX);
-                    sig.params.push(AbiParam::new(clt::I64));
+                    sig.params.push(AbiParam::new(self.tcfg.pointer_type()));
                     const INT_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                     let n_int = sig.params[..sig.params.len() - 1]
                         .iter()
@@ -4011,14 +4399,52 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // Emulated EH: a "throw" records the exception in `__pliron_eh`
             // and unwinds by early-return instead of raising SEH.
             let sym = self.st.ident_to_sym[&ident.to_string()].as_str();
-            if sym == "_CxxThrowException" {
+            if self.wasm {
+                // The wasm emulated-EH intrinsics: __pliron_eh is the
+                // {flag@0, exn@4} word the linker synthesizes (FL::call).
+                let tls = self.eh_tls();
+                let mf = MemFlagsData::new();
+                if sym == "llvm.wasm.throw" || sym == "__pliron_llvm_wasm_throw" {
+                    self.b.ins().store(mf, cargs[1], tls, 4);
+                    self.eh_raise();
+                    return;
+                }
+                if sym == "llvm.wasm.rethrow" || sym == "__pliron_llvm_wasm_rethrow" {
+                    self.eh_raise();
+                    return;
+                }
+                if sym == "llvm.wasm.get_exception"
+                    || sym == "__pliron_llvm_wasm_get_exception"
+                {
+                    let v = self
+                        .b
+                        .ins()
+                        .load(self.tcfg.pointer_type(), mf, tls, 4);
+                    self.set(op, smallvec![v]);
+                    return;
+                }
+                if sym == "llvm.wasm.get_ehselector"
+                    || sym == "llvm.wasm.landingpad_index"
+                    || sym == "__pliron_llvm_wasm_get_ehselector"
+                    || sym == "__pliron_llvm_wasm_landingpad_index"
+                {
+                    let z = self.b.ins().iconst(clt::I32, 0);
+                    self.set(op, smallvec![z]);
+                    return;
+                }
+            }
+            if !self.wasm && sym == "_CxxThrowException" {
                 // `panic_unwind::seh::Exception` = { canary, payload } = 24
                 // bytes; copy it into the TLS buffer so it outlives the
                 // unwound frame.
                 let tls = self.eh_tls();
                 let mf = MemFlagsData::new();
                 let vs: Vec<ir::Value> = (0..3)
-                    .map(|i| self.b.ins().load(clt::I64, mf, cargs[0], i * 8))
+                    .map(|i| {
+                        self.b
+                            .ins()
+                            .load(self.tcfg.pointer_type(), mf, cargs[0], i * 8)
+                    })
                     .collect();
                 for (i, v) in vs.into_iter().enumerate() {
                     self.b.ins().store(mf, v, tls, 16 + i as i32 * 8);
@@ -4028,7 +4454,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.eh_raise();
                 return;
             }
-            if sym == "_Unwind_Resume" {
+            if !self.wasm && sym == "_Unwind_Resume" {
                 let tls = self.eh_tls();
                 self.b.ins().store(MemFlagsData::new(), cargs[0], tls, 8);
                 self.eh_raise();
@@ -4077,7 +4503,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         // `info.nocap` carries rustc's `captures(none)` (Indirect params);
         // `st.nocapture` is our body-level inference, which also covers
-        // `&`/`&mut` (Direct) params. Either flags the CLIF arg a bounded use.
+        // `&`/`&mut` (Direct) params. `noalias` is NOT enough: a
+        // `&'a mut self -> Entry<'a>`-style reborrow legally hands a
+        // pointer into the slot back through the return value or an
+        // out-param — a later call writing through it would bypass the
+        // slot's writeback/reload sync. Only true no-capture flags the
+        // CLIF arg a bounded use: no usable alias outlives the call.
         let own = callee_sym.and_then(|s| self.st.nocapture.get(&s));
         if info.nocap.is_some() || own.is_some() {
             for (k, &s) in csrc.iter().enumerate() {
@@ -4133,7 +4564,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().store(f, v1, de, 0);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(slow);
-        let cfg = self.m.target_config();
+        let cfg = self.tcfg;
         if memcpy {
             self.b.call_memcpy(cfg, dst, src, n);
         } else {
@@ -4175,9 +4606,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
             "pliron.eh.exn" => {
                 if self.eh_data.is_some() {
                     // Emulated EH: deliver the in-flight exception and clear
-                    // the flag.
+                    // the flag. COFF's TLS word stores exn at +8; wasm's
+                    // linker-synthesized {flag, exn} word stores it at +4.
                     let tls = self.eh_tls();
-                    let exn = self.b.ins().load(clt::I64, MemFlagsData::new(), tls, 8);
+                    let exn_off = if self.wasm { 4 } else { 8 };
+                    let exn = self.b.ins().load(
+                        self.tcfg.pointer_type(),
+                        MemFlagsData::new(),
+                        tls,
+                        exn_off,
+                    );
                     let z = self.b.ins().iconst(clt::I32, 0);
                     self.b.ins().store(MemFlagsData::new(), z, tls, 0);
                     exn
@@ -4214,7 +4652,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2]);
                     return;
                 }
-                let cfg = self.m.target_config();
+                let cfg = self.tcfg;
                 if name == "llvm.memcpy" {
                     self.b.call_memcpy(cfg, a[0], a[1], a[2]);
                 } else {
@@ -4245,7 +4683,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                     return;
                 }
-                let cfg = self.m.target_config();
+                let cfg = self.tcfg;
                 self.b.call_memset(cfg, a[0], a[1], a[2]);
                 return;
             }
@@ -4309,7 +4747,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         } else {
                             "__rust_u128_mulo"
                         };
-                        let r = self.libcall(f, &[t, t, clt::I64], &[t], &[a[0], a[1], slot])[0];
+                        let r = self.libcall(
+                            f,
+                            &[t, t, self.tcfg.pointer_type()],
+                            &[t],
+                            &[a[0], a[1], slot],
+                        )[0];
                         let o = self
                             .b
                             .ins()
@@ -4447,7 +4890,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // Emulated rethrow (`cleanup_ret` with no unwind dest):
                 // the exception pointer is still in `__pliron_eh`; set the
                 // flag again and keep unwinding by early-return.
-                let pt = self.m.target_config().pointer_type();
+                let pt = self.tcfg.pointer_type();
                 let z = self.iconst_any(pt, 0);
                 self.set1(op, z);
                 self.eh_raise();

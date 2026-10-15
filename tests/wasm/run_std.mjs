@@ -9,6 +9,8 @@ for (const [n, f, w] of [
   ["vec_sort(1000)", () => e.vec_sort(1000), 8388227136n],
   ["float_fmt", () => e.float_fmt(), 19],
   ["big_alloc(8)", () => e.big_alloc(8), 8 << 20],
+  ["hm_u64(100)", () => e.hm_u64(100), 100000],
+  ["hash_stable", () => e.hash_stable(), 31],
 ]) {
   let r; try { r = f() } catch (x) { r = "trap: " + x.message }
   const ok = r === w; bad += !ok;

@@ -242,6 +242,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 tail: false,
                 nocap: None,
                 arg_extent: None,
+                arg_noalias: None,
                 bb: false,
             },
         );
@@ -1170,7 +1171,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let env = ty::TypingEnv::fully_monomorphized();
         let mut nc = vec![false; full.len()];
         let mut exts = vec![(0u64, 0u64); full.len()];
-        let (mut any_nc, mut any_ex) = (false, false);
+        let mut nals = vec![false; full.len()];
+        let (mut any_nc, mut any_ex, mut any_nal) = (false, false, false);
         if let Some(abi) = fn_abi {
             use rustc_target::callconv::PassMode;
             let mut j = usize::from(return_slot.is_indirect());
@@ -1223,6 +1225,24 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     }
                     _ => None,
                 };
+                // rustc's own `noalias` mark on `&mut`/`&`-frozen/Box params.
+                // The borrow it carries ends when the call returns, so the
+                // callee cannot legally touch the pointee through a retained
+                // copy afterwards — SROA syncs pinned slices around the call.
+                let na: &[bool] = match &a.mode {
+                    PassMode::Direct(attrs) | PassMode::Indirect { attrs, .. } => {
+                        &[attrs
+                            .regular
+                            .contains(rustc_target::callconv::ArgAttribute::NoAlias)]
+                    }
+                    PassMode::Pair(a0, a1) => &[
+                        a0.regular
+                            .contains(rustc_target::callconv::ArgAttribute::NoAlias),
+                        a1.regular
+                            .contains(rustc_target::callconv::ArgAttribute::NoAlias),
+                    ],
+                    _ => &[],
+                };
                 for k in 0..n {
                     if j + k >= full.len() {
                         break;
@@ -1233,9 +1253,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     if let Some(e) = ext {
                         exts[j + k] = e;
                     }
+                    if na.get(k).copied().unwrap_or(false) {
+                        nals[j + k] = true;
+                    }
                 }
                 any_nc |= cap;
                 any_ex |= ext.is_some_and(|e| e.0 > 0);
+                any_nal |= na.iter().any(|b| *b);
                 j += n;
             }
         }
@@ -1247,6 +1271,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             info.cc = cc;
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
             info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
+            info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
         }
         v
     }
