@@ -3192,6 +3192,75 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", PermVec)]),
     );
 
+    // PLIRON: vector gather/scatter. `vgather` collects result lanes
+    // from `base + idx[i]*E + offset` where `E` is the element size of
+    // a result lane; `vscatter` is the matching store (x86 VSIB
+    // encodings; scatter is AVX512-only in HW).
+    let GatherVec = &TypeVar::new(
+        "GatherVec",
+        "A SIMD vector type with 32- or 64-bit lanes",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .floats(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let GatherIdx = &TypeVar::new(
+        "GatherIdx",
+        "An integer index vector for a gather/scatter",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vgather",
+            r#"
+        Gather vector lanes from memory.
+
+        `a[i] = load(base + idx[i]*E + offset)` where `E` is the element
+        size in bytes of a result lane. `idx` is an integer vector with
+        the same lane count as the result; its lanes may be 32- or
+        64-bit. Addresses are computed with wrapping 64-bit arithmetic.
+        "#,
+            &formats.store,
+        )
+        .operands_in(vec![
+            Operand::new("MemFlags", &imm.memflags),
+            Operand::new("p", iAddr),
+            Operand::new("idx", GatherIdx),
+            Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
+        ])
+        .operands_out(vec![Operand::new("a", GatherVec)])
+        .can_load(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vscatter",
+            r#"
+        Scatter vector lanes to memory.
+
+        `store(x[i], base + idx[i]*E + offset)` where `E` is the element
+        size in bytes of a lane of `x`. `idx` is an integer vector with
+        the same lane count as `x`.
+        "#,
+            &formats.scatter,
+        )
+        .operands_in(vec![
+            Operand::new("MemFlags", &imm.memflags),
+            Operand::new("x", GatherVec),
+            Operand::new("p", iAddr),
+            Operand::new("idx", GatherIdx),
+            Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
+        ])
+        .can_store(),
+    );
+
     ig.push(
         Inst::new(
             "vswizzle2",

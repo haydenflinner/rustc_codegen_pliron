@@ -1,7 +1,7 @@
 //! 256-bit (VEX.256) and 512-bit (EVEX.512) packed-float forms used by
 //! pliron's wide-SIMD mode. Operands reuse the `xmm*` locations: the
 //! register encoding is identical and callers only pass full-width values.
-use crate::dsl::{Eflags::*, Feature::*, Inst, Length::*, Location::*, TupleType::*};
+use crate::dsl::{Customization::*, Eflags::*, Feature::*, Inst, Length::*, Location::*, TupleType::*};
 use crate::dsl::{evex, fmt, inst, r, rw, vex, w};
 
 #[rustfmt::skip] // Keeps instructions on a single line.
@@ -365,5 +365,56 @@ pub fn list() -> Vec<Inst> {
         inst("vpermt2pd", fmt("X", [rw(xmm1), r(xmm2), r(xmm_m128)]), hx()._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
         inst("vpermt2pd", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f & avx512vl),
         inst("vpermt2pd", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w1().op(0x7F).r(), (_64b | compat) & avx512f),
+        // PLIRON: VSIB gathers/scatters for `vgather`/`vscatter`
+        // (hand-rolled encode in `custom.rs`: the DSL has no
+        // vector-register index operand). VEX gathers are
+        // (mask rw, index, amode, dst w) — the `rw` mask must be
+        // operand 0 since the operand collector ties a `rw` write to
+        // use-index 0. EVEX gathers are (dst w, index, amode),
+        // unmasked (k0); scatters are (data, index, amode). Letters
+        // follow the index-register width for EVEX (the LL bits encode
+        // it) and the natural VEX.L otherwise.
+        inst("vpgatherdd", fmt("X", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), vex(L128)._66()._0f38().w0().op(0x90).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vpgatherdd", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w0().op(0x90).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherdps", fmt("X", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), vex(L128)._66()._0f38().w0().op(0x92).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherdps", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w0().op(0x92).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vpgatherqd", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w0().op(0x91).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherqps", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w0().op(0x93).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vpgatherdq", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w1().op(0x90).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vpgatherqq", fmt("X", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), vex(L128)._66()._0f38().w1().op(0x91).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vpgatherqq", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w1().op(0x91).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherdpd", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w1().op(0x92).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherqpd", fmt("X", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), vex(L128)._66()._0f38().w1().op(0x93).r(), (_64b | compat) & avx2).custom(Encode),
+        inst("vgatherqpd", fmt("Y", [rw(xmm1), r(xmm2), r(m128), w(xmm3)]), y()._66()._0f38().w1().op(0x93).r(), (_64b | compat) & avx2).custom(Encode),
+
+        inst("vpgatherdd", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w0().op(0x90).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vgatherdps", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w0().op(0x92).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vpgatherqd", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w0().op(0x91).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vgatherqps", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w0().op(0x93).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vpgatherdq", fmt("H", [w(xmm1), r(xmm2), r(m128)]), h()._66()._0f38().w1().op(0x90).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vgatherdpd", fmt("H", [w(xmm1), r(xmm2), r(m128)]), h()._66()._0f38().w1().op(0x92).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vpgatherqq", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w1().op(0x91).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vgatherqpd", fmt("Z", [w(xmm1), r(xmm2), r(m128)]), z(Full)._66()._0f38().w1().op(0x93).r(), (_64b | compat) & avx512f).custom(Encode),
+
+        inst("vpscatterdd", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w0().op(0xA0).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterdd", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w0().op(0xA0).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterdd", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w0().op(0xA0).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vpscatterdq", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w1().op(0xA0).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterdq", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w1().op(0xA0).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterqd", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w0().op(0xA1).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterqd", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w0().op(0xA1).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vpscatterqq", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w1().op(0xA1).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterqq", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w1().op(0xA1).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vpscatterqq", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w1().op(0xA1).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vscatterdps", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w0().op(0xA2).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterdps", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w0().op(0xA2).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterdps", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w0().op(0xA2).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vscatterdpd", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w1().op(0xA2).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterdpd", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w1().op(0xA2).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterqps", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w0().op(0xA3).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterqps", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w0().op(0xA3).r(), (_64b | compat) & avx512f).custom(Encode),
+        inst("vscatterqpd", fmt("X", [r(xmm1), r(xmm2), w(m128)]), hx()._66()._0f38().w1().op(0xA3).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterqpd", fmt("H", [r(xmm1), r(xmm2), w(m128)]), h()._66()._0f38().w1().op(0xA3).r(), (_64b | compat) & avx512f & avx512vl).custom(Encode),
+        inst("vscatterqpd", fmt("Z", [r(xmm1), r(xmm2), w(m128)]), z(Full)._66()._0f38().w1().op(0xA3).r(), (_64b | compat) & avx512f).custom(Encode),
 ]
 }

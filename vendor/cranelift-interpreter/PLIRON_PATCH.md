@@ -8,6 +8,9 @@ Changes, all in `src/step.rs`:
 - arms for those opcodes (marked `PLIRON:`); the dot-product arms
   compute the pairwise/quad sums lane-wise, 128-bit only like the
   rest of this interpreter;
+- `vgather`/`vscatter` arms (marked `PLIRON:`): per-lane
+  `p + idx[i]*E + off` loads/stores via `checked_load`/`checked_store`,
+  sign-extended index math like HW;
 - `bitcast` between a scalar and a vector, or between vectors with different
   lane counts, now reinterprets bytes (marked `PLIRON PATCH:`). Upstream
   returned `bitcast.i64x2 (i128)` as a single i64 scalar, which made the

@@ -334,3 +334,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     128); qword reg-index permutes are EVEX-only: `vpermq`/`vpermpd`
     X/H/Z (avx512f, +vl at 128/256). `vswizzle2` X/H/Z `vpermt2d`/
     `vpermt2q`/`vpermt2ps`/`vpermt2pd` (avx512f, +vl at 128/256).
+
+28. x64 VSIB gather/scatter (new CLIF opcodes `vgather`/`vscatter`;
+    definitions in cranelift-codegen-meta patch 3, parser arm in
+    vendored cranelift-reader, interpreter arms in
+    vendor/cranelift-interpreter). `src/isa/x64/lower.isle`: VEX
+    `vpgatherdd/dq/qq/qd` + `vgatherdps/dpd/qpd` at 128/256 (avx2)
+    fed a fresh all-ones mask (`vpcmpeqb`); EVEX `vpgather*`/
+    `vgather*` at 256/512 (avx512f) unmasked. `vscatter` is
+    EVEX-only (`vpscatterdd`/`vscatterdps`/`vpscatterqd`/
+    `vpscatterdq`/`vscatterqps`/`vscatterqpd`/`vscatterqpd` H/Z;
+    avx512f, +avx512vl for ymm-index). `src/verifier/mod.rs` +
+    `src/write.rs`: `Scatter` instruction-data arms. Trap to note:
+    the generated operand collector ties a `rw` write to use-index
+    0 (`read_write_xmm`), so the VEX gather's mask operand must be
+    declared first; the dst result comes out as `value_regs_get`
+    index 1.

@@ -1399,6 +1399,44 @@ where
                 .collect::<ValueResult<SimdVec<DataValue>>>()?;
             assign(vectorizelanes(&out, ctrl_ty)?)
         }
+        // PLIRON: `vgather.ty flags addr, idx, off`: a[i] = load(p + idx[i]*E + off)
+        // (HW sign-extends the index lanes, so use signed math).
+        Opcode::Vgather => {
+            let lane_ty = ctrl_ty.lane_type();
+            let mem_flags = resolve_memflags();
+            let base = calculate_addr(types::I64, imm(), smallvec![arg(0)])?;
+            let scale = (lane_ty.bits() / 8) as i128;
+            let idxs = extractlanes(&arg(1), arg(1).ty())?;
+            let mut out: SimdVec<DataValue> = SmallVec::with_capacity(idxs.len());
+            for idx in idxs {
+                let ea = base.wrapping_add((idx.into_int_signed()? * scale) as u64);
+                match Address::try_from(ea)
+                    .and_then(|addr| state.checked_load(addr, lane_ty, mem_flags))
+                {
+                    Ok(v) => out.push(v),
+                    Err(e) => return Ok(ControlFlow::Trap(memerror_to_trap(e))),
+                }
+            }
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        // PLIRON: `vscatter flags x, p, idx, off`: store x[i] at p + idx[i]*E + off.
+        Opcode::Vscatter => {
+            let lane_ty = ctrl_ty.lane_type();
+            let mem_flags = resolve_memflags();
+            let base = calculate_addr(types::I64, imm(), smallvec![arg(1)])?;
+            let scale = (lane_ty.bits() / 8) as i128;
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let idxs = extractlanes(&arg(2), arg(2).ty())?;
+            for (x, idx) in xs.into_iter().zip(idxs) {
+                let ea = base.wrapping_add((idx.into_int_signed()? * scale) as u64);
+                if let Err(e) = Address::try_from(ea)
+                    .and_then(|addr| state.checked_store(addr, x, mem_flags))
+                {
+                    return Ok(ControlFlow::Trap(memerror_to_trap(e)));
+                }
+            }
+            ControlFlow::Continue
+        }
         Opcode::ExtractVector => {
             unimplemented!("ExtractVector not supported");
         }

@@ -28,3 +28,12 @@ Submit upstream once proven, then drop this copy.
    `vpermt2d`/`vpermt2q`/`vpermt2ps`/`vpermt2pd` X/H/Z two-source
    forms (index is the read-write first operand). Feeds
    `vswizzle`/`vswizzle2` (cranelift-codegen patch 27).
+
+5. `src/instructions/wide.rs`: x86 VSIB gather/scatter — VEX
+   `vpgatherdd/dq/qq/qd` + `vgatherdps/dpd/qpd` X/Y (avx2; mask operand
+   is declared first since the generated `read_write_xmm` operand
+   collector ties a `rw` write to use-index 0) and EVEX
+   `vpgather*`/`vgather*`/`vpscatter*`/`vscatter*` H/Z forms (avx512f,
+   +avx512vl for ymm-index forms). All `.custom(Encode)` — emitted via
+   `emit_vsib` in cranelift-assembler-x64. Feeds `vgather`/`vscatter`
+   (cranelift-codegen patch 28).

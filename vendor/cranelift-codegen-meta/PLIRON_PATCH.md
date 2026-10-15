@@ -17,3 +17,13 @@ opcodes can be declared. Changes, all in `src/shared/instructions.rs`:
    operand is a free typevar (`IdxVec`) — the lane-count/width
    relation to the data vector is enforced in lowering. See
    cranelift-codegen patch 27 for the x64 rules.
+
+3. `vgather`, `vscatter` vector memory opcodes (marked `PLIRON:`).
+   `vgather.ty flags p, idx+off` = `a[i] = load(p + idx[i]*E + off)` and
+   `vscatter flags x, p, idx+off` = `store(x[i], p + idx[i]*E + off)`,
+   where `E` is the lane size of the data vector and `idx` an integer
+   index vector (`GatherVec`/`GatherIdx` typevars). `vgather` reuses the
+   `Store` instruction format; `vscatter` needed a new `Scatter` format
+   (memflags + 3 values + offset32) — see cranelift-reader patch 1 and
+   cranelift-codegen patch 28 for the parser/verifier/display arms and
+   the x64 rules.

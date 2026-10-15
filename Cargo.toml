@@ -72,3 +72,6 @@ cranelift-assembler-x64-meta = { path = "vendor/cranelift-assembler-x64-meta" }
 # `x86_psadbw` arm for the exhaustive opcode match; see
 # vendor/cranelift-interpreter/PLIRON_PATCH.md.
 cranelift-interpreter = { path = "vendor/cranelift-interpreter" }
+# `Scatter` instruction-format arm for the `vscatter` CLIF op; see
+# vendor/cranelift-reader/PLIRON_PATCH.md.
+cranelift-reader = { path = "vendor/cranelift-reader" }

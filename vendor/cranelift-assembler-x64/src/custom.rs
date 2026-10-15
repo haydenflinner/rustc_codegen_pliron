@@ -69,9 +69,119 @@ pub mod encode {
         buf.put1(0x84);
         buf.put1(0x00);
         buf.put4(0x00_00_00_00);
+    }    // ===== PLIRON: VSIB gathers/scatters =====
+    // The DSL has no vector-register-index addressing mode, so the
+    // SIB byte and VEX/EVEX prefixes are emitted by hand. `reg` is the
+    // ModRM.reg field (gather dst / scatter src), `index` the VSIB
+    // index register, `vvvv` the VEX mask register (0b1111 = unused
+    // for EVEX) and `scale` the lane size in bytes (4 or 8).
+    fn emit_vsib<G: AsReg>(
+        sink: &mut impl CodeSink,
+        evex: bool,
+        ll: u8,
+        w: bool,
+        op: u8,
+        reg: u8,
+        index: u8,
+        vvvv: u8,
+        amode: &crate::mem::Amode<G>,
+        scale: u8,
+    ) {
+        use crate::evex::EvexPrefix;
+        use crate::rex::{Disp, encode_modrm, encode_sib};
+        use crate::vex::VexPrefix;
+        let &crate::mem::Amode::ImmReg { base, simm32, .. } = amode else {
+            panic!("PLIRON: VSIB requires a base+disp amode")
+        };
+        let enc_base = base.enc();
+        assert!(
+            reg < 16 && index < 16 && enc_base < 16,
+            "PLIRON: VSIB registers must be encodable (<16)"
+        );
+        if evex {
+            EvexPrefix::new(reg, vvvv, (Some(enc_base), Some(index)), ll, 1, 2, w, false)
+                .encode(sink);
+        } else {
+            VexPrefix::three_op(reg, vvvv, (Some(enc_base), Some(index)), ll, 1, 2, w)
+                .encode(sink);
+        }
+        sink.put1(op);
+        let mut imm = Disp::new(simm32.value(sink), None);
+        if enc_base & 7 == crate::gpr::enc::RBP {
+            imm.force_immediate();
+        }
+        sink.put1(encode_modrm(imm.m0d(), reg & 7, 0b100));
+        sink.put1(encode_sib(scale.trailing_zeros() as u8, index & 7, enc_base & 7));
+        imm.emit(sink);
     }
-}
 
+    macro_rules! vsib {
+        // VEX gather: fields (mask rw, index, amode, dst w). The mask must
+        // be operand 0: `read_write_xmm` ties the write to use-index 0.
+        ($name:ident, vex, $ll:literal, $w:literal, $op:literal, $scale:literal) => {
+            pub fn $name<R: Registers>(inst: &inst::$name<R>, sink: &mut impl CodeSink) {
+                emit_vsib(
+                    sink, false, $ll, $w, $op, inst.xmm3.enc(), inst.xmm2.enc(),
+                    inst.xmm1.enc(), &inst.m128, $scale,
+                );
+            }
+        };
+        // EVEX gather/scatter: fields (dst-or-data, index, amode); vvvv unused.
+        ($name:ident, evex, $ll:literal, $w:literal, $op:literal, $scale:literal) => {
+            pub fn $name<R: Registers>(inst: &inst::$name<R>, sink: &mut impl CodeSink) {
+                emit_vsib(
+                    sink, true, $ll, $w, $op, inst.xmm1.enc(), inst.xmm2.enc(), 0b1111,
+                    &inst.m128, $scale,
+                );
+            }
+        };
+    }
+
+    use crate::{AsReg, Registers};
+    vsib!(vpgatherdd_x, vex, 0, false, 0x90, 4);
+    vsib!(vpgatherdd_y, vex, 1, false, 0x90, 4);
+    vsib!(vgatherdps_x, vex, 0, false, 0x92, 4);
+    vsib!(vgatherdps_y, vex, 1, false, 0x92, 4);
+    vsib!(vpgatherqd_y, vex, 1, false, 0x91, 4);
+    vsib!(vgatherqps_y, vex, 1, false, 0x93, 4);
+    vsib!(vpgatherdq_y, vex, 1, true, 0x90, 8);
+    vsib!(vpgatherqq_x, vex, 0, true, 0x91, 8);
+    vsib!(vpgatherqq_y, vex, 1, true, 0x91, 8);
+    vsib!(vgatherdpd_y, vex, 1, true, 0x92, 8);
+    vsib!(vgatherqpd_x, vex, 0, true, 0x93, 8);
+    vsib!(vgatherqpd_y, vex, 1, true, 0x93, 8);
+
+    vsib!(vpgatherdd_z, evex, 2, false, 0x90, 4);
+    vsib!(vgatherdps_z, evex, 2, false, 0x92, 4);
+    vsib!(vpgatherqd_z, evex, 2, false, 0x91, 4);
+    vsib!(vgatherqps_z, evex, 2, false, 0x93, 4);
+    vsib!(vpgatherdq_h, evex, 1, true, 0x90, 8);
+    vsib!(vgatherdpd_h, evex, 1, true, 0x92, 8);
+    vsib!(vpgatherqq_z, evex, 2, true, 0x91, 8);
+    vsib!(vgatherqpd_z, evex, 2, true, 0x93, 8);
+
+    vsib!(vpscatterdd_x, evex, 0, false, 0xA0, 4);
+    vsib!(vpscatterdd_h, evex, 1, false, 0xA0, 4);
+    vsib!(vpscatterdd_z, evex, 2, false, 0xA0, 4);
+    vsib!(vpscatterdq_x, evex, 0, true, 0xA0, 8);
+    vsib!(vpscatterdq_h, evex, 1, true, 0xA0, 8);
+    vsib!(vpscatterqd_h, evex, 1, false, 0xA1, 4);
+    vsib!(vpscatterqd_z, evex, 2, false, 0xA1, 4);
+    vsib!(vpscatterqq_x, evex, 0, true, 0xA1, 8);
+    vsib!(vpscatterqq_h, evex, 1, true, 0xA1, 8);
+    vsib!(vpscatterqq_z, evex, 2, true, 0xA1, 8);
+    vsib!(vscatterdps_x, evex, 0, false, 0xA2, 4);
+    vsib!(vscatterdps_h, evex, 1, false, 0xA2, 4);
+    vsib!(vscatterdps_z, evex, 2, false, 0xA2, 4);
+    vsib!(vscatterdpd_x, evex, 0, true, 0xA2, 8);
+    vsib!(vscatterdpd_h, evex, 1, true, 0xA2, 8);
+    vsib!(vscatterqps_h, evex, 1, false, 0xA3, 4);
+    vsib!(vscatterqps_z, evex, 2, false, 0xA3, 4);
+    vsib!(vscatterqpd_x, evex, 0, true, 0xA3, 8);
+    vsib!(vscatterqpd_h, evex, 1, true, 0xA3, 8);
+    vsib!(vscatterqpd_z, evex, 2, true, 0xA3, 8);
+
+}
 pub mod mnemonic {
     use crate::inst;
     use crate::{Registers, XmmMem};

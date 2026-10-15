@@ -592,3 +592,72 @@ fn vswizzle2_512() {
     let code = compile(512, VSWIZZLE2);
     assert!(has_wide_op38(&code, &[0x7E]), "no vpermt2d zmm: {code:02x?}");
 }
+
+/// EVEX 0F38-map check for a specific L'L (index width): `62`, mm=2 in P1,
+/// L'L = `ll` in P2[6:5]. Gathers/scatters encode the index register width
+/// in L'L (1 = ymm, 2 = zmm).
+fn has_evex_op38(code: &[u8], ops: &[u8], ll: u8) -> bool {
+    code.windows(5).any(|w| {
+        w[0] == 0x62
+            && (w[1] & 0x03) == 0x02
+            && (w[3] & 0x60) == (ll << 5)
+            && ops.contains(&w[4])
+    })
+}
+
+const GATHER_256: &str = "
+function %g(i64, i32x8) -> i32x8 {
+block0(v0: i64, v1: i32x8):
+    v2 = vgather.i32x8 notrap aligned v0, v1+0
+    return v2
+}";
+
+const GATHER_512: &str = "
+function %g(i64, i32x16) -> i32x16 {
+block0(v0: i64, v1: i32x16):
+    v2 = vgather.i32x16 notrap aligned v0, v1+0
+    return v2
+}";
+
+const SCATTER_256: &str = "
+function %s(i32x8, i64, i32x8) {
+block0(v0: i32x8, v1: i64, v2: i32x8):
+    vscatter notrap aligned v0, v1, v2+0
+    return
+}";
+
+const SCATTER_512: &str = "
+function %s(i32x16, i64, i32x16) {
+block0(v0: i32x16, v1: i64, v2: i32x16):
+    vscatter notrap aligned v0, v1, v2+0
+    return
+}";
+
+#[test]
+fn gather_256() {
+    let code = compile(256, GATHER_256);
+    // vpgatherdd ymm = VEX.256 0F38 0x90 (all-ones mask + zeroed dst regs are
+    // also emitted; only the gather opcode is checked).
+    assert!(has_wide_op38(&code, &[0x90]), "no vpgatherdd ymm: {code:02x?}");
+}
+
+#[test]
+fn gather_512() {
+    let code = compile(512, GATHER_512);
+    // vpgatherdd zmm-idx = EVEX 0F38 0x90, L'L=10
+    assert!(has_evex_op38(&code, &[0x90], 2), "no vpgatherdd zmm: {code:02x?}");
+}
+
+#[test]
+fn scatter_256() {
+    let code = compile(256, SCATTER_256);
+    // vpscatterdd ymm-idx = EVEX 0F38 0xA0, L'L=01
+    assert!(has_evex_op38(&code, &[0xA0], 1), "no vpscatterdd (ymm idx): {code:02x?}");
+}
+
+#[test]
+fn scatter_512() {
+    let code = compile(512, SCATTER_512);
+    // vpscatterdd zmm-idx = EVEX 0F38 0xA0, L'L=10
+    assert!(has_evex_op38(&code, &[0xA0], 2), "no vpscatterdd zmm: {code:02x?}");
+}
