@@ -95,6 +95,68 @@ impl ModuleBufferMethods for PlironBuffer {
     }
 }
 
+/// `base_has_feature` for the codegen `Session` (its twin takes
+/// `EarlySession`), plus `-Ctarget-feature` `+/-` overrides on top.
+fn sess_has_feature(sess: &Session, feature: &str) -> bool {
+    let baseline: &[&str] = match sess.target.arch {
+        rustc_target::spec::Arch::X86_64 => &["fxsr", "sse", "sse2", "x87"],
+        rustc_target::spec::Arch::AArch64 => &["neon"],
+        _ => &[],
+    };
+    let cpu = sess
+        .opts
+        .cg
+        .target_cpu
+        .as_deref()
+        .unwrap_or(&sess.target.cpu);
+    let mut on = baseline.contains(&feature)
+        || if cpu == "native" {
+            native_feat(sess, feature)
+        } else {
+            cpu_features(cpu).contains(&feature)
+        };
+    for t in sess.opts.cg.target_feature.split(',') {
+        let t = t.trim();
+        if t == feature || t == format!("+{feature}") {
+            on = true;
+        } else if t == format!("-{feature}") {
+            on = false;
+        }
+    }
+    on
+}
+#[cfg(target_arch = "x86_64")]
+fn native_feat(sess: &Session, feature: &str) -> bool {
+    let _ = sess;
+    match feature {
+        "sse3" => std::arch::is_x86_feature_detected!("sse3"),
+        "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
+        "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+        "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
+        "avx" => std::arch::is_x86_feature_detected!("avx"),
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        "popcnt" => std::arch::is_x86_feature_detected!("popcnt"),
+        "bmi1" => std::arch::is_x86_feature_detected!("bmi1"),
+        "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+        "lzcnt" => std::arch::is_x86_feature_detected!("lzcnt"),
+        "cmpxchg16b" => std::arch::is_x86_feature_detected!("cmpxchg16b"),
+        "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+        "avx512dq" => std::arch::is_x86_feature_detected!("avx512dq"),
+        "avx512vl" => std::arch::is_x86_feature_detected!("avx512vl"),
+        "avx512bw" => std::arch::is_x86_feature_detected!("avx512bw"),
+        "avx512cd" => std::arch::is_x86_feature_detected!("avx512cd"),
+        "avx512vbmi" => std::arch::is_x86_feature_detected!("avx512vbmi"),
+        "avx512bitalg" => std::arch::is_x86_feature_detected!("avx512bitalg"),
+        "avx512vnni" => std::arch::is_x86_feature_detected!("avx512vnni"),
+        "avxvnni" => std::arch::is_x86_feature_detected!("avxvnni"),
+        _ => false,
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn native_feat(_sess: &Session, _feature: &str) -> bool {
+    false
+}
 fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
@@ -164,6 +226,34 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         .unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
+    // ISA extension flags from rustc's effective target features.
+    // Without this everything compiles to the arch baseline (SSE2 on
+    // x86-64) no matter what `-Ctarget-cpu`/`-Ctarget-feature` asks.
+    for (feat, flag) in [
+        ("sse3", "has_sse3"),
+        ("ssse3", "has_ssse3"),
+        ("sse4.1", "has_sse41"),
+        ("sse4.2", "has_sse42"),
+        ("popcnt", "has_popcnt"),
+        ("avx", "has_avx"),
+        ("avx2", "has_avx2"),
+        ("fma", "has_fma"),
+        ("bmi1", "has_bmi1"),
+        ("bmi2", "has_bmi2"),
+        ("lzcnt", "has_lzcnt"),
+        ("cmpxchg16b", "has_cmpxchg16b"),
+        ("avx512f", "has_avx512f"),
+        ("avx512dq", "has_avx512dq"),
+        ("avx512vl", "has_avx512vl"),
+        ("avx512vbmi", "has_avx512vbmi"),
+        ("avx512bitalg", "has_avx512bitalg"),
+        ("avx512vnni", "has_avx512vnni"),
+        ("avxvnni", "has_avx_vnni"),
+    ] {
+        if sess_has_feature(sess, feat) {
+            let _ = fb.enable(flag);
+        }
+    }
     fb.set(
         "opt_level",
         if sess.opts.optimize == OptLevel::No || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH") {
