@@ -470,6 +470,15 @@ pub fn isolated_escapes(
     if cand.is_empty() {
         return (cand, escapes, ncc_bad);
     }
+    // `root` is deterministic for the whole scan; the same address value
+    // shows up at many use sites (visitor bodies re-read one pointer at
+    // every field), so memoize it rather than re-peeling each time.
+    let mut rmemo: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
+    let mut rt = |func: &Function, v: Value| {
+        *rmemo
+            .entry(v)
+            .or_insert_with(|| root(func, ps, noalias, v))
+    };
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let data = &func.dfg.insts[i];
@@ -478,7 +487,7 @@ pub fn isolated_escapes(
             // benign iff the param it feeds is the same root — i.e., the
             // pointer stays inside this equivalence class.
             for (k, v) in func.dfg.inst_values(i).enumerate() {
-                let (r, _) = root(func, ps, noalias, v);
+                let (r, _) = rt(func, v);
                 if !cand.contains(&r) {
                     continue;
                 }
@@ -506,7 +515,7 @@ pub fn isolated_escapes(
                         ..
                     } => {
                         let res = func.dfg.first_result(i);
-                        root(func, ps, noalias, res).0 == r || noalias.contains(&res)
+                        rt(func, res).0 == r || noalias.contains(&res)
                     }
                     // A comparison can't carry the pointer anywhere.
                     _ if matches!(data.opcode(), Opcode::Icmp) => true,

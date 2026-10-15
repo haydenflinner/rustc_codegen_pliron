@@ -31,6 +31,12 @@ pub struct Facts {
 }
 
 pub fn facts(func: &Function) -> Facts {
+    facts_cfg(func, &ControlFlowGraph::with_function(func))
+}
+
+/// `facts` over a caller-built CFG — passes that already compute one
+/// (`dse`, `celim`) shouldn't pay for a second `with_function`.
+pub fn facts_cfg(func: &Function, cfg: &ControlFlowGraph) -> Facts {
     let Some(entry) = func.layout.entry_block() else {
         return Facts {
             edge: Vec::new(),
@@ -40,7 +46,6 @@ pub fn facts(func: &Function) -> Facts {
     };
     // Reachable = BFS over the CFG (equivalent to `dt.is_reachable`,
     // without needing the dominator tree).
-    let cfg = ControlFlowGraph::with_function(func);
     let mut reach: FxHashSet<Block> = [entry].into_iter().collect();
     let mut stack = vec![entry];
     while let Some(b) = stack.pop() {
@@ -158,6 +163,11 @@ pub fn alias_of(f: &Facts) -> FxHashMap<Value, Value> {
 /// The alias relation alone — `param_src`'s job.
 pub fn alias_map(func: &Function) -> FxHashMap<Value, Value> {
     alias_of(&facts(func))
+}
+
+/// `alias_map` over a caller-built CFG.
+pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
+    alias_of(&facts_cfg(func, cfg))
 }
 
 /// Param → its web's canonical representative (the transitive uniform

@@ -204,6 +204,8 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   nounwind inferred for functions whose symbol contains the substring
   (`./test.sh --only facts` checks a few against `tests/facts/main.rs`).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time, sorted (stderr).
+- `PLIRON_DSE_PROF=1` — per-function `dse` phase timing on stderr:
+  param-src, isolated-scan, op decode, fixpoint pops/time, kill sweep.
 - `-Zself-profile` records the backend's work as `pliron_*` generic
   activities (`pliron_iropt`, `pliron_ir_<pass>`, `pliron_pipeline`/
   `pliron_compile` per fn, one event per pipeline step name) — the same

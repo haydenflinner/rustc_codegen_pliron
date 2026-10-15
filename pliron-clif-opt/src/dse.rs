@@ -21,6 +21,7 @@
 //! volatile accesses still read/write their own location like any access
 //! (they just can't be removed).
 
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, InstructionData, Opcode, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -120,7 +121,11 @@ impl Demands {
     /// pre-store values. Isolated roots stay precisely tracked.
     fn read_barrier(&mut self, iso: &FxHashSet<Root>) {
         self.top_non_iso = true;
-        self.cov.retain(|&(r, _, _)| iso.contains(&r));
+        if iso.is_empty() {
+            self.cov.clear();
+        } else {
+            self.cov.retain(|&(r, _, _)| iso.contains(&r));
+        }
     }
 
     /// An unknown writer (call that may write, atomic/fence/other side
@@ -129,8 +134,13 @@ impl Demands {
     /// barriers can't reach them.
     fn barrier(&mut self, iso: &FxHashSet<Root>) {
         self.read_barrier(iso);
-        self.locs.retain(|&(r, _, _)| iso.contains(&r));
-        self.roots.retain(|r| iso.contains(r));
+        if iso.is_empty() {
+            self.locs.clear();
+            self.roots.clear();
+        } else {
+            self.locs.retain(|&(r, _, _)| iso.contains(&r));
+            self.roots.retain(|r| iso.contains(r));
+        }
     }
 }
 
@@ -161,10 +171,13 @@ fn mem_width(func: &Function, i: Inst) -> Option<i64> {
 }
 
 /// Location `(root, offset, width)` touched by a plain load/store inst.
+/// `memo` caches `root` per address value — the same base pointer feeds
+/// many accesses, and `root` re-peels the alias/`iadd` chain each call.
 fn mem_loc(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    memo: &mut FxHashMap<Value, (Root, i64)>,
     i: Inst,
 ) -> Option<(Root, i64, i64)> {
     let (addr, off) = match func.dfg.insts[i] {
@@ -173,74 +186,110 @@ fn mem_loc(
         _ => return None,
     };
     let w = mem_width(func, i)?;
-    let (r, o) = loadfwd::root(func, ps, na, addr);
+    let (r, o) = *memo
+        .entry(addr)
+        .or_insert_with(|| loadfwd::root(func, ps, na, addr));
     Some((r, o.wrapping_add(i64::from(off)), w))
 }
 
-/// Backward transfer through `b`'s insts given `d` = demands at block end.
-/// `dead`, when given, collects stores proven dead on this walk.
-fn transfer(
+/// One inst's effect on the demand state, decoded once per run so the
+/// fixpoint replays `Demands` ops instead of re-reading the DFG.
+#[derive(Clone, Copy)]
+enum Op {
+    /// Plain load: add its loc to `locs`.
+    Read(DLoc),
+    /// Plain store: `killable` = notrap + plain-opcode family (the
+    /// dead-store candidate test); otherwise it just `written`s.
+    Store(Inst, DLoc, bool),
+    /// `read_barrier` — reads everything reachable, satisfies nothing.
+    ReadAll,
+    /// `barrier` — reads and may write everything reachable.
+    RwAll,
+}
+
+/// Resolve every inst's demand effect in `order`'s reachable blocks.
+fn decode(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
-    b: Block,
-    d: &mut Demands,
-    iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     eh: bool,
-    mut dead: Option<&mut Vec<Inst>>,
-) {
-    let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-    for i in insts.into_iter().rev() {
-        match func.dfg.insts[i] {
-            InstructionData::Load { .. } => {
-                if let Some((r, o, w)) = mem_loc(func, ps, na, i) {
-                    d.demand(r, o, w);
-                } else {
-                    d.barrier(iso);
+    order: &[Block],
+) -> SecondaryMap<Block, Vec<Op>> {
+    let mut ops: SecondaryMap<Block, Vec<Op>> = SecondaryMap::new();
+    let mut memo: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
+    for &b in order {
+        let mut v = Vec::new();
+        for i in func.layout.block_insts(b) {
+            match func.dfg.insts[i] {
+                InstructionData::Load { .. } => match mem_loc(func, ps, na, &mut memo, i) {
+                    Some(l) => v.push(Op::Read(l)),
+                    None => v.push(Op::RwAll),
+                },
+                InstructionData::Store { opcode, .. } => {
+                    match mem_loc(func, ps, na, &mut memo, i) {
+                        Some(l) => v.push(Op::Store(
+                            i,
+                            l,
+                            loadfwd::notrap(func, i)
+                                && matches!(
+                                    opcode,
+                                    Opcode::Store
+                                        | Opcode::Istore8
+                                        | Opcode::Istore16
+                                        | Opcode::Istore32
+                                ),
+                        )),
+                        None => v.push(Op::RwAll),
+                    }
+                }
+                _ => {
+                    let op = func.dfg.insts[i].opcode();
+                    if op.is_call() {
+                        // Readonly calls still read anything reachable;
+                        // writing calls also satisfy pending reads.
+                        v.push(if loadfwd::write_free(func, i, nw, eh) {
+                            Op::ReadAll
+                        } else {
+                            Op::RwAll
+                        });
+                    } else if op.can_load()
+                        || op.can_store()
+                        || op.other_side_effects()
+                        || matches!(op, Opcode::AtomicLoad | Opcode::Fence)
+                    {
+                        v.push(Op::RwAll);
+                    }
                 }
             }
-            InstructionData::Store { opcode, .. } => {
-                let Some((r, o, w)) = mem_loc(func, ps, na, i) else {
-                    d.barrier(iso);
-                    continue;
-                };
+        }
+        ops[b] = v;
+    }
+    ops
+}
+
+/// Backward transfer through `b`'s decoded ops given `d` = demands at
+/// block end. `dead`, when given, collects stores proven dead on this
+/// walk.
+fn transfer(ops: &[Op], d: &mut Demands, iso: &FxHashSet<Root>, mut dead: Option<&mut Vec<Inst>>) {
+    for op in ops.iter().rev() {
+        match *op {
+            Op::Read((r, o, w)) => d.demand(r, o, w),
+            Op::ReadAll => d.read_barrier(iso),
+            Op::RwAll => d.barrier(iso),
+            Op::Store(i, (r, o, w), killable) => {
                 // A dead store hides nothing: demands pass through it to
                 // earlier stores so a store-store chain collapses. A live
                 // store (and stores we may never kill — volatile,
                 // untrusted) satisfies the covered demands. The same rule
                 // runs in both phases: don't clear on a killable store
                 // even when `dead` isn't collecting.
-                let dead_store = !d.read(r, o, w, iso)
-                    && loadfwd::notrap(func, i)
-                    && matches!(
-                        opcode,
-                        Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32
-                    );
-                if dead_store {
+                if !d.read(r, o, w, iso) && killable {
                     if let Some(ds) = dead.as_deref_mut() {
                         ds.push(i);
                     }
-                    continue;
-                }
-                d.written(r, o, w);
-            }
-            _ => {
-                let op = func.dfg.insts[i].opcode();
-                if op.is_call() {
-                    // Readonly calls still read anything reachable; writing
-                    // calls also satisfy pending non-isolated reads.
-                    if loadfwd::write_free(func, i, nw, eh) {
-                        d.read_barrier(iso);
-                    } else {
-                        d.barrier(iso);
-                    }
-                } else if op.can_load()
-                    || op.can_store()
-                    || op.other_side_effects()
-                    || matches!(op, Opcode::AtomicLoad | Opcode::Fence)
-                {
-                    d.barrier(iso);
+                } else {
+                    d.written(r, o, w);
                 }
             }
         }
@@ -257,92 +306,111 @@ pub fn run(
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
+    let prof = crate::env_set("PLIRON_DSE_PROF");
+    let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
-    let ps = &loadfwd::param_src(func);
+    let ps = &crate::proots::alias_map_cfg(func, &cfg);
+    let t_ps = t0.elapsed();
     let iso = loadfwd::isolated(func, noalias, ps, cfrozen);
+    let t_iso = t0.elapsed();
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut order = Vec::new();
-    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut seen: SecondaryMap<Block, bool> = SecondaryMap::new();
     let mut stack = vec![entry];
     while let Some(b) = stack.pop() {
-        if !seen.insert(b) {
+        if seen[b] {
             continue;
         }
+        seen[b] = true;
         order.push(b);
         for s in cfg.succ_iter(b) {
             stack.push(s);
         }
     }
+    // Decode each inst's demand effect once: the fixpoint and the kill
+    // sweep then replay `Demands` ops instead of re-reading the DFG and
+    // re-peeling `root` chains.
+    let ops = decode(func, ps, noalias, nw, eh, &order);
+    let t_dec = t0.elapsed();
     // Caller-observable memory at function exits: returns demand every
     // `Root::V` — including isolated noalias params, whose pointee is
     // caller memory — but not stack slots, which die with the frame.
     // Unreachable/tarpit ends demand nothing.
-    let mut inn: FxHashMap<Block, Demands> = FxHashMap::default();
-    let mut out: FxHashMap<Block, Demands> = FxHashMap::default();
-    let mut stable = false;
-    // Backward flow: visit successors before predecessors (reverse DFS
-    // order) so demands propagate a whole chain per pass instead of one
-    // edge — preorder would need CFG-depth iterations to reach entry.
-    for _ in 0..MAX_ITERS {
-        let mut changed = false;
-        for &b in order.iter().rev() {
-            let mut d = Demands {
-                top_non_stack: func.layout.last_inst(b).is_some_and(|t| {
-                    matches!(
-                        func.dfg.insts[t].opcode(),
-                        Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect
-                    )
-                }),
-                ..Demands::default()
-            };
-            // Demands union over successors; coverage intersects — a byte
-            // counts covered only when every successor path rewrites it.
-            // A successor with no recorded state claims no coverage.
-            let mut cov: Option<FxHashSet<DLoc>> = None;
-            for s in cfg.succ_iter(b) {
-                match inn.get(&s) {
-                    Some(i) => {
-                        match &mut cov {
-                            None => cov = Some(i.cov.clone()),
-                            Some(c) => c.retain(|l| i.cov.contains(l)),
-                        }
-                        d.union(i);
-                    }
-                    // Empty: intersecting stays empty however later
-                    // successors merge.
-                    None => cov = Some(FxHashSet::default()),
+    let mut inn: SecondaryMap<Block, Demands> = SecondaryMap::new();
+    let mut out: SecondaryMap<Block, Demands> = SecondaryMap::new();
+    // `done[b]`: `inn[b]` already includes `transfer(out[b])` — so a pop
+    // where `out[b]` is unchanged needs no re-transfer, just the merge
+    // check. Without it the fixpoint re-transfers every block on every
+    // round, even ones whose successor states never moved.
+    let mut done: SecondaryMap<Block, bool> = SecondaryMap::new();
+    // Worklist over predecessors: seeding with `order` and popping gives
+    // the old loop's successors-first sweep; afterwards only preds of
+    // blocks whose `inn` actually changed are revisited. States only grow
+    // (demands union, coverage intersects) so this terminates; `budget`
+    // bounds the total pops exactly like the old iteration cap.
+    let mut inq: SecondaryMap<Block, bool> = SecondaryMap::new();
+    let mut stack: Vec<Block> = order.clone();
+    for &b in &order {
+        inq[b] = true;
+    }
+    let mut pops = 0usize;
+    let mut budget = MAX_ITERS * order.len();
+    let mut stable = true;
+    while let Some(b) = stack.pop() {
+        inq[b] = false;
+        pops += 1;
+        if budget == 0 {
+            stable = false;
+            break;
+        }
+        budget -= 1;
+        let mut d = Demands {
+            top_non_stack: func.layout.last_inst(b).is_some_and(|t| {
+                matches!(
+                    func.dfg.insts[t].opcode(),
+                    Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect
+                )
+            }),
+            ..Demands::default()
+        };
+        // Demands union over successors; coverage intersects — a byte
+        // counts covered only when every successor path rewrites it. A
+        // successor with no recorded state claims no coverage — a
+        // never-written `inn` entry is the empty `Demands`, same thing.
+        let mut cov: Option<FxHashSet<DLoc>> = None;
+        for s in cfg.succ_iter(b) {
+            let i = &inn[s];
+            match &mut cov {
+                None => cov = Some(i.cov.clone()),
+                Some(c) => c.retain(|l| i.cov.contains(l)),
+            }
+            d.union(i);
+        }
+        d.cov = cov.unwrap_or_default();
+        // The old sweep also unioned `out[b]` back in (widen demands,
+        // intersect coverage) to stop a store-demand flip-flop from
+        // oscillating (hashmap's loop-carried `&key` slot). The worklist
+        // gets the same monotonicity from the `inn` update below —
+        // `din.union(old)`/`cov.retain(old)` — and since every `inn`
+        // entry only grows demands and shrinks coverage, the succ merge
+        // already subsumes the old `out[b]`: re-unioning it is a no-op.
+        if done[b] && out[b] == d {
+            continue;
+        }
+        let mut din = d.clone();
+        transfer(&ops[b], &mut din, &iso, None);
+        din.union(&inn[b]);
+        din.cov.retain(|l| inn[b].cov.contains(l));
+        out[b] = d;
+        done[b] = true;
+        if din != inn[b] {
+            inn[b] = din;
+            for p in cfg.pred_iter(b) {
+                if seen[p.block] && !inq[p.block] {
+                    inq[p.block] = true;
+                    stack.push(p.block);
                 }
             }
-            d.cov = cov.unwrap_or_default();
-            // Widen demands upward and coverage downward so the flow
-            // can't oscillate: a covering store removes the read demand
-            // that justified it, which next round resurfaces the demand
-            // and revives the store — a two-state flip-flop that never
-            // stabilizes (hashmap's loop-carried `&key` slot). Unioning
-            // demands and intersecting coverage is a post-fixpoint, a
-            // conservative over-approximation of live reads.
-            if let Some(old) = out.get(&b) {
-                d.union(old);
-                d.cov.retain(|l| old.cov.contains(l));
-            }
-            if out.get(&b) != Some(&d) {
-                out.insert(b, d.clone());
-                changed = true;
-            }
-            let mut din = d;
-            transfer(func, ps, noalias, b, &mut din, &iso, nw, eh, None);
-            if let Some(old) = inn.get(&b) {
-                din.union(old);
-                din.cov.retain(|l| old.cov.contains(l));
-            }
-            if inn.get(&b) != Some(&din) {
-                inn.insert(b, din);
-                changed = true;
-            }
-        }
-        if !changed {
-            stable = true;
-            break;
         }
     }
     if !stable {
@@ -354,13 +422,27 @@ pub fn run(
         }
         return 0;
     }
+    let t_fix = t0.elapsed();
     let mut dead = Vec::new();
     for &b in &order {
-        let mut d = out.get(&b).cloned().unwrap_or_default();
-        transfer(func, ps, noalias, b, &mut d, &iso, nw, eh, Some(&mut dead));
+        let mut d = out[b].clone();
+        transfer(&ops[b], &mut d, &iso, Some(&mut dead));
     }
     for i in &dead {
         func.layout.remove_inst(*i);
+    }
+    if prof {
+        let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
+        eprintln!(
+            "dseprof {} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={:?} dec={:?} fix={:?} sweep={:?} dead={}",
+            func.name,
+            order.len(),
+            t_iso - t_ps,
+            t_dec - t_iso,
+            t_fix - t_dec,
+            t0.elapsed() - t_fix,
+            dead.len(),
+        );
     }
     dead.len()
 }
