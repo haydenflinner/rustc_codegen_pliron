@@ -1088,8 +1088,25 @@ pub fn slope(k: &Key, i: u32) -> Option<i64> {
 /// *keys*, so congruent-but-distinct SSA names cancel too. `ty` types
 /// the zero/const results; `depth` bounds the rewrite recursion.
 pub fn key_sub(x: &Key, y: &Key, ty: cranelift_codegen::ir::Type, depth: u32) -> Option<Key> {
+    key_sub_h(x, y, ty, depth, &mut FxHashMap::default())
+}
+
+/// `key_sub` with a shared `khash_m` memo: every structural `==` is
+/// gated on subtree-hash equality first, turning the failed compares
+/// that dominate wide sibling probes into O(1) lookups. Hash-equal
+/// pairs still run `==` — the gate only ever skips certain negatives.
+pub fn key_sub_h(
+    x: &Key,
+    y: &Key,
+    ty: cranelift_codegen::ir::Type,
+    depth: u32,
+    hm: &mut FxHashMap<*const Key, u64>,
+) -> Option<Key> {
+    let heq = |a: &Key, b: &Key, hm: &mut FxHashMap<*const Key, u64>| {
+        khash_m(a, hm) == khash_m(b, hm) && a == b
+    };
     let k0 = || Some(Key::K(ty, 0));
-    if x == y {
+    if heq(x, y, hm) {
         return k0();
     }
     if depth == 0 {
@@ -1113,38 +1130,38 @@ pub fn key_sub(x: &Key, y: &Key, ty: cranelift_codegen::ir::Type, depth: u32) ->
     }
     // `y = x - d` ⇒ x - y = d.
     if let Some((a, d)) = isub(y)
-        && a == x
+        && heq(a, x, hm)
     {
         return Some(d.clone());
     }
     // `x = y + d` ⇒ x - y = d.
     if let Some((a, d)) = iadd(x) {
-        if a == y {
+        if heq(a, y, hm) {
             return Some(d.clone());
         }
-        if d == y {
+        if heq(d, y, hm) {
             return Some(a.clone());
         }
     }
     // `y = y0 + (x - d)` ⇒ x - y = d - y0; `x = x0 + (y - d)` ⇒ x - y = x0 - d.
     for (o, m) in iadd(y).into_iter().flat_map(|(o, m)| [(o, m), (m, o)]) {
         if let Some((a, d)) = isub(m)
-            && a == x
+            && heq(a, x, hm)
         {
-            return key_sub(d, o, ty, depth - 1);
+            return key_sub_h(d, o, ty, depth - 1, hm);
         }
     }
     for (o, m) in iadd(x).into_iter().flat_map(|(o, m)| [(o, m), (m, o)]) {
         if let Some((a, d)) = isub(m)
-            && a == y
+            && heq(a, y, hm)
         {
-            return key_sub(o, d, ty, depth - 1);
+            return key_sub_h(o, d, ty, depth - 1, hm);
         }
     }
     // Affine cancellation: matching roots drop to the offset difference.
     let (bx, ox) = peel_off(x);
     let (by, oy) = peel_off(y);
-    if bx == by && (ox != 0 || oy != 0) {
+    if heq(bx, by, hm) && (ox != 0 || oy != 0) {
         return Some(Key::K(ty, ox - oy));
     }
     // Shared-operand strip: `(a + c) - (b + c) = a - b`,
@@ -1157,15 +1174,15 @@ pub fn key_sub(x: &Key, y: &Key, ty: cranelift_codegen::ir::Type, depth: u32) ->
                 ((xa[1].clone(), xa[0].clone()), (ya[0].clone(), ya[1].clone())),
                 ((xa[1].clone(), xa[0].clone()), (ya[1].clone(), ya[0].clone())),
             ] {
-                if c == c2 {
-                    return key_sub(&a, &b, ty, depth - 1);
+                if heq(&c, &c2, hm) {
+                    return key_sub_h(&a, &b, ty, depth - 1, hm);
                 }
             }
         }
         (Key::N(Opcode::Isub, _, xa, _), Key::N(Opcode::Isub, _, ya, _))
-            if xa[1] == ya[1] =>
+            if heq(&xa[1], &ya[1], hm) =>
         {
-            return key_sub(&xa[0], &ya[0], ty, depth - 1);
+            return key_sub_h(&xa[0], &ya[0], ty, depth - 1, hm);
         }
         _ => {}
     }

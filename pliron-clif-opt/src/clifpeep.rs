@@ -2154,6 +2154,31 @@ impl WmCtx {
     }
 }
 
+/// `k`'s subtree set as `khash_m` values — the necessary-condition
+/// index `webmerge`'s phase-D sibling probes filter on: `key_sub`
+/// only fires between keys sharing a subtree.
+fn subtree_hashes(
+    k: &crate::proots::Key,
+    hm: &mut FxHashMap<*const crate::proots::Key, u64>,
+    seen: &mut FxHashSet<*const crate::proots::Key>,
+    out: &mut FxHashSet<u64>,
+) {
+    use crate::proots::Key;
+    if !seen.insert(k as *const Key) {
+        return;
+    }
+    out.insert(crate::proots::khash_m(k, hm));
+    match k {
+        Key::A(_, b, _) => subtree_hashes(b, hm, seen, out),
+        Key::N(_, _, args, _) => {
+            for a in args.iter() {
+                subtree_hashes(a, hm, seen, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut ctx = WmCtx::new(func);
     webmerge_ctx(func, &mut ctx)
@@ -2407,6 +2432,16 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // `resolve_p` inlines them.
         let mut pend: FxHashMap<usize, Key> = FxHashMap::default();
         let mut cands: Vec<(usize, Key)> = vec![];
+        // `key_sub` only proves a relation between keys sharing a
+        // subtree — every success branch anchors on `a == x`,
+        // `bx == by`, or `c == c2` — so a sibling whose probe-edge key
+        // shares no subtree hash with the target's can never fire it.
+        // Index subtree hashes per probe edge lazily: O(slots×keysize)
+        // once, instead of slots² oracle probes on wide loop headers.
+        let mut edge_submap: FxHashMap<
+            usize,
+            (FxHashMap<u64, Vec<usize>>, Vec<FxHashSet<u64>>, Vec<usize>),
+        > = FxHashMap::default();
         let tblk = std::time::Instant::now();
         let dkeys = tblk - tkeys;
         nblk += 1;
@@ -2676,15 +2711,20 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     };
                     if vwithin(eargs[e][i]) && vwithin(eargs[e][ix]) {
                         let ki = pk_of(e, i);
-                        if crate::proots::within(ki, REL_KEY_CAP)
+                        let d = if crate::proots::within(ki, REL_KEY_CAP)
                             && crate::proots::within(kj, REL_KEY_CAP)
-                            && let Some(d) = crate::proots::key_sub(ki, kj, ty, 8)
+                        {
+                            let mut hm = hmemo.borrow_mut();
+                            crate::proots::key_sub_h(ki, kj, ty, 8, &mut hm)
                                 .map(|d| mk(i, Opcode::Isub, d))
                                 .or_else(|| {
-                                    crate::proots::key_sub(kj, ki, ty, 8)
+                                    crate::proots::key_sub_h(kj, ki, ty, 8, &mut hm)
                                         .map(|d| mk(i, Opcode::Iadd, d))
                                 })
-                        {
+                        } else {
+                            None
+                        };
+                        if let Some(d) = d {
                             return Some(Some(d));
                         }
                     }
@@ -2740,9 +2780,64 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     Some(e0) => e0,
                     None => continue,
                 };
+                let (submap, subsets, zeros) =
+                    edge_submap.entry(e0).or_insert_with(|| {
+                        let mut submap: FxHashMap<u64, Vec<usize>> =
+                            FxHashMap::default();
+                        let mut subsets: Vec<FxHashSet<u64>> =
+                            Vec::with_capacity(ps.len());
+                        let mut zeros: Vec<usize> = vec![];
+                        for i in 0..ps.len() {
+                            let (k, _) = pkm(e0, i);
+                            if matches!(k, Key::K(_, 0)) {
+                                zeros.push(i);
+                            }
+                            let mut s = FxHashSet::default();
+                            subtree_hashes(
+                                k,
+                                &mut hmemo.borrow_mut(),
+                                &mut FxHashSet::default(),
+                                &mut s,
+                            );
+                            for &h in &s {
+                                submap.entry(h).or_default().push(i);
+                            }
+                            subsets.push(s);
+                        }
+                        (submap, subsets, zeros)
+                    });
+                let mut candset: FxHashSet<usize> = zeros.iter().copied().collect();
+                for &h in &subsets[ix] {
+                    if let Some(v) = submap.get(&h) {
+                        candset.extend(v.iter().copied());
+                    }
+                }
+                let target_zero = matches!(kjs[e0], Key::K(_, 0));
                 for i in 0..ps.len() {
                     if i == ix || func.dfg.value_type(ps[i]) != ty {
                         continue;
+                    }
+                    // `key_sub` needs a shared subtree or a literal-0
+                    // key; `diff_b`'s same-pred param pair is the only
+                    // tree-free oracle path — mirror its gate cheaply.
+                    if !target_zero && !candset.contains(&i) {
+                        let diffable = matches!(
+                            (eargs[e0][i], eargs[e0][ix]),
+                            (Some(ai), Some(aj))
+                                if matches!(
+                                    (
+                                        func.dfg.value_def(ai),
+                                        func.dfg.value_def(aj)
+                                    ),
+                                    (
+                                        ValueDef::Param(q1, _),
+                                        ValueDef::Param(q2, _)
+                                    ) if q1 == q2
+                                )
+                        );
+                        if !diffable {
+                            continue;
+                        }
                     }
                     if oracle(e0, &kjs[e0], i).is_none() {
                         continue;
