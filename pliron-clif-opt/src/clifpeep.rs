@@ -2689,6 +2689,12 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 // edge `e` supplies `r`; `Some(None)` is a deferring step
                 // (`defers` re-verifies structurally); `None` means slot
                 // `i` can't explain edge `e` at all.
+                // Per-target budget for the `diff_b` chase: a 600-slot
+                // header otherwise pays O(slots² × chase) — most
+                // viable mates sit early in the candidate order, and
+                // an exhausted budget only means "unproven" (no merge),
+                // never a wrong merge.
+                let dfuel = std::cell::Cell::<i32>::new(96);
                 let oracle = |e: usize, kj: &Key, i: usize| -> Option<Option<Key>> {
                     // `key_sub`'s algebraic probes each pay a structural
                     // `==` — on 10⁴-node expression keys that's the
@@ -2750,6 +2756,10 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     ) {
                         return None;
                     }
+                    if (dfuel.get() <= 0) {
+                        return None;
+                    }
+                    dfuel.set(dfuel.get() - 1);
                     match crate::indvars::diff_b(
                         func, &cfg, ps[i], ps[ix], ai, aj, 8, false,
                     ) {
