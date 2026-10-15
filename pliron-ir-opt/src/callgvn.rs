@@ -209,7 +209,8 @@ fn cone_args(
     true
 }
 
-/// Any write in `os[lo..hi]`?
+/// Any write in `os[lo..hi]`? `os` is a pre-erasure snapshot — `dead`
+/// holds ops already erased (deref on them is a dangling-Ptr panic).
 fn writes_between(
     ctx: &Context,
     st: &State,
@@ -217,10 +218,11 @@ fn writes_between(
     lo: usize,
     hi: usize,
     arg_allocas: &FxHashSet<Value>,
+    dead: &FxHashSet<Ptr<Operation>>,
 ) -> bool {
     os[lo..hi]
         .iter()
-        .any(|&o| writes(ctx, st, o, arg_allocas))
+        .any(|&o| !dead.contains(&o) && writes(ctx, st, o, arg_allocas))
 }
 
 /// Every path from `src`'s block to `dst`'s (distinct, dominated-by-src)
@@ -446,8 +448,15 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
-                if writes_between(ctx, st, &bops[&cb], ci + 1, bops[&cb].len(), &arg_allocas)
-                    || writes_between(ctx, st, os, 0, i, &arg_allocas)
+                if writes_between(
+                    ctx,
+                    st,
+                    &bops[&cb],
+                    ci + 1,
+                    bops[&cb].len(),
+                    &arg_allocas,
+                    &gone,
+                ) || writes_between(ctx, st, os, 0, i, &arg_allocas, &gone)
                     || !path_write_free(&preds, &writes_blk, cb, b)
                 {
                     continue;
@@ -502,6 +511,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         let mut stored_allocas = FxHashSet::default();
         for &b in &body {
             for &op in &bops[&b] {
+                if gone.contains(&op) || killed.contains(&op) {
+                    continue;
+                }
                 if Operation::is_op::<StoreOp>(op, ctx)
                     && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(1))
                 {
