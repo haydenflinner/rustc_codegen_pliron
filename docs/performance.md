@@ -164,6 +164,35 @@ results cannot hit.
   pipeline and compares returns, calls, and memory writes.
 - `PLIRON_VERIFY=full` runs the Cranelift verifier after each pass.
 
+## Pure-call elimination (x86_64, `callgvn`)
+
+Measured on Linux x86-64 (Xeon 8559C), wall-clock best-of-3, microbenches
+where the same source builds under stock `rustc -O` (LLVM) and the pliron
+backend (`-O`).
+
+| workload | LLVM | pliron |
+|---|---|---|
+| scalar hash loop (mul/xor/rol) | 585 ms | 435 ms |
+| u32 dot product, vectorized | 169 ms | 148 ms |
+| f32 sum-of-squares, vectorized | ~240 ms | ~240 ms |
+| 100 identical pure calls in a loop | ~80 ns | ~185 ms → **2.4 ms** |
+
+The last row is `callgvn`: LLVM proves the callee pure and eliminates all
+100 calls; we now infer the same facts (`nowrite` + `nounwind`) and dedup,
+hoist and dead-eliminate calls in `pliron-ir-opt`. The hoist also moves
+the operand cone (loop-invariant loads/GEPs) and carries invokes — an
+unwind edge is keyed on the op, so it moves with it. Residual gap vs LLVM
+here: we hoist to one call per loop; LLVM removes the call entirely —
+that last step needs a `willreturn` fact we don't infer yet.
+
+Support pieces that made it fire: `nowrite` splits writes on
+return-reachable blocks from writes on dead paths (`eh.exn` pads, aborts)
+so callers aren't poisoned; `nounwind` inference runs by default (it also
+turns invokes of nounwind callees into plain calls). `-Ctarget-cpu` /
+`-Ctarget-feature` now map to Cranelift ISA flags (e.g. `native` → SSE4.1
+`pmulld` instead of `pmuludq` repacks; `PLIRON_X64_VEX=1` switches
+VEX-128 forms on for the ops that have `use_avx*` rules).
+
 ## What is next
 
 - `sieve`: bisect the +7.8% regression.
