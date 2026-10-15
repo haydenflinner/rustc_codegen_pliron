@@ -1492,3 +1492,17 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   phisimp 0.30) + fnlower 0.85s.
 - Gotcha reconfirmed: cargo does not rebuild on PLIRON_* flips —
   `touch` a bench source or expect 0.1s "Finished" no-ops.
+
+## 2026-10-15 stage2 green but gen2 rustc miscompiled (devin session 5404024b)
+- Stage2 build completed clean in 44min on merged ymm tree (guardelim
+  sparse fixpoint held ~3GB through cranelift_codegen; ~89min for that
+  crate standalone under bail).
+- verify.sh immediately caught: stage2 rustc SIGSEGVs compiling core at
+  any opt level even --emit=metadata; stage1 rustc compiles it fine.
+  Crash: thin_vec::drop_non_singleton::<rustc_ast::ast::Attribute> in
+  cfg_eval derive expansion (librustc_driver of stage2).
+- Sibling symptom (child session d2956318 hunting): pliron-built
+  cranelift-assembler-x64-meta emits assembler.isle missing all _y/_z
+  inst terms (727 ISLE errors). Same signature: silently corrupted data
+  in emitted code. Both only in artifacts compiled BY pliron output.
+- verify.sh needed ninja-build installed for x.py preflight.
