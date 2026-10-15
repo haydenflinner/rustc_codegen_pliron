@@ -49,7 +49,7 @@ use crate::state::State;
 /// `op` may change memory a caller can observe: non-frame-local stores,
 /// atomics/fences/asm/va_arg, volatile ops, non-pure intrinsics, and calls
 /// to anything not proven write-free. Mirrors `nowrite.rs`'s body scan.
-fn writes(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+pub(crate) fn writes(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
     if st.volatile.contains(&op) {
         return true;
     }
