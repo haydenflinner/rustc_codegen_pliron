@@ -1421,3 +1421,50 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   byte). `PLIRON_SGNTEST`, late step.
 - tokenize main: 608 → 469 insts, wall-time flat (~7.7ms vs llvm 5.8):
   the residual is regalloc/param-shuffle, not isel breadth.
+
+## dse build-time pass over PLIRON_DSE_PROF log (618f8fd, on main)
+
+- Self-host build log: ~105s CPU in `dse` across >111k calls (log was
+  still growing): fix 49s / iso 19s / ps 19s / dec 11s / sweep 7s.
+  ~95% of calls end dead=0.
+- `dse::run` signature changed: `(func, noalias, nw, cfrozen, an, step,
+  fname)` — draws cfg/alias-map/isolated from the ver-keyed `Analysis`
+  cache (`dse_inputs`) instead of rebuilding per run. `iso` is keyed on
+  `noalias.len()` too (`carry_aliases` grows the set inside a ver; the
+  set never shrinks).
+- `Analysis::materialize` is cfg-only now; `dt`/`la` are lazy in
+  `cfg_dt`/`cfg_dt_la` — `an.cfg()` no longer warms them.
+- `amap`/`iso` are reusable by other passes: licm/memspec/indvars/slp/
+  celim all recompute `param_src`/`alias_map` today. NOT shareable:
+  loadfwd/memspec use `isolated_escapes` with the real `nocap` set —
+  dse's cached `iso` is the empty-nocap variant; merging is unsound.
+- Early-outs: no plain-notrap-store → return before setup; decode finds
+  zero killable stores → return before fixpoint.
+- Kill sweep now only walks `store_blks` (blocks holding a killable
+  store), not every reachable block.
+- Pop budget 32x -> 6x blocks (tail above ~6x is merge churn with ~0
+  kills in the sampled log). `PLIRON_DSE_DEBUG` now prints
+  "over pop budget … (fname)" — raise `MAX_POP_ROUNDS` if a missed kill
+  on a giant fn ever matters.
+- `dseprof` line format changed: `dseprof <step> <fname> blocks=…` —
+  parsers keyed on `dseprof \S+ blocks=` need updating. Cost can now be
+  attributed per dse/dse2/dse3 and per symbol.
+- Verify: `cargo test -p pliron-clif-opt` green, `cargo check -p
+  rustc_codegen_pliron` clean. NOT yet run through test.sh/harness —
+  worth a std diff-clean pass before relying on it (budget cut is a
+  codegen-visible change).
+- Still open: `Demands` repr (FxHashMap<Root,Ranges> cloned per pop) is
+  the biggest remaining `fix` lever; re-profile first.
+
+## Build-dir contention (process)
+
+- `cargo test -p pliron-clif-opt` blocked on "file lock on build
+  directory" while the selfhost build held `target/`. Workaround that
+  worked: `CARGO_TARGET_DIR=/tmp/pltd_ttarget cargo test -p
+  pliron-clif-opt` — the opt crates are stable Rust with no dylib link,
+  so a scratch target dir is cheap and parallel-safe.
+- Suggested convention: ONE agent owns the shared `target/` (full
+  backend builds, test.sh, harness); everyone else uses a scratch
+  `CARGO_TARGET_DIR` for `cargo test/check -p pliron-*-opt`. Scratch
+  deps cost ~2min once, then incremental is fast. This avoids both lock
+  stalls and target-dir cache thrash.
