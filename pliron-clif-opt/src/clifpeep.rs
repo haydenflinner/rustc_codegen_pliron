@@ -17,12 +17,12 @@
 //! extra vreg regalloc had to coalesce).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData, LibCall,
-    MemFlagsData, Opcode, Type, Value, ValueDef, types,
+    Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData,
+    LibCall, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
@@ -128,8 +128,8 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
             opcode: Opcode::Iadd,
             args,
         } => {
-            let m = vmax_d(func, args[0], depth - 1)
-                .saturating_add(vmax_d(func, args[1], depth - 1));
+            let m =
+                vmax_d(func, args[0], depth - 1).saturating_add(vmax_d(func, args[1], depth - 1));
             hi = hi.min(m);
         }
         // `icmp` yields 0/1; `a ^ b` sets no bit clear in both operands.
@@ -784,9 +784,7 @@ fn un_not_chain(
                             iconst(func, func.dfg.resolve_aliases(args[1]))
                         {
                             (args[0], k)
-                        } else if let Some(k) =
-                            iconst(func, func.dfg.resolve_aliases(args[0]))
-                        {
+                        } else if let Some(k) = iconst(func, func.dfg.resolve_aliases(args[0])) {
                             (args[1], k)
                         } else {
                             break;
@@ -855,9 +853,16 @@ pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
         let mut v = func.dfg.resolve_aliases(v);
         for _ in 0..4 {
             if let Some(&t) = tset.get(&v) {
-                // A chain intermediate used as an edge arg: a 0/1
-                // decided by the edge itself.
-                return Some(Pick::K(t as i64));
+                // A chain intermediate used as an edge arg: the edge
+                // decides it 0 outright (the falsy arm means `v == 0`),
+                // or 1 when `v` is a canonical boolean — `brif` only
+                // proves nonzero, and the raw `arg` or a peeled `select`
+                // condition can be wider than 0/1 (e.g. a call result
+                // threaded to a return).
+                if !t || is01(func, v, 4) {
+                    return Some(Pick::K(t as i64));
+                }
+                return None;
             }
             let i = func.dfg.value_def(v).inst()?;
             match func.dfg.insts[i] {
@@ -885,10 +890,8 @@ pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
         // truth[x]: value chain value `x` takes on this edge — on the
         // then-edge `arg` is nonzero and each intermediate applies its
         // recorded parity; the else-edge flips it.
-        let tset: FxHashMap<Value, bool> = chain
-            .iter()
-            .map(|&(x, neg)| (x, (d == 0) != neg))
-            .collect();
+        let tset: FxHashMap<Value, bool> =
+            chain.iter().map(|&(x, neg)| (x, (d == 0) != neg)).collect();
         let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
         let mut repl = Vec::new();
         for (ai, a) in args.iter().enumerate() {
@@ -938,10 +941,8 @@ pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
         n += repl.len();
         let mut repl = repl.into_iter().peekable();
         let dfg = &mut func.dfg;
-        let bc_mut = &mut dfg.insts[inst].branch_destination_mut(
-            &mut dfg.jump_tables,
-            &mut dfg.exception_tables,
-        )[d];
+        let bc_mut = &mut dfg.insts[inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
         let mut ai = 0;
         bc_mut.update_args(&mut dfg.value_lists, |a| {
             let a = match repl.peek() {
@@ -1574,8 +1575,8 @@ pub fn fusechains(func: &mut Function) -> usize {
         let Some(lt) = func.layout.last_inst(b) else {
             continue;
         };
-        for bc in func.dfg.insts[lt]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[lt].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             *preds.entry(bc.block(&func.dfg.value_lists)).or_default() += 1;
         }
@@ -1685,38 +1686,36 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             let mut memo: FxHashMap<Value, Value> = FxHashMap::default();
             let mut onpath: FxHashSet<Value> = FxHashSet::default();
             let mut path: Vec<Value> = Vec::new();
-            let mut resolve =
-                |v0: Value, pmap: &FxHashMap<Value, Value>| -> Value {
-                    if let Some(&r) = memo.get(&v0) {
-                        return r;
+            let mut resolve = |v0: Value, pmap: &FxHashMap<Value, Value>| -> Value {
+                if let Some(&r) = memo.get(&v0) {
+                    return r;
+                }
+                let mut v = v0;
+                let r = loop {
+                    if let Some(&r) = memo.get(&v) {
+                        break r;
                     }
-                    let mut v = v0;
-                    let r = loop {
-                        if let Some(&r) = memo.get(&v) {
-                            break r;
-                        }
-                        if onpath.contains(&v) {
-                            break v;
-                        }
-                        match pm.get(&v).or_else(|| pmap.get(&v)) {
-                            Some(&w) => {
-                                onpath.insert(v);
-                                path.push(v);
-                                v = w;
-                            }
-                            None => break v,
-                        }
-                    };
-                    for &x in &path {
-                        onpath.remove(&x);
-                        memo.insert(x, r);
+                    if onpath.contains(&v) {
+                        break v;
                     }
-                    path.clear();
-                    memo.insert(v0, r);
-                    r
+                    match pm.get(&v).or_else(|| pmap.get(&v)) {
+                        Some(&w) => {
+                            onpath.insert(v);
+                            path.push(v);
+                            v = w;
+                        }
+                        None => break v,
+                    }
                 };
-            let pairs: Vec<(Value, Value)> =
-                pmap.iter().map(|(&x, &v)| (x, v)).collect();
+                for &x in &path {
+                    onpath.remove(&x);
+                    memo.insert(x, r);
+                }
+                path.clear();
+                memo.insert(v0, r);
+                r
+            };
+            let pairs: Vec<(Value, Value)> = pmap.iter().map(|(&x, &v)| (x, v)).collect();
             for (x, v0) in pairs {
                 let w = resolve(v0, &pmap);
                 pmap.insert(x, w);
@@ -2133,8 +2132,7 @@ pub struct WmCtx {
 impl WmCtx {
     pub fn new(func: &Function) -> Self {
         let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-        let dom =
-            cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+        let dom = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
         let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
@@ -2335,13 +2333,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         'cap: for r in &eargs {
             for c in r {
                 if let Some(v) = c {
-                    arg_nodes += crate::proots::vnodes(
-                        func,
-                        &nf,
-                        &canon,
-                        &mut vnmemo.borrow_mut(),
-                        *v,
-                    );
+                    arg_nodes +=
+                        crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), *v);
                     if arg_nodes > 2_000_000 {
                         break 'cap;
                     }
@@ -2372,11 +2365,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // either merge at phase A or are never a viable sibling, so an
         // eager `edges × slots` matrix of deep `Key` clones dominated
         // the pass on param-heavy blocks.
-        let vmap: FxHashMap<Value, u32> = ps
-            .iter()
-            .enumerate()
-            .map(|(i, &p)| (p, i as u32))
-            .collect();
+        let vmap: FxHashMap<Value, u32> =
+            ps.iter().enumerate().map(|(i, &p)| (p, i as u32)).collect();
         // Keys stay lazy: `skey_of` materializes `skc[e][ix]` on demand
         // — the hash gates above decide most slots never need one.
         let skc: Vec<Vec<std::cell::OnceCell<Key>>> = (0..es.len())
@@ -2384,9 +2374,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             .collect();
         let skey_of = |e: usize, ix: usize| -> &Key {
             skc[e][ix].get_or_init(|| match (eargs[e][ix], okey[e][ix]) {
-                (Some(v), _) => {
-                    crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v)
-                }
+                (Some(v), _) => crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v),
                 (None, Some(o)) => Key::O(o),
                 (None, None) => unreachable!("non-value arg carries an O payload"),
             })
@@ -2503,10 +2491,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                         seed = Some(e);
                         uniform = true;
                     }
-                    Some(se)
-                        if svh[se][ix] != svh[e][ix]
-                            || skey_of(se, ix) != skey_of(e, ix) =>
-                    {
+                    Some(se) if svh[se][ix] != svh[e][ix] || skey_of(se, ix) != skey_of(e, ix) => {
                         uniform = false;
                         break;
                     }
@@ -2601,11 +2586,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             if no_phased {
                 continue;
             }
-            let kjs: Vec<&Key> = es
-                .iter()
-                .enumerate()
-                .map(|(e, _)| pk_of(e, ix))
-                .collect();
+            let kjs: Vec<&Key> = es.iter().enumerate().map(|(e, _)| pk_of(e, ix)).collect();
             let selfstep = |k: &Key| {
                 // A `p_j + o` self-step (`Q(ix)` base — the param's old
                 // value) can only defer — it can never seed `R` (the
@@ -2728,13 +2709,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     // the result can't preempt.
                     let vwithin = |v: Option<Value>| {
                         v.is_some_and(|v| {
-                            crate::proots::vnodes(
-                                func,
-                                &nf,
-                                &canon,
-                                &mut vnmemo.borrow_mut(),
-                                v,
-                            ) <= REL_KEY_CAP
+                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                                <= REL_KEY_CAP
                         })
                     };
                     if vwithin(eargs[e][i]) && vwithin(eargs[e][ix]) {
@@ -2767,8 +2743,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     if wm_nodiffb {
                         return None;
                     }
-                    let (Some(ai), Some(aj)) = (eargs[e][i], eargs[e][ix])
-                    else {
+                    let (Some(ai), Some(aj)) = (eargs[e][i], eargs[e][ix]) else {
                         return None;
                     };
                     if !matches!(
@@ -2820,32 +2795,29 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     Some(e0) => e0,
                     None => continue,
                 };
-                let (submap, subsets, zeros) =
-                    edge_submap.entry(e0).or_insert_with(|| {
-                        let mut submap: FxHashMap<u64, Vec<usize>> =
-                            FxHashMap::default();
-                        let mut subsets: Vec<FxHashSet<u64>> =
-                            Vec::with_capacity(ps.len());
-                        let mut zeros: Vec<usize> = vec![];
-                        for i in 0..ps.len() {
-                            let (k, _) = pkm(e0, i);
-                            if matches!(k, Key::K(_, 0)) {
-                                zeros.push(i);
-                            }
-                            let mut s = FxHashSet::default();
-                            subtree_hashes(
-                                k,
-                                &mut hmemo.borrow_mut(),
-                                &mut FxHashSet::default(),
-                                &mut s,
-                            );
-                            for &h in &s {
-                                submap.entry(h).or_default().push(i);
-                            }
-                            subsets.push(s);
+                let (submap, subsets, zeros) = edge_submap.entry(e0).or_insert_with(|| {
+                    let mut submap: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+                    let mut subsets: Vec<FxHashSet<u64>> = Vec::with_capacity(ps.len());
+                    let mut zeros: Vec<usize> = vec![];
+                    for i in 0..ps.len() {
+                        let (k, _) = pkm(e0, i);
+                        if matches!(k, Key::K(_, 0)) {
+                            zeros.push(i);
                         }
-                        (submap, subsets, zeros)
-                    });
+                        let mut s = FxHashSet::default();
+                        subtree_hashes(
+                            k,
+                            &mut hmemo.borrow_mut(),
+                            &mut FxHashSet::default(),
+                            &mut s,
+                        );
+                        for &h in &s {
+                            submap.entry(h).or_default().push(i);
+                        }
+                        subsets.push(s);
+                    }
+                    (submap, subsets, zeros)
+                });
                 let mut candset: FxHashSet<usize> = zeros.iter().copied().collect();
                 for &h in &subsets[ix] {
                     if let Some(v) = submap.get(&h) {
@@ -3016,13 +2988,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     && !param_drops.contains(&ps[i])
                     && (0..es.len()).all(|e| {
                         eargs[e][i].is_some_and(|v| {
-                            crate::proots::vnodes(
-                                func,
-                                &nf,
-                                &canon,
-                                &mut vnmemo.borrow_mut(),
-                                v,
-                            ) <= BISIM_KEY_CAP
+                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                                <= BISIM_KEY_CAP
                         })
                     })
             })
@@ -3047,8 +3014,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     while let Some(&c) = pmap.get(&w) {
                         w = c;
                     }
-                    vmap
-                        .get(&w)
+                    vmap.get(&w)
                         .and_then(|&i| cls.get(&(i as usize)))
                         .map(|&l| ps[l])
                         .unwrap_or(w)
@@ -3103,8 +3069,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 }
             }
         }
-        if wmprof && tphasec.elapsed().as_micros() > 200
-        {
+        if wmprof && tphasec.elapsed().as_micros() > 200 {
             eprintln!(
                 "webmerge {} {b}: phaseC P={} E={} {:?}",
                 func.name,
@@ -3391,15 +3356,12 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                     // `iadd 0, x` (the egraph and edge clones produce
                     // them): emitting the shape verbatim is redundant —
                     // emit the simplified operand instead.
-                    let k0 = args
-                        .iter()
-                        .position(|a| matches!(a, Key::K(_, 0)));
+                    let k0 = args.iter().position(|a| matches!(a, Key::K(_, 0)));
                     let comm = matches!(op, Opcode::Iadd | Opcode::Bor | Opcode::Bxor);
                     match (op, k0) {
                         (Opcode::Band, Some(i)) => return Some(vals[i]),
                         (_, Some(1))
-                            if comm
-                                || matches!(op, Opcode::Isub | Opcode::Ishl | Opcode::Ushr) =>
+                            if comm || matches!(op, Opcode::Isub | Opcode::Ishl | Opcode::Ushr) =>
                         {
                             return Some(vals[0]);
                         }
@@ -3445,8 +3407,7 @@ pub fn selargs(func: &mut Function) -> usize {
                 .iter()
                 .map(|&a| {
                     let Some(v) = a.as_value() else { return a };
-                    let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
-                    else {
+                    let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
                         return a;
                     };
                     let InstructionData::Ternary {
@@ -3573,14 +3534,20 @@ fn icmp_bit_test(func: &Function, x: Value, cc: IntCC, k: u64, all: u64) -> Opti
             if sign_known_clear(func, x, all) {
                 Some(SgnFold::Const(true))
             } else {
-                Some(SgnFold::Bit { b: sign, set: false })
+                Some(SgnFold::Bit {
+                    b: sign,
+                    set: false,
+                })
             }
         }
         IntCC::SignedGreaterThan if k == all => {
             if sign_known_clear(func, x, all) {
                 Some(SgnFold::Const(true))
             } else {
-                Some(SgnFold::Bit { b: sign, set: false })
+                Some(SgnFold::Bit {
+                    b: sign,
+                    set: false,
+                })
             }
         }
         // `x <s INT_MIN` never holds; `x >=s INT_MIN` always does.
@@ -3759,8 +3726,8 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
                 *c = c.saturating_sub(1);
             }
         }
-        for bc in func.dfg.insts[d]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[d].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             for a in bc.args(&func.dfg.value_lists) {
                 if let BlockArg::Value(x) = a
@@ -3787,12 +3754,7 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
                 continue;
             }
             let r = func.dfg.first_result(d);
-            if cnt
-                .get(&func.dfg.resolve_aliases(r))
-                .copied()
-                .unwrap_or(0)
-                != 0
-            {
+            if cnt.get(&func.dfg.resolve_aliases(r)).copied().unwrap_or(0) != 0 {
                 continue;
             }
             for dd in func
@@ -4308,8 +4270,7 @@ fn loadsel_pair(
         }
         Some((a, i32::try_from(off).ok()?))
     };
-    let Some(((pa2, offa), (pb2, offb))) = arm(&mut *pos, pa).zip(arm(&mut *pos, pb))
-    else {
+    let Some(((pa2, offa), (pb2, offb))) = arm(&mut *pos, pa).zip(arm(&mut *pos, pb)) else {
         return false;
     };
     pos.goto_inst(if sib_after { inst } else { sib });
@@ -4337,10 +4298,7 @@ fn loadsel_pair(
             pos.func.dfg.resolve_aliases(x),
             pos.func.dfg.resolve_aliases(y),
         );
-        let (tv, fv) = (
-            if x == pa { la } else { lb },
-            if y == pa { la } else { lb },
-        );
+        let (tv, fv) = (if x == pa { la } else { lb }, if y == pa { la } else { lb });
         pos.func.replace(l).select(c, tv, fv);
     }
     pos.goto_inst(inst);
@@ -4356,8 +4314,9 @@ pub fn loadsel(func: &mut Function) -> usize {
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
-            if let InstructionData::Load { arg, flags, offset, .. } =
-                pos.func.dfg.insts[inst]
+            if let InstructionData::Load {
+                arg, flags, offset, ..
+            } = pos.func.dfg.insts[inst]
                 && loadsel_pair(&mut pos, inst, arg, flags, offset)
             {
                 n += 1;
@@ -4381,8 +4340,9 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
-            if let InstructionData::Load { arg, flags, offset, .. } =
-                pos.func.dfg.insts[inst]
+            if let InstructionData::Load {
+                arg, flags, offset, ..
+            } = pos.func.dfg.insts[inst]
                 && crate::pass_enabled("PLIRON_LDSEL")
                 && loadsel_pair(&mut pos, inst, arg, flags, offset)
             {
@@ -4819,11 +4779,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                                 let cty = pos.func.dfg.value_type(c);
                                 let z = pos.ins().iconst(cty, 0);
                                 pos.func.replace(inst).icmp(
-                                    if inv {
-                                        IntCC::Equal
-                                    } else {
-                                        IntCC::NotEqual
-                                    },
+                                    if inv { IntCC::Equal } else { IntCC::NotEqual },
                                     c,
                                     z,
                                 );
@@ -4841,9 +4797,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // every consumer.
                     let ncc = match cc {
                         IntCC::UnsignedLessThanOrEqual => Some(IntCC::UnsignedLessThan),
-                        IntCC::UnsignedGreaterThan => {
-                            Some(IntCC::UnsignedGreaterThanOrEqual)
-                        }
+                        IntCC::UnsignedGreaterThan => Some(IntCC::UnsignedGreaterThanOrEqual),
                         _ => None,
                     };
                     if let Some(ncc) = ncc
@@ -5548,9 +5502,7 @@ fn rgpair(func: &Function, a: Value, b: Value) -> Option<RgFold> {
                 }
                 lo = Some(lo.map_or(k as u128 + 1, |s| s.max(k as u128 + 1)))
             }
-            IntCC::UnsignedLessThan => {
-                hi = Some(hi.map_or(k as u128, |s| s.min(k as u128)))
-            }
+            IntCC::UnsignedLessThan => hi = Some(hi.map_or(k as u128, |s| s.min(k as u128))),
             IntCC::UnsignedLessThanOrEqual => {
                 hi = Some(hi.map_or(k as u128 + 1, |s| s.min(k as u128 + 1)))
             }
@@ -5585,9 +5537,7 @@ pub fn rgmerge(func: &mut Function) -> usize {
                 InstructionData::Ternary {
                     opcode: Opcode::Select,
                     args,
-                } if iconst(pos.func, args[2]) == Some(0) => {
-                    rgpair(pos.func, args[0], args[1])
-                }
+                } if iconst(pos.func, args[2]) == Some(0) => rgpair(pos.func, args[0], args[1]),
                 // `bitselect m, t, 0` is `band m, t` — loopvec's
                 // vectorized `select` arrives this way.
                 InstructionData::Ternary {
@@ -5620,7 +5570,11 @@ fn kvconst(pos: &mut FuncCursor, ty: Type, k: u64) -> Value {
         return pos.ins().iconst(ty, k as i64);
     }
     let lb = (ty.lane_bits() / 8) as usize;
-    let k = k & if lb == 8 { u64::MAX } else { (1u64 << (lb * 8)) - 1 };
+    let k = k & if lb == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (lb * 8)) - 1
+    };
     let mut bytes = Vec::with_capacity(lb * ty.lane_count() as usize);
     for _ in 0..ty.lane_count() {
         bytes.extend_from_slice(&k.to_le_bytes()[..lb]);
@@ -6259,13 +6213,9 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
             }
             Some(CseKey::FC(cc, t, a, b))
         }
-        InstructionData::Ternary { opcode, args } => Some(CseKey::T(
-            opcode,
-            t,
-            r(args[0]),
-            r(args[1]),
-            r(args[2]),
-        )),
+        InstructionData::Ternary { opcode, args } => {
+            Some(CseKey::T(opcode, t, r(args[0]), r(args[1]), r(args[2])))
+        }
         _ => None,
     }
 }
@@ -6406,10 +6356,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 else {
                     return None;
                 };
-                let (x, y) = (
-                    func.dfg.resolve_aliases(x),
-                    func.dfg.resolve_aliases(y),
-                );
+                let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
                 if b == x {
                     Some(y)
                 } else {
@@ -6583,9 +6530,7 @@ pub fn lcse(func: &mut Function) -> usize {
                             _ => None,
                         }
                     };
-                    let mut neg = |v: Value,
-                                   seen: &mut Seen,
-                                   cnt: &mut FxHashMap<Value, u32>| {
+                    let mut neg = |v: Value, seen: &mut Seen, cnt: &mut FxHashMap<Value, u32>| {
                         if let Some(x) = negdef(func, v) {
                             return Some(x);
                         }
@@ -6704,10 +6649,7 @@ pub fn lcse(func: &mut Function) -> usize {
                             args: [e, x],
                         } = func.dfg.insts[d]
                         {
-                            Some((
-                                func.dfg.resolve_aliases(e),
-                                func.dfg.resolve_aliases(x),
-                            ))
+                            Some((func.dfg.resolve_aliases(e), func.dfg.resolve_aliases(x)))
                         } else {
                             None
                         }
@@ -6773,7 +6715,9 @@ pub fn lcse(func: &mut Function) -> usize {
                     usecnt.insert(res, 0);
                     func.dfg.clear_results(i);
                     func.dfg.change_to_alias(res, *e.get());
-                    *usecnt.entry(func.dfg.resolve_aliases(*e.get())).or_default() += nu;
+                    *usecnt
+                        .entry(func.dfg.resolve_aliases(*e.get()))
+                        .or_default() += nu;
                     dead.push(i);
                     n += 1;
                 }
@@ -7410,11 +7354,7 @@ pub fn memcall(func: &mut Function) -> usize {
                 (1u64, types::I8),
             ];
             while rem > 0 {
-                let (sz, ty) = chunks
-                    .iter()
-                    .copied()
-                    .find(|&(sz, _)| sz <= rem)
-                    .unwrap();
+                let (sz, ty) = chunks.iter().copied().find(|&(sz, _)| sz <= rem).unwrap();
                 let v = if lc == LibCall::Memset {
                     let splat = match sz {
                         8 => 0x0101_0101_0101_0101u64,
@@ -7488,7 +7428,10 @@ mod tests {
             cur.ins().call(fref, &[dst, src, n])
         };
         let r = func.dfg.first_result(ci);
-        FuncCursor::new(&mut func).at_bottom(entry).ins().return_(&[r]);
+        FuncCursor::new(&mut func)
+            .at_bottom(entry)
+            .ins()
+            .return_(&[r]);
 
         assert_eq!(memcall(&mut func), 1);
         let insts: Vec<Inst> = func.layout.block_insts(entry).collect();
@@ -7497,12 +7440,7 @@ mod tests {
                 .iter()
                 .map(|&i| func.dfg.insts[i].opcode())
                 .collect::<Vec<_>>(),
-            [
-                Opcode::Iconst,
-                Opcode::Load,
-                Opcode::Store,
-                Opcode::Return
-            ]
+            [Opcode::Iconst, Opcode::Load, Opcode::Store, Opcode::Return]
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
