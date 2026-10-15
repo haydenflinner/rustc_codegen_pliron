@@ -52,6 +52,13 @@ fn fx_depth(n: u32) -> u32 {
     if n == 0 { 0 } else { 1 + fx_depth(n / 2) }
 }
 
+/// A volatile read: legal infinite-loop fuel and nondeterministic — not
+/// willreturn even though it never writes.
+#[inline(never)]
+fn fx_vread(p: *const u32) -> u32 {
+    unsafe { std::ptr::read_volatile(p) }
+}
+
 fn main() {
     let n = std::env::args().count() as i32; // 1
 
@@ -77,5 +84,7 @@ fn main() {
     assert_eq!(*fx_second(&one, &two), 2);
     assert!(fx_maybe(&z, n == 2).is_null());
     assert_eq!(fx_depth(1 << (n + 3)), 5);
+    let v = n as u32;
+    assert_eq!(fx_vread(&v), 1);
     println!("ok");
 }

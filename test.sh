@@ -223,6 +223,9 @@ nnret fx_second: true
 nnret fx_maybe: false
 retarg fx_second: Some(1)
 nounwind fx_depth: true
+willreturn fx_sum: true
+willreturn fx_depth: true
+willreturn fx_vread: false
 EOF
   return $bad
 }

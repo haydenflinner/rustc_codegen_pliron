@@ -178,12 +178,24 @@ backend (`-O`).
 | 100 identical pure calls in a loop | ~80 ns | ~185 ms → **2.4 ms** |
 
 The last row is `callgvn`: LLVM proves the callee pure and eliminates all
-100 calls; we now infer the same facts (`nowrite` + `nounwind`) and dedup,
-hoist and dead-eliminate calls in `pliron-ir-opt`. The hoist also moves
-the operand cone (loop-invariant loads/GEPs) and carries invokes — an
-unwind edge is keyed on the op, so it moves with it. Residual gap vs LLVM
-here: we hoist to one call per loop; LLVM removes the call entirely —
-that last step needs a `willreturn` fact we don't infer yet.
+100 calls; we now infer the same facts (`nowrite` + `nounwind` +
+`willreturn`) and dedup, hoist and dead-eliminate calls in
+`pliron-ir-opt`. The hoist also moves the operand cone (loop-invariant
+loads/GEPs) and carries invokes — an unwind edge is keyed on the op, so
+it moves with it. `willreturn` (like LLVM's, plus determinism —
+volatile/atomic/asm/indirect callees seed the complement) now backs the
+used-result erasure: the second same-args call provably comes back with
+the same value.
+
+Residual gap vs LLVM here: the surviving call can't be erased — the
+callee is `nowrite=Some(false)`/`nounwind=false` (its bounds-check panic
+paths call unknown fns), so dead-elim can't fire and the ~3ms is one real
+`dotprod` call. LLVM's ~80ns is a different mechanism: it proves the
+panic paths unreachable (`iter1 = umin` bounds the indices), infers
+`nounwind`+`memory(argmem:read)`, dead-arg-elim rewrites the callee to
+`void`, DCE empties its body, and the callsite goes with it — that's
+panic-path elimination and interprocedural dead-result elimination, not
+call dedup.
 
 Support pieces that made it fire: `nowrite` splits writes on
 return-reachable blocks from writes on dead paths (`eh.exn` pads, aborts)

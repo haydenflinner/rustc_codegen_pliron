@@ -16,9 +16,15 @@
 //! - **dead elim**: unused result from a strictly `nowrite` + `nounwind`
 //!   callee → erase.
 //!
-//! Speculation safety for hoists/dead-elim follows LLVM's model: rustc
-//! marks all Rust fns `mustprogress`, so a never-writing, never-unwinding
-//! callee may only differ by diverging — the same assumption LLVM makes.
+//! Every consumer also requires `st.willreturn` (LLVM's `willreturn`, here
+//! including determinism: volatile/atomic/asm/indirect/unknown-callee ops
+//! seed its complement). That is what lets a *still-used* call be erased
+//! in favour of an earlier same-args one: same args + same memory ⇒ the
+//! second call comes back with the same value, on the same exit — without
+//! the fact it could diverge or read differently where the first returned.
+//! Speculation (hoist of a call the loop might not run) is equally safe:
+//! an infinite loop with no observable interaction is UB under rustc's
+//! `mustprogress`, so a willreturn callee may only diverge via UB.
 
 use pliron::{
     basic_block::BasicBlock,
@@ -75,9 +81,11 @@ fn writes(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
                 .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
 }
 
-/// A direct call result can be deduplicated: callee is in `nowrite` at all
-/// (`true` never writes; `false` writes only on paths that never return —
-/// and a deduped-away call follows one that demonstrably returned).
+/// A direct call result can be deduplicated or hoisted: callee is in
+/// `nowrite` at all (`true` never writes; `false` writes only on paths
+/// that never return — and a deduped-away call follows one that
+/// demonstrably returned) *and* in `willreturn` — the second call provably
+/// comes back with the same value and can't read nondeterministically.
 /// Invokes are excluded (`inv == false`): erasing one removes its unwind
 /// edge, so only moves (hoists) may carry them.
 fn dedupable(
@@ -100,7 +108,7 @@ fn dedupable(
         return None;
     }
     let c = direct_callee(ctx, st, op)?;
-    if !st.nowrite.contains_key(c) {
+    if !st.nowrite.contains_key(c) || !st.willreturn.contains(c) {
         return None;
     }
     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
@@ -258,7 +266,7 @@ pub fn run(ctx: &mut Context, st: &State) {
 
 fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     let bs = blocks(ctx, fop);
-    if bs.len() < 2 {
+    if bs.is_empty() {
         return;
     }
     let Some(dom) = Dom::new(ctx, st, fop) else {
@@ -297,10 +305,29 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             if writes(ctx, st, op) {
                 seen.clear();
             }
+            if crate::env_set("PLIRON_CGDBG") && Operation::is_op::<CallOp>(op, ctx) {
+                let why = if st.invokes.contains_key(&op) {
+                    "invoke"
+                } else if op.deref(ctx).get_num_results() != 1 {
+                    "results"
+                } else if st
+                    .calls
+                    .get(&op)
+                    .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
+                {
+                    "flags"
+                } else if direct_callee(ctx, st, op).is_none() {
+                    "indirect"
+                } else {
+                    "ok"
+                };
+                eprintln!("callgvn   call dedupable={why}");
+            }
             let Some((c, args, res)) = dedupable(ctx, st, op, false) else {
                 continue;
             };
-            // Dead: nowrite + nounwind + unused result.
+            // Dead: nowrite + nounwind + unused result (willreturn comes
+            // free through `dedupable` — LLVM's `isRemovable` triple).
             if res.uses(ctx).is_empty()
                 && st.nowrite.get(&c) == Some(&true)
                 && st.funcs.get(&c).is_some_and(|f| f.nounwind)
@@ -423,6 +450,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                         .contains_key(direct_callee(ctx, st, op).unwrap())
                     {
                         "writer"
+                    } else if !st
+                        .willreturn
+                        .contains(direct_callee(ctx, st, op).unwrap())
+                    {
+                        "diverge"
                     } else {
                         "ok"
                     };
@@ -437,7 +469,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // on paths that never return, so speculating the call
                 // behaves identically on every returning execution. An
                 // unwind out of a plain call leaves this frame the same
-                // way from the preheader as from the loop body.
+                // way from the preheader as from the loop body. (`dedupable`
+                // already required `willreturn`, the part that makes
+                // speculation itself safe.)
                 if !st.nowrite.contains_key(&c) {
                     continue;
                 }

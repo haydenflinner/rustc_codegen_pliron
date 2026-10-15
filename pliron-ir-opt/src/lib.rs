@@ -30,3 +30,4 @@ pub mod spec;
 pub mod sroa;
 pub mod state;
 pub mod types;
+pub mod willreturn;

@@ -165,6 +165,10 @@ pub struct State {
     pub noalias: FxHashMap<Value, (u64, bool)>,
     /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
     pub nowrite: rustc_hash::FxHashMap<String, bool>,
+    /// Functions that provably come back (return/unwind/tail-call/UB) and
+    /// behave deterministically — no volatile, atomic, asm, trap, indirect
+    /// or unknown-callee interaction (willreturn.rs).
+    pub willreturn: rustc_hash::FxHashSet<String>,
     /// Per-callee body-level capture analysis: param indices provably not
     /// retained past the call (nocapture.rs).
     pub nocapture: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<u32>>,

@@ -42,7 +42,7 @@ mod xcgu;
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
     address_taken, callgvn, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret,
-    nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
+    nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
 };
 
 use std::any::Any;
@@ -594,6 +594,11 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_RETARG") {
             pt!(cx, "retarg", retarg::run(ctx, st));
             pt!(cx, "domcheck:ra", domcheck::run(ctx, st, "retarg"));
+        }
+        // `willreturn` on the final post-inline/devirt call set: callgvn
+        // needs it to erase still-used dedups and to speculate hoists.
+        if pass_enabled("PLIRON_WILLRETURN") {
+            pt!(cx, "willreturn", willreturn::run(ctx, st));
         }
         // Dead-call elim + readonly call dedup + loop-call hoist, on the
         // final post-inline call set.

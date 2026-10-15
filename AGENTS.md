@@ -16,10 +16,11 @@ cranelift-object (+ rsasm for `asm!`/`global_asm!`) → system linker.
   constload, domcheck), `state::State` (the side tables lowering reads),
   `types.rs` layout helpers, `has_body`/`address_taken`. Stable Rust.
   The bottom-up function summaries (nowrite, nocapture, nnret, retarg,
-  nounwind) are Datalog rules in an `ascent!` block: `run` walks the
-  bodies once to fill input relations, the rules derive the "bad" side
-  (writes, captured, may be null, may unwind) as a least fixpoint, and the
-  table is everything not derived. Add a rule rather than another loop.
+  nounwind, willreturn) are Datalog rules in an `ascent!` block: `run`
+  walks the bodies once to fill input relations, the rules derive the
+  "bad" side (writes, captured, may be null, may unwind, may diverge)
+  as a least fixpoint, and the table is everything not derived. Add a
+  rule rather than another loop.
 - `pliron-clif-check/` — `clif-check` binary: replays and reduces
   differential-checker reports without rustc (see "Miscompile hunting").
 - `pliron-cfg/` — one-shot `PLIRON_*` env parse shared by both opt
