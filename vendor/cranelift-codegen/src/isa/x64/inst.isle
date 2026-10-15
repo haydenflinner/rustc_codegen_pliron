@@ -1670,7 +1670,11 @@
 (rule 1 (x64_xor_vector $F128 x y) (x64_xorps x y))
 (rule 1 (x64_xor_vector $F32X4 x y) (x64_xorps x y))
 (rule 1 (x64_xor_vector $F64X2 x y) (x64_xorpd x y))
-(rule 0 (x64_xor_vector (multi_lane _ _) x y) (x64_pxor x y))
+;; PLIRON: 128-bit path only — wide vectors reaching this helper have no
+;; lowering rather than silently computing the low 128 bits.
+(rule 0 (x64_xor_vector ty @ (multi_lane _ _) x y)
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
+      (x64_pxor x y))
 
 ;; Generates a register value which has an all-ones pattern.
 ;;

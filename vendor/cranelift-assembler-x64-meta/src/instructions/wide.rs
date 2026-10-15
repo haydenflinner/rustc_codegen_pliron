@@ -71,5 +71,21 @@ pub fn list() -> Vec<Inst> {
         inst("vfmadd213ph", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m128)]), z(Full)._66()._map6().w0().op(0xA8).r(), (_64b | compat) & avx512fp16),
         inst("vextractf64x4", fmt("Z", [w(xmm_m128), r(xmm1), r(imm8)]), z(HalfMem)._66()._0f3a().w1().op(0x1B).r().ib(), (_64b | compat) & avx512f),
         inst("vinsertf64x4", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128), r(imm8)]), z(HalfMem)._66()._0f3a().w1().op(0x1A).r().ib(), (_64b | compat) & avx512f),
+
+        // pliron: wide boolean ops for wide-vector band/bor/bxor/bnot/bitselect —
+        // the lane-generic sse_*/x64_xor_vector rules in lower.isle otherwise emit
+        // xmm-width instructions on the low half of a wide register only.
+        inst("vpand", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), y()._66()._0f().op(0xDB).r(), (_64b | compat) & avx2),
+        inst("vpandn", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), y()._66()._0f().op(0xDF).r(), (_64b | compat) & avx2),
+        inst("vpor", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), y()._66()._0f().op(0xEB).r(), (_64b | compat) & avx2),
+        inst("vpxor", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), y()._66()._0f().op(0xEF).r(), (_64b | compat) & avx2),
+        inst("vpandd", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128)]), z(Full)._66()._0f().w0().op(0xDB).r(), (_64b | compat) & avx512f),
+        inst("vpandnd", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128)]), z(Full)._66()._0f().w0().op(0xDF).r(), (_64b | compat) & avx512f),
+        inst("vpord", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128)]), z(Full)._66()._0f().w0().op(0xEB).r(), (_64b | compat) & avx512f),
+        inst("vpxord", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m128)]), z(Full)._66()._0f().w0().op(0xEF).r(), (_64b | compat) & avx512f),
+        // pliron: width-correct all-ones materialization — self-compare for ymm
+        // (any reg compares equal to itself), ternary-LUT all-ones for zmm.
+        inst("vpcmpeqb", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m128)]), y()._66()._0f().op(0x74).r(), (_64b | compat) & avx2),
+        inst("vpternlogd", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m128), r(imm8)]), z(Full)._66()._0f3a().w0().op(0x25).r().ib(), (_64b | compat) & avx512f),
     ]
 }

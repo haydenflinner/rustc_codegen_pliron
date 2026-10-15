@@ -217,3 +217,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     A/B). Upstream's per-use-block cloning is already the pressure-
     optimal placement; remat wins have to come from *what* gets marked
     (patch 20's encodability gate), not *where* clones land.
+
+22. x64 wide-vector boolean ops (`vendor/cranelift-assembler-x64-meta/
+    src/instructions/wide.rs`, `src/isa/x64/lower.isle`): the lane-generic
+    `sse_and`/`sse_and_not`/`sse_or`/`x64_xor_vector`/`bnot`/`bitselect`
+    rules match 256/512-bit vectors but emit xmm-width instructions —
+    `Xmm` wraps an allocated ymm/zmm reg unchecked, so the high lanes
+    were silently dropped. New `vpand`/`vpandn`/`vpor`/`vpxor` ymm and
+    `vpandd`/`vpandnd`/`vpord`/`vpxord` zmm forms plus `vpcmpeqb` ymm /
+    `vpternlogd` zmm wide all-ones; `lower.isle` rules at priorities
+    20/21 emit them for `band`/`bor`/`bxor`/`bnot`/`bitselect` on
+    256/512-bit vectors. The lane-generic `sse_*`/`x64_xor_vector`/
+    `bnot`/`bitselect`/`pblendvb` fallbacks are guarded to ≤128-bit
+    types so any other wide use fails to lower instead of truncating.
+    Covered by `pliron-clif-opt/tests/widevec_lower.rs`.

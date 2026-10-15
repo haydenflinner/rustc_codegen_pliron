@@ -509,10 +509,25 @@
 (rule (sse_and $F64X2 x y) (x64_andpd x y))
 (rule (sse_and $F32 x y) (x64_andps x y))
 (rule (sse_and $F64 x y) (x64_andpd x y))
-(rule -1 (sse_and (multi_lane _bits _lanes) x y) (x64_pand x y))
+;; PLIRON: assert the width so a wide vector falling through here errors
+;; instead of silently computing the low 128 bits.
+(rule -1 (sse_and ty @ (multi_lane _bits _lanes) x y)
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
+      (x64_pand x y))
 
 (rule 6 (lower (band ty @ (multi_lane _bits _lanes) x y))
       (sse_and ty x y))
+
+;; PLIRON: wide-vector boolean ops. The `sse_*` helpers take `XmmMem128`
+;; operands whose conversion asserts 128-bit inputs, and their xmm-width
+;; instructions would compute only the low half of a wide register — so
+;; wide vectors lower directly to the ymm/zmm forms on register operands.
+(rule 20 (lower (band ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 256))
+      (x64_vpand_y x (xmm_to_xmm_mem_128 y)))
+(rule 21 (lower (band ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 512))
+      (x64_vpandd_z x (xmm_to_xmm_mem_128 y)))
 
 ;; `i128`.
 
@@ -537,7 +552,9 @@
 (decl sse_and_not (Type Xmm XmmMem128) Xmm)
 (rule (sse_and_not $F32X4 x y) (x64_andnps x y))
 (rule (sse_and_not $F64X2 x y) (x64_andnpd x y))
-(rule -1 (sse_and_not (multi_lane _bits _lanes) x y) (x64_pandn x y))
+(rule -1 (sse_and_not ty @ (multi_lane _bits _lanes) x y)
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
+      (x64_pandn x y))
 
 ;; Note the flipping of operands below as we're match
 ;;
@@ -638,10 +655,20 @@
 (rule (sse_or $F64X2 x y) (x64_orpd x y))
 (rule (sse_or $F32 x y) (x64_orps x y))
 (rule (sse_or $F64 x y) (x64_orpd x y))
-(rule -1 (sse_or (multi_lane _bits _lanes) x y) (x64_por x y))
+(rule -1 (sse_or ty @ (multi_lane _bits _lanes) x y)
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
+      (x64_por x y))
 
 (rule 6 (lower (bor ty @ (multi_lane _bits _lanes) x y))
       (sse_or ty x y))
+
+;; PLIRON: wide-vector bor (see `band` above).
+(rule 20 (lower (bor ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 256))
+      (x64_vpor_y x (xmm_to_xmm_mem_128 y)))
+(rule 21 (lower (bor ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 512))
+      (x64_vpord_z x (xmm_to_xmm_mem_128 y)))
 
 ;; `{i,b}128`.
 
@@ -705,6 +732,14 @@
 
 (rule 6 (lower (bxor ty @ (multi_lane _bits _lanes) x y))
       (x64_xor_vector ty x y))
+
+;; PLIRON: wide-vector bxor (see `band` above).
+(rule 20 (lower (bxor ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 256))
+      (x64_vpxor_y x (xmm_to_xmm_mem_128 y)))
+(rule 21 (lower (bxor ty x y))
+      (if-let true (u64_eq (ty_bits_u64 ty) 512))
+      (x64_vpxord_z x (xmm_to_xmm_mem_128 y)))
 
 ;; `{i,b}128`.
 
@@ -1653,13 +1688,30 @@
 ;; Special case for vector-types where bit-negation is an xor against an
 ;; all-one value
 (rule -1 (lower (bnot ty @ (multi_lane _bits _lanes) x))
+      ;; PLIRON: 128-bit path only (wide bnot is covered above; without the
+      ;; guard this rule emitted xmm-width pxor on wide operands).
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
       (x64_xor_vector ty x (vector_all_ones)))
+
+;; PLIRON: wide-vector bnot — xor against a width-correct all-ones vector
+;; (`vector_all_ones` materializes only xmm-width ones).
+(rule 20 (lower (bnot ty x))
+      (if-let true (u64_eq (ty_bits_u64 ty) 256))
+      (let ((u Xmm (xmm_uninit_value)))
+        (x64_vpxor_y x (xmm_to_xmm_mem_128 (x64_vpcmpeqb_y u (xmm_to_xmm_mem_128 u))))))
+(rule 21 (lower (bnot ty x))
+      (if-let true (u64_eq (ty_bits_u64 ty) 512))
+      (let ((u Xmm (xmm_uninit_value)))
+        (x64_vpxord_z x (xmm_to_xmm_mem_128 (x64_vpternlogd_z u u (xmm_to_xmm_mem_128 u) 255)))))
 
 ;;;; Rules for `bitselect` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (bitselect ty @ (multi_lane _bits _lanes) condition
                                   if_true
                                   if_false))
+      ;; PLIRON: 128-bit path only (wide bitselects lower below; the
+      ;; sse_* helpers are xmm-width).
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
       ;; a = and if_true, condition
       ;; b = and_not condition, if_false
       ;; or b, a
@@ -1673,6 +1725,9 @@
 (rule 1 (lower (bitselect ty @ (multi_lane _bits _lanes) condition
                                     if_true
                                     if_false))
+      ;; PLIRON: `pblendvb` is xmm-width only; leave wide bitselects to the
+      ;; wide rules below.
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
       (if-let true (has_sse41))
       (if (all_ones_or_all_zeros condition))
       (x64_pblendvb if_false if_true condition))
@@ -1725,6 +1780,25 @@
             (c_neg Xmm (x64_xor_vector ty c_xmm (vector_all_ones)))
             (b Xmm (sse_and ty c_neg f_xmm)))
         (sse_or ty a b)))
+
+;; PLIRON: wide-vector bitselect — same (t&c)|(~c&f) expansion on ymm/zmm
+;; registers; the generic `sse_*` helpers are xmm-width (see `band` above).
+(rule 20 (lower (bitselect ty c t f))
+      (if-let true (u64_eq (ty_bits_u64 ty) 256))
+      (let ((cx Xmm c)
+            (tx Xmm t)
+            (fx Xmm f)
+            (a Xmm (x64_vpand_y tx (xmm_to_xmm_mem_128 cx)))
+            (b Xmm (x64_vpandn_y cx (xmm_to_xmm_mem_128 fx))))
+        (x64_vpor_y b (xmm_to_xmm_mem_128 a))))
+(rule 21 (lower (bitselect ty c t f))
+      (if-let true (u64_eq (ty_bits_u64 ty) 512))
+      (let ((cx Xmm c)
+            (tx Xmm t)
+            (fx Xmm f)
+            (a Xmm (x64_vpandd_z tx (xmm_to_xmm_mem_128 cx)))
+            (b Xmm (x64_vpandnd_z cx (xmm_to_xmm_mem_128 fx))))
+        (x64_vpord_z b (xmm_to_xmm_mem_128 a))))
 
 ;;;; Rules for `blendv` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
