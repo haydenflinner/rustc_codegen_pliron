@@ -220,6 +220,15 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   syntax only gates events *inside* a matching span — it cannot suppress
   a span's own close line.) Unset = no subscriber installed; each span
   site costs one hash lookup + atomic load.
+  For sub-phase timing inside a pass, prefer an entered
+  `tracing::info_span!(target: "pliron::iropt", "name", field = ...)`
+  over a new `PLIRON_*_PROF` env var — close lines render nested
+  (`iropt:guardelim:gefix ... blocks=5178 cands=1 folds=0`) and parse
+  with the same scraper. Example: `guardelim.rs` `gefn`/`gefix`/`geprove`.
+- `samply record --save-only -o prof.json -- cargo rustc ...` — sampling
+  profile of the whole build (rustc + the dylib frames symbolize);
+  `samply load prof.json` opens Firefox Profiler. Use this first for
+  "where is time going" before adding any instrumentation.
 - `PLIRON_STEPCACHE=1` — content-addressed pipeline cache in
   `$PLIRON_CACHE_DIR` (default `~/.cache/pliron-steps`). Two levels per
   function: a whole-pipeline entry (warm reruns are ~50x faster) and

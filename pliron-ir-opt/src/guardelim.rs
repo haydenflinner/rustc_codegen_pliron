@@ -370,12 +370,20 @@ fn unreachable_terminated(ctx: &Context, info: &FnInfo, b: Ptr<BasicBlock>) -> b
 }
 
 fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
-    let prof = crate::env_set("PLIRON_GE_PROF");
-    let t0 = std::time::Instant::now();
+    let gefn = tracing::info_span!(
+        target: "pliron::iropt",
+        "gefn",
+        blocks = tracing::field::Empty,
+        cands = tracing::field::Empty,
+        rel = tracing::field::Empty,
+        folds = tracing::field::Empty
+    )
+    .entered();
     let bs = blocks(ctx, fop);
     if bs.len() < 2 {
         return false;
     }
+    gefn.record("blocks", bs.len());
     let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
         bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Prescan for foldable branches: a cond_br whose icmp predicate is in
@@ -410,14 +418,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         })
         .collect();
     let cands = cand_terms.len();
+    gefn.record("cands", cands);
     if cands == 0 {
-        if prof {
-            eprintln!(
-                "geprof {} blocks={} cands=0 skipped",
-                st.cgu,
-                bs.len()
-            );
-        }
         return false;
     }
     let Some(dom) = Dom::new(ctx, st, fop) else {
@@ -568,8 +570,11 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         .copied()
         .filter(|s| !escaped.contains(s) && needed.contains(s))
         .collect();
+    gefn.record("rel", relevant.len());
     let mut inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
         FxHashMap::default();
+    {
+    let _gefix = tracing::info_span!(target: "pliron::iropt", "gefix").entered();
     if !relevant.is_empty() {
     if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
         if crate::env_set("PLIRON_STATS") {
@@ -661,6 +666,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         inn.insert(b, m);
     }
     }
+    }
     let info = FnInfo {
         bops,
         preds,
@@ -668,7 +674,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         escaped,
     };
 
-    let t_fix = t0.elapsed();
+    let _geprove = tracing::info_span!(target: "pliron::iropt", "geprove").entered();
     let mut folds: Vec<(Ptr<Operation>, Ptr<BasicBlock>, Vec<Value>)> = Vec::new();
     {
         let mut pr = Prover {
@@ -764,18 +770,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     if crate::env_set("PLIRON_GEDBG") && !folds.is_empty() {
         eprintln!("guardelim   {} folds", folds.len());
     }
-    if prof {
-        eprintln!(
-            "geprof {} blocks={} cands={} rel={} fix={:?} prove={:?} folds={}",
-            st.cgu,
-            bs.len(),
-            cands,
-            relevant.len(),
-            t_fix,
-            t0.elapsed() - t_fix,
-            folds.len()
-        );
-    }
+    gefn.record("folds", folds.len());
     for (term, dst, ods) in &folds {
         let br = BrOp::new(ctx, *dst, ods.clone()).get_operation();
         br.insert_before(ctx, *term);
