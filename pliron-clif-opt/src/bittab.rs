@@ -892,7 +892,7 @@ fn flat(func: &mut Function) -> usize {
             if hi - lo >= 64 {
                 continue;
             }
-            let bits = ks.iter().fold(0u64, |m, k| m | (1 << k));
+            let bits = ks.iter().fold(0u64, |m, k| m | (1 << (k - lo)));
             let x = x.unwrap();
             let xty = func.dfg.value_type(x);
             let mut cur = FuncCursor::new(func).at_inst(i);
