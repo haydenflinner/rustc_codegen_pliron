@@ -44,6 +44,11 @@ const MAX_STORES: usize = 16;
 const MAX_PROOF: usize = 64;
 /// Dominator-chain depth for fact collection.
 const MAX_DOM: usize = 64;
+/// The reaching-stores fixpoint materializes a per-block map of
+/// (slot -> reaching stores): blocks x store-slots dense entries. On
+/// generated-code-class fns (tens of thousands of blocks) that is tens
+/// of GB — bail instead of ballooning.
+const MAX_FIXPOINT_WORK: usize = 1 << 21;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Rel {
@@ -378,8 +383,14 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     // Slots whose address escapes (operand of a non-load/store/gep/pure op)
     // can't carry load-equality reasoning.
     let mut escaped = FxHashSet::default();
+    let mut store_slots = FxHashSet::default();
     for &b in &bs {
         for &op in &bops[&b] {
+            if Operation::is_op::<StoreOp>(op, ctx)
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
+            {
+                store_slots.insert(s);
+            }
             let pure_intr = Operation::is_op::<CallIntrinsicOp>(op, ctx)
                 && st
                     .intrinsics
@@ -398,6 +409,9 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 }
             }
         }
+    }
+    if bs.len().saturating_mul(store_slots.len()) > MAX_FIXPOINT_WORK {
+        return false;
     }
     // Reaching stores per (block, slot): forward fixpoint over reachable
     // blocks only (unreachable preds would pollute the may-sets).
