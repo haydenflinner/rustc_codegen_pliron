@@ -361,3 +361,108 @@ fn shift_imm_256() {
     // imm forms: vpslld.yi 0x72 digit6, vpsrld.yi 0x72 digit2.
     assert!(has_wide_op(&code, &[0x72]), "no imm-shift ymm: {code:02x?}");
 }
+
+const EXTRACT_INT_256: &str = "
+function %ex(i32x8) -> i32 {
+block0(v0: i32x8):
+    v1 = extractlane v0, 5
+    v2 = extractlane v0, 1
+    v3 = iadd v1, v2
+    return v3
+}";
+
+const EXTRACT_INT_512: &str = "
+function %ex(i64x8) -> i64 {
+block0(v0: i64x8):
+    v1 = extractlane v0, 6
+    v2 = extractlane v0, 2
+    v3 = iadd v1, v2
+    return v3
+}";
+
+const INSERT_INT_256: &str = "
+function %ins(i32x8, i32) -> i32x8 {
+block0(v0: i32x8, v1: i32):
+    v2 = insertlane v0, v1, 6
+    v3 = insertlane v2, v1, 2
+    return v3
+}";
+
+const EXTRACT_F64_256: &str = "
+function %exf(f64x4) -> f64 {
+block0(v0: f64x4):
+    v1 = extractlane v0, 3
+    v2 = extractlane v0, 0
+    v3 = fadd v1, v2
+    return v3
+}";
+
+const INSERT_F64_256: &str = "
+function %insf(f64x4, f64) -> f64x4 {
+block0(v0: f64x4, v1: f64):
+    v2 = insertlane v0, v1, 3
+    v3 = insertlane v2, v1, 0
+    return v3
+}";
+
+const WIDEN_256: &str = "
+function %wid(i16x16) -> i32x8 {
+block0(v0: i16x16):
+    v2 = uwiden_low.i16x16 v0
+    v3 = swiden_high.i16x16 v0
+    v4 = iadd v2, v3
+    return v4
+}";
+
+#[test]
+fn extractlane_int_256() {
+    let code = compile(256, EXTRACT_INT_256);
+    // vextractf128 0x19 (0F3A) + vpextrd 0x16 (0F3A).
+    assert!(has_wide_op(&code, &[0x19]), "no vextractf128: {code:02x?}");
+    assert!(
+        code.windows(4)
+            .any(|w| w[0] == 0xC4 && w[3] == 0x16 || w[0] == 0xC5 && w[2] == 0x16),
+        "no vpextrd: {code:02x?}"
+    );
+}
+
+#[test]
+fn extractlane_int_512() {
+    let code = compile(512, EXTRACT_INT_512);
+    // vextractf32x4 0x19 EVEX + vpextrq.
+    assert!(has_wide_op(&code, &[0x19]), "no vextractf32x4: {code:02x?}");
+}
+
+#[test]
+fn insertlane_int_256() {
+    let code = compile(256, INSERT_INT_256);
+    // vinsertf128 0x18 + vpinsrd 0x22 (0F3A).
+    assert!(has_wide_op(&code, &[0x18]), "no vinsertf128: {code:02x?}");
+    assert!(
+        code.windows(4).any(|w| w[0] == 0xC4 && w[3] == 0x22),
+        "no vpinsrd: {code:02x?}"
+    );
+}
+
+#[test]
+fn f64_lanes_256() {
+    let code = compile(256, EXTRACT_F64_256);
+    assert!(has_wide_op(&code, &[0x19]), "no vextractf128: {code:02x?}");
+    let code = compile(256, INSERT_F64_256);
+    assert!(has_wide_op(&code, &[0x18]), "no vinsertf128: {code:02x?}");
+    // vshufpd 0xC6 (VEX.128 is correct — the in-chunk merge is xmm-width
+    // by design).
+    assert!(
+        code.windows(3).any(|w| w[0] == 0xC5 && w[2] == 0xC6),
+        "no vshufpd xmm: {code:02x?}"
+    );
+}
+
+#[test]
+fn widen_256() {
+    let code = compile(256, WIDEN_256);
+    // vpmovzxwd 0x33, vpmovsxwd 0x23 (0F38) + vextractf128 0x19 (high).
+    assert!(has_wide_op(&code, &[0x33]), "no vpmovzxwd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x23]), "no vpmovsxwd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x19]), "no vextractf128 (high half): {code:02x?}");
+}

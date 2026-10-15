@@ -1493,6 +1493,18 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         lane % 4
     }
 
+    /// PLIRON: like `wide_lane_chunk`/`wide_lane_sub` but parameterized by
+    /// lane width: the 128-bit chunk index containing `lane`, and the
+    /// sub-index within it.
+    #[inline]
+    fn wide_lane_chunk128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane / (16 / (ty.lane_bits() / 8) as u8)
+    }
+
+    fn wide_lane_sub128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane % (16 / (ty.lane_bits() / 8) as u8)
+    }
+
     fn type_register_class(&mut self, ty: Type) -> Option<RegisterClass> {
         if is_int_or_ref_ty(ty) || ty == I128 {
             Some(RegisterClass::Gpr {

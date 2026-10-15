@@ -6176,3 +6176,121 @@
             (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk idx)))
             (c2 Xmm (f32x4_insertlane c (put_in_xmm val) (wide_lane_sub idx))))
         (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk idx))))
+
+
+;; PLIRON: wide extractlane/insertlane and widen for non-f32 lanes.
+;; `wide_lane_chunk128`/`wide_lane_sub128` generalize the sibling's f32
+;; helpers: chunk = index of the 128-bit lane slice (0-1 for ymm,
+;; 0-3 for zmm), sub = lane index within it. Extract pulls the chunk
+;; down with vextractf128/vextractf32x4 and applies the existing
+;; 128-bit lane op; insert does the chunk → lane-op → reinsert
+;; round-trip.
+(decl pure wide_lane_chunk128 (Type u8) u8)
+(extern constructor wide_lane_chunk128 wide_lane_chunk128)
+(decl pure wide_lane_sub128 (Type u8) u8)
+(extern constructor wide_lane_sub128 wide_lane_sub128)
+
+;; ---- extractlane ----
+(rule 2 (lower (extractlane _ val @ (value_type $I8X32) (u8_from_uimm8 lane)))
+      (x64_pextrb (x64_vextractf128_y val (wide_lane_chunk128 $I8X32 lane))
+                  (wide_lane_sub128 $I8X32 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I8X64) (u8_from_uimm8 lane)))
+      (x64_pextrb (x64_vextractf32x4_z val (wide_lane_chunk128 $I8X64 lane))
+                  (wide_lane_sub128 $I8X64 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I16X16) (u8_from_uimm8 lane)))
+      (x64_pextrw (x64_vextractf128_y val (wide_lane_chunk128 $I16X16 lane))
+                  (wide_lane_sub128 $I16X16 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I16X32) (u8_from_uimm8 lane)))
+      (x64_pextrw (x64_vextractf32x4_z val (wide_lane_chunk128 $I16X32 lane))
+                  (wide_lane_sub128 $I16X32 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I32X8) (u8_from_uimm8 lane)))
+      (x64_pextrd (x64_vextractf128_y val (wide_lane_chunk128 $I32X8 lane))
+                  (wide_lane_sub128 $I32X8 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I32X16) (u8_from_uimm8 lane)))
+      (x64_pextrd (x64_vextractf32x4_z val (wide_lane_chunk128 $I32X16 lane))
+                  (wide_lane_sub128 $I32X16 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I64X4) (u8_from_uimm8 lane)))
+      (x64_pextrq (x64_vextractf128_y val (wide_lane_chunk128 $I64X4 lane))
+                  (wide_lane_sub128 $I64X4 lane)))
+(rule 2 (lower (extractlane _ val @ (value_type $I64X8) (u8_from_uimm8 lane)))
+      (x64_pextrq (x64_vextractf32x4_z val (wide_lane_chunk128 $I64X8 lane))
+                  (wide_lane_sub128 $I64X8 lane)))
+;; f64: extract the 128-bit chunk, then `shufpd` copies the wanted
+;; half-lane into the scalar position.
+(rule 2 (lower (extractlane _ val @ (value_type $F64X4) (u8_from_uimm8 lane)))
+      (let ((c Xmm (x64_vextractf128_y val (wide_lane_chunk128 $F64X4 lane))))
+        (x64_shufpd c (xmm_to_xmm_mem_128 c) (wide_lane_sub128 $F64X4 lane))))
+(rule 2 (lower (extractlane _ val @ (value_type $F64X8) (u8_from_uimm8 lane)))
+      (let ((c Xmm (x64_vextractf32x4_z val (wide_lane_chunk128 $F64X8 lane))))
+        (x64_shufpd c (xmm_to_xmm_mem_128 c) (wide_lane_sub128 $F64X8 lane))))
+
+;; ---- insertlane ----
+;; int: extract chunk → pinsr* the scalar in → reinsert the chunk.
+(rule 2 (lower (insertlane _ vec @ (value_type $I8X32) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf128_y v (wide_lane_chunk128 $I8X32 idx)))
+            (c2 Xmm (x64_pinsrb c (put_in_gpr_mem val) (wide_lane_sub128 $I8X32 idx))))
+        (x64_vinsertf128_y v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I8X32 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I8X64) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk128 $I8X64 idx)))
+            (c2 Xmm (x64_pinsrb c (put_in_gpr_mem val) (wide_lane_sub128 $I8X64 idx))))
+        (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I8X64 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I16X16) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf128_y v (wide_lane_chunk128 $I16X16 idx)))
+            (c2 Xmm (x64_pinsrw c (put_in_gpr_mem val) (wide_lane_sub128 $I16X16 idx))))
+        (x64_vinsertf128_y v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I16X16 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I16X32) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk128 $I16X32 idx)))
+            (c2 Xmm (x64_pinsrw c (put_in_gpr_mem val) (wide_lane_sub128 $I16X32 idx))))
+        (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I16X32 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I32X8) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf128_y v (wide_lane_chunk128 $I32X8 idx)))
+            (c2 Xmm (x64_pinsrd c (put_in_gpr_mem val) (wide_lane_sub128 $I32X8 idx))))
+        (x64_vinsertf128_y v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I32X8 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I32X16) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk128 $I32X16 idx)))
+            (c2 Xmm (x64_pinsrd c (put_in_gpr_mem val) (wide_lane_sub128 $I32X16 idx))))
+        (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I32X16 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I64X4) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf128_y v (wide_lane_chunk128 $I64X4 idx)))
+            (c2 Xmm (x64_pinsrq c (put_in_gpr_mem val) (wide_lane_sub128 $I64X4 idx))))
+        (x64_vinsertf128_y v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I64X4 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $I64X8) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk128 $I64X8 idx)))
+            (c2 Xmm (x64_pinsrq c (put_in_gpr_mem val) (wide_lane_sub128 $I64X8 idx))))
+        (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $I64X8 idx))))
+
+;; f64: `shufpd` merges the scalar into the wanted half of the chunk.
+;; sub 0 → [val0, c1] via shufpd val c imm 0b10; sub 1 → [c0, val0]
+;; via shufpd c val imm 0.
+(decl wide_f64_sub_lane (Xmm Xmm u8) Xmm)
+(rule (wide_f64_sub_lane c val 0) (x64_shufpd val (xmm_to_xmm_mem_128 c) 0b10))
+(rule (wide_f64_sub_lane c val 1) (x64_shufpd c (xmm_to_xmm_mem_128 val) 0))
+
+(rule 2 (lower (insertlane _ vec @ (value_type $F64X4) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf128_y v (wide_lane_chunk128 $F64X4 idx)))
+            (c2 Xmm (wide_f64_sub_lane c (put_in_xmm val) (wide_lane_sub128 $F64X4 idx))))
+        (x64_vinsertf128_y v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $F64X4 idx))))
+(rule 2 (lower (insertlane _ vec @ (value_type $F64X8) val (u8_from_uimm8 idx)))
+      (let ((v Xmm (put_in_xmm vec))
+            (c Xmm (x64_vextractf32x4_z v (wide_lane_chunk128 $F64X8 idx)))
+            (c2 Xmm (wide_f64_sub_lane c (put_in_xmm val) (wide_lane_sub128 $F64X8 idx))))
+        (x64_vinsertf32x4_z v (xmm_to_xmm_mem_128 c2) (wide_lane_chunk128 $F64X8 idx))))
+
+;; ---- widen_low / widen_high ----
+;; CLIF constrains widen inputs to <=16 lanes and outputs to non-i64
+;; lanes, so the only wide form representable is i16x16 -> i32x8
+;; (256-bit in/out). The low half of a ymm value is the same register
+;; as xmm; the high half comes from vextractf128.
+(rule 2 (lower (swiden_low $I32X8 x)) (x64_vpmovsxwd_y (xmm_to_xmm_mem_128 (put_in_xmm x))))
+(rule 2 (lower (swiden_high $I32X8 x)) (x64_vpmovsxwd_y (xmm_to_xmm_mem_128 (x64_vextractf128_y x 1))))
+(rule 2 (lower (uwiden_low $I32X8 x)) (x64_vpmovzxwd_y (xmm_to_xmm_mem_128 (put_in_xmm x))))
+(rule 2 (lower (uwiden_high $I32X8 x)) (x64_vpmovzxwd_y (xmm_to_xmm_mem_128 (x64_vextractf128_y x 1))))

@@ -286,3 +286,20 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     Int `splat` uses `bitcast_gpr_to_xmm` — scalar ints live in
     Int-class regs, not Xmm. Tests: `pliron-clif-opt/tests/
     widevec_lower.rs` byte-checks each family at both widths.
+
+25. x64 wide lane ops and widening (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`): `extractlane`/`insertlane` for
+    all wide int and f64 types — pull the 128-bit chunk containing
+    the lane down via `vextractf128`/`vextractf32x4` (chunk index
+    from the new `wide_lane_chunk128`/`wide_lane_sub128` helpers,
+    generalizing the f32-only `wide_lane_chunk`), run the existing
+    `pextr*`/`pinsr*` lane op, reinsert the chunk. f64 uses
+    `shufpd` for the in-chunk half-lane select (`wide_f64_sub_lane`
+    merges scalars by parity). `swiden_low/high` and
+    `uwiden_low/high` for `i16x16 -> i32x8` via `vpmovsxwd`/
+    `vpmovzxwd` ymm — the only wide widen CLIF can express
+    (inputs are capped at 16 lanes and outputs exclude i64, so
+    i8x32->i16x16, i32x8->i64x4 and any 512-bit widen are
+    unrepresentable and loud-fail on the verifier). `shuffle` is
+    i8x16-only and `gather`/`scatter` do not exist in this CLIF —
+    nothing to lower there.
