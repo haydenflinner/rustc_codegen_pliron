@@ -6130,6 +6130,24 @@
       (x64_vmovups_za (synthetic_amode_to_xmm_mem_512
                        (const_to_synthetic_amode (const_to_vconst const)))))
 
+;; PLIRON: wide contiguous load/store for every wide vector type —
+;; vmovups ymm/zmm moves raw bytes regardless of lane flavor, so one
+;; rule pair covers int lanes as well as the float lanes above.
+(rule 5 (lower (load (ty_vec256 ty) (little_or_native_endian flags) address offset))
+      (if-let true (use_avx2))
+      (x64_vmovups_ya (synthetic_amode_to_xmm_mem_256 (to_amode flags address offset))))
+(rule 7 (lower (load (ty_vec512 ty) (little_or_native_endian flags) address offset))
+      (if-let true (has_avx512f))
+      (x64_vmovups_za (synthetic_amode_to_xmm_mem_512 (to_amode flags address offset))))
+(rule 5 (lower (store (little_or_native_endian flags)
+                      value @ (value_type (ty_vec256 _)) address offset))
+      (if-let true (use_avx2))
+      (side_effect (x64_vmovups_yb_mem (to_amode flags address offset) value)))
+(rule 7 (lower (store (little_or_native_endian flags)
+                      value @ (value_type (ty_vec512 _)) address offset))
+      (if-let true (has_avx512f))
+      (side_effect (x64_vmovups_zb_mem (to_amode flags address offset) value)))
+
 
 (rule 6 (lower (iconcat ty @ (multi_lane _ _) x y))
       (if-let true (u64_eq (ty_bits_u64 ty) 256))

@@ -200,10 +200,12 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
             ("bti", "use_bti"),
         ],
         // The VEX families (avx/avx2/fma/avx512*) are deliberately not
-        // mapped: this Cranelift has no ymm register class, so the flags
-        // only buy VEX-128 encodings — which translate ~2x slower than
-        // legacy SSE under Rosetta, and on real hardware offer only the
-        // 3-operand form. `PLIRON_X64_VEX=1` opts back in for real-HW runs.
+        // mapped by default: without them only VEX-128 encodings appear —
+        // which translate ~2x slower than legacy SSE under Rosetta, and on
+        // real hardware offer only the 3-operand form. `PLIRON_X64_VEX=1`
+        // opts back in for real-HW runs, and also raises the wide-vector
+        // ceiling (`WIDE_VECTOR_BITS`) so loopvec emits 256/512-bit lanes
+        // under AVX2/AVX512F.
         // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
@@ -246,6 +248,18 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
                     .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
             }
         }
+        // The wide-vector ceiling follows the enabled VEX level: loopvec
+        // emits 256-bit lanes under AVX2 and 512 under AVX512F (its own
+        // per-loop caps still apply). 128 leaves the register file xmm-only.
+        let wide = if tf("avx512f") {
+            512
+        } else if tf("avx2") {
+            256
+        } else {
+            128
+        };
+        cranelift_codegen::isa::x64::WIDE_VECTOR_BITS
+            .store(wide, std::sync::atomic::Ordering::Relaxed);
     }
     isa.finish(flags)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))

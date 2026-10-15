@@ -132,6 +132,9 @@ struct Reduc {
     /// Extra insts allowed to read `acc` (the min/max icmp, or the
     /// conditional update's `acc ⊕ d` plus any nested selects).
     aux: Vec<Inst>,
+    /// Vector width in bits the accumulator lanes live at (set to the
+    /// plan's final `vb` once wide-vector caps are decided).
+    vb: u32,
     /// `op` can't reorder lanes (float `fadd`/`fmul` — no `reassoc`):
     /// loads and the delta are still vectorized, but lanes fold into a
     /// scalar `acc` in iteration order via `extractlane`.
@@ -181,13 +184,13 @@ enum Widen {
 }
 
 impl Reduc {
-    /// Vector accumulator type: 128 bits of `aty` lanes.
+    /// Vector accumulator type: `vb` bits of `aty` lanes.
     fn vty(&self) -> Type {
-        self.aty.by(128 / self.aty.bits()).unwrap()
+        self.aty.by(self.vb / self.aty.bits()).unwrap()
     }
     /// Lanes in the accumulator vector.
     fn lanes(&self) -> i64 {
-        128 / self.aty.bits() as i64
+        (self.vb / self.aty.bits()) as i64
     }
     /// Vector accumulators per unroll group. Widening reductions whose
     /// last-level adds chain onto the accumulator split them across this
@@ -1055,6 +1058,26 @@ fn reaches_avoiding(func: &Function, from: Block, to: Block, avoid: Block) -> bo
     false
 }
 
+/// Wide-vector capability probed off the function's `TargetIsa` by the
+/// caller: `vbits` is the largest lane width the ISA may emit (128 keeps
+/// the baseline shape); `fma`/`avx512bw` gate the wide ops that need
+/// those flags beyond plain AVX2/AVX512F.
+#[derive(Clone, Copy, Default)]
+pub struct WideCaps {
+    pub vbits: u32,
+    pub fma: bool,
+    pub avx512bw: bool,
+}
+
+impl WideCaps {
+    /// Baseline: 128-bit lanes, nothing extra.
+    pub const BASE: Self = Self {
+        vbits: 128,
+        fma: false,
+        avx512bw: false,
+    };
+}
+
 fn plan(
     func: &mut Function,
     ps: &FxHashMap<Value, Value>,
@@ -1067,6 +1090,7 @@ fn plan(
     fname: &str,
     cmp64: bool,
     x64: bool,
+    wc: WideCaps,
 ) -> Option<Plan> {
     let Some(info) = gather(func, cfg, dt, la, lp) else {
         why!(fname; "gather loop {:?}", lp);
@@ -1376,6 +1400,7 @@ fn plan(
             delta,
             aty: func.dfg.value_type(p),
             widen: None,
+            vb: 128,
             cond: (!cnd.is_empty()).then(|| Cond {
                 cs: cnd
                     .into_iter()
@@ -1609,12 +1634,11 @@ fn plan(
         why!(fname; "no mem ops");
     };
     let ebytes = i64::from(elem.bytes());
-    let Some(vf) = vf_of(elem) else {
+    // Lane-typedness check only — `vf`/`vt` are computed below once the
+    // wide-vector caps are known.
+    if vf_of(elem).is_none() {
         why!(fname; "vf");
-    };
-    let Some(vt) = elem.by(vf) else {
-        why!(fname; "vec ty");
-    };
+    }
     if mems.len() + other.len() > MAX_OPS {
         why!(fname; "too many ops");
     }
@@ -2041,6 +2065,59 @@ fn plan(
         };
         t
     };
+    // Wide vectors: `wc.vbits` may allow 256/512-bit lanes, but only
+    // ops with real x64 wide lowerings qualify — anything else drops
+    // this loop back to 128-bit lanes.
+    let mut vb = wc.vbits.max(128);
+    if vb == 512 && elem.bits() < 32 && !wc.avx512bw {
+        // Byte/word ops at 512 need AVX512BW; dword/qword lanes don't.
+        vb = 256;
+    }
+    if vb > 128 {
+        let wide_bad_op = |op: Opcode| match op {
+            // No wide lowering: widening forms beyond i16x16->i32x8
+            // aren't representable in this CLIF, and mulhi lowers
+            // through widening.
+            Opcode::Smulhi | Opcode::Umulhi | Opcode::Uextend | Opcode::Sextend
+            | Opcode::Ireduce | Opcode::Bswap | Opcode::Popcnt => true,
+            // No byte multiply; no qword multiply before AVX512DQ.
+            Opcode::Imul => elem.bits() < 16 || elem == types::I64,
+            // No byte/word variable shifts in AVX2.
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => elem.bits() < 32,
+            Opcode::Fma => !wc.fma,
+            _ => false,
+        };
+        let bad = info
+            .body
+            .iter()
+            .flat_map(|&b| func.layout.block_insts(b))
+            .any(|i| wide_bad_op(func.dfg.insts[i].opcode()))
+            // Extending/narrowing load-store ops have no wide lowering.
+            || mems.iter().any(|&i| {
+                !matches!(func.dfg.insts[i].opcode(), Opcode::Load | Opcode::Store)
+            })
+            // i64 lanes: ymm min/max/mul are AVX512-only ops.
+            || elem == types::I64
+            // Early exits emit vany_true/vall_true — 128-bit only.
+            || !early.is_empty()
+            // Widening reductions emit uwiden/swiden pairs — 128-bit
+            // only (wider forms aren't representable in CLIF).
+            || reducs.iter().any(|r| r.widen.is_some())
+            // Lane reversal lowers via `vswizzle`: dword lanes at 256,
+            // qword lanes only at 512 (vpermq ymm is imm8-only under
+            // AVX2); byte/word lanes aren't permutable at all.
+            || streams.iter().any(|s| s.neg) && (ebytes < 4 || (ebytes == 8 && vb < 512));
+        if bad {
+            vb = 128;
+        }
+    }
+    let vf = vb / elem.bits();
+    let Some(vt) = elem.by(vf) else {
+        why!(fname; "vec ty");
+    };
+    for r in reducs.iter_mut() {
+        r.vb = vb;
+    }
     // A provably-short strided trip count (< one vector group) would
     // emit a versioned vector clone that can never execute — keep the
     // scalar form alone in that case.
@@ -2334,7 +2411,7 @@ fn emit_vload(
     if s.stride == 1 {
         let v = pos.ins().load(p.vt, flags, a, off as i32);
         return if s.neg && !raw {
-            vreverse(pos, p.vt, p.rev_imm.unwrap(), v)
+            vreverse(pos, p, v)
         } else {
             v
         };
@@ -2545,15 +2622,35 @@ fn rev_mask(vt: Type) -> ConstantData {
     ConstantData::from(mask.as_slice())
 }
 
-fn vreverse(pos: &mut FuncCursor, vt: Type, imm: Immediate, v: Value) -> Value {
+fn vreverse(pos: &mut FuncCursor, p: &Plan, v: Value) -> Value {
+    if p.vt.bytes() > 16 {
+        // `shuffle` is i8x16-typed in this Cranelift — wide reversals go
+        // through `vswizzle` with a descending index vconst. The index
+        // lane width matches the element (vpermd/vpermps at 256,
+        // vpermq/vpermpd for qword lanes at 512); narrow elements never
+        // reach this path — the plan caps them to 128-bit lanes.
+        let ity = if p.elem.bytes() == 4 {
+            types::I32
+        } else {
+            types::I64
+        };
+        let eb = p.elem.bytes() as usize;
+        let mut bytes = Vec::with_capacity(p.vt.bytes() as usize);
+        for k in 0..p.vf {
+            bytes.extend_from_slice(&(p.vf - 1 - k).to_le_bytes()[..eb]);
+        }
+        let c = pos.func.dfg.constants.insert(bytes.into());
+        let idx = pos.ins().vconst(ity.by(p.vf as u32).unwrap(), c);
+        return pos.ins().vswizzle(v, idx);
+    }
     // `shuffle` is typed i8x16x2 in this Cranelift; bitcast in and out.
     // The lane-count change needs an explicit endianness: `little` keeps
     // byte i of the i8x16 view equal to byte i of each lane, so the mask
     // permutes lanes while preserving intra-element byte order.
     let le = MemFlagsData::new().with_endianness(Endianness::Little);
     let b = pos.ins().bitcast(types::I8X16, le, v);
-    let b = pos.ins().shuffle(b, b, imm);
-    pos.ins().bitcast(vt, le, b)
+    let b = pos.ins().shuffle(b, b, p.rev_imm.unwrap());
+    pos.ins().bitcast(p.vt, le, b)
 }
 
 /// Emit a conditional-update predicate's lane mask: `icmp ne v, 0` when the
@@ -4096,7 +4193,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 for (g, vl) in raws {
                     let mut vl = vl;
                     if p.streams[j].neg {
-                        vl = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vl);
+                        vl = vreverse(&mut pos, p, vl);
                     }
                     groups[g].1.insert(r, vl);
                 }
@@ -4163,7 +4260,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                         0,
                     );
                     if p.streams[j].neg {
-                        vv = vreverse(&mut pos, p.vt, p.rev_imm.unwrap(), vv);
+                        vv = vreverse(&mut pos, p, vv);
                     }
                     if batch_stores {
                         pending_stores.push((j, vv, addrs[j].0, addrs[j].1));
@@ -4446,6 +4543,7 @@ pub fn run(
     x64: bool,
     cmp64: bool,
     prof: &FxHashMap<Block, u64>,
+    wc: WideCaps,
 ) -> usize {
     if !simd {
         return 0;
@@ -4479,7 +4577,7 @@ pub fn run(
         let facts = proots::facts(func);
         let ps = proots::alias_of(&facts);
         let Some(p) = plan(
-            func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64,
+            func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64, wc,
         ) else {
             continue;
         };
@@ -4568,6 +4666,7 @@ mod tests {
             false,
             true,
             &FxHashMap::default(),
+            WideCaps::BASE,
         );
     }
 
@@ -4639,6 +4738,11 @@ mod tests {
             true,
             true,
             &FxHashMap::default(),
+            WideCaps {
+                vbits: 256,
+                fma: true,
+                avx512bw: true,
+            },
         );
         assert_eq!(n, 0);
     }
@@ -4661,7 +4765,197 @@ mod tests {
             false,
             true,
             &FxHashMap::default(),
+            WideCaps::BASE,
         );
         assert_eq!(n, 1);
+    }
+
+    /// `acc += a[i] * w[i]` over f32 with `w` read descending
+    /// (`w[n-1-i]`): two contiguous streams, one reversed. Every op has
+    /// a 256-bit x64 lowering, so `vbits:256` must emit F32X8 lanes —
+    /// and the descending stream's lane reversal a `vswizzle`.
+    fn f32_dot_desc_loop() -> Function {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let body = b.create_block();
+            let exit = b.create_block();
+            b.append_block_param(head, types::I64);
+            b.append_block_param(head, types::F32);
+            b.append_block_param(exit, types::F32);
+
+            b.switch_to_block(entry);
+            let p0 = b.ins().iconst(types::I64, 0);
+            let n = b.ins().iconst(types::I64, 64);
+            let st = b.ins().iconst(types::I64, 4);
+            let nb = b.ins().imul(n, st);
+            let end = b.ins().iadd(p0, nb);
+            let wend = b.ins().iadd_imm_s(p0, 64 * 4 - 4);
+            let zero = b.ins().f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
+            b.ins().jump(head, &[p0.into(), zero.into()]);
+
+            b.switch_to_block(head);
+            let (p, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
+            let done = b.ins().icmp(IntCC::Equal, p, end);
+            b.ins().brif(done, exit, &[acc.into()], body, &[]);
+
+            b.switch_to_block(body);
+            let x = b
+                .ins()
+                .load(types::F32, MemFlagsData::new().with_notrap(), p, 0);
+            let a2 = b.ins().isub(wend, p);
+            let y = b
+                .ins()
+                .load(types::F32, MemFlagsData::new().with_notrap(), a2, 0);
+            let m = b.ins().fmul(x, y);
+            let acc1 = b.ins().fadd(acc, m);
+            let p1 = b.ins().iadd_imm_s(p, 4);
+            b.ins().jump(head, &[p1.into(), acc1.into()]);
+
+            b.switch_to_block(exit);
+            let r = b.block_params(exit)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        func
+    }
+
+    /// `acc += a[i]` over f32 ascending: plain wide-elementwise + ordered
+    /// reduction. Emits F32X8 lanes at `vbits:256`, F32X16 at 512.
+    fn f32_sum_loop() -> Function {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let body = b.create_block();
+            let exit = b.create_block();
+            b.append_block_param(head, types::I64);
+            b.append_block_param(head, types::F32);
+            b.append_block_param(exit, types::F32);
+
+            b.switch_to_block(entry);
+            let p0 = b.ins().iconst(types::I64, 0);
+            let n = b.ins().iconst(types::I64, 64);
+            let st = b.ins().iconst(types::I64, 4);
+            let nb = b.ins().imul(n, st);
+            let end = b.ins().iadd(p0, nb);
+            let zero = b.ins().f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
+            b.ins().jump(head, &[p0.into(), zero.into()]);
+
+            b.switch_to_block(head);
+            let (p, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
+            let done = b.ins().icmp(IntCC::Equal, p, end);
+            b.ins().brif(done, exit, &[acc.into()], body, &[]);
+
+            b.switch_to_block(body);
+            let x = b
+                .ins()
+                .load(types::F32, MemFlagsData::new().with_notrap(), p, 0);
+            let acc1 = b.ins().fadd(acc, x);
+            let p1 = b.ins().iadd_imm_s(p, 4);
+            b.ins().jump(head, &[p1.into(), acc1.into()]);
+
+            b.switch_to_block(exit);
+            let r = b.block_params(exit)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        func
+    }
+
+    fn tcfg64() -> TargetFrontendConfig {
+        TargetFrontendConfig {
+            default_call_conv: CallConv::SystemV,
+            pointer_width: PointerWidth::U64,
+            page_size_align_log2: 12,
+        }
+    }
+
+    fn has_typed_inst(func: &Function, ty: Type) -> bool {
+        func.layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .any(|i| func.dfg.ctrl_typevar(i) == ty)
+    }
+
+    #[test]
+    fn f32_sum_emits_f32x8_at_256() {
+        let mut func = f32_sum_loop();
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "f32_sum",
+            &FxHashSet::default(),
+            tcfg64(),
+            true,
+            true,
+            true,
+            &FxHashMap::default(),
+            WideCaps {
+                vbits: 256,
+                fma: true,
+                avx512bw: false,
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(has_typed_inst(&func, types::F32X8));
+        assert!(!has_typed_inst(&func, types::F32X16));
+    }
+
+    #[test]
+    fn f32_sum_emits_f32x16_at_512() {
+        let mut func = f32_sum_loop();
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "f32_sum",
+            &FxHashSet::default(),
+            tcfg64(),
+            true,
+            true,
+            true,
+            &FxHashMap::default(),
+            WideCaps {
+                vbits: 512,
+                fma: true,
+                avx512bw: true,
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(has_typed_inst(&func, types::F32X16));
+    }
+
+    #[test]
+    fn f32_desc_emits_vswizzle_at_256() {
+        let mut func = f32_dot_desc_loop();
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "f32_dot_desc",
+            &FxHashSet::default(),
+            tcfg64(),
+            true,
+            true,
+            true,
+            &FxHashMap::default(),
+            WideCaps {
+                vbits: 256,
+                fma: true,
+                avx512bw: false,
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(has_typed_inst(&func, types::F32X8));
+        let has_swizzle = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .any(|i| func.dfg.insts[i].opcode() == Opcode::Vswizzle);
+        assert!(has_swizzle);
     }
 }

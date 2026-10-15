@@ -1199,6 +1199,35 @@ fn s_divconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Per-function wide-vector probing off the ISA flags: 256-bit lanes
+    // under AVX2, 512 under AVX512F — capped by the codegen-wide
+    // `wide_vector_bits` ceiling. loopvec drops a loop back to 128
+    // whenever its ops lack wide lowerings.
+    let wc = {
+        let isa_flag = |n: &str| {
+            p.isa
+                .isa_flags()
+                .iter()
+                .find(|f| f.name == n)
+                .map_or(false, |v| v.as_bool().unwrap_or(false))
+        };
+        let vb = if isa_flag("has_avx512f") {
+            512
+        } else if isa_flag("has_avx2") {
+            256
+        } else {
+            128
+        };
+        loopvec::WideCaps {
+            vbits: if p.x64 {
+                vb.min(cranelift_codegen::isa::x64::wide_vector_bits())
+            } else {
+                128
+            },
+            fma: isa_flag("has_fma"),
+            avx512bw: isa_flag("has_avx512bw"),
+        }
+    };
     let k = loopvec::run(
         &mut p.clctx.func,
         an,
@@ -1209,6 +1238,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.x64,
         p.cmp64,
         p.prof,
+        wc,
     );
     // loopvec emits `base + iv*esize` addressing fresh each iteration;
     // a second indvars round turns them into stepped pointers.

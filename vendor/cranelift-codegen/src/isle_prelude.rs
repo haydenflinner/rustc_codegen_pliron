@@ -636,6 +636,25 @@ macro_rules! isle_common_prelude_methods {
             }
         }
 
+        // PLIRON: wide-vector type extractors.
+        #[inline]
+        fn ty_vec256(&mut self, ty: Type) -> Option<Type> {
+            if ty.is_vector() && ty.bits() == 256 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        fn ty_vec512(&mut self, ty: Type) -> Option<Type> {
+            if ty.is_vector() && ty.bits() == 512 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
         #[inline]
         fn ty_dyn_vec64(&mut self, ty: Type) -> Option<Type> {
             if ty.is_dynamic_vector() && dynamic_to_fixed(ty).bits() == 64 {

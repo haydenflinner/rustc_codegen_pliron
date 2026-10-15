@@ -569,6 +569,13 @@
 (decl ty_vec128 (Type) Type)
 (extern extractor ty_vec128 ty_vec128)
 
+;; PLIRON: extractors that only match 256/512-bit vector types — the
+;; wide-vector lowering rules use them to stay lane-generic.
+(decl ty_vec256 (Type) Type)
+(extern extractor ty_vec256 ty_vec256)
+(decl ty_vec512 (Type) Type)
+(extern extractor ty_vec512 ty_vec512)
+
 ;; An extractor that matches types that support iconst_s/iconst_u construction.
 (decl ty_int_vec128 (Type) Type)
 (extern extractor ty_int_vec128 ty_int_vec128)

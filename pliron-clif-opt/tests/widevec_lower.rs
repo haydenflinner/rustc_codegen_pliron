@@ -661,3 +661,92 @@ fn scatter_512() {
     // vpscatterdd zmm-idx = EVEX 0F38 0xA0, L'L=10
     assert!(has_evex_op38(&code, &[0xA0], 2), "no vpscatterdd zmm: {code:02x?}");
 }
+
+
+// ---------------------------------------------------------------------------
+// loopvec end-to-end: a loop vectorized at vbits=256 lowers to ymm ops.
+
+use cranelift_codegen::ir::types;
+use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
+use rustc_hash::{FxHashMap, FxHashSet};
+use target_lexicon::PointerWidth;
+
+/// `acc += a[i] * w[n-1-i]` — two streams, one descending, reduction.
+const DESC_LOOP: &str = "
+function u0:0() -> f32 {
+block0:
+    v0 = iconst.i64 0
+    v1 = iconst.i64 64
+    v2 = iconst.i64 4
+    v3 = imul v1, v2
+    v4 = iadd v0, v3
+    v5 = iconst.i64 252
+    v6 = f32const 0x0.0
+    jump block1(v0, v6)
+block1(v7: i64, v8: f32):
+    v9 = icmp eq v7, v4
+    brif v9, block3(v8), block2
+block2:
+    v10 = load.f32 notrap v7
+    v11 = isub v5, v7
+    v12 = load.f32 notrap v11
+    v13 = fmul v10, v12
+    v14 = fadd v8, v13
+    v17 = iconst.i64 4
+    v15 = iadd v7, v17
+    jump block1(v15, v14)
+block3(v16: f32):
+    return v16
+}";
+
+#[test]
+fn loopvec_desc_emits_ymm_end_to_end() {
+    let mut func = parse(DESC_LOOP);
+    let tcfg = TargetFrontendConfig {
+        default_call_conv: CallConv::SystemV,
+        pointer_width: PointerWidth::U64,
+        page_size_align_log2: 12,
+    };
+    let n = pliron_clif_opt::loopvec::run(
+        &mut func,
+        &mut pliron_clif_opt::pipeline::Analysis::default(),
+        "desc",
+        &FxHashSet::default(),
+        tcfg,
+        true,
+        true,
+        true,
+        &FxHashMap::default(),
+        pliron_clif_opt::loopvec::WideCaps {
+            vbits: 256,
+            fma: true,
+            avx512bw: false,
+        },
+    );
+    assert_eq!(n, 1, "loop did not vectorize");
+    let has_x8 = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .any(|i| func.dfg.ctrl_typevar(i) == types::F32X8);
+    assert!(has_x8, "no f32x8 insts in vectorized loop");
+    let has_swizzle = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .any(|i| func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::Vswizzle);
+    assert!(has_swizzle, "descending stream did not emit vswizzle");
+
+    let isa = isa();
+    WIDE_VECTOR_BITS.store(256, Ordering::Relaxed);
+    let mut ctx = Context::for_function(func);
+    ctx.compile(&*isa, &mut ControlPlane::default())
+        .expect("wide loopvec output must lower");
+    WIDE_VECTOR_BITS.store(128, Ordering::Relaxed);
+    let code = ctx.compiled_code().unwrap().code_buffer().to_vec();
+    // vmovups ymm (0x10/0x11), vaddps ymm (0x58), vmulps ymm (0x59).
+    assert!(
+        has_wide_op(&code, &[0x10, 0x11, 0x58, 0x59]),
+        "no ymm encodings in lowered loop: {code:02x?}"
+    );
+}

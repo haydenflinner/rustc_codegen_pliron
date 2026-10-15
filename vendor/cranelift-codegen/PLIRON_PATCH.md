@@ -350,3 +350,13 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     0 (`read_write_xmm`), so the VEX gather's mask operand must be
     declared first; the dst result comes out as `value_regs_get`
     index 1.
+
+29. Wide vector emit support for load/store + sized type extractors:
+    `src/prelude.isle`/`src/isle_prelude.rs` add `ty_vec256`/`ty_vec512`
+    extern extractors (`ty_bits_u64` is a converter — it cannot appear
+    in rule patterns). `src/isa/x64/lower.isle`: generic `load`/`store`
+    rules for all 256-bit types at pri 5 → `x64_vmovups_ya`/`_yb_mem`
+    (avx2), all 512-bit types at pri 7 → `x64_vmovups_za`/`_zb_mem`
+    (avx512f); pri 7 keeps them disjoint from the pri-4 128-bit
+    concrete-type rules (same-priority rules with disjoint extractors
+    still collide in this ISLE).
