@@ -3,12 +3,13 @@
 //! intrinsic, or call to anything but a write-free function leaves memory as
 //! it found it (stores into its own frame aside), so loadfwd keeps loads available across calls to it.
 
-use pliron::context::Context;
+use pliron::basic_block::BasicBlock;
+use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron::value::Value;
 use pliron_llvm::ops::{
     AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp,
-    FenceOp, GetElementPtrOp, InlineAsmOp, StoreOp, UnreachableOp, VAArgOp,
+    FenceOp, GetElementPtrOp, InlineAsmOp, ReturnOp, StoreOp, UnreachableOp, VAArgOp,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -55,7 +56,7 @@ pub(crate) const PURE: &[&str] = &[
 
 /// An address into the function's own frame (an alloca through any GEP
 /// chain; leaving the alloca is UB): stores there die with the frame.
-fn frame_local(ctx: &Context, mut p: Value) -> bool {
+pub(crate) fn frame_local(ctx: &Context, mut p: Value) -> bool {
     loop {
         match p.defining_op() {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return true,
@@ -72,14 +73,23 @@ ascent::ascent! {
     /// "write-free until proven otherwise" table). Function ids index `Syms`.
     struct WriteFx;
     /// `f` has a write that isn't a call (store outside its frame, atomic,
-    /// fence, asm, va_arg, memory-writing intrinsic).
-    relation writes_here(u32);
+    /// fence, asm, va_arg, memory-writing intrinsic) in a block that can
+    /// still reach a normal return.
+    relation ret_write(u32);
+    /// The same but in a block that can't reach a return — unwind pads
+    /// ending in `panic_cannot_unwind`, abort paths: the write is only
+    /// seen by a path that never comes back.
+    relation dead_write(u32);
     /// A direct call in `f` to `c`, whether it is an invoke, and whether a
     /// plain `unreachable` follows it (a panic: the write is only seen by
     /// unwinding).
     relation call(u32, u32, bool, bool);
+    /// The same, restricted to calls in return-reaching blocks.
+    relation callr(u32, u32, bool, bool);
     /// The same for an indirect call (callee unknown).
     relation icall(u32, bool, bool);
+    /// The same, restricted to calls in return-reaching blocks.
+    relation icallr(u32, bool, bool);
     /// Functions with a table entry: bodied ones and `LIBC`.
     relation known(u32);
 
@@ -90,17 +100,20 @@ ascent::ascent! {
 
     /// May write at all.
     relation strict(u32);
-    strict(f) <-- writes_here(f);
+    strict(f) <-- ret_write(f);
+    strict(f) <-- dead_write(f);
     strict(f) <-- any(f, _, _);
     strict(f) <-- call(f, c, _, _), strict(c);
 
     /// May write on a path that returns normally. An invoke may land in
     /// `f`'s own pad and return, so it needs a strictly write-free callee.
+    /// Calls and writes in dead blocks can't be observed by a return.
     relation on_return(u32);
-    on_return(f) <-- writes_here(f);
-    on_return(f) <-- any(f, inv, unr), if *inv || !*unr;
-    on_return(f) <-- call(f, c, true, _), strict(c);
-    on_return(f) <-- call(f, c, false, false), on_return(c);
+    on_return(f) <-- ret_write(f);
+    on_return(f) <-- icallr(f, inv, unr), if *inv || !*unr;
+    on_return(f) <-- callr(f, c, inv, unr), !known(c), if *inv || !*unr;
+    on_return(f) <-- callr(f, c, true, _), strict(c);
+    on_return(f) <-- callr(f, c, false, false), on_return(c);
 }
 
 pub fn run(ctx: &Context, st: &mut State) {
@@ -116,7 +129,40 @@ pub fn run(ctx: &Context, st: &mut State) {
     }
     for s in &bodied {
         let f = ids.id(s);
-        for b in blocks(ctx, st.funcs[s].op) {
+        let bs = blocks(ctx, st.funcs[s].op);
+        // Blocks that can still reach a normal return: backward reach from
+        // `return`/`become` blocks over CFG+invoke edges. Pads that only
+        // reach `panic_cannot_unwind` or `unreachable` stay out — writes
+        // there (e.g. `pliron.eh.exn` clearing the flag) die with the path.
+        let mut can_ret = FxHashSet::default();
+        let mut wl = Vec::new();
+        let mut rp: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+        for &b in &bs {
+            for op in ops(ctx, b) {
+                for s in op.deref(ctx).successors() {
+                    rp.entry(s).or_default().push(b);
+                }
+                if let Some(&(l, _)) = st.invokes.get(&op) {
+                    rp.entry(l).or_default().push(b);
+                }
+                if Operation::is_op::<ReturnOp>(op, ctx)
+                    || st.calls.get(&op).is_some_and(|ci| ci.tail)
+                {
+                    if can_ret.insert(b) {
+                        wl.push(b);
+                    }
+                }
+            }
+        }
+        while let Some(b) = wl.pop() {
+            for &p in rp.get(&b).into_iter().flatten() {
+                if can_ret.insert(p) {
+                    wl.push(p);
+                }
+            }
+        }
+        for b in bs {
+            let cr = can_ret.contains(&b);
             let os = ops(ctx, b);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
@@ -130,8 +176,18 @@ pub fn run(ctx: &Context, st: &mut State) {
                         .get(k + 1)
                         .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx));
                     match direct_callee(ctx, st, op) {
-                        Some(c) => p.call.push((f, ids.id(c), inv, unr)),
-                        None => p.icall.push((f, inv, unr)),
+                        Some(c) => {
+                            p.call.push((f, ids.id(c), inv, unr));
+                            if cr {
+                                p.callr.push((f, ids.id(c), inv, unr));
+                            }
+                        }
+                        None => {
+                            p.icall.push((f, inv, unr));
+                            if cr {
+                                p.icallr.push((f, inv, unr));
+                            }
+                        }
                     }
                 } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
                     || is!(AtomicRmwOp)
@@ -147,7 +203,11 @@ pub fn run(ctx: &Context, st: &mut State) {
                             .get(&op)
                             .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
                 {
-                    p.writes_here.push((f,));
+                    if cr {
+                        p.ret_write.push((f,));
+                    } else {
+                        p.dead_write.push((f,));
+                    }
                 }
             }
         }

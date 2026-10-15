@@ -13,6 +13,7 @@ pub use pliron_cfg::{bisect, env_get, env_is, env_set, pass_enabled};
 mod helpers;
 pub use helpers::{Syms, address_taken, bodied, dump_fact, has_body};
 
+pub mod callgvn;
 pub mod constload;
 pub mod domcheck;
 pub mod inline;

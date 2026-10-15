@@ -41,8 +41,8 @@ mod xcgu;
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
-    address_taken, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret, nocapture,
-    nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
+    address_taken, callgvn, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret,
+    nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
 };
 
 use std::any::Any;
@@ -499,7 +499,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let coff_eh = cx.tcx.sess.target.options.binary_format
             == rustc_target::spec::BinaryFormat::Coff
             && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
-        if crate::env_is("PLIRON_NOUNWIND", "1") || (coff_eh && pass_enabled("PLIRON_NOUNWIND")) {
+        if pass_enabled("PLIRON_NOUNWIND") || coff_eh {
             pt!(cx, "nounwind", nounwind::run(ctx, st));
         }
         if pass_enabled("PLIRON_SRET2REG") {
@@ -594,6 +594,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_RETARG") {
             pt!(cx, "retarg", retarg::run(ctx, st));
             pt!(cx, "domcheck:ra", domcheck::run(ctx, st, "retarg"));
+        }
+        // Dead-call elim + readonly call dedup + loop-call hoist, on the
+        // final post-inline call set.
+        if pass_enabled("PLIRON_CALLGVN") {
+            pt!(cx, "callgvn", callgvn::run(ctx, st));
+            pt!(cx, "domcheck:cg", domcheck::run(ctx, st, "callgvn"));
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
