@@ -370,26 +370,72 @@ fn unreachable_terminated(ctx: &Context, info: &FnInfo, b: Ptr<BasicBlock>) -> b
 }
 
 fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
+    let prof = crate::env_set("PLIRON_GE_PROF");
+    let t0 = std::time::Instant::now();
     let bs = blocks(ctx, fop);
     if bs.len() < 2 {
+        return false;
+    }
+    let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
+        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
+    // Prescan for foldable branches: a cond_br whose icmp predicate is in
+    // the provable set and whose abandoned successor could be
+    // unreachable-terminated. Nothing downstream can fold without one, so
+    // functions with none skip the domtree, slot scan, and fixpoint.
+    let unterm = |d: Ptr<BasicBlock>| {
+        bops.get(&d)
+            .and_then(|os| os.last())
+            .is_some_and(|&t| Operation::is_op::<UnreachableOp>(t, ctx))
+    };
+    let cand_terms: Vec<Ptr<Operation>> = bs
+        .iter()
+        .filter_map(|&b| {
+            let &term = bops[&b].last()?;
+            if !Operation::is_op::<CondBrOp>(term, ctx) {
+                return None;
+            }
+            let ci = term.deref(ctx).get_operand(0).defining_op()?;
+            let icmp = Operation::get_op::<ICmpOp>(ci, ctx)?;
+            match icmp.predicate(ctx) {
+                P::ULT | P::ULE | P::UGT | P::UGE | P::EQ | P::NE => {}
+                _ => return None,
+            }
+            if unterm(term.deref(ctx).get_successor(0))
+                || unterm(term.deref(ctx).get_successor(1))
+            {
+                Some(term)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let cands = cand_terms.len();
+    if cands == 0 {
+        if prof {
+            eprintln!(
+                "geprof {} blocks={} cands=0 skipped",
+                st.cgu,
+                bs.len()
+            );
+        }
         return false;
     }
     let Some(dom) = Dom::new(ctx, st, fop) else {
         return false;
     };
-    let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
-        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Slots whose address escapes (operand of a non-load/store/gep/pure op)
     // can't carry load-equality reasoning.
     let mut escaped = FxHashSet::default();
     let mut store_slots = FxHashSet::default();
     let mut load_slots = FxHashSet::default();
+    let mut stores_by_slot: FxHashMap<Value, Vec<Ptr<Operation>>> = FxHashMap::default();
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<StoreOp>(op, ctx)
                 && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
             {
                 store_slots.insert(s);
+                stores_by_slot.entry(s).or_default().push(op);
             }
             if Operation::is_op::<LoadOp>(op, ctx)
                 && !st.volatile.contains(&op)
@@ -416,31 +462,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             }
         }
     }
-    // Only slots both stored and loaded matter to the analysis: queries
-    // happen only on loaded slots, and only store targets can reach a
-    // load. Tracking the rest is what made generated-code-class fns
-    // (cranelift_codegen's ISLE tables) balloon to ~24GB — blocks x
-    // relevant-slots is the real fixpoint size.
-    let relevant: FxHashSet<Value> = store_slots
-        .intersection(&load_slots)
-        .copied()
-        .filter(|s| !escaped.contains(s))
-        .collect();
-    if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
-        if crate::env_set("PLIRON_STATS") {
-            eprintln!(
-                "guardelim {}: bail blocks={} relevant={}",
-                st.cgu,
-                bs.len(),
-                relevant.len()
-            );
-        }
-        return false;
-    }
-    // Reaching stores per (block, slot): forward fixpoint over reachable
-    // blocks only (unreachable preds would pollute the may-sets).
-    let mut outt: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
-        FxHashMap::default();
+    // Reachable-block preds, shared by the needed-slot closure (arg
+    // forwarding edges), the fixpoint, and arg_sources.
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     let mut reach: Vec<Ptr<BasicBlock>> = Vec::new();
     for &b in &bs {
@@ -456,6 +479,113 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             }
         }
     }
+    // Only slots both stored and loaded matter to the analysis: queries
+    // happen only on loaded slots, and only store targets can reach a
+    // load. Tracking the rest is what made generated-code-class fns
+    // (cranelift_codegen's ISLE tables) balloon to ~24GB — blocks x
+    // relevant-slots is the real fixpoint size.
+    //
+    // Narrow further to slots the prover can actually consult: a Slot
+    // atom's sources are its reaching stores' stored operands, an Arg
+    // atom's are the pred-forwarded values — so the slots reachable from
+    // the candidates' icmp operands through that graph are all the
+    // fixpoint can ever feed. Over-approximate a Slot's reaching set with
+    // every store to the slot (superset ⇒ sound, usually tiny); slots
+    // outside the closure answer `V` atoms, which only weakens proofs.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Nd {
+        Slot(Value),
+        Arg(Ptr<BasicBlock>, usize),
+    }
+    let node_of = |v: Value| -> Option<Nd> {
+        if let Some(b) = v.defining_block() {
+            return b.deref(ctx)
+                .arguments()
+                .position(|a| a == v)
+                .map(|i| Nd::Arg(b, i));
+        }
+        let d = v.defining_op()?;
+        if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
+            return None;
+        }
+        slot_base(ctx, d.deref(ctx).get_operand(0)).map(Nd::Slot)
+    };
+    let mut needed: FxHashSet<Value> = FxHashSet::default();
+    {
+        let mut seen: FxHashSet<Nd> = FxHashSet::default();
+        let mut stack: Vec<Nd> = Vec::new();
+        for &term in &cand_terms {
+            let ci = term.deref(ctx).get_operand(0).defining_op().unwrap();
+            for k in 0..2 {
+                if let Some(n) = node_of(ci.deref(ctx).get_operand(k)) {
+                    stack.push(n);
+                }
+            }
+        }
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            match n {
+                Nd::Slot(s) => {
+                    if !needed.insert(s) {
+                        continue;
+                    }
+                    for &so in stores_by_slot.get(&s).into_iter().flatten() {
+                        if let Some(m) = node_of(so.deref(ctx).get_operand(0)) {
+                            stack.push(m);
+                        }
+                    }
+                }
+                Nd::Arg(b, i) => {
+                    for &p in preds.get(&b).into_iter().flatten() {
+                        let Some(&t) = bops.get(&p).and_then(|os| os.last()) else {
+                            continue;
+                        };
+                        let o = Operation::get_op_dyn(t, ctx);
+                        let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
+                            continue;
+                        };
+                        for (si, s) in t.deref(ctx).successors().enumerate() {
+                            if s != b {
+                                continue;
+                            }
+                            let v = br.successor_operands(ctx, si);
+                            if v.len() != b.deref(ctx).get_num_arguments() {
+                                continue;
+                            }
+                            if let Some(m) = node_of(v[i]) {
+                                stack.push(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let relevant: FxHashSet<Value> = store_slots
+        .intersection(&load_slots)
+        .copied()
+        .filter(|s| !escaped.contains(s) && needed.contains(s))
+        .collect();
+    let mut inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
+        FxHashMap::default();
+    if !relevant.is_empty() {
+    if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
+        if crate::env_set("PLIRON_STATS") {
+            eprintln!(
+                "guardelim {}: bail blocks={} relevant={}",
+                st.cgu,
+                bs.len(),
+                relevant.len()
+            );
+        }
+        return false;
+    }
+    // Reaching stores per (block, slot): forward fixpoint over reachable
+    // blocks only (unreachable preds would pollute the may-sets).
+    let mut outt: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
+        FxHashMap::default();
     let mut wl: Vec<Ptr<BasicBlock>> = reach.clone();
     let mut inq: FxHashSet<Ptr<BasicBlock>> = wl.iter().copied().collect();
     while let Some(b) = wl.pop() {
@@ -504,8 +634,6 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         }
     }
     // inn[b][slot] = union of preds' out — the reaching set at block head.
-    let mut inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
-        FxHashMap::default();
     for &b in &reach {
         let mut m: FxHashMap<Value, Option<Vec<Ptr<Operation>>>> = FxHashMap::default();
         for &p in preds.get(&b).into_iter().flatten() {
@@ -532,6 +660,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         }
         inn.insert(b, m);
     }
+    }
     let info = FnInfo {
         bops,
         preds,
@@ -539,6 +668,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         escaped,
     };
 
+    let t_fix = t0.elapsed();
     let mut folds: Vec<(Ptr<Operation>, Ptr<BasicBlock>, Vec<Value>)> = Vec::new();
     {
         let mut pr = Prover {
@@ -633,6 +763,18 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     }
     if crate::env_set("PLIRON_GEDBG") && !folds.is_empty() {
         eprintln!("guardelim   {} folds", folds.len());
+    }
+    if prof {
+        eprintln!(
+            "geprof {} blocks={} cands={} rel={} fix={:?} prove={:?} folds={}",
+            st.cgu,
+            bs.len(),
+            cands,
+            relevant.len(),
+            t_fix,
+            t0.elapsed() - t_fix,
+            folds.len()
+        );
     }
     for (term, dst, ods) in &folds {
         let br = BrOp::new(ctx, *dst, ods.clone()).get_operation();
