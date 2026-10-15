@@ -1506,3 +1506,23 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   inst terms (727 ISLE errors). Same signature: silently corrupted data
   in emitted code. Both only in artifacts compiled BY pliron output.
 - verify.sh needed ninja-build installed for x.py preflight.
+
+## 2026-10-15 jumpthread nn+round (devin session 761f9fa8)
+- `2226519`: NonNull seeding now memoizes `is_deps` per resolved value
+  (dropped before eviction fixpoint — eviction re-proves against the
+  shrinking params set); `PLIRON_NN_ADDR` and `PLIRON_BODYK` config reads
+  hoisted out of worklist/block loops (`pass_enabled` = TLS borrow +
+  `to_string` alloc per call); edge args collected only when the dest
+  block has candidate params; `facts_at` results borrowed from the
+  per-round memo instead of cloned.
+- Serial bench (PLIRON_PAR=0, noisy shared box): nn+round 1.91s ->
+  1.1-1.8s, jumpthread 3.97 -> 2.2-3.1s. Run-to-run variance on the same
+  binary is ~60% (4 agents' builds contending) — treat these numbers as
+  directional, not precise.
+- Soundness note for anyone touching this: `NonNull` MUST be rebuilt per
+  outer-loop iteration — bypass/thread rewrites can remove the edge that
+  proved a param non-null, so a stale `params` set would claim non-null
+  unsoundly. Cross-round caching needs dep-tracking, don't just memo it.
+- Next measured targets: slp 1.4-1.8s (slp::build_uses ~1k samples,
+  SmallVec<Inst> allocs), clifpeep webmerge_ctx ~1.2k samples,
+  inline+scan ~2.6s iropt, emit-side cfg/domtree rebuilds.
