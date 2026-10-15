@@ -117,9 +117,10 @@ there instead of in the cwd.
     stubs were strong symbols per CGU and failed `-Zbuild-std` links.
   Known checker noise: a function whose output depends on stack addresses
   (foldhash seeds from `&local`) differs when slotmerge moves slots.
-  Also open: `loopvec`'s shuffle-tree reduction emits `shuffle`, which x86-64
-  without SSSE3 lowers to an `__cranelift_x86_pshufb` libcall nobody
-  provides (rustc-demangle fails to link at the default target CPU).
+  `loopvec`'s shuffle-tree reduction emits `shuffle`, which x86-64 without
+  SSSE3 lowers to an `__cranelift_x86_pshufb` libcall; `lower_module` now
+  defines a private copy in any object that references it (see
+  `x86_pshufb_helper`).
 
 - `src/licm.rs` miscompiled `ui/impl-trait/example-calendar.rs` at `-O`
   (SIGBUS/SIGTRAP, `PLIRON_LICM=0` was clean): `clobbers` only ran the precise

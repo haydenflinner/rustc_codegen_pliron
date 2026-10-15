@@ -867,6 +867,10 @@ pub fn lower_module(
     // compiling each function serially.
     let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
     let _pgpc = host.prof().activity("pliron_phasec", None);
+    // x64 without SSSE3 lowers `shuffle`/`swizzle.i8x16` to an `X86Pshufb`
+    // libcall; note any compiled function that references it so phase (C+)
+    // can define the helper (nothing in the Rust runtime provides it).
+    let mut needs_pshufb = false;
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
@@ -898,7 +902,14 @@ pub fn lower_module(
             .buffer
             .relocs()
             .iter()
-            .map(|r| cranelift_module::ModuleReloc::from_mach_reloc(r, &j.func, j.id))
+            .map(|r| {
+                let mr = cranelift_module::ModuleReloc::from_mach_reloc(r, &j.func, j.id);
+                needs_pshufb |= matches!(
+                    mr.name,
+                    cranelift_module::ModuleRelocTarget::LibCall(ir::LibCall::X86Pshufb)
+                );
+                mr
+            })
             .collect();
         m.define_function_bytes(
             j.id,
@@ -908,6 +919,10 @@ pub fn lower_module(
         )
         .unwrap_or_else(|e| panic!("define {}: {e}", j.name));
         eh.add_function(m, j.id, code);
+    }
+
+    if needs_pshufb {
+        x86_pshufb_helper(&mut *m, &mut clctx, &mut fbc, cc, cfg);
     }
 
     if crate::env_set("PLIRON_TIMING") {
@@ -1012,6 +1027,166 @@ pub fn lower_module(
         custom_secs,
         asm_stubs,
         hot_asm,
+    }
+}
+
+/// Define `__cranelift_x86_pshufb` in `m` as a private function.
+///
+/// On x64 without SSSE3 the ISLE `lower_pshufb` helper (used by `shuffle`
+/// and `swizzle.i8x16`) emits a call to the `X86Pshufb` libcall, which
+/// `default_libcall_names` names `__cranelift_x86_pshufb`. No Rust runtime
+/// supplies that symbol — upstream embedders (wasmtime) provide it
+/// themselves — so the object would carry an unresolvable import. A local
+/// definition satisfies it instead: `ObjectModule`'s reloc resolution looks
+/// libcall names up in the object's own symbol table before inventing an
+/// import.
+///
+/// pshufb semantics are `r[i] = (m[i] & 0x80) ? 0 : a[m[i] & 15]`: a byte
+/// gather with a high-bit kill. Nothing below SSSE3 gathers by byte index,
+/// so the body spills both vectors to stack slots and selects each result
+/// byte with scalar loads/stores — correct on every ISA.
+fn x86_pshufb_helper(
+    m: &mut dyn Module,
+    clctx: &mut cranelift_codegen::Context,
+    fbc: &mut FunctionBuilderContext,
+    cc: CallConv,
+    tcfg: TargetFrontendConfig,
+) {
+    let isa = m.isa();
+    let pt = isa.pointer_type();
+    let sig = ir::LibCall::X86Pshufb.signature(CallConv::for_libcall(isa.flags(), cc), pt);
+    let fid = m
+        .declare_function("__cranelift_x86_pshufb", Linkage::Local, &sig)
+        .unwrap();
+    let mut func = ir::Function::with_name_signature(
+        ir::UserFuncName::user(0, fid.index() as u32),
+        sig,
+    );
+    {
+        let mut b = FunctionBuilder::new(&mut func, fbc);
+        let block = b.create_block();
+        b.append_block_params_for_function_params(block);
+        b.switch_to_block(block);
+        b.seal_block(block);
+        let a = b.block_params(block)[0];
+        let mask = b.block_params(block)[1];
+        let flags = MemFlagsData::trusted();
+        let mk_slot = |b: &mut FunctionBuilder<'_>| {
+            let ss = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                16,
+                4,
+            ));
+            b.ins().stack_addr(pt, ss, 0)
+        };
+        let pa = mk_slot(&mut b);
+        let pm = mk_slot(&mut b);
+        let pr = mk_slot(&mut b);
+        b.ins().store(flags, a, pa, 0);
+        b.ins().store(flags, mask, pm, 0);
+        let zero = b.ins().iconst(clt::I32, 0);
+        for i in 0..16i32 {
+            let mb = b.ins().uload8(clt::I32, flags, pm, i);
+            let idx = b.ins().band_imm_u(mb, 0x0f);
+            let idxp = if pt == clt::I64 {
+                b.ins().uextend(clt::I64, idx)
+            } else {
+                idx
+            };
+            let p = b.ins().iadd(pa, idxp);
+            let byte = b.ins().uload8(clt::I32, flags, p, 0);
+            let hi = b.ins().band_imm_u(mb, 0x80);
+            let kill = b.ins().icmp_imm_u(IntCC::NotEqual, hi, 0);
+            let byte = b.ins().select(kill, zero, byte);
+            b.ins().istore8(flags, byte, pr, i);
+        }
+        let r = b.ins().load(clt::I8X16, flags, pr, 0);
+        b.ins().return_(&[r]);
+        b.finalize(tcfg);
+    }
+    clctx.func = func;
+    m.define_function(fid, clctx)
+        .unwrap_or_else(|e| panic!("define __cranelift_x86_pshufb: {e}"));
+    m.clear_context(clctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::settings::{self, Configurable};
+
+    /// A function that calls `LibCall::X86Pshufb` (like x64's `lower_pshufb`
+    /// emits) must not leave the object with an undefined
+    /// `__cranelift_x86_pshufb` import once the helper is defined: the
+    /// libcall's symbol-name lookup reuses the local definition. Runnable
+    /// on any host — the call only needs a symbol reloc, not x86 codegen.
+    #[test]
+    fn pshufb_helper_satisfies_libcall_import() {
+        let mut fb = settings::builder();
+        fb.set("is_pic", "true").unwrap();
+        fb.set(
+            "enable_verifier",
+            if cfg!(debug_assertions) { "true" } else { "false" },
+        )
+        .unwrap();
+        let flags = settings::Flags::new(fb);
+        let isa = cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
+            .unwrap()
+            .finish(flags)
+            .unwrap();
+        let b = ObjectBuilder::new(isa.clone(), "t".to_string(), default_libcall_names()).unwrap();
+        let mut m = ObjectModule::new(b);
+        let cc = isa.default_call_conv();
+        let cfg = m.target_config();
+        let mut clctx = m.make_context();
+        let mut fbc = FunctionBuilderContext::new();
+
+        let mut sig = Signature::new(cc);
+        sig.params.push(AbiParam::new(clt::I8X16));
+        sig.params.push(AbiParam::new(clt::I8X16));
+        sig.returns.push(AbiParam::new(clt::I8X16));
+        let cid = m
+            .declare_function("caller", Linkage::Local, &sig)
+            .unwrap();
+        let mut f = ir::Function::with_name_signature(
+            ir::UserFuncName::user(0, cid.index() as u32),
+            sig.clone(),
+        );
+        {
+            let sr = f.import_signature(sig);
+            let fr = f.import_function(ir::ExtFuncData {
+                name: ir::ExternalName::LibCall(ir::LibCall::X86Pshufb),
+                signature: sr,
+                colocated: false,
+                patchable: false,
+            });
+            let mut b = FunctionBuilder::new(&mut f, &mut fbc);
+            let block = b.create_block();
+            b.append_block_params_for_function_params(block);
+            b.switch_to_block(block);
+            b.seal_block(block);
+            let a = b.block_params(block)[0];
+            let msk = b.block_params(block)[1];
+            let call = b.ins().call(fr, &[a, msk]);
+            let r = b.func.dfg.inst_results(call)[0];
+            b.ins().return_(&[r]);
+            b.finalize(cfg);
+        }
+        clctx.func = f;
+        m.define_function(cid, &mut clctx).unwrap();
+        m.clear_context(&mut clctx);
+
+        x86_pshufb_helper(&mut m, &mut clctx, &mut fbc, cc, cfg);
+
+        let product = m.finish();
+        // `get_symbol` resolves the libcall's name with this same lookup;
+        // it must hit the local definition — an `Undefined` import would
+        // mean the libcall isn't satisfied inside the object.
+        let sym = product
+            .object
+            .symbol_id(b"__cranelift_x86_pshufb")
+            .expect("__cranelift_x86_pshufb symbol");
+        assert!(!product.object.symbol(sym).is_undefined());
     }
 }
 
