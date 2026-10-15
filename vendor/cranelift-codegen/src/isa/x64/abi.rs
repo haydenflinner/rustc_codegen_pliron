@@ -895,7 +895,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // We allocate in terms of 8-byte slots.
         match rc {
             RegClass::Int => 1,
-            RegClass::Float => vector_scale / 8,
+            RegClass::Float => vector_scale.max(super::inst::wide_vector_bits() / 8) / 8,
             RegClass::Vector => unreachable!(),
         }
     }
@@ -905,21 +905,38 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // and becomes a callee-saved allocatable register like any other.
         let free_rbp = !flags.preserve_frame_pointers()
             && std::env::var_os("PLIRON_NO_FREE_RBP").is_none();
-        match (flags.enable_pinned_reg(), free_rbp) {
-            (true, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false);
+        let hi = super::inst::high_xmm_regs();
+        match (flags.enable_pinned_reg(), free_rbp, hi) {
+            (true, false, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, false);
                 &MACHINE_ENV
             }
-            (true, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true);
+            (true, false, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, true);
                 &MACHINE_ENV
             }
-            (false, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false);
+            (true, true, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, false);
                 &MACHINE_ENV
             }
-            (false, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true);
+            (true, true, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, true);
+                &MACHINE_ENV
+            }
+            (false, false, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, false);
+                &MACHINE_ENV
+            }
+            (false, false, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, true);
+                &MACHINE_ENV
+            }
+            (false, true, false) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, false);
+                &MACHINE_ENV
+            }
+            (false, true, true) => {
+                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, true);
                 &MACHINE_ENV
             }
         }
@@ -1256,11 +1273,21 @@ const SYSV_CLOBBERS: PRegSet = sysv_clobbers();
 pub(crate) const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
 
+/// xmm16-31 are caller-saved under every x64 ABI.
+const fn with_high_xmm(mut set: PRegSet) -> PRegSet {
+    let mut i = 16;
+    while i < 32 {
+        set = set.with(regs::fpr_preg(i));
+        i += 1;
+    }
+    set
+}
+
 const fn windows_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1273,14 +1300,15 @@ const fn windows_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM2))
         .with(regs::fpr_preg(XMM3))
         .with(regs::fpr_preg(XMM4))
-        .with(regs::fpr_preg(XMM5))
+        .with(regs::fpr_preg(XMM5));
+    with_high_xmm(set)
 }
 
 const fn sysv_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1305,7 +1333,8 @@ const fn sysv_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM12))
         .with(regs::fpr_preg(XMM13))
         .with(regs::fpr_preg(XMM14))
-        .with(regs::fpr_preg(XMM15))
+        .with(regs::fpr_preg(XMM15));
+    with_high_xmm(set)
 }
 
 /// For calling conventions that clobber all registers.
@@ -1313,7 +1342,7 @@ const fn all_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1343,10 +1372,11 @@ const fn all_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM12))
         .with(regs::fpr_preg(XMM13))
         .with(regs::fpr_preg(XMM14))
-        .with(regs::fpr_preg(XMM15))
+        .with(regs::fpr_preg(XMM15));
+    with_high_xmm(set)
 }
 
-const fn create_reg_env_systemv(enable_pinned_reg: bool, free_rbp: bool) -> MachineEnv {
+const fn create_reg_env_systemv(enable_pinned_reg: bool, free_rbp: bool, high_xmm: bool) -> MachineEnv {
     const fn preg(r: Reg) -> PReg {
         r.to_real_reg().unwrap().preg()
     }
@@ -1413,6 +1443,15 @@ const fn create_reg_env_systemv(enable_pinned_reg: bool, free_rbp: bool) -> Mach
         // it is free for the allocator like R12-R14.
         env.non_preferred_regs_by_class[0] =
             env.non_preferred_regs_by_class[0].with(preg(regs::rbp()));
+    }
+    if high_xmm {
+        // zmm16-31 (EVEX only; non-EVEX operands are limited to 0-15).
+        let mut i = 16;
+        while i < 32 {
+            env.non_preferred_regs_by_class[1] =
+                env.non_preferred_regs_by_class[1].with(regs::fpr_preg(i));
+            i += 1;
+        }
     }
 
     env

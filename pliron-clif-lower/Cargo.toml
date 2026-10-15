@@ -1,0 +1,25 @@
+[package]
+name = "pliron-clif-lower"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "pliron LLVM dialect -> Cranelift lowering, independent of rustc"
+
+[dependencies]
+rsasm = { version = "0.1.3", default-features = false, features = ["x86", "aarch64"] }
+gimli = { version = "0.33", default-features = false, features = ["std", "write"] }
+pliron = { path = "../vendor/pliron", default-features = false, features = ["std"] }
+pliron-llvm = { path = "../vendor/pliron/pliron-llvm", default-features = false, features = ["std"] }
+cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std", "unwind", "host-arch", "timing"] }
+cranelift-frontend = "0.135.5"
+cranelift-module = "0.135.5"
+cranelift-object = "0.135.5"
+target-lexicon = "0.13"
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf", "macho"] }
+smallvec = "1"
+pliron-clif-opt = { path = "../pliron-clif-opt" }
+pliron-ir-opt = { path = "../pliron-ir-opt" }
+pliron-cfg = { path = "../pliron-cfg" }
+rustc-hash = "2"
+tracing = "0.1"
+rustc_apfloat = "0.2"

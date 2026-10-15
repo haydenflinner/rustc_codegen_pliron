@@ -1167,6 +1167,13 @@ where
                 ctrl_ty,
             )?)
         }
+        Opcode::FvpromoteF16
+        | Opcode::FvdemoteF16
+        | Opcode::FvpromoteF16Lo
+        | Opcode::FvpromoteF16Hi
+        | Opcode::FvdemoteF16Pair
+        | Opcode::FvpromoteBf16
+        | Opcode::FvdemoteBf16 => unimplemented!("f16 vector casts"),
         Opcode::FvpromoteLow => {
             let in_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
             assert_eq!(in_ty, types::F32X4);
@@ -1310,6 +1317,128 @@ where
         }
         Opcode::IaddPairwise => {
             assign(binary_pairwise(arg(0), arg(1), ctrl_ty, DataValueExt::add)?)
+        }
+        // PLIRON: pairwise dot products (see cranelift-codegen-meta ops).
+        Opcode::Sdot => {
+            let xs = extractlanes(&arg(0), arg(0).ty())?;
+            let ys = extractlanes(&arg(1), arg(1).ty())?;
+            let out = xs
+                .chunks(2)
+                .zip(ys.chunks(2))
+                .map(|(a, b)| {
+                    let v = a[0].clone().into_int_signed()?
+                        * b[0].clone().into_int_signed()?
+                        + a[1].clone().into_int_signed()?
+                            * b[1].clone().into_int_signed()?;
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::Udot => {
+            let xs = extractlanes(&arg(0), arg(0).ty())?;
+            let ys = extractlanes(&arg(1), arg(1).ty())?;
+            let out = xs
+                .chunks(2)
+                .zip(ys.chunks(2))
+                .map(|(a, b)| {
+                    // unsigned x * signed y, saturating to the output lane
+                    let v = (a[0].clone().into_int_unsigned()? as i128)
+                        * b[0].clone().into_int_signed()?
+                        + (a[1].clone().into_int_unsigned()? as i128)
+                            * b[1].clone().into_int_signed()?;
+                    let bits = ctrl_ty.lane_bits() as i128;
+                    let v = v.clamp(-(1 << (bits - 1)), (1 << (bits - 1)) - 1);
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::Vswizzle => {
+            // PLIRON: a[i] = x[idx[i] mod N].
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let idxs = extractlanes(&arg(1), arg(1).ty())?;
+            let n = xs.len() as u128;
+            let out = idxs
+                .into_iter()
+                .map(|i| {
+                    let j = (i.into_int_unsigned()? % n) as usize;
+                    Ok(xs[j].clone())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::Vswizzle2 => {
+            // PLIRON: idx selects across x ++ y (vpermt2* semantics).
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let ys = extractlanes(&arg(1), ctrl_ty)?;
+            let idxs = extractlanes(&arg(2), arg(2).ty())?;
+            let table: Vec<DataValue> = xs.into_iter().chain(ys).collect();
+            let n = table.len() as u128;
+            let out = idxs
+                .into_iter()
+                .map(|i| {
+                    let j = (i.into_int_unsigned()? % n) as usize;
+                    Ok(table[j].clone())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::UdotAcc => {
+            let accs = extractlanes(&arg(0), ctrl_ty)?;
+            let xs = extractlanes(&arg(1), arg(1).ty())?;
+            let ys = extractlanes(&arg(2), arg(2).ty())?;
+            let out = accs
+                .into_iter()
+                .zip(xs.chunks(4).zip(ys.chunks(4)))
+                .map(|(acc, (a, b))| {
+                    let mut v = acc.into_int_signed()?;
+                    for i in 0..4 {
+                        v += (a[i].clone().into_int_unsigned()? as i128)
+                            * b[i].clone().into_int_signed()?;
+                    }
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        // PLIRON: `vgather.ty flags addr, idx, off`: a[i] = load(p + idx[i]*E + off)
+        // (HW sign-extends the index lanes, so use signed math).
+        Opcode::Vgather => {
+            let lane_ty = ctrl_ty.lane_type();
+            let mem_flags = resolve_memflags();
+            let base = calculate_addr(types::I64, imm(), smallvec![arg(0)])?;
+            let scale = (lane_ty.bits() / 8) as i128;
+            let idxs = extractlanes(&arg(1), arg(1).ty())?;
+            let mut out: SimdVec<DataValue> = SmallVec::with_capacity(idxs.len());
+            for idx in idxs {
+                let ea = base.wrapping_add((idx.into_int_signed()? * scale) as u64);
+                match Address::try_from(ea)
+                    .and_then(|addr| state.checked_load(addr, lane_ty, mem_flags))
+                {
+                    Ok(v) => out.push(v),
+                    Err(e) => return Ok(ControlFlow::Trap(memerror_to_trap(e))),
+                }
+            }
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        // PLIRON: `vscatter flags x, p, idx, off`: store x[i] at p + idx[i]*E + off.
+        Opcode::Vscatter => {
+            let lane_ty = ctrl_ty.lane_type();
+            let mem_flags = resolve_memflags();
+            let base = calculate_addr(types::I64, imm(), smallvec![arg(1)])?;
+            let scale = (lane_ty.bits() / 8) as i128;
+            let xs = extractlanes(&arg(0), ctrl_ty)?;
+            let idxs = extractlanes(&arg(2), arg(2).ty())?;
+            for (x, idx) in xs.into_iter().zip(idxs) {
+                let ea = base.wrapping_add((idx.into_int_signed()? * scale) as u64);
+                if let Err(e) = Address::try_from(ea)
+                    .and_then(|addr| state.checked_store(addr, x, mem_flags))
+                {
+                    return Ok(ControlFlow::Trap(memerror_to_trap(e)));
+                }
+            }
+            ControlFlow::Continue
         }
         Opcode::ExtractVector => {
             unimplemented!("ExtractVector not supported");

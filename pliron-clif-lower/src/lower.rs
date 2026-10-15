@@ -111,7 +111,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// Local, non-variadic functions whose address never escapes and that are
 /// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
 /// 8 int + 8 float return registers instead of SysV's 2+2).
-pub(crate) fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
+pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
         return FxHashSet::default();
@@ -137,6 +137,81 @@ pub(crate) fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<S
         .collect()
 }
 
+/// Profiler hook, shared with the codegen worker threads.
+pub trait Prof: Sync {
+    /// Guard for phase/step `nm` (optionally per function `arg`).
+    fn activity(&self, _nm: &'static str, _arg: Option<&str>) -> Box<dyn Send + '_> {
+        Box::new(())
+    }
+}
+
+/// What lowering needs from its embedder: rustc's `Session`, or a JIT.
+pub trait Host {
+    fn prof(&self) -> &dyn Prof;
+    /// Clean user-facing error (capacity limits), not an ICE.
+    fn fatal(&self, msg: String) -> ! {
+        panic!("{msg}")
+    }
+    /// x86-64 `sse4.2` (`pcmpgtq`) is available.
+    fn sse42(&self) -> bool {
+        false
+    }
+}
+
+/// Default host: no profiler, panicking `fatal`, baseline x86-64.
+pub struct NoHost;
+impl Prof for NoHost {}
+impl Host for NoHost {
+    fn prof(&self) -> &dyn Prof {
+        self
+    }
+}
+
+/// (name, bytes, align, relocs, writable, used, section name, linkage)
+type CustomSec = (
+    String,
+    Vec<u8>,
+    u64,
+    Vec<(u64, String, i64)>,
+    bool,
+    bool,
+    String,
+    Linkage,
+);
+
+/// Result of [`lower_module`]: everything defined in the module, plus the
+/// pieces only an object file can carry.
+pub struct Lowered {
+    pub eh: crate::eh::UnwindContext,
+    ids: FxHashMap<String, Sym>,
+    verbatim_syms: Vec<String>,
+    custom_secs: Vec<CustomSec>,
+    asm_stubs: rustc_hash::FxHashSet<&'static str>,
+    hot_asm: String,
+}
+
+impl Lowered {
+    /// The module function declared for symbol `n`.
+    pub fn func_id(&self, n: &str) -> Option<FuncId> {
+        match self.ids.get(n)? {
+            Sym::F(id, _) => Some(*id),
+            Sym::D(..) => None,
+        }
+    }
+
+    /// Assembly the module still needs (`asm!`, hot thunks, atomic stubs,
+    /// va trampolines): object emitters splice it in, a JIT must provide
+    /// these symbols itself or reject the module.
+    pub fn pending_asm(&self, st: &State, macho: bool) -> String {
+        let va_asm: String = VA_TRAMPS.with(|v| v.borrow_mut().drain().collect());
+        let mut asm = format!("{}\n{}\n{va_asm}", st.asm, self.hot_asm);
+        for s in &self.asm_stubs {
+            asm.push_str(&atomic_stub_asm(s, macho));
+        }
+        asm
+    }
+}
+
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
@@ -144,7 +219,7 @@ pub fn lower_to_object(
     st: &State,
     isa: Arc<dyn TargetIsa>,
     name: &str,
-    sess: &rustc_session::Session,
+    host: &dyn Host,
 ) -> Vec<u8> {
     let mut b = ObjectBuilder::new(isa.clone(), name.to_string(), default_libcall_names()).unwrap();
     // Mach-O symbols index sections with a u8 (max 255): per-symbol sections
@@ -153,6 +228,89 @@ pub fn lower_to_object(
     b.per_function_section(!macho);
     b.per_data_object_section(!macho);
     let mut m = ObjectModule::new(b);
+    let lw = lower_module(&mut m, unwind, hot, ctx, st, &isa, name, host);
+    let mut product = m.finish();
+    let asm = lw.pending_asm(st, macho);
+    let Lowered {
+        eh,
+        ids,
+        verbatim_syms,
+        custom_secs,
+        ..
+    } = lw;
+    // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
+    // declaration, so the stored name is `name` or `_name` — drop the
+    // platform prefix (e.g. `_`) that add_symbol prepended.
+    let prefix = product.object.mangling().global_prefix();
+    for n in &verbatim_syms {
+        let sid = product
+            .object
+            .symbol_id(crate::obj_sym(n).as_bytes())
+            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
+        let name = &mut product.object.symbol_mut(sid).name;
+        if let Some(p) = prefix
+            && name.starts_with(&[p])
+        {
+            name.remove(0);
+        }
+    }
+    if !custom_secs.is_empty() {
+        emit_merged_custom_sections(&mut product.object, custom_secs);
+    }
+    eh.emit(&mut product);
+    for (alias, target, weak) in &st.aliases {
+        let tsym = match ids.get(target).copied() {
+            Some(Sym::F(id, _)) => product.function_symbol(id),
+            Some(Sym::D(id, _)) => product.data_symbol(id),
+            None => continue,
+        };
+        let t = product.object.symbol(tsym);
+        let (value, size, kind, section) = (t.value, t.size, t.kind, t.section);
+        if !matches!(section, object::write::SymbolSection::Section(_)) {
+            continue;
+        }
+        let scope = match t.scope {
+            object::SymbolScope::Compilation => object::SymbolScope::Linkage,
+            s => s,
+        };
+        let obj = &mut product.object;
+        let id = obj.symbol_id(alias.as_bytes()).unwrap_or_else(|| {
+            obj.add_symbol(object::write::Symbol {
+                name: alias.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind,
+                scope,
+                weak: *weak,
+                section: object::write::SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            })
+        });
+        let s = obj.symbol_mut(id);
+        (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
+            (value, size, kind, scope, *weak, section);
+    }
+    if !asm.trim().is_empty() {
+        let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
+        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
+    }
+    product.emit().unwrap()
+}
+
+/// Declare and define every function and global of `ctx`'s module in `m`
+/// (an `ObjectModule`, a `JITModule`, ...).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_module(
+    m: &mut dyn Module,
+    unwind: bool,
+    hot: bool,
+    ctx: &Context,
+    st: &State,
+    isa: &Arc<dyn TargetIsa>,
+    name: &str,
+    host: &dyn Host,
+) -> Lowered {
+    let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
     let cc = isa.default_call_conv();
     let mut internal = internal_fns(ctx, st);
     if matches!(
@@ -251,7 +409,7 @@ pub fn lower_to_object(
         None
     };
 
-    let mut eh = crate::eh::UnwindContext::new(&mut m, true, unwind);
+    let mut eh = crate::eh::UnwindContext::new(m, true, unwind);
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
@@ -282,9 +440,7 @@ pub fn lower_to_object(
     // 64-bit vector compares are cheap on aarch64 and with sse4.2
     // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
     let cmp64 = !x64
-        || sess
-            .internal_target_features
-            .contains(&rustc_span::Symbol::intern("sse4.2"));
+        || host.sse42();
     // `PLIRON_VERIFY=full` verifies after every pass. Any other truthy
     // value verifies once after the pipeline: on failure the function is
     // restored from a pre-pipeline snapshot and re-run with per-pass
@@ -333,14 +489,14 @@ pub fn lower_to_object(
         verify_full_env: bool,
         fn_flags: &'a crate::pipeline::FnFlags,
         region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-        prof: &'a rustc_data_structures::profiling::SelfProfilerRef,
+        prof: &'a dyn Prof,
     }
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
-    let _pglo = sess.prof.generic_activity("pliron_lowerobj");
+    let _pglo = host.prof().activity("pliron_lowerobj", None);
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
-    let _pgfl = sess.prof.generic_activity("pliron_fnlower");
+    let _pgfl = host.prof().activity("pliron_fnlower", None);
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -372,7 +528,7 @@ pub fn lower_to_object(
             let mut fl = FnLower {
                 ctx,
                 st,
-                m: &mut m,
+                m: &mut *m,
                 ids: &ids,
                 b,
                 vals: FxHashMap::default(),
@@ -492,7 +648,7 @@ pub fn lower_to_object(
     // bisect counter must number pass applications deterministically) or
     // `PLIRON_PAR=0` / `PLIRON_PAR=N` overrides the thread count.
     let shared = JobShared {
-        isa: &*isa,
+        isa: &**isa,
         tcfg: cfg,
         simd,
         x64,
@@ -502,7 +658,7 @@ pub fn lower_to_object(
         verify_full_env,
         fn_flags: &fn_flags,
         region_parent: &st.region_parent,
-        prof: &sess.prof,
+        prof: host.prof(),
     };
     fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
         CUR_FN.with(|c| {
@@ -523,7 +679,7 @@ pub fn lower_to_object(
         let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
         let tpipe = std::time::Instant::now();
         let _spipe = tracing::info_span!(target: "pliron::pipeline", "pipeline").entered();
-        let _pgpipe = sh.prof.generic_activity_with_arg("pliron_pipeline", n);
+        let _pgpipe = sh.prof.activity("pliron_pipeline", Some(n));
         'retry: loop {
             {
                 // Per-step self-profile events ride `sess.prof` through
@@ -531,7 +687,7 @@ pub fn lower_to_object(
                 // LLVM's `LLVM_passes` activities on the same clock.
                 // Scoped to the block so Pipe's borrow set stays per-try.
                 let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
-                    Box::new(sh.prof.generic_activity(nm))
+                    sh.prof.activity(nm, None)
                 };
                 let mut pipe = crate::pipeline::Pipe {
                     cur_step: "",
@@ -601,7 +757,7 @@ pub fn lower_to_object(
         // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
         let _scomp = tracing::info_span!(target: "pliron::pipeline", "compile").entered();
-        let _pgcomp = sh.prof.generic_activity_with_arg("pliron_compile", n);
+        let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
         let mut vec_retry = 0;
         let defr = loop {
             let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -710,7 +866,7 @@ pub fn lower_to_object(
     // function order — identical to what `define_function` did after
     // compiling each function serially.
     let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
-    let _pgpc = sess.prof.generic_activity("pliron_phasec");
+    let _pgpc = host.prof().activity("pliron_phasec", None);
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
@@ -724,7 +880,7 @@ pub fn lower_to_object(
                 | cranelift_codegen::CodegenError::CodeTooLarge),
             ) = &j.err
             {
-                sess.dcx().fatal(format!("function `{n}` too large: {e}"));
+                host.fatal(format!("function `{n}` too large: {e}"));
             }
             panic!(
                 "cranelift rejected `{n}`: {:?}\n{}",
@@ -734,6 +890,9 @@ pub fn lower_to_object(
         };
         if let Some(v) = &code.vcode {
             eprintln!("==== vcode {} ====\n{v}", j.name);
+            if let Some(d) = crate::env_get("PLIRON_CODEBIN") {
+                let _ = std::fs::write(format!("{d}/{}.bin", j.name), code.buffer.data());
+            }
         }
         let relocs: Vec<cranelift_module::ModuleReloc> = code
             .buffer
@@ -748,7 +907,7 @@ pub fn lower_to_object(
             &relocs,
         )
         .unwrap_or_else(|e| panic!("define {}: {e}", j.name));
-        eh.add_function(&mut m, j.id, code);
+        eh.add_function(m, j.id, code);
     }
 
     if crate::env_set("PLIRON_TIMING") {
@@ -781,16 +940,7 @@ pub fn lower_to_object(
         );
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
-    let mut custom_secs: Vec<(
-        String,
-        Vec<u8>,
-        u64,
-        Vec<(u64, String, i64)>,
-        bool,
-        bool,
-        String,
-        Linkage,
-    )> = Vec::new();
+    let mut custom_secs: Vec<CustomSec> = Vec::new();
     for (n, g) in &st.globals {
         let Some(init) = g.init else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else {
@@ -855,75 +1005,19 @@ pub fn lower_to_object(
         m.define_data(id, &desc)
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
-    let mut product = m.finish();
-    // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
-    // declaration, so the stored name is `name` or `_name` — drop the
-    // platform prefix (e.g. `_`) that add_symbol prepended.
-    let prefix = product.object.mangling().global_prefix();
-    for n in &verbatim_syms {
-        let sid = product
-            .object
-            .symbol_id(crate::obj_sym(n).as_bytes())
-            .unwrap_or_else(|| panic!("verbatim symbol {n:?}"));
-        let name = &mut product.object.symbol_mut(sid).name;
-        if let Some(p) = prefix
-            && name.starts_with(&[p])
-        {
-            name.remove(0);
-        }
+    Lowered {
+        eh,
+        ids,
+        verbatim_syms,
+        custom_secs,
+        asm_stubs,
+        hot_asm,
     }
-    if !custom_secs.is_empty() {
-        emit_merged_custom_sections(&mut product.object, custom_secs);
-    }
-    eh.emit(&mut product);
-    for (alias, target, weak) in &st.aliases {
-        let tsym = match ids.get(target).copied() {
-            Some(Sym::F(id, _)) => product.function_symbol(id),
-            Some(Sym::D(id, _)) => product.data_symbol(id),
-            None => continue,
-        };
-        let t = product.object.symbol(tsym);
-        let (value, size, kind, section) = (t.value, t.size, t.kind, t.section);
-        if !matches!(section, object::write::SymbolSection::Section(_)) {
-            continue;
-        }
-        let scope = match t.scope {
-            object::SymbolScope::Compilation => object::SymbolScope::Linkage,
-            s => s,
-        };
-        let obj = &mut product.object;
-        let id = obj.symbol_id(alias.as_bytes()).unwrap_or_else(|| {
-            obj.add_symbol(object::write::Symbol {
-                name: alias.as_bytes().to_vec(),
-                value: 0,
-                size: 0,
-                kind,
-                scope,
-                weak: *weak,
-                section: object::write::SymbolSection::Undefined,
-                flags: object::SymbolFlags::None,
-            })
-        });
-        let s = obj.symbol_mut(id);
-        (s.value, s.size, s.kind, s.scope, s.weak, s.section) =
-            (value, size, kind, scope, *weak, section);
-    }
-    let va_asm: String = VA_TRAMPS.with(|v| v.borrow_mut().drain().collect());
-    let mut asm = format!("{}\n{hot_asm}\n{va_asm}", st.asm);
-    for s in &asm_stubs {
-        asm.push_str(&atomic_stub_asm(s, macho));
-    }
-    if !asm.trim().is_empty() {
-        let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-        crate::objmerge::assemble_into(&mut product.object, &asm, x86);
-    }
-    drop(_spc);
-    product.emit().unwrap()
 }
 
 /// Result of running the wasm module through the CLIF pipeline: per-function
 /// optimized CLIF plus symbol tables for resolving FuncRef/GlobalValue.
-pub(crate) struct WasmClif {
+pub struct WasmClif {
     /// (symbol name, optimized CLIF) — one per `st.funcs` entry with a body.
     pub funcs: Vec<(String, ir::Function)>,
     /// FuncId::index() -> declared symbol name.
@@ -946,10 +1040,10 @@ pub(crate) struct WasmClif {
 /// checks (`verify_is_address`, `global_type`) don't apply, so
 /// `PLIRON_VERIFY` verifies with flags only, same as the pipeline's
 /// per-step checks.
-pub(crate) fn lower_clif_wasm(
+pub fn lower_clif_wasm(
     ctx: &Context,
     st: &State,
-    sess: &rustc_session::Session,
+    host: &dyn Host,
     cgu: &str,
     unwind: bool,
 ) -> WasmClif {
@@ -1178,7 +1272,7 @@ pub(crate) fn lower_clif_wasm(
             panic!("bad clif {n}: {e}");
         }
         let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
-            Box::new(sess.prof.generic_activity(nm))
+            host.prof().activity(nm, None)
         };
         let mut stats = crate::pipeline::Stats::default();
         let mut nonnull = nonnull;
@@ -1467,7 +1561,7 @@ fn atomic_stub_asm(name: &str, macho: bool) -> String {
     }
 }
 
-pub(crate) fn write_const(
+pub fn write_const(
     ctx: &Context,
     st: &State,
     v: Value,
@@ -1547,7 +1641,7 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
 struct FnLower<'a, 'b> {
     ctx: &'a Context,
     st: &'a State,
-    m: &'a mut ObjectModule,
+    m: &'a mut dyn Module,
     ids: &'a FxHashMap<String, Sym>,
     b: FunctionBuilder<'b>,
     vals: FxHashMap<Value, Vals>,
@@ -2256,7 +2350,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
         if t.is_vector() {
-            let bytes = bits.to_le_bytes()[..t.bytes() as usize].to_vec();
+            let mut bytes = bits.to_le_bytes().to_vec();
+            debug_assert!(t.bytes() <= 16 || bits == 0, "wide non-zero iconst {t}");
+            bytes.resize(t.bytes() as usize, 0);
             let c = self.b.func.dfg.constants.insert(bytes.into());
             return self.b.ins().vconst(t, c);
         }
@@ -2318,6 +2414,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if !all_const {
             for (i, e) in elems.iter().enumerate() {
                 let x = self.get1(*e);
+                let x = self.as_lane(x, t.lane_type());
                 v = self.b.ins().insertlane(v, x, i as u8);
             }
         }
@@ -2982,10 +3079,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // missing), so f16 promotes to f32 — exact in, single
                     // rounding out — while f128 uses the quad helpers.
                     let v = if t == clt::F16 {
-                        let x = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*x])[0];
-                        let y = self.libcall("__extendhfsf2", &[t], &[clt::F32], &[*y])[0];
+                        let x = self.h2f(*x);
+                        let y = self.h2f(*y);
                         let v = self.b.ins().$m(x, y);
-                        self.libcall("__truncsfhf2", &[clt::F32], &[t], &[v])[0]
+                        self.f2h(v)
                     } else if t == clt::F128 {
                         self.libcall($tf, &[t, t], &[t], &[*x, *y])[0]
                     } else {
@@ -3259,8 +3356,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // Cranelift has no f16 compare either; promote both sides to
                 // f32 (lossless, preserves every predicate incl. NaN cases)
                 // via compiler-builtins and compare there.
-                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
-                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let a = self.h2f(a);
+                let b = self.h2f(b);
                 let r = self.b.ins().fcmp(cc, a, b);
                 return self.set1(op, r);
             }
@@ -3305,10 +3402,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let b = self.get1(opnds[1]);
             let t = self.b.func.dfg.value_type(a);
             let r = if t == clt::F16 {
-                let a = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[a])[0];
-                let b = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[b])[0];
+                let a = self.h2f(a);
+                let b = self.h2f(b);
                 let m = self.libcall("fmodf", &[clt::F32, clt::F32], &[clt::F32], &[a, b])[0];
-                self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[m])[0]
+                self.f2h(m)
             } else if t == clt::F128 {
                 // compiler-builtins' libm port exports `fmodf128`.
                 self.libcall("fmodf128", &[t, t], &[t], &[a, b])[0]
@@ -3342,11 +3439,63 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 r.push(v);
             }
             self.set(op, r);
+        } else if (is!(FPTruncOp) || is!(FPExtOp))
+            && self.ty_leaves(opnds[0].get_type(self.ctx))[0].1.is_vector()
+        {
+            // Only bf16/packed-f16 <-> f32 vectors reach here unsplit (scalarize).
+            let xs = self.get(opnds[0]);
+            let rts: Vec<ClType> = self.ty_leaves(self.res_ty(op)).iter().map(|l| l.1).collect();
+            let half = |t: ClType| t.lane_type() == clt::F16;
+            // Wide bf16 leaves (NATIVE_BF16) are f16-bit containers too.
+            let bfv = |ty: TypeHandle| {
+                ty.deref(self.ctx)
+                    .downcast_ref::<pliron_llvm::types::VectorType>()
+                    .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>())
+            };
+            let bf = bfv(if is!(FPExtOp) { opnds[0].get_type(self.ctx) } else { self.res_ty(op) });
+            let r = if half(rts[0]) || half(self.b.func.dfg.value_type(xs[0])) {
+                let mut r = Vals::new();
+                if xs.len() == rts.len() {
+                    for (&x, &t) in xs.iter().zip(&rts) {
+                        r.push(match (is!(FPExtOp), bf) {
+                            (true, false) => self.b.ins().fvpromote_f16(t, x),
+                            (false, false) => self.b.ins().fvdemote_f16(t, x),
+                            (true, true) => self.b.ins().fvpromote_bf16(t, x),
+                            (false, true) => self.b.ins().fvdemote_bf16(t, x),
+                        });
+                    }
+                } else if is!(FPExtOp) {
+                    // f16x32 leaves (native FP16) <-> pairs of f32x16.
+                    for &x in xs.iter() {
+                        r.push(self.b.ins().fvpromote_f16_lo(rts[0], x));
+                        r.push(self.b.ins().fvpromote_f16_hi(rts[0], x));
+                    }
+                } else {
+                    for p in xs.chunks(2) {
+                        r.push(self.b.ins().fvdemote_f16_pair(p[0], p[1]));
+                    }
+                }
+                r
+            } else {
+                self.vcast_bf16(is!(FPExtOp), &xs)
+            };
+            self.set(op, r);
         } else if is!(FPTruncOp) || is!(FPExtOp) {
             let x = self.get1(opnds[0]);
             let t = self.ty_leaves(self.res_ty(op))[0].1;
             let from = self.b.func.dfg.value_type(x);
-            let r = if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
+            let bf = |ty: TypeHandle| ty.deref(self.ctx).is::<pliron::builtin::types::BF16Type>();
+            let r = if is!(FPExtOp) && bf(opnds[0].get_type(self.ctx)) {
+                let f = self.bf16_to_f32(x);
+                if t == clt::F32 { f } else { self.b.ins().fpromote(t, f) }
+            } else if is!(FPTruncOp) && bf(self.res_ty(op)) {
+                let f = if from == clt::F32 { x } else { self.b.ins().fdemote(clt::F32, x) };
+                self.f32_to_bf16(f)
+            } else if from == clt::F16 && t == clt::F32 {
+                self.h2f(x)
+            } else if from == clt::F32 && t == clt::F16 {
+                self.f2h(x)
+            } else if [from, t].iter().any(|t| *t == clt::F16 || *t == clt::F128) {
                 // Cranelift x64 can't convert f16/f128; use compiler-builtins.
                 let l = |t: ClType| match t {
                     clt::F16 => "hf",
@@ -3397,7 +3546,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 } else {
                     self.b.ins().fcvt_from_uint(clt::F32, x)
                 };
-                self.libcall("__truncsfhf2", &[clt::F32], &[t], &[f32v])[0]
+                self.f2h(f32v)
             } else if t == clt::F128 {
                 // No cranelift int->f128 conversion either; compiler-builtins.
                 let isx = match it.bits() {
@@ -3507,6 +3656,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .map(|(o, t)| {
                     if atomic && self.needs_atomic_stub(t) {
                         self.atomic_load_stub(p, o)
+                    } else if atomic && t.is_float() {
+                        let it = ClType::int(t.bits() as u16).unwrap();
+                        let x = self.b.ins().atomic_load(it, MemFlagsData::trusted(), p);
+                        self.b.ins().bitcast(t, MemFlagsData::new(), x)
                     } else if atomic {
                         self.b.ins().atomic_load(t, MemFlagsData::trusted(), p)
                     } else {
@@ -3557,6 +3710,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
                 } else if is!(AtomicStoreOp) {
+                    let v = if t.is_float() {
+                        let it = ClType::int(t.bits() as u16).unwrap();
+                        self.b.ins().bitcast(it, MemFlagsData::new(), v)
+                    } else {
+                        v
+                    };
                     self.b.ins().atomic_store(MemFlagsData::trusted(), v, p);
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
@@ -3570,6 +3729,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let p = self.get1(opnds[0]);
             let v = self.get1(opnds[1]);
             use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
+            let kind = &self.st.rmw[&op];
+            if self.b.func.dfg.value_type(v).is_float()
+                || matches!(kind, KA::FAdd | KA::FSub | KA::FMax | KA::FMin)
+            {
+                let r = self.float_rmw(kind.clone(), p, v);
+                return self.set1(op, r);
+            }
             let k = match self.st.rmw[&op] {
                 KA::Xchg => R::Xchg,
                 KA::Add => R::Add,
@@ -3645,17 +3811,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let a = self.get(opnds[0]);
             let vt = self.b.func.dfg.value_type(a[0]);
             let r = if vt.is_vector() {
+                let et = self.ty_leaves(self.res_ty(op))[0].1;
                 match self.const_int(opnds[1]) {
                     Some(i) => {
                         let n = vt.lane_count() as i128;
-                        self.b.ins().extractlane(a[(i / n) as usize], (i % n) as u8)
+                        let x = self.b.ins().extractlane(a[(i / n) as usize], (i % n) as u8);
+                        self.as_lane(x, et)
                     }
                     None => {
                         let (p, es) = self.spill_vec(opnds[0], &a);
                         let addr = self.dyn_index(p, opnds[1], es);
-                        self.b
-                            .ins()
-                            .load(vt.lane_type(), MemFlagsData::trusted(), addr, 0)
+                        self.b.ins().load(et, MemFlagsData::trusted(), addr, 0)
                     }
                 }
             } else {
@@ -3679,6 +3845,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     Some(i) => {
                         let n = vt.lane_count() as i128;
                         let j = (i / n) as usize;
+                        let e = self.as_lane(e, vt.lane_type());
                         a[j] = self.b.ins().insertlane(a[j], e, (i % n) as u8);
                     }
                     None => {
@@ -3711,6 +3878,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
             }
             self.set(op, a);
+        } else if is!(ConstantOp) || is!(AddressOfOp) {
+            // Values come from `st.consts` (filled by `scan::scan`) at each use.
+        } else if let Some(a) = Operation::get_op::<InlineAsmOp>(op, self.ctx) {
+            // Operand-free spin hints (cubecl's `pause`/`yield`) have no
+            // observable effect; anything else must go through rsasm.
+            let t = String::from(a.get_attr_llvm_inline_asm_template(self.ctx).unwrap().clone());
+            assert!(
+                opnds.is_empty() && matches!(t.trim(), "" | "pause" | "yield" | "isb"),
+                "pliron->cranelift: unsupported inline asm {t:?}"
+            );
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
             let r = self
                 .ty_leaves(self.res_ty(op))
@@ -3933,7 +4110,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if ft == clt::F16 {
             // compiler-builtins doesn't ship `__fix*hf*`; f16->f32 is exact,
             // so extending first preserves the saturating result.
-            let x = self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0];
+            let x = self.h2f(x);
             return self.fcvt_sat(signed, t, x);
         }
         if t == clt::I128 || ft == clt::F128 {
@@ -4574,6 +4751,287 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.switch_to_block(done);
     }
 
+    /// bf16 (carried as f16 bits) is the top half of an f32.
+    fn bf16_to_f32(&mut self, x: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new();
+        let h = self.b.ins().bitcast(clt::I16, mf, x);
+        let w = self.b.ins().uextend(clt::I32, h);
+        let w = self.b.ins().ishl_imm_u(w, 16);
+        self.b.ins().bitcast(clt::F32, mf, w)
+    }
+
+    /// `i16x8` bf16 leaves <-> `f32x4` leaves (two per bf16 leaf, low lanes first).
+    fn vcast_bf16(&mut self, ext: bool, xs: &[ir::Value]) -> Vals {
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let mut out = Vals::new();
+        if ext {
+            for &x in xs {
+                for hi in [false, true] {
+                    let w = if hi { self.b.ins().uwiden_high(x) } else { self.b.ins().uwiden_low(x) };
+                    let w = self.b.ins().ishl_imm_u(w, 16);
+                    out.push(self.b.ins().bitcast(clt::F32X4, mf, w));
+                }
+            }
+        } else {
+            for p in xs.chunks(2) {
+                let lo = self.f32x4_to_bf16_bits(p[0]);
+                let hi = self.f32x4_to_bf16_bits(p[1]);
+                out.push(self.b.ins().unarrow(lo, hi));
+            }
+        }
+        out
+    }
+
+    /// `f32_to_bf16` on four lanes, leaving each result in the low half of an i32.
+    fn f32x4_to_bf16_bits(&mut self, f: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let mut k = |b: &mut Self, c: i64| {
+            let c = b.b.ins().iconst(clt::I32, c);
+            b.b.ins().splat(clt::I32X4, c)
+        };
+        let (one, half, quiet) = (k(self, 1), k(self, 0x7fff), k(self, 0x40));
+        let w = self.b.ins().bitcast(clt::I32X4, mf, f);
+        let hi = self.b.ins().ushr_imm_u(w, 16);
+        let odd = self.b.ins().band(hi, one);
+        let r = self.b.ins().iadd(w, half);
+        let r = self.b.ins().iadd(r, odd);
+        let r = self.b.ins().ushr_imm_u(r, 16);
+        let nan = self.b.ins().fcmp(FloatCC::Unordered, f, f);
+        let q = self.b.ins().bor(hi, quiet);
+        self.b.ins().bitselect(nan, q, r)
+    }
+
+    /// Reinterpret a lane between same-width int/float types (bf16 lanes of
+    /// `i16x8` leaves are F16 scalars).
+    fn as_lane(&mut self, x: ir::Value, want: ClType) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        if t != want && t.bits() == want.bits() { self.bitcast_to(want, x) } else { x }
+    }
+
+    /// f32 -> bf16, round-to-nearest-even; NaN stays a quiet NaN.
+    fn f32_to_bf16(&mut self, f: ir::Value) -> ir::Value {
+        let mf = MemFlagsData::new();
+        let w = self.b.ins().bitcast(clt::I32, mf, f);
+        let hi = self.b.ins().ushr_imm_u(w, 16);
+        let odd = self.b.ins().band_imm_u(hi, 1);
+        let r = self.b.ins().iadd_imm_u(w, 0x7fff);
+        let r = self.b.ins().iadd(r, odd);
+        let r = self.b.ins().ushr_imm_u(r, 16);
+        let nan = self.b.ins().fcmp(FloatCC::Unordered, f, f);
+        let q = self.b.ins().bor_imm_u(hi, 0x40);
+        let r = self.b.ins().select(nan, q, r);
+        let h = self.b.ins().ireduce(clt::I16, r);
+        self.b.ins().bitcast(clt::F16, mf, h)
+    }
+
+    /// f16 -> f32: F16C `vcvtph2ps` when the host enables it, else compiler-builtins.
+    fn h2f(&mut self, x: ir::Value) -> ir::Value {
+        if crate::types::F16C.load(std::sync::atomic::Ordering::Relaxed) {
+            self.b.ins().fpromote(clt::F32, x)
+        } else {
+            self.libcall("__extendhfsf2", &[clt::F16], &[clt::F32], &[x])[0]
+        }
+    }
+
+    /// f32 -> f16 (round to nearest even), F16C `vcvtps2ph` when enabled.
+    fn f2h(&mut self, x: ir::Value) -> ir::Value {
+        if crate::types::F16C.load(std::sync::atomic::Ordering::Relaxed) {
+            self.b.ins().fdemote(clt::F16, x)
+        } else {
+            self.libcall("__truncsfhf2", &[clt::F32], &[clt::F16], &[x])[0]
+        }
+    }
+
+    /// Float binop by name; f16 widens to f32 like `float_binop!`.
+    fn fbin(&mut self, k: &str, x: ir::Value, y: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let h = t == clt::F16;
+        let (x, y) = if h {
+            let x = self.h2f(x);
+            let y = self.h2f(y);
+            (x, y)
+        } else {
+            (x, y)
+        };
+        let i = self.b.ins();
+        let r = match k {
+            "fadd" => i.fadd(x, y),
+            "fsub" => i.fsub(x, y),
+            "fmul" => i.fmul(x, y),
+            "fmax" => i.fmax(x, y),
+            _ => i.fmin(x, y),
+        };
+        if h {
+            self.f2h(r)
+        } else {
+            r
+        }
+    }
+
+    /// Every scalar lane of `v`, across its leaves.
+    fn lanes_of(&mut self, v: Value) -> Vec<ir::Value> {
+        let mut out = Vec::new();
+        let et = match classify(self.ctx, v.get_type(self.ctx)) {
+            TyK::Vector(e, _) => self.ty_leaves(e).first().map(|x| x.1),
+            _ => None,
+        };
+        for x in self.get(v) {
+            let t = self.b.func.dfg.value_type(x);
+            if t.is_vector() {
+                for i in 0..t.lane_count() {
+                    let l = self.b.ins().extractlane(x, i as u8);
+                    out.push(et.map_or(l, |et| self.as_lane(l, et)));
+                }
+            } else {
+                out.push(x);
+            }
+        }
+        out
+    }
+
+    /// `llvm.vector.reduce.<k>`: sequential fold (the ordered form for fadd/fmul).
+    fn vec_reduce(&mut self, op: Ptr<Operation>, k: &str, opnds: &[Value]) {
+        let ordered = matches!(k, "fadd" | "fmul");
+        let vt = opnds[ordered as usize].get_type(self.ctx);
+        let bf = vt
+            .deref(self.ctx)
+            .downcast_ref::<pliron_llvm::types::VectorType>()
+            .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>());
+        let mut acc = ordered.then(|| self.get1(opnds[0]));
+        let mut lanes = self.lanes_of(opnds[ordered as usize]);
+        if bf {
+            // Reduce in f32, round once.
+            acc = acc.map(|a| self.bf16_to_f32(a));
+            lanes = lanes.into_iter().map(|x| self.bf16_to_f32(x)).collect();
+        }
+        for x in lanes {
+            let Some(a) = acc else {
+                acc = Some(x);
+                continue;
+            };
+            let i = self.b.ins();
+            acc = Some(match k {
+                "add" => i.iadd(a, x),
+                "mul" => i.imul(a, x),
+                "and" => i.band(a, x),
+                "or" => i.bor(a, x),
+                "xor" => i.bxor(a, x),
+                "smax" => i.smax(a, x),
+                "smin" => i.smin(a, x),
+                "umax" => i.umax(a, x),
+                "umin" => i.umin(a, x),
+                "fadd" | "fmul" | "fmax" | "fmin" => {
+                    acc = Some(self.fbin(k, a, x));
+                    continue;
+                }
+                _ => panic!("pliron->cranelift: unsupported intrinsic llvm.vector.reduce.{k}"),
+            });
+        }
+        let r = acc.expect("llvm.vector.reduce of an empty vector");
+        let r = if bf { self.f32_to_bf16(r) } else { r };
+        self.set1(op, r);
+    }
+
+    /// `llvm.is.fpclass(x, mask)` on the IEEE bit pattern; mask bits are
+    /// snan, qnan, -inf, -normal, -subnormal, -0, +0, +subnormal, +normal, +inf.
+    fn is_fpclass(&mut self, x: ir::Value, m: u32) -> ir::Value {
+        let t = self.b.func.dfg.value_type(x);
+        let mb: u32 = match t {
+            clt::F16 => 10,
+            clt::F32 => 23,
+            clt::F64 => 52,
+            _ => panic!("pliron->cranelift: llvm.is.fpclass on {t}"),
+        };
+        let it = ClType::int(t.bits() as u16).unwrap();
+        let w = t.bits();
+        let bits = self.b.ins().bitcast(it, MemFlagsData::new(), x);
+        let absm = (1u128 << (w - 1)) - 1;
+        let inf = ((1u128 << (w - 1 - mb)) - 1) << mb;
+        let quiet = 1u128 << (mb - 1);
+        let minnorm = 1u128 << mb;
+        let c = |s: &mut Self, v: u128| s.iconst_any(it, v);
+        let am = c(self, absm);
+        let abs = self.b.ins().band(bits, am);
+        let (ci, cq, cm, z) = (c(self, inf), c(self, inf | quiet), c(self, minnorm), c(self, 0));
+        let ins = |s: &mut Self, cc, a, b| s.b.ins().icmp(cc, a, b);
+        let nan = ins(self, IntCC::UnsignedGreaterThan, abs, ci);
+        let notq = ins(self, IntCC::UnsignedLessThan, abs, cq);
+        let snan = self.b.ins().band(nan, notq);
+        let qnan = ins(self, IntCC::UnsignedGreaterThanOrEqual, abs, cq);
+        let isinf = ins(self, IntCC::Equal, abs, ci);
+        let zero = ins(self, IntCC::Equal, abs, z);
+        let nz = ins(self, IntCC::NotEqual, abs, z);
+        let lt_min = ins(self, IntCC::UnsignedLessThan, abs, cm);
+        let sub = self.b.ins().band(nz, lt_min);
+        let ge_min = ins(self, IntCC::UnsignedGreaterThanOrEqual, abs, cm);
+        let lt_inf = ins(self, IntCC::UnsignedLessThan, abs, ci);
+        let norm = self.b.ins().band(ge_min, lt_inf);
+        let neg = ins(self, IntCC::SignedLessThan, bits, z);
+        let pos = ins(self, IntCC::SignedGreaterThanOrEqual, bits, z);
+        let classes = [
+            (snan, None),
+            (qnan, None),
+            (isinf, Some(neg)),
+            (norm, Some(neg)),
+            (sub, Some(neg)),
+            (zero, Some(neg)),
+            (zero, Some(pos)),
+            (sub, Some(pos)),
+            (norm, Some(pos)),
+            (isinf, Some(pos)),
+        ];
+        let mut r = self.b.ins().iconst(clt::I8, 0);
+        for (bit, (cls, sign)) in classes.into_iter().enumerate() {
+            if m & (1 << bit) == 0 {
+                continue;
+            }
+            let v = match sign {
+                Some(sg) => self.b.ins().band(cls, sg),
+                None => cls,
+            };
+            r = self.b.ins().bor(r, v);
+        }
+        r
+    }
+
+    /// Float `atomicrmw` via the same-width integer: xchg directly, the
+    /// arithmetic kinds as a load + compare-and-swap retry loop.
+    fn float_rmw(
+        &mut self,
+        k: pliron_llvm::attributes::AtomicRmwKindAttr,
+        p: ir::Value,
+        v: ir::Value,
+    ) -> ir::Value {
+        use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
+        let t = self.b.func.dfg.value_type(v);
+        let it = ClType::int(t.bits() as u16).unwrap();
+        let (mf, tr) = (MemFlagsData::new(), MemFlagsData::trusted());
+        if matches!(k, KA::Xchg) {
+            let vi = self.b.ins().bitcast(it, mf, v);
+            let r = self.b.ins().atomic_rmw(it, tr, ir::AtomicRmwOp::Xchg, p, vi);
+            return self.b.ins().bitcast(t, mf, r);
+        }
+        let retry = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().jump(retry, &[]);
+        self.b.switch_to_block(retry);
+        let old = self.b.ins().atomic_load(it, tr, p);
+        let of = self.b.ins().bitcast(t, mf, old);
+        let nf = match k {
+            KA::FAdd => self.fbin("fadd", of, v),
+            KA::FSub => self.fbin("fsub", of, v),
+            KA::FMax => self.fbin("fmax", of, v),
+            KA::FMin => self.fbin("fmin", of, v),
+            k => panic!("pliron->cranelift: atomicrmw {k:?} on {t}"),
+        };
+        let ni = self.b.ins().bitcast(it, mf, nf);
+        let got = self.b.ins().atomic_cas(tr, p, old, ni);
+        let ok = self.b.ins().icmp(IntCC::Equal, got, old);
+        self.b.ins().brif(ok, done, &[], retry, &[]);
+        self.b.switch_to_block(done);
+        of
+    }
+
     fn lower_intrinsic(&mut self, op: Ptr<Operation>, opnds: &[Value]) {
         let name = self.st.intrinsics[&op].as_str();
         if name.starts_with("pliron.v") {
@@ -4585,6 +5043,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if k > 1 {
                 return self.split_vec_op(op, name, opnds, k);
             }
+        }
+        if let Some(k) = name.strip_prefix("llvm.vector.reduce.") {
+            return self.vec_reduce(op, k, opnds);
+        }
+        if name == "llvm.is.fpclass" {
+            let x = self.get1(opnds[0]);
+            let m = self.const_int(opnds[1]).expect("llvm.is.fpclass: non-constant mask");
+            let r = self.is_fpclass(x, m as u32);
+            return self.set1(op, r);
         }
         if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
             // Not code — a storage-liveness marker. Record where it lands:
@@ -4600,6 +5067,29 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .push((opnds[1], anchor, b, name == "llvm.lifetime.start"));
             }
             return;
+        }
+        if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name) {
+            let ls: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
+            if ls[0].iter().all(|x| self.b.func.dfg.value_type(*x).bits() >= 128) {
+                let r: Vals = (0..ls[0].len())
+                    .map(|j| {
+                        let x: Vec<_> = ls.iter().map(|l| l[j]).collect();
+                        let i = self.b.ins();
+                        match name {
+                            "llvm.fma" | "llvm.fmuladd" => i.fma(x[0], x[1], x[2]),
+                            "llvm.sqrt" => i.sqrt(x[0]),
+                            "llvm.fabs" => i.fabs(x[0]),
+                            "llvm.floor" => i.floor(x[0]),
+                            "llvm.ceil" => i.ceil(x[0]),
+                            "llvm.trunc" => i.trunc(x[0]),
+                            "llvm.roundeven" => i.nearest(x[0]),
+                            "llvm.minimum" => i.fmin(x[0], x[1]),
+                            _ => i.fmax(x[0], x[1]),
+                        }
+                    })
+                    .collect();
+                return self.set(op, r);
+            }
         }
         let a: Vec<ir::Value> = opnds.iter().map(|v| self.get1(*v)).collect();
         let r = match name {
@@ -4830,9 +5320,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
             n @ ("llvm.sqrt" | "llvm.floor" | "llvm.ceil" | "llvm.trunc" | "llvm.roundeven"
             | "llvm.fma" | "llvm.fmuladd" | "llvm.minimum" | "llvm.maximum") => {
                 let t = self.b.func.dfg.value_type(a[0]);
-                if t == clt::F16 || t == clt::F128 {
+                let h = t == clt::F16;
+                let a: Vec<_> = if h {
+                    // f16 widens to f32: exact for these (sqrt/rounding are
+                    // innocuous under double rounding at 11 -> 24 bits).
+                    a.iter()
+                        .map(|&x| self.h2f(x))
+                        .collect()
+                } else {
+                    a.to_vec()
+                };
+                let r = if t == clt::F128 {
                     // No Cranelift lowering; compiler-builtins' libm port
-                    // exports e.g. sqrtf16 / fmaf128.
+                    // exports e.g. fmaf128.
                     let base = match n {
                         "llvm.sqrt" => "sqrt",
                         "llvm.floor" => "floor",
@@ -4843,7 +5343,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.maximum" => "fmaximum",
                         _ => "fma",
                     };
-                    let f = format!("{base}f{}", if t == clt::F16 { "16" } else { "128" });
+                    let f = format!("{base}f128");
                     let ps = vec![t; a.len()];
                     self.libcall(&f, &ps, &[t], &a)[0]
                 } else {
@@ -4857,6 +5357,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         "llvm.maximum" => self.b.ins().fmax(a[0], a[1]),
                         _ => self.b.ins().fma(a[0], a[1], a[2]),
                     }
+                };
+                if h {
+                    self.f2h(r)
+                } else {
+                    r
                 }
             }
             n if matches!(
@@ -4870,11 +5375,36 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     | "llvm.log2"
                     | "llvm.log10"
                     | "llvm.pow"
+                    | "llvm.tan"
+                    | "llvm.sinh"
+                    | "llvm.cosh"
+                    | "llvm.tanh"
+                    | "llvm.asin"
+                    | "llvm.acos"
+                    | "llvm.atan"
+                    | "llvm.atan2"
+                    | "llvm.minnum"
+                    | "llvm.maxnum"
             ) =>
             {
                 // No Cranelift instruction: call libm, like cg_llvm does on x86.
                 let t = self.b.func.dfg.value_type(a[0]);
-                let base = &n["llvm.".len()..];
+                let base = match &n["llvm.".len()..] {
+                    "minnum" => "fmin",
+                    "maxnum" => "fmax",
+                    b => b,
+                };
+                if t == clt::F16 && n != "llvm.round" {
+                    // No f16 libm on most hosts: widen, call the f32 form, narrow.
+                    let w: Vec<_> = a
+                        .iter()
+                        .map(|&x| self.h2f(x))
+                        .collect();
+                    let ps = vec![clt::F32; w.len()];
+                    let m = self.libcall(&format!("{base}f"), &ps, &[clt::F32], &w)[0];
+                    let r = self.f2h(m);
+                    return self.set1(op, r);
+                }
                 let f = match t {
                     clt::F32 => format!("{base}f"),
                     clt::F64 => base.to_string(),
@@ -4885,6 +5415,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 };
                 let ps = vec![t; a.len()];
                 self.libcall(&f, &ps, &[t], &a)[0]
+            }
+            "llvm.abs" => {
+                let x = self.get1(opnds[0]);
+                self.b.ins().iabs(x)
+            }
+            "llvm.umax" | "llvm.umin" | "llvm.smax" | "llvm.smin" => {
+                let (x, y) = (self.get1(opnds[0]), self.get1(opnds[1]));
+                match name {
+                    "llvm.umax" => self.b.ins().umax(x, y),
+                    "llvm.umin" => self.b.ins().umin(x, y),
+                    "llvm.smax" => self.b.ins().smax(x, y),
+                    _ => self.b.ins().smin(x, y),
+                }
             }
             "pliron.eh.rethrow" if self.eh_data.is_some() => {
                 // Emulated rethrow (`cleanup_ret` with no unwind dest):
@@ -4975,7 +5518,7 @@ fn reaches(ctx: &Context, from: Ptr<BasicBlock>, to: Ptr<BasicBlock>) -> bool {
     false
 }
 
-pub(crate) fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
+pub fn rpo(ctx: &Context, st: &State, blocks: &[Ptr<BasicBlock>]) -> Vec<Ptr<BasicBlock>> {
     rpo_split(ctx, st, blocks).0
 }
 

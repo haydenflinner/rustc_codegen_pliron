@@ -26,11 +26,7 @@ mod asm;
 mod builder;
 mod consts;
 mod context;
-mod eh;
-mod hot;
 mod intrinsic;
-mod lower;
-mod objmerge;
 mod simd;
 mod type_of;
 mod types;
@@ -40,6 +36,7 @@ mod xcgu;
 // CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
+pub use pliron_clif_lower::{eh, hot, lower, obj_sym, objmerge};
 pub use pliron_ir_opt::{
     address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine,
     memcpyopt, nnret, nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
@@ -293,11 +290,12 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
             ("fp16", "has_fp16"),
             ("bti", "use_bti"),
         ],
-        // The VEX families (avx/avx2/fma/avx512*) are deliberately not
-        // mapped: this Cranelift has no ymm register class, so the flags
-        // only buy VEX-128 encodings — which translate ~2x slower than
-        // legacy SSE under Rosetta, and on real hardware offer only the
-        // 3-operand form. `PLIRON_X64_VEX=1` opts back in for real-HW runs.
+        // The VEX families (avx/avx2/fma/avx512*) are mapped by default on
+        // real hardware: they unlock the 3-operand encodings and, under
+        // AVX2/AVX512F, the wide-vector lowerings (loopvec probes the
+        // resulting ISA flags per function; `WIDE_VECTOR_BITS` tracks the
+        // ceiling). `PLIRON_X64_VEX=0` opts out — e.g. under Rosetta, where
+        // VEX-128 encodings translate ~2x slower than legacy SSE.
         // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
@@ -318,15 +316,17 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
                 .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
         }
     }
-    // Opt-in VEX encodings on x64 (see the comment on the flag table above).
+    // VEX encodings on x64, default-on (see the comment on the flag table
+    // above); PLIRON_X64_VEX=0 opts out.
     if triple.architecture == target_lexicon::Architecture::X86_64
-        && crate::env_is("PLIRON_X64_VEX", "1")
+        && !crate::env_is("PLIRON_X64_VEX", "0")
     {
         for &(rust, flag) in &[
             ("avx", "has_avx"),
             ("avx2", "has_avx2"),
             ("fma", "has_fma"),
             ("avx512f", "has_avx512f"),
+            ("avx512bw", "has_avx512bw"),
             ("avx512vl", "has_avx512vl"),
             ("avx512dq", "has_avx512dq"),
             ("avx512bitalg", "has_avx512bitalg"),
@@ -339,15 +339,62 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
                     .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
             }
         }
+        // The wide-vector ceiling follows the enabled VEX level: loopvec
+        // emits 256-bit lanes under AVX2 and 512 under AVX512F (its own
+        // per-loop caps still apply). 128 leaves the register file xmm-only.
+        let wide = if tf("avx512f") {
+            512
+        } else if tf("avx2") {
+            256
+        } else {
+            128
+        };
+        // The vendored static only exists with the `x86` codegen feature —
+        // `host-arch` gives it on x86 hosts (the only hosts x64 targets
+        // build on today; all-arch cross would need a different gate).
+        #[cfg(target_arch = "x86_64")]
+        cranelift_codegen::isa::x64::WIDE_VECTOR_BITS
+            .store(wide, std::sync::atomic::Ordering::Relaxed);
+        // Mirror for the noarch opt crate, which can't see the `x86`-
+        // feature-gated static (pipeline.rs `x64_wide_bits`).
+        pliron_clif_opt::pipeline::X64_WIDE_VECTOR_BITS
+            .store(wide, std::sync::atomic::Ordering::Relaxed);
     }
     isa.finish(flags)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
 }
 
-/// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
-/// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
-pub(crate) fn obj_sym(n: &str) -> &str {
-    n.strip_prefix('\u{1}').unwrap_or(n)
+/// [`lower::Host`] over rustc's session: self-profile activities,
+/// diagnostics, and target features.
+pub(crate) struct RustcHost<'a> {
+    sess: &'a Session,
+    prof: RustcProf<'a>,
+}
+
+/// `Session` is not `Sync`; worker threads only see the profiler.
+pub(crate) struct RustcProf<'a>(&'a SelfProfilerRef);
+
+impl lower::Prof for RustcProf<'_> {
+    fn activity(&self, nm: &'static str, arg: Option<&str>) -> Box<dyn Send + '_> {
+        match arg {
+            Some(a) => Box::new(self.0.generic_activity_with_arg(nm, a)),
+            None => Box::new(self.0.generic_activity(nm)),
+        }
+    }
+}
+
+impl lower::Host for RustcHost<'_> {
+    fn prof(&self) -> &dyn lower::Prof {
+        &self.prof
+    }
+    fn fatal(&self, msg: String) -> ! {
+        self.sess.dcx().fatal(msg)
+    }
+    fn sse42(&self) -> bool {
+        self.sess
+            .internal_target_features
+            .contains(&Symbol::intern("sse4.2"))
+    }
 }
 
 /// Install the tracing subscriber when `PLIRON_TRACE` is set. The env var
@@ -632,22 +679,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 pt!(cx, "domcheck:cg2", domcheck::run(ctx, st, "callgvn2"));
             }
         }
-        st.notrap = pass_enabled("PLIRON_NOTRAP");
-        st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
-        st.loadfwd = pass_enabled("PLIRON_LOADFWD");
-        st.slot_dse = pass_enabled("PLIRON_SLOT_DSE");
-        st.dse = pass_enabled("PLIRON_DSE");
-        st.peep = pass_enabled("PLIRON_PEEP");
-        st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
-        st.unreach = pass_enabled("PLIRON_UNREACH");
-        st.taildup = pass_enabled("PLIRON_TAILDUP");
-        st.licm = pass_enabled("PLIRON_LICM");
-        st.indvars = pass_enabled("PLIRON_INDUCT");
-        st.loopidiom = pass_enabled("PLIRON_IDIOM");
-        st.loopvec = pass_enabled("PLIRON_VEC");
-        st.slp = pass_enabled("PLIRON_SLP");
-        st.bcheck = pass_enabled("PLIRON_BCHECK");
-        st.tailrec = pass_enabled("PLIRON_TAILREC");
+        pliron_clif_lower::scan::pass_flags(st);
         if pass_enabled("PLIRON_DEADFN") {
             inline::dead_fns(ctx, st);
         }
@@ -697,7 +729,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         &cx.st.borrow(),
         isa,
         name,
-        cx.tcx.sess,
+        &RustcHost {
+            sess: cx.tcx.sess,
+            prof: RustcProf(&cx.tcx.sess.prof),
+        },
     );
     let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
     PlironModule { obj, ir, asm }

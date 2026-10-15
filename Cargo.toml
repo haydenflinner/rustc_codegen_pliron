@@ -22,6 +22,7 @@ smallvec = "1"
 egg = "0.10"
 waffle = "0.3.2"
 pliron-clif-opt = { path = "pliron-clif-opt" }
+pliron-clif-lower = { path = "pliron-clif-lower" }
 pliron-ir-opt = { path = "pliron-ir-opt" }
 pliron-cfg = { path = "pliron-cfg" }
 rustc-hash = "2"
@@ -29,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]
-members = ["pliron-clif-opt", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "bench"]
+members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "bench"]
 exclude = ["vendor"]
 
 [profile.dev]
@@ -71,3 +72,6 @@ cranelift-assembler-x64-meta = { path = "vendor/cranelift-assembler-x64-meta" }
 # `x86_psadbw` arm for the exhaustive opcode match; see
 # vendor/cranelift-interpreter/PLIRON_PATCH.md.
 cranelift-interpreter = { path = "vendor/cranelift-interpreter" }
+# `Scatter` instruction-format arm for the `vscatter` CLIF op; see
+# vendor/cranelift-reader/PLIRON_PATCH.md.
+cranelift-reader = { path = "vendor/cranelift-reader" }

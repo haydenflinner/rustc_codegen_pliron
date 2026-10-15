@@ -169,7 +169,7 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
         }
         TyK::Vector(e, n) => {
             if let Some((t, k)) = vec_parts(ctx, e, n as u64) {
-                return out.extend((0..k).map(|i| (base + i * 16, t)));
+                return out.extend((0..k).map(|i| (base + i * t.bytes() as u64, t)));
             }
             let (s, _) = size_align(ctx, e);
             for i in 0..n as u64 {
@@ -193,6 +193,14 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
         return None;
     }
+    // CubeCL: 128-bit bf16 vectors are `i16x8` bit patterns; the lowerer
+    // converts them to/from f32x4 with SIMD shifts.
+    if n == 8
+        && e.deref(ctx).is::<BF16Type>()
+        && WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Some(clt::I16X8);
+    }
     let lane = match classify(ctx, e) {
         TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,
         TyK::F32 => clt::F32,
@@ -205,11 +213,78 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     lane.by(n as u32)
 }
 
+/// Also split vectors wider than 256 bits into 128-bit parts (CubeCL lines
+/// reach 128 lanes). Off for rustc, whose SIMD lowering assumes <= 2 parts.
+pub static WIDE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// CubeCL: widest `f32` vector leaf (256 = ymm, 512 = zmm); 0 disables.
+/// Host has AVX512-FP16: packed f16 arithmetic stays in f16 (no f32 twin).
+pub static NATIVE_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Scalar f16<->f32 casts as F16C `vcvtph2ps`/`vcvtps2ph` instead of libcalls (host opt-in).
+pub static F16C: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Wide bf16 vectors as packed 16-bit leaves converted with AVX512-BF16 (host opt-in).
+pub static NATIVE_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub static WIDE_F32_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+thread_local! {
+    static WIDE_F32: std::cell::RefCell<std::collections::HashSet<(TypeHandle, u64)>> =
+        Default::default();
+}
+
+/// `<n x f32>` types (element, count) whose leaves are ymm/zmm vectors; the
+/// caller guarantees every op on them has a wide Cranelift lowering.
+pub fn set_wide_f32(types: std::collections::HashSet<(TypeHandle, u64)>) {
+    WIDE_F32.with(|w| *w.borrow_mut() = types);
+}
+
+/// Whether `<n x e>` could use wide leaves (before eligibility is known).
+pub fn wide_f32_candidate(ctx: &Context, e: TypeHandle, n: u64) -> bool {
+    let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    bits >= 256 && matches!(classify(ctx, e), TyK::F32) && (n * 32) % 256 == 0
+}
+
+fn wide_f32_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    let bits = WIDE_F32_BITS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    if bits < 256 || !WIDE_F32.with(|w| w.borrow().contains(&(e, n))) {
+        return None;
+    }
+    if bits >= 512
+        && NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed)
+        && e.deref(ctx).is::<FP16Type>()
+        && n % 32 == 0
+    {
+        // Native FP16: full zmm of half lanes; casts split into two f32x16.
+        return Some((clt::F16X32, n / 32));
+    }
+    [512u64, 256]
+        .into_iter()
+        .find(|&w| w <= bits && (n * 32) % w == 0)
+        .and_then(|w| {
+            // Packed f16 twin of a wide f32 vector: half-width leaves, same count.
+            let half = e.deref(ctx).is::<FP16Type>() || e.deref(ctx).is::<pliron::builtin::types::BF16Type>();
+            let lane = if half { clt::F16 } else { clt::F32 };
+            Some((lane.by((w / 32) as u32)?, n * 32 / w))
+        })
+}
+
 /// Native SIMD parts of a vector: one 128-bit value, or two halves for 256-bit
 /// (Cranelift x64 has no 256-bit vectors; memchr's AVX2 path uses them).
 pub fn vec_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)> {
+    if let Some(p) = wide_f32_parts(ctx, e, n) {
+        return Some(p);
+    }
     if let Some(t) = native_vec(ctx, e, n) {
         return Some((t, 1));
+    }
+    if WIDE_SIMD.load(std::sync::atomic::Ordering::Relaxed) {
+        for k in [4u64, 8, 16, 32, 64, 128] {
+            if n % k == 0 {
+                if let Some(t) = native_vec(ctx, e, n / k).filter(|t| t.bits() == 128) {
+                    return Some((t, k));
+                }
+            }
+        }
     }
     (n % 2 == 0)
         .then(|| native_vec(ctx, e, n / 2))?

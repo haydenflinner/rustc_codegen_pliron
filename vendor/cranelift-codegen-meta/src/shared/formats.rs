@@ -39,6 +39,10 @@ pub(crate) struct Formats {
     pub(crate) unary_ieee64: Rc<InstructionFormat>,
     pub(crate) unary_imm: Rc<InstructionFormat>,
     pub(crate) exception_handler_address: Rc<InstructionFormat>,
+    // PLIRON: scatter stores `N` lanes at `p + idx[i]*E + offset`
+    // (memflags, data, base, index-vector, offset). `vgather` reuses
+    // `formats.store` (same field structure).
+    pub(crate) scatter: Rc<InstructionFormat>,
 }
 
 impl Formats {
@@ -168,6 +172,14 @@ impl Formats {
 
             store: Builder::new("Store")
                 .imm(&imm.memflags)
+                .value()
+                .value()
+                .imm(&imm.offset32)
+                .build(),
+
+            scatter: Builder::new("Scatter")
+                .imm(&imm.memflags)
+                .value()
                 .value()
                 .value()
                 .imm(&imm.offset32)

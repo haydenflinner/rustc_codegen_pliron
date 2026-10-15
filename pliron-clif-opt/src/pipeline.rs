@@ -21,6 +21,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::config::{bisect, bisect_count, config, env_set, reads_begin, reads_take, trace};
 use crate::*;
 
+/// Widest x64 vector register class the backend may use (128/256/512).
+/// Mirrors the vendored `isa::x64::WIDE_VECTOR_BITS` — that static lives
+/// behind cranelift's `x86` feature, which this noarch crate doesn't
+/// build. The backend stores the same value into both (src/lib.rs).
+pub static X64_WIDE_VECTOR_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(128);
+
+pub fn x64_wide_bits() -> u32 {
+    X64_WIDE_VECTOR_BITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-CGU pass categories, mirroring the `State::*` flags in the
 /// rustc-coupled crate (set from `PLIRON_*` env at CGU start, forced off
 /// at `-O0`). Steps gate on these to preserve that behavior.
@@ -1297,6 +1308,31 @@ fn s_divconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Per-function wide-vector probing off the ISA flags: 256-bit lanes
+    // under AVX2, 512 under AVX512F — capped by the codegen-wide
+    // `wide_vector_bits` ceiling. loopvec drops a loop back to 128
+    // whenever its ops lack wide lowerings.
+    let wc = {
+        let isa_flag = |n: &str| {
+            p.isa
+                .isa_flags()
+                .iter()
+                .find(|f| f.name == n)
+                .map_or(false, |v| v.as_bool().unwrap_or(false))
+        };
+        let vb = if isa_flag("has_avx512f") {
+            512
+        } else if isa_flag("has_avx2") {
+            256
+        } else {
+            128
+        };
+        loopvec::WideCaps {
+            vbits: if p.x64 { vb.min(x64_wide_bits()) } else { 128 },
+            fma: isa_flag("has_fma"),
+            avx512bw: isa_flag("has_avx512bw"),
+        }
+    };
     let k = loopvec::run(
         &mut p.clctx.func,
         an,
@@ -1307,6 +1343,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.x64,
         p.cmp64,
         p.prof,
+        wc,
     );
     // loopvec emits `base + iv*esize` addressing fresh each iteration;
     // a second indvars round turns them into stepped pointers.
@@ -1771,7 +1808,11 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = indvars::postinc(&mut p.clctx.func, an, 1024);
+    let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
+    if k > 0 {
+        an.invalidate();
+    }
+    k += indvars::postinc_ne(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("postinc");
     }

@@ -519,6 +519,17 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
             "{} {}, {}{}",
             dfg.mem_flags[flags], args[0], args[1], offset
         ),
+        // PLIRON: `vscatter flags x, p, idx+off`
+        Scatter {
+            flags,
+            args,
+            offset,
+            ..
+        } => write!(
+            w,
+            "{} {}, {}, {}{}",
+            dfg.mem_flags[flags], args[0], args[1], args[2], offset
+        ),
         Trap { code, .. } => write!(w, " {code}"),
         CondTrap { arg, code, .. } => write!(w, " {arg}, {code}"),
         ExceptionHandlerAddress { block, imm, .. } => write!(w, " {block}, {imm}"),

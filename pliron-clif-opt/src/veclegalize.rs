@@ -181,6 +181,20 @@ fn vt_of(pos: &FuncCursor, v: Value) -> Type {
 
 /// Scalarize every inst touching vector type `target`. Returns the
 /// number rewritten.
+/// Replace `inst`'s single result with `v`. Scalar ints keep the old
+/// `iadd_imm v, 0` copy; float lanes (f32x2 extractlane) can't take an
+/// integer add, so they alias directly.
+fn copy_to(pos: &mut FuncCursor, inst: ir::Inst, v: ir::Value) {
+    if pos.func.dfg.value_type(v).is_int() {
+        pos.func.replace(inst).iadd_imm(v, 0);
+        return;
+    }
+    let r = pos.func.dfg.first_result(inst);
+    pos.func.layout.remove_inst(inst);
+    pos.func.dfg.clear_results(inst);
+    pos.func.dfg.change_to_alias(r, v);
+}
+
 pub fn run(func: &mut ir::Function, target: Type) -> usize {
     let mut jobs = Vec::new();
     for block in func.layout.blocks() {
@@ -250,7 +264,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
         match op {
             Opcode::Extractlane => {
                 let out = get_lane(&mut pos, args[0], target, lane, target);
-                pos.func.replace(inst).iadd_imm(out, 0);
+                copy_to(&mut pos, inst, out);
             }
             Opcode::Insertlane => {
                 let v = pos.ins().bitcast(it, le, args[0]);
@@ -313,7 +327,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
             Opcode::VanyTrue => {
                 let v = pos.ins().bitcast(it, le, args[0]);
                 let c = pos.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, v, 0);
-                pos.func.replace(inst).iadd_imm(c, 0);
+                copy_to(&mut pos, inst, c);
             }
             Opcode::VallTrue => {
                 let v = pos.ins().bitcast(it, le, args[0]);
@@ -331,7 +345,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                         Some(a) => pos.ins().band(a, c),
                     });
                 }
-                pos.func.replace(inst).iadd_imm(acc.unwrap(), 0);
+                copy_to(&mut pos, inst, acc.unwrap());
             }
             Opcode::VhighBits => {
                 // result: bitmask of lane sign bits (scalar int).
@@ -351,7 +365,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 }
                 let rt = res_ts[0];
                 let r = if rt.bits() < 64 { pos.ins().ireduce(rt, acc) } else { acc };
-                pos.func.replace(inst).iadd_imm(r, 0);
+                copy_to(&mut pos, inst, r);
             }
             _ if bitwise_ok(op) => {
                 let iargs: Vec<Value> = args
@@ -385,7 +399,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 if out_t == target || out_t.is_vector() {
                     emit_vec_result(&mut pos, inst, ss, r, out_t);
                 } else {
-                    pos.func.replace(inst).iadd_imm(r, 0);
+                    copy_to(&mut pos, inst, r);
                 }
             }
             _ => {
@@ -418,7 +432,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                     if res_ts.is_empty() {
                         pos.func.layout.remove_inst(inst);
                     } else {
-                        pos.func.replace(inst).iadd_imm(outs[0], 0);
+                        copy_to(&mut pos, inst, outs[0]);
                     }
                     continue;
                 }
@@ -450,7 +464,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                     for (i, s) in outs.into_iter().enumerate() {
                         v = pos.ins().insertlane(v, s, i as u8);
                     }
-                    pos.func.replace(inst).iadd_imm(v, 0);
+                    copy_to(&mut pos, inst, v);
                 }
             }
         }

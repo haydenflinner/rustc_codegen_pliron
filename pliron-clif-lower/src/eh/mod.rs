@@ -8,7 +8,7 @@ use cranelift_codegen::ir::{AbiParam, Endianness, Signature, types};
 use cranelift_codegen::isa::unwind::UnwindInfo;
 use cranelift_codegen::{CompiledCode, FinalizedMachExceptionHandler};
 use cranelift_module::{DataDescription, DataId, FuncId, FuncOrDataId, Linkage, Module};
-use cranelift_object::{ObjectModule, ObjectProduct};
+use cranelift_object::ObjectProduct;
 use gcc_except_table::*;
 use gimli::write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result, Writer};
 use gimli::{Encoding, Format, RunTimeEndian, SectionId};
@@ -51,7 +51,7 @@ pub struct UnwindContext {
 
 impl UnwindContext {
     /// `unwind`: reference `rust_eh_personality` and emit LSDAs (panic=unwind).
-    pub fn new(module: &mut ObjectModule, pic: bool, unwind: bool) -> Self {
+    pub fn new(module: &mut dyn Module, pic: bool, unwind: bool) -> Self {
         let endian = match module.isa().endianness() {
             Endianness::Little => RunTimeEndian::Little,
             Endianness::Big => RunTimeEndian::Big,
@@ -154,7 +154,7 @@ impl UnwindContext {
 
     pub fn add_function(
         &mut self,
-        module: &mut ObjectModule,
+        module: &mut dyn Module,
         func_id: FuncId,
         code: &CompiledCode,
     ) {

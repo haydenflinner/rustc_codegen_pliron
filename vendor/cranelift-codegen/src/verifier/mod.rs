@@ -628,6 +628,8 @@ impl<'a> Verifier<'a> {
             UnaryGlobalValue { global_value, .. } => {
                 self.verify_global_value(inst, global_value, errors)?;
             }
+            // PLIRON: scatter has only fixed value args; nothing extra to check.
+            Scatter { .. } => {}
             NullAry {
                 opcode: Opcode::GetPinnedReg,
             }

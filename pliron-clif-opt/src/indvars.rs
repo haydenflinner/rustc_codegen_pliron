@@ -2207,6 +2207,160 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
     n
 }
 
+/// `(x, n)` when the edge `inst`/`slot` into `h` is taken iff `x <u n`.
+fn ult_guard(func: &Function, inst: Inst, slot: usize, h: Block) -> Option<(Value, Value, Inst)> {
+    let InstructionData::Brif {
+        arg: cond, blocks, ..
+    } = func.dfg.insts[inst]
+    else {
+        return None;
+    };
+    if blocks[slot].block(&func.dfg.value_lists) != h {
+        return None;
+    }
+    let ci = func.dfg.value_def(func.dfg.resolve_aliases(cond)).inst()?;
+    let InstructionData::IntCompare {
+        cond, args: [x, y], ..
+    } = func.dfg.insts[ci]
+    else {
+        return None;
+    };
+    matches!(
+        (slot, cond),
+        (0, IntCC::UnsignedLessThan) | (1, IntCC::UnsignedGreaterThanOrEqual)
+    )
+    .then(|| (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y), ci))
+}
+
+/// `n` provably `< 2^w - 1` (zero-extended from a narrower load/value).
+fn below_max(func: &Function, n: Value) -> bool {
+    let ValueDef::Result(i, _) = func.dfg.value_def(func.dfg.resolve_aliases(n)) else {
+        return false;
+    };
+    let w = func.dfg.value_type(n).bits();
+    match func.dfg.insts[i] {
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => func.dfg.value_type(arg).bits() < w,
+        InstructionData::Load { opcode, .. } => matches!(
+            opcode,
+            Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32
+        ),
+        _ => false,
+    }
+}
+
+/// [`postinc`] for a loop-invariant *value* bound `n`: a unit-step count
+/// latch `p <u n` (backedge arg `p + 1`) becomes `p+1 != n+1`, testing the
+/// already-stepped register like LLVM's LFTR. Every entry must feed `p <= n`
+/// (`0`, a `p0 <u n` guard, or an iconst `c` behind an `iconst g <u n` guard
+/// with `c <= g + 1`); latches keep `p <= n` since they step only when
+/// `p < n`. Under that invariant `p < n` ⟺ `p != n`, and `!=` survives the
+/// `+1` modulo 2^w, so no overflow condition is needed.
+pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    if std::env::var("PLIRON_POSTINC_NE").is_ok_and(|v| v == "0") {
+        return 0;
+    }
+    let crate::pipeline::CfgDtLa { cfg, la, .. } = an.cfg_dt_la(func);
+    let dbg = std::env::var("PLIRON_POSTINC_DEBUG").is_ok();
+    let mut todo = Vec::new();
+    for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
+        let h = la.loop_header(lp);
+        let body: FxHashSet<Block> = func
+            .layout
+            .blocks()
+            .filter(|&b| la.is_in_loop(b, lp))
+            .collect();
+        let edges = edges_to(func, cfg, h);
+        for (idx, &p) in func.dfg.block_params(h).iter().enumerate() {
+            let ty = func.dfg.value_type(p);
+            if !ty.is_int() || ty.is_vector() {
+                continue;
+            }
+            let (latches, entries): (Vec<_>, Vec<_>) = edges
+                .iter()
+                .cloned()
+                .partition(|e| body.contains(&func.layout.inst_block(e.inst).unwrap()));
+            let mut bound = None;
+            let mut rw = Vec::new();
+            let latch_ok = !latches.is_empty()
+                && latches.iter().all(|e| {
+                    let Some(a) = edge_arg(func, e, idx) else { return false };
+                    let Some((x, n, _)) = ult_guard(func, e.inst, e.slot, h) else {
+                        return false;
+                    };
+                    let ok = x == p
+                        && bound.is_none_or(|b| b == n)
+                        && def_block(func, n).is_some_and(|b| !body.contains(&b))
+                        && matches!(step_form(func, p, &body, a), Some(StepV::K(1)));
+                    bound = Some(n);
+                    rw.push((e.clone(), a));
+                    ok
+                });
+            let Some(n) = bound.filter(|_| latch_ok) else { continue };
+            let entry_ok = entries.iter().all(|e| {
+                let Some(a) = edge_arg(func, e, idx) else { return false };
+                if iconst(func, a) == Some(0) {
+                    return true;
+                }
+                let Some((x, m, _)) = ult_guard(func, e.inst, e.slot, h) else {
+                    return false;
+                };
+                m == n
+                    && (x == a
+                        || matches!((iconst(func, x), iconst(func, a)),
+                            (Some(g), Some(c)) if g >= 0 && c >= 0 && g < i64::MAX && c <= g + 1))
+            });
+            if !entry_ok {
+                if dbg {
+                    eprintln!("postinc_ne {h} p{p}: entry not provably <= bound");
+                }
+                continue;
+            }
+            todo.push((n, rw));
+        }
+    }
+    let mut k = 0;
+    for (n, rw) in todo {
+        // `p+1 <=u n` keeps the stepped register as the compare operand;
+        // `!=` against `n+1` gets folded back to `p != n` downstream.
+        if below_max(func, n) {
+            for (e, a) in rw {
+                let cc = if e.slot == 0 {
+                    IntCC::UnsignedLessThanOrEqual
+                } else {
+                    IntCC::UnsignedGreaterThan
+                };
+                let mut pos = FuncCursor::new(func).at_inst(e.inst);
+                let c = pos.ins().icmp(cc, a, n);
+                if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[e.inst] {
+                    *arg = c;
+                }
+                k += 1;
+            }
+            continue;
+        }
+        let mut pos = FuncCursor::new(func);
+        match pos.func.dfg.value_def(n) {
+            ValueDef::Result(i, _) => pos.goto_after_inst(i),
+            ValueDef::Param(b, _) => pos.goto_first_insertion_point(b),
+            ValueDef::Union(..) => continue,
+        }
+        let n1 = pos.ins().iadd_imm_u(n, 1);
+        for (e, a) in rw {
+            let cc = if e.slot == 0 { IntCC::NotEqual } else { IntCC::Equal };
+            let mut pos = FuncCursor::new(func).at_inst(e.inst);
+            let c = pos.ins().icmp(cc, a, n1);
+            if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[e.inst] {
+                *arg = c;
+            }
+            k += 1;
+        }
+    }
+    k
+}
+
 /// Reassociate `v` to `(root, k)` by walking `iadd`/`isub` iconst
 /// chains: `iadd(v, c)` → `v + c`, `isub(v, c)` → `v - c`.
 fn lin(func: &Function, mut v: Value) -> (Value, i64) {

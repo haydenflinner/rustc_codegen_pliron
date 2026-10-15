@@ -244,3 +244,146 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     accessor on `timing::PassTimes` plus the `timing` feature enabled
     in `Cargo.toml` so `src/lower.rs` can report `emit:<pass>`
     pseudo-steps under `PLIRON_TIMING`/`PLIRON_TRACE_FILE`.
+||||||| dd0fb97
+24. x64 wide-vector boolean ops (`vendor/cranelift-assembler-x64-meta/
+    src/instructions/wide.rs`, `src/isa/x64/lower.isle`): the lane-generic
+    `sse_and`/`sse_and_not`/`sse_or`/`x64_xor_vector`/`bnot`/`bitselect`
+    rules match 256/512-bit vectors but emit xmm-width instructions —
+    `Xmm` wraps an allocated ymm/zmm reg unchecked, so the high lanes
+    were silently dropped. New `vpand`/`vpandn`/`vpor`/`vpxor` ymm and
+    `vpandd`/`vpandnd`/`vpord`/`vpxord` zmm forms plus `vpcmpeqb` ymm /
+    `vpternlogd` zmm wide all-ones; `lower.isle` rules at priorities
+    20/21 emit them for `band`/`bor`/`bxor`/`bnot`/`bitselect` on
+    256/512-bit vectors. The lane-generic `sse_*`/`x64_xor_vector`/
+    `bnot`/`bitselect`/`pblendvb` fallbacks are guarded to ≤128-bit
+    types so any other wide use fails to lower instead of truncating.
+    `ty_bits` (`src/isle_prelude.rs`) saturates at `u8::MAX` for
+    >255-bit types instead of panicking. Covered by
+    `pliron-clif-opt/tests/widevec_lower.rs`.
+
+25. x64 wide-operand types (`src/isa/x64/inst/args.rs`,
+    `src/isa/x64/inst.isle`, `src/isa/x64/lower/isle.rs`,
+    `src/isa/x64/lower.isle`,
+    `cranelift-assembler-x64-meta/src/dsl/format.rs`,
+    `cranelift-assembler-x64-meta/src/generate/operand.rs`,
+    `cranelift-assembler-x64-meta/src/instructions/wide.rs`):
+    new `xmm_m256`/`xmm_m512` DSL locations generating `XmmMem256`/
+    `XmmMem512` ISLE operand types (`size:256`/`512` in
+    `newtype_of_reg!`), with `xmm_to_xmm_mem_*`,
+    `synthetic_amode_to_xmm_mem_*`, `writable_xmm_to_xmm_mem_*` and
+    `xmm_mem_*_to_xmm_mem` converters. Every wide instruction in
+    `wide.rs` now takes an operand of its true access width — ymm
+    instructions take `xmm_m256`, zmm `xmm_m512` — while 128-bit
+    lane-chunk ops (`vextractf128`/`vinsertf128`/`vextractf32x4`/
+    `vinsertf32x4`, `vcvtph2ps`/`vcvtps2ph`/`vpmovzxwd` at Y, the
+    `*ph` X forms) keep `xmm_m128`. This closes the latent hole where
+    a 128-bit `RegMem` operand could be passed to a ymm/zmm
+    instruction and read out of bounds. All wide `lower.isle` rules
+    use the matching-width converter. `widevec_lower.rs`
+    `float_ops_*` covers the sibling's vmovups/fadd/fmul/fma path.
+    `put_in_xmm_mem_256`/`_512` (`src/isa/x64/lower/isle.rs`) enable
+    load folding into wide operands: they delegate to
+    `put_in_reg_mem` (sinkable load → amode) but skip
+    `put_in_xmm_mem`'s u128 const-pool path, which can't
+    materialize a >128-bit constant; bound-Value operands in the
+    wide `lower.isle` rules are passed bare so the fold fires.
+    `fold_load_256` checks a single-use load folds into `vaddps`'s
+    memory operand.
+
+26. x64 wide-vector full op coverage (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`, `src/isa/x64/inst.isle`,
+    `src/isa/x64/inst/mod.rs`, `src/prelude.isle`,
+    `vendor/cranelift-codegen-meta/src/isa/x86.rs`,
+    `cranelift-assembler-x64-meta/src/dsl/features.rs`): ISLE
+    lowerings for the full op set at 256/512 bits — int
+    add/sub/mul/min-max/sat-add/avg/mulhi/shifts/abs/neg for all
+    lane widths, `vpmullq` (avx512dq) for i64x8; f64x4/x8 and the
+    missing f32 wide float ops (min/max/sqrt/div/neg/abs/round);
+    `icmp`/`fcmp` masks (512-bit compares split into two 256-bit
+    halves — the DSL has no k-register location — reassembled via
+    `vinsertf64x4`); `select`, `splat` and `vconst` for all wide
+    types; `iconcat`/`isplit`. Byte/word ops at 512 are gated on
+    the new `has_avx512bw` ISA flag (CPUID.07H:EBX[30], added to
+    skylake-avx512/znver4/x86-64-v4 presets and `Feature::avx512bw`)
+    so they fall through to loud Unsupported instead of emitting
+    an encoding the host lacks. Helpers: `wide_lane_mask_amode`
+    (Generated const-pool mask vectors of arbitrary width),
+    `wide_shift_amt_128` (mask scalar count then movq to xmm),
+    `put_low128_in_xmm_mem` (sinkable-load folding of the low half).
+    Int `splat` uses `bitcast_gpr_to_xmm` — scalar ints live in
+    Int-class regs, not Xmm. Tests: `pliron-clif-opt/tests/
+    widevec_lower.rs` byte-checks each family at both widths.
+
+27. x64 wide lane ops and widening (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`): `extractlane`/`insertlane` for
+    all wide int and f64 types — pull the 128-bit chunk containing
+    the lane down via `vextractf128`/`vextractf32x4` (chunk index
+    from the new `wide_lane_chunk128`/`wide_lane_sub128` helpers,
+    generalizing the f32-only `wide_lane_chunk`), run the existing
+    `pextr*`/`pinsr*` lane op, reinsert the chunk. f64 uses
+    `shufpd` for the in-chunk half-lane select (`wide_f64_sub_lane`
+    merges scalars by parity). `swiden_low/high` and
+    `uwiden_low/high` for `i16x16 -> i32x8` via `vpmovsxwd`/
+    `vpmovzxwd` ymm — the only wide widen CLIF can express
+    (inputs are capped at 16 lanes and outputs exclude i64, so
+    i8x32->i16x16, i32x8->i64x4 and any 512-bit widen are
+    unrepresentable and loud-fail on the verifier). `shuffle` is
+    i8x16-only and `gather`/`scatter` do not exist in this CLIF —
+    nothing to lower there.
+
+28. x64 dot-product opcodes (`src/isa/x64/lower.isle`,
+    `src/isa/aarch64/inst.isle`, `src/isa/aarch64/lower.isle`):
+    new CLIF opcodes `sdot` (signed i16xN pairwise dot -> i32xN/2,
+    pmaddwd), `udot` (unsigned x times signed y pairwise -> i16xN/2
+    saturating, pmaddubsw — x is the unsigned operand, matching
+    `udot x y` -> `vpmaddubsw x y`) and `udot_acc` (four-wide
+    u8x4N x i8x4N accumulate into i32xN, vpdpbusd). The opcode
+    definitions live in `vendor/cranelift-codegen-meta/src/shared/
+    instructions.rs` — see that crate's PLIRON_PATCH.md. `udot_acc`'s
+    byte operands are free typevars (the 4x lane relation to the
+    i32 accumulator is not expressible one derived level down), so
+    the lowering rules match concrete input types. aarch64's
+    internal `sdot`/`udot` ISLE terms were renamed `a64_sdot`/
+    `a64_udot` to free the names for the CLIF opcodes. VNNI gating:
+    `udot_acc` prefers the VEX AVX-VNNI form, falls back to the EVEX
+    AVX512-VNNI(+VL) forms; byte/word 512-bit forms gate on
+    `has_avx512bw`.
+
+29. x64 runtime-index swizzles (`src/isa/x64/lower.isle`): new CLIF
+    opcodes `vswizzle` (`a[i] = x[idx[i] mod N]` — a register-indexed
+    crossbar `shuffle`, sidestepping `shuffle`'s fixed `uimm128` mask)
+    and `vswizzle2` (`a[i] = (x++y)[idx[i] mod 2N]`, x86 `vpermt2*`
+    semantics — the index operand is the read-write register).
+    Definitions in `vendor/cranelift-codegen-meta` patch 2; index
+    operand is a free typevar (idx lane count/width relation to the
+    data vector is enforced by the concrete-type lowering rules).
+    Dword forms: `vpermd`/`vpermps` Y (avx2), X/Z (avx512f, +vl at
+    128); qword reg-index permutes are EVEX-only: `vpermq`/`vpermpd`
+    X/H/Z (avx512f, +vl at 128/256). `vswizzle2` X/H/Z `vpermt2d`/
+    `vpermt2q`/`vpermt2ps`/`vpermt2pd` (avx512f, +vl at 128/256).
+
+30. x64 VSIB gather/scatter (new CLIF opcodes `vgather`/`vscatter`;
+    definitions in cranelift-codegen-meta patch 3, parser arm in
+    vendored cranelift-reader, interpreter arms in
+    vendor/cranelift-interpreter). `src/isa/x64/lower.isle`: VEX
+    `vpgatherdd/dq/qq/qd` + `vgatherdps/dpd/qpd` at 128/256 (avx2)
+    fed a fresh all-ones mask (`vpcmpeqb`); EVEX `vpgather*`/
+    `vgather*` at 256/512 (avx512f) unmasked. `vscatter` is
+    EVEX-only (`vpscatterdd`/`vscatterdps`/`vpscatterqd`/
+    `vpscatterdq`/`vscatterqps`/`vscatterqpd`/`vscatterqpd` H/Z;
+    avx512f, +avx512vl for ymm-index). `src/verifier/mod.rs` +
+    `src/write.rs`: `Scatter` instruction-data arms. Trap to note:
+    the generated operand collector ties a `rw` write to use-index
+    0 (`read_write_xmm`), so the VEX gather's mask operand must be
+    declared first; the dst result comes out as `value_regs_get`
+    index 1.
+
+31. Wide vector emit support for load/store + sized type extractors:
+    `src/prelude.isle`/`src/isle_prelude.rs` add `ty_vec256`/`ty_vec512`
+    extern extractors (`ty_bits_u64` is a converter — it cannot appear
+    in rule patterns). `src/isa/x64/lower.isle`: generic `load`/`store`
+    rules for all 256-bit types at pri 5 → `x64_vmovups_ya`/`_yb_mem`
+    (avx2), all 512-bit types at pri 7 → `x64_vmovups_za`/`_zb_mem`
+    (avx512f); pri 7 keeps them disjoint from the pri-4 128-bit
+    concrete-type rules (same-priority rules with disjoint extractors
+    still collide in this ISLE).

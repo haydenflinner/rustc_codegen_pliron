@@ -1,6 +1,8 @@
 //! X86_64-bit Instruction Set Architecture.
 
-pub use self::inst::{AtomicRmwSeqOp, EmitInfo, EmitState, Inst, args, external};
+pub use self::inst::{
+    AtomicRmwSeqOp, EmitInfo, EmitState, Inst, WIDE_VECTOR_BITS, NATIVE_FP16, NATIVE_BF16, args, external, high_xmm_regs, wide_vector_bits,
+};
 
 use super::{OwnedTargetIsa, TargetIsa};
 use crate::dominator_tree::DominatorTree;

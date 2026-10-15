@@ -416,7 +416,10 @@ impl<R: AsReg, M: AsReg> XmmMem<R, M> {
     /// register. The `x` bit is set by the `index` register, when used.
     pub(crate) fn encode_bx_regs(&self) -> (Option<u8>, Option<u8>) {
         match self {
-            XmmMem::Xmm(reg) => (Some(reg.enc()), None),
+            XmmMem::Xmm(reg) => {
+                let enc = reg.enc();
+                (Some(enc), Some(enc >> 1))
+            }
             XmmMem::Mem(amode) => amode.encode_bx_regs(),
         }
     }

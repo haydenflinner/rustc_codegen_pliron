@@ -10610,7 +10610,16 @@ pub(crate) fn lower_to_wasm_clif(
     features: &[String],
     unwind: bool,
 ) -> Vec<u8> {
-    let mut wc = crate::lower::lower_clif_wasm(ctx, st, sess, name, unwind);
+    let mut wc = crate::lower::lower_clif_wasm(
+        ctx,
+        st,
+        &crate::RustcHost {
+            sess,
+            prof: crate::RustcProf(&sess.prof),
+        },
+        name,
+        unwind,
+    );
     let mut m = Module::empty();
     let mem = m.memories.push(MemoryData {
         initial_pages: 0,

@@ -33,6 +33,7 @@ fn run_vec(f: &mut Function, name: &str) -> usize {
         false,
         true,
         &FxHashMap::default(),
+        pliron_clif_opt::loopvec::WideCaps::BASE,
     )
 }
 

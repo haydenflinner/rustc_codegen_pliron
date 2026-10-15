@@ -322,6 +322,12 @@ impl Inst {
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_a::new(to_reg, from_addr).into()
                     }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(to_reg, from_addr).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(to_reg, from_addr).into()
+                    }
                     _ => unimplemented!("unable to load type: {}", ty),
                 };
                 Inst::External { inst }
@@ -361,6 +367,12 @@ impl Inst {
                     types::F64X2 => asm::inst::movupd_b::new(to_addr, from_reg).into(),
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_b::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_yb::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_zb::new(to_addr, from_reg).into()
                     }
                     _ => unimplemented!("unable to store type: {}", ty),
                 }
@@ -868,7 +880,53 @@ impl fmt::Debug for Inst {
     }
 }
 
+/// With zmm16-31 allocatable (512-bit wide mode), every xmm operand of a
+/// non-EVEX instruction is limited to xmm0-15.
+struct XmmLimit<'a, V: OperandVisitor>(&'a mut V);
+
+impl<V: OperandVisitor> OperandVisitor for XmmLimit<'_, V> {
+    fn add_operand(
+        &mut self,
+        reg: &mut Reg,
+        constraint: regalloc2::OperandConstraint,
+        kind: regalloc2::OperandKind,
+        pos: regalloc2::OperandPos,
+    ) {
+        use regalloc2::OperandConstraint::{Any, Limit, Reg as R};
+        let c = match constraint {
+            Any | R if reg.class() == RegClass::Float => Limit(16),
+            c => c,
+        };
+        self.0.add_operand(reg, c, kind, pos);
+    }
+
+    fn debug_assert_is_allocatable_preg(&self, reg: regalloc2::PReg, expected: bool) {
+        self.0.debug_assert_is_allocatable_preg(reg, expected);
+    }
+
+    fn reg_clobbers(&mut self, regs: regalloc2::PRegSet) {
+        self.0.reg_clobbers(regs);
+    }
+}
+
+/// Whether zmm16-31 are allocatable: 512-bit wide mode, unless
+/// `PLIRON_NO_HIGH_XMM` is set.
+pub fn high_xmm_regs() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    wide_vector_bits() >= 512 && !*OFF.get_or_init(|| std::env::var_os("PLIRON_NO_HIGH_XMM").is_some())
+}
+
 fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
+    let limit = high_xmm_regs()
+        && !matches!(inst, Inst::External { inst } if inst.num_registers_available() > 16);
+    if limit {
+        x64_get_operands_inner(inst, &mut XmmLimit(collector));
+    } else {
+        x64_get_operands_inner(inst, collector);
+    }
+}
+
+fn x64_get_operands_inner(inst: &mut Inst, collector: &mut impl OperandVisitor) {
     // Note: because we need to statically know the indices of each
     // reg in the operands list in order to fetch its allocation
     // later, we put the variable-operand-count bits (the RegMem,
@@ -1232,6 +1290,25 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
 //=============================================================================
 // Instructions: misc functions and external interface
 
+/// pliron: widest vector (bits) held in float-class registers: 128, or
+/// 256/512 when a JIT host emits ymm/zmm values. Register moves and spills of
+/// the float class use this width, so set it before compiling and only on
+/// CPUs with AVX (256) / AVX-512F (512).
+/// Host-detected AVX512-FP16 (+VL); no isa flag exists for it upstream.
+pub static NATIVE_FP16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Host has AVX512-BF16 (+BW/VL): `vcvtneps2bf16` is available.
+pub static NATIVE_BF16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Widest vector register class pliron may use (128 / 256 / 512 bits).
+pub static WIDE_VECTOR_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(128);
+
+/// See [`WIDE_VECTOR_BITS`].
+pub fn wide_vector_bits() -> u32 {
+    WIDE_VECTOR_BITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl MachInst for Inst {
     type ABIMachineSpec = X64ABIMachineSpec;
 
@@ -1376,6 +1453,15 @@ impl MachInst for Inst {
         let rc_src = src_reg.class();
         // If this isn't true, we have gone way off the rails.
         debug_assert!(rc_dst == rc_src);
+        let hi = |r: Reg| r.to_real_reg().is_some_and(|r| r.hw_enc() >= 16);
+        if rc_dst == RegClass::Float && (hi(dst_reg.to_reg()) || hi(src_reg)) {
+            // xmm16-31 need EVEX; a full zmm move covers every type.
+            let dst = dst_reg.map(|r| Xmm::new(r).unwrap());
+            let src = Xmm::new(src_reg).unwrap();
+            return Inst::External {
+                inst: asm::inst::vmovups_za::new(dst, src).into(),
+            };
+        }
         let inst = match rc_dst {
             RegClass::Int => {
                 // pliron: a `movl` is a byte shorter than `movq` and exact for
@@ -1411,6 +1497,12 @@ impl MachInst for Inst {
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() <= 128 => {
                         asm::inst::movdqa_a::new(dst_reg, src_reg).into()
                     }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(dst_reg, src_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(dst_reg, src_reg).into()
+                    }
                     _ => unimplemented!("unable to move type: {}", ty),
                 }
             }
@@ -1443,8 +1535,15 @@ impl MachInst for Inst {
             types::F64 => Ok((&[RegClass::Float], &[types::F64])),
             types::F128 => Ok((&[RegClass::Float], &[types::F128])),
             types::I128 => Ok((&[RegClass::Int, RegClass::Int], &[types::I64, types::I64])),
-            _ if ty.is_vector() && ty.bits() <= 128 => {
-                let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
+            _ if ty.is_vector() && ty.bits() <= 512 => {
+                let types = &[
+                    types::I8X2,
+                    types::I8X4,
+                    types::I8X8,
+                    types::I8X16,
+                    types::I8X32,
+                    types::I8X64,
+                ];
                 Ok((
                     &[RegClass::Float],
                     slice::from_ref(&types[ty.bytes().ilog2() as usize - 1]),
@@ -1458,7 +1557,11 @@ impl MachInst for Inst {
 
     fn canonical_type_for_rc(rc: RegClass) -> Type {
         match rc {
-            RegClass::Float => types::I8X16,
+            RegClass::Float => match wide_vector_bits() {
+                512 => types::I8X64,
+                256 => types::I8X32,
+                _ => types::I8X16,
+            },
             RegClass::Int => types::I64,
             RegClass::Vector => unreachable!(),
         }
@@ -1592,6 +1695,14 @@ impl asm::AvailableFeatures for &EmitInfo {
         self.isa_flags.has_avx512f()
     }
 
+    fn avx512fp16(&self) -> bool {
+        NATIVE_FP16.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn avx512bf16(&self) -> bool {
+        NATIVE_BF16.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     fn avx512vl(&self) -> bool {
         self.isa_flags.has_avx512vl()
     }
@@ -1605,6 +1716,10 @@ impl asm::AvailableFeatures for &EmitInfo {
     }
     fn avx_vnni(&self) -> bool {
         self.isa_flags.has_avx_vnni()
+    }
+
+    fn avx512bw(&self) -> bool {
+        self.isa_flags.has_avx512bw()
     }
 
     fn avx512dq(&self) -> bool {

@@ -473,6 +473,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn has_avx512bw(&mut self) -> bool {
+        self.backend.x64_flags.has_avx512bw()
+    }
+
+    #[inline]
     fn has_avx512vl(&mut self) -> bool {
         self.backend.x64_flags.has_avx512vl()
     }
@@ -787,6 +792,129 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn synthetic_amode_to_xmm_mem_128(&mut self, amode: &SyntheticAmode) -> XmmMem128 {
         XmmMem128::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    // PLIRON: 256/512-bit xmm-or-mem operand helpers for the wide-vector
+    // lowering rules — keeps wide operand widths type-checked end to end.
+    #[inline]
+    fn xmm_to_xmm_mem_256(&mut self, xmm: Xmm) -> XmmMem256 {
+        XmmMem256::from(xmm)
+    }
+
+    #[inline]
+    fn xmm_to_xmm_mem_512(&mut self, xmm: Xmm) -> XmmMem512 {
+        XmmMem512::from(xmm)
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_256(&mut self, amode: &SyntheticAmode) -> XmmMem256 {
+        XmmMem256::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_512(&mut self, amode: &SyntheticAmode) -> XmmMem512 {
+        XmmMem512::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn put_in_xmm_mem_256(&mut self, val: Value) -> XmmMem256 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            256,
+            "put_in_xmm_mem_256: expected a 256-bit value, got value of type {ty}"
+        );
+        // Skip `put_in_xmm_mem`'s u128 const-pool path: the constant-pool
+        // materializes only 16 bytes, which would truncate a folded 256-bit
+        // operand. `put_in_reg_mem`'s own const paths only fire for scalar
+        // `iconst` types, so a vector-typed `Value` always lands in a reg or
+        // a sinkable load here.
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_256: cannot materialize a >128-bit constant"
+        );
+        XmmMem256::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    #[inline]
+    fn put_in_xmm_mem_512(&mut self, val: Value) -> XmmMem512 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            512,
+            "put_in_xmm_mem_512: expected a 512-bit value, got value of type {ty}"
+        );
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_512: cannot materialize a >128-bit constant"
+        );
+        XmmMem512::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    /// PLIRON: constant-pool amode holding `fill` replicated across each
+    /// lane of `ty` (wide types only — the u128 pool emit can't express
+    /// >128-bit constants). `hi`/`lo` give the lane's top byte vs the rest.
+    fn wide_lane_mask_amode(&mut self, ty: Type, hi: u8, lo: u8) -> SyntheticAmode {
+        let lane_bytes = (ty.lane_bits() / 8) as usize;
+        let mut bytes = vec![lo; (ty.bits() / 8) as usize];
+        for lane in bytes.chunks_mut(lane_bytes) {
+            lane[lane_bytes - 1] = hi;
+        }
+        let c = self
+            .lower_ctx
+            .use_constant(VCodeConstantData::Generated(ConstantData::from(&bytes[..])));
+        SyntheticAmode::ConstantOffset(c)
+    }
+
+    #[inline]
+    fn wide_sign_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x80, 0x00)
+    }
+
+    #[inline]
+    fn wide_abs_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x7f, 0xff)
+    }
+
+    #[inline]
+    fn wide_ones_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0xff, 0xff)
+    }
+
+    /// PLIRON: the low 128 bits of a wide `Value` as an `XmmMem128` operand.
+    /// For a register the xmm is the low half of the ymm/zmm; for a sinkable
+    /// load it is the same address (little-endian low half).
+    fn put_low128_in_xmm_mem(&mut self, val: Value) -> XmmMem128 {
+        assert!(self.lower_ctx.dfg().value_type(val).bits() >= 256);
+        if let Some(load) = self.sinkable_load(val) {
+            return XmmMem128::unwrap_new(RegMem::mem(self.sink_load(&load)));
+        }
+        XmmMem128::unwrap_new(RegMem::reg(self.put_in_reg(val)))
+    }
+
+    fn xmm_mem_256_to_xmm_mem(&mut self, x: &XmmMem256) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn xmm_mem_512_to_xmm_mem(&mut self, x: &XmmMem512) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_256(&mut self, r: WritableXmm) -> XmmMem256 {
+        XmmMem256::from(r.to_reg())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_512(&mut self, r: WritableXmm) -> XmmMem512 {
+        XmmMem512::from(r.to_reg())
     }
 
     /// Wrap a `SyntheticAmode` as a 64-bit XMM memory operand.
@@ -1357,12 +1485,32 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     );
 
     #[inline]
+    fn wide_lane_chunk(&mut self, lane: u8) -> u8 {
+        lane / 4
+    }
+
+    fn wide_lane_sub(&mut self, lane: u8) -> u8 {
+        lane % 4
+    }
+
+    /// PLIRON: like `wide_lane_chunk`/`wide_lane_sub` but parameterized by
+    /// lane width: the 128-bit chunk index containing `lane`, and the
+    /// sub-index within it.
+    #[inline]
+    fn wide_lane_chunk128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane / (16 / (ty.lane_bits() / 8) as u8)
+    }
+
+    fn wide_lane_sub128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane % (16 / (ty.lane_bits() / 8) as u8)
+    }
+
     fn type_register_class(&mut self, ty: Type) -> Option<RegisterClass> {
         if is_int_or_ref_ty(ty) || ty == I128 {
             Some(RegisterClass::Gpr {
                 single_register: ty != I128,
             })
-        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 128) {
+        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 512) {
             Some(RegisterClass::Xmm)
         } else {
             None
