@@ -45,10 +45,9 @@ const MAX_PROOF: usize = 64;
 /// Dominator-chain depth for fact collection.
 const MAX_DOM: usize = 64;
 /// The reaching-stores fixpoint materializes a per-block map of
-/// (slot -> reaching stores): blocks x store-slots dense entries. On
-/// generated-code-class fns (tens of thousands of blocks) that is tens
-/// of GB — bail instead of ballooning.
-const MAX_FIXPOINT_WORK: usize = 1 << 21;
+/// (slot -> reaching stores): blocks x relevant-slots dense entries,
+/// ~100B each — 8M entries is under a GB; bail only past that.
+const MAX_FIXPOINT_WORK: usize = 1 << 23;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Rel {
@@ -384,12 +383,19 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     // can't carry load-equality reasoning.
     let mut escaped = FxHashSet::default();
     let mut store_slots = FxHashSet::default();
+    let mut load_slots = FxHashSet::default();
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<StoreOp>(op, ctx)
                 && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
             {
                 store_slots.insert(s);
+            }
+            if Operation::is_op::<LoadOp>(op, ctx)
+                && !st.volatile.contains(&op)
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(0))
+            {
+                load_slots.insert(s);
             }
             let pure_intr = Operation::is_op::<CallIntrinsicOp>(op, ctx)
                 && st
@@ -410,7 +416,25 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             }
         }
     }
-    if bs.len().saturating_mul(store_slots.len()) > MAX_FIXPOINT_WORK {
+    // Only slots both stored and loaded matter to the analysis: queries
+    // happen only on loaded slots, and only store targets can reach a
+    // load. Tracking the rest is what made generated-code-class fns
+    // (cranelift_codegen's ISLE tables) balloon to ~24GB — blocks x
+    // relevant-slots is the real fixpoint size.
+    let relevant: FxHashSet<Value> = store_slots
+        .intersection(&load_slots)
+        .copied()
+        .filter(|s| !escaped.contains(s))
+        .collect();
+    if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
+        if crate::env_set("PLIRON_STATS") {
+            eprintln!(
+                "guardelim {}: bail blocks={} relevant={}",
+                st.cgu,
+                bs.len(),
+                relevant.len()
+            );
+        }
         return false;
     }
     // Reaching stores per (block, slot): forward fixpoint over reachable
@@ -440,6 +464,9 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         for &p in preds.get(&b).into_iter().flatten() {
             let Some(pm) = outt.get(&p) else { continue };
             for (&s, set) in pm {
+                if !relevant.contains(&s) {
+                    continue;
+                }
                 let e = m.entry(s).or_insert_with(|| Some(Vec::new()));
                 match (e.as_mut(), set) {
                     (Some(v), Some(ps)) => {
@@ -460,6 +487,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         for &op in &bops[&b] {
             if Operation::is_op::<StoreOp>(op, ctx)
                 && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
+                && relevant.contains(&s)
             {
                 m.insert(s, Some(vec![op]));
             }
@@ -483,6 +511,9 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         for &p in preds.get(&b).into_iter().flatten() {
             let Some(pm) = outt.get(&p) else { continue };
             for (&s, set) in pm {
+                if !relevant.contains(&s) {
+                    continue;
+                }
                 let e = m.entry(s).or_insert_with(|| Some(Vec::new()));
                 match (e.as_mut(), set) {
                     (Some(v), Some(ps)) => {
