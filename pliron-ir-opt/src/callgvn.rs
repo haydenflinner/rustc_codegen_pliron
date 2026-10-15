@@ -22,6 +22,7 @@
 
 use pliron::{
     basic_block::BasicBlock,
+    printable::Printable,
     builtin::op_interfaces::CallOpInterface,
     context::{Context, Ptr},
     operation::Operation,
@@ -230,7 +231,19 @@ fn natural_loops(
 }
 
 pub fn run(ctx: &mut Context, st: &State) {
+    let dbg = crate::env_set("PLIRON_CGDBG");
     for name in bodied(ctx, st) {
+        if dbg {
+            eprintln!("callgvn fn={name}");
+        }
+        if crate::env_get("PLIRON_CGDUMP").is_some_and(|s| name.contains(s)) {
+            eprintln!(
+                "{}",
+                st.funcs[&name]
+                    .op
+                    .print(ctx, &pliron::printable::State::default())
+            );
+        }
         run_fn(ctx, st, st.funcs[&name].op);
     }
 }
@@ -330,7 +343,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 {
                     continue;
                 }
-                res.replace_all_uses_with(ctx, &cop.deref(ctx).get_result(0));
+                let prev = cop.deref(ctx).get_result(0);
+                res.replace_all_uses_with(ctx, &prev);
                 killed.insert(op);
                 break;
             }
