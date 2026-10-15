@@ -488,6 +488,21 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if ok {
             sbases.insert(c_slot);
         }
+        // A kept call that reads an in-loop-stored alloca through a
+        // pointer arg returns per-iteration values — the same unsoundness
+        // callgvn's arg_allocas covers for dedup/hoist. Any eligible call
+        // with such an operand makes the fold wrong, not just that call.
+        if ok {
+            for &c in &calls {
+                ok = (0..c.deref(ctx).get_num_operands()).all(|i| {
+                    slot_base(ctx, c.deref(ctx).get_operand(i))
+                        .is_none_or(|a| !sbases.contains(&a))
+                });
+                if !ok {
+                    break;
+                }
+            }
+        }
         if !ok {
             continue;
         }
