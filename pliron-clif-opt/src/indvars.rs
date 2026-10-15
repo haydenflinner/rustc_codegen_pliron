@@ -2242,7 +2242,7 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
 
 /// What `x - y` provably equals at a program point, for `relparm`'s
 /// diff proofs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Diff {
     /// `x - y = v` for a concrete value `v`.
     Lit(Value),
@@ -2271,32 +2271,67 @@ pub(crate) fn diff_b(
     ai: Value,
     aj: Value,
     depth: u32,
-    budget: &std::cell::Cell<u64>,
-    memo: &mut FxHashMap<(Value, Value, Value, Value), (Option<Diff>, u32)>,
+    memo: &mut DbMemo,
     dbg: bool,
 ) -> Option<Diff> {
+    diff_b_h(func, cfg, pi, pj, ai, aj, depth, memo, dbg).0
+}
+
+// `gen` caches results that hold for every oracle head (their proof
+// trees never evaluated a param pair of the head block); `head` caches
+// head-tainted results per `(pi, pj)` so a pair that *is* some other
+// query's head is never reused across heads. `Option<Diff>` entries
+// carry the depth they were proved at, as `diff_b` does.
+pub(crate) type DbMemo = (
+    FxHashMap<(Value, Value), (Option<Diff>, u32)>,
+    FxHashMap<(Value, Value, Value, Value), (Option<Diff>, u32)>,
+);
+
+// Returns the diff plus `tainted` — whether the proof evaluated any
+// param pair of the head block (including `(pi, pj)` itself via
+// `Diff::Head`). A param pair of the head block evaluates to `Head`
+// under the query that owns it but expands normally under every other
+// query, so results whose trees contain one are head-dependent.
+fn diff_b_h(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    pi: Value,
+    pj: Value,
+    ai: Value,
+    aj: Value,
+    depth: u32,
+    memo: &mut DbMemo,
+    dbg: bool,
+) -> (Option<Diff>, bool) {
     let x = func.dfg.resolve_aliases(ai);
     let y = func.dfg.resolve_aliases(aj);
     // The param-pair chase below re-proves the same (x, y) pairs along
     // every join path of the CFG — without a memo the edge fanout is
     // exponential (serde_json's parser dispatch: ~5e3s in `cparm`).
     // A `Some` is a valid proof at any budget; a `None` proved with
-    // `d >= depth` budget is conclusive for a smaller ask.
-    if let Some(&(r, d)) = memo.get(&(pi, pj, x, y)) {
+    // `d >= depth` budget is conclusive for a smaller ask. `(pi, pj)`
+    // itself short-circuits before the memos so a pair cached under
+    // another head can never stand in for `Head`.
+    if x == pi && y == pj {
+        return (diff_b_inner(func, cfg, pi, pj, x, y, depth, memo, dbg).0, true);
+    }
+    if let Some(&(r, d)) = memo.0.get(&(x, y)) {
         if r.is_some() || d >= depth {
-            return r;
+            return (r, false);
         }
     }
-    // Distinct-pair fanout is still exponential where joins keep
-    // producing fresh pairs (rustc_parse's parse_unspanned_seq ~10min):
-    // `budget` bounds expansions across the caller's whole run.
-    if budget.get() == 0 {
-        return None;
+    if let Some(&(r, d)) = memo.1.get(&(pi, pj, x, y)) {
+        if r.is_some() || d >= depth {
+            return (r, true);
+        }
     }
-    budget.set(budget.get() - 1);
-    let r = diff_b_inner(func, cfg, pi, pj, x, y, depth, budget, memo, dbg);
-    memo.insert((pi, pj, x, y), (r, depth));
-    r
+    let (r, t) = diff_b_inner(func, cfg, pi, pj, x, y, depth, memo, dbg);
+    if t {
+        memo.1.insert((pi, pj, x, y), (r, depth));
+    } else {
+        memo.0.insert((x, y), (r, depth));
+    }
+    (r, t)
 }
 
 fn diff_b_inner(
@@ -2307,14 +2342,13 @@ fn diff_b_inner(
     ai: Value,
     aj: Value,
     depth: u32,
-    budget: &std::cell::Cell<u64>,
-    memo: &mut FxHashMap<(Value, Value, Value, Value), (Option<Diff>, u32)>,
+    memo: &mut DbMemo,
     dbg: bool,
-) -> Option<Diff> {
+) -> (Option<Diff>, bool) {
     let x = func.dfg.resolve_aliases(ai);
     let y = func.dfg.resolve_aliases(aj);
     if iconst(func, y) == Some(0) {
-        return Some(Diff::Lit(x));
+        return (Some(Diff::Lit(x)), false);
     }
     if let ValueDef::Result(d, _) = func.dfg.value_def(y)
         && let InstructionData::Binary {
@@ -2323,7 +2357,7 @@ fn diff_b_inner(
         } = func.dfg.insts[d]
         && func.dfg.resolve_aliases(a) == x
     {
-        return Some(Diff::Lit(func.dfg.resolve_aliases(b)));
+        return (Some(Diff::Lit(func.dfg.resolve_aliases(b))), false);
     }
     if let ValueDef::Result(d, _) = func.dfg.value_def(x)
         && let InstructionData::Binary {
@@ -2332,17 +2366,17 @@ fn diff_b_inner(
         } = func.dfg.insts[d]
     {
         if func.dfg.resolve_aliases(a) == y {
-            return Some(Diff::Lit(func.dfg.resolve_aliases(b)));
+            return (Some(Diff::Lit(func.dfg.resolve_aliases(b))), false);
         }
         if func.dfg.resolve_aliases(b) == y {
-            return Some(Diff::Lit(func.dfg.resolve_aliases(a)));
+            return (Some(Diff::Lit(func.dfg.resolve_aliases(a))), false);
         }
     }
     if x == pi && y == pj {
-        return Some(Diff::Head);
+        return (Some(Diff::Head), true);
     }
     if depth == 0 {
-        return None;
+        return (None, false);
     }
     // `y = y0 + (x - d)` ⇒ `x - y = d - y0` (and the `x` mirror). This
     // is the un-folded byte-length form: `pos + (cur' - cur)`.
@@ -2375,7 +2409,7 @@ fn diff_b_inner(
             if let Some((a, d)) = isub_of(maybe)
                 && a == x
             {
-                return diff_b(func, cfg, pi, pj, d, other, depth - 1, budget, memo, dbg);
+                return diff_b_h(func, cfg, pi, pj, d, other, depth - 1, memo, dbg);
             }
         }
     }
@@ -2384,7 +2418,7 @@ fn diff_b_inner(
             if let Some((a, d)) = isub_of(maybe)
                 && a == y
             {
-                return diff_b(func, cfg, pi, pj, other, d, depth - 1, budget, memo, dbg);
+                return diff_b_h(func, cfg, pi, pj, other, d, depth - 1, memo, dbg);
             }
         }
     }
@@ -2393,7 +2427,7 @@ fn diff_b_inner(
     let (rx, cx) = lin(func, x);
     let (ry, cy) = lin(func, y);
     if cx == cy && (rx, ry) != (x, y) {
-        return diff_b(func, cfg, pi, pj, rx, ry, depth - 1, budget, memo, dbg);
+        return diff_b_h(func, cfg, pi, pj, rx, ry, depth - 1, memo, dbg);
     }
     // Shared-operand strip: `f(a, c) - f(b, c) = a - b`.
     let bin = |v: Value| -> Option<(Opcode, Value, Value)> {
@@ -2422,7 +2456,7 @@ fn diff_b_inner(
             _ => None,
         };
         if let Some((nx, ny)) = pair {
-            return diff_b(func, cfg, pi, pj, nx, ny, depth - 1, budget, memo, dbg);
+            return diff_b_h(func, cfg, pi, pj, nx, ny, depth - 1, memo, dbg);
         }
     }
     // Param-pair chase: `x`, `y` params of the same block — the diff at
@@ -2431,8 +2465,17 @@ fn diff_b_inner(
         (func.dfg.value_def(x), func.dfg.value_def(y))
         && q == q2
     {
+        // Any param-pair chase on the head block is head-dependent:
+        // under a query whose head is this pair it short-circuits to
+        // `Head`, under every other query it expands — so ancestors
+        // must not share this result across heads.
+        let hb = match func.dfg.value_def(pi) {
+            ValueDef::Param(b, _) => Some(b),
+            _ => None,
+        };
         let mut bound = None;
         let mut head = false;
+        let mut hit = Some(q) == hb;
         for e2 in &edges_to(func, cfg, q) {
             let (Some(a2), Some(b2)) =
                 (edge_arg(func, e2, ix2), edge_arg(func, e2, jx2))
@@ -2440,41 +2483,53 @@ fn diff_b_inner(
                 if dbg {
                     eprintln!("  diff_b {x}/{y} @{q}: e{} no args@{ix2},{jx2}", e2.inst);
                 }
-                return None;
+                return (None, hit);
             };
-            match diff_b(func, cfg, pi, pj, a2, b2, depth - 1, budget, memo, dbg) {
-                Some(Diff::Lit(bv)) => match bound {
-                    None => bound = Some(bv),
-                    Some(p) if p == bv => {}
-                    _ => {
-                        if dbg {
-                            eprintln!("  diff_b {x}/{y} @{q}: e{} B {bv}!={bound:?}", e2.inst);
+            match diff_b_h(func, cfg, pi, pj, a2, b2, depth - 1, memo, dbg) {
+                (Some(Diff::Lit(bv)), h) => {
+                    hit |= h;
+                    match bound {
+                        None => bound = Some(bv),
+                        Some(p) if p == bv => {}
+                        _ => {
+                            if dbg {
+                                eprintln!(
+                                    "  diff_b {x}/{y} @{q}: e{} B {bv}!={bound:?}",
+                                    e2.inst
+                                );
+                            }
+                            return (None, hit);
                         }
-                        return None;
                     }
-                },
-                Some(Diff::Head) => head = true,
-                None => {
+                }
+                (Some(Diff::Head), _) => {
+                    hit = true;
+                    head = true;
+                }
+                (None, h) => {
                     if dbg {
                         eprintln!(
                             "  diff_b {x}/{y} @{q}: e{} args {a2}/{b2} fail",
                             e2.inst
                         );
                     }
-                    return None;
+                    return (None, hit | h);
                 }
             }
         }
-        return match bound {
-            Some(bv) => Some(Diff::Lit(bv)),
-            None if head => Some(Diff::Head),
-            _ => None,
-        };
+        return (
+            match bound {
+                Some(bv) => Some(Diff::Lit(bv)),
+                None if head => Some(Diff::Head),
+                _ => None,
+            },
+            hit,
+        );
     }
     if dbg {
         eprintln!("  diff_b {x}/{y}: no rule (d{depth})");
     }
-    None
+    (None, false)
 }
 
 #[cfg(test)]
@@ -2752,13 +2807,73 @@ mod tests {
 
         let cfg = ControlFlowGraph::with_function(&func);
         let t = std::time::Instant::now();
-        let mut memo = FxHashMap::default();
-        let budget = std::cell::Cell::new(1_000_000u64);
-        let _ = diff_b(&func, &cfg, pi, pj, x, y, 8, &budget, &mut memo, false);
+        let mut memo = DbMemo::default();
+        let _ = diff_b(&func, &cfg, pi, pj, x, y, 8, &mut memo, false);
         assert!(
             t.elapsed().as_secs() < 5,
             "diff_b took {:?} on {F}-wide {K}-deep join chain ({bk})",
             t.elapsed()
+        );
+    }
+
+    /// A pair that is *another* query's head must not poison the shared
+    /// memo: `(u, v)` chases into the head block's `(p0, p2)`, which
+    /// proves `None` by normal expansion under head `(p0, p1)` but
+    /// must still evaluate to `Head` under head `(p0, p2)`. A flat
+    /// `(x, y)` memo would replay the cached `None` and lose the merge.
+    #[test]
+    fn diff_b_head_pairs_do_not_cross_heads() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let entry = func.dfg.make_block();
+        let s = func.dfg.make_block();
+        let hb = func.dfg.make_block();
+        let q = func.dfg.make_block();
+        for b in [entry, s, hb, q] {
+            func.layout.append_block(b);
+        }
+        for _ in 0..3 {
+            func.dfg.append_block_param(hb, types::I64);
+        }
+        for _ in 0..2 {
+            func.dfg.append_block_param(q, types::I64);
+        }
+        let ps = func.dfg.block_params(hb).to_vec();
+        let (p0, p1, p2) = (ps[0], ps[1], ps[2]);
+        let qs = func.dfg.block_params(q).to_vec();
+        let (u, v) = (qs[0], qs[1]);
+
+        // `entry -> hb` gives `(p0, p2)` edge args (1, 0): diff Lit(1).
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let c0 = cur.ins().iconst(types::I64, 0);
+        let c1 = cur.ins().iconst(types::I64, 1);
+        cur.ins().jump(hb, &[c1.into(), c0.into(), c0.into()]);
+
+        // `s -> hb` gives `(p0, p2)` edge args (0, 1): unprovable, so
+        // the normal expansion of `(p0, p2)` fails.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s);
+        let c0 = cur.ins().iconst(types::I64, 0);
+        let c1 = cur.ins().iconst(types::I64, 1);
+        cur.ins().jump(hb, &[c0.into(), c0.into(), c1.into()]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(hb)
+            .ins()
+            .jump(q, &[p0.into(), p2.into()]);
+
+        FuncCursor::new(&mut func).at_bottom(q).ins().return_(&[u]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let mut memo = DbMemo::default();
+        assert_eq!(
+            diff_b(&func, &cfg, p0, p1, u, v, 8, &mut memo, false),
+            None,
+        );
+        assert_eq!(
+            diff_b(&func, &cfg, p0, p2, u, v, 8, &mut memo, false),
+            Some(Diff::Head),
         );
     }
 

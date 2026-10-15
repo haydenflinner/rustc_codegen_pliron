@@ -1561,9 +1561,23 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
     let Some(dom) = crate::domcheck::Dom::new(ctx, st, f) else {
         return 0;
     };
-    let pos = |ctx: &Context, o: Ptr<Operation>| {
+    // `pos` is asked per (store, same-block load) pair — a fresh
+    // `ops().position()` scan each time is O(loads × block ops). Block
+    // order is stable within this pass, so index each block once.
+    let mut posm: FxHashMap<Ptr<BasicBlock>, FxHashMap<Ptr<Operation>, usize>> =
+        FxHashMap::default();
+    let mut pos = |ctx: &Context, o: Ptr<Operation>| {
         let b = o.deref(ctx).get_parent_block().unwrap();
-        crate::inline::ops(ctx, b).iter().position(|&x| x == o)
+        posm.entry(b)
+            .or_insert_with(|| {
+                crate::inline::ops(ctx, b)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| (x, i))
+                    .collect()
+            })
+            .get(&o)
+            .copied()
     };
     let mut n = 0;
     for op in allocas(ctx, f) {

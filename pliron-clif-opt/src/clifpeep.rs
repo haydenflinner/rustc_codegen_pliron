@@ -2206,14 +2206,6 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let memo = std::cell::RefCell::new(FxHashMap::<Value, crate::proots::Key>::default());
     let mut vhmemo: FxHashMap<Value, u64> = FxHashMap::default();
     let vnmemo = std::cell::RefCell::new(FxHashMap::<Value, usize>::default());
-    // `diff_b` re-proves the same (pi, pj, x, y) pairs across oracle
-    // calls and join paths — shared for the whole run.
-    let dbmemo = std::cell::RefCell::new(
-        FxHashMap::<(Value, Value, Value, Value), (Option<crate::indvars::Diff>, u32)>::default(),
-    );
-    // Join-heavy CFGs keep producing fresh pairs past the memo's
-    // reach — bound total `diff_b` expansion for the whole run.
-    let dbbudget = std::cell::Cell::new(100_000u64);
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
@@ -2237,6 +2229,13 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             tpre_sum += tb0.elapsed();
             continue;
         }
+        // `diff_b` re-proves the same (x, y) pairs across oracle calls
+        // and join paths — two-level memo: head-independent results
+        // shared by every query, head-dependent ones per (pi, pj).
+        // Scoped per target block: a chase node on *this* block's param
+        // pairs is head-sensitive, so entries must not leak into the
+        // next block's queries.
+        let dbmemo = std::cell::RefCell::new(crate::indvars::DbMemo::default());
         // The `skc`/`pk`/`eargs` matrices below are edges × params —
         // ~50B/cell even while the `Key`s stay lazy, so a megafunction
         // block (thousands of wide params × thousands of preds) spills
@@ -2409,9 +2408,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
             .collect();
         // A materialized cell costs a `paramize`+hash over the arg's
-        // def-DAG — unbounded `E×P` materialization is the pass's
-        // dominant cost on megablocks (rustc_parse's
-        // `parse_unspanned_seq`). Past the cap, cells degrade to a
+        // def-DAG — bound the per-block matrix so a megablock's scan
+        // can't go quadratic. Past the cap, cells degrade to a
         // sentinel `O` key whose per-(e,i) payload can never equal a
         // real key — misses merges, never invents them.
         const PK_CELL_CAP: usize = 250_000;
@@ -2780,7 +2778,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     ) {
                         return None;
                     }
-                    if (dfuel.get() <= 0) {
+                    if dfuel.get() <= 0 {
                         return None;
                     }
                     dfuel.set(dfuel.get() - 1);
@@ -2792,7 +2790,6 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                         ai,
                         aj,
                         8,
-                        &dbbudget,
                         &mut *dbmemo.borrow_mut(),
                         false,
                     ) {
