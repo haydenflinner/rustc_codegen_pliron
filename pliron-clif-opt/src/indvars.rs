@@ -371,13 +371,21 @@ fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: V
 /// The loop then carries one counter instead of two — LLVM's one-IV
 /// scan shape.
 ///
-/// Soundness: `pend` and every compared `np+c*e` stay inside the
-/// object's address range — the loop's own `notrap` accesses on `np`
-/// establish it contains each visited element, and the bound test
-/// exits on first failure so no pointer past `pend` is evaluated —
-/// so neither add wraps and the unsigned compare is faithful. `e`
-/// must be a positive power of two for the shift recovery; `isub` is
-/// exact mod 2^w regardless.
+/// Soundness: the unsigned compare is faithful only while `pend` and
+/// every compared `np+c*e` sort the same way `bound` and `iv+c` do —
+/// i.e. while `bound*e` and each `(iv+c)*e` stay below `2^w` relative
+/// to `base`. `bound` needn't fit the object's real extent: a loop
+/// that exits early on data may have `bound` far past it, so
+/// `bound*e` or `base + bound*e` can wrap and `pend` sorts below
+/// `np`, cutting the loop short. Entry edges therefore clamp `pend`
+/// to `u::MAX` on either overflow — `np <u MAX` keeps iterating, as
+/// `iv <u bound` does, and the first compare where they could still
+/// diverge is `~bound` notrap-guarded iterations in, i.e. `~bound*e`
+/// bytes of object, which a defined run cannot reach. Symmetrically
+/// the left side is kept affine-safe by rejecting downward steps,
+/// negative `c` (an `np-k*e` operand can sit below `base` at `iv=0`),
+/// and unbounded entry `iv` (the first compare is evaluated before
+/// any latch invariant holds).
 fn elim_shadowed(
     func: &mut Function,
     dt: &DominatorTree,
@@ -395,6 +403,10 @@ fn elim_shadowed(
     }
     let sh = i64::from(e.trailing_zeros());
     let ty = func.dfg.value_type(np);
+    // `e >= 2^w` collapses every `*e` product to 0 mod 2^w.
+    if sh >= i64::from(ty.bits()) {
+        return 0;
+    }
     if func.dfg.value_type(iv) != ty || func.dfg.value_type(base) != ty {
         return 0;
     }
@@ -428,7 +440,10 @@ fn elim_shadowed(
             }
             return 0;
         };
-        if sn != s.wrapping_mul(e) || step.is_some_and(|x| x != s) {
+        // `s <= 0` breaks the affine-order argument: a down-step lets
+        // `iv` wrap past 0, where `np - k*e` sorts below `base` but the
+        // original `iv <u bound` has already failed.
+        if s <= 0 || sn != s.wrapping_mul(e) || step.is_some_and(|x| x != s) {
             if debug {
                 eprintln!("indvars {h}: ivelim bail lockstep s={s} sn={sn}");
             }
@@ -568,6 +583,7 @@ fn elim_shadowed(
     // step backedge arg, or an exit arg with a live `np` counterpart.
     let mut icmps: Vec<(Inst, Value, Value, Value)> = vec![]; // (inst, aff, bound, map)
     let mut exits: Vec<(Inst, usize, Block, Vec<Value>)> = vec![]; // (inst, slot, dst, shim args)
+    let mut cmax: i64 = 0;
     for &b in body {
         for i in func.layout.block_insts(b) {
             if adefs.contains(&i) || dead.contains(&i) {
@@ -597,8 +613,16 @@ fn elim_shadowed(
                             }
                             hit = true;
                         }
-                        Some(_) if !body.contains(&dst) => {
+                        Some(&c) if !body.contains(&dst) => {
                             hit = true;
+                            // `iv + c` for `c < 0` recovers below `base`.
+                            if c < 0 {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail negexit {a}");
+                                }
+                                return 0;
+                            }
+                            cmax = cmax.max(c);
                             let Some(m) = pmap(a, i) else {
                                 if debug {
                                     eprintln!("indvars {h}: ivelim bail exitmap {a} at {b}");
@@ -629,6 +653,18 @@ fn elim_shadowed(
                         (false, false) => {}
                         (ax, _) => {
                             let (w, bound) = if ax { (x, y) } else { (y, x) };
+                            // `c < 0` puts the `np` counterpart below
+                            // `base` for small `iv`: `np-k*e <u pend`
+                            // reports "continue" where `iv+c <u bound`
+                            // (a wrapped-huge unsigned value) exits.
+                            let c = off[&func.dfg.resolve_aliases(w)];
+                            if c < 0 {
+                                if debug {
+                                    eprintln!("indvars {h}: ivelim bail negicmp {w}");
+                                }
+                                return 0;
+                            }
+                            cmax = cmax.max(c);
                             let bound = func.dfg.resolve_aliases(bound);
                             // `pend` materializes on entry edges, so the
                             // bound must reach every entry pred.
@@ -686,6 +722,31 @@ fn elim_shadowed(
         }
         return 0;
     }
+    // The first compare runs before the latch pins `iv` under `bound`,
+    // so an entry `iv` needs a proven ceiling: `iv + c < 2^(w-1-sh)`
+    // keeps `(iv+c)*e` inside the unsigned order and leaves `base +
+    // (iv+c)*e` a full top half of headroom against wraparound.
+    // `vmax` only tightens for iconst/zero-extended/narrow-source
+    // values — a raw runtime entry bails the whole rewrite.
+    let cap: u128 = 1u128 << (ty.bits() - 1 - sh as u32);
+    for e2 in edges {
+        if func
+            .layout
+            .inst_block(e2.inst)
+            .is_some_and(|b| body.contains(&b))
+        {
+            continue;
+        }
+        let Some(a) = edge_arg(func, e2, iv_idx) else {
+            return 0;
+        };
+        if crate::clifpeep::vmax(func, a) as u128 + cmax.max(0) as u128 >= cap {
+            if debug {
+                eprintln!("indvars {h}: ivelim bail entryiv {a}");
+            }
+            return 0;
+        }
+    }
     // `pend = base + bound*e` per distinct bound, carried as a new
     // header param: materialized on entry edges, fed itself on
     // backedges.
@@ -701,8 +762,27 @@ fn elim_shadowed(
             } else {
                 let mut pos = FuncCursor::new(func).at_inst(e2.inst);
                 let s = iconst_masked(&mut pos, ty, e);
-                let m = pos.ins().imul(bnd, s);
-                pos.ins().iadd(base, m)
+                let be = pos.ins().imul(bnd, s);
+                let raw = pos.ins().iadd(base, be);
+                // `bound` needn't fit the object's extent: `bound*e` or
+                // `base + bound*e` wrapping sorts `pend` below `np` and
+                // the unsigned test exits zero-trip. Clamp `pend` to
+                // `u::MAX` on overflow — `np <u MAX` keeps iterating, as
+                // `iv <u bound` does; divergence needs `~bound` guarded
+                // iterations, unreachable for a defined run.
+                let lo = pos.ins().icmp(IntCC::UnsignedLessThan, raw, base);
+                let bad = if sh > 0 {
+                    // `bound*e` overflows iff `bound >> (w - sh)` is set.
+                    let sc = pos.ins().iconst(types::I64, i64::from(ty.bits()) - sh);
+                    let hi = pos.ins().ushr(bnd, sc);
+                    let z = iconst_masked(&mut pos, ty, 0);
+                    let ov = pos.ins().icmp(IntCC::NotEqual, hi, z);
+                    pos.ins().bor(ov, lo)
+                } else {
+                    lo
+                };
+                let top = iconst_masked(&mut pos, ty, -1);
+                pos.ins().select(bad, top, raw)
             };
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[e2.inst]
