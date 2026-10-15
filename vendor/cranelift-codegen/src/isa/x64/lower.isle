@@ -6294,3 +6294,35 @@
 (rule 2 (lower (swiden_high $I32X8 x)) (x64_vpmovsxwd_y (xmm_to_xmm_mem_128 (x64_vextractf128_y x 1))))
 (rule 2 (lower (uwiden_low $I32X8 x)) (x64_vpmovzxwd_y (xmm_to_xmm_mem_128 (put_in_xmm x))))
 (rule 2 (lower (uwiden_high $I32X8 x)) (x64_vpmovzxwd_y (xmm_to_xmm_mem_128 (x64_vextractf128_y x 1))))
+
+;; PLIRON: dot-product opcodes. `sdot` = signed i16xN pairwise dot to
+;; i32xN/2 (pmaddwd). `udot` = unsigned x times signed y pairwise to
+;; i16xN/2 (pmaddubsw — first operand is the unsigned source, matching
+;; `udot x y`). `udot_acc` = four-wide u8x4N x i8x4N accumulate into
+;; i32xN (vpdpbusd, VNNI).
+(rule 1 (lower (sdot $I32X4 x y)) (x64_pmaddwd x y))
+(rule 2 (lower (sdot $I32X8 x y)) (x64_vpmaddwd_y x y))
+(rule 2 (lower (sdot $I32X16 x y))
+      (if-let true (has_avx512bw))
+      (x64_vpmaddwd_z x y))
+(rule 1 (lower (udot $I16X8 x y)) (x64_pmaddubsw x y))
+(rule 2 (lower (udot $I16X16 x y)) (x64_vpmaddubsw_y x y))
+(rule 2 (lower (udot $I16X32 x y))
+      (if-let true (has_avx512bw))
+      (x64_vpmaddubsw_z x y))
+;; vpdpbusd operand order: (acc, unsigned-source, signed-source).
+(rule 2 (lower (udot_acc $I32X4 acc x y))
+      (if-let true (use_avx_vnni))
+      (x64_vpdpbusd acc x y))
+(rule 1 (lower (udot_acc $I32X4 acc x y))
+      (if-let true (use_avx512vnni))
+      (x64_vpdpbusd_evex acc x y))
+(rule 2 (lower (udot_acc $I32X8 acc x y))
+      (if-let true (use_avx_vnni))
+      (x64_vpdpbusd_y acc x y))
+(rule 1 (lower (udot_acc $I32X8 acc x y))
+      (if-let true (use_avx512vnni))
+      (x64_vpdpbusd_h acc x y))
+(rule 2 (lower (udot_acc $I32X16 acc x y))
+      (if-let true (use_avx512vnni))
+      (x64_vpdpbusd_z acc x y))

@@ -303,3 +303,21 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     unrepresentable and loud-fail on the verifier). `shuffle` is
     i8x16-only and `gather`/`scatter` do not exist in this CLIF —
     nothing to lower there.
+
+26. x64 dot-product opcodes (`src/isa/x64/lower.isle`,
+    `src/isa/aarch64/inst.isle`, `src/isa/aarch64/lower.isle`):
+    new CLIF opcodes `sdot` (signed i16xN pairwise dot -> i32xN/2,
+    pmaddwd), `udot` (unsigned x times signed y pairwise -> i16xN/2
+    saturating, pmaddubsw — x is the unsigned operand, matching
+    `udot x y` -> `vpmaddubsw x y`) and `udot_acc` (four-wide
+    u8x4N x i8x4N accumulate into i32xN, vpdpbusd). The opcode
+    definitions live in `vendor/cranelift-codegen-meta/src/shared/
+    instructions.rs` — see that crate's PLIRON_PATCH.md. `udot_acc`'s
+    byte operands are free typevars (the 4x lane relation to the
+    i32 accumulator is not expressible one derived level down), so
+    the lowering rules match concrete input types. aarch64's
+    internal `sdot`/`udot` ISLE terms were renamed `a64_sdot`/
+    `a64_udot` to free the names for the CLIF opcodes. VNNI gating:
+    `udot_acc` prefers the VEX AVX-VNNI form, falls back to the EVEX
+    AVX512-VNNI(+VL) forms; byte/word 512-bit forms gate on
+    `has_avx512bw`.

@@ -3039,6 +3039,113 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", I64x2)]),
     );
 
+    // PLIRON: pairwise integer dot products — the quantized-inference
+    // primitives. `sdot` multiplies adjacent i16 lane pairs of `x` and `y`
+    // and adds them into i32 (x86 `pmaddwd`); `udot` does the same for
+    // unsigned `x` bytes times signed `y` bytes producing i16
+    // (x86 `pmaddubsw`, saturating); `udot_acc` is the four-wide
+    // u8*x*i8 dot accumulate (x86 `vpdpbusd` / AVX-VNNI) — the real
+    // quantized kernel op.
+    let I16xN = &TypeVar::new(
+        "I16xN",
+        "A SIMD vector type of 16-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(16..16)
+            .simd_lanes(2..32)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I8xN = &TypeVar::new(
+        "I8xN",
+        "A SIMD vector type of 8-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(8..8)
+            .simd_lanes(4..64)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I32xN = &TypeVar::new(
+        "I32xN",
+        "A SIMD vector type of 32-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(32..32)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I8xN2 = &TypeVar::new(
+        "I8xN2",
+        "A SIMD vector type of 8-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(8..8)
+            .simd_lanes(4..64)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "sdot",
+            r#"
+        Signed pairwise dot product.
+
+        `a[i] = x[2i]*y[2i] + x[2i+1]*y[2i+1]`: multiply adjacent signed
+        16-bit lane pairs of `x` and `y` and add them into a signed 32-bit
+        lane. Result has half the lanes of `x` at double the width.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", I16xN),
+            Operand::new("y", I16xN),
+        ])
+        .operands_out(vec![Operand::new("a", &I16xN.merge_lanes())]),
+    );
+
+    ig.push(
+        Inst::new(
+            "udot",
+            r#"
+        Pairwise unsigned-times-signed dot product.
+
+        `a[i] = x[2i]*y[2i] + x[2i+1]*y[2i+1]` where `x` lanes are
+        unsigned bytes and `y` lanes are signed bytes; the pairwise sums
+        saturate to signed 16-bit lanes (x86 `pmaddubsw` semantics).
+        Result has half the lanes of `x` at double the width.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", I8xN),
+            Operand::new("y", I8xN),
+        ])
+        .operands_out(vec![Operand::new("a", &I8xN.merge_lanes())]),
+    );
+
+    ig.push(
+        Inst::new(
+            "udot_acc",
+            r#"
+        Four-wide unsigned-times-signed dot product with accumulation.
+
+        `a[i] = acc[i] + x[4i]*y[4i] + x[4i+1]*y[4i+1] + x[4i+2]*y[4i+2]
+        + x[4i+3]*y[4i+3]` where `x` lanes are unsigned bytes and `y`
+        lanes are signed bytes (x86 `vpdpbusd` semantics). `x`/`y` have
+        four times as many lanes at a quarter of the width as `acc`.
+        "#,
+            &formats.ternary,
+        )
+        .operands_in(vec![
+            Operand::new("acc", I32xN),
+            // x/y are free typevars: the 4x lane-count relation to acc
+            // can't be expressed one derived level down, so lowering
+            // rules match the concrete byte-vector types instead.
+            Operand::new("x", I8xN),
+            Operand::new("y", I8xN2),
+        ])
+        .operands_out(vec![Operand::new("a", I32xN)]),
+    );
+
     ig.push(
         Inst::new(
             "uextend",

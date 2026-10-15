@@ -3630,8 +3630,8 @@
 
 ;; SDOT Vd.4S, Vn.16B, Vm.16B -- accumulates the 4-way i8 dot product into
 ;; `acc` (which is both source and destination). `a`/`b` are i8x16.
-(decl sdot (Reg Reg Reg) Reg)
-(rule (sdot acc a b)
+(decl a64_sdot (Reg Reg Reg) Reg)
+(rule (a64_sdot acc a b)
       (vec_rrr_mod (VecALUModOp.Sdot) acc a b (VectorSize.Size32x4)))
 
 ;; MLA Vd.<T>, Vn.<T>, Vm.<T> -- integer multiply-accumulate vectors;
@@ -3648,8 +3648,8 @@
 
 ;; UDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but both sources are read as
 ;; unsigned bytes. `acc` is both source and destination; `a`/`b` are i8x16.
-(decl udot (Reg Reg Reg) Reg)
-(rule (udot acc a b)
+(decl a64_udot (Reg Reg Reg) Reg)
+(rule (a64_udot acc a b)
       (vec_rrr_mod (VecALUModOp.Udot) acc a b (VectorSize.Size32x4)))
 
 ;; USDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but the first source is read as

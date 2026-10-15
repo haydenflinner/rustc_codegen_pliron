@@ -16,3 +16,8 @@ Submit upstream once proven, then drop this copy.
    lane-chunk ops. Operands use the `xmm_m256`/`xmm_m512` memory
    locations (see cranelift-codegen patch 23/24); byte/word
    512-bit forms are gated `avx512bw`, `vpmullq` on `avx512dq`.
+
+3. `src/instructions/wide.rs`: dot-product family — `vpmaddwd`/`vpmaddubsw`
+   Y (avx2) and Z (avx512bw), `vpdpbusd` Y (avx_vnni), H (avx512vnni+vl),
+   Z (avx512vnni). Feeds the `sdot`/`udot`/`udot_acc` CLIF opcodes
+   (cranelift-codegen patch 26).

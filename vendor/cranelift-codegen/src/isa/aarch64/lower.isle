@@ -473,7 +473,7 @@
                             (swiden_low _ hi @ (imul _ (swiden_high _ a) (swiden_high _ b)))
                             (swiden_high _ hi)))
                         c))))
-      (sdot c a b))
+      (a64_sdot c a b))
 
 ;; Same tree with both operands widened unsigned: `udot` (also FEAT_DotProd).
 ;; The u8*u8 products are unsigned, so they widen with `uwiden` too.
@@ -488,7 +488,7 @@
                             (uwiden_low _ hi @ (imul _ (uwiden_high _ a) (uwiden_high _ b)))
                             (uwiden_high _ hi)))
                         c))))
-      (udot c a b))
+      (a64_udot c a b))
 
 ;; With FEAT_I8MM, fold the same tree in its mixed unsigned-by-signed form
 ;; into a single `usdot`. This is the shape quantized inference produces —

@@ -330,5 +330,14 @@ pub fn list() -> Vec<Inst> {
         inst("vpshufd", fmt("ZI", [w(xmm1), r(xmm_m512), r(imm8)]), z(Full)._66()._0f().w0().op(0x70).r().ib(), (_64b | compat) & avx512f),
         inst("vpermps", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f38().op(0x16).r(), (_64b | compat) & avx2),
         inst("vpermd", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f38().op(0x36).r(), (_64b | compat) & avx2),
-    ]
+            // PLIRON: dot-product family (sdot/udot/udot_acc CLIF ops)
+        inst("vpmaddwd", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f().op(0xF5).r(), (_64b | compat) & avx2),
+        inst("vpmaddwd", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f().w0().op(0xF5).r(), (_64b | compat) & avx512bw),
+        inst("vpmaddubsw", fmt("Y", [w(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f38().op(0x04).r(), (_64b | compat) & avx2),
+        inst("vpmaddubsw", fmt("Z", [w(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x04).r(), (_64b | compat) & avx512bw),
+        // vpdpbusd: Y gated avx_vnni, Z gated avx512vnni (128/256 VL forms exist upstream)
+        inst("vpdpbusd", fmt("Y", [rw(xmm1), r(xmm2), r(xmm_m256)]), y()._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx_vnni),
+        inst("vpdpbusd", fmt("Z", [rw(xmm1), r(xmm2), r(xmm_m512)]), z(Full)._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx512vnni),
+        inst("vpdpbusd", fmt("H", [rw(xmm1), r(xmm2), r(xmm_m256)]), h()._66()._0f38().w0().op(0x50).r(), (_64b | compat) & avx512vnni & avx512vl),
+]
 }

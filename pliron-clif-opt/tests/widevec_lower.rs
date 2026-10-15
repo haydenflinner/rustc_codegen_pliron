@@ -21,6 +21,10 @@ fn isa() -> std::sync::Arc<dyn TargetIsa> {
     isa_b.enable("has_avx2").unwrap();
     isa_b.enable("has_fma").unwrap();
     isa_b.enable("has_avx512f").unwrap();
+    isa_b.enable("has_avx512bw").unwrap();
+    isa_b.enable("has_avx512vl").unwrap();
+    isa_b.enable("has_avx_vnni").unwrap();
+    isa_b.enable("has_avx512vnni").unwrap();
     isa_b.finish(flags).unwrap()
 }
 
@@ -465,4 +469,81 @@ fn widen_256() {
     assert!(has_wide_op(&code, &[0x33]), "no vpmovzxwd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x23]), "no vpmovsxwd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x19]), "no vextractf128 (high half): {code:02x?}");
+}
+
+/// 0F38-map variant of `has_wide_op`: VEX.256 is `C4` with mm=0F38 and L=1
+/// (C5 can't encode 0F38); EVEX.512 is `62` with mm=2 in P1 and L'L=10.
+fn has_wide_op38(code: &[u8], ops: &[u8]) -> bool {
+    code.windows(4).any(|w| {
+        w[0] == 0xC4 && (w[1] & 0x1F) == 0x02 && (w[2] & 0x04) != 0 && ops.contains(&w[3])
+    }) || code.windows(5).any(|w| {
+        w[0] == 0x62 && (w[2] & 0x03) == 0x02 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
+    })
+}
+
+/// Legacy 0F38-map encoding check (`66 0F38 xx`).
+fn has_legacy_op38(code: &[u8], ops: &[u8]) -> bool {
+    code.windows(4)
+        .any(|w| w[0] == 0x66 && w[1] == 0x0F && w[2] == 0x38 && ops.contains(&w[3]))
+}
+
+const SDOT: &str = "
+function %sdot(i16x16, i16x16) -> i32x8 {
+block0(v0: i16x16, v1: i16x16):
+    v2 = sdot.i16x16 v0, v1
+    return v2
+}";
+
+const UDOT: &str = "
+function %udot(i8x32, i8x32) -> i16x16 {
+block0(v0: i8x32, v1: i8x32):
+    v2 = udot.i8x32 v0, v1
+    return v2
+}";
+
+const UDOT_ACC: &str = "
+function %udot_acc(i32x8, i8x32, i8x32) -> i32x8 {
+block0(v0: i32x8, v1: i8x32, v2: i8x32):
+    v3 = udot_acc.i32x8 v0, v1, v2
+    return v3
+}";
+
+#[test]
+fn sdot_256() {
+    let code = compile(256, SDOT);
+    assert!(has_wide_op(&code, &[0xF5]), "no vpmaddwd ymm: {code:02x?}");
+    assert!(!has_legacy_op(&code, &[0xF5]), "xmm pmaddwd: {code:02x?}");
+}
+
+#[test]
+fn sdot_512() {
+    let code = compile(512, SDOT);
+    assert!(has_wide_op(&code, &[0xF5]), "no vpmaddwd zmm: {code:02x?}");
+    assert!(!has_legacy_op(&code, &[0xF5]), "xmm pmaddwd: {code:02x?}");
+}
+
+#[test]
+fn udot_256() {
+    let code = compile(256, UDOT);
+    assert!(has_wide_op38(&code, &[0x04]), "no vpmaddubsw ymm: {code:02x?}");
+    assert!(!has_legacy_op38(&code, &[0x04]), "xmm pmaddubsw: {code:02x?}");
+}
+
+#[test]
+fn udot_512() {
+    let code = compile(512, UDOT);
+    assert!(has_wide_op38(&code, &[0x04]), "no vpmaddubsw zmm: {code:02x?}");
+    assert!(!has_legacy_op38(&code, &[0x04]), "xmm pmaddubsw: {code:02x?}");
+}
+
+#[test]
+fn udot_acc_256() {
+    let code = compile(256, UDOT_ACC);
+    assert!(has_wide_op38(&code, &[0x50]), "no vpdpbusd ymm: {code:02x?}");
+}
+
+#[test]
+fn udot_acc_512() {
+    let code = compile(512, UDOT_ACC);
+    assert!(has_wide_op38(&code, &[0x50]), "no vpdpbusd zmm: {code:02x?}");
 }

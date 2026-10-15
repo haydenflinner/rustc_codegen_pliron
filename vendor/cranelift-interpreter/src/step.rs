@@ -1315,6 +1315,60 @@ where
         Opcode::IaddPairwise => {
             assign(binary_pairwise(arg(0), arg(1), ctrl_ty, DataValueExt::add)?)
         }
+        // PLIRON: pairwise dot products (see cranelift-codegen-meta ops).
+        Opcode::Sdot => {
+            let xs = extractlanes(&arg(0), arg(0).ty())?;
+            let ys = extractlanes(&arg(1), arg(1).ty())?;
+            let out = xs
+                .chunks(2)
+                .zip(ys.chunks(2))
+                .map(|(a, b)| {
+                    let v = a[0].clone().into_int_signed()?
+                        * b[0].clone().into_int_signed()?
+                        + a[1].clone().into_int_signed()?
+                            * b[1].clone().into_int_signed()?;
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::Udot => {
+            let xs = extractlanes(&arg(0), arg(0).ty())?;
+            let ys = extractlanes(&arg(1), arg(1).ty())?;
+            let out = xs
+                .chunks(2)
+                .zip(ys.chunks(2))
+                .map(|(a, b)| {
+                    // unsigned x * signed y, saturating to the output lane
+                    let v = (a[0].clone().into_int_unsigned()? as i128)
+                        * b[0].clone().into_int_signed()?
+                        + (a[1].clone().into_int_unsigned()? as i128)
+                            * b[1].clone().into_int_signed()?;
+                    let bits = ctrl_ty.lane_bits() as i128;
+                    let v = v.clamp(-(1 << (bits - 1)), (1 << (bits - 1)) - 1);
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
+        Opcode::UdotAcc => {
+            let accs = extractlanes(&arg(0), ctrl_ty)?;
+            let xs = extractlanes(&arg(1), arg(1).ty())?;
+            let ys = extractlanes(&arg(2), arg(2).ty())?;
+            let out = accs
+                .into_iter()
+                .zip(xs.chunks(4).zip(ys.chunks(4)))
+                .map(|(acc, (a, b))| {
+                    let mut v = acc.into_int_signed()?;
+                    for i in 0..4 {
+                        v += (a[i].clone().into_int_unsigned()? as i128)
+                            * b[i].clone().into_int_signed()?;
+                    }
+                    DataValueExt::int(v, ctrl_ty.lane_type())
+                })
+                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            assign(vectorizelanes(&out, ctrl_ty)?)
+        }
         Opcode::ExtractVector => {
             unimplemented!("ExtractVector not supported");
         }
