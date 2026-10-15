@@ -48,6 +48,7 @@ pub mod tailmerge;
 pub mod tailrec;
 pub(crate) mod trace;
 pub mod unreach;
+pub mod webroot;
 pub mod unroll;
 pub(crate) mod uses;
 pub mod veclegalize;

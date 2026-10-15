@@ -20,8 +20,7 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, ProgramPoint, Value,
-    ValueDef,
+    Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, Value,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -194,31 +193,6 @@ fn edge_candidate(func: &Function, p: Block, t: Inst) -> Option<(Block, Vec<Inst
     param_load.then_some((r, body))
 }
 
-/// One O(fn) scan producing the two indexes the per-candidate checks
-/// would otherwise rebuild per candidate: the shared `Uses` index, and
-/// per block the resolved def `(program point, def block)` of every
-/// value it references (`None` when the def isn't an inst result or
-/// block param, which fails `succs_ok`).
-fn mem_indexes(
-    func: &Function,
-) -> (
-    crate::uses::Uses,
-    FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>>,
-) {
-    let mut ext: FxHashMap<Block, Vec<Option<(ProgramPoint, Option<Block>)>>> =
-        FxHashMap::default();
-    let uses = crate::uses::Uses::build(func, |v, b, _| {
-        ext.entry(b).or_default().push(match func.dfg.value_def(v) {
-            ValueDef::Result(d, _) => {
-                Some((ProgramPoint::Inst(d), func.layout.inst_block(d)))
-            }
-            ValueDef::Param(b2, _) => Some((ProgramPoint::Block(b2), Some(b2))),
-            _ => None,
-        });
-    });
-    (uses, ext)
-}
-
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
@@ -261,7 +235,7 @@ pub fn run(
     // address, so a pointer loaded from memory can't reach its region.
     // Same rule licm's `iso_l` applies per loop, scoped to the edge.
     let mut reachers: FxHashSet<Block> = FxHashSet::default();
-    let (mut uses, mut ext) = mem_indexes(func);
+    let mut uses = crate::uses::Uses::new(func);
     let mut n = 0;
     'blocks: for (p, t, (r, body)) in cands {
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
@@ -296,11 +270,15 @@ pub fn run(
             }
             continue;
         }
-        // The clone gives every block `r` (or an embedded try_call
-        // edge) targets a new predecessor `p`. A value used inside that
-        // target's dominated region whose def sits outside it only
-        // dominated the region's old entry paths — it must also
-        // dominate `p` or the use dangles.
+        // The clone gives every block `s` that `r`'s body targets a new
+        // predecessor `p`. A strict dominator of `s` that doesn't
+        // dominate `p` stops dominating `s` — and every use of its defs
+        // downstream dangles: inside `s`'s region AND at joins `s`
+        // reaches but doesn't dominate (hashmap's grow-exit re-entered
+        // below the slotprom'd params). `idom(s)` dominating `p` keeps
+        // the whole dominator chain above `s` intact on the new edge,
+        // which is exactly what every use below relies on. `s == r` is
+        // a self-loop: the `p → r` edge already existed.
         let succs_ok = body.iter().all(|&i| {
             func.dfg
                 .insts[i]
@@ -308,17 +286,9 @@ pub fn run(
                 .into_iter()
                 .all(|bc| {
                     let s = bc.block(&func.dfg.value_lists);
-                    func.layout.blocks().filter(|&b| {
-                        b == s || domtree.block_dominates(s, b)
-                    }).all(|b| {
-                        ext.get(&b).map(Vec::as_slice).unwrap_or(&[]).iter().all(|e| {
-                            let Some((pp, db)) = *e else {
-                                return false;
-                            };
-                            db.is_some_and(|db| domtree.block_dominates(s, db))
-                                || domtree.dominates(pp, t, &func.layout)
-                        })
-                    })
+                    s == r || domtree
+                        .idom(s)
+                        .is_some_and(|id| domtree.block_dominates(id, p))
                 })
         });
         if !succs_ok {
@@ -460,7 +430,7 @@ pub fn run(
         n += 1;
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
-        (uses, ext) = mem_indexes(func);
+        uses = crate::uses::Uses::new(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
             loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());
@@ -472,9 +442,10 @@ pub fn run(
 mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{
-        Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
+        AbiParam, Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
         UserFuncName,
     };
     use cranelift_codegen::isa::CallConv;
@@ -537,6 +508,84 @@ mod tests {
             .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
             .count();
         assert_eq!(n_loads, 0);
+        verify(&func);
+    }
+
+    /// Cloning `r` into `p`'s edge makes `p` a new predecessor of every
+    /// block `r` targets. A strict dominator of such a target that
+    /// doesn't dominate `p` stops dominating it — and every use of its
+    /// defs downstream dangles, including at joins the target reaches
+    /// but doesn't dominate. `d` dominates join `j` only through its
+    /// two brif destinations; the clone must be refused.
+    #[test]
+    fn rejects_dominator_bypassing_edge() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let e = func.dfg.make_block();
+        let q = func.dfg.make_block();
+        let p = func.dfg.make_block();
+        let d = func.dfg.make_block();
+        let s1 = func.dfg.make_block();
+        let s2 = func.dfg.make_block();
+        let j = func.dfg.make_block();
+        for b in [e, q, p, d, s1, s2, j] {
+            func.layout.append_block(b);
+        }
+        let ss = func
+            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let flags = MemFlagsData::new().with_notrap();
+        let arg0 = func.dfg.append_block_param(e, types::I64);
+        let pd = func.dfg.append_block_param(d, types::I64);
+        let sp1 = func.dfg.append_block_param(s1, types::I64);
+        let sp2 = func.dfg.append_block_param(s2, types::I64);
+        let pj = func.dfg.append_block_param(j, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(e);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, arg0, z);
+        cur.ins().brif(c, p, &[], q, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(q);
+        let seven = cur.ins().iconst(types::I64, 7);
+        cur.ins().jump(d, &[seven.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(p);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let five = cur.ins().iconst(types::I64, 5);
+        cur.ins().store(flags, five, a, 0);
+        cur.ins().jump(d, &[a.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(d);
+        let l = cur.ins().load(types::I64, flags, pd, 0);
+        let one = cur.ins().iconst(types::I64, 1);
+        let inc = cur.ins().iadd(l, one);
+        cur.ins().store(flags, inc, pd, 0);
+        let c2 = cur.ins().icmp(IntCC::Equal, inc, z);
+        cur.ins().brif(c2, s1, &[pd.into()], s2, &[pd.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s1);
+        cur.ins().jump(j, &[sp1.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(s2);
+        cur.ins().jump(j, &[sp2.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(j);
+        // `pd` is `d`'s param: `j` is dominated by `d` through `s1`/`s2`
+        // — a clone giving `s1`/`s2` a `p` edge breaks that dominance.
+        let out = cur.ins().iadd(pj, pd);
+        cur.ins().return_(&[out]);
+
+        assert_eq!(
+            run(
+                &mut func,
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+            ),
+            0
+        );
         verify(&func);
     }
 

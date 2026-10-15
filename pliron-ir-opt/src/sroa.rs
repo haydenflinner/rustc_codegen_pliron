@@ -6,6 +6,7 @@
 //! across `try_call` exception edges) is done by cranelift-frontend.
 //! `PLIRON_SROA=0` disables it.
 
+use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -19,8 +20,8 @@ use pliron_llvm::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
 use pliron_llvm::ops::{
-    AllocaOp, AndOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp, LShrOp, LoadOp, OrOp,
-    PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
+    AllocaOp, AndOp, BrOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp, LShrOp, LoadOp,
+    OrOp, PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
 use pliron_llvm::types::ArrayType;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -228,6 +229,55 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         eprintln!("pinmiss {id} #{idx}: {got}");
     }
     r
+}
+
+/// Operand `idx` of call `op` cannot be retained by the callee past the
+/// call's end: rustc's `nocapture` bit on the arg (`nocap`) or our own
+/// `nocapture` inference. `noalias` alone does NOT suffice: `f(&'a mut
+/// self) -> Entry<'a>`-style reborrows legally hand a pointer into this
+/// alloca back through the return value or an out-param, and a later call
+/// writing through it would bypass the `pin_a` sync below.
+/// A slice pinned only through such operands can promote after all: the
+/// callee sees real memory in `pin_a`, and `split` writes the SSA value
+/// back before the call and reloads it on the call's return edges.
+fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bool {
+    if !crate::pass_enabled("PLIRON_SROA_SYNC") {
+        return false;
+    }
+    let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+        return false;
+    };
+    let direct = matches!(c.callee(ctx), CallOpCallable::Direct(_));
+    // Operand 0 of an indirect call is the callee, not an argument.
+    if !direct && idx == 0 {
+        return false;
+    }
+    // A call with no following op has no normal edge to reload on; an
+    // invoke whose pad takes arguments can't take a reload trampoline —
+    // treat both as retaining.
+    if op.deref(ctx).get_next().is_none() {
+        return false;
+    }
+    if let Some(&(pad, _)) = st.invokes.get(&op)
+        && pad.deref(ctx).arguments().next().is_some()
+    {
+        return false;
+    }
+    let ai = idx - usize::from(!direct);
+    let info = st.calls.get(&op);
+    if info
+        .and_then(|i| i.nocap.as_ref())
+        .is_some_and(|n| n.get(ai) == Some(&true))
+    {
+        return true;
+    }
+    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+        return false;
+    };
+    st.ident_to_sym
+        .get(&id.to_string())
+        .and_then(|sym| st.nocapture.get(sym))
+        .is_some_and(|s| s.contains(&(ai as u32)))
 }
 
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
@@ -750,6 +800,31 @@ pub fn ptr_plus(
     g.deref(ctx).get_result(0)
 }
 
+/// `pin_a` → SSA reload for one call's return edge: every op is anchored
+/// before `at` (the op after the call on the normal edge, or the
+/// trampoline's `br` on an unwind edge).
+#[allow(clippy::too_many_arguments)]
+fn reload_sync(
+    ctx: &mut Context,
+    st: &mut State,
+    pa: Value,
+    pin_lo: u64,
+    sl: &[Slice],
+    new: &[Value],
+    ss: &[usize],
+    at: Ptr<Operation>,
+) {
+    for &i in ss {
+        let p = ptr_plus(ctx, st, pa, sl[i].off - pin_lo, at);
+        let l = LoadOp::new(ctx, p, sl[i].ty).get_operation();
+        l.insert_before(ctx, at);
+        let lv = l.deref(ctx).get_result(0);
+        StoreOp::new(ctx, lv, new[i])
+            .get_operation()
+            .insert_before(ctx, at);
+    }
+}
+
 fn erase_dead(ctx: &mut Context, mut ops: Vec<Ptr<Operation>>) {
     loop {
         let before = ops.len();
@@ -823,6 +898,59 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         return false;
     };
 
+    // A pinned slice can still promote when every access covering it is a
+    // `Pin` on a nonretaining call operand: the callee sees real memory in
+    // `pin_a`, and the SSA view is synced with a writeback before the call
+    // plus a reload on each return edge. Opaque uses — loads/stores through
+    // a pointer read back out of memory (`flow`), a `store *q <- p` parking
+    // a pointer where any later call could pick it up, or a retaining pin —
+    // keep their slices memory-only.
+    let mut pin_rngs: FxHashMap<Ptr<Operation>, Vec<(u64, u64)>> = FxHashMap::default();
+    let mut covered = vec![false; sl.len()];
+    let mut bad = vec![false; sl.len()];
+    for x in &acc {
+        let n = match x.kind {
+            Kind::Pin { n, .. } | Kind::Copy { n, .. } | Kind::Set { n, .. } => n,
+            Kind::Load | Kind::Store if x.flow => {
+                access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(0)
+            }
+            _ => continue,
+        };
+        if n == 0 {
+            continue;
+        }
+        let ok = match x.kind {
+            Kind::Pin { idx, .. } => nonretaining(ctx, st, x.op, idx),
+            // A flow access is an opaque touch — no call boundary to sync at.
+            _ => !x.flow,
+        };
+        for (i, s) in sl.iter().enumerate() {
+            if x.off < s.off + s.size && s.off < x.off + n {
+                if ok {
+                    covered[i] = true;
+                } else {
+                    bad[i] = true;
+                }
+            }
+        }
+        if let Kind::Pin { .. } = x.kind
+            && ok
+        {
+            pin_rngs.entry(x.op).or_default().push((x.off, x.off + n));
+        }
+    }
+    // `store *q <- p` (a non-flow Flow access) parks a pointer into this
+    // alloca in memory a callee could pick back up — nothing is syncable.
+    if acc
+        .iter()
+        .any(|x| matches!(x.kind, Kind::Flow { .. }) && Operation::is_op::<StoreOp>(x.op, ctx))
+    {
+        bad.iter_mut().for_each(|b| *b = true);
+    }
+    let syncable: Vec<bool> = (0..sl.len())
+        .map(|i| sl[i].pinned && covered[i] && !bad[i])
+        .collect();
+
     let count = alloca.deref(ctx).get_operand(0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
     // All pinned slices share one stack object: a callee handed a pointer
@@ -882,8 +1010,9 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     };
     let new: Vec<Value> = sl
         .iter()
-        .map(|s| {
-            if s.pinned {
+        .enumerate()
+        .map(|(i, s)| {
+            if s.pinned && !syncable[i] {
                 return ptr_plus(ctx, st, pin_a.unwrap(), s.off - pin_lo, alloca);
             }
             let arr = ArrayType::get(ctx, i8t, s.size).into();
@@ -1024,10 +1153,10 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 Operation::replace_operand(x.op, ctx, idx, p);
             }
             Kind::Pin { idx, .. } => {
-                // `new[i]` is a gep into `pin_a`, so the callee sees real
-                // memory exactly covering its pointee extent.
-                let i = find(x.off);
-                let p = ptr_plus(ctx, st, new[i], x.off - sl[i].off, x.op);
+                // The callee always sees a `pin_a` address: pinned slices
+                // live there, and syncable slices mirror into it around
+                // each call.
+                let p = ptr_plus(ctx, st, pin_a.unwrap(), x.off - pin_lo, x.op);
                 Operation::replace_operand(x.op, ctx, idx, p);
             }
             Kind::Flow { idx } => {
@@ -1036,6 +1165,54 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 // address (`x.off - pin_lo` is nonneg — checked above).
                 let p = ptr_plus(ctx, st, pin_a.unwrap(), x.off - pin_lo, x.op);
                 Operation::replace_operand(x.op, ctx, idx, p);
+            }
+        }
+    }
+    // Sync the dual view: before each nonretaining pin call, write the
+    // syncable slices' SSA values into `pin_a`; on its normal-return edge
+    // (and, for an invoke, on a fresh unwind trampoline) reload them so
+    // the callee's writes land back in SSA.
+    if let Some(pa) = pin_a {
+        for (cop, rngs) in &pin_rngs {
+            let ss: Vec<usize> = (0..sl.len())
+                .filter(|&i| {
+                    syncable[i]
+                        && rngs
+                            .iter()
+                            .any(|&(lo, hi)| lo < sl[i].off + sl[i].size && sl[i].off < hi)
+                })
+                .collect();
+            if ss.is_empty() {
+                continue;
+            }
+            for &i in &ss {
+                let l = LoadOp::new(ctx, new[i], sl[i].ty).get_operation();
+                l.insert_before(ctx, *cop);
+                let lv = l.deref(ctx).get_result(0);
+                let p = ptr_plus(ctx, st, pa, sl[i].off - pin_lo, *cop);
+                StoreOp::new(ctx, lv, p)
+                    .get_operation()
+                    .insert_before(ctx, *cop);
+            }
+            let next = cop.deref(ctx).get_next();
+            if let Some(next) = next {
+                reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, next);
+            }
+            let padc = st.invokes.get(cop).copied();
+            if let Some((pad, catch)) = padc {
+                let region = cop
+                    .deref(ctx)
+                    .get_parent_block()
+                    .unwrap()
+                    .deref(ctx)
+                    .get_parent_region()
+                    .unwrap();
+                let t = BasicBlock::new(ctx, None, vec![]);
+                t.insert_at_back(region, ctx);
+                let br = BrOp::new(ctx, pad, vec![]).get_operation();
+                br.insert_at_back(t, ctx);
+                reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, br);
+                st.invokes.insert(*cop, (t, catch));
             }
         }
     }

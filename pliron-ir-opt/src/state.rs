@@ -117,6 +117,12 @@ pub struct CallInfo {
     /// proven copyable, letting the rest of the object promote (LLVM's
     /// partition-pinning equivalent).
     pub arg_extent: Option<Box<[(u64, u64)]>>,
+    /// Per-operand rustc `noalias` flags (indexed like `nocap`): the operand
+    /// is a `&mut`/`&`-frozen/Box borrow rustc declares unaliased for the
+    /// call. The borrow's scope ends when the call returns, so a retained
+    /// copy can never be legally used to touch the pointee afterwards —
+    /// SROA treats such pins as non-escaping and syncs around them.
+    pub arg_noalias: Option<Box<[bool]>>,
     /// `black_box` barrier: the callee is a never-defined `__pliron_bb*`
     /// symbol; lowering emits the CLIF `black_box` op instead of a call.
     pub bb: bool,

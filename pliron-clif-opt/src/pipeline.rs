@@ -338,7 +338,11 @@ impl Gate {
 #[derive(Default)]
 pub struct Analysis {
     ver: u64,
-    shape: (usize, usize),
+    /// `num_insts` at materialize time, for the stale-analysis debug
+    /// assert. `layout.blocks().count()` would be O(blocks) per query —
+    /// quadratic on giant functions — and inst count changes on nearly
+    /// every mutation anyway (block splits insert a branch).
+    shape: usize,
     cfg: Option<ControlFlowGraph>,
     dt: Option<DominatorTree>,
     la: Option<LoopAnalysis>,
@@ -386,8 +390,8 @@ impl Analysis {
         self.clear();
     }
 
-    fn shape(func: &Function) -> (usize, usize) {
-        (func.dfg.num_insts(), func.layout.blocks().count())
+    fn shape(func: &Function) -> usize {
+        func.dfg.num_insts()
     }
 
     fn materialize(&mut self, func: &Function) {
@@ -695,6 +699,43 @@ pub fn run_named(p: &mut Pipe, name: &str) -> Option<usize> {
     Some((s.run)(p, &mut Analysis::default()))
 }
 
+/// Max alias-chain depth and total hop count across the value table.
+/// `resolve_aliases` walks chains without compression, so a deep chain
+/// arriving at a pass turns its per-inst resolves quadratic; this is the
+/// batch diagnostic for that (`PLIRON_CHAIN_PROF`). Memoized suffix
+/// lengths keep the scan linear.
+fn chain_stats(func: &Function) -> (usize, u64) {
+    let mut memo: FxHashMap<Value, u32> = FxHashMap::default();
+    let mut path: Vec<Value> = Vec::new();
+    let (mut maxd, mut total) = (0usize, 0u64);
+    for v in func.dfg.values() {
+        path.clear();
+        let mut w = v;
+        let base = loop {
+            if let Some(&md) = memo.get(&w) {
+                break md;
+            }
+            if !func.dfg.value_is_valid(w) {
+                break 0;
+            }
+            match func.dfg.value_alias_dest_for_serialization(w) {
+                Some(o) => {
+                    path.push(w);
+                    w = o;
+                }
+                None => break 0,
+            }
+        };
+        for (i, &x) in path.iter().enumerate() {
+            memo.insert(x, base + (path.len() - i) as u32);
+        }
+        let d = base + path.len() as u32;
+        total += d as u64;
+        maxd = maxd.max(d as usize);
+    }
+    (maxd, total)
+}
+
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
@@ -743,6 +784,13 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         return;
     }
     p.cur_step = s.name;
+    let prof_chain = crate::env_set("PLIRON_CHAIN_PROF");
+    if prof_chain {
+        let (m, t) = chain_stats(&p.clctx.func);
+        if m >= 8 {
+            eprintln!("chain {m} (tot {t}) entering {} on {}", s.name, p.fname);
+        }
+    }
     let k = if s.cached {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
@@ -762,6 +810,12 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.
         an.bump();
+        if prof_chain {
+            let (m, t) = chain_stats(&p.clctx.func);
+            if m >= 8 {
+                eprintln!("chain {m} (tot {t}) made by {} on {}", s.name, p.fname);
+            }
+        }
         if k > 0 {
             // Alias targets can themselves be aliased later, so chains
             // grow a hop per re-alias — flatten before the next step's
@@ -947,7 +1001,7 @@ fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
 
 fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
     let (cfg, _) = an.cfg_dt(&p.clctx.func);
-    let k = slotprom::run(&mut p.clctx.func, cfg);
+    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap);
     p.dump("slotprom");
     k
 }
@@ -2526,6 +2580,19 @@ pub static DEFAULT: &[Step] = &[
         shape: 0,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
+    },
+    // Legality, not optimization: `iconst.i128` reaches isel with no
+    // lowering rule and panics. Any pass can mint one, so sweep last.
+    Step {
+        name: "iconst128",
+        bisect: None,
+        stat: "",
+        verify: false,
+        mutates: true,
+        cached: false,
+        shape: 0,
+        gate: Gate::Always,
+        run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
     },
 ];
 

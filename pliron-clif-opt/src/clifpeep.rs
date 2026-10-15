@@ -1564,29 +1564,34 @@ pub fn foldforwarders(func: &mut Function) -> usize {
 pub fn fusechains(func: &mut Function) -> usize {
     use rustc_hash::{FxHashMap, FxHashSet};
     let mut n = 0;
-    loop {
-        // Incoming-edge count per block (self-edges included).
-        let mut preds: FxHashMap<cranelift_codegen::ir::Block, u32> = FxHashMap::default();
-        for b in func.layout.blocks() {
-            let Some(lt) = func.layout.last_inst(b) else {
-                continue;
-            };
-            for bc in func.dfg.insts[lt]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                *preds.entry(bc.block(&func.dfg.value_lists)).or_default() += 1;
-            }
+    // Incoming-edge count per block (self-edges included). Fusion only
+    // rewires the fusing block's terminator and removes the fused block
+    // (whose sole pred edge came from that terminator), so every live
+    // block's pred count is invariant under a fusion — one count pass
+    // suffices.
+    let mut preds: FxHashMap<cranelift_codegen::ir::Block, u32> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(lt) = func.layout.last_inst(b) else {
+            continue;
+        };
+        for bc in func.dfg.insts[lt]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            *preds.entry(bc.block(&func.dfg.value_lists)).or_default() += 1;
         }
-        let mut fused = false;
-        for b in func.layout.blocks().collect::<Vec<_>>() {
-            if func.layout.is_cold(b) {
-                continue;
-            }
+    }
+    // Snapshot the order once: removed blocks yield `last_inst() == None`
+    // and are skipped. Each fusion swaps b's terminator for t's, so
+    // re-check b until it no longer ends in a fusable jump — this
+    // collapses forward chains in one pass instead of restarting a whole
+    // layout scan per fusion (O(fusions × blocks) on EH-inflated CFGs).
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        while !func.layout.is_cold(b) {
             let Some(lt) = func.layout.last_inst(b) else {
-                continue;
+                break;
             };
             if func.dfg.insts[lt].opcode() != Opcode::Jump {
-                continue;
+                break;
             }
             let dests = func.dfg.insts[lt]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
@@ -1595,7 +1600,7 @@ pub fn fusechains(func: &mut Function) -> usize {
                 let t = bc.block(&func.dfg.value_lists);
                 t != b && !func.layout.is_cold(t) && preds.get(&t).copied().unwrap_or(0) == 1
             });
-            let Some(bc) = pick else { continue };
+            let Some(bc) = pick else { break };
             let t = bc.block(&func.dfg.value_lists);
             // Edge args must all be plain values (no try_call exn markers)
             // so the successor's params can be aliased to them.
@@ -1622,7 +1627,7 @@ pub fn fusechains(func: &mut Function) -> usize {
                     .iter()
                     .any(|&(_, v)| pset.contains(&func.dfg.resolve_aliases(v)))
             {
-                continue;
+                break;
             }
             // Detach t's params so they can be aliased to the edge args;
             // every use of a param (in t or anywhere t dominated) then
@@ -1639,11 +1644,6 @@ pub fn fusechains(func: &mut Function) -> usize {
             }
             func.layout.remove_block(t);
             n += 1;
-            fused = true;
-            break;
-        }
-        if !fused {
-            break;
         }
     }
     n
@@ -2206,6 +2206,14 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let memo = std::cell::RefCell::new(FxHashMap::<Value, crate::proots::Key>::default());
     let mut vhmemo: FxHashMap<Value, u64> = FxHashMap::default();
     let vnmemo = std::cell::RefCell::new(FxHashMap::<Value, usize>::default());
+    // `diff_b` re-proves the same (pi, pj, x, y) pairs across oracle
+    // calls and join paths — shared for the whole run.
+    let dbmemo = std::cell::RefCell::new(
+        FxHashMap::<(Value, Value, Value, Value), (Option<crate::indvars::Diff>, u32)>::default(),
+    );
+    // Join-heavy CFGs keep producing fresh pairs past the memo's
+    // reach — bound total `diff_b` expansion for the whole run.
+    let dbbudget = std::cell::Cell::new(100_000u64);
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
@@ -2387,18 +2395,11 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // `hmaps[e]`: arg hash → first slot index, for `paramize`'s
         // subtree probe — `vhash` is `khash_m`-equivalent by
         // construction, so probes on `Key` nodes hit. `hmemo` memoizes
-        // per-node key hashes (`Rc` sharing → O(1) amortized).
+        // per-node key hashes (`Rc` sharing → O(1) amortized). Built
+        // lazily: an `E×P` hash table is a real cost on megablocks and
+        // `paramize` is its only consumer.
         let hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
-        let hmaps: Vec<FxHashMap<u64, u32>> = svh
-            .iter()
-            .map(|row| {
-                let mut m = FxHashMap::default();
-                for (i, &h) in row.iter().enumerate() {
-                    m.entry(h).or_insert(i as u32);
-                }
-                m
-            })
-            .collect();
+        let hmaps: std::cell::OnceCell<Vec<FxHashMap<u64, u32>>> = std::cell::OnceCell::new();
         // Each cell carries the key's hash alongside — the scan
         // compares keys `O(slots × edges)` times and a failed
         // structural `==` on a 10⁴-node key costs as much as computing
@@ -2407,8 +2408,21 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         let pk: Vec<Vec<std::cell::OnceCell<(Key, u64)>>> = (0..es.len())
             .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
             .collect();
+        // A materialized cell costs a `paramize`+hash over the arg's
+        // def-DAG — unbounded `E×P` materialization is the pass's
+        // dominant cost on megablocks (rustc_parse's
+        // `parse_unspanned_seq`). Past the cap, cells degrade to a
+        // sentinel `O` key whose per-(e,i) payload can never equal a
+        // real key — misses merges, never invents them.
+        const PK_CELL_CAP: usize = 250_000;
+        let pkcells = std::cell::Cell::new(0usize);
         let pkm = |e: usize, i: usize| -> &(Key, u64) {
             pk[e][i].get_or_init(|| {
+                if pkcells.get() >= PK_CELL_CAP {
+                    let s = u64::MAX - (((e as u64) << 32) | i as u64);
+                    return (Key::O(s), crate::proots::ohash(s));
+                }
+                pkcells.set(pkcells.get() + 1);
                 let mut hm = hmemo.borrow_mut();
                 let slotk = |j: usize| -> &Key { skey_of(e, j) };
                 let k = crate::proots::paramize(
@@ -2417,7 +2431,17 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     &slotk,
                     &ps,
                     i,
-                    &hmaps[e],
+                    &hmaps.get_or_init(|| {
+                        svh.iter()
+                            .map(|row| {
+                                let mut m = FxHashMap::default();
+                                for (i, &h) in row.iter().enumerate() {
+                                    m.entry(h).or_insert(i as u32);
+                                }
+                                m
+                            })
+                            .collect()
+                    })[e],
                     &vmap,
                     &mut hm,
                 );
@@ -2761,7 +2785,16 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     }
                     dfuel.set(dfuel.get() - 1);
                     match crate::indvars::diff_b(
-                        func, &cfg, ps[i], ps[ix], ai, aj, 8, false,
+                        func,
+                        &cfg,
+                        ps[i],
+                        ps[ix],
+                        ai,
+                        aj,
+                        8,
+                        &dbbudget,
+                        &mut *dbmemo.borrow_mut(),
+                        false,
                     ) {
                         Some(crate::indvars::Diff::Lit(bv)) => {
                             // A bound that is itself a param of `b`
@@ -4609,6 +4642,52 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         n += 1;
                         continue;
                     }
+                    // `select (x == k ? k : x)` → `x`: the constant arm
+                    // equals `x` on exactly the domain that picks it.
+                    // MIR's `Option<NonNull>` sentinel materializes this
+                    // shape (`x == 0 ? 0 : x`) and, unfolded, keeps
+                    // address webs from resolving to their slot.
+                    if let Some(ci) = pos
+                        .func
+                        .dfg
+                        .value_def(pos.func.dfg.resolve_aliases(args[0]))
+                        .inst()
+                        && let InstructionData::IntCompare {
+                            opcode: Opcode::Icmp,
+                            cond,
+                            args: [ia, ib],
+                        } = pos.func.dfg.insts[ci]
+                    {
+                        let mut folded = None;
+                        for (tt, ff, cc) in [
+                            (args[1], args[2], cond),
+                            (args[2], args[1], cond.complement()),
+                        ] {
+                            if cc != IntCC::Equal || iconst(pos.func, tt).is_none() {
+                                continue;
+                            }
+                            let matches = match (iconst(pos.func, ia), iconst(pos.func, ib)) {
+                                (Some(ka), None) => Some((ib, ka)),
+                                (None, Some(kb)) => Some((ia, kb)),
+                                _ => None,
+                            };
+                            if let Some((x, kc)) = matches
+                                && iconst(pos.func, tt) == Some(kc)
+                                && pos.func.dfg.resolve_aliases(x)
+                                    == pos.func.dfg.resolve_aliases(ff)
+                            {
+                                folded = Some(x);
+                                break;
+                            }
+                        }
+                        if let Some(a) = folded {
+                            let a = pos.func.dfg.resolve_aliases(a);
+                            let r = pos.func.dfg.first_result(inst);
+                            dead_sel.push((inst, r, a));
+                            n += 1;
+                            continue;
+                        }
+                    }
                     // `select (x >= lo), (x < hi), 0` → `(x - lo) <u w` —
                     // `Range*::contains` as one sub+compare instead of a
                     // guard branch's worth of work; under loopvec a
@@ -5963,6 +6042,36 @@ pub fn wide_minmax(func: &mut Function) -> usize {
     n
 }
 
+/// `iconst.i128` is legal CLIF but no target lowers it (the aarch64 ISLE
+/// `imm` helper has no I128 rule, so it panics in isel). Any pass that
+/// materializes a scalar constant through `iconst(ty, …)` can mint one —
+/// sweep the whole function last rather than audit every emitter. The
+/// Imm64 sign-extends, so the high half is `k >> 63`.
+pub fn iconst128(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } = pos.func.dfg.insts[inst]
+            else {
+                continue;
+            };
+            if pos.func.dfg.value_type(pos.func.dfg.first_result(inst)) != types::I128 {
+                continue;
+            }
+            let k = imm.bits();
+            let lo = pos.ins().iconst(types::I64, k);
+            let hi = pos.ins().iconst(types::I64, k >> 63);
+            pos.func.replace(inst).iconcat(lo, hi);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Loads within the dereferenceable bytes of a frozen param (rustc `noalias
 /// readonly` `&T`: immutable and live for the whole call) become `readonly
 /// can_move`, which Cranelift's egraph treats as pure: it merges repeats and
@@ -6413,6 +6522,7 @@ pub fn lcse(func: &mut Function) -> usize {
             }
         }
     }
+    let mut compact_at = 1024;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         seen.clear();
         let mut dead = Vec::new();
@@ -6678,6 +6788,15 @@ pub fn lcse(func: &mut Function) -> usize {
             }
             func.layout.remove_inst(i);
         }
+        // Folds alias each dropped result to its survivor; when a survivor
+        // is itself folded later the chain grows a hop, and every later
+        // `resolve_aliases` in this pass re-walks it. Flatten once the
+        // backlog is worth an O(values) sweep (stage2 `rustc_query_impl`
+        // cgu.15 spent ~3.5min resolving pass-grown chains).
+        if n >= compact_at {
+            func.dfg.compact_aliases();
+            compact_at = n + 1024;
+        }
     }
     n
 }
@@ -6705,6 +6824,8 @@ pub fn dgvn(func: &mut Function) -> usize {
     let mut marks: Vec<usize> = Vec::new();
     let mut stack = vec![(entry, false)];
     let mut n = 0;
+    // Same pass-grown alias-chain hazard as `lcse` above.
+    let mut compact_at = 1024;
     while let Some((b, exit)) = stack.pop() {
         if exit {
             let mark = marks.pop().unwrap();
@@ -6759,6 +6880,10 @@ pub fn dgvn(func: &mut Function) -> usize {
         }
         for i in dead {
             func.layout.remove_inst(i);
+        }
+        if n >= compact_at {
+            func.dfg.compact_aliases();
+            compact_at = n + 1024;
         }
     }
     n
@@ -8259,5 +8384,62 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("webmerge produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// Deep alias chains make per-inst `resolve_aliases` calls quadratic:
+    /// a K-hop chain walked per arg turns an M-inst block into O(M*K).
+    /// `lcse`'s keying resolves every arg, so it must compact first.
+    #[test]
+    fn lcse_alias_chains_stay_linear() {
+        const K: usize = 2000;
+        const M: usize = 2000;
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+
+        // v_chain[0] -> v_chain[1] -> ... -> root (iconst), then M
+        // `iadd chain_head, chain_head` insts that each resolve the full
+        // chain through `cse_key`.
+        let root = {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+            cur.ins().iconst(types::I64, 1)
+        };
+        let mut chain = vec![Value::reserved_value(); K];
+        for slot in chain.iter_mut().rev() {
+            func.dfg.make_invalid_value_for_parser();
+            *slot = Value::from_u32(func.dfg.len_values() as u32 - 1);
+        }
+        for i in (0..K).rev() {
+            let src = if i + 1 == K { root } else { chain[i + 1] };
+            func.dfg.make_value_alias_for_serialization(src, chain[i]);
+            func.dfg.set_alias_type_for_parser(chain[i]);
+        }
+        for i in 0..K {
+            assert_ne!(
+                func.dfg.resolve_aliases(chain[i]),
+                chain[i],
+                "chain[{i}] resolves to itself"
+            );
+        }
+        eprintln!("root={root} head={} last={}", chain[0], chain[K - 1]);
+        let head = chain[0];
+        let mut last = root;
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+            for _ in 0..M {
+                last = cur.ins().iadd(head, head);
+            }
+            cur.ins().return_(&[last]);
+        }
+
+        let t = std::time::Instant::now();
+        lcse(&mut func);
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "lcse took {:?} on {K}-deep alias chain",
+            t.elapsed()
+        );
     }
 }

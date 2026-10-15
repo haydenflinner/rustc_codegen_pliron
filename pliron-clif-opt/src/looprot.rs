@@ -24,16 +24,24 @@ pub fn run(
     // bcheck clones appended at the end) of the rotation budget.
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
+    // Batch use index, built on the first rotatable candidate and dropped
+    // with the other analyses after each rotation — one O(fn) build per
+    // rotation instead of a whole-function scan per candidate.
+    let mut useidx: Option<crate::uses::Uses> = None;
     for h in blocks {
         if n >= MAX_ROTATIONS {
             break;
         }
         let (cfg, domtree) = an.cfg_dt(func);
-        if rotatable(func, cfg, domtree, h) && rotate(func, cfg, domtree, h, derived) {
-            n += 1;
-            // Edge splits/clones rewired the CFG — the next candidate's
-            // reads must see the new shape.
-            an.invalidate();
+        if rotatable(func, cfg, domtree, h) {
+            let u = useidx.get_or_insert_with(|| crate::uses::Uses::new(func));
+            if rotate(func, cfg, domtree, h, derived, u) {
+                n += 1;
+                // Edge splits/clones rewired the CFG — the next candidate's
+                // reads must see the new shape.
+                an.invalidate();
+                useidx = None;
+            }
         }
     }
     n
@@ -138,6 +146,7 @@ fn rotate(
     domtree: &DominatorTree,
     h: Block,
     derived: &mut FxHashMap<Value, Value>,
+    useidx: &crate::uses::Uses,
 ) -> bool {
     let t = func.layout.last_inst(h).unwrap();
     let InstructionData::Brif { blocks, .. } = func.dfg.insts[t] else {
@@ -157,30 +166,32 @@ fn rotate(
     for i in func.layout.block_insts(h) {
         defs.extend_from_slice(func.dfg.inst_results(i));
     }
-    let defset: FxHashSet<Value> = defs.iter().copied().collect();
+    let rdefs: Vec<Value> = defs
+        .iter()
+        .map(|&v| func.dfg.resolve_aliases(v))
+        .collect();
     let mut need = [FxHashSet::<Value>::default(), FxHashSet::default()];
     let mut users: Vec<(Inst, usize)> = Vec::new();
-    for b in func.layout.blocks() {
-        if b == h || !domtree.is_reachable(b) {
-            continue;
-        }
-        let side = succ.iter().position(|&s| domtree.block_dominates(s, b));
-        for i in func.layout.block_insts(b) {
-            let used: Vec<Value> = resolved_args(func, i)
-                .into_iter()
-                .filter(|v| defset.contains(v))
-                .collect();
-            if used.is_empty() {
+    let mut seen_user: FxHashSet<Inst> = FxHashSet::default();
+    let mut side_cache: FxHashMap<Block, Option<usize>> = FxHashMap::default();
+    for &d in &rdefs {
+        for &(b, i) in useidx.sites.get(&d).into_iter().flatten() {
+            if b == h || !domtree.is_reachable(b) {
                 continue;
             }
+            let side = *side_cache
+                .entry(b)
+                .or_insert_with(|| succ.iter().position(|&s| domtree.block_dominates(s, b)));
             let Some(side) = side else {
                 if crate::env_set("PLIRON_LOOPROT_DEBUG") {
-                    eprintln!("looprot {h}: bail side-none blk{b} used {used:?}");
+                    eprintln!("looprot {h}: bail side-none blk{b} used {d}");
                 }
                 return false;
             };
-            need[side].extend(used);
-            users.push((i, side));
+            need[side].insert(d);
+            if seen_user.insert(i) {
+                users.push((i, side));
+            }
         }
     }
 
@@ -203,7 +214,11 @@ fn rotate(
     let mut repl = [FxHashMap::<Value, Value>::default(), FxHashMap::default()];
     let mut order: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
     for side in 0..2 {
-        for &v in defs.iter().filter(|v| need[side].contains(v)) {
+        let mut appended = FxHashSet::default();
+        for &v in rdefs
+            .iter()
+            .filter(|v| need[side].contains(v) && appended.insert(*v))
+        {
             let ty = func.dfg.value_type(v);
             let p = func.dfg.append_block_param(succ[side], ty);
             repl[side].insert(v, p);
@@ -346,17 +361,22 @@ fn rotate(
     true
 }
 
-/// Number of times `v` is used as an operand (inst args + branch args).
+/// Number of times `v` is used as an operand (inst args + branch args),
+/// capped at 2 — every caller tests `== 1`.
 pub fn uses(func: &Function, v: Value) -> usize {
     let v = func.dfg.resolve_aliases(v);
-    func.layout
-        .blocks()
-        .flat_map(|b| func.layout.block_insts(b))
-        .map(|i| {
-            func.dfg
+    let mut n = 0;
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            n += func
+                .dfg
                 .inst_values(i)
                 .filter(|&u| func.dfg.resolve_aliases(u) == v)
-                .count()
-        })
-        .sum()
+                .count();
+            if n > 1 {
+                return n;
+            }
+        }
+    }
+    n
 }

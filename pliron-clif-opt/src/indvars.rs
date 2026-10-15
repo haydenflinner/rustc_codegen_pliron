@@ -2242,6 +2242,7 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
 
 /// What `x - y` provably equals at a program point, for `relparm`'s
 /// diff proofs.
+#[derive(Clone, Copy)]
 pub(crate) enum Diff {
     /// `x - y = v` for a concrete value `v`.
     Lit(Value),
@@ -2270,6 +2271,44 @@ pub(crate) fn diff_b(
     ai: Value,
     aj: Value,
     depth: u32,
+    budget: &std::cell::Cell<u64>,
+    memo: &mut FxHashMap<(Value, Value, Value, Value), (Option<Diff>, u32)>,
+    dbg: bool,
+) -> Option<Diff> {
+    let x = func.dfg.resolve_aliases(ai);
+    let y = func.dfg.resolve_aliases(aj);
+    // The param-pair chase below re-proves the same (x, y) pairs along
+    // every join path of the CFG — without a memo the edge fanout is
+    // exponential (serde_json's parser dispatch: ~5e3s in `cparm`).
+    // A `Some` is a valid proof at any budget; a `None` proved with
+    // `d >= depth` budget is conclusive for a smaller ask.
+    if let Some(&(r, d)) = memo.get(&(pi, pj, x, y)) {
+        if r.is_some() || d >= depth {
+            return r;
+        }
+    }
+    // Distinct-pair fanout is still exponential where joins keep
+    // producing fresh pairs (rustc_parse's parse_unspanned_seq ~10min):
+    // `budget` bounds expansions across the caller's whole run.
+    if budget.get() == 0 {
+        return None;
+    }
+    budget.set(budget.get() - 1);
+    let r = diff_b_inner(func, cfg, pi, pj, x, y, depth, budget, memo, dbg);
+    memo.insert((pi, pj, x, y), (r, depth));
+    r
+}
+
+fn diff_b_inner(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    pi: Value,
+    pj: Value,
+    ai: Value,
+    aj: Value,
+    depth: u32,
+    budget: &std::cell::Cell<u64>,
+    memo: &mut FxHashMap<(Value, Value, Value, Value), (Option<Diff>, u32)>,
     dbg: bool,
 ) -> Option<Diff> {
     let x = func.dfg.resolve_aliases(ai);
@@ -2336,7 +2375,7 @@ pub(crate) fn diff_b(
             if let Some((a, d)) = isub_of(maybe)
                 && a == x
             {
-                return diff_b(func, cfg, pi, pj, d, other, depth - 1, dbg);
+                return diff_b(func, cfg, pi, pj, d, other, depth - 1, budget, memo, dbg);
             }
         }
     }
@@ -2345,7 +2384,7 @@ pub(crate) fn diff_b(
             if let Some((a, d)) = isub_of(maybe)
                 && a == y
             {
-                return diff_b(func, cfg, pi, pj, other, d, depth - 1, dbg);
+                return diff_b(func, cfg, pi, pj, other, d, depth - 1, budget, memo, dbg);
             }
         }
     }
@@ -2354,7 +2393,7 @@ pub(crate) fn diff_b(
     let (rx, cx) = lin(func, x);
     let (ry, cy) = lin(func, y);
     if cx == cy && (rx, ry) != (x, y) {
-        return diff_b(func, cfg, pi, pj, rx, ry, depth - 1, dbg);
+        return diff_b(func, cfg, pi, pj, rx, ry, depth - 1, budget, memo, dbg);
     }
     // Shared-operand strip: `f(a, c) - f(b, c) = a - b`.
     let bin = |v: Value| -> Option<(Opcode, Value, Value)> {
@@ -2383,7 +2422,7 @@ pub(crate) fn diff_b(
             _ => None,
         };
         if let Some((nx, ny)) = pair {
-            return diff_b(func, cfg, pi, pj, nx, ny, depth - 1, dbg);
+            return diff_b(func, cfg, pi, pj, nx, ny, depth - 1, budget, memo, dbg);
         }
     }
     // Param-pair chase: `x`, `y` params of the same block — the diff at
@@ -2403,7 +2442,7 @@ pub(crate) fn diff_b(
                 }
                 return None;
             };
-            match diff_b(func, cfg, pi, pj, a2, b2, depth - 1, dbg) {
+            match diff_b(func, cfg, pi, pj, a2, b2, depth - 1, budget, memo, dbg) {
                 Some(Diff::Lit(bv)) => match bound {
                     None => bound = Some(bv),
                     Some(p) if p == bv => {}
@@ -2655,6 +2694,72 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("postinc produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// `diff_b`'s param-pair chase fans out over every in-edge of a
+    /// block whose arg pair is itself params of a shared predecessor:
+    /// a `K`-deep chain of `F`-wide joins is `F^K` proofs of the same
+    /// handful of `(x, y)` pairs without the memo. This shape is
+    /// serde_json's parser dispatch, where `cparm`'s oracle spent
+    /// ~86min inside one `diff_b` call.
+    #[test]
+    fn diff_b_join_fanout_is_memoized() {
+        const K: usize = 7;
+        const F: usize = 10;
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        // Merge blocks `b[0]..b[K]` each take two params; `b[i]`'s `F`
+        // preds all pass `b[i-1]`'s param pair (alternating order), so
+        // the chase re-asks each pair `F` times per level.
+        let mut bps = vec![];
+        let mut pi_pj = None;
+        let mut prev_ps: Vec<Value> = vec![];
+        for i in 0..=K {
+            let b = func.dfg.make_block();
+            func.layout.append_block(b);
+            let p0 = func.dfg.append_block_param(b, types::I64);
+            let p1 = func.dfg.append_block_param(b, types::I64);
+            if i == 0 {
+                // `x - 0 = x` fires for either arg order, so the leaf
+                // always proves `Lit(0)` and every edge proceeds.
+                let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+                let c0 = cur.ins().iconst(types::I64, 0);
+                let c1 = cur.ins().iconst(types::I64, 1);
+                pi_pj = Some((c1, c0));
+                cur.ins().jump(b, &[c0.into(), c0.into()]);
+            } else {
+                for j in 0..F {
+                    let p = func.dfg.make_block();
+                    func.layout.append_block(p);
+                    let mut cur = FuncCursor::new(&mut func).at_bottom(p);
+                    let (a1, a2) = if j % 2 == 0 {
+                        (prev_ps[0], prev_ps[1])
+                    } else {
+                        (prev_ps[1], prev_ps[0])
+                    };
+                    cur.ins().jump(b, &[a1.into(), a2.into()]);
+                }
+            }
+            prev_ps = vec![p0, p1];
+            bps.push((b, p0, p1));
+        }
+        let (bk, x, y) = *bps.last().unwrap();
+        let (pi, pj) = pi_pj.unwrap();
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let t = std::time::Instant::now();
+        let mut memo = FxHashMap::default();
+        let budget = std::cell::Cell::new(1_000_000u64);
+        let _ = diff_b(&func, &cfg, pi, pj, x, y, 8, &budget, &mut memo, false);
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "diff_b took {:?} on {F}-wide {K}-deep join chain ({bk})",
+            t.elapsed()
+        );
     }
 
 }

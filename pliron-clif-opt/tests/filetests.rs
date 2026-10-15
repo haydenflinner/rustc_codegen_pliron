@@ -48,6 +48,10 @@ fn pass(name: &str) -> Pass {
         "sgntest" => clifpeep::sgntest,
         "sublea" => clifpeep::sublea,
         "uloads32" => clifpeep::uloads32,
+        "unswitch" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::bcheck::unswitch(f, &mut an, "filetest")
+        },
         "vecslot" => clifpeep::vecslot,
         "webmerge" => |f| clifpeep::webmerge(f).0,
         "wide_minmax" => clifpeep::wide_minmax,

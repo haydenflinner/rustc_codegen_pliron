@@ -177,7 +177,35 @@ fn with_pipe<R>(
         .map(FuncId::from_u32)
         .unwrap_or(FuncId::from_u32(0));
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-    let (e1, e2, e3, e5, e6, e7, e8) = Default::default();
+    let (e1, e2, e3, e5, e6, mut e7, e8): (
+        _,
+        _,
+        _,
+        _,
+        _,
+        rustc_hash::FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
+        _,
+    ) = Default::default();
+    // CLIFCHECK_NOCAP_ALL=1 marks every call operand bounded — the real
+    // nocap set comes from MIR-level attrs and isn't serializable, so
+    // replays that need it opt in explicitly.
+    if std::env::var("CLIFCHECK_NOCAP_ALL").is_ok() {
+        use cranelift_codegen::ir::Opcode;
+        for b in clctx.func.layout.blocks() {
+            for i in clctx.func.layout.block_insts(b) {
+                let op = clctx.func.dfg.insts[i].opcode();
+                if op.is_call() {
+                    let adj = usize::from(matches!(
+                        op,
+                        Opcode::CallIndirect | Opcode::TryCallIndirect
+                    ));
+                    for k in adj..clctx.func.dfg.inst_args(i).len() {
+                        e7.insert((i, (k - adj) as u32));
+                    }
+                }
+            }
+        }
+    }
     let (mut nonnull, mut frozen, mut noalias, mut deref, mut e4, mut lifetimes) = (
         facts.nonnull.clone(),
         facts.frozen.clone(),

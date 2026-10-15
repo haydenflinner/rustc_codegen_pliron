@@ -20,7 +20,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value,
     ValueDef, types,
 };
-use cranelift_codegen::loop_analysis::LoopAnalysis;
+use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// One branch arm resolved against a candidate merge point.
@@ -411,25 +411,68 @@ fn reachable(func: &Function, cfg: &ControlFlowGraph) -> FxHashSet<Block> {
 /// width decode) speculation only buys always-paid selects. Blocks with
 /// no reachable path (dead dispatch arms like `RangeInclusive`'s
 /// exhausted-flag branch) don't count.
-fn flat_loop(func: &Function, la: &LoopAnalysis, reach: &FxHashSet<Block>, b: Block) -> bool {
-    let Some(lp) = la.innermost_loop(b) else {
-        return true;
-    };
-    func.layout.blocks().all(|x| {
-        if x == b || !reach.contains(&x) || !la.is_in_loop(x, lp) {
-            return true;
+///
+/// `interior[lp]` is the set of reachable blocks in `lp` whose brif
+/// keeps both edges inside `lp`, built in one pass: `flat_loop(b)` then
+/// asks whether that set is empty apart from `b` itself. The set is a
+/// pure function of the CFG, so `Flat` refreshes it only when a fold
+/// changed edges (`dirty`), not per candidate.
+struct Flat {
+    ok: bool,
+    la: LoopAnalysis,
+    interior: FxHashMap<Loop, FxHashSet<Block>>,
+}
+
+impl Flat {
+    fn ensure(&mut self, func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree) {
+        if self.ok {
+            return;
         }
-        func.layout.block_insts(x).all(|i| {
-            let InstructionData::Brif { .. } = func.dfg.insts[i] else {
-                return true;
+        self.la.compute(func, cfg, domtree);
+        let reach = reachable(func, cfg);
+        self.interior.clear();
+        for x in func.layout.blocks() {
+            if !reach.contains(&x) {
+                continue;
+            }
+            let Some(t) = func.layout.last_inst(x) else {
+                continue;
             };
-            // An interior brif keeps both destinations in the loop.
-            !func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .iter()
-                .all(|bc| la.is_in_loop(bc.block(&func.dfg.value_lists), lp))
-        })
-    })
+            let InstructionData::Brif { .. } = func.dfg.insts[t] else {
+                continue;
+            };
+            let Some(mut lp) = self.la.innermost_loop(x) else {
+                continue;
+            };
+            let dests = func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            // Check each ancestor independently: a brif that leaves the
+            // inner loop can still keep both edges inside an outer one, so
+            // failing `lp` must not skip `lp`'s parents.
+            loop {
+                if dests
+                    .iter()
+                    .all(|bc| self.la.is_in_loop(bc.block(&func.dfg.value_lists), lp))
+                {
+                    self.interior.entry(lp).or_default().insert(x);
+                }
+                let Some(p) = self.la.loop_parent(lp) else {
+                    break;
+                };
+                lp = p;
+            }
+        }
+        self.ok = true;
+    }
+
+    fn flat(&self, b: Block) -> bool {
+        let Some(lp) = self.la.innermost_loop(b) else {
+            return true;
+        };
+        self.interior
+            .get(&lp)
+            .is_none_or(|s| s.iter().all(|&x| x == b))
+    }
 }
 
 /// `br_table` if-conversion: every target resolving (through pure
@@ -442,8 +485,7 @@ fn conv_table(
     func: &mut Function,
     cfg: &mut ControlFlowGraph,
     domtree: &mut DominatorTree,
-    la: &mut LoopAnalysis,
-    reach: &mut FxHashSet<Block>,
+    flat: &mut Flat,
     msets: &mut Msets,
     dirty: &mut bool,
     preds: &mut (
@@ -572,11 +614,11 @@ fn conv_table(
             cfg.compute(func);
             domtree.compute(func, &cfg);
             msets.recompute(func, domtree);
+            flat.ok = false;
             *dirty = false;
         }
-        la.compute(func, cfg, domtree);
-        *reach = reachable(func, cfg);
-        if !flat_loop(func, la, reach, b) {
+        flat.ensure(func, cfg, domtree);
+        if !flat.flat(b) {
             return false;
         }
     }
@@ -710,8 +752,11 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
     EDGE_NS.set(0);
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    let mut reach: FxHashSet<Block> = FxHashSet::default();
+    let mut flat = Flat {
+        ok: false,
+        la: LoopAnalysis::new(),
+        interior: FxHashMap::default(),
+    };
     let mut msets = Msets::new(func, &domtree);
     let mut dirty = false;
     // Exact pred deltas for applied folds — (gained direct preds, lost
@@ -734,8 +779,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                     func,
                     &mut cfg,
                     &mut domtree,
-                    &mut la,
-                    &mut reach,
+                    &mut flat,
                     &mut msets,
                     &mut dirty,
                     &mut preds,
@@ -817,11 +861,11 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 cfg.compute(func);
                 domtree.compute(func, &cfg);
                 msets.recompute(func, &domtree);
+                flat.ok = false;
                 dirty = false;
             }
-            la.compute(func, &cfg, &domtree);
-            reach = reachable(func, &cfg);
-            if !flat_loop(func, &la, &reach, b) {
+            flat.ensure(func, &cfg, &domtree);
+            if !flat.flat(b) {
                 continue;
             }
         }
@@ -924,6 +968,65 @@ mod tests {
             },
             _ => panic!("bad value def"),
         }
+    }
+
+    /// Nested loops: the inner header's brif exits the inner loop but both
+    /// edges stay inside the outer one. `flat` must see that brif as
+    /// interior to the *outer* loop — checking only the innermost loop (or
+    /// stopping at the first ancestor a brif escapes) under-reports, and an
+    /// illegal outer-loop conversion then emits uses past their defs
+    /// (rustc_errors `Chars::try_fold` verify failure, stage2).
+    #[test]
+    fn flat_counts_brif_interior_to_ancestor_loop() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (outer, inner, outer_mid) = {
+            let mut fb = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = fb.create_block();
+            let outer = fb.create_block();
+            let inner = fb.create_block();
+            let inner_body = fb.create_block();
+            let outer_mid = fb.create_block();
+            let exit = fb.create_block();
+
+            fb.switch_to_block(entry);
+            fb.ins().jump(outer, &[]);
+
+            // Outer header: enter the inner loop or leave.
+            fb.switch_to_block(outer);
+            let c = fb.ins().iconst(types::I8, 0);
+            fb.ins().brif(c, inner, &[], exit, &[]);
+
+            // Inner header: stay in the inner loop or break to the outer —
+            // both destinations remain inside the outer loop.
+            fb.switch_to_block(inner);
+            let c = fb.ins().iconst(types::I8, 0);
+            fb.ins().brif(c, inner_body, &[], outer_mid, &[]);
+
+            fb.switch_to_block(inner_body);
+            fb.ins().jump(inner, &[]);
+            fb.switch_to_block(outer_mid);
+            fb.ins().jump(outer, &[]);
+            fb.switch_to_block(exit);
+            fb.ins().return_(&[]);
+            fb.seal_all_blocks();
+            (outer, inner, outer_mid)
+        };
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let domtree = DominatorTree::with_function(&func, &cfg);
+        let mut flat = Flat {
+            ok: false,
+            la: LoopAnalysis::new(),
+            interior: FxHashMap::default(),
+        };
+        flat.ensure(&func, &cfg, &domtree);
+        // The inner header's brif is interior to the outer loop, so no
+        // other block in that loop may be if-converted...
+        assert!(!flat.flat(outer));
+        assert!(!flat.flat(outer_mid));
+        // ...except the interior block itself.
+        assert!(flat.flat(inner));
     }
 
     /// `br_table` whose arms are pure forwarders through a shared last hop:

@@ -2048,12 +2048,53 @@ fn unswitch_loop(
             }
         }
     }
-    let dead: Vec<Block> = region
-        .iter()
-        .copied()
-        .chain(bmap.values().copied())
+    let mut dead: FxHashSet<Block> = func
+        .layout
+        .blocks()
         .filter(|b| !live.contains(b))
         .collect();
+    // Sweep everything unreachable from the entry, not just region
+    // blocks and clones: a pre-existing unreachable block (e.g. a cold
+    // try_call landing pad) can branch to or use values defined in a
+    // fold-orphaned region block, so removing only the region leaves a
+    // dangling BlockCall (`rustc_borrowck` `kill_all`: `invalid block
+    // reference`). Keep anything a surviving block still references —
+    // belt-and-braces in case cfg misses an edge type.
+    let uses = crate::uses::Uses::new(func);
+    if debug {
+        eprintln!("unswitch {name}: dead candidates: {dead:?}");
+    }
+    loop {
+        let keep: Vec<Block> = dead
+            .iter()
+            .copied()
+            .filter(|d| {
+                cfg2.pred_iter(*d).any(|p| !dead.contains(&p.block))
+                    || func
+                        .dfg
+                        .block_params(*d)
+                        .iter()
+                        .chain(
+                            func.layout
+                                .block_insts(*d)
+                                .flat_map(|i| func.dfg.inst_results(i)),
+                        )
+                        .any(|&v| {
+                            uses.sites
+                                .get(&func.dfg.resolve_aliases(v))
+                                .is_some_and(|ss| {
+                                    ss.iter().any(|(b, _)| !dead.contains(b))
+                                })
+                        })
+            })
+            .collect();
+        if keep.is_empty() {
+            break;
+        }
+        for d in keep {
+            dead.remove(&d);
+        }
+    }
     if debug {
         eprintln!("unswitch {name}: dead after fold: {dead:?}");
     }
@@ -2092,4 +2133,93 @@ pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+
+    fn verify_ok(func: &Function) {
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(func, &flags) {
+            panic!("verify failed: {e}\n{func}");
+        }
+    }
+
+    /// Smoke test: unswitch a loop with an unreachable chain referencing
+    /// the fold-orphaned fragment. The real regression lives in
+    /// `filetests/unswitch_unreachable_refs.clif` — reproducing the
+    /// exact `kill_all` shape needs nested-loop `is_in_loop` tagging the
+    /// referencer escapes, which a small synthetic can't produce.
+    #[test]
+    fn unswitch_keeps_dead_target_of_unreachable_edge() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let entry = func.dfg.make_block();
+        let u1 = func.dfg.make_block();
+        let u2 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let m = func.dfg.make_block();
+        let t = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let leak = func.dfg.make_block();
+        for b in [entry, u1, u2, h, m, t, latch, leak] {
+            func.layout.append_block(b);
+        }
+
+        let (cond, v0);
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(entry);
+            let c1 = pos.ins().iconst(types::I64, 1);
+            let c2 = pos.ins().iconst(types::I64, 2);
+            cond = pos.ins().icmp(IntCC::NotEqual, c1, c2);
+            v0 = pos.ins().iconst(types::I64, 7);
+            pos.ins().jump(h, &[BlockArg::from(v0)]);
+        }
+        let p = func.dfg.append_block_param(h, types::I64);
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(h);
+            pos.ins().jump(m, &[BlockArg::from(p)]);
+        }
+        let pm = func.dfg.append_block_param(m, types::I64);
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(m);
+            pos.ins().brif(cond, t, &[], latch, &[BlockArg::from(pm)]);
+        }
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(t);
+            pos.ins().jump(leak, &[]);
+        }
+        let p2 = func.dfg.append_block_param(latch, types::I64);
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(latch);
+            pos.ins().jump(h, &[BlockArg::from(p2)]);
+        }
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(leak);
+            pos.ins().return_(&[v0]);
+        }
+        // Unreachable chain into `t`: u1 keeps u2's preds outside the
+        // region, and the fold orphans `t` — u2's BlockCall to it must
+        // not dangle.
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(u1);
+            pos.ins().jump(u2, &[]);
+        }
+        {
+            let mut pos = FuncCursor::new(&mut func).at_bottom(u2);
+            pos.ins().jump(t, &[]);
+        }
+
+        let mut an = crate::pipeline::Analysis::default();
+        let n = unswitch(&mut func, &mut an, "t");
+        eprintln!("after unswitch:\n{func}");
+        assert!(n >= 1, "unswitch did not fire");
+        verify_ok(&func);
+    }
 }
