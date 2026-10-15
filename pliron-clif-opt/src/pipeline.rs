@@ -596,6 +596,13 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     // recorder overhead for the normal path.
     let stats0 = pk.is_some().then(|| p.stats.clone());
     let armed = pk.is_some() && reads_begin();
+    if armed {
+        // The bisect budget changes which steps run but is read through
+        // a process-global `LazyLock` — it lands in this window only on
+        // the first function of a process. Record it explicitly so a
+        // pipe variant made under one budget can never hit under another.
+        let _ = config().get("PLIRON_OPT_BISECT");
+    }
     let draws0 = bisect_count();
     let sel = selected(p, false);
     let mut found = false;
