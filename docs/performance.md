@@ -175,7 +175,7 @@ backend (`-O`).
 | scalar hash loop (mul/xor/rol) | 585 ms | 435 ms |
 | u32 dot product, vectorized | 169 ms | 148 ms |
 | f32 sum-of-squares, vectorized | ~240 ms | ~240 ms |
-| 100 identical pure calls in a loop | ~80 ns | ~185 ms → **2.4 ms** |
+| 100 identical pure calls in a loop | ~80 ns | ~185 ms → **~80 ns** |
 
 The last row is `callgvn`: LLVM proves the callee pure and eliminates all
 100 calls; we now infer the same facts (`nowrite` + `nounwind` +
@@ -187,15 +187,21 @@ volatile/atomic/asm/indirect callees seed the complement) now backs the
 used-result erasure: the second same-args call provably comes back with
 the same value.
 
-Residual gap vs LLVM here: the surviving call can't be erased — the
-callee is `nowrite=Some(false)`/`nounwind=false` (its bounds-check panic
-paths call unknown fns), so dead-elim can't fire and the ~3ms is one real
-`dotprod` call. LLVM's ~80ns is a different mechanism: it proves the
-panic paths unreachable (`iter1 = umin` bounds the indices), infers
-`nounwind`+`memory(argmem:read)`, dead-arg-elim rewrites the callee to
-`void`, DCE empties its body, and the callsite goes with it — that's
-panic-path elimination and interprocedural dead-result elimination, not
-call dedup.
+The ~80ns parity on the last row is a four-pass chain, not one pass:
+`guardelim` (the CVP panic-path half) proves the bounds checks inside
+`dotprod` unreachable — the `min(a.len, b.len)` diamond's own edge facts
+give `min <= a.len`/`min <= b.len` — so `nounwind2`/`nowrite2` upgrade the
+callee to `nounwind` + `nowrite=Some(true)`. `xoridem` then collapses the
+100-trip loop to iteration 0 by redirecting the dominated back-edge to
+the exit (kept calls need only `nowrite`+`willreturn`: a dropped
+iteration's call would return the same value, and unwind/diverge is
+preserved by the copy that still runs). The even trip count makes the
+`acc ^= call` stores dead — `s0` is the answer — so `xoridem` erases them
+plus their xor/load feed chain, the call result goes unused, and
+`callgvn2`'s dead-call elim (nowrite + nounwind + willreturn) erases the
+callsite: loop and call both fold away. LLVM gets the same number by a
+different route (`umin` bound reasoning → `nounwind` +
+`memory(argmem:read)` → dead-arg-elim → callsite death).
 
 Support pieces that made it fire: `nowrite` splits writes on
 return-reachable blocks from writes on dead paths (`eh.exn` pads, aborts)

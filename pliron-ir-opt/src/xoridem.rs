@@ -7,6 +7,17 @@
 //! loop is a no-op and erases, which is what lets a hoisted pure call
 //! (already carried to the preheader by callgvn) die in turn.
 //!
+//! The rewrite never moves an op: iteration 0 executes the body exactly
+//! as written, then every dominated back-edge is redirected to the
+//! exit. Calls to nowrite+willreturn callees are allowed in the body —
+//! the dropped iterations could only have returned values identical to
+//! iteration 0's, and unwind/diverge behavior is preserved by the kept
+//! copy. On even trip counts the accumulator ends at `s0` regardless of
+//! the body, so its stores are erased when nothing else reads the slot
+//! — which is what frees the (now unused) call result for callgvn's
+//! dead-call elim; a still-read slot falls back to a preheader snapshot
+//! restored in the latch.
+//!
 //! The match is deliberately narrow: a single-entry single-exit loop
 //! whose header tests `load c <ULT> K`, whose only in-loop stores are the
 //! counter increment `store c <- add(load c, step)`, xor-recurrences
@@ -24,7 +35,6 @@ use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
-use pliron_llvm::op_interfaces::BinArithOp;
 use pliron::value::Value;
 use pliron_llvm::attributes::ICmpPredicateAttr as P;
 use pliron_llvm::ops::{
@@ -190,6 +200,30 @@ fn is_alloca(ctx: &Context, v: Value) -> bool {
         .is_some_and(|d| Operation::is_op::<AllocaOp>(d, ctx))
 }
 
+/// Erase `v`'s def while it is a single-use `xor`/`load` whose last
+/// consumer just died — frees the values the chain itself consumed
+/// (the pure call results `invs` resolve to). Bounded by `fuel`.
+fn peel_dead(ctx: &mut Context, st: &State, v: Value, fuel: usize) {
+    if fuel == 0 || !v.uses(ctx).is_empty() {
+        return;
+    }
+    let Some(d) = v.defining_op() else {
+        return;
+    };
+    let dead = Operation::is_op::<XorOp>(d, ctx)
+        || (Operation::is_op::<LoadOp>(d, ctx) && !st.volatile.contains(&d));
+    if !dead {
+        return;
+    }
+    let operands: Vec<Value> = (0..d.deref(ctx).get_num_operands())
+        .map(|i| d.deref(ctx).get_operand(i))
+        .collect();
+    Operation::erase(d, ctx);
+    for o in operands {
+        peel_dead(ctx, st, o, fuel - 1);
+    }
+}
+
 /// `v` is a non-volatile `load` of pointer `p`.
 fn is_load_of(ctx: &Context, st: &State, v: Value, p: Value) -> bool {
     v.defining_op().is_some_and(|d| {
@@ -338,7 +372,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         let mut ok = true;
         let mut step: Option<u128> = None;
         let mut calls: FxHashSet<Ptr<Operation>> = FxHashSet::default();
-        let mut stores: Vec<(Ptr<BasicBlock>, Value, Value)> = Vec::new();
+        let mut stores: Vec<(Ptr<Operation>, Ptr<BasicBlock>, Value, Value)> = Vec::new();
+        let mut loads: Vec<Ptr<Operation>> = Vec::new();
         'scan: for &b in &lset {
             let nb = bops[&b].len();
             for (i, &op) in bops[&b].iter().enumerate() {
@@ -381,7 +416,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                         }
                         continue;
                     }
-                    stores.push((b, w, p));
+                    stores.push((op, b, w, p));
+                    continue;
+                }
+                if Operation::is_op::<LoadOp>(op, ctx) {
+                    loads.push(op);
                     continue;
                 }
                 if Operation::is_op::<CallOp>(op, ctx) {
@@ -434,7 +473,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         // Every stored pointer must resolve to a bare alloca base; a
         // store anywhere else writes memory the fold cannot model.
         let mut sbases: FxHashSet<Value> = FxHashSet::default();
-        for &(_, _, p) in &stores {
+        for &(_, _, _, p) in &stores {
             let Some(a) = slot_base(ctx, p) else {
                 ok = false;
                 break;
@@ -458,8 +497,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         let mut memo: FxHashMap<Value, u8> = FxHashMap::default();
         let mut fuel = MAX_ACC_WALK;
         let mut seen_dead: FxHashSet<Value> = FxHashSet::default();
-        let mut byp: FxHashMap<Value, Vec<(Ptr<BasicBlock>, Value)>> = FxHashMap::default();
-        for &(sb, w, p) in &stores {
+        // Two distinct SSA pointers resolving to the same slot would each
+        // classify independently while really aliasing — refuse that.
+        let mut pbase: FxHashMap<Value, Value> = FxHashMap::default();
+        let mut byp: FxHashMap<Value, Vec<(Ptr<Operation>, Ptr<BasicBlock>, Value)>> =
+            FxHashMap::default();
+        for &(sop, sb, w, p) in &stores {
             let a = slot_base(ctx, p).unwrap();
             if seen_dead.contains(&a) || loop_private(ctx, st, &lset, a) {
                 seen_dead.insert(a);
@@ -471,20 +514,29 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 ok = false;
                 break;
             }
-            byp.entry(p).or_default().push((sb, w));
+            match pbase.insert(a, p) {
+                Some(q) if q != p => {
+                    ok = false;
+                    break;
+                }
+                _ => {}
+            }
+            byp.entry(p).or_default().push((sop, sb, w));
         }
         // Per pointer, every store must be the same kind: xor-recurrence
         // `store p <- xor(load p, inv)` (accumulator — final value needs a
         // fixup on even trips) or `arg_inv` (self-consistent — iteration
         // 0 already wrote the final value). Mixing kinds would make the
         // final value order-dependent.
-        let mut accs: FxHashMap<Value, (Vec<Value>, TypeHandle)> = FxHashMap::default();
+        // Per acc pointer: (store op, block, stored value, invariant).
+        let mut accs: FxHashMap<Value, (Vec<(Ptr<Operation>, Ptr<BasicBlock>, Value, Value)>, TypeHandle)> =
+            FxHashMap::default();
         let mut visible: Vec<(Ptr<BasicBlock>, Value)> = Vec::new();
         for (p, ws) in byp {
             let mut mask = 0u8;
-            let mut invs = Vec::new();
-            let mut ty = ws[0].1.get_type(ctx);
-            for (sb, w) in ws {
+            let mut ast = Vec::new();
+            let ty = ws[0].2.get_type(ctx);
+            for (sop, sb, w) in ws {
                 if w.get_type(ctx) != ty {
                     ok = false;
                     break;
@@ -509,7 +561,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 }
                 if let Some(v) = iv {
                     mask |= 1;
-                    invs.push(v);
+                    ast.push((sop, sb, w, v));
                 } else if arg_inv(ctx, st, &lset, &sbases, &mut memo, &mut fuel, w) {
                     mask |= 2;
                     visible.push((sb, p));
@@ -522,7 +574,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
             }
             match mask {
                 1 => {
-                    accs.insert(p, (invs, ty));
+                    accs.insert(p, (ast, ty));
                 }
                 2 => {}
                 _ => {
@@ -540,8 +592,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         // latch. Outside-loop defs reach it through the preheader.
         let dom_ok = visible.iter().all(|&(sb, _)| {
             dom.as_ref().is_some_and(|d| d.dominates(sb, latch))
-        }) && accs.values().all(|(invs, _)| {
-            invs.iter().all(|&iv| {
+        }) && accs.values().all(|(ast, _)| {
+            ast.iter().all(|&(_, _, _, iv)| {
                 def_block(ctx, iv)
                     .is_none_or(|db| dom.as_ref().is_some_and(|d| d.dominates(db, latch)))
             })
@@ -594,7 +646,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         };
         let (init, bound, step) = (init as u128, bound as u128, step.unwrap());
         let n = bound.saturating_sub(init).div_ceil(step);
-        if init.saturating_add(n.saturating_mul(step)) >= 1u128 << w.min(127) {
+        if n == 0 || init.saturating_add(n.saturating_mul(step)) >= 1u128 << w.min(127) {
             continue;
         }
         let odd = n % 2 == 1;
@@ -603,18 +655,43 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }
         claimed.extend(lset.iter().copied());
         // Iteration 0 runs as written; the latch's back-edge is rewired
-        // to the exit so it is also the last. On even trips the
-        // accumulator needs `s0` back — snapshot it in the preheader and
-        // restore it in the latch (leaving the xor inputs dead). On odd
-        // trips `s0 ^ D` is already the answer.
+        // to the exit so it is also the last. On odd trips `s0 ^ D` is
+        // already the answer. On even trips `s0` is — and every in-loop
+        // accumulator store is dead, so when nothing else reads the slot
+        // they are erased outright: the xor chains die, freeing the call
+        // results they consumed (callgvn then dead-eliminates the call
+        // itself). When other reads exist the store stays honest and the
+        // slot is restored from a preheader snapshot at the latch.
         let lt = *bops[&latch].last().unwrap();
         if !odd {
-            for (p, (_, ty)) in &accs {
-                let l = LoadOp::new(ctx, *p, *ty).get_operation();
-                l.insert_before(ctx, pht);
-                let lv = l.deref(ctx).get_result(0);
-                let s = StoreOp::new(ctx, lv, *p).get_operation();
-                s.insert_before(ctx, lt);
+            for (&p, (ast, ty)) in &accs {
+                let a = slot_base(ctx, p).unwrap();
+                let roots: FxHashSet<Ptr<Operation>> = ast
+                    .iter()
+                    .filter_map(|&(_, _, w, _)| {
+                        let xo = w.defining_op()?;
+                        (0..xo.deref(ctx).get_num_operands()).find_map(|i| {
+                            let v = xo.deref(ctx).get_operand(i);
+                            is_load_of(ctx, st, v, p).then(|| v.defining_op().unwrap())
+                        })
+                    })
+                    .collect();
+                let clean = loads.iter().all(|&l| {
+                    slot_base(ctx, l.deref(ctx).get_operand(0)) != Some(a)
+                        || roots.contains(&l)
+                });
+                if clean {
+                    for &(sop, _, w, _) in ast {
+                        Operation::erase(sop, ctx);
+                        peel_dead(ctx, st, w, MAX_ACC_WALK);
+                    }
+                } else {
+                    let l = LoadOp::new(ctx, p, *ty).get_operation();
+                    l.insert_before(ctx, pht);
+                    let lv = l.deref(ctx).get_result(0);
+                    let s = StoreOp::new(ctx, lv, p).get_operation();
+                    s.insert_before(ctx, lt);
+                }
             }
         }
         let hsuccs: Vec<usize> = lt
