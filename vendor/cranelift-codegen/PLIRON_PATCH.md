@@ -230,4 +230,6 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     256/512-bit vectors. The lane-generic `sse_*`/`x64_xor_vector`/
     `bnot`/`bitselect`/`pblendvb` fallbacks are guarded to ≤128-bit
     types so any other wide use fails to lower instead of truncating.
-    Covered by `pliron-clif-opt/tests/widevec_lower.rs`.
+    `ty_bits` (`src/isle_prelude.rs`) saturates at `u8::MAX` for
+    >255-bit types instead of panicking. Covered by
+    `pliron-clif-opt/tests/widevec_lower.rs`.

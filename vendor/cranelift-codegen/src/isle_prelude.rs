@@ -344,7 +344,10 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_bits(&mut self, ty: Type) -> u8 {
             use core::convert::TryInto;
-            ty.bits().try_into().unwrap()
+            // PLIRON: 256/512-bit vectors exist in wide mode; saturate rather
+            // than panic — every width guard (`eq`/`le` against ≤128) still
+            // evaluates correctly for a >255-bit type.
+            ty.bits().try_into().unwrap_or(u8::MAX)
         }
 
         #[inline]
