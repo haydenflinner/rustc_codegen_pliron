@@ -41,8 +41,9 @@ mod xcgu;
 // glob re-export keeps `crate::<pass>` paths working unchanged.
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
-    address_taken, callgvn, constload, domcheck, has_body, inline, instcombine, memcpyopt, nnret,
-    nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
+    address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine,
+    memcpyopt, nnret, nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
+    xoridem,
 };
 
 use std::any::Any;
@@ -595,6 +596,21 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(cx, "retarg", retarg::run(ctx, st));
             pt!(cx, "domcheck:ra", domcheck::run(ctx, st, "retarg"));
         }
+        // Provably-dead panic paths, on the canonical post-sroa IR (the
+        // bounds check's slot indirections are gone by now): a callee whose
+        // only unwind path is a dead bounds-check panic becomes nounwind
+        // and its writes-only-on-nonreturn nowrite=Some(false) upgrades to
+        // Some(true), which dead-callsite elim consumes. nounwind/nowrite
+        // re-run so the summaries see the cleaned CFG.
+        if pass_enabled("PLIRON_GUARDELIM") {
+            pt!(cx, "guardelim", guardelim::run(ctx, st));
+        }
+        if pass_enabled("PLIRON_NOUNWIND") || coff_eh {
+            pt!(cx, "nounwind2", nounwind::run(ctx, st));
+        }
+        if pass_enabled("PLIRON_NOWRITE") {
+            pt!(cx, "nowrite2", nowrite::run(ctx, st));
+        }
         // `willreturn` on the final post-inline/devirt call set: callgvn
         // needs it to erase still-used dedups and to speculate hoists.
         if pass_enabled("PLIRON_WILLRETURN") {
@@ -605,6 +621,16 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_CALLGVN") {
             pt!(cx, "callgvn", callgvn::run(ctx, st));
             pt!(cx, "domcheck:cg", domcheck::run(ctx, st, "callgvn"));
+        }
+        // `acc ^= inv` loop idiom: a hoisted call's result feeding only
+        // an even-count xor recurrence leaves the loop a no-op — erase
+        // it, then re-run callgvn so the now-unused call dies too.
+        if pass_enabled("PLIRON_XORIDEM") {
+            pt!(cx, "xoridem", xoridem::run(ctx, st));
+            if pass_enabled("PLIRON_CALLGVN") {
+                pt!(cx, "callgvn2", callgvn::run(ctx, st));
+                pt!(cx, "domcheck:cg2", domcheck::run(ctx, st, "callgvn2"));
+            }
         }
         st.notrap = pass_enabled("PLIRON_NOTRAP");
         st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");

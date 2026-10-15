@@ -170,4 +170,10 @@ impl Dom {
             _ => false,
         }
     }
+
+    /// Immediate dominator of a reachable block (None for the entry).
+    pub fn idom(&self, b: Ptr<BasicBlock>) -> Option<Ptr<BasicBlock>> {
+        let &i = self.idx.get(&b)?;
+        (self.idom[i] != i).then(|| self.order[self.idom[i]])
+    }
 }

@@ -1,5 +1,6 @@
 //! pliron-IR helpers shared by the passes and lowering.
 
+use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron::value::Value;
@@ -64,6 +65,57 @@ impl Syms {
         let i = self.0.len() as u32;
         self.0.insert(s.to_string(), i);
         i
+    }
+}
+
+/// Erase every block no longer reachable from the entry (over CFG + invoke
+/// edges) after an edge-removing transform: drops every dead block's held
+/// uses first (killing dead→dead and dead→live edges and operand uses),
+/// cleans op-keyed side tables, then erases the blocks. Dead blocks' results
+/// can't be used by live code (dominance), so after the use drop `erase`
+/// is safe.
+pub fn erase_unreachable(
+    ctx: &mut Context,
+    st: &mut State,
+    blocks: &[Ptr<BasicBlock>],
+    ops_of: &dyn Fn(Ptr<BasicBlock>) -> Vec<Ptr<Operation>>,
+) {
+    let Some(&entry) = blocks.first() else {
+        return;
+    };
+    // Live = reachable over real successors plus invoke pads of live ops
+    // (pads have no real incoming edges).
+    let mut live = rustc_hash::FxHashSet::default();
+    let mut wl = vec![entry];
+    while let Some(b) = wl.pop() {
+        if !live.insert(b) {
+            continue;
+        }
+        for op in ops_of(b) {
+            wl.extend(op.deref(ctx).successors());
+            if let Some(&(l, _)) = st.invokes.get(&op) {
+                wl.push(l);
+            }
+        }
+    }
+    let dead: Vec<Ptr<BasicBlock>> = blocks
+        .iter()
+        .copied()
+        .filter(|b| !live.contains(b))
+        .collect();
+    for &b in &dead {
+        for op in ops_of(b) {
+            st.calls.remove(&op);
+            st.invokes.remove(&op);
+            st.intrinsics.remove(&op);
+            st.volatile.remove(&op);
+            st.rmw.remove(&op);
+            st.nonnull.remove(&op);
+        }
+        BasicBlock::drop_all_uses(b, ctx);
+    }
+    for b in dead {
+        BasicBlock::erase(b, ctx);
     }
 }
 
