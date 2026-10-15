@@ -331,6 +331,9 @@ pub struct NonNull<'a> {
     loads: &'a FxHashSet<Value>,
     derived: &'a FxHashMap<Value, Value>,
     params: FxHashSet<Value>,
+    /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
+    /// lookup per call, which is too hot inside `is_deps`.
+    nn_addr: bool,
 }
 
 impl<'a> NonNull<'a> {
@@ -343,6 +346,7 @@ impl<'a> NonNull<'a> {
             loads,
             derived,
             params: FxHashSet::default(),
+            nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
         };
         if loads.is_empty() {
             return nn;
@@ -376,6 +380,10 @@ impl<'a> NonNull<'a> {
         let mut checks: Vec<Chk> = Vec::new();
         let mut dependents: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
         let mut evict: Vec<Value> = Vec::new();
+        // `is_deps` results are stable while `params` is frozen — memoize
+        // so a value feeding many edges is proven once. Cleared before the
+        // eviction pass, which re-proves against the shrinking set.
+        let mut memo = Some(FxHashMap::default());
         for b in func.layout.blocks() {
             let Some(t) = func.layout.last_inst(b) else {
                 continue;
@@ -388,18 +396,23 @@ impl<'a> NonNull<'a> {
                 .enumerate()
             {
                 let d = bc.block(&func.dfg.value_lists);
-                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                // Most edges feed blocks with no candidate params — collect
+                // the edge args only once one matches.
+                let mut args: Option<Vec<BlockArg>> = None;
                 for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
                     if !nn.params.contains(&p) {
                         continue;
                     }
+                    let args = args.get_or_insert_with(|| {
+                        bc.args(&func.dfg.value_lists).collect()
+                    });
                     let Some(&BlockArg::Value(v)) = args.get(i) else {
                         evict.push(p);
                         continue;
                     };
                     let v = func.dfg.resolve_aliases(v);
                     let mut deps = FxHashSet::default();
-                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps)
+                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo)
                     {
                         dependents_entry(&mut dependents, &deps, checks.len());
                         checks.push(Chk {
@@ -415,6 +428,7 @@ impl<'a> NonNull<'a> {
                 }
             }
         }
+        memo = None;
         let mut dead: FxHashSet<Value> = FxHashSet::default();
         while let Some(q) = evict.pop() {
             if std::env::var_os("PLIRON_NN_DEBUG").is_some() {
@@ -428,7 +442,7 @@ impl<'a> NonNull<'a> {
                     continue;
                 }
                 let mut deps = FxHashSet::default();
-                if nn.edge_aux_deps(func, c.t, c.ei, c.v, 0, &mut deps) {
+                if nn.edge_aux_deps(func, c.t, c.ei, c.v, 0, &mut deps, &mut memo) {
                     // Still proven — the dep set may have moved, so
                     // re-point the check at what it now relies on.
                     c.deps = deps.iter().copied().collect();
@@ -446,6 +460,31 @@ impl<'a> NonNull<'a> {
         self.is_deps(func, v, &mut FxHashSet::default())
     }
 
+    /// `is_deps` behind a per-value memo — legal only while `params` is
+    /// frozen (the `new` seeding pass); eviction shrinks `params`, which
+    /// can change answers, so callers there pass `None`.
+    fn is_deps_m(
+        &self,
+        func: &Function,
+        v: Value,
+        deps: &mut FxHashSet<Value>,
+        memo: Option<&mut FxHashMap<Value, (bool, Vec<Value>)>>,
+    ) -> bool {
+        let Some(m) = memo else {
+            return self.is_deps(func, v, deps);
+        };
+        let v = func.dfg.resolve_aliases(v);
+        if let Some((r, ds)) = m.get(&v) {
+            deps.extend(ds.iter().copied());
+            return *r;
+        }
+        let mut d2 = FxHashSet::default();
+        let r = self.is_deps(func, v, &mut d2);
+        deps.extend(d2.iter().copied());
+        m.insert(v, (r, d2.into_iter().collect()));
+        r
+    }
+
     fn is_deps(&self, func: &Function, v: Value, deps: &mut FxHashSet<Value>) -> bool {
         // `select c, a, b` is non-null iff both arms are; every term on
         // the worklist must justify itself (a `!nonnull` load, a param
@@ -458,7 +497,9 @@ impl<'a> NonNull<'a> {
                 continue;
             }
             for _ in 0..8 {
-                if self.loads.contains(&v) || addr_of_symbol(func, v) || non_zero_const(func, v)
+                if self.loads.contains(&v)
+                    || addr_of_symbol(func, v, self.nn_addr)
+                    || non_zero_const(func, v)
                 {
                     continue 'terms;
                 }
@@ -589,7 +630,16 @@ impl NonNull<'_> {
     /// niche select `select(k,0,x)` it also means `!k` and `x != 0`
     /// — the shape `Option::is_none` produces at loop tails.
     pub fn is_edge(&self, func: &Function, t: Inst, ei: usize, v: Value) -> bool {
-        self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(v), 0, &mut FxHashSet::default())
+        let mut memo = None;
+        self.edge_aux_deps(
+            func,
+            t,
+            ei,
+            func.dfg.resolve_aliases(v),
+            0,
+            &mut FxHashSet::default(),
+            &mut memo,
+        )
     }
 
     fn edge_aux_deps(
@@ -600,8 +650,9 @@ impl NonNull<'_> {
         v: Value,
         d: usize,
         deps: &mut FxHashSet<Value>,
+        memo: &mut Option<FxHashMap<Value, (bool, Vec<Value>)>>,
     ) -> bool {
-        if self.is_deps(func, v, deps) {
+        if self.is_deps_m(func, v, deps, memo.as_mut()) {
             return true;
         }
         if d > 6 {
@@ -665,11 +716,27 @@ impl NonNull<'_> {
             } = func.dfg.insts[vi]
             && func.dfg.resolve_aliases(va[0]) == func.dfg.resolve_aliases(sa[0])
         {
-            return self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(va[2]), d + 1, deps);
+            return self.edge_aux_deps(
+                func,
+                t,
+                ei,
+                func.dfg.resolve_aliases(va[2]),
+                d + 1,
+                deps,
+                memo,
+            );
         }
         // `v` an inbounds offset of a base that is nn on this edge.
         if let Some(base) = self.derived_base(func, v) {
-            return self.edge_aux_deps(func, t, ei, func.dfg.resolve_aliases(base), d + 1, deps);
+            return self.edge_aux_deps(
+                func,
+                t,
+                ei,
+                func.dfg.resolve_aliases(base),
+                d + 1,
+                deps,
+                memo,
+            );
         }
         false
     }
@@ -711,13 +778,14 @@ impl NonNull<'_> {
 }
 
 /// Addresses of symbols, thread-locals and stack slots are never null.
-fn addr_of_symbol(func: &Function, v: Value) -> bool {
-    func.dfg.value_def(v).inst().is_some_and(|i| {
-        matches!(
-            func.dfg.insts[i].opcode(),
-            Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr | Opcode::StackAddr
-        ) && crate::pass_enabled("PLIRON_NN_ADDR")
-    })
+fn addr_of_symbol(func: &Function, v: Value, nn_addr: bool) -> bool {
+    nn_addr
+        && func.dfg.value_def(v).inst().is_some_and(|i| {
+            matches!(
+                func.dfg.insts[i].opcode(),
+                Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr | Opcode::StackAddr
+            )
+        })
 }
 
 /// Trace the `src → dst` edge at destination index `di` back through
@@ -1791,6 +1859,7 @@ pub(crate) fn round(
     let entry = func.layout.entry_block();
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
+    let bodyk = crate::pass_enabled("PLIRON_BODYK");
     let dbg = std::env::var_os("PLIRON_JT_DEBUG").is_some();
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -1819,7 +1888,7 @@ pub(crate) fn round(
         // `iconst`s cost nothing to evaluate through the env map; budget
         // the real ops only (long niche-merge chains — `Option<char>`
         // flag test + sentinel compare — otherwise exceed MAX_BODY).
-        let real = if crate::pass_enabled("PLIRON_BODYK") {
+        let real = if bodyk {
             body.iter()
                 .filter(|&&i| {
                     !matches!(
@@ -1907,8 +1976,7 @@ pub(crate) fn round(
                 let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
                 let fs = fact_memo
                     .entry(pblock)
-                    .or_insert_with(|| facts_at(&domtree, &facts, pblock))
-                    .clone();
+                    .or_insert_with(|| facts_at(&domtree, &facts, pblock));
                 if !fs.is_empty() {
                     for (&p, &v) in &argv {
                         if !env.contains_key(&p)
