@@ -199,13 +199,12 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
             ("fp16", "has_fp16"),
             ("bti", "use_bti"),
         ],
-        // The VEX families (avx/avx2/fma/avx512*) are deliberately not
-        // mapped by default: without them only VEX-128 encodings appear —
-        // which translate ~2x slower than legacy SSE under Rosetta, and on
-        // real hardware offer only the 3-operand form. `PLIRON_X64_VEX=1`
-        // opts back in for real-HW runs, and also raises the wide-vector
-        // ceiling (`WIDE_VECTOR_BITS`) so loopvec emits 256/512-bit lanes
-        // under AVX2/AVX512F.
+        // The VEX families (avx/avx2/fma/avx512*) are mapped by default on
+        // real hardware: they unlock the 3-operand encodings and, under
+        // AVX2/AVX512F, the wide-vector lowerings (loopvec probes the
+        // resulting ISA flags per function; `WIDE_VECTOR_BITS` tracks the
+        // ceiling). `PLIRON_X64_VEX=0` opts out — e.g. under Rosetta, where
+        // VEX-128 encodings translate ~2x slower than legacy SSE.
         // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
@@ -226,9 +225,10 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
                 .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
         }
     }
-    // Opt-in VEX encodings on x64 (see the comment on the flag table above).
+    // VEX encodings on x64, default-on (see the comment on the flag table
+    // above); PLIRON_X64_VEX=0 opts out.
     if triple.architecture == target_lexicon::Architecture::X86_64
-        && crate::env_is("PLIRON_X64_VEX", "1")
+        && !crate::env_is("PLIRON_X64_VEX", "0")
     {
         for &(rust, flag) in &[
             ("avx", "has_avx"),
