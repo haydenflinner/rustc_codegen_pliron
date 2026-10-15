@@ -217,3 +217,147 @@ fn bnot_512() {
     assert!(has_wide_op(&code, &[0x25]), "no vpternlogd zmm: {code:02x?}");
     assert!(has_wide_op(&code, &[0xEF]), "no vpxord zmm: {code:02x?}");
 }
+
+const INT_OPS: &str = "
+function %iops(i32x8, i32x8) -> i32x8 {
+block0(v0: i32x8, v1: i32x8):
+    v2 = iadd v0, v1
+    v3 = imul v2, v1
+    v4 = isub v3, v0
+    v5 = smin v4, v2
+    return v5
+}";
+
+const INT_OPS_512: &str = "
+function %iops(i32x16, i32x16) -> i32x16 {
+block0(v0: i32x16, v1: i32x16):
+    v2 = iadd v0, v1
+    v3 = imul v2, v1
+    v4 = isub v3, v0
+    v5 = smax v4, v2
+    return v5
+}";
+
+const ICMP_256: &str = "
+function %cmp(i32x8, i32x8) -> i32x8 {
+block0(v0: i32x8, v1: i32x8):
+    v2 = icmp eq v0, v1
+    v3 = icmp ugt v0, v1
+    v4 = band v2, v3
+    return v4
+}";
+
+const SPLAT_INT: &str = "
+function %splat(i32) -> i32x8 {
+block0(v0: i32):
+    v1 = splat.i32x8 v0
+    return v1
+}";
+
+const SPLAT_512: &str = "
+function %splat(i64) -> i64x8 {
+block0(v0: i64):
+    v1 = splat.i64x8 v0
+    return v1
+}";
+
+const F64_OPS: &str = "
+function %dops(f64x4, f64x4) -> f64x4 {
+block0(v0: f64x4, v1: f64x4):
+    v2 = fadd v0, v1
+    v3 = fmin v2, v1
+    v4 = fneg v3
+    v5 = fma v4, v0, v1
+    return v5
+}";
+
+const SHIFT_256: &str = "
+function %sh(i32x8, i32) -> i32x8 {
+block0(v0: i32x8, v1: i32):
+    v2 = ishl v0, v1
+    v3 = ushr v2, v1
+    return v3
+}";
+
+const SHIFT_IMM: &str = "
+function %sh(i32x8) -> i32x8 {
+block0(v0: i32x8):
+    v9 = iconst.i32 3
+    v1 = ishl v0, v9
+    v10 = iconst.i32 2
+    v2 = ushr v1, v10
+    return v2
+}";
+
+#[test]
+fn int_ops_256() {
+    let code = compile(256, INT_OPS);
+    // vpaddd 0xFE, vpsubd 0xFA, vpmulld 0x40 (0F38), vpminsd 0x39 (0F38).
+    assert!(has_wide_op(&code, &[0xFE]), "no vpaddd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xFA]), "no vpsubd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x40, 0x39]), "no vpmulld/vpminsd ymm: {code:02x?}");
+    assert!(
+        !has_legacy_op(&code, &[0xFE, 0xFA]),
+        "xmm-width int op: {code:02x?}"
+    );
+}
+
+#[test]
+fn int_ops_512() {
+    let code = compile(512, INT_OPS_512);
+    assert!(has_wide_op(&code, &[0xFE]), "no vpaddd zmm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xFA]), "no vpsubd zmm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x40, 0x3D]), "no vpmulld/vpmaxsd zmm: {code:02x?}");
+}
+
+#[test]
+fn icmp_256() {
+    let code = compile(256, ICMP_256);
+    // eq: vpcmpeqd 0x76; ugt: two vpxor (flip mask) + vpcmpgtd 0x66.
+    assert!(has_wide_op(&code, &[0x76]), "no vpcmpeqd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x66]), "no vpcmpgtd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xEF]), "no vpxor ymm (flip mask): {code:02x?}");
+    assert!(
+        !has_legacy_op(&code, &[0x76, 0x66]),
+        "xmm-width compare: {code:02x?}"
+    );
+}
+
+#[test]
+fn splat_256() {
+    let code = compile(256, SPLAT_INT);
+    // vpbroadcastd 0x7C is a 0F38-map op -> 3-byte VEX.
+    assert!(has_wide_op(&code, &[0x7C]), "no vpbroadcastd ymm: {code:02x?}");
+}
+
+#[test]
+fn splat_512() {
+    let code = compile(512, SPLAT_512);
+    // vpbroadcastq zmm: EVEX 0F38 0x7D W=1.
+    assert!(has_wide_op(&code, &[0x7D]), "no vpbroadcastq zmm: {code:02x?}");
+}
+
+#[test]
+fn f64_ops_256() {
+    let code = compile(256, F64_OPS);
+    // vaddpd 0x58, vminpd 0x5D, vfmadd213pd 0xA8, vpxor 0xEF (fneg mask).
+    assert!(has_wide_op(&code, &[0x58]), "no vaddpd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0x5D]), "no vminpd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xA8]), "no vfmadd213pd ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xEF]), "no vpxor (fneg) ymm: {code:02x?}");
+}
+
+#[test]
+fn shifts_256() {
+    let code = compile(256, SHIFT_256);
+    // vpslld 0xF2, vpsrld 0xD2 with xmm count.
+    assert!(has_wide_op(&code, &[0xF2]), "no vpslld ymm: {code:02x?}");
+    assert!(has_wide_op(&code, &[0xD2]), "no vpsrld ymm: {code:02x?}");
+}
+
+#[test]
+fn shift_imm_256() {
+    let code = compile(256, SHIFT_IMM);
+    // imm forms: vpslld.yi 0x72 digit6, vpsrld.yi 0x72 digit2.
+    assert!(has_wide_op(&code, &[0x72]), "no imm-shift ymm: {code:02x?}");
+}

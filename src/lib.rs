@@ -233,6 +233,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
             ("avx2", "has_avx2"),
             ("fma", "has_fma"),
             ("avx512f", "has_avx512f"),
+            ("avx512bw", "has_avx512bw"),
             ("avx512vl", "has_avx512vl"),
             ("avx512dq", "has_avx512dq"),
             ("avx512bitalg", "has_avx512bitalg"),

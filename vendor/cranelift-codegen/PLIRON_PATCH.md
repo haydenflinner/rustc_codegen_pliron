@@ -262,3 +262,27 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     wide `lower.isle` rules are passed bare so the fold fires.
     `fold_load_256` checks a single-use load folds into `vaddps`'s
     memory operand.
+
+24. x64 wide-vector full op coverage (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`, `src/isa/x64/inst.isle`,
+    `src/isa/x64/inst/mod.rs`, `src/prelude.isle`,
+    `vendor/cranelift-codegen-meta/src/isa/x86.rs`,
+    `cranelift-assembler-x64-meta/src/dsl/features.rs`): ISLE
+    lowerings for the full op set at 256/512 bits — int
+    add/sub/mul/min-max/sat-add/avg/mulhi/shifts/abs/neg for all
+    lane widths, `vpmullq` (avx512dq) for i64x8; f64x4/x8 and the
+    missing f32 wide float ops (min/max/sqrt/div/neg/abs/round);
+    `icmp`/`fcmp` masks (512-bit compares split into two 256-bit
+    halves — the DSL has no k-register location — reassembled via
+    `vinsertf64x4`); `select`, `splat` and `vconst` for all wide
+    types; `iconcat`/`isplit`. Byte/word ops at 512 are gated on
+    the new `has_avx512bw` ISA flag (CPUID.07H:EBX[30], added to
+    skylake-avx512/znver4/x86-64-v4 presets and `Feature::avx512bw`)
+    so they fall through to loud Unsupported instead of emitting
+    an encoding the host lacks. Helpers: `wide_lane_mask_amode`
+    (Generated const-pool mask vectors of arbitrary width),
+    `wide_shift_amt_128` (mask scalar count then movq to xmm),
+    `put_low128_in_xmm_mem` (sinkable-load folding of the low half).
+    Int `splat` uses `bitcast_gpr_to_xmm` — scalar ints live in
+    Int-class regs, not Xmm. Tests: `pliron-clif-opt/tests/
+    widevec_lower.rs` byte-checks each family at both widths.

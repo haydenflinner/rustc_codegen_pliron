@@ -65,6 +65,12 @@ pub(crate) fn define() -> TargetIsa {
         "AVX512BITALG: CPUID.07H:ECX.AVX512BITALG[bit 12]",
         false,
     );
+    let has_avx512bw = settings.add_bool(
+        "has_avx512bw",
+        "Has support for AVX512BW.",
+        "AVX512BW: CPUID.07H:EBX.AVX512BW[bit 30]",
+        false,
+    );
     let has_avx512dq = settings.add_bool(
         "has_avx512dq",
         "Has support for AVX512DQ.",
@@ -263,7 +269,7 @@ pub(crate) fn define() -> TargetIsa {
     let skylake_avx512 = settings.add_preset(
         "skylake-avx512",
         "Skylake AVX512 microarchitecture.",
-        preset!(broadwell && has_avx512f && has_avx512dq && has_avx512vl),
+        preset!(broadwell && has_avx512f && has_avx512bw && has_avx512dq && has_avx512vl),
     );
     settings.add_preset(
         "skx",
@@ -283,7 +289,7 @@ pub(crate) fn define() -> TargetIsa {
     let cannonlake = settings.add_preset(
         "cannonlake",
         "Canon Lake microarchitecture.",
-        preset!(skylake && has_avx512f && has_avx512dq && has_avx512vl && has_avx512vbmi),
+        preset!(skylake && has_avx512f && has_avx512bw && has_avx512dq && has_avx512vl && has_avx512vbmi),
     );
     let icelake_client = settings.add_preset(
         "icelake-client",
@@ -410,6 +416,7 @@ pub(crate) fn define() -> TargetIsa {
         preset!(
             znver3
                 && has_avx512bitalg
+                && has_avx512bw
                 && has_avx512dq
                 && has_avx512f
                 && has_avx512vbmi
@@ -433,7 +440,7 @@ pub(crate) fn define() -> TargetIsa {
     settings.add_preset(
         "x86-64-v4",
         "Generic x86-64 (V4) microarchitecture.",
-        preset!(x86_64_v3 && has_avx512dq && has_avx512vl),
+        preset!(x86_64_v3 && has_avx512bw && has_avx512dq && has_avx512f && has_avx512vl),
     );
 
     TargetIsa::new("x86", settings.build())

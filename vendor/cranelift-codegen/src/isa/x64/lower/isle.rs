@@ -473,6 +473,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn has_avx512bw(&mut self) -> bool {
+        self.backend.x64_flags.has_avx512bw()
+    }
+
+    #[inline]
     fn has_avx512vl(&mut self) -> bool {
         self.backend.x64_flags.has_avx512vl()
     }
@@ -850,6 +855,47 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
             "put_in_xmm_mem_512: cannot materialize a >128-bit constant"
         );
         XmmMem512::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    /// PLIRON: constant-pool amode holding `fill` replicated across each
+    /// lane of `ty` (wide types only — the u128 pool emit can't express
+    /// >128-bit constants). `hi`/`lo` give the lane's top byte vs the rest.
+    fn wide_lane_mask_amode(&mut self, ty: Type, hi: u8, lo: u8) -> SyntheticAmode {
+        let lane_bytes = (ty.lane_bits() / 8) as usize;
+        let mut bytes = vec![lo; (ty.bits() / 8) as usize];
+        for lane in bytes.chunks_mut(lane_bytes) {
+            lane[lane_bytes - 1] = hi;
+        }
+        let c = self
+            .lower_ctx
+            .use_constant(VCodeConstantData::Generated(ConstantData::from(&bytes[..])));
+        SyntheticAmode::ConstantOffset(c)
+    }
+
+    #[inline]
+    fn wide_sign_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x80, 0x00)
+    }
+
+    #[inline]
+    fn wide_abs_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x7f, 0xff)
+    }
+
+    #[inline]
+    fn wide_ones_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0xff, 0xff)
+    }
+
+    /// PLIRON: the low 128 bits of a wide `Value` as an `XmmMem128` operand.
+    /// For a register the xmm is the low half of the ymm/zmm; for a sinkable
+    /// load it is the same address (little-endian low half).
+    fn put_low128_in_xmm_mem(&mut self, val: Value) -> XmmMem128 {
+        assert!(self.lower_ctx.dfg().value_type(val).bits() >= 256);
+        if let Some(load) = self.sinkable_load(val) {
+            return XmmMem128::unwrap_new(RegMem::mem(self.sink_load(&load)));
+        }
+        XmmMem128::unwrap_new(RegMem::reg(self.put_in_reg(val)))
     }
 
     fn xmm_mem_256_to_xmm_mem(&mut self, x: &XmmMem256) -> XmmMem {

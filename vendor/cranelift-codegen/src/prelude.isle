@@ -269,6 +269,16 @@
 (extern const $I32X4 Type)
 (extern const $I64X2 Type)
 
+;; pliron: wide vectors
+(extern const $I8X32 Type)
+(extern const $I8X64 Type)
+(extern const $I16X16 Type)
+(extern const $I16X32 Type)
+(extern const $I32X8 Type)
+(extern const $I32X16 Type)
+(extern const $I64X4 Type)
+(extern const $I64X8 Type)
+
 (extern const $F16X8 Type)
 (extern const $F16X16 Type)
 (extern const $F16X32 Type)
@@ -276,6 +286,8 @@
 (extern const $F32X8 Type)
 (extern const $F32X16 Type)
 (extern const $F64X2 Type)
+(extern const $F64X4 Type)
+(extern const $F64X8 Type)
 
 (extern const $I32X4XN Type)
 

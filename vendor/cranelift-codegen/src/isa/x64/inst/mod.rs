@@ -1718,6 +1718,10 @@ impl asm::AvailableFeatures for &EmitInfo {
         self.isa_flags.has_avx_vnni()
     }
 
+    fn avx512bw(&self) -> bool {
+        self.isa_flags.has_avx512bw()
+    }
+
     fn avx512dq(&self) -> bool {
         self.isa_flags.has_avx512dq()
     }
