@@ -812,6 +812,46 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn put_in_xmm_mem_256(&mut self, val: Value) -> XmmMem256 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            256,
+            "put_in_xmm_mem_256: expected a 256-bit value, got value of type {ty}"
+        );
+        // Skip `put_in_xmm_mem`'s u128 const-pool path: the constant-pool
+        // materializes only 16 bytes, which would truncate a folded 256-bit
+        // operand. `put_in_reg_mem`'s own const paths only fire for scalar
+        // `iconst` types, so a vector-typed `Value` always lands in a reg or
+        // a sinkable load here.
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_256: cannot materialize a >128-bit constant"
+        );
+        XmmMem256::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    #[inline]
+    fn put_in_xmm_mem_512(&mut self, val: Value) -> XmmMem512 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            512,
+            "put_in_xmm_mem_512: expected a 512-bit value, got value of type {ty}"
+        );
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_512: cannot materialize a >128-bit constant"
+        );
+        XmmMem512::unwrap_new(self.put_in_reg_mem(val))
+    }
+
     fn xmm_mem_256_to_xmm_mem(&mut self, x: &XmmMem256) -> XmmMem {
         XmmMem::unwrap_new(x.clone().into())
     }

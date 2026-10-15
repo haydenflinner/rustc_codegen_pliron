@@ -89,8 +89,8 @@ function %fops(i64, f32x8, f32x8, f32x8) -> f32x8 {
 block0(v0: i64, v1: f32x8, v2: f32x8, v3: f32x8):
     v4 = load.f32x8 v0
     v5 = fadd v1, v4
-    v6 = fmul v5, v2
-    v7 = fma v6, v1, v3
+    v6 = fmul v5, v4
+    v7 = fma v6, v2, v3
     return v7
 }";
 
@@ -99,9 +99,18 @@ function %fops(i64, f32x16, f32x16, f32x16) -> f32x16 {
 block0(v0: i64, v1: f32x16, v2: f32x16, v3: f32x16):
     v4 = load.f32x16 v0
     v5 = fadd v1, v4
-    v6 = fmul v5, v2
-    v7 = fma v6, v1, v3
+    v6 = fmul v5, v4
+    v7 = fma v6, v2, v3
     return v7
+}";
+
+const FOLD_LOAD: &str = "
+function %fold(i64, i64) -> f32x8 {
+block0(v0: i64, v1: i64):
+    v2 = load.f32x8 v0
+    v3 = load.f32x8 v1
+    v4 = fadd v2, v3
+    return v4
 }";
 
 const BITSELECT_512: &str = "
@@ -170,6 +179,22 @@ fn float_ops_512() {
     assert!(has_wide_op(&code, &[0x58]), "no vaddps zmm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x59]), "no vmulps zmm: {code:02x?}");
     assert!(has_wide_op(&code, &[0xA8]), "no vfmadd zmm: {code:02x?}");
+}
+
+#[test]
+fn fold_load_256() {
+    // v2 folds into vaddps's memory operand — exactly one vmovups load.
+    let code = compile(256, FOLD_LOAD);
+    let loads = code
+        .windows(3)
+        .filter(|w| w[0] == 0xC5 && (w[1] & 0x04) != 0 && w[2] == 0x10)
+        .count()
+        + code
+            .windows(4)
+            .filter(|w| w[0] == 0xC4 && (w[2] & 0x04) != 0 && w[3] == 0x10)
+            .count();
+    assert!(has_wide_op(&code, &[0x58]), "no vaddps ymm: {code:02x?}");
+    assert_eq!(loads, 1, "load did not fold into vaddps: {code:02x?}");
 }
 
 #[test]

@@ -254,3 +254,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     instruction and read out of bounds. All wide `lower.isle` rules
     use the matching-width converter. `widevec_lower.rs`
     `float_ops_*` covers the sibling's vmovups/fadd/fmul/fma path.
+    `put_in_xmm_mem_256`/`_512` (`src/isa/x64/lower/isle.rs`) enable
+    load folding into wide operands: they delegate to
+    `put_in_reg_mem` (sinkable load → amode) but skip
+    `put_in_xmm_mem`'s u128 const-pool path, which can't
+    materialize a >128-bit constant; bound-Value operands in the
+    wide `lower.isle` rules are passed bare so the fold fires.
+    `fold_load_256` checks a single-use load folds into `vaddps`'s
+    memory operand.
