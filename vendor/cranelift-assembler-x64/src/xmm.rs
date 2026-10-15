@@ -22,7 +22,7 @@ impl<R: AsReg> Xmm<R> {
     /// Panics if the register is not a valid Xmm register.
     pub fn enc(&self) -> u8 {
         let enc = self.0.enc();
-        assert!(enc < 16, "invalid register: {enc}");
+        assert!(enc < 32, "invalid register: {enc}");
         enc
     }
 
@@ -44,7 +44,9 @@ impl<R: AsReg> Xmm<R> {
     /// only the `b` bit is set by the topmost bit (the fourth bit) of this
     /// register. We expect this register to be in the `rm` slot.
     pub(crate) fn encode_bx_regs(&self) -> (Option<u8>, Option<u8>) {
-        (Some(self.enc()), None)
+        // EVEX register-direct r/m: bit 4 (xmm16-31) goes in X; zero below 16.
+        let enc = self.enc();
+        (Some(enc), Some(enc >> 1))
     }
 }
 
@@ -108,6 +110,22 @@ pub mod enc {
             XMM13 => "%xmm13",
             XMM14 => "%xmm14",
             XMM15 => "%xmm15",
+            16 => "%xmm16",
+            17 => "%xmm17",
+            18 => "%xmm18",
+            19 => "%xmm19",
+            20 => "%xmm20",
+            21 => "%xmm21",
+            22 => "%xmm22",
+            23 => "%xmm23",
+            24 => "%xmm24",
+            25 => "%xmm25",
+            26 => "%xmm26",
+            27 => "%xmm27",
+            28 => "%xmm28",
+            29 => "%xmm29",
+            30 => "%xmm30",
+            31 => "%xmm31",
             _ => panic!("%invalid{enc}"),
         }
     }

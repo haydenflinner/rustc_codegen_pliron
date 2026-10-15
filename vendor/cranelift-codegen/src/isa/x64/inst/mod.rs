@@ -880,7 +880,53 @@ impl fmt::Debug for Inst {
     }
 }
 
+/// With zmm16-31 allocatable (512-bit wide mode), every xmm operand of a
+/// non-EVEX instruction is limited to xmm0-15.
+struct XmmLimit<'a, V: OperandVisitor>(&'a mut V);
+
+impl<V: OperandVisitor> OperandVisitor for XmmLimit<'_, V> {
+    fn add_operand(
+        &mut self,
+        reg: &mut Reg,
+        constraint: regalloc2::OperandConstraint,
+        kind: regalloc2::OperandKind,
+        pos: regalloc2::OperandPos,
+    ) {
+        use regalloc2::OperandConstraint::{Any, Limit, Reg as R};
+        let c = match constraint {
+            Any | R if reg.class() == RegClass::Float => Limit(16),
+            c => c,
+        };
+        self.0.add_operand(reg, c, kind, pos);
+    }
+
+    fn debug_assert_is_allocatable_preg(&self, reg: regalloc2::PReg, expected: bool) {
+        self.0.debug_assert_is_allocatable_preg(reg, expected);
+    }
+
+    fn reg_clobbers(&mut self, regs: regalloc2::PRegSet) {
+        self.0.reg_clobbers(regs);
+    }
+}
+
+/// Whether zmm16-31 are allocatable: 512-bit wide mode, unless
+/// `PLIRON_NO_HIGH_XMM` is set.
+pub fn high_xmm_regs() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    wide_vector_bits() >= 512 && !*OFF.get_or_init(|| std::env::var_os("PLIRON_NO_HIGH_XMM").is_some())
+}
+
 fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
+    let limit = high_xmm_regs()
+        && !matches!(inst, Inst::External { inst } if inst.num_registers_available() > 16);
+    if limit {
+        x64_get_operands_inner(inst, &mut XmmLimit(collector));
+    } else {
+        x64_get_operands_inner(inst, collector);
+    }
+}
+
+fn x64_get_operands_inner(inst: &mut Inst, collector: &mut impl OperandVisitor) {
     // Note: because we need to statically know the indices of each
     // reg in the operands list in order to fetch its allocation
     // later, we put the variable-operand-count bits (the RegMem,
@@ -1404,6 +1450,15 @@ impl MachInst for Inst {
         let rc_src = src_reg.class();
         // If this isn't true, we have gone way off the rails.
         debug_assert!(rc_dst == rc_src);
+        let hi = |r: Reg| r.to_real_reg().is_some_and(|r| r.hw_enc() >= 16);
+        if rc_dst == RegClass::Float && (hi(dst_reg.to_reg()) || hi(src_reg)) {
+            // xmm16-31 need EVEX; a full zmm move covers every type.
+            let dst = dst_reg.map(|r| Xmm::new(r).unwrap());
+            let src = Xmm::new(src_reg).unwrap();
+            return Inst::External {
+                inst: asm::inst::vmovups_za::new(dst, src).into(),
+            };
+        }
         let inst = match rc_dst {
             RegClass::Int => {
                 // pliron: a `movl` is a byte shorter than `movq` and exact for
