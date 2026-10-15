@@ -211,6 +211,27 @@ turns invokes of nounwind callees into plain calls). `-Ctarget-cpu` /
 `pmulld` instead of `pmuludq` repacks; `PLIRON_X64_VEX=1` switches
 VEX-128 forms on for the ops that have `use_avx*` rules).
 
+## Incidents found while profiling this work
+
+- **`callgvn` miscompile** (`d781a62`): `writes_between`/`stored_allocas`
+  scanned ops that earlier passes had already *erased* from the op list —
+  the stale entries counted as writes (or left a value used before its
+  def was lowered). Symptom was a lowering ICE on `cranelift-isle`
+  (`sema` type-check), which also masked the `bittab` `flat()` mask bug
+  bisected later (unit 34819, `translate_pattern`). Fix: skip erased ops
+  in both scans. Same unsoundness class as `xoridem`'s
+  in-loop-stored-alloca rejection (`ed1159c`): an erased/stale op must
+  never feed an alias or purity query.
+- **`guardelim` OOM** (`b1d3c22`, `ba32720`): the reaching-stores
+  fixpoint kept a dense per-block `slot → store` map covering *every*
+  slot; on `cranelift_codegen`'s generated ISLE functions that was
+  ~24GB — the pass died to the OOM killer before the bailout bound could
+  help. Two-part fix: bail early on giant functions *before* building the
+  dense map (`b1d3c22`), then make the map sparse — only slots that are
+  both stored and loaded-unescaped can ever answer a query (`ba32720`).
+  24GB → bounded set; 75 CGUs run the pass with 17 bounded bails instead
+  of a universal skip.
+
 ## What is next
 
 - `sieve`: bisect the +7.8% regression.
