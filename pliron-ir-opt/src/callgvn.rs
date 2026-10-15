@@ -245,6 +245,14 @@ pub fn run(ctx: &mut Context, st: &State) {
             );
         }
         run_fn(ctx, st, st.funcs[&name].op);
+        if crate::env_get("PLIRON_CGDUMP2").is_some_and(|s| name.contains(s)) {
+            eprintln!(
+                "==== after callgvn ====\n{}",
+                st.funcs[&name]
+                    .op
+                    .print(ctx, &pliron::printable::State::default())
+            );
+        }
     }
 }
 
@@ -391,6 +399,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         for &b in &body {
             for &op in &bops[&b] {
                 if gone.contains(&op) || killed.contains(&op) {
+                    continue;
+                }
+                // An earlier hoist may have moved this op into `ph` as
+                // part of another call's operand cone — re-moving it
+                // would place it after the call that now uses it.
+                if op.deref(ctx).get_parent_block() == Some(ph) {
                     continue;
                 }
                 if dbg && Operation::is_op::<CallOp>(op, ctx) {
