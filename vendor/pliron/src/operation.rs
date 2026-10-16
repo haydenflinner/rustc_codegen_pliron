@@ -456,10 +456,22 @@ impl Operation {
             .map(|succ| succ.as_use(self.self_ptr))
     }
 
+    /// PLIRON: `ptr`'s dispatch pair from the dense `ctx.op_kind`
+    /// table — panics on a stale/dangling `Ptr` exactly as `deref`
+    /// would (cleared tag at dealloc, version mismatch on reuse).
+    #[inline]
+    fn dispatch(ptr: Ptr<Self>, ctx: &Context) -> ConcreteOpInfo {
+        let kinds = ctx.op_kind.borrow();
+        match kinds.get(crate::linked_list::links_index(ptr)) {
+            Some((Some(tag), kind)) if *tag == ptr.idx => *kind,
+            _ => panic!("Dangling Ptr deref"),
+        }
+    }
+
     /// Create an [OpObj] corresponding to self.
     /// [get_op](Self::get_op) is more efficient if the concrete type is known.
     pub fn get_op_dyn(ptr: Ptr<Self>, ctx: &Context) -> OpObj {
-        (ptr.deref(ctx).concrete_op.0)(ptr)
+        (Self::dispatch(ptr, ctx).0)(ptr)
     }
 
     /// Creates the concrete [Op] corresponding to self.
@@ -469,7 +481,7 @@ impl Operation {
 
     /// Is this operation an instance of the concrete [Op] `T`?
     pub fn is_op<T: Op>(ptr: Ptr<Self>, ctx: &Context) -> bool {
-        ptr.deref(ctx).concrete_op.1 == T::get_concrete_op_info().1
+        Self::dispatch(ptr, ctx).1 == T::get_concrete_op_info().1
     }
 
     /// Get the [OpId] this Operation. Builds an intermediate [OpObj].
@@ -587,6 +599,43 @@ impl ArenaObj for Operation {
     }
     fn get_arena_mut(ctx: &mut Context) -> &mut Arena<Self> {
         &mut ctx.operations
+    }
+    /// PLIRON: on top of the default arena insert, mirror
+    /// `concrete_op` into `ctx.op_kind` so `is_op`/`get_op_dyn`
+    /// dispatch without dereferencing the node.
+    fn alloc<T: FnOnce(Ptr<Self>) -> Self>(ctx: &mut Context, f: T) -> Ptr<Self> {
+        let creator = |idx: crate::context::ArenaIndex| {
+            let t = f(Ptr::<Self> {
+                idx,
+                _dummy: PhantomData::<Self>,
+            });
+            core::cell::RefCell::new(t)
+        };
+        let ptr = Ptr::<Self> {
+            idx: Self::get_arena_mut(ctx).insert_with_key(creator),
+            _dummy: PhantomData,
+        };
+        let kind = ptr.deref(ctx).concrete_op;
+        let mut kinds = ctx.op_kind.borrow_mut();
+        let i = crate::linked_list::links_index(ptr);
+        if kinds.len() <= i {
+            kinds.resize(i + 1, (None, kind));
+        }
+        kinds[i] = (Some(ptr.idx), kind);
+        ptr
+    }
+    /// PLIRON: clears the `op_kind` entry on top of the default
+    /// dealloc, so a stale `Ptr` hits a cleared tag.
+    fn dealloc(ptr: Ptr<Self>, ctx: &mut Context) {
+        Self::dealloc_sub_objects(ptr, ctx);
+        Self::get_arena_mut(ctx).remove(ptr.idx);
+        if let Some(entry) = ctx
+            .op_kind
+            .borrow_mut()
+            .get_mut(crate::linked_list::links_index(ptr))
+        {
+            entry.0 = None;
+        }
     }
     fn dealloc_sub_objects(ptr: Ptr<Self>, ctx: &mut Context) {
         let regions = ptr.deref(ctx).regions.clone();

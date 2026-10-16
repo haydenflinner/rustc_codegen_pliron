@@ -71,10 +71,11 @@ impl<T: private::LinkedList> Default for NodeLinks<T> {
     }
 }
 
-/// A node's index inside its links table — the `ArenaIndex` index
-/// component (`as_ffi` packs `index` in the low 32 bits).
+/// A node's index inside its dense side tables — the `ArenaIndex`
+/// index component (`as_ffi` packs `index` in the low 32 bits).
+/// Shared by the links and op-dispatch tables.
 #[inline]
-fn links_index<T: crate::context::private::ArenaObj>(ptr: Ptr<T>) -> usize {
+pub(crate) fn links_index<T: crate::context::private::ArenaObj>(ptr: Ptr<T>) -> usize {
     use slotmap::Key;
     ptr.idx.data().as_ffi() as u32 as usize
 }

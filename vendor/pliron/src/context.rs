@@ -70,6 +70,14 @@ pub struct Context {
     /// See [crate::linked_list::NodeLinks].
     pub(crate) op_links: RefCell<Vec<crate::linked_list::NodeLinks<Operation>>>,
     pub(crate) block_links: RefCell<Vec<crate::linked_list::NodeLinks<BasicBlock>>>,
+    /// PLIRON: dense dispatch table for [Operation] — `concrete_op`
+    /// mirrored here indexed by the op's `ArenaIndex` index component,
+    /// so `is_op`/`get_op_dyn` check a ~32-byte contiguous entry instead
+    /// of a `RefCell` borrow + deref of the ~250-byte node. The tag is
+    /// the slot's `ArenaIndex`; a stale pointer reads a mismatched or
+    /// cleared tag and panics like a dangling `deref`.
+    pub(crate) op_kind:
+        RefCell<Vec<(Option<ArenaIndex>, crate::op::ConcreteOpInfo)>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
@@ -119,6 +127,7 @@ impl Default for Context {
             regions: Arena::default(),
             op_links: RefCell::new(Vec::new()),
             block_links: RefCell::new(Vec::new()),
+            op_kind: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),
