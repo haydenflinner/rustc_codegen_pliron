@@ -1000,14 +1000,13 @@ pub fn get_data_layout(ctx: &Context, module: ModuleOp) -> Option<String> {
         .get_operation()
         .deref(ctx)
         .attributes
-        .get::<StringAttr>(&ATTR_KEY_LLVM_DATA_LAYOUT)
+        .get::<StringAttr>(ctx, &ATTR_KEY_LLVM_DATA_LAYOUT)
         .map(|attr| attr.clone().into())
 }
 
 /// Set the LLVM data layout of `module`.
 pub fn set_data_layout(ctx: &Context, module: ModuleOp, data_layout: String) {
-    module.get_operation().deref_mut(ctx).attributes.set(
-        ATTR_KEY_LLVM_DATA_LAYOUT.clone(),
+    module.get_operation().deref_mut(ctx).attributes.set(ctx, ATTR_KEY_LLVM_DATA_LAYOUT.clone(),
         StringAttr::new(data_layout),
     );
 }
@@ -1018,14 +1017,13 @@ pub fn get_target_triple(ctx: &Context, module: ModuleOp) -> Option<String> {
         .get_operation()
         .deref(ctx)
         .attributes
-        .get::<StringAttr>(&ATTR_KEY_LLVM_TARGET_TRIPLE)
+        .get::<StringAttr>(ctx, &ATTR_KEY_LLVM_TARGET_TRIPLE)
         .map(|attr| attr.clone().into())
 }
 
 /// Set the LLVM target triple of `module`.
 pub fn set_target_triple(ctx: &Context, module: ModuleOp, target_triple: String) {
-    module.get_operation().deref_mut(ctx).attributes.set(
-        ATTR_KEY_LLVM_TARGET_TRIPLE.clone(),
+    module.get_operation().deref_mut(ctx).attributes.set(ctx, ATTR_KEY_LLVM_TARGET_TRIPLE.clone(),
         StringAttr::new(target_triple),
     );
 }

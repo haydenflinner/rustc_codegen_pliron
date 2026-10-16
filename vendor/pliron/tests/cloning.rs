@@ -502,6 +502,7 @@ fn clone_blocks_copies_block_label_and_attributes() -> Result<()> {
     src.deref_mut(ctx).set_label(Some(label.clone()));
     let key: Identifier = ident!("test_block_attr");
     src.deref_mut(ctx).attributes.set(
+        ctx,
         key.clone(),
         IntegerAttr::new(i64_ty, APInt::from_u64(42, bw(64))),
     );
@@ -515,7 +516,7 @@ fn clone_blocks_copies_block_label_and_attributes() -> Result<()> {
     // The clone carries the same attribute.
     let copied = clone_ref
         .attributes
-        .get::<IntegerAttr>(&key)
+        .get::<IntegerAttr>(ctx, &key)
         .expect("block attribute should be copied to the clone");
     assert_eq!(copied.value().to_u64(), 42);
     // ... and the same label (given_name), but a distinct unique_name.

@@ -407,7 +407,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             {
                 let name = ::pliron::ident!(#attr_name);
                 let self_op = self.get_operation().deref(ctx);
-                let attr = self_op.attributes.0.get(&name).expect(&#missing_attr_err);
+                let attr = self_op.attributes.get_obj(ctx, &name).expect(&#missing_attr_err);
                 if ::pliron::attribute::attr_should_outline(&**attr, ctx) {
                     write!(fmt, "{}", ::pliron::irfmt::outlined::OUTLINED_ATTR_MARKER)?;
                 } else {
@@ -507,6 +507,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             res.extend(quote! {
                 let self_op = self.get_operation().deref(ctx);
                 let attr = self_op.attributes.get::<#attr_type>(
+                    ctx,
                     &::pliron::ident!(#attr_dict_key)
                 );
                 if let Some(attr) = attr {
@@ -1264,7 +1265,8 @@ impl ParsableBuilder<OpParserState> for DeriveOpParsable {
                     attribute_sets.extend(quote! {
                         // `None` is either an `opt_attr` or an outlined attribute.
                         if let Some(#attr_ident) = #attr_ident {
-                            op.deref_mut(state_stream.state.ctx).attributes.0.insert(
+                            op.deref_mut(state_stream.state.ctx).attributes.set_obj(
+                                state_stream.state.ctx,
                                 ::pliron::ident!(#attr_name),
                                 #attr_ident,
                             );

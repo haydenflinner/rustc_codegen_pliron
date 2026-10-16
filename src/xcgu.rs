@@ -64,7 +64,19 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     let limit = crate::env_get("PLIRON_XCGU_SIZE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
+    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+    // Single-CGU builds already hold every mono item: no foreign body can
+    // be a copy candidate, so skip the used-item scans entirely.
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
     let ours = cgu.items();
+    // Copies exist to feed the cross-CGU inliner; more copies than the
+    // CGU's own fns would double its IR-opt work for marginal picks.
+    // `PLIRON_XCGU_CAP` overrides (absolute count; >=usize::MAX disables).
+    let cap = crate::env_get("PLIRON_XCGU_CAP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ours.len());
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut cands = Vec::new();
     for item in ours.keys() {
@@ -84,12 +96,11 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     let depth = crate::env_get("PLIRON_XCGU_DEPTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
-    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
     let mut seen: FxHashSet<MonoItem<'tcx>> = direct.clone();
     let mut accepted: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut out = Vec::new();
     for _ in 0..depth {
-        if cands.is_empty() {
+        if cands.is_empty() || out.len() >= cap {
             break;
         }
         let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
@@ -166,6 +177,9 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
             ok
         });
         let mut next = Vec::new();
+        // The depth loop's BFS order keeps direct callees first, so a
+        // truncate drops only the deepest, least-reachable copies.
+        cands.truncate(cap.saturating_sub(out.len()));
         for &c in &cands {
             accepted.insert(MonoItem::Fn(c));
             for u in refs[&c] {
@@ -192,6 +206,15 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
     let ours = cgu.items();
+    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    // Same bound as the legacy path: copies never exceed the CGU's own
+    // item count (`PLIRON_XCGU_CAP` overrides; 0 would take none).
+    let cap = crate::env_get("PLIRON_XCGU_CAP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ours.len());
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut frontier = Vec::new();
     for item in ours.keys() {
@@ -209,7 +232,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         }
     }
 
-    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
     let inlined: FxHashSet<MonoItem<'tcx>> = parts
         .iter()
         .flat_map(|other| {
@@ -320,8 +342,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         }
     }
 
+    // BFS order keeps the closest (directly-referenced) copies first, so
+    // truncation drops only the deepest, least-reachable candidates.
     candidates
         .into_iter()
         .filter(|c| remaining.contains(&MonoItem::Fn(*c)))
+        .take(cap)
         .collect()
 }

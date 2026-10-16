@@ -149,7 +149,7 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<IntegerOverflowFlagsAttr>(&ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
+            .get::<IntegerOverflowFlagsAttr>(ctx, &ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
             .expect("Integer overflow flag missing or is of incorrect type")
             .clone()
     }
@@ -162,7 +162,7 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(), flag);
+            .set(ctx, ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(), flag);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -172,7 +172,7 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
         let op = op.get_operation().deref(ctx);
         if op
             .attributes
-            .get::<IntegerOverflowFlagsAttr>(&ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
+            .get::<IntegerOverflowFlagsAttr>(ctx, &ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
             .is_none()
         {
             return verify_err!(op.loc(), IntBinArithOpWithOverflowFlagErr);
@@ -215,7 +215,7 @@ pub trait FastMathFlags {
             .get_operation()
             .deref(ctx)
             .attributes
-            .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
+            .get::<FastmathFlagsAttr>(ctx, &ATTR_KEY_FAST_MATH_FLAGS)
             .expect("Fast math flags missing or is of incorrect type")
     }
 
@@ -227,7 +227,7 @@ pub trait FastMathFlags {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_FAST_MATH_FLAGS.clone(), flag);
+            .set(ctx, ATTR_KEY_FAST_MATH_FLAGS.clone(), flag);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -237,7 +237,7 @@ pub trait FastMathFlags {
         let op = op.get_operation().deref(ctx);
         if op
             .attributes
-            .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
+            .get::<FastmathFlagsAttr>(ctx, &ATTR_KEY_FAST_MATH_FLAGS)
             .is_none()
         {
             return verify_err!(op.loc(), FastmathFlagMissingErr);
@@ -268,7 +268,7 @@ pub trait SyncScopeInterface {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<SyncScopeAttr>(&ATTR_KEY_SYNC_SCOPE)
+            .get::<SyncScopeAttr>(ctx, &ATTR_KEY_SYNC_SCOPE)
             .expect("Synchronization scope missing or is of incorrect type")
             .clone()
     }
@@ -281,7 +281,7 @@ pub trait SyncScopeInterface {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_SYNC_SCOPE.clone(), syncscope);
+            .set(ctx, ATTR_KEY_SYNC_SCOPE.clone(), syncscope);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -291,7 +291,7 @@ pub trait SyncScopeInterface {
         let op = op.get_operation().deref(ctx);
         if op
             .attributes
-            .get::<SyncScopeAttr>(&ATTR_KEY_SYNC_SCOPE)
+            .get::<SyncScopeAttr>(ctx, &ATTR_KEY_SYNC_SCOPE)
             .is_none()
         {
             return verify_err!(op.loc(), SyncScopeMissingErr);
@@ -344,7 +344,7 @@ pub trait NNegFlag {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<BoolAttr>(&ATTR_KEY_NNEG_FLAG)
+            .get::<BoolAttr>(ctx, &ATTR_KEY_NNEG_FLAG)
             .expect("NNEG flag missing or is of incorrect type")
             .clone()
             .into()
@@ -354,14 +354,14 @@ pub trait NNegFlag {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_NNEG_FLAG.clone(), BoolAttr::new(flag));
+            .set(ctx, ATTR_KEY_NNEG_FLAG.clone(), BoolAttr::new(flag));
     }
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
     where
         Self: Sized,
     {
         let op = op.get_operation().deref(ctx);
-        if op.attributes.get::<BoolAttr>(&ATTR_KEY_NNEG_FLAG).is_none() {
+        if op.attributes.get::<BoolAttr>(ctx, &ATTR_KEY_NNEG_FLAG).is_none() {
             return verify_err!(op.loc(), NNegFlagMissingErr);
         }
 
@@ -479,14 +479,13 @@ pub trait LlvmSymbolName: SymbolOpInterface {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<pliron::builtin::attributes::StringAttr>(&ATTR_KEY_LLVM_SYMBOL_NAME)
+            .get::<pliron::builtin::attributes::StringAttr>(ctx, &ATTR_KEY_LLVM_SYMBOL_NAME)
             .map(|attr| attr.clone().into())
     }
 
     /// Set the original LLVM symbol name.
     fn set_llvm_symbol_name(&self, ctx: &Context, name: String) {
-        self.get_operation().deref_mut(ctx).attributes.set(
-            ATTR_KEY_LLVM_SYMBOL_NAME.clone(),
+        self.get_operation().deref_mut(ctx).attributes.set(ctx, ATTR_KEY_LLVM_SYMBOL_NAME.clone(),
             pliron::builtin::attributes::StringAttr::new(name),
         );
     }
@@ -516,7 +515,7 @@ pub trait AlignableOpInterface {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<AlignmentAttr>(&ATTR_KEY_LLVM_ALIGNMENT)
+            .get::<AlignmentAttr>(ctx, &ATTR_KEY_LLVM_ALIGNMENT)
             .map(|attr| attr.0)
     }
 
@@ -528,7 +527,7 @@ pub trait AlignableOpInterface {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_LLVM_ALIGNMENT.clone(), AlignmentAttr(alignment));
+            .set(ctx, ATTR_KEY_LLVM_ALIGNMENT.clone(), AlignmentAttr(alignment));
     }
 
     fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
@@ -556,7 +555,7 @@ pub trait VolatilityOpInterface {
         self.get_operation()
             .deref(ctx)
             .attributes
-            .get::<BoolAttr>(&ATTR_KEY_LLVM_VOLATILE)
+            .get::<BoolAttr>(ctx, &ATTR_KEY_LLVM_VOLATILE)
             .map(|attr| attr.clone().into())
             .unwrap_or(false)
     }
@@ -569,7 +568,7 @@ pub trait VolatilityOpInterface {
         self.get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(ATTR_KEY_LLVM_VOLATILE.clone(), BoolAttr::new(is_volatile));
+            .set(ctx, ATTR_KEY_LLVM_VOLATILE.clone(), BoolAttr::new(is_volatile));
     }
 
     fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>

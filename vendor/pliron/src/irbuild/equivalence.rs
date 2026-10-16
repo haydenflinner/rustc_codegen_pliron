@@ -122,10 +122,10 @@ pub fn attributes_eq(
     let is_relevant = |attr: &AttrObj| !(ignore_config.ignore_attr)(ctx, attr.as_ref());
 
     let lhs_relevant: IMap<&Identifier, &AttrObj> =
-        lhs.0.iter().filter(|(_, attr)| is_relevant(attr)).collect();
+        lhs.iter(ctx).filter(|(_, attr)| is_relevant(attr)).collect();
 
     let rhs_relevant: IMap<&Identifier, &AttrObj> =
-        rhs.0.iter().filter(|(_, attr)| is_relevant(attr)).collect();
+        rhs.iter(ctx).filter(|(_, attr)| is_relevant(attr)).collect();
 
     if lhs_relevant.len() != rhs_relevant.len() {
         return false;
@@ -431,8 +431,7 @@ fn attributes_hash(
     let is_relevant = |attr: &AttrObj| !(ignore_config.ignore_attr)(ctx, attr.as_ref());
 
     let mut relevant: Vec<_> = attributes
-        .0
-        .iter()
+        .iter(ctx)
         .filter(|(_, attr)| is_relevant(attr))
         .collect();
     // Sort by key so that the hash doesn't depend on insertion order.

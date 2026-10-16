@@ -98,6 +98,13 @@ pub struct Context {
     pub(crate) type_store: UniqueStore<TypeObj>,
     /// Storage for other uniqued objects.
     pub(crate) uniqued_any_store: UniqueStore<UniquedAny>,
+    /// PLIRON: storage for interned [crate::attribute::AttrObj]s.
+    /// `AttributeDict` maps [Identifier] keys to `AttrInstId` indices
+    /// into this store instead of owning a `Box<dyn Attribute>` per
+    /// entry; the store deduplicates via `hash_attr`/`eq_attr`, so
+    /// identical attributes are shared across ops and dict clones are
+    /// shallow index copies.
+    pub(crate) attr_store: UniqueStore<crate::attribute::AttrEntry>,
     /// Arbitrary data storage. Use [Self::aux_data_map] for dictionary access.
     pub aux_data: SlotMap<AuxDataIndex, Box<dyn Any + Send>>,
     /// A dictionary with keys mapping to an index in [Self::aux_data].
@@ -145,6 +152,7 @@ impl Default for Context {
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),
+            attr_store: UniqueStore::default(),
             aux_data: SlotMap::with_key(),
             aux_data_map: HMap::default(),
         };

@@ -401,9 +401,8 @@ impl Verify for BasicBlock {
             verify_err!(self.loc(), BasicBlockVerifyErr::MissingTerminator(label))?;
         }
         self.attributes
-            .0
-            .values()
-            .try_for_each(|attr| verify_attr(&**attr, ctx))?;
+            .iter(ctx)
+            .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
         // Check that every use is of this block.
         for r#use in self.self_ptr.uses(ctx) {
             if r#use.get_def(ctx) != self.self_ptr {
