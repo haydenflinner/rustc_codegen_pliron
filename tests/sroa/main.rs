@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 // PLIRON_SROA_PIN: a non-copyable call arg (callee writes through it or
 // retains it) with a known pointee extent pins only that byte range of
 // the caller's alloca — the slices covering it share one `pin_a` stack
@@ -155,6 +157,42 @@ fn sret_caller(x: u64) -> u64 {
     r.x.wrapping_add(r.y).wrapping_add(r.z)
 }
 
+// A nonzero memset covering a >16-byte typed slice must repeat the byte
+// across the whole slice: the rewrite's pattern const is a u128, and
+// wider slices used to get zeros above byte 16. `body`'s vector store
+// makes a 32-byte typed slice; `write_bytes` covers it in one memset.
+#[repr(C)]
+struct SetWide {
+    head: u64,
+    body: core::simd::u64x4,
+    tail: u64,
+}
+
+#[inline(never)]
+fn memset_wide(x: u64) -> u64 {
+    let mut w = SetWide {
+        head: x,
+        body: core::simd::u64x4::from_array([x, x + 1, x + 2, x + 3]),
+        tail: x + 4,
+    };
+    unsafe {
+        std::ptr::write_bytes(
+            &mut w as *mut SetWide as *mut u8,
+            0xA5,
+            std::mem::size_of::<SetWide>(),
+        );
+    }
+    let b = w.body;
+    let lanes_bad = b
+        .as_array()
+        .iter()
+        .map(|&v| (v != 0xA5A5A5A5A5A5A5A5) as u64)
+        .sum::<u64>();
+    lanes_bad
+        + ((w.head != 0xA5A5A5A5A5A5A5A5) as u64)
+        + ((w.tail != 0xA5A5A5A5A5A5A5A5) as u64)
+}
+
 fn main() {
     // caller: r.a=x, r.b=0xBEEF, r.c=9 (via SAVED), r.d=4, inner={5,0xF00D},
     // tag=7. total = x + 0xBEEF + 9 + 4 + 5 + 0xF00D; result adds x + 7.
@@ -173,6 +211,10 @@ fn main() {
     // sret_caller: r.x = x + 1, r.y = 2, r.z = 0xDEAD.
     let x = black_box(7);
     assert_eq!(sret_caller(x), (x + 1).wrapping_add(2).wrapping_add(0xDEAD));
+
+    // memset_wide: every byte of w must be 0xA5 after write_bytes.
+    let x = black_box(3);
+    assert_eq!(memset_wide(x), 0);
 
     println!("sroa-pin ok");
 }

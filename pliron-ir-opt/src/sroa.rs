@@ -1116,17 +1116,40 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                     .enumerate()
                     .filter(|(_, s)| x.off <= s.off && s.off + s.size <= x.off + n)
                 {
-                    let cv = if byte == 0 {
-                        ConstVal::Zero
-                    } else {
-                        let rep = (0..s.size.min(16))
+                    if byte == 0 {
+                        let c = mk_const(ctx, st, s.ty, ConstVal::Zero);
+                        StoreOp::new(ctx, c, new[i])
+                            .get_operation()
+                            .insert_before(ctx, x.op);
+                        continue;
+                    }
+                    if s.size <= 16 {
+                        let rep = (0..s.size)
                             .fold(0u128, |acc, k| acc | ((byte as u128) << (8 * k)));
-                        ConstVal::Bits(mask(rep, (s.size * 8) as u32))
-                    };
-                    let c = mk_const(ctx, st, s.ty, cv);
-                    StoreOp::new(ctx, c, new[i])
-                        .get_operation()
-                        .insert_before(ctx, x.op);
+                        let c =
+                            mk_const(ctx, st, s.ty, ConstVal::Bits(mask(rep, (s.size * 8) as u32)));
+                        StoreOp::new(ctx, c, new[i])
+                            .get_operation()
+                            .insert_before(ctx, x.op);
+                        continue;
+                    }
+                    // The repeated byte doesn't fit one u128 const:
+                    // decompose into power-of-2-aligned integer stores.
+                    let mut o = 0;
+                    while o < s.size {
+                        let mut k = 16;
+                        while o % k != 0 || o + k > s.size {
+                            k /= 2;
+                        }
+                        let ty =
+                            IntegerType::get(ctx, (k * 8) as u32, Signedness::Signless).into();
+                        let rep =
+                            (0..k).fold(0u128, |acc, j| acc | ((byte as u128) << (8 * j)));
+                        let c = mk_const(ctx, st, ty, ConstVal::Bits(rep));
+                        let p = ptr_plus(ctx, st, new[i], o, x.op);
+                        StoreOp::new(ctx, c, p).get_operation().insert_before(ctx, x.op);
+                        o += k;
+                    }
                 }
                 st.intrinsics.remove(&x.op);
                 Operation::erase(x.op, ctx);
