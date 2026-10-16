@@ -773,7 +773,7 @@ pub fn vnodes(
             && r != v
         {
             let n = go(func, nf, canon, memo, r, d + 1);
-            return if k == 0 { n } else { n + 1 };
+            return if k == 0 { n } else { n.saturating_add(1) };
         }
         let Some(di) = func.dfg.value_def(v).inst() else {
             return 1;
@@ -810,20 +810,22 @@ pub fn vnodes(
             | InstructionData::FloatCompare { args, .. } => {
                 let a0 = func.dfg.resolve_aliases(args[0]);
                 let a1 = func.dfg.resolve_aliases(args[1]);
-                1 + go(func, nf, canon, memo, a0, d + 1)
-                    + go(func, nf, canon, memo, a1, d + 1)
+                1usize
+                    .saturating_add(go(func, nf, canon, memo, a0, d + 1))
+                    .saturating_add(go(func, nf, canon, memo, a1, d + 1))
             }
             InstructionData::Ternary { args, .. } => {
                 let a0 = func.dfg.resolve_aliases(args[0]);
                 let a1 = func.dfg.resolve_aliases(args[1]);
                 let a2 = func.dfg.resolve_aliases(args[2]);
-                1 + go(func, nf, canon, memo, a0, d + 1)
-                    + go(func, nf, canon, memo, a1, d + 1)
-                    + go(func, nf, canon, memo, a2, d + 1)
+                1usize
+                    .saturating_add(go(func, nf, canon, memo, a0, d + 1))
+                    .saturating_add(go(func, nf, canon, memo, a1, d + 1))
+                    .saturating_add(go(func, nf, canon, memo, a2, d + 1))
             }
             InstructionData::Unary { arg, .. } | InstructionData::BinaryImm8 { arg, .. } => {
                 let a = func.dfg.resolve_aliases(arg);
-                1 + go(func, nf, canon, memo, a, d + 1)
+                1usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
             }
             // `K` imm pseudo-args each count as a node.
             InstructionData::StackAddr { .. }
@@ -832,11 +834,11 @@ pub fn vnodes(
             | InstructionData::UnaryIeee64 { .. } => 2,
             InstructionData::Load { arg, .. } => {
                 let a = func.dfg.resolve_aliases(arg);
-                2 + go(func, nf, canon, memo, a, d + 1)
+                2usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
             }
             InstructionData::LoadNoOffset { arg, .. } => {
                 let a = func.dfg.resolve_aliases(arg);
-                1 + go(func, nf, canon, memo, a, d + 1)
+                1usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
             }
             _ => 1,
         }

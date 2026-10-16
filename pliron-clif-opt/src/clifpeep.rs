@@ -2331,8 +2331,13 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         'cap: for r in &eargs {
             for c in r {
                 if let Some(v) = c {
-                    arg_nodes +=
-                        crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), *v);
+                    arg_nodes = arg_nodes.saturating_add(crate::proots::vnodes(
+                        func,
+                        &nf,
+                        &canon,
+                        &mut vnmemo.borrow_mut(),
+                        *v,
+                    ));
                     if arg_nodes > 2_000_000 {
                         break 'cap;
                     }
