@@ -1471,7 +1471,7 @@ impl ConstFoldInterface for SelectOp {
 #[op_interface_impl]
 impl BranchOpFoldInterface for BrOp {
     fn check_fold(&self, ctx: &Context, _operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
-        self.get_operation().deref(ctx).successors().collect()
+        self.get_operation().deref(ctx).successors(ctx).collect()
     }
     fn fold_in_place(
         &self,
@@ -1491,7 +1491,7 @@ impl CondBrOp {
         operands: &[Option<AttrObj>],
     ) -> Vec<usize> {
         let Some(cond_attr) = operands.first().unwrap().as_ref() else {
-            let num_successors = self.get_operation().deref(ctx).successors().count();
+            let num_successors = self.get_operation().deref(ctx).successors(ctx).count();
             return (0..num_successors).collect();
         };
         let cond_int = cond_attr
@@ -1506,7 +1506,7 @@ impl CondBrOp {
 impl BranchOpFoldInterface for CondBrOp {
     fn check_fold(&self, ctx: &Context, operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
         let successors: Vec<Ptr<BasicBlock>> =
-            self.get_operation().deref(ctx).successors().collect();
+            self.get_operation().deref(ctx).successors(ctx).collect();
 
         self.possible_successor_indices(ctx, operands)
             .iter()
@@ -1526,7 +1526,7 @@ impl BranchOpFoldInterface for CondBrOp {
         };
         let successor_ind = possible_successor_indices[0];
         let successors: Vec<Ptr<BasicBlock>> =
-            self.get_operation().deref(ctx).successors().collect();
+            self.get_operation().deref(ctx).successors(ctx).collect();
         let new_op = BrOp::new(
             ctx,
             successors[successor_ind],
@@ -1544,7 +1544,7 @@ impl BranchOpFoldInterface for CondBrOp {
 impl BranchOpFoldInterface for SwitchOp {
     fn check_fold(&self, ctx: &Context, operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
         let successors: Vec<Ptr<BasicBlock>> =
-            self.get_operation().deref(ctx).successors().collect();
+            self.get_operation().deref(ctx).successors(ctx).collect();
         let Some(cond_attr) = operands.first().and_then(|o| o.as_ref()) else {
             return successors;
         };
@@ -1593,7 +1593,7 @@ impl BranchOpFoldInterface for SwitchOp {
                 .unwrap_or(0)
         };
         let successors: Vec<Ptr<BasicBlock>> =
-            self.get_operation().deref(ctx).successors().collect();
+            self.get_operation().deref(ctx).successors(ctx).collect();
         let new_op = BrOp::new(
             ctx,
             successors[successor_ind],

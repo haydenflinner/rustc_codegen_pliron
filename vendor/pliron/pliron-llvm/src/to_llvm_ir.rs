@@ -712,7 +712,7 @@ impl ToLLVMValue for BrOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let succ = op.get_successor(0);
+        let succ = op.get_successor(ctx, 0);
         let succ_llvm = convert_block_operand(cctx, ctx, succ)?;
         let branch_op = llvm_build_br(&cctx.builder, succ_llvm);
 
@@ -738,7 +738,7 @@ impl ToLLVMValue for CondBrOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (true_succ, false_succ) = (op.get_successor(0), op.get_successor(1));
+        let (true_succ, false_succ) = (op.get_successor(ctx, 0), op.get_successor(ctx, 1));
         let true_succ_llvm = convert_block_operand(cctx, ctx, true_succ)?;
         let false_succ_llvm = convert_block_operand(cctx, ctx, false_succ)?;
         let cond = convert_value_operand(cctx, ctx, &self.get_operand_condition(ctx))?;

@@ -110,10 +110,10 @@ fn process_branch_op(branch_op: &dyn BranchOpInterface, ctx: &Context, state: &m
                         weakening sccp optimization",
                     branch_op.disp(ctx)
                 );
-                op.deref(ctx).successors().collect()
+                op.deref(ctx).successors(ctx).collect()
             }
         };
-    let static_successors: Vec<Ptr<BasicBlock>> = op.deref(ctx).successors().collect();
+    let static_successors: Vec<Ptr<BasicBlock>> = op.deref(ctx).successors(ctx).collect();
     for (succ_idx, succ_block) in static_successors.into_iter().enumerate() {
         if !feasible_successors.contains(&succ_block) {
             continue;

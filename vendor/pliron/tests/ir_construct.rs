@@ -835,7 +835,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     verify_op(&module_op, ctx)?;
 
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 1);
@@ -844,9 +844,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let pushed_idx = Operation::push_successor(branch_like, ctx, succ1);
     assert_eq!(pushed_idx, 1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ1);
     assert_block_pred_uses(ctx, succ1);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -859,7 +859,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let popped = Operation::pop_successor(branch_like, ctx);
     assert_eq!(popped, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 1);
@@ -871,9 +871,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_successor(branch_like, ctx, 0, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -885,11 +885,11 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_successor(branch_like, ctx, 2, succ2);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 3);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ0);
     assert_block_pred_uses(ctx, succ0);
-    assert_eq!(branch_like.deref(ctx).get_successor(2), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 2), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -905,9 +905,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let removed_mid = Operation::remove_successor(branch_like, ctx, 1);
     assert_eq!(removed_mid, succ0);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 1);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -923,7 +923,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let removed_front = Operation::remove_successor(branch_like, ctx, 0);
     assert_eq!(removed_front, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 1);
     assert_eq!(succ1.num_preds(ctx), 1);

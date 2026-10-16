@@ -530,7 +530,7 @@ impl DialectConversion for ForwardOnlyConversion {
         op: Ptr<Operation>,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
-        let succ = op.deref(ctx).get_successor(0);
+        let succ = op.deref(ctx).get_successor(ctx, 0);
         let succ_arg = succ.deref(ctx).get_argument(0);
         let succ_arg_width = succ_arg
             .get_type(ctx)

@@ -542,7 +542,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
                 return err;
             };
             Ok(quote! {
-                let succ = self.get_operation().deref(ctx).get_successor(#index);
+                let succ = self.get_operation().deref(ctx).get_successor(ctx, #index);
                 let succ_name = succ.unique_name(ctx);
                 let succ_name = ::pliron::printable::Printable::print(&succ_name, ctx, state);
                 ::core::write!(fmt, "^{}", succ_name)?;
@@ -564,7 +564,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
                 let succs = ::pliron::irfmt::printers::iter_with_sep_by(
-                    op.successors(),
+                    op.successors(ctx),
                     #sep,
                     |succ, ctx, state, fmt| {
                     let succ_name = succ.unique_name(ctx);

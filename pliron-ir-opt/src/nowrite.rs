@@ -140,7 +140,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         let mut rp: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
         for &b in &bs {
             for op in b.deref(ctx).iter(ctx) {
-                for s in op.deref(ctx).successors() {
+                for s in op.deref(ctx).successors(ctx) {
                     rp.entry(s).or_default().push(b);
                 }
                 if let Some(&(l, _)) = st.invokes.get(op) {

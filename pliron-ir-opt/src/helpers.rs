@@ -92,7 +92,7 @@ pub fn erase_unreachable(
             continue;
         }
         for op in ops_of(b) {
-            wl.extend(op.deref(ctx).successors());
+            wl.extend(op.deref(ctx).successors(ctx));
             if let Some(&(l, _)) = st.invokes.get(op) {
                 wl.push(l);
             }

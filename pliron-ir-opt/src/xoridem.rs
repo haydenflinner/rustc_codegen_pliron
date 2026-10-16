@@ -125,7 +125,7 @@ fn arg_inv(
                 )
         } else {
             !crate::callgvn::writes_plain(ctx, st, d)
-                && d.deref(ctx).successors().next().is_none()
+                && d.deref(ctx).successors(ctx).next().is_none()
                 && (0..d.deref(ctx).get_num_operands()).all(|i| {
                     arg_inv(
                         ctx,
@@ -246,7 +246,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     for &b in &bs {
         for op in &bops[&b] {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 preds.entry(s).or_default().push(b);
             }
         }
@@ -299,8 +299,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }
         // succ0 = body (cond true), succ1 = exit.
         let (body0, e) = (
-            term.deref(ctx).get_successor(0),
-            term.deref(ctx).get_successor(1),
+            term.deref(ctx).get_successor(ctx, 0),
+            term.deref(ctx).get_successor(ctx, 1),
         );
         if e == h || body0 == e || e.deref(ctx).get_num_arguments() > 0 {
             continue;
@@ -362,7 +362,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }) && lset.iter().all(|&b| {
             bops[&b].last().into_iter().all(|&t| {
                 t.deref(ctx)
-                    .successors()
+                    .successors(ctx)
                     .all(|s| lset.contains(&s) || (b == h && s == e))
             })
         });
@@ -747,7 +747,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }
         let hsuccs: Vec<usize> = lt
             .deref(ctx)
-            .successors()
+            .successors(ctx)
             .enumerate()
             .filter(|&(_, s)| s == h)
             .map(|(i, _)| i)

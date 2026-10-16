@@ -45,7 +45,7 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
         }
         // Only the terminator carries successor edges (invokes included).
         if let Some(t) = b.deref(ctx).iter(ctx).last() {
-            work.extend(t.deref(ctx).successors());
+            work.extend(t.deref(ctx).successors(ctx));
             work.extend(st.invokes.get(t).map(|&(l, _)| l));
         }
     }
@@ -73,7 +73,7 @@ pub fn run(ctx: &mut Context, st: &State) {
             let Some(t) = b.deref(ctx).iter(ctx).last() else {
                 continue;
             };
-            let succs: Vec<_> = t.deref(ctx).successors().collect();
+            let succs: Vec<_> = t.deref(ctx).successors(ctx).collect();
             for (si, s) in succs.into_iter().enumerate() {
                 preds.entry(s).or_default().push((t, si));
             }

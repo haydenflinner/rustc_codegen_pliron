@@ -229,8 +229,8 @@ fn facts(
         if !Operation::is_op::<CondBrOp>(term, ctx) {
             continue;
         }
-        let tdst = term.deref(ctx).get_successor(0);
-        let fdst = term.deref(ctx).get_successor(1);
+        let tdst = term.deref(ctx).get_successor(ctx, 0);
+        let fdst = term.deref(ctx).get_successor(ctx, 1);
         let neg = if dom.dominates(tdst, b) {
             false
         } else if dom.dominates(fdst, b) {
@@ -292,7 +292,7 @@ fn arg_sources(
         let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
             continue;
         };
-        for (si, s) in t.deref(ctx).successors().enumerate() {
+        for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
             if s != b {
                 continue;
             }
@@ -459,7 +459,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 P::ULT | P::ULE | P::UGT | P::UGE | P::EQ | P::NE => {}
                 _ => return None,
             }
-            if unterm(term.deref(ctx).get_successor(0)) || unterm(term.deref(ctx).get_successor(1))
+            if unterm(term.deref(ctx).get_successor(ctx, 0)) || unterm(term.deref(ctx).get_successor(ctx, 1))
             {
                 Some(term)
             } else {
@@ -523,7 +523,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         }
         reach.push(b);
         for op in &bops[&b] {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 if dom.idx.contains_key(&s) {
                     preds.entry(s).or_default().push(b);
                 }
@@ -604,7 +604,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                         let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
                             continue;
                         };
-                        for (si, s) in t.deref(ctx).successors().enumerate() {
+                        for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
                             if s != b {
                                 continue;
                             }
@@ -729,7 +729,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 if outt.get(&b) != Some(&m) {
                     outt.insert(b, m);
                     for op in &bops[&b] {
-                        for s in op.deref(ctx).successors() {
+                        for s in op.deref(ctx).successors(ctx) {
                             if dom.idx.contains_key(&s) && inq.insert(s) {
                                 wl.push(s);
                             }
@@ -866,8 +866,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             };
             let cb = Operation::get_op::<CondBrOp>(term, ctx).unwrap();
             let (tdst, fdst) = (
-                term.deref(ctx).get_successor(0),
-                term.deref(ctx).get_successor(1),
+                term.deref(ctx).get_successor(ctx, 0),
+                term.deref(ctx).get_successor(ctx, 1),
             );
             let (dst, ods) = if t && unreachable_terminated(ctx, &info, fdst) {
                 (tdst, cb.get_true_dest_operands(ctx))

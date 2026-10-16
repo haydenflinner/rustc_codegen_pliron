@@ -294,7 +294,7 @@ fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>>
         v.extend(st.invokes.get(op).map(|&(l, _)| l));
     }
     if let Some(t) = b.deref(ctx).iter(ctx).last() {
-        v.extend(t.deref(ctx).successors());
+        v.extend(t.deref(ctx).successors(ctx));
     }
     v
 }
@@ -1826,7 +1826,7 @@ fn frozen_args(
     {
         for b in region.deref(ctx).iter(ctx) {
             if let Some(t) = b.deref(ctx).iter(ctx).last() {
-                for (si, s) in t.deref(ctx).successors().enumerate() {
+                for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
                     preds.entry(s).or_default().push((t, si));
                 }
             }

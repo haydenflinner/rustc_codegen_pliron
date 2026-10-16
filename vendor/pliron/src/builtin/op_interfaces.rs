@@ -131,7 +131,7 @@ pub trait BranchOpInterface: IsTerminatorInterface {
 
         // Verify that the values passed to a target block
         // matches the arguments of that block.
-        for (succ_idx, succ) in op.get_operation().deref(ctx).successors().enumerate() {
+        for (succ_idx, succ) in op.get_operation().deref(ctx).successors(ctx).enumerate() {
             let succ = &*succ.deref(ctx);
             let operands = self_op.successor_operands(ctx, succ_idx);
             if succ.get_num_arguments() != operands.len() {
@@ -184,7 +184,7 @@ pub trait NSuccsInterface<const N: usize>: BranchOpInterface {
 
     /// Get the `i`'th successor block.
     fn get_successor_i(&self, ctx: &Context, i: LessThanN<N>) -> Ptr<BasicBlock> {
-        self.get_operation().deref(ctx).get_successor(i.i())
+        self.get_operation().deref(ctx).get_successor(ctx, i.i())
     }
 }
 
@@ -193,7 +193,7 @@ pub trait NSuccsInterface<const N: usize>: BranchOpInterface {
 pub trait OneSuccInterface: BranchOpInterface {
     /// Get the single successor block of this [Op].
     fn get_successor(&self, ctx: &Context) -> Ptr<BasicBlock> {
-        self.get_operation().deref(ctx).get_successor(0)
+        self.get_operation().deref(ctx).get_successor(ctx, 0)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>

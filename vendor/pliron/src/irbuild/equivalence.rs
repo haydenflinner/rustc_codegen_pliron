@@ -227,7 +227,7 @@ fn op_eq_mapped(
 
         // If a successor is mapped, its image must match. Otherwise, it must
         // be identical (e.g. a free/external block shared by both sides).
-        for (l_succ, r_succ) in lhs_ref.successors().zip(rhs_ref.successors()) {
+        for (l_succ, r_succ) in lhs_ref.successors(ctx).zip(rhs_ref.successors(ctx)) {
             if mapper.lookup_block_or_default(l_succ) != r_succ {
                 return EqResult::FirstNEQOps((lhs, rhs));
             }
@@ -491,7 +491,7 @@ fn hash_op_full(
         for opd in op_ref.operands() {
             numbering.hash_value(opd, state);
         }
-        for succ in op_ref.successors() {
+        for succ in op_ref.successors(ctx) {
             numbering.hash_block(succ, state);
         }
         op_ref.num_regions()

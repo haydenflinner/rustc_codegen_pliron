@@ -810,13 +810,13 @@ impl Printable for CondBrOp {
             "{} if {} ^{}({}) else ^{}({})",
             Self::get_opid_static(),
             condition.print(ctx, state),
-            op.get_successor(0).deref(ctx).unique_name(ctx),
+            op.get_successor(ctx, 0).deref(ctx).unique_name(ctx),
             iter_with_sep(
                 true_dest_opds.iter(),
                 pliron::printable::ListSeparator::CharSpace(',')
             )
             .print(ctx, state),
-            op.get_successor(1).deref(ctx).unique_name(ctx),
+            op.get_successor(ctx, 1).deref(ctx).unique_name(ctx),
             iter_with_sep(
                 false_dest_opds.iter(),
                 pliron::printable::ListSeparator::CharSpace(',')
@@ -1014,7 +1014,7 @@ impl Printable for SwitchOp {
         let condition = op.get_operand(0);
 
         let default_successor = op
-            .successors()
+            .successors(ctx)
             .next()
             .expect("SwitchOp must have at least one successor");
         let num_total_successors = op.get_num_successors();
@@ -1153,7 +1153,7 @@ impl SwitchOp {
 
         let op = self.get_operation().deref(ctx);
         // Skip the first one, which is the default successor.
-        let successors = op.successors().skip(1);
+        let successors = op.successors(ctx).skip(1);
 
         successors
             .zip(case_values.0.iter())
@@ -1172,7 +1172,7 @@ impl SwitchOp {
 
     /// Get the default destination of this switch operation.
     pub fn default_dest(&self, ctx: &Context) -> Ptr<BasicBlock> {
-        self.get_operation().deref(ctx).get_successor(0)
+        self.get_operation().deref(ctx).get_successor(ctx, 0)
     }
 
     /// Get the operands to pass to the default destination.
@@ -1441,7 +1441,7 @@ impl IndirectBrOp {
     /// passed to each.
     pub fn destinations(&self, ctx: &Context) -> Vec<IndirectBrDest> {
         let op = self.get_operation().deref(ctx);
-        op.successors()
+        op.successors(ctx)
             .enumerate()
             .map(|(i, dest)| IndirectBrDest {
                 dest,

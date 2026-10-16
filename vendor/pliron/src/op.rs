@@ -418,7 +418,7 @@ pub fn canonical_syntax_print(
     let opid = op.as_ref().get_opid();
     let op = op.as_ref().get_operation().deref(ctx);
     let operands = iter_with_sep(op.operands(), sep);
-    let successors = iter_with_sep_by(op.successors(), sep, |successor, ctx, state, f| {
+    let successors = iter_with_sep_by(op.successors(ctx), sep, |successor, ctx, state, f| {
         write!(f, "^{}", successor.unique_name(ctx).print(ctx, state))
     });
     let op_type = TypeSig {

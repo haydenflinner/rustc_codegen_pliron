@@ -109,7 +109,7 @@ pub(crate) struct OpSpan {
 
 impl OpSpan {
     #[inline]
-    fn range(&self) -> core::ops::Range<usize> {
+    pub(crate) fn range(&self) -> core::ops::Range<usize> {
         self.off as usize..(self.off + self.len) as usize
     }
 }
@@ -127,7 +127,8 @@ pub struct Operation {
     /// [Operand]s used by self. Most ops read ≤4 values.
     pub(crate) operands: SmallVec<[Operand<Value>; 4]>,
     /// Control-flow-graph successors. Branches carry ≤2.
-    pub(crate) successors: SmallVec<[Operand<Ptr<BasicBlock>>; 2]>,
+    /// PLIRON: span into `Context::op_successor_pool`.
+    pub(crate) successors: OpSpan,
     /// Links to the parent [BasicBlock] and
     /// previous and next [Operation]s in the block.
     block_links: BlockLinks,
@@ -180,7 +181,7 @@ impl Operation {
             concrete_op,
             results: SmallVec::with_capacity(result_types.len()),
             operands: SmallVec::with_capacity(operands.len()),
-            successors: SmallVec::with_capacity(successors.len()),
+            successors: OpSpan::default(),
             block_links: BlockLinks::default(),
             attributes: AttributeDict::default(),
             regions: OpSpan::default(),
@@ -201,11 +202,11 @@ impl Operation {
             .map(|def| Operand::new(ctx, *def, newop))
             .collect();
         newop.deref_mut(ctx).operands = operands;
-        let successors = successors
+        let successors: Vec<Operand<Ptr<BasicBlock>>> = successors
             .iter()
             .map(|def| Operand::new(ctx, *def, newop))
             .collect();
-        newop.deref_mut(ctx).successors = successors;
+        newop.deref_mut(ctx).successors = Self::alloc_successor_span(ctx, successors);
         let new_regions: Vec<Ptr<Region>> = (0..num_regions)
             .map(|_| Region::new(ctx, newop))
             .collect();
@@ -252,16 +253,76 @@ impl Operation {
         &mut self.operands
     }
 
-    /// PLIRON: raw successor-node slice (crate-internal).
-    #[inline]
-    pub(crate) fn successors_slice(&self) -> &[Operand<Ptr<BasicBlock>>] {
-        &self.successors
+    /// PLIRON: append `items` to the global successor pool, returning
+    /// the span covering them.
+    fn alloc_successor_span(
+        ctx: &Context,
+        items: Vec<Operand<Ptr<BasicBlock>>>,
+    ) -> OpSpan {
+        let mut pool = ctx.op_successor_pool.borrow_mut();
+        let off = pool.len() as u32;
+        let len = items.len() as u32;
+        pool.extend(items);
+        OpSpan { off, len }
     }
 
-    /// PLIRON: mutable successor-node slice (crate-internal).
+    /// PLIRON: raw successor-node slice borrowed from the context pool
+    /// (crate-internal read hatch).
     #[inline]
-    pub(crate) fn successors_slice_mut(&mut self) -> &mut [Operand<Ptr<BasicBlock>>] {
-        &mut self.successors
+    pub(crate) fn successors_slice<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> core::cell::Ref<'a, [Operand<Ptr<BasicBlock>>]> {
+        core::cell::Ref::map(ctx.op_successor_pool.borrow(), |pool| {
+            &pool[self.successors.range()]
+        })
+    }
+
+    /// PLIRON: mutable successor-node slice borrowed from the context
+    /// pool (crate-internal write hatch).
+    #[inline]
+    pub(crate) fn successors_slice_mut<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> core::cell::RefMut<'a, [Operand<Ptr<BasicBlock>>]> {
+        core::cell::RefMut::map(ctx.op_successor_pool.borrow_mut(), |pool| {
+            &mut pool[self.successors.range()]
+        })
+    }
+
+    /// PLIRON: collect this op's successor defs.
+    fn successor_defs(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
+        self.successors_slice(ctx)
+            .iter()
+            .map(|opd| opd.get_def())
+            .collect()
+    }
+
+    /// PLIRON: drop every use held in `ptr`'s successor span and reset
+    /// the span to empty (orphaning the pool slots).
+    fn drop_successor_uses(ptr: Ptr<Self>, ctx: &Context) {
+        let span = ptr.deref(ctx).successors;
+        {
+            let pool = ctx.op_successor_pool.borrow();
+            for succ in &pool[span.range()] {
+                succ.drop_use(ctx, ptr);
+            }
+        }
+        ptr.deref_mut(ctx).successors = OpSpan::default();
+    }
+
+    /// PLIRON: rebuild `ptr`'s successor list from `defs`: unlinks every
+    /// current successor use and writes fresh operand nodes into a new
+    /// pool span. Existing `Use`s are invalidated (documented behaviour
+    /// of successor mutation).
+    fn rewrite_successors(ptr: Ptr<Self>, ctx: &Context, defs: Vec<Ptr<BasicBlock>>) {
+        Self::drop_successor_uses(ptr, ctx);
+        let ops: Vec<Operand<Ptr<BasicBlock>>> = defs
+            .into_iter()
+            .map(|def| Operand::new(ctx, def, ptr))
+            .collect();
+        let span = Self::alloc_successor_span(ctx, ops);
+        ptr.deref_mut(ctx).successors = span;
     }
 
     /// Get parent block.
@@ -446,17 +507,21 @@ impl Operation {
 
     /// Get number of successors
     pub fn get_num_successors(&self) -> usize {
-        self.successors.len()
+        self.successors.len as usize
     }
 
     /// Get the opd_idx'th successor of this [Operation]. Panics on invalid index.
-    pub fn get_successor(&self, succ_idx: usize) -> Ptr<BasicBlock> {
-        self.successors[succ_idx].get_def()
+    pub fn get_successor(&self, ctx: &Context, succ_idx: usize) -> Ptr<BasicBlock> {
+        self.successors_slice(ctx)[succ_idx].get_def()
     }
 
     /// Get the opd_idx'th successor as a [`Use<Ptr<BasicBlock>>`]. Panics on invalid index.
-    pub fn get_successor_as_use(&self, succ_idx: usize) -> Use<Ptr<BasicBlock>> {
-        self.successors[succ_idx].as_use(self.self_ptr)
+    pub fn get_successor_as_use(
+        &self,
+        ctx: &Context,
+        succ_idx: usize,
+    ) -> Use<Ptr<BasicBlock>> {
+        self.successors_slice(ctx)[succ_idx].as_use(self.self_ptr)
     }
 
     /// Replace opd_idx'th successor of `this` with `other`. Panics on invalid index.
@@ -468,21 +533,28 @@ impl Operation {
         other: Ptr<BasicBlock>,
     ) {
         let new_successor = Operand::new(ctx, other, this);
-        core::mem::replace(&mut this.deref_mut(ctx).successors[succ_idx], new_successor)
-            .drop_use(ctx, this);
+        let span = this.deref(ctx).successors;
+        let old = {
+            let mut pool = ctx.op_successor_pool.borrow_mut();
+            core::mem::replace(&mut pool[span.range()][succ_idx], new_successor)
+        };
+        old.drop_use(ctx, this);
     }
 
     /// Add a new successor to the end of the successor list, returning its index.
     pub fn push_successor(this: Ptr<Operation>, ctx: &Context, new_succ: Ptr<BasicBlock>) -> usize {
-        let new_successor = Operand::new(ctx, new_succ, this);
-        this.deref_mut(ctx).successors.push_back(new_successor)
+        let mut defs = this.deref(ctx).successor_defs(ctx);
+        defs.push(new_succ);
+        let idx = defs.len() - 1;
+        Self::rewrite_successors(this, ctx, defs);
+        idx
     }
 
     /// Remove the last successor. Panics if there are no successors.
     /// Any [`Use<Ptr<BasicBlock>>`](Use) of the removed successor is invalidated.
     /// The removed `Ptr<BasicBlock>` is returned for convenience.
     pub fn pop_successor(this: Ptr<Operation>, ctx: &Context) -> Ptr<BasicBlock> {
-        let len = this.deref(ctx).successors.len();
+        let len = this.deref(ctx).get_num_successors();
         assert!(
             len > 0,
             "Can't pop successor from operation {} with no successors",
@@ -499,8 +571,9 @@ impl Operation {
         succ_idx: usize,
         new_succ: Ptr<BasicBlock>,
     ) {
-        let new_succ = Operand::new(ctx, new_succ, this);
-        this.deref_mut(ctx).successors.insert(succ_idx, new_succ);
+        let mut defs = this.deref(ctx).successor_defs(ctx);
+        defs.insert(succ_idx, new_succ);
+        Self::rewrite_successors(this, ctx, defs);
     }
 
     /// Remove the successor at `succ_idx`, shifting existing successors, from `succ_idx + 1`,
@@ -512,22 +585,31 @@ impl Operation {
         ctx: &Context,
         succ_idx: usize,
     ) -> Ptr<BasicBlock> {
-        let removed_succ = this.deref_mut(ctx).successors.remove(succ_idx);
-        let removed_block = removed_succ.get_def();
-        removed_succ.drop_use(ctx, this);
+        let mut defs = this.deref(ctx).successor_defs(ctx);
+        let removed_block = defs.remove(succ_idx);
+        Self::rewrite_successors(this, ctx, defs);
         removed_block
     }
 
     /// Get an iterator on the successors.
-    pub fn successors(&self) -> impl Iterator<Item = Ptr<BasicBlock>> + Clone + '_ {
-        self.successors.iter().map(|opd| opd.get_def())
+    pub fn successors<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> impl Iterator<Item = Ptr<BasicBlock>> + Clone + 'a {
+        self.successor_defs(ctx).into_iter()
     }
 
     /// Get an iterator over the successors of this operation as [`Use<Ptr<BasicBlock>>`]s.
-    pub fn successors_as_uses(&self) -> impl Iterator<Item = Use<Ptr<BasicBlock>>> + '_ {
-        self.successors
+    pub fn successors_as_uses<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> impl Iterator<Item = Use<Ptr<BasicBlock>>> + 'a {
+        let self_ptr = self.self_ptr;
+        self.successors_slice(ctx)
             .iter()
-            .map(|succ| succ.as_use(self.self_ptr))
+            .map(|succ| succ.as_use(self_ptr))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// PLIRON: `ptr`'s dispatch pair from the dense `ctx.op_kind`
@@ -673,10 +755,7 @@ impl Operation {
             opd.drop_use(ctx, ptr);
         }
         // The successors cease to be a use of their definitions.
-        let successors = core::mem::take(&mut (ptr.deref_mut(ctx).successors));
-        for succ in successors.into_iter() {
-            succ.drop_use(ctx, ptr);
-        }
+        Self::drop_successor_uses(ptr, ctx);
 
         let regions = ptr.deref(ctx).regions_slice(ctx).to_vec();
         for region in regions {
@@ -944,7 +1023,7 @@ impl Verify for Operation {
             opr.operands
                 .iter()
                 .try_for_each(|opd| opd.verify(ctx, opr.self_ptr))?;
-            opr.successors
+            opr.successors_slice(ctx)
                 .iter()
                 .try_for_each(|succ| succ.verify(ctx, opr.self_ptr))?;
             opr.regions_slice(ctx)

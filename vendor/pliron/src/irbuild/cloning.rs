@@ -128,7 +128,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     let (concrete_op, result_types, successors, num_operands, num_regions, attributes, loc) = {
         let op_ref = op.deref(ctx);
         let successors: Vec<Ptr<BasicBlock>> = op_ref
-            .successors()
+            .successors(ctx)
             .map(|b| mapper.lookup_block_or_default(b))
             .collect();
         (

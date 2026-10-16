@@ -3358,7 +3358,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let id = Operation::get_opid(op, ctx);
         let (opnds, succs): (Vec<Value>, Vec<Ptr<BasicBlock>>) = {
             let o = op.deref(ctx);
-            (o.operands().collect(), o.successors().collect())
+            (o.operands().collect(), o.successors(ctx).collect())
         };
         macro_rules! is {
             ($t:ty) => {
@@ -5853,7 +5853,7 @@ fn cold_blocks(
         }
         let t = term(b);
         if let Some(&e) = st.expect.get(t) {
-            let s = t.deref(ctx).get_successor(if e { 1 } else { 0 });
+            let s = t.deref(ctx).get_successor(ctx, if e { 1 } else { 0 });
             // An expect hint that marks a loop arm cold (hashbrown's
             // `likely(match_empty)` marks the probe-advance latch
             // "unlikely") banishes a back-edge that runs once per
@@ -5871,7 +5871,7 @@ fn cold_blocks(
                 continue;
             }
             let t = term(b);
-            let succ: Vec<_> = t.deref(ctx).successors().collect();
+            let succ: Vec<_> = t.deref(ctx).successors(ctx).collect();
             if !succ.is_empty() && succ.iter().all(|s| cold.contains(s)) {
                 cold.insert(b);
                 changed = true;
@@ -5898,7 +5898,7 @@ fn reaches(ctx: &Context, from: Ptr<BasicBlock>, to: Ptr<BasicBlock>) -> bool {
             continue;
         }
         for op in b.deref(ctx).iter(ctx) {
-            stack.extend(op.deref(ctx).successors());
+            stack.extend(op.deref(ctx).successors(ctx));
         }
     }
     false
@@ -5921,7 +5921,7 @@ fn rpo_split(
         b.deref(ctx)
             .iter(ctx)
             .flat_map(|op| {
-                let mut v: Vec<_> = op.deref(ctx).successors().collect();
+                let mut v: Vec<_> = op.deref(ctx).successors(ctx).collect();
                 // Profile-weighted order: hottest successor first, so RPO
                 // places hot blocks earlier in the function's layout.
                 if let Some(cs) = st.prof_edges.get(op) {

@@ -259,7 +259,7 @@ impl BasicBlock {
     /// Get all successors of this block.
     pub fn succs(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
         self.get_terminator(ctx)
-            .map(|term| term.deref(ctx).successors().collect())
+            .map(|term| term.deref(ctx).successors(ctx).collect())
             .unwrap_or_default()
     }
 
@@ -274,7 +274,7 @@ impl BasicBlock {
     /// O(n) in the number of successors.
     pub fn is_succ(&self, ctx: &Context, succ: Ptr<BasicBlock>) -> bool {
         self.get_terminator(ctx)
-            .is_some_and(|term| term.deref(ctx).successors().any(|s| s == succ))
+            .is_some_and(|term| term.deref(ctx).successors(ctx).any(|s| s == succ))
     }
 
     /// Get the `i`-th successor of this block.
@@ -283,7 +283,7 @@ impl BasicBlock {
         self.get_terminator(ctx)
             .expect("Can't get successor of block with no terminator")
             .deref(ctx)
-            .get_successor(i)
+            .get_successor(ctx, i)
     }
 
     /// Get the number of successors of this block. Returns 0 if there is no terminator.

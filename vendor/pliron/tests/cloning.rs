@@ -52,7 +52,7 @@ struct BranchOp {}
 /// The single successor of a terminator (asserting there is exactly one).
 fn sole_successor(ctx: &Context, term: Ptr<Operation>) -> Ptr<BasicBlock> {
     let term_ref = term.deref(ctx);
-    let mut succs = term_ref.successors();
+    let mut succs = term_ref.successors(ctx);
     let first = succs.next().expect("terminator should have a successor");
     assert!(succs.next().is_none(), "expected exactly one successor");
     first

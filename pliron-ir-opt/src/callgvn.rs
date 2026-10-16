@@ -182,7 +182,7 @@ fn cone_args(
     let Some(d) = v.defining_op() else {
         return false; // phi of a body block
     };
-    if writes(ctx, st, d, arg_allocas) || d.deref(ctx).successors().next().is_some() {
+    if writes(ctx, st, d, arg_allocas) || d.deref(ctx).successors(ctx).next().is_some() {
         return false;
     }
     // A read that reaches the preheader must not look at memory the loop
@@ -393,7 +393,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             writes_blk.insert(b);
         }
         for op in &bops[&b] {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 preds.entry(s).or_default().push(b);
                 succ.entry(b).or_default().push(s);
             }

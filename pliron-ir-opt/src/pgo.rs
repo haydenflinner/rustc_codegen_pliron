@@ -132,7 +132,7 @@ fn terminator(ctx: &Context, b: Ptr<BasicBlock>) -> Option<Ptr<Operation>> {
 }
 
 fn succs(ctx: &Context, t: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
-    t.deref(ctx).successors().collect()
+    t.deref(ctx).successors(ctx).collect()
 }
 
 /// Edges block counts can't determine: a terminator with >1 successor
@@ -145,7 +145,7 @@ fn ambiguous_edges(
     let mut npred: rustc_hash::FxHashMap<Ptr<BasicBlock>, u32> = FxHashMap::default();
     for b in bs {
         for op in b.deref(ctx).iter(ctx) {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 *npred.entry(s).or_default() += 1;
             }
         }
@@ -308,7 +308,7 @@ pub fn instrument(
             let Some(t) = terminator(ctx, bs[pi as usize]) else {
                 continue;
             };
-            let s = t.deref(ctx).get_successor(si as usize);
+            let s = t.deref(ctx).get_successor(ctx, si as usize);
             let arg_tys: Vec<TypeHandle> =
                 s.deref(ctx).arguments().map(|a| a.get_type(ctx)).collect();
             let e = BasicBlock::new(ctx, None, arg_tys);

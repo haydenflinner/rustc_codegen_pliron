@@ -97,6 +97,9 @@ pub struct Context {
     /// inline list (DoD step 5). Length changes append a new span and
     /// orphan the old one; CGU-scoped lifetimes keep the garbage bounded.
     pub(crate) op_region_pool: RefCell<Vec<Ptr<Region>>>,
+    /// PLIRON: flat pool of op successor operand nodes (DoD step 5).
+    pub(crate) op_successor_pool:
+        RefCell<Vec<crate::operation::Operand<Ptr<BasicBlock>>>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
@@ -155,6 +158,7 @@ impl Default for Context {
             block_links: RefCell::new(Vec::new()),
             op_kind: RefCell::new(Vec::new()),
             op_region_pool: RefCell::new(Vec::new()),
+            op_successor_pool: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),

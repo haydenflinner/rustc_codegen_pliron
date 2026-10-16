@@ -248,11 +248,11 @@ pub fn run(ctx: &Context, st: &mut State) {
                         }
                     }
                 }
-                if d.successors().next().is_some()
+                if d.successors(ctx).next().is_some()
                     && let Some(t) =
                         op_cast::<dyn BranchOpInterface>(&*Operation::get_op_dyn(op, ctx))
                 {
-                    for (si, s) in d.successors().enumerate() {
+                    for (si, s) in d.successors(ctx).enumerate() {
                         let args = t.successor_operands(ctx, si);
                         p.flow
                             .extend(args.into_iter().zip(s.deref(ctx).arguments()));

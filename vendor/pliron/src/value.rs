@@ -474,7 +474,12 @@ impl Ptr<BasicBlock> {
         // object to directly check membership.
         pred.deref(ctx)
             .get_tail()
-            .is_some_and(|pred_term| pred_term.deref(ctx).successors().any(|succ| self == &succ))
+            .is_some_and(|pred_term| {
+                pred_term
+                    .deref(ctx)
+                    .successors(ctx)
+                    .any(|succ| self == &succ)
+            })
     }
     /// Retarget predecessors (that satisfy pred) to `other`.
     pub fn retarget_some_preds_to<P: Fn(&Context, Ptr<BasicBlock>) -> bool>(
@@ -546,23 +551,25 @@ impl DefTrait for Ptr<BasicBlock> {
 impl UseTrait for Ptr<BasicBlock> {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
         let op = r#use.user_op.deref(ctx);
-        op.successors_slice()
+        op.successors_slice(ctx)
             .iter()
             .position(|succ| succ.use_uid == r#use.use_uid)
             .ok_or_else(|| arg_error!(op.loc(), UseError::SuccessorNotInUserOp))
     }
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref(ctx);
-        Ref::map(op, |opref| &opref.successors_slice()[succ_idx].r#use)
+        let span = r#use.user_op.deref(ctx).successors;
+        let pool = ctx.op_successor_pool.borrow();
+        Ref::map(pool, |p| &p[span.range()][succ_idx].r#use)
     }
     fn get_usenode_mut<'a>(
         r#use: &Use<Ptr<BasicBlock>>,
         ctx: &'a Context,
     ) -> RefMut<'a, UseNode<Ptr<BasicBlock>>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref_mut(ctx);
-        RefMut::map(op, |opref| &mut opref.successors_slice_mut()[succ_idx].r#use)
+        let span = r#use.user_op.deref(ctx).successors;
+        let pool = ctx.op_successor_pool.borrow_mut();
+        RefMut::map(pool, |p| &mut p[span.range()][succ_idx].r#use)
     }
 }
 

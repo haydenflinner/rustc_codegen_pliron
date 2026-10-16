@@ -123,11 +123,11 @@ pub fn run(ctx: &Context, st: &mut State) {
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
                 let d = op.deref(ctx);
-                if d.successors().next().is_some()
+                if d.successors(ctx).next().is_some()
                     && let Some(br) =
                         op_cast::<dyn BranchOpInterface>(&*Operation::get_op_dyn(op, ctx))
                 {
-                    for (si, s) in d.successors().enumerate() {
+                    for (si, s) in d.successors(ctx).enumerate() {
                         let args = br.successor_operands(ctx, si);
                         for (k, prm) in s.deref(ctx).arguments().enumerate() {
                             match args.get(k) {

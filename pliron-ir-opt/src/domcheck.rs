@@ -30,7 +30,7 @@ fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> 
     let mut v = Vec::new();
     // Only the terminator carries successor edges (invokes included).
     if let Some(t) = b.deref(ctx).iter(ctx).last() {
-        v.extend(t.deref(ctx).successors());
+        v.extend(t.deref(ctx).successors(ctx));
         v.extend(st.invokes.get(t).map(|&(l, _)| l));
     }
     v
