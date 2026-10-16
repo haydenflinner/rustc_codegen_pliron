@@ -204,3 +204,31 @@ the backend should adapt internally:
   generation — index columns by the low bits only.
 - Iteration order: `FxIndexMap` consumers may depend on insertion order
   (`funcs`/`globals` emission) — preserve with an explicit order vec.
+
+## Status update (c908b7a): steps 4 + R1 COMPLETE
+
+- Step 4a (b5a15df): ColMap/ColSet/ColKey in vendor/pliron/cols.rs;
+  ordinal-keyed State tables (26 fields) → dense Vec slots.
+- Step 4b (987dc85): SymMap/SymSet in state.rs — names intern once
+  (ids map + names vec + parallel vals), insertion-ordered iter for
+  funcs/globals emission. ident_to_sym/sym_to_ident stay FxHashMap.
+- R1a (d0f1d4e): Operation/BasicBlock `attributes` sealed behind
+  attributes()/attributes_mut() (~120 sites incl. derive templates).
+- R1b (c908b7a): results/operands/successors_slice(+_mut), regions_slice/
+  regions_mut on Operation; args_slice/args_mut on BasicBlock. External
+  surface was only ~13 sites (value.rs DefNode/UseNode projections,
+  region.rs reparent). All remaining field access is inside impl
+  Operation/BasicBlock = the store internals step 5 rewrites.
+
+## Step 5 refined design (post-R1)
+
+Fields are pub(crate); accessor seam is in place. Signature at step 5
+becomes op.xxx_slice(ctx) — pool lives on Context.
+Recommended layout: keep Operation's row; move payload to a SECOND
+arena slot keyed by the same ArenaIndex (`payloads: SlotMap<Idx,
+RefCell<OpPayload>>`) — deref(row) and deref(payload) are two separate
+RefCell borrows, no split-borrow problem, index stays ordinal-dense.
+OpPayload = {results, operands, successors, regions, attributes}.
+Then flatten each payload Vec into Context-global pools field-by-field
+(spans (u32,u16); same-len writes in place; len changes append +
+orphan). Freelist per pool only if orphans ever matter (CGU-scoped).
