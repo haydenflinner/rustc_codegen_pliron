@@ -380,6 +380,9 @@ impl<'a> NonNull<'a> {
         let mut checks: Vec<Chk> = Vec::new();
         let mut dependents: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
         let mut evict: Vec<Value> = Vec::new();
+        // Reused proof-scratch set — `Chk` keeps a Vec copy, so the set
+        // itself is per-(param, edge) scratch, not a fresh alloc.
+        let mut deps = FxHashSet::default();
         // `is_deps` results are stable while `params` is frozen — memoize
         // so a value feeding many edges is proven once. Cleared before the
         // eviction pass, which re-proves against the shrinking set.
@@ -411,7 +414,7 @@ impl<'a> NonNull<'a> {
                         continue;
                     };
                     let v = func.dfg.resolve_aliases(v);
-                    let mut deps = FxHashSet::default();
+                    deps.clear();
                     if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo)
                     {
                         dependents_entry(&mut dependents, &deps, checks.len());
@@ -420,7 +423,7 @@ impl<'a> NonNull<'a> {
                             t,
                             ei,
                             v,
-                            deps: deps.into_iter().collect(),
+                            deps: deps.iter().copied().collect(),
                         });
                     } else {
                         evict.push(p);
@@ -441,7 +444,7 @@ impl<'a> NonNull<'a> {
                 if dead.contains(&c.p) {
                     continue;
                 }
-                let mut deps = FxHashSet::default();
+                deps.clear();
                 if nn.edge_aux_deps(func, c.t, c.ei, c.v, 0, &mut deps, &mut memo) {
                     // Still proven — the dep set may have moved, so
                     // re-point the check at what it now relies on.
@@ -1877,6 +1880,14 @@ pub(crate) fn round(
     // two `s` candidates yet one walk per pred. Memoize per round.
     let mut regions: FxHashMap<(Block, Block), Option<Vec<Block>>> = FxHashMap::default();
     let mut fact_memo: FxHashMap<Block, Vec<Cmp>> = FxHashMap::default();
+    // Per-edge scratch, cleared and reused across (pred, dest) pairs —
+    // these used to be five fresh HashMap allocations per edge.
+    let mut args: Vec<BlockArg> = Vec::new();
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut argv: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut pn: FxHashSet<Value> = FxHashSet::default();
+    let mut kenv: KBits = FxHashMap::default();
+    let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
     for b in func.layout.blocks() {
         if Some(b) == entry || locked.contains(&b) {
             continue;
@@ -1931,13 +1942,14 @@ pub(crate) fn round(
                 if bc.block(&func.dfg.value_lists) != b {
                     continue;
                 }
-                let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                args.clear();
+                args.extend(bc.args(&func.dfg.value_lists));
                 if args.len() != params.len() {
                     continue;
                 }
-                let mut env: FxHashMap<Value, u64> = FxHashMap::default();
-                let mut argv: FxHashMap<Value, Value> = FxHashMap::default();
-                let mut pn: FxHashSet<Value> = FxHashSet::default();
+                env.clear();
+                argv.clear();
+                pn.clear();
                 let mut ok = true;
                 for (&p, a) in params.iter().zip(&args) {
                     let BlockArg::Value(v) = *a else {
@@ -1956,7 +1968,7 @@ pub(crate) fn round(
                     continue;
                 }
                 // Known bits of non-constant incoming args (e.g. a packed `Option` tag).
-                let mut kenv: KBits = FxHashMap::default();
+                kenv.clear();
                 if kb_on {
                     let none = FxHashMap::default();
                     for (&p, &v) in &argv {
@@ -1973,7 +1985,7 @@ pub(crate) fn round(
                     nn.is(func, v) || pn.contains(&v)
                 };
                 // Ranges of the incoming args implied by branches dominating the pred.
-                let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
+                prange.clear();
                 let fs = fact_memo
                     .entry(pblock)
                     .or_insert_with(|| facts_at(&domtree, &facts, pblock));
