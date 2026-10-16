@@ -39,10 +39,12 @@ const DEFAULT_LIMIT: usize = 320;
 pub const SMALL_LIMIT: usize = 40;
 /// The `small` limit for wasm: still the flat no-bonus rules, but the
 /// 40-op cap left iterator/UTF-8 helpers out of line in every hot loop —
-/// +67% geomean on `bench/wasm` vs LLVM for ~6% less code. `DEFAULT_LIMIT`
-/// is the measured sweet spot (geomean 1.19) while keeping `small`'s
-/// size-safe profile.
-pub const WASM_LIMIT: usize = DEFAULT_LIMIT;
+/// +67% geomean on `bench/wasm` vs LLVM for ~6% less code. 512 is the
+/// measured sweet spot: `hashbrown`'s `hash_one` (SipHash + probe glue)
+/// sits just over `DEFAULT_LIMIT`, and inlining it drops hashmap from
+/// +81% to +16% and hmget from +163% to +43% (geomean 1.08); 768 buys
+/// nothing further and lets `tokenize` slip back to parity.
+pub const WASM_LIMIT: usize = 512;
 
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
