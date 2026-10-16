@@ -24,7 +24,7 @@ use crate::{
     basic_block::BasicBlock,
     common_traits::Named,
     context::{Context, Ptr},
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     op::{Op, OpInterfaceMarker, op_cast},
     operation::Operation,
     printable::{Printable, State, indented_nl},
@@ -176,12 +176,12 @@ pub fn strictly_precedes_in_block(ctx: &Context, a: Ptr<Operation>, b: Ptr<Opera
         return false;
     }
 
-    let mut cursor = a.deref(ctx).get_next();
+    let mut cursor = a.get_next(ctx);
     while let Some(op) = cursor {
         if op == b {
             return true;
         }
-        cursor = op.deref(ctx).get_next();
+        cursor = op.get_next(ctx);
     }
     false
 }

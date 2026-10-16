@@ -9,7 +9,7 @@ use crate::{
     basic_block::BasicBlock,
     context::{Context, Ptr},
     irbuild::inserter::{BlockInsertionPoint, OpInsertionPoint},
-    linked_list::{ContainsLinkedList as _, LinkedList},
+    linked_list::ContainsLinkedList as _,
     operation::Operation,
     region::Region,
     r#type::{TypeHandle, Typed},
@@ -168,7 +168,7 @@ impl RewriteListener for Recorder {
             {
                 OpInsertionPoint::AtBlockEnd(parent_ptr)
             } else {
-                let prev_op = operation_ref.get_prev().expect(
+                let prev_op = op.get_prev(ctx).expect(
                     "Operation must have a previous operation if linked and is not the head",
                 );
                 OpInsertionPoint::AfterOperation(prev_op)
@@ -194,8 +194,8 @@ impl RewriteListener for Recorder {
             {
                 BlockInsertionPoint::AtRegionEnd(parent_region_ptr)
             } else {
-                let prev_block = block_ref
-                    .get_prev()
+                let prev_block = block
+                    .get_prev(_ctx)
                     .expect("Block must have a previous block if linked and is not the head");
                 BlockInsertionPoint::AfterBlock(prev_block)
             }

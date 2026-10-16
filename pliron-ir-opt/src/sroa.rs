@@ -10,7 +10,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::linked_list::{ContainsLinkedList, LinkedList};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
@@ -144,8 +144,7 @@ fn diverging_arg(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
     let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
         return false;
     };
-    op.deref(ctx)
-        .get_next()
+    op.get_next(ctx)
         .is_some_and(|n| Operation::is_op::<UnreachableOp>(n, ctx))
         && !matches!(c.callee(ctx), CallOpCallable::Indirect(f) if f == p)
         && crate::pass_enabled("PLIRON_SROA_ESCAPE")
@@ -256,7 +255,7 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     // A call with no following op has no normal edge to reload on; an
     // invoke whose pad takes arguments can't take a reload trampoline —
     // treat both as retaining.
-    if op.deref(ctx).get_next().is_none() {
+    if op.get_next(ctx).is_none() {
         return false;
     }
     if let Some(&(pad, _)) = st.invokes.get(&op)
@@ -1215,7 +1214,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                     .get_operation()
                     .insert_before(ctx, *cop);
             }
-            let next = cop.deref(ctx).get_next();
+            let next = cop.get_next(ctx);
             if let Some(next) = next {
                 reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, next);
             }

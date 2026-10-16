@@ -5,7 +5,7 @@
 
 use pliron::{
     context::{Context, Ptr},
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     operation::Operation,
     value::Value,
 };
@@ -102,7 +102,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     if !dst_ok {
         return false;
     }
-    let mut cur = call.deref(ctx).get_next();
+    let mut cur = call.get_next(ctx);
     while let Some(op) = cur {
         if op == m {
             break;
@@ -110,7 +110,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         if touches(ctx, op, dst) {
             return false;
         }
-        cur = op.deref(ctx).get_next();
+        cur = op.get_next(ctx);
     }
     if cur.is_none() {
         return false;
@@ -134,12 +134,12 @@ fn dominates_in_block(ctx: &Context, d: Ptr<Operation>, user: Ptr<Operation>) ->
     if user.deref(ctx).get_parent_block() != Some(db) {
         return false;
     }
-    let mut cur = d.deref(ctx).get_next();
+    let mut cur = d.get_next(ctx);
     while let Some(op) = cur {
         if op == user {
             return true;
         }
-        cur = op.deref(ctx).get_next();
+        cur = op.get_next(ctx);
     }
     false
 }

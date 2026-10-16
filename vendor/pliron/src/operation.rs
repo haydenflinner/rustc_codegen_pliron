@@ -89,14 +89,12 @@ impl Typed for OpResult {
 }
 
 /// Links an [Operation] with other operations and the container [BasicBlock]
+/// PLIRON: next/prev moved to the dense [NodeLinks](crate::linked_list::NodeLinks)
+/// table; only the container stays on the node.
 #[derive(Default)]
 struct BlockLinks {
     /// Parent block of this operation.
     parent_block: Option<Ptr<BasicBlock>>,
-    /// The next operation in the basic block's list of operations.
-    next_op: Option<Ptr<Operation>>,
-    /// The previous operation in the basic block's list of operations.
-    prev_op: Option<Ptr<Operation>>,
 }
 
 /// Basic unit of execution. May or may not be in a [BasicBlock].
@@ -130,11 +128,10 @@ impl PartialEq for Operation {
 
 impl private::LinkedList for Operation {
     type ContainerType = BasicBlock;
-    fn set_next(&mut self, next: Option<Ptr<Self>>) {
-        self.block_links.next_op = next;
-    }
-    fn set_prev(&mut self, prev: Option<Ptr<Self>>) {
-        self.block_links.prev_op = prev;
+    fn links_store(
+        ctx: &Context,
+    ) -> &core::cell::RefCell<Vec<crate::linked_list::NodeLinks<Self>>> {
+        &ctx.op_links
     }
     fn set_container(&mut self, container: Option<Ptr<BasicBlock>>) {
         self.block_links.parent_block = container;
@@ -142,12 +139,6 @@ impl private::LinkedList for Operation {
 }
 
 impl LinkedList for Operation {
-    fn get_next(&self) -> Option<Ptr<Self>> {
-        self.block_links.next_op
-    }
-    fn get_prev(&self) -> Option<Ptr<Self>> {
-        self.block_links.prev_op
-    }
     fn get_container(&self) -> Option<Ptr<BasicBlock>> {
         self.block_links.parent_block
     }
@@ -782,7 +773,9 @@ impl Verify for Operation {
                 .iter()
                 .try_for_each(|res| res.as_value(opr.self_ptr).verify(ctx))?;
             let op = &*Operation::get_op_dyn(opr.self_ptr, ctx);
-            if op_impls::<dyn IsTerminatorInterface>(op) && opr.get_next().is_some() {
+            if op_impls::<dyn IsTerminatorInterface>(op)
+                && opr.self_ptr.get_next(ctx).is_some()
+            {
                 let loc = opr.loc.clone();
                 let parent_block = opr
                     .get_parent_block()

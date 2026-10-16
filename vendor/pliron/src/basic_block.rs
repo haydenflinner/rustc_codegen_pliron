@@ -92,14 +92,12 @@ pub struct OpsInBlock {
 }
 
 /// Links a [BasicBlock] with other blocks and the container [Region].
+/// PLIRON: next/prev moved to the dense [NodeLinks](crate::linked_list::NodeLinks)
+/// table; only the container stays on the node.
 #[derive(Default)]
 struct RegionLinks {
     /// Parent region of this block.
     parent_region: Option<Ptr<Region>>,
-    /// The next block in the region's list of block.
-    next_block: Option<Ptr<BasicBlock>>,
-    /// The previous block in the region's list of blocks.
-    prev_block: Option<Ptr<BasicBlock>>,
 }
 
 /// A basic block contains a list of [Operation]s. It may have arguments.
@@ -354,11 +352,10 @@ impl PartialEq for BasicBlock {
 
 impl private::LinkedList for BasicBlock {
     type ContainerType = Region;
-    fn set_next(&mut self, next: Option<Ptr<Self>>) {
-        self.region_links.next_block = next;
-    }
-    fn set_prev(&mut self, prev: Option<Ptr<Self>>) {
-        self.region_links.prev_block = prev;
+    fn links_store(
+        ctx: &Context,
+    ) -> &core::cell::RefCell<Vec<crate::linked_list::NodeLinks<Self>>> {
+        &ctx.block_links
     }
     fn set_container(&mut self, container: Option<Ptr<Self::ContainerType>>) {
         self.region_links.parent_region = container;
@@ -366,12 +363,6 @@ impl private::LinkedList for BasicBlock {
 }
 
 impl LinkedList for BasicBlock {
-    fn get_next(&self) -> Option<Ptr<Self>> {
-        self.region_links.next_block
-    }
-    fn get_prev(&self) -> Option<Ptr<Self>> {
-        self.region_links.prev_block
-    }
     fn get_container(&self) -> Option<Ptr<Self::ContainerType>> {
         self.region_links.parent_region
     }

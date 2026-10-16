@@ -37,7 +37,7 @@ use crate::{
         listener::Recorder,
         rewriter::{IRRewriter, Rewriter},
     },
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     op::{op_cast, op_impls},
     operation::{OpDbg, Operation},
     opts::constants::{BranchOpFoldInterface, ConstFoldInterface},
@@ -131,7 +131,7 @@ fn try_merge_succ(
     rewriter.erase_operation(ctx, pred_terminator);
     let mut cur = succ.deref(ctx).get_head();
     while let Some(op) = cur {
-        let next = op.deref(ctx).get_next();
+        let next = op.get_next(ctx);
         rewriter.move_operation(ctx, op, OpInsertionPoint::AtBlockEnd(pred));
         cur = next;
     }

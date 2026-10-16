@@ -16,7 +16,7 @@ use crate::{
         inserter::{BlockInsertionPoint, IRInserter, Inserter, OpInsertionPoint},
         listener::RewriteListener,
     },
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     location::Located,
     op::Op,
     operation::Operation,
@@ -374,12 +374,12 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
             }
             OpInsertionPoint::AtBlockEnd(_target_block) => None,
             OpInsertionPoint::BeforeOperation(op) => Some(op),
-            OpInsertionPoint::AfterOperation(op) => op.deref(ctx).get_next(),
+            OpInsertionPoint::AfterOperation(op) => op.get_next(ctx),
             OpInsertionPoint::Unset => panic!("Cannot split block at unset insertion point."),
         };
         let mut current_op_opt = first_op_opt;
         while let Some(current_op) = current_op_opt {
-            let next_op = current_op.deref(ctx).get_next();
+            let next_op = current_op.get_next(ctx);
             rewriter.move_operation(ctx, current_op, OpInsertionPoint::AtBlockEnd(new_block));
             current_op_opt = next_op;
         }

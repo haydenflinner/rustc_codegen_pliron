@@ -88,7 +88,7 @@ pub mod interruptible {
     use crate::{
         basic_block::BasicBlock,
         context::{Context, Ptr},
-        linked_list::{ContainsLinkedList, LinkedList},
+        linked_list::ContainsLinkedList,
         operation::Operation,
         region::Region,
     };
@@ -211,14 +211,14 @@ pub mod interruptible {
                     let mut cur_block_opt = root.deref(ctx).get_head();
                     while let Some(cur_block) = cur_block_opt {
                         walk_block(ctx, state, config, cur_block, callback)?;
-                        cur_block_opt = cur_block.deref(ctx).get_next();
+                        cur_block_opt = cur_block.get_next(ctx);
                     }
                 }
                 Direction::Reverse => {
                     let mut cur_block_opt = root.deref(ctx).get_tail();
                     while let Some(cur_block) = cur_block_opt {
                         walk_block(ctx, state, config, cur_block, callback)?;
-                        cur_block_opt = cur_block.deref(ctx).get_prev();
+                        cur_block_opt = cur_block.get_prev(ctx);
                     }
                 }
             }
@@ -250,14 +250,14 @@ pub mod interruptible {
                     let mut cur_op_opt = root.deref(ctx).get_head();
                     while let Some(cur_op) = cur_op_opt {
                         walk_op(ctx, state, config, cur_op, callback)?;
-                        cur_op_opt = cur_op.deref(ctx).get_next();
+                        cur_op_opt = cur_op.get_next(ctx);
                     }
                 }
                 Direction::Reverse => {
                     let mut cur_op_opt = root.deref(ctx).get_tail();
                     while let Some(cur_op) = cur_op_opt {
                         walk_op(ctx, state, config, cur_op, callback)?;
-                        cur_op_opt = cur_op.deref(ctx).get_prev();
+                        cur_op_opt = cur_op.get_prev(ctx);
                     }
                 }
             }
@@ -345,14 +345,14 @@ pub mod interruptible {
                     let mut cur_block_opt = root.deref(ctx).get_head();
                     while let Some(cur_block) = cur_block_opt {
                         walk_block(ctx, state, config, cur_block, callback)?;
-                        cur_block_opt = cur_block.deref(ctx).get_next();
+                        cur_block_opt = cur_block.get_next(ctx);
                     }
                 }
                 Direction::Reverse => {
                     let mut cur_block_opt = root.deref(ctx).get_tail();
                     while let Some(cur_block) = cur_block_opt {
                         walk_block(ctx, state, config, cur_block, callback)?;
-                        cur_block_opt = cur_block.deref(ctx).get_prev();
+                        cur_block_opt = cur_block.get_prev(ctx);
                     }
                 }
             }
@@ -384,14 +384,14 @@ pub mod interruptible {
                     let mut cur_op_opt = root.deref(ctx).get_head();
                     while let Some(cur_op) = cur_op_opt {
                         walk_op(ctx, state, config, cur_op, callback)?;
-                        cur_op_opt = cur_op.deref(ctx).get_next();
+                        cur_op_opt = cur_op.get_next(ctx);
                     }
                 }
                 Direction::Reverse => {
                     let mut cur_op_opt = root.deref(ctx).get_tail();
                     while let Some(cur_op) = cur_op_opt {
                         walk_op(ctx, state, config, cur_op, callback)?;
-                        cur_op_opt = cur_op.deref(ctx).get_prev();
+                        cur_op_opt = cur_op.get_prev(ctx);
                     }
                 }
             }

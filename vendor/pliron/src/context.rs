@@ -64,6 +64,12 @@ pub struct Context {
     pub(crate) basic_blocks: Arena<BasicBlock>,
     /// Allocation pool for [Region]s.
     pub(crate) regions: Arena<Region>,
+    /// PLIRON: dense next/prev tables for the intrusive linked lists —
+    /// one entry per node, indexed by the `ArenaIndex` index component.
+    /// List iteration reads these instead of dereferencing nodes.
+    /// See [crate::linked_list::NodeLinks].
+    pub(crate) op_links: RefCell<Vec<crate::linked_list::NodeLinks<Operation>>>,
+    pub(crate) block_links: RefCell<Vec<crate::linked_list::NodeLinks<BasicBlock>>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
@@ -111,6 +117,8 @@ impl Default for Context {
             operations: Arena::default(),
             basic_blocks: Arena::default(),
             regions: Arena::default(),
+            op_links: RefCell::new(Vec::new()),
+            block_links: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),

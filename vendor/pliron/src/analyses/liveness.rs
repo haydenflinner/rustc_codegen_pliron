@@ -20,7 +20,7 @@ use crate::{
         traversals::region::{DFSEdgeKind, DFSTraversal},
     },
     irbuild::inserter::OpInsertionPoint,
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     pass::{Analysis, AnalysisManager},
     region::Region,
     result::Result,
@@ -542,13 +542,13 @@ impl<T: RegionLiveness> Liveness<T> {
 
         let op_iter = match point {
             OpInsertionPoint::BeforeOperation(op) => Some(op),
-            OpInsertionPoint::AfterOperation(op) => op.deref(ctx).get_next(),
+            OpInsertionPoint::AfterOperation(op) => op.get_next(ctx),
             OpInsertionPoint::AtBlockStart(block) => block.deref(ctx).get_head(),
             OpInsertionPoint::AtBlockEnd(_block) => None,
             OpInsertionPoint::Unset => panic!("Insertion point must be set for local use check"),
         };
 
-        core::iter::successors(op_iter, |op| op.deref(ctx).get_next())
+        core::iter::successors(op_iter, |op| op.get_next(ctx))
             .any(|op| user_ops_in_point_block.contains(&op))
     }
 
