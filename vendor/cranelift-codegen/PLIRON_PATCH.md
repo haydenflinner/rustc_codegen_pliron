@@ -421,3 +421,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `carry_aliases` in the opt pipeline compares against its last-seen
     epoch and skips the whole-`values()` scan on mutating steps that
     created no aliases — ~1.5% of bench pipeline time.
+
+35. `imul.i8x16` x64 lowering (`src/isa/x64/lower.isle`, `inst.isle`,
+    `lower/isle.rs`): upstream leaves i8x16 multiplication unimplemented
+    (no `pmullb` exists). Lowered as even/odd byte split — `pand`/`psrlw`
+    into 16-bit lanes, `pmullw`, keep each product's low byte with a
+    pooled 0x00FF mask (`mask_00ff`), weave back with `psllw`+`por`.
+    Wider i8 lanes (i8x32/i8x64) still unsupported — no VEX/EVEX
+    `vpmullw` forms exist yet.

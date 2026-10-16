@@ -4443,6 +4443,11 @@
 (decl shuffle_0_31_mask (VecMask) VCodeConstant)
 (extern constructor shuffle_0_31_mask shuffle_0_31_mask)
 
+;; PLIRON: constant 0x00FF per 16-bit lane, used by the `imul.i8x16`
+;; lowering to mask each even-byte product to its low byte.
+(decl mask_00ff () VCodeConstant)
+(extern constructor mask_00ff mask_00ff)
+
 ;; Produce a mask suitable for use with `pshufb` for permuting the lhs of a
 ;; `shuffle` operation (lanes 0-15).
 (decl shuffle_0_15_mask (VecMask) VCodeConstant)

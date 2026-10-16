@@ -1657,6 +1657,15 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn mask_00ff(&mut self) -> VCodeConstant {
+        let mask = (0..16)
+            .map(|i| if i % 2 == 0 { 0xFFu8 } else { 0 })
+            .collect();
+        self.lower_ctx
+            .use_constant(VCodeConstantData::Generated(mask))
+    }
+
+    #[inline]
     fn shuffle_0_15_mask(&mut self, mask: &VecMask) -> VCodeConstant {
         let mask = mask
             .iter()

@@ -1324,7 +1324,24 @@
 
 ;; SSE.
 
-;; (No i8x16 multiply.)
+;; i8x16 multiply: x86 has no `pmullb`, so split each operand into its
+;; even and odd bytes as 16-bit lanes (`pand`/`psrlw`), multiply with
+;; `pmullw`, keep each product's low byte, and weave the halves back.
+;; PLIRON: upstream punts on this ("No i8x16 multiply"); cubecl's i8
+;; throughput kernels need it.
+(rule (lower (imul (multi_lane 8 16) x y))
+      (let ((x2 Xmm x)
+            (y2 Xmm y)
+            (mask Xmm (x64_xmm_load_const $I16X8 (mask_00ff)))
+            (x_e Xmm (x64_pand x2 mask))
+            (x_o Xmm (x64_psrlw x2 (xmi_imm 8)))
+            (y_e Xmm (x64_pand y2 mask))
+            (y_o Xmm (x64_psrlw y2 (xmi_imm 8)))
+            (p_e Xmm (x64_pmullw x_e y_e))
+            (p_o Xmm (x64_pmullw x_o y_o))
+            (lo Xmm (x64_pand p_e mask))
+            (hi Xmm (x64_psllw p_o (xmi_imm 8))))
+        (x64_por lo hi)))
 
 (rule (lower (imul (multi_lane 16 8) x y))
       (x64_pmullw x y))
