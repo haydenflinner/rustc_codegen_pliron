@@ -608,14 +608,37 @@ pub fn iv_side(func: &Function, info: &Info, kinds: &[Param], v: Value) -> Optio
         if v == p {
             return Some((i, false));
         }
-        if let ValueDef::Result(inst, _) = func.dfg.value_def(v)
-            && let InstructionData::Binary {
-                opcode: Opcode::Iadd,
-                args: [a, b],
-            } = func.dfg.insts[inst]
-        {
-            let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
-            if (a == p && iconst(func, b).is_some()) || (b == p && iconst(func, a).is_some()) {
+        // `on_next` means the test reads the value a latch feeds back —
+        // `p + s` — so the offset must equal the param's step. Accepting
+        // any `p + K` miscounts post-tested loops (`p + K < n` with
+        // K != s yields a trip count off by ~(K - s)/s).
+        let Param::Step(s) = kinds[i] else {
+            continue;
+        };
+        if let ValueDef::Result(inst, _) = func.dfg.value_def(v) {
+            let k = match func.dfg.insts[inst] {
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [a, b],
+                } => {
+                    let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+                    if a == p {
+                        iconst(func, b)
+                    } else if b == p {
+                        iconst(func, a)
+                    } else {
+                        None
+                    }
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args: [a, b],
+                } if func.dfg.resolve_aliases(a) == p => {
+                    iconst(func, b).and_then(|c| c.checked_neg())
+                }
+                _ => None,
+            };
+            if k == Some(s) {
                 return Some((i, true));
             }
         }
