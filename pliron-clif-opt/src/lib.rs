@@ -17,6 +17,7 @@ pub mod diffcheck;
 pub mod divconst;
 pub mod dse;
 pub mod edgefwd;
+pub mod edgesink;
 pub mod edgespec;
 pub mod ifconv;
 pub mod indvars;

@@ -1519,7 +1519,7 @@ fn s_constdedup(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 fn s_splink(p: &mut Pipe, an: &mut Analysis) -> usize {
     let CfgDtLa { la, .. } = an.cfg_dt_la(&p.clctx.func);
-    let k = splink::run(&mut p.clctx.func, la);
+    let k = splink::run(&mut p.clctx.func, la, p.x64);
     p.dump("splink");
     k
 }
@@ -1825,6 +1825,14 @@ fn s_edgespec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgespec::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("edgespec");
+    }
+    k
+}
+
+fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = edgesink::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("edgesink");
     }
     k
 }
@@ -2755,6 +2763,27 @@ pub static DEFAULT: &[Step] = &[
         s_webmerge,
     )
     .needs(shape::MULTI),
+    // The late jtr/mergechain/taildup rounds stamp a fresh `iconst` per
+    // block copy (a `mov #10` before every unrolled `madd` — parse_only);
+    // merge them back to the dominating def so one register serves the
+    // loop instead of a remat per block.
+    step(
+        "constdedup2",
+        "constdedup",
+        Gate::Env("PLIRON_CSTDEDUP"),
+        s_constdedup,
+    ),
+    // Error/merge payloads computed in `b` but used only by one
+    // `brif` edge's args (parse_only's `ParseIntError` pack on every
+    // digit-validity branch) run unconditionally there — sink them
+    // onto the edge so the taken path alone pays.
+    step(
+        "edgesink",
+        "edgesink",
+        Gate::Env("PLIRON_EDGESINK"),
+        s_edgesink,
+    )
+    .needs(shape::CONDBR),
     Step {
         name: "coldret",
         bisect: Some("coldret"),

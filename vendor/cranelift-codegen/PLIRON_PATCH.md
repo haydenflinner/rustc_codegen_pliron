@@ -475,3 +475,28 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       Priorities are staggered (adjacent 5/6 < zero-arm 7/8 < 0/1 9) so the
       more-specific const pairs win; `u64_gt 0` keeps the adjacent rules off
       the zero shapes.
+
+38. Egraph remat: no `iconst` marking, no remat into deeper loops
+    (`src/opts/remat.isle`, `src/egraph/elaborate.rs`):
+
+    - `remat.isle` no longer marks `iconst` (the `imm64_remat_cheap`
+      rule is gone). The elaborator clones a marked def into every
+      use block, so a deduped constant (e.g. `iconst 10` feeding a
+      digit-parse `imul`/`icmp` chain inside a loop) became a `movz`
+      per use block per iteration — strictly more dynamic work than
+      keeping the vreg live; under real pressure regalloc spills
+      either way. op-with-imm remat stays: it re-executes the op but
+      folds the immediate into the encoding.
+    - `maybe_remat_arg` takes `&LoopAnalysis` and refuses to remat
+      when `insert_block` sits in a deeper loop than the arg's block
+      — that trades the def's single execution for per-iteration
+      work, which even a one-inst materialization loses.
+
+39. aarch64 i128 add/sub with provably-zero high half rides `xzr`
+    (`src/isa/aarch64/lower.isle`):
+
+    `iadd.i128`/`isub.i128` against `uextend` or `iconcat .., iconst 0`
+    now lower the high half to `zero_reg` (`adc`/`sbc`/`ngc` with `xzr`)
+    instead of materializing `mov xN, #0` per use. Priority 40/41 keeps
+    them above the generic i64-pair rules; zero-hi-right outranks
+    zero-hi-left so both-extended inputs resolve deterministically.

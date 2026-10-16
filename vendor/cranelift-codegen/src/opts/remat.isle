@@ -37,12 +37,13 @@
       (remat x))
 (rule (simplify x @ (bnot _ _))
       (remat x))
-;; PLIRON: only remat immediates that encode in one instruction — a
-;; full-width `iconst` costs a movz/movk chain per use on aarch64,
-;; which is strictly worse than pinning a vreg inside a loop.
-(rule (simplify x @ (iconst ty k))
-      (if (imm64_remat_cheap ty k))
-      (remat x))
+;; PLIRON: don't mark plain `iconst` for remat at all. The egraph
+;; remat clones the constant into every use block in the same loop,
+;; so a hoisted radix bound (`iconst 10` feeding `imul`/`icmp` in a
+;; digit-parse chain) becomes a `movz` per block per iteration —
+;; strictly more work than pinning it in a vreg, and under real
+;; register pressure regalloc spills either way. (Was: remat only
+;; when `imm64_remat_cheap`, i.e. one-instruction immediates.)
 (rule (simplify x @ (f32const _ _))
       (remat x))
 (rule (simplify x @ (f64const _ _))

@@ -189,6 +189,44 @@
           (add_with_flags_paired $I64 x_lo y_lo)
           (adc_paired $I64 x_hi y_hi))))
 
+;; PLIRON: an `iadd.i128` operand whose high half is provably zero —
+;; `uextend.i128` or `iconcat .., iconst 0` — rides `xzr` instead of
+;; materializing `mov xN, #0` per use (the sieve u128work loop spent
+;; dead `mov`s/iter on `v/7*7 + v%97`). Zero-hi-right outranks
+;; zero-hi-left so both-extend inputs resolve deterministically.
+(rule 41 (lower (iadd $I128 x (uextend _ y)))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg y)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (iadd $I128 (uextend _ y) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg y)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 41 (lower (iadd $I128 x (iconcat _ lo (iconst _ (u64_from_imm64 0)))))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (iadd $I128 (iconcat _ lo (iconst _ (u64_from_imm64 0))) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+
 ;;;; Rules for `shuffle` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; When a single element of one vector is broadcast to all the destination
@@ -1118,6 +1156,41 @@
 (attr rule isub_i128 (tag i128))
 (rule isub_i128 -1 (lower (isub $I128 x y))
       (sub_i128 x y))
+
+;; PLIRON: same zero-high-half trick for `isub.i128`; on the left the
+;; whole borrow resolves through `sbc xzr, x_hi` (`ngc`).
+(rule 41 (lower (isub $I128 x (uextend _ y)))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg y)))
+        (with_flags
+          (sub_with_flags_paired $I64 x_lo y_lo)
+          (sbc_paired $I64 x_hi (zero_reg)))))
+(rule 41 (lower (isub $I128 x (iconcat _ lo (iconst _ (u64_from_imm64 0)))))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (sub_with_flags_paired $I64 x_lo y_lo)
+          (sbc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (isub $I128 (uextend _ y) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg y)))
+        (with_flags
+          (sub_with_flags_paired $I64 y_lo x_lo)
+          (sbc_paired $I64 (zero_reg) x_hi))))
+(rule 40 (lower (isub $I128 (iconcat _ lo (iconst _ (u64_from_imm64 0))) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (sub_with_flags_paired $I64 y_lo x_lo)
+          (sbc_paired $I64 (zero_reg) x_hi))))
 
 ;;;; Rules for `uadd_sat` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

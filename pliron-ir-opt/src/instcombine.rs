@@ -387,7 +387,6 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
-        nv += fold_divmul(ctx, st, f);
         let (c, v) = if egg {
             run_fn_egg(ctx, st, f)
         } else {
@@ -395,6 +394,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         };
         nc += c;
         nv += v;
+        // After the worklist: divisor-shaped const exprs (`7u128.max(1)`
+        // arrives as icmp+select) have folded to literals `canon_eq` can
+        // match against the multiply's operand.
+        nv += fold_divmul(ctx, st, f);
     }
     if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         tracing::info!(target: "pliron::stats",

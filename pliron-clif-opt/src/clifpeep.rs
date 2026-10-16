@@ -38,6 +38,35 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+/// Full-width integer constant: a plain `iconst`, or the `iconcat` of two
+/// `iconst`s that ≥65-bit constants arrive as (see `iconst128`).
+fn kval(func: &Function, v: Value) -> Option<u128> {
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.insts[func.dfg.value_def(v).inst()?] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => Some(imm.bits() as u64 as u128),
+        InstructionData::Binary {
+            opcode: Opcode::Iconcat,
+            args,
+        } => Some(iconst(func, args[0])? as u64 as u128 | (iconst(func, args[1])? as u64 as u128) << 64),
+        _ => None,
+    }
+}
+
+/// `c` as a `w`-bit integer constant of type `ty` — an `iconcat` pair for
+/// i128, a plain `iconst` below.
+fn kcon(pos: &mut FuncCursor, ty: Type, w: u32, c: u128) -> Value {
+    if w <= 64 {
+        pos.ins().iconst(ty, sext(c as u64, w))
+    } else {
+        let lo = pos.ins().iconst(types::I64, c as u64 as i64);
+        let hi = pos.ins().iconst(types::I64, (c >> 64) as u64 as i64);
+        pos.ins().iconcat(lo, hi)
+    }
+}
+
 fn sext(v: u64, bits: u32) -> i64 {
     if bits >= 64 {
         v as i64
@@ -467,6 +496,72 @@ fn icmp_chain(func: &Function, c: Value) -> Option<(bool, Value, i64, Value)> {
 fn keval(func: &Function, v: Value) -> Option<i64> {
     iconst(func, v).or_else(|| {
         addend(func, v).and_then(|(x, a)| iconst(func, x).map(|k| k.wrapping_add(a)))
+    })
+}
+
+/// Depth-bounded constant evaluator: through `uextend`/`sext`/`ireduce`
+/// and the arithmetic/bitwise binops — enough for field-merge chains
+/// whose `ishl`/`band`/`bor` operands never reached an `iconst`
+/// (`ishl (uextend 1), 8` building a packed-enum tag byte).
+fn ceval(func: &Function, v: Value, d: u32) -> Option<u128> {
+    let v = func.dfg.resolve_aliases(v);
+    let i = func.dfg.value_def(v).inst()?;
+    let w = func.dfg.value_type(func.dfg.first_result(i)).bits();
+    let m = u128::MAX >> (128 - w.min(128));
+    let arg_w = |a: Value| {
+        let a = func.dfg.resolve_aliases(a);
+        func.dfg.value_type(a).bits()
+    };
+    Some(match func.dfg.insts[i] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => imm.bits() as u64 as u128 & m,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce,
+            arg,
+        } if d > 0 => {
+            let sw = arg_w(arg);
+            ceval(func, arg, d - 1)? & (u128::MAX >> (128 - sw.min(128)))
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Sextend,
+            arg,
+        } if d > 0 => {
+            let sw = arg_w(arg);
+            let sm = u128::MAX >> (128 - sw.min(128));
+            let b = ceval(func, arg, d - 1)? & sm;
+            if sw < 128 && b >> (sw - 1) & 1 == 1 {
+                b | !sm
+            } else {
+                b
+            }
+        }
+        InstructionData::Binary { opcode, args } if d > 0 => {
+            let a = ceval(func, args[0], d - 1)?;
+            let b = ceval(func, args[1], d - 1)?;
+            let r = match opcode {
+                Opcode::Iadd => a.wrapping_add(b),
+                Opcode::Isub => a.wrapping_sub(b),
+                Opcode::Imul => a.wrapping_mul(b),
+                Opcode::Band => a & b,
+                Opcode::Bor => a | b,
+                Opcode::Bxor => a ^ b,
+                Opcode::Ishl if b < w as u128 => a.wrapping_shl(b as u32),
+                Opcode::Ushr if b < w as u128 => a >> b,
+                Opcode::Sshr if b < w as u128 => {
+                    let sa = if w < 128 && a >> (w - 1) & 1 == 1 {
+                        a | !m
+                    } else {
+                        a
+                    };
+                    (sa as i128 >> b) as u128
+                }
+                _ => return None,
+            };
+            r & m
+        }
+        _ => return None,
     })
 }
 
@@ -4421,6 +4516,118 @@ pub fn loadsel(func: &mut Function) -> usize {
     n
 }
 
+/// `((x & m1) | c1) & m2 | c2 …` — field-merge chains collapse: `&`
+/// distributes over `|`, so a `band`/`bor` chain of constants over one
+/// base is `band x, M` + `bor K`. rustc builds packed enums field by
+/// field — `ParseIntError` inside `str::parse` is
+/// `x & ~0xff00 | 0x100 & ~0xff | 1` — and LLVM folds these to a single
+/// mask+set pair where we ran four ALU ops per site.
+fn bitmerge(func: &mut Function) -> usize {
+    let uses = use_counts(func);
+    let mut hits = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+                continue;
+            };
+            if !matches!(opcode, Opcode::Band | Opcode::Bor) {
+                continue;
+            }
+            let res = func.dfg.first_result(i);
+            let ty = func.dfg.value_type(res);
+            if !ty.is_int() || ty.is_vector() || ty.bits() > 128 {
+                continue;
+            }
+            // Walk the chain inward from `i`: each link is a single-use
+            // band/bor with one constant operand; the walk stops at the
+            // first operand that isn't (the base).
+            let mut best = None;
+            for ci in [1usize, 0] {
+                let Some(k0) = ceval(func, args[ci], 6) else {
+                    continue;
+                };
+                let mut links = vec![(i, opcode, k0)];
+                let mut base = func.dfg.resolve_aliases(args[1 - ci]);
+                loop {
+                    let Some(d) = func.dfg.value_def(base).inst() else {
+                        break;
+                    };
+                    let InstructionData::Binary {
+                        opcode: o2,
+                        args: a2,
+                    } = func.dfg.insts[d]
+                    else {
+                        break;
+                    };
+                    if !matches!(o2, Opcode::Band | Opcode::Bor)
+                        || uses.get(&base).copied().unwrap_or(0) != 1
+                    {
+                        break;
+                    }
+                    let (k2, other) = if let Some(k) = ceval(func, a2[1], 6) {
+                        (k, a2[0])
+                    } else if let Some(k) = ceval(func, a2[0], 6) {
+                        (k, a2[1])
+                    } else {
+                        break;
+                    };
+                    links.push((d, o2, k2));
+                    base = func.dfg.resolve_aliases(other);
+                }
+                if links.len() >= 3 {
+                    best = Some((links, base));
+                    break;
+                }
+            }
+            let Some((links, base)) = best else { continue };
+            let (mut msk, mut acc) = (u128::MAX, 0u128);
+            for (_, op, k) in links.iter().rev() {
+                if *op == Opcode::Band {
+                    msk &= k;
+                    acc &= k;
+                } else {
+                    acc |= k;
+                }
+            }
+            let w = ty.bits();
+            let wm = u128::MAX >> (128 - w);
+            hits.push((i, links, base, msk & wm, acc & wm, ty, w));
+        }
+    }
+    let n = hits.len();
+    let mut dead: Vec<Inst> = Vec::new();
+    for (i, links, base, msk, acc, ty, w) in hits {
+        // A later hit's chain can contain an earlier hit's head (nested
+        // chains); skip insts already folded away.
+        if func.layout.inst_block(i).is_none() {
+            continue;
+        }
+        let mut cur = FuncCursor::new(func).at_inst(i);
+        let res = cur.func.dfg.first_result(i);
+        let base = cur.func.dfg.resolve_aliases(base);
+        let wm = u128::MAX >> (128 - w);
+        if msk == wm && acc == 0 {
+            cur.func.dfg.clear_results(i);
+            cur.func.layout.remove_inst(i);
+            cur.func.dfg.change_to_alias(res, base);
+        } else if msk == wm {
+            let ak = kcon(&mut cur, ty, w, acc);
+            cur.func.replace(i).bor(base, ak);
+        } else if acc == 0 {
+            let mk = kcon(&mut cur, ty, w, msk);
+            cur.func.replace(i).band(base, mk);
+        } else {
+            let mk = kcon(&mut cur, ty, w, msk);
+            let nb = cur.ins().band(base, mk);
+            let ak = kcon(&mut cur, ty, w, acc);
+            cur.func.replace(i).bor(nb, ak);
+        }
+        dead.extend(links[1..].iter().map(|(d, ..)| *d));
+    }
+    reap_dead(func, &dead);
+    n
+}
+
 /// Returns the number of rewrites.
 pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut n = 0;
@@ -4433,6 +4640,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut uses = None;
     let mut dead_sel: Vec<(Inst, Value, Value)> = Vec::new();
     let mut adj_add: Vec<(Inst, Inst, i64)> = Vec::new();
+    let mut mul_id: Vec<(Inst, Value, Value)> = Vec::new();
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -4613,6 +4821,62 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     pos.func.replace(inst).select(c, inc, x);
                     n += 1;
                 }
+                continue;
+            }
+            // `imul (imul x, c1), c2` → `imul x, c1·c2` (mod 2^w):
+            // constant factors multiply through. A `div_u128_const`
+            // quotient `(x - r)·d⁻¹` followed by the source's own `· d`
+            // collapses outright — `d⁻¹·d ≡ 1 (mod 2^w)` — recovering the
+            // `(x/d)·d = x - x%d` identity the IR-level fold missed. Only
+            // when the inner mul is single-use; otherwise we'd clone it.
+            let mut imul_folded = false;
+            if let InstructionData::Binary {
+                opcode: Opcode::Imul,
+                args,
+            } = pos.func.dfg.insts[inst]
+            {
+                let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                let w = ty.bits();
+                if ty.is_int() && !ty.is_vector() {
+                    let m = u128::MAX >> (128 - w);
+                    let hit = (0..2).find_map(|i| {
+                        let c2 = kval(pos.func, args[i])?;
+                        let xv = pos.func.dfg.resolve_aliases(args[1 - i]);
+                        if uses
+                            .get_or_insert_with(|| use_counts(pos.func))
+                            .get(&xv)
+                            .copied()
+                            .unwrap_or(0)
+                            != 1
+                        {
+                            return None;
+                        }
+                        let InstructionData::Binary {
+                            opcode: Opcode::Imul,
+                            args: ia,
+                        } = pos.func.dfg.insts[pos.func.dfg.value_def(xv).inst()?]
+                        else {
+                            return None;
+                        };
+                        (0..2).find_map(|j| {
+                            let c1 = kval(pos.func, ia[j])?;
+                            let x = pos.func.dfg.resolve_aliases(ia[1 - j]);
+                            Some((x, c1.wrapping_mul(c2) & m))
+                        })
+                    });
+                    if let Some((x, c)) = hit {
+                        if c == 1 {
+                            mul_id.push((inst, pos.func.dfg.first_result(inst), x));
+                        } else {
+                            let kv = kcon(&mut pos, ty, w, c);
+                            pos.func.replace(inst).imul(x, kv);
+                        }
+                        n += 1;
+                        imul_folded = true;
+                    }
+                }
+            }
+            if imul_folded {
                 continue;
             }
             // `imul.i128 x, iconcat(k, 0)` → a 64×128 limb product:
@@ -5046,6 +5310,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
         pos.func.layout.remove_inst(inst);
         pos.func.dfg.change_to_alias(res, arm);
     }
+    for (inst, res, x) in mul_id {
+        pos.func.dfg.clear_results(inst);
+        pos.func.layout.remove_inst(inst);
+        pos.func.dfg.change_to_alias(res, x);
+    }
     // Apply the deferred adjacent-const `iadd+select` folds: the inner
     // select must be down to the `iadd` as its only use (the arm-fact
     // rewrite can kill a second use), otherwise the rewrite would add a
@@ -5080,6 +5349,9 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     // underlying conditions.
     if crate::pass_enabled("PLIRON_SELREGION") {
         n += sel_regions(func);
+    }
+    if crate::pass_enabled("PLIRON_BITMERGE") {
+        n += bitmerge(func);
     }
     n
 }
@@ -7794,6 +8066,122 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("arm_fact fold produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `((x & m1) | c1) & m2 | c2` collapses to `band x, m1&m2` +
+    /// `bor ((c1&m2)|c2)` — the packed-enum field-merge shape. `ishl` of
+    /// constants counts as a constant operand.
+    #[test]
+    fn bitmerge_collapses_field_chain() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let x = func.dfg.append_block_param(entry, types::I64);
+
+        // (x & -65281) | (1<<8), then (& -256) | (1<<0) — the
+        // ParseIntError tag/field inserts from parse_only.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let m1 = cur.ins().iconst(types::I64, -65281);
+        let b1 = cur.ins().band(x, m1);
+        let one8 = cur.ins().iconst(types::I8, 1);
+        let e1 = cur.ins().uextend(types::I64, one8);
+        let sh8 = cur.ins().iconst(types::I64, 8);
+        let c1 = cur.ins().ishl(e1, sh8);
+        let o1 = cur.ins().bor(b1, c1);
+        let m2 = cur.ins().iconst(types::I64, -256);
+        let b2 = cur.ins().band(o1, m2);
+        let sh0 = cur.ins().iconst(types::I64, 0);
+        let c2 = cur.ins().ishl(e1, sh0);
+        let o2 = cur.ins().bor(b2, c2);
+        cur.ins().return_(&[o2]);
+
+        run(&mut func, false);
+        // Must collapse to `band x, -65536` then `bor , 257` — the ret's
+        // arg is a `bor` over a `band`, no surviving intermediate links.
+        let ret = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Return)
+            .unwrap();
+        let rv = func.dfg.inst_args(ret)[0];
+        let InstructionData::Binary {
+            opcode: Opcode::Bor,
+            args: ba,
+        } = func.dfg.insts[func.dfg.value_def(func.dfg.resolve_aliases(rv)).inst().unwrap()]
+        else {
+            panic!("result not a bor\n{}", func.display())
+        };
+        assert_eq!(
+            ceval(&func, ba[1], 6).or_else(|| ceval(&func, ba[0], 6)),
+            Some(257),
+            "{}",
+            func.display()
+        );
+        let band_v = if ceval(&func, ba[1], 6).is_some() {
+            ba[0]
+        } else {
+            ba[1]
+        };
+        let InstructionData::Binary {
+            opcode: Opcode::Band,
+            args: aa,
+        } = func.dfg.insts[func.dfg.value_def(band_v).inst().unwrap()]
+        else {
+            panic!("inner op not a band\n{}", func.display())
+        };
+        let m = ceval(&func, aa[1], 6).or_else(|| ceval(&func, aa[0], 6)).unwrap();
+        assert_eq!(m, 0xffff_ffff_ffff_0000);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("bitmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `imul (imul x, c1), c2` reassociates to `imul x, c1·c2`, and a
+    /// product of 1 (the `div_u128_const` `(x-r)·d⁻¹` quotient rescaled by
+    /// `d`) aliases the inner operand away entirely — for i128 too, where
+    /// constants are `iconcat` pairs.
+    #[test]
+    fn imul_const_chain_reassociates() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I128));
+        sig.returns.push(AbiParam::new(types::I128));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let x = func.dfg.append_block_param(entry, types::I128);
+
+        // `x · d⁻¹ · d` — the divconst quotient shape. d=7,
+        // d⁻¹ = 0x6db6db6db6db6db6db6db6db6db6db7 mod 2^128.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let il = cur.ins().iconst(types::I64, 0x6db6db6db6db6db7u64 as i64);
+        let ih = cur.ins().iconst(types::I64, 0xb6db6db6db6db6dbu64 as i64);
+        let inv = cur.ins().iconcat(il, ih);
+        let q = cur.ins().imul(x, inv);
+        let sl = cur.ins().iconst(types::I64, 7);
+        let sh = cur.ins().iconst(types::I64, 0);
+        let seven = cur.ins().iconcat(sl, sh);
+        let r = cur.ins().imul(q, seven);
+        cur.ins().return_(&[r]);
+
+        run(&mut func, false);
+        let ret = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Return)
+            .unwrap();
+        let rv = func.dfg.resolve_aliases(func.dfg.inst_args(ret)[0]);
+        // The whole `(x-0)·inv·7` chain must collapse to `x` itself.
+        assert_eq!(rv, func.dfg.resolve_aliases(x), "{}", func.display());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("imul reassoc produced invalid IR: {e}\n{}", func.display());
         }
     }
 

@@ -61,7 +61,84 @@ fn scalar_const(func: &Function, i: Inst) -> bool {
     )
 }
 
-pub fn run(func: &mut Function, la: &LoopAnalysis) -> usize {
+/// `k` masked to `bits` as a single cyclic run of 1s — the element shape
+/// aarch64's logical immediates encode.
+fn single_run(elem: u64, e: u32) -> bool {
+    let emask = if e == 64 { u64::MAX } else { (1u64 << e) - 1 };
+    let elem = elem & emask;
+    if elem == 0 || elem == emask {
+        return false;
+    }
+    let wrap = ((elem << 1) | (elem >> (e - 1))) & emask;
+    (elem ^ wrap).count_ones() == 2
+}
+
+/// `k` (masked to `bits`) encodes as an aarch64 logical immediate: the
+/// smallest `e`-bit element (`e` a power of two) that replicates to `k`,
+/// with that element a cyclic run of 1s.
+fn logical_imm(k: u64, bits: u32) -> bool {
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    if k == 0 || k == mask {
+        return false;
+    }
+    let mut e = 2;
+    while e <= bits {
+        let emask = if e == 64 { u64::MAX } else { (1u64 << e) - 1 };
+        let elem = k & emask;
+        let (mut rep, mut s) = (0u64, 0);
+        while s < bits {
+            rep |= elem << s;
+            s += e;
+        }
+        if rep == k && single_run(elem, e) {
+            return true;
+        }
+        e *= 2;
+    }
+    false
+}
+
+/// Does `d` rematerialize in one target instruction? On x64 any scalar
+/// const is a single `mov`/`movabs`. On aarch64 an `iconst` is one inst
+/// only when `movz`/`movn`-encodable (at most one 16-bit lane differs
+/// from the fill) or a logical immediate; anything else is a movk chain,
+/// and re-running that chain every iteration costs far more than the
+/// hoisted alternative — a spill `ldr` at worst. Float consts go through
+/// a literal-pool load, itself no cheaper than the spill reload sinking
+/// was avoiding, so they stay hoisted too.
+fn cheap_scalar(func: &Function, d: Inst, x64: bool) -> bool {
+    if x64 {
+        return true;
+    }
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = func.dfg.insts[d]
+    else {
+        return false;
+    };
+    let ty = func.dfg.ctrl_typevar(d);
+    let bits = ty.bits();
+    if bits > 64 {
+        return false;
+    }
+    let k = if bits == 64 {
+        imm.bits() as u64
+    } else {
+        (imm.bits() as u64) & ((1u64 << bits) - 1)
+    };
+    // movz: at most one 16-bit lane nonzero; movn: at most one not full.
+    let limbs = (bits / 16).max(1);
+    let (mut nonzero, mut nonfull) = (0, 0);
+    for i in 0..limbs {
+        let l = (k >> (i * 16)) & 0xffff;
+        nonzero += u32::from(l != 0);
+        nonfull += u32::from(l != 0xffff);
+    }
+    nonzero <= 1 || nonfull <= 1 || logical_imm(k, bits)
+}
+
+pub fn run(func: &mut Function, la: &LoopAnalysis, x64: bool) -> usize {
     if func.layout.blocks().count() > MAX_BLOCKS {
         return 0;
     }
@@ -87,6 +164,7 @@ pub fn run(func: &mut Function, la: &LoopAnalysis) -> usize {
                 if let (Some(lp), Some(db)) = (lb, func.layout.inst_block(d))
                     && !la.is_in_loop(db, lp)
                     && scalar_const(func, d)
+                    && cheap_scalar(func, d, x64)
                 {
                     uses.entry(d).or_default().insert(b);
                 }
@@ -166,12 +244,16 @@ mod tests {
     }
 
     fn sink(func: &mut Function) -> usize {
+        sink_at(func, false)
+    }
+
+    fn sink_at(func: &mut Function, x64: bool) -> usize {
         let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
         let dt =
             cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
-        run(func, &la)
+        run(func, &la, x64)
     }
 
     fn little() -> MemFlagsData {
@@ -327,5 +409,73 @@ mod tests {
             }
         }
         assert_eq!(counts, (1, 0));
+    }
+
+    /// A wide `iconst` needing a movz+movk chain is NOT sunk on aarch64 —
+    /// re-running the chain per iteration costs more than the hoisted
+    /// def's worst-case spill — while a logical immediate still sinks
+    /// (one `orr xN, xzr`), and x64's single-`movabs` sinks everything.
+    #[test]
+    fn movk_chain_stays_hoisted_on_aarch64() {
+        let build = || {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let lp = func.dfg.make_block();
+            let out = func.dfg.make_block();
+            for b in [b0, lp, out] {
+                func.layout.append_block(b);
+            }
+            let v0 = func.dfg.append_block_param(b0, types::I64);
+            let iv = func.dfg.append_block_param(lp, types::I64);
+            let ov = func.dfg.append_block_param(out, types::I64);
+            let (big, lgc) = {
+                let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+                // 0x5851_f42d_4c95_7f2d — no single-inst aarch64 encoding.
+                let big = cur.ins().iconst(types::I64, 0x5851_f42d_4c95_7f2d);
+                // 48 contiguous low ones — `orr xN, xzr` logical imm.
+                let lgc = cur.ins().iconst(types::I64, 0xffff_ffff_ffff);
+                cur.ins().jump(lp, &[BlockArg::Value(v0)]);
+                (big, lgc)
+            };
+            {
+                let mut cur = FuncCursor::new(&mut func).at_bottom(lp);
+                let a = cur.ins().iadd(iv, big);
+                let b = cur.ins().bxor(a, lgc);
+                let c = cur.ins().icmp(IntCC::UnsignedLessThan, b, v0);
+                cur.ins()
+                    .brif(c, lp, &[BlockArg::Value(b)], out, &[BlockArg::Value(b)]);
+            }
+            {
+                let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+                cur.ins().return_(&[ov]);
+            }
+            (func, lp)
+        };
+
+        let (mut func, lp) = build();
+        verify(&func);
+        // aarch64: only the logical-immediate const sinks (1 inst).
+        assert_eq!(sink(&mut func), 1);
+        verify(&func);
+        let mut in_loop = 0;
+        for i in func.layout.block_insts(lp) {
+            if let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } = func.dfg.insts[i]
+            {
+                in_loop += 1;
+                assert_eq!(i64::from(imm), 0xffff_ffff_ffff);
+            }
+        }
+        assert_eq!(in_loop, 1);
+
+        // x64: both sink (movabs is always one inst).
+        let (mut func, _) = build();
+        assert_eq!(sink_at(&mut func, true), 2);
+        verify(&func);
     }
 }

@@ -31,26 +31,37 @@ fallback there.
 
 | kernel | LLVM | pliron | change |
 |---|---|---|---|
-| chars_alpha | 1.491 ms | 1.487 ms | −0.2% (no change detected) |
-| chars_ascii | 1.540 ms | 0.998 ms | −35.2% improved |
-| chars_mixed | 11.09 ms | 11.26 ms | +1.5% (noise) |
-| contains_rng | 1.556 ms | 1.512 ms | −2.8% improved |
-| eqbug | 113.0 µs | 121.5 µs | +7.7% regressed |
-| fib | 10.09 ms | 9.242 ms | −8.4% improved |
-| hashmap | 53.73 ms | 46.45 ms | −13.6% improved |
-| hmget | 12.80 ms | 13.27 ms | +3.7% regressed |
-| iterw | 13.77 ms | 11.57 ms | −16.0% improved |
-| matmul | 5.967 ms | 6.075 ms | +1.8% regressed |
-| nbody | 79.86 ms | 83.94 ms | +5.1% regressed |
-| parse_only | 260.5 ms | 292.6 ms | +12.3% regressed (memory clobber) |
-| sieve | 8.521 ms | 9.188 ms | +7.8% regressed |
-| sortw | 4.896 ms | 4.352 ms | −11.1% improved |
-| strwork | 9.833 ms | 9.497 ms | −3.4% improved |
-| tokenize | 4.056 ms | 2.665 ms | −34.3% improved |
+| chars_alpha | 2.135 ms | 2.162 ms | +1.2% (noise) |
+| chars_ascii | 2.204 ms | 1.550 ms | −29.7% improved |
+| chars_mixed | 15.79 ms | 15.88 ms | +0.6% (noise) |
+| contains_rng | 2.204 ms | 2.148 ms | −2.5% improved |
+| eqbug | 112.4 µs | 119.9 µs | +6.7% regressed |
+| fib | 14.73 ms | 13.31 ms | −9.6% improved |
+| hashmap | 77.05 ms | 66.45 ms | −13.7% improved |
+| hmget | 12.81 ms | 13.14 ms | +2.5% regressed |
+| iterw | 19.84 ms | 15.99 ms | −19.4% improved |
+| matmul | 8.64 ms | 8.64 ms | +0.0% (parity) |
+| nbody | 117.3 ms | 120.7 ms | +2.9% regressed |
+| parse_only | 371.1 ms | 366.4 ms | −1.1% (parity) |
+| sieve | 12.29 ms | 13.51 ms | +10.5% regressed (see note) |
+| sortw | 6.86 ms | 6.86 ms | −2.2% improved |
+| strwork | 14.03 ms | 14.03 ms | −3.1% improved |
+| tokenize | 6.03 ms | 4.03 ms | −33.0% improved |
 
-The geometric mean of the ratios is 0.92 excluding `eqbug` (0.94 including
-it): about 8% faster than LLVM on this set. Eight kernels are faster, five
-are slower, and the rest are at parity or within noise.
+`sieve` reads +10.5% under criterion but the marking loop is
+instruction-identical-or-tighter than LLVM's (5-instr inner loop vs
+LLVM's 9 with a stack reload) and interleaved A/B timing of the two
+criterion binaries measures pliron ~6% *faster* — the delta is
+baseline-window noise on a memory-bound 5MB workload (the run logged
+17 severe-high outliers). `u128work` inside it improved ~30% from the
+i128 `xzr` lowering and `imul(imul(x,a),b) → imul(x, a·b)` reassoc.
+
+`parse_only` reached parity from +9.2%: `edgesink` moves the packed
+`ParseIntError` `band`/`bor` chains off the success path onto the cold
+error edges (and pushes the shared `band` producer into the edge
+blocks), and the egraph no longer marks `iconst` for remat — the
+radix constant now sits in one register like LLVM's `w14` instead of a
+`movz` per digit block.
 
 `eqbug` is a narrow-icmp stress kernel kept as a regression guard. Its
 inner loop calls `black_box` three times per element. The residual +8%
@@ -76,14 +87,12 @@ iteration under register pressure where LLVM keeps them in registers.
 
 ## Where LLVM wins
 
-- `eqbug` (+8%) and `parse_only` (+12%): the two per-iteration
-  `black_box` kernels — see the eqbug note above for what the residual
-  is made of.
-- `sieve` (+7.8%), `nbody` (+5.1%): sieve's u128 multiply/divide chain
-  stays slow-side (was +10.4% last run, worth a bisect); nbody's flip from
-  −16.9% to +5.1% needs investigation — it moved far more than noise
-  between runs.
-- `matmul` (+1.8%) and `hmget` (+2.3%): hmget is consistently slow-side.
+- `eqbug` (+6.7%): the per-iteration `black_box` kernel — see the eqbug
+  note above for what the residual is made of.
+- `sieve` (+10.5% criterion, −6% interleaved A/B): measurement noise on
+  a memory-bound kernel; the codegen itself is at parity or tighter.
+- `nbody` (+2.9%) and `hmget` (+2.5%): hmget's residual is a
+  self-feeding invariant's spill pair per iteration.
 
 ## WebAssembly
 
@@ -237,8 +246,12 @@ VEX-128 forms on for the ops that have `use_avx*` rules).
 
 ## What is next
 
-- `sieve`: bisect the +7.8% regression.
-- `nbody`: investigate the −17% → +5% flip between runs.
+- `nbody` (+2.9%): investigate — flip-flops between runs.
+- `hmget` (+2.5%): self-feeding invariant's spill pair per iteration;
+  needs regalloc-level remat/pressure work.
+- `eqbug` (+6.7%): residual is LLVM's `*m`-form black_box folding the
+  narrow truncation into the barrier's store/load pair for free, plus
+  per-iteration constant rematerialisation under register pressure.
 - `black_box`: done — the CLIF `black_box` op (vendored Cranelift patch
   22) emits zero instructions, matching LLVM's `asm("" : "r,~{memory}")`.
   wasm still uses the volatile-load fallback.

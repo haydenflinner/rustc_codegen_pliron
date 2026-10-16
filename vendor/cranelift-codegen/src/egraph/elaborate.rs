@@ -416,6 +416,7 @@ impl<'a> Elaborator<'a> {
         remat_values: &FxHashSet<Value>,
         func: &mut Function,
         remat_copies: &mut FxHashMap<(Block, Value), Value>,
+        loop_analysis: &LoopAnalysis,
         insert_block: Block,
         before: Inst,
         arg: &mut ElaboratedValue,
@@ -428,6 +429,17 @@ impl<'a> Elaborator<'a> {
         // currently rematerialized. Right now we don't do this, to
         // avoid the need for another fixpoint loop here.
         if arg.in_block != insert_block && remat_values.contains(&arg.value) {
+            // PLIRON: never remat into a deeper loop — the clone
+            // executes once per iteration, strictly more often than
+            // the def, so it loses to keeping the value in a vreg no
+            // matter how cheap the materialization (a radix constant
+            // deduped above the word loop got re-sunk into every
+            // per-digit block).
+            if loop_analysis.loop_level(insert_block).level()
+                > loop_analysis.loop_level(arg.in_block).level()
+            {
+                return false;
+            }
             let new_value = match remat_copies.entry((insert_block, arg.value)) {
                 HashEntry::Occupied(o) => *o.get(),
                 HashEntry::Vacant(v) => {
@@ -638,6 +650,7 @@ impl<'a> Elaborator<'a> {
                             &self.remat_values,
                             &mut self.func,
                             &mut self.remat_copies,
+                            self.loop_analysis,
                             insert_block,
                             before,
                             arg_value,
@@ -785,6 +798,7 @@ impl<'a> Elaborator<'a> {
                     &self.remat_values,
                     &mut self.func,
                     &mut self.remat_copies,
+                    self.loop_analysis,
                     block,
                     inst,
                     &mut new_arg,
