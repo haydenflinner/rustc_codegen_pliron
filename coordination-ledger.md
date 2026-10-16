@@ -1962,3 +1962,27 @@ shaving; the box's noise floor swamps ~2%).
 Bench harness: `PLIRON_CORPUS=<dir>` dumps pre-pipeline CLIF per fn;
 `clif-check bench <dir> [reps]` replays + prints per-step times.
 Corpus at `/tmp/corpus` (55.3k fns), subset `/tmp/corpus-s` (4k).
+
+## slp → shared uses snapshot (3e8331b)
+
+`slp::Uses` no longer owns its CSR arrays; it wraps `Rc<uses::Uses>`
+from `Analysis::uses` plus a `&RefCell<FxHashSet<Inst>>` tombstone set
+owned by `run()` for the whole pass. Applies `remove()` member insts
+into `dead`; xpack also extends `dead` with `apply_pair`'s removals
+(`dead` lanes + non-`keep` kept-lanes — NOT `sink`, which is only
+repositioned; tombstoning live insts would undercount uses and let a
+plan drop a lane a moved inst still reads). Refetches go through
+`an.uses(func)`: applies emit insts so `num_insts` usually changed →
+fresh rebuild == old rebuild semantics; same-shape refetches get the
+stale snapshot + tombstones. Laziness kept via `Option<Uses>` —
+functions with no candidate runs never fetch the index. `Analysis`
+grew a `&self` `domtree()` accessor so `uses()` can be called while
+the domtree borrow is held (`cfg_dt` pins `&mut self`).
+
+`clif-check corpus` falls back to the flat `*.clif` glob when no
+`before.clif` dirs exist, so a `PLIRON_CORPUS` dump is directly
+diffcheckable.
+
+Verify: `cargo test -p pliron-clif-opt` green; `clif-check corpus` on
+200 corpus fns → 0 mismatches; `cargo check` clean post-rebase onto
+9c5e3b0 (SmallVec operand vectors).
