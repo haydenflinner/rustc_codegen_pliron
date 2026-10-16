@@ -1012,10 +1012,17 @@ impl X<'_> {
                         self.colmap.insert((a, b), row);
                         return Some(Pack::Op { op: oa, args, row });
                     }
+                    // Rolled-back rows own their `members` entries: the
+                    // `!members.contains` guard above only ever inserts
+                    // fresh insts, so remove just the truncated pairs
+                    // instead of rebuilding the whole set.
+                    for &(x, y) in &self.rows[row..] {
+                        self.members.remove(&x);
+                        self.members.remove(&y);
+                    }
                     self.rows.truncate(row);
                     self.loads.truncate(n_loads);
                     self.min_load = min_load;
-                    self.members = self.rows.iter().flat_map(|&(x, y)| [x, y]).collect();
                     self.colmap.retain(|_, &mut r| r < row);
                 }
                 if dbg {
@@ -1816,22 +1823,21 @@ fn xpack_block(
         // Seed check: xpack pairs need ≥2 stores or ≥2 same-opcode
         // vecable insts among the remaining insts. Skip the
         // whole-function use-map build when no pair can form.
-        let mut nstores = 0u32;
-        let mut dup = false;
-        let mut vecops: FxHashMap<Opcode, u32> = FxHashMap::default();
-        for &i in &insts {
+        // `byop` is also the candidate index: the seed scan below would
+        // otherwise re-scan `insts[p+1..]` per `ia` — O(n²) per round on
+        // blocks with few same-opcode insts.
+        let mut byop: FxHashMap<Opcode, Vec<usize>> = FxHashMap::default();
+        for (k, &i) in insts.iter().enumerate() {
             if taken.contains(&i) {
                 continue;
             }
             let op = func.dfg.insts[i].opcode();
-            if op == Opcode::Store {
-                nstores += 1;
-            } else if vecable(op) && res_of(func, i).is_some() {
-                let c = vecops.entry(op).or_insert(0);
-                *c += 1;
-                dup |= *c >= 2;
+            if op == Opcode::Store || (vecable(op) && res_of(func, i).is_some()) {
+                byop.entry(op).or_default().push(k);
             }
         }
+        let nstores = byop.get(&Opcode::Store).map_or(0, |v| v.len());
+        let dup = byop.iter().any(|(&o, v)| o != Opcode::Store && v.len() >= 2);
         if nstores < 2 && !dup {
             return total;
         }
@@ -1884,14 +1890,17 @@ fn xpack_block(
                 continue;
             }
             let mut cands = 0;
-            for &ib in &insts[p + 1..] {
+            // `byop` entries are already non-taken and opcode-matched;
+            // positions are in order, so this is the first ≤4 later hits.
+            for &q in byop.get(&op).map_or(&[][..], |v| &v[..]) {
+                if q <= p {
+                    continue;
+                }
                 if cands >= 4 {
                     break;
                 }
-                if taken.contains(&ib) || func.dfg.insts[ib].opcode() != op {
-                    continue;
-                }
                 cands += 1;
+                let ib = insts[q];
                 let mut try_plan = |a: Inst, b: Inst| {
                     // Store-pair plans resolve memory footprints through
                     // upstream address chains that eviction can't cheaply
