@@ -562,3 +562,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     (loop, block) pair inside `layout.blocks()` filters — O(loops ×
     blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
     profile.
+
+47. Seedable `cfg`/`domtree` in `Context::optimize` (`src/context.rs`):
+    the initial `compute_cfg`/`compute_domtree` pair is now guarded by
+    `is_valid()` — the pliron pipeline moves its own exact analyses
+    (built by `Analysis` on the final IR) into the context before
+    `compile`, so emit no longer rebuilds them per function. Paths
+    that mutate the function after seeding (the narrow-vector
+    `veclegalize` retry in pliron-clif-lower) must `clear()` both.

@@ -846,6 +846,9 @@ pub fn lower_module(
                     break defr;
                 }
                 vec_retry += 1;
+                // Seeded cfg/domtree describe the pre-legalize func.
+                clctx.cfg.clear();
+                clctx.domtree.clear();
                 continue;
             }
             break defr;

@@ -921,6 +921,15 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     p.stats.cfg_builds += an.cfg_builds;
     p.stats.dt_builds += an.dt_builds;
     p.stats.la_builds += an.la_builds;
+    // Hand the pipeline's cfg/domtree to the Context — still exact for
+    // the final IR state (`Some` implies `cfg_fp` matched at last
+    // materialize and nothing invalidated since), so `optimize()`
+    // skips its per-fn rebuild.
+    if let (Some(c), Some(d)) = (an.cfg.take(), an.dt.take()) {
+        p.clctx.cfg = c;
+        p.clctx.domtree = d;
+        tracing::debug!(target: "pliron::pipeline", "seeded cfg+dt for {}", p.fname);
+    }
     found
 }
 
