@@ -5316,7 +5316,7 @@
 ;; fmin/fmax reuse the NaN-safe packed sequences, hoisted into helpers so
 ;; the F32X4 rules above stay verbatim.
 (decl pliron_f32_min_ps (Xmm Xmm) Xmm)
-(rule (pliron_f32_min_ps (put_in_xmm x) (put_in_xmm y))
+(rule (pliron_f32_min_ps x y)
       (let ((min1 Xmm (x64_minps x y))
             (min2 Xmm (x64_minps y x))
             (min_or Xmm (x64_orps min1 min2))
@@ -5326,7 +5326,7 @@
             (final Xmm (x64_andnps nan_fraction_mask min_or_2)))
         final))
 (decl pliron_f32_max_ps (Xmm Xmm) Xmm)
-(rule (pliron_f32_max_ps (put_in_xmm x) (put_in_xmm y))
+(rule (pliron_f32_max_ps x y)
       (let ((max1 Xmm (x64_maxps x y))
             (max2 Xmm (x64_maxps y x))
             (max_xor Xmm (x64_xorps max1 max2))
