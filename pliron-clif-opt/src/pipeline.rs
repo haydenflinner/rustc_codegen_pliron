@@ -1220,7 +1220,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
 // rebundled the dispatch's uses behind edge args (the `select→icmp`
 // discriminant in the pred then folds to `brif` on the raw flag via
 // `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
-fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof2 = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
     let tt = |name: &str, t0: std::time::Instant| {
@@ -1263,7 +1263,7 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
         cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
             let t0 = std::time::Instant::now();
-            n += jumpthread::rebind_exports(&mut p.clctx.func);
+            n += jumpthread::rebind_exports(&mut p.clctx.func, an);
             tt("rebind", t0);
         }
         let t0 = std::time::Instant::now();
@@ -2071,8 +2071,8 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `brif (icmp cc (select c, K, x), K)` niche-select dispatch →
 // `brif c` + a middle block testing `x` — see
 // `jumpthread::split_niche_tests`.
-fn s_seltest(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = jumpthread::split_niche_tests(&mut p.clctx.func);
+fn s_seltest(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = jumpthread::split_niche_tests(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("seltest");
     }
