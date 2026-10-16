@@ -1986,3 +1986,17 @@ diffcheckable.
 Verify: `cargo test -p pliron-clif-opt` green; `clif-check corpus` on
 200 corpus fns → 0 mismatches; `cargo check` clean post-rebase onto
 9c5e3b0 (SmallVec operand vectors).
+
+## jumpthread Uses::new → an.uses (523a7e1) — closes the "unshared Uses" note
+
+The `~4s of unshared Uses::new` flag is now handled: slp (3e8331b) +
+jumpthread `split_niche_tests`/`rebind_exports` (this commit). Both
+take `&Analysis`; refetch is keyed on (ver, num_insts) so it rebuilds
+exactly when shape changed and shares otherwise. Stale-snapshot
+direction is overcount-uses → conservative-safe at both sites.
+
+Deliberately left unshared: `memspec` (2 builds — num_insts-net-zero
+mutations make the key lie, and escape queries can't undercount) and
+`bcheck::unswitch_loop`'s sweep (clone-added uses missing from a stale
+snapshot = dangling-block miscompile). Those need `refresh_uses`,
+which costs what `Uses::new` costs — no win, real risk.
