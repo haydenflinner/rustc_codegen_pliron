@@ -58,11 +58,29 @@ TID = re.compile(r"thread '([^']+)' \(\d+\) panicked")
 # hex digits; longer hex runs are more likely real data than addresses.
 ADDR = re.compile(r"0x[0-9a-fA-F]+|(?<![0-9a-zA-Z_.])[0-9a-f]{9,12}(?![0-9a-zA-Z_.])")
 LIBTEST = re.compile(r"^running \d+ tests$|^test result:", re.M)
-# JS-side noise on wasm run failures: module hashes, function indices and node
-# internals differ across backends and aren't part of the program's behavior.
+# JS-side noise on wasm run failures: module hashes, function indices and
+# runtime internals differ across backends and aren't part of the program's
+# behavior. wasmtime's trap reports carry the same kind of noise.
 WASM_NOISE = re.compile(
     r"^.*(wasm://wasm/|RuntimeError|node:internal|Node\.js v|ExperimentalWarning"
-    r"|trace-warnings|panic at wasm|\(Use `node).*$", re.M)
+    r"|trace-warnings|panic at wasm|\(Use `node|wasm backtrace|error while "
+    r"executing|failed to run|Caused by:|<unknown>!|wasmtime).*$", re.M)
+
+# Preferred wasm runner: wasmtime if installed (node's WASI on Windows lacks
+# fd_readdir, and wasmtime is a closer match to a real WASI host), else node.
+def _find_wasmtime():
+    import glob, shutil
+    w = shutil.which("wasmtime")
+    if w:
+        return w
+    for c in glob.glob(os.path.expanduser("~/bin/wasmtime/*/wasmtime*")) \
+            + [os.path.expanduser("~/bin/wasmtime/wasmtime")]:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+WASMTIME = _find_wasmtime() if TGT else None
 
 
 def wasm_norm(s):
@@ -192,6 +210,28 @@ def build_and_run(path, sp, exe, backend):
 def exec_bin(path, sp, exe):
     if TGT:
         d = os.path.dirname(path)
+        if WASMTIME:
+            # wasmtime: argv0 + args positionally, env via --env, preopens via
+            # --dir HOST::GUEST (guest "." is skipped — WASI has no cwd; tests
+            # behave identically on both backends since the same runner is
+            # used for both sides of the diff).
+            wcmd = [WASMTIME, "run", f"--argv0={exe}"]
+            for k, v in sp["env"]:
+                wcmd += ["--env", f"{k}={v}"]
+            for guest, host in ((d, d),
+                                ("/tmp", os.environ.get("TMPDIR", "/tmp"))):
+                wcmd += ["--dir", f"{host}::{guest}"]
+            wcmd += [exe] + sp["rflags"]
+            try:
+                r = subprocess.run(wcmd, capture_output=True, text=True,
+                                   timeout=60, env=dict(os.environ))
+            except subprocess.TimeoutExpired:
+                return "run-timeout", "", None
+            except OSError as ex:
+                return "run-error", str(ex), None
+            out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
+            err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
+            return "ran", "", (r.returncode, out, err)
         cfg = {"args": [exe] + sp["rflags"],
                "env": dict(sp["env"]),
                "preopens": {d: d, ".": d, "/tmp": os.environ.get("TMPDIR", "/tmp")}}

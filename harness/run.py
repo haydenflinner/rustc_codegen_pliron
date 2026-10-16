@@ -319,8 +319,9 @@ def suite_ui_wasm(args):
     if not os.path.isdir(stock_lib):
         print(f"ui-wasm: stock rustc has no {tgt} std (rustup target add {tgt})")
         return {}
-    if shutil.which("node") is None:
-        print("ui-wasm: node not found"); return {}
+    import glob
+    if shutil.which("node") is None and shutil.which("wasmtime") is None             and not glob.glob(os.path.expanduser("~/bin/wasmtime/*/wasmtime*")):
+        print("ui-wasm: neither wasmtime nor node found"); return {}
     libdir = ui_wasm_sysroot(args)
     if libdir is None:
         return {}

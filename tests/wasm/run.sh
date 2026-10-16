@@ -32,17 +32,36 @@ ln -sf libpliron_wasi_libc.a "$WASI_LIBC/libc.a"
 printf '!<arch>\n' > "$WASI_LIBC/libunwind.a"
 (cd tests/wasm/wasi && RUSTFLAGS="$RUSTFLAGS -Clink-self-contained=no -Lnative=$WASI_LIBC" \
   cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_abort)
-# node on Windows lacks fd_readdir (errno 52), so the wasi fs leg can't pass there.
-wasi_run=(node --no-warnings tests/wasm/run_wasi.mjs "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasmwasitest.wasm")
-if [ -n "$exe" ]; then "${wasi_run[@]}" || echo "(wasi fs leg failed on Windows host; ignored)"; else "${wasi_run[@]}"; fi
+# Prefer wasmtime: node's WASI on Windows lacks fd_readdir (errno 52) so the
+# fs leg can't pass there; node remains the fallback runner via run_wasi.mjs.
+WT=$(command -v wasmtime 2>/dev/null || true)
+if [ -z "$WT" ]; then
+  for cand in "$HOME"/bin/wasmtime/*/wasmtime.exe "$HOME"/bin/wasmtime/wasmtime; do
+    [ -x "$cand" ] && WT=$cand && break
+  done
+fi
+wtd=$(mktemp -d)
+wtd_w=$(cygpath -m "$wtd" 2>/dev/null || echo "$wtd")
+if [ -n "$WT" ]; then
+  "$WT" run --argv0=wasitest "--dir=$wtd_w" --env HELLO=world --env "WASI_DIR=$wtd_w" \
+    "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasmwasitest.wasm" a1
+else
+  wasi_run=(node --no-warnings tests/wasm/run_wasi.mjs "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasmwasitest.wasm")
+  if [ -n "$exe" ]; then "${wasi_run[@]}" || echo "(wasi fs leg failed on Windows host; ignored)"; else "${wasi_run[@]}"; fi
+fi
 # panic=unwind: emulated EH (__pliron_eh flag+exn) — catch_unwind, drop order,
 # payloads, resume_unwind.
 (cd tests/wasm/unwind && \
   RUSTFLAGS="$RUSTFLAGS -Cpanic=unwind -Clink-self-contained=no -Lnative=$WASI_LIBC" \
   CARGO_TARGET_DIR=$CARGO_TARGET_DIR/eh \
   cargo build -q --release --target wasm32-wasip1 -Zbuild-std=std,panic_unwind)
-node --no-warnings tests/wasm/run_wasi.mjs \
-  "$CARGO_TARGET_DIR/eh/wasm32-wasip1/release/wasmunwindtest.wasm"
+if [ -n "$WT" ]; then
+  "$WT" run --argv0=wasitest "--dir=$wtd_w" --env HELLO=world --env "WASI_DIR=$wtd_w" \
+    "$CARGO_TARGET_DIR/eh/wasm32-wasip1/release/wasmunwindtest.wasm"
+else
+  node --no-warnings tests/wasm/run_wasi.mjs \
+    "$CARGO_TARGET_DIR/eh/wasm32-wasip1/release/wasmunwindtest.wasm"
+fi
 # panic=unwind on wasm32-unknown-unknown: same emulated EH via the literal
 # `llvm.wasm.throw` symbol std's unwind::wasm uses.
 (cd tests/wasm/unwind-unknown && \
