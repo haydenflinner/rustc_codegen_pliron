@@ -254,9 +254,14 @@ fn mem_loc(
         _ => return None,
     };
     let w = mem_width(func, i)?;
+    // The demand must key under the *normalized* root: a `noalias`-marked
+    // `stack_addr` (scope name) peels to its slot, matching stores that
+    // reach the same slot through unmarked `stack_addr`s. With the raw
+    // root the two key differently — a load's demand lands under `V(v)`
+    // while the slot's stores sit under `S(ss)`, so a live store dies.
     let (r, o) = *memo
         .entry(addr)
-        .or_insert_with(|| loadfwd::root(func, ps, na, addr));
+        .or_insert_with(|| loadfwd::norm_root(func, ps, na, addr));
     Some((r, o.wrapping_add(i64::from(off)), w))
 }
 
@@ -541,12 +546,32 @@ pub fn run(
         return 0;
     }
     let t_fix = t.elapsed() - t_dec;
+    let dump = crate::env_set("PLIRON_DSE_DUMP");
+    if dump {
+        eprintln!("dse-dump {fname} iso={iso:?}");
+        for &b in &order {
+            eprintln!(
+                "  {b:?} inn tops={}/{} locs={:?} roots={:?} cov={:?}",
+                inn[b].top_non_iso,
+                inn[b].top_non_stack,
+                inn[b].locs,
+                inn[b].roots,
+                inn[b].cov
+            );
+        }
+    }
     let mut dead = Vec::new();
     // Only a block holding a killable store can produce a dead inst —
     // skip the re-transfer for every other reachable block.
     for &b in &store_blks {
         let mut d = out[b].clone();
+        if dump {
+            eprintln!("  sweep {b:?} out locs={:?} tops={}/{}", d.locs, d.top_non_iso, d.top_non_stack);
+        }
         transfer(&ops[b], &mut d, iso, Some(&mut dead));
+    }
+    if dump {
+        eprintln!("  dead={dead:?}");
     }
     for i in &dead {
         func.layout.remove_inst(*i);
