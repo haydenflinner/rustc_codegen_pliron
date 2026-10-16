@@ -235,7 +235,7 @@ impl Ctx<'_> {
                 }
                 Some(_) => self
                     .domtree
-                    .dominates(inst, self.insts[self.emit], &self.func.layout),
+                    .try_dominates(inst, self.insts[self.emit], &self.func.layout),
             },
             ValueDef::Union(..) => false,
         }
@@ -1147,7 +1147,7 @@ impl X<'_> {
                 }
                 Some(_) => self
                     .domtree
-                    .dominates(inst, self.insts[self.emit], &self.func.layout),
+                    .try_dominates(inst, self.insts[self.emit], &self.func.layout),
             },
             ValueDef::Union(..) => false,
         }
@@ -1466,7 +1466,7 @@ fn ext_ok(x: &X<'_>, u: Inst) -> bool {
     if x.func.layout.inst_block(u) == Some(x.block) {
         pos_get(x.pos, u).is_some_and(|p| p > x.emit)
     } else {
-        x.domtree.dominates(x.insts[x.emit], u, &x.func.layout)
+        x.domtree.try_dominates(x.insts[x.emit], u, &x.func.layout)
     }
 }
 

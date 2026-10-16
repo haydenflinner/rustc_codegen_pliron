@@ -651,7 +651,7 @@ fn find_count(
             if !cfg
                 .pred_iter(h)
                 .filter(|p| !body.contains(&p.block))
-                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+                .all(|p| dt.try_dominates(bi, p.inst, &func.layout))
             {
                 continue;
             }
@@ -668,7 +668,7 @@ fn find_count(
                 // never dominate the header, so loop-carried values are
                 // still rejected.)
                 cranelift_codegen::ir::ValueDef::Param(bb, _)
-                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                    if bb != h && dt.try_dominates(bb, h, &func.layout) => {}
                 _ => continue,
             }
         }
@@ -1928,7 +1928,7 @@ pub(crate) fn latch_count(
             if !cfg
                 .pred_iter(h)
                 .filter(|p| !body.contains(&p.block))
-                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+                .all(|p| dt.try_dominates(bi, p.inst, &func.layout))
             {
                 return None;
             }
@@ -1946,7 +1946,7 @@ pub(crate) fn latch_count(
                     bpidx = Some(q);
                 }
                 cranelift_codegen::ir::ValueDef::Param(bb, _)
-                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                    if bb != h && dt.try_dominates(bb, h, &func.layout) => {}
                 _ => return None,
             }
         }

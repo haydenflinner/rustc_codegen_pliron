@@ -1207,7 +1207,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                     ValueDef::Param(cb, _) => ProgramPoint::Block(cb),
                     _ => continue,
                 };
-                if !dt.dominates(pp, inst, &func.layout) {
+                if !dt.try_dominates(pp, inst, &func.layout) {
                     continue;
                 }
                 // `p == 0` ⇔ arm `az` taken ⇔ (az ? c : !c); `ne` inverts.
@@ -1705,7 +1705,7 @@ fn map_val(
             ValueDef::Param(db, _) => ProgramPoint::Block(db),
             _ => return false,
         };
-        if !dom.dominates(pp, pinst, &func.layout) {
+        if !dom.try_dominates(pp, pinst, &func.layout) {
             return false;
         }
         out.push(Arg::V(v));
@@ -2125,7 +2125,7 @@ pub(crate) fn round<'a>(
                                         break;
                                     }
                                 };
-                                if !domtree.dominates(pp, q, &func.layout) {
+                                if !domtree.try_dominates(pp, q, &func.layout) {
                                     okr = false;
                                     break;
                                 }
@@ -2253,7 +2253,7 @@ pub(crate) fn round<'a>(
             ValueDef::Param(db, _) => ProgramPoint::Block(db),
             _ => return false,
         };
-        if !domtree.dominates(pp, u, &func.layout) {
+        if !domtree.try_dominates(pp, u, &func.layout) {
             return false;
         }
         let Some(db) = def_block(v) else {
@@ -2728,7 +2728,7 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
                     }
                     ValueDef::Result(di, _) => {
                         func.layout.inst_block(di) == Some(y)
-                            || dom.dominates(di, term, &func.layout)
+                            || dom.try_dominates(di, term, &func.layout)
                     }
                     _ => false,
                 };
@@ -2940,7 +2940,7 @@ fn bypass_forwarders(func: &mut Function) -> usize {
                     }
                     let ok = match func.dfg.value_def(v) {
                         ValueDef::Result(i, _) => {
-                            i != pinst && domtree.dominates(i, pinst, &func.layout)
+                            i != pinst && domtree.try_dominates(i, pinst, &func.layout)
                         }
                         ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                         _ => false,
@@ -3646,7 +3646,7 @@ pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Va
             if let In::One(v) = *s
                 && let Some(d) = def_block(func, v)
                 && d != b
-                && dt.dominates(d, b, &func.layout)
+                && dt.try_dominates(d, b, &func.layout)
             {
                 rm.push((b, i, ps[i], v));
             }

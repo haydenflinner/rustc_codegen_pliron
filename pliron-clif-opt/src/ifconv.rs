@@ -324,7 +324,7 @@ fn edge_ok(
                     ValueDef::Result(di, _) => {
                         let db = func.layout.inst_block(di).unwrap_or(m);
                         !chains.contains(&db)
-                            && (mset.contains(&db) || domtree.dominates(di, term, &func.layout))
+                            && (mset.contains(&db) || domtree.try_dominates(di, term, &func.layout))
                     }
                     _ => true,
                 })
@@ -679,7 +679,7 @@ fn conv_table(
                 continue;
             }
             let dom = match func.dfg.value_def(v) {
-                ValueDef::Result(di, _) => domtree.dominates(di, term, &func.layout),
+                ValueDef::Result(di, _) => domtree.try_dominates(di, term, &func.layout),
                 ValueDef::Param(db, _) => domtree.block_dominates(db, b),
                 _ => false,
             };

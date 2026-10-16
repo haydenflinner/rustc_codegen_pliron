@@ -393,7 +393,7 @@ fn run_loop(
     // body — not a given: LoopAnalysis admits irreducible bodies with
     // external entries bypassing it.
     let pb = func.layout.inst_block(pinst).unwrap();
-    if !dt.dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
+    if !dt.try_dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.try_dominates(h, b, &func.layout))
     {
         if debug {
             if pliron_cfg::tracing_on() {
@@ -411,8 +411,8 @@ fn run_loop(
             return false;
         }
         match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
-            ValueDef::Param(b, _) => dt.dominates(b, pinst, &func.layout),
+            ValueDef::Result(i, _) => dt.try_dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.try_dominates(b, pinst, &func.layout),
             _ => false,
         }
     };
@@ -628,7 +628,7 @@ fn run_loop(
                 }
             }
             if exits.is_empty()
-                || !exits.iter().all(|&(t, _)| dt.dominates(s, t, &func.layout))
+                || !exits.iter().all(|&(t, _)| dt.try_dominates(s, t, &func.layout))
                 || !exits.iter().all(|&(t, slot)| {
                     func.dfg.insts[t]
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot]
@@ -983,8 +983,8 @@ fn promote_loc(
     // covers all of them.
     if let Root::V(v) = loc.0 {
         let ok = match func.dfg.resolved_value_def(v) {
-            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
-            ValueDef::Param(b, _) => dt.dominates(b, pb, &func.layout),
+            ValueDef::Result(i, _) => dt.try_dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.try_dominates(b, pb, &func.layout),
             _ => false,
         };
         if !ok {

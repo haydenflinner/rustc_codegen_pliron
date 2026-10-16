@@ -353,6 +353,24 @@ impl DominatorTree {
         }
     }
 
+    /// PLIRON: like `dominates`, but returns `false` when either
+    /// program point is no longer in the layout instead of panicking.
+    /// A tombstoned inst/block cannot dominate anything; callers that
+    /// hold possibly-stale captures should use this.
+    pub fn try_dominates<A, B>(&self, a: A, b: B, layout: &Layout) -> bool
+    where
+        A: Into<ProgramPoint>,
+        B: Into<ProgramPoint>,
+    {
+        let pp_in_layout = |pp: ProgramPoint| match pp {
+            ProgramPoint::Block(b) => layout.is_block_inserted(b),
+            ProgramPoint::Inst(i) => layout.inst_block(i).is_some(),
+        };
+        let a = a.into();
+        let b = b.into();
+        pp_in_layout(a) && pp_in_layout(b) && self.dominates(a, b, layout)
+    }
+
     /// Returns `true` if `block_a` dominates `block_b`.
     ///
     /// A block is considered to dominate itself.

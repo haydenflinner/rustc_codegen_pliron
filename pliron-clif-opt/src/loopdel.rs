@@ -334,7 +334,7 @@ fn finite(
     for b in func.layout.blocks().filter(|&b| la.is_in_loop(b, lp)) {
         if !latches
             .iter()
-            .all(|&(l, _)| dt.dominates(b, l, &func.layout))
+            .all(|&(l, _)| dt.try_dominates(b, l, &func.layout))
         {
             continue;
         }
@@ -492,7 +492,7 @@ fn fold_inc_overflow(func: &mut Function) -> usize {
                 let tgt = blocks[e].block(&func.dfg.value_lists);
                 if tgt != blocks[1 - e].block(&func.dfg.value_lists)
                     && cfg.pred_iter(tgt).count() == 1
-                    && dt.dominates(tgt, b, &func.layout)
+                    && dt.try_dominates(tgt, b, &func.layout)
                 {
                     todo.push(t);
                     break;

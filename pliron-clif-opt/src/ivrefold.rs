@@ -201,7 +201,7 @@ fn refold_header(
             return 0;
         };
         // An edge from inside `h`'s dominance region is a back edge.
-        if src == h || domtree.dominates(h, src, &func.layout) {
+        if src == h || domtree.try_dominates(h, src, &func.layout) {
             backs.push((i, d));
         } else {
             entries.push((i, d));
@@ -368,7 +368,7 @@ fn refold_header(
         let mut out_live = FxHashSet::default();
         for b in func.layout.blocks() {
             let body_b = body.contains(&b);
-            let dom_h = domtree.dominates(b, h, &func.layout);
+            let dom_h = domtree.try_dominates(b, h, &func.layout);
             if body_b || dom_h {
                 for i in func.layout.block_insts(b) {
                     for v in func.dfg.inst_values(i) {
@@ -613,7 +613,7 @@ fn refold_header(
                 };
                 let eb = func.layout.inst_block(ei);
                 if !matches!((db, eb), (Some(db), Some(eb))
-                        if domtree.dominates(db, eb, &func.layout))
+                        if domtree.try_dominates(db, eb, &func.layout))
                 {
                     continue;
                 }
@@ -753,7 +753,7 @@ fn refold_header(
             let a_step = func.dfg.resolve_aliases(back_args[j][ai]);
             let step_reaches = |pos: Inst| -> bool {
                 match func.dfg.value_def(a_step) {
-                    ValueDef::Result(si, _) => domtree.dominates(si, pos, &func.layout),
+                    ValueDef::Result(si, _) => domtree.try_dominates(si, pos, &func.layout),
                     _ => false,
                 }
             };
@@ -998,7 +998,7 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
         if !es.iter().any(|&(i, _)| {
             func.layout
                 .inst_block(i)
-                .is_some_and(|src| src == h || domtree.dominates(h, src, &func.layout))
+                .is_some_and(|src| src == h || domtree.try_dominates(h, src, &func.layout))
         }) {
             continue;
         }

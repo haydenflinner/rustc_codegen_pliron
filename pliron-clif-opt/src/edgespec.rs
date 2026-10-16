@@ -525,7 +525,7 @@ impl<'a> W<'a> {
                     let ib = self.func.layout.inst_block(i);
                     if let Some(b) = ib
                         && !skipped.contains(&b)
-                        && self.dom.dominates(i, self.pterm, &self.func.layout)
+                        && self.dom.try_dominates(i, self.pterm, &self.func.layout)
                     {
                         return Some(A::V(v));
                     }
@@ -675,7 +675,7 @@ impl<'a> W<'a> {
                 ConeDef::Param(b) => b,
                 ConeDef::Res(di, b) => {
                     if !skipped.contains(&b)
-                        && self.dom.dominates(di, self.pterm, &self.func.layout)
+                        && self.dom.try_dominates(di, self.pterm, &self.func.layout)
                     {
                         continue;
                     }
@@ -1092,7 +1092,7 @@ fn prep_args(
             }
             ValueDef::Result(i, _) => {
                 let inst = func.dfg.insts[i];
-                if func.layout.inst_block(i).is_some() && dom.dominates(i, pterm, &func.layout) {
+                if func.layout.inst_block(i).is_some() && dom.try_dominates(i, pterm, &func.layout) {
                     out.push(A::V(v));
                 } else if let InstructionData::UnaryImm {
                     opcode: Opcode::Iconst,
@@ -1816,7 +1816,7 @@ fn splices(func: &mut Function) -> usize {
                     match func.dfg.value_def(av) {
                         ValueDef::Result(i, _)
                             if func.layout.inst_block(i) != Some(j)
-                                && dom.dominates(i, *pt, &func.layout) =>
+                                && dom.try_dominates(i, *pt, &func.layout) =>
                         {
                             new_args.push(BlockArg::Value(av))
                         }

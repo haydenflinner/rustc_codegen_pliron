@@ -721,7 +721,7 @@ pub fn count(
         step,
         bound,
         stay,
-        post_tested: dt.dominates(store, exit.inst, &func.layout),
+        post_tested: dt.try_dominates(store, exit.inst, &func.layout),
         on_next,
         cc: cond,
         x,
@@ -1335,7 +1335,7 @@ pub fn plan(
     // latches too; a load that does not is unobservable once the loop is
     // replaced.
     for &l in &info.latches {
-        if !dt.dominates(s, l.inst, &func.layout) {
+        if !dt.try_dominates(s, l.inst, &func.layout) {
             why!("conditional store: {:?}", la.loop_header(lp));
         }
     }
@@ -1885,12 +1885,12 @@ fn rmw_locs(
         if !info
             .latches
             .iter()
-            .all(|&l| dt.dominates(st, l.inst, &func.layout))
+            .all(|&l| dt.try_dominates(st, l.inst, &func.layout))
         {
             return None;
         }
         // Each load reads the pre-store value.
-        if !ls.iter().all(|&l| dt.dominates(l, st, &func.layout)) {
+        if !ls.iter().all(|&l| dt.try_dominates(l, st, &func.layout)) {
             return None;
         }
         let sval = func.dfg.resolve_aliases(match func.dfg.insts[st] {

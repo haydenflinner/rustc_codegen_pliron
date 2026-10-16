@@ -1758,7 +1758,7 @@ fn run_loop(
         *lims.entry((lenv, k)).or_insert_with(|| {
             let term = lim_pre
                 .filter(|&pre| {
-                    def_block(func, lenv).is_some_and(|lb| dt.dominates(lb, pre, &func.layout))
+                    def_block(func, lenv).is_some_and(|lb| dt.try_dominates(lb, pre, &func.layout))
                 })
                 .and_then(|pre| func.layout.last_inst(pre));
             let mut at = match term {

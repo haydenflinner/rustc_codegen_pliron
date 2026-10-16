@@ -251,7 +251,7 @@ fn edge_dominates(
     s: Block,
 ) -> bool {
     cfg.pred_iter(s)
-        .all(|q| q.block == p || domtree.dominates(s, q.block, &func.layout))
+        .all(|q| q.block == p || domtree.try_dominates(s, q.block, &func.layout))
 }
 
 /// Map `p`'s edge args to `s`'s block params, so a fact about an argument

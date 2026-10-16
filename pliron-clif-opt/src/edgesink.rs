@@ -229,7 +229,7 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
             let ubs: Vec<Block> = ub.iter().copied().collect();
             let my_loop = la.innermost_loop(b);
             if !ubs.iter().all(|u| {
-                *u != b && la.innermost_loop(*u) == my_loop && dt.dominates(b, *u, &func.layout)
+                *u != b && la.innermost_loop(*u) == my_loop && dt.try_dominates(b, *u, &func.layout)
             }) {
                 continue;
             }
@@ -246,8 +246,8 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
                         ValueDef::Result(d, _) => func
                             .layout
                             .inst_block(d)
-                            .is_some_and(|db| db != *u && dt.dominates(db, *u, &func.layout)),
-                        ValueDef::Param(pb, _) => pb == *u || dt.dominates(pb, *u, &func.layout),
+                            .is_some_and(|db| db != *u && dt.try_dominates(db, *u, &func.layout)),
+                        ValueDef::Param(pb, _) => pb == *u || dt.try_dominates(pb, *u, &func.layout),
                         _ => false,
                     })
             });

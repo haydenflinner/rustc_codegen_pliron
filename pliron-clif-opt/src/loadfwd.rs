@@ -1238,8 +1238,8 @@ fn edge_pre(
             *dom = Some(DominatorTree::with_function(func, cfg));
         }
         let ok = match func.dfg.value_def(arg) {
-            ValueDef::Result(di, _) => dom.as_ref().unwrap().dominates(di, pinst, &func.layout),
-            ValueDef::Param(db, _) => dom.as_ref().unwrap().dominates(db, pinst, &func.layout),
+            ValueDef::Result(di, _) => dom.as_ref().unwrap().try_dominates(di, pinst, &func.layout),
+            ValueDef::Param(db, _) => dom.as_ref().unwrap().try_dominates(db, pinst, &func.layout),
             _ => false,
         };
         if !ok {

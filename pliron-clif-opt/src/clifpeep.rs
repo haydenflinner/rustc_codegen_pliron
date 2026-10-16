@@ -1472,7 +1472,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
             return Some(pargs[k]);
         }
         let ok = match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => i != pinst && domtree.dominates(i, pinst, &func.layout),
+            ValueDef::Result(i, _) => i != pinst && domtree.try_dominates(i, pinst, &func.layout),
             ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
             _ => false,
         };
@@ -1624,7 +1624,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                                 }
                                 let dom = match func.dfg.value_def(v) {
                                     ValueDef::Result(i, _) => {
-                                        i != pinst && domtree.dominates(i, pinst, &func.layout)
+                                        i != pinst && domtree.try_dominates(i, pinst, &func.layout)
                                     }
                                     ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                                     _ => false,
@@ -2656,7 +2656,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             && es.iter().any(|&(i, _)| {
                 func.layout
                     .inst_block(i)
-                    .is_some_and(|eb| dom.dominates(b, eb, &func.layout))
+                    .is_some_and(|eb| dom.try_dominates(b, eb, &func.layout))
             });
         // Shared `diff_b` probe budget for the block's phase-D oracle,
         // dealt out per slot. `diff_b` chases cost tens of µs each and
@@ -7665,7 +7665,7 @@ pub fn vecslot(func: &mut Function) -> usize {
             };
             if !lbytes
                 .iter()
-                .all(|&(_, st)| domtree.dominates(st, l, &func.layout))
+                .all(|&(_, st)| domtree.try_dominates(st, l, &func.layout))
             {
                 all_folded = false;
                 continue;

@@ -279,7 +279,7 @@ fn try_tree(
     let rterm = func.layout.last_inst(root)?;
     match func.dfg.value_def(x) {
         ValueDef::Param(b, _) if b == root || dom.block_dominates(b, root) => {}
-        ValueDef::Result(i, _) if dom.dominates(i, rterm, &func.layout) => {}
+        ValueDef::Result(i, _) if dom.try_dominates(i, rterm, &func.layout) => {}
         _ => return None,
     }
 
@@ -494,7 +494,7 @@ fn prep_args(
                 let live_dom = func
                     .layout
                     .inst_block(i)
-                    .is_some_and(|b| !dead.contains(&b) && dom.dominates(i, rterm, &func.layout));
+                    .is_some_and(|b| !dead.contains(&b) && dom.try_dominates(i, rterm, &func.layout));
                 if live_dom {
                     out.push(A::V(v));
                 } else {

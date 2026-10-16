@@ -456,7 +456,7 @@ impl Webs {
             if let Some(es) = self.edges.get(&blk) {
                 'e: for e in es {
                     for (j, eb) in eps.iter() {
-                        if !eb.iter().any(|&e| self.dt.dominates(e, b, &func.layout)) {
+                        if !eb.iter().any(|&e| self.dt.try_dominates(e, b, &func.layout)) {
                             continue;
                         }
                         let Some(&Some(a)) = e.args.get(*j) else {
