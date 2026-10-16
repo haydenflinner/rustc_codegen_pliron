@@ -79,6 +79,11 @@ fn main() -> ExitCode {
         ["corpus", dir] => {
             let mut files = Vec::new();
             collect(Path::new(dir), &mut files);
+            // A PLIRON_CORPUS dump is flat `<name>.<n>.clif`, not
+            // per-fn `before.clif` dirs — fall back to that layout.
+            if files.is_empty() {
+                collect_clif(Path::new(dir), &mut files);
+            }
             files.sort();
             let mut bad = 0;
             for f in &files {

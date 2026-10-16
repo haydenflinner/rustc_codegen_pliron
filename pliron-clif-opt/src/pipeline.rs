@@ -487,6 +487,13 @@ impl Analysis {
         }
     }
 
+    /// The cached domtree under a shared borrow. Caller must have
+    /// materialized it first (`cfg_dt`/`cfg_dt_la`); lets `&self`
+    /// consumers like `uses()` run while the borrow is held.
+    pub fn domtree(&self) -> &DominatorTree {
+        self.dt.as_ref().expect("Analysis::domtree before cfg_dt")
+    }
+
     /// Recompute whatever is missing, then borrow cfg+domtree.
     pub fn cfg_dt<'a>(&'a mut self, func: &Function) -> (&'a ControlFlowGraph, &'a DominatorTree) {
         self.materialize(func);

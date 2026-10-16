@@ -33,32 +33,29 @@ use cranelift_codegen::ir::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// `v.index() -> insts that use v` (alias-resolved at build), CSR
-/// layout: `vec![SmallVec; num_values]` paid ~40B/value of init plus a
-/// spill alloc for every >4-use value; two passes (count, fill) build
-/// offsets + one flat array instead. Applied packs tombstone their
-/// removed insts into `dead` rather than shifting `flat`, so `off`
-/// stays valid.
-struct Uses {
-    off: Vec<u32>,
-    flat: Vec<Inst>,
-    dead: FxHashSet<Inst>,
+/// `v.index() -> insts that use v` (alias-resolved at build) over the
+/// pipeline's shared `uses::Uses` CSR snapshot (`Analysis::uses`) — one
+/// function walk serves every use-index consumer per IR version.
+/// `dead` tombstones insts this pass removed since the snapshot, so
+/// stale entries read as unused.
+struct Uses<'d> {
+    shared: std::rc::Rc<crate::uses::Uses>,
+    dead: &'d std::cell::RefCell<FxHashSet<Inst>>,
 }
 
-impl Uses {
+impl Uses<'_> {
     /// Insts using `v`, in layout order, minus tombstoned members.
     fn iter(&self, v: usize) -> impl Iterator<Item = Inst> + '_ {
-        let flat: &[Inst] = if v + 1 < self.off.len() {
-            &self.flat[self.off[v] as usize..self.off[v + 1] as usize]
-        } else {
-            &[]
-        };
-        flat.iter().copied().filter(|u| !self.dead.contains(u))
+        self.shared
+            .sites_idx(v)
+            .iter()
+            .map(|&(_, i)| i)
+            .filter(|u| !self.dead.borrow().contains(u))
     }
 
-    /// Drop `i` from every use list that holds it.
-    fn remove(&mut self, i: Inst) {
-        self.dead.insert(i);
+    /// Tombstone `i` — it stays in the snapshot but reads as unused.
+    fn remove(&self, i: Inst) {
+        self.dead.borrow_mut().insert(i);
     }
 }
 
@@ -191,7 +188,7 @@ struct Ctx<'a> {
     /// Earliest position among all packed loads (writer-span check).
     min_load: usize,
     /// Whole-function uses: `v -> set of using insts`.
-    uses: &'a Uses,
+    uses: &'a Uses<'a>,
     /// Members of the current store group (allowed inside the store span).
     members: FxHashSet<Inst>,
 }
@@ -483,48 +480,18 @@ struct StoreInfo {
 }
 
 /// Find groups of stores to `base + i*esz` in one block and pack them.
-/// `uses` is the whole-function use map built once in `run()`; applied
-/// packs remove their member insts' entries so later blocks see a fresh
-/// map. Newly emitted pack insts are *not* added — an unrecorded use can
-/// only keep a scalar lane def alive longer than needed, never corrupt
-/// the plan (lane defs stay unless `remove_dead_insts` proves them dead).
-fn build_uses(func: &Function) -> Uses {
-    let n = func.dfg.num_values();
-    let mut off = vec![0u32; n + 1];
-    // One function walk collects (resolved value index, inst) pairs and
-    // histograms them; the counting-sort scatter then runs over this
-    // dense vec instead of re-walking layout + inst_values + aliases.
-    // Stable order == layout order, matching the old two-scan build.
-    let mut pairs: Vec<(u32, Inst)> = Vec::new();
-    for b2 in func.layout.blocks() {
-        for i in func.layout.block_insts(b2) {
-            for v in func.dfg.inst_values(i) {
-                let idx = func.dfg.resolve_aliases(v).index() as u32;
-                off[idx as usize + 1] += 1;
-                pairs.push((idx, i));
-            }
-        }
-    }
-    for i in 1..=n {
-        off[i] += off[i - 1];
-    }
-    let mut flat = vec![Inst::new(0); off[n] as usize];
-    let mut cur = off.clone();
-    for (idx, i) in pairs {
-        flat[cur[idx as usize] as usize] = i;
-        cur[idx as usize] += 1;
-    }
-    Uses {
-        off,
-        flat,
-        dead: FxHashSet::default(),
-    }
-}
-
-fn try_block(
+/// `uses` is the pipeline's shared whole-function use index; applied
+/// packs tombstone their member insts in `dead` so later blocks see
+/// them as unused. Newly emitted pack insts are *not* recorded — an
+/// unrecorded use can only keep a scalar lane def alive longer than
+/// needed, never corrupt the plan (lane defs stay unless
+/// `remove_dead_insts` proves them dead).
+fn try_block<'d>(
     func: &mut Function,
     domtree: &DominatorTree,
-    uses: &mut Option<Uses>,
+    an: &crate::pipeline::Analysis,
+    uses: &mut Option<Uses<'d>>,
+    dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
     _na: &FxHashSet<Value>,
     block: Block,
     x64: bool,
@@ -606,7 +573,10 @@ fn try_block(
                 }
                 if run.len() == lanes as usize && i32::try_from(run[0].off).is_ok() {
                     let emit = run.iter().map(|s| s.pos).min().unwrap();
-                    let us = uses.get_or_insert_with(|| build_uses(func));
+                    let us = uses.get_or_insert_with(|| Uses {
+                        shared: an.uses(func),
+                        dead: dead_set,
+                    });
                     let plan = Ctx {
                         func: &*func,
                         domtree,
@@ -699,21 +669,27 @@ pub fn run(
     if !simd {
         return 0;
     }
-    // One use map for the whole function, shared by every block's store
-    // grouping — building it per block made this pass O(blocks × insts).
-    // Built lazily on the first candidate run: most functions have no
-    // adjacent-store group at all, so map construction — the pass's
-    // dominant cost — is skipped entirely there.
+    // The use index comes from `Analysis::uses` — one function walk per
+    // IR version shared by every pass that wants one, fetched lazily on
+    // the first candidate run (most functions have no adjacent-store
+    // group, so even the shared build is skipped there). `dead`
+    // tombstones insts removed since the snapshot — it persists across
+    // `uses` resets because a fresh `an.uses` may hand back the same
+    // stale snapshot (removals don't change `num_insts`).
+    let dead_set = std::cell::RefCell::new(FxHashSet::default());
     let mut uses: Option<Uses> = None;
-    let (_, domtree) = an.cfg_dt(func);
+    an.cfg_dt(func);
+    // Re-borrow shared so `an.uses()` can run while `domtree` is held.
+    let an = &*an;
+    let domtree = an.domtree();
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, domtree, &mut uses, na, block, x64);
+        changed += try_block(func, domtree, an, &mut uses, &dead_set, na, block, x64);
     }
-    // try_block's emits aren't recorded in the map (its own checks never
-    // consult them — lane values are scalars it could re-pack, bases are
-    // checked by domination, not use lists). xpack's plans *do* consult
-    // uses of arbitrary values, so it must not see try_block's stale map.
+    // try_block's emits aren't recorded in the index (its own checks
+    // never consult them — lane values are scalars it could re-pack,
+    // bases are checked by domination, not use lists). Dropping the
+    // snapshot just re-fetches the shared one; `dead` persists.
     if changed > 0 {
         uses = None;
     }
@@ -723,7 +699,9 @@ pub fn run(
         // map serves every block.
         let ps = crate::loadfwd::param_src(func);
         for block in func.layout.blocks().collect::<Vec<_>>() {
-            changed += xpack_block(func, &domtree, na, block, &mut uses, &ps, x64);
+            changed += xpack_block(
+                func, &domtree, an, na, block, &mut uses, &dead_set, &ps, x64,
+            );
         }
     }
     if changed > 0 {
@@ -1883,12 +1861,14 @@ fn apply_pair(
 
 /// Greedily pair same-op insts in one block; rebuilds position state after
 /// each applied pack.
-fn xpack_block(
+fn xpack_block<'d>(
     func: &mut Function,
     domtree: &DominatorTree,
+    an: &crate::pipeline::Analysis,
     na: &FxHashSet<Value>,
     block: Block,
-    uses: &mut Option<Uses>,
+    uses: &mut Option<Uses<'d>>,
+    dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
     ps: &FxHashMap<Value, Value>,
     x64: bool,
 ) -> usize {
@@ -1932,9 +1912,15 @@ fn xpack_block(
             return total;
         }
         let pos = block_pos(&insts);
-        // The map is function-wide and shared across blocks; an apply
-        // mutates the IR, so it's rebuilt on the next loop iteration.
-        let us = &*uses.get_or_insert_with(|| build_uses(func));
+        // The index is function-wide and shared across blocks; an apply
+        // mutates the IR, so the snapshot is dropped and refetched on
+        // the next iteration — `an.uses` rebuilds when `num_insts`
+        // changed and otherwise hands back the same index, with the
+        // `dead` tombstones covering the removals.
+        let us = &*uses.get_or_insert_with(|| Uses {
+            shared: an.uses(func),
+            dead: dead_set,
+        });
         if !failed.is_empty() {
             failed.retain(|&(x, y), span| match (pos_get(&pos, x), pos_get(&pos, y)) {
                 (Some(a), Some(b)) => {
@@ -2069,6 +2055,17 @@ fn xpack_block(
         let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
         let n = apply_pair(
             func, &insts, emit_at, &root, vt, &kept, n_rows, &sink, &dead, &extracts, &keep,
+        );
+        // apply_pair removed the `dead` list and every non-`keep` lane
+        // inst (sink stores were only repositioned — tombstoning *them*
+        // would undercount real uses). Mark the removals so a stale
+        // shared snapshot never surfaces them as use sites.
+        dead_set.borrow_mut().extend(
+            dead.iter().copied().chain(
+                kept.iter()
+                    .flat_map(|&(_, (la, lb))| [la, lb])
+                    .filter(|l| !keep.contains(l)),
+            ),
         );
         // Operands that resolved through an extracted value now resolve
         // to the fresh extractlane result — record the post-apply
