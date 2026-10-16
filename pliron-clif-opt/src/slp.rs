@@ -28,8 +28,8 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::{
-    Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
-    ValueDef,
+    Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot, Type,
+    Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -75,6 +75,7 @@ pub(crate) fn vecable(op: Opcode) -> bool {
             | Opcode::Fdiv
             | Opcode::Fmin
             | Opcode::Fmax
+            | Opcode::Fma
             | Opcode::Iadd
             | Opcode::Isub
             | Opcode::Imul
@@ -194,15 +195,31 @@ struct Ctx<'a> {
     uses: &'a Uses,
     /// Members of the current store group (allowed inside the store span).
     members: FxHashSet<Inst>,
+    /// Every packed load: `(inst, pos, linear address, elem bytes)` — the
+    /// ordering check against member stores runs on these once `pack`
+    /// has collected them. Loads anywhere in the block may join a pack
+    /// now (the merged load is emitted at `emit` and moves earlier than
+    /// loads that sat inside the store span), so their positions must be
+    /// validated against the members they may overlap.
+    tloads: Vec<(Inst, usize, Lin, i64)>,
+    /// Every inst the pack consumed (loads and ops). The dead-tree
+    /// check shrinks this set to insts whose uses stay inside
+    /// `members ∪ dead` — those are the scalar lanes that stop being
+    /// observable once the member stores go away.
+    tree: FxHashSet<Inst>,
 }
 
 impl Ctx<'_> {
-    /// `v` is defined by an inst in this block before the emit point.
-    fn inst_before_emit(&self, v: Value) -> Option<Inst> {
+    /// `v` is defined by an inst in this block; returns `(inst, pos)`.
+    /// Position anywhere in the block qualifies — pure ops re-emit at
+    /// `emit` and loads are covered by the member-store ordering check —
+    /// unlike the old `pos < emit` rule that only matched straight-line
+    /// `load; op; store` sequences.
+    fn inst_in_block(&self, v: Value) -> Option<(Inst, usize)> {
         let ValueDef::Result(inst, 0) = self.func.dfg.resolved_value_def(v) else {
             return None;
         };
-        (pos_get(self.pos, inst).is_some_and(|p| p < self.emit)).then_some(inst)
+        pos_get(self.pos, inst).map(|p| (inst, p))
     }
 
     /// `v` is available at the emit point.
@@ -235,19 +252,31 @@ impl Ctx<'_> {
         if vals.iter().all(|&v| v == vals[0]) {
             return self.avail(vals[0]).then_some(Pack::Splat(vals[0]));
         }
-        self.pack_loads(&vals)
-            .or_else(|| self.pack_ops(&vals, depth))
+        // Failed packs must not leak `tloads`/`tree` entries — a stale
+        // load would be treated as re-emitted when it isn't.
+        let snap = (self.tloads.len(), self.tree.clone(), self.min_load);
+        let r = self
+            .pack_loads(&vals)
+            .or_else(|| self.pack_ops(&vals, depth));
+        if r.is_none() {
+            self.tloads.truncate(snap.0);
+            self.tree = snap.1;
+            self.min_load = snap.2;
+        }
+        r
     }
 
     /// All lanes are `load` insts of the same element type/flags at
-    /// consecutive addresses `base + i*esz`.
+    /// consecutive addresses `lin + i*esz` in one block. Lane 0's raw
+    /// address value plus its own immediate becomes the merged access —
+    /// the linear constant is already baked into it.
     fn pack_loads(&mut self, vals: &[Value]) -> Option<Pack> {
         let n = vals.len();
         let mut first = None;
         let mut esz = 0i64;
         let mut flags = None;
         for (i, &v) in vals.iter().enumerate() {
-            let inst = self.inst_before_emit(v)?;
+            let (inst, ipos) = self.inst_in_block(v)?;
             let InstructionData::Load {
                 opcode: Opcode::Load,
                 arg,
@@ -271,24 +300,30 @@ impl Ctx<'_> {
                 _ if esz == e && flags == Some(fl) => {}
                 _ => return None,
             }
-            let (base, off) = base_off(self.func, arg);
-            let off = off + i64::from(offset);
+            let (key, koff) = lin(self.func, arg)?;
+            let off = koff + i64::from(offset);
             match first {
-                None => first = Some((base, off)),
-                Some((b0, o0)) if base == b0 && off == o0 + i as i64 * esz => {}
+                None => first = Some((arg, i64::from(offset), key.clone(), off)),
+                Some((_, _, ref k0, o0)) if *k0 == key && off == o0 + i as i64 * esz => {}
                 _ => return None,
             }
-            self.min_load = self.min_load.min(pos_at(self.pos, inst));
+            self.tloads.push((inst, ipos, (key, off), e));
+            self.tree.insert(inst);
+            self.min_load = self.min_load.min(ipos);
         }
         // The merged vector access must be 8 or 16 bytes.
         if esz * n as i64 != 8 && esz * n as i64 != 16 {
             return None;
         }
-        let (base, off) = first?;
-        i32::try_from(off).ok()?;
+        let (arg, imm, _, _) = first?;
+        i32::try_from(imm).ok()?;
+        // Lane 0's address value is re-emitted at `emit`.
+        if !self.avail(arg) {
+            return None;
+        }
         Some(Pack::Load {
-            base,
-            off,
+            base: arg,
+            off: imm,
             flags: flags?,
         })
     }
@@ -299,7 +334,7 @@ impl Ctx<'_> {
         let mut insts = Vec::with_capacity(vals.len());
         let (mut op, mut ty) = (None, None);
         for &v in vals {
-            let inst = self.inst_before_emit(v)?;
+            let (inst, _) = self.inst_in_block(v)?;
             let o = self.func.dfg.insts[inst].opcode();
             let t = self.func.dfg.value_type(v);
             match (op, ty) {
@@ -321,6 +356,7 @@ impl Ctx<'_> {
                 .collect();
             args.push(self.pack(&col, depth + 1)?);
         }
+        self.tree.extend(insts.iter().copied());
         Some(Pack::Op {
             op: op?,
             args,
@@ -356,6 +392,157 @@ pub(crate) fn base_off(func: &Function, ptr: Value) -> (Value, i64) {
         }
     }
     (base, off)
+}
+
+/// A byte address decomposed as `Σ coeffᵢ·xᵢ + k` over non-additive
+/// leaves: the term multiset (sorted by value) is a canonical key —
+/// addresses built from the same variables with different constants
+/// (`p + (i + k)*esz` vs `p + i*esz`) land in one group. `base_off`'s
+/// `iadd(ptr, iconst)` peel misses that shape once an `imul`-by-esz
+/// wraps the varying index, which is exactly what unrolled loops emit.
+type Lin = (Vec<(Value, i64)>, i64);
+
+/// `lin`'s recursion budget and term cap: real address expressions are a
+/// handful of adds deep; beyond that the form isn't a linear address.
+const LIN_DEPTH: usize = 12;
+const LIN_TERMS: usize = 16;
+
+fn lin(func: &Function, v: Value) -> Option<Lin> {
+    let mut terms: Vec<(Value, i64)> = Vec::new();
+    let mut k = 0i64;
+    lin_add(func, v, 1, &mut terms, &mut k, 0)?;
+    terms.sort_unstable();
+    let mut merged: Vec<(Value, i64)> = Vec::with_capacity(terms.len());
+    for (t, c) in terms {
+        match merged.last_mut() {
+            Some(&mut (lt, ref mut lc)) if lt == t => {
+                *lc = lc.checked_add(c)?;
+            }
+            _ => merged.push((t, c)),
+        }
+    }
+    merged.retain(|&(_, c)| c != 0);
+    Some((merged, k))
+}
+
+/// Fold `mul·v` into the linear form: additive ops recurse, `imul`/`ishl`
+/// by a constant scale the coefficient, everything else is a leaf term.
+fn lin_add(
+    func: &Function,
+    v: Value,
+    mul: i64,
+    terms: &mut Vec<(Value, i64)>,
+    k: &mut i64,
+    depth: usize,
+) -> Option<()> {
+    if depth > LIN_DEPTH || terms.len() > LIN_TERMS {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(c) = iconst_val(func, v) {
+        *k = k.checked_add(c.checked_mul(mul)?)?;
+        return Some(());
+    }
+    let ValueDef::Result(inst, 0) = func.dfg.value_def(v) else {
+        terms.push((v, mul));
+        return Some(());
+    };
+    let leaf = |terms: &mut Vec<(Value, i64)>| {
+        terms.push((v, mul));
+        Some(())
+    };
+    match func.dfg.insts[inst] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [a, b],
+        } => {
+            lin_add(func, a, mul, terms, k, depth + 1)?;
+            lin_add(func, b, mul, terms, k, depth + 1)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: [a, b],
+        } => {
+            lin_add(func, a, mul, terms, k, depth + 1)?;
+            lin_add(func, b, mul.checked_neg()?, terms, k, depth + 1)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args: [a, b],
+        } => {
+            let (x, c) = if let Some(c) = iconst_val(func, b) {
+                (a, c)
+            } else if let Some(c) = iconst_val(func, a) {
+                (b, c)
+            } else {
+                return leaf(terms);
+            };
+            lin_add(func, x, mul.checked_mul(c)?, terms, k, depth + 1)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, b],
+        } => {
+            let Some(c) = iconst_val(func, b) else {
+                return leaf(terms);
+            };
+            let s = u32::try_from(c).ok().filter(|&s| s < 64)?;
+            lin_add(func, a, mul.checked_mul(1i64 << s)?, terms, k, depth + 1)
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Ineg,
+            arg: a,
+        } => lin_add(func, a, mul.checked_neg()?, terms, k, depth + 1),
+        _ => leaf(terms),
+    }
+}
+
+/// The stack slot a linear address is rooted in, if one term is a plain
+/// `stack_addr` (coeff 1). Two accesses rooted at different slots are
+/// disjoint — the same rule `loadfwd`'s `kill` applies to `Root::S`
+/// pairs. Anything else (`Root::V`-shaped leaves, mixed terms) can't be
+/// proven disjoint this way.
+fn lin_slot(func: &Function, k: &[(Value, i64)]) -> Option<StackSlot> {
+    k.iter().find_map(|&(t, c)| {
+        if c != 1 {
+            return None;
+        }
+        let ValueDef::Result(inst, 0) = func.dfg.value_def(t) else {
+            return None;
+        };
+        if let InstructionData::StackAddr {
+            opcode: Opcode::StackAddr,
+            stack_slot,
+            ..
+        } = func.dfg.insts[inst]
+        {
+            Some(stack_slot)
+        } else {
+            None
+        }
+    })
+}
+
+/// `[oa, oa+sa)` and `[ob, ob+sb)` provably don't overlap: equal term sets
+/// compare constant offsets (same expression ⇒ same base), and distinct
+/// stack-slot roots name different objects. Conservative `false`
+/// (may-alias) everywhere else.
+fn lin_disjoint(
+    func: &Function,
+    ka: &[(Value, i64)],
+    oa: i64,
+    sa: i64,
+    kb: &[(Value, i64)],
+    ob: i64,
+    sb: i64,
+) -> bool {
+    if ka == kb {
+        return ob >= oa + sa || oa >= ob + sb;
+    }
+    match (lin_slot(func, ka), lin_slot(func, kb)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
 }
 
 fn iconst_val(func: &Function, v: Value) -> Option<i64> {
@@ -438,6 +625,7 @@ fn emit_op(pos: &mut FuncCursor, op: Opcode, v: &[Value]) -> Value {
         (Opcode::Fdiv, [a, b]) => i.fdiv(*a, *b),
         (Opcode::Fmin, [a, b]) => i.fmin(*a, *b),
         (Opcode::Fmax, [a, b]) => i.fmax(*a, *b),
+        (Opcode::Fma, [a, b, c]) => i.fma(*a, *b, *c),
         (Opcode::Iadd, [a, b]) => i.iadd(*a, *b),
         (Opcode::Isub, [a, b]) => i.isub(*a, *b),
         (Opcode::Imul, [a, b]) => i.imul(*a, *b),
@@ -476,8 +664,15 @@ struct StoreInfo {
     inst: Inst,
     pos: usize,
     val: Value,
-    base: Value,
+    /// Raw address operand (`args[1]`) — the merged store's base value.
+    arg: Value,
+    /// Linear terms of `arg` — the group key.
+    key: Vec<(Value, i64)>,
+    /// Constant part of `arg`'s linear form plus the inst offset — the
+    /// byte offset within the group.
     off: i64,
+    /// The inst's offset immediate — the merged store's `imm`.
+    imm: i64,
     flags: MemFlagsData,
     ty: Type,
 }
@@ -551,13 +746,17 @@ fn try_block(
         if ty.is_vector() || !matches!(ty.bytes(), 1 | 2 | 4 | 8) {
             continue;
         }
-        let (base, off) = base_off(func, args[1]);
+        let Some((key, off)) = lin(func, args[1]) else {
+            continue;
+        };
         stores.push(StoreInfo {
             inst: i,
             pos: 0, // filled below
             val,
-            base,
+            arg: func.dfg.resolve_aliases(args[1]),
+            key,
             off: off + i64::from(offset),
+            imm: i64::from(offset),
             flags: fl,
             ty,
         });
@@ -569,11 +768,15 @@ fn try_block(
     for s in &mut stores {
         s.pos = pos_at(&pos, s.inst);
     }
-    // Group by (base, elem type, flags); within each, find consecutive-offset
-    // runs of exactly `16/esz` or `8/esz` lanes.
-    let mut by_key: FxHashMap<(Value, Type, MemFlagsData), Vec<&StoreInfo>> = FxHashMap::default();
+    // Group by (linear terms, elem type, flags); within each, find
+    // consecutive-offset runs of exactly `16/esz` or `8/esz` lanes.
+    let mut by_key: FxHashMap<(Vec<(Value, i64)>, Type, MemFlagsData), Vec<&StoreInfo>> =
+        FxHashMap::default();
     for s in &stores {
-        by_key.entry((s.base, s.ty, s.flags)).or_default().push(s);
+        by_key
+            .entry((s.key.clone(), s.ty, s.flags))
+            .or_default()
+            .push(s);
     }
     let mut changed = 0;
     let mut taken = TakenMap::new();
@@ -604,7 +807,7 @@ fn try_block(
                         run.push(s);
                     }
                 }
-                if run.len() == lanes as usize && i32::try_from(run[0].off).is_ok() {
+                if run.len() == lanes as usize && i32::try_from(run[0].imm).is_ok() {
                     let emit = run.iter().map(|s| s.pos).min().unwrap();
                     let us = uses.get_or_insert_with(|| build_uses(func));
                     let plan = Ctx {
@@ -617,6 +820,8 @@ fn try_block(
                         min_load: usize::MAX,
                         uses: &*us,
                         members: run.iter().map(|s| s.inst).collect(),
+                        tloads: Vec::new(),
+                        tree: FxHashSet::default(),
                     }
                     .analyze(&run);
                     if let Some((p, vt)) = plan {
@@ -626,8 +831,8 @@ fn try_block(
                         cur.ins().store(
                             wide_flags(run[0].flags),
                             vec,
-                            run[0].base,
-                            run[0].off as i32, // checked above
+                            run[0].arg,
+                            run[0].imm as i32, // checked above
                         );
                         for s in &run {
                             // Drop the removed store's use entries so the
@@ -650,18 +855,37 @@ fn try_block(
 }
 
 impl Ctx<'_> {
+    /// Packed insts whose every use sits inside `members ∪ dead`: the
+    /// scalar lanes that become unobservable once the member stores are
+    /// replaced (their leftover copies may read post-vstore bytes
+    /// harmlessly — nothing looks at the result). Least fixpoint over the
+    /// small pack subgraph.
+    fn dead_tree(&self) -> FxHashSet<Inst> {
+        let mut dead: FxHashSet<Inst> = self.tree.clone();
+        loop {
+            let mut gone = Vec::new();
+            for &i in &dead {
+                let live = self.func.dfg.inst_results(i).iter().any(|&r| {
+                    self.uses
+                        .iter(r.index())
+                        .any(|u| !self.members.contains(&u) && !dead.contains(&u))
+                });
+                if live {
+                    gone.push(i);
+                }
+            }
+            if gone.is_empty() {
+                return dead;
+            }
+            for i in gone {
+                dead.remove(&i);
+            }
+        }
+    }
+
     /// Validate one candidate store group; returns the packed tree and its
     /// vector type for the caller to emit.
     fn analyze(mut self, run: &[&StoreInfo]) -> Option<(Pack, Type)> {
-        // Store span: between the first and last member store, only pure
-        // insts or group members may appear.
-        let last_pos = run.iter().map(|s| s.pos).max().unwrap();
-        for p in self.emit + 1..last_pos {
-            let i = self.insts[p];
-            if !self.members.contains(&i) && side_effecting(self.func, i) {
-                return None;
-            }
-        }
         // Stored values may only be used by the group stores.
         let vals: Vec<Value> = run.iter().map(|s| s.val).collect();
         for &v in &vals {
@@ -669,12 +893,52 @@ impl Ctx<'_> {
                 return None;
             }
         }
-        // The store base must dominate the emit point.
-        if !self.avail(run[0].base) {
+        // The merged store's base must dominate the emit point.
+        if !self.avail(run[0].arg) {
             return None;
         }
         // Pack the stored-value tree.
         let p = self.pack(&vals, 0)?;
+        // Store span: between the first and last member store, only pure
+        // insts, group members, and packed loads (re-executed at `emit`,
+        // ordered below) may appear — anything else the merge would
+        // cross is a hazard.
+        let last_pos = run.iter().map(|s| s.pos).max().unwrap();
+        for pp in self.emit + 1..last_pos {
+            let i = self.insts[pp];
+            if self.members.contains(&i) || !side_effecting(self.func, i) {
+                continue;
+            }
+            if self.tloads.iter().any(|&(t, ..)| t == i) {
+                continue;
+            }
+            return None;
+        }
+        // Packed loads vs member stores. The vector load reads at `emit`
+        // — before the vector store — so a member store that may overlap
+        // a packed load must postdate it (`load acc[k]; fma; store
+        // acc[k]` reads the pre-store bytes either way). A member store
+        // *after* the load is safe for the tree, but the scalar load
+        // inst left behind would then read post-vstore bytes — it must
+        // die with the tree. Disjoint pairs need nothing.
+        let mut dead: Option<FxHashSet<Inst>> = None;
+        for &(li, lp, ref la, le) in &self.tloads {
+            for s in run {
+                let se = i64::from(s.ty.bytes());
+                if lin_disjoint(self.func, &la.0, la.1, le, &s.key, s.off, se) {
+                    continue;
+                }
+                if s.pos < lp {
+                    return None;
+                }
+                if lp > self.emit {
+                    let d = dead.get_or_insert_with(|| self.dead_tree());
+                    if !d.contains(&li) {
+                        return None;
+                    }
+                }
+            }
+        }
         // Writer check between the earliest packed load and the emit point.
         if self.min_load != usize::MAX {
             for pp in self.min_load + 1..self.emit {
