@@ -218,6 +218,7 @@ impl Layout {
 ///
 impl Layout {
     /// Is `block` currently part of the layout?
+#[inline]
     pub fn is_block_inserted(&self, block: Block) -> bool {
         Some(block) == self.first_block || self.blocks[block].prev.is_some()
     }
@@ -348,6 +349,7 @@ impl Layout {
     }
 
     /// Get the block following `block` in the layout order.
+#[inline]
     pub fn next_block(&self, block: Block) -> Option<Block> {
         self.blocks[block].next.expand()
     }
@@ -386,6 +388,7 @@ pub struct Blocks<'f> {
 impl<'f> Iterator for Blocks<'f> {
     type Item = Block;
 
+#[inline]
     fn next(&mut self) -> Option<Block> {
         match self.next {
             Some(block) => {
@@ -451,21 +454,25 @@ impl Layout {
     }
 
     /// Fetch a block's first instruction.
+#[inline]
     pub fn first_inst(&self, block: Block) -> Option<Inst> {
         self.blocks[block].first_inst.into()
     }
 
     /// Fetch a block's last instruction.
+#[inline]
     pub fn last_inst(&self, block: Block) -> Option<Inst> {
         self.blocks[block].last_inst.into()
     }
 
     /// Fetch the instruction following `inst`.
+#[inline]
     pub fn next_inst(&self, inst: Inst) -> Option<Inst> {
         self.insts[inst].next.expand()
     }
 
     /// Fetch the instruction preceding `inst`.
+#[inline]
     pub fn prev_inst(&self, inst: Inst) -> Option<Inst> {
         self.insts[inst].prev.expand()
     }
@@ -634,6 +641,7 @@ pub struct Insts<'f> {
 impl<'f> Iterator for Insts<'f> {
     type Item = Inst;
 
+#[inline]
     fn next(&mut self) -> Option<Inst> {
         let rval = self.head;
         if let Some(inst) = rval {
@@ -649,6 +657,7 @@ impl<'f> Iterator for Insts<'f> {
 }
 
 impl<'f> DoubleEndedIterator for Insts<'f> {
+#[inline]
     fn next_back(&mut self) -> Option<Inst> {
         let rval = self.tail;
         if let Some(inst) = rval {

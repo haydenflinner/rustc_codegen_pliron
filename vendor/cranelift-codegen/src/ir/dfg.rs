@@ -255,6 +255,7 @@ impl DataFlowGraph {
     }
 
     /// Get the total number of values.
+#[inline]
     pub fn num_values(&self) -> usize {
         self.values.len()
     }
@@ -262,6 +263,7 @@ impl DataFlowGraph {
     /// PLIRON: epoch bumped by every `change_to_alias`/
     /// `replace_with_aliases` call — see the field comment. Equal epochs
     /// mean no new aliases exist since the caller last scanned.
+#[inline]
     pub fn alias_epoch(&self) -> u32 {
         self.alias_epoch
     }
@@ -343,6 +345,7 @@ fn valid_valuedata(data: ValueDataPacked) -> bool {
 impl<'a> Iterator for Values<'a> {
     type Item = Value;
 
+#[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .by_ref()
@@ -403,6 +406,7 @@ impl DataFlowGraph {
     }
 
     /// Get the type of a value.
+#[inline]
     pub fn value_type(&self, v: Value) -> Type {
         self.values[v].ty()
     }
@@ -411,6 +415,7 @@ impl DataFlowGraph {
     ///
     /// This is either the instruction that defined it or the Block that has the value as an
     /// parameter.
+#[inline]
     pub fn value_def(&self, v: Value) -> ValueDef {
         match ValueData::from(self.values[v]) {
             ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
@@ -429,6 +434,7 @@ impl DataFlowGraph {
     /// Passes iterating every value (`carry_aliases`) meet tombstone
     /// chains from deleted defs — an unrecoverable panic is the wrong
     /// answer there.
+#[inline]
     pub fn try_resolve_aliases(&self, v: Value) -> Option<Value> {
         if v == Value::reserved_value() || !self.values.is_valid(v) {
             return None;
@@ -457,6 +463,7 @@ impl DataFlowGraph {
     /// `carry_pmap`'s stale pairs). Reserved, out-of-range, and aliased
     /// values yield `None`; callers that only need the def *kind* skip
     /// the resolve entirely.
+#[inline]
     pub fn try_value_def(&self, v: Value) -> Option<ValueDef> {
         if v == Value::reserved_value() || !self.values.is_valid(v) {
             return None;
@@ -475,6 +482,7 @@ impl DataFlowGraph {
     ///
     /// Value aliases are not considered to be attached to anything. Use `resolve_aliases()` to
     /// determine if the original aliased value is attached.
+#[inline]
     pub fn value_is_attached(&self, v: Value) -> bool {
         use self::ValueData::*;
         match ValueData::from(self.values[v]) {
@@ -488,6 +496,7 @@ impl DataFlowGraph {
     /// Resolve value aliases.
     ///
     /// Find the original SSA value that `value` aliases.
+#[inline]
     pub fn resolve_aliases(&self, value: Value) -> Value {
         resolve_aliases(&self.values, value)
     }
@@ -903,6 +912,7 @@ impl ValueDataPacked {
 }
 
 impl From<ValueData> for ValueDataPacked {
+#[inline]
     fn from(data: ValueData) -> Self {
         match data {
             ValueData::Inst { ty, num, inst } => {
@@ -922,6 +932,7 @@ impl From<ValueData> for ValueDataPacked {
 }
 
 impl From<ValueDataPacked> for ValueData {
+#[inline]
     fn from(data: ValueDataPacked) -> Self {
         let tag = data.field(ValueDataPacked::TAG_SHIFT, ValueDataPacked::TAG_BITS);
         let ty = data.field(ValueDataPacked::TYPE_SHIFT, ValueDataPacked::TYPE_BITS);
@@ -991,6 +1002,7 @@ impl DataFlowGraph {
     }
 
     /// Construct a read-only visitor context for the values of this instruction.
+#[inline]
     pub fn inst_values<'dfg>(
         &'dfg self,
         inst: Inst,
@@ -1045,6 +1057,7 @@ impl DataFlowGraph {
     }
 
     /// Get all value arguments on `inst` as a slice.
+#[inline]
     pub fn inst_args(&self, inst: Inst) -> &[Value] {
         self.insts[inst].arguments(&self.value_lists)
     }
@@ -1217,6 +1230,7 @@ impl DataFlowGraph {
     }
 
     /// Return all the results of an instruction.
+#[inline]
     pub fn inst_results(&self, inst: Inst) -> &[Value] {
         self.results[inst].as_slice(&self.value_lists)
     }
@@ -1380,6 +1394,7 @@ impl DataFlowGraph {
     }
 
     /// Get the parameters on `block`.
+#[inline]
     pub fn block_params(&self, block: Block) -> &[Value] {
         self.blocks[block].params(&self.value_lists)
     }

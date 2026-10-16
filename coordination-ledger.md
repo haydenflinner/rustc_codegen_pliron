@@ -1789,3 +1789,29 @@ the lookup itself.
   symmetry). Committed as its own commit with the rest of the WIP —
   passes full test.sh — but I have not audited the fold rules beyond
   that panic path; owner should sanity-check.
+
+### pliron SoA linked-list links — LANDED (0e45066)
+
+Next/prev for `Operation`/`BasicBlock` moved from node fields
+(`block_links`/`region_links`) into `NodeLinks` side tables on
+`Context` — `RefCell<Vec<NodeLinks<T>>>` indexed by the `ArenaIndex`
+index component, `tag: Option<ArenaIndex>` per entry so slot reuse
+reads as unlinked (self-healing, no alloc hook needed). `container`
+deliberately stays on the node (`get_parent_*` take no `&Context`).
+`get_next`/`get_prev` moved to `Ptr` inherent methods taking `ctx`;
+`get_container`/`is_linked`/`insert_*`/`unlink` signatures unchanged.
+Insert/unlink also got cheaper — they no longer deref neighbors' ~250B
+nodes. Measured: bench compile wall 27.7 → 21.3–24.8s on a noisy box
+(direction consistent with the ~5-7% leaf estimate; box noise prevents
+a tighter number). ~55 call sites updated; LLNode test port included.
+Enables: walkers/liveness/rewriter cursors are now cheap; passes that
+kept `Vec<Ptr>` snapshots mainly to avoid re-walking (e.g. inline's
+blklist) can go back to cheap cursor walks if simpler.
+
+Next biggest leafs (serial bench profile): `ValueData::from` ~6% +
+`resolve_aliases` ~2.5% (clif side), `slp::build_uses` ~4.4%,
+`layout::Insts::next` ~2.4%. Node-shrink (option 3, pool the four
+inline Vecs à la cranelift `ValueListPool`) remains unexplored — its
+payoff is cache capacity for scattered `op.deref` reads, harder to
+attribute than traversal; revisit if a quieter profile still shows
+pliron deref traffic high.

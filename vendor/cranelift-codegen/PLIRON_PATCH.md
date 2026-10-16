@@ -500,3 +500,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     instead of materializing `mov xN, #0` per use. Priority 40/41 keeps
     them above the generic i64-pair rules; zero-hi-right outranks
     zero-hi-left so both-extended inputs resolve deterministically.
+
+40. `#[inline]` on hot DFG/Layout readers (`src/ir/dfg.rs`,
+    `src/ir/layout.rs`): dev-profile builds have no LTO, so every
+    `value_def`/`resolve_aliases`/`inst_args`/`Insts::next` call from
+    pliron-clif-opt was a real cross-crate function call.
+    `ValueData::from` alone measured ~6% leaf samples in the opt
+    pipeline. Annotated the small leaf readers + the two `ValueData`
+    packed-conversion `From` impls + `Values`/`Blocks`/`Insts`
+    iterator `next`/`next_back`. No behavior change.
