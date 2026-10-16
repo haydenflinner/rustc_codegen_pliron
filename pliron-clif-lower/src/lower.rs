@@ -2727,6 +2727,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
     fn va_sym(&mut self, sym: &str) -> String {
         let foreign_variadic = self.m.isa().triple().architecture
             == target_lexicon::Architecture::X86_64
+            // The wasm-CLIF path runs on a 64-bit host ISA but emits wasm:
+            // variadics there use `pliron.va.buf`, not a register count.
+            && self.tcfg.pointer_width == target_lexicon::PointerWidth::U64
             && self.st.funcs.get(sym).is_some_and(|f| {
                 !has_body(self.ctx, f.op)
                     && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))

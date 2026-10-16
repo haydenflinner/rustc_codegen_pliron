@@ -44,6 +44,24 @@ pub struct Hdr {
     pub recs_len: u64,
 }
 
+#[cfg(windows)]
+unsafe extern "C" {
+    // msvc spells the POSIX calls `_open`/`_write`/... — `_O_BINARY` in
+    // OPEN_FLAGS keeps CRLF translation out of the binary dump.
+    #[link_name = "_open"]
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    #[link_name = "_write"]
+    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    #[link_name = "_close"]
+    fn close(fd: i32) -> i32;
+    #[link_name = "_getpid"]
+    fn getpid() -> i32;
+    fn getenv(name: *const u8) -> *const u8;
+    fn atexit(cb: extern "C" fn()) -> i32;
+    fn abort() -> !;
+}
+
+#[cfg(not(windows))]
 unsafe extern "C" {
     // `open` is variadic (mode only matters with O_CREAT) — declaring the
     // mode as a fixed arg lands it in a register slot libc never reads on
@@ -58,7 +76,11 @@ unsafe extern "C" {
     fn abort() -> !;
 }
 
-// O_WRONLY | O_CREAT | O_TRUNC on Linux.
+// O_WRONLY | O_CREAT | O_TRUNC on Linux; _O_WRONLY|_O_CREAT|_O_TRUNC|
+// _O_BINARY on msvc.
+#[cfg(windows)]
+const OPEN_FLAGS: i32 = 0x1 | 0x100 | 0x200 | 0x8000;
+#[cfg(not(windows))]
 const OPEN_FLAGS: i32 = 0o1 | 0o100 | 0o1000;
 
 unsafe fn w(fd: i32, mut p: *const u8, mut n: usize) {

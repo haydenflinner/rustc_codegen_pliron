@@ -316,7 +316,11 @@ t_pgo() {
   # thin .a: only the runtime object (bundled core/compiler_builtins
   # members' __rustc shims collide with the link's own std)
   local rt=$PWD/$out/libpliron_prof_rt.a
+  # staticlib lands as `libX.a` on unix-ish, `X.lib` on windows-msvc —
+  # same ar archive either way (llvm-ar reads both).
   local rt_full=$PWD/tools/pliron-prof-rt/target/release/libpliron_prof_rt.a
+  [ -f "$rt_full" ] ||
+    rt_full=$PWD/tools/pliron-prof-rt/target/release/pliron_prof_rt.lib
   local cli=$PWD/tools/pliron-prof/target/release/pliron-prof
   local prof=$out/pgo.prof
   (mkdir -p $out/pga && cd $out/pga &&
@@ -346,10 +350,14 @@ t_pgo() {
   # the same .prof out of linear memory via __pliron_prof_hdrs.
   if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
     local wdir=$PWD/$out/wasm-pgo
-    local wld=$PWD/tools/pliron-wasm-ld/target/release/pliron-wasm-ld
+    # RUSTFLAGS must be fully windows-spelled on msys: cargo's POSIX-path
+    # translation mangles flag values containing ':' when any flag's path
+    # is /c/-spelled. Build both off one native root.
+    local wroot=$PWD
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) wroot=$(cygpath -m "$wroot") ;; esac
     cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml &&
     (cd tests/wasm &&
-      RUSTFLAGS="$BE -Clinker=$wld" \
+      RUSTFLAGS="-Zcodegen-backend=$wroot/target/debug/$lib -Clinker=$wroot/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe" \
         CARGO_TARGET_DIR=$wdir PLIRON_PGO=1 \
         cargo build -q --release --target wasm32-unknown-unknown \
         -Zbuild-std=core,compiler_builtins \
