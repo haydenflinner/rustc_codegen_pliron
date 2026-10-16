@@ -171,3 +171,24 @@ Open:
   — vectorizer gap. Extending param_kinds to recognize multi-IV zip
   headers is the next perf lever for wasm.
 - native gaps unchanged: matmul ~1.5-10x, bsearch ~5x vs LLVM.
+
+## Open: ui-wasm miscompiles found under wasmtime (2026-10-16, dialect-rm run)
+
+The `ui-wasm` differential suite (`harness/run.py ui-wasm`, wasip1 under
+wasmtime) surfaced 4 genuine miscompiles — reproduction details in
+`pliron-dialect-rm/target/ui-wasm-notes.md`. All are run-fail vs the
+stock-LLVM wasm side.
+
+- `consts/cast-discriminant-zst-enum.rs`: enum discriminant `i8 -1` reads
+  back `0xFFFF_FFFF` — zero-extension instead of sign-extension on the
+  discriminant load/cast.
+- `match/overeager-sub-match-pruning-13027.rs`: `0..=2 if false => 1,
+  1..=3 => 2, _ => 3` returns 3 not 2 — range-match guard miscompiled.
+- `macros/try-macro.rs`: `"1".parse::<i32>() as f32 + "2.0".parse::<f32>()`
+  yields `Ok(1.0)` — second operand lost (f32 add or parse).
+- `binop/infer-rhs-type.rs`: `"3.1415".parse::<f64>() <= 0.0` evaluates
+  true — f64 parse or compare wrong (parse lives in pliron-built std).
+
+The two float cases may share a root cause in the pliron-built wasip1
+std float parse. Also: `wty(clt::F16)` panics to `unreachable` stub on
+wasip1 (2 tests: f16-f128-lit, primitive-usage) — known f16 limitation.
