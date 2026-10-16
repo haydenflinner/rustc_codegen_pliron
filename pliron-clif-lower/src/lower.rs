@@ -1255,6 +1255,7 @@ pub fn lower_clif_wasm(
     host: &dyn Host,
     cgu: &str,
     unwind: bool,
+    simd: bool,
 ) -> WasmClif {
     // wasm32 is not a Cranelift target; the bookkeeping ObjectModule and
     // FnLower run on the *host* ISA (see the doc comment). The ISA is never
@@ -1514,7 +1515,7 @@ pub fn lower_clif_wasm(
             lifetimes: &mut lifetimes,
             nocap: &nocap,
             tcfg: cfg,
-            simd: false,
+            simd,
             x64: false,
             cmp64: false,
             has_eh: false,

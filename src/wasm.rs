@@ -9023,9 +9023,28 @@ impl<'o, 'a> CX<'o, 'a> {
                         let v = self.bitop(opcode, t, a);
                         self.bind(f, i, smallvec![v]);
                     }
+                    P::Bmask => {
+                        // scalar: nonzero -> all 1s, zero -> 0.
+                        let a = self.get1(arg);
+                        let aw = wty(t);
+                        let z = if aw == WT::I64 { self.i64c(0) } else { self.i32c(0) };
+                        let ne = self.op(
+                            if aw == WT::I64 { O::I64Ne } else { O::I32Ne },
+                            &[a, z],
+                            WT::I32,
+                        );
+                        let z32 = self.i32c(0);
+                        let m = self.op(O::I32Sub, &[z32, ne], WT::I32);
+                        let v = if wty(rt) == WT::I64 {
+                            self.op(O::I64ExtendI32S, &[m], WT::I64)
+                        } else {
+                            m
+                        };
+                        self.bind(f, i, smallvec![v]);
+                    }
                     P::Splat | P::VhighBits | P::Swizzle | P::ScalarToVector
                     | P::IaddPairwise | P::SwidenLow | P::SwidenHigh | P::UwidenLow
-                    | P::UwidenHigh | P::Bmask | P::Snarrow | P::Unarrow | P::Uunarrow
+                    | P::UwidenHigh | P::Snarrow | P::Unarrow | P::Uunarrow
                     | P::Fvdemote | P::FvpromoteLow | P::AvgRound | P::UaddSat
                     | P::SaddSat | P::UsubSat | P::SsubSat => {
                         panic!("vector/saturating op {opcode} on wasm clif path")
@@ -10298,6 +10317,29 @@ impl<'o, 'a> CX<'o, 'a> {
         use Opcode as P;
         let lane = t.lane_type();
         let (a, b) = (self.get1(args[0]), self.get1(args[1]));
+        if op == P::IaddPairwise {
+            // phadd-style: result lanes are x's adjacent pairs in the low
+            // half, y's in the high half — shuffle evens and odds of each
+            // input together, then lane-wise add.
+            let lb = (lane.bits() / 8) as usize;
+            let pairs = 16 / lb / 2;
+            let (mut ev, mut od) = ([0u8; 16], [0u8; 16]);
+            for s in 0..2 {
+                for p in 0..pairs {
+                    for k in 0..lb {
+                        ev[(s * pairs + p) * lb + k] = (s * 16 + 2 * p * lb + k) as u8;
+                        od[(s * pairs + p) * lb + k] = (s * 16 + (2 * p + 1) * lb + k) as u8;
+                    }
+                }
+            }
+            let e = self.op(O::I8x16Shuffle { lanes: ev }, &[a, b], WT::V128);
+            let d = self.op(O::I8x16Shuffle { lanes: od }, &[a, b], WT::V128);
+            let add = vl!(lane; I8 => I8x16Add, I16 => I16x8Add,
+                          I32 => I32x4Add, I64 => I64x2Add);
+            let v = self.op(add, &[e, d], WT::V128);
+            self.set(f.dfg.inst_results(i)[0], v);
+            return;
+        }
         if matches!(op, P::Ishl | P::Ushr | P::Sshr) {
             let amt = self.cvt(b, WT::I32);
             let o = match op {
@@ -10468,6 +10510,13 @@ impl<'o, 'a> CX<'o, 'a> {
             }
             P::Fvdemote => self.op(O::F32x4DemoteF64x2Zero, &[a], WT::V128),
             P::FvpromoteLow => self.op(O::F64x2PromoteLowF32x4, &[a], WT::V128),
+            P::VallTrue => {
+                let o = vl!(t.lane_type(); I8 => I8x16AllTrue,
+                            I16 => I16x8AllTrue, I32 => I32x4AllTrue,
+                            I64 => I64x2AllTrue);
+                self.op(o, &[a], WT::I32)
+            }
+            P::VanyTrue => self.op(O::V128AnyTrue, &[a], WT::I32),
             _ => panic!("vec unary {op} {t}->{rt}"),
         };
         self.set(r0, v);
@@ -10838,6 +10887,7 @@ pub(crate) fn lower_to_wasm_clif(
     features: &[String],
     unwind: bool,
 ) -> Vec<u8> {
+    let simd = features.iter().any(|f| f == "simd128");
     let mut wc = crate::lower::lower_clif_wasm(
         ctx,
         st,
@@ -10847,6 +10897,7 @@ pub(crate) fn lower_to_wasm_clif(
         },
         name,
         unwind,
+        simd,
     );
     let mut m = Module::empty();
     let mem = m.memories.push(MemoryData {
