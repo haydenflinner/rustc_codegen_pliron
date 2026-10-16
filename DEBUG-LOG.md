@@ -128,3 +128,44 @@ Still TODO / open questions:
   Uninvestigated — likely missing x64 codegen quality (no pattern
   matching strength?) or an opt-pipeline gap. TODO: profile one of
   these (matmul is the cleanest target).
+
+## 2026-02-16 wasm clif+simd push + windows test port
+
+Vector lowering on the wasm-CLIF path (all pushed):
+- `PLIRON_WASM_CLIF` is now default-on (`=0` falls back to the dialect
+  path). simd.sh/fuzz.sh/real.sh/bench.sh all green on it; the dialect
+  path stays as the minimal fallback and passes fuzz too.
+- `lower_clif_wasm` gets `simd` from `+simd128`; loopvec now emits v128
+  on wasm. bench.sh --simd: k_count_eq 0.87x and k_dot_i32 0.85x stock
+  (faster than LLVM), histogram 0.88x, utf8 0.85x; geomean 2.81x.
+- New ops: iadd_pairwise (phadd via evens/odds i8x16 shuffles + lane
+  add), vall_true/vany_true ({lane}.all_true / v128.any_true), scalar
+  bmask, i64x2 min/max + sat add/sub (vicmp+bitselect expansions; wasm
+  has no such lanes), i8x16 mul (i16 extend halves + low-byte shuffle).
+- va_sym: gated on pointer_width==U64 — the wasm pipeline runs on the
+  x86_64 host ISA, so foreign variadics were getting __pliron_va8.*
+  trampolines the wasm linker can't resolve (undefined __pliron_va8.fcntl
+  on wasi). Wasm variadics already marshal via pliron.va.buf.
+
+Windows test-harness fixes:
+- pliron-prof-rt: msvc needs _open/_write/_close/_getpid + _O_BINARY;
+  the atexit-driven dump works unchanged.
+- test.sh pgo: staticlib is pliron_prof_rt.lib on msvc (same ar format,
+  llvm-ar extracts it). The wasm leg's RUSTFLAGS must be entirely
+  windows-spelled: cargo's POSIX-path translation corrupts ':'-bearing
+  flag values (`-Clinker=C:/...` -> `C;C:\Program...`) when the backend
+  path is /c/-spelled. Full test.sh now green end-to-end on this box.
+
+Symbol-gap audit for CRTFREE (all already covered):
+- __chkstk: exported by ntdll.dll (kernel32.dll forwards) -> implibs.
+- atexit/_initterm/_initterm_e/_cexit/exit: exported by msvcrt.dll.
+
+Open:
+- loopvec store-loop coverage: `z.iter_mut().zip(x).zip(y)` shapes
+  thread ~7 header params (pointers+counters) through bounds-check
+  islands; `param_kinds` classifies them all `?` -> "non-linear param"
+  bail. k_vadd_f32 (68x), k_memset_xor (20x), k_saturating_u8 (27x),
+  k_find_byte (10x), k_sum_i16_widen (7x) stay scalar. Not a miscompile
+  — vectorizer gap. Extending param_kinds to recognize multi-IV zip
+  headers is the next perf lever for wasm.
+- native gaps unchanged: matmul ~1.5-10x, bsearch ~5x vs LLVM.

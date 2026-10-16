@@ -8,8 +8,6 @@
 use core::arch::wasm32::*;
 use core::simd::prelude::*;
 use core::simd::simd_swizzle;
-use core::simd::num::SimdInt as _;
-use core::simd::num::SimdFloat as _;
 use core::intrinsics::simd::*;
 
 #[panic_handler]

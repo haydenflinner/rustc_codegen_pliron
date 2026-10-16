@@ -142,7 +142,7 @@ extern "C" fn flush() {
             return;
         }
         puts(fd, b"PLRAW01\0");
-        let hdrs = HDRS.as_ptr();
+        let hdrs = core::ptr::addr_of!(HDRS) as *const usize;
         for i in 0..n {
             let h = *hdrs.add(i) as *const Hdr;
             if (*h).magic != MAGIC {
@@ -173,7 +173,7 @@ pub extern "C" fn __pliron_prof_register(hdr: *const Hdr) {
     let i = NHDRS.fetch_add(1, Ordering::Relaxed);
     if i < MAX {
         unsafe {
-            *HDRS.as_mut_ptr().add(i) = hdr as usize;
+            *(core::ptr::addr_of_mut!(HDRS) as *mut usize).add(i) = hdr as usize;
         }
     }
 }
