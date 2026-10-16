@@ -619,6 +619,7 @@ fn transfer(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    na0: &FxHashSet<Value>,
     b: Block,
     av: &mut Avail,
     rw: Option<&mut Vec<(Inst, Fwd)>>,
@@ -729,6 +730,15 @@ fn transfer(
                     _ => None,
                 };
                 kill(av, r, o, ty, ms, iso, ncc, invs, cur, invreg, rpar);
+                // `na` includes `ofrozen` stops but `iso`/`ncc` classify
+                // under `na0` — the same memory can carry two root names.
+                // Kill under the `na0` name too or the store dodges the
+                // classification it was made under.
+                let (r0, o0) = norm_root(func, ps, na0, args[1]);
+                let o0 = o0.wrapping_add(i64::from(i32::from(offset)));
+                if r0 != r || o0 != o {
+                    kill(av, r0, o0, ty, None, iso, ncc, invs, cur, invreg, rpar);
+                }
                 // A store through `select c, pa, pb` may write either
                 // arm's location — kill both so kept locs don't forward
                 // stale values (the select's own root is opaque `V`).
@@ -747,6 +757,11 @@ fn transfer(
                             _ => None,
                         };
                         kill(av, ra, oa, ty, ms, iso, ncc, invs, cur, invreg, rpar);
+                        let (ra0, oa0) = norm_root(func, ps, na0, a);
+                        let oa0 = oa0.wrapping_add(o);
+                        if ra0 != ra || oa0 != oa {
+                            kill(av, ra0, oa0, ty, None, iso, ncc, invs, cur, invreg, rpar);
+                        }
                     }
                 }
                 if av.len() < MAX_ENTRIES {
@@ -765,6 +780,12 @@ fn transfer(
                     let mut reach: FxHashSet<Root> = FxHashSet::default();
                     for v in func.dfg.inst_values(i) {
                         reach.insert(norm_root(func, ps, na, v).0);
+                        // `iso`/`ncc` were classified under `na0`
+                        // (`noalias` alone); a `ofrozen` stop on an arg
+                        // (`na` includes them) renames its root, so the
+                        // plain-`noalias` root must be in `reach` too or
+                        // an ncc loc survives a call that mutates it.
+                        reach.insert(norm_root(func, ps, na0, v).0);
                     }
                     av.retain(|&(r, o, t), _| {
                         iso.contains(&r)
@@ -906,7 +927,9 @@ pub fn run(
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
-        n += pre(func, ps, &stop, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm);
+        n += pre(
+            func, ps, &stop, noalias, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
+        );
         tt("pre", t0);
         if n > 0 {
             cfg = ControlFlowGraph::with_function(func);
@@ -949,6 +972,7 @@ pub fn run(
                 func,
                 ps,
                 &stop,
+                noalias,
                 b,
                 &mut av,
                 None,
@@ -991,6 +1015,7 @@ pub fn run(
                 func,
                 ps,
                 &stop,
+                noalias,
                 b,
                 &mut av,
                 Some(&mut fwd),
@@ -1239,6 +1264,7 @@ fn pre(
     func: &mut Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    na0: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     rpo: &[Block],
     entry: Block,
@@ -1295,6 +1321,7 @@ fn pre(
                 func,
                 ps,
                 na,
+                na0,
                 b,
                 &mut av,
                 None,
@@ -1422,6 +1449,15 @@ fn pre(
                     };
                     kill_st(&mut st, r, o, ty, ms, &iso, ncc);
                     writes.push(((r, o, ty), ms));
+                    // `na0` name too — `iso`/`ncc` classify under it,
+                    // so a store named only under `na`'s `ofrozen` stop
+                    // would dodge its kill set (see `transfer`).
+                    let (r0, o0) = norm_root(func, ps, na0, args[1]);
+                    let o0 = o0.wrapping_add(i64::from(i32::from(offset)));
+                    if r0 != r || o0 != o {
+                        kill_st(&mut st, r0, o0, ty, None, &iso, ncc);
+                        writes.push(((r0, o0, ty), None));
+                    }
                     // A store through `select c, pa, pb` may write either
                     // arm's location — kill both, mirroring `transfer` (a
                     // stale `St` here would forward values the store
@@ -1436,13 +1472,20 @@ fn pre(
                         for &a in &sargs[1..] {
                             let (ra, oa) = norm_root(func, ps, na, a);
                             let oa = oa.wrapping_add(o);
-                            let a = (ra, oa, ty);
                             let ms = match ra {
                                 Root::V(arv) => ms_of(arv, oa),
                                 _ => None,
                             };
-                            kill_st(&mut st, a.0, a.1, a.2, ms, &iso, ncc);
-                            writes.push((a, ms));
+                            let al = (ra, oa, ty);
+                            kill_st(&mut st, al.0, al.1, al.2, ms, &iso, ncc);
+                            writes.push((al, ms));
+                            let (ra0, oa0) = norm_root(func, ps, na0, a);
+                            let oa0 = oa0.wrapping_add(o);
+                            if ra0 != ra || oa0 != oa {
+                                let a0 = (ra0, oa0, ty);
+                                kill_st(&mut st, a0.0, a0.1, a0.2, None, &iso, ncc);
+                                writes.push((a0, None));
+                            }
                         }
                     }
                     if st.len() < MAX_ENTRIES {
@@ -1456,10 +1499,13 @@ fn pre(
                 {
                     // `transfer`'s call arm keeps `iso` roots plus `ncc`
                     // roots the call can't reach — retain the same set
-                    // here or `st` disagrees with `out`.
+                    // here or `st` disagrees with `out`. Same dual
+                    // normalization as `transfer`: the classification
+                    // ran under `na0`, so both names must be in `reach`.
                     let mut reach: FxHashSet<Root> = FxHashSet::default();
                     for v in func.dfg.inst_values(i) {
                         reach.insert(norm_root(func, ps, na, v).0);
+                        reach.insert(norm_root(func, ps, na0, v).0);
                     }
                     st.retain(|&(r, _, _), _| {
                         iso.contains(&r) || (ncc.contains(&r) && !reach.contains(&r))

@@ -122,35 +122,51 @@ ordering are stable.
 
 | kernel | LLVM | pliron | change | clif | change |
 |---|---|---|---|---|---|
-| chars_alpha | 17.67 ms | 79.90 ms | +298.8% | 60.39 ms | +226.7% |
-| chars_ascii | 5.529 ms | 45.37 ms | +796.6% | 47.68 ms | +827.9% |
-| chars_mixed | 94.90 ms | 119.3 ms | +30.2% | 154.1 ms | +64.4% |
-| contains_rng | 26.90 ms | 216.9 ms | +711.0% | 98.77 ms | +236.4% |
-| eqbug | 0.765 ms | 0.847 ms | +12.2% | 0.791 ms | −2.5% |
-| fib | 40.34 ms | 93.37 ms | +123.7% | 82.38 ms | +119.7% |
-| hashmap | 314.8 ms | 1946 ms | +573.3% | 1162 ms | +263.3% |
-| hmget | 152.5 ms | 1332 ms | +917.4% | 614.5 ms | +318.3% |
-| iterw | 344.7 ms | 353.0 ms | −1.3% | 228.1 ms | −31.3% |
-| matmul | 133.7 ms | 103.0 ms | −15.7% | 122.0 ms | −3.7% |
-| nbody | 388.6 ms | 810.9 ms | +105.9% | 523.1 ms | +36.2% |
-| parse_only | 2040 ms | 10615 ms | +225.5% | 9668 ms | +368.6% |
-| sieve | 280.1 ms | 333.7 ms | +28.7% | 294.2 ms | +20.2% |
-| sortw | 41.58 ms | 129.9 ms | +168.9% | 132.2 ms | +168.0% |
-| strwork | 71.40 ms | 166.9 ms | +110.8% | 145.4 ms | +114.3% |
-| tokenize | 25.18 ms | 100.5 ms | +286.6% | 123.6 ms | +405.4% |
+| chars_alpha | 4.599 ms | 4.057 ms | −11.6% | 4.043 ms | −12.2% |
+| chars_ascii | 2.333 ms | 0.233 ms | −90.0% | 0.232 ms | −90.0% |
+| chars_mixed | 18.62 ms | 27.66 ms | +48.7% | 27.59 ms | +48.2% |
+| contains_rng | 4.900 ms | 5.506 ms | +12.5% | 5.521 ms | +12.4% |
+| eqbug | 0.136 ms | 0.123 ms | −9.8% | 0.123 ms | −9.5% |
+| fib | 9.525 ms | 20.94 ms | +120.4% | 20.89 ms | +119.6% |
+| hashmap | 66.35 ms | 138.7 ms | +108.9% | 139.1 ms | +109.3% |
+| hmget | 11.48 ms | 31.16 ms | +171.3% | 31.12 ms | +171.1% |
+| iterw | 66.74 ms | 57.40 ms | −13.9% | 57.51 ms | −13.7% |
+| matmul | 30.85 ms | 27.66 ms | −10.2% | 27.74 ms | −10.2% |
+| nbody | 84.61 ms | 92.65 ms | +9.5% | 92.58 ms | +9.4% |
+| parse_only | 382.8 ms | 748.2 ms | +95.5% | 746.3 ms | +95.1% |
+| sieve | 13.95 ms | 17.13 ms | +22.8% | 17.05 ms | +22.3% |
+| sortw | 6.132 ms | 7.719 ms | +25.8% | 7.683 ms | +25.3% |
+| strwork | 17.34 ms | 27.08 ms | +56.1% | 27.23 ms | +56.9% |
+| tokenize | 7.906 ms | 13.64 ms | +72.5% | 13.63 ms | +72.9% |
 
-Geomeans: dialect pliron/LLVM = 2.74, CLIF pliron/LLVM = 2.34
-(16 kernels). Both wasm paths are far behind LLVM wasm-ld codegen where
-the native Cranelift path is slightly ahead (0.92), but the CLIF path —
-which runs the same optimisation pipeline as native codegen — is
-roughly 15% faster geomean than the dialect path and produces a 41%
-smaller module (175 KB vs 296 KB; LLVM is 97 KB). It wins clearly on
-the memory-indirect and std-heavy kernels (`contains_rng`, `hashmap`,
-`hmget`, `nbody`, `iterw`, `eqbug`); `matmul` (−16% dialect, −4% CLIF)
-still wins vs LLVM. The remaining regressions vs the dialect path
-(`tokenize`, `parse_only`) are in string-scanning code — both paths run
-the same dialect-level `ir-opt` phase, so the gap is in CLIF→waffle
-lowering itself and is not yet isolated.
+Geomeans: dialect pliron/LLVM = 1.165, CLIF pliron/LLVM = 1.164
+(16 kernels), down from 1.674 before the inlining change below. Module
+sizes: LLVM 97 KB, both pliron paths 189 KB (the earlier `small`
+config's 40-op cap only bought ~6%: 178 KB).
+
+Two changes landed together here:
+
+- wasm stopped sharing `-Os`'s 40-op inline cap: `Wasm32` now uses
+  `inline::WASM_LIMIT` (= `DEFAULT_LIMIT`, 320) under the `small`
+  no-bonus rules. The cap left `str` iterators' `next_code_point` and
+  `CharIndices::next` out of line in every char loop — each call
+  round-tripped iterator state through stack memory.
+- `loadfwd` root-normalization fix: `transfer` keys locs under the
+  `stop` set (`noalias` ∪ operand-frozen values) but classified
+  `iso`/`ncc` under `noalias` alone. A `nocapture` call handed an
+  operand-frozen `iadd` cursor (`CharIndices::next(&mut iter)`,
+  `iter` = `iadd self, 16`) computed `reach` under the `ofrozen` name —
+  `V(v0)`'s `ncc` locs survived the mutating call and the post-call
+  reloads forwarded stale pre-call values, zeroing the consumed-width
+  delta in `MultiCharEqSearcher::next` (`tokenize` returned 577000 vs
+  576990). Calls now insert each arg's root under both
+  normalizations into `reach`, and stores kill under both names —
+  see `tests/loadfwd_frozen_root.rs`.
+
+Remaining regressions are in scalar codegen, not call boundaries:
+`fib`/`hmget`/`hashmap`/`parse_only` still lag LLVM's wasm. The
+`small` mode's missing bonuses (`once`, `hint`, `fold`, `devirt`,
+loop bonus, growth budget) are the next candidate lever.
 
 ## Compile time
 

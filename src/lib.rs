@@ -737,7 +737,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        inline::run(ctx, st, true, None, true, None, &mut None);
+        inline::run(ctx, st, true, inline::SMALL_LIMIT, None, true, None, &mut None);
         domcheck::run(ctx, st, "always-inline");
         inline::dead_fns(ctx, st);
     }
@@ -790,11 +790,17 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
+        let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
+        let small = wasm
             || matches!(
                 cx.tcx.sess.opts.optimize,
                 OptLevel::Size | OptLevel::SizeMin
             );
+        let small_limit = if wasm {
+            inline::WASM_LIMIT
+        } else {
+            inline::SMALL_LIMIT
+        };
         if pass_enabled("PLIRON_FROZEN") {
             pt!(
                 cx,
@@ -823,7 +829,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let d1 = pt!(
             cx,
             "inline",
-            inline::run(ctx, st, small, None, false, None, &mut adj)
+            inline::run(ctx, st, small, small_limit, None, false, None, &mut adj)
         );
         // Second round: callsites that just moved into a hot caller (e.g.
         // `get`'s `hash_one` landing inside `main`'s probe loop) never got
@@ -843,7 +849,16 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(
                 cx,
                 "inline2",
-                inline::run(ctx, st, small, None, false, Some(&touched), &mut adj)
+                inline::run(
+                    ctx,
+                    st,
+                    small,
+                    small_limit,
+                    None,
+                    false,
+                    Some(&touched),
+                    &mut adj,
+                )
             );
         }
         pt!(cx, "domcheck:inline", domcheck::run(ctx, st, "inline"));
@@ -913,7 +928,16 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     pt!(
                         cx,
                         "devirt-inline",
-                        inline::run(ctx, st, small, Some(&sites), false, Some(&owners), &mut adj)
+                        inline::run(
+                            ctx,
+                            st,
+                            small,
+                            small_limit,
+                            Some(&sites),
+                            false,
+                            Some(&owners),
+                            &mut adj,
+                        )
                     );
                     pt!(cx, "domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {

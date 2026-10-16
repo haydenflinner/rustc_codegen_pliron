@@ -36,7 +36,13 @@ use crate::state::{ConstVal, State, leaf_arg};
 use crate::types::{leaf_range, size_align};
 
 const DEFAULT_LIMIT: usize = 320;
-const SMALL_LIMIT: usize = 40;
+pub const SMALL_LIMIT: usize = 40;
+/// The `small` limit for wasm: still the flat no-bonus rules, but the
+/// 40-op cap left iterator/UTF-8 helpers out of line in every hot loop —
+/// +67% geomean on `bench/wasm` vs LLVM for ~6% less code. `DEFAULT_LIMIT`
+/// is the measured sweet spot (geomean 1.19) while keeping `small`'s
+/// size-safe profile.
+pub const WASM_LIMIT: usize = DEFAULT_LIMIT;
 
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
@@ -593,6 +599,7 @@ pub fn run(
     ctx: &mut Context,
     st: &mut State,
     small: bool,
+    small_limit: usize,
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
     callers: Option<&FxHashSet<String>>,
@@ -600,7 +607,7 @@ pub fn run(
 ) -> Delta {
     let limit = crate::env_get("PLIRON_INLINE")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(if small { SMALL_LIMIT } else { DEFAULT_LIMIT });
+        .unwrap_or(if small { small_limit } else { DEFAULT_LIMIT });
     // -O0 still honours `#[inline(always)]` like LLVM's AlwaysInliner: wasm-bindgen
     // needs its describe markers inlined into each monomorphised shim.
     let limit = if always_only { usize::MAX / 16 } else { limit };

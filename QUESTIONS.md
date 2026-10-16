@@ -24,3 +24,22 @@ that came up while working unsupervised.
    `sub x_, x10, #5` address recompute where LLVM keeps one advancing
    pointer + immediate offsets. Chasing further is diminishing — flag
    if you want the pointer-bump threading investigated.
+
+4. Wasm inlining now uses `WASM_LIMIT` (= `DEFAULT_LIMIT`, 320) with the
+   `small` no-bonus rules — wasm geomean went 1.674 → 1.165, module
+   177.8KB → 189KB on the bench suite. This unblocked a real
+   `loadfwd` miscompile (fixed, see DEBUG-LOG): the `ofrozen` stop-set
+   named call args under a different root than the `noalias`-keyed
+   `ncc` classification. Question: should -Os/-Oz (`OptLevel::Size`)
+   get the same 320 cap? I left them at 40 — they're size-first, wasm
+   was only sharing `small` by accident of the `||`.
+   If rustc.wasm size becomes a problem the knob is `PLIRON_INLINE`.
+
+5. Remaining wasm gaps at the new limit (vs LLVM): fib +120%,
+   hmget +171%, hashmap +109%, parse_only +95%, tokenize +72%,
+   strwork +56%, chars_mixed +49%. All return-checked clean. The call
+   boundary is mostly closed; what remains looks like scalar codegen
+   (fib = tight FP/arith loop → likely isel/regalloc), not inlining.
+   Next lever candidates: `once`/`hint` bonuses under wasm `small`
+   (single-caller local fns are size-neutral), or investigate fib's
+   wasm codegen directly.
