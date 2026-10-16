@@ -429,3 +429,31 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     pooled 0x00FF mask (`mask_00ff`), weave back with `psllw`+`por`.
     Wider i8 lanes (i8x32/i8x64) still unsupported — no VEX/EVEX
     `vpmullw` forms exist yet.
+
+36. aarch64 narrow-int compare/extend lowering (`src/isa/aarch64/inst.isle`,
+    `src/isa/aarch64/lower.isle`, `src/isa/aarch64/lower/isle.rs`):
+
+    - `imul_pow2p1_shamt`/`imul_pow2m1_shamt` externs + rules: `imul x, 2^n+1`
+      lowers to `add x, x, lsl #n`; `imul x, 2^n-1` to `lsl` + `sub`. Kills
+      the `movz` constant materialization and `madd`'s 3-cycle latency.
+    - `val_already_extended`: partial bool oracle answering "does this
+      value's register already hold the `ArgumentExtension`-extended form".
+      Covers 32/64-bit values, `uextend`/`sextend`, `icmp`/`fcmp` (cset
+      writes full-width 0/1), narrow loads, narrow `ireduce` (see below),
+      and narrow `black_box`. NB: `(if (oracle))` in this ISLE only tests
+      that the partial call returned `Some` — a `Some(false)` result still
+      passes. Guards that need the bool value must use `if-let true` /
+      `if-let false`.
+    - `emit_icmp_narrow` + `put_in_reg_ext32_maybe`: for i8/i16 compares,
+      when `rm` is clean and `rn` is dirty, swap operands (and `intcc_swap
+      _args` the cond) so the dirty operand rides `cmp`'s fused extend slot
+      and no standalone `uxtb`/`sxtb` is emitted; the imm-compare path also
+      elides a redundant ext on a clean operand. Bumps the string-compare
+      kernels; LLVM gets the same operand cleanliness for free via `ldrb`
+      /`ldrh` black-box traffic.
+    - `lower (ireduce (fits_in_16 ..))` now materializes `uxtb`/`uxth`
+      instead of the wide passthrough, producing the clean narrow regs the
+      oracle advertises.
+    - `lower (black_box i8/i16)` emits `uxtb`/`uxth` when the operand's
+      high bits are dirty (oracle says not clean); clean inputs still pass
+      through with no inst.

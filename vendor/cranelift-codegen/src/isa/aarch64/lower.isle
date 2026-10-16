@@ -2517,6 +2517,13 @@
     (if (ty_int_ref_scalar_64 ty))
     (value_regs_get src 0))
 
+;; PLIRON: ...except i8/i16 reductions, which we materialize as `uxtb`/`uxth`.
+;; A clean operand lets `emit_icmp` elide the standalone extension and put a
+;; dirty sibling in `cmp`'s fused extend slot (see `val_already_extended`);
+;; LLVM reaches the same state for free via `ldrb`/`ldrh`.
+(rule 1 (lower (ireduce ty @ (fits_in_16 _) src))
+    (extend (value_regs_get src 0) false (ty_bits ty) 32))
+
 ;;;; Rules for `fcmp` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule 4 (lower (fcmp ty @ (multi_lane _ _) (fcmp_zero_cond_not_eq cond) x y))
@@ -3655,6 +3662,15 @@
 ;; to the input's and emit no machine code (like a same-class `bitcast`).
 (rule (lower (black_box _ x))
       x)
+
+;; PLIRON: ...except an i8/i16 barrier with dirty high bits pays one
+;; `uxtb`/`uxth` — the same extension LLVM gets for free from `ldrb`/`ldrh`.
+;; A clean result lets `emit_icmp` put a dirty sibling operand in `cmp`'s
+;; fused extend slot instead of emitting a standalone extension per compare
+;; (see `emit_icmp_narrow`/`val_already_extended`).
+(rule 1 (lower (black_box ty @ (fits_in_16 _) x))
+      (if-let false (val_already_extended (ArgumentExtension.Uext) x))
+      (extend (value_regs_get x 0) false (ty_bits ty) 32))
 
 ;;;; Additional verification terms ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

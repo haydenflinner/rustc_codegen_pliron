@@ -3894,6 +3894,41 @@
 
 ;; Sign extension helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; PLIRON: is `val`'s register already extended per `ae` to at least 32 bits?
+;; Lets narrow compares put a dirty operand in `cmp`'s fused extend slot and
+;; skip standalone `uxtb`/`uxth`/`sxtb`s. (Ported from the riscv64 backend's
+;; oracle.)
+(decl pure partial rec val_already_extended (ArgumentExtension Value) bool)
+
+;; Producers not listed below leave their high bits dirty.
+(rule -1 (val_already_extended _ _) false)
+
+;; 32/64-bit values need no extension to reach 32 bits.
+(rule 0 (val_already_extended _ v @ (value_type (ty_32_or_64 _))) true)
+
+;; uextend/sextend produce full-width results by construction.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uextend _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sextend _ _)) true)
+
+;; icmp/fcmp materialize as full-width 0/1 via cset/fcset.
+(rule 1 (val_already_extended _ (icmp _ _ _ _)) true)
+(rule 1 (val_already_extended _ (fcmp _ _ _ _)) true)
+
+;; Narrow loads carry their own extension.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uload8 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uload16 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sload8 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sload16 _ _ _ _)) true)
+
+;; PLIRON: narrow `ireduce` lowers to `uxtb`/`uxth` — zero-extended to 32.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (ireduce (fits_in_16 _) _)) true)
+
+;; `black_box` of a narrow value emits `uxtb`/`uxth` itself (see `lower`), so
+;; its result is clean for `Uext`. A wide `black_box` aliases its input's
+;; vreg — cleanliness passes through.
+(rule 1 (val_already_extended op (black_box _ x)) (val_already_extended op x))
+(rule 2 (val_already_extended (ArgumentExtension.Uext) (black_box _ x @ (value_type (fits_in_16 _)))) true)
+
 ;; Place a `Value` into a register, sign extending it to 32-bits
 (attr put_in_reg_sext32 (veri chain))
 (attr put_in_reg_sext32 (veri chain))
@@ -5076,22 +5111,42 @@
 ;; 8/16-bit base signed/unsigned cases
 (rule 0 (emit_icmp cc rn rm @ (value_type (fits_in_16 ty)))
   (if (signed_cond_code cc))
-  (CondResult.Cond
-    (cmp_extend
-      (OperandSize.Size32)
-      (put_in_reg_sext32 rn)
-      rm
-      (lower_extend_op ty (ArgumentExtension.Sext)))
-    (cond_code cc)))
+  (emit_icmp_narrow cc rn rm ty (ArgumentExtension.Sext)))
 (rule 1 (emit_icmp cc rn rm @ (value_type (fits_in_16 ty)))
   (if (unsigned_cond_code cc))
+  (emit_icmp_narrow cc rn rm ty (ArgumentExtension.Uext)))
+
+;; PLIRON: `cmp`'s fused extend slot only covers rm. When rm is already clean
+;; for this extension mode and rn is not, swap operands (with swapped cond) so
+;; the dirty operand gets the free extension and no standalone `uxtb`/`sxtb`
+;; is emitted.
+(decl emit_icmp_narrow (IntCC Value Value Type ArgumentExtension) CondResult)
+(rule 0 (emit_icmp_narrow cc rn rm ty ae)
   (CondResult.Cond
     (cmp_extend
       (OperandSize.Size32)
-      (put_in_reg_zext32 rn)
+      (put_in_reg_ext32_maybe rn ae)
       rm
-      (lower_extend_op ty (ArgumentExtension.Uext)))
+      (lower_extend_op ty ae))
     (cond_code cc)))
+(rule 1 (emit_icmp_narrow cc rn rm ty ae)
+  (if-let true (val_already_extended ae rm))
+  (if-let false (val_already_extended ae rn))
+  (CondResult.Cond
+    (cmp_extend
+      (OperandSize.Size32)
+      rm
+      rn
+      (lower_extend_op ty ae))
+    (cond_code (intcc_swap_args cc))))
+
+;; PLIRON: `put_in_reg_ext32` that elides the `extend` entirely when the
+;; producer already left a clean register.
+(decl put_in_reg_ext32_maybe (Value ArgumentExtension) Reg)
+(rule 0 (put_in_reg_ext32_maybe val ae) (put_in_reg_ext32 val ae))
+(rule 1 (put_in_reg_ext32_maybe val @ (value_type (fits_in_16 _)) ae)
+  (if-let true (val_already_extended ae val))
+  (put_in_reg val))
 
 ;; 32/64-bit base case
 (rule 2 (emit_icmp cc rn rm @ (value_type (ty_32_or_64 ty)))
@@ -5103,7 +5158,7 @@
 (rule 3 (emit_icmp cc rn @ (value_type (fits_in_16 ty)) (imm12_from_value rm))
   (if (unsigned_cond_code cc))
   (CondResult.Cond
-    (cmp_imm (OperandSize.Size32) (put_in_reg_zext32 rn) rm)
+    (cmp_imm (OperandSize.Size32) (put_in_reg_ext32_maybe rn (ArgumentExtension.Uext)) rm)
     (cond_code cc)))
 
 ;; 128-bit base case
