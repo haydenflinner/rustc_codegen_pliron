@@ -341,6 +341,13 @@ pub fn lower_module(
         if st.dead_fns.contains(n) {
             continue;
         }
+        if n.starts_with("__pliron_bb") {
+            // black_box barrier stubs: calls become CLIF `black_box` ops,
+            // so no symbol is ever emitted — but a declared Import still
+            // lands in the object symbol table, and MSVC link demands a
+            // definition for every UNDEF entry in a linked object.
+            continue;
+        }
         let sig = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let mut l = f.linkage;
         if l == Linkage::Import && has_body(ctx, f.op) {
@@ -4539,8 +4546,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // `call_bb`); emit the zero-instruction CLIF `black_box` op
         // instead of a real call. One op per leaf covers scalars, pairs
         // and multi-leaf vectors; `__pliron_bbm`'s pointer arg carries
-        // the `~{memory}` clobber.
-        if info.bb {
+        // the `~{memory}` clobber. Fall back on the callee name: a pass
+        // that recreates the CallOp loses the `bb` flag.
+        let bb = info.bb
+            || match call.callee(ctx) {
+                CallOpCallable::Direct(id) => self
+                    .st
+                    .ident_to_sym
+                    .get(&id.to_string())
+                    .is_some_and(|s| s.starts_with("__pliron_bb")),
+                _ => false,
+            };
+        if bb {
             let mut rs = Vals::new();
             for &a in &cargs {
                 rs.push(self.b.ins().black_box(a));

@@ -19,7 +19,69 @@ mod sortw;
 mod strwork;
 mod tokenize;
 
+// Crash probe (windows): vectored handler prints faulting RIP before dying.
+#[cfg(windows)]
+fn install_crash_probe() {
+    #[repr(C)]
+    struct ExnRec {
+        code: u32,
+        flags: u32,
+        _next: usize,
+        addr: usize,
+        nparams: u32,
+        _pad: u32,
+    }
+    #[repr(C)]
+    struct ExnPtrs {
+        rec: *mut ExnRec,
+        ctx: *const u8,
+    }
+    unsafe extern "system" fn h(p: *mut ExnPtrs) -> i32 {
+        unsafe {
+            let rec = (*p).rec;
+            let rip = *((*p).ctx.add(0xF8) as *const usize);
+            let base = {
+                extern "system" fn gm(n: *const u16) -> usize {
+                    unsafe { GetModuleHandleW(n) as usize }
+                }
+                unsafe extern "system" {
+                    fn GetModuleHandleW(n: *const u16) -> *mut u8;
+                }
+                gm(std::ptr::null())
+            };
+            std::eprintln!(
+                "CRASH code={:#x} addr={:#x} rip={:#x} exe+{:#x}",
+                (*rec).code,
+                (*rec).addr,
+                rip,
+                rip.wrapping_sub(base)
+            );
+            // CONTEXT: Rsp @ 0x98, Rbp @ 0xA0 (x64)
+            let rsp = *((*p).ctx.add(0x98) as *const usize);
+            let rbp = *((*p).ctx.add(0xA0) as *const usize);
+            std::eprintln!("  rsp={:#x} rbp={:#x}", rsp, rbp);
+            for i in 0..48usize {
+                let q = *(rsp as *const usize).add(i);
+                // print slots that look like return addresses (in .text)
+                if q >= base && q < base + 0x2c6000 {
+                    std::eprintln!("  [rsp+{:#04x}] = exe+{:#x}", i * 8, q - base);
+                }
+            }
+        }
+        0
+    }
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(first: u32, h: *const ()) -> usize;
+    }
+    unsafe {
+        AddVectoredExceptionHandler(1, h as usize as *const ());
+    }
+}
+#[cfg(not(windows))]
+fn install_crash_probe() {}
+
 fn bench_chars_alpha(c: &mut Criterion) {
+    install_crash_probe();
     c.bench_function("chars_alpha", |b| {
         let s = chars_alpha::setup();
         b.iter(|| chars_alpha::run(black_box(&s)))

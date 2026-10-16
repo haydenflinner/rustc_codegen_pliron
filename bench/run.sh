@@ -18,13 +18,21 @@ esac
 
 cargo build  # the backend dylib
 
+# uv-managed python if present; else python3/python (skip the Windows alias stub)
+if command -v uv >/dev/null; then
+  PY=(uv run --no-project python)
+else
+  PY=(python3)
+  command -v "${PY[0]}" >/dev/null && "${PY[@]}" -c pass >/dev/null 2>&1 || PY=(python)
+fi
+
 # Compile the bench target and print the resulting binary path. Args after the
 # cargo options go to the bench crate's rustc invocation only, so
 # -Zcodegen-backend covers the kernels without rebuilding criterion.
 bench_bin() {
   cargo rustc -p pliron-bench --bench kernels --profile bench \
       --message-format json-render-diagnostics -- "$@" \
-    | python3 -c '
+    | "${PY[@]}" -c '
 import json, sys
 exe = ""
 for line in sys.stdin:

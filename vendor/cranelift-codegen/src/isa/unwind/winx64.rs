@@ -145,7 +145,10 @@ impl UnwindCode {
                 }
             }
             Self::SaveXmm { stack_offset, .. } | Self::SaveReg { stack_offset, .. } => {
-                if *stack_offset <= u16::MAX as u32 {
+                // Emit decides small vs far on the *scaled* offset (8-byte
+                // units for GPR saves, 16-byte for XMM); count the same way.
+                let scale = if matches!(self, Self::SaveXmm { .. }) { 16 } else { 8 };
+                if *stack_offset / scale <= u16::MAX as u32 {
                     2
                 } else {
                     3
