@@ -78,3 +78,5 @@ cranelift-interpreter = { path = "vendor/cranelift-interpreter" }
 # `Scatter` instruction-format arm for the `vscatter` CLIF op; see
 # vendor/cranelift-reader/PLIRON_PATCH.md.
 cranelift-reader = { path = "vendor/cranelift-reader" }
+# x64 call veneers for out-of-range imports; see vendor/cranelift-jit/PLIRON_PATCH.md.
+cranelift-jit = { path = "vendor/cranelift-jit" }
