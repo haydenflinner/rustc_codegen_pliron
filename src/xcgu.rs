@@ -349,11 +349,47 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         }
     }
 
-    // BFS order keeps the closest (directly-referenced) copies first, so
-    // truncation drops only the deepest, least-reachable candidates.
+    // The emit set must stay ref-closed: a caller emitted without its
+    // copy deps leaves dangling refs (stage2: 257 undefined symbols —
+    // `take(cap)` kept BFS-front callers while cutting their callee
+    // copies). Spend the cap on whole closures instead: admit a
+    // candidate only together with its uncovered dep closure, so the
+    // closest callees win the budget and anything cut takes its
+    // referrers down with it.
+    let mut emit: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+    for &c in &candidates {
+        let m = MonoItem::Fn(c);
+        if !remaining.contains(&m) || emit.contains(&m) {
+            continue;
+        }
+        let mut closure: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+        let mut stack = vec![m];
+        while let Some(n) = stack.pop() {
+            if ours.contains_key(&n) || visible.contains(&n) || emit.contains(&n) {
+                continue;
+            }
+            if !remaining.contains(&n) || !closure.insert(n) {
+                continue;
+            }
+            if let MonoItem::Fn(inst) = n {
+                stack.extend(refs[&inst].iter().map(|u| u.node));
+            }
+        }
+        let coverable = closure.iter().all(|n| match n {
+            MonoItem::Fn(inst) => refs[inst].iter().all(|u| {
+                ours.contains_key(&u.node)
+                    || visible.contains(&u.node)
+                    || emit.contains(&u.node)
+                    || closure.contains(&u.node)
+            }),
+            _ => false,
+        });
+        if coverable && emit.len() + closure.len() <= cap {
+            emit.extend(closure);
+        }
+    }
     candidates
         .into_iter()
-        .filter(|c| remaining.contains(&MonoItem::Fn(*c)))
-        .take(cap)
+        .filter(|c| emit.contains(&MonoItem::Fn(*c)))
         .collect()
 }
