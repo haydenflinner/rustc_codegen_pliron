@@ -7,6 +7,7 @@
 
 use alloc::{string::ToString, vec, vec::Vec};
 use core::marker::PhantomData;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
@@ -103,19 +104,22 @@ pub struct Operation {
     self_ptr: Ptr<Operation>,
     /// For quick creation of an [OpObj] or concrete [Op] from [Self].
     concrete_op: ConcreteOpInfo,
-    /// [Results](OpResult) defined by self.
-    pub(crate) results: Vec<OpResult>,
-    /// [Operand]s used by self.
-    pub(crate) operands: Vec<Operand<Value>>,
-    /// Control-flow-graph successors.
-    pub(crate) successors: Vec<Operand<Ptr<BasicBlock>>>,
+    /// [Results](OpResult) defined by self. Inline up to the common
+    /// arity — most ops define 0-2 results; a `Vec` here was one heap
+    /// allocation per op.
+    pub(crate) results: SmallVec<[OpResult; 2]>,
+    /// [Operand]s used by self. Most ops read ≤4 values.
+    pub(crate) operands: SmallVec<[Operand<Value>; 4]>,
+    /// Control-flow-graph successors. Branches carry ≤2.
+    pub(crate) successors: SmallVec<[Operand<Ptr<BasicBlock>>; 2]>,
     /// Links to the parent [BasicBlock] and
     /// previous and next [Operation]s in the block.
     block_links: BlockLinks,
     /// A dictionary of attributes.
     pub attributes: AttributeDict,
-    /// Regions contained inside this operation.
-    pub(crate) regions: Vec<Ptr<Region>>,
+    /// Regions contained inside this operation. Most ops hold zero or
+    /// one.
+    pub(crate) regions: SmallVec<[Ptr<Region>; 1]>,
     /// Source location of this operation.
     loc: Location,
 }
@@ -157,12 +161,12 @@ impl Operation {
         let f = |self_ptr: Ptr<Operation>| Operation {
             self_ptr,
             concrete_op,
-            results: Vec::with_capacity(result_types.len()),
-            operands: Vec::with_capacity(operands.len()),
-            successors: Vec::with_capacity(successors.len()),
+            results: SmallVec::with_capacity(result_types.len()),
+            operands: SmallVec::with_capacity(operands.len()),
+            successors: SmallVec::with_capacity(successors.len()),
             block_links: BlockLinks::default(),
             attributes: AttributeDict::default(),
-            regions: Vec::with_capacity(num_regions),
+            regions: SmallVec::with_capacity(num_regions),
             loc: Location::Unknown,
         };
 
@@ -185,7 +189,9 @@ impl Operation {
             .map(|def| Operand::new(ctx, *def, newop))
             .collect();
         newop.deref_mut(ctx).successors = successors;
-        newop.deref_mut(ctx).regions = Vec::new_init(num_regions, |_| Region::new(ctx, newop));
+        newop.deref_mut(ctx).regions = (0..num_regions)
+            .map(|_| Region::new(ctx, newop))
+            .collect();
 
         newop
     }
