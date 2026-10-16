@@ -163,7 +163,7 @@ fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: u
     let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
         return false;
     };
-    let direct = matches!(c.callee(ctx), CallOpCallable::Direct(_));
+    let direct = c.get_attr_llvm_call_callee(ctx).is_some();
     // Operand 0 of an indirect call is the callee, not an argument.
     if !direct && idx == 0 {
         return false;
@@ -177,10 +177,10 @@ fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: u
     {
         return true;
     }
-    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+    let Some(id) = c.get_attr_llvm_call_callee(ctx) else {
         return false;
     };
-    let Some(sym) = st.ident_to_sym.get(&id.to_string()) else {
+    let Some(sym) = st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())) else {
         return false;
     };
     let Some(&strict) = st.nowrite.get(sym) else {
@@ -205,11 +205,12 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         return None;
     }
     let c = Operation::get_op::<CallOp>(op, ctx)?;
-    if matches!(c.callee(ctx), CallOpCallable::Indirect(_)) && idx == 0 {
+    let indirect = c.get_attr_llvm_call_callee(ctx).is_none();
+    if indirect && idx == 0 {
         // Operand 0 of an indirect call is the callee, not an argument.
         return None;
     }
-    let ai = idx - usize::from(matches!(c.callee(ctx), CallOpCallable::Indirect(_)));
+    let ai = idx - usize::from(indirect);
     let r = st
         .calls
         .get(&op)
@@ -247,7 +248,7 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
         return false;
     };
-    let direct = matches!(c.callee(ctx), CallOpCallable::Direct(_));
+    let direct = c.get_attr_llvm_call_callee(ctx).is_some();
     // Operand 0 of an indirect call is the callee, not an argument.
     if !direct && idx == 0 {
         return false;
@@ -271,11 +272,11 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     {
         return true;
     }
-    let CallOpCallable::Direct(id) = c.callee(ctx) else {
+    let Some(id) = c.get_attr_llvm_call_callee(ctx) else {
         return false;
     };
     st.ident_to_sym
-        .get(&id.to_string())
+        .get(AsRef::<str>::as_ref(id.as_ref()))
         .and_then(|sym| st.nocapture.get(sym))
         .is_some_and(|s| s.contains(&(ai as u32)))
 }

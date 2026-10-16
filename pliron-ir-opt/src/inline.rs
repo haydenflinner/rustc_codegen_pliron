@@ -72,8 +72,14 @@ pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
 
 pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Option<&'a String> {
     let c = Operation::get_op::<CallOp>(op, ctx)?;
+    // Borrow the callee attr directly: `callee()` clones it into an owned
+    // Identifier (one String alloc) and the obvious lookup then spends a
+    // second on `to_string()` — per call op, per rescan round.
+    if let Some(id) = c.get_attr_llvm_call_callee(ctx) {
+        return st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()));
+    }
     match c.callee(ctx) {
-        CallOpCallable::Direct(id) => st.ident_to_sym.get(&id.to_string()),
+        CallOpCallable::Direct(_) => unreachable!("checked above"),
         // An indirect call through a provable function address (a monomorphized
         // closure shim like hashbrown's `make_hasher`) is direct for inlining:
         // `devirt` rewrites these later, but that runs after the main pass.
@@ -413,7 +419,11 @@ fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
         for b in blocks(ctx, f.op) {
             for op in ops(ctx, b) {
                 if let Some(c) = direct_callee(ctx, st, op) {
-                    *n.entry(c.clone()).or_default() += 1;
+                    if let Some(n) = n.get_mut(c) {
+                        *n += 1;
+                    } else {
+                        n.insert(c.clone(), 1);
+                    }
                 }
             }
         }
@@ -706,10 +716,18 @@ pub fn run(
         // `HashMap::get` brings `hash_one` inside the caller's loop, where
         // the in-loop bonus may now accept it. Rescan until a round finds
         // nothing worth inlining (`size`/`grown`/`cap` bound the fixpoint).
+        // `inline_call` only ever *adds* blocks (the split continuation and
+        // the cloned callee body) — existing blocks never gain a new CallOp
+        // (branches/erase don't produce one), so each block is scanned once
+        // and later rounds walk only freshly spliced blocks.
+        let mut done_blocks: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             for b in blocks(ctx, caller) {
+                if !done_blocks.insert(b) {
+                    continue;
+                }
                 for op in ops(ctx, b) {
                     if !seen.insert(op) {
                         continue;
@@ -728,9 +746,13 @@ pub fn run(
                     if always_only && !st.funcs[cs].always_inline {
                         continue;
                     }
-                    let ci = infos
-                        .entry(cs.clone())
-                        .or_insert_with(|| callee_info(ctx, st, cs, model, limit, bonus, fold));
+                    if !infos.contains_key(cs) {
+                        infos.insert(
+                            cs.clone(),
+                            callee_info(ctx, st, cs, model, limit, bonus, fold),
+                        );
+                    }
+                    let ci = &infos[cs];
                     let Some(ci) = ci.as_ref() else {
                         if verbose {
                             eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
@@ -759,9 +781,19 @@ pub fn run(
                     } else {
                         limit
                     };
-                    let args = Operation::get_op::<CallOp>(op, ctx)
-                        .map(|c| c.args(ctx))
-                        .unwrap_or_default();
+                    // `args` only feeds the bonus/fold/model scoring below —
+                    // collect the operand Vec lazily so plain candidates skip
+                    // the allocation entirely.
+                    let need_args = (bonus > 1 && !ci.dvirt.is_empty())
+                        || (fold > 1 && !ci.conds.is_empty())
+                        || model;
+                    let args = if need_args {
+                        Operation::get_op::<CallOp>(op, ctx)
+                            .map(|c| c.args(ctx))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     // A constant address feeding an indirect-call param lets
                     // `devirt` make the call direct; a scalar constant feeding a
                     // branch condition folds it. (The old `dv` map's bonuses.)
@@ -910,9 +942,12 @@ pub fn devirt(
                 let Some(call) = Operation::get_op::<CallOp>(c, ctx) else {
                     continue;
                 };
-                let CallOpCallable::Indirect(p) = call.callee(ctx) else {
+                // `callee()` clones the attr for direct calls only to
+                // discard it here — test the attr's presence instead.
+                if call.get_attr_llvm_call_callee(ctx).is_some() {
                     continue;
-                };
+                }
+                let p = call.get_operation().deref(ctx).get_operand(0);
                 let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(&p) else {
                     continue;
                 };
