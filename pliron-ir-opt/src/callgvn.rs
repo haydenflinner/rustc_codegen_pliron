@@ -621,6 +621,13 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 if !st.nowrite.contains_key(c) {
                     continue;
                 }
+                // An invoke whose landing pad is inside the loop must stay
+                // put: hoisting it adds a `ph → pad` edge that bypasses the
+                // header, so the header stops dominating the pad and every
+                // header-defined value used downstream of it.
+                if st.invokes.get(&op).is_some_and(|&(l, _)| body.contains(&l)) {
+                    continue;
+                }
                 // Args need to reach the preheader: values defined inside
                 // the body are hoisted along with the call when their whole
                 // operand cone is movable (a write-free loop makes every
