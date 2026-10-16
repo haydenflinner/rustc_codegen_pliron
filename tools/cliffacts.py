@@ -119,6 +119,35 @@ def main():
     for b, ss in succ_edges.items():
         for s in ss:
             succs.append((b, s))
+    # instruction edges: linear within a block; a block's last inst
+    # (its terminator) flows to the first inst of each successor.
+    inst_blk = {}
+    first_inst, last_inst = {}, {}
+    i = 0
+    for b in order:
+        for d, u, _s in blocks[b]:
+            inst_blk[i] = int(b)
+            if int(b) not in first_inst:
+                first_inst[int(b)] = i
+            last_inst[int(b)] = i
+            i += 1
+    nxt = []
+    for b in order:
+        base = first_inst[int(b)]
+        for k in range(len(blocks[b]) - 1):
+            nxt.append((base + k, base + k + 1))
+        for s in succ_edges[int(b)]:
+            if s in first_inst:
+                nxt.append((last_inst[int(b)], first_inst[s]))
+    # per-(vreg, block) spill-unit cost: accesses to v inside b,
+    # weighted by block loop depth.
+    vcost = {}
+    i = 0
+    for b in order:
+        for d, u, _s in blocks[b]:
+            for v in d + u:
+                vcost[(v, int(b))] = vcost.get((v, int(b)), 0) + weights[b]
+            i += 1
     # block-level liveness summaries: buse = upward-exposed use (used
     # before any def in the block), bdef = defined anywhere in the block
     # (params count as defs at the top).
@@ -166,6 +195,18 @@ def main():
     print("let cost_rows = [")
     for v in sorted(cost):
         print(f"    ({v}, {cost[v]}),")
+    print("];")
+    print("let iblk_rows = [")
+    for i in sorted(inst_blk):
+        print(f"    ({i}, {inst_blk[i]}),")
+    print("];")
+    print("let next_rows = [")
+    for a, b in nxt:
+        print(f"    ({a}, {b}),")
+    print("];")
+    print("let vcost_rows = [")
+    for (v, b) in sorted(vcost):
+        print(f"    ({v}, {b}, {vcost[(v, b)]}),")
     print("];")
 
 
