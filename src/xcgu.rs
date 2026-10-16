@@ -96,7 +96,12 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     let depth = crate::env_get("PLIRON_XCGU_DEPTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
-    let mut seen: FxHashSet<MonoItem<'tcx>> = direct.clone();
+    // `seen` seeds with the frontier only: items referenced by our own
+    // items are NOT guaranteed-emitted elsewhere (an Internal+inlined
+    // mono item can be dead-stripped in its home CGU), so they may still
+    // need to become local copies themselves.
+    let mut seen: FxHashSet<MonoItem<'tcx>> =
+        cands.iter().map(|&c| MonoItem::Fn(c)).collect();
     let mut accepted: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut out = Vec::new();
     for _ in 0..depth {
@@ -111,7 +116,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
             need.extend(
                 us.iter()
                     .map(|u| u.node)
-                    .filter(|m| !ours.contains_key(m) && !direct.contains(m)),
+                    .filter(|m| !ours.contains_key(m)),
             );
         }
         let mut visible: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
@@ -119,7 +124,6 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
             for other in parts {
                 for m in &need {
                     if let Some(d) = other.items().get(m)
-                        && !d.inlined
                         && matches!(d.linkage, Linkage::External)
                     {
                         visible.insert(*m);
@@ -132,7 +136,6 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
             let ok = refs.get(c).is_some_and(|us| {
                 us.iter().all(|u| {
                     ours.contains_key(&u.node)
-                        || direct.contains(&u.node)
                         || visible.contains(&u.node)
                         || accepted.contains(&u.node)
                 })
@@ -145,7 +148,6 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
                     us.iter()
                         .filter(|u| {
                             !(ours.contains_key(&u.node)
-                                || direct.contains(&u.node)
                                 || visible.contains(&u.node)
                                 || accepted.contains(&u.node))
                         })
@@ -241,7 +243,14 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 .filter_map(|(&item, data)| data.inlined.then_some(item))
         })
         .collect();
-    let mut seen = direct.clone();
+    // `seen` seeds with the frontier only: items referenced by our own
+    // items are NOT guaranteed-emitted elsewhere (an Internal+inlined
+    // mono item can be dead-stripped in its home CGU), so they may still
+    // need to become local copies themselves.
+    let mut seen: FxHashSet<MonoItem<'tcx>> = frontier
+        .iter()
+        .map(|&c| MonoItem::Fn(c))
+        .collect();
     let mut candidates = Vec::new();
     let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
     let mut needed: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
@@ -257,7 +266,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             refs.insert(c, us);
             candidates.push(c);
             for u in us {
-                if !ours.contains_key(&u.node) && !direct.contains(&u.node) {
+                if !ours.contains_key(&u.node) {
                     needed.insert(u.node);
                 }
                 if let MonoItem::Fn(c2) = u.node
@@ -278,7 +287,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         for other in parts {
             for m in &needed {
                 if let Some(d) = other.items().get(m)
-                    && !d.inlined
                     && matches!(d.linkage, Linkage::External)
                 {
                     visible.insert(*m);
@@ -301,7 +309,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     .map(|u| u.node)
                     .filter(|m| {
                         !ours.contains_key(m)
-                            && !direct.contains(m)
                             && !visible.contains(m)
                             && !remaining.contains(m)
                     })
