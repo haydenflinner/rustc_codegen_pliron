@@ -1322,6 +1322,13 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.region_parent,
         p.operand_frozen,
     );
+    // Hoisting can expose `base + iv` adds whose base was loop-internal
+    // at indvars time; stepping them into params evicts the base's live
+    // range from the loop.
+    if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
+        an.invalidate();
+        indvars::run(&mut p.clctx.func, an, amode_scale(p.isa));
+    }
     if k > 0 && p.dump {
         p.dump("licm");
     }

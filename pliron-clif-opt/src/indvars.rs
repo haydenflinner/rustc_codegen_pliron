@@ -311,14 +311,15 @@ fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bo
     }
 }
 
-/// Would replacing `insts`' uses of `base` leave `base` with no use inside
-/// the loop, while it stays live outside it? Then converting `base + iv*K`
-/// to a stepped pointer param evicts `base` from the loop even though the
-/// reg+reg*scale amode folds the address for free: it shrinks `base`'s
-/// liverange so it no longer spans the whole loop, which both frees a
-/// register inside and avoids the per-iteration copies regalloc emits when
-/// reconciling such a range's in-loop/out-of-loop assignments.
-fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: Value) -> bool {
+/// Scan `base`'s uses: `(in_loop, outside)` reports a live in-body use
+/// outside `insts`, and a live use anywhere else, once `insts` are
+/// hypothetically removed.
+fn base_live(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    insts: &[Inst],
+    base: Value,
+) -> (bool, bool) {
     let instset: FxHashSet<Inst> = insts.iter().copied().collect();
     // Anything appearing as an operand (inst args or branch args). A result
     // outside this set is dead: its def can't keep `base` live past the
@@ -356,12 +357,221 @@ fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: V
                 continue;
             }
             if in_body {
-                return false;
+                return (true, outside);
             }
             outside = true;
         }
     }
-    outside
+    (false, outside)
+}
+
+/// Would replacing `insts`' uses of `base` leave `base` with no use inside
+/// the loop, while it stays live outside it? Then converting `base + iv*K`
+/// to a stepped pointer param evicts `base` from the loop even though the
+/// reg+reg*scale amode folds the address for free: it shrinks `base`'s
+/// liverange so it no longer spans the whole loop, which both frees a
+/// register inside and avoids the per-iteration copies regalloc emits when
+/// reconciling such a range's in-loop/out-of-loop assignments.
+fn evicts_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: Value) -> bool {
+    let (in_loop, outside) = base_live(func, body, insts, base);
+    !in_loop && outside
+}
+
+/// `base` left with no live in-body use once `insts` go away — whether it
+/// stays live below the loop (`evicts_base`) or dies outright: either way
+/// its live range no longer reaches into the loop, freeing a register
+/// inside it.
+fn frees_base(func: &Function, body: &FxHashSet<Block>, insts: &[Inst], base: Value) -> bool {
+    !base_live(func, body, insts, base).0
+}
+
+/// How `pend`'s `bound` is known on entry edges: an `iconst` re-materialized
+/// there, a header param fed itself on every backedge (loop-invariant — its
+/// per-edge arg stands in for the param), or a value defined outside the
+/// loop and so dominating every entry edge. The `u128` is the bound's proven
+/// value ceiling — exact for constants, `vmax`-bounded otherwise.
+#[derive(Clone, Copy)]
+enum BSrc {
+    K(u64),
+    Param(usize),
+    V(Value),
+}
+
+fn bound_src(
+    func: &Function,
+    params: &[Value],
+    edges: &[Edge],
+    body: &FxHashSet<Block>,
+    bnd: Value,
+) -> Option<(u128, BSrc)> {
+    let ty = func.dfg.value_type(bnd);
+    let mask: u64 = if ty.bits() >= 64 {
+        u64::MAX
+    } else {
+        (1 << ty.bits()) - 1
+    };
+    if let Some(k) = iconst(func, bnd) {
+        let k = k as u64 & mask;
+        return Some((k as u128, BSrc::K(k)));
+    }
+    let bnd = func.dfg.resolve_aliases(bnd);
+    if let Some(idx) = params
+        .iter()
+        .position(|&p| func.dfg.resolve_aliases(p) == bnd)
+    {
+        let mut mx = 0u128;
+        for e2 in edges {
+            let a = edge_arg(func, e2, idx)?;
+            if func
+                .layout
+                .inst_block(e2.inst)
+                .is_some_and(|b| body.contains(&b))
+            {
+                // A backedge passing anything but the param itself makes
+                // it a carried value, not an invariant `pend` can stand
+                // in for.
+                if func.dfg.resolve_aliases(a) != bnd {
+                    return None;
+                }
+            } else {
+                mx = mx.max(crate::clifpeep::vmax(func, a) as u128 & mask as u128);
+            }
+        }
+        return Some((mx, BSrc::Param(idx)));
+    }
+    if def_block(func, bnd).is_some_and(|d| !body.contains(&d)) {
+        return Some((
+            crate::clifpeep::vmax(func, bnd) as u128 & mask as u128,
+            BSrc::V(bnd),
+        ));
+    }
+    None
+}
+
+/// Would converting `insts` leave `iv` with only the in-body uses
+/// `elim_shadowed` can retire — `iv±K` affine adds, other conversion
+/// targets of the same `invariant + iv` shape, bound icmps and the
+/// backedge arg? Then converting `base + iv` into a stepped param
+/// unlocks `iv`'s elimination instead of merely adding a param beside
+/// it.
+fn iv_only_affine(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    h: Block,
+    iv: Value,
+    iv_idx: usize,
+    insts: &[Inst],
+) -> bool {
+    // The `iv + c` closure `elim_shadowed` builds.
+    let mut off: FxHashMap<Value, i64> = [(iv, 0)].into_iter().collect();
+    for &b in body {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary {
+                opcode,
+                args: [x, y],
+            } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let r = func.dfg.first_result(i);
+            let mut try_off = |a: Value, d: i64| {
+                let a = func.dfg.resolve_aliases(a);
+                if let Some(&o) = off.get(&a) {
+                    off.insert(r, o.wrapping_add(d));
+                }
+            };
+            match opcode {
+                Opcode::Iadd => {
+                    if let Some(d) = iconst(func, y) {
+                        try_off(x, d);
+                    }
+                    if let Some(d) = iconst(func, x) {
+                        try_off(y, d);
+                    }
+                }
+                Opcode::Isub => {
+                    if let Some(d) = iconst(func, y) {
+                        try_off(x, d.wrapping_neg());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let instset: FxHashSet<Inst> = insts.iter().copied().collect();
+    for &b in body {
+        for i in func.layout.block_insts(b) {
+            if instset.contains(&i) {
+                continue;
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let dst = bc.block(&func.dfg.value_lists);
+                for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    let BlockArg::Value(a) = a else {
+                        return false;
+                    };
+                    // An affine value may only reach `h` as `iv`'s own
+                    // backedge arg — exit args need the recovery shim the
+                    // const-domain path doesn't build.
+                    if off.contains_key(&func.dfg.resolve_aliases(a))
+                        && !(dst == h && ai == iv_idx)
+                    {
+                        return false;
+                    }
+                }
+            }
+            match func.dfg.insts[i] {
+                InstructionData::IntCompare { args, .. } => {
+                    if off.contains_key(&func.dfg.resolve_aliases(args[0]))
+                        && off.contains_key(&func.dfg.resolve_aliases(args[1]))
+                    {
+                        return false;
+                    }
+                }
+                InstructionData::Binary {
+                    opcode,
+                    args: [x, y],
+                } if matches!(opcode, Opcode::Iadd | Opcode::Isub) => {
+                    let ax = off.contains_key(&func.dfg.resolve_aliases(x));
+                    let ay = off.contains_key(&func.dfg.resolve_aliases(y));
+                    if ax && ay {
+                        return false;
+                    }
+                    if ax || ay {
+                        let (aff, other) = if ax { (x, y) } else { (y, x) };
+                        let ok = match opcode {
+                            // `affine + const`: an affine def.
+                            // `iv + invariant`: a conversion co-target —
+                            // its param replaces the use when elim runs.
+                            Opcode::Iadd => {
+                                iconst(func, other).is_some()
+                                    || (func.dfg.resolve_aliases(aff) == iv
+                                        && def_block(func, other)
+                                            .is_some_and(|d| !body.contains(&d)))
+                            }
+                            // Only `affine - const` is affine; any other
+                            // isub use of an affine operand is opaque.
+                            Opcode::Isub => ax && iconst(func, y).is_some(),
+                            _ => unreachable!(),
+                        };
+                        if !ok {
+                            return false;
+                        }
+                    }
+                }
+                _ => {
+                    for &v in func.dfg.inst_args(i) {
+                        if off.contains_key(&func.dfg.resolve_aliases(v)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// `np = base + iv*e` (stepped `e*step` per iteration) evicts a live-out
@@ -396,26 +606,29 @@ fn elim_shadowed(
     edges: &[Edge],
     iv: Value,
     np: Value,
-    base: Value,
+    base: Option<Value>,
     e: i64,
     debug: bool,
 ) -> usize {
-    if e <= 0 || !e.unsigned_abs().is_power_of_two() || !crate::pass_enabled("PLIRON_IVELIM") {
+    if e <= 0 || !crate::pass_enabled("PLIRON_IVELIM") {
         return 0;
     }
     let sh = i64::from(e.trailing_zeros());
+    let pow2 = e.unsigned_abs().is_power_of_two();
     let ty = func.dfg.value_type(np);
     // `e >= 2^w` collapses every `*e` product to 0 mod 2^w.
-    if sh >= i64::from(ty.bits()) {
+    if pow2 && sh >= i64::from(ty.bits()) {
         return 0;
     }
-    if func.dfg.value_type(iv) != ty || func.dfg.value_type(base) != ty {
+    if func.dfg.value_type(iv) != ty
+        || base.is_some_and(|b| func.dfg.value_type(b) != ty)
+    {
         return 0;
     }
     let (iv, np, base) = (
         func.dfg.resolve_aliases(iv),
         func.dfg.resolve_aliases(np),
-        func.dfg.resolve_aliases(base),
+        base.map(|b| func.dfg.resolve_aliases(b)),
     );
     let params = func.dfg.block_params(h).to_vec();
     let (Some(iv_idx), Some(np_idx)) = (
@@ -431,7 +644,7 @@ fn elim_shadowed(
     // Backedges must step both params in lockstep (`np += e*step`), or
     // the `np = base + iv*e` recurrence identity doesn't hold.
     if debug {
-        tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim cand iv={iv} np={np} base={base} e={e}");
+        tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim cand iv={iv} np={np} base={base:?} e={e}");
     }
     let mut step = None;
     for e2 in edges {
@@ -551,35 +764,6 @@ fn elim_shadowed(
             .map(|v| func.dfg.resolve_aliases(v))
             .collect();
     }
-    // The recurrence identity is unsigned: `np+c*e <_u pend` tracks
-    // `iv+c <_u bound` only while both stay inside the object, which a
-    // `notrap` access on an `np`-affine address proves — as long as it
-    // runs every iteration, i.e. its block dominates every backedge.
-    let nvals: FxHashSet<Value> = noff.values().copied().collect();
-    let guarded = body.iter().any(|&b| {
-        let access = func.layout.block_insts(b).any(|i| match func.dfg.insts[i] {
-            InstructionData::Load { arg, flags, .. } => {
-                func.dfg.mem_flags[flags].notrap() && nvals.contains(&func.dfg.resolve_aliases(arg))
-            }
-            InstructionData::Store { args, flags, .. } => {
-                func.dfg.mem_flags[flags].notrap()
-                    && nvals.contains(&func.dfg.resolve_aliases(args[1]))
-            }
-            _ => false,
-        });
-        access
-            && edges.iter().all(|e2| {
-                func.layout
-                    .inst_block(e2.inst)
-                    .is_none_or(|pb| !body.contains(&pb) || dt.dominates(b, pb, &func.layout))
-            })
-    });
-    if !guarded {
-        if debug {
-            tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail notrap");
-        }
-        return 0;
-    }
     // `np` is a header param and dominates the loop; a derived
     // `np + c*e` only substitutes for `iv + c` where its def already
     // dominates the use.
@@ -680,10 +864,10 @@ fn elim_shadowed(
                             cmax = cmax.max(c);
                             let bound = func.dfg.resolve_aliases(bound);
                             // `pend` materializes on entry edges, so the
-                            // bound must reach every entry pred.
-                            if iconst(func, bound).is_none()
-                                && def_block(func, bound).is_some_and(|d| body.contains(&d))
-                            {
+                            // bound must reach every entry pred — a
+                            // constant, a loop-invariant header param, or
+                            // a value defined outside the loop.
+                            if bound_src(func, &params, edges, body, bound).is_none() {
                                 if debug {
                                     tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail bound {bound} in body");
                                 }
@@ -735,29 +919,164 @@ fn elim_shadowed(
         }
         return 0;
     }
-    // The first compare runs before the latch pins `iv` under `bound`,
-    // so an entry `iv` needs a proven ceiling: `iv + c < 2^(w-1-sh)`
-    // keeps `(iv+c)*e` inside the unsigned order and leaves `base +
-    // (iv+c)*e` a full top half of headroom against wraparound.
-    // `vmax` only tightens for iconst/zero-extended/narrow-source
-    // values — a raw runtime entry bails the whole rewrite.
-    let cap: u128 = 1u128 << (ty.bits() - 1 - sh as u32);
-    for e2 in edges {
-        if func
-            .layout
-            .inst_block(e2.inst)
-            .is_some_and(|b| body.contains(&b))
-        {
-            continue;
+    // Exact path (any `e`, including non-pow2): with every bound a
+    // constant, no affine exit args to recover, and a dominating
+    // unsigned compare that pins `iv` below a constant every
+    // iteration, the domain of `x -> base + x*e` fits `ty` — the map
+    // is strictly monotone over the domain, so `iv+c cc bound` and
+    // `np+c*e cc base+bound*e` decide identically. Nothing wraps, so
+    // neither the notrap guard nor the runtime overflow check is
+    // needed.
+    let bits = u64::from(ty.bits());
+    let tmask: u64 = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+    let bval = |v: Value| -> Option<u128> {
+        bound_src(func, &params, edges, body, v).map(|(k, _)| k)
+    };
+    let exact = (|| -> Option<u128> {
+        if !exits.is_empty() {
+            return None;
         }
-        let Some(a) = edge_arg(func, e2, iv_idx) else {
-            return 0;
+        // `base` needn't be constant — a `vmax`-proven ceiling (e.g. a
+        // `band`-masked flag) bounds `base + x*e` the same way.
+        let bv = match base {
+            Some(b) => crate::clifpeep::vmax(func, b) as u128 & tmask as u128,
+            None => 0,
         };
-        if crate::clifpeep::vmax(func, a) as u128 + cmax.max(0) as u128 >= cap {
+        // The pin: `iv+c <u bound` evaluated before every backedge —
+        // its block must dominate all backedges and its `brif` must
+        // leave the loop when the compare fails. Once it has run,
+        // `iv` stays below `bound` for the loop's remaining
+        // iterations.
+        let mut pin: Option<u128> = None;
+        let mut dom: u128 = 0;
+        for &(i, w, bnd, _) in &icmps {
+            dom = dom.max(bval(bnd)?);
+            let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] else {
+                continue;
+            };
+            let cond = if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(w) {
+                cond
+            } else {
+                cond.swap_args()
+            };
+            if !matches!(
+                cond,
+                IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual
+            ) {
+                continue;
+            }
+            let Some(bi) = func.layout.inst_block(i) else {
+                continue;
+            };
+            let r = func.dfg.first_result(i);
+            let mut exits_false = false;
+            for j in func.layout.block_insts(bi) {
+                let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[j] else {
+                    continue;
+                };
+                if func.dfg.resolve_aliases(arg) != r {
+                    continue;
+                }
+                let (t, f) = (
+                    blocks[0].block(&func.dfg.value_lists),
+                    blocks[1].block(&func.dfg.value_lists),
+                );
+                exits_false |= body.contains(&t) && !body.contains(&f);
+            }
+            if !exits_false {
+                continue;
+            }
+            if edges.iter().all(|e2| {
+                func.layout
+                    .inst_block(e2.inst)
+                    .is_none_or(|pb| !body.contains(&pb) || dt.dominates(bi, pb, &func.layout))
+            }) {
+                let bn = bval(bnd)?;
+                pin = Some(pin.map_or(bn, |p: u128| p.max(bn)));
+            }
+        }
+        let pin = pin?;
+        // First-iteration entry values are also compare operands.
+        for e2 in edges {
+            if func
+                .layout
+                .inst_block(e2.inst)
+                .is_some_and(|b| body.contains(&b))
+            {
+                continue;
+            }
+            let a = edge_arg(func, e2, iv_idx)?;
+            dom = dom.max(crate::clifpeep::vmax(func, a) as u128 & tmask as u128);
+        }
+        let lim = bv + (dom.max(pin) + cmax.max(0) as u128 + 1) * e as u128;
+        (lim < (1u128 << bits)).then_some(lim)
+    })();
+    if exact.is_none() {
+        // Legacy path: `e` must be a power of two (`pend`'s overflow
+        // check and the exit-shim `>>sh` recovery are shift-exact),
+        // `base` must be a real value, and a `notrap` access on an
+        // `np`-affine address must dominate every backedge — that is
+        // what bounds `np` against wraparound.
+        if base.is_none() {
+            return 0;
+        }
+        if !pow2 {
             if debug {
-                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail entryiv {a}");
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail pow2");
             }
             return 0;
+        }
+        let nvals: FxHashSet<Value> = noff.values().copied().collect();
+        let guarded = body.iter().any(|&b| {
+            let access = func.layout.block_insts(b).any(|i| match func.dfg.insts[i] {
+                InstructionData::Load { arg, flags, .. } => {
+                    func.dfg.mem_flags[flags].notrap()
+                        && nvals.contains(&func.dfg.resolve_aliases(arg))
+                }
+                InstructionData::Store { args, flags, .. } => {
+                    func.dfg.mem_flags[flags].notrap()
+                        && nvals.contains(&func.dfg.resolve_aliases(args[1]))
+                }
+                _ => false,
+            });
+            access
+                && edges.iter().all(|e2| {
+                    func.layout
+                        .inst_block(e2.inst)
+                        .is_none_or(|pb| !body.contains(&pb) || dt.dominates(b, pb, &func.layout))
+                })
+        });
+        if !guarded {
+            if debug {
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail notrap");
+            }
+            return 0;
+        }
+        // The first compare runs before the latch pins `iv` under
+        // `bound`, so an entry `iv` needs a proven ceiling:
+        // `iv + c < 2^(w-1-sh)` keeps `(iv+c)*e` inside the unsigned
+        // order and leaves `base + (iv+c)*e` a full top half of
+        // headroom against wraparound. `vmax` only tightens for
+        // iconst/zero-extended/narrow-source values — a raw runtime
+        // entry bails the whole rewrite.
+        let cap: u128 = 1u128 << (ty.bits() - 1 - sh as u32);
+        for e2 in edges {
+            if func
+                .layout
+                .inst_block(e2.inst)
+                .is_some_and(|b| body.contains(&b))
+            {
+                continue;
+            }
+            let Some(a) = edge_arg(func, e2, iv_idx) else {
+                return 0;
+            };
+            if crate::clifpeep::vmax(func, a) as u128 + cmax.max(0) as u128 >= cap {
+                if debug {
+                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail entryiv {a}");
+                }
+                return 0;
+            }
         }
     }
     // `pend = base + bound*e` per distinct bound, carried as a new
@@ -769,6 +1088,9 @@ fn elim_shadowed(
             continue;
         }
         let pend = func.dfg.append_block_param(h, ty);
+        // Verified in the icmp scan: every bound has an entry-edge source.
+        let bs = bound_src(func, &params, edges, body, bnd).unwrap().1;
+        let base_k = base.and_then(|b| iconst(func, b));
         for e2 in edges {
             let v = if func
                 .layout
@@ -777,29 +1099,94 @@ fn elim_shadowed(
             {
                 pend
             } else {
-                let mut pos = FuncCursor::new(func).at_inst(e2.inst);
-                let s = iconst_masked(&mut pos, ty, e);
-                let be = pos.ins().imul(bnd, s);
-                let raw = pos.ins().iadd(base, be);
-                // `bound` needn't fit the object's extent: `bound*e` or
-                // `base + bound*e` wrapping sorts `pend` below `np` and
-                // the unsigned test exits zero-trip. Clamp `pend` to
-                // `u::MAX` on overflow — `np <u MAX` keeps iterating, as
-                // `iv <u bound` does; divergence needs `~bound` guarded
-                // iterations, unreachable for a defined run.
-                let lo = pos.ins().icmp(IntCC::UnsignedLessThan, raw, base);
-                let bad = if sh > 0 {
-                    // `bound*e` overflows iff `bound >> (w - sh)` is set.
-                    let sc = pos.ins().iconst(types::I64, i64::from(ty.bits()) - sh);
-                    let hi = pos.ins().ushr(bnd, sc);
-                    let z = iconst_masked(&mut pos, ty, 0);
-                    let ov = pos.ins().icmp(IntCC::NotEqual, hi, z);
-                    pos.ins().bor(ov, lo)
-                } else {
-                    lo
+                // Resolved before the mutable cursor borrows `func`.
+                let barg = match bs {
+                    BSrc::Param(ix) => edge_arg(func, e2, ix),
+                    _ => None,
                 };
-                let top = iconst_masked(&mut pos, ty, -1);
-                pos.ins().select(bad, top, raw)
+                let mut pos = FuncCursor::new(func).at_inst(e2.inst);
+                if exact.is_some() {
+                    // `pend = base + bound*e`; the domain check proved
+                    // nothing wraps, so no runtime overflow check. `base`
+                    // may itself be a runtime value — materialize the sum.
+                    match (bs, base_k) {
+                        (BSrc::K(k), Some(b0)) => {
+                            let pv = (b0 as u64)
+                                .wrapping_add(k.wrapping_mul(e as u64))
+                                & tmask;
+                            pos.ins().iconst(ty, pv as i64)
+                        }
+                        (bs, _) => {
+                            let be = match bs {
+                                BSrc::K(k) => {
+                                    iconst_masked(&mut pos, ty, (k as i64).wrapping_mul(e))
+                                }
+                                BSrc::Param(_) => {
+                                    let barg = barg.unwrap();
+                                    if e == 1 {
+                                        barg
+                                    } else {
+                                        let c = iconst_masked(&mut pos, ty, e);
+                                        pos.ins().imul(barg, c)
+                                    }
+                                }
+                                BSrc::V(v0) => {
+                                    if e == 1 {
+                                        v0
+                                    } else {
+                                        let c = iconst_masked(&mut pos, ty, e);
+                                        pos.ins().imul(v0, c)
+                                    }
+                                }
+                            };
+                            match base {
+                                None => be,
+                                Some(b) => {
+                                    // A body-defined iconst `base` is
+                                    // re-emitted so the edge arg never
+                                    // references a def inside the loop.
+                                    let bv = match base_k {
+                                        Some(b0) => iconst_masked(&mut pos, ty, b0),
+                                        None => b,
+                                    };
+                                    pos.ins().iadd(bv, be)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let base = base.unwrap();
+                    let s = iconst_masked(&mut pos, ty, e);
+                    // The bound on this edge: a fresh iconst (a body
+                    // def can't feed an entry edge), the invariant
+                    // param's edge arg, or the outside-loop value.
+                    let bv = match bs {
+                        BSrc::K(k) => iconst_masked(&mut pos, ty, k as i64),
+                        BSrc::Param(_) => barg.unwrap(),
+                        BSrc::V(v0) => v0,
+                    };
+                    let be = pos.ins().imul(bv, s);
+                    let raw = pos.ins().iadd(base, be);
+                    // `bound` needn't fit the object's extent: `bound*e` or
+                    // `base + bound*e` wrapping sorts `pend` below `np` and
+                    // the unsigned test exits zero-trip. Clamp `pend` to
+                    // `u::MAX` on overflow — `np <u MAX` keeps iterating, as
+                    // `iv <u bound` does; divergence needs `~bound` guarded
+                    // iterations, unreachable for a defined run.
+                    let lo = pos.ins().icmp(IntCC::UnsignedLessThan, raw, base);
+                    let bad = if sh > 0 {
+                        // `bound*e` overflows iff `bound >> (w - sh)` is set.
+                        let sc = pos.ins().iconst(types::I64, i64::from(ty.bits()) - sh);
+                        let hi = pos.ins().ushr(bv, sc);
+                        let z = iconst_masked(&mut pos, ty, 0);
+                        let ov = pos.ins().icmp(IntCC::NotEqual, hi, z);
+                        pos.ins().bor(ov, lo)
+                    } else {
+                        lo
+                    };
+                    let top = iconst_masked(&mut pos, ty, -1);
+                    pos.ins().select(bad, top, raw)
+                }
             };
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[e2.inst]
@@ -855,7 +1242,9 @@ fn elim_shadowed(
                 let mut pos = FuncCursor::new(func).at_bottom(s);
                 for (ai, t) in sig.iter().enumerate() {
                     if t.is_none() {
-                        let d = pos.ins().isub(args[ai], base);
+                        // `exits` is only non-empty on the legacy
+                        // path, where `base` is known `Some`.
+                        let d = pos.ins().isub(args[ai], base.unwrap());
                         args[ai] = if sh == 0 {
                             d
                         } else {
@@ -919,7 +1308,7 @@ fn run_loop(
     let mut n = 0;
     // Pointer params created for live-out bases may fully shadow their
     // index: (iv param, np, base, e) for `elim_shadowed` below.
-    let mut cands: Vec<(Value, Value, Value, i64)> = vec![];
+    let mut cands: Vec<(Value, Value, Option<Value>, i64)> = vec![];
     // Every `iv*K` in the loop, and every `invariant + iv*K`, is a candidate.
     for (idx, &iv) in params.iter().enumerate() {
         if n >= MAX_PARAMS {
@@ -967,10 +1356,22 @@ fn run_loop(
                 break;
             }
             // `base + iv` is already a single cheap add; turning it into a
-            // stepped param only buys regalloc parallel-copy movs. A real
+            // stepped param only buys regalloc parallel-copy movs — unless
+            // the conversion removes `base`'s last live in-loop use AND
+            // leaves `iv` eliminable (`base` non-const, `iv`'s remaining
+            // uses all affine/icmp): then the add, the base's live range
+            // and `iv`'s param all leave the loop at once. A real
             // `imul iv, 1` is a genuine dead multiply — stepping it away
             // removes two insts per iteration.
-            if mul == Mul::K(0) || (mul == Mul::K(1) && bare) {
+            if mul == Mul::K(0)
+                || (mul == Mul::K(1)
+                    && bare
+                    && !base.is_some_and(|b| {
+                        iconst(func, b).is_none()
+                            && frees_base(func, &body, insts, b)
+                            && iv_only_affine(func, &body, h, iv, idx, insts)
+                    }))
+            {
                 continue;
             }
             // `base + iv*{1,2,4,8}` feeding only memory addresses folds
@@ -1023,8 +1424,10 @@ fn run_loop(
                     insts.len()
                 );
             }
-            if let (Some(b), Mul::K(k)) = (base, mul) {
-                cands.push((iv, np, b, k));
+            // Bare `iv*K` shadows `iv` with `base = 0` — the
+            // constant-domain path in `elim_shadowed` handles it.
+            if let Mul::K(k) = mul {
+                cands.push((iv, np, base, k));
             }
             n += 1;
         }
@@ -2836,7 +3239,7 @@ mod tests {
         let im1 = cur.ins().isub(i, one);
         let off2 = cur.ins().imul(im1, eight);
         let a_prev = cur.ins().iadd(base, off2);
-        let la = cur
+        let _la = cur
             .ins()
             .load(types::I64, MemFlagsData::new().with_notrap(), a_cur, 0);
         let lb = cur

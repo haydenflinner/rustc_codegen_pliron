@@ -3920,6 +3920,11 @@
 (rule 1 (val_already_extended (ArgumentExtension.Sext) (sload8 _ _ _ _)) true)
 (rule 1 (val_already_extended (ArgumentExtension.Sext) (sload16 _ _ _ _)) true)
 
+;; PLIRON: a narrow-typed `load` zero extends too (`ldrb`/`ldrh`) — only
+;; ever `Uext`-clean.
+(rule 1 (val_already_extended (ArgumentExtension.Uext)
+        (load (fits_in_16 _) _ _ _)) true)
+
 ;; PLIRON: narrow `ireduce` lowers to `uxtb`/`uxth` — zero-extended to 32.
 (rule 1 (val_already_extended (ArgumentExtension.Uext) (ireduce (fits_in_16 _) _)) true)
 

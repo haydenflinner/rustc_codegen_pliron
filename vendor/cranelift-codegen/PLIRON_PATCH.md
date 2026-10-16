@@ -439,8 +439,9 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     - `val_already_extended`: partial bool oracle answering "does this
       value's register already hold the `ArgumentExtension`-extended form".
       Covers 32/64-bit values, `uextend`/`sextend`, `icmp`/`fcmp` (cset
-      writes full-width 0/1), narrow loads, narrow `ireduce` (see below),
-      and narrow `black_box`. NB: `(if (oracle))` in this ISLE only tests
+      writes full-width 0/1), `uload8`/`uload16`/`sload8`/`sload16`,
+      narrow-typed `load` (`ldrb`/`ldrh` zero-extend — `Uext`-clean),
+      narrow `ireduce` (see below), and narrow `black_box`. NB: `(if (oracle))` in this ISLE only tests
       that the partial call returned `Some` — a `Some(false)` result still
       passes. Guards that need the bool value must use `if-let true` /
       `if-let false`.

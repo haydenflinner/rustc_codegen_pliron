@@ -134,6 +134,16 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
         }
         // `icmp` yields 0/1; `a ^ b` sets no bit clear in both operands.
         InstructionData::IntCompare { .. } => hi = hi.min(1),
+        // `a * b` is at most the product of the operand bounds —
+        // saturating keeps a wrapped product conservative.
+        InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args,
+        } => {
+            let m =
+                vmax_d(func, args[0], depth - 1).saturating_mul(vmax_d(func, args[1], depth - 1));
+            hi = hi.min(m);
+        }
         InstructionData::Unary { opcode, .. }
             if matches!(opcode, Opcode::Clz | Opcode::Ctz | Opcode::Popcnt) =>
         {
