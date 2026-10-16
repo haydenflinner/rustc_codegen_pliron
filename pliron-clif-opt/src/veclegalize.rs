@@ -186,7 +186,7 @@ fn vt_of(pos: &FuncCursor, v: Value) -> Type {
 /// integer add, so they alias directly.
 fn copy_to(pos: &mut FuncCursor, inst: ir::Inst, v: ir::Value) {
     if pos.func.dfg.value_type(v).is_int() {
-        pos.func.replace(inst).iadd_imm(v, 0);
+        pos.func.replace(inst).iadd_imm_s(v, 0);
         return;
     }
     let r = pos.func.dfg.first_result(inst);
@@ -326,7 +326,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
             }
             Opcode::VanyTrue => {
                 let v = pos.ins().bitcast(it, le, args[0]);
-                let c = pos.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, v, 0);
+                let c = pos.ins().icmp_imm_s(ir::condcodes::IntCC::NotEqual, v, 0);
                 copy_to(&mut pos, inst, c);
             }
             Opcode::VallTrue => {
@@ -339,7 +339,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                         v
                     };
                     let l = pos.ins().ireduce(lt, w);
-                    let c = pos.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, l, 0);
+                    let c = pos.ins().icmp_imm_s(ir::condcodes::IntCC::NotEqual, l, 0);
                     acc = Some(match acc {
                         None => c,
                         Some(a) => pos.ins().band(a, c),
