@@ -632,7 +632,12 @@ fn refold_header(
                     if num.checked_rem(sc) != Some(0) {
                         continue;
                     }
-                    let t = num / sc;
+                    // `sc == -1` divides cleanly but `i64::MIN / -1`
+                    // overflows — a down-counter with that span is a
+                    // compiler ICE, not a fold we need to take.
+                    let Some(t) = num.checked_div(sc) else {
+                        continue;
+                    };
                     // The new test exits at `t+1 ≡ T` under the anchor's
                     // step period; for it to coincide with the original's
                     // first exit, T must be the smallest positive solution
