@@ -41,8 +41,13 @@ fn parse(clif: &str) -> Function {
         .unwrap()
 }
 
+/// `WIDE_VECTOR_BITS` is process-global — tests run on threads, so a 512
+/// compile must hold the ceiling for its whole compile/reset window.
+static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn compile(bits: u32, clif: &str) -> Vec<u8> {
     let isa = isa();
+    let _g = COMPILE_LOCK.lock().unwrap();
     WIDE_VECTOR_BITS.store(bits, Ordering::Relaxed);
     let mut ctx = Context::for_function(parse(clif));
     ctx.compile(&*isa, &mut ControlPlane::default())

@@ -1052,29 +1052,32 @@ fn pred_blocks(cfg: &ControlFlowGraph, b: Block) -> Vec<Block> {
 }
 
 /// The value `loc` holds on entry to `b`: the single predecessor's value, or
-/// a new block param whose args are filled in later.
-fn start_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Value {
+/// a new block param whose args are filled in later. `None` when the pred's
+/// end state lacks `loc` — `ins[b]` comes from the `out` fixpoint while
+/// `pre.end` comes from the scan, and the two can disagree (MAX_ENTRIES
+/// cap, a back-edge pred not yet scanned).
+fn start_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Option<Value> {
     if let Some(&v) = pre.start.get(&(b, loc)) {
-        return v;
+        return Some(v);
     }
     let preds = pred_blocks(pre.cfg, b);
     let v = if let [p] = preds[..]
         && p != b
     {
-        end_val(func, pre, p, loc)
+        end_val(func, pre, p, loc)?
     } else {
         pre.pending.push((b, loc));
         func.dfg.append_block_param(b, loc.2)
     };
     pre.start.insert((b, loc), v);
-    v
+    Some(v)
 }
 
-fn end_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Value {
-    match pre.end[&b].get(&loc) {
-        Some(&St::Local(v)) => v,
+fn end_val(func: &mut Function, pre: &mut Pre, b: Block, loc: Loc) -> Option<Value> {
+    match pre.end.get(&b)?.get(&loc) {
+        Some(&St::Local(v)) => Some(v),
         Some(St::In) => start_val(func, pre, b, loc),
-        None => unreachable!("loadpre: location not available at end of {b}"),
+        None => None,
     }
 }
 
@@ -1355,12 +1358,21 @@ fn pre(
                     let (r, o) = norm_root(func, ps, na, arg);
                     let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                     if let Some(&s) = st.get(&loc) {
+                        // `St::In` with no materializable entry value
+                        // (scan/fixpoint divergence) — keep the load.
                         let v = match s {
-                            St::Local(v) => v,
+                            St::Local(v) => Some(v),
                             St::In => start_val(func, &mut pre, b, loc),
                         };
-                        fwd.push((i, v));
-                        st.insert(loc, St::Local(v));
+                        match v {
+                            Some(v) => {
+                                fwd.push((i, v));
+                                st.insert(loc, St::Local(v));
+                            }
+                            None => {
+                                st.insert(loc, St::Local(res));
+                            }
+                        }
                     } else if !clobbered
                         && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
                         && let Some(v) =
@@ -1477,7 +1489,7 @@ fn pre(
                 Some(&v) => Some(v),
                 None => match pre.end.get(&pb).and_then(|e| e.get(&loc)) {
                     Some(&St::Local(v)) => Some(v),
-                    Some(&St::In) => Some(start_val(func, &mut pre, pb, loc)),
+                    Some(&St::In) => start_val(func, &mut pre, pb, loc),
                     _ => None,
                 },
             };
