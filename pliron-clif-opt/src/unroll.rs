@@ -18,6 +18,7 @@ use cranelift_codegen::ir::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::{NonNull, eval, known};
+use crate::uses::Uses;
 
 const MAX_ITERS: usize = 32;
 /// Cap on instructions emitted into the straight-line replacement block —
@@ -60,6 +61,10 @@ pub fn run(
     // O(E) fixpoint per unrolled loop. Built lazily: NonNull::new is a
     // whole-function fixpoint and most functions have no candidate.
     let mut nn: Option<NonNull> = None;
+    // `uses` feeds each candidate's `used_out` query: without it the
+    // outside-use scan is O(fn) per loop header. Stale after an unroll,
+    // so invalidated alongside the CFG.
+    let mut uses: Option<crate::uses::Uses> = None;
     'outer: while n < MAX_LOOPS {
         let (cfg, dt) = an.cfg_dt(func);
         let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -72,7 +77,9 @@ pub fn run(
             if prof.get(&h) == Some(&0) {
                 continue;
             }
-            let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, h) else {
+            let Some((pred, pinst, body, entry, used_out)) =
+                candidate(func, cfg, dt, uses.get_or_insert_with(|| Uses::new(func)), h)
+            else {
                 continue;
             };
             if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
@@ -130,6 +137,7 @@ pub fn run(
             n += 1;
             // The preheader block + edge retargets rewired the CFG.
             an.invalidate();
+            uses = None;
             continue 'outer;
         }
         break;
@@ -144,6 +152,7 @@ fn candidate(
     func: &Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
+    uses: &crate::uses::Uses,
     h: Block,
 ) -> Option<(Block, Inst, FxHashSet<Block>, Vec<Value>, FxHashSet<Value>)> {
     if !dt.is_reachable(h) {
@@ -206,18 +215,17 @@ fn candidate(
             defs.extend(func.dfg.inst_results(i).iter().copied());
         }
     }
+    // A def "used outside" is any site whose block is not in the body —
+    // `uses.sites` already resolves aliases, so this is O(defs x uses)
+    // instead of a whole-function scan per header.
     let mut used_out = FxHashSet::default();
-    for b in func.layout.blocks() {
-        if body.contains(&b) {
-            continue;
-        }
-        for i in func.layout.block_insts(b) {
-            used_out.extend(
-                func.dfg
-                    .inst_values(i)
-                    .map(|v| func.dfg.resolve_aliases(v))
-                    .filter(|v| defs.contains(v)),
-            );
+    for &v in &defs {
+        if uses
+            .sites
+            .get(&v)
+            .is_some_and(|ss| ss.iter().any(|&(b, _)| !body.contains(&b)))
+        {
+            used_out.insert(v);
         }
     }
     Some((e.block, e.inst, body, entry, used_out))
