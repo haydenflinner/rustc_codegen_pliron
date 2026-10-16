@@ -1538,3 +1538,42 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   only spliced blocks instead of the whole (growing) caller.
 - Same alloc pattern fixed in sroa (3 callee() calls per op).
 - bench: inline+scan ~2.6s -> ~1.4s.
+
+## 2026-10-16 phisimp/domcheck/nocap/nowrite + slp + inline-scan (devin 761f9fa8, cont.)
+- `f9b9ef7`: phisimp hoists bs/reach/preds out of the fixpoint (removing
+  successor operands never retargets edges — the map is loop-invariant);
+  reachable()/domcheck::succs scan terminators only. nocapture: linked-list
+  scans, per-Value type-classification memo, FxHashMap param index (was
+  O(fns*params) find). nowrite: Vec-free CFG scan.
+- CORRECTNESS TRAP (phisimp): caching `successor_operands` Vecs per edge is
+  UNSOUND — `replace_all_uses_with` mutates operand lists on edges keyed to
+  OTHER blocks' pred lists (a block arg can be forwarded to several
+  successors), so a cached Vec goes silently stale and can yield an
+  already-removed arg -> `NotInBlockArgument` panic in
+  arg.replace_all_uses_with. Fix was to drop the memo; the edge operand
+  Vec alloc per (edge,arg) stays.
+- `d65d0ff`/`8b8d151`: inline callee_info fused 4 callee-body walks
+  (legal+devirt_params+cond_params) into one op scan; ops() Vec-collects
+  removed at all read-only sites (iter() only borrow-checks per step);
+  `seen` set removed (done_blocks already scans each block once; ops
+  moved into a split cont block now get re-scored, which is the point of
+  the fixpoint). bench iropt: inline+inline2 ~2.5-3.1s -> ~2.1s.
+- `503f8d6` slp: byop opcode->positions index replaces the per-ia linear
+  candidate scan (O(n^2) on sparse-opcode blocks); col's failure rollback
+  removes truncated rows' member pairs instead of rebuilding `members`
+  from all rows. slp 1.6s -> 1.47s (modest; col_cost tree-recursion is
+  the remaining bulk).
+- `2b4ce54`... phisimp successor-operand memo REVERTED in-tree before
+  commit — see trap above. If you re-attempt: invalidate on every
+  replace_all_uses_with that can touch the edge, not just
+  remove_successor_operand.
+- Fresh samply (post-inline, parallel build, ~16 CPU-s on bench):
+  CLIF run_step tree ~7.8s; jumpthread ~1.6-2.9s (NonNull::new ~750,
+  round ~425), slp ~1.3s (col_cost ~950), clifpeep webmerge_ctx ~777 +
+  emit_key ~528, sroa forward_single_store ~618, callgvn base_alloca
+  ~549, lower_to_object ~942. PLIRON_TIMING says: jumpthread 2.1-2.9s,
+  slp 1.5-1.6s, ifconv2 ~0.5s, loadfwd ~0.45s, sameargs2/unroll/
+  mergechain/edgespec ~0.3s each.
+- Reminder: samply inclusive attribution misleads when callees inline —
+  s_mergechain showed 1634 samples but PLIRON_JT_PROF2 sub-phases sum to
+  ~356ms; trust PLIRON_TIMING for step ranking, samply for leaf frames.
