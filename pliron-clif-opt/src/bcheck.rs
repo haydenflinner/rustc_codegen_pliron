@@ -118,7 +118,7 @@ struct Chk {
 }
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     match func.dfg.insts[i] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
@@ -180,7 +180,7 @@ fn feeds(
 
 fn def_block(func: &Function, v: Value) -> Option<Block> {
     use cranelift_codegen::ir::ValueDef;
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
         ValueDef::Union(..) => None,
@@ -594,7 +594,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 Opcode::Call | Opcode::CallIndirect => call = true,
                 Opcode::Load => {
                     if let InstructionData::Load { arg, .. } = *d
-                        && let Some(ai) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+                        && let Some(ai) = func.dfg.resolved_value_def(arg).inst()
                         && func.dfg.insts[ai].opcode() == Opcode::TlsValue
                     {
                         flag = true;
@@ -602,10 +602,9 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 }
                 Opcode::Brif => {
                     if let InstructionData::Brif { arg, .. } = *d {
-                        if let Some(li) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+                        if let Some(li) = func.dfg.resolved_value_def(arg).inst()
                             && let InstructionData::Load { arg: la, .. } = func.dfg.insts[li]
-                            && let Some(ai) =
-                                func.dfg.value_def(func.dfg.resolve_aliases(la)).inst()
+                            && let Some(ai) = func.dfg.resolved_value_def(la).inst()
                             && func.dfg.insts[ai].opcode() == Opcode::TlsValue
                         {
                             flag_brif = true;
@@ -1024,7 +1023,7 @@ fn run_loop(
         let InstructionData::Brif { arg: c, .. } = func.dfg.insts[i] else {
             return None;
         };
-        let ci = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+        let ci = func.dfg.resolved_value_def(c).inst()?;
         let InstructionData::IntCompare {
             opcode: Opcode::Icmp,
             cond,
@@ -1206,7 +1205,7 @@ fn run_loop(
         if to_cold && iconst(func, c).is_none() {
             total_checks += 1;
         }
-        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+        let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
             continue;
         };
         let InstructionData::IntCompare {

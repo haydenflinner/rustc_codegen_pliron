@@ -823,7 +823,7 @@ fn is_splat(
 /// predicate the early-exit resume machinery rarely pays for itself.
 fn eqchain_testable(func: &Function, v: Value) -> bool {
     fn k_of(func: &Function, v: Value) -> Option<i64> {
-        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        let di = func.dfg.resolved_value_def(v).inst()?;
         if let InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             imm,
@@ -894,7 +894,7 @@ fn eqchain_testable(func: &Function, v: Value) -> bool {
 }
 
 fn is_const(func: &Function, v: Value) -> bool {
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => matches!(
             func.dfg.insts[i].opcode(),
             // These may be defined in-body (splink sinks consts into use

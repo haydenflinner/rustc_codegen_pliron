@@ -213,7 +213,7 @@ fn nn_subject(func: &Function, mut v: Value) -> Value {
         };
         // select(icmp cc x, k) arms — the identity when one arm is the
         // tested constant and the other is the tested value.
-        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(args[0])).inst() else {
+        let Some(ci) = func.dfg.resolved_value_def(args[0]).inst() else {
             return v;
         };
         let InstructionData::IntCompare {
@@ -344,11 +344,7 @@ impl Webs {
             if bcs.len() != 2 {
                 continue;
             }
-            let Some(ci) = func
-                .dfg
-                .value_def(func.dfg.resolve_aliases(arg))
-                .inst()
-            else {
+            let Some(ci) = func.dfg.resolved_value_def(arg).inst() else {
                 continue;
             };
             let InstructionData::IntCompare {

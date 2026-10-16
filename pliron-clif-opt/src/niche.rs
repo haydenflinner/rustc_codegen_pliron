@@ -114,7 +114,7 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
     let (sv, kv) = (args[0], args[1]);
     let k = const64(func, kv)?;
     let bits = func.dfg.value_type(sv).bits();
-    let si = func.dfg.value_def(func.dfg.resolve_aliases(sv)).inst()?;
+    let si = func.dfg.resolved_value_def(sv).inst()?;
     let InstructionData::Ternary {
         opcode: Opcode::Select,
         args: sa,

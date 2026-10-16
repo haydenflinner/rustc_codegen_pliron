@@ -109,7 +109,7 @@ fn eval_icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
 }
 
 fn iconst(func: &Function, v: Value) -> Option<u64> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     match func.dfg.insts[i] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
@@ -125,7 +125,7 @@ fn is_bool(func: &Function, v: Value, depth: usize) -> bool {
     if depth > 4 {
         return false;
     }
-    let Some(i) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+    let Some(i) = func.dfg.resolved_value_def(v).inst() else {
         return false;
     };
     match func.dfg.insts[i] {

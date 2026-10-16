@@ -314,7 +314,7 @@ fn edge_ok(
         func.layout.block_insts(x).all(|i| {
             func.dfg
                 .inst_values(i)
-                .all(|v| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+                .all(|v| match func.dfg.resolved_value_def(v) {
                     ValueDef::Param(d, _) => {
                         !chains.contains(&d)
                             && (d == m

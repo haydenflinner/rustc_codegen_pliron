@@ -25,7 +25,7 @@ const MAX_LOOPS: usize = 32;
 const MAX_MOVES: usize = 96;
 
 fn def_block(func: &Function, v: Value) -> Option<Block> {
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
         _ => None,
@@ -949,7 +949,7 @@ fn promote_loc(
     // is dominated by `pinst`, so requiring the def to dominate `pinst`
     // covers all of them.
     if let Root::V(v) = loc.0 {
-        let ok = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        let ok = match func.dfg.resolved_value_def(v) {
             ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
             ValueDef::Param(b, _) => dt.dominates(b, pb, &func.layout),
             _ => false,

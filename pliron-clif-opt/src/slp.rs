@@ -199,8 +199,7 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// `v` is defined by an inst in this block before the emit point.
     fn inst_before_emit(&self, v: Value) -> Option<Inst> {
-        let ValueDef::Result(inst, 0) = self.func.dfg.value_def(self.func.dfg.resolve_aliases(v))
-        else {
+        let ValueDef::Result(inst, 0) = self.func.dfg.resolved_value_def(v) else {
             return None;
         };
         (pos_get(self.pos, inst).is_some_and(|p| p < self.emit)).then_some(inst)
@@ -360,7 +359,7 @@ pub(crate) fn base_off(func: &Function, ptr: Value) -> (Value, i64) {
 }
 
 fn iconst_val(func: &Function, v: Value) -> Option<i64> {
-    let ValueDef::Result(inst, 0) = func.dfg.value_def(func.dfg.resolve_aliases(v)) else {
+    let ValueDef::Result(inst, 0) = func.dfg.resolved_value_def(v) else {
         return None;
     };
     if let InstructionData::UnaryImm {
@@ -828,8 +827,7 @@ struct X<'a> {
 
 impl X<'_> {
     fn def(&self, v: Value) -> Option<Inst> {
-        let ValueDef::Result(inst, 0) = self.func.dfg.value_def(self.func.dfg.resolve_aliases(v))
-        else {
+        let ValueDef::Result(inst, 0) = self.func.dfg.resolved_value_def(v) else {
             return None;
         };
         Some(inst)

@@ -50,7 +50,7 @@ pub fn iconst(func: &Function, v: Value) -> Option<i64> {
 }
 
 pub fn def_block(func: &Function, v: Value) -> Option<Block> {
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
         _ => None,
@@ -875,7 +875,7 @@ pub fn guard_dead(func: &Function, cnt: &Count, e: Edge) -> bool {
                 args: [a, b],
             } = func.dfg.insts[xi]
             && func.dfg.resolve_aliases(b) == cnt.iv
-            && let ValueDef::Result(ai, _) = func.dfg.value_def(func.dfg.resolve_aliases(a))
+            && let ValueDef::Result(ai, _) = func.dfg.resolved_value_def(a)
         {
             let km1 = match func.dfg.insts[ai] {
                 InstructionData::Binary {
@@ -1900,7 +1900,7 @@ fn rmw_locs(
         });
         let is_ld = |v: Value| {
             func.dfg
-                .value_def(func.dfg.resolve_aliases(v))
+                .resolved_value_def(v)
                 .inst()
                 .is_some_and(|d| ls.contains(&d))
         };
@@ -2181,7 +2181,7 @@ fn plan_dead(
         // bound to the original value on the loop-side edges — it dominated
         // `dest`, hence every pred edge — and to the closed form on the
         // fast edge.
-        let loop_val = |v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        let loop_val = |v: Value| match func.dfg.resolved_value_def(v) {
             ValueDef::Param(b, _) => info.body.contains(&b),
             ValueDef::Result(i, _) => func
                 .layout

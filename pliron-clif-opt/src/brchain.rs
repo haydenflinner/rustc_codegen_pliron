@@ -359,12 +359,10 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
             let mut args: Vec<BlockArg> = call
                 .args(&func.dfg.value_lists)
                 .map(|a| match a {
-                    BlockArg::Value(av) => {
-                        match func.dfg.value_def(func.dfg.resolve_aliases(av)) {
-                            ValueDef::Param(b, j) if b == blk => src[j],
-                            _ => a,
-                        }
-                    }
+                    BlockArg::Value(av) => match func.dfg.resolved_value_def(av) {
+                        ValueDef::Param(b, j) if b == blk => src[j],
+                        _ => a,
+                    },
                     _ => a,
                 })
                 .collect();

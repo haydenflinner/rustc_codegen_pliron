@@ -501,6 +501,79 @@ impl DataFlowGraph {
         resolve_aliases(&self.values, value)
     }
 
+    /// PLIRON: walk `v`'s alias chain once, returning the resolved
+    /// value and its decoded data. The common `value_def` +
+    /// `resolve_aliases` pattern hits `values` and decodes twice; this
+    /// does each once per chain hop.
+    fn resolve_to_data(&self, v: Value) -> (Value, ValueData) {
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => v = original,
+                data => return (v, data),
+            }
+        }
+        panic!("Value alias loop detected for {v}");
+    }
+
+    /// PLIRON: fused `resolve_aliases` + `value_def`. For unaliased
+    /// `v` (the common case) this is one `values` hit + one decode
+    /// instead of two.
+    ///
+    /// Same panic behavior as `resolve_aliases` + `value_def`.
+    #[inline]
+    pub fn resolved_value_def(&self, v: Value) -> ValueDef {
+        match self.resolve_to_data(v).1 {
+            ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
+            ValueData::Param { block, num, .. } => ValueDef::Param(block, num as usize),
+            ValueData::Union { x, y, .. } => ValueDef::Union(x, y),
+            ValueData::Alias { .. } => unreachable!("resolve_to_data never returns an alias"),
+        }
+    }
+
+    /// PLIRON: `resolved_value_def` with `try_resolve_aliases`'s
+    /// hazards: reserved/invalid values and dead-ended chains yield
+    /// `None`.
+    #[inline]
+    pub fn try_resolved_value_def(&self, v: Value) -> Option<ValueDef> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => {
+                    if original == Value::reserved_value() || !self.values.is_valid(original) {
+                        return None;
+                    }
+                    v = original;
+                }
+                ValueData::Inst { inst, num, .. } => {
+                    return Some(ValueDef::Result(inst, num as usize));
+                }
+                ValueData::Param { block, num, .. } => {
+                    return Some(ValueDef::Param(block, num as usize));
+                }
+                ValueData::Union { x, y, .. } => return Some(ValueDef::Union(x, y)),
+            }
+        }
+        None
+    }
+
+    /// PLIRON: `resolve_aliases` + `value_def` when the caller needs
+    /// both the resolved value and its def — one chain walk.
+    #[inline]
+    pub fn resolve_and_def(&self, v: Value) -> (Value, ValueDef) {
+        let (v, data) = self.resolve_to_data(v);
+        let def = match data {
+            ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
+            ValueData::Param { block, num, .. } => ValueDef::Param(block, num as usize),
+            ValueData::Union { x, y, .. } => ValueDef::Union(x, y),
+            ValueData::Alias { .. } => unreachable!("resolve_to_data never returns an alias"),
+        };
+        (v, def)
+    }
+
     /// Replace all uses of value aliases with their resolved values, and delete
     /// the aliases.
     pub fn resolve_all_aliases(&mut self) {

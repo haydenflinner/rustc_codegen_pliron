@@ -20,7 +20,7 @@ use cranelift_codegen::ir::{
 use cranelift_module::FuncId;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     match func.dfg.insts[i] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,

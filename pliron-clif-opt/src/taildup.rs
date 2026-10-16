@@ -140,7 +140,7 @@ fn flip_inst(
 pub(crate) fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) -> bool {
     func.layout.block_insts(r).all(|i| {
         func.dfg.inst_values(i).all(|v| {
-            let def = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+            let def = match func.dfg.resolved_value_def(v) {
                 ValueDef::Result(d, _) => func.layout.inst_block(d),
                 ValueDef::Param(b, _) => Some(b),
                 _ => None,
@@ -233,7 +233,7 @@ pub fn run(func: &mut Function) -> usize {
                 && !latch
                 && !dest.args(&func.dfg.value_lists).any(|a| {
                     matches!(a, BlockArg::Value(v)
-                        if func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()
+                        if func.dfg.resolved_value_def(v).inst()
                             .is_some_and(|i| func.dfg.insts[i].opcode() == Opcode::Iconst))
                 })
             {
@@ -291,7 +291,7 @@ pub fn run(func: &mut Function) -> usize {
             // clone of block1191 carried block68's params).
             let arg_in_candidate = dest.args(&func.dfg.value_lists).any(|a| {
                 if let BlockArg::Value(v) = a {
-                    let b = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+                    let b = match func.dfg.resolved_value_def(v) {
                         ValueDef::Result(d, _) => func.layout.inst_block(d),
                         ValueDef::Param(b, _) => Some(b),
                         _ => None,

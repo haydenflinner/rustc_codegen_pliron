@@ -509,3 +509,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     pipeline. Annotated the small leaf readers + the two `ValueData`
     packed-conversion `From` impls + `Values`/`Blocks`/`Insts`
     iterator `next`/`next_back`. No behavior change.
+
+41. Fused resolve+def accessors (`src/ir/dfg.rs`):
+    `resolved_value_def`, `try_resolved_value_def`, `resolve_and_def`,
+    all built on `resolve_to_data` — the alias walk hands back the
+    resolved entry's decoded `ValueData`, so the ubiquitous
+    `value_def(resolve_aliases(v))` pattern costs one map hit + one
+    decode instead of two. ~95 opt-crate call sites converted.
+    Panic/Option semantics identical to the unfused pair.

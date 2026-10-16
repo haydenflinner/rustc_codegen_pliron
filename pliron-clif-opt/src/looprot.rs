@@ -311,7 +311,7 @@ fn rotate(
         {
             if let InstructionData::Brif { arg, .. } = func.dfg.insts[l.inst]
                 && uses(func, arg) == 1
-                && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+                && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
                 && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
             {
                 *cond = cond.complement();
@@ -345,7 +345,7 @@ fn rotate(
         == Some(1)
         && let InstructionData::Brif { arg, .. } = func.dfg.insts[lt]
         && uses(func, arg) == 1
-        && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+        && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
         && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
     {
         *cond = cond.complement();

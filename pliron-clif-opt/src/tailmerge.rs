@@ -92,7 +92,7 @@ fn constant(func: &Function, v: Value) -> Option<String> {
     if !func.dfg.value_is_valid(v) {
         return None;
     }
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     if !func.dfg.inst_args(i).is_empty()
         || !matches!(
             func.dfg.insts[i].opcode(),
@@ -216,10 +216,7 @@ pub fn run(func: &mut Function) -> usize {
     for &c in map.values() {
         needs.entry(c).or_insert_with(|| {
             let mut s = FxHashSet::default();
-            let note = |v: Value, s: &mut FxHashSet<Block>| match func
-                .dfg
-                .value_def(func.dfg.resolve_aliases(v))
-            {
+            let note = |v: Value, s: &mut FxHashSet<Block>| match func.dfg.resolved_value_def(v) {
                 ValueDef::Result(d, _) => {
                     if let Some(db) = func.layout.inst_block(d)
                         && db != c

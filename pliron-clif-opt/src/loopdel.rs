@@ -143,7 +143,7 @@ fn reachable_without(
 }
 
 fn def_block(func: &Function, v: Value) -> Option<Block> {
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
         _ => None,

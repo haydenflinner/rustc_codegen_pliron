@@ -186,7 +186,7 @@ fn sat(cc: IntCC, k: u64, bits: u32) -> ISet {
 }
 
 fn iconst_bits(func: &Function, v: Value) -> Option<i64> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     match func.dfg.insts[i] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
@@ -204,7 +204,7 @@ fn test_of(func: &Function, b: Block) -> Option<(Inst, IntCC, Value, u64)> {
     let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
         return None;
     };
-    let ci = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+    let ci = func.dfg.resolved_value_def(c).inst()?;
     if func.layout.inst_block(ci) != Some(b) {
         return None;
     }
@@ -524,7 +524,7 @@ fn eqrange(func: &mut Function) -> usize {
     /// Lane-typed constant bits: `iconst` scalar, or a `vconst` that
     /// splats one lane value (all lanes byte-identical).
     fn const_of(func: &Function, v: Value) -> Option<u64> {
-        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        let di = func.dfg.resolved_value_def(v).inst()?;
         match func.dfg.insts[di] {
             InstructionData::UnaryImm {
                 opcode: Opcode::Iconst,
@@ -774,7 +774,7 @@ fn eqrange(func: &mut Function) -> usize {
 /// for regalloc to drop (they may have other uses).
 fn flat(func: &mut Function) -> usize {
     fn const_of(func: &Function, v: Value) -> Option<i64> {
-        let di = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        let di = func.dfg.resolved_value_def(v).inst()?;
         if let InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             imm,

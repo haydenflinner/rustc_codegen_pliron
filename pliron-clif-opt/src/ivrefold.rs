@@ -606,7 +606,7 @@ fn refold_header(
             if let Some(v) = kv
                 && iconst(func, v).is_none()
             {
-                let db = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+                let db = match func.dfg.resolved_value_def(v) {
                     ValueDef::Result(i, _) => func.layout.inst_block(i),
                     ValueDef::Param(b, _) => Some(b),
                     _ => None,
@@ -820,7 +820,7 @@ fn pd(
         return (k as u64).wrapping_rem(s) == 0;
     }
     let pd = |a: Value| pd(func, edges, a, s, depth - 1);
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         // A param of a single-pred block equals the arg that edge passes —
         // unless the edge is a self-loop, where the param is an IV.
         ValueDef::Param(b, ix) => match edges.get(&b) {
@@ -842,9 +842,7 @@ fn pd(
                         // `x - (x & m)` for `m = s*2^j - 1` rounds `x` down
                         // to a multiple of `m+1`, hence of `s`.
                         let x = func.dfg.resolve_aliases(args[0]);
-                        let ValueDef::Result(j, _) =
-                            func.dfg.value_def(func.dfg.resolve_aliases(args[1]))
-                        else {
+                        let ValueDef::Result(j, _) = func.dfg.resolved_value_def(args[1]) else {
                             return false;
                         };
                         let InstructionData::Binary {

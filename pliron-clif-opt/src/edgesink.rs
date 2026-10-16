@@ -241,15 +241,17 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
             // operand's def out of `b`, so re-check each operand's def
             // block against each use block.
             let ops_ok = ubs.iter().all(|u| {
-                func.dfg.inst_args(i).iter().all(|w| {
-                    match func.dfg.value_def(func.dfg.resolve_aliases(*w)) {
-                        ValueDef::Result(d, _) => func.layout.inst_block(d).is_some_and(|db| {
-                            db != *u && dt.dominates(db, *u, &func.layout)
-                        }),
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .all(|w| match func.dfg.resolved_value_def(*w) {
+                        ValueDef::Result(d, _) => func
+                            .layout
+                            .inst_block(d)
+                            .is_some_and(|db| db != *u && dt.dominates(db, *u, &func.layout)),
                         ValueDef::Param(pb, _) => pb == *u || dt.dominates(pb, *u, &func.layout),
                         _ => false,
-                    }
-                })
+                    })
             });
             if !ops_ok {
                 continue;

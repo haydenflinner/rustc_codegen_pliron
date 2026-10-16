@@ -100,7 +100,7 @@ enum Half {
 }
 
 fn half_bound(func: &Function, c: Value) -> Option<(Value, Half)> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+    let i = func.dfg.resolved_value_def(c).inst()?;
     let InstructionData::IntCompare {
         opcode: Opcode::Icmp,
         args,
@@ -284,7 +284,7 @@ fn emit_mat(func: &mut Function, at: Inst, m: &Mat) -> BlockArg {
 
 /// `v` defined as `isub x, k` → `(x, k)`.
 fn isub_const(func: &Function, v: Value) -> Option<(Value, u64)> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     match func.dfg.insts[i] {
         InstructionData::Binary {
             opcode: Opcode::Isub,
@@ -296,7 +296,7 @@ fn isub_const(func: &Function, v: Value) -> Option<(Value, u64)> {
 
 /// An `icmp ult s, w` where `s = isub x, k` → `(x, k, w)`.
 fn offset_test(func: &Function, c: Value) -> Option<(Value, u64, u64)> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+    let i = func.dfg.resolved_value_def(c).inst()?;
     let InstructionData::IntCompare {
         opcode: Opcode::Icmp,
         args: [a, b],
@@ -497,8 +497,8 @@ fn shared_args(
                 return None;
             };
             let (xi, yi) = (
-                func.dfg.value_def(func.dfg.resolve_aliases(xv)).inst()?,
-                func.dfg.value_def(func.dfg.resolve_aliases(yv)).inst()?,
+                func.dfg.resolved_value_def(xv).inst()?,
+                func.dfg.resolved_value_def(yv).inst()?,
             );
             if !shape_eq(func, xi, yi) {
                 return None;

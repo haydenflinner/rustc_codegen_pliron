@@ -37,7 +37,7 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 }
 
 fn def_block(func: &Function, v: Value) -> Option<Block> {
-    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+    match func.dfg.resolved_value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
         _ => None,
@@ -188,7 +188,7 @@ fn vmax_entry(func: &Function, cfg: &ControlFlowGraph, v: Value, depth: usize) -
     if depth == 0 {
         return hi;
     }
-    let ValueDef::Param(b, idx) = func.dfg.value_def(func.dfg.resolve_aliases(v)) else {
+    let ValueDef::Param(b, idx) = func.dfg.resolved_value_def(v) else {
         return hi;
     };
     let mut m = 0u64;
@@ -2168,7 +2168,7 @@ fn rot_loop(
             }
             let mut ls: Vec<Inst> = Vec::with_capacity(2);
             for &a in func.dfg.inst_args(i) {
-                if let ValueDef::Result(li, _) = func.dfg.value_def(func.dfg.resolve_aliases(a))
+                if let ValueDef::Result(li, _) = func.dfg.resolved_value_def(a)
                     && decs.contains_key(&li)
                 {
                     ls.push(li);
@@ -2399,10 +2399,8 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis, kmin: i
                 // strictly (`ult j0, K` -> `j0 <= K - 1 <= D`).
                 let Some(k) = (e.slot == 0 && blocks[0].block(&func.dfg.value_lists) == h)
                     .then(|| {
-                        func.dfg
-                            .value_def(func.dfg.resolve_aliases(cond))
-                            .inst()
-                            .and_then(|ci| match func.dfg.insts[ci] {
+                        func.dfg.resolved_value_def(cond).inst().and_then(|ci| {
+                            match func.dfg.insts[ci] {
                                 InstructionData::IntCompare {
                                     cond: IntCC::UnsignedLessThan,
                                     args: [x, y],
@@ -2411,7 +2409,8 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis, kmin: i
                                     iconst(func, y).filter(|k| (kmin..=i64::MAX).contains(k))
                                 }
                                 _ => None,
-                            })
+                            }
+                        })
                     })
                     .flatten()
                 else {
@@ -2509,7 +2508,7 @@ fn count_tested(
     if blocks[slot].block(&func.dfg.value_lists) != h {
         return None;
     }
-    let ci = func.dfg.value_def(func.dfg.resolve_aliases(cond)).inst()?;
+    let ci = func.dfg.resolved_value_def(cond).inst()?;
     let InstructionData::IntCompare {
         cond, args: [x, y], ..
     } = func.dfg.insts[ci]
@@ -2790,7 +2789,7 @@ fn ult_guard(func: &Function, inst: Inst, slot: usize, h: Block) -> Option<(Valu
     if blocks[slot].block(&func.dfg.value_lists) != h {
         return None;
     }
-    let ci = func.dfg.value_def(func.dfg.resolve_aliases(cond)).inst()?;
+    let ci = func.dfg.resolved_value_def(cond).inst()?;
     let InstructionData::IntCompare {
         cond, args: [x, y], ..
     } = func.dfg.insts[ci]
@@ -2806,7 +2805,7 @@ fn ult_guard(func: &Function, inst: Inst, slot: usize, h: Block) -> Option<(Valu
 
 /// `n` provably `< 2^w - 1` (zero-extended from a narrower load/value).
 fn below_max(func: &Function, n: Value) -> bool {
-    let ValueDef::Result(i, _) = func.dfg.value_def(func.dfg.resolve_aliases(n)) else {
+    let ValueDef::Result(i, _) = func.dfg.resolved_value_def(n) else {
         return false;
     };
     let w = func.dfg.value_type(n).bits();
@@ -3119,7 +3118,7 @@ fn diff_b_inner(
     // `y = y0 + (x - d)` ⇒ `x - y = d - y0` (and the `x` mirror). This
     // is the un-folded byte-length form: `pos + (cur' - cur)`.
     let isub_of = |v: Value| -> Option<(Value, Value)> {
-        match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        match func.dfg.resolved_value_def(v) {
             ValueDef::Result(d, _) => match func.dfg.insts[d] {
                 InstructionData::Binary {
                     opcode: Opcode::Isub,
@@ -3131,7 +3130,7 @@ fn diff_b_inner(
         }
     };
     let iadd_of = |v: Value| -> Option<(Value, Value)> {
-        match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        match func.dfg.resolved_value_def(v) {
             ValueDef::Result(d, _) => match func.dfg.insts[d] {
                 InstructionData::Binary {
                     opcode: Opcode::Iadd,

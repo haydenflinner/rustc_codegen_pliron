@@ -586,33 +586,27 @@ pub fn prop_derived(
 }
 
 fn is_iconst(func: &Function, v: Value) -> bool {
-    func.dfg
-        .value_def(func.dfg.resolve_aliases(v))
-        .inst()
-        .is_some_and(|i| {
-            matches!(
-                func.dfg.insts[i],
-                InstructionData::UnaryImm {
-                    opcode: Opcode::Iconst,
-                    ..
-                }
-            )
-        })
+    func.dfg.resolved_value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                ..
+            }
+        )
+    })
 }
 
 fn zero_iconst(func: &Function, v: Value) -> bool {
-    func.dfg
-        .value_def(func.dfg.resolve_aliases(v))
-        .inst()
-        .is_some_and(|i| {
-            matches!(
-                func.dfg.insts[i],
-                InstructionData::UnaryImm {
-                    opcode: Opcode::Iconst,
-                    imm
-                } if imm.bits() == 0
-            )
-        })
+    func.dfg.resolved_value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        )
+    })
 }
 
 impl NonNull<'_> {
@@ -663,7 +657,7 @@ impl NonNull<'_> {
         let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
             return false;
         };
-        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+        let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
             return false;
         };
         let InstructionData::IntCompare {
@@ -1340,7 +1334,7 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
             let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[term] else {
                 continue;
             };
-            let Some(icmp_inst) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst() else {
+            let Some(icmp_inst) = func.dfg.resolved_value_def(arg).inst() else {
                 continue;
             };
             let InstructionData::IntCompare {
@@ -1401,7 +1395,7 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
             // re-create this test one level down in `mid`: the inner
             // select stays, we add a block, and the next iteration splits
             // again. Require `x` to be a plain value.
-            if let Some(xi) = func.dfg.value_def(func.dfg.resolve_aliases(xop)).inst()
+            if let Some(xi) = func.dfg.resolved_value_def(xop).inst()
                 && matches!(
                     func.dfg.insts[xi],
                     InstructionData::Ternary {
@@ -3823,15 +3817,14 @@ pub fn remove_unreachable_blocks(func: &mut Function) -> usize {
     if dead.is_empty() {
         return 0;
     }
-    let defined_in_dead =
-        |func: &Function, v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
-            ValueDef::Result(i, _) => func
-                .layout
-                .inst_block(i)
-                .is_some_and(|b| !seen.contains(&b)),
-            ValueDef::Param(b, _) => !seen.contains(&b),
-            _ => false,
-        };
+    let defined_in_dead = |func: &Function, v: Value| match func.dfg.resolved_value_def(v) {
+        ValueDef::Result(i, _) => func
+            .layout
+            .inst_block(i)
+            .is_some_and(|b| !seen.contains(&b)),
+        ValueDef::Param(b, _) => !seen.contains(&b),
+        _ => false,
+    };
     for &b in &seen {
         for i in func.layout.block_insts(b) {
             if func.dfg.inst_values(i).any(|v| defined_in_dead(func, v)) {
@@ -3872,7 +3865,7 @@ pub fn fold_same_target_brifs(func: &mut Function) -> usize {
 }
 
 fn nonzero_iconst(func: &Function, v: Value) -> bool {
-    let Some(i) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+    let Some(i) = func.dfg.resolved_value_def(v).inst() else {
         return false;
     };
     matches!(

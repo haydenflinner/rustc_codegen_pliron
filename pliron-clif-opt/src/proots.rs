@@ -195,7 +195,7 @@ pub fn aff_facts(func: &Function) -> Vec<(Value, Value, i64)> {
                 continue;
             };
             let kof = |v: Value| {
-                let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                let d = func.dfg.resolved_value_def(v).inst()?;
                 match func.dfg.insts[d] {
                     InstructionData::UnaryImm {
                         opcode: Opcode::Iconst,

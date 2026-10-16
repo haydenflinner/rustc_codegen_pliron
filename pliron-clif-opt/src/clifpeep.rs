@@ -467,7 +467,7 @@ fn addend(func: &Function, v: Value) -> Option<(Value, i64)> {
 /// come from the add-chain operand — a bare operand is `x + 0` — and `k`
 /// is whatever the other operand is.
 fn icmp_chain(func: &Function, c: Value) -> Option<(bool, Value, i64, Value)> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+    let i = func.dfg.resolved_value_def(c).inst()?;
     let InstructionData::IntCompare {
         opcode: Opcode::Icmp,
         cond,
@@ -588,7 +588,7 @@ fn eq_decided(func: &Function, bits: u32, a1: i64, k1: Value, a2: i64, k2: Value
 /// `v` as `uextend b` where `b` is an i8 provably in {0,1} — returns `b`,
 /// usable as a `select` condition.
 fn uext01(func: &Function, v: Value) -> Option<Value> {
-    let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let d = func.dfg.resolved_value_def(v).inst()?;
     if let InstructionData::Unary {
         opcode: Opcode::Uextend,
         arg,
@@ -733,7 +733,7 @@ fn same_lane(func: &Function, a: Value, b: Value, w: u32) -> bool {
 
 /// `v` as `min_or_max(x, k)` → `(op, x, k)` with the constant second.
 fn minmax_k(func: &Function, v: Value) -> Option<(Opcode, Value, i64)> {
-    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let i = func.dfg.resolved_value_def(v).inst()?;
     let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
         return None;
     };
@@ -773,7 +773,7 @@ fn minmax(pos: &mut FuncCursor, inst: Inst) -> bool {
         return false;
     }
     let [c, t, fv] = args;
-    let Some(ci) = f.dfg.value_def(f.dfg.resolve_aliases(c)).inst() else {
+    let Some(ci) = f.dfg.resolved_value_def(c).inst() else {
         return false;
     };
     let InstructionData::IntCompare {
@@ -2032,7 +2032,7 @@ pub fn coldrets(func: &mut Function) -> usize {
         if side == 0
             && let InstructionData::Brif { arg, .. } = func.dfg.insts[tinst]
             && crate::looprot::uses(func, arg) == 1
-            && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+            && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
             && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
         {
             *cond = cond.complement();
@@ -2200,15 +2200,12 @@ pub fn const_sweep(func: &mut Function) -> usize {
     // (`func_addr`/`symbol_value` are not counted: weak externs resolve
     // to 0.)
     let nz = |v: Value| {
-        func.dfg
-            .value_def(func.dfg.resolve_aliases(v))
-            .inst()
-            .is_some_and(|d| {
-                matches!(
-                    func.dfg.insts[d].opcode(),
-                    Opcode::StackAddr | Opcode::DynamicStackAddr
-                )
-            })
+        func.dfg.resolved_value_def(v).inst().is_some_and(|d| {
+            matches!(
+                func.dfg.insts[d].opcode(),
+                Opcode::StackAddr | Opcode::DynamicStackAddr
+            )
+        })
     };
     let rg = |_: Value| None;
     let mut sels = Vec::new();
@@ -3597,7 +3594,7 @@ pub fn selargs(func: &mut Function) -> usize {
                 .iter()
                 .map(|&a| {
                     let Some(v) = a.as_value() else { return a };
-                    let Some(di) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+                    let Some(di) = func.dfg.resolved_value_def(v).inst() else {
                         return a;
                     };
                     let InstructionData::Ternary {
@@ -3951,7 +3948,7 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
                 .dfg
                 .inst_args(d)
                 .iter()
-                .filter_map(|&a| func.dfg.value_def(func.dfg.resolve_aliases(a)).inst())
+                .filter_map(|&a| func.dfg.resolved_value_def(a).inst())
             {
                 if seen.insert(dd) && func.dfg.insts[dd].opcode() == Opcode::Iconst {
                     wl.push(dd);
@@ -4217,7 +4214,7 @@ fn sel_regions(func: &mut Function) -> usize {
                     let BlockArg::Value(v) = a else {
                         continue;
                     };
-                    let Some(d) = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst() else {
+                    let Some(d) = func.dfg.resolved_value_def(v).inst() else {
                         continue;
                     };
                     let InstructionData::Ternary {
@@ -4373,12 +4370,7 @@ fn loadsel_pair(
         if !pos.func.dfg.mem_flags[f2].notrap() {
             continue;
         }
-        let Some(d2) = pos
-            .func
-            .dfg
-            .value_def(pos.func.dfg.resolve_aliases(a2))
-            .inst()
-        else {
+        let Some(d2) = pos.func.dfg.resolved_value_def(a2).inst() else {
             continue;
         };
         let InstructionData::Ternary {
@@ -4472,10 +4464,10 @@ fn loadsel_pair(
         let ldef = pos
             .func
             .dfg
-            .value_def(pos.func.dfg.resolve_aliases(match pos.func.dfg.insts[l] {
+            .resolved_value_def(match pos.func.dfg.insts[l] {
                 InstructionData::Load { arg, .. } => arg,
                 _ => unreachable!(),
-            }))
+            })
             .inst()
             .unwrap();
         let InstructionData::Ternary {
@@ -4676,11 +4668,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 // uxtb` — one fused inst instead of `uxtb` + `eor`.
                 let b = pos.func.dfg.resolve_aliases(arg);
                 if let Some((c, 1)) = bin_k(pos.func, b, Opcode::Bxor)
-                    && let Some(cd) = pos
-                        .func
-                        .dfg
-                        .value_def(pos.func.dfg.resolve_aliases(c))
-                        .inst()
+                    && let Some(cd) = pos.func.dfg.resolved_value_def(c).inst()
                     && let InstructionData::IntCompare {
                         opcode: Opcode::Icmp,
                         cond,
@@ -4747,20 +4735,12 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 } else {
                     None
                 };
-                if let Some(d) = x.and_then(|x| {
-                    pos.func
-                        .dfg
-                        .value_def(pos.func.dfg.resolve_aliases(x))
-                        .inst()
-                }) && let InstructionData::Unary {
-                    opcode: Opcode::Uextend,
-                    arg: c,
-                } = pos.func.dfg.insts[d]
-                    && let Some(cd) = pos
-                        .func
-                        .dfg
-                        .value_def(pos.func.dfg.resolve_aliases(c))
-                        .inst()
+                if let Some(d) = x.and_then(|x| pos.func.dfg.resolved_value_def(x).inst())
+                    && let InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg: c,
+                    } = pos.func.dfg.insts[d]
+                    && let Some(cd) = pos.func.dfg.resolved_value_def(c).inst()
                     && let InstructionData::IntCompare {
                         opcode: Opcode::Icmp,
                         cond,
@@ -4964,11 +4944,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // MIR's `Option<NonNull>` sentinel materializes this
                     // shape (`x == 0 ? 0 : x`) and, unfolded, keeps
                     // address webs from resolving to their slot.
-                    if let Some(ci) = pos
-                        .func
-                        .dfg
-                        .value_def(pos.func.dfg.resolve_aliases(args[0]))
-                        .inst()
+                    if let Some(ci) = pos.func.dfg.resolved_value_def(args[0]).inst()
                         && let InstructionData::IntCompare {
                             opcode: Opcode::Icmp,
                             cond,
@@ -5135,17 +5111,12 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // to 0.)
                     if ku == 0
                         && matches!(cc, IntCC::Equal | IntCC::NotEqual)
-                        && pos
-                            .func
-                            .dfg
-                            .value_def(pos.func.dfg.resolve_aliases(x))
-                            .inst()
-                            .is_some_and(|d| {
-                                matches!(
-                                    pos.func.dfg.insts[d].opcode(),
-                                    Opcode::StackAddr | Opcode::DynamicStackAddr
-                                )
-                            })
+                        && pos.func.dfg.resolved_value_def(x).inst().is_some_and(|d| {
+                            matches!(
+                                pos.func.dfg.insts[d].opcode(),
+                                Opcode::StackAddr | Opcode::DynamicStackAddr
+                            )
+                        })
                     {
                         let c = i64::from(cc == IntCC::NotEqual);
                         pos.func.replace(inst).iconst(types::I8, c);
@@ -5441,7 +5412,7 @@ pub fn ovkill(func: &mut Function) -> usize {
         let InstructionData::Brif { arg, .. } = func.dfg.insts[pi] else {
             return f;
         };
-        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst() else {
+        let Some(ci) = func.dfg.resolved_value_def(arg).inst() else {
             return f;
         };
         let InstructionData::IntCompare {
@@ -5733,12 +5704,7 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
         (Some(0), None) => (args[1], args[0]),
         _ => return false,
     };
-    let Some(i) = pos
-        .func
-        .dfg
-        .value_def(pos.func.dfg.resolve_aliases(x))
-        .inst()
-    else {
+    let Some(i) = pos.func.dfg.resolved_value_def(x).inst() else {
         return false;
     };
     let InstructionData::Binary { opcode, args: ra } = pos.func.dfg.insts[i] else {
@@ -6330,11 +6296,7 @@ fn icmp_eqfold(
     }
     // `isub` must be `x - c` — `c - x` doesn't shift.
     let issub = |v: Value| {
-        let i = pos
-            .func
-            .dfg
-            .value_def(pos.func.dfg.resolve_aliases(v))
-            .inst()?;
+        let i = pos.func.dfg.resolved_value_def(v).inst()?;
         let InstructionData::Binary {
             opcode: Opcode::Isub,
             args: aa,
@@ -6982,7 +6944,7 @@ pub fn lcse(func: &mut Function) -> usize {
                     // a single-use `imul (isub 0, a), k` operand lets the
                     // neg ride through to `isub b, (a * k)` — an `msub`.
                     let negdef = |func: &Function, v: Value| {
-                        let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        let i = func.dfg.resolved_value_def(v).inst()?;
                         match func.dfg.insts[i] {
                             InstructionData::Unary {
                                 opcode: Opcode::Ineg,
@@ -7004,7 +6966,7 @@ pub fn lcse(func: &mut Function) -> usize {
                         // Peel a single-use `imul (neg a), y` — rewriting
                         // the mul to `a * y` changes its value, so no other
                         // use may observe it.
-                        let mi = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        let mi = func.dfg.resolved_value_def(v).inst()?;
                         let InstructionData::Binary {
                             opcode: Opcode::Imul,
                             args: margs,
@@ -7110,7 +7072,7 @@ pub fn lcse(func: &mut Function) -> usize {
                         continue;
                     }
                     let sub_of = |func: &Function, v: Value| -> Option<(Value, Value)> {
-                        let d = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+                        let d = func.dfg.resolved_value_def(v).inst()?;
                         if let InstructionData::Binary {
                             opcode: Opcode::Isub,
                             args: [e, x],
@@ -8112,7 +8074,7 @@ mod tests {
         let InstructionData::Binary {
             opcode: Opcode::Bor,
             args: ba,
-        } = func.dfg.insts[func.dfg.value_def(func.dfg.resolve_aliases(rv)).inst().unwrap()]
+        } = func.dfg.insts[func.dfg.resolved_value_def(rv).inst().unwrap()]
         else {
             panic!("result not a bor\n{}", func.display())
         };
@@ -8305,12 +8267,8 @@ mod tests {
                 func.layout.block_insts(entry).all(|i| {
                     match func.dfg.insts[i] {
                         InstructionData::Load { arg, .. } => {
-                            func.dfg.insts[func
-                                .dfg
-                                .value_def(func.dfg.resolve_aliases(arg))
-                                .inst()
-                                .unwrap()]
-                            .opcode()
+                            func.dfg.insts[func.dfg.resolved_value_def(arg).inst().unwrap()]
+                                .opcode()
                                 == Opcode::Select
                         }
                         _ => true,
