@@ -45,7 +45,11 @@ pub struct Hdr {
 }
 
 unsafe extern "C" {
-    fn open(path: *const u8, flags: i32, mode: i32) -> i32;
+    // `open` is variadic (mode only matters with O_CREAT) — declaring the
+    // mode as a fixed arg lands it in a register slot libc never reads on
+    // targets where variadic args pass on the stack (aarch64 Darwin),
+    // creating files with a garbage mode.
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn getpid() -> i32;

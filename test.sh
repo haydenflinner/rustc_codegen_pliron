@@ -39,7 +39,11 @@ if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
   BE="$BE -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$PWD/target/wild-ld"
 fi
 out=target/tests; mkdir -p $out
-llvmod="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin/llvm-objdump$exe"
+llvmbin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
+llvmod="$llvmbin/llvm-objdump$exe"
+# llvm-ar/nm/objcopy behave identically on every platform; the system
+# tools (BSD ar/nm on macOS, none on Windows) don't.
+llvmar="$llvmbin/llvm-ar$exe"; llvmnm="$llvmbin/llvm-nm$exe"; llvmoc="$llvmbin/llvm-objcopy$exe"
 so=${lib##*.}
 # On Windows the unwind machinery only interoperates when std is also built by
 # us: against the stock LLVM std, panics are real SEH throws our emulated-EH
@@ -316,14 +320,14 @@ t_pgo() {
   local cli=$PWD/tools/pliron-prof/target/release/pliron-prof
   local prof=$out/pgo.prof
   (mkdir -p $out/pga && cd $out/pga &&
-    ar x $rt_full &&
+    "$llvmar" x $rt_full &&
     for o in pliron_prof_rt-*.o; do
-      for s in $(nm -g --defined-only "$o" | awk '{print $3}' |
+      for s in $("$llvmnm" -g --defined-only "$o" | awk '{print $3}' |
         grep -E 'rust_begin_unwind|rust_eh_personality'); do
-        objcopy --redefine-sym "$s=__pliron_rt_shim_$s" "$o"
+        "$llvmoc" --redefine-sym "$s=__pliron_rt_shim_$s" "$o"
       done
     done &&
-    ar rcs $rt pliron_prof_rt-*.o) &&
+    "$llvmar" rcs $rt pliron_prof_rt-*.o) &&
   rm -f $prof
   PLIRON_PGO=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
     -o $out/pgo_i$exe -Clink-arg="$rt" &&
