@@ -9,6 +9,7 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
@@ -145,6 +146,11 @@ pub struct Pipe<'a> {
     pub scoped: &'a FxHashMap<Inst, Ptr<BasicBlock>>,
     pub invariant: &'a FxHashSet<Inst>,
     pub operand_frozen: &'a mut FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    /// Dense "value may carry a fact" bitmask (`F_*`) — one
+    /// `SecondaryMap` probe in `carry_one` gates the six hash-table
+    /// lookups. Bits are only ever set, never cleared: a stale bit costs
+    /// one wasted probe against a table that decides anyway.
+    pub fact_bits: &'a mut SecondaryMap<Value, u8>,
     pub block_region: &'a FxHashMap<Block, Ptr<BasicBlock>>,
     /// PGO: CLIF block -> executed count (empty without PLIRON_PGO_USE).
     /// Loop passes scale budgets off it; `block_count` is the read path.
@@ -740,8 +746,46 @@ pub(crate) fn selected(p: &Pipe, quiet: bool) -> Vec<&'static Step> {
         out.extend(DEFAULT.iter().filter(|s| matches!(s.gate, Gate::Always)));
         out
     } else {
-        DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
+        gate_sel(p)
     }
+}
+
+/// `FnFlags` packed for the `SEL_MEMO` key — field order only.
+fn flags_key(f: &FnFlags) -> u64 {
+    (f.jumpthread as u64)
+        | (f.unreach as u64) << 1
+        | (f.peep as u64) << 2
+        | (f.tailmerge as u64) << 3
+        | (f.taildup as u64) << 4
+        | (f.tailrec as u64) << 5
+        | (f.loadfwd as u64) << 6
+        | (f.slot_dse as u64) << 7
+        | (f.dse as u64) << 8
+        | (f.indvars as u64) << 9
+        | (f.licm as u64) << 10
+        | (f.loopidiom as u64) << 11
+        | (f.loopvec as u64) << 12
+        | (f.bcheck as u64) << 13
+        | (f.slp as u64) << 14
+}
+
+fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
+    thread_local! {
+        /// Env gates are process-fixed, so a flags key decides the same
+        /// selection every call. Skipped while a stepcache read window
+        /// is open — the window must see the gate vars actually consulted.
+        static SEL_MEMO: std::cell::RefCell<FxHashMap<u64, Vec<&'static Step>>> =
+            Default::default();
+    }
+    if !pliron_cfg::reads_open() {
+        return SEL_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            m.entry(flags_key(&p.flags))
+                .or_insert_with(|| DEFAULT.iter().filter(|s| s.gate.ok(p)).collect())
+                .clone()
+        });
+    }
+    DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
 }
 
 /// Runs the selected steps. With `check_each`, every step that changes
@@ -776,15 +820,19 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     }
     let draws0 = bisect_count();
     let sel = selected(p, false);
+    // Per-step wall time accumulates into a dense slot during the loop
+    // and merges into `stats.timing` once — a `FxHashMap<&str>` probe
+    // per step per function was a measurable leaf.
+    let mut step_t = vec![std::time::Duration::ZERO; sel.len()];
     let mut found = false;
-    for &s in &sel {
+    for (i, &s) in sel.iter().enumerate() {
         if !check_each {
-            run_step(p, s, &mut an);
+            run_step(p, s, &mut an, &mut step_t[i]);
             continue;
         }
         let before = p.clctx.func.clone();
         let before_text = before.display().to_string();
-        run_step(p, s, &mut an);
+        run_step(p, s, &mut an, &mut step_t[i]);
         if p.clctx.func.display().to_string() != before_text {
             found |= crate::diffcheck::check_and_report(
                 p.fname,
@@ -794,6 +842,9 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
                 &facts_of(p),
             );
         }
+    }
+    for (&s, d) in sel.iter().zip(step_t) {
+        *p.stats.timing.entry(s.name).or_default() += d;
     }
     let reads = reads_take();
     let draws = bisect_count() - draws0;
@@ -853,10 +904,12 @@ fn run_whole_checked(p: &mut Pipe) {
     let final_func = std::mem::replace(&mut p.clctx.func, initial.clone());
     let final_derived = std::mem::replace(p.derived, derived0);
     let real_stats = std::mem::take(p.stats);
+    p.seed_derived_bits();
     let localized = run_steps(p, true);
     *p.stats = real_stats;
     p.clctx.func = final_func;
     *p.derived = final_derived;
+    p.seed_derived_bits();
     if !localized {
         crate::diffcheck::report(
             p.fname,
@@ -921,6 +974,14 @@ fn chain_stats(func: &Function) -> (usize, u64) {
 /// themselves (see `run_step`). `PLIRON_GIANT_MAX=<n>` overrides;
 /// `=0` disables the bail entirely.
 fn giant_max() -> usize {
+    if pliron_cfg::reads_open() {
+        return giant_max_env();
+    }
+    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(giant_max_env);
+    *MAX
+}
+
+fn giant_max_env() -> usize {
     match config()
         .get("PLIRON_GIANT_MAX")
         .and_then(|v| v.parse().ok())
@@ -932,7 +993,7 @@ fn giant_max() -> usize {
 }
 const GIANT_MAX: usize = 50_000;
 
-fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
+fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Duration) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
     {
@@ -965,12 +1026,29 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     // (unrolled bodies seed `slp` pairs, rotations create back edges).
     // `PLIRON_NOSHAPE` disables the skip for A/B debugging;
     // `PLIRON_SHAPE_ONLY=<hex>` masks which bits gate (bisecting).
-    let mask = config()
-        .get("PLIRON_SHAPE_ONLY")
-        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(u32::MAX);
+    // These debug knobs are process-fixed; under a stepcache read window
+    // they must go through `config()` so the reads get recorded.
+    let (mask, noshape) = if pliron_cfg::reads_open() {
+        (
+            config()
+                .get("PLIRON_SHAPE_ONLY")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(u32::MAX),
+            env_set("PLIRON_NOSHAPE"),
+        )
+    } else {
+        static SHAPE_ONLY: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            config()
+                .get("PLIRON_SHAPE_ONLY")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(u32::MAX)
+        });
+        static NOSHAPE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| env_set("PLIRON_NOSHAPE"));
+        (*SHAPE_ONLY, *NOSHAPE)
+    };
     let req = s.shape & mask;
-    if req != 0 && !env_set("PLIRON_NOSHAPE") && an.shape_bits(&p.clctx.func) & req != req {
+    if req != 0 && !noshape && an.shape_bits(&p.clctx.func) & req != req {
         if crate::config::tracing_on()
             && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
         {
@@ -982,7 +1060,14 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // changed the function — the bits are supposed to be necessary
         // conditions, so any mutation means the gate is wrong. The
         // function is restored so the pipeline keeps gated semantics.
-        if env_set("PLIRON_SHAPE_CHECK") {
+        let shape_check = if pliron_cfg::reads_open() {
+            env_set("PLIRON_SHAPE_CHECK")
+        } else {
+            static SHAPE_CHECK: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| env_set("PLIRON_SHAPE_CHECK"));
+            *SHAPE_CHECK
+        };
+        if shape_check {
             let before = p.clctx.func.clone();
             let before_text = before.display().to_string();
             let derived0 = p.derived.clone();
@@ -992,9 +1077,10 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
             }
             p.clctx.func = before;
             *p.derived = derived0;
+            p.seed_derived_bits();
             an.invalidate();
         }
-        *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
+        *slot += t0.elapsed();
         return;
     }
     p.cur_step = s.name;
@@ -1021,7 +1107,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         }
         k
     };
-    *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
+    *slot += t0.elapsed();
     trace(s.name, t0.elapsed().as_secs_f64() * 1e3, p.fname);
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
@@ -2092,6 +2178,54 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Carry `d`'s recorded facts onto `w` when `w` is `d`'s value
 // everywhere — a merge carrier, an alias target, or a sunk/rebased
 // replacement.
+/// `Pipe::fact_bits` flag bits — which per-value fact tables `d` may
+/// appear in. Stale-set bits are safe (the table probe decides); a bit
+/// must never be absent while the table holds the value.
+pub(crate) mod fact_bits {
+    pub const DERIVED: u8 = 1;
+    pub const NONNULL: u8 = 2;
+    pub const FROZEN: u8 = 4;
+    pub const NOALIAS: u8 = 8;
+    pub const DEREF: u8 = 16;
+    pub const OPERAND_FROZEN: u8 = 32;
+}
+
+impl Pipe<'_> {
+    /// Seed `fact_bits` from the already-populated fact tables — the
+    /// only place bits can be missing is writes made before this `Pipe`
+    /// borrowed them. Bits only gate lookups, so a stale-set bit costs
+    /// one wasted probe and a missing bit is a skipped carry.
+    pub fn seed_fact_bits(&mut self) {
+        for &v in self.derived.keys() {
+            self.fact_bits[v] |= fact_bits::DERIVED;
+        }
+        for &v in self.nonnull.iter() {
+            self.fact_bits[v] |= fact_bits::NONNULL;
+        }
+        for &v in self.frozen.keys() {
+            self.fact_bits[v] |= fact_bits::FROZEN;
+        }
+        for &v in self.noalias.iter() {
+            self.fact_bits[v] |= fact_bits::NOALIAS;
+        }
+        for &v in self.deref.keys() {
+            self.fact_bits[v] |= fact_bits::DEREF;
+        }
+        for &v in self.operand_frozen.keys() {
+            self.fact_bits[v] |= fact_bits::OPERAND_FROZEN;
+        }
+    }
+
+    /// Re-seed one table's bit after a wholesale `*p.derived = ...`
+    /// replace — the collect doesn't go through `insert`, so no bits
+    /// were set along the way.
+    pub fn seed_derived_bits(&mut self) {
+        for &v in self.derived.keys() {
+            self.fact_bits[v] |= fact_bits::DERIVED;
+        }
+    }
+}
+
 pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     p.carry_log.push((d, w));
     // `nonnull` and `derived` are site facts — `!nonnull`/inbounds mark a
@@ -2104,82 +2238,97 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // first (a param "def" is the block head).
     // The coverage check below only matters when `d` carries a site
     // fact (derived/nonnull); most carried pairs have neither, so gate
-    // the two `try_value_def` + `pp_block` lookups on the hash probes.
-    let dbase = p.derived.get(&d).copied();
-    let dnn = p.nonnull.contains(&d);
-    if dbase.is_some() || dnn {
-        let covered = {
-            use cranelift_codegen::ir::ProgramPoint;
-            let f = &p.clctx.func;
-            // `try_value_def` skips reserved/stale values and doesn't
-            // chase aliases (`value_def` resolves unchecked and panics
-            // on chains ending at a tombstone); an alias def just falls
-            // through to no-carry. Program points compare in O(1): a
-            // param's point is its block head, which orders before
-            // every inst in the block — the same ordering the old
-            // inst-index scan gave.
-            let pp = |v: Value| match f.dfg.try_value_def(v) {
-                // A def may be detached (removed from the layout) while
-                // its value still exists — `pp_block`/`pp_cmp` panic on
-                // those, where the old position scan returned `None`.
-                Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
-                    Some(ProgramPoint::Inst(i))
+    // the two `try_value_def` + `pp_block` lookups on the fact bits.
+    let bits = p.fact_bits[d];
+    if bits & (fact_bits::DERIVED | fact_bits::NONNULL) != 0 {
+        let dbase = p.derived.get(&d).copied();
+        let dnn = p.nonnull.contains(&d);
+        if dbase.is_some() || dnn {
+            let covered = {
+                use cranelift_codegen::ir::ProgramPoint;
+                let f = &p.clctx.func;
+                // `try_value_def` skips reserved/stale values and doesn't
+                // chase aliases (`value_def` resolves unchecked and panics
+                // on chains ending at a tombstone); an alias def just falls
+                // through to no-carry. Program points compare in O(1): a
+                // param's point is its block head, which orders before
+                // every inst in the block — the same ordering the old
+                // inst-index scan gave.
+                let pp = |v: Value| match f.dfg.try_value_def(v) {
+                    // A def may be detached (removed from the layout) while
+                    // its value still exists — `pp_block`/`pp_cmp` panic on
+                    // those, where the old position scan returned `None`.
+                    Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
+                        Some(ProgramPoint::Inst(i))
+                    }
+                    Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
+                        Some(ProgramPoint::Block(b))
+                    }
+                    _ => None,
+                };
+                match (pp(d), pp(w)) {
+                    (Some(a), Some(b)) => {
+                        f.layout.pp_block(a) == f.layout.pp_block(b)
+                            && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+                    }
+                    _ => false,
                 }
-                Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
-                    Some(ProgramPoint::Block(b))
-                }
-                _ => None,
             };
-            match (pp(d), pp(w)) {
-                (Some(a), Some(b)) => {
-                    f.layout.pp_block(a) == f.layout.pp_block(b)
-                        && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+            if covered {
+                if let Some(b) = dbase {
+                    p.derived.insert(w, b);
+                    p.fact_bits[w] |= fact_bits::DERIVED;
                 }
-                _ => false,
-            }
-        };
-        if covered {
-            if let Some(b) = dbase {
-                p.derived.insert(w, b);
-            }
-            if dnn {
-                if crate::config::tracing_on()
-                    && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
-                {
-                    let dd = p
-                        .clctx
-                        .func
-                        .dfg
-                        .value_def(d)
-                        .inst()
-                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-                    let wd = p
-                        .clctx
-                        .func
-                        .dfg
-                        .value_def(w)
-                        .inst()
-                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step)
-                    };
+                if dnn {
+                    if crate::config::tracing_on()
+                        && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
+                    {
+                        let dd = p
+                            .clctx
+                            .func
+                            .dfg
+                            .value_def(d)
+                            .inst()
+                            .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                        let wd = p
+                            .clctx
+                            .func
+                            .dfg
+                            .value_def(w)
+                            .inst()
+                            .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step)
+                        };
+                    }
+                    p.nonnull.insert(w);
+                    p.fact_bits[w] |= fact_bits::NONNULL;
                 }
-                p.nonnull.insert(w);
             }
         }
     }
-    if p.noalias.contains(&d) {
+    if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
         p.noalias.insert(w);
+        p.fact_bits[w] |= fact_bits::NOALIAS;
     }
-    if let Some(&f) = p.frozen.get(&d) {
+    if bits & fact_bits::FROZEN != 0
+        && let Some(&f) = p.frozen.get(&d)
+    {
         p.frozen.insert(w, f);
+        p.fact_bits[w] |= fact_bits::FROZEN;
     }
-    if let Some(&x) = p.deref.get(&d) {
+    if bits & fact_bits::DEREF != 0
+        && let Some(&x) = p.deref.get(&d)
+    {
         p.deref.insert(w, x);
+        p.fact_bits[w] |= fact_bits::DEREF;
     }
-    if let Some(v) = p.operand_frozen.get(&d) {
+    if bits & fact_bits::OPERAND_FROZEN != 0
+        && let Some(v) = p.operand_frozen.get(&d)
+    {
         let v = v.clone();
         p.operand_frozen.insert(w, v);
+        p.fact_bits[w] |= fact_bits::OPERAND_FROZEN;
     }
     for lt in p.lifetimes.iter_mut() {
         if lt.0 == d {
@@ -3028,8 +3177,10 @@ mod tests {
         let mut operand_frozen = FxHashMap::default();
         let mut lifetimes = Vec::new();
         let mut stats = Stats::default();
+        let mut fact_bits = SecondaryMap::new();
         let flags = FnFlags::default();
         let mut p = Pipe {
+            fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: "carry_keeps_param_facts_scoped",
@@ -3063,6 +3214,7 @@ mod tests {
             carry_log: Vec::new(),
             cur_step: "",
         };
+        p.seed_fact_bits();
         // The buggy pair: a param's guarded nonnull onto the wider-scope
         // call result — must not transfer (different blocks: v4's site
         // doesn't cover v1's def).
@@ -3074,6 +3226,7 @@ mod tests {
         // Dedup carries still work: a result's mark reaches its
         // later-defined twin in the same block.
         p.nonnull.insert(v1);
+        p.fact_bits[v1] |= fact_bits::NONNULL;
         carry_one(&mut p, v1, v2);
         assert!(
             p.nonnull.contains(&v2),

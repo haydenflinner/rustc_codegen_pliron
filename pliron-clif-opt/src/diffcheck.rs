@@ -1132,9 +1132,7 @@ fn stub(
                     }
                     let rel = (d % s.frame_size) / 0x1000;
                     let in_off = (d % s.frame_size) % 0x1000;
-                    let Some((slot, _)) =
-                        s.func.sized_stack_slots.iter().nth(rel as usize)
-                    else {
+                    let Some((slot, _)) = s.func.sized_stack_slots.iter().nth(rel as usize) else {
                         continue;
                     };
                     let sz = s.func.sized_stack_slots[slot].size as u64;

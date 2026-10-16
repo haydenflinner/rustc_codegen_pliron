@@ -1913,3 +1913,52 @@ Verified: `PLIRON_STATS`, `PLIRON_TIMING`, `PLIRON_TRACE=pliron::step`
 Known residual: `enabled!` callsites inside closures (e.g.
 `ifconv::EDGE_NS.with`) still pay the registry walk when reached, but
 their outer guards now gate them.
+
+---
+
+## post-tracing-gate profile (prof11, 3.3M samples) + easy-win batch
+
+Deep profile of `cargo rustc -p pliron-clif-opt` through the backend:
+2.65M/3.3M samples leafed in our dylib; `run_steps` = 2.19M inclusive.
+New leaf picture after the tracing gate landed: CFG/domtree recompute
+(~394k, ~12% — owned by the `devin/analysis-granularity` worktree),
+linked_list::Iter (~40k, fixed: `#[inline]`), `LoopAnalysis::is_in_loop`
+(~40k — same subagent), `Vec<Inst>::from_iter` growth (~25k, fixed:
+layout `size_hint`), pliron_cfg env-hash leaf (~19k, fixed: reads-open
+gate + step memoization), `carry_one` (~17.6k, fixed: `fact_bits`
+sidecar), bforest maps inside CFG/DT, `slp::build_uses` (~12k).
+
+Changes (this commit):
+- `pliron_cfg::reads_open()` — cross-thread `AtomicUsize` gate; `record()`
+  skips the TLS walk when no stepcache window is open anywhere.
+- `selected()` memoized per `FnFlags` bits (thread-local) when no read
+  window is open — the `PLIRON_PIPELINE` custom path is never memoized.
+- `run_step`'s shape knobs (`SHAPE_ONLY`/`NOSHAPE`/`SHAPE_CHECK`),
+  `giant_max()`, and `stepcache::enabled()`/`dir()` are `LazyLock`-cached
+  with a `reads_open()` fallback that re-reads through `config()` so
+  armed windows still record the consulted vars.
+- Per-step `stats.timing` accumulates into a `Vec<Duration>` slot
+  indexed by `sel` position and merges into the map once per function —
+  kills a `FxHashMap<&str>` probe per step per fn.
+- `vendor/pliron` `linked_list::Iter`/`get_next`/`get_prev`/`iter`
+  `#[inline]` (PLIRON-marked).
+- `vendor/cranelift-codegen` `layout.rs` patch 45: `BlockNode.count` +
+  `Layout.num_blocks` maintained through every insert/remove/split; both
+  iterators get exact `size_hint` + `ExactSizeIterator`; serde uses the
+  stored counts.
+- `Pipe::fact_bits: SecondaryMap<Value, u8>` — `carry_one` does one
+  dense probe gating all six fact-table lookups; bits set on every
+  insert path + seeded at each `Pipe` construction (pre-Pipe writes)
+  and after wholesale `*p.derived =` restores. Stale bits are
+  conservative-safe; a missing bit would be a skipped carry, so all
+  write paths were audited (~22 sites, all covered).
+
+Verify: `cargo test -p pliron-clif-opt` green (incl. the
+`carry_keeps_param_facts_scoped` test), workspace check clean, smoke
+compile + `PLIRON_DIFFCHECK=1` run clean, `bench /tmp/corpus-s` 76.2s
+(noise-equal to the 74.8s baseline — this batch is constant-factor
+shaving; the box's noise floor swamps ~2%).
+
+Bench harness: `PLIRON_CORPUS=<dir>` dumps pre-pipeline CLIF per fn;
+`clif-check bench <dir> [reps]` replays + prints per-step times.
+Corpus at `/tmp/corpus` (55.3k fns), subset `/tmp/corpus-s` (4k).

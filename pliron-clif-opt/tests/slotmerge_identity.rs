@@ -12,12 +12,7 @@ fn parse(src: &str) -> Function {
 }
 
 fn merge(f: &mut Function) -> usize {
-    pliron_clif_opt::slotmerge::run(
-        f,
-        &FxHashMap::default(),
-        &[],
-        &FxHashSet::default(),
-    )
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashSet::default())
 }
 
 fn slot_sizes(f: &Function) -> Vec<(String, u32)> {
@@ -112,8 +107,16 @@ fn ptrdiff_between_slots_never_merges() {
     merge(&mut f);
     let sizes = slot_sizes(&f);
     let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
-    assert_eq!(get("ss1"), Some(8), "ptrdiff'd ss1 must not fold: {sizes:?}");
-    assert_eq!(get("ss2"), Some(8), "ptrdiff'd ss2 must not fold: {sizes:?}");
+    assert_eq!(
+        get("ss1"),
+        Some(8),
+        "ptrdiff'd ss1 must not fold: {sizes:?}"
+    );
+    assert_eq!(
+        get("ss2"),
+        Some(8),
+        "ptrdiff'd ss2 must not fold: {sizes:?}"
+    );
 }
 
 // A pointer stored into a container slot and reloaded later must keep

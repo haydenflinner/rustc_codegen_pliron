@@ -493,6 +493,9 @@ pub fn lower_module(
         scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
         invariant: FxHashSet<ir::Inst>,
         operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+        /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
+        /// from the tables at each `Pipe` construction.
+        fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
         block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
         // PGO: CLIF block -> executed count (from st.prof_bcount via
         // block_region); CLIF passes read it through Pipe.prof.
@@ -658,6 +661,7 @@ pub fn lower_module(
             scoped,
             invariant,
             operand_frozen,
+            fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
             block_region,
             prof,
             lifetimes,
@@ -744,6 +748,7 @@ pub fn lower_module(
                     scoped: &j.scoped,
                     invariant: &j.invariant,
                     operand_frozen: &mut j.operand_frozen,
+                    fact_bits: &mut j.fact_bits,
                     block_region: &j.block_region,
                     prof: &j.prof,
                     region_parent: sh.region_parent,
@@ -762,6 +767,7 @@ pub fn lower_module(
                     carry_log: Vec::new(),
                     prof_hook: Some(&prof_hook),
                 };
+                pipe.seed_fact_bits();
                 crate::pipeline::run_pipeline(&mut pipe);
             }
             if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
@@ -1532,9 +1538,11 @@ pub fn lower_clif_wasm(
         let mut noalias = noalias;
         let mut deref = deref;
         let mut operand_frozen = operand_frozen;
+        let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
         let mut lifetimes = lifetimes;
         let mut pipe = crate::pipeline::Pipe {
             cur_step: "",
+            fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: n,
@@ -1575,6 +1583,7 @@ pub fn lower_clif_wasm(
         let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
             && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
         if run_pipe {
+            pipe.seed_fact_bits();
             crate::pipeline::run_pipeline(&mut pipe);
         }
         drop(pipe);

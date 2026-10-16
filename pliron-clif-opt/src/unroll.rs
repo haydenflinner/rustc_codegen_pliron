@@ -78,13 +78,7 @@ pub fn run(
             if prof.get(&h) == Some(&0) {
                 continue;
             }
-            let Some((pred, pinst, body, entry, used_out)) = candidate(
-                func,
-                cfg,
-                dt,
-                &u,
-                h,
-            ) else {
+            let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, &u, h) else {
                 continue;
             };
             if pliron_cfg::tracing_on()

@@ -91,9 +91,7 @@ fn main() -> ExitCode {
             bad == 0
         }
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
-        ["bench", dir, reps] => {
-            bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps"))
-        }
+        ["bench", dir, reps] => bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps")),
         _ => {
             eprintln!(
                 "{}",
@@ -233,7 +231,9 @@ fn with_pipe<R>(
         Default::default(),
         Vec::new(),
     );
+    let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
     let mut p = Pipe {
+        fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,
         fname: "clif-check",
@@ -267,6 +267,7 @@ fn with_pipe<R>(
         carry_log: Vec::new(),
         cur_step: "",
     };
+    p.seed_fact_bits();
     k(&mut p)
 }
 

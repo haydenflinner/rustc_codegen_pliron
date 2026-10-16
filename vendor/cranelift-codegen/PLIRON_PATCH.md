@@ -544,3 +544,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     casts (`fvpromote_f16`/`_lo`/`_hi` -> `fcvtl`/`fcvtl2`,
     `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
     lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.
+
+45. Exact `size_hint` on the layout iterators (`src/ir/layout.rs`):
+    `BlockNode` gains a per-block inst `count` and `Layout` gains a
+    `num_blocks` counter (maintained in append/insert/remove/split),
+    feeding `Blocks`/`Insts` `size_hint`/`ExactSizeIterator`. Passes
+    that snapshot `layout.block_insts(b).collect()`/`blocks().collect()`
+    were hitting `spec_from_iter_nested` growth — a ~1% leaf —
+    because the linked-list iterators reported `(0, None)`. The serde
+    round-trip rebuilds counts through the public insert path.
