@@ -60,10 +60,13 @@ const MAX_T: usize = 32;
 const GROWTH_MULT: usize = 25;
 
 pub fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
-    if f.deref(ctx).regions().next().is_none() {
-        panic!("blocks: op has no regions: {}", OpDbg { op: f, ctx });
-    }
-    f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect()
+    // Bodiless `llvm.func` ops (extern decls like `rust_eh_personality`)
+    // legitimately have no regions — callers iterating all funcs see an
+    // empty body rather than a panic.
+    let Some(r) = f.deref(ctx).regions().next() else {
+        return Vec::new();
+    };
+    r.deref(ctx).iter(ctx).collect()
 }
 
 pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
