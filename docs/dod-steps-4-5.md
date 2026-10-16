@@ -255,3 +255,35 @@ protocol — DefNode inside), Operation.attributes (needs AttrId
 interning — deferred; measure first), Operation.loc (POD, no gain).
 Pools are append-only; orphaned spans are bounded garbage under
 CGU-scoped Context lifetimes.
+
+## Step 6 design: Sync-shareable reads -> per-fn phaseA parallelism
+
+Goal: parallelize phaseA (iropt) across fns inside a CGU without
+-Zthreads. Blockers as of 62eafb7:
+
+- Read path: op payload reads are pool `RefCell` borrows (Ref<[T]>
+  projections). RefCell is !Sync — fine on one thread, hard-blocked
+  under rayon/scope threads.
+- Options:
+  a) **Snapshot views**: before phaseA, snapshot each op's spans +
+     needed columns into immutable Vecs/Arcs; workers read snapshots,
+     main thread applies mutations. iropt is already scan-then-edit —
+     facts tables (ColMap/ColSet) are Vec<Option<T>> reads under & —
+     Sync if the container is. But ops pools sit inside RefCell.
+  b) **UnsafeCell + unsafe sync** — ruled out (no unsafe).
+  c) **Phase-split Context**: split mutation points so that during a
+     "read phase" all pools are taken out (&mut Context borrow gives
+     us `&Vec<T>` re-borrowed as `&[T]` — provably immutable) and
+     worker fns get a read-only `IrView<'a>` struct holding `&'a`
+     slices + `&'a State` columns. Writes queue to a per-worker
+     edit list, applied single-threaded between phases. iropt's
+     structure (scan bodies -> fact tables -> inline decisions ->
+     splice) maps onto this naturally: body-scan+fact-derive is the
+     50%-of-modgen part and is read-only per fn.
+- Prerequisite for (c): State columns are already &T-readable
+  (ColMap = Vec-backed). Need: Operation/BasicBlock read API on
+  IrView (spans + pools as slices), printable/verifier deps checked,
+  then a scoped-threads map over CGU fn list for the scan+derive leg.
+- Writes that stay serial: op construction (alloc spans appends),
+  inline splicing, symbol registration. Estimated split:
+  ~60-70% of iropt CPU is the read-only scan+derive per fn.
