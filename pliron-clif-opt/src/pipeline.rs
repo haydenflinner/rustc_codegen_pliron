@@ -2200,8 +2200,8 @@ fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
 // `0` the fresh-insert edge wrote — clone the small block onto the edge
 // and alias the load to the stored value so lcse/dse fold `store 0` +
 // `load;+1;store` into `store 1`.
-fn s_memspec(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = memspec::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+fn s_memspec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = memspec::run(&mut p.clctx.func, an, p.noalias, p.nowrite, p.call_frozen);
     if k > 0 && p.dump {
         p.dump("memspec");
     }

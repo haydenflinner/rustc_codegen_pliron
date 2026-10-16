@@ -202,6 +202,7 @@ fn edge_candidate(func: &Function, p: Block, t: Inst) -> Option<(Block, Vec<Inst
 
 pub fn run(
     func: &mut Function,
+    an: &crate::pipeline::Analysis,
     noalias: &FxHashSet<Value>,
     nowrite: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
@@ -238,7 +239,9 @@ pub fn run(
     // address, so a pointer loaded from memory can't reach its region.
     // Same rule licm's `iso_l` applies per loop, scoped to the edge.
     let mut reachers: FxHashSet<Block> = FxHashSet::default();
-    let mut uses = crate::uses::Uses::new(func);
+    // Shared per-version index — exact until this pass's first
+    // mutation (the IR is frozen between `ver` bumps).
+    let mut uses = an.uses(func);
     let mut n = 0;
     'blocks: for (p, t, (r, body)) in cands {
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
@@ -437,7 +440,7 @@ pub fn run(
         n += 1;
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
-        uses = crate::uses::Uses::new(func);
+        uses = an.refresh_uses(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
             loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());
@@ -499,6 +502,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut func,
+                &crate::pipeline::Analysis::default(),
                 &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashMap::default(),
@@ -587,6 +591,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut func,
+                &crate::pipeline::Analysis::default(),
                 &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashMap::default(),
@@ -643,6 +648,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut func,
+                &crate::pipeline::Analysis::default(),
                 &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashMap::default(),
@@ -688,6 +694,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut func,
+                &crate::pipeline::Analysis::default(),
                 &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashMap::default(),
