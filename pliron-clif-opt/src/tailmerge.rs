@@ -216,7 +216,7 @@ pub fn run(func: &mut Function) -> usize {
     for &c in map.values() {
         needs.entry(c).or_insert_with(|| {
             let mut s = FxHashSet::default();
-            let mut note = |v: Value, s: &mut FxHashSet<Block>| match func
+            let note = |v: Value, s: &mut FxHashSet<Block>| match func
                 .dfg
                 .value_def(func.dfg.resolve_aliases(v))
             {

@@ -957,7 +957,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
 // `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
 fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
-    let mut tt = |name: &str, t0: std::time::Instant| {
+    let tt = |name: &str, t0: std::time::Instant| {
         if prof2 {
             eprintln!("    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
         }

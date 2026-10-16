@@ -4960,7 +4960,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// `f32_to_bf16` on four lanes, leaving each result in the low half of an i32.
     fn f32x4_to_bf16_bits(&mut self, f: ir::Value) -> ir::Value {
         let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
-        let mut k = |b: &mut Self, c: i64| {
+        let k = |b: &mut Self, c: i64| {
             let c = b.b.ins().iconst(clt::I32, c);
             b.b.ins().splat(clt::I32X4, c)
         };

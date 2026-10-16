@@ -175,10 +175,6 @@ fn iconst_wide(pos: &mut FuncCursor, it: Type, imm: u128) -> Value {
     }
 }
 
-fn vt_of(pos: &FuncCursor, v: Value) -> Type {
-    pos.func.dfg.value_type(v)
-}
-
 /// Scalarize every inst touching vector type `target`. Returns the
 /// number rewritten.
 /// Replace `inst`'s single result with `v`. Scalar ints keep the old
