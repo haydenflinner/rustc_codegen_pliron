@@ -819,10 +819,37 @@ fn chain_stats(func: &Function) -> (usize, u64) {
     (maxd, total)
 }
 
+/// Instruction count at which optimization steps stop paying for
+/// themselves (see `run_step`). `PLIRON_GIANT_MAX=<n>` overrides;
+/// `=0` disables the bail entirely.
+fn giant_max() -> usize {
+    match config()
+        .get("PLIRON_GIANT_MAX")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GIANT_MAX)
+    {
+        0 => usize::MAX,
+        n => n,
+    }
+}
+const GIANT_MAX: usize = 50_000;
+
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
     {
+        return;
+    }
+    // Giant-function bail: generated matchers (Cranelift's ISLE
+    // `constructor_simplify`) and pathologically unrolled bodies reach
+    // 10⁵+ instructions, where the optimization steps are pure cost —
+    // a single superlinear pass burns minutes for wins that are
+    // marginal at that scale. Past `PLIRON_GIANT_MAX` instructions
+    // only `Gate::Always` correctness lowerings still run; a skipped
+    // step can only leave the function unoptimized, never wrong.
+    // Checked per step rather than once at selection: a step can grow
+    // the function past the limit mid-pipeline (unroll).
+    if !matches!(s.gate, Gate::Always) && p.clctx.func.dfg.num_insts() > giant_max() {
         return;
     }
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
@@ -1330,15 +1357,9 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
         }
     }
     // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
-    // leaf-up: repeat to fixpoint (bounded by diamond depth).
-    let mut k = 0;
-    for _ in 0..8 {
-        let n2 = ifconv::run(&mut p.clctx.func, p.derived);
-        k += n2;
-        if n2 == 0 {
-            break;
-        }
-    }
+    // leaf-up: `run` rescans to fixpoint internally on one
+    // cfg/domtree setup.
+    let k = ifconv::run(&mut p.clctx.func, p.derived);
     if k > 0 {
         // Folded merges leave dead forwarders still edging into
         // the merge — remove them so the merge is single-pred,

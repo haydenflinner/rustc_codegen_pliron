@@ -769,6 +769,14 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         FxHashMap<Block, FxHashSet<Block>>,
     ) = (FxHashMap::default(), FxHashMap::default());
     let mut n = 0;
+    // A fold can expose a convertible diamond in a block already
+    // scanned, so rescan to fixpoint (bounded). The setup —
+    // cfg/domtree/msets/`preds` deltas — carries across rounds; `dirty`
+    // reads still trigger the incremental recompute. The pred deltas
+    // are idempotent against a recomputed cfg, so a recompute inside a
+    // round leaves later rounds correct.
+    'outer: for _ in 0..8 {
+    let mut rn = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         let Some(term) = func.layout.last_inst(b) else {
             continue;
@@ -911,7 +919,12 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
         if crate::env_set("PLIRON_IFCONV_DEBUG") {
             eprintln!("ifconv {b} -> jump {m} (arms {t:?} {e:?})");
         }
-        n += 1;
+        rn += 1;
+    }
+    n += rn;
+    if rn == 0 {
+        break 'outer;
+    }
     }
     if crate::env_set("PLIRON_ICPROF") {
         EDGE_NS.with(|c| eprintln!("ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
