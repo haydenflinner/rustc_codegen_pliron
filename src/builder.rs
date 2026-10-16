@@ -1111,8 +1111,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_invariant_load(&mut self, load: Value) {
-        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::frozen", "invariant.load {load:?}");
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "invariant.load {load:?}") };
         }
         if let Some(op) = load.defining_op() {
             self.st.borrow_mut().invariant.insert(op);

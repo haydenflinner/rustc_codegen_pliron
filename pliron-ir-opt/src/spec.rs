@@ -23,7 +23,8 @@ use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
 
 pub fn run(ctx: &mut Context, st: &mut State) {
-    let dbg = tracing::enabled!(target: "pliron::spec", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::spec", tracing::Level::DEBUG);
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     for f in st.funcs.values() {
@@ -44,13 +45,15 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     let mut done = 0usize;
     for (sym, f) in &st.funcs {
         if dbg {
-            tracing::debug!(target: "pliron::spec",
-                "spec {sym}: linkage={:?} body={} taken={} sites={:?}",
-                f.linkage,
-                has_body(ctx, f.op),
-                taken.contains(sym.as_str()),
-                sites.get(sym).map(|v| v.len())
-            );
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::spec",
+                    "spec {sym}: linkage={:?} body={} taken={} sites={:?}",
+                    f.linkage,
+                    has_body(ctx, f.op),
+                    taken.contains(sym.as_str()),
+                    sites.get(sym).map(|v| v.len())
+                )
+            };
         }
         if f.linkage != Linkage::Local
             || !has_body(ctx, f.op)
@@ -93,7 +96,12 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             done += 1;
         }
     }
-    if done > 0 && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "spec {}: {done} params", st.cgu);
+    if done > 0
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "spec {}: {done} params", st.cgu)
+        };
     }
 }

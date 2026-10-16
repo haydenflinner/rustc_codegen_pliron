@@ -1881,3 +1881,35 @@ is Vec growth everywhere; `Vec<Ptr>::from_iter` on list collects
 could add `size_hint` if containers tracked length. `carry_one` 1.2k
 (post-epoch-gate residual), `indvars::edge_arg` ~1k, `sroa::gep_offset`
 0.5k, `trace::dyn_site` 0.6k (tracer overhead worth a look).
+
+### disabled-tracing gate — LANDED
+
+The profile showed tracing machinery leafs with no subscriber
+installed: `trace::dyn_site` (0.6k) does a global Mutex+hashmap lookup
+per pipeline step; every `enabled!`/event macro pays `get_default`
+(TLS + callsite registry). `finish_module` alone attributed ~9.2k
+samples to dispatch overhead (~4%).
+
+`pliron_cfg::tracing_on()` is now the gate: a `TRACING_ON` AtomicBool
+set once by `src/lib.rs::tracing_init` before installing the
+subscriber, OR'd with `tracing::dispatcher::has_been_set()` so test
+harnesses that install their own dispatcher still see `true`.
+`mark_tracing_on()` never flips back — one relaxed load per check.
+
+Gated sites: the per-step `dyn_site` span in `pipeline` (the hot one —
+steps × fns), per-fn `pliron::fn`/`pipeline`/`compile` spans in
+`lower.rs`, all `tracing::enabled!` checks (147 sites, now
+`tracing_on() && enabled!`), bare `debug!`/`info!`/`trace!`/`warn!`
+event macros (~290 sites wrapped in `if tracing_on() { }` via a
+paren-balancing script — format args with parens/strings handled),
+and guardelim's per-fn `gefn`/`gefix`/`geprove` spans (`Span::none()`
+fallback keeps the `record()` calls unconditional). When off, all of
+this is one atomic load; when on, identical behavior.
+
+Verified: `PLIRON_STATS`, `PLIRON_TIMING`, `PLIRON_TRACE=pliron::step`
+(6527 span-close lines), `PLIRON_TRACE_FILE` (5652 lines) all emit;
+`cargo test` both opt crates + full `./test.sh` green.
+
+Known residual: `enabled!` callsites inside closures (e.g.
+`ifconv::EDGE_NS.with`) still pay the registry walk when reached, but
+their outer guards now gate them.

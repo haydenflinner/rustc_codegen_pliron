@@ -40,15 +40,24 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
             || op.is_branch()
             || op.is_terminator()
         {
-            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
-                tracing::debug!(target: "pliron::taildup", "taildup: cand {b} impure {i} (fn {})", func.name);
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::taildup", "taildup: cand {b} impure {i} (fn {})", func.name)
+                };
             }
             return false;
         }
         n += 1;
     }
-    if n > MAX_INSTS && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
-        tracing::debug!(target: "pliron::taildup", "taildup: cand {b} too-big {n} (fn {})", func.name);
+    if n > MAX_INSTS
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::taildup", "taildup: cand {b} too-big {n} (fn {})", func.name)
+        };
     }
     n <= MAX_INSTS
 }
@@ -72,11 +81,14 @@ fn use_blocks(func: &Function, domtree: &DominatorTree) -> FxHashMap<Value, Opti
 
 /// No parameter or result of `b` is used outside `b` (so copies need no SSA repair).
 fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
-    let dbg = tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG);
     let ok = |v: &Value| {
         let good = uses.get(v).is_none_or(|&u| u == Some(b));
         if dbg && !good {
-            tracing::debug!(target: "pliron::taildup", "taildup: cand {b} escapes {v} (fn {})", func.name);
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::taildup", "taildup: cand {b} escapes {v} (fn {})", func.name)
+            };
         }
         good
     };
@@ -257,10 +269,13 @@ pub fn run(func: &mut Function) -> usize {
             } else {
                 ""
             };
-            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
                 && !why.is_empty()
             {
-                tracing::debug!(target: "pliron::taildup", "taildup: skip {p}->{r} edge {di}: {why} (fn {})", func.name);
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::taildup", "taildup: skip {p}->{r} edge {di}: {why} (fn {})", func.name)
+                };
             }
             if !why.is_empty() {
                 continue;
@@ -318,8 +333,12 @@ pub fn run(func: &mut Function) -> usize {
             if !ok {
                 continue;
             }
-            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
-                tracing::debug!(target: "pliron::taildup", "taildup: clone {r} into {p} edge {di} (fn {})", func.name);
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::taildup", "taildup: clone {r} into {p} edge {di} (fn {})", func.name)
+                };
             }
             let body: Vec<_> = func.layout.block_insts(r).collect();
             let alias: FxHashMap<Value, Value> = body

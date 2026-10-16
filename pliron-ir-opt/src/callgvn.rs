@@ -320,25 +320,25 @@ fn natural_loops(
 }
 
 pub fn run(ctx: &mut Context, st: &State) {
-    let dbg = tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
     for name in bodied(ctx, st) {
         if dbg {
-            tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}");
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}") };
         }
         if crate::env_get("PLIRON_CGDUMP").is_some_and(|s| name.contains(s)) {
-            tracing::info!(target: "pliron::dump", "{}",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "{}",
                 st.funcs[&name]
                     .op
                     .print(ctx, &pliron::printable::State::default())
-            );
+            ) };
         }
         run_fn(ctx, st, st.funcs[&name].op);
         if crate::env_get("PLIRON_CGDUMP2").is_some_and(|s| name.contains(s)) {
-            tracing::info!(target: "pliron::dump", "==== after callgvn ====\n{}",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== after callgvn ====\n{}",
                 st.funcs[&name]
                     .op
                     .print(ctx, &pliron::printable::State::default())
-            );
+            ) };
         }
     }
 }
@@ -417,7 +417,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             if op_writes.get(&op).copied().unwrap_or(false) {
                 seen.clear();
             }
-            if tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG)
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG)
                 && Operation::is_op::<CallOp>(op, ctx)
             {
                 let why = if st.invokes.contains_key(&op) {
@@ -435,7 +435,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 } else {
                     "ok"
                 };
-                tracing::debug!(target: "pliron::callgvn", "callgvn   call dedupable={why}");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn   call dedupable={why}") };
             }
             let Some((c, args, res)) = dmemo
                 .entry((op, false))
@@ -523,11 +523,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     }
 
     // 3) Loop hoist: write-free natural loops with a unique preheader.
-    let dbg = tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
     for (h, body) in natural_loops(&dom, &succ, &preds) {
         if dbg {
-            tracing::debug!(target: "pliron::callgvn", "callgvn loop h={h:?} body={} w={:?}", body.len(),
-                body.iter().filter(|b| writes_blk.contains(b)).count());
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn loop h={h:?} body={} w={:?}", body.len(),
+                body.iter().filter(|b| writes_blk.contains(b)).count()) };
         }
         if body.iter().any(|b| writes_blk.contains(b)) {
             continue;
@@ -541,7 +541,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             .collect();
         let [ph] = outside[..] else {
             if dbg {
-                tracing::debug!(target: "pliron::callgvn", "callgvn   no unique ph: {} outside preds", outside.len());
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn   no unique ph: {} outside preds", outside.len()) };
             }
             continue;
         };
@@ -552,7 +552,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         // preheader to dominate it too.
         if body.iter().any(|&b| b != h && !dom.dominates(h, b)) {
             if dbg {
-                tracing::debug!(target: "pliron::callgvn", "callgvn   header doesn't dominate body");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn   header doesn't dominate body") };
             }
             continue;
         }
@@ -600,7 +600,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     } else {
                         "ok"
                     };
-                    tracing::debug!(target: "pliron::callgvn", "callgvn   call in body dedupable={why}");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn   call in body dedupable={why}") };
                 }
                 // Hoists may carry invokes: the unwind edge is an
                 // `st.invokes` entry keyed on the op, so it moves with it.
@@ -659,7 +659,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                         )
                     });
                 if dbg {
-                    tracing::debug!(target: "pliron::callgvn", "callgvn   {c} hoistable={ok} cone={}", cone.len());
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::callgvn", "callgvn   {c} hoistable={ok} cone={}", cone.len()) };
                 }
                 if !ok {
                     continue;

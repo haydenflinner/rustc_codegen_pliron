@@ -7,7 +7,7 @@
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::types::{BF16Type, FP16Type, FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::irbuild::cloning::{IrMapping, clone_operation};
+use pliron::irbuild::cloning::{clone_operation, IrMapping};
 use pliron::irbuild::listener::DummyListener;
 use pliron::irbuild::rewriter::IRRewriter;
 use pliron::linked_list::ContainsLinkedList;
@@ -101,15 +101,14 @@ fn leafwise_kind(ctx: &Context, op: Ptr<Operation>) -> bool {
     macro_rules! any {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
-    any!(
-        AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp
-    ) || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
-        let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
-        LEAFWISE_INTRINSICS.iter().any(|k| {
-            n.strip_prefix(k)
-                .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+    any!(AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp)
+        || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+            let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+            LEAFWISE_INTRINSICS.iter().any(|k| {
+                n.strip_prefix(k)
+                    .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+            })
         })
-    })
 }
 
 /// bf16 vector arithmetic whose `<n x f32>` twin is all SIMD leaves: promote
@@ -502,6 +501,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                     let good = wide_op(ctx, op) || will_split(ctx, op);
                     let good16 = half_wide_op(ctx, op);
                     if !good16
+                        && pliron_cfg::tracing_on()
                         && tracing::enabled!(target: "pliron::scalarize", tracing::Level::DEBUG)
                         && op
                             .deref(ctx)
@@ -512,7 +512,9 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                                     .is_some_and(|(e, _)| e == f16h || e == bf16h)
                             })
                     {
-                        tracing::debug!(target: "pliron::scalarize", "wide-f16 reject: {}", Operation::get_opid(op, ctx));
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::scalarize", "wide-f16 reject: {}", Operation::get_opid(op, ctx))
+                        };
                     }
                     let o = op.deref(ctx);
                     for v in o.operands().chain(o.results()) {

@@ -202,7 +202,7 @@ pub fn run(
     let nslots = func.sized_stack_slots.len();
     let mut iv: Vec<(u32, u32)> = vec![(u32::MAX, 0); nslots];
     let mut uses: Vec<Vec<u32>> = vec![Vec::new(); nslots];
-    let dbg = tracing::enabled!(target: "pliron::slotmerge", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::slotmerge", tracing::Level::DEBUG);
     let mut esc: Vec<(StackSlot, Inst)> = Vec::new();
     // `llvm.lifetime.{start,end}` markers (MIR StorageLive/Dead) pin
     // validity windows in LLVM's model: a pointer into dead storage can't
@@ -541,16 +541,16 @@ pub fn run(
     if dbg {
         for s in 0..nslots {
             let s = StackSlot::from_u32(s as u32);
-            tracing::debug!(target: "pliron::slotmerge", "slotmerge: {s} iv={:?} uses={:?}",
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::slotmerge", "slotmerge: {s} iv={:?} uses={:?}",
                 iv[s.index()],
                 uses[s.index()],
-            );
+            ) };
         }
         for &(s, i) in &esc {
-            tracing::debug!(target: "pliron::slotmerge", "slotmerge: {s} escapes at {i} {}: {}",
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::slotmerge", "slotmerge: {s} escapes at {i} {}: {}",
                 func.layout.inst_block(i).unwrap(),
                 func.dfg.display_inst(i),
-            );
+            ) };
         }
     }
     // Greedy interval coloring, best-fit by region size.

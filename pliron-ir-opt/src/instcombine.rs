@@ -8,8 +8,8 @@
 //! `=0` disables the pass.
 
 use egg::{
-    Analysis, Applier, DidMerge, EGraph, Id, Language, PatternAst, Rewrite, Runner, Subst, Symbol,
-    Var, define_language, rewrite as rw,
+    define_language, rewrite as rw, Analysis, Applier, DidMerge, EGraph, Id, Language, PatternAst,
+    Rewrite, Runner, Subst, Symbol, Var,
 };
 use pliron::{
     context::{Context, Ptr},
@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
 use crate::state::{ConstVal, State};
-use crate::types::{TyK, classify};
+use crate::types::{classify, TyK};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cst(u128, u32);
@@ -66,7 +66,11 @@ define_language! {
 }
 
 fn mask(b: u128, w: u32) -> u128 {
-    if w >= 128 { b } else { b & ((1u128 << w) - 1) }
+    if w >= 128 {
+        b
+    } else {
+        b & ((1u128 << w) - 1)
+    }
 }
 fn sext(b: u128, w: u32) -> i128 {
     if w >= 128 {
@@ -399,11 +403,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         // match against the multiply's operand.
         nv += fold_divmul(ctx, st, f);
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats",
-            "instcombine {}: {nc} values folded to constants, {nv} to an operand",
-            st.cgu
-        );
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "instcombine {}: {nc} values folded to constants, {nv} to an operand",
+                st.cgu
+            )
+        };
     }
 }
 
@@ -565,7 +572,11 @@ enum Ck {
 
 impl POp {
     fn nargs(&self) -> usize {
-        if self.ic == Pk::Select { 3 } else { 2 }
+        if self.ic == Pk::Select {
+            3
+        } else {
+            2
+        }
     }
 }
 

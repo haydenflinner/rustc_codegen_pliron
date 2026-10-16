@@ -384,7 +384,7 @@ pub fn lower_module(
             ids.insert(n.clone(), Sym::F(thunk, f.ty));
             continue;
         }
-        tracing::debug!(target: "pliron::lower", declfn = %n, ?l, ?sig);
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lower", declfn = %n, ?l, ?sig); }
         let id = m
             .declare_function(crate::obj_sym(n), l, &sig)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
@@ -591,7 +591,7 @@ pub fn lower_module(
                 eh_tls_v: None,
                 eject: None,
             };
-            tracing::debug!(target: "pliron::lower", lowerfn = %n);
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lower", lowerfn = %n); }
             fl.lower(f.op);
             fl.b.finalize(cfg);
             asm_stubs.extend(fl.stubs.iter().copied());
@@ -696,16 +696,22 @@ pub fn lower_module(
         clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
         let n = j.name;
         if j.dump {
-            tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display());
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display()) };
         }
         let mut verify_full = sh.verify_full_env;
         let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
-        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::frozen", "==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref) };
         }
-        let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
+        let tron = pliron_cfg::tracing_on();
+        let _sfn = tron.then(|| {
+            tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered()
+        });
         let tpipe = std::time::Instant::now();
-        let _spipe = tracing::info_span!(target: "pliron::pipeline", "pipeline").entered();
+        let _spipe = tron
+            .then(|| tracing::info_span!(target: "pliron::pipeline", "pipeline").entered());
         let _pgpipe = sh.prof.activity("pliron_pipeline", Some(n));
         'retry: loop {
             {
@@ -774,7 +780,7 @@ pub fn lower_module(
         *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
         pliron_cfg::trace("*pipeline*", tpipe.elapsed().as_secs_f64() * 1e3, n);
         if j.dump {
-            tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display());
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display()) };
         }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
@@ -783,7 +789,8 @@ pub fn lower_module(
         // 128-bit ops. When emit names an unsupported vector type,
         // scalarize every inst touching it and retry.
         let tcomp = std::time::Instant::now();
-        let _scomp = tracing::info_span!(target: "pliron::pipeline", "compile").entered();
+        let _scomp = tron
+            .then(|| tracing::info_span!(target: "pliron::pipeline", "compile").entered());
         let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
         let mut vec_retry = 0;
         let defr = loop {
@@ -834,7 +841,8 @@ pub fn lower_module(
         // Cranelift's own pass profiler: `emit:<pass>` pseudo-steps show
         // where inside `compile` (vcode lower/emit, regalloc) time goes.
         if pliron_cfg::env_set("PLIRON_TIMING")
-            || tracing::enabled!(target: "pliron::timing", tracing::Level::INFO)
+            || (pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::timing", tracing::Level::INFO))
             || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
         {
             for (d, t) in cranelift_codegen::timing::take_current().self_times() {
@@ -931,7 +939,7 @@ pub fn lower_module(
             );
         };
         if let Some(v) = &code.vcode {
-            tracing::info!(target: "pliron::dump", "==== vcode {} ====\n{v}", j.name);
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== vcode {} ====\n{v}", j.name) };
             if let Some(d) = crate::env_get("PLIRON_CODEBIN") {
                 let _ = std::fs::write(format!("{d}/{}.bin", j.name), code.buffer.data());
             }
@@ -963,22 +971,22 @@ pub fn lower_module(
         x86_pshufb_helper(&mut *m, &mut clctx, &mut fbc, cc, cfg);
     }
 
-    if tracing::enabled!(target: "pliron::timing", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::timing", tracing::Level::INFO) {
         let mut t: Vec<_> = stats.timing.iter().collect();
         t.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
         for (n, d) in t {
-            tracing::info!(target: "pliron::timing", "timing {name} {n} {:.3}ms", d.as_secs_f64() * 1e3);
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::timing", "timing {name} {n} {:.3}ms", d.as_secs_f64() * 1e3) };
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "pipeline {name}: {}", crate::config::config().describe());
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "pipeline {name}: {}", crate::config::config().describe()) };
     }
-    if st.loadfwd && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if st.loadfwd && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (forwarded, peeped, slot_dse) = (stats.forwarded, stats.peeped, stats.slot_dse);
-        tracing::info!(target: "pliron::stats", "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
-        );
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
+        ) };
     }
-    if st.jumpthread && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if st.jumpthread && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (threaded, dead_params, dominated_folds, merged, unreached, dupd) = (
             stats.threaded,
             stats.dead_params,
@@ -987,8 +995,8 @@ pub fn lower_module(
             stats.unreached,
             stats.dupd,
         );
-        tracing::info!(target: "pliron::stats", "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
-        );
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
+        ) };
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
     let mut custom_secs: Vec<CustomSec> = Vec::new();
@@ -1477,7 +1485,7 @@ pub fn lower_clif_wasm(
         };
         let dump = crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s));
         if dump {
-            tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display());
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display()) };
         }
         // Flags-only verify: the ISA-aware checks (pointer width, global
         // value types) consult `isa.pointer_type()` — i64 on the host —
@@ -1542,7 +1550,7 @@ pub fn lower_clif_wasm(
         }
         drop(pipe);
         if dump {
-            tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display());
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display()) };
         }
         out.push((
             n.clone(),
@@ -1995,8 +2003,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
-                            tracing::debug!(target: "pliron::frozen", "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}");
+                        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}") };
                         }
                         self.noalias.insert(v);
                         self.deref.insert(v, (bytes, false));
@@ -2009,11 +2017,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
-                            tracing::debug!(target: "pliron::frozen", "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
+                        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
                                 *pb,
                                 pb.deref(ctx).arguments().count()
-                            );
+                            ) };
                         }
                         self.noalias.insert(v);
                     }
@@ -2401,8 +2409,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let op = v.defining_op()?;
         let ctx = self.ctx;
         let id = Operation::get_opid(op, ctx);
-        if tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id);
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id) };
         }
         let ops: Vec<Value> = op.deref(ctx).operands().collect();
         let bit = |v| self.const_bits(v, depth + 1);
@@ -2842,7 +2850,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             sig.returns.clear();
             s
         });
-        tracing::debug!(target: "pliron::lower", libcall = %name, ?params, ?rets, ?sig);
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lower", libcall = %name, ?params, ?rets, ?sig); }
         let id = self
             .m
             .declare_function(crate::obj_sym(name), Linkage::Import, &sig)
@@ -3926,8 +3934,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.b.ins().fence();
             }
             if r.len() == 1 && self.st.nonnull.contains(&op) {
-                if tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
-                    tracing::debug!(target: "pliron::lower", "nndbg seed {} <- op {:?}", r[0], op);
+                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lower", "nndbg seed {} <- op {:?}", r[0], op) };
                 }
                 self.nonnull.insert(r[0]);
             }
@@ -4602,14 +4610,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // called on a SysV host).
         let cc = info.cc.unwrap_or(cc);
         let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
-        tracing::debug!(
-            target: "pliron::lower",
-            callee = ?match call.callee(ctx) {
-                CallOpCallable::Direct(id) => self.st.ident_to_sym.get(&id.to_string()).cloned(),
-                CallOpCallable::Indirect(_) => None,
-            },
-            callsig = ?format!("{} params -> {} rets", sig.params.len(), sig.returns.len()),
-        );
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(
+                target: "pliron::lower",
+                callee = ?match call.callee(ctx) {
+                    CallOpCallable::Direct(id) => self.st.ident_to_sym.get(&id.to_string()).cloned(),
+                    CallOpCallable::Indirect(_) => None,
+                },
+                callsig = ?format!("{} params -> {} rets", sig.params.len(), sig.returns.len()),
+            );
+        }
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         // Which pliron operand each CLIF arg expands from (for `nocap`

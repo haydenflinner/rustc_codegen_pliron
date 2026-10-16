@@ -19,7 +19,7 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
         if has_body(ctx, f.op)
             && let Some(e) = check(ctx, st, f.op)
         {
-            tracing::error!(target: "pliron::domcheck", "domcheck after {pass}: {name}: {e}");
+            if pliron_cfg::tracing_on() { tracing::error!(target: "pliron::domcheck", "domcheck after {pass}: {name}: {e}") };
         }
     }
 }

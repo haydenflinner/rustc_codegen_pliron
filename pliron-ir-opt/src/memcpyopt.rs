@@ -172,7 +172,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             }
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats","memcpyopt {}: {n} call slots forwarded", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats","memcpyopt {}: {n} call slots forwarded", st.cgu)
+        };
     }
 }

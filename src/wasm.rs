@@ -342,7 +342,7 @@ pub fn lower_to_wasm(
         });
         o.fidx.insert(n.clone(), o.funcs.len() - 1);
     }
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     let mut stubs = 0;
     let mut defined = 0;
     for (n, f) in &st.funcs {
@@ -372,7 +372,7 @@ pub fn lower_to_wasm(
                         .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
                 }
                 if verbose {
-                    tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {n}: {e}");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {n}: {e}") };
                 }
                 stub(&o.m, sig)
             }
@@ -462,7 +462,7 @@ fn emit_obj(
                                 });
                         }
                         if verbose {
-                            tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {} (backend): {e}", d.name);
+                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {} (backend): {e}", d.name) };
                         }
                         stub(&o.m, d.sig).compile().unwrap().into_raw_body()
                     }
@@ -1015,7 +1015,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             if need == 0 { Some(lo) } else { None }
         };
-        let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+        let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
         let mut del = vec![false; ins.len()]; // forwarded sets + moved producers
         let mut splice: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         let mut i = 0;
@@ -1119,7 +1119,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 continue;
             }
             if verbose {
-                tracing::debug!(target: "pliron::wasm","wsched: fwd {k} mats at set@{}", ins[segsets[0].0].1);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wsched: fwd {k} mats at set@{}", ins[segsets[0].0].1) };
             }
             for (m, &(s, _, u)) in segsets[..k].iter().enumerate() {
                 let (ps, pe) = pvec[m];
@@ -1181,7 +1181,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 _ => {}
             }
         }
-        let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+        let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
         // Stack-order matching inside runs of pure local ops.
         let mut pairs: Vec<(usize, usize)> = Vec::new(); // (get idx, set idx)
         let mut pending: Vec<usize> = Vec::new();
@@ -1297,10 +1297,10 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                             ok = false;
                             why = 3;
                             if verbose {
-                                tracing::debug!(target: "pliron::wasm",
+                                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm",
                                     "  fail3 t={} use@{} uctx={:?} pctx={:?}",
                                     t, ins[u].1, ctx[ins[u].3], ctx[ins[p1].3]
-                                );
+                                ) };
                             }
                             break;
                         }
@@ -1322,7 +1322,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                                     ok = false;
                                     why = 5;
                                     if verbose {
-                                        tracing::debug!(target: "pliron::wasm","  fail5 x={} i@{}", x, ins[i].1);
+                                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","  fail5 x={} i@{}", x, ins[i].1) };
                                     }
                                     break;
                                 }
@@ -1349,7 +1349,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                     }
                 }
                 if verbose && !ok {
-                    tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} why={why}");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} why={why}") };
                 }
                 if !ok {
                     live[ci] = false;
@@ -1358,10 +1358,10 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             if verbose {
                 for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
-                    tracing::debug!(target: "pliron::wasm",
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm",
                         "wpeep cand p1={} gi={} si={} t={} x={} live={}",
                         ins[p1].1, ins[gi].1, ins[si].1, t, x, live[ci]
-                    );
+                    ) };
                 }
             }
             if !dropped {
@@ -2734,7 +2734,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
         }
     }
     if verbose {
-        tracing::debug!(target: "pliron::wasm","pliron-wasm: inlined {inlined} callsites");
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","pliron-wasm: inlined {inlined} callsites") };
     }
 }
 
@@ -3015,11 +3015,11 @@ impl<'o, 'a> FL<'o, 'a> {
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false);
         if dbg {
-            tracing::info!(target: "pliron::dump",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump",
                 "==== pre-loopopt {} ====\n{}",
                 self.name,
                 self.b.display("  ", None)
-            );
+            ) };
         }
         // Second range pass: optimize/wtab can expose new bounded
         // operands (copy-prop through and/select). DCE immediately so
@@ -3063,11 +3063,11 @@ impl<'o, 'a> FL<'o, 'a> {
             );
         }
         if dbg {
-            tracing::info!(target: "pliron::dump",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump",
                 "==== post-loopopt {} ====\n{}",
                 self.name,
                 self.b.display("  ", None)
-            );
+            ) };
         }
         self.b.optimize(&waffle::OptOptions::default());
         if let Some(lim) = crate::env_get("PLIRON_WASM_TRIP").and_then(|v| v.parse::<u64>().ok()) {
@@ -3081,11 +3081,11 @@ impl<'o, 'a> FL<'o, 'a> {
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false)
         {
-            tracing::info!(target: "pliron::dump",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump",
                 "==== wasm body {} ====\n{}",
                 self.name,
                 self.b.display("  ", None)
-            );
+            ) };
         }
         self.b
     }
@@ -5956,8 +5956,8 @@ fn loop_licm(
             break;
         }
     }
-    if n_deref > 0 && tracing::enabled!(target: "pliron::wasm", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::wasm", "loop_licm: {n_deref} noalias-param loads hoisted past writers");
+    if n_deref > 0 && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::wasm", "loop_licm: {n_deref} noalias-param loads hoisted past writers") };
     }
 }
 
@@ -6107,10 +6107,10 @@ fn wtab(b: &mut FunctionBody) -> bool {
     if edits.is_empty() {
         return false;
     }
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     for (blk, v, k1, k2, hit1, hit2, miss) in edits {
         if verbose {
-            tracing::debug!(target: "pliron::wasm","wtab: {blk} {v}=={k1}|{k2} -> {hit1:?} {hit2:?} miss={miss:?}");
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wtab: {blk} {v}=={k1}|{k2} -> {hit1:?} {hit2:?} miss={miss:?}") };
         }
         let lo = k1.min(k2);
         let idx = if lo == 0 {
@@ -6451,7 +6451,7 @@ fn wunroll(
     copies: usize,
     fname: &str,
 ) {
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     // Size limits: unrolling is a tradeoff, not a free win. Scale the
     // copy count down for larger bodies — a 64-inst loop gets 2 copies,
     // a tiny one gets the full 8. `unreachable` panic sinks are cold:
@@ -6467,11 +6467,11 @@ fn wunroll(
     let copies = copies.min((256 / insts.max(1)).max(2));
     if copies < 2 || eff_blocks > 16 || insts > 64 {
         if verbose {
-            tracing::debug!(target: "pliron::wasm",
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm",
                 "wunroll: {fname} {h} skipped size blocks={eff_blocks}+{sink_blocks} insts={insts}"
-            );
+            ) };
             for &lb in inloop {
-                tracing::debug!(target: "pliron::wasm",
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm",
                     "wunroll:   {lb} insts={} term={:?} -> {:?} {}",
                     b.blocks[lb].insts.len(),
                     std::mem::discriminant(&b.blocks[lb].terminator),
@@ -6486,7 +6486,7 @@ fn wunroll(
                         }
                         _ => String::new(),
                     }
-                );
+                ) };
             }
         }
         return;
@@ -6499,12 +6499,12 @@ fn wunroll(
     let flat_ok = crate::env_get("PLIRON_WASM_FLAT") != Some("0");
     if flat_ok && wunroll_flat(b, defb, inloop, h, copies, &order) {
         if verbose {
-            tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} flat");
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} flat") };
         }
         return;
     }
     if verbose {
-        tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} chain x{copies}");
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} chain x{copies}") };
     }
     // Build the copies.
     let mut heads = vec![h];
@@ -6552,11 +6552,11 @@ fn wunroll_flat(
     copies: usize,
     order: &[WBlock],
 ) -> bool {
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     macro_rules! rej {
         ($why:expr) => {{
             if verbose {
-                tracing::debug!(target: "pliron::wasm","wunroll_flat: {h} reject: {}", $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wunroll_flat: {h} reject: {}", $why) };
             }
             return false;
         }};
@@ -6756,7 +6756,7 @@ fn wunroll_flat(
     }
     b.recompute_edges();
     if verbose {
-        tracing::debug!(target: "pliron::wasm","wunroll: {h} flat x{copies} -> {h_t}");
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wunroll: {h} flat x{copies} -> {h_t}") };
     }
     true
 }
@@ -6784,7 +6784,7 @@ fn loop_cloneable(
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
 ) -> bool {
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     for &lb in inloop {
         for &inst in &b.blocks[lb].insts {
             if !matches!(
@@ -6798,7 +6798,7 @@ fn loop_cloneable(
                         ValueDef::BlockParam(..) => "blockparam",
                         _ => "other",
                     };
-                    tracing::debug!(target: "pliron::wasm","wloop: {h} skipped exotic inst {inst} {k}");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wloop: {h} skipped exotic inst {inst} {k}") };
                 }
                 return false;
             }
@@ -6808,7 +6808,7 @@ fn loop_cloneable(
             Terminator::Br { .. } | Terminator::CondBr { .. } | Terminator::Select { .. }
         ) {
             if verbose {
-                tracing::debug!(target: "pliron::wasm","wloop: {h} skipped terminator in {lb}");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wloop: {h} skipped terminator in {lb}") };
             }
             return false;
         }
@@ -6838,7 +6838,7 @@ fn loop_cloneable(
                             .any(|&a| inloop.contains(&defb[b.resolve_alias(a)]))
                         {
                             if verbose {
-                                tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak {v} in {blk}");
+                                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak {v} in {blk}") };
                             }
                             return false;
                         }
@@ -6846,7 +6846,7 @@ fn loop_cloneable(
                     ValueDef::PickOutput(src, ..) => {
                         if inloop.contains(&defb[b.resolve_alias(src)]) {
                             if verbose {
-                                tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak pick {v} in {blk}");
+                                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak pick {v} in {blk}") };
                             }
                             return false;
                         }
@@ -6866,10 +6866,10 @@ fn loop_cloneable(
             });
             if let Some(a) = leak {
                 if verbose {
-                    tracing::debug!(target: "pliron::wasm",
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm",
                         "wloop: {h} skipped leak via terminator {a} in {blk} defb={} term={:?}",
                         defb[a], b.blocks[blk].terminator
-                    );
+                    ) };
                 }
                 return false;
             }
@@ -7090,7 +7090,7 @@ fn wseal_exits(
     inloop: &FxHashSet<WBlock>,
     h: WBlock,
 ) {
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
     let mut wl = vec![WBlock::new(0)];
     while let Some(x) = wl.pop() {
@@ -7148,14 +7148,14 @@ fn wseal_exits(
             continue;
         }
         if verbose {
-            tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} leaks={leaks:?} picks={picks:?}");
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} leaks={leaks:?} picks={picks:?}") };
         }
         let mut leaks: Vec<WV> = leaks.into_iter().collect();
         leaks.sort();
         for &v in &leaks {
             let np = seal_value(b, defb, cfg, inloop, &reach, &mut carriers, blk, v);
             if np == v && verbose {
-                tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} unsealable leak {v} {:?}", b.values[v]);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} unsealable leak {v} {:?}", b.values[v]) };
             }
         }
         for &(inst, from, idx, ty) in &picks {
@@ -7448,11 +7448,11 @@ fn wbcheck(
     h: WBlock,
     loops: &[(WBlock, FxHashSet<WBlock>)],
 ) -> Option<(WBlock, FxHashSet<WBlock>)> {
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     macro_rules! bail {
         ($($a:tt)*) => {{
             if verbose {
-                tracing::debug!(target: "pliron::wasm","wbcheck: {h} {}", format_args!($($a)*));
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wbcheck: {h} {}", format_args!($($a)*)) };
             }
             return None;
         }};
@@ -7799,7 +7799,7 @@ fn wbcheck(
     };
     b.recompute_edges();
     if verbose {
-        tracing::debug!(target: "pliron::wasm","wbcheck: {h} versioned {} checks -> {fh}", checks.len());
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wbcheck: {h} versioned {} checks -> {fh}", checks.len()) };
     }
     Some((fh, order.iter().map(|lb| bmap[lb]).collect()))
 }
@@ -8763,11 +8763,11 @@ impl<'o, 'a> CX<'o, 'a> {
             .map(|f| f.is_empty() || self.name.contains(&f))
             .unwrap_or(false)
         {
-            tracing::info!(target: "pliron::dump",
+            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump",
                 "==== wasm body {} ====\n{}",
                 self.name,
                 self.b.display("  ", None)
-            );
+            ) };
         }
         self.b
     }
@@ -11107,7 +11107,7 @@ pub(crate) fn lower_to_wasm_clif(
         });
         o.fidx.insert(n.clone(), o.funcs.len() - 1);
     }
-    let verbose = tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
+    let verbose = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
     let mut stubs = 0;
     let mut defined = 0;
     for (n, cf) in &mut wc.funcs {
@@ -11115,7 +11115,7 @@ pub(crate) fn lower_to_wasm_clif(
         let i = o.fidx[n];
         let sig = o.funcs[i].sig;
         if verbose {
-            tracing::debug!(target: "pliron::wasm","pliron-wasm: cx {n}");
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","pliron-wasm: cx {n}") };
         }
         let body = match guarded(|| {
             let mut cx = CX::new(&mut o, sig, &wc.fn_names, &wc.data_names);
@@ -11136,7 +11136,7 @@ pub(crate) fn lower_to_wasm_clif(
                         .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
                 }
                 if verbose {
-                    tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {n}: {e}");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {n}: {e}") };
                 }
                 stub(&o.m, sig)
             }

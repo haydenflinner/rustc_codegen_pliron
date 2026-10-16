@@ -111,11 +111,11 @@ ascent::ascent! {
 /// resolved. Anything else (a memcpy of opaque bytes, the slot passed to a
 /// call, no stores at all) leaves the callee unknown.
 fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> {
-    let dbg = tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG);
     macro_rules! bail {
         ($m:expr) => {
             if dbg {
-                tracing::debug!(target: "pliron::nocapture", "NOCAPDBG resolve: {} at {}", $m, OpDbg { op: c.defining_op().unwrap_or_else(|| panic!()), ctx });
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::nocapture", "NOCAPDBG resolve: {} at {}", $m, OpDbg { op: c.defining_op().unwrap_or_else(|| panic!()), ctx }) };
             }
             return None;
         };
@@ -172,7 +172,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
             Some(ConstVal::Sym { sym, off: 0 }) => syms.push(sym.clone()),
             _ => {
                 if dbg {
-                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG resolve: stored value not a const sym");
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::nocapture", "NOCAPDBG resolve: stored value not a const sym") };
                 }
                 return None;
             }
@@ -344,16 +344,16 @@ pub fn run(ctx: &Context, st: &mut State) {
         }
     }
     p.run();
-    if dbg.is_some() && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG) {
+    if dbg.is_some() && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG) {
         let der: FxHashMap<Value, Mask> = p.der.iter().map(|(v, m)| (*v, *m)).collect();
         for (s, v, o) in &dbgrets {
             for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
-                tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} retained via {v:?} at {o}");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} retained via {v:?} at {o}") };
             }
         }
         for (s, v, o) in &dbgargs {
             for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
-                tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} via call-arg {v:?} at {o}");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} via call-arg {v:?} at {o}") };
             }
         }
     }
@@ -369,11 +369,11 @@ pub fn run(ctx: &Context, st: &mut State) {
             (0..n).filter(|&i| !cap.contains(&(f, i))).collect(),
         );
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (p, t): (usize, usize) = nc.values().fold((0, 0), |(p, t), s| (p + s.len(), t + 1));
-        tracing::info!(target: "pliron::stats", "nocapture {}: {p} non-capturing params across {t} bodies",
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "nocapture {}: {p} non-capturing params across {t} bodies",
             st.cgu
-        );
+        ) };
     }
     for (s, set) in &nc {
         let mut v: Vec<_> = set.iter().collect();

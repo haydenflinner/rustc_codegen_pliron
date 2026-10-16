@@ -325,7 +325,8 @@ fn bypassable(func: &Function, b: Block) -> bool {
 /// Rule 1: `brif (x >= lo) → [brif (x < hi) → HIT else MISS] else MISS`
 /// becomes `brif (x-lo u< hi-lo) → HIT else MISS`.
 fn bound_pairs(func: &mut Function) -> usize {
-    let dbg = tracing::enabled!(target: "pliron::rangefold", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::rangefold", tracing::Level::DEBUG);
     let uses = use_blocks(func);
     let mut n = 0;
     // Bypassing moves edges, and a stale dominator tree could let a
@@ -353,7 +354,9 @@ fn bound_pairs(func: &mut Function) -> usize {
                 _ => continue,
             };
             if dbg {
-                tracing::debug!(target: "pliron::rangefold", "rf: block{b} lo-test x={x} lo={lo}");
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::rangefold", "rf: block{b} lo-test x={x} lo={lo}")
+                };
             }
             let hi_b = dest_block(func, pass_bc);
             if hi_b == b {
@@ -363,7 +366,9 @@ fn bound_pairs(func: &mut Function) -> usize {
             // same miss edge — we bypass it entirely.
             if !bypassable(func, hi_b) || !defs_local(func, &uses, hi_b) {
                 if dbg {
-                    tracing::debug!(target: "pliron::rangefold", "rf:   hi_b{hi_b} impure or escaping");
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::rangefold", "rf:   hi_b{hi_b} impure or escaping")
+                    };
                 }
                 continue;
             }
@@ -407,12 +412,14 @@ fn bound_pairs(func: &mut Function) -> usize {
                 && miss_eq
                 && body_avail(func, &dom, dest_block(func, hbc), term);
             if dbg {
-                tracing::debug!(target: "pliron::rangefold", "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
-                    func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
-                    hi > lo,
-                    miss_eq,
-                    hit_mats.len()
-                );
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::rangefold", "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
+                        func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
+                        hi > lo,
+                        miss_eq,
+                        hit_mats.len()
+                    )
+                };
             }
             if !ok {
                 continue;
@@ -573,8 +580,7 @@ fn range_unions(func: &mut Function) -> usize {
             // the contiguous interval the bit math models.
             let tb = func.dfg.value_type(x1).bits();
             let fits = |v: u64| tb >= 64 || v >> tb == 0;
-            if !(fits(k1) && fits(k2) && fits(w1))
-                || (k_hi as u128) + (w1 as u128) > (1u128 << tb)
+            if !(fits(k1) && fits(k2) && fits(w1)) || (k_hi as u128) + (w1 as u128) > (1u128 << tb)
             {
                 continue;
             }

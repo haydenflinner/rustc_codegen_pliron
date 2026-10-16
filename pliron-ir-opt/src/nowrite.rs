@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{Syms, bodied};
+use crate::{bodied, Syms};
 
 /// libc functions that only read memory.
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];
@@ -226,15 +226,18 @@ pub fn run(ctx: &Context, st: &mut State) {
             (!on_return.contains(&f)).then(|| (s.clone(), !strict.contains(&f)))
         }))
         .collect();
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
         let strict = nw.values().filter(|&&v| v).count() - LIBC.len();
-        tracing::info!(target: "pliron::stats",
-            "nowrite {}: {} of {} bodies write-free, {} more on return",
-            st.cgu,
-            strict,
-            bodied.len(),
-            nw.len() - LIBC.len() - strict
-        );
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "nowrite {}: {} of {} bodies write-free, {} more on return",
+                st.cgu,
+                strict,
+                bodied.len(),
+                nw.len() - LIBC.len() - strict
+            )
+        };
     }
     for s in &bodied {
         crate::dump_fact("nowrite", s, &nw.get(s));

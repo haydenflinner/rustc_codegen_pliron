@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 use crate::has_body;
 use crate::sroa::{gep_offset, mk_const};
 use crate::state::{ConstVal, State};
-use crate::types::{TyK, classify, size_align, struct_offsets};
+use crate::types::{classify, size_align, struct_offsets, TyK};
 
 /// Byte image of a constant: known bytes, plus pointer relocations by offset.
 #[derive(Default)]
@@ -153,7 +153,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             n += 1;
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "constload {}: {n} loads folded", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "constload {}: {n} loads folded", st.cgu)
+        };
     }
 }

@@ -738,8 +738,8 @@ fn conv_table(
         opcode: Opcode::Jump,
         destination: bc,
     };
-    if tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
-        tracing::debug!(target: "pliron::ifconv", "ifconv {b} br_table -> jump {m} (arms {})", arms.len());
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::ifconv", "ifconv {b} br_table -> jump {m} (arms {})", arms.len()) };
     }
     true
 }
@@ -917,8 +917,8 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 opcode: Opcode::Jump,
                 destination: bc,
             };
-            if tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
-                tracing::debug!(target: "pliron::ifconv", "ifconv {b} -> jump {m} (arms {t:?} {e:?})");
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::ifconv", "ifconv {b} -> jump {m} (arms {t:?} {e:?})") };
             }
             rn += 1;
         }
@@ -927,7 +927,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             break 'outer;
         }
     }
-    if tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO) {
         EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
     }
     n

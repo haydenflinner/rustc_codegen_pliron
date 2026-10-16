@@ -11,7 +11,7 @@ use rustc_hash::FxHashSet;
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{Syms, bodied};
+use crate::{bodied, Syms};
 
 /// Unwind-outs invisible to the attribute scan. The emulated-EH entries
 /// (`llvm.wasm.*`, and `_CxxThrowException`/`_Unwind_Resume`/`_Unwind_RaiseException`
@@ -102,13 +102,16 @@ pub fn run(ctx: &Context, st: &mut State) {
             })
         })
         .collect();
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats",
-            "nounwind {}: {} of {} invokes -> calls",
-            st.cgu,
-            dead.len(),
-            st.invokes.len()
-        );
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "nounwind {}: {} of {} invokes -> calls",
+                st.cgu,
+                dead.len(),
+                st.invokes.len()
+            )
+        };
     }
     for op in dead {
         st.invokes.remove(&op);

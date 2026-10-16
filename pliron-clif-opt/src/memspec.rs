@@ -120,15 +120,19 @@ fn last_writer(
                 continue;
             }
             if !iso.contains(&sr) && !loc_iso {
-                if tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG) {
+                if pliron_cfg::tracing_on()
+                    && tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG)
+                {
                     let norm = |r: &Root| match r {
                         Root::V(v) => loadfwd::concrete(func, ps, *v),
                         _ => (*r, 0),
                     };
-                    tracing::debug!(target: "pliron::memspec", "memspec:   bail {i} store ({sr:?},{so},{sw}) ~{:?} vs ({r:?},{o},{w}) ~{:?}",
-                        norm(&sr).0,
-                        norm(&r).0
-                    );
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::memspec", "memspec:   bail {i} store ({sr:?},{so},{sw}) ~{:?} vs ({r:?},{o},{w}) ~{:?}",
+                            norm(&sr).0,
+                            norm(&r).0
+                        )
+                    };
                 }
                 return None;
             }
@@ -202,7 +206,8 @@ pub fn run(
     nowrite: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> usize {
-    let dbg = tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG);
     // First pass: only structural checks — most functions have no
     // candidate edges and skip the CFG/domtree/param_src/isolated work.
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -248,7 +253,9 @@ pub fn run(
         let args: Vec<BlockArg> = destination.args(&func.dfg.value_lists).collect();
         if args.len() != prms.len() || !outer_dominate(func, &domtree, r, p) {
             if dbg {
-                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip args/dom (fn {})", func.name);
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip args/dom (fn {})", func.name)
+                };
             }
             continue;
         }
@@ -264,7 +271,9 @@ pub fn run(
             .collect();
         if !defs.is_empty() && defs.iter().any(|v| uses.escapes(*v, r)) {
             if dbg {
-                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip escaping def (fn {})", func.name);
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip escaping def (fn {})", func.name)
+                };
             }
             continue;
         }
@@ -341,10 +350,12 @@ pub fn run(
             };
             let hit = last_writer(func, &ps, noalias, &iso_l, nowrite, eh, p, t, loc);
             if dbg {
-                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} load {i} loc {loc:?} hit={} (fn {})",
-                    hit.is_some(),
-                    func.name
-                );
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} load {i} loc {loc:?} hit={} (fn {})",
+                        hit.is_some(),
+                        func.name
+                    )
+                };
             }
             if let Some(sv) = hit {
                 let res = func.dfg.inst_results(i);
@@ -357,10 +368,12 @@ pub fn run(
             continue;
         }
         if dbg {
-            tracing::debug!(target: "pliron::memspec", "memspec: clone {r} into {p} edge ({} fwd) (fn {})",
-                fwd.len(),
-                func.name
-            );
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::memspec", "memspec: clone {r} into {p} edge ({} fwd) (fn {})",
+                    fwd.len(),
+                    func.name
+                )
+            };
         }
         // Splice a copy of `r` into `p` in place of the jump (taildup's
         // mechanic): params map to edge args, results to fresh values.

@@ -120,7 +120,10 @@ pub fn run(ctx: &mut Context, st: &State) {
             }
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats","phisimp {}: {n} block args removed", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats","phisimp {}: {n} block args removed", st.cgu)
+        };
     }
 }

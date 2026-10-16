@@ -41,7 +41,7 @@ use rustc_hash::FxHashSet;
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{Syms, bodied};
+use crate::{bodied, Syms};
 
 /// libc functions that return and read deterministically (the same set
 /// `nowrite` trusts).
@@ -131,13 +131,16 @@ pub fn run(ctx: &Context, st: &mut State) {
                 .cloned(),
         )
         .collect();
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats",
-            "willreturn {}: {} of {} bodies come back",
-            st.cgu,
-            wr.len() - LIBC.len(),
-            bodied.len()
-        );
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "willreturn {}: {} of {} bodies come back",
+                st.cgu,
+                wr.len() - LIBC.len(),
+                bodied.len()
+            )
+        };
     }
     for s in &bodied {
         crate::dump_fact("willreturn", s, &wr.contains(s));

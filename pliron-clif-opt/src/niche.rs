@@ -136,10 +136,17 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
         _ => return None,
     };
     let xcmp = provable_cmp(func, nn, cond, x, k);
-    if xcmp.is_none() && tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG) {
-        tracing::debug!(target: "pliron::niche", "nfold reject i{i}: cond {cond:?} x {x} k {k}");
+    if xcmp.is_none()
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::niche", "nfold reject i{i}: cond {cond:?} x {x} k {k}")
+        };
         if let ValueDef::Param(pb, _) = func.dfg.value_def(x) {
-            tracing::debug!(target: "pliron::niche", "  param-in-set={}", nn.params_debug(func, x));
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::niche", "  param-in-set={}", nn.params_debug(func, x))
+            };
             for b in func.layout.blocks().collect::<Vec<_>>() {
                 for i in func.layout.block_insts(b).collect::<Vec<_>>() {
                     for (ei, bc) in func.dfg.insts[i]
@@ -149,18 +156,22 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
                     {
                         if bc.block(&func.dfg.value_lists) == pb {
                             for a in bc.args(&func.dfg.value_lists) {
-                                tracing::debug!(target: "pliron::niche", "  edge i{i} ei{ei} arg {a:?} nn={} en={}",
-                                    a.as_value().is_some_and(|v| nn.is(func, v)),
-                                    a.as_value().is_some_and(|v| nn.is_edge(func, i, ei, v)),
-                                );
+                                if pliron_cfg::tracing_on() {
+                                    tracing::debug!(target: "pliron::niche", "  edge i{i} ei{ei} arg {a:?} nn={} en={}",
+                                        a.as_value().is_some_and(|v| nn.is(func, v)),
+                                        a.as_value().is_some_and(|v| nn.is_edge(func, i, ei, v)),
+                                    )
+                                };
                                 if let Some(v) = a.as_value() {
                                     let mut w = func.dfg.resolve_aliases(v);
                                     for _ in 0..6 {
                                         match nn.derived_debug(func, w) {
                                             Some(bb) => {
-                                                tracing::debug!(target: "pliron::niche", "    derived[{w}] = {bb} real={}",
-                                                    func.dfg.value_is_real(bb)
-                                                );
+                                                if pliron_cfg::tracing_on() {
+                                                    tracing::debug!(target: "pliron::niche", "    derived[{w}] = {bb} real={}",
+                                                        func.dfg.value_is_real(bb)
+                                                    )
+                                                };
                                                 w = func.dfg.resolve_aliases(bb);
                                             }
                                             None => break,
@@ -205,8 +216,12 @@ pub fn run(func: &mut Function, nn: &NonNull) -> usize {
             Fold::NotC(c) => format!("!c {c}"),
             Fold::K(k) => format!("k {k}"),
         };
-        if tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::niche", "nfold fold i{i} -> {t}");
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::niche", "nfold fold i{i} -> {t}")
+            };
         }
         // `c` is a select condition — any nonzero truthy value, not the
         // 0/1 an icmp result must be — so canonicalize with a compare

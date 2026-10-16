@@ -155,11 +155,11 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
                         })
                         .collect()
                 });
-                tracing::info!(target: "pliron::stats", "xcgu reject {} in {}: {:?}",
+                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "xcgu reject {} in {}: {:?}",
                     with_no_trimmed_paths!(c.to_string()),
                     cgu.name(),
                     bad
-                );
+                ) };
             }
             ok
         });
@@ -307,11 +307,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                         format!("{} @ {:?}", with_no_trimmed_paths!(u.to_string()), home)
                     })
                     .collect();
-                tracing::info!(target: "pliron::stats", "xcgu reject {} in {}: {:?}",
+                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "xcgu reject {} in {}: {:?}",
                     with_no_trimmed_paths!(c.to_string()),
                     cgu.name(),
                     bad
-                );
+                ) };
             }
         }
     }

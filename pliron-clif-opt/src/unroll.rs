@@ -86,16 +86,16 @@ pub fn run(
             ) else {
                 continue;
             };
-            if tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
-                tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} ({} blocks)", body.len());
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} ({} blocks)", body.len()) };
             }
             let nn = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
             match trip(func, nn, &body, h, entry.clone(), None) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
                 _ => {
-                    if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+                    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
                         let ub = bound_ub(func, cfg, dt, h, &body, pred, pinst);
-                        tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} undecidable, bound_ub={ub:?}");
+                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} undecidable, bound_ub={ub:?}") };
                     }
                     continue;
                 }
@@ -532,8 +532,8 @@ fn trip(
 }
 
 fn why<T>(r: &str) -> Option<T> {
-    if tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
-        tracing::debug!(target: "pliron::unroll", "unroll: no: {r}");
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: no: {r}") };
     }
     None
 }
@@ -755,14 +755,14 @@ fn bound_ub(
         }
     }
     let Some(cnt) = cnt else {
-        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
-            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} no latch_count");
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} no latch_count") };
         }
         return None;
     };
     if cnt.signed || cnt.eq {
-        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
-            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt signed/eq");
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt signed/eq") };
         }
         return None;
     }
@@ -816,15 +816,15 @@ fn bound_ub(
                 }
             }
             _ => {
-                if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
-                    tracing::debug!(target: "pliron::unroll", "unroll: {h} bound inst {:?}", func.dfg.insts[bi].opcode());
+                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: {h} bound inst {:?}", func.dfg.insts[bi].opcode()) };
                 }
             }
         }
     }
     let Some(k) = ub else {
-        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
-            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt ok, no bound fact (bound={:?})", cnt.bound);
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt ok, no bound fact (bound={:?})", cnt.bound) };
         }
         return None;
     };

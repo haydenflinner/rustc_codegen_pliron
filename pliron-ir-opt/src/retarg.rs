@@ -126,11 +126,11 @@ pub fn run(ctx: &Context, st: &State) {
             }
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats",
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats",
             "retarg {}: {} returned-arg bodies, {folded} call results folded",
             st.cgu,
             ra.len()
-        );
+        ) };
     }
 }

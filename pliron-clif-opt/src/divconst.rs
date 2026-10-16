@@ -19,8 +19,8 @@
 use crate::clifpeep;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
-    ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
-    Value, types,
+    types, ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode,
+    Type, Value,
 };
 
 /// `v`'s low `w` bits.
@@ -224,7 +224,11 @@ fn quotient(
             let t = pos.ins().ushr(s, c2);
             let a = pos.ins().iadd(x, t);
             let q = pos.ins().sshr(a, c3);
-            if sext(d, w) < 0 { pos.ins().ineg(q) } else { q }
+            if sext(d, w) < 0 {
+                pos.ins().ineg(q)
+            } else {
+                q
+            }
         } else {
             // x / -d = -(x / d): build the positive-divisor sequence and
             // negate. LLVM instead negates the magic constant; this form
@@ -399,8 +403,12 @@ pub fn run(func: &mut Function) -> usize {
         pos.func.layout.remove_inst(i);
         pos.func.dfg.change_to_alias(res, v);
         done += 1;
-        if tracing::enabled!(target: "pliron::divconst", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::divconst", "divconst: expanded {op}.{ty} by {d:#x}");
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::divconst", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::divconst", "divconst: expanded {op}.{ty} by {d:#x}")
+            };
         }
     }
     done

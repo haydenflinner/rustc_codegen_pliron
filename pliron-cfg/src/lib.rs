@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct PassConfig {
     /// Every `PLIRON_*` var present in the environment (raw values).
@@ -125,6 +125,27 @@ fn record(k: &str, v: Option<&str>) {
 /// `PLIRON_<PASS>=0` disables a pass at runtime (default on).
 pub fn pass_enabled(var: &str) -> bool {
     config().enabled(var)
+}
+
+/// Whether any tracing subscriber is live. The `tracing` macros pay a
+/// `get_default` TLS access + callsite-registry interest check per
+/// invocation even with no dispatcher installed — measured at ~4% of
+/// codegen samples under `finish_module`. Guarding per-fn/per-step span
+/// construction with this is one relaxed atomic load. `tracing_on()` is
+/// true once the backend's `tracing_init` installs its subscriber, or
+/// when any caller (e.g. a test harness) installed a dispatcher itself.
+static TRACING_ON: AtomicBool = AtomicBool::new(false);
+
+/// Mark that a subscriber was installed. Called from the backend's
+/// `tracing_init`; test harnesses that call `fmt::init()`/`set_default`
+/// are caught by the `has_been_set` arm below.
+pub fn mark_tracing_on() {
+    TRACING_ON.store(true, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn tracing_on() -> bool {
+    TRACING_ON.load(Ordering::Relaxed) || tracing::dispatcher::has_been_set()
 }
 
 /// `PLIRON_<X>` present — presence-flag debug knobs.

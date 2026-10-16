@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::context::{ArgExt, ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};
 use crate::sroa::{mk_const, ptr_plus};
-use crate::types::{TyK, classify, size_align, struct_offsets};
+use crate::types::{classify, size_align, struct_offsets, TyK};
 
 const MAX_REGS: usize = 8;
 
@@ -187,15 +187,19 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
         }
         n += live.iter().filter(|&&l| !l).count();
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "deadarg {}: {n} params removed", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "deadarg {}: {n} params removed", st.cgu)
+        };
     }
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
         let (mut total, mut dead, mut ro) = (0, 0, 0);
         for s in &internal {
             let f = &st.funcs[s];
@@ -216,10 +220,12 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 }
             }
         }
-        tracing::info!(target: "pliron::stats", "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
-            st.cgu,
-            internal.len()
-        );
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
+                st.cgu,
+                internal.len()
+            )
+        };
     }
     let mut n = 0;
     let mut cands: Vec<&String> = internal.iter().collect();
@@ -244,8 +250,11 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         rewrite(ctx, st, sym, sty, &leaves, &calls);
         n += 1;
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "sret2reg {}: {n} functions", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "sret2reg {}: {n} functions", st.cgu)
+        };
     }
 }
 

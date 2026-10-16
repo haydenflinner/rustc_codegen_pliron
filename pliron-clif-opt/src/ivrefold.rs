@@ -780,7 +780,7 @@ fn refold_header(
                 }
             }
             if debug {
-                tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t:?})");
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t:?})") };
             }
             n += 1;
             break;
@@ -1034,7 +1034,7 @@ pub fn run(
 ) -> (usize, FxHashMap<Value, Value>) {
     let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
-    let debug = tracing::enabled!(target: "pliron::ivrefold", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ivrefold", tracing::Level::DEBUG);
     let mut n = 0;
     let mut pmap = FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {

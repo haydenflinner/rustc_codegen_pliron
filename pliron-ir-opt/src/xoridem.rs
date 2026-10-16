@@ -47,7 +47,7 @@ use crate::guardelim::slot_base;
 use crate::helpers::{bodied, erase_unreachable};
 use crate::inline::{blocks, ops};
 use crate::state::State;
-use crate::types::{TyK, classify};
+use crate::types::{classify, TyK};
 
 /// Blocks a single fold may erase (bounds the backward natural-loop walk
 /// and the per-block validation scan).
@@ -676,8 +676,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
             continue;
         }
         let odd = n % 2 == 1;
-        if tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG) {
-            tracing::debug!(target: "pliron::xoridem", "xoridem   fold h={h:?} n={n} accs={}", accs.len());
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::xoridem", "xoridem   fold h={h:?} n={n} accs={}", accs.len())
+            };
         }
         // Even trips: an accumulator's final value is `s0` — each acc is
         // either `clean` (every in-loop load of the slot is a recurrence
@@ -705,7 +709,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         let cleans: FxHashMap<Value, bool> = if odd {
             FxHashMap::default()
         } else {
-            accs.iter().map(|(&p, (ast, _))| (p, clean_of(p, ast))).collect()
+            accs.iter()
+                .map(|(&p, (ast, _))| (p, clean_of(p, ast)))
+                .collect()
         };
         if !odd
             && accs
@@ -767,10 +773,17 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             erase_unreachable(ctx, st, &bs, &|b| om[&b].clone());
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "xoridem   {n} folds");
-    } else if tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG) {
-        tracing::debug!(target: "pliron::xoridem", "xoridem   {n} folds");
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "xoridem   {n} folds")
+        };
+    } else if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::xoridem", "xoridem   {n} folds")
+        };
     }
 }
 

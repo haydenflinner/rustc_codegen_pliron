@@ -417,14 +417,18 @@ fn unreachable_terminated(ctx: &Context, info: &FnInfo, b: Ptr<BasicBlock>) -> b
 }
 
 fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
-    let gefn = tracing::info_span!(
+    let gefn = if pliron_cfg::tracing_on() {
+        tracing::info_span!(
         target: "pliron::iropt",
         "gefn",
         blocks = tracing::field::Empty,
         cands = tracing::field::Empty,
         rel = tracing::field::Empty,
         folds = tracing::field::Empty
-    )
+        )
+    } else {
+        tracing::Span::none()
+    }
     .entered();
     let bs = blocks(ctx, fop);
     if bs.len() < 2 {
@@ -636,15 +640,15 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
     > = FxHashMap::default();
     {
-        let _gefix = tracing::info_span!(target: "pliron::iropt", "gefix").entered();
+        let _gefix = if pliron_cfg::tracing_on() { tracing::info_span!(target: "pliron::iropt", "gefix") } else { tracing::Span::none() }.entered();
         if !relevant.is_empty() {
             if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
-                if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-                    tracing::info!(target: "pliron::stats", "guardelim {}: bail blocks={} relevant={}",
+                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+                    if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "guardelim {}: bail blocks={} relevant={}",
                         st.cgu,
                         bs.len(),
                         relevant.len()
-                    );
+                    ) };
                 }
                 return false;
             }
@@ -762,7 +766,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         escaped,
     };
 
-    let _geprove = tracing::info_span!(target: "pliron::iropt", "geprove").entered();
+    let _geprove = if pliron_cfg::tracing_on() { tracing::info_span!(target: "pliron::iropt", "geprove") } else { tracing::Span::none() }.entered();
     let mut folds: Vec<(Ptr<Operation>, Ptr<BasicBlock>, Vec<Value>)> = Vec::new();
     {
         let mut pr = Prover {
@@ -791,13 +795,13 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             let (ax, ay) = (atom(ctx, st, &info, x), atom(ctx, st, &info, y));
             pr.fuel = MAX_PROOF;
             let fs = pr.facts_of(b);
-            if tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) {
-                tracing::debug!(target: "pliron::guardelim", "guardelim   br {b:?} pred={:?} x={ax:?} y={ay:?} facts={fs:?}",
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) {
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::guardelim", "guardelim   br {b:?} pred={:?} x={ax:?} y={ay:?} facts={fs:?}",
                     icmp.predicate(ctx)
-                );
+                ) };
                 for atom_v in [&ax, &ay] {
                     for (w, sb) in sources(ctx, st, &info, atom_v) {
-                        tracing::debug!(target: "pliron::guardelim", "guardelim       src {w:?} @{sb:?}");
+                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::guardelim", "guardelim       src {w:?} @{sb:?}") };
                     }
                 }
             }
@@ -856,8 +860,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             folds.push((term, dst, ods));
         }
     }
-    if tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) && !folds.is_empty() {
-        tracing::debug!(target: "pliron::guardelim", "guardelim   {} folds", folds.len());
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) && !folds.is_empty() {
+        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::guardelim", "guardelim   {} folds", folds.len()) };
     }
     gefn.record("folds", folds.len());
     for (term, dst, ods) in &folds {
@@ -879,8 +883,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             erase_unreachable(ctx, st, &bs, &|b| om[&b].clone());
         }
     }
-    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        tracing::info!(target: "pliron::stats", "guardelim {}: {} fns folded", st.cgu, n);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "guardelim {}: {} fns folded", st.cgu, n) };
     }
 }
 
