@@ -44,12 +44,15 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 
-# Vendored backend: cheap rebuilds while patching ISLE/-meta (its
-# generated lowering is the bulk of the O3 cost downstream). Build-time
-# ISLE regeneration is already mtime-gated on the tracked .isle inputs.
-# Benchmarks / perf runs: CARGO_PROFILE_DEV_PACKAGE_CRANELIFT_CODEGEN_OPT_LEVEL=3
+# Vendored backend: O3 so the dev dylib runs at ~release speed (the O1
+# codegen was the gap — measure on a large file with -Ztime-passes
+# `codegen_crate`). Costs ~2x on the rare vendored-cranelift rebuild;
+# flip to 1 while patching ISLE/-meta. Note package-profile overrides
+# can't come from the environment — use
+# `--config 'profile.dev.package.cranelift-codegen.opt-level=N'` or
+# .cargo/config.toml.
 [profile.dev.package.cranelift-codegen]
-opt-level = 1
+opt-level = 3
 
 [package.metadata.rust-analyzer]
 rustc_private = true

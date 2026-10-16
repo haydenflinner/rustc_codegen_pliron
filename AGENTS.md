@@ -254,6 +254,7 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   never re-invokes rustc. When bisecting under `cargo build`/`-Zbuild-std`,
   `cargo clean -p <pkg>` or use a fresh target dir after gate changes.
 - Dev profile: our crates at `opt-level=1`, deps at O3, vendored
-  `cranelift-codegen` at O1 (override:
-  `CARGO_PROFILE_DEV_PACKAGE_CRANELIFT_CODEGEN_OPT_LEVEL=3`),
+  `cranelift-codegen` at O3 (flip to 1 for cheap rebuilds while patching
+  ISLE/-meta — package-profile overrides can't come from the env, use
+  `--config 'profile.dev.package.cranelift-codegen.opt-level=1'`),
   `debug="line-tables-only"` (revert for lldb variable inspection).
