@@ -716,10 +716,23 @@ pub fn run(
         // (branches/erase don't produce one), so each block is scanned once
         // and later rounds walk only freshly spliced blocks.
         let mut done_blocks: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+        // Persistent mirror of the caller's block order: inlining splices
+        // the split continuation right after the callsite block and appends
+        // callee clones at the region end, so a rescan can't just extend —
+        // `pending` holds continuations keyed by the block they follow and
+        // the scan splices them in at the same point the real list would.
+        let mut blklist = blocks(ctx, caller);
+        let mut pending: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
+            FxHashMap::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
-            for b in blocks(ctx, caller) {
+            let mut bi = 0;
+            while let Some(&b) = blklist.get(bi) {
+                bi += 1;
+                if let Some(tail) = pending.remove(&b) {
+                    blklist.splice(bi..bi, tail);
+                }
                 if !done_blocks.insert(b) {
                     continue;
                 }
@@ -892,7 +905,11 @@ pub fn run(
                 break;
             }
             for (call, callee, cs) in sites {
-                inline_call(ctx, st, &mut rw, call, callee);
+                let (b, mut news) = inline_call(ctx, st, &mut rw, call, callee);
+                // `news[0]` is the split continuation (follows `b` in region
+                // order); the rest are callee clones appended at region end.
+                pending.entry(b).or_default().push(news.remove(0));
+                blklist.extend(news);
                 if let Some(a) = adj.as_mut() {
                     a.inlined(ctx, st, &sym, &cs);
                 }
@@ -1872,13 +1889,16 @@ fn frozen_args(
     }
 }
 
+/// Returns the callsite block plus the freshly created blocks in region
+/// order (`cont` follows `block`; callee clones sit at the region end), so
+/// the rescan worklist can track the list without re-walking it.
 fn inline_call(
     ctx: &mut Context,
     st: &mut State,
     rw: &mut IRRewriter<DummyListener>,
     call: Ptr<Operation>,
     callee: Ptr<Operation>,
-) {
+) -> (Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>) {
     let block = call.deref(ctx).get_parent_block().unwrap();
     let region = block.deref(ctx).get_parent_region().unwrap();
     let args = Operation::get_op::<CallOp>(call, ctx).unwrap().args(ctx);
@@ -2010,4 +2030,6 @@ fn inline_call(
     frozen_args(ctx, st, callee, &src, &map, &args, block);
     st.calls.remove(&call);
     Operation::erase(call, ctx);
+    let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
+    (block, std::iter::once(cont).chain(clones).collect())
 }
