@@ -21,7 +21,6 @@ pub use pliron_ir_opt::{
     nounwind, nowrite, pgo, phisimp, retarg, spec, sroa,
 };
 
-
 /// Strip LLVM's `\x01` no-mangle marker.
 pub fn obj_sym(n: &str) -> &str {
     n.strip_prefix('\u{1}').unwrap_or(n)

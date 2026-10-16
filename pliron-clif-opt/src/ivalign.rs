@@ -52,10 +52,8 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
         if !matches!(func.dfg.insts[term], InstructionData::Brif { .. }) {
             continue;
         }
-        let dests = func.dfg.insts[term].branch_destination(
-            &func.dfg.jump_tables,
-            &func.dfg.exception_tables,
-        );
+        let dests = func.dfg.insts[term]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         let mut self_edges = dests
             .iter()
             .enumerate()
@@ -118,8 +116,7 @@ fn same_step(dfg: &DataFlowGraph, a: Value, s: Value) -> bool {
     if dfg.resolve_aliases(a) == s {
         return true;
     }
-    if let (ValueDef::Result(ai, _), ValueDef::Result(si, _)) =
-        (dfg.value_def(a), dfg.value_def(s))
+    if let (ValueDef::Result(ai, _), ValueDef::Result(si, _)) = (dfg.value_def(a), dfg.value_def(s))
     {
         matches!(
             (&dfg.insts[ai], &dfg.insts[si]),
@@ -278,8 +275,8 @@ fn apply(func: &mut Function, s: &Shift) {
     }
     for &(inst, di, a, _) in &s.entries {
         let dfg = &mut func.dfg;
-        let dests = dfg.insts[inst]
-            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+        let dests =
+            dfg.insts[inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
         let mut k = 0;
         dests[di].update_args(&mut dfg.value_lists, |arg| {
             let r = if k == s.pi { BlockArg::Value(a) } else { arg };

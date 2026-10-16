@@ -285,10 +285,10 @@ pub fn instrument(
 
     // ---- counters ----
     let mut recs = Vec::new(); // serialized record bytes
-                               // `PLIRON_PGO_COUNTERS=block` skips edge counters entirely (the CFG
-                               // layout still feeds the fingerprint, so a block-only profile keeps
-                               // matching); edge counts alone can't disambiguate block counts, so
-                               // any other value means block+edge.
+    // `PLIRON_PGO_COUNTERS=block` skips edge counters entirely (the CFG
+    // layout still feeds the fingerprint, so a block-only profile keeps
+    // matching); edge counts alone can't disambiguate block counts, so
+    // any other value means block+edge.
     let edges_on = crate::env_get("PLIRON_PGO_COUNTERS").is_none_or(|c| c != "block");
     let mut names = Vec::new(); // sym_hash -> name blob
     let mut nctrs = 0u32;

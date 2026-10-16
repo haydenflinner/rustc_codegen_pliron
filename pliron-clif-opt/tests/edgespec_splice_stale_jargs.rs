@@ -18,8 +18,7 @@ fn parse(src: &str) -> Function {
 fn assert_no_dangling_args(f: &Function) {
     for b in f.layout.blocks().collect::<Vec<_>>() {
         for i in f.layout.block_insts(b) {
-            for bc in f.dfg.insts[i]
-                .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+            for bc in f.dfg.insts[i].branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
             {
                 for a in bc.args(&f.dfg.value_lists) {
                     let BlockArg::Value(v) = a else { continue };

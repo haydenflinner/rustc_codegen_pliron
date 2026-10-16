@@ -21,9 +21,9 @@
 //! jump-table pool and `try_call` edges carry pseudo-value args —
 //! neither is touched.
 
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Value, ValueDef,
 };
@@ -73,7 +73,12 @@ fn sinkable_def(func: &Function, b: Block, v: Value) -> Option<Inst> {
 /// The set of `b`-insts movable onto edge `edge` of terminator `t`,
 /// in `b`'s layout order. `None` when the edge carries no sinkable
 /// arg or the chain exceeds `MAX_SINK`.
-fn sink_set(func: &Function, uses: &FxHashMap<Value, u32>, b: Block, edge: usize) -> Option<Vec<Inst>> {
+fn sink_set(
+    func: &Function,
+    uses: &FxHashMap<Value, u32>,
+    b: Block,
+    edge: usize,
+) -> Option<Vec<Inst>> {
     let t = func.layout.last_inst(b)?;
     let data = &func.dfg.insts[t];
     let calls = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
@@ -130,9 +135,7 @@ fn sink_set(func: &Function, uses: &FxHashMap<Value, u32>, b: Block, edge: usize
                     .filter(|a| func.dfg.resolve_aliases(**a) == wr)
                     .count() as u32;
             }
-            if cnt == uses.get(&wr).copied().unwrap_or(0)
-                && sinkable_def(func, b, wr).is_some()
-            {
+            if cnt == uses.get(&wr).copied().unwrap_or(0) && sinkable_def(func, b, wr).is_some() {
                 queue.push(wr);
             }
         }
@@ -162,10 +165,7 @@ fn apply(func: &mut Function, b: Block, edge: usize, set: &[Inst]) -> bool {
         let calls = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         let call = calls[edge];
         let pool = &func.dfg.value_lists;
-        let args: Vec<Value> = call
-            .args(pool)
-            .map(|a| a.as_value().unwrap())
-            .collect();
+        let args: Vec<Value> = call.args(pool).map(|a| a.as_value().unwrap()).collect();
         (call.block(pool), args)
     };
     let mid = func.dfg.make_block();
@@ -229,9 +229,7 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
             let ubs: Vec<Block> = ub.iter().copied().collect();
             let my_loop = la.innermost_loop(b);
             if !ubs.iter().all(|u| {
-                *u != b
-                    && la.innermost_loop(*u) == my_loop
-                    && dt.dominates(b, *u, &func.layout)
+                *u != b && la.innermost_loop(*u) == my_loop && dt.dominates(b, *u, &func.layout)
             }) {
                 continue;
             }
@@ -330,8 +328,7 @@ mod tests {
     use cranelift_codegen::isa::CallConv;
 
     fn verify(func: &Function) {
-        let flags =
-            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         cranelift_codegen::verify_function(func, &flags).unwrap();
     }
 
@@ -365,13 +362,8 @@ mod tests {
             let e2 = cur.ins().bor(e1, k5);
             let k7 = cur.ins().iconst(I64, 7);
             let s = cur.ins().bor(e1, k7);
-            cur.ins().brif(
-                c,
-                err,
-                &[BlockArg::Value(e2)],
-                ok,
-                &[BlockArg::Value(s)],
-            );
+            cur.ins()
+                .brif(c, err, &[BlockArg::Value(e2)], ok, &[BlockArg::Value(s)]);
         }
         {
             let mut cur = FuncCursor::new(&mut func).at_bottom(err);
@@ -409,9 +401,7 @@ mod tests {
                         func.dfg.insts[*insts.last().unwrap()],
                         InstructionData::Jump { .. }
                     )
-                    && insts[..insts.len() - 1]
-                        .iter()
-                        .all(|i| pure_op(&func, *i))
+                    && insts[..insts.len() - 1].iter().all(|i| pure_op(&func, *i))
             })
             .count();
         assert_eq!(edge_blocks, 2, "{}", func.display());
@@ -440,13 +430,8 @@ mod tests {
             let k = cur.ins().iconst(I64, 3);
             // v goes to BOTH edges — must not sink.
             let v = cur.ins().iadd(x, k);
-            cur.ins().brif(
-                c,
-                l,
-                &[BlockArg::Value(v)],
-                r,
-                &[BlockArg::Value(v)],
-            );
+            cur.ins()
+                .brif(c, l, &[BlockArg::Value(v)], r, &[BlockArg::Value(v)]);
         }
         {
             let p = func.dfg.block_params(l)[0];

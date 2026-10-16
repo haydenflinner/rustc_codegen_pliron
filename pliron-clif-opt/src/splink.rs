@@ -77,7 +77,11 @@ fn single_run(elem: u64, e: u32) -> bool {
 /// smallest `e`-bit element (`e` a power of two) that replicates to `k`,
 /// with that element a cyclic run of 1s.
 fn logical_imm(k: u64, bits: u32) -> bool {
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     if k == 0 || k == mask {
         return false;
     }
@@ -249,8 +253,7 @@ mod tests {
 
     fn sink_at(func: &mut Function, x64: bool) -> usize {
         let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-        let dt =
-            cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+        let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
         let mut la = LoopAnalysis::new();
         la.compute(func, &cfg, &dt);
         run(func, &la, x64)

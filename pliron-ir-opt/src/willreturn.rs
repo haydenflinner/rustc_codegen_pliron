@@ -41,7 +41,7 @@ use rustc_hash::FxHashSet;
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{bodied, Syms};
+use crate::{Syms, bodied};
 
 /// libc functions that return and read deterministically (the same set
 /// `nowrite` trusts).

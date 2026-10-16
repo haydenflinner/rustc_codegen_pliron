@@ -20,8 +20,8 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
-    self, Endianness, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot,
-    StackSlotData, StackSlotKind, Type, Value,
+    self, Endianness, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot, StackSlotData,
+    StackSlotKind, Type, Value,
 };
 
 /// Materialize a narrow-vector result from an int view: no CLIF op
@@ -196,11 +196,16 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let op = func.dfg.insts[inst].opcode();
-            let has = func.dfg.inst_args(inst).iter().any(|a| {
-                func.dfg.value_type(func.dfg.resolve_aliases(*a)) == target
-            }) || func.dfg.inst_results(inst).iter().any(|r| {
-                func.dfg.value_type(*r) == target
-            });
+            let has = func
+                .dfg
+                .inst_args(inst)
+                .iter()
+                .any(|a| func.dfg.value_type(func.dfg.resolve_aliases(*a)) == target)
+                || func
+                    .dfg
+                    .inst_results(inst)
+                    .iter()
+                    .any(|r| func.dfg.value_type(*r) == target);
             if !has {
                 continue;
             }
@@ -233,17 +238,16 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
         let results: Vec<Value> = func.dfg.inst_results(inst).to_vec();
         let res_ts: Vec<Type> = results.iter().map(|r| func.dfg.value_type(*r)).collect();
         let (lane, mfo) = match func.dfg.insts[inst] {
-            InstructionData::BinaryImm8 { imm, .. }
-            | InstructionData::TernaryImm8 { imm, .. } => (u8::from(imm) as u64, None),
+            InstructionData::BinaryImm8 { imm, .. } | InstructionData::TernaryImm8 { imm, .. } => {
+                (u8::from(imm) as u64, None)
+            }
             InstructionData::Store { flags, .. } | InstructionData::Load { flags, .. } => {
                 (0, Some(flags))
             }
             _ => (0, None),
         };
         let off = match func.dfg.insts[inst] {
-            InstructionData::Store { offset, .. } | InstructionData::Load { offset, .. } => {
-                offset
-            }
+            InstructionData::Store { offset, .. } | InstructionData::Load { offset, .. } => offset,
             _ => Offset32::from(0),
         };
         let it = int_ty(target.bits() as u16);
@@ -276,7 +280,11 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 let mask: u64 = !lanemask;
                 let mc = pos.ins().iconst(it, mask as i64);
                 let masked = pos.ins().band(v, mc);
-                let sin = if sh > 0 { pos.ins().ishl_imm_u(s, sh as i64) } else { s };
+                let sin = if sh > 0 {
+                    pos.ins().ishl_imm_u(s, sh as i64)
+                } else {
+                    s
+                };
                 let r = pos.ins().bor(masked, sin);
                 emit_vec_result(&mut pos, inst, ss, r, target);
             }
@@ -363,11 +371,19 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                     let l = pos.ins().ireduce(lt, w);
                     let s = pos.ins().ushr_imm_u(l, (esz - 1) as i64);
                     let s = pos.ins().uextend(ir::types::I64, s);
-                    let s = if i > 0 { pos.ins().ishl_imm_u(s, i as i64) } else { s };
+                    let s = if i > 0 {
+                        pos.ins().ishl_imm_u(s, i as i64)
+                    } else {
+                        s
+                    };
                     acc = pos.ins().bor(acc, s);
                 }
                 let rt = res_ts[0];
-                let r = if rt.bits() < 64 { pos.ins().ireduce(rt, acc) } else { acc };
+                let r = if rt.bits() < 64 {
+                    pos.ins().ireduce(rt, acc)
+                } else {
+                    acc
+                };
                 copy_to(&mut pos, inst, r);
             }
             _ if bitwise_ok(op) => {

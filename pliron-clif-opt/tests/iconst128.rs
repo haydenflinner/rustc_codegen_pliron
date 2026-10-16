@@ -16,9 +16,7 @@ fn iconst128_lowers_to_iconcat() {
             UserFuncName::user(0, 0),
             Signature::new(CallConv::SystemV),
         );
-        f.signature
-            .returns
-            .push(AbiParam::new(types::I128));
+        f.signature.returns.push(AbiParam::new(types::I128));
         let b = f.dfg.make_block();
         f.layout.append_block(b);
         let mut pos = FuncCursor::new(&mut f).at_bottom(b);

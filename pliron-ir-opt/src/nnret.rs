@@ -202,13 +202,16 @@ pub fn run(ctx: &Context, st: &mut State) {
         .filter(|s| !null.contains(&ids.id(s)))
         .cloned()
         .collect();
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats",
-            "nnret {}: {} of {} pointer-returning bodies nonnull",
-            st.cgu,
-            t.len(),
-            cand.len()
-        ) };
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "nnret {}: {} of {} pointer-returning bodies nonnull",
+                st.cgu,
+                t.len(),
+                cand.len()
+            )
+        };
     }
     for s in &cand {
         crate::dump_fact("nnret", s, &t.contains(s));

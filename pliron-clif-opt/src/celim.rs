@@ -667,8 +667,12 @@ fn induction_facts(
             }
             out.entry(h).or_default().push(c);
         }
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::celim", "induct {h}: facts={:?}", out.get(&h)) };
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::celim", "induct {h}: facts={:?}", out.get(&h))
+            };
         }
     }
     out
@@ -1970,11 +1974,17 @@ fn fold_guard_bands(func: &mut Function) -> usize {
 /// Fold `icmp`s decided by dominating branch conditions; returns the folds.
 /// Counts guard-band collapses separately under `PLIRON_STATS`.
 pub fn run(func: &mut Function) -> usize {
-    let prof = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::celim", tracing::Level::INFO);
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::celim", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let guards = fold_guard_bands(func);
-    if guards > 0 && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "celim-guard {guards}") };
+    if guards > 0
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "celim-guard {guards}")
+        };
     }
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
@@ -2015,8 +2025,12 @@ pub fn run(func: &mut Function) -> usize {
                     r = decide(func, &fs, qp, qraw, &srcs);
                 }
                 if let Some(k) = r {
-                    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG) {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::celim", "celim fold {i} -> {k} q={q:?} facts={fs:?}") };
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG)
+                    {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::celim", "celim fold {i} -> {k} q={q:?} facts={fs:?}")
+                        };
                     }
                     folds.push((i, k));
                 }
@@ -2035,15 +2049,17 @@ pub fn run(func: &mut Function) -> usize {
         crate::jumpthread::fold_const_branches(func);
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::celim", "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
-            t0.elapsed(),
-            guards,
-            t_setup,
-            t_join,
-            t_induct,
-            t_scan,
-            tp.elapsed()
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::celim", "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
+                t0.elapsed(),
+                guards,
+                t_setup,
+                t_join,
+                t_induct,
+                t_scan,
+                tp.elapsed()
+            )
+        };
     }
     folds.len()
 }

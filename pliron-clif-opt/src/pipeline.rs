@@ -185,15 +185,22 @@ pub struct Pipe<'a> {
 impl Pipe<'_> {
     pub(crate) fn dump(&self, tag: &str) {
         if self.dump {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {} after {tag} ====\n{}",
-                self.fname,
-                self.clctx.func.display()
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::dump", "==== clif {} after {tag} ====\n{}",
+                    self.fname,
+                    self.clctx.func.display()
+                )
+            };
         }
     }
     fn log(&self, label: &str, k: usize) {
-        if k > 0 && crate::config::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "{label} {k} {}", self.fname) };
+        if k > 0
+            && crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::stats", "{label} {k} {}", self.fname)
+            };
         }
     }
 }
@@ -751,13 +758,17 @@ fn run_whole_checked(p: &mut Pipe) {
         &crate::diffcheck::config_from_env(),
     ) {
         Ok(sum) => {
-            if crate::config::tracing_on() && tracing::enabled!(target: "pliron::diffcheck", tracing::Level::INFO) {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::diffcheck", "diffcheck {} compared={} inconclusive={} {}",
-                    p.fname,
-                    sum.compared,
-                    sum.inconclusive,
-                    sum.why.unwrap_or_default().lines().next().unwrap_or("")
-                ) };
+            if crate::config::tracing_on()
+                && tracing::enabled!(target: "pliron::diffcheck", tracing::Level::INFO)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::diffcheck", "diffcheck {} compared={} inconclusive={} {}",
+                        p.fname,
+                        sum.compared,
+                        sum.inconclusive,
+                        sum.why.unwrap_or_default().lines().next().unwrap_or("")
+                    )
+                };
             }
             return;
         }
@@ -886,8 +897,12 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         .unwrap_or(u32::MAX);
     let req = s.shape & mask;
     if req != 0 && !env_set("PLIRON_NOSHAPE") && an.shape_bits(&p.clctx.func) & req != req {
-        if crate::config::tracing_on() && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::pipeline", "shape skip: {} lacks {req:04x} on {}", s.name, p.fname) };
+        if crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::pipeline", "shape skip: {} lacks {req:04x} on {}", s.name, p.fname)
+            };
         }
         // `PLIRON_SHAPE_CHECK`: run the step anyway and report if it
         // changed the function — the bits are supposed to be necessary
@@ -909,11 +924,14 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         return;
     }
     p.cur_step = s.name;
-    let prof_chain = crate::config::tracing_on() && tracing::enabled!(target: "pliron::pipeline", tracing::Level::INFO);
+    let prof_chain = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::pipeline", tracing::Level::INFO);
     if prof_chain {
         let (m, t) = chain_stats(&p.clctx.func);
         if m >= 8 {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::pipeline", "chain {m} (tot {t}) entering {} on {}", s.name, p.fname) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::pipeline", "chain {m} (tot {t}) entering {} on {}", s.name, p.fname)
+            };
         }
     }
     let k = if s.cached {
@@ -938,7 +956,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         if prof_chain {
             let (m, t) = chain_stats(&p.clctx.func);
             if m >= 8 {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::pipeline", "chain {m} (tot {t}) made by {} on {}", s.name, p.fname) };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::pipeline", "chain {m} (tot {t}) made by {} on {}", s.name, p.fname)
+                };
             }
         }
         if k > 0 {
@@ -971,10 +991,13 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
 // discriminant in the pred then folds to `brif` on the raw flag via
 // `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
 fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let prof2 = crate::config::tracing_on() && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let prof2 = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
     let tt = |name: &str, t0: std::time::Instant| {
         if prof2 {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            };
         }
     };
     let mut n = 0;
@@ -1153,14 +1176,23 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
                 break;
             }
         }
-        if crate::config::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll cleanup {}: {ub} blocks, {dp} params, {di} insts",
-                p.fname
-            ) };
+        if crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::unroll", "unroll cleanup {}: {ub} blocks, {dp} params, {di} insts",
+                    p.fname
+                )
+            };
         }
     }
-    if k > 0 && crate::config::tracing_on() && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unroll", "unroll {k} {}", p.fname) };
+    if k > 0
+        && crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::unroll", "unroll {k} {}", p.fname)
+        };
     }
     p.dump("unroll");
     k
@@ -1214,18 +1246,25 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
         p.call_frozen,
         p.nocap,
     );
-    if crate::config::tracing_on() && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-run {:?}", t.elapsed()) };
+    if crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::loadfwd", "    lf-run {:?}", t.elapsed())
+        };
     }
     if p.flags.slot_dse {
-        let prof2 = crate::config::tracing_on() && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
+        let prof2 = crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
         // A load whose only user was a removed dead store keeps its own
         // slot alive, so alternate the two until nothing changes.
         for i in 0..4 {
             let t = std::time::Instant::now();
             p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
             if prof2 {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-dss[{i}] {:?}", t.elapsed()) };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::loadfwd", "    lf-dss[{i}] {:?}", t.elapsed())
+                };
             }
             let t = std::time::Instant::now();
             let n = if config().enabled("PLIRON_DEAD_LOADS") {
@@ -1237,7 +1276,9 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 0
             };
             if prof2 {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-rdi[{i}] {n} {:?}", t.elapsed()) };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::loadfwd", "    lf-rdi[{i}] {n} {:?}", t.elapsed())
+                };
             }
             if n == 0 {
                 break;
@@ -1375,10 +1416,12 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
             jumpthread::remove_dead_insts(&mut p.clctx.func, true);
         }
         if p.dump {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {} after cparm ({k}) ====\n{}",
-                p.fname,
-                p.clctx.func.display()
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::dump", "==== clif {} after cparm ({k}) ====\n{}",
+                    p.fname,
+                    p.clctx.func.display()
+                )
+            };
         }
     }
     // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
@@ -1496,16 +1539,26 @@ fn s_switchmap(p: &mut Pipe, _an: &mut Analysis) -> usize {
         } else {
             0
         };
-    if k > 0 && crate::config::tracing_on() && tracing::enabled!(target: "pliron::switchmap", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::switchmap", "switchmap {k} fold {f} {}", p.fname) };
+    if k > 0
+        && crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::switchmap", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::switchmap", "switchmap {k} fold {f} {}", p.fname)
+        };
     }
     0
 }
 
 fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = jumpthread::fold_const_branches(&mut p.clctx.func);
-    if k > 0 && crate::config::tracing_on() && tracing::enabled!(target: "pliron::constbr", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::constbr", "constbr {k} {}", p.fname) };
+    if k > 0
+        && crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::constbr", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::constbr", "constbr {k} {}", p.fname)
+        };
     }
     k
 }
@@ -1538,11 +1591,13 @@ fn s_frozen_loads(p: &mut Pipe, _an: &mut Analysis) -> usize {
     }
     let k = clifpeep::frozen_loads(&mut p.clctx.func, p.frozen);
     if p.dump {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== clif {}: {k} frozen loads, params {:?} ====\n{}",
-            p.fname,
-            p.frozen,
-            p.clctx.func.display()
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dump", "==== clif {}: {k} frozen loads, params {:?} ====\n{}",
+                p.fname,
+                p.frozen,
+                p.clctx.func.display()
+            )
+        };
     }
     k
 }
@@ -1766,8 +1821,12 @@ fn s_dgvn(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // the `mov;b` edge-split blocks that dominate the block count.
 // Runs before coldedges so adapters inherit smaller arg lists.
 fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    if crate::config::tracing_on() && tracing::enabled!(target: "pliron::sameargs", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::sameargs", "--- sameargs {}", p.fname) };
+    if crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::sameargs", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::sameargs", "--- sameargs {}", p.fname)
+        };
     }
     let (k, pmap) = clifpeep::sameargs(&mut p.clctx.func);
     if k > 0 {
@@ -2010,7 +2069,9 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
                 p.derived.insert(w, b);
             }
             if dnn {
-                if crate::config::tracing_on() && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG) {
+                if crate::config::tracing_on()
+                    && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
+                {
                     let dd = p
                         .clctx
                         .func
@@ -2025,7 +2086,9 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
                         .value_def(w)
                         .inst()
                         .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step)
+                    };
                 }
                 p.nonnull.insert(w);
             }
@@ -2197,7 +2260,8 @@ fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Merge disjoint-lifetime explicit slots — last, so slot references
 // cloned by earlier passes are all accounted for before sharing.
 fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let stats = crate::config::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO);
+    let stats = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO);
     let before: u64 = stats
         .then(|| {
             p.clctx
@@ -2217,10 +2281,12 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
             .values()
             .map(|d| d.size as u64)
             .sum();
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "slotmerge {k} {before}->{after}B {} {}",
-            p.nocap.len(),
-            p.fname
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "slotmerge {k} {before}->{after}B {} {}",
+                p.nocap.len(),
+                p.fname
+            )
+        };
     }
     if k > 0 && p.dump {
         p.dump("slotmerge");

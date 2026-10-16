@@ -279,7 +279,8 @@ fn wide_f32_parts(ctx: &Context, e: TypeHandle, n: u64) -> Option<(ClType, u64)>
         .find(|&w| w <= bits && (n * 32) % w == 0)
         .and_then(|w| {
             // Packed f16 twin of a wide f32 vector: half-width leaves, same count.
-            let half = e.deref(ctx).is::<FP16Type>() || e.deref(ctx).is::<pliron::builtin::types::BF16Type>();
+            let half = e.deref(ctx).is::<FP16Type>()
+                || e.deref(ctx).is::<pliron::builtin::types::BF16Type>();
             let lane = if half { clt::F16 } else { clt::F32 };
             Some((lane.by((w / 32) as u32)?, n * 32 / w))
         })

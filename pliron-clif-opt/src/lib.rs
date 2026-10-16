@@ -49,9 +49,9 @@ pub mod tailmerge;
 pub mod tailrec;
 pub(crate) mod trace;
 pub mod unreach;
-pub mod webroot;
 pub mod unroll;
 pub(crate) mod uses;
 pub mod veclegalize;
+pub mod webroot;
 
 pub use config::{bisect, env_get, env_is, env_set, pass_enabled};

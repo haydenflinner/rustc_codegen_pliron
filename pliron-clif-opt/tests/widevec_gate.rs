@@ -165,7 +165,10 @@ fn wide_ops_respect_ceiling() {
         WIDE_VECTOR_BITS.store(bits, Ordering::Relaxed);
         for &(name, clif, width) in CASES {
             match compile(&*isa, clif) {
-                Ok(_) => assert!(width <= bits, "{name} ({width}-bit) compiled at {bits} ceiling"),
+                Ok(_) => assert!(
+                    width <= bits,
+                    "{name} ({width}-bit) compiled at {bits} ceiling"
+                ),
                 Err(e) => assert!(
                     width > bits,
                     "{name} ({width}-bit) failed at {bits} ceiling: {e}"

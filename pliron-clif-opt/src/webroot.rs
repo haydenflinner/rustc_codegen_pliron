@@ -38,9 +38,7 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::{
-    Block, Function, InstructionData, Opcode, StackSlot, Value,
-};
+use cranelift_codegen::ir::{Block, Function, InstructionData, Opcode, StackSlot, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 
@@ -281,10 +279,9 @@ impl Webs {
         }
         for &b in &reach {
             for i in func.layout.block_insts(b) {
-                for bc in func.dfg.insts[i].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                ) {
+                for bc in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let dst = bc.block(&func.dfg.value_lists);
                     let args = bc
                         .args(&func.dfg.value_lists)
@@ -337,9 +334,7 @@ impl Webs {
             else {
                 continue;
             };
-            let bcs = func
-                .dfg
-                .insts[t]
+            let bcs = func.dfg.insts[t]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             if bcs.len() != 2 {
                 continue;
@@ -361,16 +356,13 @@ impl Webs {
                 _ => continue,
             };
             let idx = match cond {
-                IntCC::Equal => 1,     // eq → else arm is non-null
-                IntCC::NotEqual => 0,  // ne → then arm is non-null
+                IntCC::Equal => 1,    // eq → else arm is non-null
+                IntCC::NotEqual => 0, // ne → then arm is non-null
                 _ => continue,
             };
             let dst = bcs[idx].block(&func.dfg.value_lists);
             if cfg.pred_iter(dst).count() == 1 {
-                w.est
-                    .entry(nn_subject(func, x))
-                    .or_default()
-                    .push(dst);
+                w.est.entry(nn_subject(func, x)).or_default().push(dst);
             }
         }
         w
@@ -452,9 +444,7 @@ impl Webs {
                             .block_params(blk)
                             .iter()
                             .enumerate()
-                            .filter_map(|(j, &q)| {
-                                self.est.get(&q).cloned().map(|es| (j, es))
-                            })
+                            .filter_map(|(j, &q)| self.est.get(&q).cloned().map(|es| (j, es)))
                             .collect()
                     })
                     .clone()
@@ -466,10 +456,7 @@ impl Webs {
             if let Some(es) = self.edges.get(&blk) {
                 'e: for e in es {
                     for (j, eb) in eps.iter() {
-                        if !eb
-                            .iter()
-                            .any(|&e| self.dt.dominates(e, b, &func.layout))
-                        {
+                        if !eb.iter().any(|&e| self.dt.dominates(e, b, &func.layout)) {
                             continue;
                         }
                         let Some(&Some(a)) = e.args.get(*j) else {
@@ -518,9 +505,15 @@ impl Webs {
     ) -> Web {
         let _ = v;
         if let Some(k) = iconst(func, y) {
-            let k = if op == Opcode::Isub { k.wrapping_neg() } else { k };
+            let k = if op == Opcode::Isub {
+                k.wrapping_neg()
+            } else {
+                k
+            };
             self.at_in(func, x, b, d + 1).shifted(k)
-        } else if op == Opcode::Iadd && let Some(k) = iconst(func, x) {
+        } else if op == Opcode::Iadd
+            && let Some(k) = iconst(func, x)
+        {
             self.at_in(func, y, b, d + 1).shifted(k)
         } else {
             let mut w = self.at_in(func, x, b, d + 1).widened();
@@ -574,9 +567,15 @@ impl Webs {
                 args,
             } => {
                 if let Some(k) = iconst(func, args[1]) {
-                    let k = if op == Opcode::Isub { k.wrapping_neg() } else { k };
+                    let k = if op == Opcode::Isub {
+                        k.wrapping_neg()
+                    } else {
+                        k
+                    };
                     self.eval(func, args[0], d + 1).shifted(k)
-                } else if op == Opcode::Iadd && let Some(k) = iconst(func, args[0]) {
+                } else if op == Opcode::Iadd
+                    && let Some(k) = iconst(func, args[0])
+                {
                     self.eval(func, args[1], d + 1).shifted(k)
                 } else {
                     let mut w = self.eval(func, args[0], d + 1).widened();
@@ -590,5 +589,3 @@ impl Webs {
         w
     }
 }
-
-

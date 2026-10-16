@@ -388,7 +388,8 @@ pub fn run(
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
-    let prof = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
+    let prof =
+        pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
     // Only a plain notrap store is killable, and `decode` can only
     // demote candidates to `RwAll`, never create them — a function with
     // no candidate skips the whole CFG/alias/iso setup and the dataflow.
@@ -438,9 +439,11 @@ pub fn run(
         // sweep can only ever report `dead = []`.
         if prof {
             let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops=0 ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix=0ns sweep=0ns dead=0",
-                order.len(),
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops=0 ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix=0ns sweep=0ns dead=0",
+                    order.len(),
+                )
+            };
         }
         return 0;
     }
@@ -533,24 +536,33 @@ pub fn run(
         }
     }
     if !stable {
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::DEBUG) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::dse", "dse: fixpoint over pop budget ({MAX_POP_ROUNDS}x blocks), bailing ({fname})"
-            ) };
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::dse", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::dse", "dse: fixpoint over pop budget ({MAX_POP_ROUNDS}x blocks), bailing ({fname})"
+                )
+            };
         }
         return 0;
     }
     let t_fix = t.elapsed() - t_dec;
-    let dump = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
+    let dump =
+        pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
     if dump {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::dse", "dse-dump {fname} iso={iso:?}") };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::dse", "dse-dump {fname} iso={iso:?}")
+        };
         for &b in &order {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dse", "  {b:?} inn tops={}/{} locs={:?} roots={:?} cov={:?}",
-                inn[b].top_non_iso,
-                inn[b].top_non_stack,
-                inn[b].locs,
-                inn[b].roots,
-                inn[b].cov
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::dse", "  {b:?} inn tops={}/{} locs={:?} roots={:?} cov={:?}",
+                    inn[b].top_non_iso,
+                    inn[b].top_non_stack,
+                    inn[b].locs,
+                    inn[b].roots,
+                    inn[b].cov
+                )
+            };
         }
     }
     let mut dead = Vec::new();
@@ -559,12 +571,16 @@ pub fn run(
     for &b in &store_blks {
         let mut d = out[b].clone();
         if dump {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dse", "  sweep {b:?} out locs={:?} tops={}/{}", d.locs, d.top_non_iso, d.top_non_stack) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::dse", "  sweep {b:?} out locs={:?} tops={}/{}", d.locs, d.top_non_iso, d.top_non_stack)
+            };
         }
         transfer(&ops[b], &mut d, iso, Some(&mut dead));
     }
     if dump {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dse", "  dead={dead:?}") };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dse", "  dead={dead:?}")
+        };
     }
     for i in &dead {
         func.layout.remove_inst(*i);
@@ -572,10 +588,12 @@ pub fn run(
     if prof {
         let t_sweep = t.elapsed() - t_fix - t_dec;
         let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
-            order.len(),
-            dead.len(),
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
+                order.len(),
+                dead.len(),
+            )
+        };
     }
     dead.len()
 }

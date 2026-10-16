@@ -125,6 +125,8 @@ pub fn dump_fact(analysis: &str, sym: &str, fact: &dyn std::fmt::Debug) {
     if let Some(f) = crate::env_get("PLIRON_FACTS")
         && sym.contains(f)
     {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::facts", "{analysis} {sym}: {fact:?}") };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::facts", "{analysis} {sym}: {fact:?}")
+        };
     }
 }

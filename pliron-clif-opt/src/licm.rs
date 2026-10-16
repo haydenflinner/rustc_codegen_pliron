@@ -158,17 +158,22 @@ fn hoists(
     pb: Block,
     i: Inst,
 ) -> bool {
-    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG)
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG)
         && matches!(func.dfg.insts[i], InstructionData::Load { .. });
     if dbg && let Some(&reg) = scoped.get(&i) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm? {}: scoped region {reg:?} breg={:?}",
-            func.dfg.display_inst(i),
-            breg.get(&pb)
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::licm", "licm? {}: scoped region {reg:?} breg={:?}",
+                func.dfg.display_inst(i),
+                breg.get(&pb)
+            )
+        };
     }
     if !func.dfg.inst_args(i).iter().all(|&a| inv(func, a)) {
         if dbg {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm? {}: arg not invariant", func.dfg.display_inst(i)) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm? {}: arg not invariant", func.dfg.display_inst(i))
+            };
         }
         return false;
     }
@@ -186,22 +191,26 @@ fn hoists(
     };
     if !loadfwd::notrap(func, i) {
         if dbg {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm? {}: trapping", func.dfg.display_inst(i)) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm? {}: trapping", func.dfg.display_inst(i))
+            };
         }
         return false;
     }
     let ty = func.dfg.value_type(func.dfg.first_result(i));
     let (r, o) = loadfwd::root(func, ps, na, arg);
     if dbg {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm? {}: root {:?} off {o} iso={} deref={:?}",
-            func.dfg.display_inst(i),
-            r,
-            iso.contains(&r),
-            match r {
-                Root::V(v) => deref.get(&v).copied(),
-                _ => None,
-            }
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::licm", "licm? {}: root {:?} off {o} iso={} deref={:?}",
+                func.dfg.display_inst(i),
+                r,
+                iso.contains(&r),
+                match r {
+                    Root::V(v) => deref.get(&v).copied(),
+                    _ => None,
+                }
+            )
+        };
     }
     // The clobber scan and the `safe` check below want the concrete object
     // (`norm_root` peels a scope name to its stack slot), while `r` stays
@@ -243,7 +252,9 @@ fn hoists(
             chain.push(x);
             if x == target {
                 if dbg {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm?   scoped frozen, in-region hoist") };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::licm", "licm?   scoped frozen, in-region hoist")
+                    };
                 }
                 // The tag is the dereferenceability proof: `frozen_args`
                 // only tags accesses bounded by the param's
@@ -254,7 +265,9 @@ fn hoists(
             r = rpar.get(&x).copied().filter(|&n| n != x);
         }
         if dbg {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm?   scoped miss chain={chain:?} target={target:?}") };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm?   scoped miss chain={chain:?} target={target:?}")
+            };
         }
     }
     // `region_frozen_op` records (operand-frozen roots) carry the same
@@ -280,7 +293,9 @@ fn hoists(
                 && in_region(breg_, reg, rpar)
             {
                 if dbg {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm?   operand-frozen, in-region hoist") };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::licm", "licm?   operand-frozen, in-region hoist")
+                    };
                 }
                 return true;
             }
@@ -291,16 +306,20 @@ fn hoists(
         .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw))
         .count();
     if dbg {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm?   safe={safe} writers_clobbering={nw_w}") };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::licm", "licm?   safe={safe} writers_clobbering={nw_w}")
+        };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
                 && clobbers(func, ps, na, w, loc, iso, nw)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm?     clob {} root {r2:?} off {}",
-                    func.dfg.display_inst(w),
-                    o2.wrapping_add(i64::from(i32::from(offset)))
-                ) };
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::licm", "licm?     clob {} root {r2:?} off {}",
+                        func.dfg.display_inst(w),
+                        o2.wrapping_add(i64::from(i32::from(offset)))
+                    )
+                };
             }
         }
     }
@@ -343,7 +362,9 @@ fn run_loop(
             }
             if entry.is_some() {
                 if debug {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: multi-entry", func.name) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: multi-entry", func.name)
+                    };
                 }
                 return 0;
             }
@@ -352,7 +373,9 @@ fn run_loop(
     }
     let Some((pinst, slot)) = entry else {
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: no entry", func.name) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: no entry", func.name)
+            };
         }
         return 0;
     };
@@ -373,7 +396,9 @@ fn run_loop(
     if !dt.dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
     {
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: dom", func.name) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm: skip {h:?} of {}: dom", func.name)
+            };
         }
         return 0;
     }
@@ -439,11 +464,13 @@ fn run_loop(
             ph_inst = func.layout.last_inst(nb);
         }
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: hoist {} in {:?} of {}",
-                func.dfg.display_inst(i),
-                h,
-                func.name
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::licm", "licm: hoist {} in {:?} of {}",
+                    func.dfg.display_inst(i),
+                    h,
+                    func.name
+                )
+            };
         }
         func.layout.remove_inst(i);
         func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
@@ -464,11 +491,13 @@ fn run_loop(
                     func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar, ofz, pb, i,
                 ) {
                     if debug {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: hoist {} in {:?} of {}",
-                            func.dfg.display_inst(i),
-                            h,
-                            func.name
-                        ) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::licm", "licm: hoist {} in {:?} of {}",
+                                func.dfg.display_inst(i),
+                                h,
+                                func.name
+                            )
+                        };
                     }
                     if anchor.is_none() && ph_inst.is_none() {
                         // No plain-jump entry edge to hoist to; `try_call`
@@ -620,11 +649,13 @@ fn run_loop(
                     let j = func.layout.last_inst(nb).unwrap();
                     func.layout.insert_inst(ni, j);
                     if debug {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: sink {} past {:?} of {}",
-                            func.dfg.display_inst(s),
-                            h,
-                            func.name
-                        ) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::licm", "licm: sink {} past {:?} of {}",
+                                func.dfg.display_inst(s),
+                                h,
+                                func.name
+                            )
+                        };
                     }
                     n += 1;
                 }
@@ -774,9 +805,11 @@ fn promote(
                     && ofz.contains_key(&v)
                 {
                     if debug {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: operand-frozen access {} in {h} — V-keyed promotion off",
-                            func.dfg.display_inst(i)
-                        ) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::licm", "licm: operand-frozen access {} in {h} — V-keyed promotion off",
+                                func.dfg.display_inst(i)
+                            )
+                        };
                     }
                     ofz_access = true;
                 }
@@ -1259,7 +1292,9 @@ fn promote_loc(
         store_back(func, t, v);
     }
     if debug {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::licm", "licm: promote {:?} in {:?} of {}", loc, h, func.name) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::licm", "licm: promote {:?} in {:?} of {}", loc, h, func.name)
+        };
     }
     1
 }
@@ -1290,7 +1325,8 @@ pub fn run(
     // region check can apply it.
     let mut stop: FxHashSet<Value> = noalias.clone();
     stop.extend(ofz.keys().copied());
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG);
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
     let mut loops: Vec<Loop> = la.loops().collect();

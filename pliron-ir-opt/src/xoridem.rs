@@ -47,7 +47,7 @@ use crate::guardelim::slot_base;
 use crate::helpers::{bodied, erase_unreachable};
 use crate::inline::{blocks, ops};
 use crate::state::State;
-use crate::types::{classify, TyK};
+use crate::types::{TyK, classify};
 
 /// Blocks a single fold may erase (bounds the backward natural-loop walk
 /// and the per-block validation scan).

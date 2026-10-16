@@ -186,15 +186,17 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let forced = sess.opts.cg.force_frame_pointers != rustc_target::spec::FramePointer::MayOmit;
     let keep_fp = tail_calls || forced || !pass_enabled("PLIRON_OMIT_FP");
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::lib", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::lib", "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
-            sess.target.options.frame_pointer,
-            sess.opts.cg.force_frame_pointers,
-            fp,
-            tail_calls,
-            forced,
-            pass_enabled("PLIRON_OMIT_FP"),
-            keep_fp
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::lib", "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
+                sess.target.options.frame_pointer,
+                sess.opts.cg.force_frame_pointers,
+                fp,
+                tail_calls,
+                forced,
+                pass_enabled("PLIRON_OMIT_FP"),
+                keep_fp
+            )
+        };
     }
     fb.set(
         "preserve_frame_pointers",
@@ -734,11 +736,22 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         String::new()
     };
     if crate::env_set("PLIRON_DUMP") {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== {name} ====\n{ir}") };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dump", "==== {name} ====\n{ir}")
+        };
     }
     if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        inline::run(ctx, st, true, inline::SMALL_LIMIT, None, true, None, &mut None);
+        inline::run(
+            ctx,
+            st,
+            true,
+            inline::SMALL_LIMIT,
+            None,
+            true,
+            None,
+            &mut None,
+        );
         domcheck::run(ctx, st, "always-inline");
         inline::dead_fns(ctx, st);
     }
@@ -1017,7 +1030,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     drop(_siro);
     if crate::env_set("PLIRON_DUMP_OPT") {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir())
+        };
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
         // The CLIF-pipeline path is the default — it runs the full
@@ -1611,8 +1626,11 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     } else {
         Vec::new()
     };
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len()) };
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len())
+        };
     }
     for &inst in &extra {
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(

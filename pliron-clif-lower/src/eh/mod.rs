@@ -152,12 +152,7 @@ impl UnwindContext {
         }
     }
 
-    pub fn add_function(
-        &mut self,
-        module: &mut dyn Module,
-        func_id: FuncId,
-        code: &CompiledCode,
-    ) {
+    pub fn add_function(&mut self, module: &mut dyn Module, func_id: FuncId, code: &CompiledCode) {
         if self.coff {
             let info = code.create_unwind_info(module.isa()).unwrap();
             if let Some(UnwindInfo::WindowsX64(info)) = info {

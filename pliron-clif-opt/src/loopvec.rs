@@ -1119,19 +1119,23 @@ fn plan(
     };
     let mut kinds = param_kinds(func, &info);
     upgrade_lagged(func, ps, &info, &mut kinds);
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec kinds {} {:?}: {:?}",
-            fname,
-            info.h,
-            kinds
-                .iter()
-                .map(|k| match k {
-                    Param::Step(s) => format!("S{s}"),
-                    Param::Inv => "I".into(),
-                    Param::Other => "?".into(),
-                })
-                .collect::<Vec<_>>()
-        ) };
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::loopvec", "vec kinds {} {:?}: {:?}",
+                fname,
+                info.h,
+                kinds
+                    .iter()
+                    .map(|k| match k {
+                        Param::Step(s) => format!("S{s}"),
+                        Param::Inv => "I".into(),
+                        Param::Other => "?".into(),
+                    })
+                    .collect::<Vec<_>>()
+            )
+        };
     }
     // A `Param::Other` header param can still be a reduction accumulator:
     // `acc = acc ⊕ delta` for a lane-wise associative+commutative op. Each
@@ -1146,10 +1150,14 @@ fn plan(
             continue;
         }
         let p = func.dfg.block_params(info.h)[j];
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} analyzing, {} latches",
-                info.latches.len()
-            ) };
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} analyzing, {} latches",
+                    info.latches.len()
+                )
+            };
         }
         // The acc update as a lane op + delta: a whitelisted binary
         // (`acc ⊕ d`), a select-diamond min/max (`select(icmp cc acc d)`,
@@ -1183,27 +1191,39 @@ fn plan(
                     continue;
                 }
                 let ValueDef::Result(i, _) = func.dfg.value_def(lv) else {
-                    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} leaf is {:?}", func.dfg.value_def(lv)) };
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                    {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} leaf is {:?}", func.dfg.value_def(lv))
+                        };
                     }
                     ok = false;
                     break;
                 };
                 let Some((op, d, aux, cnd)) = upd_decomp(&mut cx, i, 0) else {
-                    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} upd_decomp fails {}",
-                            func.dfg.display_inst(i)
-                        ) };
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                    {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} upd_decomp fails {}",
+                                func.dfg.display_inst(i)
+                            )
+                        };
                     }
                     ok = false;
                     break;
                 };
                 if let Some((pi, po, pd, paux, pc)) = &upd {
                     if !(*pi == i && *po == op && *pd == d && *paux == aux && *pc == cnd) {
-                        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} second update {}",
-                                func.dfg.display_inst(i)
-                            ) };
+                        if pliron_cfg::tracing_on()
+                            && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                        {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} second update {}",
+                                    func.dfg.display_inst(i)
+                                )
+                            };
                         }
                         ok = false;
                         break;
@@ -1218,8 +1238,12 @@ fn plan(
             }
         }
         if !ok {
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} latch args not one update inst") };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} latch args not one update inst")
+                };
             }
             other_ok = false;
             continue;
@@ -1228,8 +1252,12 @@ fn plan(
             // Every arm passed `acc` through (e.g. behind block
             // params) — effectively invariant, just not recognized.
             kinds[j] = Param::Inv;
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} reclassified Inv") };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} reclassified Inv")
+                };
             }
             continue;
         };
@@ -1325,8 +1353,12 @@ fn plan(
                         .then(|| (func.dfg.resolve_aliases(arg), invert))
                 });
             let Some(gc) = gc else {
-                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} CFG diamond has no gating brif") };
+                if pliron_cfg::tracing_on()
+                    && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} CFG diamond has no gating brif")
+                    };
                 }
                 other_ok = false;
                 continue;
@@ -1385,19 +1417,25 @@ fn plan(
                         .all(|&r| !used.contains(&func.dfg.resolve_aliases(r))))
             });
         if bad_use || reducs.len() >= 2 {
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+            {
                 for &b in &info.body {
                     for i in func.layout.block_insts(b) {
                         if !allowed.contains(&i)
                             && func.dfg.inst_args(i).iter().any(|&a| is_acc_arg(a))
                         {
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use {}",
-                                func.dfg.display_inst(i)
-                            ) };
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use {}",
+                                    func.dfg.display_inst(i)
+                                )
+                            };
                         }
                     }
                 }
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use") };
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use")
+                };
             }
             other_ok = false;
             continue;
@@ -1524,18 +1562,26 @@ fn plan(
             if !guard_pred(func, &info, &kinds, &c, e2, &mut ps) {
                 match early_cond(func, &info, e2) {
                     Some(ec) => {
-                        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec exit {} -> early_cond {ec:?}",
-                                func.dfg.display_inst(e2.inst)
-                            ) };
+                        if pliron_cfg::tracing_on()
+                            && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                        {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::loopvec", "vec exit {} -> early_cond {ec:?}",
+                                    func.dfg.display_inst(e2.inst)
+                                )
+                            };
                         }
                         es.push(ec);
                     }
                     None => {
-                        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec exit {} uncovered, kills count cand",
-                                func.dfg.display_inst(e2.inst)
-                            ) };
+                        if pliron_cfg::tracing_on()
+                            && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+                        {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::loopvec", "vec exit {} uncovered, kills count cand",
+                                    func.dfg.display_inst(e2.inst)
+                                )
+                            };
                         }
                         ok = false;
                         break;
@@ -2939,7 +2985,8 @@ fn widen_delta(
                 mask = Some(k);
                 d = func.dfg.resolve_aliases(nn);
             }
-            let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
+            let dbg = pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
             let (x, signed) = match ext_of(func, d, &mut ext_insts) {
                 Some(x) => x,
                 // `cnt += select(pred, 1, 0)` with no widening cast: the
@@ -2949,7 +2996,9 @@ fn widen_delta(
                 None if bools.contains(&d) || matches!(iconst(func, d), Some(0 | 1)) => (d, false),
                 None => {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "widen_delta: no ext in {d:?}") };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loopvec", "widen_delta: no ext in {d:?}")
+                        };
                     }
                     return false;
                 }
@@ -2963,7 +3012,9 @@ fn widen_delta(
                 let v = func.dfg.resolve_aliases(func.dfg.first_result(i));
                 if !uses_ok(func, v, &ok) {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "widen_delta: extra use of {}", func.dfg.display_inst(i)) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loopvec", "widen_delta: extra use of {}", func.dfg.display_inst(i))
+                        };
                     }
                     return false;
                 }
@@ -2976,7 +3027,9 @@ fn widen_delta(
                 let x_bool = bools.contains(&x) || matches!(iconst(func, x), Some(0 | 1));
                 if !x_bool || !matches!(mask, None | Some(1)) {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "widen_delta: {:?} not can_vec/bool", x) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loopvec", "widen_delta: {:?} not can_vec/bool", x)
+                        };
                     }
                     return false;
                 }
@@ -3018,7 +3071,9 @@ fn widen_delta(
                                 .all(|&rr| bools.contains(&func.dfg.resolve_aliases(rr)))
                         {
                             if dbg {
-                                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "widen_delta: bool reader {}", func.dfg.display_inst(i)) };
+                                if pliron_cfg::tracing_on() {
+                                    tracing::debug!(target: "pliron::loopvec", "widen_delta: bool reader {}", func.dfg.display_inst(i))
+                                };
                             }
                             bad = true;
                         }
@@ -4232,14 +4287,18 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             .iter()
             .any(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Load { .. }));
     let mut pending_stores: Vec<(usize, Value, Value, i64)> = Vec::new();
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
-            pos.func.name,
-            p.mems
-                .iter()
-                .map(|&(i, j)| (pos.func.dfg.insts[i].opcode(), j))
-                .collect::<Vec<_>>()
-        ) };
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::loopvec", "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
+                pos.func.name,
+                p.mems
+                    .iter()
+                    .map(|&(i, j)| (pos.func.dfg.insts[i].opcode(), j))
+                    .collect::<Vec<_>>()
+            )
+        };
     }
     // Lane-wise early-exit checks accumulate across all groups into
     // `exit_accs` — see the fused test emitted at the last group below.
@@ -4588,7 +4647,8 @@ pub fn run(
     // Deepest-first: parent loops always fail `gather`'s innermost check,
     // so iterating them first would just burn the MAX_LOOPS budget.
     let loops = deepest_first(&la);
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
@@ -4604,7 +4664,9 @@ pub fn run(
             continue;
         };
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec {:?}: {}x{}", p.h, p.vf, p.elem) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::loopvec", "vec {:?}: {}x{}", p.h, p.vf, p.elem)
+            };
         }
         apply(func, &p, pty, x64);
         n += 1;

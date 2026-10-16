@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{bodied, Syms};
+use crate::{Syms, bodied};
 
 /// libc functions that only read memory.
 const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];

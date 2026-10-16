@@ -54,7 +54,11 @@ block0(v0: i64):
     return v60
 }";
 
-fn run(f: &mut Function, nocap: &FxHashSet<(cranelift_codegen::ir::Inst, u32)>, ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<BasicBlock>)>>) -> usize {
+fn run(
+    f: &mut Function,
+    nocap: &FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
+    ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<BasicBlock>)>>,
+) -> usize {
     pliron_clif_opt::loadfwd::run(
         f,
         &[Value::from_u32(0)].into_iter().collect(),

@@ -661,8 +661,12 @@ impl<'a> W<'a> {
         }
         let cone = self.cone(d);
         if cone.order.is_empty() {
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} cone>64 from {:?}", self.p, d) };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} cone>64 from {:?}", self.p, d)
+                };
             }
             return false;
         }
@@ -693,10 +697,14 @@ impl<'a> W<'a> {
             {
                 continue;
             }
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} use (def blk {:?}) at {:?} fails",
-                    self.p, db, cone.order[cu.k as usize]
-                ) };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} use (def blk {:?}) at {:?} fails",
+                        self.p, db, cone.order[cu.k as usize]
+                    )
+                };
             }
             return false;
         }
@@ -1137,7 +1145,8 @@ pub fn sweep_dead(func: &mut Function) {
 }
 
 pub fn run(func: &mut Function) -> usize {
-    let prof = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
@@ -1152,7 +1161,9 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.elapsed())
+        };
     }
     let tp = std::time::Instant::now();
     // Cones are CFG-invariant for the whole plans phase (no mutation until
@@ -1175,7 +1186,9 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.elapsed())
+        };
     }
     let tp = std::time::Instant::now();
     let mut n = 0;
@@ -1225,7 +1238,9 @@ pub fn run(func: &mut Function) -> usize {
         n += 1;
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.elapsed())
+        };
     }
     let tp = std::time::Instant::now();
     if n > 0 {
@@ -1238,7 +1253,9 @@ pub fn run(func: &mut Function) -> usize {
         sweep_dead(func);
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.elapsed())
+        };
     }
     let tp = std::time::Instant::now();
     let d = deadbits(func);
@@ -1249,7 +1266,9 @@ pub fn run(func: &mut Function) -> usize {
         n += d;
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed())
+        };
     }
     n
 }

@@ -13,9 +13,9 @@ use core::sync::atomic::Ordering;
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::Function;
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::isa::x64::WIDE_VECTOR_BITS;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::isa::TargetIsa;
 
 fn isa() -> std::sync::Arc<dyn TargetIsa> {
     let mut b = settings::builder();
@@ -50,8 +50,7 @@ fn compile(bits: u32, clif: &str) -> Vec<u8> {
     let _g = COMPILE_LOCK.lock().unwrap();
     WIDE_VECTOR_BITS.store(bits, Ordering::Relaxed);
     let mut ctx = Context::for_function(parse(clif));
-    ctx.compile(&*isa, &mut ControlPlane::default())
-        .unwrap();
+    ctx.compile(&*isa, &mut ControlPlane::default()).unwrap();
     WIDE_VECTOR_BITS.store(128, Ordering::Relaxed);
     ctx.compiled_code().unwrap().code_buffer().to_vec()
 }
@@ -59,13 +58,14 @@ fn compile(bits: u32, clif: &str) -> Vec<u8> {
 /// Does `code` contain a VEX.256 (`C5`/`C4`) or EVEX.512 (`62`) encoding of
 /// one of `ops`? VEX.256: L=1 in vvvvL byte. EVEX: L'L = 10 in P2[6:5].
 fn has_wide_op(code: &[u8], ops: &[u8]) -> bool {
-    code.windows(3).any(|w| {
-        w[0] == 0xC5 && (w[1] & 0x04) != 0 && ops.contains(&w[2])
-    }) || code.windows(4).any(|w| {
-        w[0] == 0xC4 && (w[2] & 0x04) != 0 && ops.contains(&w[3])
-    }) || code.windows(5).any(|w| {
-        w[0] == 0x62 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
-    })
+    code.windows(3)
+        .any(|w| w[0] == 0xC5 && (w[1] & 0x04) != 0 && ops.contains(&w[2]))
+        || code
+            .windows(4)
+            .any(|w| w[0] == 0xC4 && (w[2] & 0x04) != 0 && ops.contains(&w[3]))
+        || code
+            .windows(5)
+            .any(|w| w[0] == 0x62 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4]))
 }
 
 /// Is there a legacy (non-VEX) encoding of `ops` (`66 0F xx`)? That would mean
@@ -228,7 +228,10 @@ fn bitselect_512() {
 fn bnot_512() {
     let code = compile(512, BNOT_512);
     // vpternlogd 0x25 (all-ones LUT) + vpxord 0xEF.
-    assert!(has_wide_op(&code, &[0x25]), "no vpternlogd zmm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x25]),
+        "no vpternlogd zmm: {code:02x?}"
+    );
     assert!(has_wide_op(&code, &[0xEF]), "no vpxord zmm: {code:02x?}");
 }
 
@@ -309,7 +312,10 @@ fn int_ops_256() {
     // vpaddd 0xFE, vpsubd 0xFA, vpmulld 0x40 (0F38), vpminsd 0x39 (0F38).
     assert!(has_wide_op(&code, &[0xFE]), "no vpaddd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0xFA]), "no vpsubd ymm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0x40, 0x39]), "no vpmulld/vpminsd ymm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x40, 0x39]),
+        "no vpmulld/vpminsd ymm: {code:02x?}"
+    );
     assert!(
         !has_legacy_op(&code, &[0xFE, 0xFA]),
         "xmm-width int op: {code:02x?}"
@@ -321,7 +327,10 @@ fn int_ops_512() {
     let code = compile(512, INT_OPS_512);
     assert!(has_wide_op(&code, &[0xFE]), "no vpaddd zmm: {code:02x?}");
     assert!(has_wide_op(&code, &[0xFA]), "no vpsubd zmm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0x40, 0x3D]), "no vpmulld/vpmaxsd zmm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x40, 0x3D]),
+        "no vpmulld/vpmaxsd zmm: {code:02x?}"
+    );
 }
 
 #[test]
@@ -330,7 +339,10 @@ fn icmp_256() {
     // eq: vpcmpeqd 0x76; ugt: two vpxor (flip mask) + vpcmpgtd 0x66.
     assert!(has_wide_op(&code, &[0x76]), "no vpcmpeqd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x66]), "no vpcmpgtd ymm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0xEF]), "no vpxor ymm (flip mask): {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0xEF]),
+        "no vpxor ymm (flip mask): {code:02x?}"
+    );
     assert!(
         !has_legacy_op(&code, &[0x76, 0x66]),
         "xmm-width compare: {code:02x?}"
@@ -341,14 +353,20 @@ fn icmp_256() {
 fn splat_256() {
     let code = compile(256, SPLAT_INT);
     // vpbroadcastd 0x7C is a 0F38-map op -> 3-byte VEX.
-    assert!(has_wide_op(&code, &[0x7C]), "no vpbroadcastd ymm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x7C]),
+        "no vpbroadcastd ymm: {code:02x?}"
+    );
 }
 
 #[test]
 fn splat_512() {
     let code = compile(512, SPLAT_512);
     // vpbroadcastq zmm: EVEX 0F38 0x7D W=1.
-    assert!(has_wide_op(&code, &[0x7D]), "no vpbroadcastq zmm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x7D]),
+        "no vpbroadcastq zmm: {code:02x?}"
+    );
 }
 
 #[test]
@@ -357,8 +375,14 @@ fn f64_ops_256() {
     // vaddpd 0x58, vminpd 0x5D, vfmadd213pd 0xA8, vpxor 0xEF (fneg mask).
     assert!(has_wide_op(&code, &[0x58]), "no vaddpd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x5D]), "no vminpd ymm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0xA8]), "no vfmadd213pd ymm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0xEF]), "no vpxor (fneg) ymm: {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0xA8]),
+        "no vfmadd213pd ymm: {code:02x?}"
+    );
+    assert!(
+        has_wide_op(&code, &[0xEF]),
+        "no vpxor (fneg) ymm: {code:02x?}"
+    );
 }
 
 #[test]
@@ -478,17 +502,20 @@ fn widen_256() {
     // vpmovzxwd 0x33, vpmovsxwd 0x23 (0F38) + vextractf128 0x19 (high).
     assert!(has_wide_op(&code, &[0x33]), "no vpmovzxwd ymm: {code:02x?}");
     assert!(has_wide_op(&code, &[0x23]), "no vpmovsxwd ymm: {code:02x?}");
-    assert!(has_wide_op(&code, &[0x19]), "no vextractf128 (high half): {code:02x?}");
+    assert!(
+        has_wide_op(&code, &[0x19]),
+        "no vextractf128 (high half): {code:02x?}"
+    );
 }
 
 /// 0F38-map variant of `has_wide_op`: VEX.256 is `C4` with mm=0F38 and L=1
 /// (C5 can't encode 0F38); EVEX.512 is `62` with mm=2 in P1 and L'L=10.
 fn has_wide_op38(code: &[u8], ops: &[u8]) -> bool {
-    code.windows(4).any(|w| {
-        w[0] == 0xC4 && (w[1] & 0x1F) == 0x02 && (w[2] & 0x04) != 0 && ops.contains(&w[3])
-    }) || code.windows(5).any(|w| {
-        w[0] == 0x62 && (w[1] & 0x03) == 0x02 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
-    })
+    code.windows(4)
+        .any(|w| w[0] == 0xC4 && (w[1] & 0x1F) == 0x02 && (w[2] & 0x04) != 0 && ops.contains(&w[3]))
+        || code.windows(5).any(|w| {
+            w[0] == 0x62 && (w[1] & 0x03) == 0x02 && (w[3] & 0x60) == 0x40 && ops.contains(&w[4])
+        })
 }
 
 /// Legacy 0F38-map encoding check (`66 0F38 xx`).
@@ -535,27 +562,45 @@ fn sdot_512() {
 #[test]
 fn udot_256() {
     let code = compile(256, UDOT);
-    assert!(has_wide_op38(&code, &[0x04]), "no vpmaddubsw ymm: {code:02x?}");
-    assert!(!has_legacy_op38(&code, &[0x04]), "xmm pmaddubsw: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x04]),
+        "no vpmaddubsw ymm: {code:02x?}"
+    );
+    assert!(
+        !has_legacy_op38(&code, &[0x04]),
+        "xmm pmaddubsw: {code:02x?}"
+    );
 }
 
 #[test]
 fn udot_512() {
     let code = compile(512, UDOT);
-    assert!(has_wide_op38(&code, &[0x04]), "no vpmaddubsw zmm: {code:02x?}");
-    assert!(!has_legacy_op38(&code, &[0x04]), "xmm pmaddubsw: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x04]),
+        "no vpmaddubsw zmm: {code:02x?}"
+    );
+    assert!(
+        !has_legacy_op38(&code, &[0x04]),
+        "xmm pmaddubsw: {code:02x?}"
+    );
 }
 
 #[test]
 fn udot_acc_256() {
     let code = compile(256, UDOT_ACC);
-    assert!(has_wide_op38(&code, &[0x50]), "no vpdpbusd ymm: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x50]),
+        "no vpdpbusd ymm: {code:02x?}"
+    );
 }
 
 #[test]
 fn udot_acc_512() {
     let code = compile(512, UDOT_ACC);
-    assert!(has_wide_op38(&code, &[0x50]), "no vpdpbusd zmm: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x50]),
+        "no vpdpbusd zmm: {code:02x?}"
+    );
 }
 
 const VSWIZZLE: &str = "
@@ -600,7 +645,10 @@ fn vswizzle_f64_512() {
 #[test]
 fn vswizzle2_512() {
     let code = compile(512, VSWIZZLE2);
-    assert!(has_wide_op38(&code, &[0x7E]), "no vpermt2d zmm: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x7E]),
+        "no vpermt2d zmm: {code:02x?}"
+    );
 }
 
 /// EVEX 0F38-map check for a specific L'L (index width): `62`, mm=2 in P1,
@@ -608,10 +656,7 @@ fn vswizzle2_512() {
 /// in L'L (1 = ymm, 2 = zmm).
 fn has_evex_op38(code: &[u8], ops: &[u8], ll: u8) -> bool {
     code.windows(5).any(|w| {
-        w[0] == 0x62
-            && (w[1] & 0x03) == 0x02
-            && (w[3] & 0x60) == (ll << 5)
-            && ops.contains(&w[4])
+        w[0] == 0x62 && (w[1] & 0x03) == 0x02 && (w[3] & 0x60) == (ll << 5) && ops.contains(&w[4])
     })
 }
 
@@ -648,30 +693,41 @@ fn gather_256() {
     let code = compile(256, GATHER_256);
     // vpgatherdd ymm = VEX.256 0F38 0x90 (all-ones mask + zeroed dst regs are
     // also emitted; only the gather opcode is checked).
-    assert!(has_wide_op38(&code, &[0x90]), "no vpgatherdd ymm: {code:02x?}");
+    assert!(
+        has_wide_op38(&code, &[0x90]),
+        "no vpgatherdd ymm: {code:02x?}"
+    );
 }
 
 #[test]
 fn gather_512() {
     let code = compile(512, GATHER_512);
     // vpgatherdd zmm-idx = EVEX 0F38 0x90, L'L=10
-    assert!(has_evex_op38(&code, &[0x90], 2), "no vpgatherdd zmm: {code:02x?}");
+    assert!(
+        has_evex_op38(&code, &[0x90], 2),
+        "no vpgatherdd zmm: {code:02x?}"
+    );
 }
 
 #[test]
 fn scatter_256() {
     let code = compile(256, SCATTER_256);
     // vpscatterdd ymm-idx = EVEX 0F38 0xA0, L'L=01
-    assert!(has_evex_op38(&code, &[0xA0], 1), "no vpscatterdd (ymm idx): {code:02x?}");
+    assert!(
+        has_evex_op38(&code, &[0xA0], 1),
+        "no vpscatterdd (ymm idx): {code:02x?}"
+    );
 }
 
 #[test]
 fn scatter_512() {
     let code = compile(512, SCATTER_512);
     // vpscatterdd zmm-idx = EVEX 0F38 0xA0, L'L=10
-    assert!(has_evex_op38(&code, &[0xA0], 2), "no vpscatterdd zmm: {code:02x?}");
+    assert!(
+        has_evex_op38(&code, &[0xA0], 2),
+        "no vpscatterdd zmm: {code:02x?}"
+    );
 }
-
 
 // ---------------------------------------------------------------------------
 // loopvec end-to-end: a loop vectorized at vbits=256 lowers to ymm ops.

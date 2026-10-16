@@ -2,7 +2,11 @@ use std::hint::black_box;
 
 #[inline(never)]
 fn fib(n: u32) -> u64 {
-    if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) }
+    if n < 2 {
+        n as u64
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
 }
 
 pub fn run() -> u64 {

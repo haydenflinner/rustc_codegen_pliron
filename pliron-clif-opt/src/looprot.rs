@@ -50,7 +50,8 @@ pub fn run(
 /// Header `h` with one latch ending in `jump h`, a small call-free body and a
 /// `brif` to two blocks that only `h` reaches.
 fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
-    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG);
     macro_rules! bail {
         ($($t:tt)*) => {{
             if dbg {
@@ -128,7 +129,9 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
         bail!("header size {k}");
     }
     if dbg {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::looprot", "looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::looprot", "looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block)
+        };
     }
     true
 }
@@ -180,8 +183,12 @@ fn rotate(
                 .entry(b)
                 .or_insert_with(|| succ.iter().position(|&s| domtree.block_dominates(s, b)));
             let Some(side) = side else {
-                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG) {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::looprot", "looprot {h}: bail side-none blk{b} used {d}") };
+                if pliron_cfg::tracing_on()
+                    && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG)
+                {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::looprot", "looprot {h}: bail side-none blk{b} used {d}")
+                    };
                 }
                 return false;
             };
@@ -197,10 +204,14 @@ fn rotate(
     // supply appended params.
     for side in 0..2 {
         if cfg.pred_iter(succ[side]).count() > 1 && !need[side].is_empty() {
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::looprot", "looprot {h}: bail multipred {:?} need {:?}",
-                    succ[side], need[side]
-                ) };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::looprot", "looprot {h}: bail multipred {:?} need {:?}",
+                        succ[side], need[side]
+                    )
+                };
             }
             return false;
         }

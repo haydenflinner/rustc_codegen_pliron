@@ -571,18 +571,21 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     // no `throw_ret` gate: leaf throwers (panic_bounds_check callers with no
     // landing pad of their own) end every OOB edge in exactly this shape.
     let mut rethrow = false;
-    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     while let Some(b) = stack.pop() {
         if !seen.insert(b) {
             continue;
         }
         if seen.len() > 64 {
             if dbg {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: bail seen={} cold={}",
-                    b.as_u32(),
-                    seen.len(),
-                    func.layout.is_cold(b)
-                ) };
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: bail seen={} cold={}",
+                        b.as_u32(),
+                        seen.len(),
+                        func.layout.is_cold(b)
+                    )
+                };
             }
             return false;
         }
@@ -613,9 +616,11 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 }
                 Opcode::Return if !(call && flag || (throw_ret && rethrow)) => {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}",
-                            b.as_u32()
-                        ) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}",
+                                b.as_u32()
+                            )
+                        };
                     }
                     return false;
                 }
@@ -924,7 +929,8 @@ fn run_loop(
     throw_ret: bool,
     seen: &mut FxHashSet<Block>,
 ) -> usize {
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -1227,10 +1233,12 @@ fn run_loop(
             };
             if !invariant(func, cfg, &info, &body, bb) {
                 if debug {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len not invariant",
-                        h.as_u32(),
-                        b.as_u32()
-                    ) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len not invariant",
+                            h.as_u32(),
+                            b.as_u32()
+                        )
+                    };
                 }
                 continue;
             }
@@ -1303,11 +1311,13 @@ fn run_loop(
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
             if !dead_end(func, bad, throw_ret) {
                 if debug {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
-                        h.as_u32(),
-                        b.as_u32(),
-                        bsub
-                    ) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
+                            h.as_u32(),
+                            b.as_u32(),
+                            bsub
+                        )
+                    };
                 }
                 continue;
             }
@@ -1861,7 +1871,8 @@ pub fn run(
     name: &str,
     throw_ret: bool,
 ) -> usize {
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
     // find the first loop that versions, then rescan.
@@ -1871,10 +1882,12 @@ pub fn run(
         let mut did = 0;
         let lps = deepest_first(la);
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "bcheck {name}: {} loops: {:?}",
-                lps.len(),
-                lps.iter().map(|&lp| la.loop_header(lp)).collect::<Vec<_>>()
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::bcheck", "bcheck {name}: {} loops: {:?}",
+                    lps.len(),
+                    lps.iter().map(|&lp| la.loop_header(lp)).collect::<Vec<_>>()
+                )
+            };
         }
         for lp in lps.into_iter().take(MAX_LOOPS) {
             let k = run_loop(func, cfg, dt, la, lp, name, throw_ret, &mut seen);
@@ -1889,7 +1902,9 @@ pub fn run(
             break;
         }
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::bcheck", "bcheck {name}: versioned") };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::bcheck", "bcheck {name}: versioned")
+            };
         }
     }
     n
@@ -1917,7 +1932,8 @@ fn unswitch_loop(
     name: &str,
     seen: &mut FxHashSet<Block>,
 ) -> usize {
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -2093,7 +2109,9 @@ fn unswitch_loop(
     // belt-and-braces in case cfg misses an edge type.
     let uses = crate::uses::Uses::new(func);
     if debug {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead candidates: {dead:?}") };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead candidates: {dead:?}")
+        };
     }
     loop {
         let keep: Vec<Block> = dead
@@ -2125,21 +2143,26 @@ fn unswitch_loop(
         }
     }
     if debug {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead after fold: {dead:?}") };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead after fold: {dead:?}")
+        };
     }
     for b in dead {
         func.layout.remove_block_and_insts(b);
     }
     seen.insert(hc);
     if debug {
-        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unswitch", "unswitch {name}: block{} unswitched", h.as_u32()) };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::unswitch", "unswitch {name}: block{} unswitched", h.as_u32())
+        };
     }
     1
 }
 
 /// `PLIRON_UNSWITCH=0` disables invariant-brif loop unswitching.
 pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
     let mut n = 0;
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..MAX_VERSIONS {
@@ -2158,7 +2181,9 @@ pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &
             break;
         }
         if debug {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::unswitch", "unswitch {name}: versioned") };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::unswitch", "unswitch {name}: versioned")
+            };
         }
     }
     n

@@ -8,8 +8,8 @@
 //! `=0` disables the pass.
 
 use egg::{
-    define_language, rewrite as rw, Analysis, Applier, DidMerge, EGraph, Id, Language, PatternAst,
-    Rewrite, Runner, Subst, Symbol, Var,
+    Analysis, Applier, DidMerge, EGraph, Id, Language, PatternAst, Rewrite, Runner, Subst, Symbol,
+    Var, define_language, rewrite as rw,
 };
 use pliron::{
     context::{Context, Ptr},
@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
 use crate::state::{ConstVal, State};
-use crate::types::{classify, TyK};
+use crate::types::{TyK, classify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cst(u128, u32);
@@ -66,11 +66,7 @@ define_language! {
 }
 
 fn mask(b: u128, w: u32) -> u128 {
-    if w >= 128 {
-        b
-    } else {
-        b & ((1u128 << w) - 1)
-    }
+    if w >= 128 { b } else { b & ((1u128 << w) - 1) }
 }
 fn sext(b: u128, w: u32) -> i128 {
     if w >= 128 {
@@ -572,11 +568,7 @@ enum Ck {
 
 impl POp {
     fn nargs(&self) -> usize {
-        if self.ic == Pk::Select {
-            3
-        } else {
-            2
-        }
+        if self.ic == Pk::Select { 3 } else { 2 }
     }
 }
 

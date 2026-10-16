@@ -164,8 +164,12 @@ fn dir() -> Option<PathBuf> {
 }
 
 fn log(what: &str) {
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stepcache", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stepcache", "stepcache {what}") };
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::stepcache", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stepcache", "stepcache {what}")
+        };
     }
 }
 

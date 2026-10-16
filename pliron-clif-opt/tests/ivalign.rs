@@ -66,7 +66,11 @@ fn retimes_shifted_param() {
     let mut after = before.clone();
     let k = pliron_clif_opt::ivalign::run(&mut after, &mut Analysis::default());
     assert!(k > 0, "no shift:\n{}", after.display());
-    assert!(tested_is_iadd(&after), "icmp still reads param:\n{}", after.display());
+    assert!(
+        tested_is_iadd(&after),
+        "icmp still reads param:\n{}",
+        after.display()
+    );
     let cfg = Config::default();
     if let Err(m) = check(&before, &after, &Facts::default(), &cfg) {
         panic!("{m}\n---- after\n{}", after.display());
@@ -119,5 +123,10 @@ block2(v9: i64):
 ";
     let mut after = parse(src);
     let k = pliron_clif_opt::ivalign::run(&mut after, &mut Analysis::default());
-    assert_eq!(k, 0, "shifted despite unmatched entry:\n{}", after.display());
+    assert_eq!(
+        k,
+        0,
+        "shifted despite unmatched entry:\n{}",
+        after.display()
+    );
 }

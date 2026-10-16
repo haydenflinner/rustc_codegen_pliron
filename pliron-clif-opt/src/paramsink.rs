@@ -46,10 +46,7 @@ pub(crate) fn rebuild(data: &InstructionData, a: &[Value]) -> InstructionData {
             opcode,
             args: [a[0], a[1]],
         },
-        InstructionData::Unary { opcode, .. } => InstructionData::Unary {
-            opcode,
-            arg: a[0],
-        },
+        InstructionData::Unary { opcode, .. } => InstructionData::Unary { opcode, arg: a[0] },
         InstructionData::IntCompare { opcode, cond, .. } => InstructionData::IntCompare {
             opcode,
             cond,
@@ -81,7 +78,9 @@ fn chain_of(
     let mut cur = p;
     loop {
         let mut it = func.layout.block_insts(b).filter(|&i| {
-            func.dfg.inst_values(i).any(|v| func.dfg.resolve_aliases(v) == cur)
+            func.dfg
+                .inst_values(i)
+                .any(|v| func.dfg.resolve_aliases(v) == cur)
         });
         let Some(ui) = it.next() else { break };
         if it.next().is_some() || !crate::jumpthread::pure_op(func, ui) {
@@ -178,7 +177,10 @@ pub fn run(func: &mut Function) -> (usize, Vec<(Value, Value)>) {
                 func.dfg.insts[i]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
                     .args(&func.dfg.value_lists)
-                    .any(|a| a.as_value().is_some_and(|x| func.dfg.resolve_aliases(x) == p))
+                    .any(|a| {
+                        a.as_value()
+                            .is_some_and(|x| func.dfg.resolve_aliases(x) == p)
+                    })
             }) {
                 continue;
             }
@@ -189,9 +191,7 @@ pub fn run(func: &mut Function) -> (usize, Vec<(Value, Value)>) {
                 .flat_map(|&ci| func.dfg.inst_args(ci).to_vec())
                 .filter_map(|v| {
                     let v = func.dfg.resolve_aliases(v);
-                    (v != p)
-                        .then(|| ps.iter().position(|&q| q == v))
-                        .flatten()
+                    (v != p).then(|| ps.iter().position(|&q| q == v)).flatten()
                 })
                 .collect();
             // Non-param operands must strictly dominate `b` — then they
@@ -342,10 +342,8 @@ pub fn run(func: &mut Function) -> (usize, Vec<(Value, Value)>) {
                 // value; trampolines close with a fresh jump.
                 if sinkable {
                     let dfg = &mut func.dfg;
-                    let bc = &mut dfg.insts[i].branch_destination_mut(
-                        &mut dfg.jump_tables,
-                        &mut dfg.exception_tables,
-                    )[d];
+                    let bc = &mut dfg.insts[i]
+                        .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
                     bc.remove(ix, &mut dfg.value_lists);
                     bc.append_argument(tv, &mut dfg.value_lists);
                 } else {

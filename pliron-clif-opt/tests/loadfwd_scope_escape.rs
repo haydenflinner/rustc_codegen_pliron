@@ -62,6 +62,14 @@ fn scope_escape_unisolates_the_slot() {
     let v9 = after.dfg.resolve_aliases(Value::from_u32(9));
     let v6 = Value::from_u32(6);
     assert_eq!(v9, v6, "{}", after.display());
-    check(&before, &after, &Facts::default(), &Config { trials: 64, ..Config::default() })
-        .unwrap_or_else(|m| panic!("{}", m));
+    check(
+        &before,
+        &after,
+        &Facts::default(),
+        &Config {
+            trials: 64,
+            ..Config::default()
+        },
+    )
+    .unwrap_or_else(|m| panic!("{}", m));
 }

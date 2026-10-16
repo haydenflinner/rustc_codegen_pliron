@@ -218,7 +218,8 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         .copied()
         .filter(|&e| e.0 > 0);
     if r.is_none()
-        && pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG)
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG)
         && let CallOpCallable::Direct(id) = c.callee(ctx)
     {
         let got = st
@@ -226,7 +227,9 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
             .get(&op)
             .map(|i| format!("extent={:?}", i.arg_extent))
             .unwrap_or_else(|| "no CallInfo".into());
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::sroa", "pinmiss {id} #{idx}: {got}") };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::sroa", "pinmiss {id} #{idx}: {got}")
+        };
     }
     r
 }
@@ -1123,10 +1126,14 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                         continue;
                     }
                     if s.size <= 16 {
-                        let rep = (0..s.size)
-                            .fold(0u128, |acc, k| acc | ((byte as u128) << (8 * k)));
-                        let c =
-                            mk_const(ctx, st, s.ty, ConstVal::Bits(mask(rep, (s.size * 8) as u32)));
+                        let rep =
+                            (0..s.size).fold(0u128, |acc, k| acc | ((byte as u128) << (8 * k)));
+                        let c = mk_const(
+                            ctx,
+                            st,
+                            s.ty,
+                            ConstVal::Bits(mask(rep, (s.size * 8) as u32)),
+                        );
                         StoreOp::new(ctx, c, new[i])
                             .get_operation()
                             .insert_before(ctx, x.op);
@@ -1140,13 +1147,13 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                         while o % k != 0 || o + k > s.size {
                             k /= 2;
                         }
-                        let ty =
-                            IntegerType::get(ctx, (k * 8) as u32, Signedness::Signless).into();
-                        let rep =
-                            (0..k).fold(0u128, |acc, j| acc | ((byte as u128) << (8 * j)));
+                        let ty = IntegerType::get(ctx, (k * 8) as u32, Signedness::Signless).into();
+                        let rep = (0..k).fold(0u128, |acc, j| acc | ((byte as u128) << (8 * j)));
                         let c = mk_const(ctx, st, ty, ConstVal::Bits(rep));
                         let p = ptr_plus(ctx, st, new[i], o, x.op);
-                        StoreOp::new(ctx, c, p).get_operation().insert_before(ctx, x.op);
+                        StoreOp::new(ctx, c, p)
+                            .get_operation()
+                            .insert_before(ctx, x.op);
                         o += k;
                     }
                 }
@@ -1321,17 +1328,20 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             validate(ctx, st, a);
         }
     }
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
         let total = st
             .funcs
             .values()
             .filter(|f| has_body(ctx, f.op))
             .map(|f| allocas(ctx, f.op).len())
             .sum::<usize>();
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "sroa {}: {} of {total} allocas promoted",
-            st.cgu,
-            st.promoted.len()
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "sroa {}: {} of {total} allocas promoted",
+                st.cgu,
+                st.promoted.len()
+            )
+        };
         {
             let (mut n, mut k, mut kk) = (0, 0, 0);
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
@@ -1351,9 +1361,13 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                     }
                 }
             }
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "  cond_br {n}: {k} const cond, {kk} cond of all-const operands") };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::stats", "  cond_br {n}: {k} const cond, {kk} cond of all-const operands")
+            };
         }
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+        {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let kind = |v: Value| -> String {
                 let Some(d) = v.defining_op() else {
@@ -1398,10 +1412,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(25) {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "  memcpy {c:5} {n}") };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::stats", "  memcpy {c:5} {n}")
+                };
             }
         }
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+        {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let fs: Vec<_> = st
                 .funcs
@@ -1427,7 +1445,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         let a = op.deref(ctx).get_result(0);
                         if !st.promoted.contains_key(&a) {
                             let sz = st.allocas.get(&a).map(|x| x.0).unwrap_or(0);
-                            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B {} {name}", why2(ctx, st, a)) };
+                            if pliron_cfg::tracing_on() {
+                                tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B {} {name}", why2(ctx, st, a))
+                            };
                         }
                     }
                 }
@@ -1435,10 +1455,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(20) {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "  why {c:6} {n}") };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::stats", "  why {c:6} {n}")
+                };
             }
         }
-        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+        {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
                 for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
@@ -1452,7 +1476,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(30) {
-                if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "  {c:7} {n}") };
+                if pliron_cfg::tracing_on() {
+                    tracing::info!(target: "pliron::stats", "  {c:7} {n}")
+                };
             }
         }
     }
@@ -1566,8 +1592,11 @@ pub fn forward(ctx: &mut Context, st: &State) {
         .into_iter()
         .map(|f| forward_single_store(ctx, st, f))
         .sum();
-    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::stats", "sroa-fwd {}: {n} single-store allocas forwarded", st.cgu) };
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "sroa-fwd {}: {n} single-store allocas forwarded", st.cgu)
+        };
     }
 }
 

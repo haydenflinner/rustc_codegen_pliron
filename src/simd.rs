@@ -1191,7 +1191,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
-                        "llvm.x86.sha256rnds2" | "llvm.x86.sha256msg1" | "llvm.x86.sha256msg2" => {
+            "llvm.x86.sha256rnds2" | "llvm.x86.sha256msg1" | "llvm.x86.sha256msg2" => {
                 // SHA-NI ops in plain i32 IR (lane i is element i).
                 // σ0(x)=ror7^ror18^shr3, σ1(x)=ror17^ror19^shr10,
                 // Σ0(x)=ror2^ror13^ror22, Σ1(x)=ror6^ror11^ror25.
@@ -1255,7 +1255,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     Some(self.build_vec(ret, vec![l0, l1, l2, l3]))
                 }
             }
-"llvm.x86.sse.max.ps"
+            "llvm.x86.sse.max.ps"
             | "llvm.x86.sse2.max.pd"
             | "llvm.x86.avx.max.ps.256"
             | "llvm.x86.avx.max.pd.256"

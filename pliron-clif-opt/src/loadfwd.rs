@@ -674,10 +674,14 @@ fn transfer(
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let off0 = o0.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
-                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::DEBUG) {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loadfwd", "load {res} arg {arg} root {r:?} off {off} av={:?}",
-                        av.get(&loc)
-                    ) };
+                if pliron_cfg::tracing_on()
+                    && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::DEBUG)
+                {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::loadfwd", "load {res} arg {arg} root {r:?} off {off} av={:?}",
+                            av.get(&loc)
+                        )
+                    };
                 }
                 // `!invariant.load`: the location holds one value for the
                 // whole program point range the load is legal at — mark it
@@ -868,7 +872,8 @@ pub fn run(
         post.reverse();
         post
     };
-    let prof2 = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
+    let prof2 = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
@@ -910,15 +915,21 @@ pub fn run(
     let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
         if func.name.to_string().contains(&f) {
-            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loadfwd", "lf-debug {}: iso={:?} ncc={:?} escapes={:?}", func.name, iso, ncc, _escapes) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::loadfwd", "lf-debug {}: iso={:?} ncc={:?} escapes={:?}", func.name, iso, ncc, _escapes)
+            };
         }
     }
     if prof2 {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+        };
     }
     let tt = |name: &str, t0: std::time::Instant| {
         if prof2 {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::loadfwd", "    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            };
         }
     };
     if crate::pass_enabled("PLIRON_LOADPRE") {
@@ -1000,9 +1011,11 @@ pub fn run(
         }
     }
     if prof2 {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
-            t0.elapsed().as_secs_f64() * 1e3
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
+                t0.elapsed().as_secs_f64() * 1e3
+            )
+        };
     }
     if !stable {
         return 0;

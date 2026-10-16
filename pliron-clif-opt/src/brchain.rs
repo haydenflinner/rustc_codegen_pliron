@@ -148,13 +148,10 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
     // A `k` edge arg is the param's constant — apply the conversion
     // chain's narrowing masks (walked outermost-first) before indexing.
     let norm = |k: i64| -> i64 {
-        conv_masks.iter().rev().fold(k, |k, &b| {
-            if b >= 64 {
-                k
-            } else {
-                k & ((1i64 << b) - 1)
-            }
-        })
+        conv_masks
+            .iter()
+            .rev()
+            .fold(k, |k, &b| if b >= 64 { k } else { k & ((1i64 << b) - 1) })
     };
     // Classify every incoming edge's argument for `param[num]`; a
     // select arg is only expressible where the pred's terminator is a
@@ -380,8 +377,8 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
                 let dfg = &mut func.dfg;
                 let bc = BlockCall::new(tb, targs, &mut dfg.value_lists);
                 dfg.insts[pinst]
-                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                    [di] = bc;
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
+                    bc;
                 n += 1;
             }
             EdgeArg::Sel(c, ka, kb) => {
@@ -473,7 +470,9 @@ fn select_dispatch(
                         found = bc.args(&func.dfg.value_lists).nth(num);
                     }
                 }
-                let Some(BlockArg::Value(a)) = found else { break };
+                let Some(BlockArg::Value(a)) = found else {
+                    break;
+                };
                 v = a;
             }
             _ => break,
@@ -496,13 +495,10 @@ fn select_dispatch(
     let w = func.dfg.value_type(arg).bits();
     let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let norm = |k: i64| -> i64 {
-        conv_masks.iter().rev().fold(k, |k, &b| {
-            if b >= 64 {
-                k
-            } else {
-                k & ((1i64 << b) - 1)
-            }
-        })
+        conv_masks
+            .iter()
+            .rev()
+            .fold(k, |k, &b| if b >= 64 { k } else { k & ((1i64 << b) - 1) })
     };
     let call = |k: i64| -> (Block, Vec<BlockArg>) {
         let k = (norm(k) as u64) & m;

@@ -19,8 +19,8 @@
 use crate::clifpeep;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
-    types, ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode,
-    Type, Value,
+    ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
+    Value, types,
 };
 
 /// `v`'s low `w` bits.
@@ -224,11 +224,7 @@ fn quotient(
             let t = pos.ins().ushr(s, c2);
             let a = pos.ins().iadd(x, t);
             let q = pos.ins().sshr(a, c3);
-            if sext(d, w) < 0 {
-                pos.ins().ineg(q)
-            } else {
-                q
-            }
+            if sext(d, w) < 0 { pos.ins().ineg(q) } else { q }
         } else {
             // x / -d = -(x / d): build the positive-divisor sequence and
             // negate. LLVM instead negates the magic constant; this form

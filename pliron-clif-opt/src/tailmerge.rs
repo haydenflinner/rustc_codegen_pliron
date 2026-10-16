@@ -167,9 +167,7 @@ pub fn run(func: &mut Function) -> usize {
         let Some(last) = func.layout.last_inst(b) else {
             continue;
         };
-        let has_succs = !func
-            .dfg
-            .insts[last]
+        let has_succs = !func.dfg.insts[last]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             .is_empty();
         if has_succs {

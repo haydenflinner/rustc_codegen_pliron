@@ -436,8 +436,7 @@ pub fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
                         | Opcode::Vconst
                         | Opcode::SymbolValue
                         | Opcode::FuncAddr
-                )
-            {
+                ) {
                 let ni = pos.func.dfg.clone_inst(i);
                 pos.insert_inst(ni);
                 pos.func.dfg.inst_results(ni)[0]
@@ -2076,8 +2075,12 @@ fn plan_dead(
             }
         })();
         let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG) {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopidiom", "dead: no count {:?} exit {:?}", info.h, e.inst) };
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::loopidiom", "dead: no count {:?} exit {:?}", info.h, e.inst)
+                };
             }
             continue;
         };
@@ -2431,7 +2434,8 @@ pub fn run(
     {
         return 0;
     }
-    let debug = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG);
+    let debug = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG);
     let mut n = 0;
     // `apply` rewires the CFG, so recompute the analyses before each
     // conversion rather than letting `plan` see stale dominance/latches.
@@ -2445,16 +2449,20 @@ pub fn run(
             }
             if let Some(p) = plan(func, &ps, cfg, dt, la, lp, noalias) {
                 if debug {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: loop {:?} -> {}",
-                        p.h,
-                        if p.src.is_some() { "memcpy" } else { "memset" }
-                    ) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: loop {:?} -> {}",
+                            p.h,
+                            if p.src.is_some() { "memcpy" } else { "memset" }
+                        )
+                    };
                 }
                 apply(func, &p, tcfg);
                 done.insert(p.h);
             } else if let Some(d) = plan_dead(func, &ps, noalias, cfg, dt, la, lp) {
                 if debug {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: dead loop {:?} eliminated", d.h) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: dead loop {:?} eliminated", d.h)
+                    };
                 }
                 apply_dead(func, &d, tcfg);
                 done.insert(d.h);

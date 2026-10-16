@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::context::{ArgExt, ConstVal, State};
 use crate::inline::{blocks, direct_callee, ops};
 use crate::sroa::{mk_const, ptr_plus};
-use crate::types::{classify, size_align, struct_offsets, TyK};
+use crate::types::{TyK, classify, size_align, struct_offsets};
 
 const MAX_REGS: usize = 8;
 

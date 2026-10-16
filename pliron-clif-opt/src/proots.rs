@@ -277,10 +277,7 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
             // A self-row `(p, p, 0)` from `affine_nf` — p used as an
             // `iadd`/`isub` base anywhere — is no class at all; only a
             // real row (`r != p`) settles p's membership.
-            if es.is_empty()
-                || blocked.contains(&p)
-                || nf.get(&p).is_some_and(|&(r, _)| r != p)
-            {
+            if es.is_empty() || blocked.contains(&p) || nf.get(&p).is_some_and(|&(r, _)| r != p) {
                 continue;
             }
             let mut cls: Option<(Value, i64)> = None;
@@ -444,8 +441,7 @@ pub fn key_of(
         // `inst_predicates::is_pure_for_egraph` (private upstream).
         let op = func.dfg.insts[di].opcode();
         let pure_load = match func.dfg.insts[di] {
-            InstructionData::Load { flags, .. }
-            | InstructionData::LoadNoOffset { flags, .. } => {
+            InstructionData::Load { flags, .. } | InstructionData::LoadNoOffset { flags, .. } => {
                 let f = func.dfg.mem_flags[flags];
                 f.readonly() && f.notrap() && f.can_move()
             }
@@ -469,33 +465,24 @@ pub fn key_of(
                 opcode: Opcode::Iconst,
                 imm,
             } => Key::K(rty, imm.bits()),
-            InstructionData::Binary { opcode, args: a } => {
-                Key::N(opcode, rty, args(&a), tag::BIN)
-            }
-            InstructionData::Unary { opcode, arg } => {
-                Key::N(opcode, rty, args(&[arg]), tag::UNARY)
-            }
+            InstructionData::Binary { opcode, args: a } => Key::N(opcode, rty, args(&a), tag::BIN),
+            InstructionData::Unary { opcode, arg } => Key::N(opcode, rty, args(&[arg]), tag::UNARY),
             InstructionData::Ternary { opcode, args: a } => {
                 Key::N(opcode, rty, args(&a), tag::TERN)
             }
-            InstructionData::BinaryImm8 { opcode, arg, imm } => Key::N(
+            InstructionData::BinaryImm8 { opcode, arg, imm } => {
+                Key::N(opcode, rty, args(&[arg]), tag::BIMM8 | (imm as u64) << 8)
+            }
+            InstructionData::IntCompare {
                 opcode,
-                rty,
-                args(&[arg]),
-                tag::BIMM8 | (imm as u64) << 8,
-            ),
-            InstructionData::IntCompare { opcode, args: a, cond } => Key::N(
+                args: a,
+                cond,
+            } => Key::N(opcode, rty, args(&a), tag::ICMP | (cond as u64) << 8),
+            InstructionData::FloatCompare {
                 opcode,
-                rty,
-                args(&a),
-                tag::ICMP | (cond as u64) << 8,
-            ),
-            InstructionData::FloatCompare { opcode, args: a, cond } => Key::N(
-                opcode,
-                rty,
-                args(&a),
-                tag::FCMP | (cond as u64) << 8,
-            ),
+                args: a,
+                cond,
+            } => Key::N(opcode, rty, args(&a), tag::FCMP | (cond as u64) << 8),
             InstructionData::StackAddr {
                 opcode,
                 stack_slot,
@@ -536,19 +523,13 @@ pub fn key_of(
             InstructionData::UnaryIeee16 { opcode, imm } => Key::N(
                 opcode,
                 rty,
-                std::rc::Rc::new([Key::K(
-                    cranelift_codegen::ir::types::I64,
-                    imm.bits() as i64,
-                )]),
+                std::rc::Rc::new([Key::K(cranelift_codegen::ir::types::I64, imm.bits() as i64)]),
                 tag::UIEEE,
             ),
             InstructionData::UnaryIeee32 { opcode, imm } => Key::N(
                 opcode,
                 rty,
-                std::rc::Rc::new([Key::K(
-                    cranelift_codegen::ir::types::I64,
-                    imm.bits() as i64,
-                )]),
+                std::rc::Rc::new([Key::K(cranelift_codegen::ir::types::I64, imm.bits() as i64)]),
                 tag::UIEEE,
             ),
             InstructionData::UnaryIeee64 { opcode, imm } => Key::N(
@@ -644,8 +625,7 @@ pub fn vhash(
         let rty = func.dfg.value_type(v);
         let op = func.dfg.insts[di].opcode();
         let pure_load = match func.dfg.insts[di] {
-            InstructionData::Load { flags, .. }
-            | InstructionData::LoadNoOffset { flags, .. } => {
+            InstructionData::Load { flags, .. } | InstructionData::LoadNoOffset { flags, .. } => {
                 let f = func.dfg.mem_flags[flags];
                 f.readonly() && f.notrap() && f.can_move()
             }
@@ -780,8 +760,7 @@ pub fn vnodes(
         };
         let op = func.dfg.insts[di].opcode();
         let pure_load = match func.dfg.insts[di] {
-            InstructionData::Load { flags, .. }
-            | InstructionData::LoadNoOffset { flags, .. } => {
+            InstructionData::Load { flags, .. } | InstructionData::LoadNoOffset { flags, .. } => {
                 let f = func.dfg.mem_flags[flags];
                 f.readonly() && f.notrap() && f.can_move()
             }
@@ -1181,10 +1160,22 @@ pub fn key_sub_h(
     match (x, y) {
         (Key::N(Opcode::Iadd, _, xa, _), Key::N(Opcode::Iadd, _, ya, _)) => {
             for ((a, c), (b, c2)) in [
-                ((xa[0].clone(), xa[1].clone()), (ya[0].clone(), ya[1].clone())),
-                ((xa[0].clone(), xa[1].clone()), (ya[1].clone(), ya[0].clone())),
-                ((xa[1].clone(), xa[0].clone()), (ya[0].clone(), ya[1].clone())),
-                ((xa[1].clone(), xa[0].clone()), (ya[1].clone(), ya[0].clone())),
+                (
+                    (xa[0].clone(), xa[1].clone()),
+                    (ya[0].clone(), ya[1].clone()),
+                ),
+                (
+                    (xa[0].clone(), xa[1].clone()),
+                    (ya[1].clone(), ya[0].clone()),
+                ),
+                (
+                    (xa[1].clone(), xa[0].clone()),
+                    (ya[0].clone(), ya[1].clone()),
+                ),
+                (
+                    (xa[1].clone(), xa[0].clone()),
+                    (ya[1].clone(), ya[0].clone()),
+                ),
             ] {
                 if heq(&c, &c2, hm) {
                     return key_sub_h(&a, &b, ty, depth - 1, hm);
@@ -1421,10 +1412,10 @@ pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
 mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::InstBuilder;
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{AbiParam, Function, Signature, UserFuncName};
-    use cranelift_codegen::ir::InstBuilder;
     use cranelift_codegen::isa::CallConv;
 
     /// `uextend`/`imul`/`iadd`/`select` chains bound; an i64 param fed a
@@ -1469,7 +1460,10 @@ mod tests {
             &[small.into()],
         );
 
-        FuncCursor::new(&mut func).at_bottom(tail).ins().return_(&[r]);
+        FuncCursor::new(&mut func)
+            .at_bottom(tail)
+            .ins()
+            .return_(&[r]);
 
         let f = facts(&func);
         let bnd = bounds(&func, &f);

@@ -11,7 +11,7 @@ use rustc_hash::FxHashSet;
 
 use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
-use crate::{bodied, Syms};
+use crate::{Syms, bodied};
 
 /// Unwind-outs invisible to the attribute scan. The emulated-EH entries
 /// (`llvm.wasm.*`, and `_CxxThrowException`/`_Unwind_Resume`/`_Unwind_RaiseException`

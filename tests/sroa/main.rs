@@ -188,9 +188,7 @@ fn memset_wide(x: u64) -> u64 {
         .iter()
         .map(|&v| (v != 0xA5A5A5A5A5A5A5A5) as u64)
         .sum::<u64>();
-    lanes_bad
-        + ((w.head != 0xA5A5A5A5A5A5A5A5) as u64)
-        + ((w.tail != 0xA5A5A5A5A5A5A5A5) as u64)
+    lanes_bad + ((w.head != 0xA5A5A5A5A5A5A5A5) as u64) + ((w.tail != 0xA5A5A5A5A5A5A5A5) as u64)
 }
 
 fn main() {

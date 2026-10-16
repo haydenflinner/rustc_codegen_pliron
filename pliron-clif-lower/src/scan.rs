@@ -5,21 +5,20 @@
 
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
+use pliron::builtin::attr_interfaces::TypedAttrInterface;
 use pliron::builtin::attributes::{
     FPBFloatAttr, FPDoubleAttr, FPHalfAttr, FPSingleAttr, IntegerAttr,
 };
-use pliron::builtin::attr_interfaces::TypedAttrInterface;
 use pliron::builtin::op_interfaces::{
     CallOpInterface, SingleBlockRegionInterface, SymbolOpInterface,
 };
-use pliron::linked_list::ContainsLinkedList;
 use pliron::builtin::ops::ModuleOp;
+use pliron::builtin::type_interfaces::FunctionTypeInterface;
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed, TypedHandle};
-use rustc_apfloat::Float;
-use pliron::builtin::type_interfaces::FunctionTypeInterface;
 use pliron_llvm::attributes::LinkageAttr;
 use pliron_llvm::op_interfaces::AlignableOpInterface;
 use pliron_llvm::ops::{
@@ -27,6 +26,7 @@ use pliron_llvm::ops::{
     UndefOp,
 };
 use pliron_llvm::types::FuncType;
+use rustc_apfloat::Float;
 
 use crate::context::{ArgExt, CallInfo, ConstVal, Exts, FuncInfo, GlobalInfo, State};
 use crate::types::size_align;
@@ -108,7 +108,10 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
             st.consts
                 .insert(op.deref(ctx).get_result(0), ConstVal::Sym { sym, off: 0 });
         } else if let Some(a) = Operation::get_op::<AllocaOp>(op, ctx) {
-            let ety = TypedAttrInterface::get_type(&*a.get_attr_llvm_alloca_element_type(ctx).unwrap(), ctx);
+            let ety = TypedAttrInterface::get_type(
+                &*a.get_attr_llvm_alloca_element_type(ctx).unwrap(),
+                ctx,
+            );
             let (sz, al) = size_align(ctx, ety);
             let n = match st.consts.get(&op.deref(ctx).get_operand(0)) {
                 Some(ConstVal::Bits(n)) => *n as u64,
@@ -135,7 +138,8 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
             );
         } else if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {
             let n = c.get_attr_llvm_intrinsic_name(ctx).unwrap();
-            st.intrinsics.insert(op, base_intrinsic(&String::from(n.clone())));
+            st.intrinsics
+                .insert(op, base_intrinsic(&String::from(n.clone())));
         } else if let Some(r) = Operation::get_op::<AtomicRmwOp>(op, ctx) {
             st.rmw
                 .insert(op, r.get_attr_llvm_rmw_kind(ctx).unwrap().clone());
@@ -237,7 +241,10 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
                 || g.get_attr_llvm_global_linkage(ctx).is_none();
             let (_, align) = size_align(ctx, ty);
             let init = defined.then(|| {
-                let v = UndefOp::new(ctx, ty).get_operation().deref(ctx).get_result(0);
+                let v = UndefOp::new(ctx, ty)
+                    .get_operation()
+                    .deref(ctx)
+                    .get_result(0);
                 st.consts.insert(v, ConstVal::Zero);
                 v
             });

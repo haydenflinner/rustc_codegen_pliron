@@ -429,7 +429,9 @@ impl<'a> NonNull<'a> {
         memo = None;
         let mut dead: FxHashSet<Value> = FxHashSet::default();
         while let Some(q) = evict.pop() {
-            if pliron_cfg::tracing_on() { tracing::trace!(target: "pliron::jumpthread", "nn evict {q}") };
+            if pliron_cfg::tracing_on() {
+                tracing::trace!(target: "pliron::jumpthread", "nn evict {q}")
+            };
             nn.params.remove(&q);
             dead.insert(q);
             for ci in dependents
@@ -1564,15 +1566,17 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                         .map_inst_values(u, |v| repl_map.get(&v).copied().unwrap_or(v));
                 }
             }
-            if pliron_cfg::tracing_on() { tracing::debug!(
-                target: "pliron::jumpthread",
-                "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
-                in_k.len(),
-                in_x.len(),
-                kargs.len(),
-                xargs_t.len(),
-                xargs_f.len()
-            ) };
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(
+                    target: "pliron::jumpthread",
+                    "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
+                    in_k.len(),
+                    in_x.len(),
+                    kargs.len(),
+                    xargs_t.len(),
+                    xargs_f.len()
+                )
+            };
             // Splice `mid` in and re-point `b`'s brif at it. `blocks[0]`
             // is the cond-true arm: `k_target` when `cond == Equal`.
             let (t_blk, f_blk) = if cond == IntCC::Equal {
@@ -1865,7 +1869,8 @@ pub(crate) fn round<'a>(
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
     let bodyk = crate::pass_enabled("PLIRON_BODYK");
-    let dbg = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -2028,19 +2033,23 @@ pub(crate) fn round<'a>(
                     None => continue,
                 };
                 if dbg {
-                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread",
-                        "jt take {pblock}->{b}->{s_tag} cond={cond} env={env:?} pn={pn:?} kenv={kenv:?} prange={prange:?} taken={taken}",
-                        s_tag = if taken { "T" } else { "F" }
-                    ) };
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::jumpthread",
+                            "jt take {pblock}->{b}->{s_tag} cond={cond} env={env:?} pn={pn:?} kenv={kenv:?} prange={prange:?} taken={taken}",
+                            s_tag = if taken { "T" } else { "F" }
+                        )
+                    };
                     if let Some(di) = func.dfg.value_def(cond).inst() {
                         for v in func.dfg.inst_args(di) {
                             let r = func.dfg.resolve_aliases(*v);
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread",
-                                "  jt arg {r}: loads={} params={} derived={:?}",
-                                nnr.loads.contains(&r),
-                                nnr.params.contains(&r),
-                                nnr.derived.get(&r),
-                            ) };
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::jumpthread",
+                                    "  jt arg {r}: loads={} params={} derived={:?}",
+                                    nnr.loads.contains(&r),
+                                    nnr.params.contains(&r),
+                                    nnr.derived.get(&r),
+                                )
+                            };
                         }
                     }
                 }
@@ -2049,7 +2058,9 @@ pub(crate) fn round<'a>(
                 let s = t.block(&func.dfg.value_lists);
                 if s == b || locked.contains(&s) {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: self/locked") };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: self/locked")
+                        };
                     }
                     continue;
                 }
@@ -2059,7 +2070,9 @@ pub(crate) fn round<'a>(
                     .clone()
                 else {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: region>MAX_WALK") };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: region>MAX_WALK")
+                        };
                     }
                     continue;
                 };
@@ -2125,7 +2138,9 @@ pub(crate) fn round<'a>(
                     }
                     if !okr {
                         if dbg {
-                            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s} from {pblock}: extra edge can't supply exports") };
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s} from {pblock}: extra edge can't supply exports")
+                            };
                         }
                         continue;
                     }
@@ -2146,21 +2161,23 @@ pub(crate) fn round<'a>(
                             .all(|&x| domtree.block_dominates(s, x)))
                 {
                     if dbg {
-                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::jumpthread",
-                            "jt skip {b}->{s} from {pblock}: repair seen={}/{}/{} regseen={} dom={}",
-                            seen.contains(&b),
-                            seen.contains(&s),
-                            seen.contains(&pblock),
-                            reg.iter().any(|x| seen.contains(x)),
-                            reg.iter()
-                                .filter(|x| {
-                                users_l
-                                    .get_or_insert_with(|| users(func))
-                                    .get(&b)
-                                    .is_some_and(|bu| bu.contains(x))
-                            })
-                                .all(|&x| domtree.block_dominates(s, x))
-                        ) };
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread",
+                                "jt skip {b}->{s} from {pblock}: repair seen={}/{}/{} regseen={} dom={}",
+                                seen.contains(&b),
+                                seen.contains(&s),
+                                seen.contains(&pblock),
+                                reg.iter().any(|x| seen.contains(x)),
+                                reg.iter()
+                                    .filter(|x| {
+                                    users_l
+                                        .get_or_insert_with(|| users(func))
+                                        .get(&b)
+                                        .is_some_and(|bu| bu.contains(x))
+                                })
+                                    .all(|&x| domtree.block_dominates(s, x))
+                            )
+                        };
                     }
                     continue;
                 }
@@ -2371,7 +2388,8 @@ pub(crate) fn round<'a>(
 /// Splice `jump`-only successors that have no other predecessor into their
 /// predecessor, so a merge block and its test end up in one block.
 pub fn merge_chains(func: &mut Function) {
-    let prof = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
@@ -2438,13 +2456,15 @@ pub fn merge_chains(func: &mut Function) {
         }
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread",
-            "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
-            t0.elapsed(),
-            t_cfg / 1_000_000,
-            t_alias / 1_000_000,
-            t_move / 1_000_000
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
+                t0.elapsed(),
+                t_cfg / 1_000_000,
+                t_alias / 1_000_000,
+                t_move / 1_000_000
+            )
+        };
     }
 }
 
@@ -2456,7 +2476,8 @@ pub fn merge_chains(func: &mut Function) {
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
 pub fn rebind_exports(func: &mut Function) -> usize {
-    let prof2 = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let prof2 = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
@@ -2464,10 +2485,12 @@ pub fn rebind_exports(func: &mut Function) -> usize {
     // walk instead of re-walking `inst_values` per use.
     let uses = crate::uses::Uses::new(func);
     if prof2 {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread",
-            "    rebind setup {:.3}ms",
-            t0.elapsed().as_secs_f64() * 1e3
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "    rebind setup {:.3}ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            )
+        };
     }
     let t0 = std::time::Instant::now();
     let mut edits = Vec::new();
@@ -2553,11 +2576,13 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         }
     }
     if prof2 {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread",
-            "    rebind scan {:.3}ms (edits={})",
-            t0.elapsed().as_secs_f64() * 1e3,
-            edits.len()
-        ) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "    rebind scan {:.3}ms (edits={})",
+                t0.elapsed().as_secs_f64() * 1e3,
+                edits.len()
+            )
+        };
     }
     let t0 = std::time::Instant::now();
     let n = edits.len();
@@ -2604,7 +2629,9 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         }
     }
     if prof2 {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+        };
     }
     n
 }
@@ -3913,11 +3940,14 @@ pub fn run(
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
-    let prof = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
     let mut tp = std::time::Instant::now();
     merge_chains(func);
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed())
+        };
         tp = std::time::Instant::now();
     }
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
@@ -3977,7 +4007,9 @@ pub fn run(
             check(func, "trivp");
         }
         if prof {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.elapsed()) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.elapsed())
+            };
             tp = std::time::Instant::now();
         }
         if deadp {
@@ -3990,7 +4022,9 @@ pub fn run(
             check(func, "deadp");
         }
         if prof {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.elapsed()) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.elapsed())
+            };
             tp = std::time::Instant::now();
         }
         let dc = if domcond {
@@ -4003,7 +4037,9 @@ pub fn run(
         dominated_folds += dc;
         check(func, "domcond");
         if prof {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.elapsed()) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.elapsed())
+            };
             tp = std::time::Instant::now();
         }
         // Select-diamond if-conversion feeds back: folded forwarders expose
@@ -4031,7 +4067,9 @@ pub fn run(
             cd = None;
         }
         if prof {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.elapsed()) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.elapsed())
+            };
             tp = std::time::Instant::now();
         }
         let mut nn_opt = None;
@@ -4045,7 +4083,9 @@ pub fn run(
         round_quiet = rn == 0;
         check(func, "round");
         if prof {
-            if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.elapsed()) };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.elapsed())
+            };
         }
         if rn > 0 {
             cd = None;
@@ -4061,7 +4101,9 @@ pub fn run(
         }
     }
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.elapsed())
+        };
         tp = std::time::Instant::now();
     }
     let fnn = match fnn_cur {
@@ -4069,7 +4111,9 @@ pub fn run(
         None => fold_null_tests(func, &NonNull::new(func, loads, derived)),
     };
     if prof {
-        if pliron_cfg::tracing_on() { tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.elapsed()) };
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.elapsed())
+        };
     }
     (total + fnn, dead_params, dominated_folds, pmap)
 }

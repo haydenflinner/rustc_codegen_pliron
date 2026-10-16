@@ -195,10 +195,8 @@ fn with_pipe<R>(
             for i in clctx.func.layout.block_insts(b) {
                 let op = clctx.func.dfg.insts[i].opcode();
                 if op.is_call() {
-                    let adj = usize::from(matches!(
-                        op,
-                        Opcode::CallIndirect | Opcode::TryCallIndirect
-                    ));
+                    let adj =
+                        usize::from(matches!(op, Opcode::CallIndirect | Opcode::TryCallIndirect));
                     for k in adj..clctx.func.dfg.inst_args(i).len() {
                         e7.insert((i, (k - adj) as u32));
                     }

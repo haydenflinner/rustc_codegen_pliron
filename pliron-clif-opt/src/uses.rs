@@ -32,12 +32,11 @@ pub fn worklist_dce(func: &mut Function, killable: impl Fn(&Function, Inst) -> b
         .blocks()
         .flat_map(|b| func.layout.block_insts(b))
         .filter(|&i| {
-            func.dfg.inst_results(i).iter().all(|&r| {
-                uses.get(&func.dfg.resolve_aliases(r))
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
-            }) && killable(func, i)
+            func.dfg
+                .inst_results(i)
+                .iter()
+                .all(|&r| uses.get(&func.dfg.resolve_aliases(r)).copied().unwrap_or(0) == 0)
+                && killable(func, i)
         })
         .collect();
     let mut n = 0;
@@ -45,12 +44,11 @@ pub fn worklist_dce(func: &mut Function, killable: impl Fn(&Function, Inst) -> b
         // Skip insts already removed by an earlier wave, and defs pushed
         // when one result died while a sibling result stayed live.
         if func.layout.inst_block(i).is_none()
-            || func.dfg.inst_results(i).iter().any(|&r| {
-                uses.get(&func.dfg.resolve_aliases(r))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-            })
+            || func
+                .dfg
+                .inst_results(i)
+                .iter()
+                .any(|&r| uses.get(&func.dfg.resolve_aliases(r)).copied().unwrap_or(0) > 0)
         {
             continue;
         }
