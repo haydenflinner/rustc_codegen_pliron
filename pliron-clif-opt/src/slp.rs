@@ -732,7 +732,10 @@ fn mem_range(
             offset,
             ..
         } => {
-            let (r, o) = crate::loadfwd::root(func, ps, na, arg);
+            // Normalized root: a `noalias` scope name over a stack_addr
+            // peels to the slot so `may_overlap` can't read a same-slot
+            // `V`/`S` pair as disjoint.
+            let (r, o) = crate::loadfwd::norm_root(func, ps, na, arg);
             let sz = func.dfg.value_type(func.dfg.inst_results(i)[0]).bytes();
             Some((r, o + i64::from(i32::from(offset)), sz))
         }
@@ -742,7 +745,7 @@ fn mem_range(
             offset,
             ..
         } => {
-            let (r, o) = crate::loadfwd::root(func, ps, na, args[1]);
+            let (r, o) = crate::loadfwd::norm_root(func, ps, na, args[1]);
             let sz = func.dfg.value_type(args[0]).bytes();
             Some((r, o + i64::from(i32::from(offset)), sz))
         }

@@ -1702,8 +1702,11 @@ fn plan(
             if streams[li].base == streams[si].base {
                 continue;
             }
-            let (lr, _) = loadfwd::root(func, ps, noalias, streams[li].root_val);
-            let (sr, _) = loadfwd::root(func, ps, noalias, streams[si].root_val);
+            // Normalized roots: a `noalias` scope name over a stack_addr
+            // peels to its slot, so a scoped access and a direct access
+            // of the same local compare equal rather than disjoint.
+            let (lr, _) = loadfwd::norm_root(func, ps, noalias, streams[li].root_val);
+            let (sr, _) = loadfwd::norm_root(func, ps, noalias, streams[si].root_val);
             let na = |r: Root| matches!(r, Root::V(v) if noalias.contains(&v));
             let proven = match (lr, sr) {
                 (Root::S(a), Root::S(b)) => a != b,

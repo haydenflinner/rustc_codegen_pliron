@@ -68,7 +68,11 @@ fn mem_loc(
         }
         _ => return None,
     };
-    let (r, o) = loadfwd::root(func, ps, na, addr);
+    // Loc keys must sit on the normalized root: a `noalias` scope name
+    // peels to its slot so a scope-keyed read still meets slot-keyed
+    // writes (the `dse::mem_loc` invariant — a raw root lets a live
+    // store/read pair key differently).
+    let (r, o) = loadfwd::norm_root(func, ps, na, addr);
     Some((r, o.wrapping_add(i64::from(off)), w))
 }
 
@@ -336,7 +340,7 @@ pub fn run(
                     let BlockArg::Value(a) = args[pi] else {
                         continue 'blocks;
                     };
-                    let (ar, ao) = loadfwd::root(func, &ps, noalias, a);
+                    let (ar, ao) = loadfwd::norm_root(func, &ps, noalias, a);
                     (ar, ao.wrapping_add(lo), w)
                 }
                 _ => (lr, lo, w),

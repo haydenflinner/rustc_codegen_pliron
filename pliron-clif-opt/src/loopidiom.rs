@@ -1462,8 +1462,8 @@ pub fn plan(
         // predicates) — `isolated` itself is stricter than needed here since
         // it also guards load-forwarding, which drops roots whose pointers
         // are offset by dynamic amounts.
-        let (sr, _) = loadfwd::root(func, ps, noalias, sbase);
-        let (dr, _) = loadfwd::root(func, ps, noalias, dbase);
+        let (sr, _) = loadfwd::norm_root(func, ps, noalias, sbase);
+        let (dr, _) = loadfwd::norm_root(func, ps, noalias, dbase);
         let na = |r: Root| matches!(r, Root::V(v) if noalias.contains(&v));
         let proven = match (sr, dr) {
             (Root::S(a), Root::S(b)) => a != b,
@@ -1774,7 +1774,7 @@ fn rmw_locs(
             return None;
         };
         let ty = func.dfg.value_type(func.dfg.first_result(i));
-        let (r, o) = loadfwd::root(func, ps, na, arg);
+        let (r, o) = loadfwd::norm_root(func, ps, na, arg);
         let o = o.wrapping_add(i64::from(i32::from(offset)));
         let e = groups
             .entry((r, o))
@@ -1789,7 +1789,7 @@ fn rmw_locs(
             return None;
         };
         let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-        let (r, o) = loadfwd::root(func, ps, na, args[1]);
+        let (r, o) = loadfwd::norm_root(func, ps, na, args[1]);
         let o = o.wrapping_add(i64::from(i32::from(offset)));
         let e = groups
             .entry((r, o))
