@@ -250,6 +250,13 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     seq_hash(&mut h, p.region_parent.iter());
     seq_hash(&mut h, p.lifetimes.iter());
     seq_hash(&mut h, p.nocap.iter());
+    seq_hash(&mut h, p.prof.iter());
+    // Steps can observe the function's identity: `tailrec` matches
+    // self-calls on `func_id`, `loopidiom` refuses libcall-named `fname`s.
+    // Two stencils may be identical across functions — without these a
+    // hit replays a decision made for a different self.
+    p.fname.hash(&mut h);
+    p.func_id.as_u32().hash(&mut h);
     (
         p.tcfg.default_call_conv,
         p.tcfg.pointer_width,
