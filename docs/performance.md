@@ -438,3 +438,11 @@ VEX-128 forms on for the ops that have `use_avx*` rules).
   chains, and inner loops inside outer loops.
 - Compile time: run `slp` only where vectorizable shapes exist, or add an
   applicability check that skips passes that cannot fire.
+
+### DoD step 5 landed (62eafb7, 2026-10-16)
+
+All op list fields + BasicBlock.args now OpSpan into Context-global
+flat pools (no unsafe, no per-op allocs). regex-syntax wall ~13.8-17.7s
+(box noise ±2s) — flat vs ~15s baseline as predicted: the step is
+structural (dense rows, Sync-readable path), wins compound with the
+per-fn parallelism it unlocks, not standalone.
