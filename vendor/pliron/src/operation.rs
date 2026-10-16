@@ -209,6 +209,43 @@ impl Operation {
         &mut self.attributes
     }
 
+    /// PLIRON: raw result-node slice. Prefer typed helpers for Value-level
+    /// reads; this is the column store's escape hatch (crate-internal).
+    #[inline]
+    pub(crate) fn results_slice(&self) -> &[OpResult] {
+        &self.results
+    }
+
+    /// PLIRON: mutable result-node slice (crate-internal).
+    #[inline]
+    pub(crate) fn results_slice_mut(&mut self) -> &mut [OpResult] {
+        &mut self.results
+    }
+
+    /// PLIRON: raw operand-node slice (crate-internal).
+    #[inline]
+    pub(crate) fn operands_slice(&self) -> &[Operand<Value>] {
+        &self.operands
+    }
+
+    /// PLIRON: mutable operand-node slice (crate-internal).
+    #[inline]
+    pub(crate) fn operands_slice_mut(&mut self) -> &mut [Operand<Value>] {
+        &mut self.operands
+    }
+
+    /// PLIRON: raw successor-node slice (crate-internal).
+    #[inline]
+    pub(crate) fn successors_slice(&self) -> &[Operand<Ptr<BasicBlock>>] {
+        &self.successors
+    }
+
+    /// PLIRON: mutable successor-node slice (crate-internal).
+    #[inline]
+    pub(crate) fn successors_slice_mut(&mut self) -> &mut [Operand<Ptr<BasicBlock>>] {
+        &mut self.successors
+    }
+
     /// Get parent block.
     pub fn get_parent_block(&self) -> Option<Ptr<BasicBlock>> {
         self.block_links.parent_block
@@ -543,6 +580,19 @@ impl Operation {
     /// Get an iterator on the regions.
     pub fn regions(&self) -> impl Iterator<Item = Ptr<Region>> + Clone + '_ {
         self.regions.iter().cloned()
+    }
+
+    /// PLIRON: raw region-id slice (crate-internal store escape hatch).
+    #[inline]
+    pub(crate) fn regions_slice(&self) -> &[Ptr<Region>] {
+        &self.regions
+    }
+
+    /// PLIRON: mutable region store (crate-internal; allows structural
+    /// edits like push/remove that a slice can't).
+    #[inline]
+    pub(crate) fn regions_mut(&mut self) -> &mut SmallVec<[Ptr<Region>; 1]> {
+        &mut self.regions
     }
 
     /// Get [ConcreteOpInfo], useful for creating a [new](Operation::new) operation

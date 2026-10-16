@@ -201,7 +201,7 @@ impl Value {
         match self.defining_entity {
             DefiningEntity::Op(op) => {
                 let op = op.deref(ctx);
-                op.results
+                op.results_slice()
                     .iter()
                     .position(|res| res.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(op.loc(), ValueError::NotInOpResult))
@@ -209,7 +209,7 @@ impl Value {
             DefiningEntity::Block(block) => {
                 let block = block.deref(ctx);
                 block
-                    .args
+                    .args_slice()
                     .iter()
                     .position(|arg| arg.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(block.loc(), ValueError::NotInBlockArgument))
@@ -281,7 +281,7 @@ impl Value {
     pub fn set_type(&self, ctx: &Context, ty: TypeHandle) {
         let index = self.find_index(ctx);
         match self.defining_entity {
-            DefiningEntity::Op(op) => op.deref_mut(ctx).results[index].set_type(ty),
+            DefiningEntity::Op(op) => op.deref_mut(ctx).results_slice_mut()[index].set_type(ty),
             DefiningEntity::Block(block) => block.deref_mut(ctx).args[index].set_type(ty),
         }
     }
@@ -326,7 +326,7 @@ impl Typed for Value {
     fn get_type(&self, ctx: &Context) -> TypeHandle {
         let index = self.find_index(ctx);
         match self.defining_entity {
-            DefiningEntity::Op(op) => op.deref(ctx).results[index].get_type(),
+            DefiningEntity::Op(op) => op.deref(ctx).results_slice()[index].get_type(),
             DefiningEntity::Block(block) => block.deref(ctx).args[index].get_type(),
         }
     }
@@ -363,7 +363,7 @@ impl DefTrait for Value {
         match self.defining_entity {
             DefiningEntity::Op(op) => {
                 let op = op.deref(ctx);
-                Ref::map(op, |opref| &opref.results[index].def)
+                Ref::map(op, |opref| &opref.results_slice()[index].def)
             }
             DefiningEntity::Block(block) => {
                 let block = block.deref(ctx);
@@ -377,7 +377,7 @@ impl DefTrait for Value {
         match self.defining_entity {
             DefiningEntity::Op(op) => {
                 let op = op.deref_mut(ctx);
-                RefMut::map(op, |opref| &mut opref.results[index].def)
+                RefMut::map(op, |opref| &mut opref.results_slice_mut()[index].def)
             }
             DefiningEntity::Block(block) => {
                 let block = block.deref_mut(ctx);
@@ -390,7 +390,7 @@ impl DefTrait for Value {
 impl UseTrait for Value {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
         let op = r#use.user_op.deref(ctx);
-        op.operands
+        op.operands_slice()
             .iter()
             .position(|operand| operand.use_uid == r#use.use_uid)
             .ok_or_else(|| arg_error!(op.loc(), UseError::OperandNotInUserOp))
@@ -398,12 +398,12 @@ impl UseTrait for Value {
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>> {
         let index = <Self as UseTrait>::find(r#use, ctx);
         let op = r#use.user_op.deref(ctx);
-        Ref::map(op, |opref| &opref.operands[index].r#use)
+        Ref::map(op, |opref| &opref.operands_slice()[index].r#use)
     }
     fn get_usenode_mut<'a>(r#use: &Use<Self>, ctx: &'a Context) -> RefMut<'a, UseNode<Value>> {
         let index = <Self as UseTrait>::find(r#use, ctx);
         let op = r#use.user_op.deref_mut(ctx);
-        RefMut::map(op, |opref| &mut opref.operands[index].r#use)
+        RefMut::map(op, |opref| &mut opref.operands_slice_mut()[index].r#use)
     }
 }
 
@@ -546,7 +546,7 @@ impl DefTrait for Ptr<BasicBlock> {
 impl UseTrait for Ptr<BasicBlock> {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
         let op = r#use.user_op.deref(ctx);
-        op.successors
+        op.successors_slice()
             .iter()
             .position(|succ| succ.use_uid == r#use.use_uid)
             .ok_or_else(|| arg_error!(op.loc(), UseError::SuccessorNotInUserOp))
@@ -554,7 +554,7 @@ impl UseTrait for Ptr<BasicBlock> {
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
         let op = r#use.user_op.deref(ctx);
-        Ref::map(op, |opref| &opref.successors[succ_idx].r#use)
+        Ref::map(op, |opref| &opref.successors_slice()[succ_idx].r#use)
     }
     fn get_usenode_mut<'a>(
         r#use: &Use<Ptr<BasicBlock>>,
@@ -562,7 +562,7 @@ impl UseTrait for Ptr<BasicBlock> {
     ) -> RefMut<'a, UseNode<Ptr<BasicBlock>>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
         let op = r#use.user_op.deref_mut(ctx);
-        RefMut::map(op, |opref| &mut opref.successors[succ_idx].r#use)
+        RefMut::map(op, |opref| &mut opref.successors_slice_mut()[succ_idx].r#use)
     }
 }
 

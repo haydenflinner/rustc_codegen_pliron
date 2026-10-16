@@ -165,6 +165,18 @@ impl BasicBlock {
         &mut self.attributes
     }
 
+    /// PLIRON: raw block-argument slice (crate-internal store escape hatch).
+    #[inline]
+    pub(crate) fn args_slice(&self) -> &[BlockArgument] {
+        &self.args
+    }
+
+    /// PLIRON: mutable arg store (crate-internal).
+    #[inline]
+    pub(crate) fn args_mut(&mut self) -> &mut Vec<BlockArgument> {
+        &mut self.args
+    }
+
     /// Set the block's label.
     /// This corresponds to the [given_name](Named::given_name) of this block.
     pub fn set_label(&mut self, label: Option<Identifier>) {
@@ -548,7 +560,7 @@ impl Parsable for BasicBlock {
         }
 
         for (arg_idx, (arg_loc, name)) in arg_names.into_iter().enumerate() {
-            let def: Value = block.deref(state_stream.state.ctx).args[arg_idx].as_value(block);
+            let def: Value = block.deref(state_stream.state.ctx).args_slice()[arg_idx].as_value(block);
             state_stream.state.name_tracker.ssa_def(
                 state_stream.state.ctx,
                 &(name.clone(), arg_loc),
