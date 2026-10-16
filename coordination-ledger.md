@@ -1526,3 +1526,15 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
 - Next measured targets: slp 1.4-1.8s (slp::build_uses ~1k samples,
   SmallVec<Inst> allocs), clifpeep webmerge_ctx ~1.2k samples,
   inline+scan ~2.6s iropt, emit-side cfg/domtree rebuilds.
+
+## 2026-10-15 inline/sroa allocs + scan-once (devin session 761f9fa8, cont.)
+- `9a25edb`: `direct_callee` now borrows the `llvm.call.callee` attr —
+  `CallOp::callee()` clones it into an owned Identifier and the lookup
+  did `id.to_string()`, two String allocs per call op per rescan round
+  (also hit by Adj::build, call_counts's dead_fns loop, post_order).
+- The caller rescan fixpoint now tracks `done_blocks`: `inline_call`
+  only ever creates NEW blocks (split continuation, cloned callee body),
+  so an already-scanned block can't gain a CallOp — later rounds walk
+  only spliced blocks instead of the whole (growing) caller.
+- Same alloc pattern fixed in sroa (3 callee() calls per op).
+- bench: inline+scan ~2.6s -> ~1.4s.
