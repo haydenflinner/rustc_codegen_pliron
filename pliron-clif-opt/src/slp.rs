@@ -32,12 +32,35 @@ use cranelift_codegen::ir::{
     ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 
-/// `v.index() -> insts that use v` (alias-resolved at build). Dense: the
-/// map is rebuilt after every xpack apply, so per-value hashing/set
-/// allocation dominated pass time as a `FxHashMap<Value, FxHashSet>`.
-type Uses = Vec<SmallVec<[Inst; 4]>>;
+/// `v.index() -> insts that use v` (alias-resolved at build), CSR
+/// layout: `vec![SmallVec; num_values]` paid ~40B/value of init plus a
+/// spill alloc for every >4-use value; two passes (count, fill) build
+/// offsets + one flat array instead. Applied packs tombstone their
+/// removed insts into `dead` rather than shifting `flat`, so `off`
+/// stays valid.
+struct Uses {
+    off: Vec<u32>,
+    flat: Vec<Inst>,
+    dead: FxHashSet<Inst>,
+}
+
+impl Uses {
+    /// Insts using `v`, in layout order, minus tombstoned members.
+    fn iter(&self, v: usize) -> impl Iterator<Item = Inst> + '_ {
+        let flat: &[Inst] = if v + 1 < self.off.len() {
+            &self.flat[self.off[v] as usize..self.off[v + 1] as usize]
+        } else {
+            &[]
+        };
+        flat.iter().copied().filter(|u| !self.dead.contains(u))
+    }
+
+    /// Drop `i` from every use list that holds it.
+    fn remove(&mut self, i: Inst) {
+        self.dead.insert(i);
+    }
+}
 
 /// Max recursion depth when packing operand trees.
 const MAX_DEPTH: usize = 6;
@@ -438,15 +461,34 @@ struct StoreInfo {
 /// only keep a scalar lane def alive longer than needed, never corrupt
 /// the plan (lane defs stay unless `remove_dead_insts` proves them dead).
 fn build_uses(func: &Function) -> Uses {
-    let mut uses: Uses = vec![SmallVec::new(); func.dfg.num_values()];
+    let n = func.dfg.num_values();
+    let mut off = vec![0u32; n + 1];
     for b2 in func.layout.blocks() {
         for i in func.layout.block_insts(b2) {
             for v in func.dfg.inst_values(i) {
-                uses[func.dfg.resolve_aliases(v).index()].push(i);
+                off[func.dfg.resolve_aliases(v).index() + 1] += 1;
             }
         }
     }
-    uses
+    for i in 1..=n {
+        off[i] += off[i - 1];
+    }
+    let mut flat = vec![Inst::new(0); off[n] as usize];
+    let mut cur = off.clone();
+    for b2 in func.layout.blocks() {
+        for i in func.layout.block_insts(b2) {
+            for v in func.dfg.inst_values(i) {
+                let slot = &mut cur[func.dfg.resolve_aliases(v).index()];
+                flat[*slot as usize] = i;
+                *slot += 1;
+            }
+        }
+    }
+    Uses {
+        off,
+        flat,
+        dead: FxHashSet::default(),
+    }
 }
 
 fn try_block(
@@ -560,14 +602,7 @@ fn try_block(
                         for s in &run {
                             // Drop the removed store's use entries so the
                             // map stays fresh for later blocks.
-                            for v in cur.func.dfg.inst_values(s.inst) {
-                                let v = cur.func.dfg.resolve_aliases(v);
-                                if let Some(us) =
-                                    uses.as_mut().unwrap().get_mut(v.index())
-                                {
-                                    us.retain(|u| *u != s.inst);
-                                }
-                            }
+                            uses.as_mut().unwrap().remove(s.inst);
                             cur.func.layout.remove_inst(s.inst);
                             cur.func.dfg.clear_results(s.inst);
                         }
@@ -602,8 +637,8 @@ impl Ctx<'_> {
         for &v in &vals {
             if !self
                 .uses
-                .get(v.index())
-                .is_some_and(|us| us.iter().all(|u| self.members.contains(u)))
+                .iter(v.index())
+                .all(|u| self.members.contains(&u))
             {
                 return None;
             }
@@ -1499,15 +1534,13 @@ fn finish_plan(
             }
             let v = func.dfg.inst_results(l)[0];
             let mut need = false;
-            if let Some(us) = uses.get(ra_fix(func, v).index()) {
-                for &u in us {
-                    if x.members.contains(&u) {
-                        continue;
-                    }
-                    need = true;
-                    if !ext_ok(&x, u) {
-                        work.push(u);
-                    }
+            for u in uses.iter(ra_fix(func, v).index()) {
+                if x.members.contains(&u) {
+                    continue;
+                }
+                need = true;
+                if !ext_ok(&x, u) {
+                    work.push(u);
                 }
             }
             if need {
@@ -1535,11 +1568,9 @@ fn finish_plan(
                 sink.push(u);
                 for &ru in func.dfg.inst_results(u) {
                     let ru = ra_fix(func, ru);
-                    if let Some(us) = uses.get(ru.index()) {
-                        for &u2 in us {
-                            if !x.members.contains(&u2) && !ext_ok(&x, u2) {
-                                work.push(u2);
-                            }
+                    for u2 in uses.iter(ru.index()) {
+                        if !x.members.contains(&u2) && !ext_ok(&x, u2) {
+                            work.push(u2);
                         }
                     }
                 }
