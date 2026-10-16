@@ -2452,6 +2452,26 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             usize,
             (FxHashMap<u64, Vec<usize>>, Vec<FxHashSet<u64>>, Vec<usize>),
         > = FxHashMap::default();
+        // Phase D's diff-seeded probes only pay on loop headers (a
+        // deferring edge must reach back into the head's dominance
+        // region). Loop-invariant — once per block, not per slot.
+        let is_header = !no_phased
+            && es.iter().any(|&(i, _)| {
+                func.layout
+                    .inst_block(i)
+                    .is_some_and(|eb| dom.dominates(b, eb, &func.layout))
+            });
+        // Shared `diff_b` probe budget for the block's phase-D oracle,
+        // dealt out per slot. `diff_b` chases cost tens of µs each and
+        // a slot scans O(slots) siblings for a mate, so a flat
+        // per-slot cap is still O(slots² × chase) — ~90k chases and
+        // seconds per webmerge round on ~1000-param headers (regex's
+        // `c_bounded` dispatch join). Sharing a fixed block budget
+        // keeps small headers at the original 96 probes while wide
+        // ones degrade evenly to a few probes per slot; an exhausted
+        // budget only means "unproven" (no merge), never a wrong merge.
+        const DIFF_B_BLOCK_FUEL: usize = 4096;
+        let dfuel_cap = (DIFF_B_BLOCK_FUEL / ps.len().max(1)).clamp(2, 96) as i32;
         let tblk = std::time::Instant::now();
         let dkeys = tblk - tkeys;
         nblk += 1;
@@ -2667,12 +2687,9 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             // The diff-seeded path only pays on loop headers — a
             // deferring edge must reach back into the head's dominance
             // region anyway — and the `O(slots × edges)` oracle probes
-            // are too hot to run on every non-loop block.
-            let is_header = es.iter().any(|&(i, _)| {
-                func.layout
-                    .inst_block(i)
-                    .is_some_and(|eb| dom.dominates(b, eb, &func.layout))
-            });
+            // are too hot to run on every non-loop block. `is_header`
+            // is loop-invariant; computing it per slot was an
+            // `O(slots × edges)` dom-query tax on wide headers.
             if !rels
                 .iter()
                 .any(|(r, pr)| (0..es.len()).all(|e| defers(e, r, khash(r), pr)))
@@ -2691,13 +2708,10 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 // `oracle(e, kj, i)` is tri-state: `Some(Some(r))` proves
                 // edge `e` supplies `r`; `Some(None)` is a deferring step
                 // (`defers` re-verifies structurally); `None` means slot
-                // `i` can't explain edge `e` at all.
-                // Per-target budget for the `diff_b` chase: a 600-slot
-                // header otherwise pays O(slots² × chase) — most
-                // viable mates sit early in the candidate order, and
-                // an exhausted budget only means "unproven" (no merge),
-                // never a wrong merge.
-                let dfuel = std::cell::Cell::<i32>::new(96);
+                // `i` can't explain edge `e` at all. `dfuel_cap` is the
+                // slot's share of the block's `diff_b` budget — most
+                // viable mates sit early in the candidate order.
+                let dfuel = std::cell::Cell::<i32>::new(dfuel_cap);
                 let oracle = |e: usize, kj: &Key, i: usize| -> Option<Option<Key>> {
                     // `key_sub`'s algebraic probes each pay a structural
                     // `==` — on 10⁴-node expression keys that's the
