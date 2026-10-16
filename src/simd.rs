@@ -1191,7 +1191,71 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
-            "llvm.x86.sse.max.ps"
+                        "llvm.x86.sha256rnds2" | "llvm.x86.sha256msg1" | "llvm.x86.sha256msg2" => {
+                // SHA-NI ops in plain i32 IR (lane i is element i).
+                // σ0(x)=ror7^ror18^shr3, σ1(x)=ror17^ror19^shr10,
+                // Σ0(x)=ror2^ror13^ror22, Σ1(x)=ror6^ror11^ror25.
+                let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
+                if name == "llvm.x86.sha256rnds2" {
+                    // Two rounds of SHA-256; arg2 lanes 0/1 carry W+K.
+                    // arg0 supplies the (C,D,G,H) state, arg1 the (A,B,E,F).
+                    let ks = self.arg_lanes(&args[2]);
+                    let (mut a, mut b, mut c, mut d) = (ys[3], ys[2], xs[3], xs[2]);
+                    let (mut e, mut f, mut g, mut h) = (ys[1], ys[0], xs[1], xs[0]);
+                    for i in 0..2 {
+                        let bs1 = sha_ror_sum(self, e, &[6, 11, 25]);
+                        let ef = self.and(e, f);
+                        let ne = self.not(e);
+                        let neg = self.and(ne, g);
+                        let ch = self.xor(ef, neg);
+                        let bs0 = sha_ror_sum(self, a, &[2, 13, 22]);
+                        let ab = self.and(a, b);
+                        let ac = self.and(a, c);
+                        let bc = self.and(b, c);
+                        let abac = self.xor(ab, ac);
+                        let maj = self.xor(abac, bc);
+                        let hbs1 = self.add(h, bs1);
+                        let chk = self.add(ch, ks[i]);
+                        let t1 = self.add(hbs1, chk);
+                        let t2 = self.add(bs0, maj);
+                        h = g;
+                        g = f;
+                        f = e;
+                        e = self.add(t1, d);
+                        d = c;
+                        c = b;
+                        b = a;
+                        a = self.add(t1, t2);
+                    }
+                    Some(self.build_vec(ret, vec![f, e, b, a]))
+                } else if name == "llvm.x86.sha256msg1" {
+                    // lane i: W_i += σ0(W_{i+1}); top lane adds σ0(src top).
+                    let s = sha_sigma(self, ys[0], 7, 18, 3);
+                    let l3 = self.add(xs[3], s);
+                    let s = sha_sigma(self, xs[3], 7, 18, 3);
+                    let l2 = self.add(xs[2], s);
+                    let s = sha_sigma(self, xs[2], 7, 18, 3);
+                    let l1 = self.add(xs[1], s);
+                    let s = sha_sigma(self, xs[1], 7, 18, 3);
+                    let l0 = self.add(xs[0], s);
+                    Some(self.build_vec(ret, vec![l0, l1, l2, l3]))
+                } else {
+                    // msg2: σ1 of the running top word; right-to-left, using
+                    // updated values. σ1(x)=ror17^ror19^shr10.
+                    // W16=x0+σ1(src W14), W17=x1+σ1(src W15),
+                    // W18=x2+σ1(W16), W19=x3+σ1(W17).
+                    let s = sha_sigma(self, ys[2], 17, 19, 10);
+                    let l0 = self.add(xs[0], s);
+                    let s = sha_sigma(self, ys[3], 17, 19, 10);
+                    let l1 = self.add(xs[1], s);
+                    let s = sha_sigma(self, l0, 17, 19, 10);
+                    let l2 = self.add(xs[2], s);
+                    let s = sha_sigma(self, l1, 17, 19, 10);
+                    let l3 = self.add(xs[3], s);
+                    Some(self.build_vec(ret, vec![l0, l1, l2, l3]))
+                }
+            }
+"llvm.x86.sse.max.ps"
             | "llvm.x86.sse2.max.pd"
             | "llvm.x86.avx.max.ps.256"
             | "llvm.x86.avx.max.pd.256"
@@ -1311,3 +1375,29 @@ const X86_CMP: [rustc_codegen_ssa::common::RealPredicate; 16] = {
         RealPredicateTrue,
     ]
 };
+
+/// ror(x, n) composed from shifts for the SHA-256 intrinsic emulation.
+fn sha_ror(b: &mut Builder<'_, '_>, x: Value, n: u32) -> Value {
+    let lo = b.lshr(x, b.const_u32(n));
+    let hi = b.shl(x, b.const_u32(32 - n));
+    b.or(lo, hi)
+}
+
+/// xor of rotates — the Σ0/Σ1 round-function sums.
+fn sha_ror_sum(b: &mut Builder<'_, '_>, x: Value, ns: &[u32]) -> Value {
+    let mut acc = sha_ror(b, x, ns[0]);
+    for &n in &ns[1..] {
+        let r = sha_ror(b, x, n);
+        acc = b.xor(acc, r);
+    }
+    acc
+}
+
+/// xor of two rotates and a logical shift — the σ0/σ1 message sums.
+fn sha_sigma(b: &mut Builder<'_, '_>, x: Value, r1: u32, r2: u32, s: u32) -> Value {
+    let a = sha_ror(b, x, r1);
+    let c = sha_ror(b, x, r2);
+    let d = b.lshr(x, b.const_u32(s));
+    let ac = b.xor(a, c);
+    b.xor(ac, d)
+}
