@@ -796,6 +796,9 @@ struct X<'a> {
     keep: FxHashSet<Inst>,
     /// Identical columns `(a, b)` already packed, mapped to their `Op` row.
     colmap: FxHashMap<(Value, Value), usize>,
+    /// `PLIRON_XPACK_DEBUG` — hoisted out of the `col` recursion where
+    /// the env lookup was re-taken per node.
+    dbg: bool,
 }
 
 impl X<'_> {
@@ -918,14 +921,14 @@ impl X<'_> {
             {
                 return Some(Pack::Vec(va));
             }
-            if crate::env_set("PLIRON_XPACK_DEBUG") {
+            if self.dbg {
                 eprintln!(
                     "    xpack novec d{depth}: {a:?}/{b:?} va={va:?} vb={vb:?} samev={} avail={}",
                     va == vb,
                     self.avail(va)
                 );
             }
-        } else if crate::env_set("PLIRON_XPACK_DEBUG") && (la.is_some() || lb.is_some()) {
+        } else if self.dbg && (la.is_some() || lb.is_some()) {
             eprintln!("    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
         }
         // A column may legitimately need a member's scalar result (e.g. the
@@ -989,7 +992,7 @@ impl X<'_> {
         }
         // Isomorphic ops: pack recursively. A failed attempt rolls back the
         // rows/members it pushed, then the column falls back to a gather.
-        let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
+        let dbg = self.dbg;
         if dbg
             && depth <= 6
             && let (da, db) = (self.def(a), self.def(b))
@@ -1328,6 +1331,7 @@ fn plan_pair(
         pruned: FxHashSet::default(),
         keep: FxHashSet::default(),
         colmap: FxHashMap::default(),
+        dbg: crate::env_set("PLIRON_XPACK_DEBUG"),
     };
     x.members.insert(ia);
     x.members.insert(ib);
@@ -1747,6 +1751,7 @@ fn plan_store(
         pruned: FxHashSet::default(),
         keep: FxHashSet::default(),
         colmap: FxHashMap::default(),
+        dbg: crate::env_set("PLIRON_XPACK_DEBUG"),
     };
     x.members.insert(sa);
     x.members.insert(sb);

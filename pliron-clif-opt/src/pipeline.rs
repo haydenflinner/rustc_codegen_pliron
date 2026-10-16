@@ -1047,8 +1047,10 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // touched. Later dispatch-dup edges decided by constants (the
     // block388 -> block935 disc) need follow-up rounds.
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
+    // NonNull builds lazily inside `round` on the first candidate edge;
+    // a round that threads nothing never pays for the fixpoint.
+    let mut nn: Option<jumpthread::NonNull> = None;
     for i in 0..8 {
-        let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
         let n = {
             let (c, d) = cd.get_or_insert_with(|| {
                 let c = ControlFlowGraph::with_function(&p.clctx.func);
@@ -1057,7 +1059,9 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
             });
             jumpthread::round(
                 &mut p.clctx.func,
-                &nn,
+                p.nonnull,
+                p.derived,
+                &mut nn,
                 crate::pass_enabled("PLIRON_DOMCOND"),
                 c,
                 d,
@@ -1065,6 +1069,7 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
         };
         if n > 0 {
             cd = None;
+            nn = None;
         }
         total += n;
         if p.dump {

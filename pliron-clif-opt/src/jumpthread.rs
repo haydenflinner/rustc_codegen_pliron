@@ -1846,19 +1846,19 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
-pub(crate) fn round(
+pub(crate) fn round<'a>(
     func: &mut Function,
-    nn: &NonNull,
+    loads: &'a FxHashSet<Value>,
+    derived: &'a FxHashMap<Value, Value>,
+    nn: &mut Option<NonNull<'a>>,
     domcond: bool,
     cfg: &ControlFlowGraph,
     domtree: &DominatorTree,
 ) -> usize {
-    let users = users(func);
-    let facts = if domcond {
-        edge_facts(func, &cfg)
-    } else {
-        FxHashMap::default()
-    };
+    // Both whole-function indexes are consulted only once a candidate
+    // edge actually threads — lazy so a no-work round is a linear scan.
+    let mut users_l: Option<FxHashMap<Block, FxHashSet<Block>>> = None;
+    let mut facts_l: Option<FxHashMap<Block, Cmp>> = None;
     let entry = func.layout.entry_block();
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
@@ -1926,8 +1926,7 @@ pub(crate) fn round(
             continue;
         };
         let params = func.dfg.block_params(b).to_vec();
-        let body_vals: FxHashSet<Value> = body.iter().map(|&i| func.dfg.first_result(i)).collect();
-        let b_users = users.get(&b);
+        let mut body_vals_l: Option<FxHashSet<Value>> = None;
         for pred in cfg.pred_iter(b) {
             let (pinst, pblock) = (pred.inst, pred.block);
             if pblock == b || touched.contains(&pinst) || locked.contains(&pblock) {
@@ -1947,6 +1946,10 @@ pub(crate) fn round(
                 if args.len() != params.len() {
                     continue;
                 }
+                // A real candidate edge — the first one per round builds
+                // the NonNull fixpoint; blocks failing the gates above
+                // never reach it.
+                let nnr = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
                 env.clear();
                 argv.clear();
                 pn.clear();
@@ -1960,7 +1963,7 @@ pub(crate) fn round(
                     argv.insert(p, v);
                     if let Some(c) = known(func, &env, v) {
                         env.insert(p, c);
-                    } else if nn.is(func, v) {
+                    } else if nnr.is(func, v) {
                         pn.insert(p);
                     }
                 }
@@ -1982,13 +1985,23 @@ pub(crate) fn round(
                 }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
-                    nn.is(func, v) || pn.contains(&v)
+                    nnr.is(func, v) || pn.contains(&v)
                 };
                 // Ranges of the incoming args implied by branches dominating the pred.
                 prange.clear();
-                let fs = fact_memo
-                    .entry(pblock)
-                    .or_insert_with(|| facts_at(&domtree, &facts, pblock));
+                let fs = fact_memo.entry(pblock).or_insert_with(|| {
+                    facts_at(
+                        &domtree,
+                        facts_l.get_or_insert_with(|| {
+                            if domcond {
+                                edge_facts(func, cfg)
+                            } else {
+                                FxHashMap::default()
+                            }
+                        }),
+                        pblock,
+                    )
+                });
                 if !fs.is_empty() {
                     for (&p, &v) in &argv {
                         if !env.contains_key(&p)
@@ -2022,9 +2035,9 @@ pub(crate) fn round(
                             let r = func.dfg.resolve_aliases(*v);
                             eprintln!(
                                 "  jt arg {r}: loads={} params={} derived={:?}",
-                                nn.loads.contains(&r),
-                                nn.params.contains(&r),
-                                nn.derived.get(&r),
+                                nnr.loads.contains(&r),
+                                nnr.params.contains(&r),
+                                nnr.derived.get(&r),
                             );
                         }
                     }
@@ -2050,7 +2063,7 @@ pub(crate) fn round(
                 };
                 // B's values used from `s` on (resolved), in first-use order.
                 let mut needed: Vec<Value> = Vec::new();
-                if let Some(bu) = b_users
+                if let Some(bu) = users_l.get_or_insert_with(|| users(func)).get(&b)
                     && reg.iter().any(|x| bu.contains(x))
                 {
                     for &x in &reg {
@@ -2124,7 +2137,12 @@ pub(crate) fn round(
                         || reg.iter().any(|x| seen.contains(x))
                         || !reg
                             .iter()
-                            .filter(|x| b_users.is_some_and(|bu| bu.contains(x)))
+                            .filter(|x| {
+                                users_l
+                                    .get_or_insert_with(|| users(func))
+                                    .get(&b)
+                                    .is_some_and(|bu| bu.contains(x))
+                            })
                             .all(|&x| domtree.block_dominates(s, x)))
                 {
                     if dbg {
@@ -2135,13 +2153,21 @@ pub(crate) fn round(
                             seen.contains(&pblock),
                             reg.iter().any(|x| seen.contains(x)),
                             reg.iter()
-                                .filter(|x| b_users.is_some_and(|bu| bu.contains(x)))
+                                .filter(|x| {
+                                users_l
+                                    .get_or_insert_with(|| users(func))
+                                    .get(&b)
+                                    .is_some_and(|bu| bu.contains(x))
+                            })
                                 .all(|&x| domtree.block_dominates(s, x))
                         );
                     }
                     continue;
                 }
                 let mut new = Vec::new();
+                let body_vals = body_vals_l.get_or_insert_with(|| {
+                    body.iter().map(|&i| func.dfg.first_result(i)).collect()
+                });
                 for a in t.args(&func.dfg.value_lists) {
                     let BlockArg::Value(v) = a else {
                         ok = false;
@@ -3936,11 +3962,12 @@ pub fn run(
         let d = DominatorTree::with_function(func, &c);
         (c, d)
     };
-    // When the loop converges (`n == 0`), the `nn` built that iteration is
-    // still exact — nothing after it rewrote the function — so run
-    // `fold_null_tests` on it inside the loop instead of rebuilding. The
-    // usize result crosses the loop boundary; `nn`'s borrow may not (older
-    // bootstrap rustc NLL rejects it).
+    // `round` builds NonNull lazily on the first real candidate edge — a
+    // quiet round never pays for the fixpoint. `derived` mutates across
+    // iterations (ifconv), so the Option is per-iteration; when the loop
+    // converges (`n == 0`) nothing after its construction rewrote the
+    // function, so `fold_null_tests` runs on it inside the loop and the
+    // usize result crosses the boundary while `nn`'s borrow may not.
     let mut fnn_cur: Option<usize> = None;
     for _ in 0..8 {
         let mut tp = std::time::Instant::now();
@@ -4005,11 +4032,10 @@ pub fn run(
             eprintln!("  ifconv+bypass {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
-        // Rebuild after `ifconv` so cloned `inbounds` offsets are seen.
-        let nn = NonNull::new(func, loads, derived);
+        let mut nn_opt = None;
         let rn = {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
-            round(func, &nn, domcond, c, d)
+            round(func, loads, derived, &mut nn_opt, domcond, c, d)
         };
         check(func, "round");
         if prof {
@@ -4021,7 +4047,10 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            fnn_cur = Some(fold_null_tests(func, &nn));
+            fnn_cur = Some(fold_null_tests(
+                func,
+                &nn_opt.unwrap_or_else(|| NonNull::new(func, loads, derived)),
+            ));
             break;
         }
     }
