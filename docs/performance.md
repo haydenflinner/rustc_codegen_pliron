@@ -35,10 +35,10 @@ fallback there.
 | chars_ascii | 1.540 ms | 0.998 ms | −35.2% improved |
 | chars_mixed | 11.09 ms | 11.26 ms | +1.5% (noise) |
 | contains_rng | 1.556 ms | 1.512 ms | −2.8% improved |
-| eqbug | 78.3 µs | 95.9 µs | +22.3% regressed |
+| eqbug | 113.0 µs | 121.5 µs | +7.7% regressed |
 | fib | 10.09 ms | 9.242 ms | −8.4% improved |
 | hashmap | 53.73 ms | 46.45 ms | −13.6% improved |
-| hmget | 9.088 ms | 9.297 ms | +2.3% regressed |
+| hmget | 12.80 ms | 13.27 ms | +3.7% regressed |
 | iterw | 13.77 ms | 11.57 ms | −16.0% improved |
 | matmul | 5.967 ms | 6.075 ms | +1.8% regressed |
 | nbody | 79.86 ms | 83.94 ms | +5.1% regressed |
@@ -53,10 +53,14 @@ it): about 8% faster than LLVM on this set. Eight kernels are faster, five
 are slower, and the rest are at parity or within noise.
 
 `eqbug` is a narrow-icmp stress kernel kept as a regression guard. Its
-inner loop calls `black_box` three times per element — the residual +22%
-is real codegen gap in the kernel itself, not barrier overhead: the
-`black_box` op emits no machine code (each barrier only forces the value
-into a register, exactly like LLVM's `r` constraint).
+inner loop calls `black_box` three times per element. The residual +8%
+decomposes into two pieces: LLVM chooses the `*m` asm alternative for
+the narrow barriers, so `sturb`/`ldrb`/`strh`/`ldrh` pairs both run on
+otherwise-idle LSU ports and truncate the narrow values for free (we
+pay a standalone `uxtb`/`uxth` per barrier — a stack round-trip variant
+was measured and loses: the store→load forwarding latency outweighs the
+ALU saving), and a few loop-invariant constants get rematerialised per
+iteration under register pressure where LLVM keeps them in registers.
 
 ## Where pliron wins
 
@@ -72,10 +76,9 @@ into a register, exactly like LLVM's `r` constraint).
 
 ## Where LLVM wins
 
-- `eqbug` (+22%) and `parse_only` (+12%): the two per-iteration
-  `black_box` kernels. The barrier itself emits zero instructions — the
-  residual is the `~{memory}` clobber (loads can't forward across it) plus
-  surrounding codegen, same semantics LLVM applies.
+- `eqbug` (+8%) and `parse_only` (+12%): the two per-iteration
+  `black_box` kernels — see the eqbug note above for what the residual
+  is made of.
 - `sieve` (+7.8%), `nbody` (+5.1%): sieve's u128 multiply/divide chain
   stays slow-side (was +10.4% last run, worth a bisect); nbody's flip from
   −16.9% to +5.1% needs investigation — it moved far more than noise
