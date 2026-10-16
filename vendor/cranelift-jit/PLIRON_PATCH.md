@@ -7,7 +7,8 @@
 - `perform_relocations`: an out-of-range `X86CallPCRel4` no longer panics
   (`i32::try_from` overflow); the call is retargeted to a veneer appended
   after the code: `ff 25 00 00 00 00` (`jmp qword ptr [rip+0]`) + 8-byte
-  absolute target. `X86PCRel4` (data refs) still panics — a veneer can't
+  absolute target. The retargeted rel32 counts from the field end
+  (`veneer - at - 4`). `X86PCRel4` (data refs) still panics — a veneer can't
   reproduce the target's address for `lea`.
 
 Motivation: JIT modules on Windows resolve imports (ucrtbase.dll, the host

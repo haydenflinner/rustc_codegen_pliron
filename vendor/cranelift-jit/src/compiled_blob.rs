@@ -159,8 +159,10 @@ impl CompiledBlob {
                                 write_unaligned(veneer.byte_add(2).cast::<u32>(), 0);
                                 write_unaligned(veneer.byte_add(6).cast::<u64>(), what as u64);
                             }
+                            // `at` is the rel32 field; the displacement is
+                            // measured from the following instruction.
                             let pcrel =
-                                i32::try_from((veneer as isize) - (at as isize)).unwrap();
+                                i32::try_from((veneer as isize) - (at as isize) - 4).unwrap();
                             unsafe { write_unaligned(at as *mut i32, pcrel) };
                         }
                     }
