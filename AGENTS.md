@@ -110,7 +110,9 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   instructions while it still prints `MISMATCH`, then add it as a test.
 - `harness/bisect.py -- <cmd>` binary-searches `PLIRON_OPT_BISECT` for the
   first bad step application when a program misbehaves at run time, and
-  prints the step and function it touched.
+  prints the step and function it touched. `PLIRON_OPT_BISECT` unit
+  numbers race across parallel codegen units, so the reported step/fn is
+  only deterministic with `-C codegen-units=1` — always bisect under it.
 - `cranelift-interpreter` is vendored with small fixes; see
   `vendor/cranelift-interpreter/PLIRON_PATCH.md`.
 
