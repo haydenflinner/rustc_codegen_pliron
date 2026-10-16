@@ -907,20 +907,26 @@ pub fn lower_module(
         }
         jobs
     } else {
+        // Compile longest-first (LPT): a CGU's pipeline wall is bound by
+        // its slowest function, and an arbitrary order can leave the one
+        // 10s fn for last while the pool drains 100ms fns.
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_unstable_by_key(|&i| std::cmp::Reverse(jobs[i].func.dfg.num_insts()));
         let jobs: Vec<std::sync::Mutex<FnJob>> =
             jobs.into_iter().map(std::sync::Mutex::new).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let shared = &shared;
+        let order = &order;
         std::thread::scope(|s| {
             for _ in 0..nthreads {
                 s.spawn(|| {
                     let mut wcl = cranelift_codegen::Context::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= jobs.len() {
+                        if i >= order.len() {
                             break;
                         }
-                        let mut j = jobs[i].lock().unwrap_or_else(|e| e.into_inner());
+                        let mut j = jobs[order[i]].lock().unwrap_or_else(|e| e.into_inner());
                         run_job(&mut j, &mut wcl, shared);
                     }
                 });
