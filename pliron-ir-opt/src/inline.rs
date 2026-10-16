@@ -136,6 +136,8 @@ fn callee_info(
 ) -> Option<CInfo> {
     let f = &st.funcs[sym];
     if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
+        tracing::debug!(target: "pliron::inline", "callee {sym}: no_inline={} linkage={:?} has_body={}",
+            f.no_inline, f.linkage, has_body(ctx, f.op));
         return None;
     }
     let (mut n, mut ncalls, mut eh) = (0, 0, false);

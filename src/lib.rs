@@ -1604,7 +1604,6 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let mono_items = cgu.items_in_deterministic_order(tcx);
     let extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
-        && !tcx.sess.target.is_like_wasm
         && !crate::env_set("PLIRON_HOT")
     {
         xcgu::copies(tcx, cgu)
