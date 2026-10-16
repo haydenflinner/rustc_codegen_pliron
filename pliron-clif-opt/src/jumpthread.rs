@@ -3936,6 +3936,10 @@ pub fn run(
         let d = DominatorTree::with_function(func, &c);
         (c, d)
     };
+    // When the loop converges (`n == 0`), the `nn` built that iteration is
+    // still exact — nothing after it rewrote the function — so carry it out
+    // for `fold_null_tests` instead of rebuilding.
+    let mut nn_cur: Option<NonNull> = None;
     for _ in 0..8 {
         let mut tp = std::time::Instant::now();
         if trivp {
@@ -4015,6 +4019,7 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
+            nn_cur = Some(nn);
             break;
         }
     }
@@ -4022,7 +4027,7 @@ pub fn run(
         eprintln!("  loop-total {:?}", tp.elapsed());
         tp = std::time::Instant::now();
     }
-    let nn = NonNull::new(func, loads, derived);
+    let nn = nn_cur.unwrap_or_else(|| NonNull::new(func, loads, derived));
     let fnn = fold_null_tests(func, &nn);
     if prof {
         eprintln!("  fold_null_tests {:?}", tp.elapsed());
