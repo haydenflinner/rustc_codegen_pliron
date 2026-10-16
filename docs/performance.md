@@ -98,9 +98,11 @@ iteration under register pressure where LLVM keeps them in registers.
 
 `bench/wasm/run.sh` compiles the same kernel sources to
 wasm32-unknown-unknown three ways: stock rustc (LLVM + wasm-ld), the
-pliron backend's dialect path (pliron LLVM dialect → waffle), and the
-pliron backend's CLIF path (`PLIRON_WASM_CLIF=1`: MIR → Cranelift IR →
-the shared optimisation pipeline → waffle). `bench/wasm/run.mjs` times
+pliron backend (dialect → waffle), and the same backend under
+`PLIRON_WASM_CLIF=1`. Note the CLIF pipeline is now the default wasm
+route, so the second and third columns produce identical modules —
+`PLIRON_WASM_CLIF=0` selects the minimal dialect fallback.
+`bench/wasm/run.mjs` times
 each `k_<name>(iters)` export in node (V8): warm calls for
 Liftoff→TurboFan tier-up, then 9 interleaved samples of ~150 ms. The
 reported change is the median of per-round ratios, so a load burst hits
@@ -116,41 +118,42 @@ because pliron-wasm-ld reads pliron objects, not wasm-ld objects), so
 stdlib-heavy kernels like `hashmap`/`hmget`/`sortw` also measure
 std codegen; and measurement granularity is a whole `run()` call.
 
-This run was taken while the host was under heavy unrelated build load,
-so per-kernel deltas are approximate — the module sizes and the column
-ordering are stable.
+This run is the committed default configuration on an otherwise idle
+host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 
 | kernel | LLVM | pliron | change | clif | change |
 |---|---|---|---|---|---|
-| chars_alpha | 4.599 ms | 4.057 ms | −11.6% | 4.043 ms | −12.2% |
-| chars_ascii | 2.333 ms | 0.233 ms | −90.0% | 0.232 ms | −90.0% |
-| chars_mixed | 18.62 ms | 27.66 ms | +48.7% | 27.59 ms | +48.2% |
-| contains_rng | 4.900 ms | 5.506 ms | +12.5% | 5.521 ms | +12.4% |
-| eqbug | 0.136 ms | 0.123 ms | −9.8% | 0.123 ms | −9.5% |
-| fib | 9.525 ms | 20.94 ms | +120.4% | 20.89 ms | +119.6% |
-| hashmap | 66.35 ms | 138.7 ms | +108.9% | 139.1 ms | +109.3% |
-| hmget | 11.48 ms | 31.16 ms | +171.3% | 31.12 ms | +171.1% |
-| iterw | 66.74 ms | 57.40 ms | −13.9% | 57.51 ms | −13.7% |
-| matmul | 30.85 ms | 27.66 ms | −10.2% | 27.74 ms | −10.2% |
-| nbody | 84.61 ms | 92.65 ms | +9.5% | 92.58 ms | +9.4% |
-| parse_only | 382.8 ms | 748.2 ms | +95.5% | 746.3 ms | +95.1% |
-| sieve | 13.95 ms | 17.13 ms | +22.8% | 17.05 ms | +22.3% |
-| sortw | 6.132 ms | 7.719 ms | +25.8% | 7.683 ms | +25.3% |
-| strwork | 17.34 ms | 27.08 ms | +56.1% | 27.23 ms | +56.9% |
-| tokenize | 7.906 ms | 13.64 ms | +72.5% | 13.63 ms | +72.9% |
+| chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
+| chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
+| chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
+| contains_rng | 4.926 ms | 5.506 ms | +11.6% | 5.507 ms | +11.5% |
+| eqbug | 0.136 ms | 0.119 ms | −12.2% | 0.120 ms | −11.7% |
+| fib | 9.462 ms | 9.011 ms | −5.5% | 8.911 ms | −5.8% |
+| hashmap | 66.71 ms | 77.26 ms | +15.7% | 76.97 ms | +15.2% |
+| hmget | 11.58 ms | 16.50 ms | +42.6% | 16.55 ms | +42.6% |
+| iterw | 67.29 ms | 57.69 ms | −14.0% | 57.69 ms | −14.3% |
+| matmul | 30.87 ms | 27.68 ms | −10.6% | 27.61 ms | −10.8% |
+| nbody | 84.39 ms | 91.73 ms | +8.7% | 91.69 ms | +8.7% |
+| parse_only | 382.9 ms | 510.6 ms | +33.4% | 510.7 ms | +33.0% |
+| sieve | 14.05 ms | 17.12 ms | +21.8% | 17.12 ms | +21.9% |
+| sortw | 6.258 ms | 7.757 ms | +23.6% | 7.753 ms | +23.9% |
+| strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
+| tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
 
-Geomeans: dialect pliron/LLVM = 1.165, CLIF pliron/LLVM = 1.164
-(16 kernels), down from 1.674 before the inlining change below. Module
-sizes: LLVM 97 KB, both pliron paths 189 KB (the earlier `small`
-config's 40-op cap only bought ~6%: 178 KB).
+Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
+CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
+work below. Module sizes: LLVM 97 KB, pliron 187 KB.
 
-Two changes landed together here:
+Changes since the 1.674 geomean:
 
-- wasm stopped sharing `-Os`'s 40-op inline cap: `Wasm32` now uses
-  `inline::WASM_LIMIT` (= `DEFAULT_LIMIT`, 320) under the `small`
-  no-bonus rules. The cap left `str` iterators' `next_code_point` and
+- wasm stopped sharing `-Os`'s 40-op inline cap: `Wasm32` uses
+  `inline::WASM_LIMIT` (= 512) under the `small` no-bonus rules. The
+  40-op cap left `str` iterators' `next_code_point` and
   `CharIndices::next` out of line in every char loop — each call
-  round-tripped iterator state through stack memory.
+  round-tripped iterator state through stack memory. 320 halved the
+  gap; 512 additionally inlines hashbrown's `hash_one` (SipHash + probe
+  glue, ~350 ops), dropping hashmap +81% → +16% and hmget +163% → +43%.
+  768 bought nothing further.
 - `loadfwd` root-normalization fix: `transfer` keys locs under the
   `stop` set (`noalias` ∪ operand-frozen values) but classified
   `iso`/`ncc` under `noalias` alone. A `nocapture` call handed an
@@ -162,11 +165,30 @@ Two changes landed together here:
   576990). Calls now insert each arg's root under both
   normalizations into `reach`, and stores kill under both names —
   see `tests/loadfwd_frozen_root.rs`.
+- `elide_sp_frame` runs in both `finish()` paths: the CLIF-emit
+  lowering never dropped the `__stack_pointer` save/align/restore for
+  slotless functions, so `fib` paid a global.get/sub/and/global.set
+  prologue plus a restore on every one of its ~2M recursive returns
+  (+120% → −5%).
+- `CX::norm` skips the `and 255` mask when `normed()` proves the value
+  already fits — icmp/eqz results, `and` of masked or 0/1 operands,
+  selects of normed arms, shr_u by a big const, narrow unsigned loads.
+  Narrow CLIF arithmetic otherwise left a dead mask on every bool
+  producer (chars_mixed +49% → +38%).
+
+Caveat on `chars_ascii`: its −90% under the 320 run was a lucky hoist —
+the out-of-line `count()` call was pure, so LICM pulled it out of the
+×10 rescan loop. At 512 the scan inlines and recomputes per iteration
+like LLVM's, so the kernel sits at parity.
 
 Remaining regressions are in scalar codegen, not call boundaries:
-`fib`/`hmget`/`hashmap`/`parse_only` still lag LLVM's wasm. The
+`hmget`/`chars_mixed`/`strwork`/`parse_only`/`sortw`/`sieve` still lag.
+The common shape is per-element overhead LLVM avoids: `ptr + i*4`
+index recompute instead of a bumped pointer (indvars doesn't rewrite
+the exit compare to pointer form, so the index stays live), and
+`if/else` structured splits where LLVM emits flat `br_if` chains. The
 `small` mode's missing bonuses (`once`, `hint`, `fold`, `devirt`,
-loop bonus, growth budget) are the next candidate lever.
+loop bonus, growth budget) are the other candidate lever.
 
 ## Compile time
 

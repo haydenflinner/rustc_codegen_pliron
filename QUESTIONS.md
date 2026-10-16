@@ -25,21 +25,42 @@ that came up while working unsupervised.
    pointer + immediate offsets. Chasing further is diminishing — flag
    if you want the pointer-bump threading investigated.
 
-4. Wasm inlining now uses `WASM_LIMIT` (= `DEFAULT_LIMIT`, 320) with the
-   `small` no-bonus rules — wasm geomean went 1.674 → 1.165, module
-   177.8KB → 189KB on the bench suite. This unblocked a real
-   `loadfwd` miscompile (fixed, see DEBUG-LOG): the `ofrozen` stop-set
-   named call args under a different root than the `noalias`-keyed
-   `ncc` classification. Question: should -Os/-Oz (`OptLevel::Size`)
-   get the same 320 cap? I left them at 40 — they're size-first, wasm
-   was only sharing `small` by accident of the `||`.
-   If rustc.wasm size becomes a problem the knob is `PLIRON_INLINE`.
+4. Wasm inlining now uses `WASM_LIMIT` = 512 with the `small` no-bonus
+   rules — geomean went 1.674 → 1.069, module 178KB → 187KB on the
+   bench suite. 512 (not 320) because hashbrown's `hash_one` sits just
+   over 320 — inlining it took hashmap +81% → +16%, hmget +163% → +43%.
+   768 was neutral-to-worse (tokenize slipped back to parity) so the
+   curve has a knee around 512. Question: should -Os/-Oz
+   (`OptLevel::Size`) get the same treatment? I left them at 40 —
+   they're size-first, wasm was only sharing `small` by accident of
+   the `||`. If rustc.wasm size becomes a problem the knob is
+   `PLIRON_INLINE`.
 
-5. Remaining wasm gaps at the new limit (vs LLVM): fib +120%,
-   hmget +171%, hashmap +109%, parse_only +95%, tokenize +72%,
-   strwork +56%, chars_mixed +49%. All return-checked clean. The call
-   boundary is mostly closed; what remains looks like scalar codegen
-   (fib = tight FP/arith loop → likely isel/regalloc), not inlining.
-   Next lever candidates: `once`/`hint` bonuses under wasm `small`
-   (single-caller local fns are size-neutral), or investigate fib's
-   wasm codegen directly.
+5. Resolved: fib's +120% was the `__stack_pointer` dance — the dialect
+   `FL::finish` elided it for frame==0 functions but the CLIF-emit
+   `finish` (the default wasm path) never had the rewrite. Factored
+   into `elide_sp_frame`; fib is now −5% and its standalone wasm beats
+   LLVM ~2x.
+
+6. Resolved: `CX::norm` emitted `and 255` on already-0/1 icmp results
+   (chars_mixed filter loop paid it per char). `normed()` now proves
+   small ranges on icmp/eqz/and/select/load producers.
+   chars_mixed +49% → +38%, geomean −1.2pts.
+
+7. Remaining wasm gaps at 512+normed (vs LLVM): hmget +43%,
+   chars_mixed +38%, strwork +37%, parse_only +33%, sortw +24%,
+   sieve +22%, hashmap +16%, contains_rng +12%, nbody +9%.
+   All return-checked clean; all fully inlined now — pure codegen.
+   Two structural differences seen in `contains_rng`:
+   (a) LLVM strength-reduces `ptr + i*4` to a bumped pointer AND
+       rewrites the exit compare to pointer form; our indvars leaves
+       the index live so each element pays `shl`+`add` for the
+       address. This is probably the single biggest remaining lever —
+       sieve/hashmap/parse loops all index like this.
+   (b) waffle emits `if { set; br } else { return }` where LLVM uses
+       flat `block { br_if }` chains — probably benign, but the
+       structured form forces extra locals.
+   Also: `PLIRON_WASM_CLIF=1` is now a no-op (CLIF is the default
+   path; `=0` is the dialect fallback). run.sh's third column is
+   therefore always identical to the second — worth removing the
+   duplicate build to halve bench time?
