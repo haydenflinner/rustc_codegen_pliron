@@ -609,9 +609,13 @@ mod tests {
         cur.ins()
             .store(MemFlagsData::new().with_notrap(), five, addr, 0);
         // Opaque pointer (a function param would work too; a call result
-        // is simplest): a store through it may alias the slot.
+        // is simplest): a store through it may alias the slot — but only
+        // once the slot's address has escaped the tracked roots, since a
+        // `jump` binding `addr` to a param keeps the scope tracked.
         let seven = cur.ins().iconst(types::I64, 7);
         let other = cur.ins().iadd_imm_u(five, 0x1000);
+        cur.ins()
+            .store(MemFlagsData::new().with_notrap(), addr, other, 0);
         cur.ins()
             .store(MemFlagsData::new().with_notrap(), seven, other, 0);
         cur.ins().jump(r, &[addr.into()]);

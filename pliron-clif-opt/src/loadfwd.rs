@@ -473,11 +473,16 @@ pub fn isolated_escapes(
     // `root` is deterministic for the whole scan; the same address value
     // shows up at many use sites (visitor bodies re-read one pointer at
     // every field), so memoize it rather than re-peeling each time.
+    // Normalize like the loc keys do (`norm_root`): a `noalias` value
+    // that concretes to a stack slot names the slot's memory, and locs
+    // rooted through it key under `S(slot)` — an escape recorded under
+    // the scope name `V(v)` would leave `S(slot)` isolated while its
+    // memory is reachable through the stashed pointer.
     let mut rmemo: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
     let mut rt = |func: &Function, v: Value| {
         *rmemo
             .entry(v)
-            .or_insert_with(|| root(func, ps, noalias, v))
+            .or_insert_with(|| norm_root(func, ps, noalias, v))
     };
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
@@ -500,7 +505,14 @@ pub fn isolated_escapes(
                 // own uses would escape scanning entirely.)
                 let fwd = |j: usize| {
                     fwd_arg(func, i, j).is_some_and(|(dst, pos)| {
-                        Root::V(psrc(ps, noalias, func, func.dfg.block_params(dst)[pos])) == r
+                        norm_root(
+                            func,
+                            ps,
+                            noalias,
+                            psrc(ps, noalias, func, func.dfg.block_params(dst)[pos]),
+                        )
+                        .0
+                            == r
                     })
                 };
                 let ok = match data {
