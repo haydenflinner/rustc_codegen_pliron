@@ -239,6 +239,7 @@ fn with_pipe<R>(
         simd: true,
         x64,
         cmp64: true,
+        amode_scale: pipeline::amode_scale(isa),
         has_eh: false,
         flags: &flags,
         dump: false,

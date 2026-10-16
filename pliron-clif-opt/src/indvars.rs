@@ -179,6 +179,71 @@ fn emit_add(func: &mut Function, inst: Inst, p: Value, mul: Mul, step: StepV) ->
     pos.ins().iadd(p, d)
 }
 
+/// `vmax` through block params: a param's value is one of its incoming
+/// edge args, so its ceiling is the max over those args' ceilings.
+/// Depth-bounded recursion handles param chains; anything unresolvable
+/// falls back to `vmax`'s type bound.
+fn vmax_entry(func: &Function, cfg: &ControlFlowGraph, v: Value, depth: usize) -> u64 {
+    let hi = crate::clifpeep::vmax(func, v);
+    if depth == 0 {
+        return hi;
+    }
+    let ValueDef::Param(b, idx) = func.dfg.value_def(func.dfg.resolve_aliases(v)) else {
+        return hi;
+    };
+    let mut m = 0u64;
+    let mut any = false;
+    for p in cfg.pred_iter(b) {
+        for bc in func.dfg.insts[p.inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            if bc.block(&func.dfg.value_lists) != b {
+                continue;
+            }
+            let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(idx) else {
+                return hi;
+            };
+            any = true;
+            m = m.max(vmax_entry(func, cfg, a, depth - 1));
+            if m >= hi {
+                return hi;
+            }
+        }
+    }
+    if !any {
+        return hi;
+    }
+    m
+}
+
+/// `np + k` for `elim_shadowed`'s `iv + c -> np + c*e` map: reuse an
+/// in-body `np`-affine add when one dominates `at`, else emit the add
+/// just before `at`. `np` is a header param, so it dominates every
+/// in-body use — the emit is always legal, and later GVN folds
+/// duplicates of the step add.
+fn np_off(
+    func: &mut Function,
+    dt: &DominatorTree,
+    noff: &mut FxHashMap<i64, Value>,
+    np: Value,
+    k: i64,
+    at: Inst,
+) -> Value {
+    if let Some(&m) = noff.get(&k)
+        && (m == np
+            || matches!(func.dfg.value_def(m), ValueDef::Result(di, _)
+                if dt.dominates(di, at, &func.layout)))
+    {
+        return m;
+    }
+    let ty = func.dfg.value_type(np);
+    let mut pos = FuncCursor::new(func).at_inst(at);
+    let d = iconst_masked(&mut pos, ty, k);
+    let m = pos.ins().iadd(np, d);
+    noff.insert(k, m);
+    m
+}
+
 /// `base + v*K` materialized at the end of `inst`'s block.
 fn emit_lin(func: &mut Function, inst: Inst, base: Option<Value>, v: Value, mul: Mul) -> Value {
     let t = func.dfg.value_type(v);
@@ -601,6 +666,7 @@ fn iv_only_affine(
 fn elim_shadowed(
     func: &mut Function,
     dt: &DominatorTree,
+    cfg: &ControlFlowGraph,
     body: &FxHashSet<Block>,
     h: Block,
     edges: &[Edge],
@@ -764,22 +830,18 @@ fn elim_shadowed(
             .map(|v| func.dfg.resolve_aliases(v))
             .collect();
     }
-    // `np` is a header param and dominates the loop; a derived
-    // `np + c*e` only substitutes for `iv + c` where its def already
-    // dominates the use.
-    let pmap = |w: Value, at: Inst| -> Option<Value> {
-        let c = off.get(&func.dfg.resolve_aliases(w))?;
-        let m = *noff.get(&c.wrapping_mul(e))?;
-        (m == np
-            || matches!(func.dfg.value_def(m), ValueDef::Result(di, _)
-                if dt.dominates(di, at, &func.layout)))
-        .then_some(m)
-    };
     // Every use of an `iv`-affine value must be a bound icmp (both
     // sides affine is ambiguous), the lockstep adds themselves, the
     // step backedge arg, or an exit arg with a live `np` counterpart.
-    let mut icmps: Vec<(Inst, Value, Value, Value)> = vec![]; // (inst, aff, bound, map)
-    let mut exits: Vec<(Inst, usize, Block, Vec<Value>)> = vec![]; // (inst, slot, dst, shim args)
+    // The `np + c*e` counterpart is resolved in the commit phase
+    // (`np_off`): an existing in-body `np`-affine add is reused when it
+    // dominates the use, otherwise a fresh one is emitted there — `np`
+    // is a header param and dominates the whole body. The `np` step
+    // add sits at the latch terminator, below any latch compare, so a
+    // same-block reuse often needs the emit.
+    let mut icmps: Vec<(Inst, Value, Value, Option<Value>)> = vec![]; // (inst, aff, bound, map)
+    // (inst, slot, dst, (arg, map) shim args)
+    let mut exits: Vec<(Inst, usize, Block, Vec<(Value, Option<Value>)>)> = vec![];
     let mut cmax: i64 = 0;
     for &b in body {
         for i in func.layout.block_insts(b) {
@@ -800,7 +862,7 @@ fn elim_shadowed(
                     };
                     let a = func.dfg.resolve_aliases(a);
                     match off.get(&a) {
-                        None => mapped.push(a),
+                        None => mapped.push((a, Some(a))),
                         Some(_) if dst == h => {
                             if ai != iv_idx {
                                 if debug {
@@ -820,13 +882,7 @@ fn elim_shadowed(
                                 return 0;
                             }
                             cmax = cmax.max(c);
-                            let Some(m) = pmap(a, i) else {
-                                if debug {
-                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail exitmap {a} at {b}");
-                                }
-                                return 0;
-                            };
-                            mapped.push(m);
+                            mapped.push((a, None));
                         }
                         Some(_) => {
                             if debug {
@@ -873,13 +929,7 @@ fn elim_shadowed(
                                 }
                                 return 0;
                             }
-                            let Some(m) = pmap(w, i) else {
-                                if debug {
-                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail icmpmap {w} at {b}");
-                                }
-                                return 0;
-                            };
-                            icmps.push((i, w, bound, m));
+                            icmps.push((i, w, bound, None));
                         }
                     }
                 }
@@ -1006,7 +1056,7 @@ fn elim_shadowed(
                 continue;
             }
             let a = edge_arg(func, e2, iv_idx)?;
-            dom = dom.max(crate::clifpeep::vmax(func, a) as u128 & tmask as u128);
+            dom = dom.max(vmax_entry(func, cfg, a, 4) as u128 & tmask as u128);
         }
         let lim = bv + (dom.max(pin) + cmax.max(0) as u128 + 1) * e as u128;
         (lim < (1u128 << bits)).then_some(lim)
@@ -1071,11 +1121,27 @@ fn elim_shadowed(
             let Some(a) = edge_arg(func, e2, iv_idx) else {
                 return 0;
             };
-            if crate::clifpeep::vmax(func, a) as u128 + cmax.max(0) as u128 >= cap {
+            if vmax_entry(func, cfg, a, 4) as u128 + cmax.max(0) as u128 >= cap {
                 if debug {
                     tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail entryiv {a}");
                 }
                 return 0;
+            }
+        }
+    }
+    // Commit: resolve every deferred `iv + c -> np + c*e` map now that
+    // the transform is known to be legal.
+    for c in &mut icmps {
+        if c.3.is_none() {
+            let k = off[&func.dfg.resolve_aliases(c.1)].wrapping_mul(e);
+            c.3 = Some(np_off(func, dt, &mut noff, np, k, c.0));
+        }
+    }
+    for x in &mut exits {
+        for m in &mut x.3 {
+            if m.1.is_none() {
+                let k = off[&func.dfg.resolve_aliases(m.0)].wrapping_mul(e);
+                m.1 = Some(np_off(func, dt, &mut noff, np, k, x.0));
             }
         }
     }
@@ -1196,6 +1262,7 @@ fn elim_shadowed(
         pends.insert(bnd, pend);
     }
     for &(i, w, bnd, m) in &icmps {
+        let m = m.unwrap();
         let pend = pends[&bnd];
         let mut data = func.dfg.insts[i];
         if let InstructionData::IntCompare { cond, args, .. } = &mut data {
@@ -1264,7 +1331,10 @@ fn elim_shadowed(
             .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
         bc.set_block(shim, &mut dfg.value_lists);
         bc.clear(&mut dfg.value_lists);
-        bc.extend(mapped.iter().copied(), &mut dfg.value_lists);
+        bc.extend(
+            mapped.iter().map(|&(_, m)| m.unwrap()),
+            &mut dfg.value_lists,
+        );
     }
     // Strip `iv`'s edge arg and param; the affine adds are dead once
     // their uses are gone, along with the waste insts ignored above.
@@ -1433,7 +1503,7 @@ fn run_loop(
         }
     }
     for (iv, np, b, k) in cands {
-        n += elim_shadowed(func, dt, &body, h, &edges, iv, np, b, k, debug);
+        n += elim_shadowed(func, dt, cfg, &body, h, &edges, iv, np, b, k, debug);
     }
     n
 }

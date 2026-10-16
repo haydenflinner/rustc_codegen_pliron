@@ -156,6 +156,12 @@ pub struct Pipe<'a> {
     pub simd: bool,
     pub x64: bool,
     pub cmp64: bool,
+    /// The code emitter folds `base + reg*{1,2,4,8}` into the load's
+    /// addressing mode (x86 SIB, aarch64 extended-register). False on
+    /// wasm, where the bookkeeping ISA is the host's but the waffle
+    /// output computes every address explicitly — indvars then wants
+    /// stepped pointer IVs rather than leaving `base + iv*s` inside.
+    pub amode_scale: bool,
     pub has_eh: bool,
     pub flags: &'a FnFlags,
     /// `PLIRON_CLIF=<substr>` matched this function's name.
@@ -1304,7 +1310,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
     // shared base from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate();
-        indvars::run(&mut p.clctx.func, an, amode_scale(p.isa));
+        indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     k
 }
@@ -1327,7 +1333,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
     // range from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate();
-        indvars::run(&mut p.clctx.func, an, amode_scale(p.isa));
+        indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     if k > 0 && p.dump {
         p.dump("licm");
@@ -1461,7 +1467,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         // loopvec rewrote the loop the cache describes.
         an.invalidate();
-        indvars::run(&mut p.clctx.func, an, amode_scale(p.isa));
+        indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     k
 }
@@ -2246,13 +2252,15 @@ fn s_coldret(p: &mut Pipe, _an: &mut Analysis) -> usize {
 /// The target folds `base + reg*{1,2,4,8}` into a memory addressing mode
 /// (x86 SIB; aarch64 extended-register offset). wasm/riscv compute
 /// addresses explicitly — stepped pointer IVs still pay off there.
-fn amode_scale(isa: &dyn TargetIsa) -> bool {
+/// Callers whose emit target differs from `isa` (the wasm path keeps a
+/// host ISA purely for bookkeeping) pass their own `Pipe::amode_scale`.
+pub fn amode_scale(isa: &dyn TargetIsa) -> bool {
     use target_lexicon::Architecture as A;
     matches!(isa.triple().architecture, A::X86_64 | A::Aarch64(_))
 }
 
 fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
-    indvars::run(&mut p.clctx.func, an, amode_scale(p.isa))
+    indvars::run(&mut p.clctx.func, an, p.amode_scale)
 }
 
 fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
@@ -2903,6 +2911,7 @@ mod tests {
             simd: true,
             x64: false,
             cmp64: true,
+            amode_scale: amode_scale(&*isa),
             has_eh: false,
             flags: &flags,
             prof_hook: None,

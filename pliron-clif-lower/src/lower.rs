@@ -738,6 +738,7 @@ pub fn lower_module(
                     simd: sh.simd,
                     x64: sh.x64,
                     cmp64: sh.cmp64,
+                    amode_scale: crate::pipeline::amode_scale(sh.isa),
                     has_eh: sh.has_eh,
                     flags: sh.fn_flags,
                     dump: j.dump,
@@ -1518,6 +1519,10 @@ pub fn lower_clif_wasm(
             simd,
             x64: false,
             cmp64: false,
+            // `isa` is the host's purely for bookkeeping; the waffle
+            // emitter computes `base + iv*s` addresses explicitly, so
+            // indvars should produce stepped pointer IVs.
+            amode_scale: false,
             has_eh: false,
             flags: &fn_flags,
             dump,
