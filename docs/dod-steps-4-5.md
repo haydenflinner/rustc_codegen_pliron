@@ -232,3 +232,26 @@ OpPayload = {results, operands, successors, regions, attributes}.
 Then flatten each payload Vec into Context-global pools field-by-field
 (spans (u32,u16); same-len writes in place; len changes append +
 orphan). Freelist per pool only if orphans ever matter (CGU-scoped).
+
+## Step 5 status (as of 2707715)
+
+DONE: regions, successors, operands, results all → `OpSpan{off,len}`
+into `Context::op_{region,successor,operand,result}_pool`
+(RefCell<Vec<_>>). Mutation protocols:
+- operands/successors: drop all uses in span → fresh nodes → new span
+  (Use invalidation was already documented); same-len replace writes
+  the pool slot + drop_use on swapped-out.
+- results: rewrite_results seeds a fresh tail span with new OpResults
+  then swaps old nodes into mapped slots — preserves val_uid/DefNode
+  identity without Clone; unmapped/skipped nodes orphan (same as
+  SmallVec::remove).
+- get_region/get_result/get_operand/get_successor/regions()/results()/
+  operands()/uses()/has_use()/num_uses()/result_types() gained a ctx
+  arg; *_slice(ctx) accessors return Ref/RefMut slices from the pools.
+- value.rs DefNode/UseNode projections re-root onto pools via op span.
+
+REMAINING: BasicBlock.args (Vec<BlockArgument>, same seed+swap
+protocol — DefNode inside), Operation.attributes (needs AttrId
+interning — deferred; measure first), Operation.loc (POD, no gain).
+Pools are append-only; orphaned spans are bounded garbage under
+CGU-scoped Context lifetimes.
