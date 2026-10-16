@@ -1293,6 +1293,20 @@ pub fn check_and_report(
     }
 }
 
+pub(crate) fn safe_name(fname: &str) -> String {
+    fname
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect()
+}
+
 /// Write `before.clif` / `after.clif` / `report.txt` under
 /// `PLIRON_DIFFCHECK_DIR` (default `pliron-diffcheck/`) and log one line.
 /// `PLIRON_DIFFCHECK_PANIC=1` turns the report into a panic.
@@ -1305,17 +1319,7 @@ pub fn report(
     m: &Mismatch,
 ) {
     let root = crate::config::env_get("PLIRON_DIFFCHECK_DIR").unwrap_or("pliron-diffcheck");
-    let safe: String = fname
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(80)
-        .collect();
+    let safe = safe_name(fname);
     let dir = std::path::Path::new(root).join(format!(
         "{safe}.{}",
         step.trim_matches(|c| c == '<' || c == '>')

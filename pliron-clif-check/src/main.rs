@@ -7,6 +7,7 @@
 //!   clif-check pipeline before.clif        run the default pipeline, check each step
 //!   clif-check pair before.clif after.clif check two saved functions
 //!   clif-check corpus <dir>                `pipeline` on every before.clif under dir
+//!   clif-check bench <dir> [reps]          time `run_pipeline` over the corpus
 //!   clif-check steps                       list step names
 //!
 //! Options (after the subcommand args): --trials N, --seed N, --fuel N, --print.
@@ -89,6 +90,10 @@ fn main() -> ExitCode {
             println!("{} files, {bad} with mismatches", files.len());
             bad == 0
         }
+        ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
+        ["bench", dir, reps] => {
+            bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps"))
+        }
         _ => {
             eprintln!(
                 "{}",
@@ -136,6 +141,22 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         if p.is_dir() {
             collect(&p, out);
         } else if p.file_name().is_some_and(|n| n == "before.clif") {
+            out.push(p);
+        }
+    }
+}
+
+/// Like `collect` but accepts any `*.clif` — `PLIRON_CORPUS` dumps use a
+/// flat `<name>.<n>.clif` layout rather than per-fn `before.clif` dirs.
+fn collect_clif(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_clif(&p, out);
+        } else if p.extension().is_some_and(|x| x == "clif") {
             out.push(p);
         }
     }
@@ -279,6 +300,38 @@ fn run_one(
     }
     let ok = report(name, &before, &after, facts, o);
     (ok, after)
+}
+
+/// `bench <dir> [reps]` — wall-time the full `run_pipeline` over every
+/// `before.clif` under `dir` (a `PLIRON_CORPUS` dump or a diffcheck
+/// collection), printing the per-step timing table. Pure pass code: no
+/// rustc, no sampler — the iteration loop for pipeline perf work.
+fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
+    let mut files = Vec::new();
+    collect_clif(dir, &mut files);
+    files.sort();
+    let corpus: Vec<(Function, OwnedFacts)> = files.iter().map(|f| load(f)).collect();
+    eprintln!("bench: {} functions, {reps} rep(s)", corpus.len());
+    for r in 0..reps {
+        let t0 = std::time::Instant::now();
+        let mut stats = Stats::default();
+        for (f, facts) in &corpus {
+            with_pipe(isa, f.clone(), facts, |p| {
+                pipeline::run_pipeline(p);
+                stats.merge(&*p.stats);
+            });
+        }
+        let el = t0.elapsed();
+        println!("rep {r}: {el:.2?} over {} fns", corpus.len());
+        if r + 1 == reps {
+            let mut rows: Vec<_> = stats.timing.iter().collect();
+            rows.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
+            for (n, d) in rows.iter().take(24) {
+                println!("  {d:>9.1?}  {n}");
+            }
+        }
+    }
+    true
 }
 
 fn pipeline_checked(isa: &dyn TargetIsa, file: &Path, o: &Opts) -> bool {

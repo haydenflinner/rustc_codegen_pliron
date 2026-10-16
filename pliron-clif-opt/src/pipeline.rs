@@ -668,6 +668,7 @@ const fn cstep(
 }
 
 pub fn run_pipeline(p: &mut Pipe) {
+    corpus_dump(p);
     match crate::diffcheck::mode_for(p.fname) {
         None => {
             run_steps(p, false);
@@ -677,6 +678,41 @@ pub fn run_pipeline(p: &mut Pipe) {
         }
         Some(crate::diffcheck::Mode::Whole) => run_whole_checked(p),
     }
+}
+
+/// `PLIRON_CORPUS=<dir>` dumps each function's pre-pipeline CLIF (facts
+/// header + text body) as `<dir>/<name>.<n>.clif`, giving `clif-check
+/// bench` a real-world corpus so pipeline perf work iterates without
+/// rustc in the loop.
+fn corpus_dump(p: &mut Pipe) {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    let Some(dir) = DIR
+        .get_or_init(|| crate::config::env_get("PLIRON_CORPUS").map(str::to_string))
+        .as_deref()
+    else {
+        return;
+    };
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let facts = crate::diffcheck::Facts {
+        nonnull: Some(&*p.nonnull),
+        noalias: Some(&*p.noalias),
+        deref: Some(&*p.deref),
+        frozen: Some(&*p.frozen),
+        nowrite: Some(p.nowrite),
+        self_name: Some(p.fname.to_string()),
+        derived: Some(&*p.derived),
+    };
+    let text = format!(
+        "{}{}",
+        crate::diffcheck::facts_header(&p.clctx.func, &facts),
+        crate::diffcheck::clif_text(&p.clctx.func)
+    );
+    let name = crate::diffcheck::safe_name(p.fname);
+    let path = std::path::Path::new(dir).join(format!("{name}.{n}.clif"));
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(path, text);
 }
 
 /// The steps this run selects, in order: `PLIRON_PIPELINE` if set (plus
