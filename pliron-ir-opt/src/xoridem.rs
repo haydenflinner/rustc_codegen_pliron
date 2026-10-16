@@ -761,7 +761,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
     folds
 }
 
-pub fn run(ctx: &mut Context, st: &mut State) {
+/// Returns the number of loops folded so callers can gate reruns (the
+/// follow-up callgvn only exists to kill the calls the fold deadens).
+pub fn run(ctx: &mut Context, st: &mut State) -> usize {
     let mut n = 0usize;
     for s in bodied(ctx, st) {
         let fop = st.funcs[&s].op;
@@ -785,6 +787,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             tracing::debug!(target: "pliron::xoridem", "xoridem   {n} folds")
         };
     }
+    n
 }
 
 #[cfg(test)]

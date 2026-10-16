@@ -1020,8 +1020,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         // an even-count xor recurrence leaves the loop a no-op -- erase
         // it, then re-run callgvn so the now-unused call dies too.
         if pass_enabled("PLIRON_XORIDEM") {
-            pt!(cx, "xoridem", xoridem::run(ctx, st));
-            if pass_enabled("PLIRON_CALLGVN") {
+            // callgvn2 exists only to sweep the calls a xoridem fold
+            // deadened; with zero folds the re-run is byte-identical.
+            let xn = pt!(cx, "xoridem", xoridem::run(ctx, st));
+            if xn > 0 && pass_enabled("PLIRON_CALLGVN") {
                 pt!(cx, "callgvn2", callgvn::run(ctx, st));
                 pt!(cx, "domcheck:cg2", domcheck::run(ctx, st, "callgvn2"));
             }
