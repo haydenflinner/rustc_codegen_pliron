@@ -539,11 +539,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(cx, "spec", spec::run(ctx, st));
             pt!(cx, "domcheck:spec", domcheck::run(ctx, st, "spec"));
         }
-        // Opt-in: unsound on wasm emulated EH, which unwinds through ordinary
-        // calls (llvm.wasm.throw / __pliron_eh) the body scan can't see. On
-        // COFF the emulated-EH "throw" is a flag+early-return through plain
-        // calls, so inference is sound — and lets lowering skip the flag
-        // check after calls that can't throw.
+        // Emulated EH (wasm, COFF) unwinds through ordinary calls the body
+        // scan can't see — `llvm.wasm.throw`-class entries are declared
+        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp —
+        // so nounwind.rs models them explicitly (THROWS + the rethrow check).
+        // On COFF the inference also lets lowering skip the flag check after
+        // calls that can't throw.
         let coff_eh = cx.tcx.sess.target.options.binary_format
             == rustc_target::spec::BinaryFormat::Coff
             && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;

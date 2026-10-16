@@ -13,6 +13,23 @@ use crate::inline::{blocks, direct_callee, ops};
 use crate::state::State;
 use crate::{Syms, bodied};
 
+/// Unwind-outs invisible to the attribute scan. The emulated-EH entries
+/// (`llvm.wasm.*`, and `_CxxThrowException`/`_Unwind_Resume`/`_Unwind_RaiseException`
+/// when lowering intercepts them) are `extern "C"` decls rustc marks
+/// `!can_unwind`, but wasm.rs/lower.rs lower calls to them into a flag set
+/// on `__pliron_eh` plus an early return that the caller's post-call check
+/// unwinds through. Native `_Unwind_*` calls unwind out for real, so they
+/// belong here under any EH model.
+const THROWS: &[&str] = &[
+    "llvm.wasm.throw",
+    "llvm.wasm.rethrow",
+    "__pliron_llvm_wasm_throw",
+    "__pliron_llvm_wasm_rethrow",
+    "_CxxThrowException",
+    "_Unwind_Resume",
+    "_Unwind_RaiseException",
+];
+
 ascent::ascent! {
     struct Unwind;
     /// A plain (non-invoke) call in `f` to `c`.
@@ -37,7 +54,7 @@ pub fn run(ctx: &Context, st: &mut State) {
     let mut ids = Syms::default();
     let mut p = Unwind::default();
     for (s, f) in &st.funcs {
-        if f.nounwind {
+        if f.nounwind && !THROWS.contains(&s.as_str()) {
             p.nounwind.push((ids.id(s),));
         }
     }
@@ -46,6 +63,15 @@ pub fn run(ctx: &Context, st: &mut State) {
         p.body.push((f,));
         for b in blocks(ctx, st.funcs[s].op) {
             for op in ops(ctx, b) {
+                // `pliron.eh.rethrow` unwinds out of `f` through a
+                // CallIntrinsicOp — the `call` relation only sees CallOps.
+                if st
+                    .intrinsics
+                    .get(&op)
+                    .is_some_and(|n| n == "pliron.eh.rethrow")
+                {
+                    p.may_unwind.push((f,));
+                }
                 if Operation::is_op::<CallOp>(op, ctx) && !st.invokes.contains_key(&op) {
                     match direct_callee(ctx, st, op) {
                         Some(c) => p.call.push((f, ids.id(c))),
@@ -70,8 +96,10 @@ pub fn run(ctx: &Context, st: &mut State) {
         .keys()
         .copied()
         .filter(|&op| {
-            direct_callee(ctx, st, op)
-                .is_some_and(|c| nw.contains(c) || st.funcs.get(c).is_some_and(|f| f.nounwind))
+            direct_callee(ctx, st, op).is_some_and(|c| {
+                !THROWS.contains(&c.as_str())
+                    && (nw.contains(c) || st.funcs.get(c).is_some_and(|f| f.nounwind))
+            })
         })
         .collect();
     if crate::env_set("PLIRON_STATS") {
