@@ -655,7 +655,11 @@ impl<'a> State<'a> for Sandbox<'a> {
         self.regions.insert(
             base,
             Region {
-                data: vec![0xa5; self.frame_size as usize],
+                // Uninit stack reads must yield a value slotprom-style
+                // passes can legally rematerialize: 0 matches the
+                // `iconst 0` emitted for never-stored slots. 0xa5 made
+                // every undef-byte reshuffle a false report.
+                data: vec![0; self.frame_size as usize],
                 init: Vec::new(),
                 stub_writable: false,
             },

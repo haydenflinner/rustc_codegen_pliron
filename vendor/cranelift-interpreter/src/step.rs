@@ -213,7 +213,10 @@ where
 
     let calculate_addr =
         |addr_ty: Type, imm: DataValue, args: SmallVec<[DataValue; 1]>| -> ValueResult<u64> {
-            let imm = imm.convert(ValueConversionKind::ZeroExtend(addr_ty))?;
+            // PLIRON: mem-op offsets are signed displacements (Offset32);
+            // sign-extend like real codegen. Upstream zero-extends, so
+            // `load v38-16` computed v38 + 0xFFFFFF0 and trapped.
+            let imm = imm.convert(ValueConversionKind::SignExtend(addr_ty))?;
             let args = args
                 .into_iter()
                 .map(|v| v.convert(ValueConversionKind::ZeroExtend(addr_ty)))

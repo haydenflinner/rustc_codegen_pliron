@@ -15,6 +15,13 @@ Changes, all in `src/step.rs`:
   lane counts, now reinterprets bytes (marked `PLIRON PATCH:`). Upstream
   returned `bitcast.i64x2 (i128)` as a single i64 scalar, which made the
   differential checker report a false miscompile in `vecslot`.
+- `calculate_addr` sign-extends the load/store offset immediate to the
+  address type (marked `PLIRON:`). Upstream zero-extends it, so a pass
+  folding `iadd base, -K` into `load base-K` computed `base + 0xFFFFFF0`
+  and produced bogus `heap_oob` traps / wild writes in the differential
+  checker. Real codegen sign-extends Offset32. (`stack_addr`'s offset
+  path via `sum_unsigned` shares the latent issue; nothing in our
+  pipeline emits negative stack-slot offsets yet.)
 
 Used by `pliron-clif-opt`'s differential checker (`src/diffcheck.rs`).
 Drop this copy once those opcodes are upstream or no longer vendored.
