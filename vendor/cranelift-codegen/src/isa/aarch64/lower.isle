@@ -1159,6 +1159,32 @@
 (rule imul_base_case -3 (lower (imul (ty_int_ref_scalar_64_extract ty) x y))
       (madd ty x y (zero_reg)))
 
+;; PLIRON: `imul x, 2^n + 1` lowers to a single `add x, x, lsl #n`; the
+;; `movz` for the constant and the `madd`'s 3-cycle latency both disappear.
+(rule 4 (lower (imul (ty_int_ref_scalar_64_extract ty) x (iconst _ (u64_from_imm64 c))))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((xx Reg (put_in_reg x)))
+        (add_shift ty xx xx (lshl_from_u64 ty (u8_into_u64 n)))))
+
+;; PLIRON: `imul x, 2^n - 1` is `(x << n) - x` — `lsl` + `sub`.
+(rule 2 (lower (imul (ty_int_ref_scalar_64_extract ty) x (iconst _ (u64_from_imm64 c))))
+      (if-let n (imul_pow2m1_shamt ty c))
+      (let ((xx Reg (put_in_reg x))
+            (sh Reg (alu_rr_imm_shift (ALUOp.Lsl) ty xx (imm_shift_from_u8 n))))
+        (sub ty sh xx)))
+
+;; PLIRON: same folds with the constant on the left.
+(rule 3 (lower (imul (ty_int_ref_scalar_64_extract ty) (iconst _ (u64_from_imm64 c)) x))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((xx Reg (put_in_reg x)))
+        (add_shift ty xx xx (lshl_from_u64 ty (u8_into_u64 n)))))
+
+(rule 1 (lower (imul (ty_int_ref_scalar_64_extract ty) (iconst _ (u64_from_imm64 c)) x))
+      (if-let n (imul_pow2m1_shamt ty c))
+      (let ((xx Reg (put_in_reg x))
+            (sh Reg (alu_rr_imm_shift (ALUOp.Lsl) ty xx (imm_shift_from_u8 n))))
+        (sub ty sh xx)))
+
 ;; `i128`.
 (attr rule imul_i128 (tag i128))
 (rule imul_i128 -1 (lower (imul $I128 x y))
@@ -1568,6 +1594,13 @@
 (rule uextend -2 (lower (uextend (fits_in_64 out) x @ (value_type in)))
       (extend x false (ty_bits in) (ty_bits out)))
 
+;; PLIRON: `icmp`/`fcmp` materialize as `cset`/`fcset`, which already write a
+;; full-width 0/1 — re-extending that result is a dead instruction.
+(rule uextend_icmp 0 (lower (uextend (fits_in_64 _) x @ (icmp _ _ _ _)))
+      (put_in_reg x))
+(rule uextend_fcmp 0 (lower (uextend (fits_in_64 _) x @ (fcmp _ _ _ _)))
+      (put_in_reg x))
+
 ;; Extraction of a vector lane automatically extends as necessary, so we can
 ;; skip an explicit extending instruction.
 (rule 1 (lower (uextend (fits_in_64 out) (extractlane _ vec @ (value_type in)
@@ -1611,6 +1644,13 @@
 ;; register.
 (rule sextend -4 (lower (sextend (fits_in_64 out) x @ (value_type in)))
       (extend x true (ty_bits in) (ty_bits out)))
+
+;; PLIRON: as for `uextend` above — a `cset` result is already 0/1 at full
+;; width, so sign-extending it is a no-op.
+(rule -1 (lower (sextend (fits_in_64 _) x @ (icmp _ _ _ _)))
+      (put_in_reg x))
+(rule -1 (lower (sextend (fits_in_64 _) x @ (fcmp _ _ _ _)))
+      (put_in_reg x))
 
 ;; Extraction of a vector lane automatically extends as necessary, so we can
 ;; skip an explicit extending instruction.

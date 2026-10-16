@@ -277,6 +277,24 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
     }
 
+    // PLIRON: `imul` by `2^n + 1` / `2^n - 1` strength reduction — the shift
+    // amount `n` when `c` has that form and the shift fits the operand's
+    // register width (`bits < 32` ops run as 32-bit regs).
+    fn imul_pow2p1_shamt(&mut self, ty: Type, c: u64) -> Option<u8> {
+        let bits = ty_bits(ty);
+        let c = if bits < 64 { c & ((1u64 << bits) - 1) } else { c };
+        let n = c.checked_sub(1)?.trailing_zeros();
+        (n > 0 && n < bits.max(32) as u32 && (1u64 << n) + 1 == c).then_some(n as u8)
+    }
+
+    fn imul_pow2m1_shamt(&mut self, ty: Type, c: u64) -> Option<u8> {
+        let bits = ty_bits(ty);
+        let c = if bits < 64 { c & ((1u64 << bits) - 1) } else { c };
+        let n = c.checked_add(1)?.trailing_zeros();
+        (n > 1 && n < bits.max(32) as u32 && (1u64 << n).checked_sub(1) == Some(c))
+            .then_some(n as u8)
+    }
+
     // PLIRON: ROR operand for the logical (shifted register) fold below.
     fn rotr_from_u64(&mut self, ty: Type, n: u64) -> Option<ShiftOpAndAmt> {
         let shiftimm = ShiftOpShiftImm::maybe_from_shift(n)?;

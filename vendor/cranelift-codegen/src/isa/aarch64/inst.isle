@@ -2390,6 +2390,12 @@
 (decl pure partial rotr_from_u64 (Type u64) ShiftOpAndAmt)
 (extern constructor rotr_from_u64 rotr_from_u64)
 
+;; PLIRON: `imul` by `2^n ± 1` strength reduction — returns the shift amount.
+(decl pure partial imul_pow2p1_shamt (Type u64) u8)
+(extern constructor imul_pow2p1_shamt imul_pow2p1_shamt)
+(decl pure partial imul_pow2m1_shamt (Type u64) u8)
+(extern constructor imul_pow2m1_shamt imul_pow2m1_shamt)
+
 (spec (integral_ty ty)
       (provide (= result ty))
       (match (or
