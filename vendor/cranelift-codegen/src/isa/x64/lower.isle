@@ -5289,7 +5289,8 @@
 ;; vector value (f32x2, f16x4) lives in the low bits of an xmm and only
 ;; its real lanes are observable: loads/stores/lane ops touch just those
 ;; bits. So running the packed 128-bit op and leaving lanes 2-3 as
-;; garbage is correct -- the same narrow-vector-in-wide-reg trick the
+;; garbage is correct. (`put_in_xmm` wraps keep the typed Value->XmmMem128
+;; conversion from asserting on the 64-bit CLIF type.) -- the same narrow-vector-in-wide-reg trick the
 ;; PLIRON `splat` rules above use. These rules let `simd_leaves` in
 ;; pliron-clif-lower admit F32X2/F16X4 leaves instead of splitting every
 ;; op into extractlane+scalar+insertlane (or hitting the veclegalize
@@ -5302,20 +5303,20 @@
 ;; match.
 
 ;; f32x2 arithmetic: plain packed-ss ops.
-(rule -1 (lower (fadd (multi_lane 32 2) x y)) (x64_addps x y))
-(rule -1 (lower (fsub (multi_lane 32 2) x y)) (x64_subps x y))
-(rule -1 (lower (fmul (multi_lane 32 2) x y)) (x64_mulps x y))
-(rule -1 (lower (fdiv (multi_lane 32 2) x y)) (x64_divps x y))
-(rule -1 (lower (sqrt (multi_lane 32 2) x)) (x64_sqrtps x))
+(rule -1 (lower (fadd (multi_lane 32 2) x y)) (x64_addps (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fsub (multi_lane 32 2) x y)) (x64_subps (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fmul (multi_lane 32 2) x y)) (x64_mulps (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fdiv (multi_lane 32 2) x y)) (x64_divps (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (sqrt (multi_lane 32 2) x)) (x64_sqrtps (put_in_xmm x)))
 (rule -1 (lower (fneg (multi_lane 32 2) x))
-      (x64_xorps x (x64_pslld (vector_all_ones) (xmi_imm 31))))
+      (x64_xorps (put_in_xmm x) (x64_pslld (vector_all_ones) (xmi_imm 31))))
 (rule -1 (lower (fabs (multi_lane 32 2) x))
-      (x64_andps x (x64_psrld (vector_all_ones) (xmi_imm 1))))
+      (x64_andps (put_in_xmm x) (x64_psrld (vector_all_ones) (xmi_imm 1))))
 
 ;; fmin/fmax reuse the NaN-safe packed sequences, hoisted into helpers so
 ;; the F32X4 rules above stay verbatim.
 (decl pliron_f32_min_ps (Xmm Xmm) Xmm)
-(rule (pliron_f32_min_ps x y)
+(rule (pliron_f32_min_ps (put_in_xmm x) (put_in_xmm y))
       (let ((min1 Xmm (x64_minps x y))
             (min2 Xmm (x64_minps y x))
             (min_or Xmm (x64_orps min1 min2))
@@ -5325,7 +5326,7 @@
             (final Xmm (x64_andnps nan_fraction_mask min_or_2)))
         final))
 (decl pliron_f32_max_ps (Xmm Xmm) Xmm)
-(rule (pliron_f32_max_ps x y)
+(rule (pliron_f32_max_ps (put_in_xmm x) (put_in_xmm y))
       (let ((max1 Xmm (x64_maxps x y))
             (max2 Xmm (x64_maxps y x))
             (max_xor Xmm (x64_xorps max1 max2))
@@ -5335,22 +5336,22 @@
             (nan_fraction_mask Xmm (x64_psrld is_nan_mask (xmi_imm 10)))
             (final Xmm (x64_andnps nan_fraction_mask max_blended_nan_positive)))
         final))
-(rule -1 (lower (fmin (multi_lane 32 2) x y)) (pliron_f32_min_ps x y))
-(rule -1 (lower (fmax (multi_lane 32 2) x y)) (pliron_f32_max_ps x y))
+(rule -1 (lower (fmin (multi_lane 32 2) x y)) (pliron_f32_min_ps (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fmax (multi_lane 32 2) x y)) (pliron_f32_max_ps (put_in_xmm x) (put_in_xmm y)))
 
 ;; ceil/floor/nearest/trunc share `x64_round`'s packed form.
-(rule -1 (x64_round (multi_lane 32 2) a imm) (x64_round_f32x4 a imm))
+(rule -1 (x64_round (multi_lane 32 2) a imm) (x64_round_f32x4 (put_in_xmm a) imm))
 
 ;; `fma.f32x2` reaches `fmadd`/`fnmadd`/`fmsub`/`fnmsub` through the
 ;; type-polymorphic rules above; arm the 213/132 instruction picks.
-(rule -1 (x64_vfmadd213  (multi_lane 32 2) a b c) (x64_vfmadd213_f32x4  a b c))
-(rule -1 (x64_vfmadd132  (multi_lane 32 2) a b c) (x64_vfmadd132_f32x4  a b c))
-(rule -1 (x64_vfnmadd213 (multi_lane 32 2) a b c) (x64_vfnmadd213_f32x4 a b c))
-(rule -1 (x64_vfnmadd132 (multi_lane 32 2) a b c) (x64_vfnmadd132_f32x4 a b c))
-(rule -1 (x64_vfmsub213  (multi_lane 32 2) a b c) (x64_vfmsub213_f32x4  a b c))
-(rule -1 (x64_vfmsub132  (multi_lane 32 2) a b c) (x64_vfmsub132_f32x4 a b c))
-(rule -1 (x64_vfnmsub213 (multi_lane 32 2) a b c) (x64_vfnmsub213_f32x4 a b c))
-(rule -1 (x64_vfnmsub132 (multi_lane 32 2) a b c) (x64_vfnmsub132_f32x4 a b c))
+(rule -1 (x64_vfmadd213  (multi_lane 32 2) a b c) (x64_vfmadd213_f32x4  a b (put_in_xmm c)))
+(rule -1 (x64_vfmadd132  (multi_lane 32 2) a b c) (x64_vfmadd132_f32x4  a b (put_in_xmm c)))
+(rule -1 (x64_vfnmadd213 (multi_lane 32 2) a b c) (x64_vfnmadd213_f32x4 a b (put_in_xmm c)))
+(rule -1 (x64_vfnmadd132 (multi_lane 32 2) a b c) (x64_vfnmadd132_f32x4 a b (put_in_xmm c)))
+(rule -1 (x64_vfmsub213  (multi_lane 32 2) a b c) (x64_vfmsub213_f32x4  a b (put_in_xmm c)))
+(rule -1 (x64_vfmsub132  (multi_lane 32 2) a b c) (x64_vfmsub132_f32x4 a b (put_in_xmm c)))
+(rule -1 (x64_vfnmsub213 (multi_lane 32 2) a b c) (x64_vfnmsub213_f32x4 a b (put_in_xmm c)))
+(rule -1 (x64_vfnmsub132 (multi_lane 32 2) a b c) (x64_vfnmsub132_f32x4 a b (put_in_xmm c)))
 
 ;; f32x2 lane ops: lane 0 extracts are already free for any
 ;; scalar-float-lane vector (the generic rule above); lane 1 is one
@@ -5358,15 +5359,15 @@
 ;; arms are exactly what a 2-lane vector needs. The lane-type guards
 ;; keep i32x2 lane ops from matching (they need pextrd/pinsrd).
 (rule -1 (lower (extractlane $F32 val @ (value_type (multi_lane 32 2)) 1))
-      (x64_pshufd val 1))
+      (x64_pshufd (put_in_xmm val) 1))
 (rule -1 (lower (insertlane _ vec @ (value_type (multi_lane 32 2))
                          val @ (value_type $F32) (u8_from_uimm8 idx)))
-      (f32x4_insertlane vec val idx))
+      (f32x4_insertlane (put_in_xmm vec) (put_in_xmm val) idx))
 
 ;; Packed f16 converts on xmm (F16C): the same `vcvtph2ps`/`vcvtps2ph`
 ;; forms the scalar fpromote/fdemote rules use; an F16X4 source occupies
 ;; the convert's full 64-bit input.
-(rule (lower (fvpromote_f16 $F32X4 x)) (x64_vcvtph2ps_x (xmm_to_xmm_mem_128 x)))
+(rule (lower (fvpromote_f16 $F32X4 x)) (x64_vcvtph2ps_x (xmm_to_xmm_mem_128 (put_in_xmm x))))
 (rule -1 (lower (fvdemote_f16 (multi_lane 16 4) x)) (x64_vcvtps2ph_x x 0))
 
 ;; f16x4 lane ops: f16 lanes live in xmm registers, so extract is a
@@ -5374,19 +5375,19 @@
 ;; generic scalar-float rule) and insert is a `pinsrw` of the lane's low
 ;; 16 bits moved to a gpr first. The $F16 lane guards keep i16x4 away.
 (rule -1 (lower (extractlane $F16 val @ (value_type (multi_lane 16 4)) (u8_from_uimm8 lane)))
-      (x64_pshuflw val lane))
+      (x64_pshuflw (put_in_xmm val) lane))
 (rule -1 (lower (insertlane _ vec @ (value_type (multi_lane 16 4))
                          val @ (value_type $F16) (u8_from_uimm8 idx)))
-      (x64_pinsrw vec (x64_movd_to_gpr val) idx))
+      (x64_pinsrw (put_in_xmm vec) (x64_movd_to_gpr (put_in_xmm val)) idx))
 
 ;; f16x4 native packed arithmetic -- only reached when the host enables
 ;; NATIVE_F16 (AVX512-FP16); lanes 4-7 of the xmm result are
 ;; unobservable.
-(rule -1 (lower (fadd (multi_lane 16 4) x y)) (x64_vaddph_x x y))
-(rule -1 (lower (fsub (multi_lane 16 4) x y)) (x64_vsubph_x x y))
-(rule -1 (lower (fmul (multi_lane 16 4) x y)) (x64_vmulph_x x y))
-(rule -1 (lower (fdiv (multi_lane 16 4) x y)) (x64_vdivph_x x y))
-(rule -1 (lower (fma (multi_lane 16 4) x y z)) (x64_vfmadd213ph_x x y z))
+(rule -1 (lower (fadd (multi_lane 16 4) x y)) (x64_vaddph_x (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fsub (multi_lane 16 4) x y)) (x64_vsubph_x (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fmul (multi_lane 16 4) x y)) (x64_vmulph_x (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fdiv (multi_lane 16 4) x y)) (x64_vdivph_x (put_in_xmm x) (put_in_xmm y)))
+(rule -1 (lower (fma (multi_lane 16 4) x y z)) (x64_vfmadd213ph_x (put_in_xmm x) (put_in_xmm y) (put_in_xmm z)))
 
 ;; Rules for `vany_true` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
