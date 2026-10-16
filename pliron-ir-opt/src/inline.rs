@@ -90,35 +90,6 @@ pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Op
     }
 }
 
-/// Legality only — `Some((has_eh, ops, calls))` if `sym` may be inlined at
-/// all; profitability is judged per callsite. `has_eh` = it has invokes or
-/// reads the exception pointer. `PLIRON_INLINE_EH=0` rejects those callees
-/// outright.
-fn legal(ctx: &Context, st: &State, sym: &str) -> Option<(bool, usize, usize)> {
-    let f = &st.funcs[sym];
-    if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
-        return None;
-    }
-    let (mut n, mut ncalls, mut eh) = (0, 0, false);
-    for b in blocks(ctx, f.op) {
-        for op in ops(ctx, b) {
-            n += 1;
-            let intr = st.intrinsics.get(&op);
-            if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
-                || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
-            {
-                return None;
-            }
-            eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
-            ncalls += usize::from(Operation::is_op::<CallOp>(op, ctx));
-        }
-    }
-    if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
-        return None;
-    }
-    Some((eh, n, ncalls))
-}
-
 /// Callee-body facts the callsite score is computed from.
 struct CInfo {
     op: Ptr<Operation>,
@@ -137,7 +108,10 @@ struct CInfo {
     fold: Vec<u32>,
 }
 
-/// `legal` plus the body scans the score needs. The fixed thresholds only
+/// Legality plus the body facts the callsite score needs, from ONE walk of
+/// the callee body (the legality count, the indirect-call targets, and the
+/// branch-condition roots used to be three separate scans; the small
+/// def-chain DFSs they feed stay per-feature). The fixed thresholds only
 /// profile callees a devirt/fold multiplier could rescue (as the old `dv` map
 /// did); the model profiles every plausibly inlinable body.
 fn callee_info(
@@ -149,9 +123,43 @@ fn callee_info(
     bonus: usize,
     fold: usize,
 ) -> Option<CInfo> {
-    let (eh, n, ncalls) = legal(ctx, st, sym)?;
+    let f = &st.funcs[sym];
+    if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
+        return None;
+    }
+    let (mut n, mut ncalls, mut eh) = (0, 0, false);
+    let mut dvirt_tgt = Vec::new();
+    let mut cond_roots = Vec::new();
+    for b in blocks(ctx, f.op) {
+        for op in b.deref(ctx).iter(ctx) {
+            n += 1;
+            let intr = st.intrinsics.get(&op);
+            if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
+                || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
+            {
+                return None;
+            }
+            eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
+            if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
+                ncalls += 1;
+                // Indirect target is operand 0; `callee()` would clone the
+                // attr for a direct call only to discard it here.
+                if c.get_attr_llvm_call_callee(ctx).is_none() {
+                    dvirt_tgt.push(op.deref(ctx).get_operand(0));
+                }
+            }
+            if Operation::is_op::<CondBrOp>(op, ctx)
+                || (model && Operation::is_op::<SwitchOp>(op, ctx))
+            {
+                cond_roots.push(op.deref(ctx).get_operand(0));
+            }
+        }
+    }
+    if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
+        return None;
+    }
     let mut ci = CInfo {
-        op: st.funcs[sym].op,
+        op: f.op,
         eh,
         n,
         ncalls,
@@ -168,14 +176,18 @@ fn callee_info(
     if !want {
         return Some(ci);
     }
+    let params: Vec<Value> = match blocks(ctx, f.op).first() {
+        Some(&entry) => entry.deref(ctx).arguments().collect(),
+        None => return Some(ci),
+    };
     if model || bonus > 1 {
-        ci.dvirt = devirt_params(ctx, st.funcs[sym].op);
+        ci.dvirt = devirt_params(ctx, &params, &dvirt_tgt);
     }
     if model || fold > 1 {
-        ci.conds = cond_params(ctx, st.funcs[sym].op, model);
+        ci.conds = cond_params(ctx, &params, &cond_roots);
     }
     if model {
-        (ci.mem, ci.fold) = param_uses(ctx, st, st.funcs[sym].op);
+        (ci.mem, ci.fold) = param_uses(ctx, st, f.op);
     }
     Some(ci)
 }
@@ -249,9 +261,13 @@ fn const_arg(st: &State, v: &Value) -> bool {
 /// Successor blocks, counting invoke landing-pad edges.
 fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
-    for op in ops(ctx, b) {
-        v.extend(op.deref(ctx).successors());
+    // Invokes are non-terminator CallOps — they need the whole block scan;
+    // successor lists live only on the terminator (`iter().last()` is O(1)).
+    for op in b.deref(ctx).iter(ctx) {
         v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+    }
+    if let Some(t) = b.deref(ctx).iter(ctx).last() {
+        v.extend(t.deref(ctx).successors());
     }
     v
 }
@@ -326,37 +342,26 @@ fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<Ba
 /// Parameter indices of `f` that (through loads / GEPs) feed an indirect call's
 /// target: a constant address there (a vtable, a fn pointer) lets `devirt`
 /// make the call direct once `f` is inlined, as LLVM's inline-cost bonus does.
-fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
-    let bs = blocks(ctx, f);
-    let Some(&entry) = bs.first() else {
-        return Vec::new();
-    };
-    let params: Vec<Value> = entry.deref(ctx).arguments().collect();
+/// `targets` is the indirect-call operand-0s `callee_info` already collected.
+fn devirt_params(ctx: &Context, params: &[Value], targets: &[Value]) -> Vec<usize> {
     let mut out = Vec::new();
-    for &b in &bs {
-        for op in ops(ctx, b) {
-            let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
-                continue;
-            };
-            let CallOpCallable::Indirect(mut p) = c.callee(ctx) else {
-                continue;
-            };
-            for _ in 0..4 {
-                if let Some(i) = params.iter().position(|&a| a == p) {
-                    if !out.contains(&i) {
-                        out.push(i);
-                    }
-                    break;
+    for &t in targets {
+        let mut p = t;
+        for _ in 0..4 {
+            if let Some(i) = params.iter().position(|&a| a == p) {
+                if !out.contains(&i) {
+                    out.push(i);
                 }
-                match p.defining_op() {
-                    Some(d)
-                        if Operation::is_op::<LoadOp>(d, ctx)
-                            || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
-                    {
-                        p = d.deref(ctx).get_operand(0);
-                    }
-                    _ => break,
+                break;
+            }
+            match p.defining_op() {
+                Some(d)
+                    if Operation::is_op::<LoadOp>(d, ctx)
+                        || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
+                {
+                    p = d.deref(ctx).get_operand(0);
                 }
+                _ => break,
             }
         }
     }
@@ -366,44 +371,33 @@ fn devirt_params(ctx: &Context, f: Ptr<Operation>) -> Vec<usize> {
 /// Parameter indices of `f` that reach a conditional branch's condition
 /// through a short def chain: a scalar-constant argument there folds the
 /// branch in the inlined clone, so the callsite gets a size-limit bonus.
-/// `incl_switch` (the cost model) also counts `switch` conditions.
-fn cond_params(ctx: &Context, f: Ptr<Operation>, incl_switch: bool) -> Vec<usize> {
-    let bs = blocks(ctx, f);
-    let Some(&entry) = bs.first() else {
-        return Vec::new();
-    };
-    let params: Vec<Value> = entry.deref(ctx).arguments().collect();
+/// `roots` is the branch-condition operands `callee_info` already collected
+/// (it decides whether `switch` conditions are included).
+fn cond_params(ctx: &Context, params: &[Value], roots: &[Value]) -> Vec<usize> {
     let mut out = Vec::new();
-    for &b in &bs {
-        for op in ops(ctx, b) {
-            if !Operation::is_op::<CondBrOp>(op, ctx)
-                && !(incl_switch && Operation::is_op::<SwitchOp>(op, ctx))
-            {
+    for &root in roots {
+        let mut work = vec![root];
+        let mut seen: FxHashSet<Value> = FxHashSet::default();
+        let mut budget = 32;
+        while let Some(v) = work.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if let Some(i) = params.iter().position(|&a| a == v) {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
                 continue;
             }
-            let mut work = vec![op.deref(ctx).get_operand(0)];
-            let mut seen: FxHashSet<Value> = FxHashSet::default();
-            let mut budget = 32;
-            while let Some(v) = work.pop() {
-                if budget == 0 {
-                    break;
-                }
-                budget -= 1;
-                if let Some(i) = params.iter().position(|&a| a == v) {
-                    if !out.contains(&i) {
-                        out.push(i);
-                    }
-                    continue;
-                }
-                if !seen.insert(v) {
-                    continue;
-                }
-                let Some(d) = v.defining_op() else {
-                    continue;
-                };
-                for oi in 0..d.deref(ctx).get_num_operands() {
-                    work.push(d.deref(ctx).get_operand(oi));
-                }
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(d) = v.defining_op() else {
+                continue;
+            };
+            for oi in 0..d.deref(ctx).get_num_operands() {
+                work.push(d.deref(ctx).get_operand(oi));
             }
         }
     }
@@ -417,7 +411,7 @@ fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
             continue;
         }
         for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+            for op in b.deref(ctx).iter(ctx) {
                 if let Some(c) = direct_callee(ctx, st, op) {
                     if let Some(n) = n.get_mut(c) {
                         *n += 1;
@@ -453,7 +447,7 @@ impl Adj {
                 continue;
             }
             for b in blocks(ctx, f.op) {
-                for op in ops(ctx, b) {
+                for op in b.deref(ctx).iter(ctx) {
                     if let Some(c) = direct_callee(ctx, st, op) {
                         callers_of.entry(c.clone()).or_default().push(sym.clone());
                     }
@@ -562,7 +556,7 @@ fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> 
 fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
     blocks(ctx, st.funcs[sym].op)
         .into_iter()
-        .flat_map(|b| ops(ctx, b))
+        .flat_map(|b| b.deref(ctx).iter(ctx))
         .filter_map(|op| direct_callee(ctx, st, op).cloned())
         .filter(|c| st.funcs.contains_key(c))
         .collect()
@@ -698,9 +692,11 @@ pub fn run(
     let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
     for sym in order {
         let caller = st.funcs[&sym].op;
-        let mut size: usize = blocks(ctx, caller).iter().map(|&b| ops(ctx, b).len()).sum();
+        let mut size: usize = blocks(ctx, caller)
+            .iter()
+            .map(|&b| b.deref(ctx).iter(ctx).count())
+            .sum();
         let mut grown = 0usize;
-        let mut seen: FxHashSet<Ptr<Operation>> = FxHashSet::default();
         // `only` (the devirt-inline pass) restricts which pre-existing
         // callsites may inline; ops this run itself splices in are fair game —
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
@@ -708,7 +704,7 @@ pub fn run(
             .map(|_| {
                 blocks(ctx, caller)
                     .iter()
-                    .flat_map(|&b| ops(ctx, b))
+                    .flat_map(|&b| b.deref(ctx).iter(ctx))
                     .collect()
             })
             .unwrap_or_default();
@@ -728,10 +724,7 @@ pub fn run(
                 if !done_blocks.insert(b) {
                     continue;
                 }
-                for op in ops(ctx, b) {
-                    if !seen.insert(op) {
-                        continue;
-                    }
+                for op in b.deref(ctx).iter(ctx) {
                     if !bottom_up && st.invokes.contains_key(&op) {
                         continue;
                     }
@@ -1014,7 +1007,7 @@ fn left_stats(
             continue;
         }
         for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+            for op in b.deref(ctx).iter(ctx) {
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;
                 };
@@ -1232,7 +1225,7 @@ fn store_src(
     let Some(b) = load.deref(ctx).get_parent_block() else {
         return fail("noblock");
     };
-    let pos = ops(ctx, b).iter().position(|o| *o == load);
+    let pos = b.deref(ctx).iter(ctx).position(|o| o == load);
     let mut fuel = 32;
     store_src_in(
         ctx, st, preds, lb, ll, loff, lsz, b, pos, &mut fuel, scan, load, mem,
@@ -1749,9 +1742,9 @@ fn frozen_args(
         && let Some(region) = call_block.deref(ctx).get_parent_region()
     {
         for b in region.deref(ctx).iter(ctx) {
-            for op in ops(ctx, b) {
-                for (si, s) in op.deref(ctx).successors().enumerate() {
-                    preds.entry(s).or_default().push((op, si));
+            if let Some(t) = b.deref(ctx).iter(ctx).last() {
+                for (si, s) in t.deref(ctx).successors().enumerate() {
+                    preds.entry(s).or_default().push((t, si));
                 }
             }
         }
@@ -1846,7 +1839,7 @@ fn frozen_args(
         let Some(nb) = map.lookup_block(b) else {
             continue;
         };
-        for op in ops(ctx, nb) {
+        for op in nb.deref(ctx).iter(ctx) {
             if !Operation::is_op::<LoadOp>(op, ctx) {
                 continue;
             }
