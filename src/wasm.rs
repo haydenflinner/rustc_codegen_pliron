@@ -3072,6 +3072,16 @@ impl<'o, 'a> FL<'o, 'a> {
             }
             wtrip_guard(&mut self.b, self.o.trip, lim);
         }
+        if crate::env_get("PLIRON_WASM_DUMP")
+            .map(|f| f.is_empty() || self.name.contains(&f))
+            .unwrap_or(false)
+        {
+            tracing::info!(target: "pliron::dump",
+                "==== wasm body {} ====\n{}",
+                self.name,
+                self.b.display("  ", None)
+            );
+        }
         self.b
     }
 
@@ -8107,6 +8117,15 @@ impl<'o, 'a> CX<'o, 'a> {
         }
     }
 
+    /// `binop` for *comparisons*: operand picks the i32/i64 op, but the
+    /// result is always an i32 flag regardless of operand width.
+    fn cbinop(&mut self, t: ClType, o32: O, o64: O, a: WV, b: WV) -> WV {
+        match wty(t) {
+            WT::I64 => self.op(o64, &[a, b], WT::I32),
+            _ => self.op(o32, &[a, b], WT::I32),
+        }
+    }
+
     /// Add `inst`'s results -> `vals` binding (split i128 into lo/hi).
     fn bind(&mut self, f: &ir::Function, inst: CInst, vs: Vals) {
         let rs = f.dfg.inst_results(inst);
@@ -8415,17 +8434,22 @@ impl<'o, 'a> CX<'o, 'a> {
             P::Ishl => {
                 // CLIF masks the amount by the value's bit width; wasm masks
                 // mod the container width. Narrow types must mask themselves.
+                // The amount may carry a wider CLIF type than the value —
+                // wasm shift operands must match the value's container.
+                let b = self.cvt(b, wty(t));
                 let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
                 let r = self.binop(t, O::I32Shl, O::I64Shl, a, b);
                 if w < 32 { self.norm(r, w) } else { r }
             }
             P::Ushr => {
                 let a = if w < 32 { self.norm(a, w) } else { a };
+                let b = self.cvt(b, wty(t));
                 let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
                 self.binop(t, O::I32ShrU, O::I64ShrU, a, b)
             }
             P::Sshr => {
                 let a = if w < 32 { self.sext(a, w) } else { a };
+                let b = self.cvt(b, wty(t));
                 let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
                 let r = self.binop(t, O::I32ShrS, O::I64ShrS, a, b);
                 if w < 32 { self.norm(r, w) } else { r }
@@ -8458,6 +8482,7 @@ impl<'o, 'a> CX<'o, 'a> {
 
     fn rot(&mut self, t: ClType, a: WV, b: WV, left: bool) -> WV {
         let w = t.bits();
+        let b = self.cvt(b, wty(t));
         match wty(t) {
             WT::I64 => {
                 let c63 = self.i64c(63);
@@ -8485,14 +8510,14 @@ impl<'o, 'a> CX<'o, 'a> {
     }
 
     fn minmax(&mut self, t: ClType, a: WV, b: WV, c32: O, c64: O) -> WV {
-        let c = self.binop(t, c32, c64, a, b);
+        let c = self.cbinop(t, c32, c64, a, b);
         self.sel(c, a, b)
     }
 
     fn minmax_s(&mut self, t: ClType, a: WV, b: WV, min: bool) -> WV {
         let w = t.bits();
         let (a2, b2) = if w < 32 { (self.sext(a, w), self.sext(b, w)) } else { (a, b) };
-        let c = self.binop(
+        let c = self.cbinop(
             t,
             if min { O::I32LtS } else { O::I32GtS },
             if min { O::I64LtS } else { O::I64GtS },
@@ -8582,7 +8607,7 @@ impl<'o, 'a> CX<'o, 'a> {
             b,
         );
         let sum = if t.bits() < 32 { self.norm(sum, t.bits()) } else { sum };
-        let c = self.binop(
+        let c = self.cbinop(
             t,
             if sub { O::I32GtU } else { O::I32LtU },
             if sub { O::I64GtU } else { O::I64LtU },
@@ -8669,6 +8694,16 @@ impl<'o, 'a> CX<'o, 'a> {
         waddr(&mut self.b);
         check_targets(&self.b, &self.name);
         self.b.optimize(&waffle::OptOptions::default());
+        if crate::env_get("PLIRON_WASM_DUMP")
+            .map(|f| f.is_empty() || self.name.contains(&f))
+            .unwrap_or(false)
+        {
+            tracing::info!(target: "pliron::dump",
+                "==== wasm body {} ====\n{}",
+                self.name,
+                self.b.display("  ", None)
+            );
+        }
         self.b
     }
 }
@@ -9928,7 +9963,7 @@ impl<'o, 'a> CX<'o, 'a> {
     fn overflow(&mut self, op: Opcode, t: ClType, a: WV, b: WV) -> Vals {
         use Opcode as P;
         let w = t.bits();
-        let flag = |cx: &mut Self, x: WV, y: WV, o32: O, o64: O| cx.binop(t, o32, o64, x, y);
+        let flag = |cx: &mut Self, x: WV, y: WV, o32: O, o64: O| cx.cbinop(t, o32, o64, x, y);
         match op {
             P::UaddOverflow => {
                 let s = self.ibin(P::Iadd, t, a, b);
@@ -9953,7 +9988,7 @@ impl<'o, 'a> CX<'o, 'a> {
                 let m = self.binop(t, O::I32And, O::I64And, x1, x2);
                 let m = if w < 32 { self.sext(m, w) } else { m };
                 let z = self.leaf_const(t, 0);
-                let c = self.binop(t, O::I32LtS, O::I64LtS, m, z);
+                let c = self.cbinop(t, O::I32LtS, O::I64LtS, m, z);
                 smallvec![s, c]
             }
             P::UmulOverflow | P::SmulOverflow => {
@@ -9964,10 +9999,10 @@ impl<'o, 'a> CX<'o, 'a> {
                     // hi should equal the sign-extension of prod's top bit.
                     let sh = self.leaf_const(t, w as u64 - 1);
                     let e = self.binop(t, O::I32ShrS, O::I64ShrS, prod, sh);
-                    self.binop(t, O::I32Ne, O::I64Ne, hi, e)
+                    self.cbinop(t, O::I32Ne, O::I64Ne, hi, e)
                 } else {
                     let z = self.leaf_const(t, 0);
-                    self.binop(t, O::I32Ne, O::I64Ne, hi, z)
+                    self.cbinop(t, O::I32Ne, O::I64Ne, hi, z)
                 };
                 smallvec![prod, c]
             }
