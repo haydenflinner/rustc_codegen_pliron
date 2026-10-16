@@ -27,18 +27,19 @@ WLD=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld
 # rlibs hold wasm-ld objects pliron-wasm-ld cannot read, so -Zbuild-std
 # rebuilds them (same reason as tests/wasm/run.sh). Cargo does not track
 # the backend dylib, so the target dir starts fresh. Built twice: the
-# default dialect->waffle path and the CLIF pipeline path
-# (PLIRON_WASM_CLIF=1), which shares the native Cranelift opt pipeline.
+# default CLIF pipeline path (MIR/dialect -> Cranelift IR -> waffle) and
+# the dialect fallback (PLIRON_WASM_CLIF=0, dialect -> waffle direct),
+# which skips the Cranelift opt suite in favour of waffle-level passes.
 rm -rf "$ROOT/target/wasm-bench"
 (cd bench/wasm &&
   CARGO_TARGET_DIR=$ROOT/target/wasm-bench \
   RUSTFLAGS="-Zcodegen-backend=$ROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=std,panic_abort)
-rm -rf "$ROOT/target/wasm-bench-clif"
+rm -rf "$ROOT/target/wasm-bench-dialect"
 (cd bench/wasm &&
-  CARGO_TARGET_DIR=$ROOT/target/wasm-bench-clif \
-  PLIRON_WASM_CLIF=1 \
+  CARGO_TARGET_DIR=$ROOT/target/wasm-bench-dialect \
+  PLIRON_WASM_CLIF=0 \
   RUSTFLAGS="-Zcodegen-backend=$ROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=std,panic_abort)
@@ -46,4 +47,4 @@ rm -rf "$ROOT/target/wasm-bench-clif"
 exec node "$ROOT/bench/wasm/run.mjs" \
   "$ROOT/target/wasm-bench-llvm/wasm32-unknown-unknown/release/wasmbench.wasm" \
   "$ROOT/target/wasm-bench/wasm32-unknown-unknown/release/wasmbench.wasm" \
-  "$ROOT/target/wasm-bench-clif/wasm32-unknown-unknown/release/wasmbench.wasm" "$@"
+  "$ROOT/target/wasm-bench-dialect/wasm32-unknown-unknown/release/wasmbench.wasm" "$@"
