@@ -2019,3 +2019,47 @@ shared-snapshot refactor (3e8331b) — wrapper API (`iter`/`remove`)
 was unchanged so B's code merged textually-correct. Verified: full
 `cargo test -p pliron-clif-opt` (27 binaries incl. new slp_fma),
 workspace check, plirun example builds.
+
+## attr interning: AttributeDict → AttrInstId(u32) arena handles (attr leg)
+
+`AttributeDict` values are now `AttrInstId(u32)` handles into a
+`Context::attr_store: UniqueStore<AttrEntry>` instead of a
+`Box<dyn Attribute>` per op — kills a heap Box per attribute per op.
+Dedup is full hash-consing on the existing `hash_attr`/`eq_attr` hooks
+(not the "cheap v0" the scoping note assumed — the hooks already
+existed), so identical attrs share one entry and dict clone/eq/hash
+are 4-byte handle ops.
+
+Interface "capability bitmask" became per-entry interface lists
+instead: >64 registered cast targets killed the u64 mask (ir-opt tests
+caught it). Each `AttrEntry` lazily computes the interface TypeIds it
+casts to (`OnceCell<Box<[TypeId]>>` scanned once per unique attr from
+`iter_caster_pairs`, new in trait_cast.rs); `dict.impls::<I>`/
+`attr_should_outline` short-circuit on a ~3-entry TypeId scan, no
+caster-map probe.
+
+Semantics: interned attrs are immutable — `given_names` (the one
+in-place mutation path upstream) is copy-on-write (clone, mutate,
+re-set). Accessors take `&Context` (`get`/`get_as`/`set`/`set_obj`/
+`get_obj`/`iter`/`impls`); returned `&T` borrows the ctx store, not
+the op `Ref` — strictly looser. Generated op attr getters now return
+`Option<&T>` not `Option<Ref<T>>`; `ConstantOp::get_value` returns
+`&dyn TypedAttrInterface`. `OnceVec` chunks never move, so refs are
+stable. `AttributeDict` PartialEq/Hash compare handles — same-ctx
+only (documented; no cross-ctx dict-transfer API exists). `DictAttr`
+keeps the interned dict (`new`/`insert`/`lookup` take `&Context`).
+
+Traps hit: `as_any()` on `Box<dyn Attribute>` resolves to
+`Downcast`'s blanket `impl<T: Any>` → yields the *Box's* TypeId, not
+the attr's — `ifaces()` must go through `&dyn Attribute` first (test
+caught it; `attr_cast` only works because it takes `&dyn Attribute`).
+
+Verify: `cargo test -p pliron-ir-opt` (incl. new tests/attr_intern.rs:
+dedup, iface pos/neg, parse/print roundtrip, given-names COW across
+deduped ops) + `cargo test -p pliron-clif-opt` (27 binaries) green;
+`cargo check` workspace clean; pliron-llvm `--no-default-features
+--features std` clean (LLVM 23 absent — vendored pliron's own test
+target still can't build here). Smoke: compiled+ran a real program
+through the dylib — output matches stock rustc. Vendored-pliron unit
+tests for ifaces can't run here (dev-dep → llvm-sys); the ir-opt
+public-API test covers the same ground.

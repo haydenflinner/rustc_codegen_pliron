@@ -812,9 +812,8 @@ impl Verify for Operation {
     fn verify(&self, ctx: &Context) -> Result<()> {
         fn verify_inner(opr: &Operation, ctx: &Context) -> Result<()> {
             opr.attributes
-                .0
-                .values()
-                .try_for_each(|attr| verify_attr(&**attr, ctx))?;
+                .iter(ctx)
+                .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
             opr.operands
                 .iter()
                 .try_for_each(|opd| opd.verify(ctx, opr.self_ptr))?;

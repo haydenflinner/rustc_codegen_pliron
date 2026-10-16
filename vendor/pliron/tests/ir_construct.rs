@@ -1009,6 +1009,7 @@ fn parse_function_with_attrs() -> Result<()> {
         .get_parent_op(ctx)
         .unwrap();
     func_op.deref_mut(ctx).attributes.set(
+        ctx,
         ATTR_KEY_TEST_ON_FUNC_VALUE.clone(),
         StringAttr::new("func_attr_value".into()),
     );
@@ -1528,6 +1529,7 @@ fn block_inline_attrs_print() -> Result<()> {
 
     // Set an inline attribute on the block
     entry_block.deref_mut(ctx).attributes.set(
+        ctx,
         ATTR_KEY_BLOCK_TEST.clone(),
         StringAttr::new("test_value".into()),
     );

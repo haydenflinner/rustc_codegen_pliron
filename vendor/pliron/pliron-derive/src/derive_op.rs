@@ -264,28 +264,26 @@ pub(crate) fn derive_attr_get_set(
         let get_set_fns = if let Some(ty) = ty_opt {
             quote! {
                 #[doc = #fn_comment_get]
-                /// The `Ref` is a borrow of the containing `Operation` object.
+                /// The reference is borrowed from `ctx`'s attribute store.
                 pub fn #fn_name_get<'a>(&self, ctx: &'a ::pliron::context::Context)
-                    -> Option<::core::cell::Ref<'a, #ty>>
+                    -> Option<&'a #ty>
                 {
-                    ::core::cell::Ref::filter_map(self.op.deref(ctx), |op|
-                        op.attributes.get::<#ty>(&#module_name::#attr_name_const)).ok()
+                    self.op.deref(ctx).attributes.get::<#ty>(ctx, &#module_name::#attr_name_const)
                 }
 
                 #[doc = #fn_comment_set]
                 pub fn #fn_name_set(&self, ctx: &::pliron::context::Context, value: #ty) {
-                    self.op.deref_mut(ctx).attributes.set(#module_name::#attr_name_const.clone(), value);
+                    self.op.deref_mut(ctx).attributes.set(ctx, #module_name::#attr_name_const.clone(), value);
                 }
             }
         } else {
             quote! {
                 #[doc = #fn_comment_get]
-                /// The `Ref` is a borrow of the containing `Operation` object.
+                /// The reference is borrowed from `ctx`'s attribute store.
                 pub fn #fn_name_get<'a>(&self, ctx: &'a ::pliron::context::Context)
-                    -> Option<::core::cell::Ref<'a, ::pliron::attribute::AttrObj>>
+                    -> Option<&'a ::pliron::attribute::AttrObj>
                 {
-                    ::core::cell::Ref::filter_map(self.op.deref(ctx), |op|
-                        op.attributes.0.get(&#module_name::#attr_name_const)).ok()
+                    self.op.deref(ctx).attributes.get_obj(ctx, &#module_name::#attr_name_const)
                 }
 
                 #[doc = #fn_comment_set]
@@ -294,7 +292,7 @@ pub(crate) fn derive_attr_get_set(
                     value: ::pliron::attribute::AttrObj)
                 {
                     self.op.deref_mut(ctx).attributes
-                        .0.insert(#module_name::#attr_name_const.clone(), value);
+                        .set_obj(ctx, #module_name::#attr_name_const.clone(), value);
                 }
             }
         };

@@ -299,7 +299,7 @@ pub trait OperandSegmentInterface {
         let mut self_op = self.get_operation().deref_mut(ctx);
         self_op
             .attributes
-            .set(ATTR_KEY_OPERAND_SEGMENT_SIZES.clone(), sizes);
+            .set(ctx, ATTR_KEY_OPERAND_SEGMENT_SIZES.clone(), sizes);
     }
 
     /// Get the `operand_segment_sizes` attribute for this operation.
@@ -307,7 +307,7 @@ pub trait OperandSegmentInterface {
         let self_op = self.get_operation().deref(ctx);
         self_op
             .attributes
-            .get::<OperandSegmentSizesAttr>(&ATTR_KEY_OPERAND_SEGMENT_SIZES)
+            .get::<OperandSegmentSizesAttr>(ctx, &ATTR_KEY_OPERAND_SEGMENT_SIZES)
             .unwrap()
             .clone()
     }
@@ -412,7 +412,7 @@ pub trait OperandSegmentInterface {
         let self_op = op.get_operation().deref(ctx);
         let Some(attr) = self_op
             .attributes
-            .get::<OperandSegmentSizesAttr>(&ATTR_KEY_OPERAND_SEGMENT_SIZES)
+            .get::<OperandSegmentSizesAttr>(ctx, &ATTR_KEY_OPERAND_SEGMENT_SIZES)
         else {
             return verify_err!(
                 self_op.loc(),
@@ -632,7 +632,7 @@ pub trait SymbolOpInterface {
         let self_op = self.get_operation().deref(ctx);
         let s_attr = self_op
             .attributes
-            .get::<IdentifierAttr>(&ATTR_KEY_SYM_NAME)
+            .get::<IdentifierAttr>(ctx, &ATTR_KEY_SYM_NAME)
             .unwrap();
         s_attr.clone().into()
     }
@@ -641,7 +641,7 @@ pub trait SymbolOpInterface {
     fn set_symbol_name(&self, ctx: &mut Context, name: Identifier) {
         let name_attr = IdentifierAttr::new(name);
         let mut self_op = self.get_operation().deref_mut(ctx);
-        self_op.attributes.set(ATTR_KEY_SYM_NAME.clone(), name_attr);
+        self_op.attributes.set(ctx, ATTR_KEY_SYM_NAME.clone(), name_attr);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -651,7 +651,7 @@ pub trait SymbolOpInterface {
         let self_op = op.get_operation().deref(ctx);
         if self_op
             .attributes
-            .get::<IdentifierAttr>(&ATTR_KEY_SYM_NAME)
+            .get::<IdentifierAttr>(ctx, &ATTR_KEY_SYM_NAME)
             .is_none()
         {
             return verify_err!(op.loc(ctx), SymbolOpInterfaceErr);
@@ -1716,7 +1716,7 @@ pub trait CallOpInterface {
         Self: Sized,
     {
         let op = op.get_operation().deref(ctx);
-        let Some(callee_type_attr) = op.attributes.get::<TypeAttr>(&ATTR_KEY_CALLEE_TYPE) else {
+        let Some(callee_type_attr) = op.attributes.get::<TypeAttr>(ctx, &ATTR_KEY_CALLEE_TYPE) else {
             return verify_err!(op.loc(), CallOpInterfaceErr::CalleeTypeAttrNotFoundErr);
         };
         if !type_impls::<dyn FunctionTypeInterface>(&*callee_type_attr.get_type(ctx).deref(ctx)) {
@@ -1746,7 +1746,7 @@ pub trait CallOpInterface {
         let self_op = self.get_operation().deref(ctx);
         self_op
             .attributes
-            .get::<TypeAttr>(&ATTR_KEY_CALLEE_TYPE)
+            .get::<TypeAttr>(ctx, &ATTR_KEY_CALLEE_TYPE)
             .unwrap()
             .get_type(ctx)
     }
@@ -1757,7 +1757,7 @@ pub trait CallOpInterface {
         let ty_attr = TypeAttr::new(callee_ty);
         self_op
             .attributes
-            .set(ATTR_KEY_CALLEE_TYPE.clone(), ty_attr);
+            .set(ctx, ATTR_KEY_CALLEE_TYPE.clone(), ty_attr);
     }
 }
 
