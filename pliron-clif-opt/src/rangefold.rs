@@ -395,8 +395,15 @@ fn bound_pairs(func: &mut Function) -> usize {
                 continue;
             };
             let miss_eq = same_edge(func, miss_bc, mbc) || miss_twin(func, miss_bc, mbc);
+            // The bounds must be representable in x's type: an iconst
+            // wider than the type truncates on materialization, and the
+            // `x-lo u< hi-lo` model needs hi <= 2^bits to hold mod 2^N.
+            let tb = func.dfg.value_type(x).bits();
+            let fits = |v: u64| tb >= 64 || v >> tb == 0;
             let ok = func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2)
                 && hi > lo
+                && fits(lo)
+                && fits(hi)
                 && miss_eq
                 && body_avail(func, &dom, dest_block(func, hbc), term);
             if dbg {
@@ -558,6 +565,17 @@ fn range_unions(func: &mut Function) -> usize {
             let (k_lo, k_hi) = (k1.min(k2), k1.max(k2));
             let d = k_hi - k_lo;
             if !d.is_power_of_two() {
+                continue;
+            }
+            // The mod-2d bit analysis is only exact in a non-wrapping
+            // type: constants must fit the width and the hi window must
+            // not wrap past the type's max, or the satisfying set isn't
+            // the contiguous interval the bit math models.
+            let tb = func.dfg.value_type(x1).bits();
+            let fits = |v: u64| tb >= 64 || v >> tb == 0;
+            if !(fits(k1) && fits(k2) && fits(w1))
+                || (k_hi as u128) + (w1 as u128) > (1u128 << tb)
+            {
                 continue;
             }
             // Exactness: lo range entirely inside a bit-d-clear mod-2d
