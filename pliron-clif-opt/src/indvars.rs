@@ -1300,12 +1300,16 @@ fn elim_shadowed(
         let m = m.unwrap();
         let pend = pends[&bnd];
         let mut data = func.dfg.insts[i];
-        if let InstructionData::IntCompare { cond, args, .. } = &mut data {
+        if let InstructionData::IntCompare { args, .. } = &mut data {
             if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(w) {
                 *args = [m, pend];
             } else {
+                // `bnd` was operand 0 and `w` operand 1: `pend` fills the
+                // `bnd` slot and `m` the `w` slot, preserving operand
+                // order — the condition code stays as-is (swapping it
+                // here inverts the test, mir_raw_fat_ptr's `i < j` coming
+                // out as `i > j`).
                 *args = [pend, m];
-                *cond = cond.swap_args();
             }
         }
         func.dfg.insts[i] = data;
