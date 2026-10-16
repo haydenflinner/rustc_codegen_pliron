@@ -2547,26 +2547,41 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // wins outright — nothing can write between them.
             let lops: Vec<Ptr<Operation>> = lb.deref(ctx).iter(ctx).collect();
             let lpos = lops.iter().position(|o| *o == op)?;
-            let local = pre
-                .iter()
-                .filter_map(|(uop, s)| {
-                    lops.iter()
-                        .position(|o| o == uop)
-                        .filter(|p| *p < lpos)
-                        .map(|p| (p, s))
-                })
-                .max_by_key(|(p, _)| *p);
-            if let Some((_, s)) = local {
-                return Some(*s);
+            // Unless the block is on a cycle: a store positioned after the
+            // load ran on an earlier iteration, so every store is a
+            // candidate previous write and no same-block ordering applies.
+            let cyclic = lb
+                .deref(ctx)
+                .iter(ctx)
+                .flat_map(|o| o.deref(ctx).successors(ctx).collect::<Vec<_>>())
+                .any(|s| reaches(ctx, s, lb));
+            if !cyclic {
+                let local = pre
+                    .iter()
+                    .filter_map(|(uop, s)| {
+                        lops.iter()
+                            .position(|o| o == uop)
+                            .filter(|p| *p < lpos)
+                            .map(|p| (p, s))
+                    })
+                    .max_by_key(|(p, _)| *p);
+                if let Some((_, s)) = local {
+                    return Some(*s);
+                }
             }
             // Stores in other blocks: paths reaching the load either ran one
             // of these or read uninitialized (UB).
+            let rest: Vec<_> = if cyclic {
+                pre.iter().chain(rest.iter()).copied().collect()
+            } else {
+                rest
+            };
             if rest.is_empty() {
                 return None;
             }
             if rest.iter().all(|(_, s)| *s == rest[0].1) {
                 rest[0].1.0
-            } else if rest.len() == 2 {
+            } else if !cyclic && rest.len() == 2 {
                 let b1 = rest[0].0.deref(ctx).get_parent_block()?;
                 let b2 = rest[1].0.deref(ctx).get_parent_block()?;
                 if b1 == b2 {
