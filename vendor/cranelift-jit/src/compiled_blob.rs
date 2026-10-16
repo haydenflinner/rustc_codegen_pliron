@@ -155,9 +155,15 @@ impl CompiledBlob {
                                 self.ptr.byte_add(self.size + veneer_idx * VENEER_SIZE)
                             };
                             unsafe {
+                                // `what` carries the rel32's -4 addend; the
+                                // veneer needs the target address itself.
+                                let target = relocation_target_addr(name, 0);
                                 write_unaligned(veneer.cast::<u16>(), 0x25ff);
                                 write_unaligned(veneer.byte_add(2).cast::<u32>(), 0);
-                                write_unaligned(veneer.byte_add(6).cast::<u64>(), what as u64);
+                                write_unaligned(
+                                    veneer.byte_add(6).cast::<u64>(),
+                                    target as u64,
+                                );
                             }
                             // `at` is the rel32 field; the displacement is
                             // measured from the following instruction.
