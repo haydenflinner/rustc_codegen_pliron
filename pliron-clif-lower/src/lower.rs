@@ -257,6 +257,23 @@ pub fn lower_to_object(
     if !custom_secs.is_empty() {
         emit_merged_custom_sections(&mut product.object, custom_secs);
     }
+    // PLIRON_CRTFREE: the bookkeeping module emits the CRT/TLS statics; the
+    // remaining piece is making the linker pull the CRT import libraries —
+    // /defaultlib:msvcrt is already on rustc's line, so advertise the rest
+    // via .drectve.
+    if isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
+        && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0")
+    {
+        let s =
+            product
+                .object
+                .add_section(vec![], b".drectve".to_vec(), object::SectionKind::Linker);
+        product.object.append_section_data(
+            s,
+            b" /DEFAULTLIB:ucrtbase /DEFAULTLIB:vcruntime140 ",
+            1,
+        );
+    }
     eh.emit(&mut product);
     for (alias, target, weak) in &st.aliases {
         let tsym = match ids.get(target).copied() {
@@ -972,7 +989,11 @@ pub fn lower_module(
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
     let mut custom_secs: Vec<CustomSec> = Vec::new();
-    for (n, g) in &st.globals {
+    // `_tls_start` must land at the head of .tls — the merged section is
+    // input-ordered, so emit it before every other TLS datum.
+    let mut globals: Vec<_> = st.globals.iter().collect();
+    globals.sort_by_key(|(n, _)| usize::from(n.as_str() != "_tls_start"));
+    for (n, g) in globals {
         let Some(init) = g.init else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else {
             continue;

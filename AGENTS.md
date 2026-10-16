@@ -114,6 +114,35 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
 - `cranelift-interpreter` is vendored with small fixes; see
   `vendor/cranelift-interpreter/PLIRON_PATCH.md`.
 
+## MSVC-free Windows links (PLIRON_CRTFREE)
+
+`PLIRON_CRTFREE=1` makes the backend emit the static-CRT pieces
+msvcrt/vcruntime normally supply — `mainCRTStartup`/`wmainCRTStartup`/
+`WinMainCRTStartup`/`wWinMainCRTStartup` (exec) or `_DllMainCRTStartup`
+(dylib), `_tls_used`+`_tls_start`/`_tls_end`/`_tls_index` (the PE TLS
+directory — `_tls_start` is a plain byte in unsuffixed `.tls`, the
+bookkeeping object is first input so it anchors the template),
+`_pliron_tls_cbs`, `_fltused`, the `type_info` vftable slot, and
+`__security_cookie`/`__security_check_cookie`/`__GSHandlerCheck` (GS is a
+stub: check-cookie compares against the sentinel, the SEH handler returns
+ExceptionContinueSearch). Every emitted object gets a `.drectve` with
+`/DEFAULTLIB:ucrtbase /DEFAULTLIB:vcruntime140`.
+
+Combined with synthesized import libraries, this links with zero
+MSVC/WinSDK files:
+
+    uv run --no-project tools/mkwinlibs/mkwinlibs.py <OUTDIR>
+    PLIRON_CRTFREE=1 rustc -O foo.rs -Zcodegen-backend=.../rustc_codegen_pliron.dll         -Clinker=rust-lld -Lnative=<OUTDIR>
+
+`tools/mkwinlibs/mkwinlibs.py` dumps System32 DLL export tables via
+`llvm-readobj --coff-exports` and builds `.lib` files with
+`rust-lld -flavor link -def:` — kernel32/ntdll/userenv/ws2_32/dbghelp/
+msvcrt/ucrtbase/vcruntime140/ole32/advapi32/shell32/user32/bcrypt/
+bcryptprimitives plus `synchronization.lib` (api-set forwarders). Names
+unspellable in .def (C++ operators, `=X.#N` ordinal forwards) are skipped —
+rustc objects never import them. Verified end-to-end: the criterion bench
+builds and runs with zero VS inputs.
+
 ## Platform notes
 
 - windows-msvc (x86_64): `is_pic=false`, Cranelift `tls_model="coff"`.

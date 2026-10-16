@@ -68,6 +68,9 @@ where
         // `object` calls Mach-O `__DATA,__mod_init_func` Unknown, but the
         // ctor pointer it holds is the reason the asm exists — keep it by
         // name. Its S_MOD_INIT_FUNC_POINTERS flags pass through below.
+        // COFF `$`-sections (.tls$AAA/.CRT$XLA link-range markers, COMDAT
+        // groups) classify as Other/Unknown — keep them too.
+        let coff_named = out.format() == BinaryFormat::Coff && name.contains(&b'$');
         let keep = (matches!(
             kind,
             SectionKind::Text
@@ -79,8 +82,9 @@ where
                 | SectionKind::Tls
                 | SectionKind::UninitializedTls
                 | SectionKind::Elf(_)
-        ) || (out.format() == BinaryFormat::MachO && name == b"__mod_init_func"))
-            && s.size() > 0;
+        ) || coff_named
+            || (out.format() == BinaryFormat::MachO && name == b"__mod_init_func"))
+            && (s.size() > 0 || coff_named);
         if !keep {
             continue;
         }

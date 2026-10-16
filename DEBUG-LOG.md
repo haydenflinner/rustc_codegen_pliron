@@ -55,3 +55,52 @@ LLVM baseline are noisy (a few +/-10-30%); worth a proper look later.
 - OK to keep the temporary repro bin + serde deps out of the repo? (dropped
   from the commit; they were only crash repro scaffolding.)
 - Next: MSVC-free Windows link path — see plan below.
+
+
+## Overnight progress — MSVC-free linking (DONE, working)
+
+Achieved: full Rust compile+link+run on windows-msvc target with ZERO
+Visual Studio / Windows SDK inputs.
+
+Stack that works (all verified running correctly):
+- `-Clinker=rust-lld` replaces link.exe (lld is shipped in the toolchain)
+- `tools/mkwinlibs/mkwinlibs.py` generates import .libs from
+  C:\Windows\System32 DLL export tables via llvm-readobj + rust-lld /def
+- `PLIRON_CRTFREE=1` makes the backend emit into symbols.o: TLS directory
+  (_tls_used/_tls_start/_tls_end/_tls_index/_pliron_tls_cbs), CRT entry
+  thunks, _fltused, type_info vftable, GS-cookie symbols; plus .drectve
+  /DEFAULTLIB directives for ucrtbase+vcruntime140
+
+Final recipe:
+    uv run --no-project tools/mkwinlibs/mkwinlibs.py <out>
+    PLIRON_CRTFREE=1 rustc -O foo.rs -Zcodegen-backend=<be>         -Clinker=rust-lld -Lnative=<out>
+
+Traps hit on the way (all fixed):
+- lld only emits the PE TLS dir when _tls_used symbol exists; the struct
+  fields are real relocations, not linker-filled
+- `.tls` merge ordering: unsuffixed .tls first, then .tls$AAA..$ZZZ by
+  suffix — _tls_start must be a plain byte in unsuffixed .tls from the
+  first object (symbols.o); _tls_end rides .tls$ZZZ; cranelift TLS data
+  goes to `.tls$$subsection` which sorts between
+- implib DLL binding name comes from lld-link's /out:, not def LIBRARY
+- `.def` can't spell `=X.#N` ordinal forwards or `=`/` ` in names — skipped
+- llvm-ar can't merge implibs (member-name mangling) — use per-DLL implibs
+  + .drectve /DEFAULTLIB instead of a fat merged lib
+- api-ms-win-* sync functions aren't in kernel32.dll — synchronization.lib
+  needs forwarder defs to API-MS-WIN-CORE-SYNCH-L1-2-0
+- `PLIRON_CRTFREE` also drives `.drectve` emission — object carries
+  /DEFAULTLIB:ucrtbase /DEFAULTLIB:vcruntime140 so no extra -l args needed
+
+Still TODO / open questions:
+- `_tls_start` ordering relies on symbols.o being first + our emit-order
+  sort — works; a deeper fix would name-boundary the whole template
+- gnullvm target tried first: needs mingw-w64 libs not shipped with rustup
+  (mingw32/mingwex/libunwind) — abandoned in favor of msvc+lld approach
+- crtstatic/CRT statics not emitted: __chkstk (MSVC name — only referenced
+  if a /GS+chkstk foreign .o needs it — alloca.o didn't), _initterm,
+  atexit-driven cleanup — minimal CRT entry skips C++ static-init lists;
+  `std::process::exit` works (42 verified), println works
+- `panic=abort` still fails on alloca.o unwind requirement — unrelated
+- benchmark under CRTFREE runs clean end-to-end; perf deltas unchanged
+  (strwork -30% faster, sortw +20% slower vs LLVM baseline)
+- the `loadfwd` CGU=1 ICE noted earlier remains open

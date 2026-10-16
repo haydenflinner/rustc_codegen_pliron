@@ -88,7 +88,11 @@ fn install_crash_probe() {
             // Virtual unwind via RtlLookupFunctionEntry + RtlVirtualUnwind —
             // walks .pdata RUNTIME_FUNCTION entries (ours AND llvm's).
             unsafe extern "system" {
-                fn RtlLookupFunctionEntry(pc: usize, base: *mut usize, hist: *mut usize) -> *const u8;
+                fn RtlLookupFunctionEntry(
+                    pc: usize,
+                    base: *mut usize,
+                    hist: *mut usize,
+                ) -> *const u8;
                 fn RtlVirtualUnwind(
                     htype: u32,
                     base: usize,
@@ -127,10 +131,17 @@ fn install_crash_probe() {
                 }
             }
             // x64 CONTEXT GPRs: rax@0x78 .. r15@0xF0, rip@0xF8
-            let names = ["rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"];
+            let names = [
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                "r12", "r13", "r14", "r15",
+            ];
             for (i, n) in names.iter().enumerate() {
                 let v = *(ctx.add(0x78 + i * 8) as *const usize);
-                let tag = if v >= base && v < base + 0x360000 { " (in exe)" } else { "" };
+                let tag = if v >= base && v < base + 0x360000 {
+                    " (in exe)"
+                } else {
+                    ""
+                };
                 std::eprintln!("  {n}={v:#x}{tag}");
             }
             let rsp = *(ctx.add(0x98) as *const usize);

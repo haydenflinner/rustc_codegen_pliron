@@ -18,6 +18,7 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 
@@ -275,7 +276,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let flags = settings::Flags::new(fb);
     let mut isa = cranelift_codegen::isa::lookup(triple.clone())
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
-    // Target features → ISA flags. `sess.internal_target_features` holds the
+    // Target features â†’ ISA flags. `sess.internal_target_features` holds the
     // effective set (spec baseline + `-Ctarget-cpu` + `-Ctarget-feature`).
     let tf = |rust: &str| {
         sess.internal_target_features
@@ -293,9 +294,9 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         // real hardware: they unlock the 3-operand encodings and, under
         // AVX2/AVX512F, the wide-vector lowerings (loopvec probes the
         // resulting ISA flags per function; `WIDE_VECTOR_BITS` tracks the
-        // ceiling). `PLIRON_X64_VEX=0` opts out — e.g. under Rosetta, where
+        // ceiling). `PLIRON_X64_VEX=0` opts out -- e.g. under Rosetta, where
         // VEX-128 encodings translate ~2x slower than legacy SSE.
-        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
+        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/â€¦) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
             ("ssse3", "has_ssse3"),
@@ -348,7 +349,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         } else {
             128
         };
-        // The vendored static only exists with the `x86` codegen feature —
+        // The vendored static only exists with the `x86` codegen feature â€”
         // `host-arch` gives it on x86 hosts (the only hosts x64 targets
         // build on today; all-arch cross would need a different gate).
         #[cfg(target_arch = "x86_64")]
@@ -399,19 +400,19 @@ impl lower::Host for RustcHost<'_> {
 /// Install the tracing subscriber when `PLIRON_TRACE` or any legacy
 /// diagnostic knob is set. `PLIRON_TRACE` is an
 /// [`EnvFilter`](tracing_subscriber::EnvFilter) over our `pliron::*`
-/// targets — `pliron` for everything, `pliron::phase` for per-phase
+/// targets -- `pliron` for everything, `pliron::phase` for per-phase
 /// times, `pliron::iropt` for each ir-opt pass, `pliron::step` for every
 /// pipeline step (span name = step name), `pliron::fn` per function,
 /// `pliron::<pass>` for per-pass diagnostics (what used to be
 /// `PLIRON_<PASS>_DEBUG`/`_PROF`), `pliron::stats`, `pliron::timing`,
 /// `pliron::facts`, `pliron::dump` for the aggregated report channels.
 /// The fmt layer emits each span's `time.busy` on close. Narrow further
-/// with grep — EnvFilter's `[{field=x}]` syntax only gates events
+/// with grep -- EnvFilter's `[{field=x}]` syntax only gates events
 /// *inside* a matching span, not the span's own close line. When no
 /// knob is set no subscriber is installed and span/event sites cost a
 /// branch or a hash lookup.
 ///
-/// Legacy knob table: `(env var, target, level)` — setting the var
+/// Legacy knob table: `(env var, target, level)` -- setting the var
 /// enables that target at that level, so `PLIRON_JT_PROF=1` keeps
 /// printing jumpthread phase timings (now as `INFO pliron::jumpthread`).
 /// Print-gating knobs only; behavioral knobs stay `env_set` reads.
@@ -741,7 +742,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         inline::dead_fns(ctx, st);
     }
     // PGO: `PLIRON_PGO=<dir>` instruments every body (source-level
-    // attribution — the inliner clones counters, keeping counts on the
+    // attribution -- the inliner clones counters, keeping counts on the
     // callee), `PLIRON_PGO_USE=<file>` loads a profile before the
     // pipeline. Both run after the O0 always-inline round so
     // fingerprints are computed at the same CFG stage in gen and use
@@ -772,7 +773,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         };
         if let Some(a) = asm {
             // The ctor's `jmp __pliron_prof_register` resolves through the
-            // splice's symbol map like any other callee — declare the
+            // splice's symbol map like any other callee -- declare the
             // import so Mach-O gets its `_` mangle (and every format a
             // real undefined symbol rather than an asm-only name).
             let fty = cx.type_func(&[cx.type_ptr()], cx.type_void());
@@ -826,7 +827,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         );
         // Second round: callsites that just moved into a hot caller (e.g.
         // `get`'s `hash_one` landing inside `main`'s probe loop) never got
-        // scored in their new context — re-run so the loop bonus applies.
+        // scored in their new context -- re-run so the loop bonus applies.
         // Incremental: rescore only the callers round 1 inlined into, plus
         // callers of callees that lost a callsite (a now-single callee can
         // newly inline free there).
@@ -851,8 +852,8 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(cx, "domcheck:spec", domcheck::run(ctx, st, "spec"));
         }
         // Emulated EH (wasm, COFF) unwinds through ordinary calls the body
-        // scan can't see — `llvm.wasm.throw`-class entries are declared
-        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp —
+        // scan can't see -- `llvm.wasm.throw`-class entries are declared
+        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp â€”
         // so nounwind.rs models them explicitly (THROWS + the rethrow check).
         // On COFF the inference also lets lowering skip the flag check after
         // calls that can't throw.
@@ -906,7 +907,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 let (sites, owners) = pt!(cx, "devirt", inline::devirt(ctx, st));
                 pt!(cx, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    // Passes since the inline rounds may have moved calls —
+                    // Passes since the inline rounds may have moved calls â€”
                     // rebuild the adjacency fresh.
                     adj = None;
                     pt!(
@@ -975,7 +976,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(cx, "domcheck:cg", domcheck::run(ctx, st, "callgvn"));
         }
         // `acc ^= inv` loop idiom: a hoisted call's result feeding only
-        // an even-count xor recurrence leaves the loop a no-op — erase
+        // an even-count xor recurrence leaves the loop a no-op -- erase
         // it, then re-run callgvn so the now-unused call dies too.
         if pass_enabled("PLIRON_XORIDEM") {
             pt!(cx, "xoridem", xoridem::run(ctx, st));
@@ -1117,13 +1118,13 @@ fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool
         _ => false,
     }
 }
-/// rustc `-Ctarget-cpu` names → feature sets, for the cpus whose properties
+/// rustc `-Ctarget-cpu` names â†’ feature sets, for the cpus whose properties
 /// feed cranelift lowering. Only entries we can state confidently go here;
 /// anything else falls back to the spec baseline.
 fn cpu_features(cpu: &str) -> &'static [&'static str] {
-    // x86-64 psABI levels: each arm lists entry-point features only —
+    // x86-64 psABI levels: each arm lists entry-point features only â€”
     // `internal_target_features` expands the implied closure
-    // (avx2 → avx → sse4.2 → … → sse2), so the v2 non-SIMD extras are the
+    // (avx2 â†’ avx â†’ sse4.2 â†’ â€¦ â†’ sse2), so the v2 non-SIMD extras are the
     // only ones repeated per tier.
     const X64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse4.2"];
     const X64_AVX: &[&str] = &["avx", "cmpxchg16b", "lahfsahf", "popcnt"];
@@ -1175,7 +1176,7 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         "avx512vnni",
     ];
     match cpu {
-        // Apple A12-generation and later: v8.3/v8.4+ — dotprod, lse, fp16.
+        // Apple A12-generation and later: v8.3/v8.4+ -- dotprod, lse, fp16.
         "apple-a12" | "apple-s4" | "apple-s5" => &["aes", "sha2", "dotprod", "lse", "fp16"],
         // FEAT_SHA3 arrived with A13; all Apple Silicon Macs (M1+) have it.
         "apple-a13" | "apple-a14" | "apple-s6" | "apple-s7" | "apple-s8" | "apple-m1" => {
@@ -1196,7 +1197,7 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         // AVX without AVX2: Sandy Bridge/Ivy Bridge and the matching AMD.
         "sandybridge" | "corei7-avx" | "ivybridge" | "core-avx-i" | "bdver1" | "bdver2"
         | "btver2" => X64_AVX,
-        // AVX2-class (v3): Haswell onward, Zen 1–3, recent E-cores.
+        // AVX2-class (v3): Haswell onward, Zen 1â€“3, recent E-cores.
         "x86-64-v3" | "haswell" | "core-avx2" | "broadwell" | "skylake" | "kabylake"
         | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake" | "raptorlake"
         | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake"
@@ -1331,11 +1332,200 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             &[],
             None,
         );
-        if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind
-            && tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff
-        {
+        let coff = tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+        // PLIRON_CRTFREE: emit the static-CRT bits msvcrt.lib/vcruntime
+        // normally supply -- the TLS directory anchor (_tls_used), TLS index
+        // slot, template boundary markers, _fltused, and the PE entry
+        // thunks -- so `rust-lld` plus synthesized import libraries (see
+        // tools/mkwinlibs) need nothing from a Visual Studio install.
+        let crtfree = coff && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0");
+        if crtfree {
+            let i32t = cx.type_i32();
+            let ptr = cx.type_ptr();
+            let mk = |name: &str,
+                      ty,
+                      init: pliron_ir_opt::state::ConstVal,
+                      mutable: bool,
+                      tls: bool,
+                      section: Option<&str>| {
+                cx.declare_global(
+                    name,
+                    context::GlobalInfo {
+                        ty,
+                        init: Some(cx.new_value(ty, init)),
+                        align: 8,
+                        mutable,
+                        tls,
+                        linkage: Linkage::Export,
+                        used: true,
+                        section: section.map(|s| s.to_string()),
+                    },
+                );
+            };
+            // `_tls_start` must anchor the merged .tls region: a plain
+            // (non-TLS) byte in an unsuffixed `.tls` section. Cranelift
+            // emits real TLS data as `.tls$$subsection`, which sorts after
+            // plain `.tls`, so this marker always precedes every TLS var.
+            mk(
+                "_tls_start",
+                cx.type_array(cx.type_i8(), 1),
+                context::ConstVal::Zero,
+                true,
+                false,
+                Some(".tls"),
+            );
+            mk(
+                "_tls_index",
+                i32t,
+                context::ConstVal::Zero,
+                true,
+                false,
+                None,
+            );
+            mk(
+                "_pliron_tls_cbs",
+                cx.type_array(ptr, 1),
+                context::ConstVal::Zero,
+                false,
+                false,
+                None,
+            );
+            // IMAGE_TLS_DIRECTORY64: {StartRaw, EndRaw, IndexAddr, CbAddr,
+            // ZeroFill: u32, Flags: u32}
+            let dirty = cx.type_struct(&[ptr, ptr, ptr, ptr, i32t, i32t], false);
+            let dirinit = cx.new_value(
+                dirty,
+                context::ConstVal::Agg(vec![
+                    cx.sym_addr("_tls_start"),
+                    cx.sym_addr("_tls_end"),
+                    cx.sym_addr("_tls_index"),
+                    cx.sym_addr("_pliron_tls_cbs"),
+                    cx.new_value(i32t, context::ConstVal::Bits(0)),
+                    cx.new_value(i32t, context::ConstVal::Bits(0)),
+                ]),
+            );
+            cx.declare_global(
+                "_tls_used",
+                context::GlobalInfo {
+                    ty: dirty,
+                    init: Some(dirinit),
+                    align: 8,
+                    mutable: false,
+                    tls: false,
+                    linkage: Linkage::Export,
+                    used: true,
+                    section: None,
+                },
+            );
+            // Not a TLS datum -- plain data in a `.tls$ZZZ`-named section,
+            // which the linker sorts to the end of the merged .tls region.
+            mk(
+                "_tls_end",
+                cx.type_array(cx.type_i8(), 1),
+                context::ConstVal::Zero,
+                true,
+                false,
+                Some(".tls$ZZZ"),
+            );
+            mk(
+                "_fltused",
+                i32t,
+                context::ConstVal::Bits(0),
+                false,
+                false,
+                None,
+            );
+            mk(
+                "??_7type_info@@6B@",
+                cx.type_array(ptr, 2),
+                context::ConstVal::Zero,
+                false,
+                false,
+                None,
+            );
+            // GS stack-cookie symbols for foreign objects built with /GS
+            // (e.g. winapi's alloca.o). Cookie is the MSVC default sentinel;
+            // __GSHandlerCheck returning 1 (ExceptionContinueSearch) is
+            // correct for unwinding, it just skips cookie validation.
+            mk(
+                "__security_cookie",
+                cx.type_isize(),
+                context::ConstVal::Bits(0x2B99_2DDF_A232),
+                false,
+                false,
+                None,
+            );
+            {
+                let gsty = cx.type_func(&[ptr, ptr, ptr, ptr], i32t);
+                let f =
+                    cx.declare_fn_sym("__GSHandlerCheck", gsty, Linkage::Export, Exts::default());
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                bx.ret(bx.const_uint(i32t, 1));
+            }
+            {
+                let ckty = cx.type_func(&[ptr], cx.type_void());
+                let f = cx.declare_fn_sym(
+                    "__security_check_cookie",
+                    ckty,
+                    Linkage::Export,
+                    Exts::default(),
+                );
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let cookie = bx.get_param(0);
+                let want = bx.load(
+                    ptr,
+                    cx.sym_addr("__security_cookie"),
+                    rustc_abi::Align::EIGHT,
+                );
+                let ok = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, cookie, want);
+                let good = bx.append_sibling_block("ok");
+                let bad = bx.append_sibling_block("bad");
+                bx.cond_br(ok, good, bad);
+                bx.switch_to_block(good);
+                bx.ret_void();
+                bx.switch_to_block(bad);
+                bx.call_sym("__report_gsfailure", cx.type_void(), &[cookie]);
+                bx.ret_void();
+            }
+
+            let cts = tcx.crate_types();
+            let exec = cts.contains(&rustc_structures::CrateType::Executable);
+            let dylib = cts.contains(&rustc_structures::CrateType::Dylib)
+                || cts.contains(&rustc_structures::CrateType::Cdylib);
+            let void = cx.type_void();
+            if exec {
+                for entry in [
+                    "mainCRTStartup",
+                    "wmainCRTStartup",
+                    "WinMainCRTStartup",
+                    "wWinMainCRTStartup",
+                ] {
+                    let sty = cx.type_func(&[], void);
+                    let f = cx.declare_fn_sym(entry, sty, Linkage::Export, Exts::default());
+                    let bb = Builder::append_block(&cx, f, "entry");
+                    let mut bx = Builder::build(&cx, bb);
+                    let z = bx.const_uint(i32t, 0);
+                    let np = bx.const_null(ptr);
+                    let r = bx.call_sym("main", i32t, &[z, np, np]);
+                    bx.call_sym("ExitProcess", void, &[r]);
+                    bx.ret_void();
+                }
+            }
+            if dylib {
+                let sty = cx.type_func(&[ptr, i32t, ptr], i32t);
+                let f =
+                    cx.declare_fn_sym("_DllMainCRTStartup", sty, Linkage::Export, Exts::default());
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let one = bx.const_uint(i32t, 1);
+                bx.ret(one);
+            }
+        }
+        if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind && coff {
             // TLS slot driving emulated EH on COFF: `{ flag: i32, _pad: i32,
-            // exn: ptr, buf: [u8; 32] }` — the buffer holds a copy of
+            // exn: ptr, buf: [u8; 32] }` -- the buffer holds a copy of
             // `panic_unwind::seh::Exception` made at the throw site so it
             // outlives the unwound frame. See `eh_tls`/`eh_check` in lower.rs.
             let ty = cx.type_array(cx.type_i8(), 48);

@@ -251,7 +251,7 @@ t_loopalign() {
   # PLIRON_ALIGN=0 disables.
   if [[ -x "$llvmod" && "$(uname -m)" == x86_64 ]]; then
     rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/loopalign/main.rs -o $out/loopalign.o &&
-        "$llvmod" -d --no-show-raw-insn $out/loopalign.o | sed -n '/spin.*>:/,/retq/p' > $out/loopalign.dis
+        "$llvmod" -d --no-show-raw-insn $out/loopalign.o | sed -n '/spin.*>:/,/^$/p' > $out/loopalign.dis
     back=0; bad=0
     while read -r line; do
       if [[ "$line" =~ ^[[:space:]]*([0-9a-f]+):.*j[a-z]+[[:space:]]+0x([0-9a-f]+) ]]; then
