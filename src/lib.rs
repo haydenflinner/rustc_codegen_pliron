@@ -947,10 +947,14 @@ impl CodegenBackend for PlironCodegenBackend {
                     |feature| base_has_feature(sess, feature),
                 )
             }
-            Arch::Wasm32 => wasm::target_features(&sess.target, &sess.opts)
-                .iter()
-                .map(|f| Symbol::intern(f))
-                .collect(),
+            Arch::Wasm32 => {
+                let fs = wasm::target_features(&sess.target, &sess.opts);
+                types::NATIVE_SIMD.store(
+                    fs.iter().any(|f| f == "simd128"),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                fs.iter().map(|f| Symbol::intern(f)).collect()
+            }
             _ => Default::default(),
         };
         TargetConfig {

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="330" fill="white"/>
+<text x="380.0" y="24" text-anchor="middle" font-size="15" font-weight="bold">WebAssembly module size</text>
+<line x1="70" y1="270.0" x2="740" y2="270.0" stroke="#ddd"/>
+<text x="64" y="274.0" text-anchor="end" fill="#444">0</text>
+<line x1="70" y1="215.0" x2="740" y2="215.0" stroke="#ddd"/>
+<text x="64" y="219.0" text-anchor="end" fill="#444">136</text>
+<line x1="70" y1="160.0" x2="740" y2="160.0" stroke="#ddd"/>
+<text x="64" y="164.0" text-anchor="end" fill="#444">273</text>
+<line x1="70" y1="105.0" x2="740" y2="105.0" stroke="#ddd"/>
+<text x="64" y="109.0" text-anchor="end" fill="#444">409</text>
+<line x1="70" y1="50.0" x2="740" y2="50.0" stroke="#ddd"/>
+<text x="64" y="54.0" text-anchor="end" fill="#444">545</text>
+<text x="14" y="165.0" transform="rotate(-90 14 165.0)" text-anchor="middle" fill="#444">KiB</text>
+<rect x="95.125" y="255.06696019079067" width="55.62499999999999" height="14.933039809209323" fill="#2b6cb0"/>
+<text x="123.4375" y="251.06696019079067" text-anchor="middle" font-size="10">37</text>
+<rect x="153.75" y="266.36763896532744" width="55.62499999999999" height="3.6323610346725377" fill="#718096"/>
+<text x="182.0625" y="262.36763896532744" text-anchor="middle" font-size="10">9</text>
+<text x="153.75" y="286" text-anchor="middle">micro, no SIMD</text>
+<rect x="262.625" y="242.5554944046964" width="55.62499999999999" height="27.444505595303617" fill="#2b6cb0"/>
+<text x="290.9375" y="238.5554944046964" text-anchor="middle" font-size="10">68</text>
+<rect x="321.25" y="265.9640432948083" width="55.62499999999999" height="4.035956705191708" fill="#718096"/>
+<text x="349.5625" y="261.9640432948083" text-anchor="middle" font-size="10">10</text>
+<text x="321.25" y="286" text-anchor="middle">micro, +simd128</text>
+<rect x="430.125" y="88.78554393689228" width="55.62499999999999" height="181.21445606310772" fill="#2b6cb0"/>
+<text x="458.4375" y="84.78554393689228" text-anchor="middle" font-size="10">449</text>
+<rect x="488.75" y="215.51458447991195" width="55.62499999999999" height="54.48541552008807" fill="#718096"/>
+<text x="517.0625" y="211.51458447991195" text-anchor="middle" font-size="10">135</text>
+<text x="488.75" y="286" text-anchor="middle">real, no SIMD</text>
+<rect x="597.625" y="78.695652173913" width="55.62499999999999" height="191.304347826087" fill="#2b6cb0"/>
+<text x="625.9375" y="74.695652173913" text-anchor="middle" font-size="10">474</text>
+<rect x="656.25" y="214.30379746835442" width="55.62499999999999" height="55.69620253164558" fill="#718096"/>
+<text x="684.5625" y="210.30379746835442" text-anchor="middle" font-size="10">138</text>
+<text x="656.25" y="286" text-anchor="middle">real, +simd128</text>
+<rect x="70" y="308" width="12" height="10" fill="#2b6cb0"/>
+<text x="86" y="317">pliron</text>
+<rect x="220" y="308" width="12" height="10" fill="#718096"/>
+<text x="236" y="317">LLVM</text>
+</svg>

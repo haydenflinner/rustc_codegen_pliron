@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="330" fill="white"/>
+<text x="380.0" y="24" text-anchor="middle" font-size="15" font-weight="bold">Compile time</text>
+<line x1="70" y1="270.0" x2="740" y2="270.0" stroke="#ddd"/>
+<text x="64" y="274.0" text-anchor="end" fill="#444">0</text>
+<line x1="70" y1="215.0" x2="740" y2="215.0" stroke="#ddd"/>
+<text x="64" y="219.0" text-anchor="end" fill="#444">7</text>
+<line x1="70" y1="160.0" x2="740" y2="160.0" stroke="#ddd"/>
+<text x="64" y="164.0" text-anchor="end" fill="#444">14</text>
+<line x1="70" y1="105.0" x2="740" y2="105.0" stroke="#ddd"/>
+<text x="64" y="109.0" text-anchor="end" fill="#444">21</text>
+<line x1="70" y1="50.0" x2="740" y2="50.0" stroke="#ddd"/>
+<text x="64" y="54.0" text-anchor="end" fill="#444">28</text>
+<text x="14" y="165.0" transform="rotate(-90 14 165.0)" text-anchor="middle" fill="#444">seconds</text>
+<rect x="103.5" y="265.72287027218096" width="75.16666666666667" height="4.277129727819018" fill="#2b6cb0"/>
+<text x="141.58333333333334" y="261.72287027218096" text-anchor="middle" font-size="10">0.55</text>
+<rect x="181.66666666666669" y="266.7338282078473" width="75.16666666666667" height="3.266171792152704" fill="#718096"/>
+<text x="219.75000000000003" y="262.7338282078473" text-anchor="middle" font-size="10">0.42</text>
+<text x="181.66666666666669" y="286" text-anchor="middle">wasm micro crate</text>
+<rect x="326.83333333333337" y="78.69565217391303" width="75.16666666666667" height="191.30434782608697" fill="#2b6cb0"/>
+<text x="364.9166666666667" y="74.69565217391303" text-anchor="middle" font-size="10">24.6</text>
+<rect x="405.00000000000006" y="126.13290915517851" width="75.16666666666667" height="143.8670908448215" fill="#718096"/>
+<text x="443.08333333333337" y="122.13290915517851" text-anchor="middle" font-size="10">18.5</text>
+<text x="405.00000000000006" y="286" text-anchor="middle">wasm real, with std</text>
+<rect x="550.1666666666667" y="246.67020148462353" width="75.16666666666667" height="23.32979851537646" fill="#2b6cb0"/>
+<text x="588.2500000000001" y="242.67020148462353" text-anchor="middle" font-size="10">3</text>
+<rect x="628.3333333333334" y="263.7787203958996" width="75.16666666666667" height="6.221279604100389" fill="#718096"/>
+<text x="666.4166666666667" y="259.7787203958996" text-anchor="middle" font-size="10">0.8</text>
+<text x="628.3333333333334" y="286" text-anchor="middle">native real</text>
+<rect x="70" y="308" width="12" height="10" fill="#2b6cb0"/>
+<text x="86" y="317">pliron</text>
+<rect x="220" y="308" width="12" height="10" fill="#718096"/>
+<text x="236" y="317">LLVM</text>
+</svg>

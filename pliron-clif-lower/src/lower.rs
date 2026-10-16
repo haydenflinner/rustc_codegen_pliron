@@ -358,6 +358,7 @@ pub fn lower_module(
             ids.insert(n.clone(), Sym::F(thunk, f.ty));
             continue;
         }
+        tracing::debug!(target: "pliron::lower", declfn = %n, ?l, ?sig);
         let id = m
             .declare_function(crate::obj_sym(n), l, &sig)
             .unwrap_or_else(|e| panic!("declare {n}: {e}"));
@@ -2748,10 +2749,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // MSVC has no i128/f128 ABI: LLVM passes them byval through pointers
         // and returns them in xmm0. Cranelift's ABI doesn't model that, so
         // spill wide args to stack slots and pass the pointers ourselves, and
-        // read the result back as a vector.
+        // read the result back as a vector. The wasm path's bookkeeping
+        // module carries the host triple — keep 128-bit args direct there
+        // (CX splits them to i64 pairs; wsret handles the return side).
         let coff = self.m.isa().triple().binary_format == target_lexicon::BinaryFormat::Coff;
         let wideof = |t: ClType| t == clt::I128 || t == clt::F128;
-        let wide = coff && (params.iter().any(|t| wideof(*t)) || rets.iter().any(|t| wideof(*t)));
+        let wide = (coff && !self.wasm)
+            && (params.iter().any(|t| wideof(*t)) || rets.iter().any(|t| wideof(*t)));
         let mut sig = Signature::new(self.cc);
         let mut call_args: Vec<ir::Value> = Vec::new();
         for (t, a) in params.iter().zip(args.iter()) {
@@ -2783,6 +2787,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             sig.returns.clear();
             s
         });
+        tracing::debug!(target: "pliron::lower", libcall = %name, ?params, ?rets, ?sig);
         let id = self
             .m
             .declare_function(crate::obj_sym(name), Linkage::Import, &sig)

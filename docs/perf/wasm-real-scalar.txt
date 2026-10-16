@@ -1,0 +1,17 @@
+wasm build (std + program) pliron: 24.6 s
+wasm build (std + program) llvm:   18.5 s
+size 460457 C:/Users/haydu/code/rcp-wasm/target/wasm-real/p/wasm32-unknown-unknown/release/wasmreal.wasm
+size 138286 C:/Users/haydu/code/rcp-wasm/target/wasm-real/s/wasm32-unknown-unknown/release/wasmreal.wasm
+program       pliron ms    llvm ms   ratio
+sha256             6.55       2.88    2.27 
+base64_crc        18.52       9.08    2.04 
+mandelbrot         8.62       8.84    0.98 
+nbody              0.69       0.27    2.55 
+wordfreq          15.81       7.30    2.16 
+records            6.70       4.10    1.63 
+matmul            12.07      12.86    0.94 
+sort              27.34      11.89    2.30 
+sort_unstable       6.40       3.36    1.91 
+sort_stable       18.97       4.94    3.84 
+bsearch            5.35       3.37    1.59 
+geomean 1.877 (0 mismatches)

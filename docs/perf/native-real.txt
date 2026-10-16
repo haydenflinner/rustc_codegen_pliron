@@ -1,0 +1,17 @@
+--- native (x86_64-pc-windows-msvc)
+native compile llvm:   0.8 s
+native compile pliron: 3.0 s
+size 250368 real_llvm.exe
+size 402432 real_plir.exe
+program        llvm-ms  pliron-ms  ratio
+sha256            2.54      5.50    2.17 
+base64_crc        6.81     21.72    3.19 
+mandelbrot        8.59     10.17    1.18 
+nbody             0.22      0.31    1.41 
+wordfreq          6.62      8.46    1.28 
+records           7.48      8.44    1.13 
+matmul            1.56     16.58   10.63 
+sort              9.33     23.33    2.50 
+sort_unstable      3.23      3.76    1.16 
+sort_stable       4.12      5.04    1.22 
+bsearch           1.73      9.01    5.21 

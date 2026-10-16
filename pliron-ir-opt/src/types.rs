@@ -76,6 +76,10 @@ pub fn classify(ctx: &Context, ty: TypeHandle) -> TyK {
 /// Set for 32-bit-pointer targets (wasm32) before any layout query.
 pub static PTR32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether 64/128-bit vectors lower to native SIMD values. Cleared for wasm
+/// targets without `simd128` (v128 would be invalid there).
+pub static NATIVE_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn ptr32() -> bool {
     PTR32.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -190,7 +194,9 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
 /// (64-bit matters for hashbrown's `Group<u64>`: `cmeq.8b` + `fmov x, d`.)
 pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD")) {
+    if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SIMD"))
+        || !NATIVE_SIMD.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return None;
     }
     // CubeCL: 128-bit bf16 vectors are `i16x8` bit patterns; the lowerer

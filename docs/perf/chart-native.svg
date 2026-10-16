@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 526" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="526" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">Native x86-64 (Windows): micro-kernels and real programs</text>
+<text x="380.0" y="40" text-anchor="middle" fill="#555">Cranelift-based backend relative to LLVM -O</text>
+<line x1="170.0" y1="50" x2="170.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="170.0" y="508" text-anchor="middle" fill="#444">0.5x</text>
+<line x1="280.0" y1="50" x2="280.0" y2="492" stroke="#222" stroke-width="1.5"/>
+<text x="280.0" y="508" text-anchor="middle" fill="#444">1x</text>
+<line x1="390.0" y1="50" x2="390.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="390.0" y="508" text-anchor="middle" fill="#444">2x</text>
+<line x1="500.0" y1="50" x2="500.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="500.0" y="508" text-anchor="middle" fill="#444">4x</text>
+<line x1="610.0" y1="50" x2="610.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="610.0" y="508" text-anchor="middle" fill="#444">8x</text>
+<line x1="720.0" y1="50" x2="720.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="720.0" y="508" text-anchor="middle" fill="#444">16x</text>
+<text x="445.0" y="523" text-anchor="middle" fill="#444">run time relative to LLVM (lower is better; log scale)</text>
+<text x="162" y="67.0" text-anchor="end">micro fib</text>
+<rect x="278.40504733353737" y="56" width="1.594952666462632" height="12" fill="#2b6cb0"/>
+<text x="274.40504733353737" y="67" text-anchor="end" font-size="10" fill="#333">0.99</text>
+<text x="162" y="87.0" text-anchor="end">micro hashmap</text>
+<rect x="280.0" y="76" width="23.553728588813215" height="12" fill="#2b6cb0"/>
+<text x="307.5537285888132" y="87" text-anchor="start" font-size="10" fill="#333">1.16</text>
+<text x="162" y="107.0" text-anchor="end">micro hmget</text>
+<rect x="280.0" y="96" width="13.67609485024218" height="12" fill="#2b6cb0"/>
+<text x="297.6760948502422" y="107" text-anchor="start" font-size="10" fill="#333">1.09</text>
+<text x="162" y="127.0" text-anchor="end">micro iterw</text>
+<rect x="280.0" y="116" width="13.67609485024218" height="12" fill="#2b6cb0"/>
+<text x="297.6760948502422" y="127" text-anchor="start" font-size="10" fill="#333">1.09</text>
+<text x="162" y="147.0" text-anchor="end">micro matmul</text>
+<rect x="280.0" y="136" width="6.2241881203004255" height="12" fill="#2b6cb0"/>
+<text x="290.2241881203004" y="147" text-anchor="start" font-size="10" fill="#333">1.04</text>
+<text x="162" y="167.0" text-anchor="end">micro nbody</text>
+<rect x="270.1805928093204" y="156" width="9.819407190679613" height="12" fill="#2b6cb0"/>
+<text x="266.1805928093204" y="167" text-anchor="end" font-size="10" fill="#333">0.94</text>
+<text x="162" y="187.0" text-anchor="end">micro parse_only</text>
+<rect x="265.0332295466369" y="176" width="14.966770453363097" height="12" fill="#2b6cb0"/>
+<text x="261.0332295466369" y="187" text-anchor="end" font-size="10" fill="#333">0.91</text>
+<text x="162" y="207.0" text-anchor="end">micro sieve</text>
+<rect x="280.0" y="196" width="7.742826068053773" height="12" fill="#2b6cb0"/>
+<text x="291.7428260680538" y="207" text-anchor="start" font-size="10" fill="#333">1.05</text>
+<text x="162" y="227.0" text-anchor="end">micro sortw</text>
+<rect x="280.0" y="216" width="65.40034045053892" height="12" fill="#2b6cb0"/>
+<text x="349.4003404505389" y="227" text-anchor="start" font-size="10" fill="#333">1.51</text>
+<text x="162" y="247.0" text-anchor="end">micro strwork</text>
+<rect x="280.0" y="236" width="15.125387612492887" height="12" fill="#2b6cb0"/>
+<text x="299.1253876124929" y="247" text-anchor="start" font-size="10" fill="#333">1.10</text>
+<text x="162" y="267.0" text-anchor="end">real sha256</text>
+<rect x="280.0" y="256" width="122.94645469367299" height="12" fill="#2b6cb0"/>
+<text x="406.946454693673" y="267" text-anchor="start" font-size="10" fill="#333">2.17</text>
+<text x="162" y="287.0" text-anchor="end">real base64_crc</text>
+<rect x="280.0" y="276" width="184.09120663891593" height="12" fill="#2b6cb0"/>
+<text x="468.09120663891593" y="287" text-anchor="start" font-size="10" fill="#333">3.19</text>
+<text x="162" y="307.0" text-anchor="end">real mandelbrot</text>
+<rect x="280.0" y="296" width="26.266554554582854" height="12" fill="#2b6cb0"/>
+<text x="310.26655455458285" y="307" text-anchor="start" font-size="10" fill="#333">1.18</text>
+<text x="162" y="327.0" text-anchor="end">real nbody</text>
+<rect x="280.0" y="316" width="54.52646788864757" height="12" fill="#2b6cb0"/>
+<text x="338.5264678886476" y="327" text-anchor="start" font-size="10" fill="#333">1.41</text>
+<text x="162" y="347.0" text-anchor="end">real wordfreq</text>
+<rect x="280.0" y="336" width="39.17581912478033" height="12" fill="#2b6cb0"/>
+<text x="323.17581912478033" y="347" text-anchor="start" font-size="10" fill="#333">1.28</text>
+<text x="162" y="367.0" text-anchor="end">real records</text>
+<rect x="280.0" y="356" width="19.395504990450945" height="12" fill="#2b6cb0"/>
+<text x="303.39550499045095" y="367" text-anchor="start" font-size="10" fill="#333">1.13</text>
+<text x="162" y="387.0" text-anchor="end">real matmul</text>
+<rect x="280.0" y="376" width="375.10766609320183" height="12" fill="#2b6cb0"/>
+<text x="659.1076660932018" y="387" text-anchor="start" font-size="10" fill="#333">10.63</text>
+<text x="162" y="407.0" text-anchor="end">real sort</text>
+<rect x="280.0" y="396" width="145.4120904376099" height="12" fill="#2b6cb0"/>
+<text x="429.4120904376099" y="407" text-anchor="start" font-size="10" fill="#333">2.50</text>
+<text x="162" y="427.0" text-anchor="end">real sort_unstable</text>
+<rect x="280.0" y="416" width="23.553728588813215" height="12" fill="#2b6cb0"/>
+<text x="307.5537285888132" y="427" text-anchor="start" font-size="10" fill="#333">1.16</text>
+<text x="162" y="447.0" text-anchor="end">real sort_stable</text>
+<rect x="280.0" y="436" width="31.55692625669775" height="12" fill="#2b6cb0"/>
+<text x="315.55692625669775" y="447" text-anchor="start" font-size="10" fill="#333">1.22</text>
+<text x="162" y="467.0" text-anchor="end">real bsearch</text>
+<rect x="280.0" y="456" width="261.9411709754163" height="12" fill="#2b6cb0"/>
+<text x="545.9411709754163" y="467" text-anchor="start" font-size="10" fill="#333">5.21</text>
+</svg>

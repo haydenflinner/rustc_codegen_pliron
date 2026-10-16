@@ -1,0 +1,16 @@
+stub _RNvNtNtNtCs57k1PqIgFCu_4core9core_arch6wasm327simd12822i16x8_extend_low_u8x16: vconst 8 bytes
+stub _RNvNtNtNtCs57k1PqIgFCu_4core9core_arch6wasm327simd12822i32x4_extend_low_u16x8: vconst 8 bytes
+stub _RNvNtNtNtCs57k1PqIgFCu_4core9core_arch6wasm327simd12823i16x8_extend_high_u8x16: vconst 8 bytes
+stub _RNvNtNtNtCs57k1PqIgFCu_4core9core_arch6wasm327simd12823i32x4_extend_high_u16x8: vconst 8 bytes
+stub _RNvNtNtNtCs57k1PqIgFCu_4core9core_arch6wasm327simd1285u8x16: assertion `left == right` failed
+  left: 2
+ right: 1
+stub arch_bitselect_any: assertion `left == right` failed
+  left: 2
+ right: 1
+stub ops_cast: load i8x8
+stub ops_i64: assertion `left == right` failed
+  left: 2
+ right: 1
+stub ops_shuffle: vconst 8 bytes
+stub psimd_small: bitcast i64->i32x2

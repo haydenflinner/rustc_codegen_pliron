@@ -1,0 +1,12 @@
+kernel        llvm-ms  pliron-ms    ratio compile-llvm compile-plir
+eqbug            9983       9983     1.00     0m0.231s     0m0.369s
+fib             6.902      6.834     0.99     0m0.181s     0m0.376s
+hashmap        51.855     59.940     1.16     0m0.350s     0m0.992s
+hmget           9.148     10.006     1.09     0m0.330s     0m0.852s
+iterw          35.566     38.746     1.09     0m0.213s     0m0.484s
+matmul          5.321      5.514     1.04     0m0.229s     0m0.457s
+nbody          70.411     66.168     0.94     0m0.205s     0m0.543s
+parse_only    292.030    264.880     0.91     0m0.185s     0m0.381s
+sieve          13.947     14.693     1.05     0m0.207s     0m0.453s
+sortw           5.044      7.638     1.51     0m0.611s     0m0.906s
+strwork        11.783     12.903     1.10     0m0.239s     0m0.985s

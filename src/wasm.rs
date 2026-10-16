@@ -67,6 +67,9 @@ fn wty(t: ClType) -> WT {
         clt::I64 => WT::I64,
         clt::F32 => WT::F32,
         clt::F64 => WT::F64,
+        // Native 64/128-bit vectors: one v128 (a 64-bit vector's upper half
+        // is don't-care).
+        t if t.is_vector() && matches!(t.bits(), 64 | 128) => WT::V128,
         t => panic!("wasm: no scalar type for {t}"),
     }
 }
@@ -518,6 +521,53 @@ fn stub(m: &Module, sig: Signature) -> FunctionBody {
     let e = b.entry;
     b.set_terminator(e, Terminator::Unreachable);
     b
+}
+
+/// `core::arch::wasm32` / `llvm.*` vector intrinsics arrive as calls to
+/// `__pliron_llvm_*` symbols (see `llvm_intrinsic_stub`); wasm covers them
+/// natively. Returns (op, nargs, result type); scalar ops return i32.
+fn vw_intrinsic(sym: &str) -> Option<(O, usize, WT)> {
+    let n = sym
+        .strip_prefix("__pliron_llvm_")
+        .or_else(|| sym.strip_prefix("llvm."))
+        .unwrap_or(sym);
+    let n: String = n.chars().map(|c| if c == '.' { '_' } else { c }).collect();
+    Some(match n.as_str() {
+        "wasm_swizzle" => (O::I8x16Swizzle, 2, WT::V128),
+        "wasm_bitselect_v16i8" => (O::V128Bitselect, 3, WT::V128),
+        "wasm_anytrue_v16i8" => (O::V128AnyTrue, 1, WT::I32),
+        "wasm_alltrue_v16i8" => (O::I8x16AllTrue, 1, WT::I32),
+        "wasm_alltrue_v8i16" => (O::I16x8AllTrue, 1, WT::I32),
+        "wasm_alltrue_v4i32" => (O::I32x4AllTrue, 1, WT::I32),
+        "wasm_alltrue_v2i64" => (O::I64x2AllTrue, 1, WT::I32),
+        "wasm_bitmask_v16i8" => (O::I8x16Bitmask, 1, WT::I32),
+        "wasm_bitmask_v8i16" => (O::I16x8Bitmask, 1, WT::I32),
+        "wasm_bitmask_v4i32" => (O::I32x4Bitmask, 1, WT::I32),
+        "wasm_bitmask_v2i64" => (O::I64x2Bitmask, 1, WT::I32),
+        "wasm_avgr_unsigned_v16i8" => (O::I8x16AvgrU, 2, WT::V128),
+        "wasm_avgr_unsigned_v8i16" => (O::I16x8AvgrU, 2, WT::V128),
+        "wasm_q15mulr_sat_signed" => (O::I16x8Q15MulrSatS, 2, WT::V128),
+        "wasm_extadd_pairwise_signed_v8i16" => {
+            (O::I16x8ExtAddPairwiseI8x16S, 1, WT::V128)
+        }
+        "wasm_extadd_pairwise_unsigned_v8i16" => {
+            (O::I16x8ExtAddPairwiseI8x16U, 1, WT::V128)
+        }
+        "wasm_extadd_pairwise_signed_v4i32" => {
+            (O::I32x4ExtAddPairwiseI16x8S, 1, WT::V128)
+        }
+        "wasm_extadd_pairwise_unsigned_v4i32" => {
+            (O::I32x4ExtAddPairwiseI16x8U, 1, WT::V128)
+        }
+        "wasm_dot" => (O::I32x4DotI16x8S, 2, WT::V128),
+        "nearbyint_v4f32" => (O::F32x4Nearest, 1, WT::V128),
+        "nearbyint_v2f64" => (O::F64x2Nearest, 1, WT::V128),
+        "minimum_v4f32" => (O::F32x4Min, 2, WT::V128),
+        "minimum_v2f64" => (O::F64x2Min, 2, WT::V128),
+        "maximum_v4f32" => (O::F32x4Max, 2, WT::V128),
+        "maximum_v2f64" => (O::F64x2Max, 2, WT::V128),
+        _ => return None,
+    })
 }
 
 /// Read a u32 LEB128 at `*p`, advancing past it.
@@ -2534,7 +2584,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
-    const HOT: usize = 15;
+    const HOT: usize = 36;
     // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
     // attribute a large budget bonus — mirror that with a raised cap.
     // Off by default: on a real std workload (regex wbig) it added
@@ -4658,6 +4708,10 @@ impl<'o, 'a> FL<'o, 'a> {
                 let v = self.i32c(0);
                 return self.set(op, smallvec![v]);
             }
+            if let Some((o, n, rt)) = vw_intrinsic(sym) {
+                let v = self.op(o, &wargs[..n], rt);
+                return self.set(op, smallvec![v]);
+            }
         }
         let direct = match call.callee(ctx) {
             CallOpCallable::Direct(ident) => {
@@ -4823,6 +4877,64 @@ impl<'o, 'a> FL<'o, 'a> {
         let w = |s: &Self, i: usize| s.width(opnds[i].get_type(ctx));
         match name {
             "llvm.memcpy" | "llvm.memmove" | "llvm.memset" => {
+                // Small constant lengths become plain loads and stores: a
+                // `memory.copy`/`memory.fill` instruction costs far more than
+                // the access it replaces in V8 (LLVM expands these too).
+                if let Some(c) = self.const_int(opnds[2])
+                    && (0..=32).contains(&c)
+                {
+                    let n = c as u64;
+                    let d = self.get1(opnds[0]);
+                    let mut chunks: Vec<(u64, u64)> = Vec::new(); // (offset, bytes)
+                    let mut off = 0;
+                    for w in [8u64, 4, 2, 1] {
+                        while n - off >= w {
+                            chunks.push((off, w));
+                            off += w;
+                        }
+                    }
+                    let lt = |w: u64| match w {
+                        8 => clt::I64,
+                        4 => clt::I32,
+                        2 => clt::I16,
+                        _ => clt::I8,
+                    };
+                    if name == "llvm.memset" {
+                        let v = self.get1(opnds[1]);
+                        let b8 = {
+                            let m = self.i32c(0xff);
+                            self.op(O::I32And, &[v, m], WT::I32)
+                        };
+                        for &(o, w) in &chunks {
+                            let x = match w {
+                                1 => b8,
+                                2 => {
+                                    let k = self.i32c(0x0101);
+                                    self.op(O::I32Mul, &[b8, k], WT::I32)
+                                }
+                                4 => {
+                                    let k = self.i32c(0x0101_0101);
+                                    self.op(O::I32Mul, &[b8, k], WT::I32)
+                                }
+                                _ => {
+                                    let w64 = self.op(O::I64ExtendI32U, &[b8], WT::I64);
+                                    let k = self.i64c(0x0101_0101_0101_0101);
+                                    self.op(O::I64Mul, &[w64, k], WT::I64)
+                                }
+                            };
+                            self.store(lt(w), x, d, o);
+                        }
+                    } else {
+                        let s = self.get1(opnds[1]);
+                        // all loads first: correct for overlapping memmove
+                        let vals: Vec<WV> =
+                            chunks.iter().map(|&(o, w)| self.load(lt(w), s, o)).collect();
+                        for (&(o, w), v) in chunks.iter().zip(vals) {
+                            self.store(lt(w), v, d, o);
+                        }
+                    }
+                    return;
+                }
                 let d = self.get1(opnds[0]);
                 let s = self.get1(opnds[1]);
                 let n = self.get(opnds[2]);
@@ -7910,7 +8022,9 @@ impl<'o, 'a> CX<'o, 'a> {
 
     fn get1(&self, v: ir::Value) -> WV {
         let vs = self.get(v);
-        assert_eq!(vs.len(), 1);
+        if vs.len() != 1 {
+            panic!("get1 {v} has {} vals (fn {})", vs.len(), self.name);
+        }
         vs[0]
     }
 
@@ -8099,6 +8213,12 @@ impl<'o, 'a> CX<'o, 'a> {
             t if t.is_vector() && t.bits() == 128 => {
                 (O::V128Load { memory }, WT::V128)
             }
+            t if t.is_vector() && t.bits() == 64 => {
+                (O::V128Load64Zero { memory }, WT::V128)
+            }
+            t if t.is_vector() && t.bits() == 32 => {
+                (O::V128Load32Zero { memory }, WT::V128)
+            }
             t => panic!("load {t}"),
         };
         self.op(o, &[p], ty)
@@ -8106,6 +8226,18 @@ impl<'o, 'a> CX<'o, 'a> {
 
     fn store(&mut self, t: ClType, v: WV, p: WV, off: u64) {
         let memory = self.ma(off, t.bytes() as u64);
+        // Sub-128 vectors have no narrow store; write lane 0 of the
+        // i64x2/i32x4 view (upper lanes are don't-care).
+        if t.is_vector() && t.bits() < 128 {
+            let (ext, st, wt) = if t.bits() == 64 {
+                (O::I64x2ExtractLane { lane: 0 }, O::I64Store { memory }, WT::I64)
+            } else {
+                (O::I32x4ExtractLane { lane: 0 }, O::I32Store { memory }, WT::I32)
+            };
+            let x = self.op(ext, &[v], wt);
+            self.op0(st, &[p, x]);
+            return;
+        }
         let o = match t {
             clt::I8 => O::I32Store8 { memory },
             clt::I16 => O::I32Store16 { memory },
@@ -8869,10 +9001,28 @@ impl<'o, 'a> CX<'o, 'a> {
             ir::InstructionData::LoadNoOffset { opcode: P::Bitcast, arg, .. } => {
                 let t = self.vty(f, arg);
                 let rt = self.vty(f, f.dfg.inst_results(i)[0]);
-                if self.flat(t).len() == 2 && self.flat(rt).len() == 2 {
+                let (ft, fr) = (self.flat(t).len(), self.flat(rt).len());
+                if ft == 2 && fr == 2 {
                     // i128<->f128: same two-i64 bit pattern.
                     let vs = self.get(arg).clone();
                     self.setv(f.dfg.inst_results(i)[0], vs);
+                    return;
+                }
+                if ft == 2 && rt.is_vector() && rt.bits() == 128 {
+                    // i128/f128 -> v128: pack (lo, hi) into i64x2 lanes.
+                    let (al, ah) = self.pair(arg);
+                    let z = self.op(O::V128Const { value: 0 }, &[], WT::V128);
+                    let v = self.op(O::I64x2ReplaceLane { lane: 0 }, &[z, al], WT::V128);
+                    let v = self.op(O::I64x2ReplaceLane { lane: 1 }, &[v, ah], WT::V128);
+                    self.set(f.dfg.inst_results(i)[0], v);
+                    return;
+                }
+                if t.is_vector() && t.bits() == 128 && fr == 2 {
+                    // v128 -> i128/f128: extract the i64x2 lanes.
+                    let x = self.get1(arg);
+                    let lo = self.op(O::I64x2ExtractLane { lane: 0 }, &[x], WT::I64);
+                    let hi = self.op(O::I64x2ExtractLane { lane: 1 }, &[x], WT::I64);
+                    self.setv(f.dfg.inst_results(i)[0], smallvec![lo, hi]);
                     return;
                 }
                 let v = self.reinterp(self.get1(arg), t, rt);
@@ -8974,6 +9124,12 @@ impl<'o, 'a> CX<'o, 'a> {
                     if name.starts_with("__pliron_llvm_wasm_memory_size") {
                         let mem = self.o.mem;
                         let v = self.op(O::MemorySize { mem }, &[], WT::I32);
+                        self.bind_call(f, i, smallvec![v]);
+                        return;
+                    }
+                    if let Some((o, n, rt)) = vw_intrinsic(&name) {
+                        let wargs = self.call_args(&sig, &args);
+                        let v = self.op(o, &wargs[..n], rt);
                         self.bind_call(f, i, smallvec![v]);
                         return;
                     }
@@ -9160,11 +9316,13 @@ impl<'o, 'a> CX<'o, 'a> {
             }
             ir::InstructionData::UnaryConst { opcode: P::Vconst, constant_handle } => {
                 let bytes = f.dfg.constants.get(constant_handle).as_slice();
-                let value = u128::from_le_bytes(
-                    bytes
-                        .try_into()
-                        .unwrap_or_else(|_| panic!("vconst {} bytes", bytes.len())),
-                );
+                // Sub-128-bit vectors: upper lanes are don't-care, zero-pad.
+                if bytes.len() > 16 {
+                    panic!("vconst {} bytes", bytes.len());
+                }
+                let mut padded = [0u8; 16];
+                padded[..bytes.len()].copy_from_slice(bytes);
+                let value = u128::from_le_bytes(padded);
                 let v = self.op(O::V128Const { value }, &[], WT::V128);
                 self.set(f.dfg.inst_results(i)[0], v);
             }
@@ -9500,11 +9658,26 @@ impl<'o, 'a> CX<'o, 'a> {
 
     /// CLIF bitcast: reinterpret scalar reps.
     fn reinterp(&mut self, v: WV, st: ClType, rt: ClType) -> WV {
-        // v128<->v128 bitcasts are a free reinterpret; vector<->scalar
-        // bitcasts don't exist in CLIF.
+        // v128<->v128 bitcasts are a free reinterpret. Scalar<->vector
+        // bitcasts only arise for sub-128 vectors (e.g. i64 -> i32x2):
+        // lane 0 of the same-width int view; other lanes are don't-care.
         if st.is_vector() || rt.is_vector() {
-            assert!(st.is_vector() && rt.is_vector(), "bitcast {st}->{rt}");
-            return v;
+            if st.is_vector() && rt.is_vector() {
+                return v;
+            }
+            let bits = st.bits().max(rt.bits());
+            let (ex, rp, it, wt) = match bits {
+                64 => (O::I64x2ExtractLane { lane: 0 }, O::I64x2ReplaceLane { lane: 0 }, clt::I64, WT::I64),
+                32 => (O::I32x4ExtractLane { lane: 0 }, O::I32x4ReplaceLane { lane: 0 }, clt::I32, WT::I32),
+                _ => panic!("bitcast {st}->{rt}"),
+            };
+            if st.is_vector() {
+                let x = self.op(ex, &[v], wt);
+                return if wty(rt) == wt { x } else { self.reinterp(x, it, rt) };
+            }
+            let x = if wty(st) == wt { v } else { self.reinterp(v, st, it) };
+            let z = self.op(O::V128Const { value: 0 }, &[], WT::V128);
+            return self.op(rp, &[z, x], WT::V128);
         }
         match (wty(st), wty(rt)) {
             (a, b) if a == b => v,
@@ -10306,6 +10479,21 @@ impl<'o, 'a> CX<'o, 'a> {
             CC::SignedGreaterThanOrEqual => 8,
             CC::UnsignedGreaterThanOrEqual => 9,
         };
+        let mut a = a;
+        let mut b = b;
+        let mut k = k;
+        if t.lane_type() == clt::I64 && matches!(k, 3 | 5 | 7 | 9) {
+            // i64x2 has signed-only compares: flip both operands into
+            // signed order by xoring the sign bit in every lane.
+            let smin = self.op(
+                O::V128Const { value: 0x8000_0000_0000_0000_8000_0000_0000_0000 },
+                &[],
+                WT::V128,
+            );
+            a = self.op(O::V128Xor, &[a, smin], WT::V128);
+            b = self.op(O::V128Xor, &[b, smin], WT::V128);
+            k -= 1;
+        }
         let o = ops[k].unwrap_or_else(|| panic!("vec icmp {cond} on {t}"));
         self.op(o, &[a, b], WT::V128)
     }

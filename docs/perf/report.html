@@ -1,0 +1,507 @@
+<title>pliron against LLVM</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@400;600&family=Source+Serif+4:wght@400;600&display=swap">
+<style>
+:root {
+  /* layout: one reading column, tables and charts may be wider and scroll inside their own box */
+  --bg: #fbfaf8; --fg: #1c1f24; --muted: #5b6370; --rule: #dcd8d0; --accent: #1f5a8a;
+  --code-bg: #efece6; --th: #e8e4dc; --chart-bg: #ffffff;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15181c; --fg: #e6e3dc; --muted: #9aa3ad; --rule: #333840; --accent: #7fb2e0;
+    --code-bg: #20252b; --th: #232930; --chart-bg: #ffffff; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15181c; --fg: #e6e3dc; --muted: #9aa3ad; --rule: #333840; --accent: #7fb2e0;
+  --code-bg: #20252b; --th: #232930; --chart-bg: #ffffff; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--serif); font-size: 17px; line-height: 1.6;
+  padding-inline: 16px; padding-block: 32px; margin: 0; }
+main { max-width: 46rem; margin-inline: auto; }
+h1, h2, h3 { font-family: var(--sans); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 1.9rem; margin: 0 0 1rem; }
+h2 { font-size: 1.3rem; margin: 2.4rem 0 0.8rem; padding-top: 1rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.05rem; margin: 1.6rem 0 0.4rem; color: var(--muted); }
+p, li { max-width: 65ch; }
+code { font-family: var(--mono); font-size: 0.86em; background: var(--code-bg); padding: 0.05em 0.3em; border-radius: 3px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 4px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+.tw { overflow-x: auto; margin: 1rem 0; }
+table { border-collapse: collapse; font-family: var(--sans); font-size: 0.86rem; min-width: 100%; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { background: var(--th); font-weight: 600; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+figure { margin: 1.4rem 0; background: var(--chart-bg); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 8px; overflow-x: auto; }
+figure svg { width: 100%; height: auto; min-width: 520px; display: block; }
+a { color: var(--accent); }
+</style>
+<main>
+<h1>The pliron backend compared with LLVM: WebAssembly and native performance</h1>
+<p>Date: 2026-10-13. Branch: <code>wasm-simd</code>. Written in ASD-STE100 Simplified Technical English.</p>
+<h2>1. Summary</h2>
+<p>This report compares the pliron backend with the LLVM backend of rustc. Both backends compile the same Rust source with the same nightly compiler and the same flags. We measure run time, compile time, and code size.</p>
+<p>A ratio is the pliron value divided by the LLVM value. A ratio below 1.0 means that pliron is faster or smaller.</p>
+<div class="tw"><table><thead><tr><th>Measurement</th><th>Before this work</th><th>After this work</th><th>Remark</th></tr></thead><tbody><tr><td>WebAssembly micro-kernels, no SIMD, run time</td><td class="n">1.61x</td><td class="n"><strong>1.24x</strong></td><td>22 kernels, geometric mean</td></tr><tr><td>WebAssembly micro-kernels, +simd128, run time</td><td class="n">2.68x</td><td class="n"><strong>1.25x</strong></td><td>LLVM auto-vectorizes. pliron did not vectorize before.</td></tr><tr><td>WebAssembly real programs, no SIMD, run time</td><td class="n">2.05x</td><td class="n"><strong>1.88x</strong></td><td>11 programs now. The same 8 programs: 2.05x before, 1.75x now.</td></tr><tr><td>WebAssembly real programs, +simd128, run time</td><td>not measured</td><td class="n">2.11x</td><td>Matrix multiply and sorts are the weak points.</td></tr><tr><td>WebAssembly module size, real programs</td><td>not measured</td><td class="n">3.3x</td><td>See section 7.</td></tr><tr><td>Native x86-64 micro-kernels, run time</td><td class="n">1.0x</td><td class="n">1.08x</td><td>10 kernels. Not changed by this work. Run to run noise is large.</td></tr><tr><td>Native x86-64 real programs, run time</td><td>not measured</td><td class="n">2.1x</td><td>One kernel is 12.9x slower. See section 5.</td></tr><tr><td>Compile time, wasm with std</td><td>not measured</td><td class="n">1.3x</td><td>24.6 s against 18.5 s</td></tr><tr><td>Compile time, native</td><td>2 to 3x</td><td class="n">3.8x</td><td>3.0 s against 0.8 s for the real programs</td></tr></tbody></table></div>
+<p>The main result is this: the WebAssembly path now vectorizes loops and uses simd128 instructions. On the micro-kernels, the pliron output is about 1.2 times slower than LLVM output on average. On real programs that use the standard library, it is about 1.9 times slower (2.1 times with SIMD). The remaining gap is mostly in sorting, hashing and fully unrolled arithmetic loops.</p>
+<h2>2. How we measured</h2>
+<h3>2.1 Machine and tools</h3>
+<ul><li>CPU: Intel Core i7-12700K, 12 cores, Windows 11.</li><li>Rust: nightly 2026-10-06. The LLVM backend uses LLVM 23.1.3.</li><li>WebAssembly engine: Node.js 24.21.0 (V8). Both modules run in the same process on the same machine.</li><li>Native target: <code>x86_64-pc-windows-msvc</code>. The native standard library is the prebuilt one, compiled by LLVM.</li><li>Build flags: <code>-O</code> (opt-level 3), <code>panic=abort</code>, <code>codegen-units</code> at the default value.</li><li>WebAssembly standard library: built from source with <code>-Zbuild-std</code> by the backend under test.</li></ul>
+<h3>2.2 Method</h3>
+<ul><li>Each kernel runs one warm-up call. Then we take the best of 5 timed calls.</li><li>Each program returns a checksum. The test fails if the two backends return different checksums. All results here have 0 mismatches.</li><li>The micro-kernels write one byte to every input array before each repetition. This stops LLVM from moving a whole kernel out of the repetition loop.</li><li>Timing noise on this machine is up to 10 percent. Do not trust smaller differences.</li></ul>
+<h3>2.3 Programs</h3>
+<p>The micro-kernels are in <code>tests/wasm/bench/lib.rs</code>. They are small loops over static arrays: sums, dot products, byte counts, saturating add, histogram, prefix sum, matrix multiply and others.</p>
+<p>The real programs are in <code>tests/wasm/real/real.rs</code>. They are normal Rust code that uses <code>Vec</code>, <code>String</code>, <code>HashMap</code>, <code>format!</code>, <code>sort</code> and <code>parse</code>:</p>
+<div class="tw"><table><thead><tr><th>Program</th><th>What it does</th></tr></thead><tbody><tr><td>sha256</td><td>SHA-256 of a 64 KiB buffer</td></tr><tr><td>base64_crc</td><td>Base64 encode and decode, then CRC-32</td></tr><tr><td>mandelbrot</td><td>Mandelbrot set, <code>f64</code></td></tr><tr><td>nbody</td><td>N-body simulation, <code>f64</code></td></tr><tr><td>wordfreq</td><td>Count words with a <code>HashMap</code>, sort, format the top 50</td></tr><tr><td>records</td><td>Format records as text, then parse them back</td></tr><tr><td>matmul</td><td>Matrix multiply, <code>f32</code></td></tr><tr><td>sort, sort_unstable, sort_stable</td><td>Sort and search 50 000 integers</td></tr><tr><td>bsearch</td><td>Binary search</td></tr></tbody></table></div>
+<h2>3. WebAssembly micro-kernels</h2>
+<figure role="img" aria-label="WebAssembly micro-kernels without SIMD"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 546" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="546" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">WebAssembly micro-kernels, no SIMD</text>
+<text x="380.0" y="40" text-anchor="middle" fill="#555">geometric mean 1.24x</text>
+<line x1="170.0" y1="50" x2="170.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="170.0" y="528" text-anchor="middle" fill="#444">0.5x</text>
+<line x1="280.0" y1="50" x2="280.0" y2="512" stroke="#222" stroke-width="1.5"/>
+<text x="280.0" y="528" text-anchor="middle" fill="#444">1x</text>
+<line x1="390.0" y1="50" x2="390.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="390.0" y="528" text-anchor="middle" fill="#444">2x</text>
+<line x1="500.0" y1="50" x2="500.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="500.0" y="528" text-anchor="middle" fill="#444">4x</text>
+<line x1="610.0" y1="50" x2="610.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="610.0" y="528" text-anchor="middle" fill="#444">8x</text>
+<line x1="720.0" y1="50" x2="720.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="720.0" y="528" text-anchor="middle" fill="#444">16x</text>
+<text x="445.0" y="543" text-anchor="middle" fill="#444">run time relative to LLVM (lower is better; log scale)</text>
+<text x="162" y="67.0" text-anchor="end">adler</text>
+<rect x="280.0" y="56" width="22.17972472866154" height="12" fill="#2b6cb0"/>
+<text x="306.17972472866154" y="67" text-anchor="start" font-size="10" fill="#333">1.15</text>
+<text x="162" y="87.0" text-anchor="end">axpy_f32</text>
+<rect x="280.0" y="76" width="54.52646788864757" height="12" fill="#2b6cb0"/>
+<text x="338.5264678886476" y="87" text-anchor="start" font-size="10" fill="#333">1.41</text>
+<text x="162" y="107.0" text-anchor="end">count_eq</text>
+<rect x="280.0" y="96" width="80.430156572942" height="12" fill="#2b6cb0"/>
+<text x="364.430156572942" y="107" text-anchor="start" font-size="10" fill="#333">1.66</text>
+<text x="162" y="127.0" text-anchor="end">dot_f64</text>
+<rect x="280.0" y="116" width="3.1426067416447836" height="12" fill="#2b6cb0"/>
+<text x="287.1426067416448" y="127" text-anchor="start" font-size="10" fill="#333">1.02</text>
+<text x="162" y="147.0" text-anchor="end">dot_i32</text>
+<rect x="280.0" y="136" width="48.7967316623176" height="12" fill="#2b6cb0"/>
+<text x="332.7967316623176" y="147" text-anchor="start" font-size="10" fill="#333">1.36</text>
+<text x="162" y="167.0" text-anchor="end">find_byte</text>
+<rect x="280.0" y="156" width="75.57667571738818" height="12" fill="#2b6cb0"/>
+<text x="359.5766757173882" y="167" text-anchor="start" font-size="10" fill="#333">1.61</text>
+<text x="162" y="187.0" text-anchor="end">histogram</text>
+<rect x="280.0" y="176" width="1.5" height="12" fill="#2b6cb0"/>
+<text x="284.0" y="187" text-anchor="start" font-size="10" fill="#333">1.00</text>
+<text x="162" y="207.0" text-anchor="end">i16_dot</text>
+<rect x="280.0" y="196" width="87.8996036681404" height="12" fill="#2b6cb0"/>
+<text x="371.8996036681404" y="207" text-anchor="start" font-size="10" fill="#333">1.74</text>
+<text x="162" y="227.0" text-anchor="end">matmul64</text>
+<rect x="280.0" y="216" width="53.39695098872653" height="12" fill="#2b6cb0"/>
+<text x="337.39695098872653" y="227" text-anchor="start" font-size="10" fill="#333">1.40</text>
+<text x="162" y="247.0" text-anchor="end">max_u8</text>
+<rect x="206.6766107097711" y="236" width="73.3233892902289" height="12" fill="#2b6cb0"/>
+<text x="202.6766107097711" y="247" text-anchor="end" font-size="10" fill="#333">0.63</text>
+<text x="162" y="267.0" text-anchor="end">memset_xor</text>
+<rect x="280.0" y="256" width="49.95934825043827" height="12" fill="#2b6cb0"/>
+<text x="333.95934825043827" y="267" text-anchor="start" font-size="10" fill="#333">1.37</text>
+<text x="162" y="287.0" text-anchor="end">nbody_step</text>
+<rect x="278.40504733353737" y="276" width="1.594952666462632" height="12" fill="#2b6cb0"/>
+<text x="274.40504733353737" y="287" text-anchor="end" font-size="10" fill="#333">0.99</text>
+<text x="162" y="307.0" text-anchor="end">prefix_sum</text>
+<rect x="257.8996036681404" y="296" width="22.1003963318596" height="12" fill="#2b6cb0"/>
+<text x="253.8996036681404" y="307" text-anchor="end" font-size="10" fill="#333">0.87</text>
+<text x="162" y="327.0" text-anchor="end">saturating_u8</text>
+<rect x="280.0" y="316" width="48.7967316623176" height="12" fill="#2b6cb0"/>
+<text x="332.7967316623176" y="327" text-anchor="start" font-size="10" fill="#333">1.36</text>
+<text x="162" y="347.0" text-anchor="end">sort_small</text>
+<rect x="280.0" y="336" width="42.852349293899806" height="12" fill="#2b6cb0"/>
+<text x="326.8523492938998" y="347" text-anchor="start" font-size="10" fill="#333">1.31</text>
+<text x="162" y="367.0" text-anchor="end">split_ws</text>
+<rect x="280.0" y="356" width="19.395504990450945" height="12" fill="#2b6cb0"/>
+<text x="303.39550499045095" y="367" text-anchor="start" font-size="10" fill="#333">1.13</text>
+<text x="162" y="387.0" text-anchor="end">sum_f32</text>
+<rect x="280.0" y="376" width="1.579082227477727" height="12" fill="#2b6cb0"/>
+<text x="285.5790822274777" y="387" text-anchor="start" font-size="10" fill="#333">1.01</text>
+<text x="162" y="407.0" text-anchor="end">sum_i16_widen</text>
+<rect x="280.0" y="396" width="97.62777978157465" height="12" fill="#2b6cb0"/>
+<text x="381.62777978157465" y="407" text-anchor="start" font-size="10" fill="#333">1.85</text>
+<text x="162" y="427.0" text-anchor="end">sum_u32</text>
+<rect x="280.0" y="416" width="63.28435637561802" height="12" fill="#2b6cb0"/>
+<text x="347.284356375618" y="427" text-anchor="start" font-size="10" fill="#333">1.49</text>
+<text x="162" y="447.0" text-anchor="end">sum_u8</text>
+<rect x="280.0" y="436" width="57.86756928343459" height="12" fill="#2b6cb0"/>
+<text x="341.8675692834346" y="447" text-anchor="start" font-size="10" fill="#333">1.44</text>
+<text x="162" y="467.0" text-anchor="end">utf8_ascii</text>
+<rect x="265.0332295466369" y="456" width="14.966770453363097" height="12" fill="#2b6cb0"/>
+<text x="261.0332295466369" y="467" text-anchor="end" font-size="10" fill="#333">0.91</text>
+<text x="162" y="487.0" text-anchor="end">vadd_f32</text>
+<rect x="280.0" y="476" width="55.64800227029531" height="12" fill="#2b6cb0"/>
+<text x="339.6480022702953" y="487" text-anchor="start" font-size="10" fill="#333">1.42</text>
+</svg></figure>
+<p>Without SIMD, the geometric mean is 1.24x. Seven kernels are within 5 percent of LLVM or faster.</p>
+<div class="tw"><table><thead><tr><th>Kernel</th><th>pliron ms</th><th>LLVM ms</th><th>Ratio</th></tr></thead><tbody><tr><td>adler</td><td class="n">121.62</td><td class="n">105.46</td><td class="n">1.15</td></tr><tr><td>axpy_f32</td><td class="n">5.46</td><td class="n">3.87</td><td class="n">1.41</td></tr><tr><td>count_eq</td><td class="n">22.89</td><td class="n">13.82</td><td class="n">1.66</td></tr><tr><td>dot_f64</td><td class="n">5.32</td><td class="n">5.21</td><td class="n">1.02</td></tr><tr><td>dot_i32</td><td class="n">4.15</td><td class="n">3.06</td><td class="n">1.36</td></tr><tr><td>find_byte</td><td class="n">5.95</td><td class="n">3.70</td><td class="n">1.61</td></tr><tr><td>histogram</td><td class="n">17.01</td><td class="n">16.95</td><td class="n">1.00</td></tr><tr><td>i16_dot</td><td class="n">4.77</td><td class="n">2.74</td><td class="n">1.74</td></tr><tr><td>matmul64</td><td class="n">353.53</td><td class="n">253.22</td><td class="n">1.40</td></tr><tr><td>max_u8</td><td class="n">15.41</td><td class="n">24.31</td><td class="n">0.63</td></tr><tr><td>memset_xor</td><td class="n">12.95</td><td class="n">9.45</td><td class="n">1.37</td></tr><tr><td>nbody_step</td><td class="n">10.64</td><td class="n">10.73</td><td class="n">0.99</td></tr><tr><td>prefix_sum</td><td class="n">2.64</td><td class="n">3.03</td><td class="n">0.87</td></tr><tr><td>saturating_u8</td><td class="n">21.09</td><td class="n">15.48</td><td class="n">1.36</td></tr><tr><td>sort_small</td><td class="n">0.94</td><td class="n">0.72</td><td class="n">1.31</td></tr><tr><td>split_ws</td><td class="n">19.44</td><td class="n">17.28</td><td class="n">1.13</td></tr><tr><td>sum_f32</td><td class="n">5.28</td><td class="n">5.25</td><td class="n">1.01</td></tr><tr><td>sum_i16_widen</td><td class="n">4.86</td><td class="n">2.63</td><td class="n">1.85</td></tr><tr><td>sum_u32</td><td class="n">3.91</td><td class="n">2.63</td><td class="n">1.49</td></tr><tr><td>sum_u8</td><td class="n">15.10</td><td class="n">10.47</td><td class="n">1.44</td></tr><tr><td>utf8_ascii</td><td class="n">7.39</td><td class="n">8.13</td><td class="n">0.91</td></tr><tr><td>vadd_f32</td><td class="n">5.62</td><td class="n">3.96</td><td class="n">1.42</td></tr></tbody></table></div>
+<p>LLVM unrolls most integer loops by a larger factor than pliron does. This explains most of the 1.3x to 1.8x entries.</p>
+<figure role="img" aria-label="WebAssembly micro-kernels with simd128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 546" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="546" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">WebAssembly micro-kernels, +simd128</text>
+<text x="380.0" y="40" text-anchor="middle" fill="#555">geometric mean 1.25x</text>
+<line x1="170.0" y1="50" x2="170.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="170.0" y="528" text-anchor="middle" fill="#444">0.5x</text>
+<line x1="280.0" y1="50" x2="280.0" y2="512" stroke="#222" stroke-width="1.5"/>
+<text x="280.0" y="528" text-anchor="middle" fill="#444">1x</text>
+<line x1="390.0" y1="50" x2="390.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="390.0" y="528" text-anchor="middle" fill="#444">2x</text>
+<line x1="500.0" y1="50" x2="500.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="500.0" y="528" text-anchor="middle" fill="#444">4x</text>
+<line x1="610.0" y1="50" x2="610.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="610.0" y="528" text-anchor="middle" fill="#444">8x</text>
+<line x1="720.0" y1="50" x2="720.0" y2="512" stroke="#ddd" stroke-width="1"/>
+<text x="720.0" y="528" text-anchor="middle" fill="#444">16x</text>
+<text x="445.0" y="543" text-anchor="middle" fill="#444">run time relative to LLVM (lower is better; log scale)</text>
+<text x="162" y="67.0" text-anchor="end">adler</text>
+<rect x="280.0" y="56" width="22.17972472866154" height="12" fill="#2b6cb0"/>
+<text x="306.17972472866154" y="67" text-anchor="start" font-size="10" fill="#333">1.15</text>
+<text x="162" y="87.0" text-anchor="end">axpy_f32</text>
+<rect x="280.0" y="76" width="46.44563007513523" height="12" fill="#2b6cb0"/>
+<text x="330.4456300751352" y="87" text-anchor="start" font-size="10" fill="#333">1.34</text>
+<text x="162" y="107.0" text-anchor="end">count_eq</text>
+<rect x="252.3307356304439" y="96" width="27.66926436955609" height="12" fill="#2b6cb0"/>
+<text x="248.3307356304439" y="107" text-anchor="end" font-size="10" fill="#333">0.84</text>
+<text x="162" y="127.0" text-anchor="end">dot_f64</text>
+<rect x="280.0" y="116" width="4.690877114934324" height="12" fill="#2b6cb0"/>
+<text x="288.6908771149343" y="127" text-anchor="start" font-size="10" fill="#333">1.03</text>
+<text x="162" y="147.0" text-anchor="end">dot_i32</text>
+<rect x="280.0" y="136" width="28.933784641717352" height="12" fill="#2b6cb0"/>
+<text x="312.93378464171735" y="147" text-anchor="start" font-size="10" fill="#333">1.20</text>
+<text x="162" y="167.0" text-anchor="end">find_byte</text>
+<rect x="280.0" y="156" width="362.52953269939667" height="12" fill="#2b6cb0"/>
+<text x="646.5295326993967" y="167" text-anchor="start" font-size="10" fill="#333">9.82</text>
+<text x="162" y="187.0" text-anchor="end">histogram</text>
+<rect x="221.11350937037886" y="176" width="58.886490629621136" height="12" fill="#2b6cb0"/>
+<text x="217.11350937037886" y="187" text-anchor="end" font-size="10" fill="#333">0.69</text>
+<text x="162" y="207.0" text-anchor="end">i16_dot</text>
+<rect x="193.55372858881321" y="196" width="86.44627141118679" height="12" fill="#2b6cb0"/>
+<text x="189.55372858881321" y="207" text-anchor="end" font-size="10" fill="#333">0.58</text>
+<text x="162" y="227.0" text-anchor="end">matmul64</text>
+<rect x="280.0" y="216" width="62.215689343964755" height="12" fill="#2b6cb0"/>
+<text x="346.21568934396475" y="227" text-anchor="start" font-size="10" fill="#333">1.48</text>
+<text x="162" y="247.0" text-anchor="end">max_u8</text>
+<rect x="206.6766107097711" y="236" width="73.3233892902289" height="12" fill="#2b6cb0"/>
+<text x="202.6766107097711" y="247" text-anchor="end" font-size="10" fill="#333">0.63</text>
+<text x="162" y="267.0" text-anchor="end">memset_xor</text>
+<rect x="280.0" y="256" width="83.27255711582052" height="12" fill="#2b6cb0"/>
+<text x="367.2725571158205" y="267" text-anchor="start" font-size="10" fill="#333">1.69</text>
+<text x="162" y="287.0" text-anchor="end">nbody_step</text>
+<rect x="280.0" y="276" width="1.5" height="12" fill="#2b6cb0"/>
+<text x="284.0" y="287" text-anchor="start" font-size="10" fill="#333">1.00</text>
+<text x="162" y="307.0" text-anchor="end">prefix_sum</text>
+<rect x="280.0" y="296" width="1.5" height="12" fill="#2b6cb0"/>
+<text x="284.0" y="307" text-anchor="start" font-size="10" fill="#333">1.00</text>
+<text x="162" y="327.0" text-anchor="end">saturating_u8</text>
+<rect x="280.0" y="316" width="184.09120663891593" height="12" fill="#2b6cb0"/>
+<text x="468.09120663891593" y="327" text-anchor="start" font-size="10" fill="#333">3.19</text>
+<text x="162" y="347.0" text-anchor="end">sort_small</text>
+<rect x="280.0" y="336" width="34.13741326733657" height="12" fill="#2b6cb0"/>
+<text x="318.13741326733657" y="347" text-anchor="start" font-size="10" fill="#333">1.24</text>
+<text x="162" y="367.0" text-anchor="end">split_ws</text>
+<rect x="280.0" y="356" width="106.79390197745317" height="12" fill="#2b6cb0"/>
+<text x="390.7939019774532" y="367" text-anchor="start" font-size="10" fill="#333">1.96</text>
+<text x="162" y="387.0" text-anchor="end">sum_f32</text>
+<rect x="280.0" y="376" width="1.5" height="12" fill="#2b6cb0"/>
+<text x="284.0" y="387" text-anchor="start" font-size="10" fill="#333">1.00</text>
+<text x="162" y="407.0" text-anchor="end">sum_i16_widen</text>
+<rect x="280.0" y="396" width="17.984860551116753" height="12" fill="#2b6cb0"/>
+<text x="301.98486055111675" y="407" text-anchor="start" font-size="10" fill="#333">1.12</text>
+<text x="162" y="427.0" text-anchor="end">sum_u32</text>
+<rect x="280.0" y="416" width="48.7967316623176" height="12" fill="#2b6cb0"/>
+<text x="332.7967316623176" y="427" text-anchor="start" font-size="10" fill="#333">1.36</text>
+<text x="162" y="447.0" text-anchor="end">sum_u8</text>
+<rect x="256.06494214201103" y="436" width="23.935057857988966" height="12" fill="#2b6cb0"/>
+<text x="252.06494214201103" y="447" text-anchor="end" font-size="10" fill="#333">0.86</text>
+<text x="162" y="467.0" text-anchor="end">utf8_ascii</text>
+<rect x="265.0332295466369" y="456" width="14.966770453363097" height="12" fill="#2b6cb0"/>
+<text x="261.0332295466369" y="467" text-anchor="end" font-size="10" fill="#333">0.91</text>
+<text x="162" y="487.0" text-anchor="end">vadd_f32</text>
+<rect x="280.0" y="476" width="74.58790956239017" height="12" fill="#2b6cb0"/>
+<text x="358.58790956239017" y="487" text-anchor="start" font-size="10" fill="#333">1.60</text>
+</svg></figure>
+<p>With <code>-Ctarget-feature=+simd128</code>, LLVM vectorizes loops. Before this work, the pliron backend did not. The geometric mean fell from 2.68x to 1.25x. Five kernels are now faster than LLVM: <code>count_eq</code>, <code>histogram</code>, <code>i16_dot</code>, <code>max_u8</code> and <code>sum_u8</code>.</p>
+<div class="tw"><table><thead><tr><th>Kernel</th><th>pliron ms</th><th>LLVM ms</th><th>Ratio</th></tr></thead><tbody><tr><td>adler</td><td class="n">121.32</td><td class="n">105.46</td><td class="n">1.15</td></tr><tr><td>axpy_f32</td><td class="n">1.15</td><td class="n">0.86</td><td class="n">1.34</td></tr><tr><td>count_eq</td><td class="n">4.13</td><td class="n">4.92</td><td class="n"><strong>0.84</strong></td></tr><tr><td>dot_f64</td><td class="n">5.34</td><td class="n">5.19</td><td class="n">1.03</td></tr><tr><td>dot_i32</td><td class="n">1.31</td><td class="n">1.09</td><td class="n">1.20</td></tr><tr><td>find_byte</td><td class="n">5.92</td><td class="n">0.60</td><td class="n">9.82</td></tr><tr><td>histogram</td><td class="n">11.72</td><td class="n">17.07</td><td class="n"><strong>0.69</strong></td></tr><tr><td>i16_dot</td><td class="n">2.06</td><td class="n">3.57</td><td class="n"><strong>0.58</strong></td></tr><tr><td>matmul64</td><td class="n">370.52</td><td class="n">249.73</td><td class="n">1.48</td></tr><tr><td>max_u8</td><td class="n">15.40</td><td class="n">24.55</td><td class="n"><strong>0.63</strong></td></tr><tr><td>memset_xor</td><td class="n">1.27</td><td class="n">0.75</td><td class="n">1.69</td></tr><tr><td>nbody_step</td><td class="n">10.66</td><td class="n">10.65</td><td class="n">1.00</td></tr><tr><td>prefix_sum</td><td class="n">2.62</td><td class="n">2.62</td><td class="n">1.00</td></tr><tr><td>saturating_u8</td><td class="n">2.41</td><td class="n">0.76</td><td class="n">3.19</td></tr><tr><td>sort_small</td><td class="n">0.93</td><td class="n">0.76</td><td class="n">1.24</td></tr><tr><td>split_ws</td><td class="n">18.95</td><td class="n">9.68</td><td class="n">1.96</td></tr><tr><td>sum_f32</td><td class="n">5.14</td><td class="n">5.13</td><td class="n">1.00</td></tr><tr><td>sum_i16_widen</td><td class="n">0.76</td><td class="n">0.67</td><td class="n">1.12</td></tr><tr><td>sum_u32</td><td class="n">0.91</td><td class="n">0.66</td><td class="n">1.36</td></tr><tr><td>sum_u8</td><td class="n">2.42</td><td class="n">2.83</td><td class="n"><strong>0.86</strong></td></tr><tr><td>utf8_ascii</td><td class="n">7.39</td><td class="n">8.14</td><td class="n">0.91</td></tr><tr><td>vadd_f32</td><td class="n">1.46</td><td class="n">0.91</td><td class="n">1.60</td></tr></tbody></table></div>
+<p>Two entries are worth a note.</p>
+<ul><li><code>find_byte</code> is 9.8x slower. The LLVM loop is about 10 times faster than its own scalar loop, so it probably vectorizes the early exit. The pliron vectorizer does not do this yet.</li><li><code>saturating_u8</code> is 3.2x slower. Both backends use the saturating instruction. We have not found the cause yet.</li></ul>
+<h2>4. WebAssembly real programs</h2>
+<figure role="img" aria-label="WebAssembly real programs"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 480" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="480" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">WebAssembly real programs</text>
+<text x="380.0" y="40" text-anchor="middle" fill="#555">geometric mean 1.88x / 2.11x</text>
+<line x1="170.0" y1="50" x2="170.0" y2="446" stroke="#ddd" stroke-width="1"/>
+<text x="170.0" y="462" text-anchor="middle" fill="#444">0.5x</text>
+<line x1="280.0" y1="50" x2="280.0" y2="446" stroke="#222" stroke-width="1.5"/>
+<text x="280.0" y="462" text-anchor="middle" fill="#444">1x</text>
+<line x1="390.0" y1="50" x2="390.0" y2="446" stroke="#ddd" stroke-width="1"/>
+<text x="390.0" y="462" text-anchor="middle" fill="#444">2x</text>
+<line x1="500.0" y1="50" x2="500.0" y2="446" stroke="#ddd" stroke-width="1"/>
+<text x="500.0" y="462" text-anchor="middle" fill="#444">4x</text>
+<line x1="610.0" y1="50" x2="610.0" y2="446" stroke="#ddd" stroke-width="1"/>
+<text x="610.0" y="462" text-anchor="middle" fill="#444">8x</text>
+<line x1="720.0" y1="50" x2="720.0" y2="446" stroke="#ddd" stroke-width="1"/>
+<text x="720.0" y="462" text-anchor="middle" fill="#444">16x</text>
+<text x="445.0" y="477" text-anchor="middle" fill="#444">run time relative to LLVM (lower is better; log scale)</text>
+<text x="162" y="74.0" text-anchor="end">sha256</text>
+<rect x="280.0" y="56" width="130.09615272678093" height="12" fill="#2b6cb0"/>
+<text x="414.09615272678093" y="67" text-anchor="start" font-size="10" fill="#333">2.27</text>
+<rect x="280.0" y="70" width="129.3955049904509" height="12" fill="#c05621"/>
+<text x="413.3955049904509" y="81" text-anchor="start" font-size="10" fill="#333">2.26</text>
+<text x="162" y="108.0" text-anchor="end">base64_crc</text>
+<rect x="280.0" y="90" width="113.14260674164478" height="12" fill="#2b6cb0"/>
+<text x="397.1426067416448" y="101" text-anchor="start" font-size="10" fill="#333">2.04</text>
+<rect x="280.0" y="104" width="107.60151926498168" height="12" fill="#c05621"/>
+<text x="391.6015192649817" y="115" text-anchor="start" font-size="10" fill="#333">1.97</text>
+<text x="162" y="142.0" text-anchor="end">mandelbrot</text>
+<rect x="276.7939019774532" y="124" width="3.2060980225468256" height="12" fill="#2b6cb0"/>
+<text x="272.7939019774532" y="135" text-anchor="end" font-size="10" fill="#333">0.98</text>
+<rect x="278.40504733353737" y="138" width="1.594952666462632" height="12" fill="#c05621"/>
+<text x="274.40504733353737" y="149" text-anchor="end" font-size="10" fill="#333">0.99</text>
+<text x="162" y="176.0" text-anchor="end">nbody</text>
+<rect x="280.0" y="158" width="148.55469717925467" height="12" fill="#2b6cb0"/>
+<text x="432.5546971792547" y="169" text-anchor="start" font-size="10" fill="#333">2.55</text>
+<rect x="280.0" y="172" width="157.0366790060089" height="12" fill="#c05621"/>
+<text x="441.0366790060089" y="183" text-anchor="start" font-size="10" fill="#333">2.69</text>
+<text x="162" y="210.0" text-anchor="end">wordfreq</text>
+<rect x="280.0" y="192" width="122.21344436276183" height="12" fill="#2b6cb0"/>
+<text x="406.21344436276183" y="203" text-anchor="start" font-size="10" fill="#333">2.16</text>
+<rect x="280.0" y="206" width="125.84510065783775" height="12" fill="#c05621"/>
+<text x="409.84510065783775" y="217" text-anchor="start" font-size="10" fill="#333">2.21</text>
+<text x="162" y="244.0" text-anchor="end">records</text>
+<rect x="280.0" y="226" width="77.53591609019884" height="12" fill="#2b6cb0"/>
+<text x="361.53591609019884" y="237" text-anchor="start" font-size="10" fill="#333">1.63</text>
+<rect x="280.0" y="240" width="77.53591609019884" height="12" fill="#c05621"/>
+<text x="361.53591609019884" y="251" text-anchor="start" font-size="10" fill="#333">1.63</text>
+<text x="162" y="278.0" text-anchor="end">matmul</text>
+<rect x="270.1805928093204" y="260" width="9.819407190679613" height="12" fill="#2b6cb0"/>
+<text x="266.1805928093204" y="271" text-anchor="end" font-size="10" fill="#333">0.94</text>
+<rect x="280.0" y="274" width="186.55931944208896" height="12" fill="#c05621"/>
+<text x="470.55931944208896" y="285" text-anchor="start" font-size="10" fill="#333">3.24</text>
+<text x="162" y="312.0" text-anchor="end">sort</text>
+<rect x="280.0" y="294" width="132.17972472866154" height="12" fill="#2b6cb0"/>
+<text x="416.17972472866154" y="305" text-anchor="start" font-size="10" fill="#333">2.30</text>
+<rect x="280.0" y="308" width="119.9938773496225" height="12" fill="#c05621"/>
+<text x="403.9938773496225" y="319" text-anchor="start" font-size="10" fill="#333">2.13</text>
+<text x="162" y="346.0" text-anchor="end">sort_unstable</text>
+<rect x="280.0" y="328" width="102.69299020871262" height="12" fill="#2b6cb0"/>
+<text x="386.6929902087126" y="339" text-anchor="start" font-size="10" fill="#333">1.91</text>
+<rect x="280.0" y="342" width="102.69299020871262" height="12" fill="#c05621"/>
+<text x="386.6929902087126" y="353" text-anchor="start" font-size="10" fill="#333">1.91</text>
+<text x="162" y="380.0" text-anchor="end">sort_stable</text>
+<rect x="280.0" y="362" width="213.52169420410752" height="12" fill="#2b6cb0"/>
+<text x="497.5216942041075" y="373" text-anchor="start" font-size="10" fill="#333">3.84</text>
+<rect x="280.0" y="376" width="219.60276210923837" height="12" fill="#c05621"/>
+<text x="503.60276210923837" y="387" text-anchor="start" font-size="10" fill="#333">3.99</text>
+<text x="162" y="414.0" text-anchor="end">bsearch</text>
+<rect x="280.0" y="396" width="73.59294420605943" height="12" fill="#2b6cb0"/>
+<text x="357.5929442060594" y="407" text-anchor="start" font-size="10" fill="#333">1.59</text>
+<rect x="280.0" y="410" width="82.33073563044388" height="12" fill="#c05621"/>
+<text x="366.3307356304439" y="421" text-anchor="start" font-size="10" fill="#333">1.68</text>
+<rect x="570" y="42" width="12" height="10" fill="#2b6cb0"/>
+<text x="586" y="51">no SIMD</text>
+<rect x="570" y="58" width="12" height="10" fill="#c05621"/>
+<text x="586" y="67">+simd128</text>
+</svg></figure>
+<div class="tw"><table><thead><tr><th>Program</th><th>pliron ms</th><th>LLVM ms</th><th>Ratio, no SIMD</th><th>Ratio, +simd128</th></tr></thead><tbody><tr><td>sha256</td><td class="n">6.55</td><td class="n">2.88</td><td class="n">2.27</td><td class="n">2.26</td></tr><tr><td>base64_crc</td><td class="n">18.52</td><td class="n">9.08</td><td class="n">2.04</td><td class="n">1.97</td></tr><tr><td>mandelbrot</td><td class="n">8.62</td><td class="n">8.84</td><td class="n">0.98</td><td class="n">0.99</td></tr><tr><td>nbody</td><td class="n">0.69</td><td class="n">0.27</td><td class="n">2.55</td><td class="n">2.69</td></tr><tr><td>wordfreq</td><td class="n">15.81</td><td class="n">7.30</td><td class="n">2.16</td><td class="n">2.21</td></tr><tr><td>records</td><td class="n">6.70</td><td class="n">4.10</td><td class="n">1.63</td><td class="n">1.63</td></tr><tr><td>matmul</td><td class="n">12.07</td><td class="n">12.86</td><td class="n">0.94</td><td class="n">3.24</td></tr><tr><td>sort</td><td class="n">27.34</td><td class="n">11.89</td><td class="n">2.30</td><td class="n">2.13</td></tr><tr><td>sort_unstable</td><td class="n">6.40</td><td class="n">3.36</td><td class="n">1.91</td><td class="n">1.91</td></tr><tr><td>sort_stable</td><td class="n">18.97</td><td class="n">4.94</td><td class="n">3.84</td><td class="n">3.99</td></tr><tr><td>bsearch</td><td class="n">5.35</td><td class="n">3.37</td><td class="n">1.59</td><td class="n">1.68</td></tr><tr><td><strong>geometric mean</strong></td><td></td><td></td><td class="n"><strong>1.88</strong></td><td class="n"><strong>2.11</strong></td></tr></tbody></table></div>
+<p>The times in the first two data columns are for the build without SIMD.</p>
+<p>Three results need an explanation.</p>
+<ol><li><strong>sha256 is 2.3x slower.</strong> The most likely cause is full unrolling. LLVM can unroll the 64 rounds and keep the message schedule in registers. pliron keeps the schedule in memory.</li><li><strong>sort_stable is 3.8x slower.</strong> The merge step of the standard library does many small copies and pointer picks. pliron now expands small copies, but the merge loop is still slow. We have not found the cause yet.</li><li><strong>matmul is 3.2x slower with SIMD.</strong> Both backends vectorize the inner loop. LLVM is 7 times faster than its own scalar code. pliron is only 2 times faster than its own scalar code. We have not found the cause yet.</li></ol>
+<h3>4.1 What fixed the first run</h3>
+<p>The first run of this suite had <code>sort</code> at 8.3x. We found three causes and fixed them in this work:</p>
+<div class="tw"><table><thead><tr><th>Cause</th><th>Fix</th><th>Effect on <code>sort</code></th></tr></thead><tbody><tr><td>Small constant <code>memcpy</code> became a <code>memory.copy</code> instruction. V8 runs this instruction slowly.</td><td>Expand copies of 32 bytes or fewer into loads and stores.</td><td>8.3x to 4.3x</td></tr><tr><td>Closures called in a hot loop were not inlined.</td><td>Raise the inline limit for loop call sites from 15 to 36 instructions.</td><td>4.3x to 2.2x</td></tr><tr><td>Pointer picks like <code>if c { &amp;a } else { &amp;b }</code> kept stack slots in memory.</td><td>Turn the diamond into <code>select</code> and promote the slots to registers.</td><td><code>bsearch</code> 6.1x to 3.6x, then 1.7x with the inline limit</td></tr></tbody></table></div>
+<h2>5. Native x86-64</h2>
+<figure role="img" aria-label="Native results"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 526" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="526" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">Native x86-64 (Windows): micro-kernels and real programs</text>
+<text x="380.0" y="40" text-anchor="middle" fill="#555">Cranelift-based backend relative to LLVM -O</text>
+<line x1="170.0" y1="50" x2="170.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="170.0" y="508" text-anchor="middle" fill="#444">0.5x</text>
+<line x1="280.0" y1="50" x2="280.0" y2="492" stroke="#222" stroke-width="1.5"/>
+<text x="280.0" y="508" text-anchor="middle" fill="#444">1x</text>
+<line x1="390.0" y1="50" x2="390.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="390.0" y="508" text-anchor="middle" fill="#444">2x</text>
+<line x1="500.0" y1="50" x2="500.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="500.0" y="508" text-anchor="middle" fill="#444">4x</text>
+<line x1="610.0" y1="50" x2="610.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="610.0" y="508" text-anchor="middle" fill="#444">8x</text>
+<line x1="720.0" y1="50" x2="720.0" y2="492" stroke="#ddd" stroke-width="1"/>
+<text x="720.0" y="508" text-anchor="middle" fill="#444">16x</text>
+<text x="445.0" y="523" text-anchor="middle" fill="#444">run time relative to LLVM (lower is better; log scale)</text>
+<text x="162" y="67.0" text-anchor="end">micro fib</text>
+<rect x="278.40504733353737" y="56" width="1.594952666462632" height="12" fill="#2b6cb0"/>
+<text x="274.40504733353737" y="67" text-anchor="end" font-size="10" fill="#333">0.99</text>
+<text x="162" y="87.0" text-anchor="end">micro hashmap</text>
+<rect x="280.0" y="76" width="23.553728588813215" height="12" fill="#2b6cb0"/>
+<text x="307.5537285888132" y="87" text-anchor="start" font-size="10" fill="#333">1.16</text>
+<text x="162" y="107.0" text-anchor="end">micro hmget</text>
+<rect x="280.0" y="96" width="13.67609485024218" height="12" fill="#2b6cb0"/>
+<text x="297.6760948502422" y="107" text-anchor="start" font-size="10" fill="#333">1.09</text>
+<text x="162" y="127.0" text-anchor="end">micro iterw</text>
+<rect x="280.0" y="116" width="13.67609485024218" height="12" fill="#2b6cb0"/>
+<text x="297.6760948502422" y="127" text-anchor="start" font-size="10" fill="#333">1.09</text>
+<text x="162" y="147.0" text-anchor="end">micro matmul</text>
+<rect x="280.0" y="136" width="6.2241881203004255" height="12" fill="#2b6cb0"/>
+<text x="290.2241881203004" y="147" text-anchor="start" font-size="10" fill="#333">1.04</text>
+<text x="162" y="167.0" text-anchor="end">micro nbody</text>
+<rect x="270.1805928093204" y="156" width="9.819407190679613" height="12" fill="#2b6cb0"/>
+<text x="266.1805928093204" y="167" text-anchor="end" font-size="10" fill="#333">0.94</text>
+<text x="162" y="187.0" text-anchor="end">micro parse_only</text>
+<rect x="265.0332295466369" y="176" width="14.966770453363097" height="12" fill="#2b6cb0"/>
+<text x="261.0332295466369" y="187" text-anchor="end" font-size="10" fill="#333">0.91</text>
+<text x="162" y="207.0" text-anchor="end">micro sieve</text>
+<rect x="280.0" y="196" width="7.742826068053773" height="12" fill="#2b6cb0"/>
+<text x="291.7428260680538" y="207" text-anchor="start" font-size="10" fill="#333">1.05</text>
+<text x="162" y="227.0" text-anchor="end">micro sortw</text>
+<rect x="280.0" y="216" width="65.40034045053892" height="12" fill="#2b6cb0"/>
+<text x="349.4003404505389" y="227" text-anchor="start" font-size="10" fill="#333">1.51</text>
+<text x="162" y="247.0" text-anchor="end">micro strwork</text>
+<rect x="280.0" y="236" width="15.125387612492887" height="12" fill="#2b6cb0"/>
+<text x="299.1253876124929" y="247" text-anchor="start" font-size="10" fill="#333">1.10</text>
+<text x="162" y="267.0" text-anchor="end">real sha256</text>
+<rect x="280.0" y="256" width="122.94645469367299" height="12" fill="#2b6cb0"/>
+<text x="406.946454693673" y="267" text-anchor="start" font-size="10" fill="#333">2.17</text>
+<text x="162" y="287.0" text-anchor="end">real base64_crc</text>
+<rect x="280.0" y="276" width="184.09120663891593" height="12" fill="#2b6cb0"/>
+<text x="468.09120663891593" y="287" text-anchor="start" font-size="10" fill="#333">3.19</text>
+<text x="162" y="307.0" text-anchor="end">real mandelbrot</text>
+<rect x="280.0" y="296" width="26.266554554582854" height="12" fill="#2b6cb0"/>
+<text x="310.26655455458285" y="307" text-anchor="start" font-size="10" fill="#333">1.18</text>
+<text x="162" y="327.0" text-anchor="end">real nbody</text>
+<rect x="280.0" y="316" width="54.52646788864757" height="12" fill="#2b6cb0"/>
+<text x="338.5264678886476" y="327" text-anchor="start" font-size="10" fill="#333">1.41</text>
+<text x="162" y="347.0" text-anchor="end">real wordfreq</text>
+<rect x="280.0" y="336" width="39.17581912478033" height="12" fill="#2b6cb0"/>
+<text x="323.17581912478033" y="347" text-anchor="start" font-size="10" fill="#333">1.28</text>
+<text x="162" y="367.0" text-anchor="end">real records</text>
+<rect x="280.0" y="356" width="19.395504990450945" height="12" fill="#2b6cb0"/>
+<text x="303.39550499045095" y="367" text-anchor="start" font-size="10" fill="#333">1.13</text>
+<text x="162" y="387.0" text-anchor="end">real matmul</text>
+<rect x="280.0" y="376" width="375.10766609320183" height="12" fill="#2b6cb0"/>
+<text x="659.1076660932018" y="387" text-anchor="start" font-size="10" fill="#333">10.63</text>
+<text x="162" y="407.0" text-anchor="end">real sort</text>
+<rect x="280.0" y="396" width="145.4120904376099" height="12" fill="#2b6cb0"/>
+<text x="429.4120904376099" y="407" text-anchor="start" font-size="10" fill="#333">2.50</text>
+<text x="162" y="427.0" text-anchor="end">real sort_unstable</text>
+<rect x="280.0" y="416" width="23.553728588813215" height="12" fill="#2b6cb0"/>
+<text x="307.5537285888132" y="427" text-anchor="start" font-size="10" fill="#333">1.16</text>
+<text x="162" y="447.0" text-anchor="end">real sort_stable</text>
+<rect x="280.0" y="436" width="31.55692625669775" height="12" fill="#2b6cb0"/>
+<text x="315.55692625669775" y="447" text-anchor="start" font-size="10" fill="#333">1.22</text>
+<text x="162" y="467.0" text-anchor="end">real bsearch</text>
+<rect x="280.0" y="456" width="261.9411709754163" height="12" fill="#2b6cb0"/>
+<text x="545.9411709754163" y="467" text-anchor="start" font-size="10" fill="#333">5.21</text>
+</svg></figure>
+<p>The native results were not the target of this work. The same native code generator is in the repository head. We measured it to give a complete picture.</p>
+<div class="tw"><table><thead><tr><th>Micro-kernel</th><th>LLVM ms</th><th>pliron ms</th><th>Ratio</th></tr></thead><tbody><tr><td>fib</td><td class="n">6.902</td><td class="n">6.834</td><td class="n">0.99</td></tr><tr><td>hashmap</td><td class="n">51.855</td><td class="n">59.940</td><td class="n">1.16</td></tr><tr><td>hmget</td><td class="n">9.148</td><td class="n">10.006</td><td class="n">1.09</td></tr><tr><td>iterw</td><td class="n">35.566</td><td class="n">38.746</td><td class="n">1.09</td></tr><tr><td>matmul</td><td class="n">5.321</td><td class="n">5.514</td><td class="n">1.04</td></tr><tr><td>nbody</td><td class="n">70.411</td><td class="n">66.168</td><td class="n">0.94</td></tr><tr><td>parse_only</td><td class="n">292.030</td><td class="n">264.880</td><td class="n">0.91</td></tr><tr><td>sieve</td><td class="n">13.947</td><td class="n">14.693</td><td class="n">1.05</td></tr><tr><td>sortw</td><td class="n">5.044</td><td class="n">7.638</td><td class="n">1.51</td></tr><tr><td>strwork</td><td class="n">11.783</td><td class="n">12.903</td><td class="n">1.10</td></tr><tr><td><strong>geometric mean</strong></td><td></td><td></td><td class="n"><strong>1.08</strong></td></tr></tbody></table></div>
+<div class="tw"><table><thead><tr><th>Real program</th><th>LLVM ms</th><th>pliron ms</th><th>Ratio</th></tr></thead><tbody><tr><td>sha256</td><td class="n">2.54</td><td class="n">5.50</td><td class="n">2.17</td></tr><tr><td>base64_crc</td><td class="n">6.81</td><td class="n">21.72</td><td class="n">3.19</td></tr><tr><td>mandelbrot</td><td class="n">8.59</td><td class="n">10.17</td><td class="n">1.18</td></tr><tr><td>nbody</td><td class="n">0.22</td><td class="n">0.31</td><td class="n">1.41</td></tr><tr><td>wordfreq</td><td class="n">6.62</td><td class="n">8.46</td><td class="n">1.28</td></tr><tr><td>records</td><td class="n">7.48</td><td class="n">8.44</td><td class="n">1.13</td></tr><tr><td>matmul</td><td class="n">1.56</td><td class="n">16.58</td><td class="n">10.63</td></tr><tr><td>sort</td><td class="n">9.33</td><td class="n">23.33</td><td class="n">2.50</td></tr><tr><td>sort_unstable</td><td class="n">3.23</td><td class="n">3.76</td><td class="n">1.16</td></tr><tr><td>sort_stable</td><td class="n">4.12</td><td class="n">5.04</td><td class="n">1.22</td></tr><tr><td>bsearch</td><td class="n">1.73</td><td class="n">9.01</td><td class="n">5.21</td></tr><tr><td><strong>geometric mean</strong></td><td></td><td></td><td class="n"><strong>2.09</strong></td></tr></tbody></table></div>
+<p>The micro-kernels in <code>bench/</code> are at parity. The real programs show larger gaps.</p>
+<ul><li><strong>matmul is 12.9x slower.</strong> The inner loop <code>out[j] += a * row[j]</code> works on two slices that the compiler cannot prove to be separate. The probable cause is that the native loop vectorizer needs this proof. The WebAssembly vectorizer adds a runtime overlap check instead. We recommend the same change for the native vectorizer. We did not verify this.</li><li><strong>sha256 and base64_crc are 3.6x slower.</strong> Both are byte and word loops with table lookups and rotates. We have not analyzed them.</li><li><strong>bsearch is 5.1x slower.</strong> The standard library binary search is written to use conditional moves. We have not analyzed the native code for it.</li></ul>
+<h2>6. Compile time</h2>
+<figure role="img" aria-label="Compile time"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="330" fill="white"/>
+<text x="380.0" y="24" text-anchor="middle" font-size="15" font-weight="bold">Compile time</text>
+<line x1="70" y1="270.0" x2="740" y2="270.0" stroke="#ddd"/>
+<text x="64" y="274.0" text-anchor="end" fill="#444">0</text>
+<line x1="70" y1="215.0" x2="740" y2="215.0" stroke="#ddd"/>
+<text x="64" y="219.0" text-anchor="end" fill="#444">7</text>
+<line x1="70" y1="160.0" x2="740" y2="160.0" stroke="#ddd"/>
+<text x="64" y="164.0" text-anchor="end" fill="#444">14</text>
+<line x1="70" y1="105.0" x2="740" y2="105.0" stroke="#ddd"/>
+<text x="64" y="109.0" text-anchor="end" fill="#444">21</text>
+<line x1="70" y1="50.0" x2="740" y2="50.0" stroke="#ddd"/>
+<text x="64" y="54.0" text-anchor="end" fill="#444">28</text>
+<text x="14" y="165.0" transform="rotate(-90 14 165.0)" text-anchor="middle" fill="#444">seconds</text>
+<rect x="103.5" y="265.72287027218096" width="75.16666666666667" height="4.277129727819018" fill="#2b6cb0"/>
+<text x="141.58333333333334" y="261.72287027218096" text-anchor="middle" font-size="10">0.55</text>
+<rect x="181.66666666666669" y="266.7338282078473" width="75.16666666666667" height="3.266171792152704" fill="#718096"/>
+<text x="219.75000000000003" y="262.7338282078473" text-anchor="middle" font-size="10">0.42</text>
+<text x="181.66666666666669" y="286" text-anchor="middle">wasm micro crate</text>
+<rect x="326.83333333333337" y="78.69565217391303" width="75.16666666666667" height="191.30434782608697" fill="#2b6cb0"/>
+<text x="364.9166666666667" y="74.69565217391303" text-anchor="middle" font-size="10">24.6</text>
+<rect x="405.00000000000006" y="126.13290915517851" width="75.16666666666667" height="143.8670908448215" fill="#718096"/>
+<text x="443.08333333333337" y="122.13290915517851" text-anchor="middle" font-size="10">18.5</text>
+<text x="405.00000000000006" y="286" text-anchor="middle">wasm real, with std</text>
+<rect x="550.1666666666667" y="246.67020148462353" width="75.16666666666667" height="23.32979851537646" fill="#2b6cb0"/>
+<text x="588.2500000000001" y="242.67020148462353" text-anchor="middle" font-size="10">3</text>
+<rect x="628.3333333333334" y="263.7787203958996" width="75.16666666666667" height="6.221279604100389" fill="#718096"/>
+<text x="666.4166666666667" y="259.7787203958996" text-anchor="middle" font-size="10">0.8</text>
+<text x="628.3333333333334" y="286" text-anchor="middle">native real</text>
+<rect x="70" y="308" width="12" height="10" fill="#2b6cb0"/>
+<text x="86" y="317">pliron</text>
+<rect x="220" y="308" width="12" height="10" fill="#718096"/>
+<text x="236" y="317">LLVM</text>
+</svg></figure>
+<div class="tw"><table><thead><tr><th>Build</th><th>pliron</th><th>LLVM</th><th>Ratio</th></tr></thead><tbody><tr><td>WebAssembly micro crate (core prebuilt)</td><td class="n">0.55 s</td><td class="n">0.42 s</td><td class="n">1.3x</td></tr><tr><td>WebAssembly real program, std built from source</td><td class="n">24.6 s</td><td class="n">18.5 s</td><td class="n">1.3x</td></tr><tr><td>WebAssembly real program, +simd128</td><td class="n">23.4 s</td><td class="n">19.0 s</td><td class="n">1.2x</td></tr><tr><td>Native real program (prebuilt std)</td><td class="n">3.0 s</td><td class="n">0.8 s</td><td class="n">3.8x</td></tr></tbody></table></div>
+<p>The WebAssembly path is close to LLVM in compile time. The native path is slower because it runs a long pipeline of Cranelift IR passes.</p>
+<h2>7. Code size</h2>
+<figure role="img" aria-label="WebAssembly module size"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" font-family="Segoe UI,Arial,sans-serif" font-size="12">
+<rect width="760" height="330" fill="white"/>
+<text x="380.0" y="24" text-anchor="middle" font-size="15" font-weight="bold">WebAssembly module size</text>
+<line x1="70" y1="270.0" x2="740" y2="270.0" stroke="#ddd"/>
+<text x="64" y="274.0" text-anchor="end" fill="#444">0</text>
+<line x1="70" y1="215.0" x2="740" y2="215.0" stroke="#ddd"/>
+<text x="64" y="219.0" text-anchor="end" fill="#444">136</text>
+<line x1="70" y1="160.0" x2="740" y2="160.0" stroke="#ddd"/>
+<text x="64" y="164.0" text-anchor="end" fill="#444">273</text>
+<line x1="70" y1="105.0" x2="740" y2="105.0" stroke="#ddd"/>
+<text x="64" y="109.0" text-anchor="end" fill="#444">409</text>
+<line x1="70" y1="50.0" x2="740" y2="50.0" stroke="#ddd"/>
+<text x="64" y="54.0" text-anchor="end" fill="#444">545</text>
+<text x="14" y="165.0" transform="rotate(-90 14 165.0)" text-anchor="middle" fill="#444">KiB</text>
+<rect x="95.125" y="255.06696019079067" width="55.62499999999999" height="14.933039809209323" fill="#2b6cb0"/>
+<text x="123.4375" y="251.06696019079067" text-anchor="middle" font-size="10">37</text>
+<rect x="153.75" y="266.36763896532744" width="55.62499999999999" height="3.6323610346725377" fill="#718096"/>
+<text x="182.0625" y="262.36763896532744" text-anchor="middle" font-size="10">9</text>
+<text x="153.75" y="286" text-anchor="middle">micro, no SIMD</text>
+<rect x="262.625" y="242.5554944046964" width="55.62499999999999" height="27.444505595303617" fill="#2b6cb0"/>
+<text x="290.9375" y="238.5554944046964" text-anchor="middle" font-size="10">68</text>
+<rect x="321.25" y="265.9640432948083" width="55.62499999999999" height="4.035956705191708" fill="#718096"/>
+<text x="349.5625" y="261.9640432948083" text-anchor="middle" font-size="10">10</text>
+<text x="321.25" y="286" text-anchor="middle">micro, +simd128</text>
+<rect x="430.125" y="88.78554393689228" width="55.62499999999999" height="181.21445606310772" fill="#2b6cb0"/>
+<text x="458.4375" y="84.78554393689228" text-anchor="middle" font-size="10">449</text>
+<rect x="488.75" y="215.51458447991195" width="55.62499999999999" height="54.48541552008807" fill="#718096"/>
+<text x="517.0625" y="211.51458447991195" text-anchor="middle" font-size="10">135</text>
+<text x="488.75" y="286" text-anchor="middle">real, no SIMD</text>
+<rect x="597.625" y="78.695652173913" width="55.62499999999999" height="191.304347826087" fill="#2b6cb0"/>
+<text x="625.9375" y="74.695652173913" text-anchor="middle" font-size="10">474</text>
+<rect x="656.25" y="214.30379746835442" width="55.62499999999999" height="55.69620253164558" fill="#718096"/>
+<text x="684.5625" y="210.30379746835442" text-anchor="middle" font-size="10">138</text>
+<text x="656.25" y="286" text-anchor="middle">real, +simd128</text>
+<rect x="70" y="308" width="12" height="10" fill="#2b6cb0"/>
+<text x="86" y="317">pliron</text>
+<rect x="220" y="308" width="12" height="10" fill="#718096"/>
+<text x="236" y="317">LLVM</text>
+</svg></figure>
+<div class="tw"><table><thead><tr><th>Module</th><th>pliron</th><th>LLVM</th><th>Ratio</th></tr></thead><tbody><tr><td>Micro crate, no SIMD</td><td class="n">38 124 B</td><td class="n">10 077 B</td><td class="n">3.8x</td></tr><tr><td>Micro crate, +simd128</td><td class="n">70 491 B</td><td class="n">10 861 B</td><td class="n">6.5x</td></tr><tr><td>Real program, no SIMD</td><td class="n">460 457 B</td><td class="n">138 286 B</td><td class="n">3.3x</td></tr><tr><td>Real program, +simd128</td><td class="n">485 543 B</td><td class="n">142 139 B</td><td class="n">3.4x</td></tr><tr><td>Native real program (<code>.exe</code>)</td><td class="n">402 432 B</td><td class="n">250 368 B</td><td class="n">1.6x</td></tr></tbody></table></div>
+<p>The modules are about 3 times larger than the LLVM modules. The pliron output of the real program has 476 functions. The LLVM output has 195. There are three known causes.</p>
+<ol><li><strong>Loop unrolling.</strong> The default factor is 8. The setting <code>PLIRON_WASM_UNROLL=2</code> makes the micro crate 33 percent smaller and about 5 percent slower.</li><li><strong>Vectorizer copies.</strong> Each vectorized loop has a vector loop, a second vector loop and the original scalar loop. LLVM emits a vector loop and a scalar remainder.</li><li><strong>No cross-unit inlining.</strong> The standard library is split into many code units. LLVM runs thin local LTO and inlines between them. pliron inlines only inside one unit. Many small helper functions stay as separate copies.</li></ol>
+<p>We tried <code>-Ccodegen-units=1</code>. The module became larger (1.0 MB), because the linker keeps more code. We do not recommend it.</p>
+<h2>8. What changed in this work</h2>
+<p>All changes are in the WebAssembly path (<code>src/wasm.rs</code> and <code>src/wasm/</code>) unless noted.</p>
+<div class="tw"><table><thead><tr><th>Change</th><th>Purpose</th></tr></thead><tbody><tr><td>simd128 lowering of native vectors, lane operations, shuffles, casts and <code>llvm.wasm.*</code> intrinsics</td><td>Correct and fast explicit SIMD. Vectors are lane-flattened when <code>simd128</code> is off.</td></tr><tr><td>Loop vectorizer (<code>src/wasm/vec.rs</code>)</td><td>Unit-stride loops, reductions, widening and narrowing, 4x unroll, runtime overlap check</td></tr><tr><td>Scalar simplifier (<code>src/wasm/simp.rs</code>)</td><td>Constant folding, algebra, value numbering, known-condition folding, jump threading, block merging, select diamonds</td></tr><tr><td>Frame-slot promotion (<code>src/wasm/mem2reg.rs</code>)</td><td>Move address-taken stack slots to SSA values after inlining</td></tr><tr><td>Loop optimizations run after inlining</td><td>Loops see the inlined iterator code</td></tr><tr><td>Small <code>memcpy</code>/<code>memmove</code>/<code>memset</code> expansion</td><td>Avoid slow bulk-memory instructions</td></tr><tr><td>Inline limits</td><td>Hot call sites inline up to 36 instructions</td></tr><tr><td>Tests</td><td><code>tests/wasm/simd.sh</code>, <code>bench.sh</code>, <code>real.sh</code>, <code>fuzz.sh</code></td></tr></tbody></table></div>
+<p>One older bug was found and fixed with the real-program suite. When the inliner put a function with a stack frame into a caller that had one block and no frame, the new stack reservation looked like a restore. The stack pointer then leaked 32 bytes per call, and a program trapped after many calls.</p>
+<p>The test suites all pass:</p>
+<ul><li><code>tests/wasm/run.sh</code>: core, std, WASI (the filesystem leg is skipped on Windows), unwinding.</li><li><code>tests/wasm/simd.sh</code>: about 40 SIMD test calls compared with LLVM.</li><li><code>tests/wasm/fuzz.sh</code>: random loop kernels of 8 integer types and 2 float types, 13 loop shapes, compared with LLVM on 13 sizes. More than 1000 kernels ran with 0 mismatches, in both SIMD and scalar mode.</li></ul>
+<h2>9. Known problems and next steps</h2>
+<ol><li><strong>Fully unrolled loops.</strong> Add full unrolling of loops with a small constant trip count, and promotion of small constant-size arrays. This is the main cause of the <code>sha256</code> gap.</li><li><strong>Early-exit vectorization.</strong> Needed for <code>find_byte</code>, <code>position</code>, <code>any</code> and <code>all</code>.</li><li><strong>Cross-unit inlining.</strong> Inline between code units at link time. This reduces size and run time.</li><li><strong>Native vectorizer.</strong> Add the runtime overlap check. This should fix the 12.9x <code>matmul</code> result.</li><li><strong>Code size.</strong> Choose an unroll factor from the loop size. The dead-code pass made inlining more eager and the modules 9 percent larger.</li></ol>
+<h2>10. How to repeat these measurements</h2>
+<pre><code>cargo build
+bash tests/wasm/bench.sh 3000            # micro-kernels, no SIMD
+bash tests/wasm/bench.sh --simd 3000     # micro-kernels, +simd128
+bash tests/wasm/real.sh                  # real programs: wasm and native
+bash tests/wasm/real.sh --simd --wasm-only
+bash bench/run.sh 5                      # native micro-kernels
+bash tests/wasm/fuzz.sh 1 80             # differential loop fuzzer
+python docs/perf/charts.py               # redraw the charts</code></pre>
+<p>The raw output files are in <code>docs/perf/</code>. The tool <code>tools/wfn.py</code> prints one exported function as text for code review.</p>
+</main>

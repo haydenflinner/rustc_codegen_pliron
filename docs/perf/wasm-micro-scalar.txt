@@ -1,0 +1,26 @@
+38124 C:/Users/haydu/code/rcp-wasm/target/wasm-bench/pliron-scalar/wasm32-unknown-unknown/release/wasmbench.wasm
+10077 C:/Users/haydu/code/rcp-wasm/target/wasm-bench/stock-scalar/wasm32-unknown-unknown/release/wasmbench.wasm
+kernel              pliron ms   stock ms   ratio
+k_adler                121.62     105.46    1.15 
+k_axpy_f32               5.46       3.87    1.41 
+k_count_eq              22.89      13.82    1.66 
+k_dot_f64                5.32       5.21    1.02 
+k_dot_i32                4.15       3.06    1.36 
+k_find_byte              5.95       3.70    1.61 
+k_histogram             17.01      16.95    1.00 
+k_i16_dot                4.77       2.74    1.74 
+k_matmul64             353.53     253.22    1.40 
+k_max_u8                15.41      24.31    0.63 
+k_memset_xor            12.95       9.45    1.37 
+k_nbody_step            10.64      10.73    0.99 
+k_prefix_sum             2.64       3.03    0.87 
+k_saturating_u8         21.09      15.48    1.36 
+k_sort_small             0.94       0.72    1.31 
+k_split_ws              19.44      17.28    1.13 
+k_sum_f32                5.28       5.25    1.01 
+k_sum_i16_widen          4.86       2.63    1.85 
+k_sum_u32                3.91       2.63    1.49 
+k_sum_u8                15.10      10.47    1.44 
+k_utf8_ascii             7.39       8.13    0.91 
+k_vadd_f32               5.62       3.96    1.42 
+geomean ratio 1.240  (0 mismatches)
