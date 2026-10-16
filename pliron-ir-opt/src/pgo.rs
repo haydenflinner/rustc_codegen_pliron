@@ -444,10 +444,12 @@ pub fn instrument(
 
 /// Registration ctor + init slot, as rsasm text: ELF gets a `.init_array`
 /// entry, Mach-O a `__DATA,__mod_init_func` pointer via rsasm's
-/// `.mod_init_func` shorthand. COFF would want `.CRT$XCU` and wasm has
-/// no ctors at all — `None` for both. `__pliron_prof_register` is
-/// declared as a normal import by the caller so the splice resolves it
-/// (Mach-O included, where it links as `___pliron_prof_register`).
+/// `.mod_init_func` shorthand, and COFF a pointer in `.CRT$XCU` — the
+/// band MSVC's CRT calls via `__initterm(__xc_a, __xc_z)` during init,
+/// where `__attribute__((constructor))` lands too. wasm has no ctors —
+/// `None` there. `__pliron_prof_register` is declared as a normal import
+/// by the caller so the splice resolves it (Mach-O included, where it
+/// links as `___pliron_prof_register`).
 pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<String> {
     let asm = match fmt {
         ObjFmt::Elf => {
@@ -481,7 +483,29 @@ pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<Str
                 "{att}.section __TEXT,__text,regular,pure_instructions\n.globl {ctor}\n.weak_definition {ctor}\n.private_extern {ctor}\n{ctor}:\n  {body}\n.mod_init_func\n.balign 8\n.quad {ctor}\n.text\n"
             )
         }
-        _ => return None,
+        ObjFmt::Coff => {
+            // COFF has no real weak symbols; the ctor name is already
+            // per-CGU unique, and the `.CRT$XCU` slot (not the symbol)
+            // is what the CRT walks. A local suffices — LLVM's own
+            // ctor functions are `internal` there.
+            let (att, body) = if aarch64 {
+                (
+                    "",
+                    format!(
+                        "adrp x0, {hdr}\n  add x0, x0, :lo12:{hdr}\n  b __pliron_prof_register"
+                    ),
+                )
+            } else {
+                (
+                    ".att_syntax\n",
+                    format!("lea {hdr}(%rip), %rdi\n  jmp __pliron_prof_register"),
+                )
+            };
+            format!(
+                "{att}.text\n{ctor}:\n  {body}\n.section .CRT$XCU,\"dr\"\n.balign 8\n.quad {ctor}\n.text\n"
+            )
+        }
+        ObjFmt::Wasm => return None,
     };
     Some(asm)
 }

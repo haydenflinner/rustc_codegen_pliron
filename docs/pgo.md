@@ -70,7 +70,8 @@ Per CGU, three data objects plus one constructor stub:
   (`lea hdr; jmp __pliron_prof_register`) plus an init slot, emitted
   through `st.asm`/objmerge: `.init_array` on ELF,
   `__DATA,__mod_init_func` on Mach-O (weak + private_extern; sectnames
-  are capped at 16 bytes, so the names blob lands in `pliron_pnames`).
+  are capped at 16 bytes, so the names blob lands in `pliron_pnames`),
+  `.CRT$XCU` on COFF (the `__initterm` band the MSVC CRT calls).
   `__pliron_prof_register` is declared as a normal import so the splice
   resolves it like any other callee — undefined, it pulls the runtime
   out of `libpliron_prof.a`; link without it and you get a clean
