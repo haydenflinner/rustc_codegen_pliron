@@ -2726,17 +2726,25 @@ impl<'a, 'b> FnLower<'a, 'b> {
         f
     }
 
+    /// SysV x86-64 host calls — where `%al` carries the xmm vararg count.
+    /// Windows x64 has no register count (its varargs duplicate fp args into
+    /// GPR slots, which Cranelift signatures can't express, so calls go out
+    /// direct and un-duplicated); the wasm-CLIF path uses `pliron.va.buf`,
+    /// not a register count.
+    fn sysv_x64(&self) -> bool {
+        let t = self.m.isa().triple();
+        t.architecture == target_lexicon::Architecture::X86_64
+            && self.tcfg.pointer_width == target_lexicon::PointerWidth::U64
+            && t.operating_system != target_lexicon::OperatingSystem::Windows
+    }
+
     /// Foreign variadic callees can't be given `%al` (the xmm vararg count) by
     /// Cranelift, so calls to them go through a `__pliron_va8.<sym>` stub that
     /// sets it to 8 and tail-jumps (emitted into `st.asm` at emit time).
     /// SysV x86-64 only: on aarch64 there is no register count to fake (Darwin
     /// puts every variadic arg on the stack), so no redirect is needed.
     fn va_sym(&mut self, sym: &str) -> String {
-        let foreign_variadic = self.m.isa().triple().architecture
-            == target_lexicon::Architecture::X86_64
-            // The wasm-CLIF path runs on a 64-bit host ISA but emits wasm:
-            // variadics there use `pliron.va.buf`, not a register count.
-            && self.tcfg.pointer_width == target_lexicon::PointerWidth::U64
+        let foreign_variadic = self.sysv_x64()
             && self.st.funcs.get(sym).is_some_and(|f| {
                 !has_body(self.ctx, f.op)
                     && matches!(classify(self.ctx, f.ty), TyK::Func(_, _, true))
@@ -4825,9 +4833,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             CallOpCallable::Indirect(v) => {
                 let addr = self.get1(v);
-                if var_arg
-                    && self.m.isa().triple().architecture == target_lexicon::Architecture::X86_64
-                {
+                if var_arg && self.sysv_x64() {
                     // fp appended as a hidden last argument; a per-register
                     // stub sets %al=8 then tail-jumps to it (fp's SysV
                     // register is computed positionally).
