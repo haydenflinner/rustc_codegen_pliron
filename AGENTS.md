@@ -244,6 +244,19 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   name contains the substring; `PLIRON_VERIFY=full` runs the cranelift
   verifier after each step; any other truthy value verifies once after
   the pipeline, then retries per-step on failure for attribution.
+- `PLIRON_TRACE=<filter>` — tracing `EnvFilter` for always-compiled
+  diagnostics (no rebuild to toggle): `PLIRON_TRACE=pliron::lower=debug`
+  shows libcall/declfn signatures; `pliron::iropt` / `pliron::phase` /
+  `pliron::pipeline` / `pliron::fn` span targets carry per-pass
+  `time.busy` on close. Prefer `tracing::debug!`/`info_span!` over
+  `eprintln!` for any instrumentation that should persist.
+- `PLIRON_WASM_CLIF=1` — wasm via FnLower + the clif-opt pipeline then
+  CLIF→waffle (vector/simd128 lowering only exists here); `=0` is the
+  older dialect→waffle path (kept as a bisection fallback). The
+  `tests/wasm/{simd,fuzz,real,bench}.sh` scripts default it on.
+  `PLIRON_WASM_STUBLOG=<file>` writes stub reasons per function;
+  `PLIRON_WASM_VERBOSE=1` / `PLIRON_WASM_PANIC=1` list stubs / unmute
+  panic locations.
 - Quick single-file check (no test.sh):
   `rustc +nightly-2026-10-06 -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs -o out`
 - Gotcha: build-level caching does **not** track `PLIRON_*` env or the
