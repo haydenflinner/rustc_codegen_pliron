@@ -12,6 +12,7 @@ use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
 use pliron_llvm::attributes::AtomicRmwKindAttr;
 use pliron_llvm::ops::FuncOp;
+pub use pliron::cols::{ColMap, ColSet};
 use rustc_hash::FxHashMap;
 
 /// Order-preserving map (rustc's `FxIndexMap` equivalent).
@@ -135,19 +136,19 @@ pub struct CallInfo {
 
 #[derive(Default)]
 pub struct State {
-    pub consts: FxHashMap<Value, ConstVal>,
+    pub consts: ColMap<Value, ConstVal>,
     pub funcs: FxIndexMap<String, FuncInfo>,
     pub globals: FxIndexMap<String, GlobalInfo>,
     pub ident_to_sym: FxHashMap<String, String>,
     pub sym_to_ident: FxHashMap<String, Identifier>,
-    pub allocas: FxHashMap<Value, (u64, u64)>,
+    pub allocas: ColMap<Value, (u64, u64)>,
     /// Allocas lowered as Cranelift variables (see sroa.rs), with their value type.
-    pub promoted: FxHashMap<Value, TypeHandle>,
+    pub promoted: ColMap<Value, TypeHandle>,
     /// Fresh copies SROA makes for a diverging call; never split again.
-    pub escape_copies: rustc_hash::FxHashSet<Value>,
-    pub calls: FxHashMap<Ptr<Operation>, CallInfo>,
-    pub intrinsics: FxHashMap<Ptr<Operation>, String>,
-    pub rmw: FxHashMap<Ptr<Operation>, AtomicRmwKindAttr>,
+    pub escape_copies: ColSet<Value>,
+    pub calls: ColMap<Ptr<Operation>, CallInfo>,
+    pub intrinsics: ColMap<Ptr<Operation>, String>,
+    pub rmw: ColMap<Ptr<Operation>, AtomicRmwKindAttr>,
     pub strs: FxHashMap<String, Value>,
     pub counter: usize,
     pub cgu: String,
@@ -155,19 +156,19 @@ pub struct State {
     /// EII symbol aliases: (alias, aliasee, weak); emitted as extra object symbols.
     pub aliases: Vec<(String, String, bool)>,
     /// call op → (landing block, is catch_unwind catch-all)
-    pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
+    pub invokes: ColMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
     pub llvm_stubs: rustc_hash::FxHashSet<String>,
     /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
-    pub volatile: rustc_hash::FxHashSet<Ptr<Operation>>,
+    pub volatile: ColSet<Ptr<Operation>>,
     /// Loads whose (pointer) result rustc marked `!nonnull`.
-    pub nonnull: rustc_hash::FxHashSet<Ptr<Operation>>,
+    pub nonnull: ColSet<Ptr<Operation>>,
     /// Entry params of local functions that point at frozen memory, with
     /// their dereferenceable size (see `FuncInfo::frozen`).
-    pub frozen: FxHashMap<Value, u64>,
+    pub frozen: ColMap<Value, u64>,
     /// Entry params of local functions that rustc marks `noalias`:
     /// (dereferenceable bytes when known, writable when not `readonly`).
-    pub noalias: FxHashMap<Value, (u64, bool)>,
+    pub noalias: ColMap<Value, (u64, bool)>,
     /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
     pub nowrite: rustc_hash::FxHashMap<String, bool>,
     /// Functions that provably come back (return/unwind/tail-call/UB) and
@@ -181,41 +182,41 @@ pub struct State {
     /// seeds their call results into `FnLower::nonnull` for jumpthread.
     pub nnret: rustc_hash::FxHashSet<String>,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
-    pub bool01: rustc_hash::FxHashSet<Ptr<Operation>>,
+    pub bool01: ColSet<Ptr<Operation>>,
     /// Args inside inlined clones that bind a `noalias readonly` callee
     /// param (`inline.rs`): arg → (leaf within the arg, dereferenceable
     /// bytes, region id). The pointee is frozen only for the clone's
     /// duration — the region id is the clone's entry block, so hoists can
     /// stay inside the scope (`frozen_loads`) rather than the function-wide
     /// `readonly can_move` flags `FnLower::frozen` gets.
-    pub region_frozen: FxHashMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
+    pub region_frozen: ColMap<Value, Vec<(u32, u64, Ptr<BasicBlock>)>>,
     /// Caller-side operands bound to `region_frozen` leaves: `*v` is
     /// frozen for the callee call's duration — exactly the clone's span —
     /// so the record is `(dereferenceable bytes, clone entry)`. Kept
     /// separate from `region_frozen`: those records seed `FnLower::noalias`
     /// on clone args, while operands are ordinary caller values that
     /// outlive the clone and must not claim function-wide `noalias`.
-    pub region_frozen_op: FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    pub region_frozen_op: ColMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     /// Load ops inside inlined clones whose address provably derives from a
     /// `region_frozen` arg at a constant offset inside the pointee: op →
     /// region id (the clone's entry block). At lowering these seed
     /// `FnLower::scoped` — licm may hoist them without a clobber scan as
     /// long as the preheader stays inside the region: `noalias readonly`
     /// promises no write to the pointee for the call's duration.
-    pub frozen_loads: FxHashMap<Ptr<Operation>, Ptr<BasicBlock>>,
+    pub frozen_loads: ColMap<Ptr<Operation>, Ptr<BasicBlock>>,
     /// Loads rustc marked `!invariant.load` (`set_invariant_load`): every
     /// load from that address yields the same value, so the location can
     /// forward across arbitrary stores — `*pivot` in the partition loop
     /// stays live while the element swaps happen.
-    pub invariant: rustc_hash::FxHashSet<Ptr<Operation>>,
+    pub invariant: ColSet<Ptr<Operation>>,
     /// Pliron blocks belonging to an inlined clone → the clone's entry
     /// block (the region id used by `frozen_loads`/`region_frozen`).
-    pub region_blocks: FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    pub region_blocks: ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     /// Clone entry block → the enclosing clone's entry block (the region
     /// containing the callsite), or itself when the call sits in original
     /// code. Regions nest: a load tagged R may hoist anywhere in R, so a
     /// block whose own region is a descendant of R is in-region for it.
-    pub region_parent: rustc_hash::FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    pub region_parent: ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     /// Args inside inlined clones that bind any `noalias` callee param
     /// (`&mut [T]` included — `frozen` is the `readonly` subset): arg →
     /// leaf within the arg. Each becomes a DISTINCT memory root at
@@ -223,13 +224,13 @@ pub struct State {
     /// not merge even though `v.as_ptr() == pivot + 1`: `noalias` declares
     /// their pointees disjoint, and keeping the roots separate is what lets
     /// licm hoist the pivot load past the element swaps.
-    pub region_noalias: FxHashMap<Value, Vec<u32>>,
+    pub region_noalias: ColMap<Value, Vec<u32>>,
     /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
     /// `NonNull`): a bitmask over the arg's leaf indices (see
     /// `FuncInfo::nonnull`).
-    pub nnargs: FxHashMap<Value, u64>,
+    pub nnargs: ColMap<Value, u64>,
     /// `inbounds` GEPs: null only if their base is.
-    pub inbounds: rustc_hash::FxHashSet<Ptr<Operation>>,
+    pub inbounds: ColSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
     pub dead_fns: rustc_hash::FxHashSet<String>,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
@@ -269,20 +270,20 @@ pub struct State {
     /// Accumulator tail-recursion elimination (`-O`, `PLIRON_TAILREC`).
     pub tailrec: bool,
     /// cond_br op → expected condition value (`likely`/`unlikely`).
-    pub expect: FxHashMap<Ptr<Operation>, bool>,
+    pub expect: ColMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
     pub wasm_imports: FxHashMap<String, (String, String)>,
     /// Loaded PGO profile (`PLIRON_PGO_USE`): FuncOp → function record.
     /// Only functions whose CFG fingerprint matched are present.
-    pub prof: FxHashMap<Ptr<Operation>, crate::pgo::ProfFn>,
+    pub prof: ColMap<Ptr<Operation>, crate::pgo::ProfFn>,
     /// Block → entry count (loaded profile). The inliner propagates it
     /// to cloned blocks (scaled by callsite/callee-entry ratio), so
     /// inlined code carries the callee's counts into the caller.
-    pub prof_bcount: FxHashMap<Ptr<BasicBlock>, u64>,
+    pub prof_bcount: ColMap<Ptr<BasicBlock>, u64>,
     /// Terminator → count per successor slot (from edge counters and
     /// single-pred block counts); drives profile-weighted block layout
     /// and `expect` seeding.
-    pub prof_edges: FxHashMap<Ptr<Operation>, Vec<u64>>,
+    pub prof_edges: ColMap<Ptr<Operation>, Vec<u64>>,
 }
 
 pub fn mask(bits: u128, w: u32) -> u128 {

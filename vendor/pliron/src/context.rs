@@ -287,6 +287,16 @@ impl<'a, T: ArenaObj> Ptr<T> {
             .map_err(|err| arg_error_noloc!(err))
     }
 
+    /// PLIRON: dense arena slot ordinal (`ArenaIndex` index component,
+    /// low 32 of `as_ffi`) — indexes the columnar side tables
+    /// (`pliron_ir_opt::state::ColMap`/`ColSet`). Includes no version
+    /// bits: callers storing the `Ptr` itself (as column entries do)
+    /// detect stale slots by key equality.
+    #[inline]
+    pub fn ord(&self) -> usize {
+        self.idx.ffi() as u32 as usize
+    }
+
     /// Create a unique (to the arena) name based on the arena index.
     pub(crate) fn make_name(&self, name_base: &str) -> Identifier {
         let idx = format!("{}", self.idx);

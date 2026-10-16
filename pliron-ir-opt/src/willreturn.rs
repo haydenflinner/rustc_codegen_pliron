@@ -96,7 +96,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                 if is!(CallOp) {
                     // A tail call *is* the caller's exit: `unreachable`
                     // after it can't let an unknown callee off the hook.
-                    let tail = st.calls.get(&op).is_some_and(|ci| ci.tail);
+                    let tail = st.calls.get(op).is_some_and(|ci| ci.tail);
                     let unr = !tail
                         && os
                             .get(k + 1)
@@ -105,7 +105,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                         Some(c) => p.call.push((f, ids.id(c), unr)),
                         None => p.icall.push((f, unr)),
                     }
-                } else if st.volatile.contains(&op)
+                } else if st.volatile.contains(op)
                     || is!(AtomicRmwOp)
                     || is!(AtomicCmpxchgOp)
                     || is!(AtomicLoadOp)
@@ -113,7 +113,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || is!(FenceOp)
                     || is!(InlineAsmOp)
                     || (is!(CallIntrinsicOp)
-                        && st.intrinsics.get(&op).is_some_and(|n| n.contains("trap")))
+                        && st.intrinsics.get(op).is_some_and(|n| n.contains("trap")))
                 {
                     p.side_fx.push((f,));
                 }

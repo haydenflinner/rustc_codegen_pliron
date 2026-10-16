@@ -112,7 +112,7 @@ fn arg_inv(
         true
     } else if let Some(d) = v.defining_op() {
         if Operation::is_op::<LoadOp>(d, ctx) {
-            !st.volatile.contains(&d)
+            !st.volatile.contains(d)
                 && slot_base(ctx, d.deref(ctx).get_operand(0)).is_some_and(|a| !sbases.contains(&a))
                 && arg_inv(
                     ctx,
@@ -186,8 +186,7 @@ fn loop_private(ctx: &Context, st: &State, lset: &FxHashSet<Ptr<BasicBlock>>, a:
                 }
             } else if Operation::is_op::<CallIntrinsicOp>(op, ctx) {
                 if !st
-                    .intrinsics
-                    .get(&op)
+                    .intrinsics.get(op)
                     .is_some_and(|n| n == "llvm.lifetime.start" || n == "llvm.lifetime.end")
                 {
                     return false;
@@ -218,7 +217,7 @@ fn peel_dead(ctx: &mut Context, st: &State, v: Value, fuel: usize) {
         return;
     };
     let dead = Operation::is_op::<XorOp>(d, ctx)
-        || (Operation::is_op::<LoadOp>(d, ctx) && !st.volatile.contains(&d));
+        || (Operation::is_op::<LoadOp>(d, ctx) && !st.volatile.contains(d));
     if !dead {
         return;
     }
@@ -235,7 +234,7 @@ fn peel_dead(ctx: &mut Context, st: &State, v: Value, fuel: usize) {
 fn is_load_of(ctx: &Context, st: &State, v: Value, p: Value) -> bool {
     v.defining_op().is_some_and(|d| {
         Operation::is_op::<LoadOp>(d, ctx)
-            && !st.volatile.contains(&d)
+            && !st.volatile.contains(d)
             && d.deref(ctx).get_operand(0) == p
     })
 }
@@ -285,7 +284,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         };
         // The counter test must be a plain alloca load in the header.
         if !Operation::is_op::<LoadOp>(cl, ctx)
-            || st.volatile.contains(&cl)
+            || st.volatile.contains(cl)
             || parent(ctx, cl) != Some(h)
         {
             continue;
@@ -433,7 +432,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                     // iteration-0 copy still runs, so unwind and any
                     // non-returning write happen exactly as they would
                     // have.
-                    if !st.volatile.contains(&op)
+                    if !st.volatile.contains(op)
                         && crate::inline::direct_callee(ctx, st, op).is_some_and(|c| {
                             st.nowrite.contains_key(c) && st.willreturn.contains(c)
                         })

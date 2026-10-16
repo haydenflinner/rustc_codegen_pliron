@@ -74,7 +74,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             .collect();
         for (i, p) in params.iter().enumerate() {
             let Some(a0) = args[0].get(i) else { break };
-            let Some(c0) = st.consts.get(a0).cloned() else {
+            let Some(c0) = st.consts.get(*a0).cloned() else {
                 continue;
             };
             if a0.get_type(ctx) != p.get_type(ctx) {
@@ -82,7 +82,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             }
             if !args
                 .iter()
-                .all(|a| a.get(i).is_some_and(|&v| st.consts.get(&v) == Some(&c0)))
+                .all(|a| a.get(i).is_some_and(|&v| st.consts.get(v) == Some(&c0)))
             {
                 continue;
             }

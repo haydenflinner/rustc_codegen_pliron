@@ -82,7 +82,7 @@ fn writes_impl(
     op: Ptr<Operation>,
     arg_allocas: &FxHashSet<Value>,
 ) -> bool {
-    if st.volatile.contains(&op) {
+    if st.volatile.contains(op) {
         return true;
     }
     macro_rules! is {
@@ -110,8 +110,7 @@ fn writes_impl(
         || is!(VAArgOp)
         || (is!(CallIntrinsicOp)
             && !st
-                .intrinsics
-                .get(&op)
+                .intrinsics.get(op)
                 .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
 }
 
@@ -129,14 +128,13 @@ fn dedupable(
     inv: bool,
 ) -> Option<(String, Vec<Value>, Value)> {
     if !Operation::is_op::<CallOp>(op, ctx)
-        || (!inv && st.invokes.contains_key(&op))
+        || (!inv && st.invokes.contains(op))
         || op.deref(ctx).get_num_results() != 1
     {
         return None;
     }
     if st
-        .calls
-        .get(&op)
+        .calls.get(op)
         .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
     {
         return None;
@@ -399,7 +397,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 preds.entry(s).or_default().push(b);
                 succ.entry(b).or_default().push(s);
             }
-            if let Some(&(l, _)) = st.invokes.get(op) {
+            if let Some(&(l, _)) = st.invokes.get(*op) {
                 preds.entry(l).or_default().push(b);
                 succ.entry(b).or_default().push(l);
             }
@@ -428,13 +426,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG)
                 && Operation::is_op::<CallOp>(op, ctx)
             {
-                let why = if st.invokes.contains_key(&op) {
+                let why = if st.invokes.contains(op) {
                     "invoke"
                 } else if op.deref(ctx).get_num_results() != 1 {
                     "results"
                 } else if st
-                    .calls
-                    .get(&op)
+                    .calls.get(op)
                     .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
                 {
                     "flags"
@@ -603,8 +600,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     let why = if op.deref(ctx).get_num_results() != 1 {
                         "results"
                     } else if st
-                        .calls
-                        .get(&op)
+                        .calls.get(op)
                         .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
                     {
                         "flags"
@@ -644,7 +640,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // put: hoisting it adds a `ph → pad` edge that bypasses the
                 // header, so the header stops dominating the pad and every
                 // header-defined value used downstream of it.
-                if st.invokes.get(&op).is_some_and(|&(l, _)| body.contains(&l)) {
+                if st.invokes.get(op).is_some_and(|&(l, _)| body.contains(&l)) {
                     continue;
                 }
                 // Args need to reach the preheader: values defined inside

@@ -143,11 +143,11 @@ pub fn run(ctx: &Context, st: &mut State) {
                 for s in op.deref(ctx).successors() {
                     rp.entry(s).or_default().push(b);
                 }
-                if let Some(&(l, _)) = st.invokes.get(&op) {
+                if let Some(&(l, _)) = st.invokes.get(op) {
                     rp.entry(l).or_default().push(b);
                 }
                 if Operation::is_op::<ReturnOp>(op, ctx)
-                    || st.calls.get(&op).is_some_and(|ci| ci.tail)
+                    || st.calls.get(op).is_some_and(|ci| ci.tail)
                 {
                     if can_ret.insert(b) {
                         wl.push(b);
@@ -173,7 +173,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 if is!(CallOp) {
-                    let inv = st.invokes.contains_key(&op);
+                    let inv = st.invokes.contains(op);
                     let unr = os
                         .get(k + 1)
                         .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx));
@@ -201,8 +201,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || is!(VAArgOp)
                     || (is!(CallIntrinsicOp)
                         && !st
-                            .intrinsics
-                            .get(&op)
+                            .intrinsics.get(op)
                             .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
                 {
                     if cr {

@@ -42,13 +42,13 @@ type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 
 /// `cur` is inside region `target` (or is it): regions nest through
 /// `region_parent` — same walk licm does for scoped loads.
-pub fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) -> bool {
+pub fn in_region(cur: Region, target: Region, rpar: &pliron::cols::ColMap<Region, Region>) -> bool {
     let mut r = Some(cur);
     while let Some(x) = r {
         if x == target {
             return true;
         }
-        r = rpar.get(&x).copied().filter(|&n| n != x);
+        r = rpar.get(x).copied().filter(|&n| n != x);
     }
     false
 }
@@ -353,7 +353,7 @@ pub fn kill(
     invs: &FxHashSet<Loc>,
     cur: Option<Region>,
     invreg: &FxHashMap<Loc, Vec<Region>>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
 ) {
     let n = i64::from(ty.bytes());
     // `iso` roots can't be reached by untracked pointers at all; `ncc`
@@ -630,7 +630,7 @@ fn transfer(
     cur: Option<Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     invreg: &mut FxHashMap<Loc, Vec<Region>>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     bnd: &FxHashMap<Value, u64>,
     pm: &FxHashMap<Value, (Root, i64)>,
@@ -841,7 +841,7 @@ pub fn run(
     inv_insts: &FxHashSet<Inst>,
     ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
     nocap: &FxHashSet<(Inst, u32)>,
@@ -1350,7 +1350,7 @@ fn pre(
                 None,
                 &FxHashMap::default(),
                 &mut FxHashMap::default(),
-                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
                 nw,
                 bnd,
                 pm,

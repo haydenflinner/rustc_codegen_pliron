@@ -41,7 +41,7 @@ fn defined(ctx: &Context, st: &State, sym: &str) -> bool {
 /// A constant that can't be null: a defined symbol's address or non-zero
 /// bits.
 fn const_nonnull(ctx: &Context, st: &State, v: Value) -> bool {
-    match st.consts.get(&v) {
+    match st.consts.get(v) {
         Some(ConstVal::Sym { sym, .. }) => defined(ctx, st, sym),
         Some(ConstVal::Bits(b)) => *b != 0,
         _ => false,
@@ -106,7 +106,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         // no incoming edge is in an unreachable block, whose `ret`s can't
         // run).
         for a in bs[0].deref(ctx).arguments() {
-            if !(ptr(a) && st.nnargs.get(&a).is_some_and(|m| m & 1 != 0)) {
+            if !(ptr(a) && st.nnargs.get(a).is_some_and(|m| m & 1 != 0)) {
                 p.src.push((a,));
             }
         }
@@ -154,15 +154,15 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 for r in rs {
-                    if st.consts.contains_key(&r) {
+                    if st.consts.contains(r) {
                         if !const_nonnull(ctx, st, r) {
                             p.src.push((r,));
                         }
-                    } else if st.nonnull.contains(&op) || is!(AllocaOp) {
+                    } else if st.nonnull.contains(op) || is!(AllocaOp) {
                     } else if is!(BitcastOp) || is!(FreezeOp) {
                         p.copy.push((d.get_operand(0), r));
                     } else if is!(GetElementPtrOp)
-                        && (st.inbounds.contains(&op)
+                        && (st.inbounds.contains(op)
                             || Operation::get_op::<GetElementPtrOp>(op, ctx)
                                 .unwrap()
                                 .no_wrap_flags(ctx)

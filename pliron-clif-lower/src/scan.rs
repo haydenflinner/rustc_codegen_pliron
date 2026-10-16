@@ -113,7 +113,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
                 ctx,
             );
             let (sz, al) = size_align(ctx, ety);
-            let n = match st.consts.get(&op.deref(ctx).get_operand(0)) {
+            let n = match st.consts.get(op.deref(ctx).get_operand(0)) {
                 Some(ConstVal::Bits(n)) => *n as u64,
                 _ => panic!("pliron-clif-lower: dynamic alloca size"),
             };

@@ -163,7 +163,7 @@ pub struct Pipe<'a> {
     /// PGO: CLIF block -> executed count (empty without PLIRON_PGO_USE).
     /// Loop passes scale budgets off it; `block_count` is the read path.
     pub prof: &'a FxHashMap<Block, u64>,
-    pub region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    pub region_parent: &'a pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     pub lifetimes: &'a mut Vec<(Value, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
     pub tcfg: TargetFrontendConfig,
@@ -3258,7 +3258,7 @@ mod tests {
         let invariant: FxHashSet<Inst> = Default::default();
         let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
         let prof: FxHashMap<Block, u64> = Default::default();
-        let region_parent: FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>> = Default::default();
+        let region_parent: pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>> = Default::default();
         let nocap: FxHashSet<(Inst, u32)> = Default::default();
         let mut nonnull = FxHashSet::default();
         nonnull.insert(v4);

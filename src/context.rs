@@ -99,7 +99,7 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub fn cval(&self, v: Value) -> Option<ConstVal> {
-        self.st.borrow().consts.get(&v).cloned()
+        self.st.borrow().consts.get(v).cloned()
     }
 
     pub fn ty_of(&self, v: Value) -> TypeHandle {

@@ -134,7 +134,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
         if !seen.insert(v) {
             continue;
         }
-        if !st.allocas.contains_key(&v) {
+        if !st.allocas.contains(v) {
             let Some(d) = v.defining_op() else {
                 bail!("non-alloca non-gep ptr (block arg)");
             };
@@ -146,7 +146,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
         }
         for u in v.uses(ctx) {
             let o = u.user_op();
-            if st.volatile.contains(&o) {
+            if st.volatile.contains(o) {
                 bail!("volatile use");
             }
             if Operation::is_op::<GetElementPtrOp>(o, ctx) {
@@ -156,7 +156,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
                 stored.push(o.deref(ctx).get_operand(0));
             } else if !Operation::is_op::<CallIntrinsicOp>(o, ctx)
                 || !matches!(
-                    st.intrinsics.get(&o).map(|s| s.as_str()),
+                    st.intrinsics.get(o).map(|s| s.as_str()),
                     Some(n) if n.starts_with("llvm.lifetime.")
                 )
             {
@@ -169,7 +169,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     }
     let mut syms = Vec::new();
     for v in stored {
-        match st.consts.get(&v) {
+        match st.consts.get(v) {
             Some(ConstVal::Sym { sym, off: 0 }) => syms.push(sym.clone()),
             _ => {
                 if dbg {
@@ -260,7 +260,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                 }
                 // The exception payload is produced by the callee; it may
                 // encode any arg.
-                if let Some(&(lp, _)) = st.invokes.get(&op)
+                if let Some(&(lp, _)) = st.invokes.get(op)
                     && let Some(x) = lp.deref(ctx).arguments().next()
                 {
                     p.flow.extend(d.operands().map(|v| (v, x)));
@@ -327,7 +327,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                         }
                     }
                 } else if is!(CallIntrinsicOp) {
-                    match st.intrinsics.get(&op).map(|s| s.as_str()) {
+                    match st.intrinsics.get(op).map(|s| s.as_str()) {
                         // A bulk read+region write: neither operand is
                         // retained — the bytes move, but every derived
                         // pointer inside was already retained by the store

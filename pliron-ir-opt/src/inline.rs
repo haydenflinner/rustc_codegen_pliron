@@ -92,7 +92,7 @@ pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Op
     // probe instead of the attr-dict get + ident lookup every pass was
     // repeating per call site. The callee attr is constructor-only, so
     // the memo can't go stale; ops without an entry fall back below.
-    if let Some(sym) = st.calls.get(&op).and_then(|ci| ci.callee.as_ref()) {
+    if let Some(sym) = st.calls.get(op).and_then(|ci| ci.callee.as_ref()) {
         return Some(sym);
     }
     let c = Operation::get_op::<CallOp>(op, ctx)?;
@@ -107,7 +107,7 @@ pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Op
         // An indirect call through a provable function address (a monomorphized
         // closure shim like hashbrown's `make_hasher`) is direct for inlining:
         // `devirt` rewrites these later, but that runs after the main pass.
-        CallOpCallable::Indirect(p) => match st.consts.get(&p) {
+        CallOpCallable::Indirect(p) => match st.consts.get(p) {
             Some(ConstVal::Sym { sym, off: 0 }) => st.funcs.get_key_value(sym).map(|(k, _)| k),
             _ => None,
         },
@@ -161,13 +161,13 @@ fn callee_info(
     for b in blocks(ctx, f.op) {
         for op in b.deref(ctx).iter(ctx) {
             n += 1;
-            let intr = st.intrinsics.get(&op);
+            let intr = st.intrinsics.get(op);
             if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
                 || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
             {
                 return None;
             }
-            eh |= st.invokes.contains_key(&op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
+            eh |= st.invokes.contains(op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
             if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
                 ncalls += 1;
                 // Indirect target is operand 0; `callee()` would clone the
@@ -255,8 +255,7 @@ fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u3
                         || Operation::is_op::<AtomicStoreOp>(o, ctx))
                         && ui != 0)
                     || st
-                        .intrinsics
-                        .get(&o)
+                        .intrinsics.get(o)
                         .is_some_and(|s| s.starts_with("llvm.mem") && ui <= 1)
                 {
                     mem[i] += 1;
@@ -281,7 +280,7 @@ fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u3
 /// addresses make by-ref memory direct).
 fn const_arg(st: &State, v: &Value) -> bool {
     matches!(
-        st.consts.get(v),
+        st.consts.get(*v),
         Some(ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. })
     )
 }
@@ -292,7 +291,7 @@ fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>>
     // Invokes are non-terminator CallOps — they need the whole block scan;
     // successor lists live only on the terminator (`iter().last()` is O(1)).
     for op in b.deref(ctx).iter(ctx) {
-        v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+        v.extend(st.invokes.get(op).map(|&(l, _)| l));
     }
     if let Some(t) = b.deref(ctx).iter(ctx).last() {
         v.extend(t.deref(ctx).successors());
@@ -766,7 +765,7 @@ pub fn run(
                     continue;
                 }
                 for op in b.deref(ctx).iter(ctx) {
-                    if !bottom_up && st.invokes.contains_key(&op) {
+                    if !bottom_up && st.invokes.contains(op) {
                         continue;
                     }
                     if pre.contains(&op) && only.is_some_and(|o| !o.contains(&op)) {
@@ -837,7 +836,7 @@ pub fn run(
                     if bonus > 1
                         && ci.dvirt.iter().any(|&i| {
                             args.get(i).is_some_and(|a| {
-                                matches!(st.consts.get(a), Some(ConstVal::Sym { .. }))
+                                matches!(st.consts.get(*a), Some(ConstVal::Sym { .. }))
                             })
                         })
                     {
@@ -869,7 +868,7 @@ pub fn run(
                                     FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
                                 );
                             }
-                            if const_arg(st, a) || st.allocas.contains_key(a) {
+                            if const_arg(st, a) || st.allocas.contains(*a) {
                                 save = save.saturating_add(
                                     MEM_USE * ci.mem.get(i).copied().unwrap_or(0) as usize,
                                 );
@@ -906,14 +905,13 @@ pub fn run(
                     // into a catch pad: unwinder phase 1 would never see that catch.
                     let eh_block = ci.eh
                         && st
-                            .invokes
-                            .get(&op)
+                            .invokes.get(op)
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
                     let why = if cost > t {
                         "reject (score)"
                     } else if eh_block {
                         "reject (eh)"
-                    } else if ci.op == caller || st.calls[&op].fn_ty != f.ty {
+                    } else if ci.op == caller || st.calls[op].fn_ty != f.ty {
                         "reject (self/fnty)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
@@ -988,12 +986,12 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                     continue;
                 }
                 let p = call.get_operation().deref(ctx).get_operand(0);
-                let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(&p) else {
+                let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(p) else {
                     continue;
                 };
                 let (Some(fi), Some(info), Some(id)) = (
                     st.funcs.get(sym),
-                    st.calls.get(&c),
+                    st.calls.get(c),
                     st.sym_to_ident.get(sym),
                 ) else {
                     continue;
@@ -1010,12 +1008,12 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                     let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
                     old.replace_all_uses_with(ctx, &new);
                 }
-                let info = st.calls.remove(&c).unwrap();
+                let info = st.calls.remove(c).unwrap();
                 st.calls.insert(nc, info);
-                if let Some(u) = st.invokes.remove(&c) {
+                if let Some(u) = st.invokes.remove(c) {
                     st.invokes.insert(nc, u);
                 }
-                if let Some(e) = st.expect.remove(&c) {
+                if let Some(e) = st.expect.remove(c) {
                     st.expect.insert(nc, e);
                 }
                 if st.last_call == Some(c) {
@@ -1079,9 +1077,9 @@ fn left_stats(
                     .or_insert_with(|| callee_info(ctx, st, cs, model, limit, bonus, fold))
                     .as_ref()
                 {
-                    if ci.eh && st.invokes.contains_key(&op) {
+                    if ci.eh && st.invokes.contains(op) {
                         "eh callee at invoke (catch pad / EH_INVOKE=0)"
-                    } else if st.calls[&op].fn_ty != g.ty {
+                    } else if st.calls[op].fn_ty != g.ty {
                         "fn type mismatch"
                     } else {
                         "eligible but left"
@@ -1279,7 +1277,7 @@ fn store_src(
         }
         None
     };
-    if st.volatile.contains(&load) {
+    if st.volatile.contains(load) {
         return fail("volatile");
     }
     let addr = load.deref(ctx).get_operand(0);
@@ -1334,7 +1332,7 @@ fn store_src_in(
             // `llvm.memcpy/memmove(dst, src, n)`: a load fully inside the
             // copied range reads the same bytes the *source* held just
             // before the copy — resolve the store to that source slot.
-            if let Some(name) = st.intrinsics.get(&o) {
+            if let Some(name) = st.intrinsics.get(o) {
                 if name != "llvm.memcpy" && name != "llvm.memmove" {
                     if name.starts_with("llvm.mem") {
                         return None;
@@ -1384,7 +1382,7 @@ fn store_src_in(
                 }
                 continue;
             }
-            if Operation::is_op::<StoreOp>(o, ctx) && !st.volatile.contains(&o) {
+            if Operation::is_op::<StoreOp>(o, ctx) && !st.volatile.contains(o) {
                 let od = o.deref(ctx);
                 let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(1), mem)?;
                 let soff = soff?;
@@ -1614,7 +1612,7 @@ fn ptr_base(
             // captured any outer-clone region when the record was made.
             // Forwarding past it into the caller's operand chain can only
             // strand the record on an unreachable side path.
-            && !st.region_frozen.contains_key(&v)
+            && !st.region_frozen.contains(v)
             && let Some(w) = arg_src(ctx, preds, b, v)
         {
             v = w;
@@ -1650,8 +1648,7 @@ fn ptr_base(
             // Same rule as the arg case: don't decompose a recorded
             // aggregate arg past its own leaf record.
             if st
-                .region_frozen
-                .get(&agg)
+                .region_frozen.get(agg)
                 .is_some_and(|rs| rs.iter().any(|&(ss, _, _)| ss as usize == s))
             {
                 return Some((agg, Some(s), off));
@@ -1690,7 +1687,7 @@ fn anc_or_self(st: &State, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> bool
         if b == anc {
             return true;
         }
-        match st.region_parent.get(&b) {
+        match st.region_parent.get(b) {
             Some(&p) if p != b => b = p,
             _ => return false,
         }
@@ -1719,7 +1716,7 @@ fn frozen_of(
             best = Some((bytes, r));
         }
     };
-    if let Some(rs) = st.region_frozen.get(&base) {
+    if let Some(rs) = st.region_frozen.get(base) {
         for &(s, bytes, r) in rs {
             if bl.unwrap_or(0) == s as usize {
                 pick(st, bytes, r);
@@ -1727,7 +1724,7 @@ fn frozen_of(
         }
     }
     if bl.is_none_or(|b| b == 0)
-        && let Some(rs) = st.region_frozen_op.get(&base)
+        && let Some(rs) = st.region_frozen_op.get(base)
     {
         for &(bytes, r) in rs {
             pick(st, bytes, r);
@@ -1786,8 +1783,7 @@ fn frozen_args(
     // no FuncInfo: a missing link breaks the ancestor walk for every
     // clone nested inside it.
     let parent = st
-        .region_blocks
-        .get(&call_block)
+        .region_blocks.get(call_block)
         .copied()
         .or(fentry)
         .unwrap_or(entry);
@@ -1796,7 +1792,7 @@ fn frozen_args(
         if let Some(nb) = map.lookup_block(b) {
             // Nested clones inside `src` keep their own (remapped) region;
             // only unclaimed blocks belong to this clone's region.
-            st.region_blocks.entry(nb).or_insert(entry);
+            st.region_blocks.or_insert_with(nb, || entry);
         }
     }
     let Some(f) = st.funcs.values().find(|f| f.op == callee) else {
@@ -1908,9 +1904,7 @@ fn frozen_args(
                 )
             };
         }
-        st.region_frozen
-            .entry(a)
-            .or_default()
+        st.region_frozen.or_default(a)
             .push((sub as u32, bytes, region));
         // `*operand` is frozen for the call's duration — exactly this
         // clone's span. Record the caller-side leaf too, in
@@ -1921,9 +1915,7 @@ fn frozen_args(
         // block param — tag this clone's region, which reaches an
         // enclosing loop's preheader where the load's own entry can't.
         if let Some(lv) = lv {
-            st.region_frozen_op
-                .entry(lv)
-                .or_default()
+            st.region_frozen_op.or_default(lv)
                 .push((bytes, entry));
         }
     }
@@ -1980,7 +1972,7 @@ fn frozen_args(
                 tracing::debug!(target: "pliron::frozen", "frozen_args: na record leaf {leaf} a={a:?} entry={entry:?}")
             };
         }
-        st.region_noalias.entry(a).or_default().push(sub as u32);
+        st.region_noalias.or_default(a).push(sub as u32);
     }
 }
 
@@ -1998,15 +1990,15 @@ fn inline_call(
     let region = block.deref(ctx).get_parent_region().unwrap();
     let args = Operation::get_op::<CallOp>(call, ctx).unwrap().args(ctx);
     let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(0));
-    let unwind = st.invokes.remove(&call);
+    let unwind = st.invokes.remove(call);
     let cont = rw.split_block(ctx, block, OpInsertionPoint::AfterOperation(call), None);
     // PGO: scale the callee's counts by callsite/entry so cloned blocks
     // carry an honest count into the caller (LLVM's scaling rule).
-    let callsite_c = st.prof_bcount.get(&block).copied();
+    let callsite_c = st.prof_bcount.get(block).copied();
     if let Some(c) = callsite_c {
         st.prof_bcount.insert(cont, c);
     }
-    let callee_entry = st.prof.get(&callee).and_then(|p| p.blocks.first().copied());
+    let callee_entry = st.prof.get(callee).and_then(|p| p.blocks.first().copied());
     let scale = |x: u64| match (callsite_c, callee_entry) {
         (Some(c), Some(e)) => ((x as u128 * c as u128) / e.max(1) as u128) as u64,
         _ => x,
@@ -2023,81 +2015,81 @@ fn inline_call(
     let remap = |r: Ptr<BasicBlock>| map.lookup_block(r).unwrap_or(r);
     for &b in &src {
         let nb = map.lookup_block(b).unwrap();
-        if let Some(&pr) = st.region_blocks.get(&b) {
+        if let Some(&pr) = st.region_blocks.get(b) {
             st.region_blocks.insert(nb, remap(pr));
         }
-        if let Some(&pp) = st.region_parent.get(&b) {
+        if let Some(&pp) = st.region_parent.get(b) {
             st.region_parent.insert(nb, remap(pp));
         }
-        if let Some(&c) = st.prof_bcount.get(&b) {
+        if let Some(&c) = st.prof_bcount.get(b) {
             st.prof_bcount.insert(nb, scale(c));
         }
         for (a, na) in b.deref(ctx).arguments().zip(nb.deref(ctx).arguments()) {
-            if let Some(f) = st.region_frozen.get(&a).cloned() {
+            if let Some(f) = st.region_frozen.get(a).cloned() {
                 st.region_frozen.insert(
                     na,
                     f.into_iter().map(|(s, b, r)| (s, b, remap(r))).collect(),
                 );
             }
-            if let Some(f) = st.region_noalias.get(&a).cloned() {
+            if let Some(f) = st.region_noalias.get(a).cloned() {
                 st.region_noalias.insert(na, f);
             }
-            if let Some(f) = st.region_frozen_op.get(&a).cloned() {
+            if let Some(f) = st.region_frozen_op.get(a).cloned() {
                 st.region_frozen_op
                     .insert(na, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
             }
         }
         for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
-            if let Some(c) = st.calls.get(&op).cloned() {
+            if let Some(c) = st.calls.get(op).cloned() {
                 st.calls.insert(new, c);
-                if let Some(&(lp, catch)) = st.invokes.get(&op) {
+                if let Some(&(lp, catch)) = st.invokes.get(op) {
                     st.invokes
                         .insert(new, (map.lookup_block(lp).unwrap(), catch));
                 } else if let Some(u) = unwind {
                     st.invokes.insert(new, u);
                 }
             }
-            if let Some(s) = st.intrinsics.get(&op).cloned() {
+            if let Some(s) = st.intrinsics.get(op).cloned() {
                 st.intrinsics.insert(new, s);
             }
-            if let Some(r) = st.rmw.get(&op).cloned() {
+            if let Some(r) = st.rmw.get(op).cloned() {
                 st.rmw.insert(new, r);
             }
-            if let Some(e) = st.expect.get(&op).copied() {
+            if let Some(e) = st.expect.get(op).copied() {
                 st.expect.insert(new, e);
             }
-            if let Some(cs) = st.prof_edges.get(&op).cloned() {
+            if let Some(cs) = st.prof_edges.get(op).cloned() {
                 st.prof_edges
                     .insert(new, cs.iter().map(|&c| scale(c)).collect());
             }
-            if st.volatile.contains(&op) {
+            if st.volatile.contains(op) {
                 st.volatile.insert(new);
             }
-            if st.nonnull.contains(&op) {
+            if st.nonnull.contains(op) {
                 st.nonnull.insert(new);
             }
-            if st.inbounds.contains(&op) {
+            if st.inbounds.contains(op) {
                 st.inbounds.insert(new);
             }
-            if st.bool01.contains(&op) {
+            if st.bool01.contains(op) {
                 st.bool01.insert(new);
             }
-            if let Some(r) = st.frozen_loads.get(&op).copied() {
+            if let Some(r) = st.frozen_loads.get(op).copied() {
                 st.frozen_loads.insert(new, remap(r));
             }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
                 let (v, nv) = (op.deref(ctx).get_result(i), new.deref(ctx).get_result(i));
-                if let Some(a) = st.allocas.get(&v).copied() {
+                if let Some(a) = st.allocas.get(v).copied() {
                     st.allocas.insert(nv, a);
                 }
-                if let Some(t) = st.promoted.get(&v).copied() {
+                if let Some(t) = st.promoted.get(v).copied() {
                     st.promoted.insert(nv, t);
                 }
-                if let Some(c) = st.consts.get(&v).cloned() {
+                if let Some(c) = st.consts.get(v).cloned() {
                     st.consts.insert(nv, c);
                 }
-                if let Some(f) = st.region_frozen_op.get(&v).cloned() {
+                if let Some(f) = st.region_frozen_op.get(v).cloned() {
                     st.region_frozen_op
                         .insert(nv, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
                 }
@@ -2123,7 +2115,7 @@ fn inline_call(
     let br = BrOp::new(ctx, entry, args.clone()).get_operation();
     br.insert_before(ctx, call);
     frozen_args(ctx, st, callee, &src, &map, &args, block);
-    st.calls.remove(&call);
+    st.calls.remove(call);
     Operation::erase(call, ctx);
     let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
     (block, std::iter::once(cont).chain(clones).collect())

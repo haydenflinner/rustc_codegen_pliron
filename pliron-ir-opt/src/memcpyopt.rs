@@ -28,7 +28,7 @@ fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
             i == 0 && non_escaping(ctx, st, o.deref(ctx).get_result(0))
         } else {
             matches!(
-                st.intrinsics.get(&o).map(|s| s.as_str()),
+                st.intrinsics.get(o).map(|s| s.as_str()),
                 Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
             ) && i <= 1
         }
@@ -46,7 +46,7 @@ fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
 }
 
 fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Operation>) -> bool {
-    if st.volatile.contains(&m) || st.intrinsics.get(&m).map(|s| s.as_str()) != Some("llvm.memcpy")
+    if st.volatile.contains(m) || st.intrinsics.get(m).map(|s| s.as_str()) != Some("llvm.memcpy")
     {
         return false;
     }
@@ -58,7 +58,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     let Some(a) = src.defining_op() else {
         return false;
     };
-    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(&src).map(|x| x.0 as i128) != Some(n)
+    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(src).map(|x| x.0 as i128) != Some(n)
     {
         return false;
     }
@@ -73,10 +73,10 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     let Some(&(call, idx)) = uses.iter().find(|(u, _)| *u != m) else {
         return false;
     };
-    let Some(ci) = st.calls.get(&call) else {
+    let Some(ci) = st.calls.get(call) else {
         return false;
     };
-    if st.invokes.contains_key(&call) {
+    if st.invokes.contains(call) {
         return false;
     }
     let nopd = call.deref(ctx).get_num_operands();
@@ -93,7 +93,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         non_escaping(ctx, st, dst)
     } else if let Some(d) = dst.defining_op() {
         Operation::is_op::<AllocaOp>(d, ctx)
-            && st.allocas.get(&dst).is_some_and(|x| x.0 as i128 >= n)
+            && st.allocas.get(dst).is_some_and(|x| x.0 as i128 >= n)
             && non_escaping(ctx, st, dst)
             && dominates_in_block(ctx, d, call)
     } else {
@@ -116,10 +116,10 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         return false;
     }
     Operation::replace_operand(call, ctx, idx, dst);
-    st.intrinsics.remove(&m);
+    st.intrinsics.remove(m);
     Operation::erase(m, ctx);
-    st.allocas.remove(&src);
-    st.promoted.remove(&src);
+    st.allocas.remove(src);
+    st.promoted.remove(src);
     Operation::erase(a, ctx);
     true
 }

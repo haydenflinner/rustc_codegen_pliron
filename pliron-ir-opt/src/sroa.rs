@@ -92,7 +92,7 @@ struct Slice {
 }
 
 pub fn const_int(ctx: &Context, st: &State, v: Value) -> Option<i128> {
-    let b = match st.consts.get(&v)? {
+    let b = match st.consts.get(v)? {
         ConstVal::Bits(b) => *b,
         ConstVal::Zero => return Some(0),
         _ => return None,
@@ -169,8 +169,7 @@ fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: u
     }
     let ai = idx - usize::from(!direct);
     if st
-        .calls
-        .get(&op)
+        .calls.get(op)
         .and_then(|i| i.nocap.as_ref())
         .is_some_and(|n| n.get(ai) == Some(&true))
     {
@@ -185,7 +184,7 @@ fn copyable_arg(ctx: &Context, st: &State, op: Ptr<Operation>, _p: Value, idx: u
     let Some(&strict) = st.nowrite.get(sym) else {
         return false;
     };
-    if !strict && st.invokes.contains_key(&op) {
+    if !strict && st.invokes.contains(op) {
         return false;
     }
     st.nocapture
@@ -211,8 +210,7 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
     }
     let ai = idx - usize::from(indirect);
     let r = st
-        .calls
-        .get(&op)
+        .calls.get(op)
         .and_then(|i| i.arg_extent.as_ref())
         .and_then(|e| e.get(ai))
         .copied()
@@ -223,8 +221,7 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         && let CallOpCallable::Direct(id) = c.callee(ctx)
     {
         let got = st
-            .calls
-            .get(&op)
+            .calls.get(op)
             .map(|i| format!("extent={:?}", i.arg_extent))
             .unwrap_or_else(|| "no CallInfo".into());
         if pliron_cfg::tracing_on() {
@@ -261,13 +258,13 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     if op.get_next(ctx).is_none() {
         return false;
     }
-    if let Some(&(pad, _)) = st.invokes.get(&op)
+    if let Some(&(pad, _)) = st.invokes.get(op)
         && pad.deref(ctx).arguments().next().is_some()
     {
         return false;
     }
     let ai = idx - usize::from(!direct);
-    let info = st.calls.get(&op);
+    let info = st.calls.get(op);
     if info
         .and_then(|i| i.nocap.as_ref())
         .is_some_and(|n| n.get(ai) == Some(&true))
@@ -284,7 +281,7 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
 }
 
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
-    st.intrinsics.get(&op).map(|s| s.as_str())
+    st.intrinsics.get(op).map(|s| s.as_str())
 }
 
 /// Deepest `store *q <- p` chain the flow walk will chase (a pointer stored
@@ -348,7 +345,7 @@ pub(crate) fn slot_loads(
     memo: &mut AccMemo,
 ) -> Option<Vec<Value>> {
     let mut q = dst;
-    while !st.allocas.contains_key(&q) {
+    while !st.allocas.contains(q) {
         let op = q.defining_op()?;
         if !Operation::is_op::<GetElementPtrOp>(op, ctx) {
             return None;
@@ -370,7 +367,7 @@ fn slot_loads_inner(
     depth: u32,
     memo: &mut AccMemo,
 ) -> Option<Vec<Value>> {
-    let &(qsize, _) = st.allocas.get(&q)?;
+    let &(qsize, _) = st.allocas.get(q)?;
     let (qacc, _) = accesses_m(ctx, st, q, qsize, depth + 1, memo)?;
     let mut loads = Vec::new();
     for qa in &qacc {
@@ -468,7 +465,7 @@ fn accesses_inner(
         for u in p.uses(ctx) {
             let op = u.user_op();
             let idx = u.find_index(ctx);
-            if st.volatile.contains(&op) {
+            if st.volatile.contains(op) {
                 return None;
             }
             let in_range = |off: i64, n: u64| {
@@ -868,15 +865,15 @@ fn trivially_promotable(
 
 fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     let a = alloca.deref(ctx).get_result(0);
-    let Some(&(size, align)) = st.allocas.get(&a) else {
+    let Some(&(size, align)) = st.allocas.get(a) else {
         return false;
     };
-    if st.escape_copies.contains(&a) {
+    if st.escape_copies.contains(a) {
         return false;
     }
-    if st.promoted.contains_key(&a) {
+    if st.promoted.contains(a) {
         validate(ctx, st, a);
-        if st.promoted.contains_key(&a) {
+        if st.promoted.contains(a) {
             return false;
         }
     }
@@ -1109,7 +1106,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                         .get_operation()
                         .insert_before(ctx, x.op);
                 }
-                st.intrinsics.remove(&x.op);
+                st.intrinsics.remove(x.op);
                 Operation::erase(x.op, ctx);
             }
             Kind::Set { n, byte } => {
@@ -1157,7 +1154,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                         o += k;
                     }
                 }
-                st.intrinsics.remove(&x.op);
+                st.intrinsics.remove(x.op);
                 Operation::erase(x.op, ctx);
             }
             Kind::Escape { idx } => {
@@ -1225,7 +1222,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             if let Some(next) = next {
                 reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, next);
             }
-            let padc = st.invokes.get(cop).copied();
+            let padc = st.invokes.get(*cop).copied();
             if let Some((pad, catch)) = padc {
                 let region = cop
                     .deref(ctx)
@@ -1245,7 +1242,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     }
     erase_dead(ctx, geps.into_iter().rev().collect());
     if !a.is_used(ctx) {
-        st.allocas.remove(&a);
+        st.allocas.remove(a);
         Operation::erase(alloca, ctx);
     }
     true
@@ -1254,7 +1251,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
 /// Drop promotion for any alloca that ended up with a use lowering can't
 /// turn into a variable access (it then stays a stack slot).
 fn validate(ctx: &Context, st: &mut State, a: Value) {
-    let Some(&ty) = st.promoted.get(&a) else {
+    let Some(&ty) = st.promoted.get(a) else {
         return;
     };
     let ok = a.uses(ctx).iter().all(|u| {
@@ -1272,7 +1269,7 @@ fn validate(ctx: &Context, st: &mut State, a: Value) {
         }
     });
     if !ok {
-        st.promoted.remove(&a);
+        st.promoted.remove(a);
     }
 }
 
@@ -1320,8 +1317,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         for op in allocas(ctx, f) {
             let a = op.deref(ctx).get_result(0);
             if !a.is_used(ctx) {
-                st.allocas.remove(&a);
-                st.promoted.remove(&a);
+                st.allocas.remove(a);
+                st.promoted.remove(a);
                 Operation::erase(op, ctx);
                 continue;
             }
@@ -1350,10 +1347,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         if Operation::is_op::<pliron_llvm::ops::CondBrOp>(op, ctx) {
                             n += 1;
                             let c = op.deref(ctx).get_operand(0);
-                            if st.consts.contains_key(&c) {
+                            if st.consts.contains(c) {
                                 k += 1;
                             } else if let Some(d) = c.defining_op() {
-                                if d.deref(ctx).operands().all(|o| st.consts.contains_key(&o)) {
+                                if d.deref(ctx).operands().all(|o| st.consts.contains(o)) {
                                     kk += 1;
                                 }
                             }
@@ -1379,8 +1376,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         .iter()
                         .map(|u| {
                             let o = u.user_op();
-                            st.intrinsics
-                                .get(&o)
+                            st.intrinsics.get(o)
                                 .cloned()
                                 .unwrap_or_else(|| Operation::get_opid(o, ctx).to_string())
                                 + &format!("#{}", u.find_index(ctx))
@@ -1430,7 +1426,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             for f in fs {
                 for op in allocas(ctx, f) {
                     let a = op.deref(ctx).get_result(0);
-                    if !st.promoted.contains_key(&a) {
+                    if !st.promoted.contains(a) {
                         *h.entry(why2(ctx, st, a)).or_default() += 1;
                     }
                 }
@@ -1443,8 +1439,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                     }
                     for op in allocas(ctx, f.op) {
                         let a = op.deref(ctx).get_result(0);
-                        if !st.promoted.contains_key(&a) {
-                            let sz = st.allocas.get(&a).map(|x| x.0).unwrap_or(0);
+                        if !st.promoted.contains(a) {
+                            let sz = st.allocas.get(a).map(|x| x.0).unwrap_or(0);
                             if pliron_cfg::tracing_on() {
                                 tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B {} {name}", why2(ctx, st, a))
                             };
@@ -1468,7 +1464,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
                     for op in b.deref(ctx).iter(ctx) {
                         let n = Operation::get_opid(op, ctx).to_string();
-                        let n = st.intrinsics.get(&op).map_or(n, |i| i.clone());
+                        let n = st.intrinsics.get(op).map_or(n, |i| i.clone());
                         *h.entry(n).or_default() += 1;
                     }
                 }
@@ -1538,8 +1534,7 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                 uses.push("pin");
             } else {
                 let n = st
-                    .intrinsics
-                    .get(&op)
+                    .intrinsics.get(op)
                     .cloned()
                     .unwrap_or_else(|| Operation::get_opid(op, ctx).to_string());
                 let callee = Operation::get_op::<CallOp>(op, ctx)
@@ -1561,7 +1556,7 @@ fn why2(ctx: &mut Context, st: &State, a: Value) -> String {
     if !w.starts_with("layout") {
         return w;
     }
-    let Some(&(size, _)) = st.allocas.get(&a) else {
+    let Some(&(size, _)) = st.allocas.get(a) else {
         return "not in st.allocas".into();
     };
     if size == 0 || size > MAX_SIZE {
@@ -1634,7 +1629,7 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
         while let Some(p) = work.pop() {
             for u in p.uses(ctx) {
                 let o = u.user_op();
-                ok &= !st.volatile.contains(&o)
+                ok &= !st.volatile.contains(o)
                     && if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
                         store.replace(o).is_none()
                     } else if Operation::is_op::<LoadOp>(o, ctx) {

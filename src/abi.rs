@@ -120,7 +120,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
@@ -159,7 +159,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
                 old.replace_all_uses_with(ctx, &new);
             }
-            let mut info = st.calls.remove(&c).unwrap();
+            let mut info = st.calls.remove(c).unwrap();
             info.fn_ty = nty.into();
             info.exts = exts.clone();
             // `nocap`/`arg_extent` are indexed by operand position — re-index
@@ -177,7 +177,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
             st.calls.insert(nc, info);
-            if let Some(u) = st.invokes.remove(&c) {
+            if let Some(u) = st.invokes.remove(c) {
                 st.invokes.insert(nc, u);
             }
             if st.last_call == Some(c) {
@@ -243,7 +243,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
@@ -346,7 +346,7 @@ fn rewrite(
                 .get_operation()
                 .insert_before(ctx, c);
         }
-        let mut info = st.calls.remove(&c).unwrap();
+        let mut info = st.calls.remove(c).unwrap();
         info.fn_ty = nty.into();
         info.exts = exts.clone();
         // `nocap`/`arg_extent` are indexed by operand position, and operand 0
@@ -361,7 +361,7 @@ fn rewrite(
             info.arg_noalias = (v.len() == cargs.len()).then(|| v[1..].into());
         }
         st.calls.insert(nc, info);
-        if let Some(u) = st.invokes.remove(&c) {
+        if let Some(u) = st.invokes.remove(c) {
             st.invokes.insert(nc, u);
         }
         if st.last_call == Some(c) {

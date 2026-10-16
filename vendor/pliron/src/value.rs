@@ -166,6 +166,15 @@ pub enum ValueError {
 
 impl Value {
     /// Get the defining entity
+    /// PLIRON: dense per-Context value ordinal — `get_new_value_uid`
+    /// hands out a monotonically increasing uid, so it indexes the
+    /// columnar side tables (`pliron_ir_opt::state::ColMap`/`ColSet`).
+    /// Never reused: a deleted value's uid stays vacated.
+    #[inline]
+    pub fn uid(&self) -> u64 {
+        self.val_uid
+    }
+
     pub fn defining_entity(&self) -> DefiningEntity {
         self.defining_entity
     }

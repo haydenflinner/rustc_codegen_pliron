@@ -173,7 +173,7 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     let Some(d) = v.defining_op() else {
         return Atom::V(v);
     };
-    if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
+    if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
         return Atom::V(v);
     }
     let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(0)) else {
@@ -490,15 +490,14 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 stores_by_slot.entry(s).or_default().push(op);
             }
             if Operation::is_op::<LoadOp>(op, ctx)
-                && !st.volatile.contains(&op)
+                && !st.volatile.contains(op)
                 && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(0))
             {
                 load_slots.insert(s);
             }
             let pure_intr = Operation::is_op::<CallIntrinsicOp>(op, ctx)
                 && st
-                    .intrinsics
-                    .get(&op)
+                    .intrinsics.get(op)
                     .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p)));
             if Operation::is_op::<LoadOp>(op, ctx)
                 || Operation::is_op::<StoreOp>(op, ctx)
@@ -558,7 +557,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 .map(|i| Nd::Arg(b, i));
         }
         let d = v.defining_op()?;
-        if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
+        if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
             return None;
         }
         let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(0))?;

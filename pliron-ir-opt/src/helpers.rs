@@ -20,9 +20,9 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
         }
     }
     let mut taken = FxHashSet::default();
-    for (v, c) in &st.consts {
+    for (v, c) in st.consts.iter() {
         if let ConstVal::Sym { sym, .. } = c {
-            if v.is_used(ctx) || escaped.contains(v) {
+            if v.is_used(ctx) || escaped.contains(&v) {
                 taken.insert(sym.clone());
             }
         }
@@ -93,7 +93,7 @@ pub fn erase_unreachable(
         }
         for op in ops_of(b) {
             wl.extend(op.deref(ctx).successors());
-            if let Some(&(l, _)) = st.invokes.get(&op) {
+            if let Some(&(l, _)) = st.invokes.get(op) {
                 wl.push(l);
             }
         }
@@ -105,12 +105,12 @@ pub fn erase_unreachable(
         .collect();
     for &b in &dead {
         for op in ops_of(b) {
-            st.calls.remove(&op);
-            st.invokes.remove(&op);
-            st.intrinsics.remove(&op);
-            st.volatile.remove(&op);
-            st.rmw.remove(&op);
-            st.nonnull.remove(&op);
+            st.calls.remove(op);
+            st.invokes.remove(op);
+            st.intrinsics.remove(op);
+            st.volatile.remove(op);
+            st.rmw.remove(op);
+            st.nonnull.remove(op);
         }
         BasicBlock::drop_all_uses(b, ctx);
     }

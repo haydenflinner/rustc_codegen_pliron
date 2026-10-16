@@ -295,7 +295,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
                 let id = if let Some(&id) = ids.get(&v) {
                     id
                 } else if let Some(vw) = int_width(ctx, v) {
-                    let id = match st.consts.get(&v) {
+                    let id = match st.consts.get(v) {
                         Some(ConstVal::Bits(c)) => eg.add(IC::Const(Cst(*c, vw))),
                         Some(ConstVal::Zero) => eg.add(IC::Const(Cst(0, vw))),
                         _ => {
@@ -479,7 +479,7 @@ fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
 /// distinct `undef` result sharing a `ConstVal`.
 fn canon_eq(st: &State, a: Value, b: Value) -> bool {
     a == b
-        || match (st.consts.get(&a), st.consts.get(&b)) {
+        || match (st.consts.get(a), st.consts.get(b)) {
             (Some(ConstVal::Zero), Some(ConstVal::Zero)) => true,
             (Some(ConstVal::Bits(x)), Some(ConstVal::Bits(y))) => x == y,
             (Some(ConstVal::Zero), Some(ConstVal::Bits(y)))
@@ -737,7 +737,7 @@ fn safe_leaf(ops: &[POp], defop: &FxHashMap<Value, usize>, i: usize, v: Value) -
 /// Canonical key for a value: `st.consts` constants key by masked value,
 /// everything else by SSA name.
 fn key(st: &State, v: Value, w: u32) -> K {
-    match st.consts.get(&v) {
+    match st.consts.get(v) {
         Some(ConstVal::Bits(c)) => K::C(mask(*c, w)),
         Some(ConstVal::Zero) => K::C(0),
         _ => K::V(v),

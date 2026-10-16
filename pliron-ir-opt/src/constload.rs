@@ -30,7 +30,7 @@ fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
     let ty = v.get_type(ctx);
     let (size, _) = size_align(ctx, ty);
     let start = out.bytes.len();
-    match st.consts.get(&v)? {
+    match st.consts.get(v)? {
         ConstVal::Bits(b) if size <= 16 => out
             .bytes
             .extend(b.to_le_bytes()[..size as usize].iter().map(|&x| Some(x))),
@@ -68,7 +68,7 @@ fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
 
 /// The global symbol and byte offset `p` points at, if constant.
 fn sym_off(ctx: &Context, st: &State, p: Value) -> Option<(String, i64)> {
-    if let Some(ConstVal::Sym { sym, off }) = st.consts.get(&p) {
+    if let Some(ConstVal::Sym { sym, off }) = st.consts.get(p) {
         return Some((sym.clone(), *off));
     }
     let op = p.defining_op()?;
@@ -124,7 +124,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             .flat_map(|b| b.deref(ctx).iter(ctx).collect::<Vec<_>>())
             .collect();
         for op in ops {
-            if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(&op) {
+            if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(op) {
                 continue;
             }
             let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(0)) else {

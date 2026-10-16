@@ -274,7 +274,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let v = self.call_sym(sym, ret, args);
         let mut st = self.st.borrow_mut();
         if let Some(p) = st.last_call {
-            st.calls.get_mut(&p).unwrap().bb = true;
+            st.calls.get_mut(p).unwrap().bb = true;
         }
         v
     }
@@ -1286,7 +1286,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
             let mut st = self.st.borrow_mut();
-            let info = st.calls.get_mut(&p).unwrap();
+            let info = st.calls.get_mut(p).unwrap();
             info.foreign = foreign;
             info.cc = cc;
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
@@ -1321,7 +1321,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // skipped by the terminator logic once `return_call` is emitted.
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
-            self.st.borrow_mut().calls.get_mut(&p).unwrap().tail = true;
+            self.st.borrow_mut().calls.get_mut(p).unwrap().tail = true;
         }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),

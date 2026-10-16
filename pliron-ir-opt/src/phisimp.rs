@@ -46,7 +46,7 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
         // Only the terminator carries successor edges (invokes included).
         if let Some(t) = b.deref(ctx).iter(ctx).last() {
             work.extend(t.deref(ctx).successors());
-            work.extend(st.invokes.get(&t).map(|&(l, _)| l));
+            work.extend(st.invokes.get(t).map(|&(l, _)| l));
         }
     }
     seen

@@ -153,7 +153,7 @@ fn hoists(
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     pb: Block,
     i: Inst,
@@ -262,7 +262,7 @@ fn hoists(
                 // the whole clone — the hoist stays inside it.
                 return true;
             }
-            r = rpar.get(&x).copied().filter(|&n| n != x);
+            r = rpar.get(x).copied().filter(|&n| n != x);
         }
         if dbg {
             if pliron_cfg::tracing_on() {
@@ -342,7 +342,7 @@ fn run_loop(
     debug: bool,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
 ) -> usize {
     let h = la.loop_header(lp);
@@ -1308,10 +1308,7 @@ pub fn run(
     cfrozen: &FxHashMap<FuncRef, u64>,
     scoped: &FxHashMap<Inst, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
-    rpar: &FxHashMap<
-        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
-        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
-    >,
+    rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
 ) -> usize {
     let mut la = LoopAnalysis::new();
@@ -1453,7 +1450,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
-            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -1513,7 +1510,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
-            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());

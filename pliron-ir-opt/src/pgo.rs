@@ -701,10 +701,10 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
 
 /// Profiled entry count of the block, if a matching record exists.
 pub fn block_count(st: &State, b: Ptr<BasicBlock>) -> Option<u64> {
-    st.prof_bcount.get(&b).copied()
+    st.prof_bcount.get(b).copied()
 }
 
 /// Total entry count (block 0) of the FuncOp, if profiled.
 pub fn func_count(st: &State, f: Ptr<Operation>) -> Option<u64> {
-    st.prof.get(&f)?.blocks.first().copied()
+    st.prof.get(f)?.blocks.first().copied()
 }
