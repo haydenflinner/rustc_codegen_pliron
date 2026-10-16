@@ -2095,7 +2095,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let exn = self.b.declare_var(pt);
         self.exn = Some(exn);
         for op in crate::sroa::allocas(ctx, f) {
-            let a = op.deref(ctx).get_result(0);
+            let a = op.deref(ctx).get_result(ctx, 0);
             if let Some(&ty) = self.st.promoted.get(a) {
                 let vs = leaves(ctx, ty)
                     .into_iter()
@@ -2478,7 +2478,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id)
             };
         }
-        let ops: Vec<Value> = op.deref(ctx).operands().collect();
+        let ops: Vec<Value> = op.deref(ctx).operands(ctx).collect();
         let bit = |v| self.const_bits(v, depth + 1);
         let sext = |(b, w): (u128, u32)| -> i128 {
             if w < 128 && (b >> (w - 1)) & 1 == 1 {
@@ -2538,7 +2538,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 {
                     return None;
                 }
-                stores.push((uop, bit(uop.deref(ctx).get_operand(0))?));
+                stores.push((uop, bit(uop.deref(ctx).get_operand(ctx, 0))?));
             }
             let (pre, rest): (Vec<_>, Vec<_>) = stores
                 .iter()
@@ -2590,7 +2590,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     {
                         return None;
                     }
-                    let (c, _) = bit(t1.deref(ctx).get_operand(0))?;
+                    let (c, _) = bit(t1.deref(ctx).get_operand(ctx, 0))?;
                     if (i1 == 0) == (c & 1 == 1) {
                         rest[0].1.0
                     } else {
@@ -3293,7 +3293,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
-        let r = op.deref(self.ctx).get_result(0);
+        let r = op.deref(self.ctx).get_result(self.ctx, 0);
         self.vals.insert(r, vals);
     }
 
@@ -3328,7 +3328,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn res_ty(&self, op: Ptr<Operation>) -> TypeHandle {
-        op.deref(self.ctx).get_result(0).get_type(self.ctx)
+        op.deref(self.ctx).get_result(self.ctx, 0).get_type(self.ctx)
     }
 
     fn int_width(&self, t: TypeHandle) -> u32 {
@@ -3358,7 +3358,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let id = Operation::get_opid(op, ctx);
         let (opnds, succs): (Vec<Value>, Vec<Ptr<BasicBlock>>) = {
             let o = op.deref(ctx);
-            (o.operands().collect(), o.successors(ctx).collect())
+            (o.operands(ctx).collect(), o.successors(ctx).collect())
         };
         macro_rules! is {
             ($t:ty) => {
@@ -3410,7 +3410,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // unfolded (`7u128.max(1)` lowers to `select(icmp ..)`); folding
         // here also collapses their dependent Assert(cond) checks.
         if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, &id) {
-            let r = op.deref(ctx).get_result(0);
+            let r = op.deref(ctx).get_result(ctx, 0);
             let t = self.ty_leaves(r.get_type(ctx));
             if t.len() == 1 {
                 if let Some((b, _)) = self.const_bits(r, 0) {
@@ -3938,7 +3938,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .collect()
             };
             self.set(op, r);
-        } else if is!(AllocaOp) && self.vars.contains_key(&op.deref(ctx).get_result(0)) {
+        } else if is!(AllocaOp) && self.vars.contains_key(&op.deref(ctx).get_result(ctx, 0)) {
         } else if is!(LoadOp) && self.vars.contains_key(&opnds[0]) {
             let lv = self.ty_leaves(self.res_ty(op));
             let vars = self.vars[&opnds[0]].clone();
@@ -3963,7 +3963,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.b.def_var(var, x);
             }
         } else if is!(AllocaOp) {
-            let res = op.deref(ctx).get_result(0);
+            let res = op.deref(ctx).get_result(ctx, 0);
             let (size, align) = self.st.allocas[res];
             let p = self.slot(size, align);
             self.set1(op, p);

@@ -371,7 +371,7 @@ pub(crate) fn operands(
             let fn_name_get = format_ident!("get_operand_{}", name);
             getter_fns.push(quote! {
                 pub fn #fn_name_get(&self, ctx: &::pliron::context::Context) -> ::pliron::value::Value {
-                    self.op.deref(ctx).get_operand(#index)
+                    self.op.deref(ctx).get_operand(ctx, #index)
                 }
             });
         }
@@ -423,7 +423,7 @@ pub(crate) fn results(
             let fn_name_get = format_ident!("get_result_{}", name);
             getter_fns.push(quote! {
                 pub fn #fn_name_get(&self, ctx: &::pliron::context::Context) -> ::pliron::value::Value {
-                    self.op.deref(ctx).get_result(#index)
+                    self.op.deref(ctx).get_result(ctx, #index)
                 }
             });
         }

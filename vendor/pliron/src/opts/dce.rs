@@ -111,7 +111,7 @@ fn is_safe_to_erase(cand: DCECandidate, ctx: &Context) -> bool {
     match cand {
         DCECandidate::Op(def_op) => {
             let def_op_ref = def_op.deref(ctx);
-            if def_op_ref.has_use() {
+            if def_op_ref.has_use(ctx) {
                 // If the operation has uses, we can't erase it.
                 return false;
             }
@@ -262,7 +262,7 @@ pub fn dce(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
                     continue;
                 }
                 // Collect defining values before erasing this one
-                let defining_vals: Vec<Value> = dead_op.deref(ctx).operands().collect();
+                let defining_vals: Vec<Value> = dead_op.deref(ctx).operands(ctx).collect();
                 // Erase the dead operation
                 log::debug!("Erasing dead operation: {}", OpDbg { op: dead_op, ctx });
                 rewriter.erase_operation(ctx, dead_op);

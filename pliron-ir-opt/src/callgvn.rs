@@ -53,7 +53,7 @@ fn base_alloca(ctx: &Context, mut p: Value) -> Option<Value> {
         match p.defining_op() {
             Some(d) if Operation::is_op::<pliron_llvm::ops::AllocaOp>(d, ctx) => return Some(p),
             Some(d) if Operation::is_op::<pliron_llvm::ops::GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -99,7 +99,7 @@ fn writes_impl(
         };
     }
     (is!(StoreOp) && {
-        let a = op.deref(ctx).get_operand(1);
+        let a = op.deref(ctx).get_operand(ctx, 1);
         !frame_local(ctx, a) || base_alloca(ctx, a).is_some_and(|b| arg_allocas.contains(&b))
     }) || is!(AtomicRmwOp)
         || is!(AtomicCmpxchgOp)
@@ -144,7 +144,7 @@ fn dedupable(
         return None;
     }
     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
-    Some((c.clone(), args, op.deref(ctx).get_result(0)))
+    Some((c.clone(), args, op.deref(ctx).get_result(ctx, 0)))
 }
 
 /// Can `v` be made available in `ph`? Values defined outside the loop body
@@ -191,12 +191,12 @@ fn cone_args(
     // a load of a stored alloca, or a movable call taking its pointer.
     let mem_reads = |a: Value| base_alloca(ctx, a).is_some_and(|b| stored_allocas.contains(&b));
     if (Operation::is_op::<pliron_llvm::ops::LoadOp>(d, ctx)
-        && mem_reads(d.deref(ctx).get_operand(0)))
-        || (Operation::is_op::<CallOp>(d, ctx) && d.deref(ctx).operands().any(|a| mem_reads(a)))
+        && mem_reads(d.deref(ctx).get_operand(ctx, 0)))
+        || (Operation::is_op::<CallOp>(d, ctx) && d.deref(ctx).operands(ctx).any(|a| mem_reads(a)))
     {
         return false;
     }
-    for a in d.deref(ctx).operands() {
+    for a in d.deref(ctx).operands(ctx) {
         if !cone_args(
             ctx,
             st,
@@ -367,7 +367,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<CallOp>(op, ctx) {
-                for a in op.deref(ctx).operands() {
+                for a in op.deref(ctx).operands(ctx) {
                     if let Some(ba) = base_alloca(ctx, a) {
                         arg_allocas.insert(ba);
                     }
@@ -518,7 +518,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 {
                     continue;
                 }
-                let prev = cop.deref(ctx).get_result(0);
+                let prev = cop.deref(ctx).get_result(ctx, 0);
                 res.replace_all_uses_with(ctx, &prev);
                 killed.insert(op);
                 break;
@@ -579,7 +579,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     continue;
                 }
                 if Operation::is_op::<StoreOp>(op, ctx)
-                    && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(1))
+                    && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(ctx, 1))
                 {
                     stored_allocas.insert(ba);
                 }

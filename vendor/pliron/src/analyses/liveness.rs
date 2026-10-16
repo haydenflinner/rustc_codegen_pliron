@@ -742,7 +742,7 @@ mod tests {
             0,
         );
         def_op.insert_at_back(block, ctx);
-        let value = def_op.deref(ctx).get_result(0);
+        let value = def_op.deref(ctx).get_result(ctx, 0);
         (def_op, value)
     }
 

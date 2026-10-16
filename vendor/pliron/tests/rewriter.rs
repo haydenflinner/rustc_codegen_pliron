@@ -454,7 +454,7 @@ fn split_block_after_const_zero() -> Result<()> {
 
             // Insert constant 1 in the new block at the start
             let const1_op = ConstantOp::new(ctx, 1).get_operation();
-            let const1_result = const1_op.deref(ctx).get_result(0);
+            let const1_result = const1_op.deref(ctx).get_result(ctx, 0);
             rewriter.set_insertion_point(OpInsertionPoint::AtBlockStart(new_block));
             rewriter.insert_operation(ctx, const1_op);
             // Modify the return operation in the new block to return constant 1

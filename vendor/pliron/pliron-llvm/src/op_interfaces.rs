@@ -690,13 +690,13 @@ pub trait ScalarOrVectorOpd<T: Type, const N: usize> {
     /// Get the type of operand N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypedHandle<T> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of(op.get_operand(N).get_type(ctx), ctx)
+        elem_ty_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of operand N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_operand(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -714,13 +714,13 @@ pub trait ScalarOrVectorOpdImpls<I: ?Sized + TypeInterfaceMarker + 'static, cons
     /// Get the type of operand N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypeInterfaceHandle<I> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of_impls::<I>(op.get_operand(N).get_type(ctx), ctx)
+        elem_ty_of_impls::<I>(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of operand N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_operand(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -738,13 +738,13 @@ pub trait ScalarOrVectorRes<T: Type, const N: usize> {
     /// Get the type of result N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypedHandle<T> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of(op.get_result(N).get_type(ctx), ctx)
+        elem_ty_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of result N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_result(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -762,13 +762,13 @@ pub trait ScalarOrVectorResImpls<I: ?Sized + TypeInterfaceMarker + 'static, cons
     /// Get the type of result N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypeInterfaceHandle<I> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of_impls::<I>(op.get_result(N).get_type(ctx), ctx)
+        elem_ty_of_impls::<I>(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of result N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_result(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>

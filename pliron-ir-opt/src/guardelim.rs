@@ -88,7 +88,7 @@ pub(crate) fn slot_base(ctx: &Context, mut p: Value) -> Option<Value> {
         match p.defining_op() {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return Some(p),
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -105,7 +105,7 @@ fn slot_range(ctx: &Context, st: &State, mut p: Value) -> Option<(Value, i64)> {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return Some((p, off)),
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
                 off = off.checked_add(crate::sroa::gep_offset(ctx, st, d)?)?;
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -116,8 +116,8 @@ fn slot_range(ctx: &Context, st: &State, mut p: Value) -> Option<(Value, i64)> {
 /// isn't a frame slot or the offset is dynamic (unknown overlap — poison).
 fn store_range(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<(Value, i64, i64)> {
     let od = op.deref(ctx);
-    let (s, off) = slot_range(ctx, st, od.get_operand(1))?;
-    let sz = crate::types::size_align(ctx, od.get_operand(0).get_type(ctx)).0 as i64;
+    let (s, off) = slot_range(ctx, st, od.get_operand(ctx, 1))?;
+    let sz = crate::types::size_align(ctx, od.get_operand(ctx, 0).get_type(ctx)).0 as i64;
     Some((s, off, sz))
 }
 
@@ -138,7 +138,7 @@ fn stores_of(
 ) -> Option<Vec<Ptr<Operation>>> {
     for &op in info.bops.get(&b)?.iter().take(i).rev() {
         if !Operation::is_op::<StoreOp>(op, ctx)
-            || slot_base(ctx, op.deref(ctx).get_operand(1)) != Some(slot)
+            || slot_base(ctx, op.deref(ctx).get_operand(ctx, 1)) != Some(slot)
         {
             continue;
         }
@@ -176,7 +176,7 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
         return Atom::V(v);
     }
-    let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(0)) else {
+    let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(ctx, 0)) else {
         return Atom::V(v);
     };
     let lsz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
@@ -238,14 +238,14 @@ fn facts(
         } else {
             continue;
         };
-        let cond = term.deref(ctx).get_operand(0);
+        let cond = term.deref(ctx).get_operand(ctx, 0);
         let Some(ci) = cond.defining_op() else {
             continue;
         };
         let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
             continue;
         };
-        let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+        let (x, y) = (ci.deref(ctx).get_operand(ctx, 0), ci.deref(ctx).get_operand(ctx, 1));
         let (rel, swap) = match (icmp.predicate(ctx), neg) {
             // Edge fact `x P y` (or its negation) normalized to `a R b`.
             (P::ULT, false) => (Rel::Lt, false),
@@ -271,7 +271,7 @@ fn facts(
 
 /// Atom form of a store's stored value.
 fn stored_atom(ctx: &Context, st: &State, info: &FnInfo, store: Ptr<Operation>) -> Atom {
-    atom(ctx, st, info, store.deref(ctx).get_operand(0))
+    atom(ctx, st, info, store.deref(ctx).get_operand(ctx, 0))
 }
 
 /// The values a predecessor branch forwards to an `Arg` atom:
@@ -453,7 +453,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             if !Operation::is_op::<CondBrOp>(term, ctx) {
                 return None;
             }
-            let ci = term.deref(ctx).get_operand(0).defining_op()?;
+            let ci = term.deref(ctx).get_operand(ctx, 0).defining_op()?;
             let icmp = Operation::get_op::<ICmpOp>(ci, ctx)?;
             match icmp.predicate(ctx) {
                 P::ULT | P::ULE | P::UGT | P::UGE | P::EQ | P::NE => {}
@@ -484,14 +484,14 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<StoreOp>(op, ctx)
-                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 1))
             {
                 store_slots.insert(s);
                 stores_by_slot.entry(s).or_default().push(op);
             }
             if Operation::is_op::<LoadOp>(op, ctx)
                 && !st.volatile.contains(op)
-                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(0))
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 0))
             {
                 load_slots.insert(s);
             }
@@ -507,7 +507,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 continue;
             }
             for i in 0..op.deref(ctx).get_num_operands() {
-                if let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(i)) {
+                if let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, i)) {
                     escaped.insert(s);
                 }
             }
@@ -560,7 +560,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
             return None;
         }
-        let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(0))?;
+        let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(ctx, 0))?;
         let sz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
         Some(Nd::Slot(s, off, sz))
     };
@@ -569,9 +569,9 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         let mut seen: FxHashSet<Nd> = FxHashSet::default();
         let mut stack: Vec<Nd> = Vec::new();
         for &term in &cand_terms {
-            let ci = term.deref(ctx).get_operand(0).defining_op().unwrap();
+            let ci = term.deref(ctx).get_operand(ctx, 0).defining_op().unwrap();
             for k in 0..2 {
-                if let Some(n) = node_of(ci.deref(ctx).get_operand(k)) {
+                if let Some(n) = node_of(ci.deref(ctx).get_operand(ctx, k)) {
                     stack.push(n);
                 }
             }
@@ -589,7 +589,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                         // Only exact-cover stores are sources of this key's
                         // loads; partial overlaps poison instead.
                         if store_range(ctx, st, so) == Some((s, off, sz))
-                            && let Some(m) = node_of(so.deref(ctx).get_operand(0))
+                            && let Some(m) = node_of(so.deref(ctx).get_operand(ctx, 0))
                         {
                             stack.push(m);
                         }
@@ -701,7 +701,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                     if !Operation::is_op::<StoreOp>(op, ctx) {
                         continue;
                     }
-                    let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(1)) else {
+                    let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 1)) else {
                         continue;
                     };
                     match store_range(ctx, st, op) {
@@ -797,14 +797,14 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             if !Operation::is_op::<CondBrOp>(term, ctx) {
                 continue;
             }
-            let cond = term.deref(ctx).get_operand(0);
+            let cond = term.deref(ctx).get_operand(ctx, 0);
             let Some(ci) = cond.defining_op() else {
                 continue;
             };
             let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
                 continue;
             };
-            let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+            let (x, y) = (ci.deref(ctx).get_operand(ctx, 0), ci.deref(ctx).get_operand(ctx, 1));
             let (ax, ay) = (atom(ctx, st, &info, x), atom(ctx, st, &info, y));
             pr.fuel = MAX_PROOF;
             let fs = pr.facts_of(b);

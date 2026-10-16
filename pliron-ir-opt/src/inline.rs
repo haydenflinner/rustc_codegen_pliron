@@ -173,13 +173,13 @@ fn callee_info(
                 // Indirect target is operand 0; `callee()` would clone the
                 // attr for a direct call only to discard it here.
                 if c.get_attr_llvm_call_callee(ctx).is_none() {
-                    dvirt_tgt.push(op.deref(ctx).get_operand(0));
+                    dvirt_tgt.push(op.deref(ctx).get_operand(ctx, 0));
                 }
             }
             if Operation::is_op::<CondBrOp>(op, ctx)
                 || (model && Operation::is_op::<SwitchOp>(op, ctx))
             {
-                cond_roots.push(op.deref(ctx).get_operand(0));
+                cond_roots.push(op.deref(ctx).get_operand(ctx, 0));
             }
         }
     }
@@ -246,8 +246,8 @@ fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u3
                     || Operation::is_op::<BitcastOp>(o, ctx))
                     && ui == 0
                 {
-                    if seen.insert(o.deref(ctx).get_result(0)) {
-                        work.push(o.deref(ctx).get_result(0));
+                    if seen.insert(o.deref(ctx).get_result(ctx, 0)) {
+                        work.push(o.deref(ctx).get_result(ctx, 0));
                     }
                 } else if Operation::is_op::<LoadOp>(o, ctx)
                     || Operation::is_op::<AtomicLoadOp>(o, ctx)
@@ -386,7 +386,7 @@ fn devirt_params(ctx: &Context, params: &[Value], targets: &[Value]) -> Vec<usiz
                     if Operation::is_op::<LoadOp>(d, ctx)
                         || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
                 {
-                    p = d.deref(ctx).get_operand(0);
+                    p = d.deref(ctx).get_operand(ctx, 0);
                 }
                 _ => break,
             }
@@ -424,7 +424,7 @@ fn cond_params(ctx: &Context, params: &[Value], roots: &[Value]) -> Vec<usize> {
                 continue;
             };
             for oi in 0..d.deref(ctx).get_num_operands() {
-                work.push(d.deref(ctx).get_operand(oi));
+                work.push(d.deref(ctx).get_operand(ctx, oi));
             }
         }
     }
@@ -985,7 +985,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                 if call.get_attr_llvm_call_callee(ctx).is_some() {
                     continue;
                 }
-                let p = call.get_operation().deref(ctx).get_operand(0);
+                let p = call.get_operation().deref(ctx).get_operand(ctx, 0);
                 let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(p) else {
                     continue;
                 };
@@ -1005,7 +1005,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                 let nc = CallOp::new(ctx, CallOpCallable::Direct(id), fty, args).get_operation();
                 nc.insert_before(ctx, c);
                 if c.deref(ctx).get_num_results() > 0 {
-                    let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                    let (old, new) = (c.deref(ctx).get_result(ctx, 0), nc.deref(ctx).get_result(ctx, 0));
                     old.replace_all_uses_with(ctx, &new);
                 }
                 let info = st.calls.remove(c).unwrap();
@@ -1229,12 +1229,12 @@ fn extract_leaf(
             let idx = Operation::get_op::<InsertValueOp>(op, ctx)
                 .unwrap()
                 .indices(ctx);
-            let (s, n, _) = leaf_range(ctx, op.deref(ctx).get_operand(0).get_type(ctx), &idx);
+            let (s, n, _) = leaf_range(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx), &idx);
             if sub >= s && sub < s + n {
                 sub -= s;
-                v = op.deref(ctx).get_operand(1);
+                v = op.deref(ctx).get_operand(ctx, 1);
             } else {
-                v = op.deref(ctx).get_operand(0);
+                v = op.deref(ctx).get_operand(ctx, 0);
             }
             continue;
         }
@@ -1280,14 +1280,14 @@ fn store_src(
     if st.volatile.contains(load) {
         return fail("volatile");
     }
-    let addr = load.deref(ctx).get_operand(0);
+    let addr = load.deref(ctx).get_operand(ctx, 0);
     let Some((lb, ll, loff)) = ptr_base(ctx, st, preds, addr, mem) else {
         return fail("ptr_base");
     };
     let Some(loff) = loff else {
         return fail("dynoff");
     };
-    let lsz = size_align(ctx, load.deref(ctx).get_result(0).get_type(ctx)).0 as i64;
+    let lsz = size_align(ctx, load.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
     let Some(b) = load.deref(ctx).get_parent_block() else {
         return fail("noblock");
     };
@@ -1340,10 +1340,10 @@ fn store_src_in(
                     continue;
                 }
                 let od = o.deref(ctx);
-                let Some(n) = crate::sroa::const_int(ctx, st, od.get_operand(2)) else {
+                let Some(n) = crate::sroa::const_int(ctx, st, od.get_operand(ctx, 2)) else {
                     return None;
                 };
-                let Some((db, dl, doff)) = ptr_base(ctx, st, preds, od.get_operand(0), mem) else {
+                let Some((db, dl, doff)) = ptr_base(ctx, st, preds, od.get_operand(ctx, 0), mem) else {
                     return None;
                 };
                 let Some(doff) = doff else { return None };
@@ -1351,7 +1351,7 @@ fn store_src_in(
                     let (lo, hi) = (doff, doff + n as i64);
                     if loff >= lo && loff + lsz <= hi {
                         let Some((sb2, sl2, soff2)) =
-                            ptr_base(ctx, st, preds, od.get_operand(1), mem)
+                            ptr_base(ctx, st, preds, od.get_operand(ctx, 1), mem)
                         else {
                             return None;
                         };
@@ -1384,12 +1384,12 @@ fn store_src_in(
             }
             if Operation::is_op::<StoreOp>(o, ctx) && !st.volatile.contains(o) {
                 let od = o.deref(ctx);
-                let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(1), mem)?;
+                let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(ctx, 1), mem)?;
                 let soff = soff?;
-                let ssz = size_align(ctx, od.get_operand(0).get_type(ctx)).0 as i64;
+                let ssz = size_align(ctx, od.get_operand(ctx, 0).get_type(ctx)).0 as i64;
                 if sb == lb && sl == ll {
                     if soff == loff && ssz == lsz {
-                        return Some(od.get_operand(0));
+                        return Some(od.get_operand(ctx, 0));
                     }
                     if soff < loff + lsz && loff < soff + ssz {
                         return None;
@@ -1527,17 +1527,17 @@ fn same_ptr(
                 off = off.and_then(|o| {
                     crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d))
                 });
-                v = op.deref(ctx).get_operand(0);
+                v = op.deref(ctx).get_operand(ctx, 0);
             } else if Operation::is_op::<BitcastOp>(op, ctx)
                 || Operation::is_op::<FreezeOp>(op, ctx)
                 || Operation::is_op::<AddrSpaceCastOp>(op, ctx)
             {
-                v = op.deref(ctx).get_operand(0);
+                v = op.deref(ctx).get_operand(ctx, 0);
             } else if Operation::is_op::<ExtractValueOp>(op, ctx) {
                 let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
                     .unwrap()
                     .indices(ctx);
-                let agg = op.deref(ctx).get_operand(0);
+                let agg = op.deref(ctx).get_operand(ctx, 0);
                 let (s, n, _) = leaf_range(ctx, agg.get_type(ctx), &idx);
                 if n != 1 {
                     return (v, off);
@@ -1626,12 +1626,12 @@ fn ptr_base(
             // inheritance only needs which frozen arg it lands in.
             off = off
                 .and_then(|o| crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d)));
-            v = op.deref(ctx).get_operand(0);
+            v = op.deref(ctx).get_operand(ctx, 0);
         } else if Operation::is_op::<BitcastOp>(op, ctx)
             || Operation::is_op::<FreezeOp>(op, ctx)
             || Operation::is_op::<AddrSpaceCastOp>(op, ctx)
         {
-            v = op.deref(ctx).get_operand(0);
+            v = op.deref(ctx).get_operand(ctx, 0);
         } else if Operation::is_op::<ExtractValueOp>(op, ctx) {
             // `extractvalue agg, idx` of a pointer leaf: decomposing `agg`
             // (`insertvalue` chains) keeps provenance; an opaque aggregate
@@ -1640,7 +1640,7 @@ fn ptr_base(
             let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
                 .unwrap()
                 .indices(ctx);
-            let agg = op.deref(ctx).get_operand(0);
+            let agg = op.deref(ctx).get_operand(ctx, 0);
             let (s, n, _) = leaf_range(ctx, agg.get_type(ctx), &idx);
             if n != 1 {
                 return Some((v, None, off));
@@ -1929,7 +1929,7 @@ fn frozen_args(
             if !Operation::is_op::<LoadOp>(op, ctx) {
                 continue;
             }
-            let ptr = op.deref(ctx).get_operand(0);
+            let ptr = op.deref(ctx).get_operand(ctx, 0);
             let Some((base, bl, Some(off))) =
                 ptr_base(ctx, st, &preds, ptr, &mut FxHashSet::default())
             else {
@@ -1951,7 +1951,7 @@ fn frozen_args(
                 }
                 continue;
             };
-            let sz = size_align(ctx, op.deref(ctx).get_result(0).get_type(ctx)).0 as i64;
+            let sz = size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
             if off < 0 || off + sz > bytes as i64 {
                 continue;
             }
@@ -1989,7 +1989,7 @@ fn inline_call(
     let block = call.deref(ctx).get_parent_block().unwrap();
     let region = block.deref(ctx).get_parent_region().unwrap();
     let args = Operation::get_op::<CallOp>(call, ctx).unwrap().args(ctx);
-    let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(0));
+    let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(ctx, 0));
     let unwind = st.invokes.remove(call);
     let cont = rw.split_block(ctx, block, OpInsertionPoint::AfterOperation(call), None);
     // PGO: scale the callee's counts by callsite/entry so cloned blocks
@@ -2079,7 +2079,7 @@ fn inline_call(
             }
             let n = op.deref(ctx).get_num_results();
             for i in 0..n {
-                let (v, nv) = (op.deref(ctx).get_result(i), new.deref(ctx).get_result(i));
+                let (v, nv) = (op.deref(ctx).get_result(ctx, i), new.deref(ctx).get_result(ctx, i));
                 if let Some(a) = st.allocas.get(v).copied() {
                     st.allocas.insert(nv, a);
                 }

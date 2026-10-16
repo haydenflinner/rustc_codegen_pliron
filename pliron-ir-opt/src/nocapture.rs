@@ -127,7 +127,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     if !Operation::is_op::<LoadOp>(op, ctx) {
         bail!("callee not a load");
     }
-    let mut work = vec![op.deref(ctx).get_operand(0)];
+    let mut work = vec![op.deref(ctx).get_operand(ctx, 0)];
     let mut seen = FxHashSet::default();
     let mut stored = Vec::new();
     while let Some(v) = work.pop() {
@@ -141,7 +141,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
             if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
                 bail!("non-alloca ptr from non-gep");
             }
-            work.push(d.deref(ctx).get_operand(0));
+            work.push(d.deref(ctx).get_operand(ctx, 0));
             continue;
         }
         for u in v.uses(ctx) {
@@ -150,10 +150,10 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
                 bail!("volatile use");
             }
             if Operation::is_op::<GetElementPtrOp>(o, ctx) {
-                work.push(o.deref(ctx).get_result(0));
+                work.push(o.deref(ctx).get_result(ctx, 0));
             } else if Operation::is_op::<LoadOp>(o, ctx) {
             } else if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
-                stored.push(o.deref(ctx).get_operand(0));
+                stored.push(o.deref(ctx).get_operand(ctx, 0));
             } else if !Operation::is_op::<CallIntrinsicOp>(o, ctx)
                 || !matches!(
                     st.intrinsics.get(o).map(|s| s.as_str()),
@@ -238,9 +238,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                         })
                     };
                     let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
-                    for r in d.results() {
+                    for r in d.results(ctx) {
                         let (rp, ri) = pk(r);
-                        for v in d.operands() {
+                        for v in d.operands(ctx) {
                             let (vp, vi) = pk(v);
                             if bridge || !(vp && ri) && !(vi && rp) {
                                 p.flow.push((v, r));
@@ -263,7 +263,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                 if let Some(&(lp, _)) = st.invokes.get(op)
                     && let Some(x) = lp.deref(ctx).arguments().next()
                 {
-                    p.flow.extend(d.operands().map(|v| (v, x)));
+                    p.flow.extend(d.operands(ctx).map(|v| (v, x)));
                 }
                 let mut retain = |v: Value| {
                     p.retain.push((f, v));
@@ -279,17 +279,17 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // not a capture: the pointer can only come back through
                     // that slot's load results, so flow to them instead.
                     // Anything else retains — the pointer can roam.
-                    let (sv, dp) = (d.get_operand(0), d.get_operand(1));
+                    let (sv, dp) = (d.get_operand(ctx, 0), d.get_operand(ctx, 1));
                     match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
                         Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
                         None => retain(sv),
                     }
                 } else if is!(AtomicStoreOp) {
-                    retain(d.get_operand(0));
+                    retain(d.get_operand(ctx, 0));
                 } else if is!(AtomicRmwOp) {
-                    retain(d.get_operand(1));
+                    retain(d.get_operand(ctx, 1));
                 } else if is!(AtomicCmpxchgOp) {
-                    retain(d.get_operand(2));
+                    retain(d.get_operand(ctx, 2));
                 } else if is!(CallOp) {
                     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
                     match direct_callee(ctx, st, op) {
@@ -338,10 +338,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                                 || n.starts_with("llvm.dbg.")
                                 || PURE.iter().any(|p| n.starts_with(p)) => {}
                         // Unknown intrinsic: may retain any operand.
-                        _ => d.operands().for_each(retain),
+                        _ => d.operands(ctx).for_each(retain),
                     }
                 } else if is!(ReturnOp) || is!(InlineAsmOp) {
-                    d.operands().for_each(retain);
+                    d.operands(ctx).for_each(retain);
                 }
             }
         }

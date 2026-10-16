@@ -1456,7 +1456,7 @@ impl ConstFoldInterface for SelectOp {
             let (chosen, result) = {
                 let op = self.get_operation().deref(ctx);
                 let chosen_idx = if cond_int.value().is_zero() { 2 } else { 1 };
-                (op.get_operand(chosen_idx), op.get_result(0))
+                (op.get_operand(ctx, chosen_idx), op.get_result(ctx, 0))
             };
             if !result.is_used(ctx) {
                 return IRStatus::Unchanged;

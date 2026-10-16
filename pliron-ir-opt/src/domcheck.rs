@@ -48,7 +48,7 @@ fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
         let pos: FxHashMap<Ptr<Operation>, usize> =
             bops.iter().enumerate().map(|(i, &o)| (o, i)).collect();
         for (oi, &op) in bops.iter().enumerate() {
-            for v in op.deref(ctx).operands() {
+            for v in op.deref(ctx).operands(ctx) {
                 let (db, before) = match v.defining_entity() {
                     DefiningEntity::Op(d) => {
                         let Some(db) = d.deref(ctx).get_parent_block() else {

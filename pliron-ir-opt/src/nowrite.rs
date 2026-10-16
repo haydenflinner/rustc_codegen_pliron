@@ -62,7 +62,7 @@ pub(crate) fn frame_local(ctx: &Context, mut p: Value) -> bool {
         match p.defining_op() {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return true,
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return false,
         }
@@ -191,7 +191,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                             }
                         }
                     }
-                } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
+                } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(ctx, 1)))
                     || is!(AtomicRmwOp)
                     || is!(AtomicCmpxchgOp)
                     || is!(FenceOp)

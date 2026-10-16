@@ -67,7 +67,7 @@ fn constant_operand_attrs(op: Ptr<Operation>, ctx: &Context) -> Vec<Option<AttrO
         }
     };
     op.deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| v.defining_op().and_then(|def| get_def_const(def, v)))
         .collect()
 }

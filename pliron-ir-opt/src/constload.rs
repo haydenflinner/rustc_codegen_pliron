@@ -74,7 +74,7 @@ fn sym_off(ctx: &Context, st: &State, p: Value) -> Option<(String, i64)> {
     let op = p.defining_op()?;
     Operation::get_op::<GetElementPtrOp>(op, ctx)?;
     let o = gep_offset(ctx, st, op)?;
-    let (s, base) = sym_off(ctx, st, op.deref(ctx).get_operand(0))?;
+    let (s, base) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0))?;
     Some((s, base + o))
 }
 
@@ -127,7 +127,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(op) {
                 continue;
             }
-            let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(0)) else {
+            let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0)) else {
                 continue;
             };
             let img = images.entry(sym.clone()).or_insert_with(|| {
@@ -140,7 +140,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 image(ctx, st, g.init?, &mut img)?;
                 Some(img)
             });
-            let r = op.deref(ctx).get_result(0);
+            let r = op.deref(ctx).get_result(ctx, 0);
             let Some(cv) = img
                 .as_ref()
                 .and_then(|img| fold(ctx, img, off, r.get_type(ctx)))

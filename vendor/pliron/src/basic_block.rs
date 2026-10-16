@@ -325,7 +325,7 @@ impl BasicBlock {
                 arg.unique_name(ctx)
             );
         }
-        if let Some(op) = ptr.deref(ctx).iter(ctx).find(|op| op.deref(ctx).has_use()) {
+        if let Some(op) = ptr.deref(ctx).iter(ctx).find(|op| op.deref(ctx).has_use(ctx)) {
             panic!(
                 "Attempting to erase block {} which contains {} with use outside the block",
                 ptr.deref(ctx).unique_name(ctx),

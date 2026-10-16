@@ -423,7 +423,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
         index: usize,
     ) -> Result<TokenStream> {
         Ok(quote! {
-            let opd = self.get_operation().deref(ctx).get_operand(#index);
+            let opd = self.get_operation().deref(ctx).get_operand(ctx, #index);
             ::pliron::printable::Printable::fmt(&opd, ctx, state, fmt)?;
         })
     }
@@ -448,7 +448,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             }
             if let Elem::UnnamedVar(UnnamedVar { index, .. }) = &d.args[0] {
                 Ok(quote! {
-                    let res = self.get_operation().deref(ctx).get_type(#index);
+                    let res = self.get_operation().deref(ctx).get_type(ctx, #index);
                     ::pliron::printable::Printable::fmt(&res, ctx, state, fmt)?;
                 })
             } else {
@@ -464,7 +464,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             }
             if let Elem::UnnamedVar(UnnamedVar { index, .. }) = &d.args[0] {
                 Ok(quote! {
-                    let opd = ::pliron::r#type::Typed::get_type(&self.get_operation().deref(ctx).get_operand(#index), ctx);
+                    let opd = ::pliron::r#type::Typed::get_type(&self.get_operation().deref(ctx).get_operand(ctx, #index), ctx);
                     ::pliron::printable::Printable::fmt(&opd, ctx, state, fmt)?;
                 })
             } else {
@@ -610,7 +610,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let operands = op.operands();
+                let operands = op.operands(ctx);
                 let operands = ::pliron::irfmt::printers::iter_with_sep(operands, #sep);
                 ::pliron::printable::Printable::fmt(&operands, ctx, state, fmt)?;
             })
@@ -630,7 +630,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let types = op.result_types();
+                let types = op.result_types(ctx);
                 let types = ::pliron::irfmt::printers::iter_with_sep(types, #sep);
                 ::pliron::printable::Printable::fmt(&types, ctx, state, fmt)?;
             })
@@ -650,7 +650,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let operand_types = op.operands().map(|opd| ::pliron::r#type::Typed::get_type(&opd, ctx));
+                let operand_types = op.operands(ctx).map(|opd| ::pliron::r#type::Typed::get_type(&opd, ctx));
                 let operand_types = ::pliron::irfmt::printers::iter_with_sep(operand_types, #sep);
                 ::pliron::printable::Printable::fmt(&operand_types, ctx, state, fmt)?;
             })
@@ -664,7 +664,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
                 let arguments = op.operand_types(ctx).collect();
-                let results = op.result_types().collect();
+                let results = op.result_types(ctx).collect();
                 let typesig = ::pliron::r#type::TypeSig { arguments, results };
                 ::pliron::printable::Printable::fmt(&typesig, ctx, state, fmt)?;
             })
@@ -690,7 +690,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
                 let op = self.get_operation().deref(ctx);
                 if op.get_num_results() > 0 {
                     let sep = ::pliron::printable::ListSeparator::CharSpace(',');
-                    let results = iter_with_sep(op.results(), sep);
+                    let results = iter_with_sep(op.results(ctx), sep);
                     write!(fmt, "{} = ", results.print(ctx, state))?;
                 }
                 write!(fmt, "{} ", self.get_opid())?;

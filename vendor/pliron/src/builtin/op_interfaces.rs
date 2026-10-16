@@ -88,7 +88,7 @@ pub trait BranchOpInterface: IsTerminatorInterface {
     fn successor_operands(&self, ctx: &Context, succ_idx: usize) -> Vec<Value> {
         let range = self.successor_operand_range(ctx, succ_idx);
         let op = self.get_operation().deref(ctx);
-        range.map(|opd_idx| op.get_operand(opd_idx)).collect()
+        range.map(|opd_idx| op.get_operand(ctx, opd_idx)).collect()
     }
 
     /// Replace the operand forwarded to argument `arg_idx` of successor `succ_idx` with `operand`.
@@ -277,7 +277,7 @@ pub trait OperandSegmentInterface {
     fn get_segment(&self, ctx: &Context, seg_idx: usize) -> Vec<Value> {
         let range = self.segment_range(ctx, seg_idx);
         let self_op = self.get_operation().deref(ctx);
-        range.map(|opd_idx| self_op.get_operand(opd_idx)).collect()
+        range.map(|opd_idx| self_op.get_operand(ctx, opd_idx)).collect()
     }
 
     /// Get the length of the `seg_idx`th segment.
@@ -777,12 +777,12 @@ pub trait NResultsInterface<const N: usize> {
 
     /// Get the `i`'th result.
     fn get_result_i(&self, ctx: &Context, i: LessThanN<N>) -> Value {
-        self.get_operation().deref(ctx).get_result(i.i())
+        self.get_operation().deref(ctx).get_result(ctx, i.i())
     }
 
     /// Get the type of the `i`'th result.
     fn result_type_i(&self, ctx: &Context, i: LessThanN<N>) -> TypeHandle {
-        self.get_operation().deref(ctx).get_type(i.i())
+        self.get_operation().deref(ctx).get_type(ctx, i.i())
     }
 }
 
@@ -825,7 +825,7 @@ pub trait OptionalResultInterface {
     /// Get the single result defined by this [Op], if any.
     fn get_result_opt(&self, ctx: &Context) -> Option<Value> {
         let self_op = self.get_operation().deref(ctx);
-        (self_op.get_num_results() == 1).then(|| self_op.get_result(0))
+        (self_op.get_num_results() == 1).then(|| self_op.get_result(ctx, 0))
     }
 }
 
@@ -854,12 +854,12 @@ pub trait AtLeastNResultsInterface<const N: usize> {
 pub trait OneResultInterface {
     /// Get the single result defined by this [Op].
     fn get_result(&self, ctx: &Context) -> Value {
-        self.get_operation().deref(ctx).get_result(0)
+        self.get_operation().deref(ctx).get_result(ctx, 0)
     }
 
     /// Get the type of the single result defined by this [Op].
     fn result_type(&self, ctx: &Context) -> TypeHandle {
-        self.get_operation().deref(ctx).get_type(0)
+        self.get_operation().deref(ctx).get_type(ctx, 0)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -898,7 +898,7 @@ pub trait NOpdsInterface<const N: usize> {
 
     /// Get the `i`'th operand.
     fn get_operand_i(&self, ctx: &Context, i: LessThanN<N>) -> Value {
-        self.get_operation().deref(ctx).get_operand(i.i())
+        self.get_operation().deref(ctx).get_operand(ctx, i.i())
     }
 
     /// Get the type of the `i`'th operand.
@@ -945,7 +945,7 @@ pub trait OptionalOpdInterface {
 
     fn get_operand_opt(&self, ctx: &Context) -> Option<Value> {
         let self_op = self.get_operation().deref(ctx);
-        (self_op.get_num_operands() == 1).then(|| self_op.get_operand(0))
+        (self_op.get_num_operands() == 1).then(|| self_op.get_operand(ctx, 0))
     }
 }
 
@@ -974,7 +974,7 @@ pub trait AtLeastNOpdsInterface<const N: usize> {
 pub trait OneOpdInterface {
     /// Get the single operand used by this [Op].
     fn get_operand(&self, ctx: &Context) -> Value {
-        self.get_operation().deref(ctx).get_operand(0)
+        self.get_operation().deref(ctx).get_operand(ctx, 0)
     }
 
     /// Get the type of the single operand used by this [Op].
@@ -1022,7 +1022,7 @@ pub trait SameOperandsType {
     /// Get the common type of the operands.
     fn common_operand_type(&self, ctx: &Context) -> Option<TypeHandle> {
         let self_op = self.get_operation().deref(ctx);
-        (self_op.get_num_operands() > 0).then(|| self_op.get_operand(0).get_type(ctx))
+        (self_op.get_num_operands() > 0).then(|| self_op.get_operand(ctx, 0).get_type(ctx))
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -1031,7 +1031,7 @@ pub trait SameOperandsType {
     {
         let op = op.get_operation().deref(ctx);
 
-        let mut opds = op.operands();
+        let mut opds = op.operands(ctx);
         let Some(ty) = opds.next().map(|opd| opd.get_type(ctx)) else {
             return Ok(());
         };
@@ -1058,7 +1058,7 @@ pub trait AllOperandsOfType<T: Type> {
     {
         let op = op.get_operation().deref(ctx);
 
-        for opd in op.operands() {
+        for opd in op.operands(ctx) {
             let opd_ty = &*opd.get_type(ctx).deref(ctx);
             if !opd_ty.as_any().is::<T>() {
                 return verify_err!(
@@ -1101,7 +1101,7 @@ pub trait AllOperandsImplsTy<I: ?Sized + TypeInterfaceMarker + 'static> {
     {
         let op = op.get_operation().deref(ctx);
 
-        for (idx, opd) in op.operands().enumerate() {
+        for (idx, opd) in op.operands(ctx).enumerate() {
             let opd_ty = &*opd.get_type(ctx).deref(ctx);
             if !type_impls::<I>(opd_ty) {
                 return verify_err!(
@@ -1129,7 +1129,7 @@ pub fn verify_get_operand_n<const N: usize>(op: Ptr<Operation>, ctx: &Context) -
     if opr.get_num_operands() <= N {
         return verify_err!(opr.loc(), NotEnoughOperandsErr(opr.get_num_operands(), N));
     }
-    Ok(opr.get_operand(N))
+    Ok(opr.get_operand(ctx, N))
 }
 
 #[derive(Error, Debug)]
@@ -1290,7 +1290,7 @@ pub trait OperandsMNOfType<const M: u32, const N: i32, T: Type> {
         verify_index_range_types(
             ctx,
             self_op.loc(),
-            self_op.operands(),
+            self_op.operands(ctx),
             (M, N),
             |ty| ty.as_any().is::<T>(),
             OperandsMNOfTypeError::NotEnoughOperands,
@@ -1328,7 +1328,7 @@ pub trait OperandsMNImplsTy<const M: u32, const N: i32, I: ?Sized + TypeInterfac
         verify_index_range_types(
             ctx,
             self_op.loc(),
-            self_op.operands(),
+            self_op.operands(ctx),
             (M, N),
             type_impls::<I>,
             NotEnoughOperandsErr,
@@ -1425,7 +1425,7 @@ pub trait SameResultsType {
     /// Get the common type of the results.
     fn common_result_type(&self, ctx: &Context) -> Option<TypeHandle> {
         let self_op = self.get_operation().deref(ctx);
-        (self_op.get_num_results() > 0).then(|| self_op.get_result(0).get_type(ctx))
+        (self_op.get_num_results() > 0).then(|| self_op.get_result(ctx, 0).get_type(ctx))
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -1434,7 +1434,7 @@ pub trait SameResultsType {
     {
         let op = op.get_operation().deref(ctx);
 
-        let mut results = op.results();
+        let mut results = op.results(ctx);
         let Some(ty) = results.next().map(|result| result.get_type(ctx)) else {
             return Ok(());
         };
@@ -1459,7 +1459,7 @@ pub trait AllResultsOfType<T: Type> {
         Self: Sized,
     {
         let op = op.get_operation().deref(ctx);
-        for res in op.results() {
+        for res in op.results(ctx) {
             let res_ty = &*res.get_type(ctx).deref(ctx);
             if !res_ty.as_any().is::<T>() {
                 return verify_err!(
@@ -1483,7 +1483,7 @@ pub trait AllResultsImplsTy<I: ?Sized + TypeInterfaceMarker + 'static> {
         Self: Sized,
     {
         let op = op.get_operation().deref(ctx);
-        for (idx, res) in op.results().enumerate() {
+        for (idx, res) in op.results(ctx).enumerate() {
             let res_ty = &*res.get_type(ctx).deref(ctx);
             if !type_impls::<I>(res_ty) {
                 return verify_err!(
@@ -1510,7 +1510,7 @@ pub fn verify_get_result_n<const N: usize>(op: Ptr<Operation>, ctx: &Context) ->
     if opr.get_num_results() <= N {
         return verify_err!(opr.loc(), NotEnoughResultsErr(opr.get_num_results(), N));
     }
-    Ok(opr.get_result(N))
+    Ok(opr.get_result(ctx, N))
 }
 
 #[derive(Error, Debug)]
@@ -1595,7 +1595,7 @@ pub trait ResultsMNOfType<const M: u32, const N: i32, T: Type> {
         verify_index_range_types(
             ctx,
             self_op.loc(),
-            self_op.results(),
+            self_op.results(ctx),
             (M, N),
             |ty| ty.as_any().is::<T>(),
             ResultsMNOfTypeError::NotEnoughResults,
@@ -1633,7 +1633,7 @@ pub trait ResultsMNImplsTy<const M: u32, const N: i32, I: ?Sized + TypeInterface
         verify_index_range_types(
             ctx,
             self_op.loc(),
-            self_op.results(),
+            self_op.results(ctx),
             (M, N),
             type_impls::<I>,
             NotEnoughResultsErr,
@@ -1738,7 +1738,7 @@ pub trait CallOpInterface {
     fn args(&self, ctx: &Context) -> Vec<Value> {
         let range = self.arg_range(ctx);
         let op = self.get_operation().deref(ctx);
-        range.map(|opd_idx| op.get_operand(opd_idx)).collect()
+        range.map(|opd_idx| op.get_operand(ctx, opd_idx)).collect()
     }
 
     /// Type of the callee

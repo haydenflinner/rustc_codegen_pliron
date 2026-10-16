@@ -92,7 +92,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let v = {
             let mut ctx = self.pctx.borrow_mut();
             let op = UndefOp::new(&mut ctx, ty).get_operation();
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st.borrow_mut().consts.insert(v, cv);
         v

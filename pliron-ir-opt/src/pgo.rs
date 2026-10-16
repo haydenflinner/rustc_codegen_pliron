@@ -92,10 +92,10 @@ fn bump(ctx: &mut Context, st: &mut State, block: Ptr<BasicBlock>, ctrs: &str, i
         vec![r]
     } else {
         let l = LoadOp::new(ctx, addr, i64t).get_operation();
-        let lv = l.deref(ctx).get_result(0);
+        let lv = l.deref(ctx).get_result(ctx, 0);
         let one = crate::sroa::mk_const(ctx, st, i64t, ConstVal::Bits(1));
         let a = AddOp::new(ctx, lv, one).get_operation();
-        let av = a.deref(ctx).get_result(0);
+        let av = a.deref(ctx).get_result(ctx, 0);
         let s = StoreOp::new(ctx, av, addr).get_operation();
         st.volatile.insert(l);
         st.volatile.insert(s);

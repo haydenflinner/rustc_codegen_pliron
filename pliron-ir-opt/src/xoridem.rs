@@ -113,7 +113,7 @@ fn arg_inv(
     } else if let Some(d) = v.defining_op() {
         if Operation::is_op::<LoadOp>(d, ctx) {
             !st.volatile.contains(d)
-                && slot_base(ctx, d.deref(ctx).get_operand(0)).is_some_and(|a| !sbases.contains(&a))
+                && slot_base(ctx, d.deref(ctx).get_operand(ctx, 0)).is_some_and(|a| !sbases.contains(&a))
                 && arg_inv(
                     ctx,
                     st,
@@ -121,7 +121,7 @@ fn arg_inv(
                     sbases,
                     memo,
                     fuel,
-                    d.deref(ctx).get_operand(0),
+                    d.deref(ctx).get_operand(ctx, 0),
                 )
         } else {
             !crate::callgvn::writes_plain(ctx, st, d)
@@ -134,7 +134,7 @@ fn arg_inv(
                         sbases,
                         memo,
                         fuel,
-                        d.deref(ctx).get_operand(i),
+                        d.deref(ctx).get_operand(ctx, i),
                     )
                 })
         }
@@ -169,7 +169,7 @@ fn loop_private(ctx: &Context, st: &State, lset: &FxHashSet<Ptr<BasicBlock>>, a:
                 if u.find_index(ctx) != 0 {
                     return false;
                 }
-                let r = o.get_result(0);
+                let r = o.get_result(ctx, 0);
                 if seen.insert(r) {
                     wl.push(r);
                 }
@@ -222,7 +222,7 @@ fn peel_dead(ctx: &mut Context, st: &State, v: Value, fuel: usize) {
         return;
     }
     let operands: Vec<Value> = (0..d.deref(ctx).get_num_operands())
-        .map(|i| d.deref(ctx).get_operand(i))
+        .map(|i| d.deref(ctx).get_operand(ctx, i))
         .collect();
     Operation::erase(d, ctx);
     for o in operands {
@@ -235,7 +235,7 @@ fn is_load_of(ctx: &Context, st: &State, v: Value, p: Value) -> bool {
     v.defining_op().is_some_and(|d| {
         Operation::is_op::<LoadOp>(d, ctx)
             && !st.volatile.contains(d)
-            && d.deref(ctx).get_operand(0) == p
+            && d.deref(ctx).get_operand(ctx, 0) == p
     })
 }
 
@@ -265,7 +265,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if !Operation::is_op::<CondBrOp>(term, ctx) {
             continue;
         }
-        let cond = term.deref(ctx).get_operand(0);
+        let cond = term.deref(ctx).get_operand(ctx, 0);
         let Some(ci) = cond.defining_op() else {
             continue;
         };
@@ -275,7 +275,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if icmp.predicate(ctx) != P::ULT || parent(ctx, ci) != Some(h) {
             continue;
         }
-        let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+        let (x, y) = (ci.deref(ctx).get_operand(ctx, 0), ci.deref(ctx).get_operand(ctx, 1));
         let Some(bound) = crate::sroa::const_int(ctx, st, y) else {
             continue;
         };
@@ -289,7 +289,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         {
             continue;
         }
-        let c_ptr = cl.deref(ctx).get_operand(0);
+        let c_ptr = cl.deref(ctx).get_operand(ctx, 0);
         if !is_alloca(ctx, c_ptr) {
             continue;
         }
@@ -385,7 +385,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                     continue;
                 }
                 if Operation::is_op::<StoreOp>(op, ctx) {
-                    let (w, p) = (o.get_operand(0), o.get_operand(1));
+                    let (w, p) = (o.get_operand(ctx, 0), o.get_operand(ctx, 1));
                     if p == c_ptr {
                         // Counter increment: `add (load c_ptr), K`.
                         if step.is_some() {
@@ -400,7 +400,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                             ok = false;
                             break 'scan;
                         }
-                        let (a0, a1) = (ad.deref(ctx).get_operand(0), ad.deref(ctx).get_operand(1));
+                        let (a0, a1) = (ad.deref(ctx).get_operand(ctx, 0), ad.deref(ctx).get_operand(ctx, 1));
                         let kv = if is_load_of(ctx, st, a0, c_ptr) {
                             a1
                         } else if is_load_of(ctx, st, a1, c_ptr) {
@@ -462,7 +462,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 let o = op.deref(ctx);
                 for r in 0..o.get_num_results() {
                     if !o
-                        .get_result(r)
+                        .get_result(ctx, r)
                         .uses(ctx)
                         .iter()
                         .all(|u| parent(ctx, u.user_op()).is_some_and(|pb| lset.contains(&pb)))
@@ -500,7 +500,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if ok {
             for &c in &calls {
                 ok = (0..c.deref(ctx).get_num_operands()).all(|i| {
-                    slot_base(ctx, c.deref(ctx).get_operand(i)).is_none_or(|a| !sbases.contains(&a))
+                    slot_base(ctx, c.deref(ctx).get_operand(ctx, i)).is_none_or(|a| !sbases.contains(&a))
                 });
                 if !ok {
                     break;
@@ -570,7 +570,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                     .defining_op()
                     .filter(|&d| Operation::is_op::<XorOp>(d, ctx))
                 {
-                    let (x0, x1) = (xo.deref(ctx).get_operand(0), xo.deref(ctx).get_operand(1));
+                    let (x0, x1) = (xo.deref(ctx).get_operand(ctx, 0), xo.deref(ctx).get_operand(ctx, 1));
                     iv = if is_load_of(ctx, st, x0, p)
                         && arg_inv(ctx, st, &lset, &sbases, &mut memo, &mut fuel, x1)
                     {
@@ -637,19 +637,19 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 }
                 let o = op.deref(ctx);
                 if Operation::is_op::<LoadOp>(op, ctx)
-                    && slot_base(ctx, o.get_operand(0)) == Some(c_slot)
+                    && slot_base(ctx, o.get_operand(ctx, 0)) == Some(c_slot)
                 {
                     ok = false;
                     break;
                 }
                 if Operation::is_op::<StoreOp>(op, ctx)
-                    && slot_base(ctx, o.get_operand(1)) == Some(c_slot)
+                    && slot_base(ctx, o.get_operand(ctx, 1)) == Some(c_slot)
                 {
                     if init.is_some() {
                         ok = false;
                         break;
                     }
-                    init = crate::sroa::const_int(ctx, st, o.get_operand(0));
+                    init = crate::sroa::const_int(ctx, st, o.get_operand(ctx, 0));
                     if init.is_none() {
                         ok = false;
                         break;
@@ -696,13 +696,13 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 .filter_map(|&(_, _, w, _)| {
                     let xo = w.defining_op()?;
                     (0..xo.deref(ctx).get_num_operands()).find_map(|i| {
-                        let v = xo.deref(ctx).get_operand(i);
+                        let v = xo.deref(ctx).get_operand(ctx, i);
                         is_load_of(ctx, st, v, p).then(|| v.defining_op().unwrap())
                     })
                 })
                 .collect();
             loads.iter().all(|&l| {
-                slot_base(ctx, l.deref(ctx).get_operand(0)) != Some(a) || roots.contains(&l)
+                slot_base(ctx, l.deref(ctx).get_operand(ctx, 0)) != Some(a) || roots.contains(&l)
             })
         };
         let cleans: FxHashMap<Value, bool> = if odd {
@@ -739,7 +739,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 } else {
                     let l = LoadOp::new(ctx, p, *ty).get_operation();
                     l.insert_before(ctx, pht);
-                    let lv = l.deref(ctx).get_result(0);
+                    let lv = l.deref(ctx).get_result(ctx, 0);
                     let s = StoreOp::new(ctx, lv, p).get_operation();
                     s.insert_before(ctx, lt);
                 }
@@ -857,7 +857,7 @@ mod xtest {
             for o in crate::inline::ops(ctx, fb) {
                 if Operation::is_op::<ConstantOp>(o, ctx) {
                     st.consts.insert(
-                        o.deref(ctx).get_result(0),
+                        o.deref(ctx).get_result(ctx, 0),
                         crate::state::ConstVal::Bits(cvals.next().unwrap()),
                     );
                 }

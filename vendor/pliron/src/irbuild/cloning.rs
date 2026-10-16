@@ -133,7 +133,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
             .collect();
         (
             op_ref.concrete_op_info(),
-            op_ref.result_types().collect::<Vec<_>>(),
+            op_ref.result_types(ctx).collect::<Vec<_>>(),
             successors,
             op_ref.get_num_operands(),
             op_ref.num_regions(),
@@ -161,7 +161,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     mapper.map_op(op, new_op);
     let old_ref = op.deref(ctx);
     let new_ref = new_op.deref(ctx);
-    for (old, new) in old_ref.results().zip(new_ref.results()) {
+    for (old, new) in old_ref.results(ctx).zip(new_ref.results(ctx)) {
         mapper.map_value(old, new);
     }
 
@@ -183,7 +183,7 @@ fn fill_operation(
     // Operands, remapped through the now-complete mapping and pushed in order.
     let operands: Vec<Value> = op
         .deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| mapper.lookup_value_or_default(v))
         .collect();
     for operand in operands {

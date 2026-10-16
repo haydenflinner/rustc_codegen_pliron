@@ -138,7 +138,7 @@ fn clone_function_remaps_operands() -> Result<()> {
     assert_eq!(mapper.lookup_op(func.get_operation()), Some(cloned_func));
 
     // The constant's result maps to a fresh value in the clone.
-    let orig_const_val = const_op.get_operation().deref(ctx).get_result(0);
+    let orig_const_val = const_op.get_operation().deref(ctx).get_result(ctx, 0);
     let cloned_const_val = mapper
         .lookup_value(orig_const_val)
         .expect("constant result should be mapped");
@@ -148,9 +148,9 @@ fn clone_function_remaps_operands() -> Result<()> {
     let cloned_ret = mapper
         .lookup_op(ret_op.get_operation())
         .expect("return should be mapped");
-    assert_eq!(cloned_ret.deref(ctx).get_operand(0), cloned_const_val);
+    assert_eq!(cloned_ret.deref(ctx).get_operand(ctx, 0), cloned_const_val);
     assert_eq!(
-        ret_op.get_operation().deref(ctx).get_operand(0),
+        ret_op.get_operation().deref(ctx).get_operand(ctx, 0),
         orig_const_val
     );
 
@@ -264,7 +264,7 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
         .get_terminator(ctx)
         .expect("A's clone has a terminator");
     assert_eq!(sole_successor(ctx, a2_term), b2);
-    assert_eq!(a2_term.deref(ctx).get_operand(0), c2);
+    assert_eq!(a2_term.deref(ctx).get_operand(ctx, 0), c2);
 
     // B's clone has its own fresh argument, and its return reads that argument.
     let b2_arg = b2.deref(ctx).get_argument(0);
@@ -273,7 +273,7 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
         .deref(ctx)
         .get_terminator(ctx)
         .expect("B's clone has a terminator");
-    assert_eq!(b2_term.deref(ctx).get_operand(0), b2_arg);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), b2_arg);
 
     Ok(())
 }
@@ -382,8 +382,8 @@ fn clone_blocks_resolves_op_result_forward_ref_in_any_order() -> Result<()> {
     let b2 = mapper.lookup_block(block_b).expect("B should be mapped");
     let b2_term = b2.deref(ctx).get_terminator(ctx).expect("B' terminator");
     // B's clone returns the *cloned* constant, not A's original.
-    assert_eq!(b2_term.deref(ctx).get_operand(0), c2);
-    assert_ne!(b2_term.deref(ctx).get_operand(0), c_val);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), c2);
+    assert_ne!(b2_term.deref(ctx).get_operand(ctx, 0), c_val);
 
     Ok(())
 }
@@ -460,7 +460,7 @@ fn clone_blocks_keeps_external_value_shared() -> Result<()> {
     let b2 = mapper.lookup_block(block_b).expect("B should be mapped");
     let b2_term = b2.deref(ctx).get_terminator(ctx).expect("B' terminator");
     // The clone still returns A's original constant.
-    assert_eq!(b2_term.deref(ctx).get_operand(0), c_val);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), c_val);
     // ...and the mapping has no entry for that external value.
     assert_eq!(mapper.lookup_value(c_val), None);
 

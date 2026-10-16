@@ -350,7 +350,7 @@ pub(crate) fn slot_loads(
         if !Operation::is_op::<GetElementPtrOp>(op, ctx) {
             return None;
         }
-        q = op.deref(ctx).get_operand(0);
+        q = op.deref(ctx).get_operand(ctx, 0);
     }
     if let Some(r) = memo.loads.get(&(q, depth)) {
         return r.clone();
@@ -373,7 +373,7 @@ fn slot_loads_inner(
     for qa in &qacc {
         match qa.kind {
             Kind::Load => {
-                let r = qa.op.deref(ctx).get_result(0);
+                let r = qa.op.deref(ctx).get_result(ctx, 0);
                 if matches!(classify(ctx, r.get_type(ctx)), TyK::Ptr) {
                     loads.push(r);
                 } else if r
@@ -391,7 +391,7 @@ fn slot_loads_inner(
             Kind::Copy { dst: false, .. } => {
                 // The bytes were memcpy'd into another slot — the stored
                 // pointer may come back at the destination's loads.
-                let d = qa.op.deref(ctx).get_operand(0);
+                let d = qa.op.deref(ctx).get_operand(ctx, 0);
                 loads.extend(slot_loads(ctx, st, d, depth + 1, memo)?);
             }
             _ => return None,
@@ -479,9 +479,9 @@ fn accesses_inner(
                 if !flow {
                     geps.push(op);
                 }
-                work.push((op.deref(ctx).get_result(0), o, flow));
+                work.push((op.deref(ctx).get_result(ctx, 0), o, flow));
             } else if Operation::is_op::<LoadOp>(op, ctx) {
-                let ty = op.deref(ctx).get_result(0).get_type(ctx);
+                let ty = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
                 if !in_range(base, size_align(ctx, ty).0) {
                     return None;
                 }
@@ -492,7 +492,7 @@ fn accesses_inner(
                     flow,
                 });
             } else if Operation::is_op::<StoreOp>(op, ctx) {
-                let ty = op.deref(ctx).get_operand(0).get_type(ctx);
+                let ty = op.deref(ctx).get_operand(ctx, 0).get_type(ctx);
                 if idx == 1 {
                     if !in_range(base, size_align(ctx, ty).0) {
                         return None;
@@ -511,7 +511,7 @@ fn accesses_inner(
                 // `store *q <- p`: the pointer itself goes through memory.
                 // Sound to chase only if `q`'s bytes stay inside this walk;
                 // the loaded-back value keeps this pointer's offset.
-                let loads = slot_loads(ctx, st, op.deref(ctx).get_operand(1), depth, memo)?;
+                let loads = slot_loads(ctx, st, op.deref(ctx).get_operand(ctx, 1), depth, memo)?;
                 if !flow {
                     out.push(Access {
                         op,
@@ -540,7 +540,7 @@ fn accesses_inner(
                 if Operation::is_op::<PtrToIntOp>(op, ctx)
                     && op
                         .deref(ctx)
-                        .get_result(0)
+                        .get_result(ctx, 0)
                         .uses(ctx)
                         .iter()
                         .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
@@ -552,7 +552,7 @@ fn accesses_inner(
                 if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
                     continue;
                 }
-                let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+                let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
                 let kind = match name {
                     "llvm.memcpy" | "llvm.memmove" if idx < 2 => {
                         let n = const_int(ctx, st, opnds[2])?;
@@ -635,8 +635,8 @@ fn leaf_compatible(ctx: &Context, a: TypeHandle, b: TypeHandle) -> bool {
 
 fn access_ty(ctx: &Context, a: &Access) -> Option<TypeHandle> {
     match a.kind {
-        Kind::Load => Some(a.op.deref(ctx).get_result(0).get_type(ctx)),
-        Kind::Store => Some(a.op.deref(ctx).get_operand(0).get_type(ctx)),
+        Kind::Load => Some(a.op.deref(ctx).get_result(ctx, 0).get_type(ctx)),
+        Kind::Store => Some(a.op.deref(ctx).get_operand(ctx, 0).get_type(ctx)),
         _ => None,
     }
 }
@@ -774,7 +774,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
 
 pub fn mk_const(ctx: &mut Context, st: &mut State, ty: TypeHandle, cv: ConstVal) -> Value {
     let op = UndefOp::new(ctx, ty).get_operation();
-    let v = op.deref(ctx).get_result(0);
+    let v = op.deref(ctx).get_result(ctx, 0);
     st.consts.insert(v, cv);
     v
 }
@@ -794,7 +794,7 @@ pub fn ptr_plus(
     let c = mk_const(ctx, st, i64t, ConstVal::Bits(off as u128));
     let g = GetElementPtrOp::new(ctx, p, vec![GepIndex::Value(c)], i8t).get_operation();
     g.insert_before(ctx, before);
-    g.deref(ctx).get_result(0)
+    g.deref(ctx).get_result(ctx, 0)
 }
 
 /// `pin_a` → SSA reload for one call's return edge: every op is anchored
@@ -815,7 +815,7 @@ fn reload_sync(
         let p = ptr_plus(ctx, st, pa, sl[i].off - pin_lo, at);
         let l = LoadOp::new(ctx, p, sl[i].ty).get_operation();
         l.insert_before(ctx, at);
-        let lv = l.deref(ctx).get_result(0);
+        let lv = l.deref(ctx).get_result(ctx, 0);
         StoreOp::new(ctx, lv, new[i])
             .get_operation()
             .insert_before(ctx, at);
@@ -826,7 +826,7 @@ fn erase_dead(ctx: &mut Context, mut ops: Vec<Ptr<Operation>>) {
     loop {
         let before = ops.len();
         ops.retain(|&op| {
-            if op.deref(ctx).results().any(|r| r.is_used(ctx)) {
+            if op.deref(ctx).results(ctx).any(|r| r.is_used(ctx)) {
                 return true;
             }
             Operation::erase(op, ctx);
@@ -864,7 +864,7 @@ fn trivially_promotable(
 }
 
 fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
-    let a = alloca.deref(ctx).get_result(0);
+    let a = alloca.deref(ctx).get_result(ctx, 0);
     let Some(&(size, align)) = st.allocas.get(a) else {
         return false;
     };
@@ -948,7 +948,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
 
-    let count = alloca.deref(ctx).get_operand(0);
+    let count = alloca.deref(ctx).get_operand(ctx, 0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
     // All pinned slices share one stack object: a callee handed a pointer
     // into the pin range may legally roam the whole extent, and per-slice
@@ -996,7 +996,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         let arr = ArrayType::get(ctx, i8t, pin_hi - pin_lo).into();
         let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
         op.insert_before(ctx, alloca);
-        let v = op.deref(ctx).get_result(0);
+        let v = op.deref(ctx).get_result(ctx, 0);
         st.allocas.insert(v, (pin_hi - pin_lo, align.max(1)));
         // Its bytes back a live call operand — re-splitting would just
         // re-pin the same range.
@@ -1015,7 +1015,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             let arr = ArrayType::get(ctx, i8t, s.size).into();
             let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
             op.insert_before(ctx, alloca);
-            let v = op.deref(ctx).get_result(0);
+            let v = op.deref(ctx).get_result(ctx, 0);
             let al = if s.off == 0 {
                 align
             } else {
@@ -1051,7 +1051,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 let shc = mk_const(ctx, st, s.ty, ConstVal::Bits(sh as u128));
                 let ins = |ctx: &mut Context, o: Ptr<Operation>| {
                     o.insert_before(ctx, x.op);
-                    o.deref(ctx).get_result(0)
+                    o.deref(ctx).get_result(ctx, 0)
                 };
                 let w = LoadOp::new(ctx, new[i], s.ty).get_operation();
                 let w = ins(ctx, w);
@@ -1060,14 +1060,14 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                     let v = ins(ctx, v);
                     let v = TruncOp::new(ctx, v, ty).get_operation();
                     let v = ins(ctx, v);
-                    let r = x.op.deref(ctx).get_result(0);
+                    let r = x.op.deref(ctx).get_result(ctx, 0);
                     r.replace_all_uses_with(ctx, &v);
                 } else {
                     let flags = IntegerOverflowFlagsAttr {
                         nsw: false,
                         nuw: false,
                     };
-                    let val = x.op.deref(ctx).get_operand(0);
+                    let val = x.op.deref(ctx).get_operand(ctx, 0);
                     let z = ZExtOp::new_with_nneg(ctx, val, s.ty, false).get_operation();
                     let z = ins(ctx, z);
                     let z = ShlOp::new_with_overflow_flag(ctx, z, shc, flags).get_operation();
@@ -1088,7 +1088,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 Operation::erase(x.op, ctx);
             }
             Kind::Copy { dst, n } => {
-                let other = x.op.deref(ctx).get_operand(if dst { 1 } else { 0 });
+                let other = x.op.deref(ctx).get_operand(ctx, if dst { 1 } else { 0 });
                 let mut stores = Vec::new();
                 for (i, s) in sl
                     .iter()
@@ -1099,7 +1099,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                     let (from, to) = if dst { (p, new[i]) } else { (new[i], p) };
                     let l = LoadOp::new(ctx, from, s.ty).get_operation();
                     l.insert_before(ctx, x.op);
-                    stores.push((l.deref(ctx).get_result(0), to));
+                    stores.push((l.deref(ctx).get_result(ctx, 0), to));
                 }
                 for (v, to) in stores {
                     StoreOp::new(ctx, v, to)
@@ -1161,13 +1161,13 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 let arr = ArrayType::get(ctx, i8t, size).into();
                 let tmp = AllocaOp::new(ctx, arr, count, 0).get_operation();
                 tmp.insert_before(ctx, alloca);
-                let tmp = tmp.deref(ctx).get_result(0);
+                let tmp = tmp.deref(ctx).get_result(ctx, 0);
                 st.allocas.insert(tmp, (size, align));
                 st.escape_copies.insert(tmp);
                 for (i, s) in sl.iter().enumerate() {
                     let l = LoadOp::new(ctx, new[i], s.ty).get_operation();
                     l.insert_before(ctx, x.op);
-                    let v = l.deref(ctx).get_result(0);
+                    let v = l.deref(ctx).get_result(ctx, 0);
                     let to = ptr_plus(ctx, st, tmp, s.off, x.op);
                     StoreOp::new(ctx, v, to)
                         .get_operation()
@@ -1212,7 +1212,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             for &i in &ss {
                 let l = LoadOp::new(ctx, new[i], sl[i].ty).get_operation();
                 l.insert_before(ctx, *cop);
-                let lv = l.deref(ctx).get_result(0);
+                let lv = l.deref(ctx).get_result(ctx, 0);
                 let p = ptr_plus(ctx, st, pa, sl[i].off - pin_lo, *cop);
                 StoreOp::new(ctx, lv, p)
                     .get_operation()
@@ -1258,9 +1258,9 @@ fn validate(ctx: &Context, st: &mut State, a: Value) {
         let op = u.user_op();
         let idx = u.find_index(ctx);
         if Operation::is_op::<LoadOp>(op, ctx) {
-            leaf_compatible(ctx, ty, op.deref(ctx).get_result(0).get_type(ctx))
+            leaf_compatible(ctx, ty, op.deref(ctx).get_result(ctx, 0).get_type(ctx))
         } else if Operation::is_op::<StoreOp>(op, ctx) {
-            idx == 1 && leaf_compatible(ctx, ty, op.deref(ctx).get_operand(0).get_type(ctx))
+            idx == 1 && leaf_compatible(ctx, ty, op.deref(ctx).get_operand(ctx, 0).get_type(ctx))
         } else {
             matches!(
                 intrinsic(st, op),
@@ -1315,7 +1315,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             forward_single_store(ctx, st, f);
         }
         for op in allocas(ctx, f) {
-            let a = op.deref(ctx).get_result(0);
+            let a = op.deref(ctx).get_result(ctx, 0);
             if !a.is_used(ctx) {
                 st.allocas.remove(a);
                 st.promoted.remove(a);
@@ -1346,11 +1346,11 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                     for op in b.deref(ctx).iter(ctx) {
                         if Operation::is_op::<pliron_llvm::ops::CondBrOp>(op, ctx) {
                             n += 1;
-                            let c = op.deref(ctx).get_operand(0);
+                            let c = op.deref(ctx).get_operand(ctx, 0);
                             if st.consts.contains(c) {
                                 k += 1;
                             } else if let Some(d) = c.defining_op() {
-                                if d.deref(ctx).operands().all(|o| st.consts.contains(o)) {
+                                if d.deref(ctx).operands(ctx).all(|o| st.consts.contains(o)) {
                                     kk += 1;
                                 }
                             }
@@ -1393,7 +1393,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 for b in f.op.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
                     for op in b.deref(ctx).iter(ctx) {
                         if intrinsic(st, op) == Some("llvm.memcpy") {
-                            let o: Vec<Value> = op.deref(ctx).operands().collect();
+                            let o: Vec<Value> = op.deref(ctx).operands(ctx).collect();
                             let c = if const_int(ctx, st, o[2]).is_some() {
                                 "const"
                             } else {
@@ -1425,7 +1425,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 .collect();
             for f in fs {
                 for op in allocas(ctx, f) {
-                    let a = op.deref(ctx).get_result(0);
+                    let a = op.deref(ctx).get_result(ctx, 0);
                     if !st.promoted.contains(a) {
                         *h.entry(why2(ctx, st, a)).or_default() += 1;
                     }
@@ -1438,7 +1438,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         continue;
                     }
                     for op in allocas(ctx, f.op) {
-                        let a = op.deref(ctx).get_result(0);
+                        let a = op.deref(ctx).get_result(ctx, 0);
                         if !st.promoted.contains(a) {
                             let sz = st.allocas.get(a).map(|x| x.0).unwrap_or(0);
                             if pliron_cfg::tracing_on() {
@@ -1493,20 +1493,20 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                 if gep_offset(ctx, st, op).is_none() {
                     return "dynamic gep".into();
                 }
-                work.push(op.deref(ctx).get_result(0));
+                work.push(op.deref(ctx).get_result(ctx, 0));
             } else if Operation::is_op::<LoadOp>(op, ctx) {
                 uses.push("load");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 0 {
-                match slot_loads(ctx, st, op.deref(ctx).get_operand(1), 0, &mut memo) {
+                match slot_loads(ctx, st, op.deref(ctx).get_operand(ctx, 1), 0, &mut memo) {
                     Some(ls) => work.extend(ls),
                     None => return "store-ptr escapes".into(),
                 }
             } else if Operation::is_op::<PtrToIntOp>(op, ctx) {
                 if op
                     .deref(ctx)
-                    .get_result(0)
+                    .get_result(ctx, 0)
                     .uses(ctx)
                     .iter()
                     .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
@@ -1525,7 +1525,7 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                 intrinsic(st, op),
                 Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
             ) && (idx == 0 || (idx == 1 && intrinsic(st, op) != Some("llvm.memset")))
-                && const_int(ctx, st, op.deref(ctx).get_operand(2)).is_some()
+                && const_int(ctx, st, op.deref(ctx).get_operand(ctx, 2)).is_some()
             {
                 uses.push("mem");
             } else if diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx) {
@@ -1625,7 +1625,7 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
     let mut n = 0;
     for op in allocas(ctx, f) {
         let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
-        let mut work = vec![op.deref(ctx).get_result(0)];
+        let mut work = vec![op.deref(ctx).get_result(ctx, 0)];
         while let Some(p) = work.pop() {
             for u in p.uses(ctx) {
                 let o = u.user_op();
@@ -1638,10 +1638,10 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
                     } else if Operation::is_op::<GetElementPtrOp>(o, ctx)
                         && u.find_index(ctx) == 0
                         && (gep_offset(ctx, st, o) == Some(0)
-                            || o.deref(ctx).get_result(0).uses(ctx).is_empty())
+                            || o.deref(ctx).get_result(ctx, 0).uses(ctx).is_empty())
                     {
                         geps.push(o);
-                        work.push(o.deref(ctx).get_result(0));
+                        work.push(o.deref(ctx).get_result(ctx, 0));
                         true
                     } else {
                         false
@@ -1651,14 +1651,14 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
         let Some(s) = store.filter(|_| ok && !loads.is_empty()) else {
             continue;
         };
-        let v = s.deref(ctx).get_operand(0);
+        let v = s.deref(ctx).get_operand(ctx, 0);
         let vt = v.get_type(ctx);
         let sb = s.deref(ctx).get_parent_block().unwrap();
         let fwd = dom.idx.contains_key(&sb)
             && loads.iter().all(|&l| {
                 let lb = l.deref(ctx).get_parent_block().unwrap();
                 // Unreachable loads never run (lowering traps those blocks).
-                l.deref(ctx).get_result(0).get_type(ctx) == vt
+                l.deref(ctx).get_result(ctx, 0).get_type(ctx) == vt
                     && (!dom.idx.contains_key(&lb)
                         || if lb == sb {
                             pos(ctx, s) < pos(ctx, l)
@@ -1670,7 +1670,7 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
             continue;
         }
         for l in loads {
-            let r = l.deref(ctx).get_result(0);
+            let r = l.deref(ctx).get_result(ctx, 0);
             r.replace_all_uses_with(ctx, &v);
             Operation::erase(l, ctx);
         }

@@ -1685,7 +1685,7 @@ mod tests {
         );
         use_op.insert_at_back(bb, ctx);
 
-        let val = def_op.deref(ctx).get_result(0);
+        let val = def_op.deref(ctx).get_result(ctx, 0);
         let mut dom_info = super::DomInfo::default();
 
         assert!(dom_info.value_strictly_dominates_op(ctx, val, use_op));

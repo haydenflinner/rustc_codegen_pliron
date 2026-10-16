@@ -110,7 +110,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let ctx = self.cx.pctx.borrow();
         op.insert_at_back(self.block, &ctx);
         let o = op.deref(&ctx);
-        (o.get_num_results() > 0).then(|| o.get_result(0))
+        (o.get_num_results() > 0).then(|| o.get_result(&ctx, 0))
     }
 
     fn mk_op<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Ptr<Operation> {
@@ -604,7 +604,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .get_head()
                 .expect("function has no entry block");
             op.insert_at_front(entry, &ctx);
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st
             .borrow_mut()

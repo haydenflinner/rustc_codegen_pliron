@@ -69,8 +69,8 @@ pub trait ConstFoldInterface {
             };
             let const_op = materializable.materialize(ctx);
             rewriter.append_operation(ctx, const_op);
-            let new_value = const_op.deref(ctx).get_result(0);
-            let old_value = op.deref(ctx).get_result(result_idx);
+            let new_value = const_op.deref(ctx).get_result(ctx, 0);
+            let old_value = op.deref(ctx).get_result(ctx, result_idx);
             rewriter.replace_value_uses_with(ctx, old_value, new_value);
             status = IRStatus::Changed;
         }

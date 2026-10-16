@@ -75,9 +75,9 @@ pub fn run(ctx: &Context, st: &State) {
                     n += 1;
                 } else if Operation::is_op::<SelectOp>(op, ctx) {
                     p.select
-                        .push((d.get_result(0), d.get_operand(1), d.get_operand(2)));
+                        .push((d.get_result(ctx, 0), d.get_operand(ctx, 1), d.get_operand(ctx, 2)));
                 } else if Operation::is_op::<CallOp>(op, ctx)
-                    && let Some(r) = d.results().next()
+                    && let Some(r) = d.results(ctx).next()
                     && let Some(c) = direct_callee(ctx, st, op)
                 {
                     let c = ids.id(c);
@@ -120,7 +120,7 @@ pub fn run(ctx: &Context, st: &State) {
                 let Some(&a) = call.args(ctx).get(k as usize) else {
                     continue;
                 };
-                let r = op.deref(ctx).get_result(0);
+                let r = op.deref(ctx).get_result(ctx, 0);
                 // Guard: a type mismatch would mean the inference lied.
                 if r.get_type(ctx) == a.get_type(ctx) {
                     r.replace_all_uses_with(ctx, &a);

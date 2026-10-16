@@ -224,7 +224,7 @@ mod tests {
         let malloc_call = CallOp::new(&mut ctx, callee, callee_ty, args);
         inserter.append_op(&ctx, &malloc_call);
 
-        let ptr_result = malloc_call.get_result(&ctx);
+        let ptr_result = malloc_call.get_result(ctx, &ctx);
         let free_callee = CallOpCallable::Direct(free_fn.get_symbol_name(&ctx));
         let free_callee_ty = free_fn.get_type(&ctx);
         let free_args = vec![ptr_result];

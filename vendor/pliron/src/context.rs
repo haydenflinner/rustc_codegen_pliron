@@ -100,6 +100,11 @@ pub struct Context {
     /// PLIRON: flat pool of op successor operand nodes (DoD step 5).
     pub(crate) op_successor_pool:
         RefCell<Vec<crate::operation::Operand<Ptr<BasicBlock>>>>,
+    /// PLIRON: flat pool of op result nodes (DoD step 5).
+    pub(crate) op_result_pool: RefCell<Vec<crate::operation::OpResult>>,
+    /// PLIRON: flat pool of op operand nodes (DoD step 5).
+    pub(crate) op_operand_pool:
+        RefCell<Vec<crate::operation::Operand<crate::value::Value>>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
@@ -159,6 +164,8 @@ impl Default for Context {
             op_kind: RefCell::new(Vec::new()),
             op_region_pool: RefCell::new(Vec::new()),
             op_successor_pool: RefCell::new(Vec::new()),
+            op_result_pool: RefCell::new(Vec::new()),
+            op_operand_pool: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),

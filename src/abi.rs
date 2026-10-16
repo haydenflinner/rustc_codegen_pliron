@@ -156,7 +156,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 CallOp::new(ctx, CallOpCallable::Direct(id.clone()), nty, kept).get_operation();
             nc.insert_before(ctx, c);
             if c.deref(ctx).get_num_results() > 0 {
-                let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                let (old, new) = (c.deref(ctx).get_result(ctx, 0), nc.deref(ctx).get_result(ctx, 0));
                 old.replace_all_uses_with(ctx, &new);
             }
             let mut info = st.calls.remove(c).unwrap();
@@ -287,7 +287,7 @@ fn rewrite(
     let one = mk_const(ctx, st, i32t, ConstVal::Bits(1));
     let a = AllocaOp::new(ctx, arr, one, 0).get_operation();
     a.insert_at_front(entry, ctx);
-    let slot = a.deref(ctx).get_result(0);
+    let slot = a.deref(ctx).get_result(ctx, 0);
     st.allocas.insert(slot, (size, align));
     let sret = entry.deref(ctx).get_argument(0);
     sret.replace_all_uses_with(ctx, &slot);
@@ -303,10 +303,10 @@ fn rewrite(
             let p = ptr_plus(ctx, st, slot, off, r);
             let ld = LoadOp::new(ctx, p, t).get_operation();
             ld.insert_before(ctx, r);
-            let v = ld.deref(ctx).get_result(0);
+            let v = ld.deref(ctx).get_result(ctx, 0);
             let iv = InsertValueOp::new(ctx, agg, v, vec![i as u32]).get_operation();
             iv.insert_before(ctx, r);
-            agg = iv.deref(ctx).get_result(0);
+            agg = iv.deref(ctx).get_result(ctx, 0);
         }
         ReturnOp::new(ctx, Some(agg))
             .get_operation()
@@ -334,13 +334,13 @@ fn rewrite(
         )
         .get_operation();
         nc.insert_before(ctx, c);
-        let r = nc.deref(ctx).get_result(0);
+        let r = nc.deref(ctx).get_result(ctx, 0);
         for (i, &(off, _)) in leaves.iter().enumerate() {
             let ev = ExtractValueOp::new(ctx, r, vec![i as u32])
                 .unwrap()
                 .get_operation();
             ev.insert_before(ctx, c);
-            let v = ev.deref(ctx).get_result(0);
+            let v = ev.deref(ctx).get_result(ctx, 0);
             let p = ptr_plus(ctx, st, cargs[0], off, c);
             StoreOp::new(ctx, v, p)
                 .get_operation()

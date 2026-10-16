@@ -92,7 +92,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let nv = UndefOp::new(ctx, p.get_type(ctx))
                 .get_operation()
                 .deref(ctx)
-                .get_result(0);
+                .get_result(ctx, 0);
             st.consts.insert(nv, c0);
             p.replace_all_uses_with(ctx, &nv);
             done += 1;

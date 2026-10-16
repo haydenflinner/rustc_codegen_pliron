@@ -101,25 +101,25 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
     for op in ops {
         if let Some(c) = Operation::get_op::<ConstantOp>(op, ctx) {
             if let Some(cv) = const_of(ctx, &c) {
-                st.consts.insert(op.deref(ctx).get_result(0), cv);
+                st.consts.insert(op.deref(ctx).get_result(ctx, 0), cv);
             }
         } else if let Some(a) = Operation::get_op::<AddressOfOp>(op, ctx) {
             let sym = a.get_global_name(ctx).to_string();
             st.consts
-                .insert(op.deref(ctx).get_result(0), ConstVal::Sym { sym, off: 0 });
+                .insert(op.deref(ctx).get_result(ctx, 0), ConstVal::Sym { sym, off: 0 });
         } else if let Some(a) = Operation::get_op::<AllocaOp>(op, ctx) {
             let ety = TypedAttrInterface::get_type(
                 &*a.get_attr_llvm_alloca_element_type(ctx).unwrap(),
                 ctx,
             );
             let (sz, al) = size_align(ctx, ety);
-            let n = match st.consts.get(op.deref(ctx).get_operand(0)) {
+            let n = match st.consts.get(op.deref(ctx).get_operand(ctx, 0)) {
                 Some(ConstVal::Bits(n)) => *n as u64,
                 _ => panic!("pliron-clif-lower: dynamic alloca size"),
             };
             let al = a.alignment(ctx).map_or(al, |x| al.max(u64::from(x)));
             st.allocas
-                .insert(op.deref(ctx).get_result(0), (sz * n, al.max(1)));
+                .insert(op.deref(ctx).get_result(ctx, 0), (sz * n, al.max(1)));
         } else if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
             let fn_ty = c.callee_type(ctx);
             let callee = c
@@ -248,7 +248,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
                 let v = UndefOp::new(ctx, ty)
                     .get_operation()
                     .deref(ctx)
-                    .get_result(0);
+                    .get_result(ctx, 0);
                 st.consts.insert(v, ConstVal::Zero);
                 v
             });

@@ -25,7 +25,7 @@ fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
         } else if Operation::is_op::<StoreOp>(o, ctx) {
             i == 1
         } else if Operation::is_op::<GetElementPtrOp>(o, ctx) {
-            i == 0 && non_escaping(ctx, st, o.deref(ctx).get_result(0))
+            i == 0 && non_escaping(ctx, st, o.deref(ctx).get_result(ctx, 0))
         } else {
             matches!(
                 st.intrinsics.get(o).map(|s| s.as_str()),
@@ -41,7 +41,7 @@ fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
         let o = u.user_op();
         o == op
             || (Operation::is_op::<GetElementPtrOp>(o, ctx)
-                && touches(ctx, op, o.deref(ctx).get_result(0)))
+                && touches(ctx, op, o.deref(ctx).get_result(ctx, 0)))
     })
 }
 
@@ -50,7 +50,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     {
         return false;
     }
-    let o: Vec<Value> = m.deref(ctx).operands().collect();
+    let o: Vec<Value> = m.deref(ctx).operands(ctx).collect();
     let (dst, src) = (o[0], o[1]);
     let Some(n) = const_int(ctx, st, o[2]) else {
         return false;

@@ -417,18 +417,18 @@ pub fn canonical_syntax_print(
     let sep = printable::ListSeparator::CharSpace(',');
     let opid = op.as_ref().get_opid();
     let op = op.as_ref().get_operation().deref(ctx);
-    let operands = iter_with_sep(op.operands(), sep);
+    let operands = iter_with_sep(op.operands(ctx), sep);
     let successors = iter_with_sep_by(op.successors(ctx), sep, |successor, ctx, state, f| {
         write!(f, "^{}", successor.unique_name(ctx).print(ctx, state))
     });
     let op_type = TypeSig {
-        arguments: op.operands().map(|opd| opd.get_type(ctx)).collect(),
-        results: op.results().map(|res| res.get_type(ctx)).collect(),
+        arguments: op.operands(ctx).map(|opd| opd.get_type(ctx)).collect(),
+        results: op.results(ctx).map(|res| res.get_type(ctx)).collect(),
     };
     let regions = iter_with_sep(op.regions(ctx), printable::ListSeparator::Newline);
 
     if op.get_num_results() != 0 {
-        let results = iter_with_sep(op.results(), sep);
+        let results = iter_with_sep(op.results(ctx), sep);
         write!(f, "{} = ", results.print(ctx, state))?;
     }
 

@@ -97,7 +97,7 @@ pub fn run(ctx: &Context, st: &mut State) {
             local.extend(b.deref(ctx).arguments());
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
-                local.extend(op.deref(ctx).results());
+                local.extend(op.deref(ctx).results(ctx));
             }
         }
         // Entry params: only `nonnull` pointers. A landing pad's payload
@@ -144,7 +144,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     }
                     continue;
                 }
-                let mut rs = d.results().peekable();
+                let mut rs = d.results(ctx).peekable();
                 if rs.peek().is_none() {
                     continue;
                 }
@@ -160,7 +160,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                         }
                     } else if st.nonnull.contains(op) || is!(AllocaOp) {
                     } else if is!(BitcastOp) || is!(FreezeOp) {
-                        p.copy.push((d.get_operand(0), r));
+                        p.copy.push((d.get_operand(ctx, 0), r));
                     } else if is!(GetElementPtrOp)
                         && (st.inbounds.contains(op)
                             || Operation::get_op::<GetElementPtrOp>(op, ctx)
@@ -168,10 +168,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                                 .no_wrap_flags(ctx)
                                 .contains(GepNoWrapFlags::INBOUNDS))
                     {
-                        p.copy.push((d.get_operand(0), r));
+                        p.copy.push((d.get_operand(ctx, 0), r));
                     } else if is!(SelectOp) {
-                        p.copy.push((d.get_operand(1), r));
-                        p.copy.push((d.get_operand(2), r));
+                        p.copy.push((d.get_operand(ctx, 1), r));
+                        p.copy.push((d.get_operand(ctx, 2), r));
                     } else if is!(CallOp)
                         && let Some(c) = direct_callee(ctx, st, op)
                     {

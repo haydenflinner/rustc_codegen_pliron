@@ -183,7 +183,7 @@ fn op_eq_map(
     }
 
     // Check result types.
-    let results = lhs_ref.results().zip(rhs_ref.results());
+    let results = lhs_ref.results(ctx).zip(rhs_ref.results(ctx));
     if results
         .clone()
         .any(|(l_res, r_res)| l_res.get_type(ctx) != r_res.get_type(ctx))
@@ -217,7 +217,7 @@ fn op_eq_mapped(
 
         // If an operand is mapped, its image must match. Otherwise, it must
         // be identical (e.g. a free/external value shared by both sides).
-        for (l_opd, r_opd) in lhs_ref.operands().zip(rhs_ref.operands()) {
+        for (l_opd, r_opd) in lhs_ref.operands(ctx).zip(rhs_ref.operands(ctx)) {
             if mapper.lookup_value_or_default(l_opd) != r_opd
                 || l_opd.get_type(ctx) != r_opd.get_type(ctx)
             {
@@ -466,12 +466,12 @@ fn hash_op_shell(
 
         attributes_hash(ctx, ignore_config, op_ref.attributes(), state);
 
-        for res in op_ref.results() {
+        for res in op_ref.results(ctx) {
             res.get_type(ctx).stable_hash(ctx, state);
         }
     }
 
-    for res in op.deref(ctx).results() {
+    for res in op.deref(ctx).results(ctx) {
         numbering.define_value(res);
     }
 }
@@ -488,7 +488,7 @@ fn hash_op_full(
     let num_regions = {
         let op_ref = op.deref(ctx);
 
-        for opd in op_ref.operands() {
+        for opd in op_ref.operands(ctx) {
             numbering.hash_value(opd, state);
         }
         for succ in op_ref.successors(ctx) {
