@@ -213,7 +213,7 @@ impl Ctx<'_> {
     /// unlike the old `pos < emit` rule that only matched straight-line
     /// `load; op; store` sequences.
     fn inst_in_block(&self, v: Value) -> Option<(Inst, usize)> {
-        let ValueDef::Result(inst, 0) = self.func.dfg.resolved_value_def(v) else {
+        let ValueDef::Result(inst, 0) = self.func.dfg.try_resolved_value_def(v)? else {
             return None;
         };
         pos_get(self.pos, inst).map(|p| (inst, p))
@@ -221,16 +221,22 @@ impl Ctx<'_> {
 
     /// `v` is available at the emit point.
     fn avail(&self, v: Value) -> bool {
-        match self.func.dfg.value_def(v) {
+        // PLIRON: pending candidates can outlive insts the scan itself
+        // deleted — a tombstoned def is simply unavailable.
+        let Some(def) = self.func.dfg.try_value_def(v) else {
+            return false;
+        };
+        match def {
             ValueDef::Param(b, _) => self.domtree.block_dominates(b, self.block),
-            ValueDef::Result(inst, _) => {
-                if self.func.layout.inst_block(inst) == Some(self.block) {
+            ValueDef::Result(inst, _) => match self.func.layout.inst_block(inst) {
+                None => false,
+                Some(b) if b == self.block => {
                     pos_get(self.pos, inst).is_some_and(|p| p < self.emit)
-                } else {
-                    self.domtree
-                        .dominates(inst, self.insts[self.emit], &self.func.layout)
                 }
-            }
+                Some(_) => self
+                    .domtree
+                    .dominates(inst, self.insts[self.emit], &self.func.layout),
+            },
             ValueDef::Union(..) => false,
         }
     }
@@ -1127,16 +1133,22 @@ impl X<'_> {
 
     /// `v` can be read at the emit point.
     fn avail(&self, v: Value) -> bool {
-        match self.func.dfg.value_def(v) {
+        // PLIRON: pending candidates can outlive insts the scan itself
+        // deleted — a tombstoned def is simply unavailable.
+        let Some(def) = self.func.dfg.try_value_def(v) else {
+            return false;
+        };
+        match def {
             ValueDef::Param(b, _) => self.domtree.block_dominates(b, self.block),
-            ValueDef::Result(inst, _) => {
-                if self.func.layout.inst_block(inst) == Some(self.block) {
+            ValueDef::Result(inst, _) => match self.func.layout.inst_block(inst) {
+                None => false,
+                Some(b) if b == self.block => {
                     pos_get(self.pos, inst).is_some_and(|p| p < self.emit)
-                } else {
-                    self.domtree
-                        .dominates(inst, self.insts[self.emit], &self.func.layout)
                 }
-            }
+                Some(_) => self
+                    .domtree
+                    .dominates(inst, self.insts[self.emit], &self.func.layout),
+            },
             ValueDef::Union(..) => false,
         }
     }
