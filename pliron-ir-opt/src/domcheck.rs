@@ -6,6 +6,7 @@ use crate::inline::{blocks, ops};
 use crate::state::State;
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
 use pliron::value::DefiningEntity;
 use rustc_hash::FxHashMap;
@@ -25,7 +26,7 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
 
 fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
-    for op in ops(ctx, b) {
+    for op in b.deref(ctx).iter(ctx) {
         v.extend(op.deref(ctx).successors());
         v.extend(st.invokes.get(&op).map(|&(l, _)| l));
     }
@@ -91,21 +92,31 @@ impl Dom {
     pub fn new(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<Dom> {
         let bs = blocks(ctx, f);
         let entry = *bs.first()?;
-        // Reverse post-order over reachable blocks.
+        // Reverse post-order over reachable blocks. Successor lists are
+        // memoized: the DFS needs each block's once, and the `preds`
+        // build below needs them all again — `succs` walks the block's
+        // linked-list ops, so a second call doubles the pass's scan cost.
         let mut seen = FxHashMap::default();
         let mut post = Vec::new();
-        let mut stack = vec![(entry, succs(ctx, st, entry), 0usize)];
+        let mut smap: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
+            FxHashMap::default();
+        smap.insert(entry, succs(ctx, st, entry));
+        let mut stack = vec![(entry, 0usize)];
         seen.insert(entry, ());
-        while let Some((b, ss, i)) = stack.last_mut() {
-            if let Some(&n) = ss.get(*i) {
-                *i += 1;
-                if seen.insert(n, ()).is_none() {
-                    let ns = succs(ctx, st, n);
-                    stack.push((n, ns, 0));
+        while let Some((b, i)) = stack.last_mut() {
+            let next = smap.get(b).and_then(|ss| ss.get(*i).copied());
+            match next {
+                Some(n) => {
+                    *i += 1;
+                    if seen.insert(n, ()).is_none() {
+                        smap.insert(n, succs(ctx, st, n));
+                        stack.push((n, 0));
+                    }
                 }
-            } else {
-                post.push(*b);
-                stack.pop();
+                None => {
+                    post.push(*b);
+                    stack.pop();
+                }
             }
         }
         post.reverse();
@@ -113,7 +124,7 @@ impl Dom {
             post.iter().enumerate().map(|(i, &b)| (b, i)).collect();
         let mut preds = vec![Vec::new(); post.len()];
         for (i, &b) in post.iter().enumerate() {
-            for s in succs(ctx, st, b) {
+            for &s in smap.get(&b).into_iter().flatten() {
                 preds[idx[&s]].push(i);
             }
         }
