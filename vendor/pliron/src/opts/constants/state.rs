@@ -167,7 +167,7 @@ impl SccpState {
                 continue;
             };
             self.merge_block_state(ctx, entry, BlockState::Reachable);
-            let entry_args: Vec<Value> = entry.deref(ctx).arguments().collect();
+            let entry_args: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
             for arg in entry_args {
                 self.merge_val_state(ctx, arg, Constness::NotAConstant);
             }

@@ -224,7 +224,7 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
     // Block B takes one argument and returns it.
     let block_b = BasicBlock::new(ctx, None, vec![i64_ty.into()]);
     block_b.insert_at_back(region, ctx);
-    let b_arg = block_b.deref(ctx).get_argument(0);
+    let b_arg = block_b.deref(ctx).get_argument(ctx, 0);
     ReturnOp::new(ctx, b_arg)
         .get_operation()
         .insert_at_back(block_b, ctx);
@@ -267,7 +267,7 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
     assert_eq!(a2_term.deref(ctx).get_operand(ctx, 0), c2);
 
     // B's clone has its own fresh argument, and its return reads that argument.
-    let b2_arg = b2.deref(ctx).get_argument(0);
+    let b2_arg = b2.deref(ctx).get_argument(ctx, 0);
     assert_eq!(mapper.lookup_value(b_arg), Some(b2_arg));
     let b2_term = b2
         .deref(ctx)
@@ -764,7 +764,7 @@ fn self_contained_blocks_hash_equal() -> Result<()> {
 
     let make_block = |ctx: &mut Context| -> Ptr<BasicBlock> {
         let block = BasicBlock::new(ctx, None, vec![i64_ty.into()]);
-        let arg = block.deref(ctx).get_argument(0);
+        let arg = block.deref(ctx).get_argument(ctx, 0);
         ReturnOp::new(ctx, arg)
             .get_operation()
             .insert_at_back(block, ctx);

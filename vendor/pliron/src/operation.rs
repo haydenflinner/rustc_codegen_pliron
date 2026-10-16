@@ -1138,7 +1138,7 @@ pub fn verify_value_dominance(ir: Ptr<Operation>, ctx: &Context) -> Result<()> {
                 walk_advance()
             }
             IRNode::BasicBlock(block) => {
-                for arg in block.deref(ctx).arguments() {
+                for arg in block.deref(ctx).arguments(ctx) {
                     check_value_use(ctx, dom_info, arg)?;
                 }
                 walk_advance()

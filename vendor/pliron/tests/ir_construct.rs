@@ -277,8 +277,8 @@ fn test_replace_within_same_def_site() {
 
     let dual_arg_block = BasicBlock::new(ctx, None, vec![u64_ty, u64_ty]);
     let (arg1, arg2) = (
-        dual_arg_block.deref(ctx).get_argument(0),
-        dual_arg_block.deref(ctx).get_argument(1),
+        dual_arg_block.deref(ctx).get_argument(ctx, 0),
+        dual_arg_block.deref(ctx).get_argument(ctx, 1),
     );
     dual_arg_block.insert_after(ctx, func_op.get_entry_block(ctx));
     let ret_op = ReturnOp::new(ctx, arg1);
@@ -565,8 +565,8 @@ fn test_block_arg_push_pop_insert_remove() -> Result<()> {
     // Create a block with two i64 arguments.
     let block = BasicBlock::new(ctx, None, vec![i64_ty, i64_ty]);
 
-    let a0 = block.deref(ctx).get_argument(0);
-    let a1 = block.deref(ctx).get_argument(1);
+    let a0 = block.deref(ctx).get_argument(ctx, 0);
+    let a1 = block.deref(ctx).get_argument(ctx, 1);
 
     a0.set_name(ctx, Some(ident!("a0")));
     a1.set_name(ctx, Some(ident!("a1")));
@@ -584,7 +584,7 @@ fn test_block_arg_push_pop_insert_remove() -> Result<()> {
     // a0 and a1 retain their indices.
     assert_eq!(a0.find_index(ctx), 0);
     assert_eq!(a1.find_index(ctx), 1);
-    let a2 = block.deref(ctx).get_argument(2);
+    let a2 = block.deref(ctx).get_argument(ctx, 2);
     assert_eq!(a2.find_index(ctx), 2);
     assert_eq!(get_block_arg_name(ctx, block, 2), None);
 
@@ -729,8 +729,8 @@ fn test_block_arg_index_tracking_with_uses() -> Result<()> {
     // Create a block with two i64 arguments: a0 at index 0, a1 at index 1.
     let block = BasicBlock::new(ctx, None, vec![i64_ty, i64_ty]);
 
-    let a0 = block.deref(ctx).get_argument(0);
-    let a1 = block.deref(ctx).get_argument(1);
+    let a0 = block.deref(ctx).get_argument(ctx, 0);
+    let a1 = block.deref(ctx).get_argument(ctx, 1);
 
     // Build a user op that holds a0 as its first operand, a1 as its second.
     let user_op = ReturnOp::new(ctx, a0).get_operation();
@@ -1499,7 +1499,7 @@ fn test_verify_operation_fails_on_undominated_block_argument_use() {
     );
     branch.insert_at_back(entry, ctx);
 
-    let b1_arg0 = b1.deref(ctx).get_argument(0);
+    let b1_arg0 = b1.deref(ctx).get_argument(ctx, 0);
 
     ReturnOp::new(ctx, b1_arg0)
         .get_operation()

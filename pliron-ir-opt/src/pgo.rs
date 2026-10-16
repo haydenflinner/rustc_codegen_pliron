@@ -310,10 +310,10 @@ pub fn instrument(
             };
             let s = t.deref(ctx).get_successor(ctx, si as usize);
             let arg_tys: Vec<TypeHandle> =
-                s.deref(ctx).arguments().map(|a| a.get_type(ctx)).collect();
+                s.deref(ctx).arguments(ctx).map(|a| a.get_type(ctx)).collect();
             let e = BasicBlock::new(ctx, None, arg_tys);
             e.insert_at_back(region, ctx);
-            let args: Vec<Value> = e.deref(ctx).arguments().collect();
+            let args: Vec<Value> = e.deref(ctx).arguments(ctx).collect();
             let br = BrOp::new(ctx, s, args).get_operation();
             br.insert_at_back(e, ctx);
             bump(ctx, st, e, &ctrs_sym, nctrs);

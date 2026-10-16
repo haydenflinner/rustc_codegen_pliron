@@ -2152,7 +2152,7 @@ fn convert_function(
     {
         let entry = block_iter.next().expect("Missing entry block");
         // Map entry block arguments to LLVM function arguments.
-        for (arg_idx, arg) in entry.deref(ctx).arguments().enumerate() {
+        for (arg_idx, arg) in entry.deref(ctx).arguments(ctx).enumerate() {
             cctx.value_map
                 .insert(arg, llvm_get_param(func_llvm, arg_idx.try_into().unwrap()));
         }
@@ -2170,7 +2170,7 @@ fn convert_function(
             block.deref(ctx).unique_name(ctx).as_ref(),
         );
         llvm_position_builder_at_end(&cctx.builder, llvm_block);
-        for arg in block.deref(ctx).arguments() {
+        for arg in block.deref(ctx).arguments(ctx) {
             let arg_type = convert_type(ctx, llvm_ctx, &mut cctx.types, arg.get_type(ctx))?;
             let phi = llvm_build_phi(&cctx.builder, arg_type, arg.unique_name(ctx).as_ref());
             cctx.value_map.insert(arg, phi);

@@ -1727,7 +1727,7 @@ fn convert_block(
             let ty = convert_type(ctx, cctx, llvm_type_of(inst))?;
             let arg_idx = BasicBlock::push_argument(m_block, ctx, ty);
             cctx.value_map
-                .insert(inst, m_block.deref(ctx).get_argument(arg_idx));
+                .insert(inst, m_block.deref(ctx).get_argument(ctx, arg_idx));
         } else {
             let m_inst = convert_instruction(ctx, cctx, inst)?;
             inserter.insert_operation(ctx, m_inst);
@@ -1801,7 +1801,7 @@ fn convert_function(
         let m_entry_block_ref = m_entry_block.deref(ctx);
         // Map function args to entry block args.
         for (arg_idx, arg) in param_iter(function).enumerate() {
-            val_map.insert(arg, m_entry_block_ref.get_argument(arg_idx));
+            val_map.insert(arg, m_entry_block_ref.get_argument(ctx, arg_idx));
         }
     }
 

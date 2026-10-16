@@ -259,7 +259,7 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
         return false;
     }
     if let Some(&(pad, _)) = st.invokes.get(op)
-        && pad.deref(ctx).arguments().next().is_some()
+        && pad.deref(ctx).arguments(ctx).next().is_some()
     {
         return false;
     }

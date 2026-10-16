@@ -111,7 +111,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
             .unwrap();
         let live: Vec<bool> = entry
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .map(|a| a.is_used(ctx))
             .collect();
         if live.len() != args.len() || live.iter().all(|&l| l) {
@@ -207,7 +207,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 .unwrap()
                 .get_entry_block(ctx)
                 .unwrap();
-            for a in e.deref(ctx).arguments() {
+            for a in e.deref(ctx).arguments(ctx) {
                 total += 1;
                 if !a.is_used(ctx) {
                     dead += 1;
@@ -289,7 +289,7 @@ fn rewrite(
     a.insert_at_front(entry, ctx);
     let slot = a.deref(ctx).get_result(ctx, 0);
     st.allocas.insert(slot, (size, align));
-    let sret = entry.deref(ctx).get_argument(0);
+    let sret = entry.deref(ctx).get_argument(ctx, 0);
     sret.replace_all_uses_with(ctx, &slot);
     BasicBlock::remove_argument(entry, ctx, 0);
     let rets: Vec<_> = blocks(ctx, fop)

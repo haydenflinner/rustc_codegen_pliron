@@ -119,7 +119,7 @@ fn process_branch_op(branch_op: &dyn BranchOpInterface, ctx: &Context, state: &m
             continue;
         }
         let forwarded = branch_op.successor_operands(ctx, succ_idx);
-        let target_args: Vec<Value> = succ_block.deref(ctx).arguments().collect();
+        let target_args: Vec<Value> = succ_block.deref(ctx).arguments(ctx).collect();
         for (fwd_val, target_arg) in forwarded.into_iter().zip(target_args) {
             let incoming = state.get_val_state(fwd_val);
             state.merge_val_state(ctx, target_arg, incoming);
@@ -220,7 +220,7 @@ pub fn sccp(root_op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
                 if !matches!(state.get_block_state(block), BlockState::Reachable) {
                     return;
                 }
-                for arg in block.deref(ctx).arguments() {
+                for arg in block.deref(ctx).arguments(ctx) {
                     if let Constness::Constant { val } = state.get_val_state(arg) {
                         const_args.push((block, arg, val));
                     }

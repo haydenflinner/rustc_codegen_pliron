@@ -457,7 +457,7 @@ pub fn mask(bits: u128, w: u32) -> u128 {
 /// if the leaf counts disagree.
 pub(crate) fn leaf_arg(ctx: &Context, e: Ptr<BasicBlock>, leaf: usize) -> Option<(Value, usize)> {
     let mut off = 0usize;
-    for a in e.deref(ctx).arguments() {
+    for a in e.deref(ctx).arguments(ctx) {
         let n = crate::types::leaves(ctx, a.get_type(ctx)).len();
         if leaf >= off && leaf < off + n {
             return Some((a, leaf - off));

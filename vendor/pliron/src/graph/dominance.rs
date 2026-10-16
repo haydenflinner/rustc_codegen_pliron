@@ -1727,7 +1727,7 @@ mod tests {
         );
         op_in_arg_block.insert_at_back(arg_block, ctx);
 
-        let val = arg_block.deref(ctx).get_argument(0);
+        let val = arg_block.deref(ctx).get_argument(ctx, 0);
         let mut dom_info = super::DomInfo::default();
 
         assert!(dom_info.value_strictly_dominates_op(ctx, val, op_in_arg_block));

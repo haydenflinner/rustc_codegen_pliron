@@ -67,7 +67,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let Some(calls) = sites.get(sym) else {
             continue;
         };
-        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments().collect();
+        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments(ctx).collect();
         let args: Vec<Vec<Value>> = calls
             .iter()
             .map(|&c| Operation::get_op::<CallOp>(c, ctx).unwrap().args(ctx))

@@ -94,7 +94,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         p.cand.push((f,));
         let bs = blocks(ctx, st.funcs[s].op);
         for &b in &bs {
-            local.extend(b.deref(ctx).arguments());
+            local.extend(b.deref(ctx).arguments(ctx));
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
                 local.extend(op.deref(ctx).results(ctx));
@@ -105,7 +105,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         // are non-null unless an incoming edge says otherwise (a param with
         // no incoming edge is in an unreachable block, whose `ret`s can't
         // run).
-        for a in bs[0].deref(ctx).arguments() {
+        for a in bs[0].deref(ctx).arguments(ctx) {
             if !(ptr(a) && st.nnargs.get(a).is_some_and(|m| m & 1 != 0)) {
                 p.src.push((a,));
             }
@@ -114,7 +114,7 @@ pub fn run(ctx: &Context, st: &mut State) {
             let pad = pads.contains(&b);
             p.src.extend(
                 b.deref(ctx)
-                    .arguments()
+                    .arguments(ctx)
                     .filter(|&a| pad || !ptr(a))
                     .map(|a| (a,)),
             );
@@ -129,7 +129,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                 {
                     for (si, s) in d.successors(ctx).enumerate() {
                         let args = br.successor_operands(ctx, si);
-                        for (k, prm) in s.deref(ctx).arguments().enumerate() {
+                        for (k, prm) in s.deref(ctx).arguments(ctx).enumerate() {
                             match args.get(k) {
                                 Some(&a) => p.copy.push((a, prm)),
                                 None => p.src.push((prm,)),

@@ -205,7 +205,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         p.nparams.push((f, n.min(MAX_PARAMS)));
         for (i, a) in bs[0]
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .enumerate()
             .take(MAX_PARAMS as usize)
         {
@@ -255,13 +255,13 @@ pub fn run(ctx: &Context, st: &mut State) {
                     for (si, s) in d.successors(ctx).enumerate() {
                         let args = t.successor_operands(ctx, si);
                         p.flow
-                            .extend(args.into_iter().zip(s.deref(ctx).arguments()));
+                            .extend(args.into_iter().zip(s.deref(ctx).arguments(ctx)));
                     }
                 }
                 // The exception payload is produced by the callee; it may
                 // encode any arg.
                 if let Some(&(lp, _)) = st.invokes.get(op)
-                    && let Some(x) = lp.deref(ctx).arguments().next()
+                    && let Some(x) = lp.deref(ctx).arguments(ctx).next()
                 {
                     p.flow.extend(d.operands(ctx).map(|v| (v, x)));
                 }

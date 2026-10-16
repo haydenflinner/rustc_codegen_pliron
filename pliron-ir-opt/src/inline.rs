@@ -205,7 +205,7 @@ fn callee_info(
         return Some(ci);
     }
     let params: Vec<Value> = match blocks(ctx, f.op).first() {
-        Some(&entry) => entry.deref(ctx).arguments().collect(),
+        Some(&entry) => entry.deref(ctx).arguments(ctx).collect(),
         None => return Some(ci),
     };
     if model || bonus > 1 {
@@ -230,9 +230,9 @@ fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u3
     let Some(&entry) = bs.first() else {
         return (Vec::new(), Vec::new());
     };
-    let nparams = entry.deref(ctx).arguments().count();
+    let nparams = entry.deref(ctx).arguments(ctx).count();
     let (mut mem, mut fold) = (vec![0u32; nparams], vec![0u32; nparams]);
-    for (i, p) in entry.deref(ctx).arguments().enumerate() {
+    for (i, p) in entry.deref(ctx).arguments(ctx).enumerate() {
         let (mut work, mut seen, mut budget) = (vec![p], FxHashSet::default(), 64);
         while let Some(v) = work.pop() {
             if budget == 0 {
@@ -1842,7 +1842,7 @@ fn frozen_args(
     // Caller-side operands bound to each entry arg, for region inheritance.
     // `inline_call` branches to `entry` with `args` positionally, so the
     // entry arg at index k is bound to `call_args[k]`.
-    let eargs: Vec<Value> = entry.deref(ctx).arguments().collect();
+    let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
     for &(leaf, bytes) in &f.frozen {
         let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
             if dbg {
@@ -2024,7 +2024,7 @@ fn inline_call(
         if let Some(&c) = st.prof_bcount.get(b) {
             st.prof_bcount.insert(nb, scale(c));
         }
-        for (a, na) in b.deref(ctx).arguments().zip(nb.deref(ctx).arguments()) {
+        for (a, na) in b.deref(ctx).arguments(ctx).zip(nb.deref(ctx).arguments(ctx)) {
             if let Some(f) = st.region_frozen.get(a).cloned() {
                 st.region_frozen.insert(
                     na,
@@ -2105,7 +2105,7 @@ fn inline_call(
     if let Some(res) = res {
         let ty = res.get_type(ctx);
         BasicBlock::push_argument(cont, ctx, ty);
-        let arg = cont.deref(ctx).get_argument(0);
+        let arg = cont.deref(ctx).get_argument(ctx, 0);
         res.replace_all_uses_with(ctx, &arg);
     }
     // Create the branch to the clone before `frozen_args` so its

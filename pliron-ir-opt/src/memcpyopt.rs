@@ -162,7 +162,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             .iter()
             .enumerate()
             .filter(|(i, e)| **e == ArgExt::SRet && *i < entry.deref(ctx).get_num_arguments())
-            .map(|(i, _)| entry.deref(ctx).get_argument(i))
+            .map(|(i, _)| entry.deref(ctx).get_argument(ctx, i))
             .collect();
         let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
         for b in blocks {

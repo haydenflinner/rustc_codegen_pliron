@@ -340,7 +340,7 @@ pub fn apply_dialect_conversion<C: DialectConversion>(
                 "Converting block arguments for block: {}",
                 block.deref(ctx).unique_name(ctx).disp(ctx)
             );
-            let args: Vec<_> = block.deref(ctx).arguments().collect();
+            let args: Vec<_> = block.deref(ctx).arguments(ctx).collect();
             for arg in args {
                 self.convert_block_argument_type(ctx, arg)?;
             }

@@ -493,7 +493,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     for &f in funcs {
         for r in f.deref(ctx).regions(ctx) {
             for (i, b) in r.deref(ctx).iter(ctx).enumerate() {
-                for a in b.deref(ctx).arguments() {
+                for a in b.deref(ctx).arguments(ctx) {
                     note(ctx, a.get_type(ctx), i != 0, i != 0);
                 }
                 for op in b.deref(ctx).iter(ctx) {

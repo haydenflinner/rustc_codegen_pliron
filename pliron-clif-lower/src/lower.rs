@@ -2040,7 +2040,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
         }
         for pb in &pblocks[1..] {
-            let args: Vec<Value> = pb.deref(ctx).arguments().collect();
+            let args: Vec<Value> = pb.deref(ctx).arguments(ctx).collect();
             for a in args {
                 let cb = self.blocks[pb];
                 let vs: Vals = leaves(ctx, a.get_type(ctx))
@@ -2081,7 +2081,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::frozen", "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
                                     *pb,
-                                    pb.deref(ctx).arguments().count()
+                                    pb.deref(ctx).arguments(ctx).count()
                                 )
                             };
                         }
@@ -2106,7 +2106,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         let params = self.b.block_params(entry).to_vec();
         let mut i = 0;
-        let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
+        let args: Vec<Value> = pblocks[0].deref(ctx).arguments(ctx).collect();
         for arg in args {
             let n = leaves(ctx, arg.get_type(ctx)).len();
             if n == 1

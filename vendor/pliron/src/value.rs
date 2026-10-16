@@ -209,7 +209,7 @@ impl Value {
             DefiningEntity::Block(block) => {
                 let block = block.deref(ctx);
                 block
-                    .args_slice()
+                    .args_slice(ctx)
                     .iter()
                     .position(|arg| arg.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(block.loc(), ValueError::NotInBlockArgument))
@@ -282,7 +282,9 @@ impl Value {
         let index = self.find_index(ctx);
         match self.defining_entity {
             DefiningEntity::Op(op) => op.deref(ctx).results_slice_mut(ctx)[index].set_type(ty),
-            DefiningEntity::Block(block) => block.deref_mut(ctx).args[index].set_type(ty),
+            DefiningEntity::Block(block) => {
+                block.deref(ctx).args_slice_mut(ctx)[index].set_type(ty)
+            }
         }
     }
 
@@ -327,7 +329,9 @@ impl Typed for Value {
         let index = self.find_index(ctx);
         match self.defining_entity {
             DefiningEntity::Op(op) => op.deref(ctx).results_slice(ctx)[index].get_type(),
-            DefiningEntity::Block(block) => block.deref(ctx).args[index].get_type(),
+            DefiningEntity::Block(block) => {
+                block.deref(ctx).args_slice(ctx)[index].get_type()
+            }
         }
     }
 }
@@ -367,8 +371,9 @@ impl DefTrait for Value {
                 Ref::map(pool, |p| &p[span.range()][index].def)
             }
             DefiningEntity::Block(block) => {
-                let block = block.deref(ctx);
-                Ref::map(block, |blockref| &blockref.args[index].def)
+                let span = block.deref(ctx).args;
+                let pool = ctx.block_arg_pool.borrow();
+                Ref::map(pool, |p| &p[span.range()][index].def)
             }
         }
     }
@@ -382,8 +387,9 @@ impl DefTrait for Value {
                 RefMut::map(pool, |p| &mut p[span.range()][index].def)
             }
             DefiningEntity::Block(block) => {
-                let block = block.deref_mut(ctx);
-                RefMut::map(block, |blockref| &mut blockref.args[index].def)
+                let span = block.deref(ctx).args;
+                let pool = ctx.block_arg_pool.borrow_mut();
+                RefMut::map(pool, |p| &mut p[span.range()][index].def)
             }
         }
     }

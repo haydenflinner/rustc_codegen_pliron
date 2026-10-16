@@ -31,7 +31,7 @@ fn succ_operand(ctx: &Context, t: Ptr<Operation>, si: usize, i: usize, na: usize
 fn defined_in(ctx: &Context, v: Value, b: Ptr<BasicBlock>) -> bool {
     match v.defining_op() {
         Some(op) => op.deref(ctx).get_parent_block() == Some(b),
-        None => b.deref(ctx).arguments().any(|a| a == v),
+        None => b.deref(ctx).arguments(ctx).any(|a| a == v),
     }
 }
 
@@ -89,7 +89,7 @@ pub fn run(ctx: &mut Context, st: &State) {
                 };
                 let na = b.deref(ctx).get_num_arguments();
                 for i in (0..na).rev() {
-                    let arg = b.deref(ctx).get_argument(i);
+                    let arg = b.deref(ctx).get_argument(ctx, i);
                     let mut uniq = None;
                     let ok = ps
                         .iter()

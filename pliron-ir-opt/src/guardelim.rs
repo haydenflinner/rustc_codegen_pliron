@@ -165,7 +165,7 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     if let Some(b) = v.defining_block() {
         return b
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .position(|a| a == v)
             .map(|i| Atom::Arg(b, i))
             .unwrap_or(Atom::V(v));
@@ -552,7 +552,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         if let Some(b) = v.defining_block() {
             return b
                 .deref(ctx)
-                .arguments()
+                .arguments(ctx)
                 .position(|a| a == v)
                 .map(|i| Nd::Arg(b, i));
         }

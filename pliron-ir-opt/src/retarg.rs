@@ -59,7 +59,7 @@ pub fn run(ctx: &Context, st: &State) {
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
-        for (i, a) in bs[0].deref(ctx).arguments().enumerate() {
+        for (i, a) in bs[0].deref(ctx).arguments(ctx).enumerate() {
             p.param.push((a, i as u32));
         }
         let mut n = 0;

@@ -237,7 +237,7 @@ pub fn clone_blocks_into(
     for &src_block in blocks {
         let (arg_types, label, attrs, loc) = {
             let block_ref = src_block.deref(ctx);
-            let arg_types: Vec<_> = block_ref.arguments().map(|arg| arg.get_type(ctx)).collect();
+            let arg_types: Vec<_> = block_ref.arguments(ctx).map(|arg| arg.get_type(ctx)).collect();
             (
                 arg_types,
                 block_ref.label.clone(),
@@ -260,7 +260,7 @@ pub fn clone_blocks_into(
 
         let src_ref = src_block.deref(ctx);
         let new_ref = new_block.deref(ctx);
-        for (old, new) in src_ref.arguments().zip(new_ref.arguments()) {
+        for (old, new) in src_ref.arguments(ctx).zip(new_ref.arguments(ctx)) {
             mapper.map_value(old, new);
         }
 

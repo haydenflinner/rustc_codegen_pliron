@@ -1340,7 +1340,7 @@ impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
             .unwrap()
             .get_entry_block(&ctx)
             .unwrap();
-        entry.deref(&ctx).get_argument(index)
+        entry.deref(&ctx).get_argument(&ctx, index)
     }
 }
 

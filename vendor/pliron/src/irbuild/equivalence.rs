@@ -361,7 +361,7 @@ fn block_eq_map(
     }
 
     // Check arg types.
-    let args = lhs_ref.arguments().zip(rhs_ref.arguments());
+    let args = lhs_ref.arguments(ctx).zip(rhs_ref.arguments(ctx));
     if args
         .clone()
         .any(|(l_arg, r_arg)| l_arg.get_type(ctx) != r_arg.get_type(ctx))
@@ -527,13 +527,13 @@ fn hash_block_shell(
 
         attributes_hash(ctx, ignore_config, block_ref.attributes(), state);
 
-        for arg in block_ref.arguments() {
+        for arg in block_ref.arguments(ctx) {
             arg.get_type(ctx).stable_hash(ctx, state);
         }
     }
 
     numbering.define_block(block);
-    for arg in block.deref(ctx).arguments() {
+    for arg in block.deref(ctx).arguments(ctx) {
         numbering.define_value(arg);
     }
 }

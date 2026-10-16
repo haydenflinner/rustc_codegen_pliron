@@ -144,7 +144,7 @@ pub trait BranchOpInterface: IsTerminatorInterface {
                 );
             }
             for (idx, operand) in operands.iter().enumerate() {
-                let block_arg = succ.get_argument(idx);
+                let block_arg = succ.get_argument(ctx, idx);
                 if operand.get_type(ctx) != block_arg.get_type(ctx) {
                     return verify_err!(
                         op.loc(ctx),

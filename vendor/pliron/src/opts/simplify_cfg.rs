@@ -118,7 +118,7 @@ fn try_merge_succ(
         succ.label(ctx)
     );
 
-    let formal_args: Vec<Value> = succ.deref(ctx).arguments().collect();
+    let formal_args: Vec<Value> = succ.deref(ctx).arguments(ctx).collect();
     assert_eq!(
         formal_args.len(),
         actual_args.len(),
