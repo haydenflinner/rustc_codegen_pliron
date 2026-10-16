@@ -1605,6 +1605,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
 }
 
 fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
+    let tmod = std::time::Instant::now();
     let _smod = tracing::info_span!(target: "pliron::module", "module", cgu = %cgu_name).entered();
     let _pgmod = tcx
         .sess
@@ -1665,6 +1666,7 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
     drop(_sdef);
     let m = finish_module(&cx, cgu_name.as_str());
+    pliron_cfg::trace("*modgen*", tmod.elapsed().as_secs_f64() * 1e3, cgu_name.as_str());
     ModuleCodegen::new_regular(cgu_name.to_string(), m)
 }
 

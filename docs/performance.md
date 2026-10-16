@@ -302,6 +302,26 @@ pliron op construction (`pliron_llvm::ops`, `value`/`operation` tables).
 So the remaining compile-time gap is mostly *our glue*: op construction +
 hash tables + lowering, not the clif passes and not vendored cranelift.
 
+### Wall decomposition + config lever (2026-10-16)
+
+`*modgen*`/`*iropt*`/`*phaseA|B|C*` trace lines (PLIRON_TRACE_FILE)
+decompose per-CGU codegen. On syn CU=16 serial: modgen 99.9s of 102s
+wall — CGUs compile serially, and modgen CPU is superlinear in CGU
+count (152s at CU16 vs 38s at CU2): `PLIRON_XCGU` local copies +
+per-CGU `State`/iropt re-analyze shared generic bodies per CGU.
+
+Flags alone move wall dramatically (no code changes):
+
+| crate | default | `-Zthreads=8` + CGUs | wall |
+|---|---|---|---|
+| syn | 102 s | CU=2 | **24.0 s** |
+| syn | 102 s | CU=4 | 25.2 s |
+| regex-syntax | 14.9 s | CU=4 | **5.97 s** |
+
+`PLIRON_XCGU=0` alone cuts syn CU16 wall 78→55s (iropt 76.5→57.2s,
+phaseB 59.5→30.5s) at a runtime-quality cost — copies exist to feed
+the inliner.
+
 Per-pass fixes that took pipeline CPU ~483s → ~220s:
 
 - `indvars::elim_shadowed`: the fixpoint rebuilt the whole-function use
