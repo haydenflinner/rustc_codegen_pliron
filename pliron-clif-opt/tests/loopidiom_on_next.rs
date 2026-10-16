@@ -83,3 +83,33 @@ fn post_step_exit_test_still_idioms() {
     assert!(has_call(&after), "{}", after.display());
     check(&before, &after, &Facts::default(), &Config::default()).unwrap();
 }
+
+/// `dead` loops delete the body and jump straight to the exit dest. A
+/// value defined inside the loop may still be used there — it dominated
+/// the dest — so it has to become a closed-form edge arg. Internal block
+/// params were invisible to the escape scan (`b == h` only), and a fast
+/// edge jumping past them left a dangling use.
+#[test]
+fn dead_loop_refuses_internal_param_escape() {
+    let mut f = parse(
+        "function %f(i64) -> i64 {
+        block0(v0: i64):
+            v1 = iconst.i64 0
+            jump block1(v1)
+
+        block1(v2: i64):
+            v3 = iconst.i64 1
+            v4 = iadd v2, v3
+            v5 = iconst.i64 77
+            jump block5(v5)
+
+        block5(v13: i64):
+            v14 = icmp ult v4, v0
+            brif v14, block1(v4), block6
+
+        block6:
+            return v13
+        }",
+    );
+    assert_eq!(run_idiom(&mut f), 0, "{}", f.display());
+}

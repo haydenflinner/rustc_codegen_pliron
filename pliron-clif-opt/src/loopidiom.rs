@@ -1740,6 +1740,10 @@ fn arg_ins(
                 )),
                 Param::Other => None,
             }
+        } else if info.body.contains(&b) {
+            // A param of a loop-internal block has no closed form — the
+            // emitted `Ins::Val` would dangle on the fast path.
+            None
         } else {
             Some(Ins::Val(v))
         };
@@ -2178,7 +2182,7 @@ fn plan_dead(
         // `dest`, hence every pred edge — and to the closed form on the
         // fast edge.
         let loop_val = |v: Value| match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
-            ValueDef::Param(b, _) => b == info.h,
+            ValueDef::Param(b, _) => info.body.contains(&b),
             ValueDef::Result(i, _) => func
                 .layout
                 .inst_block(i)
