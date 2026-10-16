@@ -3775,11 +3775,11 @@ fn run_jam(
     let fih = fblk[&ih];
     let ity = func.dfg.value_type(ivp);
 
-    // j_d at the top of each copy's first pre block (d>0; d==0 uses the
-    // header param directly, already seeded in `vmaps`).
+    // j_d = a0 + d*step at the top of each copy's first pre block (d>0;
+    // d==0 uses the header param directly, already seeded in `vmaps`).
     for d in 1..j {
         let mut pos = FuncCursor::new(func).at_first_insertion_point(preblk[d][0]);
-        let dc = pos.ins().iconst(ity, d as i64);
+        let dc = pos.ins().iconst(ity, (d as i64).wrapping_mul(step));
         let jd = pos.ins().iadd(ojhparams[opidx], dc);
         vmaps[d].insert(func.dfg.resolve_aliases(ivp), jd);
     }
@@ -5247,14 +5247,14 @@ fn run_jam_chooser(
                 omap.insert(func.dfg.resolve_aliases(o), nv);
             }
         }
-        // j_d = iv + d: materialize in ojh so dep insts defined there
-        // (e.g. iv_next feeding the latch args) see copy d's iv.
+        // j_d = iv + d*step: materialize in ojh so dep insts defined
+        // there (e.g. iv_next feeding the latch args) see copy d's iv.
         {
             let ity0 = func.dfg.value_type(ivp);
             let ivr = func.dfg.resolve_aliases(ivp);
             let mut pos0 = FuncCursor::new(func).at_bottom(ojh);
             for d in 1..j {
-                let dc = pos0.ins().iconst(ity0, d as i64);
+                let dc = pos0.ins().iconst(ity0, (d as i64).wrapping_mul(step));
                 let jd = pos0.ins().iadd(ojhparams[opidx], dc);
                 vmaps[d].insert(ivr, jd);
             }
@@ -5313,12 +5313,34 @@ fn run_jam_chooser(
         let mut pos = FuncCursor::new(func).at_bottom(ojh);
         let a0 = ojhparams[opidx];
         let ok1 = pos.ins().icmp(cc, a0, boundv);
-        let off = pos.ins().iconst(ity, (j as i64 - 1) * step);
-        let alast = pos.ins().iadd(a0, off);
-        let ok2 = pos.ins().icmp(cc, alast, boundv);
-        // Widening is only needed for the subtraction form; the direct
-        // `last cc bound` form needs no rem — keep wty for parity.
-        let _ = wty;
+        // The direct `a0 + (J-1)*step cc bound` form can wrap when step
+        // is huge; compare the widened remainder like `run_jam`'s guard.
+        let (a0w, bw) = if wty != ity && osigned {
+            (
+                pos.ins().sextend(wty, a0),
+                pos.ins().sextend(wty, boundv),
+            )
+        } else if wty != ity {
+            (
+                pos.ins().uextend(wty, a0),
+                pos.ins().uextend(wty, boundv),
+            )
+        } else {
+            (a0, boundv)
+        };
+        let rem = pos.ins().isub(bw, a0w);
+        let lim = pos
+            .ins()
+            .iconst(wty, ((j as i64) - 1).wrapping_mul(step));
+        let ok2 = pos.ins().icmp(
+            if ole {
+                IntCC::UnsignedGreaterThanOrEqual
+            } else {
+                IntCC::UnsignedGreaterThan
+            },
+            rem,
+            lim,
+        );
         ok_guard = pos.ins().band(ok1, ok2);
     }
 
