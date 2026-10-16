@@ -346,7 +346,9 @@ pub fn run(ctx: &Context, st: &mut State) {
             }
         }
     }
+    let trun = std::time::Instant::now();
     p.run();
+    pliron_cfg::trace("nocap-fixpoint", trun.elapsed().as_secs_f64() * 1e3, &st.cgu);
     if dbg.is_some()
         && pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG)
