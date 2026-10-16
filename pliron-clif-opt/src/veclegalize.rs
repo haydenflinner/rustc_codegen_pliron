@@ -266,7 +266,14 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 let v = pos.ins().bitcast(it, le, args[0]);
                 let s = lane_to_int(&mut pos, args[1], lt, it);
                 let sh = lane * esz;
-                let mask: u64 = !(((1u64 << esz) - 1) << sh);
+                // `1 << esz` overflows at esz == 64 (i64x1/f64x1): the
+                // lane mask covers the whole word there anyway.
+                let lanemask: u64 = if esz >= 64 {
+                    u64::MAX
+                } else {
+                    ((1u64 << esz) - 1) << sh
+                };
+                let mask: u64 = !lanemask;
                 let mc = pos.ins().iconst(it, mask as i64);
                 let masked = pos.ins().band(v, mc);
                 let sin = if sh > 0 { pos.ins().ishl_imm_u(s, sh as i64) } else { s };
