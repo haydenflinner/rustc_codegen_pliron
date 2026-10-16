@@ -29,6 +29,116 @@ use cranelift_codegen::ir::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
+// Worklist propagation of a slot-set map over a function: branch args
+// flow into destination params (try_call payloads inherit the call
+// args' union); every other inst's results take the union of its args'
+// sets. `wl`/`inq` are the caller's initial worklist.
+fn propagate(
+    func: &Function,
+    users: &SecondaryMap<Value, Vec<Inst>>,
+    map: &mut SecondaryMap<Value, Vec<StackSlot>>,
+    mut wl: VecDeque<Inst>,
+    mut inq: FxHashSet<Inst>,
+    contains: Option<&Vec<FxHashSet<StackSlot>>>,
+) {
+    while let Some(i) = wl.pop_front() {
+        inq.remove(&i);
+        if func.dfg.insts[i].opcode().is_branch() {
+            let call_slots: Vec<StackSlot> = if func.dfg.insts[i].opcode().is_call() {
+                let mut v = Vec::new();
+                for &a in func.dfg.inst_args(i) {
+                    for &s in &map[func.dfg.resolve_aliases(a)] {
+                        if !v.contains(&s) {
+                            v.push(s);
+                        }
+                    }
+                }
+                // A callee can read through the pointer it was handed:
+                // payloads it returns may name any slot reachable
+                // through the arg's bytes, not just the arg's slot.
+                if let Some(c) = contains {
+                    let s0: Vec<StackSlot> = v.clone();
+                    for s in s0 {
+                        for &s2 in &c[s.index()] {
+                            if !v.contains(&s2) {
+                                v.push(s2);
+                            }
+                        }
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            };
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let blk = bc.block(&func.dfg.value_lists);
+                for (k, ba) in bc.args(&func.dfg.value_lists).enumerate() {
+                    let src: Vec<StackSlot> = match ba {
+                        BlockArg::Value(v) => map[func.dfg.resolve_aliases(v)].clone(),
+                        BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => call_slots.clone(),
+                    };
+                    if src.is_empty() {
+                        continue;
+                    }
+                    let Some(&p) = func.dfg.block_params(blk).get(k) else {
+                        continue;
+                    };
+                    // A float param can't hold a pointer or a byte image
+                    // of one; every other param type can carry them.
+                    if func.dfg.value_type(p).is_float() {
+                        continue;
+                    }
+                    let mut grew = false;
+                    for &s in &src {
+                        if !map[p].contains(&s) {
+                            map[p].push(s);
+                            grew = true;
+                        }
+                    }
+                    if grew {
+                        for &u in &users[p] {
+                            if inq.insert(u) {
+                                wl.push_back(u);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let mut acc: Vec<StackSlot> = Vec::new();
+        for &a in func.dfg.inst_args(i) {
+            for &s in &map[func.dfg.resolve_aliases(a)] {
+                if !acc.contains(&s) {
+                    acc.push(s);
+                }
+            }
+        }
+        if acc.is_empty() {
+            continue;
+        }
+        for &r in func.dfg.inst_results(i) {
+            let r = func.dfg.resolve_aliases(r);
+            let mut grew = false;
+            for &s in &acc {
+                if !map[r].contains(&s) {
+                    map[r].push(s);
+                    grew = true;
+                }
+            }
+            if grew {
+                for &u in &users[r] {
+                    if inq.insert(u) {
+                        wl.push_back(u);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
@@ -79,11 +189,13 @@ pub fn run(
         }
     }
 
-    // `derived[v]` = slots whose address `v` may hold. Seeds are
-    // `stack_addr` results; results copy the union of their args' sets
-    // (over-approximating only costs merges); branch args flow into the
-    // destination's block params, and a `try_call`'s return / exception
-    // payloads conservatively inherit the union of its call args.
+    // `derived[v]` = slots whose address `v` may hold, and
+    // `from_bytes[v]` = slots whose byte image `v` may carry (a vector
+    // load of an aggregate keeps the whole image — `extractlane`d lanes
+    // can reconstitute stored pointers). Seeds: `stack_addr` results
+    // (derived), and every load's results (from_bytes, keyed by the
+    // address's slots). Both propagate over args like `derived` above;
+    // a `try_call`'s payloads conservatively inherit call-arg unions.
     let mut derived: SecondaryMap<Value, Vec<StackSlot>> = SecondaryMap::new();
     let mut wl: VecDeque<Inst> = VecDeque::new();
     let mut inq: FxHashSet<Inst> = FxHashSet::default();
@@ -101,101 +213,34 @@ pub fn run(
             wl.push_back(i);
         }
     }
-    while let Some(i) = wl.pop_front() {
-        inq.remove(&i);
-        if func.dfg.insts[i].opcode().is_branch() {
-            let call_slots: Vec<StackSlot> = if func.dfg.insts[i].opcode().is_call() {
-                let mut v = Vec::new();
-                for &a in func.dfg.inst_args(i) {
+    propagate(func, &users, &mut derived, wl, inq, None);
+
+    // `from_bytes` seeds: every load's results carry the byte image of
+    // the slot its address derives from — an aggregate copy moves
+    // contained pointers with it, so a store of the loaded bytes into
+    // another slot must flow those pointers dst-ward.
+    let mut from_bytes: SecondaryMap<Value, Vec<StackSlot>> = SecondaryMap::new();
+    let mut wl: VecDeque<Inst> = VecDeque::new();
+    let mut inq: FxHashSet<Inst> = FxHashSet::default();
+    for &b in &order {
+        for i in func.layout.block_insts(b) {
+            if func.dfg.insts[i].opcode().can_load() {
+                if let Some(&a) = func.dfg.inst_args(i).first() {
                     for &s in &derived[func.dfg.resolve_aliases(a)] {
-                        if !v.contains(&s) {
-                            v.push(s);
-                        }
-                    }
-                }
-                v
-            } else {
-                Vec::new()
-            };
-            for bc in func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                let blk = bc.block(&func.dfg.value_lists);
-                for (k, ba) in bc.args(&func.dfg.value_lists).enumerate() {
-                    let src: Vec<StackSlot> = match ba {
-                        BlockArg::Value(v) => derived[func.dfg.resolve_aliases(v)].clone(),
-                        BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => call_slots.clone(),
-                    };
-                    if src.is_empty() {
-                        continue;
-                    }
-                    let Some(&p) = func.dfg.block_params(blk).get(k) else {
-                        continue;
-                    };
-                    // A non-scalar-int param can't hold a pointer.
-                    let ty = func.dfg.value_type(p);
-                    if ty.is_vector() || !ty.is_int() {
-                        continue;
-                    }
-                    let mut grew = false;
-                    for &s in &src {
-                        if !derived[p].contains(&s) {
-                            derived[p].push(s);
-                            grew = true;
-                        }
-                    }
-                    if grew {
-                        for &u in &users[p] {
-                            if inq.insert(u) {
-                                wl.push_back(u);
+                        for &r in func.dfg.inst_results(i) {
+                            let r = func.dfg.resolve_aliases(r);
+                            if !from_bytes[r].contains(&s) {
+                                from_bytes[r].push(s);
                             }
                         }
                     }
                 }
             }
-            continue;
-        }
-        let mut acc: Vec<StackSlot> = Vec::new();
-        for &a in func.dfg.inst_args(i) {
-            for &s in &derived[func.dfg.resolve_aliases(a)] {
-                if !acc.contains(&s) {
-                    acc.push(s);
-                }
-            }
-        }
-        if acc.is_empty() {
-            continue;
-        }
-        // Loaded data can't carry a slot pointer unless the load is
-        // scalar-integer shaped: vector/float loads return bytes, not
-        // pointers, so they can't make the slot escape when stored onward
-        // — this keeps chunked i8x16 aggregate copies from pinning every
-        // slot to the end. All other insts propagate into every result.
-        let loadish = func.dfg.insts[i].opcode().can_load();
-        for &r in func.dfg.inst_results(i) {
-            let r = func.dfg.resolve_aliases(r);
-            if loadish {
-                let ty = func.dfg.value_type(r);
-                if ty.is_vector() || !ty.is_int() {
-                    continue;
-                }
-            }
-            let mut grew = false;
-            for &s in &acc {
-                if !derived[r].contains(&s) {
-                    derived[r].push(s);
-                    grew = true;
-                }
-            }
-            if grew {
-                for &u in &users[r] {
-                    if inq.insert(u) {
-                        wl.push_back(u);
-                    }
-                }
-            }
+            inq.insert(i);
+            wl.push_back(i);
         }
     }
+    propagate(func, &users, &mut from_bytes, wl, inq, None);
 
     // Per-slot use positions and live interval [lo, hi] (`u32::MAX` hi is
     // normalized to `last` afterwards).
@@ -237,14 +282,194 @@ pub fn run(
             }
         }};
     }
+    // Escaping a pointer to `s` exposes `s`'s bytes — including pointers
+    // stored inside it — to whoever holds the escapee. Escape the whole
+    // contains-reach.
+    macro_rules! escape_deep {
+        ($c:expr, $s:expr, $i:expr) => {{
+            for s2 in $c[$s.index()].clone() {
+                escape!(s2, $i);
+            }
+        }};
+    }
     // (stored, container): `&stored` was written into `container`'s bytes.
     // A reload through the container can expose the pointer at any point
     // in the container's live range, so the stored slot's interval must
     // contain the container's — still bounded when the container is.
     let mut edges: FxHashSet<(StackSlot, StackSlot)> = FxHashSet::default();
-    // (src, dst): memcpy/memmove copied src's bytes into dst, so pointers
+    // (src, dst): src's byte image was copied into dst — a `memcpy`/
+    // `memmove` libcall or an aggregate load/store move — so pointers
     // contained in src are now contained in dst as well.
-    let mut cpy: Vec<(StackSlot, StackSlot)> = Vec::new();
+    let mut cpy: FxHashSet<(StackSlot, StackSlot)> = FxHashSet::default();
+    // contains[d] = slots a pointer reloaded out of d's bytes may name:
+    // d itself, every slot whose pointer was stored into d, and the
+    // closure through byte-copies.
+    let mut contains: Vec<FxHashSet<StackSlot>> = (0..nslots)
+        .map(|s| [StackSlot::from_u32(s as u32)].into_iter().collect())
+        .collect();
+
+    // The prepass edges are built from `derived`, and `derived` gains
+    // entries once load results resolve through `contains` — a reloaded
+    // pointer's pointee is only known after the pointer was stored —
+    // so iterate the three to a joint fixpoint. All inserts are
+    // monotone; a pathological function that fails to converge still
+    // exits soundly (unmerged is always safe).
+    for round in 0..8 {
+        let mut grew = 0usize;
+        for &b in &order {
+            for i in func.layout.block_insts(b) {
+                let d = &func.dfg.insts[i];
+                let op = d.opcode();
+                let args = func.dfg.inst_args(i).to_vec();
+                let aslot = |k: usize| -> &[StackSlot] {
+                    args.get(k)
+                        .map(|&a| derived[func.dfg.resolve_aliases(a)].as_slice())
+                        .unwrap_or(&[])
+                };
+                if op.is_call() {
+                    let info =
+                        d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
+                    if let CallInfo::Direct(fr, cargs)
+                    | CallInfo::DirectWithSig(fr, _, cargs) = info
+                    {
+                        use cranelift_codegen::ir::{ExternalName, LibCall};
+                        if cargs.len() >= 2
+                            && matches!(
+                                func.dfg.ext_funcs[fr].name,
+                                ExternalName::LibCall(LibCall::Memcpy)
+                                    | ExternalName::LibCall(LibCall::Memmove)
+                            )
+                        {
+                            for &x in &derived[func.dfg.resolve_aliases(cargs[1])] {
+                                for &d2 in &derived[func.dfg.resolve_aliases(cargs[0])] {
+                                    if x != d2 {
+                                        grew += cpy.insert((x, d2)) as usize;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if op.can_store() {
+                    match op {
+                        Opcode::Store
+                        | Opcode::Istore8
+                        | Opcode::Istore16
+                        | Opcode::Istore32
+                        | Opcode::AtomicStore => {
+                            let dst: Vec<StackSlot> = aslot(1).to_vec();
+                            for &s in aslot(0) {
+                                for &d2 in &dst {
+                                    if s != d2 {
+                                        grew += edges.insert((s, d2)) as usize;
+                                    }
+                                }
+                            }
+                            for &s in &from_bytes[func.dfg.resolve_aliases(args[0])] {
+                                for &d2 in &dst {
+                                    if s != d2 {
+                                        grew += cpy.insert((s, d2)) as usize;
+                                    }
+                                }
+                            }
+                        }
+                        Opcode::AtomicRmw | Opcode::AtomicCas => {
+                            let dst: Vec<StackSlot> = aslot(0).to_vec();
+                            for k in 1..args.len() {
+                                for &s in aslot(k) {
+                                    for &d2 in &dst {
+                                        if s != d2 {
+                                            grew += edges.insert((s, d2)) as usize;
+                                        }
+                                    }
+                                }
+                                for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
+                                {
+                                    for &d2 in &dst {
+                                        if s != d2 {
+                                            grew += cpy.insert((s, d2)) as usize;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // `contains` fixpoint: direct stored pointers plus the
+        // transitive closure over byte-copies.
+        loop {
+            let mut changed = false;
+            for &(s, d) in &edges {
+                if contains[d.index()].insert(s) {
+                    changed = true;
+                }
+            }
+            for &(x, d) in &cpy {
+                let add: Vec<StackSlot> = contains[x.index()].iter().copied().collect();
+                for s in add {
+                    if contains[d.index()].insert(s) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // A load result may hold the address of any slot the source's
+        // bytes contain — the reconstituted pointer attributes its
+        // uses to the pointee, not the container.
+        let mut wl2: VecDeque<Inst> = VecDeque::new();
+        let mut inq2: FxHashSet<Inst> = FxHashSet::default();
+        for &b in &order {
+            for i in func.layout.block_insts(b) {
+                if !func.dfg.insts[i].opcode().can_load() {
+                    continue;
+                }
+                let Some(&a) = func.dfg.inst_args(i).first() else {
+                    continue;
+                };
+                let mut acc: Vec<StackSlot> = Vec::new();
+                for &s0 in &derived[func.dfg.resolve_aliases(a)] {
+                    if !acc.contains(&s0) {
+                        acc.push(s0);
+                    }
+                    for &s in &contains[s0.index()] {
+                        if !acc.contains(&s) {
+                            acc.push(s);
+                        }
+                    }
+                }
+                for &r in func.dfg.inst_results(i) {
+                    let r = func.dfg.resolve_aliases(r);
+                    let mut grew2 = false;
+                    for &s in &acc {
+                        if !derived[r].contains(&s) {
+                            derived[r].push(s);
+                            grew2 = true;
+                            grew += 1;
+                        }
+                    }
+                    if grew2 {
+                        for &u in &users[r] {
+                            if inq2.insert(u) {
+                                wl2.push_back(u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        propagate(func, &users, &mut derived, wl2, inq2, Some(&contains));
+        if grew == 0 {
+            break;
+        }
+        if round == 7 {
+            return 0;
+        }
+    }
     let use_at = |iv: &mut Vec<(u32, u32)>, uses: &mut Vec<Vec<u32>>, s: StackSlot, p: u32| {
         uses[s.index()].push(p);
         let e = &mut iv[s.index()];
@@ -280,7 +505,7 @@ pub fn run(
                             for k in 0..args.len() {
                                 for &s in arg_slots(k) {
                                     use_at(&mut iv, &mut uses, s, pos);
-                                    escape!(s, i);
+                                    escape_deep!(contains, s, i);
                                 }
                             }
                         }
@@ -311,24 +536,15 @@ pub fn run(
                                         nowrite.get(&fr) == Some(&true)
                                     };
                                     // libc mem* copies through the pointers
-                                    // but never retains them. memcpy/
-                                    // memmove also duplicate the src
-                                    // region's contents into dst, so
-                                    // contained pointers flow dst-ward.
+                                    // but never retains them (the copy
+                                    // edges are collected in the prepass).
                                     use cranelift_codegen::ir::{ExternalName, LibCall};
-                                    let (nokeep, copy) = match func.dfg.ext_funcs[fr].name {
+                                    let nokeep = matches!(
+                                        func.dfg.ext_funcs[fr].name,
                                         ExternalName::LibCall(LibCall::Memcpy)
-                                        | ExternalName::LibCall(LibCall::Memmove) => (true, true),
-                                        ExternalName::LibCall(LibCall::Memset) => (true, false),
-                                        _ => (false, false),
-                                    };
-                                    if copy && cargs.len() >= 2 {
-                                        for &x in &derived[func.dfg.resolve_aliases(cargs[1])] {
-                                            for &d in &derived[func.dfg.resolve_aliases(cargs[0])] {
-                                                cpy.push((x, d));
-                                            }
-                                        }
-                                    }
+                                            | ExternalName::LibCall(LibCall::Memmove)
+                                            | ExternalName::LibCall(LibCall::Memset)
+                                    );
                                     for (k, &a) in cargs.iter().enumerate() {
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
@@ -340,7 +556,7 @@ pub fn run(
                                                 && !(sret && k == 0)
                                                 && !nocap.contains(&(i, k as u32))
                                             {
-                                                escape!(s, i);
+                                                escape_deep!(contains, s, i);
                                             }
                                         }
                                     }
@@ -350,7 +566,7 @@ pub fn run(
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
                                             if !nocap.contains(&(i, k as u32)) {
-                                                escape!(s, i);
+                                                escape_deep!(contains, s, i);
                                             }
                                         }
                                     }
@@ -379,13 +595,16 @@ pub fn run(
                             for &s in arg_slots(0) {
                                 use_at(&mut iv, &mut uses, s, pos);
                                 if dst.is_empty() {
-                                    escape!(s, i);
-                                } else {
-                                    for &d in &dst {
-                                        if d != s {
-                                            edges.insert((s, d));
-                                        }
-                                    }
+                                    escape_deep!(contains, s, i);
+                                }
+                            }
+                            if dst.is_empty() {
+                                // A stored byte image leaks every pointer
+                                // it carried — the container itself is
+                                // only a use when the image lands in a
+                                // tracked slot (copy edge covers it).
+                                for &s in &from_bytes[func.dfg.resolve_aliases(args[0])] {
+                                    escape_deep!(contains, s, i);
                                 }
                             }
                             for &s in arg_slots(1) {
@@ -402,13 +621,13 @@ pub fn run(
                                 for &s in arg_slots(k) {
                                     use_at(&mut iv, &mut uses, s, pos);
                                     if dst.is_empty() {
-                                        escape!(s, i);
-                                    } else {
-                                        for &d in &dst {
-                                            if d != s {
-                                                edges.insert((s, d));
-                                            }
-                                        }
+                                        escape_deep!(contains, s, i);
+                                    }
+                                }
+                                if dst.is_empty() {
+                                    for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
+                                    {
+                                        escape_deep!(contains, s, i);
                                     }
                                 }
                             }
@@ -429,14 +648,14 @@ pub fn run(
                     for k in 1..args.len() {
                         for &s in arg_slots(k) {
                             use_at(&mut iv, &mut uses, s, pos);
-                            escape!(s, i);
+                            escape_deep!(contains, s, i);
                         }
                     }
                 } else if op.other_side_effects() || op.is_terminator() {
                     for k in 0..args.len() {
                         for &s in arg_slots(k) {
                             use_at(&mut iv, &mut uses, s, pos);
-                            escape!(s, i);
+                            escape_deep!(contains, s, i);
                         }
                     }
                 } else {
@@ -464,7 +683,7 @@ pub fn run(
                         for k in 0..args.len() {
                             for &s in arg_slots(k) {
                                 use_at(&mut iv, &mut uses, s, pos);
-                                escape!(s, i);
+                                escape_deep!(contains, s, i);
                             }
                         }
                     }
@@ -534,32 +753,27 @@ pub fn run(
         }
     }
 
-    // Container edges: `&s` stored into `d`'s bytes stays reachable for
-    // `d`'s whole live range, so `s`'s interval must contain `d`'s.
-    // memcpy/memmove copy edges duplicate contained pointers dst-ward.
-    // Iterate to a fixpoint — chains and cycles both converge.
+    // `contains` is closed over stores and byte-copies: a slot reachable
+    // through another's bytes stays reachable for that container's whole
+    // live range, so its interval must contain the container's. (The
+    // store/copy edges were gathered before the scan; `contains` is the
+    // fixpoint's result — iterate just the interval extension since
+    // growing `d`'s range can widen `s`'s in turn.)
     loop {
         let mut changed = false;
-        for &(x, d) in &cpy {
-            let add: Vec<StackSlot> = edges
-                .iter()
-                .filter_map(|&(s, c)| (c == x && s != d).then_some(s))
-                .collect();
-            for s in add {
-                changed |= edges.insert((s, d));
-            }
-        }
-        for &(s, d) in &edges {
-            let (dlo, dhi) = iv[d.index()];
-            let e = &mut iv[s.index()];
-            if e.0 != u32::MAX {
-                if e.0 > dlo {
-                    e.0 = dlo;
-                    changed = true;
-                }
-                if e.1 < dhi {
-                    e.1 = dhi;
-                    changed = true;
+        for d in 0..nslots {
+            let (dlo, dhi) = iv[d];
+            for &s in &contains[d] {
+                let e = &mut iv[s.index()];
+                if e.0 != u32::MAX {
+                    if e.0 > dlo {
+                        e.0 = dlo;
+                        changed = true;
+                    }
+                    if e.1 < dhi {
+                        e.1 = dhi;
+                        changed = true;
+                    }
                 }
             }
         }
