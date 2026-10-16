@@ -330,6 +330,10 @@ fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
         let el = t0.elapsed();
         println!("rep {r}: {el:.2?} over {} fns", corpus.len());
         if r + 1 == reps {
+            println!(
+                "  analysis builds: cfg={} dt={} la={}",
+                stats.cfg_builds, stats.dt_builds, stats.la_builds
+            );
             let mut rows: Vec<_> = stats.timing.iter().collect();
             rows.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
             for (n, d) in rows.iter().take(24) {

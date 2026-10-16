@@ -1570,7 +1570,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale:
         let m = run_loop(func, cfg, dt, la, lp, debug, amode_scale);
         n += m;
         if m > 0 {
-            an.invalidate();
+            an.invalidate(func);
         }
     }
     n

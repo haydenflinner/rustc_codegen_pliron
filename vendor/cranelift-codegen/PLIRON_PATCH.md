@@ -553,3 +553,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     were hitting `spec_from_iter_nested` growth — a ~1% leaf —
     because the linked-list iterators reported `(0, None)`. The serde
     round-trip rebuilds counts through the public insert path.
+
+46. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
+    now also assigns each loop an Euler-tour interval `[tin, tout)` over
+    the loop forest (`assign_loop_intervals`); `is_in_loop` tests
+    `tin[lp] <= tin[innermost(block)] < tout[lp]` instead of finger-
+    walking the parent chain. The opt pipeline calls it per
+    (loop, block) pair inside `layout.blocks()` filters — O(loops ×
+    blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
+    profile.

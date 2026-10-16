@@ -41,7 +41,7 @@ pub fn run(
                 n += 1;
                 // Edge splits/clones rewired the CFG — the next candidate's
                 // reads must see the new shape.
-                an.invalidate();
+                an.invalidate(func);
             }
         }
     }

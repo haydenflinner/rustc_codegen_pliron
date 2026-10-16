@@ -2476,7 +2476,7 @@ pub fn run(
             // `apply`/`apply_dead` rewired the CFG — refresh analyses
             // before the next conversion rather than letting `plan`
             // see stale dominance/latches.
-            an.invalidate();
+            an.invalidate(func);
             continue 'outer;
         }
         break;
