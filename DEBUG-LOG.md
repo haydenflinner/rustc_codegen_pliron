@@ -104,3 +104,27 @@ Still TODO / open questions:
 - benchmark under CRTFREE runs clean end-to-end; perf deltas unchanged
   (strwork -30% faster, sortw +20% slower vs LLVM baseline)
 - the `loadfwd` CGU=1 ICE noted earlier remains open
+
+## 2026-02 wasm clif-path audit (fuzzer-driven)
+
+- `ctz_nonzero` unary op unhandled on the wasm CLIF path — stubbed
+  `core::mem::alignment::Alignment::fmt`. Plain `ctz` lowering is a
+  superset (the nonzero guarantee only skips the zero case). Fixed.
+- `binop()` tagged comparison results with the operand container (i64) —
+  `minmax`/`addc`/`overflow` flags then saw I64 and wrapped an already-i32
+  value (`i32.wrap_i64` on an `i64.lt_s` result; invalid module, seed-1
+  k28). Added `cbinop` (result always i32) at all comparison sites.
+- Shift/rotate amounts: CLIF `ushr.i32` may carry an `i64` amount
+  (`iconst.i64 29` from bounds-check folding); wasm `i32.shr_u` requires
+  both operands i32. `cvt()` the amount to the value's container in
+  ishl/ushr/sshr/rot. Fixed seed-7/11 invalid-module failures.
+- Added `PLIRON_WASM_DUMP=<substr>` — dumps the final waffle body to
+  `pliron::dump` (the `PLIRON_WASM_LOOPS` knob only brackets loopopt).
+- fuzz.sh seeds 1,2,7,11,17,23,42,99 × 40 kernels all green; simd.sh
+  34/34; real.sh 0 mismatches both wasm and native.
+- real.sh perf (wasm, pliron vs llvm geomean 2.38x slower):
+  sort 4.1x, sort_stable 5.2x, bsearch 4.3x — sort/search code is the
+  weak spot. Native: matmul 10.5x, bsearch 5.6x; sha256/base64 ~2-3x.
+  Uninvestigated — likely missing x64 codegen quality (no pattern
+  matching strength?) or an opt-pipeline gap. TODO: profile one of
+  these (matmul is the cleanest target).
