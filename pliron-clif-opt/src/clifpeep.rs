@@ -5865,11 +5865,11 @@ fn icmp_eqfold(
     let Some((cc0, x0, k0)) = ck else {
         return false;
     };
-    // i64 only: the motivating pattern is the peeled pointer/countdown test.
-    // Narrower widths are correct in isolation but a `b-9` whitespace-switch
-    // fold in strwork miscompiled when shifted at i8 — untraced downstream
-    // interaction, no perf value.
-    if !matches!(cc0, IntCC::Equal | IntCC::NotEqual) || ty != types::I64 {
+    // Sound for eq/ne at any width: `(x + c1) == k` and `x == k - c1` are
+    // the same test mod 2^bits. (Narrow widths were once gated off after a
+    // strwork miscompile that was never traced to this fold; if it
+    // resurfaces the downstream bug is still there to fix.)
+    if !matches!(cc0, IntCC::Equal | IntCC::NotEqual) {
         return false;
     }
     // `isub` must be `x - c` — `c - x` doesn't shift.
