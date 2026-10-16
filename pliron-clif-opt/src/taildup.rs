@@ -40,15 +40,15 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
             || op.is_branch()
             || op.is_terminator()
         {
-            if crate::env_set("PLIRON_TDDBG") {
-                eprintln!("taildup: cand {b} impure {i} (fn {})", func.name);
+            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::taildup", "taildup: cand {b} impure {i} (fn {})", func.name);
             }
             return false;
         }
         n += 1;
     }
-    if n > MAX_INSTS && crate::env_set("PLIRON_TDDBG") {
-        eprintln!("taildup: cand {b} too-big {n} (fn {})", func.name);
+    if n > MAX_INSTS && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::taildup", "taildup: cand {b} too-big {n} (fn {})", func.name);
     }
     n <= MAX_INSTS
 }
@@ -72,11 +72,11 @@ fn use_blocks(func: &Function, domtree: &DominatorTree) -> FxHashMap<Value, Opti
 
 /// No parameter or result of `b` is used outside `b` (so copies need no SSA repair).
 fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
-    let dbg = crate::env_set("PLIRON_TDDBG");
+    let dbg = tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG);
     let ok = |v: &Value| {
         let good = uses.get(v).is_none_or(|&u| u == Some(b));
         if dbg && !good {
-            eprintln!("taildup: cand {b} escapes {v} (fn {})", func.name);
+            tracing::debug!(target: "pliron::taildup", "taildup: cand {b} escapes {v} (fn {})", func.name);
         }
         good
     };
@@ -137,12 +137,7 @@ fn flip_inst(
 }
 
 /// Every value `r` uses from outside `r` is available at the end of `p`.
-pub(crate) fn outer_dominate(
-    func: &Function,
-    domtree: &DominatorTree,
-    r: Block,
-    p: Block,
-) -> bool {
+pub(crate) fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block, p: Block) -> bool {
     func.layout.block_insts(r).all(|i| {
         func.dfg.inst_values(i).all(|v| {
             let def = match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
@@ -262,8 +257,10 @@ pub fn run(func: &mut Function) -> usize {
             } else {
                 ""
             };
-            if crate::env_set("PLIRON_TDDBG") && !why.is_empty() {
-                eprintln!("taildup: skip {p}->{r} edge {di}: {why} (fn {})", func.name);
+            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+                && !why.is_empty()
+            {
+                tracing::debug!(target: "pliron::taildup", "taildup: skip {p}->{r} edge {di}: {why} (fn {})", func.name);
             }
             if !why.is_empty() {
                 continue;
@@ -273,11 +270,12 @@ pub fn run(func: &mut Function) -> usize {
             // `r` loses its last pred and is removed (quicksort's
             // `brif .., block68(a,b), block1191(param68,param68)` case).
             let uses_r_defs = {
-                let mut defs: FxHashSet<Value> =
-                    func.dfg.block_params(r).iter().copied().collect();
-                defs.extend(func.layout.block_insts(r).flat_map(|i| {
-                    func.dfg.inst_results(i).iter().copied().collect::<Vec<_>>()
-                }));
+                let mut defs: FxHashSet<Value> = func.dfg.block_params(r).iter().copied().collect();
+                defs.extend(
+                    func.layout
+                        .block_insts(r)
+                        .flat_map(|i| func.dfg.inst_results(i).iter().copied().collect::<Vec<_>>()),
+                );
                 func.layout.block_insts(p).any(|i| {
                     func.dfg
                         .inst_values(i)
@@ -320,8 +318,8 @@ pub fn run(func: &mut Function) -> usize {
             if !ok {
                 continue;
             }
-            if crate::env_set("PLIRON_TDDBG") {
-                eprintln!("taildup: clone {r} into {p} edge {di} (fn {})", func.name);
+            if tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::taildup", "taildup: clone {r} into {p} edge {di} (fn {})", func.name);
             }
             let body: Vec<_> = func.layout.block_insts(r).collect();
             let alias: FxHashMap<Value, Value> = body

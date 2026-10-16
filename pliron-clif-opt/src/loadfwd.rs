@@ -268,9 +268,7 @@ fn pmroots(
                     }
                 }
             }
-            if ok
-                && let Some((r, m)) = acc
-            {
+            if ok && let Some((r, m)) = acc {
                 pm.insert(p, (r, m));
                 changed = true;
             }
@@ -380,9 +378,7 @@ pub fn kill(
             _ => {
                 shel(&r)
                     || shel(&r2)
-                    || ms.is_some_and(|(mr, mo)| {
-                        mr == r2 && mo >= o2 + i64::from(t2.bytes())
-                    })
+                    || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes()))
             }
         }
     });
@@ -511,8 +507,7 @@ pub fn isolated_escapes(
                             noalias,
                             psrc(ps, noalias, func, func.dfg.block_params(dst)[pos]),
                         )
-                        .0
-                            == r
+                        .0 == r
                     })
                 };
                 let ok = match data {
@@ -670,9 +665,8 @@ fn transfer(
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let off0 = o0.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
-                if crate::env_set("PLIRON_LFDEBUG") {
-                    eprintln!(
-                        "load {res} arg {arg} root {r:?} off {off} av={:?}",
+                if tracing::enabled!(target: "pliron::loadfwd", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "pliron::loadfwd", "load {res} arg {arg} root {r:?} off {off} av={:?}",
                         av.get(&loc)
                     );
                 }
@@ -845,7 +839,7 @@ pub fn run(
         post.reverse();
         post
     };
-    let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
+    let prof2 = tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
@@ -887,15 +881,15 @@ pub fn run(
     let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
         if func.name.to_string().contains(&f) {
-            eprintln!("lf-debug {}: iso={:?} ncc={:?} escapes={:?}", func.name, iso, ncc, _escapes);
+            tracing::debug!(target: "pliron::loadfwd", "lf-debug {}: iso={:?} ncc={:?} escapes={:?}", func.name, iso, ncc, _escapes);
         }
     }
     if prof2 {
-        eprintln!("    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+        tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
     }
     let tt = |name: &str, t0: std::time::Instant| {
         if prof2 {
-            eprintln!("    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+            tracing::info!(target: "pliron::loadfwd", "    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
     };
     if crate::pass_enabled("PLIRON_LOADPRE") {
@@ -974,8 +968,7 @@ pub fn run(
         }
     }
     if prof2 {
-        eprintln!(
-            "    lf-fxpt {:.3}ms (iters={iters})",
+        tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
             t0.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -1465,8 +1458,7 @@ fn pre(
     // out of a pred's `end` — poison those pairs (and, transitively, pairs
     // whose arg would be a poisoned param) and roll their params back out
     // rather than violate edge-arg arity.
-    let mut resolved: FxHashMap<(Block, Loc), Vec<(Block, Inst, Value)>> =
-        FxHashMap::default();
+    let mut resolved: FxHashMap<(Block, Loc), Vec<(Block, Inst, Value)>> = FxHashMap::default();
     let mut dead: FxHashSet<(Block, Loc)> = FxHashSet::default();
     let mut k = 0;
     while k < pre.pending.len() {
@@ -1475,8 +1467,7 @@ fn pre(
         if resolved.contains_key(&(b, loc)) {
             continue;
         }
-        let mut pinsts: Vec<(Block, Inst)> =
-            cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
+        let mut pinsts: Vec<(Block, Inst)> = cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
         pinsts.sort_unstable();
         pinsts.dedup();
         let mut args: Vec<(Block, Inst, Value)> = Vec::with_capacity(pinsts.len());
@@ -1622,10 +1613,10 @@ pub fn dead_slot_stores(func: &mut Function) -> usize {
 mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::InstBuilder;
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
-    use cranelift_codegen::ir::InstBuilder;
     use cranelift_codegen::isa::CallConv;
 
     /// `p` fed `base + 8` on the entry edge and `p + 16` on the back
@@ -1666,15 +1657,13 @@ mod tests {
         let done = cur.ins().icmp(IntCC::Equal, p2, q);
         // `q`'s back edge carries a foreign root — `q` must stay
         // unsolved even though its other edge matches `p`'s bound.
-        cur.ins().brif(
-            done,
-            tail,
-            &[q.into()],
-            head,
-            &[p2.into(), other.into()],
-        );
+        cur.ins()
+            .brif(done, tail, &[q.into()], head, &[p2.into(), other.into()]);
 
-        FuncCursor::new(&mut func).at_bottom(tail).ins().return_(&[r]);
+        FuncCursor::new(&mut func)
+            .at_bottom(tail)
+            .ins()
+            .return_(&[r]);
 
         let pf = crate::proots::facts(&func);
         let ps = crate::proots::alias_of(&pf);

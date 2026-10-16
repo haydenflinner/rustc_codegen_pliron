@@ -226,9 +226,9 @@ pub fn run(ctx: &Context, st: &mut State) {
             (!on_return.contains(&f)).then(|| (s.clone(), !strict.contains(&f)))
         }))
         .collect();
-    if crate::env_set("PLIRON_STATS") {
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let strict = nw.values().filter(|&&v| v).count() - LIBC.len();
-        eprintln!(
+        tracing::info!(target: "pliron::stats",
             "nowrite {}: {} of {} bodies write-free, {} more on return",
             st.cgu,
             strict,

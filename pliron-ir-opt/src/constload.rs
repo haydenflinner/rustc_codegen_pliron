@@ -153,7 +153,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             n += 1;
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("constload {}: {n} loads folded", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "constload {}: {n} loads folded", st.cgu);
     }
 }

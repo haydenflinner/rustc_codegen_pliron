@@ -120,7 +120,7 @@ pub fn run(ctx: &mut Context, st: &State) {
             }
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("phisimp {}: {n} block args removed", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats","phisimp {}: {n} block args removed", st.cgu);
     }
 }

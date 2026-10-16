@@ -391,9 +391,7 @@ impl<'a> NonNull<'a> {
             let Some(t) = func.layout.last_inst(b) else {
                 continue;
             };
-            for (ei, bc) in func
-                .dfg
-                .insts[t]
+            for (ei, bc) in func.dfg.insts[t]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 .into_iter()
                 .enumerate()
@@ -406,17 +404,14 @@ impl<'a> NonNull<'a> {
                     if !nn.params.contains(&p) {
                         continue;
                     }
-                    let args = args.get_or_insert_with(|| {
-                        bc.args(&func.dfg.value_lists).collect()
-                    });
+                    let args = args.get_or_insert_with(|| bc.args(&func.dfg.value_lists).collect());
                     let Some(&BlockArg::Value(v)) = args.get(i) else {
                         evict.push(p);
                         continue;
                     };
                     let v = func.dfg.resolve_aliases(v);
                     deps.clear();
-                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo)
-                    {
+                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
                         dependents_entry(&mut dependents, &deps, checks.len());
                         checks.push(Chk {
                             p,
@@ -434,12 +429,16 @@ impl<'a> NonNull<'a> {
         memo = None;
         let mut dead: FxHashSet<Value> = FxHashSet::default();
         while let Some(q) = evict.pop() {
-            if std::env::var_os("PLIRON_NN_DEBUG").is_some() {
-                eprintln!("nn evict {q}");
-            }
+            tracing::trace!(target: "pliron::jumpthread", "nn evict {q}");
             nn.params.remove(&q);
             dead.insert(q);
-            for ci in dependents.get(&q).into_iter().flatten().copied().collect::<Vec<_>>() {
+            for ci in dependents
+                .get(&q)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+            {
                 let c = &mut checks[ci];
                 if dead.contains(&c.p) {
                     continue;
@@ -1322,9 +1321,7 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
                 for v in func.dfg.inst_values(i) {
-                    uses.entry(func.dfg.resolve_aliases(v))
-                        .or_default()
-                        .push(i);
+                    uses.entry(func.dfg.resolve_aliases(v)).or_default().push(i);
                 }
             }
         }
@@ -1343,8 +1340,7 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
             let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[term] else {
                 continue;
             };
-            let Some(icmp_inst) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
-            else {
+            let Some(icmp_inst) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst() else {
                 continue;
             };
             let InstructionData::IntCompare {
@@ -1574,16 +1570,15 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
                         .map_inst_values(u, |v| repl_map.get(&v).copied().unwrap_or(v));
                 }
             }
-            if crate::env_set("PLIRON_SELTEST_DBG") {
-                eprintln!(
-                    "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
-                    in_k.len(),
-                    in_x.len(),
-                    kargs.len(),
-                    xargs_t.len(),
-                    xargs_f.len()
-                );
-            }
+            tracing::debug!(
+                target: "pliron::jumpthread",
+                "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
+                in_k.len(),
+                in_x.len(),
+                kargs.len(),
+                xargs_t.len(),
+                xargs_f.len()
+            );
             // Splice `mid` in and re-point `b`'s brif at it. `blocks[0]`
             // is the cond-true arm: `k_target` when `cond == Equal`.
             let (t_blk, f_blk) = if cond == IntCC::Equal {
@@ -1738,7 +1733,17 @@ fn map_val(
     for a in args {
         let a = func.dfg.resolve_aliases(a);
         let mut tmp = Vec::with_capacity(1);
-        if !map_val(func, argv, body_vals, env, dom, pinst, a, &mut tmp, depth - 1) {
+        if !map_val(
+            func,
+            argv,
+            body_vals,
+            env,
+            dom,
+            pinst,
+            a,
+            &mut tmp,
+            depth - 1,
+        ) {
             return false;
         }
         subs.push(tmp.pop().unwrap());
@@ -1751,7 +1756,10 @@ fn map_val(
 fn emit_arg(func: &mut Function, pinst: Inst, a: &Arg) -> Value {
     match a {
         Arg::V(v) => *v,
-        Arg::K(k, ty) => FuncCursor::new(func).at_inst(pinst).ins().iconst(*ty, *k as i64),
+        Arg::K(k, ty) => FuncCursor::new(func)
+            .at_inst(pinst)
+            .ins()
+            .iconst(*ty, *k as i64),
         Arg::R(di, subs) => {
             let vals: Vec<Value> = subs.iter().map(|s| emit_arg(func, pinst, s)).collect();
             let ni = func.dfg.clone_inst(*di);
@@ -1863,7 +1871,7 @@ pub(crate) fn round<'a>(
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
     let bodyk = crate::pass_enabled("PLIRON_BODYK");
-    let dbg = std::env::var_os("PLIRON_JT_DEBUG").is_some();
+    let dbg = tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let def_block = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
         ValueDef::Param(b, _) => Some(b),
@@ -2026,14 +2034,14 @@ pub(crate) fn round<'a>(
                     None => continue,
                 };
                 if dbg {
-                    eprintln!(
+                    tracing::debug!(target: "pliron::jumpthread",
                         "jt take {pblock}->{b}->{s_tag} cond={cond} env={env:?} pn={pn:?} kenv={kenv:?} prange={prange:?} taken={taken}",
                         s_tag = if taken { "T" } else { "F" }
                     );
                     if let Some(di) = func.dfg.value_def(cond).inst() {
                         for v in func.dfg.inst_args(di) {
                             let r = func.dfg.resolve_aliases(*v);
-                            eprintln!(
+                            tracing::debug!(target: "pliron::jumpthread",
                                 "  jt arg {r}: loads={} params={} derived={:?}",
                                 nnr.loads.contains(&r),
                                 nnr.params.contains(&r),
@@ -2047,7 +2055,7 @@ pub(crate) fn round<'a>(
                 let s = t.block(&func.dfg.value_lists);
                 if s == b || locked.contains(&s) {
                     if dbg {
-                        eprintln!("jt skip {b}->{s}: self/locked");
+                        tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: self/locked");
                     }
                     continue;
                 }
@@ -2057,7 +2065,7 @@ pub(crate) fn round<'a>(
                     .clone()
                 else {
                     if dbg {
-                        eprintln!("jt skip {b}->{s}: region>MAX_WALK");
+                        tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: region>MAX_WALK");
                     }
                     continue;
                 };
@@ -2092,10 +2100,8 @@ pub(crate) fn round<'a>(
                     let mut okr = true;
                     for pr in cfg.pred_iter(s) {
                         let q = pr.inst;
-                        let qdests = func.dfg.insts[q].branch_destination(
-                            &func.dfg.jump_tables,
-                            &func.dfg.exception_tables,
-                        );
+                        let qdests = func.dfg.insts[q]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
                         for (dj, qbc) in qdests.iter().enumerate() {
                             if qbc.block(&func.dfg.value_lists) != s || (q == term && dj == ti) {
                                 continue;
@@ -2125,7 +2131,7 @@ pub(crate) fn round<'a>(
                     }
                     if !okr {
                         if dbg {
-                            eprintln!("jt skip {b}->{s} from {pblock}: extra edge can't supply exports");
+                            tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s} from {pblock}: extra edge can't supply exports");
                         }
                         continue;
                     }
@@ -2146,7 +2152,7 @@ pub(crate) fn round<'a>(
                             .all(|&x| domtree.block_dominates(s, x)))
                 {
                     if dbg {
-                        eprintln!(
+                        tracing::debug!(target: "pliron::jumpthread",
                             "jt skip {b}->{s} from {pblock}: repair seen={}/{}/{} regseen={} dom={}",
                             seen.contains(&b),
                             seen.contains(&s),
@@ -2334,11 +2340,8 @@ pub(crate) fn round<'a>(
             for ((q, dj), es) in extra.iter().zip(&e.eargs) {
                 let dest_ok = {
                     let dfg = &func.dfg;
-                    dfg.insts[*q].branch_destination(
-                        &dfg.jump_tables,
-                        &dfg.exception_tables,
-                    )[*dj]
-                    .block(&dfg.value_lists)
+                    dfg.insts[*q].branch_destination(&dfg.jump_tables, &dfg.exception_tables)[*dj]
+                        .block(&dfg.value_lists)
                         == e.s
                 };
                 if !dest_ok {
@@ -2346,10 +2349,8 @@ pub(crate) fn round<'a>(
                 }
                 let vals: Vec<Value> = es.iter().map(|a| emit_arg(func, *q, a)).collect();
                 let dfg = &mut func.dfg;
-                let bc = &mut dfg.insts[*q].branch_destination_mut(
-                    &mut dfg.jump_tables,
-                    &mut dfg.exception_tables,
-                )[*dj];
+                let bc = &mut dfg.insts[*q]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[*dj];
                 for v in vals {
                     bc.append_argument(v, &mut dfg.value_lists);
                 }
@@ -2376,7 +2377,7 @@ pub(crate) fn round<'a>(
 /// Splice `jump`-only successors that have no other predecessor into their
 /// predecessor, so a merge block and its test end up in one block.
 pub fn merge_chains(func: &mut Function) {
-    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let prof = tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
@@ -2443,7 +2444,7 @@ pub fn merge_chains(func: &mut Function) {
         }
     }
     if prof {
-        eprintln!(
+        tracing::info!(target: "pliron::jumpthread",
             "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
             t0.elapsed(),
             t_cfg / 1_000_000,
@@ -2461,7 +2462,7 @@ pub fn merge_chains(func: &mut Function) {
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
 pub fn rebind_exports(func: &mut Function) -> usize {
-    let prof2 = crate::env_get("PLIRON_JT_PROF2").is_some();
+    let prof2 = tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
@@ -2469,7 +2470,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
     // walk instead of re-walking `inst_values` per use.
     let uses = crate::uses::Uses::new(func);
     if prof2 {
-        eprintln!(
+        tracing::info!(target: "pliron::jumpthread",
             "    rebind setup {:.3}ms",
             t0.elapsed().as_secs_f64() * 1e3
         );
@@ -2502,10 +2503,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             // Every edge into `s` must leave `y`'s terminator — `pred_iter`
             // counts instructions, so a brif with both arms on `s` still
             // qualifies (all its calls get args appended below).
-            if s == y
-                || !done.insert(s)
-                || !cfg.pred_iter(s).all(|e| e.inst == term)
-            {
+            if s == y || !done.insert(s) || !cfg.pred_iter(s).all(|e| e.inst == term) {
                 continue;
             }
             quals.push(s);
@@ -2555,15 +2553,12 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             if needed.len() > 8 {
                 continue;
             }
-            let insts: Vec<Inst> = needed
-                .iter()
-                .flat_map(|w| ws[w].iter().copied())
-                .collect();
+            let insts: Vec<Inst> = needed.iter().flat_map(|w| ws[w].iter().copied()).collect();
             edits.push((y, term, s, needed, insts));
         }
     }
     if prof2 {
-        eprintln!(
+        tracing::info!(target: "pliron::jumpthread",
             "    rebind scan {:.3}ms (edits={})",
             t0.elapsed().as_secs_f64() * 1e3,
             edits.len()
@@ -2589,10 +2584,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
             let to: FxHashMap<Value, Value> = func
                 .dfg
                 .inst_values(i)
-                .filter_map(|v| {
-                    repl.get(&func.dfg.resolve_aliases(v))
-                        .map(|&n| (v, n))
-                })
+                .filter_map(|v| repl.get(&func.dfg.resolve_aliases(v)).map(|&n| (v, n)))
                 .collect();
             if !to.is_empty() {
                 func.dfg
@@ -2617,7 +2609,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         }
     }
     if prof2 {
-        eprintln!("    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
+        tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3);
     }
     n
 }
@@ -2704,9 +2696,7 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
                 }
                 let okd = match func.dfg.value_def(v) {
                     ValueDef::Param(b, _) => {
-                        b == y
-                            || (func.layout.is_block_inserted(b)
-                                && dom.block_dominates(b, p))
+                        b == y || (func.layout.is_block_inserted(b) && dom.block_dominates(b, p))
                     }
                     ValueDef::Result(di, _) => {
                         func.layout.inst_block(di) == Some(y)
@@ -2763,17 +2753,18 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
                 map.insert(r, nr);
             }
         }
-        let sub = |bc: BlockCall, map: &FxHashMap<Value, Value>, func: &Function| -> Vec<BlockArg> {
-            bc.args(&func.dfg.value_lists)
-                .map(|a| match a {
-                    BlockArg::Value(v) => {
-                        let v = func.dfg.resolve_aliases(v);
-                        BlockArg::Value(*map.get(&v).unwrap_or(&v))
-                    }
-                    a => a,
-                })
-                .collect()
-        };
+        let sub =
+            |bc: BlockCall, map: &FxHashMap<Value, Value>, func: &Function| -> Vec<BlockArg> {
+                bc.args(&func.dfg.value_lists)
+                    .map(|a| match a {
+                        BlockArg::Value(v) => {
+                            let v = func.dfg.resolve_aliases(v);
+                            BlockArg::Value(*map.get(&v).unwrap_or(&v))
+                        }
+                        a => a,
+                    })
+                    .collect()
+            };
         let mut cur = FuncCursor::new(func).at_inst(term);
         let made = match cur.func.dfg.insts[yterm] {
             InstructionData::Jump { destination, .. } => {
@@ -2904,10 +2895,8 @@ fn bypass_forwarders(func: &mut Function) -> usize {
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 .len();
             for di in 0..ndest {
-                let bc = &func.dfg.insts[pinst].branch_destination(
-                    &func.dfg.jump_tables,
-                    &func.dfg.exception_tables,
-                )[di];
+                let bc = &func.dfg.insts[pinst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[di];
                 if bc.block(&func.dfg.value_lists) != b {
                     continue;
                 }
@@ -3337,7 +3326,11 @@ fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<
         let arg = func.dfg.resolve_aliases(arg);
         // One pass over the shared table: target -> (count, first index).
         let mut cnt: FxHashMap<Block, (u32, u64)> = FxHashMap::default();
-        for (k, c) in func.dfg.jump_tables[arms[0].1].as_slice().iter().enumerate() {
+        for (k, c) in func.dfg.jump_tables[arms[0].1]
+            .as_slice()
+            .iter()
+            .enumerate()
+        {
             let e = cnt.entry(c.block(pool)).or_default();
             e.0 += 1;
             e.1 = k as u64;
@@ -3373,7 +3366,11 @@ fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<
 }
 
 /// Facts holding throughout `b`: those of `b` and its dominators.
-pub(crate) fn facts_at(domtree: &DominatorTree, fact: &FxHashMap<Block, Cmp>, b: Block) -> Vec<Cmp> {
+pub(crate) fn facts_at(
+    domtree: &DominatorTree,
+    fact: &FxHashMap<Block, Cmp>,
+    b: Block,
+) -> Vec<Cmp> {
     let mut fs = Vec::new();
     if fact.is_empty() {
         return fs;
@@ -3558,10 +3555,7 @@ fn dominated_conds(
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
 /// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(
-    func: &mut Function,
-    dt: &DominatorTree,
-) -> Vec<(Value, Value)> {
+pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Value, Value)> {
     #[derive(Clone, Copy, PartialEq)]
     enum In {
         Unset,
@@ -3925,11 +3919,11 @@ pub fn run(
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
-    let prof = crate::env_set("PLIRON_JT_PROF");
+    let prof = tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
     let mut tp = std::time::Instant::now();
     merge_chains(func);
     if prof {
-        eprintln!("  merge_chains {:?}", tp.elapsed());
+        tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed());
         tp = std::time::Instant::now();
     }
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
@@ -3989,7 +3983,7 @@ pub fn run(
             check(func, "trivp");
         }
         if prof {
-            eprintln!("  trivp {:?}", tp.elapsed());
+            tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
         if deadp {
@@ -4002,7 +3996,7 @@ pub fn run(
             check(func, "deadp");
         }
         if prof {
-            eprintln!("  deadp {:?}", tp.elapsed());
+            tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
         let dc = if domcond {
@@ -4015,7 +4009,7 @@ pub fn run(
         dominated_folds += dc;
         check(func, "domcond");
         if prof {
-            eprintln!("  domcond {:?}", tp.elapsed());
+            tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
         // Select-diamond if-conversion feeds back: folded forwarders expose
@@ -4043,7 +4037,7 @@ pub fn run(
             cd = None;
         }
         if prof {
-            eprintln!("  ifconv+bypass {:?}", tp.elapsed());
+            tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
         let mut nn_opt = None;
@@ -4057,7 +4051,7 @@ pub fn run(
         round_quiet = rn == 0;
         check(func, "round");
         if prof {
-            eprintln!("  nn+round {:?}", tp.elapsed());
+            tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.elapsed());
         }
         if rn > 0 {
             cd = None;
@@ -4073,7 +4067,7 @@ pub fn run(
         }
     }
     if prof {
-        eprintln!("  loop-total {:?} (skips {round_skips})", tp.elapsed());
+        tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.elapsed());
         tp = std::time::Instant::now();
     }
     let fnn = match fnn_cur {
@@ -4081,7 +4075,7 @@ pub fn run(
         None => fold_null_tests(func, &NonNull::new(func, loads, derived)),
     };
     if prof {
-        eprintln!("  fold_null_tests {:?}", tp.elapsed());
+        tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.elapsed());
     }
     (total + fnn, dead_params, dominated_folds, pmap)
 }

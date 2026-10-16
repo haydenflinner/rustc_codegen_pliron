@@ -48,8 +48,8 @@ const MAX_GATHER: i64 = 2048;
 
 macro_rules! why {
     ($f:expr; $($t:tt)*) => {{
-        if crate::env_set("PLIRON_VEC_DEBUG") {
-            eprintln!("vec bail {}: {}", $f, format_args!($($t)*));
+        if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::loopvec", "vec bail {}: {}", $f, format_args!($($t)*));
         }
         return None;
     }};
@@ -1097,9 +1097,8 @@ fn plan(
     };
     let mut kinds = param_kinds(func, &info);
     upgrade_lagged(func, ps, &info, &mut kinds);
-    if crate::env_set("PLIRON_VEC_DEBUG") {
-        eprintln!(
-            "vec kinds {} {:?}: {:?}",
+    if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::loopvec", "vec kinds {} {:?}: {:?}",
             fname,
             info.h,
             kinds
@@ -1125,9 +1124,8 @@ fn plan(
             continue;
         }
         let p = func.dfg.block_params(info.h)[j];
-        if crate::env_set("PLIRON_VEC_DEBUG") {
-            eprintln!(
-                "vec reduc?: param {j} analyzing, {} latches",
+        if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} analyzing, {} latches",
                 info.latches.len()
             );
         }
@@ -1163,16 +1161,15 @@ fn plan(
                     continue;
                 }
                 let ValueDef::Result(i, _) = func.dfg.value_def(lv) else {
-                    if crate::env_set("PLIRON_VEC_DEBUG") {
-                        eprintln!("vec reduc?: param {j} leaf is {:?}", func.dfg.value_def(lv));
+                    if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                        tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} leaf is {:?}", func.dfg.value_def(lv));
                     }
                     ok = false;
                     break;
                 };
                 let Some((op, d, aux, cnd)) = upd_decomp(&mut cx, i, 0) else {
-                    if crate::env_set("PLIRON_VEC_DEBUG") {
-                        eprintln!(
-                            "vec reduc?: param {j} upd_decomp fails {}",
+                    if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                        tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} upd_decomp fails {}",
                             func.dfg.display_inst(i)
                         );
                     }
@@ -1181,9 +1178,8 @@ fn plan(
                 };
                 if let Some((pi, po, pd, paux, pc)) = &upd {
                     if !(*pi == i && *po == op && *pd == d && *paux == aux && *pc == cnd) {
-                        if crate::env_set("PLIRON_VEC_DEBUG") {
-                            eprintln!(
-                                "vec reduc?: param {j} second update {}",
+                        if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                            tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} second update {}",
                                 func.dfg.display_inst(i)
                             );
                         }
@@ -1200,8 +1196,8 @@ fn plan(
             }
         }
         if !ok {
-            if crate::env_set("PLIRON_VEC_DEBUG") {
-                eprintln!("vec reduc?: param {j} latch args not one update inst");
+            if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} latch args not one update inst");
             }
             other_ok = false;
             continue;
@@ -1210,8 +1206,8 @@ fn plan(
             // Every arm passed `acc` through (e.g. behind block
             // params) — effectively invariant, just not recognized.
             kinds[j] = Param::Inv;
-            if crate::env_set("PLIRON_VEC_DEBUG") {
-                eprintln!("vec reduc?: param {j} reclassified Inv");
+            if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} reclassified Inv");
             }
             continue;
         };
@@ -1307,8 +1303,8 @@ fn plan(
                         .then(|| (func.dfg.resolve_aliases(arg), invert))
                 });
             let Some(gc) = gc else {
-                if crate::env_set("PLIRON_VEC_DEBUG") {
-                    eprintln!("vec reduc?: param {j} CFG diamond has no gating brif");
+                if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} CFG diamond has no gating brif");
                 }
                 other_ok = false;
                 continue;
@@ -1367,20 +1363,19 @@ fn plan(
                         .all(|&r| !used.contains(&func.dfg.resolve_aliases(r))))
             });
         if bad_use || reducs.len() >= 2 {
-            if crate::env_set("PLIRON_VEC_DEBUG") {
+            if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
                 for &b in &info.body {
                     for i in func.layout.block_insts(b) {
                         if !allowed.contains(&i)
                             && func.dfg.inst_args(i).iter().any(|&a| is_acc_arg(a))
                         {
-                            eprintln!(
-                                "vec reduc?: param {j} extra use {}",
+                            tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use {}",
                                 func.dfg.display_inst(i)
                             );
                         }
                     }
                 }
-                eprintln!("vec reduc?: param {j} extra use");
+                tracing::debug!(target: "pliron::loopvec", "vec reduc?: param {j} extra use");
             }
             other_ok = false;
             continue;
@@ -1507,18 +1502,16 @@ fn plan(
             if !guard_pred(func, &info, &kinds, &c, e2, &mut ps) {
                 match early_cond(func, &info, e2) {
                     Some(ec) => {
-                        if crate::env_set("PLIRON_VEC_DEBUG") {
-                            eprintln!(
-                                "vec exit {} -> early_cond {ec:?}",
+                        if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                            tracing::debug!(target: "pliron::loopvec", "vec exit {} -> early_cond {ec:?}",
                                 func.dfg.display_inst(e2.inst)
                             );
                         }
                         es.push(ec);
                     }
                     None => {
-                        if crate::env_set("PLIRON_VEC_DEBUG") {
-                            eprintln!(
-                                "vec exit {} uncovered, kills count cand",
+                        if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+                            tracing::debug!(target: "pliron::loopvec", "vec exit {} uncovered, kills count cand",
                                 func.dfg.display_inst(e2.inst)
                             );
                         }
@@ -2081,8 +2074,13 @@ fn plan(
             // No wide lowering: widening forms beyond i16x16->i32x8
             // aren't representable in this CLIF, and mulhi lowers
             // through widening.
-            Opcode::Smulhi | Opcode::Umulhi | Opcode::Uextend | Opcode::Sextend
-            | Opcode::Ireduce | Opcode::Bswap | Opcode::Popcnt => true,
+            Opcode::Smulhi
+            | Opcode::Umulhi
+            | Opcode::Uextend
+            | Opcode::Sextend
+            | Opcode::Ireduce
+            | Opcode::Bswap
+            | Opcode::Popcnt => true,
             // No byte multiply; no qword multiply before AVX512DQ.
             Opcode::Imul => elem.bits() < 16 || elem == types::I64,
             // No byte/word variable shifts in AVX2.
@@ -2919,7 +2917,7 @@ fn widen_delta(
                 mask = Some(k);
                 d = func.dfg.resolve_aliases(nn);
             }
-            let dbg = crate::env_set("PLIRON_VEC_DEBUG");
+            let dbg = tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
             let (x, signed) = match ext_of(func, d, &mut ext_insts) {
                 Some(x) => x,
                 // `cnt += select(pred, 1, 0)` with no widening cast: the
@@ -2929,7 +2927,7 @@ fn widen_delta(
                 None if bools.contains(&d) || matches!(iconst(func, d), Some(0 | 1)) => (d, false),
                 None => {
                     if dbg {
-                        eprintln!("widen_delta: no ext in {d:?}");
+                        tracing::debug!(target: "pliron::loopvec", "widen_delta: no ext in {d:?}");
                     }
                     return false;
                 }
@@ -2943,7 +2941,7 @@ fn widen_delta(
                 let v = func.dfg.resolve_aliases(func.dfg.first_result(i));
                 if !uses_ok(func, v, &ok) {
                     if dbg {
-                        eprintln!("widen_delta: extra use of {}", func.dfg.display_inst(i));
+                        tracing::debug!(target: "pliron::loopvec", "widen_delta: extra use of {}", func.dfg.display_inst(i));
                     }
                     return false;
                 }
@@ -2956,7 +2954,7 @@ fn widen_delta(
                 let x_bool = bools.contains(&x) || matches!(iconst(func, x), Some(0 | 1));
                 if !x_bool || !matches!(mask, None | Some(1)) {
                     if dbg {
-                        eprintln!("widen_delta: {:?} not can_vec/bool", x);
+                        tracing::debug!(target: "pliron::loopvec", "widen_delta: {:?} not can_vec/bool", x);
                     }
                     return false;
                 }
@@ -2998,7 +2996,7 @@ fn widen_delta(
                                 .all(|&rr| bools.contains(&func.dfg.resolve_aliases(rr)))
                         {
                             if dbg {
-                                eprintln!("widen_delta: bool reader {}", func.dfg.display_inst(i));
+                                tracing::debug!(target: "pliron::loopvec", "widen_delta: bool reader {}", func.dfg.display_inst(i));
                             }
                             bad = true;
                         }
@@ -4212,9 +4210,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             .iter()
             .any(|&(i, _)| matches!(pos.func.dfg.insts[i], InstructionData::Load { .. }));
     let mut pending_stores: Vec<(usize, Value, Value, i64)> = Vec::new();
-    if crate::env_set("PLIRON_LOOPVEC_DEBUG") {
-        eprintln!(
-            "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
+    if tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::loopvec", "loopvec {}: hoist={hoist} batch={batch_stores} first_store={first_store} mems={:?}",
             pos.func.name,
             p.mems
                 .iter()
@@ -4569,7 +4566,7 @@ pub fn run(
     // Deepest-first: parent loops always fail `gather`'s innermost check,
     // so iterating them first would just burn the MAX_LOOPS budget.
     let loops = deepest_first(&la);
-    let debug = crate::env_set("PLIRON_VEC_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
     let pty = tcfg.pointer_type();
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
@@ -4585,7 +4582,7 @@ pub fn run(
             continue;
         };
         if debug {
-            eprintln!("vec {:?}: {}x{}", p.h, p.vf, p.elem);
+            tracing::debug!(target: "pliron::loopvec", "vec {:?}: {}x{}", p.h, p.vf, p.elem);
         }
         apply(func, &p, pty, x64);
         n += 1;
@@ -4797,7 +4794,9 @@ mod tests {
             let nb = b.ins().imul(n, st);
             let end = b.ins().iadd(p0, nb);
             let wend = b.ins().iadd_imm_s(p0, 64 * 4 - 4);
-            let zero = b.ins().f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
+            let zero = b
+                .ins()
+                .f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
             b.ins().jump(head, &[p0.into(), zero.into()]);
 
             b.switch_to_block(head);
@@ -4847,7 +4846,9 @@ mod tests {
             let st = b.ins().iconst(types::I64, 4);
             let nb = b.ins().imul(n, st);
             let end = b.ins().iadd(p0, nb);
-            let zero = b.ins().f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
+            let zero = b
+                .ins()
+                .f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(0));
             b.ins().jump(head, &[p0.into(), zero.into()]);
 
             b.switch_to_block(head);

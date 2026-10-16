@@ -28,10 +28,10 @@
 
 use pliron::{
     basic_block::BasicBlock,
-    printable::Printable,
     builtin::op_interfaces::CallOpInterface,
     context::{Context, Ptr},
     operation::Operation,
+    printable::Printable,
     value::Value,
 };
 use pliron_llvm::ops::{
@@ -194,14 +194,24 @@ fn cone_args(
     let mem_reads = |a: Value| base_alloca(ctx, a).is_some_and(|b| stored_allocas.contains(&b));
     if (Operation::is_op::<pliron_llvm::ops::LoadOp>(d, ctx)
         && mem_reads(d.deref(ctx).get_operand(0)))
-        || (Operation::is_op::<CallOp>(d, ctx)
-            && d.deref(ctx).operands().any(|a| mem_reads(a)))
+        || (Operation::is_op::<CallOp>(d, ctx) && d.deref(ctx).operands().any(|a| mem_reads(a)))
     {
         return false;
     }
     for a in d.deref(ctx).operands() {
-        if !cone_args(ctx, st, dom, body, ph, a, cone, seen_v, fuel, arg_allocas, stored_allocas)
-        {
+        if !cone_args(
+            ctx,
+            st,
+            dom,
+            body,
+            ph,
+            a,
+            cone,
+            seen_v,
+            fuel,
+            arg_allocas,
+            stored_allocas,
+        ) {
             return false;
         }
     }
@@ -310,14 +320,13 @@ fn natural_loops(
 }
 
 pub fn run(ctx: &mut Context, st: &State) {
-    let dbg = crate::env_set("PLIRON_CGDBG");
+    let dbg = tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
     for name in bodied(ctx, st) {
         if dbg {
-            eprintln!("callgvn fn={name}");
+            tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}");
         }
         if crate::env_get("PLIRON_CGDUMP").is_some_and(|s| name.contains(s)) {
-            eprintln!(
-                "{}",
+            tracing::info!(target: "pliron::dump", "{}",
                 st.funcs[&name]
                     .op
                     .print(ctx, &pliron::printable::State::default())
@@ -325,8 +334,7 @@ pub fn run(ctx: &mut Context, st: &State) {
         }
         run_fn(ctx, st, st.funcs[&name].op);
         if crate::env_get("PLIRON_CGDUMP2").is_some_and(|s| name.contains(s)) {
-            eprintln!(
-                "==== after callgvn ====\n{}",
+            tracing::info!(target: "pliron::dump", "==== after callgvn ====\n{}",
                 st.funcs[&name]
                     .op
                     .print(ctx, &pliron::printable::State::default())
@@ -398,8 +406,10 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         FxHashMap::default();
 
     // 1) Block-local dedup + dead-call elim.
-    let mut index: FxHashMap<u64, Vec<(String, Vec<Value>, Ptr<BasicBlock>, usize, Ptr<Operation>)>> =
-        FxHashMap::default();
+    let mut index: FxHashMap<
+        u64,
+        Vec<(String, Vec<Value>, Ptr<BasicBlock>, usize, Ptr<Operation>)>,
+    > = FxHashMap::default();
     for &b in &bs {
         let mut seen: FxHashMap<u64, Vec<(String, Vec<Value>, Value)>> = FxHashMap::default();
         let os = &bops[&b];
@@ -407,7 +417,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             if op_writes.get(&op).copied().unwrap_or(false) {
                 seen.clear();
             }
-            if crate::env_set("PLIRON_CGDBG") && Operation::is_op::<CallOp>(op, ctx) {
+            if tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG)
+                && Operation::is_op::<CallOp>(op, ctx)
+            {
                 let why = if st.invokes.contains_key(&op) {
                     "invoke"
                 } else if op.deref(ctx).get_num_results() != 1 {
@@ -423,7 +435,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 } else {
                     "ok"
                 };
-                eprintln!("callgvn   call dedupable={why}");
+                tracing::debug!(target: "pliron::callgvn", "callgvn   call dedupable={why}");
             }
             let Some((c, args, res)) = dmemo
                 .entry((op, false))
@@ -451,7 +463,9 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 gone.insert(op);
                 continue;
             }
-            seen.entry(h).or_default().push((c.clone(), args.clone(), *res));
+            seen.entry(h)
+                .or_default()
+                .push((c.clone(), args.clone(), *res));
             index
                 .entry(h)
                 .or_default()
@@ -491,13 +505,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
-                if writes_between(
-                    &bops[cb],
-                    *ci + 1,
-                    bops[cb].len(),
-                    &op_writes,
-                    &gone,
-                ) || writes_between(os, 0, i, &op_writes, &gone)
+                if writes_between(&bops[cb], *ci + 1, bops[cb].len(), &op_writes, &gone)
+                    || writes_between(os, 0, i, &op_writes, &gone)
                     || !path_write_free(&preds, &writes_blk, *cb, b)
                 {
                     continue;
@@ -514,10 +523,10 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     }
 
     // 3) Loop hoist: write-free natural loops with a unique preheader.
-    let dbg = crate::env_set("PLIRON_CGDBG");
+    let dbg = tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
     for (h, body) in natural_loops(&dom, &succ, &preds) {
         if dbg {
-            eprintln!("callgvn loop h={h:?} body={} w={:?}", body.len(),
+            tracing::debug!(target: "pliron::callgvn", "callgvn loop h={h:?} body={} w={:?}", body.len(),
                 body.iter().filter(|b| writes_blk.contains(b)).count());
         }
         if body.iter().any(|b| writes_blk.contains(b)) {
@@ -532,7 +541,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             .collect();
         let [ph] = outside[..] else {
             if dbg {
-                eprintln!("callgvn   no unique ph: {} outside preds", outside.len());
+                tracing::debug!(target: "pliron::callgvn", "callgvn   no unique ph: {} outside preds", outside.len());
             }
             continue;
         };
@@ -543,7 +552,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         // preheader to dominate it too.
         if body.iter().any(|&b| b != h && !dom.dominates(h, b)) {
             if dbg {
-                eprintln!("callgvn   header doesn't dominate body");
+                tracing::debug!(target: "pliron::callgvn", "callgvn   header doesn't dominate body");
             }
             continue;
         }
@@ -584,20 +593,14 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                         "flags"
                     } else if direct_callee(ctx, st, op).is_none() {
                         "indirect"
-                    } else if !st
-                        .nowrite
-                        .contains_key(direct_callee(ctx, st, op).unwrap())
-                    {
+                    } else if !st.nowrite.contains_key(direct_callee(ctx, st, op).unwrap()) {
                         "writer"
-                    } else if !st
-                        .willreturn
-                        .contains(direct_callee(ctx, st, op).unwrap())
-                    {
+                    } else if !st.willreturn.contains(direct_callee(ctx, st, op).unwrap()) {
                         "diverge"
                     } else {
                         "ok"
                     };
-                    eprintln!("callgvn   call in body dedupable={why}");
+                    tracing::debug!(target: "pliron::callgvn", "callgvn   call in body dedupable={why}");
                 }
                 // Hoists may carry invokes: the unwind edge is an
                 // `st.invokes` entry keyed on the op, so it moves with it.
@@ -630,25 +633,26 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // The call's own pointer args must not reach into an
                 // alloca the body still stores — cone_args only screens
                 // ops *inside* the cone.
-                let ok = args.iter().all(|&a| {
-                    base_alloca(ctx, a).is_none_or(|b| !stored_allocas.contains(&b))
-                }) && args.iter().all(|&a| {
-                    cone_args(
-                        ctx,
-                        st,
-                        &dom,
-                        &body,
-                        ph,
-                        a,
-                        &mut cone,
-                        &mut seen_v,
-                        &mut fuel,
-                        &arg_allocas,
-                        &stored_allocas,
-                    )
-                });
+                let ok = args
+                    .iter()
+                    .all(|&a| base_alloca(ctx, a).is_none_or(|b| !stored_allocas.contains(&b)))
+                    && args.iter().all(|&a| {
+                        cone_args(
+                            ctx,
+                            st,
+                            &dom,
+                            &body,
+                            ph,
+                            a,
+                            &mut cone,
+                            &mut seen_v,
+                            &mut fuel,
+                            &arg_allocas,
+                            &stored_allocas,
+                        )
+                    });
                 if dbg {
-                    eprintln!("callgvn   {c} hoistable={ok} cone={}", cone.len());
+                    tracing::debug!(target: "pliron::callgvn", "callgvn   {c} hoistable={ok} cone={}", cone.len());
                 }
                 if !ok {
                     continue;

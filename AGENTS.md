@@ -210,21 +210,36 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   activities (`pliron_iropt`, `pliron_ir_<pass>`, `pliron_pipeline`/
   `pliron_compile` per fn, one event per pipeline step name) — the same
   clock and viewer as rustc's own `LLVM_*` activities.
-- `PLIRON_TRACE=<env-filter>` — tracing spans with `time.busy` on close
-  (stderr). Targets: `pliron::module`/`pliron::phase` (per-CGU phases:
-  define, iropt, fnlower, phasec, lowerobj), `pliron::iropt` (each ir-opt
-  pass), `pliron::fn` (per function), `pliron::pipeline` (pipeline and
-  cranelift-compile halves), `pliron::step` (every pipeline step, span
-  name = step name). `pliron` enables all of them; narrow further with
-  `grep 'INFO slp:'` or `grep 'fn="hashmap'`. (EnvFilter's `[{field=x}]`
-  syntax only gates events *inside* a matching span — it cannot suppress
-  a span's own close line.) Unset = no subscriber installed; each span
-  site costs one hash lookup + atomic load.
+- `PLIRON_TRACE=<env-filter>` — the one logging switchboard. All
+  diagnostics are `tracing` events/spans on `pliron::<module>` targets
+  (bare messages on stderr — no level/target/time prefix, so stats,
+  facts, and timing lines stay verbatim-greppable). Span targets:
+  `pliron::module`/`pliron::phase` (per-CGU phases), `pliron::iropt`,
+  `pliron::fn`, `pliron::pipeline`, `pliron::step` (every pipeline step,
+  span name = step name); event targets follow the pass file stem
+  (`pliron::jumpthread`, `pliron::slp`, `pliron::guardelim`, ...) plus
+  report channels `pliron::stats`/`pliron::timing`/`pliron::facts`/
+  `pliron::dump`. `pliron` enables all of them. (EnvFilter's
+  `[{field=x}]` syntax only gates events *inside* a matching span — it
+  cannot suppress a span's own close line.) Unset = no subscriber
+  installed; each site costs one atomic load.
+  **The legacy `PLIRON_*` diagnostic knobs still work**: `tracing_init`
+  (src/lib.rs) maps each set knob to a target+level directive in
+  `KNOB_TARGETS` — e.g. `PLIRON_JT_PROF=1` → `pliron::jumpthread=info`,
+  `PLIRON_XPACK_DEBUG=1` → `pliron::slp=debug`, `PLIRON_UNROLL_DEBUG=3`
+  → `pliron::unroll=trace`. Knob-gated prints became
+  `tracing::debug!`/`info!` and `if env_set(...)`/`var_os(...)` print
+  gates became `tracing::enabled!(target: ..., Level::..)`. Keep it
+  that way: no `eprintln!` for diagnostics — `eprintln!` only for
+  output that must appear with no subscriber (unknown-step errors,
+  panic paths, diffcheck reports). Behavioral knobs
+  (`PLIRON_XPACK_NOCACHE`, `PLIRON_WASM_NOSHL`, `PLIRON_PIPEFN`,
+  substring filters like `PLIRON_CLIF=<substr>`) stay `env_*` reads.
   For sub-phase timing inside a pass, prefer an entered
-  `tracing::info_span!(target: "pliron::iropt", "name", field = ...)`
+  `tracing::info_span!(target: "pliron::<pass>", "name", field = ...)`
   over a new `PLIRON_*_PROF` env var — close lines render nested
-  (`iropt:guardelim:gefix ... blocks=5178 cands=1 folds=0`) and parse
-  with the same scraper. Example: `guardelim.rs` `gefn`/`gefix`/`geprove`.
+  and parse with the same scraper. Example: `guardelim.rs`
+  `gefn`/`gefix`/`geprove`.
 - `samply record --save-only -o prof.json -- cargo rustc ...` — sampling
   profile of the whole build (rustc + the dylib frames symbolize);
   `samply load prof.json` opens Firefox Profiler. Use this first for
@@ -238,7 +253,7 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   crate build hash, so a backend edit cold-misses everything.
   `PLIRON_CACHE_LOG=1` prints hit/miss per step. Caveats: cold runs pay
   ~1.3x for hashing+storing; hits replay results rather than
-  re-executing, so in-pass `eprintln!` debug prints don't fire on hits
+  re-executing, so in-pass `tracing::debug!` prints don't fire on hits
   (aggregated `PLIRON_STATS` counters replay exactly).
 - `PLIRON_CLIF=<substr>` — dump CLIF after every step for functions whose
   name contains the substring; `PLIRON_VERIFY=full` runs the cranelift

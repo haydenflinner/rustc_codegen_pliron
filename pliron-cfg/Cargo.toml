@@ -6,3 +6,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 rustc-hash = "2"
+tracing = "0.1"

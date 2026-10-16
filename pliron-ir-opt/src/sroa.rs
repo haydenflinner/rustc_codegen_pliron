@@ -219,7 +219,7 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
         .copied()
         .filter(|&e| e.0 > 0);
     if r.is_none()
-        && crate::env_set("PLIRON_PINMISS")
+        && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG)
         && let CallOpCallable::Direct(id) = c.callee(ctx)
     {
         let got = st
@@ -227,7 +227,7 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
             .get(&op)
             .map(|i| format!("extent={:?}", i.arg_extent))
             .unwrap_or_else(|| "no CallInfo".into());
-        eprintln!("pinmiss {id} #{idx}: {got}");
+        tracing::info!(target: "pliron::sroa", "pinmiss {id} #{idx}: {got}");
     }
     r
 }
@@ -524,8 +524,7 @@ fn accesses_inner(
                 for l in loads {
                     work.push((l, base, true));
                 }
-            } else if Operation::is_op::<PtrToIntOp>(op, ctx)
-                || Operation::is_op::<ICmpOp>(op, ctx)
+            } else if Operation::is_op::<PtrToIntOp>(op, ctx) || Operation::is_op::<ICmpOp>(op, ctx)
             {
                 // The pointer is only observed as a number or compared —
                 // sound as long as the int never becomes a pointer again.
@@ -753,9 +752,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
             let n = match a.kind {
                 Kind::Pin { n, .. } => n,
                 Kind::Copy { n, .. } | Kind::Set { n, .. } if a.flow => n,
-                Kind::Load | Kind::Store if a.flow => {
-                    size_align(ctx, access_ty(ctx, a)?).0
-                }
+                Kind::Load | Kind::Store if a.flow => size_align(ctx, access_ty(ctx, a)?).0,
                 _ => return None,
             };
             (n > 0).then_some((a.off, a.off + n))
@@ -1302,15 +1299,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             validate(ctx, st, a);
         }
     }
-    if crate::env_set("PLIRON_STATS") {
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let total = st
             .funcs
             .values()
             .filter(|f| has_body(ctx, f.op))
             .map(|f| allocas(ctx, f.op).len())
             .sum::<usize>();
-        eprintln!(
-            "sroa {}: {} of {total} allocas promoted",
+        tracing::info!(target: "pliron::stats", "sroa {}: {} of {total} allocas promoted",
             st.cgu,
             st.promoted.len()
         );
@@ -1333,9 +1329,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                     }
                 }
             }
-            eprintln!("  cond_br {n}: {k} const cond, {kk} cond of all-const operands");
+            tracing::info!(target: "pliron::stats", "  cond_br {n}: {k} const cond, {kk} cond of all-const operands");
         }
-        if crate::env_set("PLIRON_STATS_MEMCPY") {
+        if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let kind = |v: Value| -> String {
                 let Some(d) = v.defining_op() else {
@@ -1380,10 +1376,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(25) {
-                eprintln!("  memcpy {c:5} {n}");
+                tracing::info!(target: "pliron::stats", "  memcpy {c:5} {n}");
             }
         }
-        if crate::env_set("PLIRON_STATS_WHY") {
+        if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             let fs: Vec<_> = st
                 .funcs
@@ -1409,7 +1405,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         let a = op.deref(ctx).get_result(0);
                         if !st.promoted.contains_key(&a) {
                             let sz = st.allocas.get(&a).map(|x| x.0).unwrap_or(0);
-                            eprintln!("  whyfn {sz:5}B {} {name}", why2(ctx, st, a));
+                            tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B {} {name}", why2(ctx, st, a));
                         }
                     }
                 }
@@ -1417,10 +1413,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(20) {
-                eprintln!("  why {c:6} {n}");
+                tracing::info!(target: "pliron::stats", "  why {c:6} {n}");
             }
         }
-        if crate::env_set("PLIRON_STATS_OPS") {
+        if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
                 for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
@@ -1434,7 +1430,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut v: Vec<_> = h.into_iter().collect();
             v.sort_by_key(|x| std::cmp::Reverse(x.1));
             for (n, c) in v.iter().take(30) {
-                eprintln!("  {c:7} {n}");
+                tracing::info!(target: "pliron::stats", "  {c:7} {n}");
             }
         }
     }
@@ -1548,8 +1544,8 @@ pub fn forward(ctx: &mut Context, st: &State) {
         .into_iter()
         .map(|f| forward_single_store(ctx, st, f))
         .sum();
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("sroa-fwd {}: {n} single-store allocas forwarded", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "sroa-fwd {}: {n} single-store allocas forwarded", st.cgu);
     }
 }
 

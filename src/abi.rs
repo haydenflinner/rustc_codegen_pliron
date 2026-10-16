@@ -187,15 +187,15 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
         }
         n += live.iter().filter(|&&l| !l).count();
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("deadarg {}: {n} params removed", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "deadarg {}: {n} params removed", st.cgu);
     }
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
-    if crate::env_set("PLIRON_STATS") {
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (mut total, mut dead, mut ro) = (0, 0, 0);
         for s in &internal {
             let f = &st.funcs[s];
@@ -216,8 +216,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 }
             }
         }
-        eprintln!(
-            "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
+        tracing::info!(target: "pliron::stats", "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
             st.cgu,
             internal.len()
         );
@@ -245,8 +244,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         rewrite(ctx, st, sym, sty, &leaves, &calls);
         n += 1;
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("sret2reg {}: {n} functions", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "sret2reg {}: {n} functions", st.cgu);
     }
 }
 

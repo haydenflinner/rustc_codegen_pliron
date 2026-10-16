@@ -447,8 +447,7 @@ pub fn lower_module(
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
     // 64-bit vector compares are cheap on aarch64 and with sse4.2
     // (`pcmpgtq`); the SSE2 i64 expansion is ~10 insts per compare.
-    let cmp64 = !x64
-        || host.sse42();
+    let cmp64 = !x64 || host.sse42();
     // `PLIRON_VERIFY=full` verifies after every pass. Any other truthy
     // value verifies once after the pipeline: on failure the function is
     // restored from a pre-pipeline snapshot and re-run with per-pass
@@ -677,12 +676,12 @@ pub fn lower_module(
         clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
         let n = j.name;
         if j.dump {
-            eprintln!("==== clif {n} ====\n{}", clctx.func.display());
+            tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display());
         }
         let mut verify_full = sh.verify_full_env;
         let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
-        if crate::env_set("PLIRON_FROZEN_DEBUG") {
-            eprintln!("==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
+        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::frozen", "==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref);
         }
         let _sfn = tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered();
         let tpipe = std::time::Instant::now();
@@ -694,9 +693,8 @@ pub fn lower_module(
                 // this hook — `-Zself-profile` shows each step next to
                 // LLVM's `LLVM_passes` activities on the same clock.
                 // Scoped to the block so Pipe's borrow set stays per-try.
-                let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
-                    sh.prof.activity(nm, None)
-                };
+                let prof_hook =
+                    |nm: &'static str| -> Box<dyn Send + '_> { sh.prof.activity(nm, None) };
                 let mut pipe = crate::pipeline::Pipe {
                     cur_step: "",
                     clctx,
@@ -755,7 +753,7 @@ pub fn lower_module(
         *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
         pliron_cfg::trace("*pipeline*", tpipe.elapsed().as_secs_f64() * 1e3, n);
         if j.dump {
-            eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
+            tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display());
         }
         // Panics inside Cranelift (verifier, egraph, regalloc asserts)
         // bypass the Err path below — catch and rethrow so the message
@@ -788,11 +786,17 @@ pub fn lower_module(
             let vt = {
                 use ir::types::*;
                 let re: [(&str, ir::Type); 7] = [
-                    ("i8x8", I8X8), ("i16x4", I16X4), ("i32x2", I32X2),
-                    ("f32x2", F32X2), ("i8x4", I8X4), ("i16x2", I16X2),
+                    ("i8x8", I8X8),
+                    ("i16x4", I16X4),
+                    ("i32x2", I32X2),
+                    ("f32x2", F32X2),
+                    ("i8x4", I8X4),
+                    ("i16x2", I16X2),
                     ("i8x2", I8X2),
                 ];
-                re.iter().find(|(t, _)| msg.contains(&format!(".{t}")) || msg.contains(&format!(" {t}"))).map(|(_, ty)| *ty)
+                re.iter()
+                    .find(|(t, _)| msg.contains(&format!(".{t}")) || msg.contains(&format!(" {t}")))
+                    .map(|(_, ty)| *ty)
             };
             if let Some(t) = vt.filter(|t| t.is_vector() && t.bits() < 128 && sh.x64) {
                 if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t) == 0 {
@@ -808,10 +812,15 @@ pub fn lower_module(
         pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);
         // Cranelift's own pass profiler: `emit:<pass>` pseudo-steps show
         // where inside `compile` (vcode lower/emit, regalloc) time goes.
-        if pliron_cfg::env_set("PLIRON_TIMING") || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
+        if pliron_cfg::env_set("PLIRON_TIMING")
+            || tracing::enabled!(target: "pliron::timing", tracing::Level::INFO)
+            || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
         {
             for (d, t) in cranelift_codegen::timing::take_current().self_times() {
-                *j.stats.timing.entry(format!("emit:{d}").leak()).or_default() += t;
+                *j.stats
+                    .timing
+                    .entry(format!("emit:{d}").leak())
+                    .or_default() += t;
                 pliron_cfg::trace(&format!("emit:{d}"), t.as_secs_f64() * 1e3, n);
             }
         } else {
@@ -901,7 +910,7 @@ pub fn lower_module(
             );
         };
         if let Some(v) = &code.vcode {
-            eprintln!("==== vcode {} ====\n{v}", j.name);
+            tracing::info!(target: "pliron::dump", "==== vcode {} ====\n{v}", j.name);
             if let Some(d) = crate::env_get("PLIRON_CODEBIN") {
                 let _ = std::fs::write(format!("{d}/{}.bin", j.name), code.buffer.data());
             }
@@ -933,23 +942,22 @@ pub fn lower_module(
         x86_pshufb_helper(&mut *m, &mut clctx, &mut fbc, cc, cfg);
     }
 
-    if crate::env_set("PLIRON_TIMING") {
+    if tracing::enabled!(target: "pliron::timing", tracing::Level::INFO) {
         let mut t: Vec<_> = stats.timing.iter().collect();
         t.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
         for (n, d) in t {
-            eprintln!("timing {name} {n} {:.3}ms", d.as_secs_f64() * 1e3);
+            tracing::info!(target: "pliron::timing", "timing {name} {n} {:.3}ms", d.as_secs_f64() * 1e3);
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("pipeline {name}: {}", crate::config::config().describe());
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "pipeline {name}: {}", crate::config::config().describe());
     }
-    if st.loadfwd && crate::env_set("PLIRON_STATS") {
+    if st.loadfwd && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (forwarded, peeped, slot_dse) = (stats.forwarded, stats.peeped, stats.slot_dse);
-        eprintln!(
-            "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
+        tracing::info!(target: "pliron::stats", "loadfwd {name}: {forwarded} loads forwarded, {peeped} peepholes, {slot_dse} dead slot stores"
         );
     }
-    if st.jumpthread && crate::env_set("PLIRON_STATS") {
+    if st.jumpthread && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         let (threaded, dead_params, dominated_folds, merged, unreached, dupd) = (
             stats.threaded,
             stats.dead_params,
@@ -958,8 +966,7 @@ pub fn lower_module(
             stats.unreached,
             stats.dupd,
         );
-        eprintln!(
-            "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
+        tracing::info!(target: "pliron::stats", "jumpthread {name}: {threaded} edges threaded, {dead_params} dead params removed, {dominated_folds} dominated conditions folded, {merged} exit blocks merged, {unreached} unreachable edges, {dupd} returns duplicated"
         );
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
@@ -1066,10 +1073,8 @@ fn x86_pshufb_helper(
     let fid = m
         .declare_function("__cranelift_x86_pshufb", Linkage::Local, &sig)
         .unwrap();
-    let mut func = ir::Function::with_name_signature(
-        ir::UserFuncName::user(0, fid.index() as u32),
-        sig,
-    );
+    let mut func =
+        ir::Function::with_name_signature(ir::UserFuncName::user(0, fid.index() as u32), sig);
     {
         let mut b = FunctionBuilder::new(&mut func, fbc);
         let block = b.create_block();
@@ -1080,11 +1085,8 @@ fn x86_pshufb_helper(
         let mask = b.block_params(block)[1];
         let flags = MemFlagsData::trusted();
         let mk_slot = |b: &mut FunctionBuilder<'_>| {
-            let ss = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                16,
-                4,
-            ));
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
             b.ins().stack_addr(pt, ss, 0)
         };
         let pa = mk_slot(&mut b);
@@ -1134,7 +1136,11 @@ mod tests {
         fb.set("is_pic", "true").unwrap();
         fb.set(
             "enable_verifier",
-            if cfg!(debug_assertions) { "true" } else { "false" },
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
         )
         .unwrap();
         let flags = settings::Flags::new(fb);
@@ -1153,9 +1159,7 @@ mod tests {
         sig.params.push(AbiParam::new(clt::I8X16));
         sig.params.push(AbiParam::new(clt::I8X16));
         sig.returns.push(AbiParam::new(clt::I8X16));
-        let cid = m
-            .declare_function("caller", Linkage::Local, &sig)
-            .unwrap();
+        let cid = m.declare_function("caller", Linkage::Local, &sig).unwrap();
         let mut f = ir::Function::with_name_signature(
             ir::UserFuncName::user(0, cid.index() as u32),
             sig.clone(),
@@ -1239,7 +1243,11 @@ pub fn lower_clif_wasm(
     fb.set("is_pic", "true").unwrap();
     fb.set(
         "enable_verifier",
-        if cfg!(debug_assertions) { "true" } else { "false" },
+        if cfg!(debug_assertions) {
+            "true"
+        } else {
+            "false"
+        },
     )
     .unwrap();
     let flags = cranelift_codegen::settings::Flags::new(fb);
@@ -1443,20 +1451,17 @@ pub fn lower_clif_wasm(
         };
         let dump = crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s));
         if dump {
-            eprintln!("==== clif {n} ====\n{}", clctx.func.display());
+            tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display());
         }
         // Flags-only verify: the ISA-aware checks (pointer width, global
         // value types) consult `isa.pointer_type()` — i64 on the host —
         // while this CLIF deliberately uses i32 pointers (see `tcfg`).
         if crate::env_set("PLIRON_VERIFY")
-            && let Err(e) =
-                cranelift_codegen::verifier::verify_function(&clctx.func, isa.flags())
+            && let Err(e) = cranelift_codegen::verifier::verify_function(&clctx.func, isa.flags())
         {
             panic!("bad clif {n}: {e}");
         }
-        let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> {
-            host.prof().activity(nm, None)
-        };
+        let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> { host.prof().activity(nm, None) };
         let mut stats = crate::pipeline::Stats::default();
         let mut nonnull = nonnull;
         let mut derived = derived;
@@ -1507,9 +1512,12 @@ pub fn lower_clif_wasm(
         }
         drop(pipe);
         if dump {
-            eprintln!("==== clif {n} final ====\n{}", clctx.func.display());
+            tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display());
         }
-        out.push((n.clone(), std::mem::replace(&mut clctx.func, ir::Function::new())));
+        out.push((
+            n.clone(),
+            std::mem::replace(&mut clctx.func, ir::Function::new()),
+        ));
         m.clear_context(&mut clctx);
     }
     CUR_FN.with(|c| c.borrow_mut().clear());
@@ -1957,8 +1965,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if crate::env_set("PLIRON_FROZEN_DEBUG") {
-                            eprintln!("region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}");
+                        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+                            tracing::debug!(target: "pliron::frozen", "region_frozen seed {v} leaf {sub} bytes {bytes} blk {cb:?}");
                         }
                         self.noalias.insert(v);
                         self.deref.insert(v, (bytes, false));
@@ -1971,9 +1979,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
                         };
-                        if crate::env_set("PLIRON_FROZEN_DEBUG") {
-                            eprintln!(
-                                "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
+                        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+                            tracing::debug!(target: "pliron::frozen", "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
                                 *pb,
                                 pb.deref(ctx).arguments().count()
                             );
@@ -2364,8 +2371,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let op = v.defining_op()?;
         let ctx = self.ctx;
         let id = Operation::get_opid(op, ctx);
-        if crate::env_set("PLIRON_CONSTDBG") {
-            eprintln!("const_bits {}: {}", depth, id);
+        if tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id);
         }
         let ops: Vec<Value> = op.deref(ctx).operands().collect();
         let bit = |v| self.const_bits(v, depth + 1);
@@ -3631,15 +3638,27 @@ impl<'a, 'b> FnLower<'a, 'b> {
         {
             // Only bf16/packed-f16 <-> f32 vectors reach here unsplit (scalarize).
             let xs = self.get(opnds[0]);
-            let rts: Vec<ClType> = self.ty_leaves(self.res_ty(op)).iter().map(|l| l.1).collect();
+            let rts: Vec<ClType> = self
+                .ty_leaves(self.res_ty(op))
+                .iter()
+                .map(|l| l.1)
+                .collect();
             let half = |t: ClType| t.lane_type() == clt::F16;
             // Wide bf16 leaves (NATIVE_BF16) are f16-bit containers too.
             let bfv = |ty: TypeHandle| {
                 ty.deref(self.ctx)
                     .downcast_ref::<pliron_llvm::types::VectorType>()
-                    .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>())
+                    .is_some_and(|v| {
+                        v.elem_type()
+                            .deref(self.ctx)
+                            .is::<pliron::builtin::types::BF16Type>()
+                    })
             };
-            let bf = bfv(if is!(FPExtOp) { opnds[0].get_type(self.ctx) } else { self.res_ty(op) });
+            let bf = bfv(if is!(FPExtOp) {
+                opnds[0].get_type(self.ctx)
+            } else {
+                self.res_ty(op)
+            });
             let r = if half(rts[0]) || half(self.b.func.dfg.value_type(xs[0])) {
                 let mut r = Vals::new();
                 if xs.len() == rts.len() {
@@ -3674,9 +3693,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let bf = |ty: TypeHandle| ty.deref(self.ctx).is::<pliron::builtin::types::BF16Type>();
             let r = if is!(FPExtOp) && bf(opnds[0].get_type(self.ctx)) {
                 let f = self.bf16_to_f32(x);
-                if t == clt::F32 { f } else { self.b.ins().fpromote(t, f) }
+                if t == clt::F32 {
+                    f
+                } else {
+                    self.b.ins().fpromote(t, f)
+                }
             } else if is!(FPTruncOp) && bf(self.res_ty(op)) {
-                let f = if from == clt::F32 { x } else { self.b.ins().fdemote(clt::F32, x) };
+                let f = if from == clt::F32 {
+                    x
+                } else {
+                    self.b.ins().fdemote(clt::F32, x)
+                };
                 self.f32_to_bf16(f)
             } else if from == clt::F16 && t == clt::F32 {
                 self.h2f(x)
@@ -3858,8 +3885,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.b.ins().fence();
             }
             if r.len() == 1 && self.st.nonnull.contains(&op) {
-                if std::env::var_os("PLIRON_NNDBG").is_some() {
-                    eprintln!("nndbg seed {} <- op {:?}", r[0], op);
+                if tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "pliron::lower", "nndbg seed {} <- op {:?}", r[0], op);
                 }
                 self.nonnull.insert(r[0]);
             }
@@ -4070,7 +4097,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if let Some(a) = Operation::get_op::<InlineAsmOp>(op, self.ctx) {
             // Operand-free spin hints (cubecl's `pause`/`yield`) have no
             // observable effect; anything else must go through rsasm.
-            let t = String::from(a.get_attr_llvm_inline_asm_template(self.ctx).unwrap().clone());
+            let t = String::from(
+                a.get_attr_llvm_inline_asm_template(self.ctx)
+                    .unwrap()
+                    .clone(),
+            );
             assert!(
                 opnds.is_empty() && matches!(t.trim(), "" | "pause" | "yield" | "isb"),
                 "pliron->cranelift: unsupported inline asm {t:?}"
@@ -4787,13 +4818,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     self.eh_raise();
                     return;
                 }
-                if sym == "llvm.wasm.get_exception"
-                    || sym == "__pliron_llvm_wasm_get_exception"
-                {
-                    let v = self
-                        .b
-                        .ins()
-                        .load(self.tcfg.pointer_type(), mf, tls, 4);
+                if sym == "llvm.wasm.get_exception" || sym == "__pliron_llvm_wasm_get_exception" {
+                    let v = self.b.ins().load(self.tcfg.pointer_type(), mf, tls, 4);
                     self.set(op, smallvec![v]);
                     return;
                 }
@@ -4964,7 +4990,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if ext {
             for &x in xs {
                 for hi in [false, true] {
-                    let w = if hi { self.b.ins().uwiden_high(x) } else { self.b.ins().uwiden_low(x) };
+                    let w = if hi {
+                        self.b.ins().uwiden_high(x)
+                    } else {
+                        self.b.ins().uwiden_low(x)
+                    };
                     let w = self.b.ins().ishl_imm_u(w, 16);
                     out.push(self.b.ins().bitcast(clt::F32X4, mf, w));
                 }
@@ -5002,7 +5032,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// `i16x8` leaves are F16 scalars).
     fn as_lane(&mut self, x: ir::Value, want: ClType) -> ir::Value {
         let t = self.b.func.dfg.value_type(x);
-        if t != want && t.bits() == want.bits() { self.bitcast_to(want, x) } else { x }
+        if t != want && t.bits() == want.bits() {
+            self.bitcast_to(want, x)
+        } else {
+            x
+        }
     }
 
     /// f32 -> bf16, round-to-nearest-even; NaN stays a quiet NaN.
@@ -5058,11 +5092,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             "fmax" => i.fmax(x, y),
             _ => i.fmin(x, y),
         };
-        if h {
-            self.f2h(r)
-        } else {
-            r
-        }
+        if h { self.f2h(r) } else { r }
     }
 
     /// Every scalar lane of `v`, across its leaves.
@@ -5093,7 +5123,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let bf = vt
             .deref(self.ctx)
             .downcast_ref::<pliron_llvm::types::VectorType>()
-            .is_some_and(|v| v.elem_type().deref(self.ctx).is::<pliron::builtin::types::BF16Type>());
+            .is_some_and(|v| {
+                v.elem_type()
+                    .deref(self.ctx)
+                    .is::<pliron::builtin::types::BF16Type>()
+            });
         let mut acc = ordered.then(|| self.get1(opnds[0]));
         let mut lanes = self.lanes_of(opnds[ordered as usize]);
         if bf {
@@ -5149,7 +5183,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let c = |s: &mut Self, v: u128| s.iconst_any(it, v);
         let am = c(self, absm);
         let abs = self.b.ins().band(bits, am);
-        let (ci, cq, cm, z) = (c(self, inf), c(self, inf | quiet), c(self, minnorm), c(self, 0));
+        let (ci, cq, cm, z) = (
+            c(self, inf),
+            c(self, inf | quiet),
+            c(self, minnorm),
+            c(self, 0),
+        );
         let ins = |s: &mut Self, cc, a, b| s.b.ins().icmp(cc, a, b);
         let nan = ins(self, IntCC::UnsignedGreaterThan, abs, ci);
         let notq = ins(self, IntCC::UnsignedLessThan, abs, cq);
@@ -5205,7 +5244,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let (mf, tr) = (MemFlagsData::new(), MemFlagsData::trusted());
         if matches!(k, KA::Xchg) {
             let vi = self.b.ins().bitcast(it, mf, v);
-            let r = self.b.ins().atomic_rmw(it, tr, ir::AtomicRmwOp::Xchg, p, vi);
+            let r = self
+                .b
+                .ins()
+                .atomic_rmw(it, tr, ir::AtomicRmwOp::Xchg, p, vi);
             return self.b.ins().bitcast(t, mf, r);
         }
         let retry = self.b.create_block();
@@ -5246,7 +5288,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if name == "llvm.is.fpclass" {
             let x = self.get1(opnds[0]);
-            let m = self.const_int(opnds[1]).expect("llvm.is.fpclass: non-constant mask");
+            let m = self
+                .const_int(opnds[1])
+                .expect("llvm.is.fpclass: non-constant mask");
             let r = self.is_fpclass(x, m as u32);
             return self.set1(op, r);
         }
@@ -5267,7 +5311,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name) {
             let ls: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
-            if ls[0].iter().all(|x| self.b.func.dfg.value_type(*x).bits() >= 128) {
+            if ls[0]
+                .iter()
+                .all(|x| self.b.func.dfg.value_type(*x).bits() >= 128)
+            {
                 let r: Vals = (0..ls[0].len())
                     .map(|j| {
                         let x: Vec<_> = ls.iter().map(|l| l[j]).collect();
@@ -5521,9 +5568,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let a: Vec<_> = if h {
                     // f16 widens to f32: exact for these (sqrt/rounding are
                     // innocuous under double rounding at 11 -> 24 bits).
-                    a.iter()
-                        .map(|&x| self.h2f(x))
-                        .collect()
+                    a.iter().map(|&x| self.h2f(x)).collect()
                 } else {
                     a.to_vec()
                 };
@@ -5555,11 +5600,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         _ => self.b.ins().fma(a[0], a[1], a[2]),
                     }
                 };
-                if h {
-                    self.f2h(r)
-                } else {
-                    r
-                }
+                if h { self.f2h(r) } else { r }
             }
             n if matches!(
                 n,
@@ -5593,10 +5634,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 };
                 if t == clt::F16 && n != "llvm.round" {
                     // No f16 libm on most hosts: widen, call the f32 form, narrow.
-                    let w: Vec<_> = a
-                        .iter()
-                        .map(|&x| self.h2f(x))
-                        .collect();
+                    let w: Vec<_> = a.iter().map(|&x| self.h2f(x)).collect();
                     let ps = vec![clt::F32; w.len()];
                     let m = self.libcall(&format!("{base}f"), &ps, &[clt::F32], &w)[0];
                     let r = self.f2h(m);

@@ -67,7 +67,7 @@ const JAM: usize = 4;
 const MAX_JAM_BODY: usize = 16;
 
 fn debug() -> bool {
-    crate::env_set("PLIRON_PUNROLL_DEBUG")
+    tracing::enabled!(target: "pliron::punroll", tracing::Level::DEBUG)
 }
 
 struct Vm<'a> {
@@ -360,7 +360,7 @@ pub fn run(
                         .filter(|&c| la.loop_parent(c) == Some(lp))
                         .count();
                     if debug() {
-                        eprintln!("jam {name} block{}: children={}", h.as_u32(), nch);
+                        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: children={}", h.as_u32(), nch);
                     }
                     if nch == 0 || nch > 2 {
                         continue;
@@ -398,7 +398,7 @@ pub fn run(
                 }
                 let trip = trip_est(cfg, la, lp, h, prof);
                 if debug() {
-                    eprintln!("punroll {name} try block{}", h.as_u32());
+                    tracing::debug!(target: "pliron::punroll", "punroll {name} try block{}", h.as_u32());
                 }
                 if crate::pass_enabled("PLIRON_PEEL")
                     && run_peel(func, cfg, dt, la, lp, h, name).is_some()
@@ -427,7 +427,7 @@ pub fn run(
 macro_rules! wbail {
     ($name:expr, $h:expr, $why:expr) => {{
         if debug() {
-            eprintln!("punroll {} block{}: {}", $name, $h.as_u32(), $why);
+            tracing::debug!(target: "pliron::punroll", "punroll {} block{}: {}", $name, $h.as_u32(), $why);
         }
         return None;
     }};
@@ -787,7 +787,7 @@ fn sink_test(
             func.replace(lt).brif(c, h, &bargs, eblk, &eargs);
         }
         if debug() {
-            eprintln!("punroll {name} block{}: sunk mid-chain test", h.as_u32());
+            tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: sunk mid-chain test", h.as_u32());
         }
         return true;
     }
@@ -1157,7 +1157,7 @@ fn run_loop(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                eprintln!("punroll {name} block{}: {}", h.as_u32(), $why);
+                tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why);
             }
             return None;
         }};
@@ -1953,7 +1953,7 @@ fn run_region(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                eprintln!("punroll {name} block{}: {}", h.as_u32(), $why);
+                tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why);
             }
             return None;
         }};
@@ -2255,7 +2255,9 @@ fn run_region(
                 };
                 // `hu` carries the invariant `stop` as a trailing param —
                 // the backedge passes it through unchanged.
-                if t == hu && let Some(sv) = stop {
+                if t == hu
+                    && let Some(sv) = stop
+                {
                     args.push(sv.into());
                 }
                 (t, args)
@@ -2294,7 +2296,7 @@ fn run_region(
     }
 
     if debug() {
-        eprintln!("punroll {name} block{}: region unrolled k={k}", h.as_u32());
+        tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: region unrolled k={k}", h.as_u32());
     }
     redirect_entries(func, cfg, &body, h, hu, stop.map(|_| (&cnt, k, ity)));
     Some(())
@@ -2359,7 +2361,7 @@ fn run_peel(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                eprintln!("peel {name} block{}: {}", h.as_u32(), $why);
+                tracing::debug!(target: "pliron::punroll", "peel {name} block{}: {}", h.as_u32(), $why);
             }
             return None;
         }};
@@ -2840,14 +2842,14 @@ fn run_jam(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                eprintln!("jam {name} block{}: {}", oh.as_u32(), $why);
+                tracing::debug!(target: "pliron::punroll", "jam {name} block{}: {}", oh.as_u32(), $why);
             }
             return None;
         }};
     }
     let j = JAM;
     if debug() {
-        eprintln!("jam {name} block{}: try", oh.as_u32());
+        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: try", oh.as_u32());
     }
     if !dt.is_reachable(oh) || func.layout.is_cold(oh) {
         bail!("header unreachable/cold");
@@ -4108,7 +4110,7 @@ fn run_jam(
         }
     }
     if debug() {
-        eprintln!("jam {name} block{}: jammed x{j}", oh.as_u32());
+        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: jammed x{j}", oh.as_u32());
     }
     Some(vec![ojh])
 }
@@ -4241,7 +4243,7 @@ fn run_jam_chooser(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                eprintln!("jam2 {name} block{}: {}", oh.as_u32(), $why);
+                tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: {}", oh.as_u32(), $why);
             }
             return None;
         }};
@@ -4291,7 +4293,7 @@ fn run_jam_chooser(
         macro_rules! ifail {
             ($why:expr) => {{
                 if debug() {
-                    eprintln!("jam2 {name} block{}: inner{} {}", oh.as_u32(), ci, $why);
+                    tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: inner{} {}", oh.as_u32(), ci, $why);
                 }
                 return None;
             }};
@@ -5859,7 +5861,7 @@ fn run_jam_chooser(
         }
     }
     if debug() {
-        eprintln!("jam2 {name} block{}: jammed x{j} (chooser)", oh.as_u32());
+        tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: jammed x{j} (chooser)", oh.as_u32());
     }
     Some(vec![ojh])
 }

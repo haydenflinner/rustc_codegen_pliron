@@ -39,9 +39,16 @@ fn elementwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     }
     if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {
         let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
-        return !["reduce", "masked", "vector.", "shuffle", "experimental", "lifetime"]
-            .iter()
-            .any(|k| n.contains(k));
+        return ![
+            "reduce",
+            "masked",
+            "vector.",
+            "shuffle",
+            "experimental",
+            "lifetime",
+        ]
+        .iter()
+        .any(|k| n.contains(k));
     }
     false
 }
@@ -54,14 +61,25 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
         return false;
     }
     let o = op.deref(ctx);
-    let tys: Vec<_> = o.operands().chain([o.get_result(0)]).map(|v| v.get_type(ctx)).collect();
-    let bfv = tys.iter().filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| is_bf16(ctx, e))).count();
+    let tys: Vec<_> = o
+        .operands()
+        .chain([o.get_result(0)])
+        .map(|v| v.get_type(ctx))
+        .collect();
+    let bfv = tys
+        .iter()
+        .filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| is_bf16(ctx, e)))
+        .count();
     // bf16 vector leaves are i16 bit patterns: only the f32 casts are native.
-    let cast = Operation::get_op::<FPExtOp>(op, ctx).is_some() || Operation::get_op::<FPTruncOp>(op, ctx).is_some();
+    let cast = Operation::get_op::<FPExtOp>(op, ctx).is_some()
+        || Operation::get_op::<FPTruncOp>(op, ctx).is_some();
     // Packed f16 vectors (wide f32 twins): likewise only the casts are native.
     let hfv = tys
         .iter()
-        .filter(|&&t| vec_of(ctx, t).is_some_and(|(e, _)| e.deref(ctx).is::<FP16Type>()) && simd_leaves(ctx, t))
+        .filter(|&&t| {
+            vec_of(ctx, t).is_some_and(|(e, _)| e.deref(ctx).is::<FP16Type>())
+                && simd_leaves(ctx, t)
+        })
         .count();
     let ok = if bfv + hfv == 0 {
         leafwise_kind(ctx, op)
@@ -83,13 +101,15 @@ fn leafwise_kind(ctx: &Context, op: Ptr<Operation>) -> bool {
     macro_rules! any {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
-    any!(AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp)
-        || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
-            let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
-            LEAFWISE_INTRINSICS
-                .iter()
-                .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+    any!(
+        AddOp, SubOp, MulOp, AndOp, OrOp, XorOp, FAddOp, FSubOp, FMulOp, FDivOp, FNegOp
+    ) || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
+        let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+        LEAFWISE_INTRINSICS.iter().any(|k| {
+            n.strip_prefix(k)
+                .is_some_and(|r| r.is_empty() || r.starts_with('.'))
         })
+    })
 }
 
 /// bf16 vector arithmetic whose `<n x f32>` twin is all SIMD leaves: promote
@@ -121,8 +141,16 @@ fn bf16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
 
 /// Float intrinsics `lower_intrinsic` maps over SIMD leaves.
 pub const LEAFWISE_INTRINSICS: [&str; 10] = [
-    "llvm.fma", "llvm.fmuladd", "llvm.sqrt", "llvm.fabs", "llvm.floor", "llvm.ceil",
-    "llvm.trunc", "llvm.roundeven", "llvm.minimum", "llvm.maximum",
+    "llvm.fma",
+    "llvm.fmuladd",
+    "llvm.sqrt",
+    "llvm.fabs",
+    "llvm.floor",
+    "llvm.ceil",
+    "llvm.trunc",
+    "llvm.roundeven",
+    "llvm.minimum",
+    "llvm.maximum",
 ];
 
 fn idx(ctx: &mut Context, i: u32, before: Ptr<Operation>) -> pliron::value::Value {
@@ -230,7 +258,9 @@ fn widen_bf16(ctx: &mut Context, t: TypeHandle) -> TypeHandle {
         return f32t;
     }
     match vec_of(ctx, t) {
-        Some((e, n)) if is_bf16(ctx, e) => VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into(),
+        Some((e, n)) if is_bf16(ctx, e) => {
+            VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into()
+        }
         _ => t,
     }
 }
@@ -263,7 +293,11 @@ fn is_f16_any(ctx: &Context, t: TypeHandle) -> bool {
 }
 
 fn widen_f16_any(ctx: &mut Context, t: TypeHandle) -> TypeHandle {
-    if t.deref(ctx).is::<FP16Type>() { FP32Type::get(ctx).into() } else { widen_f16_vec(ctx, t) }
+    if t.deref(ctx).is::<FP16Type>() {
+        FP32Type::get(ctx).into()
+    } else {
+        widen_f16_vec(ctx, t)
+    }
 }
 
 /// f16 vector arithmetic (and lane building) whose `<n x f32>` twin may get wide leaves: compute
@@ -388,7 +422,10 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
                 if o.get_num_results() != 1 || !bf16_arith(ctx, op) {
                     continue;
                 }
-                if o.operands().chain([o.get_result(0)]).any(|v| is_bf16(ctx, v.get_type(ctx))) {
+                if o.operands()
+                    .chain([o.get_result(0)])
+                    .any(|v| is_bf16(ctx, v.get_type(ctx)))
+                {
                     bf.push(op);
                 }
             }
@@ -406,13 +443,29 @@ fn wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
     any!(
-        LoadOp, StoreOp, InsertElementOp, ExtractElementOp, PoisonOp, UndefOp, ZeroOp, FreezeOp,
-        ConstantOp, FAddOp, FSubOp, FMulOp, FDivOp, BrOp, CondBrOp, FPExtOp, FPTruncOp
+        LoadOp,
+        StoreOp,
+        InsertElementOp,
+        ExtractElementOp,
+        PoisonOp,
+        UndefOp,
+        ZeroOp,
+        FreezeOp,
+        ConstantOp,
+        FAddOp,
+        FSubOp,
+        FMulOp,
+        FDivOp,
+        BrOp,
+        CondBrOp,
+        FPExtOp,
+        FPTruncOp
     ) || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
         let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
-        ["llvm.fma", "llvm.fmuladd"]
-            .iter()
-            .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+        ["llvm.fma", "llvm.fmuladd"].iter().any(|k| {
+            n.strip_prefix(k)
+                .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+        })
     })
 }
 
@@ -449,10 +502,17 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                     let good = wide_op(ctx, op) || will_split(ctx, op);
                     let good16 = half_wide_op(ctx, op);
                     if !good16
-                        && std::env::var_os("PLIRON_WIDE_DEBUG").is_some()
-                        && op.deref(ctx).operands().chain(op.deref(ctx).results()).any(|v| vec_of(ctx, v.get_type(ctx)).is_some_and(|(e, _)| e == f16h || e == bf16h))
+                        && tracing::enabled!(target: "pliron::scalarize", tracing::Level::DEBUG)
+                        && op
+                            .deref(ctx)
+                            .operands()
+                            .chain(op.deref(ctx).results())
+                            .any(|v| {
+                                vec_of(ctx, v.get_type(ctx))
+                                    .is_some_and(|(e, _)| e == f16h || e == bf16h)
+                            })
                     {
-                        eprintln!("wide-f16 reject: {}", Operation::get_opid(op, ctx));
+                        tracing::debug!(target: "pliron::scalarize", "wide-f16 reject: {}", Operation::get_opid(op, ctx));
                     }
                     let o = op.deref(ctx);
                     for v in o.operands().chain(o.results()) {
@@ -465,7 +525,9 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
     // A packed f16 vector needs its f32 twin wide too (casts map leaf to leaf).
     let wide: std::collections::HashSet<_> = ok
         .iter()
-        .filter(|&(&(e, n), &g)| g && ((e != f16h && e != bf16h) || ok.get(&(f32h, n)) != Some(&false)))
+        .filter(|&(&(e, n), &g)| {
+            g && ((e != f16h && e != bf16h) || ok.get(&(f32h, n)) != Some(&false))
+        })
         .map(|x| *x.0)
         .collect();
     set_wide_f32(wide);
@@ -485,8 +547,10 @@ fn half_wide_op(ctx: &Context, op: Ptr<Operation>) -> bool {
     macro_rules! any {
         ($($t:ty),*) => { false $(|| id == <$t>::get_opid_static())* };
     }
-    any!(LoadOp, StoreOp, FreezeOp, BrOp, CondBrOp, FPExtOp, FPTruncOp, ConstantOp, ZeroOp, PoisonOp, UndefOp)
-        || (native_f16() && f16_native_arith(ctx, op))
+    any!(
+        LoadOp, StoreOp, FreezeOp, BrOp, CondBrOp, FPExtOp, FPTruncOp, ConstantOp, ZeroOp,
+        PoisonOp, UndefOp
+    ) || (native_f16() && f16_native_arith(ctx, op))
 }
 
 fn native_f16() -> bool {
@@ -502,8 +566,9 @@ fn f16_native_arith(ctx: &Context, op: Ptr<Operation>) -> bool {
     any!(FAddOp, FSubOp, FMulOp, FDivOp)
         || Operation::get_op::<CallIntrinsicOp>(op, ctx).is_some_and(|c| {
             let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
-            ["llvm.fma", "llvm.fmuladd"]
-                .iter()
-                .any(|k| n.strip_prefix(k).is_some_and(|r| r.is_empty() || r.starts_with('.')))
+            ["llvm.fma", "llvm.fmuladd"].iter().any(|k| {
+                n.strip_prefix(k)
+                    .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+            })
         })
 }

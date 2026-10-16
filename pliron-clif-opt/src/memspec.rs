@@ -41,12 +41,13 @@ fn mem_loc(
 ) -> Option<(Root, i64, i64)> {
     let (addr, off, w) = match func.dfg.insts[i] {
         InstructionData::Load {
-            opcode, arg, offset, ..
+            opcode,
+            arg,
+            offset,
+            ..
         } => {
             let w = match opcode {
-                Opcode::Load => {
-                    i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes())
-                }
+                Opcode::Load => i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes()),
                 Opcode::Uload8 | Opcode::Sload8 => 1,
                 Opcode::Uload16 | Opcode::Sload16 => 2,
                 Opcode::Uload32 | Opcode::Sload32 => 4,
@@ -55,7 +56,10 @@ fn mem_loc(
             (arg, i32::from(offset), w)
         }
         InstructionData::Store {
-            opcode, args, offset, ..
+            opcode,
+            args,
+            offset,
+            ..
         } => {
             let w = match opcode {
                 Opcode::Store => i64::from(func.dfg.value_type(args[0]).bytes()),
@@ -94,11 +98,7 @@ fn last_writer(
 ) -> Option<Value> {
     let (r, o, w) = loc;
     let loc_iso = iso.contains(&r);
-    let insts: Vec<Inst> = func
-        .layout
-        .block_insts(p)
-        .take_while(|&i| i != t)
-        .collect();
+    let insts: Vec<Inst> = func.layout.block_insts(p).take_while(|&i| i != t).collect();
     for i in insts.into_iter().rev().take(MAX_SCAN) {
         let d = func.dfg.insts[i];
         if let Some((sr, so, sw)) = mem_loc(func, ps, na, i) {
@@ -120,13 +120,12 @@ fn last_writer(
                 continue;
             }
             if !iso.contains(&sr) && !loc_iso {
-                if crate::env_set("PLIRON_MEMSPEC_DEBUG") {
+                if tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG) {
                     let norm = |r: &Root| match r {
                         Root::V(v) => loadfwd::concrete(func, ps, *v),
                         _ => (*r, 0),
                     };
-                    eprintln!(
-                        "memspec:   bail {i} store ({sr:?},{so},{sw}) ~{:?} vs ({r:?},{o},{w}) ~{:?}",
+                    tracing::debug!(target: "pliron::memspec", "memspec:   bail {i} store ({sr:?},{so},{sw}) ~{:?} vs ({r:?},{o},{w}) ~{:?}",
                         norm(&sr).0,
                         norm(&r).0
                     );
@@ -203,7 +202,7 @@ pub fn run(
     nowrite: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> usize {
-    let dbg = crate::env_set("PLIRON_MEMSPEC_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::memspec", tracing::Level::DEBUG);
     // First pass: only structural checks — most functions have no
     // candidate edges and skip the CFG/domtree/param_src/isolated work.
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -225,13 +224,8 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
     let mut ps = loadfwd::param_src(func);
-    let (mut iso, mut escapes, _) = loadfwd::isolated_escapes(
-        func,
-        noalias,
-        &ps,
-        cfrozen,
-        &FxHashSet::default(),
-    );
+    let (mut iso, mut escapes, _) =
+        loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default());
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     // Roots that only escape on blocks that can't reach `p` are still
     // isolated *at* `p`: before the first escaping use can run (the cold
@@ -254,7 +248,7 @@ pub fn run(
         let args: Vec<BlockArg> = destination.args(&func.dfg.value_lists).collect();
         if args.len() != prms.len() || !outer_dominate(func, &domtree, r, p) {
             if dbg {
-                eprintln!("memspec: {p}->{r} skip args/dom (fn {})", func.name);
+                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip args/dom (fn {})", func.name);
             }
             continue;
         }
@@ -270,7 +264,7 @@ pub fn run(
             .collect();
         if !defs.is_empty() && defs.iter().any(|v| uses.escapes(*v, r)) {
             if dbg {
-                eprintln!("memspec: {p}->{r} skip escaping def (fn {})", func.name);
+                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} skip escaping def (fn {})", func.name);
             }
             continue;
         }
@@ -284,15 +278,15 @@ pub fn run(
         // which is exactly what every use below relies on. `s == r` is
         // a self-loop: the `p → r` edge already existed.
         let succs_ok = body.iter().all(|&i| {
-            func.dfg
-                .insts[i]
+            func.dfg.insts[i]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 .into_iter()
                 .all(|bc| {
                     let s = bc.block(&func.dfg.value_lists);
-                    s == r || domtree
-                        .idom(s)
-                        .is_some_and(|id| domtree.block_dominates(id, p))
+                    s == r
+                        || domtree
+                            .idom(s)
+                            .is_some_and(|id| domtree.block_dominates(id, p))
                 })
         });
         if !succs_ok {
@@ -347,8 +341,7 @@ pub fn run(
             };
             let hit = last_writer(func, &ps, noalias, &iso_l, nowrite, eh, p, t, loc);
             if dbg {
-                eprintln!(
-                    "memspec: {p}->{r} load {i} loc {loc:?} hit={} (fn {})",
+                tracing::debug!(target: "pliron::memspec", "memspec: {p}->{r} load {i} loc {loc:?} hit={} (fn {})",
                     hit.is_some(),
                     func.name
                 );
@@ -364,8 +357,7 @@ pub fn run(
             continue;
         }
         if dbg {
-            eprintln!(
-                "memspec: clone {r} into {p} edge ({} fwd) (fn {})",
+            tracing::debug!(target: "pliron::memspec", "memspec: clone {r} into {p} edge ({} fwd) (fn {})",
                 fwd.len(),
                 func.name
             );
@@ -392,9 +384,7 @@ pub fn run(
             let ni = func.dfg.clone_inst(i);
             let dfg = &mut func.dfg;
             let mut data = dfg.insts[ni];
-            for d in
-                data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-            {
+            for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
                 *d = d.deep_clone(&mut dfg.value_lists);
             }
             dfg.insts[ni] = data;
@@ -472,8 +462,8 @@ mod tests {
         let r = func.dfg.make_block();
         func.layout.append_block(p);
         func.layout.append_block(r);
-        let ss = func
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let pp = func.dfg.append_block_param(r, types::I64);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(p);
@@ -537,8 +527,8 @@ mod tests {
         for b in [e, q, p, d, s1, s2, j] {
             func.layout.append_block(b);
         }
-        let ss = func
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let flags = MemFlagsData::new().with_notrap();
         let arg0 = func.dfg.append_block_param(e, types::I64);
         let pd = func.dfg.append_block_param(d, types::I64);
@@ -603,8 +593,8 @@ mod tests {
         let r = func.dfg.make_block();
         func.layout.append_block(p);
         func.layout.append_block(r);
-        let ss = func
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let pp = func.dfg.append_block_param(r, types::I64);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(p);
@@ -661,8 +651,8 @@ mod tests {
         for b in [p, r, s] {
             func.layout.append_block(b);
         }
-        let ss = func
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let pp = func.dfg.append_block_param(r, types::I64);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(p);

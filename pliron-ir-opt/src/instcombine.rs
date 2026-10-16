@@ -396,8 +396,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         nc += c;
         nv += v;
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats",
             "instcombine {}: {nc} values folded to constants, {nv} to an operand",
             st.cgu
         );
@@ -562,11 +562,7 @@ enum Ck {
 
 impl POp {
     fn nargs(&self) -> usize {
-        if self.ic == Pk::Select {
-            3
-        } else {
-            2
-        }
+        if self.ic == Pk::Select { 3 } else { 2 }
     }
 }
 
@@ -715,12 +711,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
 /// therefore all uses of its result — so it's always a sound replacement
 /// target. Bounded DFS: give up (conservatively) past a depth of operand
 /// chains no real fold needs.
-fn safe_leaf(
-    ops: &[POp],
-    defop: &FxHashMap<Value, usize>,
-    i: usize,
-    v: Value,
-) -> bool {
+fn safe_leaf(ops: &[POp], defop: &FxHashMap<Value, usize>, i: usize, v: Value) -> bool {
     let mut seen = FxHashSet::default();
     let mut stack: Vec<Value> = ops[i].args[..ops[i].nargs()].to_vec();
     while let Some(a) = stack.pop() {

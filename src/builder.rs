@@ -1090,8 +1090,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_invariant_load(&mut self, load: Value) {
-        if crate::env_set("PLIRON_FROZEN_DEBUG") {
-            eprintln!("invariant.load {load:?}");
+        if tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::frozen", "invariant.load {load:?}");
         }
         if let Some(op) = load.defining_op() {
             self.st.borrow_mut().invariant.insert(op);
@@ -1179,7 +1179,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             // The sret out-pointer's reachable range is the return layout —
             // what LLVM's `sret` attr encodes (dereferenceable size/align).
             if return_slot.is_indirect() {
-                let e = (abi.ret.layout.size.bytes(), abi.ret.layout.align.abi.bytes());
+                let e = (
+                    abi.ret.layout.size.bytes(),
+                    abi.ret.layout.align.abi.bytes(),
+                );
                 exts[0] = e;
                 any_ex |= e.0 > 0;
             }
@@ -1214,14 +1217,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     }
                     PassMode::Direct(attrs) => {
                         let n = attrs.pointee_size.bytes();
-                        (n > 0).then(|| {
-                            (
-                                n,
-                                attrs
-                                    .pointee_align
-                                    .map_or(1, |a| a.bytes()),
-                            )
-                        })
+                        (n > 0).then(|| (n, attrs.pointee_align.map_or(1, |a| a.bytes())))
                     }
                     _ => None,
                 };
@@ -1230,11 +1226,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 // callee cannot legally touch the pointee through a retained
                 // copy afterwards — SROA syncs pinned slices around the call.
                 let na: &[bool] = match &a.mode {
-                    PassMode::Direct(attrs) | PassMode::Indirect { attrs, .. } => {
-                        &[attrs
-                            .regular
-                            .contains(rustc_target::callconv::ArgAttribute::NoAlias)]
-                    }
+                    PassMode::Direct(attrs) | PassMode::Indirect { attrs, .. } => &[attrs
+                        .regular
+                        .contains(rustc_target::callconv::ArgAttribute::NoAlias)],
                     PassMode::Pair(a0, a1) => &[
                         a0.regular
                             .contains(rustc_target::callconv::ArgAttribute::NoAlias),

@@ -126,8 +126,8 @@ pub fn run(ctx: &Context, st: &State) {
             }
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats",
             "retarg {}: {} returned-arg bodies, {folded} call results folded",
             st.cgu,
             ra.len()

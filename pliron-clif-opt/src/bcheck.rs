@@ -571,15 +571,14 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
     // no `throw_ret` gate: leaf throwers (panic_bounds_check callers with no
     // landing pad of their own) end every OOB edge in exactly this shape.
     let mut rethrow = false;
-    let dbg = crate::env_set("PLIRON_BCHECK_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     while let Some(b) = stack.pop() {
         if !seen.insert(b) {
             continue;
         }
         if seen.len() > 64 {
             if dbg {
-                eprintln!(
-                    "dead_end blk{}: bail seen={} cold={}",
+                tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: bail seen={} cold={}",
                     b.as_u32(),
                     seen.len(),
                     func.layout.is_cold(b)
@@ -615,8 +614,7 @@ fn dead_end(func: &Function, bad: Block, throw_ret: bool) -> bool {
                 }
                 Opcode::Return if !(call && flag || (throw_ret && rethrow)) => {
                     if dbg {
-                        eprintln!(
-                            "dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}",
+                        tracing::debug!(target: "pliron::bcheck", "dead_end blk{}: live return throw_ret={throw_ret} call={call} flag={flag} rethrow={rethrow}",
                             b.as_u32()
                         );
                     }
@@ -927,7 +925,7 @@ fn run_loop(
     throw_ret: bool,
     seen: &mut FxHashSet<Block>,
 ) -> usize {
-    let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -935,7 +933,7 @@ fn run_loop(
     macro_rules! bail {
         ($why:expr) => {{
             if debug {
-                eprintln!("bcheck {name} block{}: {}", h.as_u32(), $why);
+                tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: {}", h.as_u32(), $why);
             }
             return 0;
         }};
@@ -1230,8 +1228,7 @@ fn run_loop(
             };
             if !invariant(func, cfg, &info, &body, bb) {
                 if debug {
-                    eprintln!(
-                        "bcheck {name} block{}: blk{} len not invariant",
+                    tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len not invariant",
                         h.as_u32(),
                         b.as_u32()
                     );
@@ -1307,8 +1304,7 @@ fn run_loop(
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
             if !dead_end(func, bad, throw_ret) {
                 if debug {
-                    eprintln!(
-                        "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
+                    tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
                         h.as_u32(),
                         b.as_u32(),
                         bsub
@@ -1459,11 +1455,10 @@ fn run_loop(
     };
     let fits_wide = |func: &Function, c: &Chk| -> bool {
         let fits = |v: Value| {
-            iconst(func, v).is_some()
-                || {
-                    let t = vty(func, v);
-                    t.is_int() && !t.is_vector() && t.bits() <= wty.bits()
-                }
+            iconst(func, v).is_some() || {
+                let t = vty(func, v);
+                t.is_int() && !t.is_vector() && t.bits() <= wty.bits()
+            }
         };
         let l_fits = |l: &Lin| match l {
             Lin::K(_) => true,
@@ -1535,9 +1530,7 @@ fn run_loop(
             }
         };
         let tk = match (iconst(pos.func, boundv), iconst(pos.func, iv0v)) {
-            (Some(b), Some(i)) => {
-                Some((b.wrapping_sub(i).wrapping_sub(info.adj)) as u64 & umax)
-            }
+            (Some(b), Some(i)) => Some((b.wrapping_sub(i).wrapping_sub(info.adj)) as u64 & umax),
             _ => None,
         };
         (Some(t), tk)
@@ -1571,8 +1564,7 @@ fn run_loop(
         *lims.entry((lenv, k)).or_insert_with(|| {
             let term = lim_pre
                 .filter(|&pre| {
-                    def_block(func, lenv)
-                        .is_some_and(|lb| dt.dominates(lb, pre, &func.layout))
+                    def_block(func, lenv).is_some_and(|lb| dt.dominates(lb, pre, &func.layout))
                 })
                 .and_then(|pre| func.layout.last_inst(pre));
             let mut at = match term {
@@ -1661,9 +1653,7 @@ fn run_loop(
             });
             let mut hi = match c.aff.m {
                 Lin::K(0) => iconst_masked(&mut pos, ity, 0),
-                Lin::K(_) if hi_k.is_some() => {
-                    iconst_masked(&mut pos, ity, hi_k.unwrap() as i64)
-                }
+                Lin::K(_) if hi_k.is_some() => iconst_masked(&mut pos, ity, hi_k.unwrap() as i64),
                 Lin::K(1) => t,
                 Lin::K(k) => {
                     let kv = iconst_masked(&mut pos, ity, k);
@@ -1872,7 +1862,7 @@ pub fn run(
     name: &str,
     throw_ret: bool,
 ) -> usize {
-    let debug = crate::env_set("PLIRON_BCHECK_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::bcheck", tracing::Level::DEBUG);
     let mut n = 0;
     // Analyses go stale after each versioning, so recompute per iteration:
     // find the first loop that versions, then rescan.
@@ -1882,8 +1872,7 @@ pub fn run(
         let mut did = 0;
         let lps = deepest_first(la);
         if debug {
-            eprintln!(
-                "bcheck {name}: {} loops: {:?}",
+            tracing::debug!(target: "pliron::bcheck", "bcheck {name}: {} loops: {:?}",
                 lps.len(),
                 lps.iter().map(|&lp| la.loop_header(lp)).collect::<Vec<_>>()
             );
@@ -1901,7 +1890,7 @@ pub fn run(
             break;
         }
         if debug {
-            eprintln!("bcheck {name}: versioned");
+            tracing::debug!(target: "pliron::bcheck", "bcheck {name}: versioned");
         }
     }
     n
@@ -1929,7 +1918,7 @@ fn unswitch_loop(
     name: &str,
     seen: &mut FxHashSet<Block>,
 ) -> usize {
-    let debug = crate::env_set("PLIRON_UNSWITCH_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
     let h = la.loop_header(lp);
     if !seen.insert(h) {
         return 0;
@@ -1937,7 +1926,7 @@ fn unswitch_loop(
     macro_rules! bail {
         ($why:expr) => {{
             if debug {
-                eprintln!("unswitch {name} block{}: {}", h.as_u32(), $why);
+                tracing::debug!(target: "pliron::unswitch", "unswitch {name} block{}: {}", h.as_u32(), $why);
             }
             return 0;
         }};
@@ -2095,11 +2084,7 @@ fn unswitch_loop(
             }
         }
     }
-    let mut dead: FxHashSet<Block> = func
-        .layout
-        .blocks()
-        .filter(|b| !live.contains(b))
-        .collect();
+    let mut dead: FxHashSet<Block> = func.layout.blocks().filter(|b| !live.contains(b)).collect();
     // Sweep everything unreachable from the entry, not just region
     // blocks and clones: a pre-existing unreachable block (e.g. a cold
     // try_call landing pad) can branch to or use values defined in a
@@ -2109,7 +2094,7 @@ fn unswitch_loop(
     // belt-and-braces in case cfg misses an edge type.
     let uses = crate::uses::Uses::new(func);
     if debug {
-        eprintln!("unswitch {name}: dead candidates: {dead:?}");
+        tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead candidates: {dead:?}");
     }
     loop {
         let keep: Vec<Block> = dead
@@ -2129,9 +2114,7 @@ fn unswitch_loop(
                         .any(|&v| {
                             uses.sites
                                 .get(&func.dfg.resolve_aliases(v))
-                                .is_some_and(|ss| {
-                                    ss.iter().any(|(b, _)| !dead.contains(b))
-                                })
+                                .is_some_and(|ss| ss.iter().any(|(b, _)| !dead.contains(b)))
                         })
             })
             .collect();
@@ -2143,21 +2126,21 @@ fn unswitch_loop(
         }
     }
     if debug {
-        eprintln!("unswitch {name}: dead after fold: {dead:?}");
+        tracing::debug!(target: "pliron::unswitch", "unswitch {name}: dead after fold: {dead:?}");
     }
     for b in dead {
         func.layout.remove_block_and_insts(b);
     }
     seen.insert(hc);
     if debug {
-        eprintln!("unswitch {name}: block{} unswitched", h.as_u32());
+        tracing::debug!(target: "pliron::unswitch", "unswitch {name}: block{} unswitched", h.as_u32());
     }
     1
 }
 
 /// `PLIRON_UNSWITCH=0` disables invariant-brif loop unswitching.
 pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
-    let debug = crate::env_set("PLIRON_UNSWITCH_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::unswitch", tracing::Level::DEBUG);
     let mut n = 0;
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..MAX_VERSIONS {
@@ -2176,7 +2159,7 @@ pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &
             break;
         }
         if debug {
-            eprintln!("unswitch {name}: versioned");
+            tracing::debug!(target: "pliron::unswitch", "unswitch {name}: versioned");
         }
     }
     n
@@ -2189,8 +2172,7 @@ mod tests {
     use cranelift_codegen::isa::CallConv;
 
     fn verify_ok(func: &Function) {
-        let flags =
-            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(func, &flags) {
             panic!("verify failed: {e}\n{func}");
         }

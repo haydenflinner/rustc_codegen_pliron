@@ -11,6 +11,7 @@
 //! *events nested inside* a matching span — they cannot suppress the
 //! span's own close line, which is why the callsite-per-name route exists.
 
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tracing::Span;
@@ -19,7 +20,6 @@ use tracing_core::field::{FieldSet, Value};
 use tracing_core::metadata::Kind;
 use tracing_core::subscriber::Interest;
 use tracing_core::{Level, Metadata};
-use rustc_hash::FxHashMap;
 
 const NEVER: u8 = 0;
 const SOMETIMES: u8 = 1;
@@ -60,7 +60,11 @@ pub struct DynSite {
 /// span's tracing target (e.g. `pliron::step`) and `fields` the declared
 /// field names; the leaked callsite+metadata live for the process, so
 /// callers must pass compile-time-stable names, not arbitrary strings.
-pub fn dyn_site(target: &'static str, fields: &'static [&'static str], name: &'static str) -> &'static DynSite {
+pub fn dyn_site(
+    target: &'static str,
+    fields: &'static [&'static str],
+    name: &'static str,
+) -> &'static DynSite {
     static MAP: Mutex<Option<FxHashMap<(&'static str, &'static str), &'static DynSite>>> =
         Mutex::new(None);
     let key = (target, name);

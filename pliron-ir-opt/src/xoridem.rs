@@ -38,8 +38,8 @@ use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
 use pliron_llvm::attributes::ICmpPredicateAttr as P;
 use pliron_llvm::ops::{
-    AddOp, AllocaOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, GetElementPtrOp, ICmpOp,
-    LoadOp, StoreOp, XorOp,
+    AddOp, AllocaOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, GetElementPtrOp, ICmpOp, LoadOp,
+    StoreOp, XorOp,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -113,8 +113,7 @@ fn arg_inv(
     } else if let Some(d) = v.defining_op() {
         if Operation::is_op::<LoadOp>(d, ctx) {
             !st.volatile.contains(&d)
-                && slot_base(ctx, d.deref(ctx).get_operand(0))
-                    .is_some_and(|a| !sbases.contains(&a))
+                && slot_base(ctx, d.deref(ctx).get_operand(0)).is_some_and(|a| !sbases.contains(&a))
                 && arg_inv(
                     ctx,
                     st,
@@ -128,7 +127,15 @@ fn arg_inv(
             !crate::callgvn::writes_plain(ctx, st, d)
                 && d.deref(ctx).successors().next().is_none()
                 && (0..d.deref(ctx).get_num_operands()).all(|i| {
-                    arg_inv(ctx, st, lset, sbases, memo, fuel, d.deref(ctx).get_operand(i))
+                    arg_inv(
+                        ctx,
+                        st,
+                        lset,
+                        sbases,
+                        memo,
+                        fuel,
+                        d.deref(ctx).get_operand(i),
+                    )
                 })
         }
     } else {
@@ -301,14 +308,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }
         // Natural loop: latches are h's preds dominated by h; the body is
         // their backward cone without crossing h.
-        let hpreds: Vec<Ptr<BasicBlock>> =
-            preds.get(&h).into_iter().flatten().copied().collect();
+        let hpreds: Vec<Ptr<BasicBlock>> = preds.get(&h).into_iter().flatten().copied().collect();
         let latches: Vec<Ptr<BasicBlock>> = hpreds
             .iter()
             .copied()
-            .filter(|&p| {
-                p != h && dom.as_ref().is_some_and(|d| d.dominates(h, p))
-            })
+            .filter(|&p| p != h && dom.as_ref().is_some_and(|d| d.dominates(h, p)))
             .collect();
         if latches.is_empty() {
             continue;
@@ -352,16 +356,16 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         }
         // Interior: unconditional brs only, exits only through h.
         let ok = lset.iter().all(|&b| {
-            b == h || bops[&b].last().is_some_and(|&t| Operation::is_op::<BrOp>(t, ctx))
+            b == h
+                || bops[&b]
+                    .last()
+                    .is_some_and(|&t| Operation::is_op::<BrOp>(t, ctx))
         }) && lset.iter().all(|&b| {
-            bops[&b]
-                .last()
-                .into_iter()
-                .all(|&t| {
-                    t.deref(ctx)
-                        .successors()
-                        .all(|s| lset.contains(&s) || (b == h && s == e))
-                })
+            bops[&b].last().into_iter().all(|&t| {
+                t.deref(ctx)
+                    .successors()
+                    .all(|s| lset.contains(&s) || (b == h && s == e))
+            })
         });
         if !ok {
             continue;
@@ -397,8 +401,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                             ok = false;
                             break 'scan;
                         }
-                        let (a0, a1) =
-                            (ad.deref(ctx).get_operand(0), ad.deref(ctx).get_operand(1));
+                        let (a0, a1) = (ad.deref(ctx).get_operand(0), ad.deref(ctx).get_operand(1));
                         let kv = if is_load_of(ctx, st, a0, c_ptr) {
                             a1
                         } else if is_load_of(ctx, st, a1, c_ptr) {
@@ -459,9 +462,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 }
                 let o = op.deref(ctx);
                 for r in 0..o.get_num_results() {
-                    if !o.get_result(r).uses(ctx).iter().all(|u| {
-                        parent(ctx, u.user_op()).is_some_and(|pb| lset.contains(&pb))
-                    }) {
+                    if !o
+                        .get_result(r)
+                        .uses(ctx)
+                        .iter()
+                        .all(|u| parent(ctx, u.user_op()).is_some_and(|pb| lset.contains(&pb)))
+                    {
                         ok = false;
                     }
                 }
@@ -495,8 +501,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if ok {
             for &c in &calls {
                 ok = (0..c.deref(ctx).get_num_operands()).all(|i| {
-                    slot_base(ctx, c.deref(ctx).get_operand(i))
-                        .is_none_or(|a| !sbases.contains(&a))
+                    slot_base(ctx, c.deref(ctx).get_operand(i)).is_none_or(|a| !sbases.contains(&a))
                 });
                 if !ok {
                     break;
@@ -544,8 +549,13 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         // 0 already wrote the final value). Mixing kinds would make the
         // final value order-dependent.
         // Per acc pointer: (store op, block, stored value, invariant).
-        let mut accs: FxHashMap<Value, (Vec<(Ptr<Operation>, Ptr<BasicBlock>, Value, Value)>, TypeHandle)> =
-            FxHashMap::default();
+        let mut accs: FxHashMap<
+            Value,
+            (
+                Vec<(Ptr<Operation>, Ptr<BasicBlock>, Value, Value)>,
+                TypeHandle,
+            ),
+        > = FxHashMap::default();
         let mut visible: Vec<(Ptr<BasicBlock>, Value)> = Vec::new();
         for (p, ws) in byp {
             let mut mask = 0u8;
@@ -557,11 +567,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                     break;
                 }
                 let mut iv = None;
-                if let Some(xo) =
-                    w.defining_op().filter(|&d| Operation::is_op::<XorOp>(d, ctx))
+                if let Some(xo) = w
+                    .defining_op()
+                    .filter(|&d| Operation::is_op::<XorOp>(d, ctx))
                 {
-                    let (x0, x1) =
-                        (xo.deref(ctx).get_operand(0), xo.deref(ctx).get_operand(1));
+                    let (x0, x1) = (xo.deref(ctx).get_operand(0), xo.deref(ctx).get_operand(1));
                     iv = if is_load_of(ctx, st, x0, p)
                         && arg_inv(ctx, st, &lset, &sbases, &mut memo, &mut fuel, x1)
                     {
@@ -605,14 +615,15 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         // The executed iteration must actually run every live store and
         // produce every fixup input: their defs have to dominate the
         // latch. Outside-loop defs reach it through the preheader.
-        let dom_ok = visible.iter().all(|&(sb, _)| {
-            dom.as_ref().is_some_and(|d| d.dominates(sb, latch))
-        }) && accs.values().all(|(ast, _)| {
-            ast.iter().all(|&(_, _, _, iv)| {
-                def_block(ctx, iv)
-                    .is_none_or(|db| dom.as_ref().is_some_and(|d| d.dominates(db, latch)))
-            })
-        });
+        let dom_ok = visible
+            .iter()
+            .all(|&(sb, _)| dom.as_ref().is_some_and(|d| d.dominates(sb, latch)))
+            && accs.values().all(|(ast, _)| {
+                ast.iter().all(|&(_, _, _, iv)| {
+                    def_block(ctx, iv)
+                        .is_none_or(|db| dom.as_ref().is_some_and(|d| d.dominates(db, latch)))
+                })
+            });
         if !dom_ok {
             continue;
         }
@@ -665,8 +676,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
             continue;
         }
         let odd = n % 2 == 1;
-        if crate::env_set("PLIRON_XIDBG") {
-            eprintln!("xoridem   fold h={h:?} n={n} accs={}", accs.len());
+        if tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::xoridem", "xoridem   fold h={h:?} n={n} accs={}", accs.len());
         }
         // Even trips: an accumulator's final value is `s0` — each acc is
         // either `clean` (every in-loop load of the slot is a recurrence
@@ -756,8 +767,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             erase_unreachable(ctx, st, &bs, &|b| om[&b].clone());
         }
     }
-    if crate::env_set("PLIRON_STATS") || crate::env_set("PLIRON_XIDBG") {
-        eprintln!("xoridem   {n} folds");
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "xoridem   {n} folds");
+    } else if tracing::enabled!(target: "pliron::xoridem", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::xoridem", "xoridem   {n} folds");
     }
 }
 

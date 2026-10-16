@@ -222,11 +222,7 @@ fn undef(func: &mut Function, b: Block, ty: Type) -> Value {
     }
 }
 
-pub fn run(
-    func: &mut Function,
-    cfg: &ControlFlowGraph,
-    nocap: &FxHashSet<(Inst, u32)>,
-) -> usize {
+pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst, u32)>) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -234,11 +230,11 @@ pub fn run(
     if func.sized_stack_slots.is_empty() || nblocks > MAX_BLOCKS {
         return 0;
     }
-    let timer = crate::env_set("PLIRON_SLOTPROM_TIME");
+    let timer = tracing::enabled!(target: "pliron::slotprom", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let webs = Webs::new(func, cfg);
     if timer {
-        eprintln!("slotprom: webs {:?} ({} blocks)", t0.elapsed(), nblocks);
+        tracing::info!(target: "pliron::slotprom", "slotprom: webs {:?} ({} blocks)", t0.elapsed(), nblocks);
     }
     let t1 = std::time::Instant::now();
 
@@ -339,9 +335,7 @@ pub fn run(
                         && k < nargs
                         && !matches!(
                             data.opcode(),
-                            Opcode::ReturnCall
-                                | Opcode::ReturnCallIndirect
-                                | Opcode::StackSwitch
+                            Opcode::ReturnCall | Opcode::ReturnCallIndirect | Opcode::StackSwitch
                         ) =>
                     {
                         // Operand `k`; the callee operand of an indirect
@@ -362,8 +356,9 @@ pub fn run(
                                 let ss_ = sync_calls.entry(ss).or_default();
                                 if !ss_.contains(&i) {
                                     ss_.push(i);
-                                    if crate::env_set("PLIRON_SLOTPROM_WHY") {
-                                        eprintln!("slotprom: bounded call {i} on {ss}");
+                                    if tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                                    {
+                                        tracing::debug!(target: "pliron::slotprom", "slotprom: bounded call {i} on {ss}");
                                     }
                                 }
                             } else {
@@ -378,9 +373,10 @@ pub fn run(
                     _ => esc.extend(w.slots.iter().map(|&(s, _)| s)),
                 }
                 for ss in esc {
-                    if crate::env_set("PLIRON_SLOTPROM_WHY") && !bad.contains(&ss) {
-                        eprintln!(
-                            "slotprom: {ss} escaped at {i} {:?} ({})",
+                    if tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                        && !bad.contains(&ss)
+                    {
+                        tracing::debug!(target: "pliron::slotprom", "slotprom: {ss} escaped at {i} {:?} ({})",
                             data.opcode(),
                             func.name
                         );
@@ -396,8 +392,7 @@ pub fn run(
         }
     }
     if timer {
-        eprintln!(
-            "slotprom: accs scan {:?} ({} poisoned={})",
+        tracing::debug!(target: "pliron::slotprom", "slotprom: accs scan {:?} ({} poisoned={})",
             t1.elapsed(),
             func.name,
             webs.poisoned()
@@ -475,8 +470,7 @@ pub fn run(
 
     // Each access inst's slot site — field-invariant, so it is computed
     // once here rather than per field inside the livein scan.
-    let mut sites: FxHashMap<Inst, (Option<(StackSlot, i64)>, bool)> =
-        FxHashMap::default();
+    let mut sites: FxHashMap<Inst, (Option<(StackSlot, i64)>, bool)> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let s = match func.dfg.insts[i] {
@@ -592,8 +586,7 @@ pub fn run(
         }
     }
     if timer {
-        eprintln!(
-            "slotprom: liveins {:?} ({} fields)",
+        tracing::debug!(target: "pliron::slotprom", "slotprom: liveins {:?} ({} fields)",
             t2.elapsed(),
             fields.len()
         );
@@ -627,9 +620,7 @@ pub fn run(
                 Opcode::TryCall | Opcode::TryCallIndirect
             ) {
                 let dfg = &func.dfg;
-                for bc in
-                    dfg.insts[i].branch_destination(&dfg.jump_tables, &dfg.exception_tables)
-                {
+                for bc in dfg.insts[i].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
                     reload_top
                         .entry(bc.block(&dfg.value_lists))
                         .or_default()
@@ -672,7 +663,7 @@ pub fn run(
         kept_ix.insert(fi, ki);
     }
     if timer {
-        eprintln!("slotprom: plan {:?}", t3.elapsed());
+        tracing::info!(target: "pliron::slotprom", "slotprom: plan {:?}", t3.elapsed());
     }
     let t4 = std::time::Instant::now();
 
@@ -704,12 +695,11 @@ pub fn run(
                 let sa = *sas
                     .entry(f.slot)
                     .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
-                cur[ki] = Some(pos.ins().load(
-                    f.ty,
-                    MemFlagsData::new().with_notrap(),
-                    sa,
-                    f.off as i32,
-                ));
+                cur[ki] =
+                    Some(
+                        pos.ins()
+                            .load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32),
+                    );
             }
         }
         for i in insts {
@@ -727,12 +717,8 @@ pub fn run(
                             .entry(f.slot)
                             .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
                         if let Some(v) = cur[ki] {
-                            pos.ins().store(
-                                MemFlagsData::new().with_notrap(),
-                                v,
-                                sa,
-                                f.off as i32,
-                            );
+                            pos.ins()
+                                .store(MemFlagsData::new().with_notrap(), v, sa, f.off as i32);
                         }
                     }
                 }
@@ -760,7 +746,8 @@ pub fn run(
             }
             match func.dfg.insts[i] {
                 InstructionData::Load {
-                    opcode: Opcode::Load, ..
+                    opcode: Opcode::Load,
+                    ..
                 } => {
                     let ty = func.dfg.value_type(func.dfg.first_result(i));
                     if let Some(&(Some((ss, off)), _)) = sites.get(&i)
@@ -838,7 +825,7 @@ pub fn run(
         }
     }
     if timer {
-        eprintln!("slotprom: rewrite {:?}", t4.elapsed());
+        tracing::info!(target: "pliron::slotprom", "slotprom: rewrite {:?}", t4.elapsed());
     }
     n
 }
@@ -858,7 +845,6 @@ mod tests {
             panic!("slotprom produced invalid IR: {e}\n{}", func.display());
         }
     }
-
 
     fn empty_nocap() -> FxHashSet<(Inst, u32)> {
         FxHashSet::default()
@@ -1301,7 +1287,8 @@ mod tests {
         let z = cur.ins().iconst(types::I64, 0);
         let c = cur.ins().icmp(IntCC::Equal, x, z);
         // Null edge binds (0, &slot); non-null edge binds (&slot, heap).
-        cur.ins().brif(c, join, &[z.into(), a.into()], join, &[a.into(), hp.into()]);
+        cur.ins()
+            .brif(c, join, &[z.into(), a.into()], join, &[a.into(), hp.into()]);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(join);
         let z2 = cur.ins().iconst(types::I64, 0);
@@ -1355,7 +1342,8 @@ mod tests {
         cur.ins().store(flags, x, a, 0);
         let z = cur.ins().iconst(types::I64, 0);
         let c = cur.ins().icmp(IntCC::Equal, x, z);
-        cur.ins().brif(c, join, &[z.into(), a.into()], join, &[a.into(), a.into()]);
+        cur.ins()
+            .brif(c, join, &[z.into(), a.into()], join, &[a.into(), a.into()]);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(join);
         let z2 = cur.ins().iconst(types::I64, 0);
@@ -1389,9 +1377,8 @@ mod tests {
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
-        let un = func.declare_imported_user_function(
-            cranelift_codegen::ir::UserExternalName::new(0, 0),
-        );
+        let un =
+            func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName::new(0, 0));
         let mut csig = Signature::new(CallConv::Fast);
         csig.params.push(AbiParam::new(types::I64));
         csig.params.push(AbiParam::new(types::I64));

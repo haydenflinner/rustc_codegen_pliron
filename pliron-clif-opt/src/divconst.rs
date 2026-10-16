@@ -274,14 +274,7 @@ fn quotient(
 
 /// Expand one matched inst at the cursor; returns the value its result
 /// aliases to. `None` only if the magic search declined.
-fn expand(
-    pos: &mut FuncCursor,
-    ty: Type,
-    x: Value,
-    d: u64,
-    op: Opcode,
-    lz: u32,
-) -> Option<Value> {
+fn expand(pos: &mut FuncCursor, ty: Type, x: Value, d: u64, op: Opcode, lz: u32) -> Option<Value> {
     let w = ty.lane_type().bits();
     let m = mask(w);
     let signed = matches!(op, Opcode::Sdiv | Opcode::Srem);
@@ -406,8 +399,8 @@ pub fn run(func: &mut Function) -> usize {
         pos.func.layout.remove_inst(i);
         pos.func.dfg.change_to_alias(res, v);
         done += 1;
-        if crate::env_set("PLIRON_DIVCONST_DEBUG") {
-            eprintln!("divconst: expanded {op}.{ty} by {d:#x}");
+        if tracing::enabled!(target: "pliron::divconst", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::divconst", "divconst: expanded {op}.{ty} by {d:#x}");
         }
     }
     done

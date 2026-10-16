@@ -133,13 +133,11 @@ impl Demands {
         // Same-root ranges need the byte check; a non-isolated `r` also
         // may-aliases any demand on another non-isolated root.
         let hit = self.locs.get(&r).is_some_and(overlap)
-            || (!iso.contains(&r)
-                && self.locs.keys().any(|r2| *r2 != r && !iso.contains(r2)));
+            || (!iso.contains(&r) && self.locs.keys().any(|r2| *r2 != r && !iso.contains(r2)));
         if hit || self.roots.contains(&r) {
             return true;
         }
-        ((self.top_non_iso && !iso.contains(&r))
-            || (self.top_non_stack && matches!(r, Root::V(_))))
+        ((self.top_non_iso && !iso.contains(&r)) || (self.top_non_stack && matches!(r, Root::V(_))))
             && !self
                 .cov
                 .get(&r)
@@ -163,9 +161,7 @@ impl Demands {
                 self.cov.remove(&r);
             }
         }
-        if self.ncov < MAX_LOCS
-            && rput(self.cov.entry(r).or_default(), o, w)
-        {
+        if self.ncov < MAX_LOCS && rput(self.cov.entry(r).or_default(), o, w) {
             self.ncov += 1;
         }
     }
@@ -392,7 +388,7 @@ pub fn run(
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
-    let prof = crate::env_set("PLIRON_DSE_PROF");
+    let prof = tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
     // Only a plain notrap store is killable, and `decode` can only
     // demote candidates to `RwAll`, never create them — a function with
     // no candidate skips the whole CFG/alias/iso setup and the dataflow.
@@ -442,8 +438,7 @@ pub fn run(
         // sweep can only ever report `dead = []`.
         if prof {
             let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
-            eprintln!(
-                "dseprof {step} {fname} blocks={} ops={ninst} pops=0 ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix=0ns sweep=0ns dead=0",
+            tracing::debug!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops=0 ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix=0ns sweep=0ns dead=0",
                 order.len(),
             );
         }
@@ -538,20 +533,18 @@ pub fn run(
         }
     }
     if !stable {
-        if crate::env_set("PLIRON_DSE_DEBUG") {
-            eprintln!(
-                "dse: fixpoint over pop budget ({MAX_POP_ROUNDS}x blocks), bailing ({fname})"
+        if tracing::enabled!(target: "pliron::dse", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::dse", "dse: fixpoint over pop budget ({MAX_POP_ROUNDS}x blocks), bailing ({fname})"
             );
         }
         return 0;
     }
     let t_fix = t.elapsed() - t_dec;
-    let dump = crate::env_set("PLIRON_DSE_DUMP");
+    let dump = tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
     if dump {
-        eprintln!("dse-dump {fname} iso={iso:?}");
+        tracing::debug!(target: "pliron::dse", "dse-dump {fname} iso={iso:?}");
         for &b in &order {
-            eprintln!(
-                "  {b:?} inn tops={}/{} locs={:?} roots={:?} cov={:?}",
+            tracing::info!(target: "pliron::dse", "  {b:?} inn tops={}/{} locs={:?} roots={:?} cov={:?}",
                 inn[b].top_non_iso,
                 inn[b].top_non_stack,
                 inn[b].locs,
@@ -566,12 +559,12 @@ pub fn run(
     for &b in &store_blks {
         let mut d = out[b].clone();
         if dump {
-            eprintln!("  sweep {b:?} out locs={:?} tops={}/{}", d.locs, d.top_non_iso, d.top_non_stack);
+            tracing::info!(target: "pliron::dse", "  sweep {b:?} out locs={:?} tops={}/{}", d.locs, d.top_non_iso, d.top_non_stack);
         }
         transfer(&ops[b], &mut d, iso, Some(&mut dead));
     }
     if dump {
-        eprintln!("  dead={dead:?}");
+        tracing::info!(target: "pliron::dse", "  dead={dead:?}");
     }
     for i in &dead {
         func.layout.remove_inst(*i);
@@ -579,8 +572,7 @@ pub fn run(
     if prof {
         let t_sweep = t.elapsed() - t_fix - t_dec;
         let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
-        eprintln!(
-            "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
+        tracing::info!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
             order.len(),
             dead.len(),
         );
@@ -632,9 +624,11 @@ mod tests {
     fn store_chain_kills_earlier() {
         let mut func = func_with(|cur, p| {
             let one = cur.ins().iconst(types::I64, 1);
-            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, p, 0);
             let two = cur.ins().iconst(types::I64, 2);
-            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 0);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), two, p, 0);
         });
         assert_eq!(dse(&mut func), 1);
     }
@@ -645,10 +639,13 @@ mod tests {
     fn load_between_stores_keeps_earlier() {
         let mut func = func_with(|cur, p| {
             let one = cur.ins().iconst(types::I64, 1);
-            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
-            cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), p, 0);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, p, 0);
+            cur.ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), p, 0);
             let two = cur.ins().iconst(types::I64, 2);
-            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 0);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), two, p, 0);
         });
         assert_eq!(dse(&mut func), 0);
     }
@@ -659,9 +656,11 @@ mod tests {
     fn disjoint_store_survives() {
         let mut func = func_with(|cur, p| {
             let one = cur.ins().iconst(types::I64, 1);
-            cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, p, 0);
             let two = cur.ins().iconst(types::I64, 2);
-            cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 8);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), two, p, 8);
         });
         assert_eq!(dse(&mut func), 0);
     }

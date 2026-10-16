@@ -1662,3 +1662,29 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   The linked_list `Iter::next` leaf (~1.4k samples) is structural:
   per-node `RefCell` in `Ptr::deref` (context.rs:207) — fixing it means
   a vendor-level arena redesign, not a pass change.
+- Tracing refactor (uncommitted -> this commit): all diagnostic
+  `eprintln!` sites across both opt crates + src/ converted to
+  `tracing::debug!/info!/trace!` on `pliron::<module>` targets
+  (~350 sites, ~55 files). Report channels are separate targets:
+  `pliron::stats`/`timing`/`facts`/`dump`. `tracing_init` installs the
+  subscriber when `PLIRON_TRACE` **or** any legacy diagnostic knob is
+  set, via the `KNOB_TARGETS` (env var -> target, level) table in
+  src/lib.rs — so `PLIRON_JT_PROF=1`, `PLIRON_XPACK_DEBUG=1`,
+  `PLIRON_STATS=1` etc. keep working unchanged. Subscriber emits bare
+  messages (no level/target/time) because test.sh greps stats/facts
+  lines verbatim. `eprintln!` remains only where output must appear
+  with no subscriber: unknown-step errors, panic paths, diffcheck
+  reports, wasm stub summary, pgo read errors, test prints.
+  Gotchas hit during conversion: a scripted edit spliced file content
+  into eight ir-opt files (restored from HEAD and redone by hand);
+  stats-channel prints must target `pliron::stats` specifically (a
+  `pliron::<stem>`-targeted stats line is invisible under
+  `PLIRON_STATS` — that's what broke `nnret inferred nothing` in the
+  retattr test); `p.dump` carries the `PLIRON_CLIF` substring match and
+  must not be replaced by bare `enabled!(dump)`; `s_slp` now uses
+  `p.dump("slp")`. `PLIRON_UNROLL_DEBUG=3` maps to `trace` (deepest
+  tier); `PLIRON_POSTINC_DEBUG` -> `pliron::indvars` debug.
+  Validated: `cargo check --workspace`, `cargo test -p pliron-clif-opt
+  -p pliron-ir-opt` (68 + all filetests), full `./test.sh` incl.
+  `facts`/`retattr`/`edgespec`, `PLIRON_TRACE=pliron::stats=info` and
+  legacy `PLIRON_STATS`/`PLIRON_JT_PROF`/`PLIRON_FACTS` runs.

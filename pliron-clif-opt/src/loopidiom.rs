@@ -28,8 +28,8 @@ const MAX_CONV: usize = 8;
 /// Debug macro: return None, logging `why` under PLIRON_IDIOM_DEBUG.
 macro_rules! why {
     ($($t:tt)*) => {{
-        if crate::env_set("PLIRON_IDIOM_DEBUG") {
-            eprintln!("idiom bail: {}", format_args!($($t)*));
+        if tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::loopidiom", "idiom bail: {}", format_args!($($t)*));
         }
         return None;
     }};
@@ -183,8 +183,8 @@ pub fn gather(
 ) -> Option<Info> {
     macro_rules! gwhy {
         ($($t:tt)*) => {{
-            if crate::env_set("PLIRON_GATHER_DEBUG") {
-                eprintln!("gather bail {:?}: {}", lp, format_args!($($t)*));
+            if tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::loopidiom", "gather bail {:?}: {}", lp, format_args!($($t)*));
             }
             return None;
         }};
@@ -715,8 +715,8 @@ pub fn deadend(func: &Function, b: Block) -> bool {
         let Some(t) = func.layout.last_inst(cur) else {
             return false;
         };
-        let dests = func.dfg.insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let dests =
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         match func.dfg.insts[t].opcode() {
             Opcode::Trap => {}
             Opcode::Return | Opcode::ReturnCall | Opcode::ReturnCallIndirect
@@ -1316,8 +1316,8 @@ pub fn plan(
             Some((e, c, ps))
         })
         .or_else(|| {
-            if crate::env_set("PLIRON_IDIOM_DEBUG") {
-                eprintln!("idiom bail: count/guards {:?}", la.loop_header(lp));
+            if tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::loopidiom", "idiom bail: count/guards {:?}", la.loop_header(lp));
             }
             None
         })?;
@@ -2029,8 +2029,8 @@ fn plan_dead(
             }
         })();
         let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
-            if crate::env_set("PLIRON_IDIOM_DEBUG") {
-                eprintln!("dead: no count {:?} exit {:?}", info.h, e.inst);
+            if tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::loopidiom", "dead: no count {:?} exit {:?}", info.h, e.inst);
             }
             continue;
         };
@@ -2384,7 +2384,7 @@ pub fn run(
     {
         return 0;
     }
-    let debug = crate::env_set("PLIRON_IDIOM_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG);
     let mut n = 0;
     // `apply` rewires the CFG, so recompute the analyses before each
     // conversion rather than letting `plan` see stale dominance/latches.
@@ -2398,8 +2398,7 @@ pub fn run(
             }
             if let Some(p) = plan(func, &ps, cfg, dt, la, lp, noalias) {
                 if debug {
-                    eprintln!(
-                        "idiom {fname}: loop {:?} -> {}",
+                    tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: loop {:?} -> {}",
                         p.h,
                         if p.src.is_some() { "memcpy" } else { "memset" }
                     );
@@ -2408,7 +2407,7 @@ pub fn run(
                 done.insert(p.h);
             } else if let Some(d) = plan_dead(func, &ps, noalias, cfg, dt, la, lp) {
                 if debug {
-                    eprintln!("idiom {fname}: dead loop {:?} eliminated", d.h);
+                    tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: dead loop {:?} eliminated", d.h);
                 }
                 apply_dead(func, &d, tcfg);
                 done.insert(d.h);

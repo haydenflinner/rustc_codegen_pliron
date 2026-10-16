@@ -19,7 +19,7 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
         if has_body(ctx, f.op)
             && let Some(e) = check(ctx, st, f.op)
         {
-            eprintln!("domcheck after {pass}: {name}: {e}");
+            tracing::error!(target: "pliron::domcheck", "domcheck after {pass}: {name}: {e}");
         }
     }
 }
@@ -99,8 +99,7 @@ impl Dom {
         // linked-list ops, so a second call doubles the pass's scan cost.
         let mut seen = FxHashMap::default();
         let mut post = Vec::new();
-        let mut smap: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
-            FxHashMap::default();
+        let mut smap: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
         smap.insert(entry, succs(ctx, st, entry));
         let mut stack = vec![(entry, 0usize)];
         seen.insert(entry, ());

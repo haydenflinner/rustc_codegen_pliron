@@ -738,8 +738,8 @@ fn conv_table(
         opcode: Opcode::Jump,
         destination: bc,
     };
-    if crate::env_set("PLIRON_IFCONV_DEBUG") {
-        eprintln!("ifconv {b} br_table -> jump {m} (arms {})", arms.len());
+    if tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::ifconv", "ifconv {b} br_table -> jump {m} (arms {})", arms.len());
     }
     true
 }
@@ -776,158 +776,159 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
     // are idempotent against a recomputed cfg, so a recompute inside a
     // round leaves later rounds correct.
     'outer: for _ in 0..8 {
-    let mut rn = 0;
-    for b in func.layout.blocks().collect::<Vec<_>>() {
-        let Some(term) = func.layout.last_inst(b) else {
-            continue;
-        };
-        let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
-            if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
-                && conv_table(
-                    func,
-                    &mut cfg,
-                    &mut domtree,
-                    &mut flat,
-                    &mut msets,
-                    &mut dirty,
-                    &mut preds,
-                    b,
-                    term,
-                    derived,
-                )
+        let mut rn = 0;
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            let Some(term) = func.layout.last_inst(b) else {
+                continue;
+            };
+            let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
+                if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
+                    && conv_table(
+                        func,
+                        &mut cfg,
+                        &mut domtree,
+                        &mut flat,
+                        &mut msets,
+                        &mut dirty,
+                        &mut preds,
+                        b,
+                        term,
+                        derived,
+                    )
+                {
+                    n += 1;
+                }
+                continue;
+            };
+            let dests = func.dfg.insts[term]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .to_vec();
+            let [t_bc, e_bc] = dests[..] else {
+                continue;
+            };
+            let (t, e) = (
+                t_bc.block(&func.dfg.value_lists),
+                e_bc.block(&func.dfg.value_lists),
+            );
+            if t == b || e == b {
+                continue;
+            }
+            let t_edge: Vec<BlockArg> = t_bc.args(&func.dfg.value_lists).collect();
+            let e_edge: Vec<BlockArg> = e_bc.args(&func.dfg.value_lists).collect();
+            let Some(ta) = resolve_arm(func, t, &t_edge) else {
+                continue;
+            };
+            let Some(ea) = resolve_arm(func, e, &e_edge) else {
+                continue;
+            };
+            if ta.m != ea.m || ta.m == b {
+                continue;
+            }
+            // The merge can't sit inside an arm's forwarder chain (a self
+            // loop routed through hops).
+            if ta.chain.contains(&ta.m) || ea.chain.contains(&ea.m) {
+                continue;
+            }
+            let m = ta.m;
+            // A non-forwarder arm must target M itself (its edge args are the
+            // merge args); both arms direct is `brif c, M, M`.
+            if (ta.side.is_none() && t != m) || (ea.side.is_none() && e != m) {
+                continue;
+            }
+            if ta.args.len() != ea.args.len() || ta.args.len() != func.dfg.num_block_params(m) {
+                continue;
+            }
+            // Type-check before mutating (clones preserve types).
+            if !ta
+                .args
+                .iter()
+                .zip(&ea.args)
+                .all(|(&x, &y)| x == y || select_ok(func, x, y))
             {
-                n += 1;
-            }
-            continue;
-        };
-        let dests = func.dfg.insts[term]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .to_vec();
-        let [t_bc, e_bc] = dests[..] else {
-            continue;
-        };
-        let (t, e) = (
-            t_bc.block(&func.dfg.value_lists),
-            e_bc.block(&func.dfg.value_lists),
-        );
-        if t == b || e == b {
-            continue;
-        }
-        let t_edge: Vec<BlockArg> = t_bc.args(&func.dfg.value_lists).collect();
-        let e_edge: Vec<BlockArg> = e_bc.args(&func.dfg.value_lists).collect();
-        let Some(ta) = resolve_arm(func, t, &t_edge) else {
-            continue;
-        };
-        let Some(ea) = resolve_arm(func, e, &e_edge) else {
-            continue;
-        };
-        if ta.m != ea.m || ta.m == b {
-            continue;
-        }
-        // The merge can't sit inside an arm's forwarder chain (a self
-        // loop routed through hops).
-        if ta.chain.contains(&ta.m) || ea.chain.contains(&ea.m) {
-            continue;
-        }
-        let m = ta.m;
-        // A non-forwarder arm must target M itself (its edge args are the
-        // merge args); both arms direct is `brif c, M, M`.
-        if (ta.side.is_none() && t != m) || (ea.side.is_none() && e != m) {
-            continue;
-        }
-        if ta.args.len() != ea.args.len() || ta.args.len() != func.dfg.num_block_params(m) {
-            continue;
-        }
-        // Type-check before mutating (clones preserve types).
-        if !ta
-            .args
-            .iter()
-            .zip(&ea.args)
-            .all(|(&x, &y)| x == y || select_ok(func, x, y))
-        {
-            continue;
-        }
-        // A >`SPEC_NARROW` arm pays its speculation every iteration; only
-        // fold it when the merge carries a real predicate bool (the
-        // `filter(pred)` diamonds loopvec wants flat). The UTF-8 width
-        // dispatch merges const flags + pointers instead — its branches
-        // are predictable and must stay branches (x64: ~2x chars hit).
-        // A multi-hop arm is instead gated by `flat_loop`: folding is
-        // only profitable when the loop ends up branch-free (the
-        // count-if accumulator merges a select, not a bool tree).
-        if !ta.chained
-            && !ea.chained
-            && (ta.clone.len() > SPEC_NARROW || ea.clone.len() > SPEC_NARROW)
-            && !bool_merge(func, &[&ta, &ea])
-        {
-            continue;
-        }
-        // Multi-hop arms only pay off when the fold leaves its loop
-        // branch-free (see `flat_loop`).
-        if ta.chained || ea.chained {
-            if dirty {
-                cfg.compute(func);
-                domtree.compute(func, &cfg);
-                msets.recompute(func, &domtree);
-                flat.ok = false;
-                dirty = false;
-            }
-            flat.ensure(func, &cfg, &domtree);
-            if !flat.flat(b) {
                 continue;
             }
-        }
-        let chains: FxHashSet<Block> = ta.chain.iter().chain(ea.chain.iter()).copied().collect();
-        let mset = msets.get(m);
-        let t0 = std::time::Instant::now();
-        let ok = !mset.is_empty() && edge_ok(func, &domtree, m, mset, &chains, term);
-        EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
-        if !ok {
-            continue;
-        }
-        dirty = true;
-        for d in [t, e] {
-            if d != m {
-                preds.1.entry(d).or_default().insert(b);
-            }
-        }
-        preds.0.entry(m).or_default().insert(b);
-        let targs = emit_arm(func, term, &ta, derived);
-        let eargs = emit_arm(func, term, &ea, derived);
-        let cond = func.dfg.resolve_aliases(cond);
-        let mut sargs: Vec<BlockArg> = Vec::with_capacity(targs.len());
-        for (x, y) in targs.into_iter().zip(eargs) {
-            if x == y {
-                sargs.push(BlockArg::Value(x));
+            // A >`SPEC_NARROW` arm pays its speculation every iteration; only
+            // fold it when the merge carries a real predicate bool (the
+            // `filter(pred)` diamonds loopvec wants flat). The UTF-8 width
+            // dispatch merges const flags + pointers instead — its branches
+            // are predictable and must stay branches (x64: ~2x chars hit).
+            // A multi-hop arm is instead gated by `flat_loop`: folding is
+            // only profitable when the loop ends up branch-free (the
+            // count-if accumulator merges a select, not a bool tree).
+            if !ta.chained
+                && !ea.chained
+                && (ta.clone.len() > SPEC_NARROW || ea.clone.len() > SPEC_NARROW)
+                && !bool_merge(func, &[&ta, &ea])
+            {
                 continue;
             }
-            let ty = func.dfg.value_type(x);
-            let sel = func.dfg.make_inst(InstructionData::Ternary {
-                opcode: Opcode::Select,
-                args: [cond, x, y],
-            });
-            func.dfg.make_inst_results(sel, ty);
-            func.layout.insert_inst(sel, term);
-            sargs.push(BlockArg::Value(func.dfg.first_result(sel)));
+            // Multi-hop arms only pay off when the fold leaves its loop
+            // branch-free (see `flat_loop`).
+            if ta.chained || ea.chained {
+                if dirty {
+                    cfg.compute(func);
+                    domtree.compute(func, &cfg);
+                    msets.recompute(func, &domtree);
+                    flat.ok = false;
+                    dirty = false;
+                }
+                flat.ensure(func, &cfg, &domtree);
+                if !flat.flat(b) {
+                    continue;
+                }
+            }
+            let chains: FxHashSet<Block> =
+                ta.chain.iter().chain(ea.chain.iter()).copied().collect();
+            let mset = msets.get(m);
+            let t0 = std::time::Instant::now();
+            let ok = !mset.is_empty() && edge_ok(func, &domtree, m, mset, &chains, term);
+            EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            if !ok {
+                continue;
+            }
+            dirty = true;
+            for d in [t, e] {
+                if d != m {
+                    preds.1.entry(d).or_default().insert(b);
+                }
+            }
+            preds.0.entry(m).or_default().insert(b);
+            let targs = emit_arm(func, term, &ta, derived);
+            let eargs = emit_arm(func, term, &ea, derived);
+            let cond = func.dfg.resolve_aliases(cond);
+            let mut sargs: Vec<BlockArg> = Vec::with_capacity(targs.len());
+            for (x, y) in targs.into_iter().zip(eargs) {
+                if x == y {
+                    sargs.push(BlockArg::Value(x));
+                    continue;
+                }
+                let ty = func.dfg.value_type(x);
+                let sel = func.dfg.make_inst(InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: [cond, x, y],
+                });
+                func.dfg.make_inst_results(sel, ty);
+                func.layout.insert_inst(sel, term);
+                sargs.push(BlockArg::Value(func.dfg.first_result(sel)));
+            }
+            let dfg = &mut func.dfg;
+            let bc = BlockCall::new(m, sargs.iter().copied(), &mut dfg.value_lists);
+            dfg.insts[term] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: bc,
+            };
+            if tracing::enabled!(target: "pliron::ifconv", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::ifconv", "ifconv {b} -> jump {m} (arms {t:?} {e:?})");
+            }
+            rn += 1;
         }
-        let dfg = &mut func.dfg;
-        let bc = BlockCall::new(m, sargs.iter().copied(), &mut dfg.value_lists);
-        dfg.insts[term] = InstructionData::Jump {
-            opcode: Opcode::Jump,
-            destination: bc,
-        };
-        if crate::env_set("PLIRON_IFCONV_DEBUG") {
-            eprintln!("ifconv {b} -> jump {m} (arms {t:?} {e:?})");
+        n += rn;
+        if rn == 0 {
+            break 'outer;
         }
-        rn += 1;
     }
-    n += rn;
-    if rn == 0 {
-        break 'outer;
-    }
-    }
-    if crate::env_set("PLIRON_ICPROF") {
-        EDGE_NS.with(|c| eprintln!("ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
+    if tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO) {
+        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
     }
     n
 }

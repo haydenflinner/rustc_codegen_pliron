@@ -35,8 +35,8 @@ mod xcgu;
 
 // CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
 // glob re-export keeps `crate::<pass>` paths working unchanged.
-pub use pliron_clif_opt::*;
 pub use pliron_clif_lower::{eh, hot, lower, obj_sym, objmerge};
+pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
     address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine,
     memcpyopt, nnret, nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
@@ -184,9 +184,8 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     // metadata-driven and LLVM drops it for ordinary functions the same way.
     let forced = sess.opts.cg.force_frame_pointers != rustc_target::spec::FramePointer::MayOmit;
     let keep_fp = tail_calls || forced || !pass_enabled("PLIRON_OMIT_FP");
-    if crate::env_set("PLIRON_DEBUG_FP") {
-        eprintln!(
-            "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
+    if tracing::enabled!(target: "pliron::lib", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::lib", "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
             sess.target.options.frame_pointer,
             sess.opts.cg.force_frame_pointers,
             fp,
@@ -397,29 +396,306 @@ impl lower::Host for RustcHost<'_> {
     }
 }
 
-/// Install the tracing subscriber when `PLIRON_TRACE` is set. The env var
-/// is an [`EnvFilter`](tracing_subscriber::EnvFilter) over our `pliron::*`
-/// span targets — `pliron` for everything, `pliron::phase` for per-phase
+/// Install the tracing subscriber when `PLIRON_TRACE` or any legacy
+/// diagnostic knob is set. `PLIRON_TRACE` is an
+/// [`EnvFilter`](tracing_subscriber::EnvFilter) over our `pliron::*`
+/// targets — `pliron` for everything, `pliron::phase` for per-phase
 /// times, `pliron::iropt` for each ir-opt pass, `pliron::step` for every
-/// pipeline step (span name = step name), `pliron::fn` per function. The
-/// fmt layer emits each span's `time.busy` on close. Narrow further with
-/// grep — EnvFilter's `[{field=x}]` syntax only gates events *inside* a
-/// matching span, not the span's own close line. Unset means no subscriber
-/// is installed and span sites cost a branch or a hash lookup.
+/// pipeline step (span name = step name), `pliron::fn` per function,
+/// `pliron::<pass>` for per-pass diagnostics (what used to be
+/// `PLIRON_<PASS>_DEBUG`/`_PROF`), `pliron::stats`, `pliron::timing`,
+/// `pliron::facts`, `pliron::dump` for the aggregated report channels.
+/// The fmt layer emits each span's `time.busy` on close. Narrow further
+/// with grep — EnvFilter's `[{field=x}]` syntax only gates events
+/// *inside* a matching span, not the span's own close line. When no
+/// knob is set no subscriber is installed and span/event sites cost a
+/// branch or a hash lookup.
+///
+/// Legacy knob table: `(env var, target, level)` — setting the var
+/// enables that target at that level, so `PLIRON_JT_PROF=1` keeps
+/// printing jumpthread phase timings (now as `INFO pliron::jumpthread`).
+/// Print-gating knobs only; behavioral knobs stay `env_set` reads.
+const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
+    ("PLIRON_STATS", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_OPS", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_WHY", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_MEMCPY", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_DEVIRT", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_XCGU", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_TIMING", "pliron::timing", tracing::Level::INFO),
+    ("PLIRON_FACTS", "pliron::facts", tracing::Level::INFO),
+    ("PLIRON_DUMP", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_DUMP_OPT", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CLIF", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CGDUMP", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CGDUMP2", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_XPACK_CLIF", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_VCODE", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_WASM_LOOPS", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_JT_PROF", "pliron::jumpthread", tracing::Level::INFO),
+    (
+        "PLIRON_JT_PROF2",
+        "pliron::jumpthread",
+        tracing::Level::INFO,
+    ),
+    ("PLIRON_JT_PROF2", "pliron::edgespec", tracing::Level::INFO),
+    ("PLIRON_JT_PROF2", "pliron::celim", tracing::Level::INFO),
+    ("PLIRON_JT_PROF2", "pliron::loadfwd", tracing::Level::INFO),
+    ("PLIRON_DSE_PROF", "pliron::dse", tracing::Level::INFO),
+    ("PLIRON_DSE_DUMP", "pliron::dse", tracing::Level::INFO),
+    ("PLIRON_ICPROF", "pliron::ifconv", tracing::Level::INFO),
+    (
+        "PLIRON_CHAIN_PROF",
+        "pliron::pipeline",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_SLOTPROM_TIME",
+        "pliron::slotprom",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_CACHE_LOG",
+        "pliron::stepcache",
+        tracing::Level::INFO,
+    ),
+    ("PLIRON_WASM_LICM", "pliron::wasm", tracing::Level::INFO),
+    ("PLIRON_PGO", "pliron::pgo", tracing::Level::INFO),
+    ("PLIRON_PGO_USE", "pliron::pgo", tracing::Level::INFO),
+    (
+        "PLIRON_DIFFCHECK_VERBOSE",
+        "pliron::diffcheck",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_CHECK_DOM",
+        "pliron::domcheck",
+        tracing::Level::ERROR,
+    ),
+    (
+        "PLIRON_JT_DEBUG",
+        "pliron::jumpthread",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_NNDBG", "pliron::pipeline", tracing::Level::DEBUG),
+    ("PLIRON_NNDBG", "pliron::lower", tracing::Level::DEBUG),
+    (
+        "PLIRON_SELTEST_DBG",
+        "pliron::jumpthread",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_VEC_DEBUG", "pliron::loopvec", tracing::Level::DEBUG),
+    (
+        "PLIRON_LOOPVEC_DEBUG",
+        "pliron::loopvec",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_XPACK_DEBUG", "pliron::slp", tracing::Level::DEBUG),
+    ("PLIRON_TDDBG", "pliron::taildup", tracing::Level::DEBUG),
+    (
+        "PLIRON_FROZEN_SCAN",
+        "pliron::frozen",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_FROZEN_DEBUG",
+        "pliron::frozen",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_IDIOM_DEBUG",
+        "pliron::loopidiom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_GATHER_DEBUG",
+        "pliron::loopidiom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_LOOPROT_DEBUG",
+        "pliron::looprot",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INDUCT_DEBUG",
+        "pliron::indvars",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INDUCT_DEBUG",
+        "pliron::celim",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_POSTINC_DEBUG",
+        "pliron::indvars",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_BCHECK_DEBUG",
+        "pliron::bcheck",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_UNSWITCH_DEBUG",
+        "pliron::unswitch",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_UNROLL_DEBUG",
+        "pliron::unroll",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SLOTPROM_WHY",
+        "pliron::slotprom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_MEMSPEC_DEBUG",
+        "pliron::memspec",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_IFCONV_DEBUG",
+        "pliron::ifconv",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_GEDBG", "pliron::guardelim", tracing::Level::DEBUG),
+    ("PLIRON_XIDBG", "pliron::xoridem", tracing::Level::DEBUG),
+    (
+        "PLIRON_EDGESPEC_DEBUG",
+        "pliron::edgespec",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_CELIM_DEBUG", "pliron::celim", tracing::Level::DEBUG),
+    ("PLIRON_CGDBG", "pliron::callgvn", tracing::Level::DEBUG),
+    (
+        "PLIRON_NOCAPDBG",
+        "pliron::nocapture",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_CONSTBR_DEBUG",
+        "pliron::constbr",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SWITCHMAP_DEBUG",
+        "pliron::switchmap",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_DEBUG_FP", "pliron::lib", tracing::Level::DEBUG),
+    (
+        "PLIRON_DIVCONST_DEBUG",
+        "pliron::divconst",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_DSE_DEBUG", "pliron::dse", tracing::Level::DEBUG),
+    (
+        "PLIRON_IVREFOLD_DEBUG",
+        "pliron::ivrefold",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_LFDEBUG", "pliron::loadfwd", tracing::Level::DEBUG),
+    ("PLIRON_LF_DEBUG", "pliron::loadfwd", tracing::Level::DEBUG),
+    ("PLIRON_LICM_DEBUG", "pliron::licm", tracing::Level::DEBUG),
+    ("PLIRON_LICM_DEBUG2", "pliron::licm", tracing::Level::DEBUG),
+    (
+        "PLIRON_PHI_DEBUG",
+        "pliron::sameargs",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_SA_DEBUG", "pliron::sameargs", tracing::Level::DEBUG),
+    ("PLIRON_PINMISS", "pliron::sroa", tracing::Level::DEBUG),
+    ("PLIRON_SROA_WHYFN", "pliron::stats", tracing::Level::INFO),
+    (
+        "PLIRON_PUNROLL_DEBUG",
+        "pliron::punroll",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_RF_DEBUG",
+        "pliron::rangefold",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SHAPE_DEBUG",
+        "pliron::pipeline",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SLOTMERGE_DEBUG",
+        "pliron::slotmerge",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_SPEC_DEBUG", "pliron::spec", tracing::Level::DEBUG),
+    ("PLIRON_WM_PROF", "pliron::clifpeep", tracing::Level::INFO),
+    ("PLIRON_WM_SIZES", "pliron::clifpeep", tracing::Level::DEBUG),
+    (
+        "PLIRON_WEBMERGE_REL",
+        "pliron::clifpeep",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_WIDE_DEBUG",
+        "pliron::scalarize",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_CONSTDBG", "pliron::lower", tracing::Level::DEBUG),
+    (
+        "PLIRON_OPT_BISECT_DEBUG",
+        "pliron::cfg",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INLINE_VERBOSE",
+        "pliron::inline",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_WASM_VERBOSE", "pliron::wasm", tracing::Level::DEBUG),
+];
+
 fn tracing_init() {
-    if std::env::var_os("PLIRON_TRACE").is_none() {
+    let mut filter = String::new();
+    if let Ok(t) = std::env::var("PLIRON_TRACE") {
+        filter = t;
+    }
+    for &(var, target, level) in KNOB_TARGETS {
+        if std::env::var_os(var).is_some() {
+            if !filter.is_empty() {
+                filter.push(',');
+            }
+            filter.push_str(target);
+            filter.push('=');
+            // `PLIRON_UNROLL_DEBUG=3` was the deepest spew tier; keep it
+            // reachable behind `trace` now that levels unify there.
+            let level = if var == "PLIRON_UNROLL_DEBUG" && std::env::var(var).as_deref() == Ok("3")
+            {
+                tracing::Level::TRACE
+            } else {
+                level
+            };
+            filter.push_str(level.as_str());
+        }
+    }
+    if filter.is_empty() {
         return;
     }
     use tracing_subscriber::prelude::*;
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_env_var("PLIRON_TRACE")
-        .from_env_lossy();
+    let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(filter);
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stderr)
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
                 .with_ansi(false)
+                // Bare messages: the filter already scopes output, and
+                // test.sh/bench grep stats/facts/timing lines verbatim.
+                .with_level(false)
+                .with_target(false)
+                .without_time()
                 .compact(),
         )
         .with(filter)
@@ -456,7 +732,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         String::new()
     };
     if crate::env_set("PLIRON_DUMP") {
-        eprintln!("==== {name} ====\n{ir}");
+        tracing::info!(target: "pliron::dump", "==== {name} ====\n{ir}");
     }
     if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
@@ -519,19 +795,32 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 OptLevel::Size | OptLevel::SizeMin
             );
         if pass_enabled("PLIRON_FROZEN") {
-            pt!(cx, "frozen", st.frozen = context::frozen_values(ctx, st).into_iter().collect());
+            pt!(
+                cx,
+                "frozen",
+                st.frozen = context::frozen_values(ctx, st).into_iter().collect()
+            );
         }
         if pass_enabled("PLIRON_NOALIAS_FWD") {
-            pt!(cx, "noalias", st.noalias = context::noalias_values(ctx, st)
-                .into_iter()
-                .map(|(v, d, w)| (v, (d, w)))
-                .collect());
+            pt!(
+                cx,
+                "noalias",
+                st.noalias = context::noalias_values(ctx, st)
+                    .into_iter()
+                    .map(|(v, d, w)| (v, (d, w)))
+                    .collect()
+            );
         }
         if pass_enabled("PLIRON_NNARGS") {
-            pt!(cx, "nnargs", st.nnargs = context::nonnull_values(ctx, st).into_iter().collect());
+            pt!(
+                cx,
+                "nnargs",
+                st.nnargs = context::nonnull_values(ctx, st).into_iter().collect()
+            );
         }
         let mut adj = None;
-        let d1 = pt!(cx, 
+        let d1 = pt!(
+            cx,
             "inline",
             inline::run(ctx, st, small, None, false, None, &mut adj)
         );
@@ -550,7 +839,8 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     }
                 }
             }
-            pt!(cx, 
+            pt!(
+                cx,
                 "inline2",
                 inline::run(ctx, st, small, None, false, Some(&touched), &mut adj)
             );
@@ -619,17 +909,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     // Passes since the inline rounds may have moved calls —
                     // rebuild the adjacency fresh.
                     adj = None;
-                    pt!(cx, 
+                    pt!(
+                        cx,
                         "devirt-inline",
-                        inline::run(
-                            ctx,
-                            st,
-                            small,
-                            Some(&sites),
-                            false,
-                            Some(&owners),
-                            &mut adj
-                        )
+                        inline::run(ctx, st, small, Some(&sites), false, Some(&owners), &mut adj)
                     );
                     pt!(cx, "domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
@@ -708,7 +991,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     drop(_siro);
     if crate::env_set("PLIRON_DUMP_OPT") {
-        eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
+        tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
         let obj = if crate::env_set("PLIRON_WASM_CLIF") {
@@ -1111,8 +1394,8 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     } else {
         Vec::new()
     };
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("xcgu {cgu_name}: {} local copies", extra.len());
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len());
     }
     for &inst in &extra {
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(

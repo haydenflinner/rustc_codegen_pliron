@@ -102,8 +102,8 @@ pub fn run(ctx: &Context, st: &mut State) {
             })
         })
         .collect();
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats",
             "nounwind {}: {} of {} invokes -> calls",
             st.cgu,
             dead.len(),

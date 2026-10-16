@@ -24,8 +24,8 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode,
-    ProgramPoint, Value, ValueDef,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, ProgramPoint,
+    Value, ValueDef,
 };
 use rustc_hash::FxHashMap;
 
@@ -116,9 +116,7 @@ fn half_bound(func: &Function, c: Value) -> Option<(Value, Half)> {
         (IntCC::UnsignedLessThan, Some(k), None) => Some((b, Half::Lo(k.checked_add(1)?))),
         (IntCC::UnsignedGreaterThan, None, Some(k)) => Some((a, Half::Lo(k.checked_add(1)?))),
         (IntCC::UnsignedLessThan, None, Some(k)) => Some((a, Half::Hi(k))),
-        (IntCC::UnsignedLessThanOrEqual, None, Some(k)) => {
-            Some((a, Half::Hi(k.checked_add(1)?)))
-        }
+        (IntCC::UnsignedLessThanOrEqual, None, Some(k)) => Some((a, Half::Hi(k.checked_add(1)?))),
         (IntCC::UnsignedGreaterThan, Some(k), None) => Some((b, Half::Hi(k))),
         (IntCC::UnsignedGreaterThanOrEqual, Some(k), None) => {
             Some((b, Half::Hi(k.checked_add(1)?)))
@@ -178,12 +176,7 @@ fn miss_twin(func: &Function, a: BlockCall, b: BlockCall) -> bool {
 /// moved from its origin block carries args evaluated there, and a def
 /// inside the bypassed block (or anywhere not dominating `inst`) would
 /// dangle.
-fn args_avail(
-    func: &Function,
-    dom: &DominatorTree,
-    bc: BlockCall,
-    inst: Inst,
-) -> bool {
+fn args_avail(func: &Function, dom: &DominatorTree, bc: BlockCall, inst: Inst) -> bool {
     bc.args(&func.dfg.value_lists).all(|a| match a {
         BlockArg::Value(v) => {
             let v = func.dfg.resolve_aliases(v);
@@ -212,12 +205,7 @@ enum Mat {
 /// Can this edge arg be materialized at `at`? Dominating defs reuse;
 /// a pure inst may be re-emitted when every operand dominates `at` or
 /// is itself an iconst (depth-1 — enough for `count+1` arms).
-fn mat_of(
-    func: &Function,
-    dom: &DominatorTree,
-    a: BlockArg,
-    at: Inst,
-) -> Option<Mat> {
+fn mat_of(func: &Function, dom: &DominatorTree, a: BlockArg, at: Inst) -> Option<Mat> {
     // Pseudo-args (try_call ret/exn) are bound to their own terminator
     // — they can't ride the merged edge.
     let v = a.as_value()?;
@@ -337,7 +325,7 @@ fn bypassable(func: &Function, b: Block) -> bool {
 /// Rule 1: `brif (x >= lo) → [brif (x < hi) → HIT else MISS] else MISS`
 /// becomes `brif (x-lo u< hi-lo) → HIT else MISS`.
 fn bound_pairs(func: &mut Function) -> usize {
-    let dbg = crate::config::env_set("PLIRON_RF_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::rangefold", tracing::Level::DEBUG);
     let uses = use_blocks(func);
     let mut n = 0;
     // Bypassing moves edges, and a stale dominator tree could let a
@@ -352,10 +340,7 @@ fn bound_pairs(func: &mut Function) -> usize {
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
             };
-            let InstructionData::Brif {
-                arg: c, blocks, ..
-            } = func.dfg.insts[term]
-            else {
+            let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[term] else {
                 continue;
             };
             let (tbc, fbc) = (blocks[0], blocks[1]);
@@ -368,7 +353,7 @@ fn bound_pairs(func: &mut Function) -> usize {
                 _ => continue,
             };
             if dbg {
-                eprintln!("rf: block{b} lo-test x={x} lo={lo}");
+                tracing::debug!(target: "pliron::rangefold", "rf: block{b} lo-test x={x} lo={lo}");
             }
             let hi_b = dest_block(func, pass_bc);
             if hi_b == b {
@@ -378,7 +363,7 @@ fn bound_pairs(func: &mut Function) -> usize {
             // same miss edge — we bypass it entirely.
             if !bypassable(func, hi_b) || !defs_local(func, &uses, hi_b) {
                 if dbg {
-                    eprintln!("rf:   hi_b{hi_b} impure or escaping");
+                    tracing::debug!(target: "pliron::rangefold", "rf:   hi_b{hi_b} impure or escaping");
                 }
                 continue;
             }
@@ -415,8 +400,7 @@ fn bound_pairs(func: &mut Function) -> usize {
                 && miss_eq
                 && body_avail(func, &dom, dest_block(func, hbc), term);
             if dbg {
-                eprintln!(
-                    "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
+                tracing::debug!(target: "pliron::rangefold", "rf:   x={x}=={x2}? {} hi={hi}>lo? {} miss-eq? {} mats={}",
                     func.dfg.resolve_aliases(x) == func.dfg.resolve_aliases(x2),
                     hi > lo,
                     miss_eq,
@@ -426,7 +410,15 @@ fn bound_pairs(func: &mut Function) -> usize {
             if !ok {
                 continue;
             }
-            found = Some((term, x, lo, hi - lo, dest_block(func, hbc), miss_bc, hit_mats));
+            found = Some((
+                term,
+                x,
+                lo,
+                hi - lo,
+                dest_block(func, hbc),
+                miss_bc,
+                hit_mats,
+            ));
             break;
         }
         let Some((term, x, lo, w, hdest, fbc, mats)) = found else {
@@ -466,7 +458,10 @@ fn shape_eq(func: &Function, di: Inst, dj: Inst) -> bool {
     if func.dfg.insts[di].opcode() != func.dfg.insts[dj].opcode() {
         return false;
     }
-    let (aa, bb) = (func.dfg.inst_args(di).to_vec(), func.dfg.inst_args(dj).to_vec());
+    let (aa, bb) = (
+        func.dfg.inst_args(di).to_vec(),
+        func.dfg.inst_args(dj).to_vec(),
+    );
     aa.len() == bb.len() && aa.iter().zip(&bb).all(|(&x, &y)| op_eq(func, x, y))
 }
 
@@ -522,10 +517,7 @@ fn range_unions(func: &mut Function) -> usize {
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
             };
-            let InstructionData::Brif {
-                arg: c, blocks, ..
-            } = func.dfg.insts[term]
-            else {
+            let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[term] else {
                 continue;
             };
             let (tbc, fbc) = (blocks[0], blocks[1]);
@@ -554,11 +546,7 @@ fn range_unions(func: &mut Function) -> usize {
             let Some((x2, k2, w2)) = offset_test(func, c2) else {
                 continue;
             };
-            if x1 != x2
-                || w1 != w2
-                || k1 == k2
-                || dest_block(func, tbc) != dest_block(func, tbc2)
-            {
+            if x1 != x2 || w1 != w2 || k1 == k2 || dest_block(func, tbc) != dest_block(func, tbc2) {
                 continue;
             }
             // The hit edges must agree on args: identical values, or the
@@ -574,10 +562,7 @@ fn range_unions(func: &mut Function) -> usize {
             }
             // Exactness: lo range entirely inside a bit-d-clear mod-2d
             // window, hi range entirely inside a bit-d-set one.
-            if (k_lo % (2 * d)) + w1 > d
-                || (k_hi % (2 * d)) + w1 > 2 * d
-                || (k_hi % (2 * d)) < d
-            {
+            if (k_lo % (2 * d)) + w1 > d || (k_hi % (2 * d)) + w1 > 2 * d || (k_hi % (2 * d)) < d {
                 continue;
             }
             if !args_avail(func, &dom, fbc2, term)
@@ -621,8 +606,8 @@ pub fn run(func: &mut Function) -> usize {
     // neutral elsewhere — default on; PLIRON_RF2=0 disables.
     let r2 = crate::config::config().enabled("PLIRON_RF2");
     for _ in 0..4 {
-        let k = (if r1 { bound_pairs(func) } else { 0 })
-            + (if r2 { range_unions(func) } else { 0 });
+        let k =
+            (if r1 { bound_pairs(func) } else { 0 }) + (if r2 { range_unions(func) } else { 0 });
         n += k;
         if k == 0 {
             break;

@@ -35,7 +35,11 @@ fn sext(x: u64, bits: u32) -> i64 {
 }
 
 fn icmp_cc(cc: IntCC, a: u64, b: u64, bits: u32) -> bool {
-    let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let m = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let (a, b) = (a & m, b & m);
     let (sa, sb) = (sext(a, bits), sext(b, bits));
     match cc {
@@ -80,11 +84,15 @@ fn canonical_bool(func: &Function, v: Value) -> bool {
     let v = func.dfg.resolve_aliases(v);
     match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => match func.dfg.insts[i] {
-            InstructionData::IntCompare { opcode: Opcode::Icmp, .. }
-            | InstructionData::FloatCompare { .. } => true,
-            InstructionData::Binary { opcode: Opcode::Band, args } => {
-                const64(func, args[0]) == Some(1) || const64(func, args[1]) == Some(1)
+            InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                ..
             }
+            | InstructionData::FloatCompare { .. } => true,
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => const64(func, args[0]) == Some(1) || const64(func, args[1]) == Some(1),
             InstructionData::UnaryImm {
                 opcode: Opcode::Iconst,
                 imm,
@@ -128,10 +136,10 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
         _ => return None,
     };
     let xcmp = provable_cmp(func, nn, cond, x, k);
-    if xcmp.is_none() && std::env::var_os("PLIRON_NFOLD_DEBUG").is_some() {
-        eprintln!("nfold reject i{i}: cond {cond:?} x {x} k {k}");
+    if xcmp.is_none() && tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::niche", "nfold reject i{i}: cond {cond:?} x {x} k {k}");
         if let ValueDef::Param(pb, _) = func.dfg.value_def(x) {
-            eprintln!("  param-in-set={}", nn.params_debug(func, x));
+            tracing::debug!(target: "pliron::niche", "  param-in-set={}", nn.params_debug(func, x));
             for b in func.layout.blocks().collect::<Vec<_>>() {
                 for i in func.layout.block_insts(b).collect::<Vec<_>>() {
                     for (ei, bc) in func.dfg.insts[i]
@@ -141,8 +149,7 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
                     {
                         if bc.block(&func.dfg.value_lists) == pb {
                             for a in bc.args(&func.dfg.value_lists) {
-                                eprintln!(
-                                    "  edge i{i} ei{ei} arg {a:?} nn={} en={}",
+                                tracing::debug!(target: "pliron::niche", "  edge i{i} ei{ei} arg {a:?} nn={} en={}",
                                     a.as_value().is_some_and(|v| nn.is(func, v)),
                                     a.as_value().is_some_and(|v| nn.is_edge(func, i, ei, v)),
                                 );
@@ -151,8 +158,7 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
                                     for _ in 0..6 {
                                         match nn.derived_debug(func, w) {
                                             Some(bb) => {
-                                                eprintln!(
-                                                    "    derived[{w}] = {bb} real={}",
+                                                tracing::debug!(target: "pliron::niche", "    derived[{w}] = {bb} real={}",
                                                     func.dfg.value_is_real(bb)
                                                 );
                                                 w = func.dfg.resolve_aliases(bb);
@@ -199,8 +205,8 @@ pub fn run(func: &mut Function, nn: &NonNull) -> usize {
             Fold::NotC(c) => format!("!c {c}"),
             Fold::K(k) => format!("k {k}"),
         };
-        if std::env::var_os("PLIRON_NFOLD_DEBUG").is_some() {
-            eprintln!("nfold fold i{i} -> {t}");
+        if tracing::enabled!(target: "pliron::niche", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::niche", "nfold fold i{i} -> {t}");
         }
         // `c` is a select condition — any nonzero truthy value, not the
         // 0/1 an icmp result must be — so canonicalize with a compare

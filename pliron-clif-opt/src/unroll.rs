@@ -77,21 +77,25 @@ pub fn run(
             if prof.get(&h) == Some(&0) {
                 continue;
             }
-            let Some((pred, pinst, body, entry, used_out)) =
-                candidate(func, cfg, dt, uses.get_or_insert_with(|| Uses::new(func)), h)
-            else {
+            let Some((pred, pinst, body, entry, used_out)) = candidate(
+                func,
+                cfg,
+                dt,
+                uses.get_or_insert_with(|| Uses::new(func)),
+                h,
+            ) else {
                 continue;
             };
-            if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
-                eprintln!("unroll: candidate {h} ({} blocks)", body.len());
+            if tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} ({} blocks)", body.len());
             }
             let nn = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
             match trip(func, nn, &body, h, entry.clone(), None) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
                 _ => {
-                    if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
+                    if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
                         let ub = bound_ub(func, cfg, dt, h, &body, pred, pinst);
-                        eprintln!("unroll: candidate {h} undecidable, bound_ub={ub:?}");
+                        tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} undecidable, bound_ub={ub:?}");
                     }
                     continue;
                 }
@@ -528,8 +532,8 @@ fn trip(
 }
 
 fn why<T>(r: &str) -> Option<T> {
-    if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
-        eprintln!("unroll: no: {r}");
+    if tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG) {
+        tracing::debug!(target: "pliron::unroll", "unroll: no: {r}");
     }
     None
 }
@@ -710,9 +714,7 @@ fn bound_ub(
         if !body.contains(&p.block) {
             continue;
         }
-        for bc in func
-            .dfg
-            .insts[p.inst]
+        for bc in func.dfg.insts[p.inst]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             if bc.block(pool) == h {
@@ -726,7 +728,9 @@ fn bound_ub(
     // The counted exit test: a body brif with one successor outside.
     let mut cnt = None;
     'scan: for &b in body {
-        let Some(t) = func.layout.last_inst(b) else { continue };
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
         let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else {
             continue;
         };
@@ -751,23 +755,20 @@ fn bound_ub(
         }
     }
     let Some(cnt) = cnt else {
-        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
-            eprintln!("unroll: candidate {h} no latch_count");
+        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} no latch_count");
         }
         return None;
     };
     if cnt.signed || cnt.eq {
-        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
-            eprintln!("unroll: candidate {h} cnt signed/eq");
+        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt signed/eq");
         }
         return None;
     }
     // Facts on the edge pred -> h plus dominated facts at pred.
-    let mut facts = crate::jumpthread::facts_at(
-        dt,
-        &crate::jumpthread::edge_facts(func, cfg),
-        pred,
-    );
+    let mut facts =
+        crate::jumpthread::facts_at(dt, &crate::jumpthread::edge_facts(func, cfg), pred);
     if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[pinst]
         && let Some(i) = crate::jumpthread::cond_icmp(func, arg)
         && let Some(mut c) = crate::jumpthread::norm_icmp(func, i)
@@ -783,9 +784,13 @@ fn bound_ub(
         let x = func.dfg.resolve_aliases(x);
         let y = func.dfg.resolve_aliases(y);
         let k = match cc {
-            IntCC::UnsignedLessThan if x == cnt.bound => crate::punroll::iconst(func, y).map(|k| k - 1),
+            IntCC::UnsignedLessThan if x == cnt.bound => {
+                crate::punroll::iconst(func, y).map(|k| k - 1)
+            }
             IntCC::UnsignedLessThanOrEqual if x == cnt.bound => crate::punroll::iconst(func, y),
-            IntCC::UnsignedGreaterThan if y == cnt.bound => crate::punroll::iconst(func, x).map(|k| k - 1),
+            IntCC::UnsignedGreaterThan if y == cnt.bound => {
+                crate::punroll::iconst(func, x).map(|k| k - 1)
+            }
             IntCC::UnsignedGreaterThanOrEqual if y == cnt.bound => crate::punroll::iconst(func, x),
             _ => None,
         };
@@ -811,15 +816,15 @@ fn bound_ub(
                 }
             }
             _ => {
-                if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
-                    eprintln!("unroll: {h} bound inst {:?}", func.dfg.insts[bi].opcode());
+                if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+                    tracing::debug!(target: "pliron::unroll", "unroll: {h} bound inst {:?}", func.dfg.insts[bi].opcode());
                 }
             }
         }
     }
     let Some(k) = ub else {
-        if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
-            eprintln!("unroll: candidate {h} cnt ok, no bound fact (bound={:?})", cnt.bound);
+        if tracing::enabled!(target: "pliron::unroll", tracing::Level::TRACE) {
+            tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} cnt ok, no bound fact (bound={:?})", cnt.bound);
         }
         return None;
     };

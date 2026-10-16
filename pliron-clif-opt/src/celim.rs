@@ -460,10 +460,8 @@ fn edge_conds(func: &Function, inst: Inst, s: Block) -> Vec<Cmp> {
     let InstructionData::Brif { arg, .. } = func.dfg.insts[inst] else {
         return Vec::new();
     };
-    let dests = func.dfg.insts[inst].branch_destination(
-        &func.dfg.jump_tables,
-        &func.dfg.exception_tables,
-    );
+    let dests =
+        func.dfg.insts[inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
     let (t0, t1) = (
         dests[0].block(&func.dfg.value_lists) == s,
         dests[1].block(&func.dfg.value_lists) == s,
@@ -531,10 +529,9 @@ fn join_facts(
             // arg-base -> (param, arg's offset from that base)
             let mut xlat: FxHashMap<Value, (Value, i64)> = FxHashMap::default();
             let mut bad: FxHashSet<Value> = FxHashSet::default();
-            for bc in func.dfg.insts[q.inst].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[q.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 if bc.block(&func.dfg.value_lists) != s {
                     continue;
                 }
@@ -612,15 +609,13 @@ fn induction_facts(
         // establishes, and maps between the header-param and edge-arg
         // operand namespaces (`decomp`d `Op`s: `arg` is `param + k` in the
         // common `i + 1` backedge shape).
-        let mut edges: Vec<(Block, Vec<Cmp>, FxHashMap<Op, Op>, FxHashMap<Op, Op>)> =
-            Vec::new();
+        let mut edges: Vec<(Block, Vec<Cmp>, FxHashMap<Op, Op>, FxHashMap<Op, Op>)> = Vec::new();
         for q in cfg.pred_iter(h).take(MAX_INDUCT_EDGES + 1) {
             let mut a2p: FxHashMap<Op, Op> = FxHashMap::default();
             let mut p2a: FxHashMap<Op, Op> = FxHashMap::default();
-            for bc in func.dfg.insts[q.inst].branch_destination(
-                &func.dfg.jump_tables,
-                &func.dfg.exception_tables,
-            ) {
+            for bc in func.dfg.insts[q.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 if bc.block(&func.dfg.value_lists) != h {
                     continue;
                 }
@@ -672,8 +667,8 @@ fn induction_facts(
             }
             out.entry(h).or_default().push(c);
         }
-        if crate::env_set("PLIRON_INDUCT_DEBUG") {
-            eprintln!("induct {h}: facts={:?}", out.get(&h));
+        if tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::celim", "induct {h}: facts={:?}", out.get(&h));
         }
     }
     out
@@ -1212,13 +1207,9 @@ fn rng_decide(cc: IntCC, l: i128, h: i128, t: i128) -> Option<bool> {
     };
     match cc {
         IntCC::UnsignedLessThan | IntCC::SignedLessThan => dec(h < t, l >= t),
-        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => {
-            dec(h <= t, l > t)
-        }
+        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => dec(h <= t, l > t),
         IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => dec(l > t, h <= t),
-        IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedGreaterThanOrEqual => {
-            dec(l >= t, h < t)
-        }
+        IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedGreaterThanOrEqual => dec(l >= t, h < t),
         IntCC::Equal => dec(l == h && l == t, t < l || t > h),
         IntCC::NotEqual => dec(t < l || t > h, l == h && l == t),
     }
@@ -1798,13 +1789,9 @@ fn decide_d(
                     let cc = if h < half && k < half {
                         match cc {
                             IntCC::SignedLessThan => IntCC::UnsignedLessThan,
-                            IntCC::SignedLessThanOrEqual => {
-                                IntCC::UnsignedLessThanOrEqual
-                            }
+                            IntCC::SignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
                             IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
-                            IntCC::SignedGreaterThanOrEqual => {
-                                IntCC::UnsignedGreaterThanOrEqual
-                            }
+                            IntCC::SignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
                             c => c,
                         }
                     } else {
@@ -1840,8 +1827,7 @@ fn decide_d(
                     return Some(r);
                 }
                 if let Some((l, h)) = srange(func, fs, v, 0)
-                    && let Some(r) =
-                        rng_decide(cc, l as i128, h as i128, sext(k2, w) as i128)
+                    && let Some(r) = rng_decide(cc, l as i128, h as i128, sext(k2, w) as i128)
                 {
                     return Some(r);
                 }
@@ -1862,8 +1848,7 @@ fn decide_d(
                 } else {
                     (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
                 };
-                let (l, h) =
-                    srange(func, fs, v, 0).unwrap_or((smin as i64, smax as i64));
+                let (l, h) = srange(func, fs, v, 0).unwrap_or((smin as i64, smax as i64));
                 let nw = if d > 0 {
                     h as i128 + d as i128 <= smax
                 } else {
@@ -1985,11 +1970,11 @@ fn fold_guard_bands(func: &mut Function) -> usize {
 /// Fold `icmp`s decided by dominating branch conditions; returns the folds.
 /// Counts guard-band collapses separately under `PLIRON_STATS`.
 pub fn run(func: &mut Function) -> usize {
-    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let prof = tracing::enabled!(target: "pliron::celim", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let guards = fold_guard_bands(func);
-    if guards > 0 && crate::env_set("PLIRON_STATS") {
-        eprintln!("celim-guard {guards}");
+    if guards > 0 && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "celim-guard {guards}");
     }
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
@@ -2030,8 +2015,8 @@ pub fn run(func: &mut Function) -> usize {
                     r = decide(func, &fs, qp, qraw, &srcs);
                 }
                 if let Some(k) = r {
-                    if crate::env_set("PLIRON_CELIM_DEBUG") {
-                        eprintln!("celim fold {i} -> {k} q={q:?} facts={fs:?}");
+                    if tracing::enabled!(target: "pliron::celim", tracing::Level::DEBUG) {
+                        tracing::debug!(target: "pliron::celim", "celim fold {i} -> {k} q={q:?} facts={fs:?}");
                     }
                     folds.push((i, k));
                 }
@@ -2050,8 +2035,7 @@ pub fn run(func: &mut Function) -> usize {
         crate::jumpthread::fold_const_branches(func);
     }
     if prof {
-        eprintln!(
-            "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
+        tracing::info!(target: "pliron::celim", "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
             t0.elapsed(),
             guards,
             t_setup,
@@ -2068,10 +2052,8 @@ pub fn run(func: &mut Function) -> usize {
 mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
-    use cranelift_codegen::ir::{
-        AbiParam, Function, InstBuilder, Signature, UserFuncName, types,
-    };
     use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName, types};
     use cranelift_codegen::isa::CallConv;
 
     /// A swap loop's mirror guard `isub(n-1), i < n` can't be decided by
@@ -2112,8 +2094,14 @@ mod tests {
         let c2 = cur.ins().icmp(IntCC::UnsignedLessThan, i2, n);
         cur.ins().brif(c2, h, &[i2.into()], exit, &[]);
 
-        FuncCursor::new(&mut func).at_bottom(panic).ins().return_(&[]);
-        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[]);
+        FuncCursor::new(&mut func)
+            .at_bottom(panic)
+            .ins()
+            .return_(&[]);
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[]);
 
         assert!(run(&mut func) >= 1);
         // The folded guard leaves an unconditional edge into `body`.
@@ -2123,8 +2111,7 @@ mod tests {
             "guard not folded: {}",
             func.display()
         );
-        let flags =
-            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("celim produced invalid IR: {e}\n{}", func.display());
         }
@@ -2159,7 +2146,10 @@ mod tests {
         let cond = cur.ins().icmp(IntCC::NotEqual, c, zero);
         cur.ins().brif(cond, h, &[next.into()], exit, &[]);
 
-        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[]);
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[]);
 
         run(&mut func);
         let t = func.layout.last_inst(h).unwrap();

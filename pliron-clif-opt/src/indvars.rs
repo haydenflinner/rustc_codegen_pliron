@@ -10,7 +10,9 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode,
-    ProgramPoint, Type, Value, ValueDef, condcodes::{CondCode, IntCC}, types,
+    ProgramPoint, Type, Value, ValueDef,
+    condcodes::{CondCode, IntCC},
+    types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -417,26 +419,34 @@ fn elim_shadowed(
     );
     let params = func.dfg.block_params(h).to_vec();
     let (Some(iv_idx), Some(np_idx)) = (
-        params.iter().position(|&p| func.dfg.resolve_aliases(p) == iv),
-        params.iter().position(|&p| func.dfg.resolve_aliases(p) == np),
+        params
+            .iter()
+            .position(|&p| func.dfg.resolve_aliases(p) == iv),
+        params
+            .iter()
+            .position(|&p| func.dfg.resolve_aliases(p) == np),
     ) else {
         return 0;
     };
     // Backedges must step both params in lockstep (`np += e*step`), or
     // the `np = base + iv*e` recurrence identity doesn't hold.
     if debug {
-        eprintln!("indvars {h}: ivelim cand iv={iv} np={np} base={base} e={e}");
+        tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim cand iv={iv} np={np} base={base} e={e}");
     }
     let mut step = None;
     for e2 in edges {
-        if !func.layout.inst_block(e2.inst).is_some_and(|b| body.contains(&b)) {
+        if !func
+            .layout
+            .inst_block(e2.inst)
+            .is_some_and(|b| body.contains(&b))
+        {
             continue;
         }
         let si = edge_arg(func, e2, iv_idx).and_then(|a| step_form(func, iv, body, a));
         let sn = edge_arg(func, e2, np_idx).and_then(|a| step_form(func, np, body, a));
         let (Some(StepV::K(s)), Some(StepV::K(sn))) = (si, sn) else {
             if debug {
-                eprintln!("indvars {h}: ivelim bail stepform");
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail stepform");
             }
             return 0;
         };
@@ -445,7 +455,7 @@ fn elim_shadowed(
         // original `iv <u bound` has already failed.
         if s <= 0 || sn != s.wrapping_mul(e) || step.is_some_and(|x| x != s) {
             if debug {
-                eprintln!("indvars {h}: ivelim bail lockstep s={s} sn={sn}");
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail lockstep s={s} sn={sn}");
             }
             return 0;
         }
@@ -461,7 +471,11 @@ fn elim_shadowed(
     let mut adefs: FxHashSet<Inst> = FxHashSet::default();
     for &b in body {
         for i in func.layout.block_insts(b) {
-            let InstructionData::Binary { opcode, args: [x, y] } = func.dfg.insts[i] else {
+            let InstructionData::Binary {
+                opcode,
+                args: [x, y],
+            } = func.dfg.insts[i]
+            else {
                 continue;
             };
             let r = func.dfg.first_result(i);
@@ -545,8 +559,7 @@ fn elim_shadowed(
     let guarded = body.iter().any(|&b| {
         let access = func.layout.block_insts(b).any(|i| match func.dfg.insts[i] {
             InstructionData::Load { arg, flags, .. } => {
-                func.dfg.mem_flags[flags].notrap()
-                    && nvals.contains(&func.dfg.resolve_aliases(arg))
+                func.dfg.mem_flags[flags].notrap() && nvals.contains(&func.dfg.resolve_aliases(arg))
             }
             InstructionData::Store { args, flags, .. } => {
                 func.dfg.mem_flags[flags].notrap()
@@ -563,7 +576,7 @@ fn elim_shadowed(
     });
     if !guarded {
         if debug {
-            eprintln!("indvars {h}: ivelim bail notrap");
+            tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail notrap");
         }
         return 0;
     }
@@ -607,7 +620,7 @@ fn elim_shadowed(
                         Some(_) if dst == h => {
                             if ai != iv_idx {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail harg slot {ai}");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail harg slot {ai}");
                                 }
                                 return 0;
                             }
@@ -618,14 +631,14 @@ fn elim_shadowed(
                             // `iv + c` for `c < 0` recovers below `base`.
                             if c < 0 {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail negexit {a}");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail negexit {a}");
                                 }
                                 return 0;
                             }
                             cmax = cmax.max(c);
                             let Some(m) = pmap(a, i) else {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail exitmap {a} at {b}");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail exitmap {a} at {b}");
                                 }
                                 return 0;
                             };
@@ -633,7 +646,7 @@ fn elim_shadowed(
                         }
                         Some(_) => {
                             if debug {
-                                eprintln!("indvars {h}: ivelim bail inbody arg {a} -> {dst}");
+                                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail inbody arg {a} -> {dst}");
                             }
                             return 0;
                         }
@@ -660,7 +673,7 @@ fn elim_shadowed(
                             let c = off[&func.dfg.resolve_aliases(w)];
                             if c < 0 {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail negicmp {w}");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail negicmp {w}");
                                 }
                                 return 0;
                             }
@@ -672,13 +685,13 @@ fn elim_shadowed(
                                 && def_block(func, bound).is_some_and(|d| body.contains(&d))
                             {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail bound {bound} in body");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail bound {bound} in body");
                                 }
                                 return 0;
                             }
                             let Some(m) = pmap(w, i) else {
                                 if debug {
-                                    eprintln!("indvars {h}: ivelim bail icmpmap {w} at {b}");
+                                    tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail icmpmap {w} at {b}");
                                 }
                                 return 0;
                             };
@@ -690,7 +703,7 @@ fn elim_shadowed(
                     for &v in func.dfg.inst_args(i) {
                         if off.contains_key(&func.dfg.resolve_aliases(v)) {
                             if debug {
-                                eprintln!("indvars {h}: ivelim bail use {v} in {i} @{b}");
+                                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail use {v} in {i} @{b}");
                             }
                             return 0;
                         }
@@ -709,7 +722,7 @@ fn elim_shadowed(
             for v in func.dfg.inst_values(i) {
                 if off.contains_key(&func.dfg.resolve_aliases(v)) {
                     if debug {
-                        eprintln!("indvars {h}: ivelim bail outer use {v} @{b}");
+                        tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail outer use {v} @{b}");
                     }
                     return 0;
                 }
@@ -718,7 +731,7 @@ fn elim_shadowed(
     }
     if icmps.is_empty() {
         if debug {
-            eprintln!("indvars {h}: ivelim bail noicmps");
+            tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail noicmps");
         }
         return 0;
     }
@@ -742,7 +755,7 @@ fn elim_shadowed(
         };
         if crate::clifpeep::vmax(func, a) as u128 + cmax.max(0) as u128 >= cap {
             if debug {
-                eprintln!("indvars {h}: ivelim bail entryiv {a}");
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim bail entryiv {a}");
             }
             return 0;
         }
@@ -757,7 +770,11 @@ fn elim_shadowed(
         }
         let pend = func.dfg.append_block_param(h, ty);
         for e2 in edges {
-            let v = if func.layout.inst_block(e2.inst).is_some_and(|b| body.contains(&b)) {
+            let v = if func
+                .layout
+                .inst_block(e2.inst)
+                .is_some_and(|b| body.contains(&b))
+            {
                 pend
             } else {
                 let mut pos = FuncCursor::new(func).at_inst(e2.inst);
@@ -786,8 +803,7 @@ fn elim_shadowed(
             };
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[e2.inst]
-                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                [e2.slot];
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e2.slot];
             bc.append_argument(v, &mut dfg.value_lists);
         }
         pends.insert(bnd, pend);
@@ -875,7 +891,7 @@ fn elim_shadowed(
     }
     func.dfg.remove_block_param(params[iv_idx]);
     if debug {
-        eprintln!("indvars {h}: ivelim {iv} via {np} (e={e})");
+        tracing::debug!(target: "pliron::indvars", "indvars {h}: ivelim {iv} via {np} (e={e})");
     }
     1
 }
@@ -1003,8 +1019,7 @@ fn run_loop(
                 func.dfg.change_to_alias(r, np);
             }
             if debug {
-                eprintln!(
-                    "indvars {h}: base {base:?} mul {mul:?} -> {np} ({} insts)",
+                tracing::debug!(target: "pliron::indvars", "indvars {h}: base {base:?} mul {mul:?} -> {np} ({} insts)",
                     insts.len()
                 );
             }
@@ -1021,7 +1036,7 @@ fn run_loop(
 }
 
 pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale: bool) -> usize {
-    let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let mut n = 0;
     let mut done: FxHashSet<Block> = FxHashSet::default();
     // `elim_shadowed`'s exit shims create edges into headers processed
@@ -1542,7 +1557,7 @@ fn rot_loop(
                 )
             {
                 if debug {
-                    eprintln!("ldrot {h}: bail {op} at {b}");
+                    tracing::debug!(target: "pliron::indvars", "ldrot {h}: bail {op} at {b}");
                 }
                 return 0;
             }
@@ -1555,7 +1570,7 @@ fn rot_loop(
             .is_some_and(|b| !body.contains(&b))
     }) {
         if debug {
-            eprintln!("ldrot {h}: bail no entry edge");
+            tracing::debug!(target: "pliron::indvars", "ldrot {h}: bail no entry edge");
         }
         return 0; // no entry edge — nothing to seed `prev` from
     }
@@ -1649,8 +1664,7 @@ fn rot_loop(
     }
     if debug {
         for ((terms, kcoef), ls) in &groups {
-            eprintln!(
-                "ldrot {h}: group kcoef={kcoef} terms={terms:?} loads={:?}",
+            tracing::debug!(target: "pliron::indvars", "ldrot {h}: group kcoef={kcoef} terms={terms:?} loads={:?}",
                 ls.iter().map(|&(k, i, ..)| (k, i)).collect::<Vec<_>>()
             );
         }
@@ -1673,8 +1687,7 @@ fn rot_loop(
             }
             let mut ls: Vec<Inst> = Vec::with_capacity(2);
             for &a in func.dfg.inst_args(i) {
-                if let ValueDef::Result(li, _) =
-                    func.dfg.value_def(func.dfg.resolve_aliases(a))
+                if let ValueDef::Result(li, _) = func.dfg.value_def(func.dfg.resolve_aliases(a))
                     && decs.contains_key(&li)
                 {
                     ls.push(li);
@@ -1766,9 +1779,7 @@ fn rot_loop(
             for e in &edges {
                 if inb(func, e) {
                     es.push(None);
-                } else if let Some(v) =
-                    sloc.and_then(|l| edge_avail(func, ps, na, dt, l, e))
-                {
+                } else if let Some(v) = sloc.and_then(|l| edge_avail(func, ps, na, dt, l, e)) {
                     es.push(Some(Seed::V(v)));
                 } else if every && rot_edge_ok(func, dt, &bdec, e) {
                     es.push(Some(Seed::Load));
@@ -1799,7 +1810,7 @@ fn rot_loop(
             func.dfg.clear_results(bi);
             func.dfg.change_to_alias(r, prev);
             if debug {
-                eprintln!("ldrot {h}: load {bi} -> param {prev} (feed {ares}, shift {shift})");
+                tracing::debug!(target: "pliron::indvars", "ldrot {h}: load {bi} -> param {prev} (feed {ares}, shift {shift})");
             }
             removed.insert(bi);
             rot += 1;
@@ -1811,7 +1822,7 @@ fn rot_loop(
 
 pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
-    let debug = crate::env_set("PLIRON_LDROT_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let ps = crate::loadfwd::param_src(func);
     let na = FxHashSet::default();
     let loops = deepest_first(la);
@@ -1844,7 +1855,7 @@ enum Lt {
 pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis, kmin: i64) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let psrc = crate::loadfwd::param_src(func);
-    let debug = crate::env_set("PLIRON_INDUCT_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let mut n = 0;
     for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
         let h = la.loop_header(lp);
@@ -1989,7 +2000,7 @@ pub fn boundcmp(func: &mut Function, an: &mut crate::pipeline::Analysis, kmin: i
                 args[0] = v;
                 args[1] = rem0;
                 if debug {
-                    eprintln!("indvars {h}: countdown {li} (bound {k})");
+                    tracing::debug!(target: "pliron::indvars", "indvars {h}: countdown {li} (bound {k})");
                 }
                 n += 1;
             }
@@ -2148,7 +2159,7 @@ fn bounded(
 /// `boundcmp` expects, so a later countdown pass can still fire.
 pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i64) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
-    let dbg = std::env::var("PLIRON_POSTINC_DEBUG").is_ok();
+    let dbg = tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let mut n = 0;
     for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
         let h = la.loop_header(lp);
@@ -2178,7 +2189,7 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
             }
             if latches.is_empty() {
                 if dbg && !entries.is_empty() {
-                    eprintln!("postinc {h} p{p}: no latch edge");
+                    tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: no latch edge");
                 }
                 continue;
             }
@@ -2190,7 +2201,7 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
             for e in &latches {
                 let Some(a) = edge_arg(func, e, idx) else {
                     if dbg {
-                        eprintln!("postinc {h} p{p}: latch edge arg not a value");
+                        tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: latch edge arg not a value");
                     }
                     ok = false;
                     break;
@@ -2199,21 +2210,21 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
                     .filter(|(k, _, _)| k_bound.is_none_or(|b| b == *k))
                 else {
                     if dbg {
-                        eprintln!("postinc {h} p{p}: latch {} not `p cc K`", e.inst);
+                        tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: latch {} not `p cc K`", e.inst);
                     }
                     ok = false;
                     break;
                 };
                 let Some(StepV::K(s)) = step_form(func, p, &body, a) else {
                     if dbg {
-                        eprintln!("postinc {h} p{p}: backedge arg {a} not `p + const`");
+                        tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: backedge arg {a} not `p + const`");
                     }
                     ok = false;
                     break;
                 };
                 if s <= 0 || s > smax || k > i64::MAX - 2 * s {
                     if dbg {
-                        eprintln!("postinc {h} p{p}: s={s} k={k} rejected");
+                        tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: s={s} k={k} rejected");
                     }
                     ok = false;
                     break;
@@ -2232,7 +2243,7 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
                     });
                     if !bounded {
                         if dbg {
-                            eprintln!("postinc {h} p{p}: entry {} arg unbounded", e.inst);
+                            tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: entry {} arg unbounded", e.inst);
                         }
                         ok = false;
                         break;
@@ -2243,7 +2254,7 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
                 continue;
             }
             if dbg {
-                eprintln!("postinc {h} p{p}: rewriting {} compares", rewrite.len());
+                tracing::debug!(target: "pliron::indvars", "postinc {h} p{p}: rewriting {} compares", rewrite.len());
             }
             for (e, ci, a, k) in rewrite {
                 let dom = match func.dfg.value_def(a) {
@@ -2323,10 +2334,9 @@ fn below_max(func: &Function, n: Value) -> bool {
             opcode: Opcode::Uextend,
             arg,
         } => func.dfg.value_type(arg).bits() < w,
-        InstructionData::Load { opcode, .. } => matches!(
-            opcode,
-            Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32
-        ),
+        InstructionData::Load { opcode, .. } => {
+            matches!(opcode, Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32)
+        }
         _ => false,
     }
 }
@@ -2343,7 +2353,7 @@ pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> us
         return 0;
     }
     let crate::pipeline::CfgDtLa { cfg, la, .. } = an.cfg_dt_la(func);
-    let dbg = std::env::var("PLIRON_POSTINC_DEBUG").is_ok();
+    let dbg = tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let mut todo = Vec::new();
     for lp in deepest_first(la).into_iter().take(MAX_LOOPS) {
         let h = la.loop_header(lp);
@@ -2366,7 +2376,9 @@ pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> us
             let mut rw = Vec::new();
             let latch_ok = !latches.is_empty()
                 && latches.iter().all(|e| {
-                    let Some(a) = edge_arg(func, e, idx) else { return false };
+                    let Some(a) = edge_arg(func, e, idx) else {
+                        return false;
+                    };
                     let Some((x, n, _)) = ult_guard(func, e.inst, e.slot, h) else {
                         return false;
                     };
@@ -2378,9 +2390,13 @@ pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> us
                     rw.push((e.clone(), a));
                     ok
                 });
-            let Some(n) = bound.filter(|_| latch_ok) else { continue };
+            let Some(n) = bound.filter(|_| latch_ok) else {
+                continue;
+            };
             let entry_ok = entries.iter().all(|e| {
-                let Some(a) = edge_arg(func, e, idx) else { return false };
+                let Some(a) = edge_arg(func, e, idx) else {
+                    return false;
+                };
                 if iconst(func, a) == Some(0) {
                     return true;
                 }
@@ -2394,7 +2410,7 @@ pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> us
             });
             if !entry_ok {
                 if dbg {
-                    eprintln!("postinc_ne {h} p{p}: entry not provably <= bound");
+                    tracing::debug!(target: "pliron::indvars", "postinc_ne {h} p{p}: entry not provably <= bound");
                 }
                 continue;
             }
@@ -2429,7 +2445,11 @@ pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> us
         }
         let n1 = pos.ins().iadd_imm_u(n, 1);
         for (e, a) in rw {
-            let cc = if e.slot == 0 { IntCC::NotEqual } else { IntCC::Equal };
+            let cc = if e.slot == 0 {
+                IntCC::NotEqual
+            } else {
+                IntCC::Equal
+            };
             let mut pos = FuncCursor::new(func).at_inst(e.inst);
             let c = pos.ins().icmp(cc, a, n1);
             if let InstructionData::Brif { arg, .. } = &mut func.dfg.insts[e.inst] {
@@ -2547,7 +2567,10 @@ fn diff_b_h(
     // itself short-circuits before the memos so a pair cached under
     // another head can never stand in for `Head`.
     if x == pi && y == pj {
-        return (diff_b_inner(func, cfg, pi, pj, x, y, depth, memo, dbg).0, true);
+        return (
+            diff_b_inner(func, cfg, pi, pj, x, y, depth, memo, dbg).0,
+            true,
+        );
     }
     if let Some(&(r, d)) = memo.0.get(&(x, y)) {
         if r.is_some() || d >= depth {
@@ -2711,11 +2734,9 @@ fn diff_b_inner(
         let mut head = false;
         let mut hit = Some(q) == hb;
         for e2 in &edges_to(func, cfg, q) {
-            let (Some(a2), Some(b2)) =
-                (edge_arg(func, e2, ix2), edge_arg(func, e2, jx2))
-            else {
+            let (Some(a2), Some(b2)) = (edge_arg(func, e2, ix2), edge_arg(func, e2, jx2)) else {
                 if dbg {
-                    eprintln!("  diff_b {x}/{y} @{q}: e{} no args@{ix2},{jx2}", e2.inst);
+                    tracing::debug!(target: "pliron::indvars", "  diff_b {x}/{y} @{q}: e{} no args@{ix2},{jx2}", e2.inst);
                 }
                 return (None, hit);
             };
@@ -2727,8 +2748,7 @@ fn diff_b_inner(
                         Some(p) if p == bv => {}
                         _ => {
                             if dbg {
-                                eprintln!(
-                                    "  diff_b {x}/{y} @{q}: e{} B {bv}!={bound:?}",
+                                tracing::debug!(target: "pliron::indvars", "  diff_b {x}/{y} @{q}: e{} B {bv}!={bound:?}",
                                     e2.inst
                                 );
                             }
@@ -2742,8 +2762,7 @@ fn diff_b_inner(
                 }
                 (None, h) => {
                     if dbg {
-                        eprintln!(
-                            "  diff_b {x}/{y} @{q}: e{} args {a2}/{b2} fail",
+                        tracing::debug!(target: "pliron::indvars", "  diff_b {x}/{y} @{q}: e{} args {a2}/{b2} fail",
                             e2.inst
                         );
                     }
@@ -2761,7 +2780,7 @@ fn diff_b_inner(
         );
     }
     if dbg {
-        eprintln!("  diff_b {x}/{y}: no rule (d{depth})");
+        tracing::debug!(target: "pliron::indvars", "  diff_b {x}/{y}: no rule (d{depth})");
     }
     (None, false)
 }
@@ -2849,16 +2868,12 @@ mod tests {
             .map(|b| {
                 func.layout
                     .block_insts(b)
-                    .filter(|&i| {
-                        matches!(func.dfg.insts[i], InstructionData::Load { .. })
-                    })
+                    .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
                     .count()
             })
             .sum::<usize>();
         assert_eq!(nloads, 2);
-        let flags = cranelift_codegen::settings::Flags::new(
-            cranelift_codegen::settings::builder(),
-        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("ldrot produced invalid IR: {e}\n{}", func.display());
         }
@@ -2931,10 +2946,8 @@ mod tests {
     /// moves down beside the brif and retargets to `icmp (p+s), K+s`.
     #[test]
     fn postinc_moves_count_test_onto_step() {
-        let mut func = Function::with_name_signature(
-            UserFuncName::user(0, 0),
-            Signature::new(CallConv::Fast),
-        );
+        let mut func =
+            Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
         let entry = func.dfg.make_block();
         let h = func.dfg.make_block();
         let done = func.dfg.make_block();
@@ -2966,9 +2979,7 @@ mod tests {
         let brif = func.layout.block_insts(h).last().unwrap();
         let ci = func.layout.prev_inst(brif).unwrap();
         let InstructionData::IntCompare {
-            cond,
-            args: [x, y],
-            ..
+            cond, args: [x, y], ..
         } = func.dfg.insts[ci]
         else {
             panic!("no compare before brif: {}", func.display());
@@ -2977,9 +2988,7 @@ mod tests {
         assert_eq!(func.dfg.resolve_aliases(x), a);
         assert_eq!(iconst(&func, y), Some(5001));
 
-        let flags = cranelift_codegen::settings::Flags::new(
-            cranelift_codegen::settings::builder(),
-        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("postinc produced invalid IR: {e}\n{}", func.display());
         }
@@ -3101,14 +3110,10 @@ mod tests {
 
         let cfg = ControlFlowGraph::with_function(&func);
         let mut memo = DbMemo::default();
-        assert_eq!(
-            diff_b(&func, &cfg, p0, p1, u, v, 8, &mut memo, false),
-            None,
-        );
+        assert_eq!(diff_b(&func, &cfg, p0, p1, u, v, 8, &mut memo, false), None,);
         assert_eq!(
             diff_b(&func, &cfg, p0, p2, u, v, 8, &mut memo, false),
             Some(Diff::Head),
         );
     }
-
 }

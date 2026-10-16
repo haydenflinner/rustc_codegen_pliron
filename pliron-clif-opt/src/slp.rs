@@ -13,7 +13,7 @@
 //! earliest packed load and the emit point. Each stored lane value may only
 //! be used by the group stores (otherwise the pack would need extractlanes).
 //!
-//! `PLIRON_SLP=0` disables it; `PLIRON_SLP_DEBUG` logs conversions.
+//! `PLIRON_SLP=0` disables it; `PLIRON_XPACK_DEBUG` logs conversions.
 //!
 //! xpack: pairs of isomorphic scalar insts — most often adjacent iterations
 //! of an unrolled loop body — merge into one 2-lane vector op (`sqrtsd` ×2 →
@@ -25,8 +25,8 @@
 //! overwritten stores drop out). `PLIRON_XPACK=0` disables this half.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
     ValueDef,
@@ -664,11 +664,7 @@ impl Ctx<'_> {
         // Stored values may only be used by the group stores.
         let vals: Vec<Value> = run.iter().map(|s| s.val).collect();
         for &v in &vals {
-            if !self
-                .uses
-                .iter(v.index())
-                .all(|u| self.members.contains(&u))
-            {
+            if !self.uses.iter(v.index()).all(|u| self.members.contains(&u)) {
                 return None;
             }
         }
@@ -951,14 +947,14 @@ impl X<'_> {
                 return Some(Pack::Vec(va));
             }
             if self.dbg {
-                eprintln!(
+                tracing::debug!(target: "pliron::slp",
                     "    xpack novec d{depth}: {a:?}/{b:?} va={va:?} vb={vb:?} samev={} avail={}",
                     va == vb,
                     self.avail(va)
                 );
             }
         } else if self.dbg && (la.is_some() || lb.is_some()) {
-            eprintln!("    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
+            tracing::debug!(target: "pliron::slp", "    xpack novec-lanes d{depth}: {a:?}={la:?} {b:?}={lb:?}");
         }
         // A column may legitimately need a member's scalar result (e.g. the
         // `dx` shared by `dx*dx` and another row). Mark the producer to stay
@@ -1000,7 +996,10 @@ impl X<'_> {
                     return Some(Pack::Splat(a));
                 }
                 if rb.1 == ra.1 + i64::from(ra.2) && (ra.2 == 4 || ra.2 == 8) {
-                    self.min_load = self.min_load.min(pos_at(self.pos, ia)).min(pos_at(self.pos, ib));
+                    self.min_load = self
+                        .min_load
+                        .min(pos_at(self.pos, ia))
+                        .min(pos_at(self.pos, ib));
                     self.loads.push(ra);
                     self.loads.push(rb);
                     let InstructionData::Load { arg, offset, .. } = self.func.dfg.insts[ia] else {
@@ -1030,7 +1029,7 @@ impl X<'_> {
                 || self.func.dfg.insts[da.unwrap()].opcode()
                     == self.func.dfg.insts[db.unwrap()].opcode())
         {
-            eprintln!(
+            tracing::debug!(target: "pliron::slp",
                 "    xpack col-enter d{depth}: {a:?}(def={da:?} pos={:?}) {b:?}(def={db:?} pos={:?}) emit={}",
                 da.and_then(|i| pos_get(self.pos, i)),
                 db.and_then(|i| pos_get(self.pos, i)),
@@ -1069,7 +1068,7 @@ impl X<'_> {
                             Some(p) => args.push(p),
                             None => {
                                 if dbg {
-                                    eprintln!(
+                                    tracing::debug!(target: "pliron::slp",
                                         "    xpack col-rec d{depth}: {oa:?} arg{j} {ca:?}/{cb:?}"
                                     );
                                 }
@@ -1096,7 +1095,7 @@ impl X<'_> {
                     self.colmap.retain(|_, &mut r| r < row);
                 }
                 if dbg {
-                    eprintln!(
+                    tracing::debug!(target: "pliron::slp",
                         "    xpack nopair d{depth}: {a:?}/{b:?} -> {:?}/{:?}",
                         self.func.dfg.insts[ia].opcode(),
                         self.func.dfg.insts[ib].opcode()
@@ -1112,12 +1111,12 @@ impl X<'_> {
                 } else {
                     "member"
                 };
-                eprintln!("    xpack nopair-{why} d{depth}: {a:?}/{b:?} ({oa:?})");
+                tracing::debug!(target: "pliron::slp", "    xpack nopair-{why} d{depth}: {a:?}/{b:?} ({oa:?})");
             }
         }
         self.gathers += 1;
         if dbg && !(self.avail(a) && self.avail(b)) {
-            eprintln!(
+            tracing::debug!(target: "pliron::slp",
                 "    xpack gather-unavail: {a:?} (avail={}) {b:?} (avail={})",
                 self.avail(a),
                 self.avail(b)
@@ -1311,11 +1310,11 @@ fn plan_pair(
     Vec<(Value, usize, u8)>,
     FxHashSet<Inst>,
 )> {
-    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG);
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
-                eprintln!(
+                tracing::debug!(target: "pliron::slp",
                     "  xpack {} {ia:?}/{ib:?}: {}",
                     $why,
                     func.dfg.insts[ia].opcode()
@@ -1360,7 +1359,7 @@ fn plan_pair(
         pruned: FxHashSet::default(),
         keep: FxHashSet::default(),
         colmap: FxHashMap::default(),
-        dbg: crate::env_set("PLIRON_XPACK_DEBUG"),
+        dbg: tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG),
     };
     x.members.insert(ia);
     x.members.insert(ib);
@@ -1398,11 +1397,11 @@ fn finish_plan(
 )> {
     let (func, pos, insts) = (x.func, x.pos, x.insts);
     let (ia, ib) = tag;
-    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG);
     macro_rules! bail {
         ($why:expr) => {{
             if dbg {
-                eprintln!(
+                tracing::debug!(target: "pliron::slp",
                     "  xpack {} {ia:?}/{ib:?}: {}",
                     $why,
                     func.dfg.insts[ia].opcode()
@@ -1639,7 +1638,7 @@ fn finish_plan(
         - extracts.len() as i32
         - n_keep;
     if dbg && net <= 10 {
-        eprintln!(
+        tracing::debug!(target: "pliron::slp",
             "    xpack cost {:?}: rows={} heavy={heavy} emit={emit_cost} ext={} sink={} net={net}",
             func.dfg.insts[ia].opcode(),
             kept.len(),
@@ -1780,7 +1779,7 @@ fn plan_store(
         pruned: FxHashSet::default(),
         keep: FxHashSet::default(),
         colmap: FxHashMap::default(),
-        dbg: crate::env_set("PLIRON_XPACK_DEBUG"),
+        dbg: tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG),
     };
     x.members.insert(sa);
     x.members.insert(sb);
@@ -1884,7 +1883,7 @@ fn xpack_block(
     // changed an operand/result's uses — checked in `failed.retain`
     // below. Cached failures don't consume a candidate slot.
     let mut failed: FxHashMap<(Inst, Inst), (usize, usize)> = FxHashMap::default();
-    let dbg = crate::env_set("PLIRON_XPACK_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG);
     let nocache = crate::env_set("PLIRON_XPACK_NOCACHE");
     loop {
         let insts: Vec<Inst> = func.layout.block_insts(block).collect();
@@ -1905,7 +1904,9 @@ fn xpack_block(
             }
         }
         let nstores = byop.get(&Opcode::Store).map_or(0, |v| v.len());
-        let dup = byop.iter().any(|(&o, v)| o != Opcode::Store && v.len() >= 2);
+        let dup = byop
+            .iter()
+            .any(|(&o, v)| o != Opcode::Store && v.len() >= 2);
         if nstores < 2 && !dup {
             return total;
         }
@@ -1914,17 +1915,15 @@ fn xpack_block(
         // mutates the IR, so it's rebuilt on the next loop iteration.
         let us = &*uses.get_or_insert_with(|| build_uses(func));
         if !failed.is_empty() {
-            failed.retain(|&(x, y), span| {
-                match (pos_get(&pos, x), pos_get(&pos, y)) {
-                    (Some(a), Some(b)) => {
-                        *span = (a.min(b), a.max(b));
-                        true
-                    }
-                    _ => false,
+            failed.retain(|&(x, y), span| match (pos_get(&pos, x), pos_get(&pos, y)) {
+                (Some(a), Some(b)) => {
+                    *span = (a.min(b), a.max(b));
+                    true
                 }
+                _ => false,
             });
         }
-        if crate::env_set("PLIRON_XPACK_DEBUG") && total > 0 {
+        if tracing::enabled!(target: "pliron::slp", tracing::Level::DEBUG) && total > 0 {
             for (p, &i) in insts.iter().enumerate() {
                 let d = &func.dfg.insts[i];
                 let args: Vec<String> = func
@@ -1939,7 +1938,7 @@ fn xpack_block(
                     .iter()
                     .map(|v| format!("{v:?}"))
                     .collect();
-                eprintln!(
+                tracing::debug!(target: "pliron::slp",
                     "    map p{p} {i:?} {:?} {} -> {}",
                     d.opcode(),
                     args.join(","),
@@ -1978,9 +1977,13 @@ fn xpack_block(
                     }
                     tried += 1;
                     let plan = if is_store {
-                        plan_store(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64)
+                        plan_store(
+                            func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64,
+                        )
                     } else {
-                        plan_pair(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64)
+                        plan_pair(
+                            func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64,
+                        )
                     };
                     if plan.is_none() && !is_store {
                         if let (Some(a1), Some(b1)) = (pos_get(&pos, a), pos_get(&pos, b)) {
@@ -2001,7 +2004,7 @@ fn xpack_block(
         }
         let Some((emit_at, root, vt, kept, sink, dead, extracts, keep)) = applied else {
             if dbg && (tried > 0 || total > 0) {
-                eprintln!("xpack block{block:?}: {total} rows packed, {tried} plans tried");
+                tracing::debug!(target: "pliron::slp", "xpack block{block:?}: {total} rows packed, {tried} plans tried");
             }
             return total;
         };
@@ -2047,7 +2050,7 @@ fn xpack_block(
         }
         total += n;
         if dbg {
-            eprintln!(
+            tracing::debug!(target: "pliron::slp",
                 "xpack APPLY @{emit_at}: {n} rows ({} kept) sink={sink:?} keep={keep:?}",
                 kept.len()
             );

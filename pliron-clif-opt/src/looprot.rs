@@ -50,11 +50,11 @@ pub fn run(
 /// Header `h` with one latch ending in `jump h`, a small call-free body and a
 /// `brif` to two blocks that only `h` reaches.
 fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
-    let dbg = crate::env_set("PLIRON_LOOPROT_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG);
     macro_rules! bail {
         ($($t:tt)*) => {{
             if dbg {
-                eprintln!("looprot {h}: bail {}", format_args!($($t)*));
+                tracing::debug!(target: "pliron::looprot", "looprot {h}: bail {}", format_args!($($t)*));
             }
             return false;
         }};
@@ -128,7 +128,7 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
         bail!("header size {k}");
     }
     if dbg {
-        eprintln!("looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block);
+        tracing::debug!(target: "pliron::looprot", "looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block);
     }
     true
 }
@@ -166,10 +166,7 @@ fn rotate(
     for i in func.layout.block_insts(h) {
         defs.extend_from_slice(func.dfg.inst_results(i));
     }
-    let rdefs: Vec<Value> = defs
-        .iter()
-        .map(|&v| func.dfg.resolve_aliases(v))
-        .collect();
+    let rdefs: Vec<Value> = defs.iter().map(|&v| func.dfg.resolve_aliases(v)).collect();
     let mut need = [FxHashSet::<Value>::default(), FxHashSet::default()];
     let mut users: Vec<(Inst, usize)> = Vec::new();
     let mut seen_user: FxHashSet<Inst> = FxHashSet::default();
@@ -183,8 +180,8 @@ fn rotate(
                 .entry(b)
                 .or_insert_with(|| succ.iter().position(|&s| domtree.block_dominates(s, b)));
             let Some(side) = side else {
-                if crate::env_set("PLIRON_LOOPROT_DEBUG") {
-                    eprintln!("looprot {h}: bail side-none blk{b} used {d}");
+                if tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "pliron::looprot", "looprot {h}: bail side-none blk{b} used {d}");
                 }
                 return false;
             };
@@ -200,9 +197,8 @@ fn rotate(
     // supply appended params.
     for side in 0..2 {
         if cfg.pred_iter(succ[side]).count() > 1 && !need[side].is_empty() {
-            if crate::env_set("PLIRON_LOOPROT_DEBUG") {
-                eprintln!(
-                    "looprot {h}: bail multipred {:?} need {:?}",
+            if tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::looprot", "looprot {h}: bail multipred {:?} need {:?}",
                     succ[side], need[side]
                 );
             }

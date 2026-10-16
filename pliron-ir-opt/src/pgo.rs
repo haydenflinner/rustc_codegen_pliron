@@ -289,8 +289,7 @@ pub fn instrument(
     // layout still feeds the fingerprint, so a block-only profile keeps
     // matching); edge counts alone can't disambiguate block counts, so
     // any other value means block+edge.
-    let edges_on = crate::env_get("PLIRON_PGO_COUNTERS")
-        .is_none_or(|c| c != "block");
+    let edges_on = crate::env_get("PLIRON_PGO_COUNTERS").is_none_or(|c| c != "block");
     let mut names = Vec::new(); // sym_hash -> name blob
     let mut nctrs = 0u32;
     for (sym, fop) in funcs {
@@ -310,7 +309,8 @@ pub fn instrument(
                 continue;
             };
             let s = t.deref(ctx).get_successor(si as usize);
-            let arg_tys: Vec<TypeHandle> = s.deref(ctx).arguments().map(|a| a.get_type(ctx)).collect();
+            let arg_tys: Vec<TypeHandle> =
+                s.deref(ctx).arguments().map(|a| a.get_type(ctx)).collect();
             let e = BasicBlock::new(ctx, None, arg_tys);
             e.insert_at_back(region, ctx);
             let args: Vec<Value> = e.deref(ctx).arguments().collect();
@@ -693,7 +693,7 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
             }
         }
     }
-    eprintln!("pliron-pgo: {path}: {matched} functions matched, {stale} stale");
+    tracing::info!(target: "pliron::pgo", "pliron-pgo: {path}: {matched} functions matched, {stale} stale");
     matched
 }
 

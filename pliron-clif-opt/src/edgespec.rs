@@ -643,10 +643,7 @@ impl<'a> W<'a> {
                         },
                         _ => ConeDef::Bad,
                     };
-                    uses.push(ConeUse {
-                        k: k as u32,
-                        def,
-                    });
+                    uses.push(ConeUse { k: k as u32, def });
                 }
             }
         }
@@ -664,8 +661,8 @@ impl<'a> W<'a> {
         }
         let cone = self.cone(d);
         if cone.order.is_empty() {
-            if crate::env_get("PLIRON_EDGESPEC_DEBUG").is_some() {
-                eprintln!("edgespec cone_ok: {:?} cone>64 from {:?}", self.p, d);
+            if tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} cone>64 from {:?}", self.p, d);
             }
             return false;
         }
@@ -696,9 +693,8 @@ impl<'a> W<'a> {
             {
                 continue;
             }
-            if crate::env_get("PLIRON_EDGESPEC_DEBUG").is_some() {
-                eprintln!(
-                    "edgespec cone_ok: {:?} use (def blk {:?}) at {:?} fails",
+            if tracing::enabled!(target: "pliron::edgespec", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::edgespec", "edgespec cone_ok: {:?} use (def blk {:?}) at {:?} fails",
                     self.p, db, cone.order[cu.k as usize]
                 );
             }
@@ -1141,7 +1137,7 @@ pub fn sweep_dead(func: &mut Function) {
 }
 
 pub fn run(func: &mut Function) -> usize {
-    let prof = crate::env_set("PLIRON_JT_PROF2");
+    let prof = tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
@@ -1156,7 +1152,7 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     if prof {
-        eprintln!("  edgespec setup {:?}", t0.elapsed());
+        tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.elapsed());
     }
     let tp = std::time::Instant::now();
     // Cones are CFG-invariant for the whole plans phase (no mutation until
@@ -1179,7 +1175,7 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     if prof {
-        eprintln!("  edgespec plans({}) {:?}", plans.len(), tp.elapsed());
+        tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.elapsed());
     }
     let tp = std::time::Instant::now();
     let mut n = 0;
@@ -1229,7 +1225,7 @@ pub fn run(func: &mut Function) -> usize {
         n += 1;
     }
     if prof {
-        eprintln!("  edgespec apply({n}) {:?}", tp.elapsed());
+        tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.elapsed());
     }
     let tp = std::time::Instant::now();
     if n > 0 {
@@ -1242,7 +1238,7 @@ pub fn run(func: &mut Function) -> usize {
         sweep_dead(func);
     }
     if prof {
-        eprintln!("  edgespec splices(n={n}) {:?}", tp.elapsed());
+        tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.elapsed());
     }
     let tp = std::time::Instant::now();
     let d = deadbits(func);
@@ -1253,7 +1249,7 @@ pub fn run(func: &mut Function) -> usize {
         n += d;
     }
     if prof {
-        eprintln!("  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed());
+        tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed());
     }
     n
 }
@@ -1376,10 +1372,8 @@ fn deadbits(func: &mut Function) -> usize {
         let Some(t) = func.layout.last_inst(b) else {
             continue;
         };
-        for bc in func
-            .dfg
-            .insts[t]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             let d = bc.block(&func.dfg.value_lists);
             for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
@@ -1403,10 +1397,10 @@ fn deadbits(func: &mut Function) -> usize {
     }
     let mut work: Vec<Work> = Vec::new();
     let grow = |need: &mut FxHashMap<Value, u64>,
-                    work: &mut Vec<Work>,
-                    func: &Function,
-                    v: Value,
-                    d: u64| {
+                work: &mut Vec<Work>,
+                func: &Function,
+                v: Value,
+                d: u64| {
         if d & !need.get(&v).copied().unwrap_or(0) == 0 {
             return;
         }
@@ -1655,9 +1649,7 @@ fn splices(func: &mut Function) -> usize {
             for b in func.layout.blocks() {
                 for i in func.layout.block_insts(b) {
                     for v in func.dfg.inst_values(i) {
-                        u.entry(func.dfg.resolve_aliases(v))
-                            .or_default()
-                            .insert(b);
+                        u.entry(func.dfg.resolve_aliases(v)).or_default().insert(b);
                     }
                 }
             }
@@ -1669,9 +1661,7 @@ fn splices(func: &mut Function) -> usize {
                 let Some(t) = func.layout.last_inst(p) else {
                     continue;
                 };
-                for bc in func
-                    .dfg
-                    .insts[t]
+                for bc in func.dfg.insts[t]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     m.entry(bc.block(&func.dfg.value_lists))
@@ -1693,7 +1683,9 @@ fn splices(func: &mut Function) -> usize {
             if !ok {
                 break;
             }
-            ok &= preds_map.get(&s).is_none_or(|ps| ps.iter().all(|&p| p == j));
+            ok &= preds_map
+                .get(&s)
+                .is_none_or(|ps| ps.iter().all(|&p| p == j));
         }
         if ok {
             'defs: for (di, &d) in jdefs.iter().enumerate() {

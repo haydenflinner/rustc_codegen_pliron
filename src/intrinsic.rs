@@ -284,9 +284,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                         return IntrinsicResult::Operand(OperandValue::Ref(p));
                     }
                     &OperandValue::Immediate(v) if clif_bb => {
-                        return IntrinsicResult::Operand(OperandValue::Immediate(
-                            bb_val(self, v),
-                        ));
+                        return IntrinsicResult::Operand(OperandValue::Immediate(bb_val(self, v)));
                     }
                     &OperandValue::Pair(a, b) if clif_bb => {
                         let a = bb_val(self, a);

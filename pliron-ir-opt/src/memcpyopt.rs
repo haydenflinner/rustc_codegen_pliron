@@ -172,7 +172,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             }
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("memcpyopt {}: {n} call slots forwarded", st.cgu);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats","memcpyopt {}: {n} call slots forwarded", st.cgu);
     }
 }

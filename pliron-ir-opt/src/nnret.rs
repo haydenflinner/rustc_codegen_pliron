@@ -199,8 +199,8 @@ pub fn run(ctx: &Context, st: &mut State) {
         .filter(|s| !null.contains(&ids.id(s)))
         .cloned()
         .collect();
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats",
             "nnret {}: {} of {} pointer-returning bodies nonnull",
             st.cgu,
             t.len(),

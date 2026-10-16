@@ -112,10 +112,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || is!(FenceOp)
                     || is!(InlineAsmOp)
                     || (is!(CallIntrinsicOp)
-                        && st
-                            .intrinsics
-                            .get(&op)
-                            .is_some_and(|n| n.contains("trap")))
+                        && st.intrinsics.get(&op).is_some_and(|n| n.contains("trap")))
                 {
                     p.side_fx.push((f,));
                 }
@@ -134,8 +131,8 @@ pub fn run(ctx: &Context, st: &mut State) {
                 .cloned(),
         )
         .collect();
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats",
             "willreturn {}: {} of {} bodies come back",
             st.cgu,
             wr.len() - LIBC.len(),

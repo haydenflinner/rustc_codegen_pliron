@@ -775,7 +775,7 @@ fn refold_header(
                 }
             }
             if debug {
-                eprintln!("ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t:?})");
+                tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: counter {cp} folded onto anchor {pa} (trips {t:?})");
             }
             n += 1;
             break;
@@ -910,7 +910,12 @@ fn self_feeding(
         last = Some(i);
         // All inst args except branch-destination args (call args are
         // variable-length, so `inst_fixed_args` would miss them).
-        if func.dfg.inst_args(i).iter().any(|&a| func.dfg.resolve_aliases(a) == v) {
+        if func
+            .dfg
+            .inst_args(i)
+            .iter()
+            .any(|&a| func.dfg.resolve_aliases(a) == v)
+        {
             if !crate::jumpthread::removable(func, i, true) {
                 return false;
             }
@@ -921,8 +926,8 @@ fn self_feeding(
             }
         }
         // Edge args: only the self-slot is a dead sink.
-        for bc in func.dfg.insts[i]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        for bc in
+            func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         {
             let dst = bc.block(&func.dfg.value_lists);
             for (s, a) in bc.args(&func.dfg.value_lists).enumerate() {
@@ -936,9 +941,9 @@ fn self_feeding(
         }
         // Exception contexts are always real uses.
         if let Some(et) = func.dfg.insts[i].exception_table()
-            && func.dfg.exception_tables[et]
-                .items()
-                .any(|x| matches!(x, ExceptionTableItem::Context(x) if func.dfg.resolve_aliases(x) == v))
+            && func.dfg.exception_tables[et].items().any(
+                |x| matches!(x, ExceptionTableItem::Context(x) if func.dfg.resolve_aliases(x) == v),
+            )
         {
             return false;
         }
@@ -1025,7 +1030,7 @@ pub fn run(
 ) -> (usize, FxHashMap<Value, Value>) {
     let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
-    let debug = crate::env_set("PLIRON_IVREFOLD_DEBUG");
+    let debug = tracing::enabled!(target: "pliron::ivrefold", tracing::Level::DEBUG);
     let mut n = 0;
     let mut pmap = FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {

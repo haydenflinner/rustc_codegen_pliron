@@ -308,20 +308,13 @@ fn arg_sources(
 /// Sources of a multi-source atom: for a Slot its reaching stores, for an
 /// Arg its pred-forwarded values — each paired with the block whose facts
 /// bound the produced value (the store's block / the forwarding pred).
-fn sources(
-    ctx: &Context,
-    st: &State,
-    info: &FnInfo,
-    a: &Atom,
-) -> Vec<(Atom, Ptr<BasicBlock>)> {
+fn sources(ctx: &Context, st: &State, info: &FnInfo, a: &Atom) -> Vec<(Atom, Ptr<BasicBlock>)> {
     match a {
         Atom::Slot(_, _, _, set) => set
             .iter()
             .filter_map(|&s| {
                 let w = stored_atom(ctx, st, info, s);
-                s.deref(ctx)
-                    .get_parent_block()
-                    .map(|b| (w, b))
+                s.deref(ctx).get_parent_block().map(|b| (w, b))
             })
             .collect(),
         Atom::Arg(b, i) => arg_sources(ctx, info, *b, *i)
@@ -391,7 +384,11 @@ impl<'a> Prover<'a> {
             let srcs = sources(self.ctx, self.st, self.info, av);
             if srcs.len() == 1 {
                 let w = srcs[0].0.clone();
-                let (x, y) = if side == 0 { (w, b.clone()) } else { (a.clone(), w) };
+                let (x, y) = if side == 0 {
+                    (w, b.clone())
+                } else {
+                    (a.clone(), w)
+                };
                 if self.prove(strict, fs, &x, &y) {
                     return true;
                 }
@@ -458,8 +455,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 P::ULT | P::ULE | P::UGT | P::UGE | P::EQ | P::NE => {}
                 _ => return None,
             }
-            if unterm(term.deref(ctx).get_successor(0))
-                || unterm(term.deref(ctx).get_successor(1))
+            if unterm(term.deref(ctx).get_successor(0)) || unterm(term.deref(ctx).get_successor(1))
             {
                 Some(term)
             } else {
@@ -551,7 +547,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     }
     let node_of = |v: Value| -> Option<Nd> {
         if let Some(b) = v.defining_block() {
-            return b.deref(ctx)
+            return b
+                .deref(ctx)
                 .arguments()
                 .position(|a| a == v)
                 .map(|i| Nd::Arg(b, i));
@@ -639,125 +636,124 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
     > = FxHashMap::default();
     {
-    let _gefix = tracing::info_span!(target: "pliron::iropt", "gefix").entered();
-    if !relevant.is_empty() {
-    if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
-        if crate::env_set("PLIRON_STATS") {
-            eprintln!(
-                "guardelim {}: bail blocks={} relevant={}",
-                st.cgu,
-                bs.len(),
-                relevant.len()
-            );
-        }
-        return false;
-    }
-    // Reaching stores per (block, key): forward fixpoint over reachable
-    // blocks only (unreachable preds would pollute the may-sets).
-    let mut outt: FxHashMap<
-        Ptr<BasicBlock>,
-        FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
-    > = FxHashMap::default();
-    let mut wl: Vec<Ptr<BasicBlock>> = reach.clone();
-    let mut inq: FxHashSet<Ptr<BasicBlock>> = wl.iter().copied().collect();
-    while let Some(b) = wl.pop() {
-        inq.remove(&b);
-        let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
-            FxHashMap::default();
-        for &p in preds.get(&b).into_iter().flatten() {
-            let Some(pm) = outt.get(&p) else { continue };
-            for (&key, set) in pm {
-                if !relevant.contains(&key) {
-                    continue;
+        let _gefix = tracing::info_span!(target: "pliron::iropt", "gefix").entered();
+        if !relevant.is_empty() {
+            if bs.len().saturating_mul(relevant.len()) > MAX_FIXPOINT_WORK {
+                if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+                    tracing::info!(target: "pliron::stats", "guardelim {}: bail blocks={} relevant={}",
+                        st.cgu,
+                        bs.len(),
+                        relevant.len()
+                    );
                 }
-                let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
-                match (e.as_mut(), set) {
-                    (Some(v), Some(ps)) => {
-                        for &op in ps {
-                            if !v.contains(&op) {
-                                v.push(op);
-                            }
-                        }
-                        if v.len() > MAX_STORES {
-                            *e = None;
-                        }
-                    }
-                    _ => *e = None,
-                }
+                return false;
             }
-        }
-        // out = in, killed per-key by the block's own stores: exact cover
-        // replaces the set, a partial or unresolvable overlap poisons it,
-        // disjoint stores leave it alone.
-        for &op in &bops[&b] {
-            if !Operation::is_op::<StoreOp>(op, ctx) {
-                continue;
-            }
-            let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(1)) else {
-                continue;
-            };
-            match store_range(ctx, st, op) {
-                Some((_, soff, ssz)) => {
-                    for &(s, off, sz) in &relevant {
-                        if s != sl {
+            // Reaching stores per (block, key): forward fixpoint over reachable
+            // blocks only (unreachable preds would pollute the may-sets).
+            let mut outt: FxHashMap<
+                Ptr<BasicBlock>,
+                FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
+            > = FxHashMap::default();
+            let mut wl: Vec<Ptr<BasicBlock>> = reach.clone();
+            let mut inq: FxHashSet<Ptr<BasicBlock>> = wl.iter().copied().collect();
+            while let Some(b) = wl.pop() {
+                inq.remove(&b);
+                let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
+                    FxHashMap::default();
+                for &p in preds.get(&b).into_iter().flatten() {
+                    let Some(pm) = outt.get(&p) else { continue };
+                    for (&key, set) in pm {
+                        if !relevant.contains(&key) {
                             continue;
                         }
-                        if soff == off && ssz == sz {
-                            m.insert((s, off, sz), Some(vec![op]));
-                        } else if soff < off + sz && off < soff + ssz {
-                            m.insert((s, off, sz), None);
+                        let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
+                        match (e.as_mut(), set) {
+                            (Some(v), Some(ps)) => {
+                                for &op in ps {
+                                    if !v.contains(&op) {
+                                        v.push(op);
+                                    }
+                                }
+                                if v.len() > MAX_STORES {
+                                    *e = None;
+                                }
+                            }
+                            _ => *e = None,
                         }
                     }
                 }
-                None => {
-                    for &(s, off, sz) in &relevant {
-                        if s == sl {
-                            m.insert((s, off, sz), None);
-                        }
+                // out = in, killed per-key by the block's own stores: exact cover
+                // replaces the set, a partial or unresolvable overlap poisons it,
+                // disjoint stores leave it alone.
+                for &op in &bops[&b] {
+                    if !Operation::is_op::<StoreOp>(op, ctx) {
+                        continue;
                     }
-                }
-            }
-        }
-        if outt.get(&b) != Some(&m) {
-            outt.insert(b, m);
-            for op in &bops[&b] {
-                for s in op.deref(ctx).successors() {
-                    if dom.idx.contains_key(&s) && inq.insert(s) {
-                        wl.push(s);
-                    }
-                }
-            }
-        }
-    }
-    // inn[b][slot] = union of preds' out — the reaching set at block head.
-    for &b in &reach {
-        let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
-            FxHashMap::default();
-        for &p in preds.get(&b).into_iter().flatten() {
-            let Some(pm) = outt.get(&p) else { continue };
-            for (&key, set) in pm {
-                if !relevant.contains(&key) {
-                    continue;
-                }
-                let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
-                match (e.as_mut(), set) {
-                    (Some(v), Some(ps)) => {
-                        for &op in ps {
-                            if !v.contains(&op) {
-                                v.push(op);
+                    let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(1)) else {
+                        continue;
+                    };
+                    match store_range(ctx, st, op) {
+                        Some((_, soff, ssz)) => {
+                            for &(s, off, sz) in &relevant {
+                                if s != sl {
+                                    continue;
+                                }
+                                if soff == off && ssz == sz {
+                                    m.insert((s, off, sz), Some(vec![op]));
+                                } else if soff < off + sz && off < soff + ssz {
+                                    m.insert((s, off, sz), None);
+                                }
                             }
                         }
-                        if v.len() > MAX_STORES {
-                            *e = None;
+                        None => {
+                            for &(s, off, sz) in &relevant {
+                                if s == sl {
+                                    m.insert((s, off, sz), None);
+                                }
+                            }
                         }
                     }
-                    _ => *e = None,
+                }
+                if outt.get(&b) != Some(&m) {
+                    outt.insert(b, m);
+                    for op in &bops[&b] {
+                        for s in op.deref(ctx).successors() {
+                            if dom.idx.contains_key(&s) && inq.insert(s) {
+                                wl.push(s);
+                            }
+                        }
+                    }
                 }
             }
+            // inn[b][slot] = union of preds' out — the reaching set at block head.
+            for &b in &reach {
+                let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
+                    FxHashMap::default();
+                for &p in preds.get(&b).into_iter().flatten() {
+                    let Some(pm) = outt.get(&p) else { continue };
+                    for (&key, set) in pm {
+                        if !relevant.contains(&key) {
+                            continue;
+                        }
+                        let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
+                        match (e.as_mut(), set) {
+                            (Some(v), Some(ps)) => {
+                                for &op in ps {
+                                    if !v.contains(&op) {
+                                        v.push(op);
+                                    }
+                                }
+                                if v.len() > MAX_STORES {
+                                    *e = None;
+                                }
+                            }
+                            _ => *e = None,
+                        }
+                    }
+                }
+                inn.insert(b, m);
+            }
         }
-        inn.insert(b, m);
-    }
-    }
     }
     let info = FnInfo {
         bops,
@@ -778,72 +774,73 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             fuel: MAX_PROOF,
         };
         for &b in &bs {
-        let Some(&term) = info.bops[&b].last() else {
-            continue;
-        };
-        if !Operation::is_op::<CondBrOp>(term, ctx) {
-            continue;
-        }
-        let cond = term.deref(ctx).get_operand(0);
-        let Some(ci) = cond.defining_op() else {
-            continue;
-        };
-        let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
-            continue;
-        };
-        let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
-        let (ax, ay) = (atom(ctx, st, &info, x), atom(ctx, st, &info, y));
-        pr.fuel = MAX_PROOF;
-        let fs = pr.facts_of(b);
-        if crate::env_set("PLIRON_GEDBG") {
-            eprintln!(
-                "guardelim   br {b:?} pred={:?} x={ax:?} y={ay:?} facts={fs:?}",
-                icmp.predicate(ctx)
-            );
-            for atom_v in [&ax, &ay] {
-                for (w, sb) in sources(ctx, st, &info, atom_v) {
-                    eprintln!("guardelim       src {w:?} @{sb:?}");
+            let Some(&term) = info.bops[&b].last() else {
+                continue;
+            };
+            if !Operation::is_op::<CondBrOp>(term, ctx) {
+                continue;
+            }
+            let cond = term.deref(ctx).get_operand(0);
+            let Some(ci) = cond.defining_op() else {
+                continue;
+            };
+            let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
+                continue;
+            };
+            let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+            let (ax, ay) = (atom(ctx, st, &info, x), atom(ctx, st, &info, y));
+            pr.fuel = MAX_PROOF;
+            let fs = pr.facts_of(b);
+            if tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::guardelim", "guardelim   br {b:?} pred={:?} x={ax:?} y={ay:?} facts={fs:?}",
+                    icmp.predicate(ctx)
+                );
+                for atom_v in [&ax, &ay] {
+                    for (w, sb) in sources(ctx, st, &info, atom_v) {
+                        tracing::debug!(target: "pliron::guardelim", "guardelim       src {w:?} @{sb:?}");
+                    }
                 }
             }
-        }
-        // cond provably true / false? (unsigned + eq/ne; signed skipped)
-        let (t, f) = match icmp.predicate(ctx) {
-            P::ULT => (
-                pr.prove(true, &fs, &ax, &ay),
-                pr.prove(false, &fs, &ay, &ax),
-            ),
-            P::ULE => (
-                pr.prove(false, &fs, &ax, &ay),
-                pr.prove(true, &fs, &ay, &ax),
-            ),
-            P::UGT => (
-                pr.prove(true, &fs, &ay, &ax),
-                pr.prove(false, &fs, &ax, &ay),
-            ),
-            P::UGE => (
-                pr.prove(false, &fs, &ay, &ax),
-                pr.prove(true, &fs, &ax, &ay),
-            ),
-            P::EQ => (
-                ax == ay || fs.iter().any(|f| {
-                    f.0 == Rel::Eq && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
-                }),
-                fs.iter().any(|f| {
-                    f.0 == Rel::Ne && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
-                }) || pr.prove(true, &fs, &ax, &ay)
-                    || pr.prove(true, &fs, &ay, &ax),
-            ),
-            P::NE => (
-                fs.iter().any(|f| {
-                    f.0 == Rel::Ne && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
-                }) || pr.prove(true, &fs, &ax, &ay)
-                    || pr.prove(true, &fs, &ay, &ax),
-                ax == ay || fs.iter().any(|f| {
-                    f.0 == Rel::Eq && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
-                }),
-            ),
-            _ => (false, false),
-        };
+            // cond provably true / false? (unsigned + eq/ne; signed skipped)
+            let (t, f) = match icmp.predicate(ctx) {
+                P::ULT => (
+                    pr.prove(true, &fs, &ax, &ay),
+                    pr.prove(false, &fs, &ay, &ax),
+                ),
+                P::ULE => (
+                    pr.prove(false, &fs, &ax, &ay),
+                    pr.prove(true, &fs, &ay, &ax),
+                ),
+                P::UGT => (
+                    pr.prove(true, &fs, &ay, &ax),
+                    pr.prove(false, &fs, &ax, &ay),
+                ),
+                P::UGE => (
+                    pr.prove(false, &fs, &ay, &ax),
+                    pr.prove(true, &fs, &ax, &ay),
+                ),
+                P::EQ => (
+                    ax == ay
+                        || fs.iter().any(|f| {
+                            f.0 == Rel::Eq && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
+                        }),
+                    fs.iter().any(|f| {
+                        f.0 == Rel::Ne && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
+                    }) || pr.prove(true, &fs, &ax, &ay)
+                        || pr.prove(true, &fs, &ay, &ax),
+                ),
+                P::NE => (
+                    fs.iter().any(|f| {
+                        f.0 == Rel::Ne && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
+                    }) || pr.prove(true, &fs, &ax, &ay)
+                        || pr.prove(true, &fs, &ay, &ax),
+                    ax == ay
+                        || fs.iter().any(|f| {
+                            f.0 == Rel::Eq && ((f.1 == ax && f.2 == ay) || (f.1 == ay && f.2 == ax))
+                        }),
+                ),
+                _ => (false, false),
+            };
             let cb = Operation::get_op::<CondBrOp>(term, ctx).unwrap();
             let (tdst, fdst) = (
                 term.deref(ctx).get_successor(0),
@@ -859,8 +856,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             folds.push((term, dst, ods));
         }
     }
-    if crate::env_set("PLIRON_GEDBG") && !folds.is_empty() {
-        eprintln!("guardelim   {} folds", folds.len());
+    if tracing::enabled!(target: "pliron::guardelim", tracing::Level::DEBUG) && !folds.is_empty() {
+        tracing::debug!(target: "pliron::guardelim", "guardelim   {} folds", folds.len());
     }
     gefn.record("folds", folds.len());
     for (term, dst, ods) in &folds {
@@ -882,8 +879,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             erase_unreachable(ctx, st, &bs, &|b| om[&b].clone());
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("guardelim {}: {} fns folded", st.cgu, n);
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "guardelim {}: {} fns folded", st.cgu, n);
     }
 }
 
@@ -939,8 +936,7 @@ mod tests {
         }
         "#;
         let ctx = &mut Context::new();
-        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input)
-            .expect("parse");
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
         let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
         let fs = module_funcs(ctx, mop);
         let st = &mut State::default();

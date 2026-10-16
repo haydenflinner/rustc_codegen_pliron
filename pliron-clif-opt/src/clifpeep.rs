@@ -2190,9 +2190,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let t2 = std::time::Instant::now();
     let canon = crate::proots::canon_map(func);
     let t3 = std::time::Instant::now();
-    if std::env::var_os("PLIRON_WM_PROF").is_some() {
-        eprintln!(
-            "webmerge {}: web_nf {:?} canon {:?}",
+    if tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::clifpeep", "webmerge {}: web_nf {:?} canon {:?}",
             func.name,
             t2 - t0,
             t3 - t2
@@ -2217,9 +2216,9 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let mut tpre_sum = std::time::Duration::ZERO;
     // `var_os` reads /proc-level state per call — hoisted out of the
     // per-block loop (16k lookups per webmerge round otherwise).
-    let wmprof = std::env::var_os("PLIRON_WM_PROF").is_some();
+    let wmprof = tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
     let wm_nodiffb = std::env::var_os("PLIRON_WM_NODIFFB").is_some();
-    let wm_rel = std::env::var_os("PLIRON_WEBMERGE_REL").is_some();
+    let wm_rel = tracing::enabled!(target: "pliron::clifpeep", tracing::Level::DEBUG);
     for (&b, es) in edges.iter() {
         let tb0 = std::time::Instant::now();
         let ps = func.dfg.block_params(b).to_vec();
@@ -2244,8 +2243,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 .ok()
                 .and_then(|s| s.split_whitespace().nth(1).map(|x| x.to_string()))
                 .unwrap_or_default();
-            eprintln!(
-                "wmb {} {b} E={} P={} rss={}",
+            tracing::info!(target: "pliron::clifpeep", "wmb {} {b} E={} P={} rss={}",
                 func.name,
                 es.len(),
                 ps.len(),
@@ -2344,7 +2342,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         if arg_nodes > 2_000_000 {
             continue;
         }
-        if std::env::var_os("PLIRON_WM_SIZES").is_some() {
+        if tracing::enabled!(target: "pliron::clifpeep", tracing::Level::DEBUG) {
             for (ix, _) in ps.iter().enumerate() {
                 let sz: Vec<usize> = eargs
                     .iter()
@@ -2354,7 +2352,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                         })
                     })
                     .collect();
-                eprintln!("wmsz {b} slot{ix} {sz:?}");
+                tracing::info!(target: "pliron::clifpeep", "wmsz {b} slot{ix} {sz:?}");
             }
         }
         let no_phased = std::env::var_os("PLIRON_WM_NOPHASED").is_some();
@@ -2477,8 +2475,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         nblk += 1;
         tkeys_sum += dkeys;
         if wmprof && dkeys.as_micros() > 200 {
-            eprintln!(
-                "webmerge {} {b}: {} slots {} edges keying {:?}",
+            tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: {} slots {} edges keying {:?}",
                 func.name,
                 ps.len(),
                 es.len(),
@@ -2905,7 +2902,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             for (rk, pr) in rels {
                 let hold = has_p(&rk) && (0..es.len()).all(|e| defers(e, &rk, khash(&rk), &pr));
                 if wm_rel {
-                    eprintln!("webmerge-rel {b} slot{ix} cand {rk:?} hold={hold}");
+                    tracing::info!(target: "pliron::clifpeep", "webmerge-rel {b} slot{ix} cand {rk:?} hold={hold}");
                 }
                 if hold {
                     cands.push((ix, rk));
@@ -2925,8 +2922,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         if wmprof {
             let d = tblk.elapsed();
             if d.as_micros() > 200 {
-                eprintln!(
-                    "webmerge {} {b}: {} slots {} edges ixl {:?}",
+                tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: {} slots {} edges ixl {:?}",
                     func.name,
                     ps.len(),
                     es.len(),
@@ -2956,7 +2952,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 continue;
             }
             if wm_rel {
-                eprintln!("webmerge-rel {:?} slot{} {:?}", b, ix, k2);
+                tracing::info!(target: "pliron::clifpeep", "webmerge-rel {:?} slot{} {:?}", b, ix, k2);
             }
             pend.insert(ix, k2.clone());
             inserts.push((b, k2, p));
@@ -2969,8 +2965,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         let dblk = tblk.elapsed();
         tblk_sum += dblk;
         if wmprof && dblk.as_micros() > 200 {
-            eprintln!(
-                "webmerge {} {b}: {} slots {} edges scan {:?}",
+            tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: {} slots {} edges scan {:?}",
                 func.name,
                 ps.len(),
                 es.len(),
@@ -3061,8 +3056,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 cls = next;
             }
             if wmprof && tbis.elapsed().as_micros() > 200 {
-                eprintln!(
-                    "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
+                tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
                     func.name,
                     surv.len(),
                     es.len(),
@@ -3084,8 +3078,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             }
         }
         if wmprof && tphasec.elapsed().as_micros() > 200 {
-            eprintln!(
-                "webmerge {} {b}: phaseC P={} E={} {:?}",
+            tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: phaseC P={} E={} {:?}",
                 func.name,
                 ps.len(),
                 es.len(),
@@ -3148,9 +3141,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let temit = std::time::Instant::now();
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
     let demit = temit.elapsed();
-    if std::env::var_os("PLIRON_WM_PROF").is_some() {
-        eprintln!(
-            "webmerge {}: total {:?} wloop {:?} pre {:?} keying {:?} ixscan {:?} prep {:?} emit {:?} blocks {}",
+    if tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::clifpeep", "webmerge {}: total {:?} wloop {:?} pre {:?} keying {:?} ixscan {:?} prep {:?} emit {:?} blocks {}",
             func.name,
             t0.elapsed(),
             twloop.elapsed(),
@@ -5966,8 +5958,8 @@ pub fn sublea(func: &mut Function) -> usize {
     // `acc*10+d` chains, which is where it pays.
     if crate::pass_enabled("PLIRON_OVKILL") {
         let k = ovkill(func);
-        if k > 0 && crate::env_set("PLIRON_STATS") {
-            eprintln!("ovkill {k} {}", func.name);
+        if k > 0 && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+            tracing::info!(target: "pliron::stats", "ovkill {k} {}", func.name);
         }
         n += k;
     }
@@ -8375,7 +8367,7 @@ mod tests {
                 "chain[{i}] resolves to itself"
             );
         }
-        eprintln!("root={root} head={} last={}", chain[0], chain[K - 1]);
+        tracing::debug!(target: "pliron::clifpeep", "root={root} head={} last={}", chain[0], chain[K - 1]);
         let head = chain[0];
         let mut last = root;
         {

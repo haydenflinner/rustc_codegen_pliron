@@ -512,9 +512,8 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
         }
         st.dead_fns.extend(dead);
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!(
-            "deadfn {}: {} of {} fns not lowered",
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "deadfn {}: {} of {} fns not lowered",
             st.cgu,
             st.dead_fns.len(),
             st.funcs.len()
@@ -621,10 +620,7 @@ pub fn run(
             .filter(|(n, f)| {
                 f.linkage == Linkage::Local
                     && !adj.taken.contains(n.as_str())
-                    && adj
-                        .callers_of
-                        .get(n.as_str())
-                        .is_some_and(|v| v.len() == 1)
+                    && adj.callers_of.get(n.as_str()).is_some_and(|v| v.len() == 1)
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -661,7 +657,7 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
-    let verbose = crate::env_get("PLIRON_INLINE_VERBOSE").map_or(false, |v| v != "0");
+    let verbose = tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
@@ -751,7 +747,7 @@ pub fn run(
                     let ci = &infos[cs];
                     let Some(ci) = ci.as_ref() else {
                         if verbose {
-                            eprintln!("inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu);
                         }
                         continue;
                     };
@@ -762,8 +758,7 @@ pub fn run(
                     let site_count = crate::pgo::block_count(st, b);
                     if !f.always_inline && site_count == Some(0) {
                         if verbose {
-                            eprintln!(
-                                "inline {}: {sym} -> {cs}: reject (cold callsite)",
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (cold callsite)",
                                 st.cgu
                             );
                         }
@@ -887,8 +882,7 @@ pub fn run(
                         "accept"
                     };
                     if verbose {
-                        eprintln!(
-                            "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
+                        tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
                             st.cgu, ci.n, ci.ncalls
                         );
                     }
@@ -910,7 +904,7 @@ pub fn run(
             add_info!(&sym);
         }
     }
-    if crate::env_set("PLIRON_STATS") {
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
         left_stats(ctx, st, &mut infos, model, limit, bonus, fold);
     }
     delta
@@ -920,10 +914,7 @@ pub fn run(
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
 /// become direct calls. Returns the rewritten calls plus the callers owning
 /// them, so the next inline round can restrict itself to those callers.
-pub fn devirt(
-    ctx: &mut Context,
-    st: &mut State,
-) -> (FxHashSet<Ptr<Operation>>, FxHashSet<String>) {
+pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, FxHashSet<String>) {
     let mut out = FxHashSet::default();
     let mut owners = FxHashSet::default();
     let fns: Vec<(String, _)> = st
@@ -980,14 +971,14 @@ pub fn devirt(
                 Operation::erase(c, ctx);
                 out.insert(nc);
                 owners.insert(fname.clone());
-                if crate::env_set("PLIRON_STATS_DEVIRT") {
-                    eprintln!("devirt {fname:?} -> {sym}");
+                if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+                    tracing::info!(target: "pliron::stats", "devirt {fname:?} -> {sym}");
                 }
             }
         }
     }
-    if crate::env_set("PLIRON_STATS") {
-        eprintln!("devirt {}: {} calls", st.cgu, out.len());
+    if tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "devirt {}: {} calls", st.cgu, out.len());
     }
     (out, owners)
 }
@@ -1042,7 +1033,7 @@ fn left_stats(
             }
         }
     }
-    eprintln!("inline left {}: {why:?}", st.cgu);
+    tracing::info!(target: "pliron::stats", "inline left {}: {why:?}", st.cgu);
 }
 
 /// The callee's `noalias readonly` params point at memory the caller can't
@@ -1100,7 +1091,7 @@ fn extract_leaf(
     depth: usize,
 ) -> Option<Value> {
     let mut seen = FxHashSet::default();
-    let scan = crate::env_set("PLIRON_FROZEN_SCAN");
+    let scan = tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
     if depth > 24 {
         return None;
     }
@@ -1121,7 +1112,7 @@ fn extract_leaf(
             };
             let Ok(i) = v.try_find_index(ctx) else {
                 if scan {
-                    eprintln!("extract_leaf: no idx for {v:?} in {b:?}");
+                    tracing::debug!(target: "pliron::frozen", "extract_leaf: no idx for {v:?} in {b:?}");
                 }
                 return None;
             };
@@ -1132,13 +1123,13 @@ fn extract_leaf(
                     op_cast::<dyn BranchOpInterface>(&*o).map(|br| br.successor_operands(ctx, si))
                 else {
                     if scan {
-                        eprintln!("extract_leaf: non-branch pred {t:?} of {b:?}");
+                        tracing::debug!(target: "pliron::frozen", "extract_leaf: non-branch pred {t:?} of {b:?}");
                     }
                     return None;
                 };
                 let Some(&w) = ops.get(i) else {
                     if scan {
-                        eprintln!("extract_leaf: arg {i} missing in {t:?} ops for {b:?}");
+                        tracing::debug!(target: "pliron::frozen", "extract_leaf: arg {i} missing in {t:?} ops for {b:?}");
                     }
                     return None;
                 };
@@ -1148,7 +1139,7 @@ fn extract_leaf(
                 let l = extract_leaf(ctx, preds, w, sub, depth + 1)?;
                 if uniq.is_some_and(|u| u != l) {
                     if scan {
-                        eprintln!("extract_leaf: arg {v:?} of {b:?} merges {uniq:?} with {l:?}");
+                        tracing::debug!(target: "pliron::frozen", "extract_leaf: arg {v:?} of {b:?} merges {uniq:?} with {l:?}");
                     }
                     return None;
                 }
@@ -1207,10 +1198,10 @@ fn store_src(
     load: Ptr<Operation>,
     mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<Value> {
-    let scan = crate::env_set("PLIRON_FROZEN_SCAN");
+    let scan = tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
     let fail = |why: &str| -> Option<Value> {
         if scan {
-            eprintln!("store_src: {why} for {load:?}");
+            tracing::debug!(target: "pliron::frozen", "store_src: {why} for {load:?}");
         }
         None
     };
@@ -1341,7 +1332,7 @@ fn store_src_in(
                 || Operation::is_op::<StoreOp>(o, ctx)
             {
                 if scan {
-                    eprintln!("store_src: writer {} for {load:?}", OpDbg { op: o, ctx });
+                    tracing::debug!(target: "pliron::frozen", "store_src: writer {} for {load:?}", OpDbg { op: o, ctx });
                 }
                 return None;
             }
@@ -1350,7 +1341,7 @@ fn store_src_in(
         let mut pr: Vec<Ptr<BasicBlock>> = Vec::new();
         let Some(pr_ops) = preds.get(&b) else {
             if scan {
-                eprintln!("store_src: no preds {b:?} for {load:?}");
+                tracing::debug!(target: "pliron::frozen", "store_src: no preds {b:?} for {load:?}");
             }
             return None;
         };
@@ -1400,13 +1391,13 @@ fn store_src_in(
                                 .map(|o| OpDbg { op: o, ctx }.to_string())
                                 .unwrap_or_else(|| format!("{v:?}"))
                         }
-                        eprintln!("store_src: merge diff {} vs {}", d(ctx, w), d(ctx, v));
+                        tracing::debug!(target: "pliron::frozen", "store_src: merge diff {} vs {}", d(ctx, w), d(ctx, v));
                     }
                     eq
                 })
             {
                 if scan {
-                    eprintln!("store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}");
+                    tracing::debug!(target: "pliron::frozen", "store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}");
                 }
                 return None;
             }
@@ -1494,13 +1485,13 @@ fn same_ptr(
         norm(ctx, st, preds, v1, &mut mem.clone()),
         norm(ctx, st, preds, v2, &mut mem.clone()),
     );
-    if n1 != n2 && crate::env_set("PLIRON_FROZEN_SCAN") {
+    if n1 != n2 && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
         let d = |v: Value| {
             v.defining_op()
                 .map(|o| OpDbg { op: o, ctx }.to_string())
                 .unwrap_or_else(|| format!("{v:?}"))
         };
-        eprintln!("same_ptr: {n1:?} ({}) vs {n2:?} ({})", d(n1.0), d(n2.0));
+        tracing::debug!(target: "pliron::frozen", "same_ptr: {n1:?} ({}) vs {n2:?} ({})", d(n1.0), d(n2.0));
     }
     n1 == n2
 }
@@ -1688,7 +1679,7 @@ fn frozen_args(
     if !crate::pass_enabled("PLIRON_FROZEN_INLINE") {
         return;
     }
-    let dbg = crate::env_set("PLIRON_FROZEN_DEBUG");
+    let dbg = tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
     let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {
         return;
     };
@@ -1720,7 +1711,7 @@ fn frozen_args(
     }
     let Some(f) = st.funcs.values().find(|f| f.op == callee) else {
         if dbg {
-            eprintln!("frozen_args: callee {callee:?} not in funcs");
+            tracing::debug!(target: "pliron::frozen", "frozen_args: callee {callee:?} not in funcs");
         }
         return;
     };
@@ -1730,8 +1721,7 @@ fn frozen_args(
         .find(|(_, x)| x.op == callee)
         .map(|(n, _)| n.clone());
     if dbg {
-        eprintln!(
-            "frozen_args: na={:?} frz={:?} callee={fname:?} entry={entry:?}",
+        tracing::debug!(target: "pliron::frozen", "frozen_args: na={:?} frz={:?} callee={fname:?} entry={entry:?}",
             f.noalias.len(),
             f.frozen.len()
         );
@@ -1766,7 +1756,7 @@ fn frozen_args(
     for &(leaf, bytes) in &f.frozen {
         let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
             if dbg {
-                eprintln!("frozen_args: leaf {leaf} unresolved");
+                tracing::debug!(target: "pliron::frozen", "frozen_args: leaf {leaf} unresolved");
             }
             continue;
         };
@@ -1789,9 +1779,8 @@ fn frozen_args(
                 .map(|(_, r)| r)
         });
         let region = inh.unwrap_or(entry);
-        if dbg && crate::env_set("PLIRON_FROZEN_SCAN") {
-            eprintln!(
-                "frozen_args: leaf {leaf} sub {sub} entry {entry:?} inh={inh:?} rb={rb:?} cv={cv:?}"
+        if dbg && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::frozen", "frozen_args: leaf {leaf} sub {sub} entry {entry:?} inh={inh:?} rb={rb:?} cv={cv:?}"
             );
         }
         if dbg {
@@ -1813,8 +1802,7 @@ fn frozen_args(
                 })
                 .collect::<Vec<_>>()
                 .join(" ; ");
-            eprintln!(
-                "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={fname:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
+            tracing::debug!(target: "pliron::frozen", "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={fname:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
             );
         }
         st.region_frozen
@@ -1854,12 +1842,12 @@ fn frozen_args(
             };
             let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
             else {
-                if dbg && crate::env_set("PLIRON_FROZEN_SCAN") {
+                if dbg && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG) {
                     let bs = base
                         .defining_op()
                         .map(|o| OpDbg { op: o, ctx }.to_string())
                         .unwrap_or_default();
-                    eprintln!("frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}");
+                    tracing::debug!(target: "pliron::frozen", "frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}");
                 }
                 continue;
             };
@@ -1869,7 +1857,7 @@ fn frozen_args(
             }
             st.frozen_loads.insert(op, region);
             if dbg {
-                eprintln!("frozen_args: load {op:?} base {base:?} off {off} region {region:?}");
+                tracing::debug!(target: "pliron::frozen", "frozen_args: load {op:?} base {base:?} off {off} region {region:?}");
             }
         }
     }
@@ -1878,7 +1866,7 @@ fn frozen_args(
             continue;
         };
         if dbg {
-            eprintln!("frozen_args: na record leaf {leaf} a={a:?} entry={entry:?}");
+            tracing::debug!(target: "pliron::frozen", "frozen_args: na record leaf {leaf} a={a:?} entry={entry:?}");
         }
         st.region_noalias.entry(a).or_default().push(sub as u32);
     }
