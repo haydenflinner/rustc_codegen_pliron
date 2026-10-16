@@ -293,6 +293,21 @@ fn affine(
     if let Some(o) = outv(func, info, kinds, v) {
         return Some((0, Ins::Val(o)));
     }
+    // Rematable const-like insts are invariant even when a def was sunk
+    // into the loop body (splink/constdedup/egraph remat): `emit` clones
+    // them at the insertion cursor, so `Ins::Val(v)` is still sound.
+    if let ValueDef::Result(i, _) = func.dfg.value_def(v)
+        && matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::F32const
+                | Opcode::F64const
+                | Opcode::Vconst
+                | Opcode::SymbolValue
+                | Opcode::FuncAddr
+        )
+    {
+        return Some((0, Ins::Val(v)));
+    }
     // A `Step` param is affine in the iv: `p(t) = entry + s*t` with `t`
     // the iteration count, i.e. `p = entry + (s/step)*(iv - iv0)` — this
     // is the same shape `stream_base`'s direct param check produces.
@@ -882,7 +897,14 @@ fn is_const(func: &Function, v: Value) -> bool {
     match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
         ValueDef::Result(i, _) => matches!(
             func.dfg.insts[i].opcode(),
-            Opcode::Iconst | Opcode::F32const | Opcode::F64const
+            // These may be defined in-body (splink sinks consts into use
+            // blocks); every consumer remats them at its cursor.
+            Opcode::Iconst
+                | Opcode::F32const
+                | Opcode::F64const
+                | Opcode::Vconst
+                | Opcode::SymbolValue
+                | Opcode::FuncAddr
         ),
         _ => false,
     }

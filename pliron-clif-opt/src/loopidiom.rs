@@ -423,7 +423,27 @@ pub fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
     }
     match e {
         Ins::Val(v) => {
-            let v = *v;
+            let v = pos.func.dfg.resolve_aliases(*v);
+            // Rematable const-like insts (const dedup / splink / egraph
+            // remat may have moved the def into a loop block that does not
+            // dominate this emission point) — clone them at the cursor.
+            let v = if let ValueDef::Result(i, _) = pos.func.dfg.value_def(v)
+                && matches!(
+                    pos.func.dfg.insts[i].opcode(),
+                    Opcode::Iconst
+                        | Opcode::F32const
+                        | Opcode::F64const
+                        | Opcode::Vconst
+                        | Opcode::SymbolValue
+                        | Opcode::FuncAddr
+                )
+            {
+                let ni = pos.func.dfg.clone_inst(i);
+                pos.insert_inst(ni);
+                pos.func.dfg.inst_results(ni)[0]
+            } else {
+                v
+            };
             let vt = pos.func.dfg.value_type(v);
             if vt == ty {
                 v
