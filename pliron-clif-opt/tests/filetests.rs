@@ -45,6 +45,11 @@ fn pass(name: &str) -> Pass {
         "memcall" => clifpeep::memcall,
         "ovkill" => clifpeep::ovkill,
         "paramsink" => |f| paramsink::run(f).0,
+        "punroll" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            let prof = std::collections::HashMap::default();
+            pliron_clif_opt::punroll::run(f, &mut an, "filetest", &prof)
+        },
         "rangefold" => rangefold::run,
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,

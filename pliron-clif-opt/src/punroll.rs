@@ -67,7 +67,7 @@ const JAM: usize = 4;
 const MAX_JAM_BODY: usize = 16;
 
 fn debug() -> bool {
-    tracing::enabled!(target: "pliron::punroll", tracing::Level::DEBUG)
+    pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::punroll", tracing::Level::DEBUG)
 }
 
 struct Vm<'a> {
@@ -301,7 +301,9 @@ fn trip_est(
 /// the unrolled clone dead weight — cap at the largest power of two
 /// below it. `None` => no measured bound, keep `k`.
 fn cap_unroll(k: i64, trip: Option<u64>) -> Option<i64> {
-    let t = trip?;
+    let Some(t) = trip else {
+        return Some(k);
+    };
     if t < 2 {
         return None;
     }
@@ -360,7 +362,9 @@ pub fn run(
                         .filter(|&c| la.loop_parent(c) == Some(lp))
                         .count();
                     if debug() {
-                        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: children={}", h.as_u32(), nch);
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::punroll", "jam {name} block{}: children={}", h.as_u32(), nch)
+                        };
                     }
                     if nch == 0 || nch > 2 {
                         continue;
@@ -398,17 +402,19 @@ pub fn run(
                 }
                 let trip = trip_est(cfg, la, lp, h, prof);
                 if debug() {
-                    tracing::debug!(target: "pliron::punroll", "punroll {name} try block{}", h.as_u32());
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::punroll", "punroll {name} try block{}", h.as_u32())
+                    };
                 }
-                if crate::pass_enabled("PLIRON_PEEL")
-                    && run_peel(func, cfg, dt, la, lp, h, name).is_some()
+                if run_loop(func, cfg, dt, la, lp, h, name, trip).is_some()
+                    || run_region(func, cfg, dt, la, lp, h, name, trip).is_some()
                 {
                     n += 1;
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
-                if run_loop(func, cfg, dt, la, lp, h, name, trip).is_some()
-                    || run_region(func, cfg, dt, la, lp, h, name, trip).is_some()
+                if crate::pass_enabled("PLIRON_PEEL")
+                    && run_peel(func, cfg, dt, la, lp, h, name).is_some()
                 {
                     n += 1;
                     hit = true;
@@ -427,7 +433,7 @@ pub fn run(
 macro_rules! wbail {
     ($name:expr, $h:expr, $why:expr) => {{
         if debug() {
-            tracing::debug!(target: "pliron::punroll", "punroll {} block{}: {}", $name, $h.as_u32(), $why);
+            if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "punroll {} block{}: {}", $name, $h.as_u32(), $why) };
         }
         return None;
     }};
@@ -741,7 +747,7 @@ fn sink_test(
         let InstructionData::Brif { arg: c, .. } = func.dfg.insts[te] else {
             continue;
         };
-        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+        let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
             continue;
         };
         let InstructionData::IntCompare {
@@ -787,7 +793,9 @@ fn sink_test(
             func.replace(lt).brif(c, h, &bargs, eblk, &eargs);
         }
         if debug() {
-            tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: sunk mid-chain test", h.as_u32());
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: sunk mid-chain test", h.as_u32())
+            };
         }
         return true;
     }
@@ -822,6 +830,7 @@ fn analyze_exit_cone(
     let mut lset: FxHashSet<Value> = FxHashSet::default();
     let mut elvals: Vec<Value> = Vec::new();
     let mut sconebad = false;
+    let mut reenters = false;
     let mut sinsts = 0usize;
     for &cb in &scone {
         for i in func.layout.block_insts(cb) {
@@ -851,13 +860,18 @@ fn analyze_exit_cone(
                     }
                 }
                 if body.contains(&bc.block(&func.dfg.value_lists)) {
-                    return Err("exit cone re-enters loop");
+                    reenters = true;
                 }
             }
         }
     }
     if elvals.is_empty() {
         return Ok(cone);
+    }
+    // Re-entry matters only once the cone is cloned: an uncloned cone's
+    // edges still reach the rolled loop through its normal entries.
+    if reenters {
+        return Err("exit cone re-enters loop");
     }
     if sconebad || scone.len() > 8 || sinsts > 48 {
         return Err("side-exit cone too big");
@@ -1157,7 +1171,7 @@ fn run_loop(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why) };
             }
             return None;
         }};
@@ -1229,7 +1243,7 @@ fn run_loop(
     let InstructionData::Brif { arg: c, .. } = func.dfg.insts[test_i] else {
         bail!("cond not a brif")
     };
-    let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else {
+    let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
         bail!("cond not an icmp");
     };
     let InstructionData::IntCompare {
@@ -1287,6 +1301,7 @@ fn run_loop(
         .collect();
     let mut needs_cone = false;
     let mut cone_bad = false;
+    let mut reenters = false;
     let mut cone_insts = 0;
     for &cb in &cone {
         for i in func.layout.block_insts(cb) {
@@ -1314,10 +1329,19 @@ fn run_loop(
                     needs_cone = true;
                 }
                 if body.contains(&bc.block(&func.dfg.value_lists)) {
-                    bail!("exit cone re-enters loop");
+                    reenters = true;
                 }
             }
         }
+    }
+    // A cone block re-entering the body is only unsafe once the cone is
+    // cloned — its edge would bind this copy's values into the rolled
+    // loop instead of the fresh entry args. With no clone, the edge
+    // still reaches `h` unchanged. Nested inner loops hit this every
+    // time: the exit's cone contains the next outer iteration's re-entry
+    // wedge into `h`.
+    if needs_cone && reenters {
+        bail!("exit cone re-enters loop");
     }
     if needs_cone && (cone_bad || cone_insts > 128) {
         bail!("exit cone too big");
@@ -1953,7 +1977,7 @@ fn run_region(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: {}", h.as_u32(), $why) };
             }
             return None;
         }};
@@ -2079,7 +2103,7 @@ fn run_region(
             unreachable!()
         };
         let counting = (|| {
-            let ci = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+            let ci = func.dfg.resolved_value_def(c).inst()?;
             let InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond,
@@ -2296,7 +2320,9 @@ fn run_region(
     }
 
     if debug() {
-        tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: region unrolled k={k}", h.as_u32());
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::punroll", "punroll {name} block{}: region unrolled k={k}", h.as_u32())
+        };
     }
     redirect_entries(func, cfg, &body, h, hu, stop.map(|_| (&cnt, k, ity)));
     Some(())
@@ -2361,7 +2387,7 @@ fn run_peel(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                tracing::debug!(target: "pliron::punroll", "peel {name} block{}: {}", h.as_u32(), $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "peel {name} block{}: {}", h.as_u32(), $why) };
             }
             return None;
         }};
@@ -2842,14 +2868,16 @@ fn run_jam(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                tracing::debug!(target: "pliron::punroll", "jam {name} block{}: {}", oh.as_u32(), $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "jam {name} block{}: {}", oh.as_u32(), $why) };
             }
             return None;
         }};
     }
     let j = JAM;
     if debug() {
-        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: try", oh.as_u32());
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::punroll", "jam {name} block{}: try", oh.as_u32())
+        };
     }
     if !dt.is_reachable(oh) || func.layout.is_cold(oh) {
         bail!("header unreachable/cold");
@@ -3023,7 +3051,7 @@ fn run_jam(
     let InstructionData::Brif { arg: gc, .. } = func.dfg.insts[lt] else {
         unreachable!()
     };
-    let Some(gci) = func.dfg.value_def(func.dfg.resolve_aliases(gc)).inst() else {
+    let Some(gci) = func.dfg.resolved_value_def(gc).inst() else {
         bail!("outer cond not an icmp");
     };
     let InstructionData::IntCompare {
@@ -4110,7 +4138,9 @@ fn run_jam(
         }
     }
     if debug() {
-        tracing::debug!(target: "pliron::punroll", "jam {name} block{}: jammed x{j}", oh.as_u32());
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::punroll", "jam {name} block{}: jammed x{j}", oh.as_u32())
+        };
     }
     Some(vec![ojh])
 }
@@ -4243,7 +4273,7 @@ fn run_jam_chooser(
     macro_rules! bail {
         ($why:expr) => {{
             if debug() {
-                tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: {}", oh.as_u32(), $why);
+                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: {}", oh.as_u32(), $why) };
             }
             return None;
         }};
@@ -4293,7 +4323,7 @@ fn run_jam_chooser(
         macro_rules! ifail {
             ($why:expr) => {{
                 if debug() {
-                    tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: inner{} {}", oh.as_u32(), ci, $why);
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: inner{} {}", oh.as_u32(), ci, $why) };
                 }
                 return None;
             }};
@@ -4756,7 +4786,7 @@ fn run_jam_chooser(
             }
         }
     };
-    let Some(lci) = func.dfg.value_def(func.dfg.resolve_aliases(lc)).inst() else {
+    let Some(lci) = func.dfg.resolved_value_def(lc).inst() else {
         bail!("latch cond not an icmp");
     };
     let InstructionData::IntCompare {
@@ -5316,22 +5346,14 @@ fn run_jam_chooser(
         // The direct `a0 + (J-1)*step cc bound` form can wrap when step
         // is huge; compare the widened remainder like `run_jam`'s guard.
         let (a0w, bw) = if wty != ity && osigned {
-            (
-                pos.ins().sextend(wty, a0),
-                pos.ins().sextend(wty, boundv),
-            )
+            (pos.ins().sextend(wty, a0), pos.ins().sextend(wty, boundv))
         } else if wty != ity {
-            (
-                pos.ins().uextend(wty, a0),
-                pos.ins().uextend(wty, boundv),
-            )
+            (pos.ins().uextend(wty, a0), pos.ins().uextend(wty, boundv))
         } else {
             (a0, boundv)
         };
         let rem = pos.ins().isub(bw, a0w);
-        let lim = pos
-            .ins()
-            .iconst(wty, ((j as i64) - 1).wrapping_mul(step));
+        let lim = pos.ins().iconst(wty, ((j as i64) - 1).wrapping_mul(step));
         let ok2 = pos.ins().icmp(
             if ole {
                 IntCC::UnsignedGreaterThanOrEqual
@@ -5883,7 +5905,9 @@ fn run_jam_chooser(
         }
     }
     if debug() {
-        tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: jammed x{j} (chooser)", oh.as_u32());
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::punroll", "jam2 {name} block{}: jammed x{j} (chooser)", oh.as_u32())
+        };
     }
     Some(vec![ojh])
 }

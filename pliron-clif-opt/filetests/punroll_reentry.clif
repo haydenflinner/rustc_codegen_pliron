@@ -1,0 +1,46 @@
+; test punroll
+; Nested inner loop (block3) whose exit edge lands on the outer
+; continuation block4 — the loop's exit target. block4 dominates the
+; re-entry wedge block10, which branches back into the inner header.
+; No loop-defined value escapes into the exit's dominance cone, so the
+; cone is not cloned and the re-entry edge is harmless: the unroll must
+; still fire (was: "exit cone re-enters loop" bail, matmul shape).
+;
+; The group unroll must fire: a fused clone behind a wide trip guard
+; (umin/isub remainder bound), while the rolled block3 loop survives as
+; the remainder path:
+; check: umin.i64
+; check: brif v102, block11(v101, v26), block4(v20)
+; check: brif v16, block3(v15), block4(v20)
+
+function u0:0(i64, i64) fast {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0
+    jump block4(v2)
+
+block4(v5: i64):
+    v21 = iconst.i64 1
+    v6 = icmp ult v5, v1
+    v20 = iadd v5, v21
+    brif v6, block10, block9
+
+block10:
+    v7 = iconst.i64 0
+    jump block3(v7)
+
+block3(v8: i64):
+    v22 = iconst.i64 8
+    v23 = iconst.i64 1
+    v24 = iconst.i64 1
+    v11 = imul v8, v22
+    v12 = iadd v0, v11
+    v13 = load.i64 notrap aligned v12
+    v14 = iadd v13, v23
+    store.i64 notrap aligned v14, v12
+    v15 = iadd v8, v24
+    v16 = icmp ult v15, v1
+    brif v16, block3(v15), block4(v20)
+
+block9:
+    return
+}
