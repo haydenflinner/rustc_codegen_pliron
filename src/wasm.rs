@@ -2860,6 +2860,54 @@ struct Promo {
     incomplete: FxHashMap<WBlock, Vec<(u32, WV)>>,
 }
 
+/// When no stack slots were ever allocated, the save/align/restore dance
+/// around `__stack_pointer` is pure overhead. Drop every `global.set` of it
+/// (entry adjust, return/unwind/rethrow restores) plus the now-dead
+/// fp/mask producer chain rooted at `roots` — the callee's own SP is never
+/// touched, so nothing needs restoring. A stray consumer of the dead
+/// values cancels the whole rewrite (defensive).
+fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
+    let mut dead: FxHashSet<WV> = roots.into_iter().collect();
+    let mut wl: Vec<WV> = dead.iter().copied().collect();
+    while let Some(v) = wl.pop() {
+        if let ValueDef::Operator(_, args, _) = &b.values[v] {
+            for i in 0..b.arg_pool[*args].len() {
+                let a = b.arg_pool[*args][i];
+                if dead.insert(a) {
+                    wl.push(a);
+                }
+            }
+        }
+    }
+    let mut kill = dead.clone();
+    for blk in b.blocks.iter() {
+        for &i in &b.blocks[blk].insts {
+            if let ValueDef::Operator(O::GlobalSet { global_index: g }, ..) = &b.values[i]
+                && *g == sp
+            {
+                kill.insert(i);
+            }
+        }
+    }
+    let mut bad = false;
+    for blk in b.blocks.iter() {
+        for &i in &b.blocks[blk].insts {
+            if kill.contains(&i) {
+                continue;
+            }
+            b.values[i].visit_uses(&b.arg_pool, |u| bad |= dead.contains(&u));
+        }
+        b.blocks[blk]
+            .terminator
+            .visit_uses(|u| bad |= dead.contains(&u));
+    }
+    if !bad {
+        for blk in b.blocks.iter() {
+            b.blocks[blk].insts.retain(|i| !kill.contains(i));
+        }
+    }
+}
+
 struct FL<'o, 'a> {
     o: &'o mut Obj<'a>,
     ctx: &'a Context,
@@ -2941,56 +2989,11 @@ impl<'o, 'a> FL<'o, 'a> {
             }
         }
         if self.frame == 0 {
-            // No stack slots were ever allocated: the save/align/restore
-            // dance around __stack_pointer is pure overhead. Drop every
-            // global.set of it (entry adjust, return/unwind/rethrow
-            // restores) plus the now-dead fp/mask producer chain — the
-            // callee's own SP is never touched, so nothing needs
-            // restoring. A stray consumer of the dead values cancels
-            // the whole rewrite (defensive).
-            let sp = self.o.sp;
-            let mut dead: FxHashSet<WV> = [self.sp0, self.fp, self.frame_c, self.mask_c]
-                .into_iter()
-                .collect();
-            let mut wl: Vec<WV> = dead.iter().copied().collect();
-            while let Some(v) = wl.pop() {
-                if let ValueDef::Operator(_, args, _) = &self.b.values[v] {
-                    for i in 0..self.b.arg_pool[*args].len() {
-                        let a = self.b.arg_pool[*args][i];
-                        if dead.insert(a) {
-                            wl.push(a);
-                        }
-                    }
-                }
-            }
-            let mut kill = dead.clone();
-            for blk in self.b.blocks.iter() {
-                for &i in &self.b.blocks[blk].insts {
-                    if let ValueDef::Operator(O::GlobalSet { global_index: g }, ..) =
-                        &self.b.values[i]
-                        && *g == sp
-                    {
-                        kill.insert(i);
-                    }
-                }
-            }
-            let mut bad = false;
-            for blk in self.b.blocks.iter() {
-                for &i in &self.b.blocks[blk].insts {
-                    if kill.contains(&i) {
-                        continue;
-                    }
-                    self.b.values[i].visit_uses(&self.b.arg_pool, |u| bad |= dead.contains(&u));
-                }
-                self.b.blocks[blk]
-                    .terminator
-                    .visit_uses(|u| bad |= dead.contains(&u));
-            }
-            if !bad {
-                for blk in self.b.blocks.iter() {
-                    self.b.blocks[blk].insts.retain(|i| !kill.contains(i));
-                }
-            }
+            elide_sp_frame(
+                &mut self.b,
+                self.o.sp,
+                [self.sp0, self.fp, self.frame_c, self.mask_c],
+            );
         }
         // Provable-range folds (`byte <u 256` etc.); the optimize below
         // drops the dead arms this opens up.
@@ -8689,6 +8692,13 @@ impl<'o, 'a> CX<'o, 'a> {
             if let ValueDef::Operator(op, ..) = &mut self.b.values[v] {
                 *op = O::I32Const { value: c };
             }
+        }
+        if self.frame == 0 {
+            elide_sp_frame(
+                &mut self.b,
+                self.o.sp,
+                [self.sp0, self.fp, self.frame_c, self.mask_c],
+            );
         }
         wrange(&mut self.b);
         waddr(&mut self.b);
