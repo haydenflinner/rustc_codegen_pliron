@@ -1267,6 +1267,12 @@ fn store_src_in(
         *fuel = fuel.checked_sub(1)?;
         let block_ops = ops(ctx, b);
         let start = pos.unwrap_or(block_ops.len());
+        // The backward scan must see every op that could clobber the slot:
+        // a truncated window would fall through to the pred walk as if the
+        // block were transparent and silently skip an older same-slot store.
+        if start > 400 {
+            return None;
+        }
         for (oi, &o) in block_ops[..start].iter().enumerate().rev().take(400) {
             // `llvm.memcpy/memmove(dst, src, n)`: a load fully inside the
             // copied range reads the same bytes the *source* held just
