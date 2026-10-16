@@ -10,10 +10,16 @@
 //! to `movi`: it matches on the value's *defining instruction*, wherever
 //! it sits.
 //!
-//! Only `splat` is handled: regalloc already remats scalar `iconst`s, and
-//! anything else is not clearly cheaper than the reload it replaces.
+//! Scalar constants get the same treatment, but only for uses inside a
+//! loop the def sits outside: that is the shape where the def's live
+//! range spans every back edge and regalloc2 — which does not
+//! rematerialize — answers with a spill slot. A `mov`/`movi` per use
+//! beats the store+reload pair (and the extra store regalloc2 emits on
+//! each back edge when the value is param-shaped). Outside loops a
+//! shared def costs nothing a per-use clone would save.
 
 use cranelift_codegen::ir::{Block, Function, Inst, InstructionData, Opcode, Value};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Walk every reachable block once; per-block work is trivial.
@@ -42,23 +48,48 @@ fn const_splat(func: &Function, i: Inst) -> bool {
     )
 }
 
-pub fn run(func: &mut Function) -> usize {
+/// Is `i` itself a scalar materializable constant (`iconst`/`f32const`/
+/// `f64const`)?
+fn scalar_const(func: &Function, i: Inst) -> bool {
+    matches!(
+        func.dfg.insts[i],
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            ..
+        } | InstructionData::UnaryIeee32 { .. }
+            | InstructionData::UnaryIeee64 { .. }
+    )
+}
+
+pub fn run(func: &mut Function, la: &LoopAnalysis) -> usize {
     if func.layout.blocks().count() > MAX_BLOCKS {
         return 0;
     }
-    // splat inst -> set of blocks (other than its def block) using it.
+    // splat/const inst -> set of blocks (other than its def block) using it.
     let mut uses: FxHashMap<Inst, FxHashSet<Block>> = FxHashMap::default();
     for b in func.layout.blocks() {
+        let lb = la.innermost_loop(b);
         for i in func.layout.block_insts(b) {
             for v in func.dfg.inst_values(i) {
                 let v = func.dfg.resolve_aliases(v);
                 let Some(d) = func.dfg.value_def(v).inst() else {
                     continue;
                 };
-                if func.layout.inst_block(d) == Some(b) || !const_splat(func, d) {
+                if func.layout.inst_block(d) == Some(b) {
                     continue;
                 }
-                uses.entry(d).or_default().insert(b);
+                if const_splat(func, d) {
+                    uses.entry(d).or_default().insert(b);
+                    continue;
+                }
+                // Scalar consts only move when the use's innermost loop
+                // excludes the def — that's the shape that costs a spill.
+                if let (Some(lp), Some(db)) = (lb, func.layout.inst_block(d))
+                    && !la.is_in_loop(db, lp)
+                    && scalar_const(func, d)
+                {
+                    uses.entry(d).or_default().insert(b);
+                }
             }
         }
     }
@@ -134,6 +165,15 @@ mod tests {
         }
     }
 
+    fn sink(func: &mut Function) -> usize {
+        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+        let dt =
+            cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+        let mut la = LoopAnalysis::new();
+        la.compute(func, &cfg, &dt);
+        run(func, &la)
+    }
+
     fn little() -> MemFlagsData {
         MemFlagsData::new().with_endianness(Endianness::Little)
     }
@@ -176,7 +216,7 @@ mod tests {
             cur.ins().return_(&[ov]);
         }
         verify(&func);
-        assert_eq!(run(&mut func), 1);
+        assert_eq!(sink(&mut func), 1);
         verify(&func);
         // Exactly one splat left in the whole function, inside the loop.
         let mut splats = 0;
@@ -221,7 +261,71 @@ mod tests {
             cur.ins().return_(&[w]);
         }
         verify(&func);
-        assert_eq!(run(&mut func), 0);
+        assert_eq!(sink(&mut func), 0);
         verify(&func);
+    }
+
+    /// A scalar `iconst` defined before a loop and used inside it clones
+    /// into the loop block; a use outside any loop leaves it alone.
+    #[test]
+    fn sinks_scalar_into_loop_only() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let lp = func.dfg.make_block();
+        let out = func.dfg.make_block();
+        for b in [b0, lp, out] {
+            func.layout.append_block(b);
+        }
+        let v0 = func.dfg.append_block_param(b0, types::I64);
+        let iv = func.dfg.append_block_param(lp, types::I64);
+        let ov = func.dfg.append_block_param(out, types::I64);
+
+        let k = {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let k = cur.ins().iconst(types::I64, 5000);
+            cur.ins().jump(lp, &[BlockArg::Value(v0)]);
+            k
+        };
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(lp);
+            let n2 = cur.ins().iadd(iv, k);
+            let c = cur.ins().icmp(IntCC::UnsignedLessThan, n2, v0);
+            cur.ins()
+                .brif(c, lp, &[BlockArg::Value(n2)], out, &[BlockArg::Value(n2)]);
+        }
+        {
+            // `k` also used in the exit block — outside the loop.
+            let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+            let s = cur.ins().iadd(ov, k);
+            cur.ins().return_(&[s]);
+        }
+        verify(&func);
+        assert_eq!(sink(&mut func), 1);
+        verify(&func);
+        // Two `iconst`s: the clone in the loop block, plus the original
+        // which the out-block use keeps alive.
+        let mut counts = (0, 0);
+        for i in func.layout.block_insts(lp) {
+            if let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                ..
+            } = func.dfg.insts[i]
+            {
+                counts.0 += 1;
+            }
+        }
+        for i in func.layout.block_insts(out) {
+            if let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                ..
+            } = func.dfg.insts[i]
+            {
+                counts.1 += 1;
+            }
+        }
+        assert_eq!(counts, (1, 0));
     }
 }

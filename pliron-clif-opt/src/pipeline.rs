@@ -1510,8 +1510,9 @@ fn s_constdedup(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
-fn s_splink(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = splink::run(&mut p.clctx.func);
+fn s_splink(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let CfgDtLa { la, .. } = an.cfg_dt_la(&p.clctx.func);
+    let k = splink::run(&mut p.clctx.func, la);
     p.dump("splink");
     k
 }
