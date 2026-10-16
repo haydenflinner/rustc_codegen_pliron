@@ -1688,3 +1688,104 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   -p pliron-ir-opt` (68 + all filetests), full `./test.sh` incl.
   `facts`/`retattr`/`edgespec`, `PLIRON_TRACE=pliron::stats=info` and
   legacy `PLIRON_STATS`/`PLIRON_JT_PROF`/`PLIRON_FACTS` runs.
+
+## 2026-10-16 jumpthread map audit + pliron Iter::next (devin 761f9fa8, cont.)
+
+### Entity-keyed-map audit (jumpthread, ~69 FxHashMap/FxHashSet<Inst|Block|Value> sites)
+
+Classification rule: `SecondaryMap`/dense wins when keys are entity-typed
+AND the domain is dense-or-total (per-block side tables, per-inst
+positions); FxHashMap stays right for sparse subsets over a large domain.
+Result — most sites are already correct:
+
+- **Sparse/correct**: per-edge `env`/`argv`/`pn`/`kenv`/`prange` scratch in
+  `round` (pooled, few entries per edge — a `SecondaryMap` there would pay
+  O(num_values) alloc per edge, strictly worse); `dependents`, `memo`,
+  `derived`, `args_of`, `cand`, `regions`, `benvs`, `cone`, `appends`,
+  `repl`/`to`/`map` substitution maps, `table_facts`/`by_inst`/`cnt`,
+  `inc`/`idx`/`dead`/`preds`, `gone`/`escaping`/`seen`/`protected`/`qual`,
+  `pmap`, `const_env`, `fold_const_branches` env.
+- **Dense candidates**: `users` (Block→Set, whole-fn), `uses` in
+  split_niche_tests (Value→Vec<Inst>, rebuilt per fixpoint — could also
+  reuse `uses::Uses`), `live` in remove_dead_params (Block→Vec<bool>,
+  built for ALL blocks — `SecondaryMap<Block, Vec<bool>>` is strictly
+  better), `children` in dominated_conds (domtree children, dense),
+  `fact_memo` (Block→Vec<Cmp>, lazily filled per round).
+- **Verdict**: none of the dense candidates are on the hot path —
+  sampling shows jumpthread's cost is the per-edge work in `round`, not
+  map ops (hashbrown inserts of entity keys ≈ 1.3% total, and most of
+  that is `Value`→u64 in non-jumpthread passes). Deferred; only
+  `live`/`children`/`users` are worth converting opportunistically.
+
+### pliron linked-list traversal (the "elephant")
+
+Serial profile (PAR=0, samply, bench kernels): `Iter<Operation>::next`
+3.8% leaf + `Iter<BasicBlock>::next` 0.8% + `ArenaIndex::data` 1.4% +
+`ArenaObj::get_arena` 0.6% ≈ 7% of total compile in arena hops. Callers
+of Iter::next: `inline::ops` 220 + `inline::blocks` 201 + `sroa::allocas`
+121 of 906 — the rest is long-tail scattered across ir-opt/lower.
+
+**Design space for the arena** (`Arena<T> = SlotMap<ArenaIndex,
+RefCell<T>>`, `Ptr::deref` = slotmap get + `RefCell::borrow` per node):
+
+- **Vec-backed lists**: dead — cursor APIs (`op.deref(ctx).get_next()`,
+  ~38 sites in walkers/liveness/rewriter) have no container arg, so a
+  container-owned `Vec<Ptr>` can't answer "next of this op" without a
+  position index on every node. API-incompatible.
+- **One `RefCell` per arena**: dead — borrow conflicts become arena-wide;
+  holding `Ref<A>` while `deref_mut`ing `B` panics, and that pattern is
+  everywhere (insert ops hold `mark.deref_mut` while dereffing neighbors).
+- **`UnsafeCell` + `&T` API**: eliminates flags entirely but `deref`'s
+  return type changes (`Ref`→`&T`); ~50 explicit `Ref<`/`RefMut<`
+  signatures across pliron+backend, plus `Ref::map` uses. Also converts
+  aliasing bugs from panics into UB — real risk for marginal extra gain
+  over the landed patch. Not taken.
+- **Tried and REVERTED**: `hop()` in `linked_list.rs` — `Iter::next`/
+  `next_back` reading the node via `slotmap.get(idx).as_ptr()` to skip
+  the `RefCell` borrow-flag RMW. Re-profiled: `Iter::next` leaf 906 →
+  964 samples, statistically flat — the hop cost is the slotmap pointer
+  chase itself (cache miss), not the flag ops. Unmeasurable `unsafe`
+  is a bad trade; reverted. Remaining real levers: (a) reduce walk
+  count at pass level (done for inline, below); (b) shrink node size /
+  arena locality (large redesign); (c) `SecondaryMap`-style iteration
+  where a pass can snapshot pointers once and reuse.
+
+### inline rescan de-quadratified
+
+`inline::run`'s round loop collected `blocks(ctx, caller)` every round
+(up to 32) just to filter `done_blocks`. Now a persistent `blklist` Vec
++ `pending` map (continuation blocks splice in right after their parent,
+clones append at end — `split_block` uses `AfterBlock`, `clone_blocks_into`
+uses `AtRegionEnd`, so the Vec order is exact). `inline_call` returns
+`(callsite_block, [cont, ...clones])`. Same scan order ⇒ same accept
+order ⇒ identical codegen, minus the per-round O(#blocks) collect.
+
+### DFG alias epoch → skip dead carry_aliases scans
+
+`carry_aliases` walked `dfg.values()` after every mutating step while
+any fact map was non-empty, but most mutating steps never write an
+alias. `DataFlowGraph` now has `alias_epoch` (u32, bumped in
+`change_to_alias`/`replace_with_aliases`/serialization alias writes;
+tombstones and same-root retargets intentionally don't bump since they
+create no new resolvable pairs). `Analysis` records the last-seen epoch
+and `carry_aliases` early-outs when unchanged. Placement subtlety: the
+epoch is recorded only *after* the empty-fact-maps early-out — a later
+step can add facts without touching aliases and the pairs must still
+be carried then. Bench `*pipeline*` A/B (PLIRON_PAR=0, kernels):
+9635.7ms → 9449–9529ms across two runs (~1.5–2%). Vendor patch #34.
+Note: `ValueData::from`+`resolve_aliases` remain ~8-9% leaf — next real
+lever there is likely fewer alias lookups (pass-level batching), not
+the lookup itself.
+
+### stray notes
+
+- Found uncommitted aarch64 WIP in the worktree (`lower.isle`/`inst.isle`
+  uextend/sextend-of-cset fold, PLIRON_PATCH.md #33, `isle.rs`
+  `imul_pow2p1_shamt`). It broke the build on arrival (ISLE priority
+  overlap — self-fixed while I watched, so it may still be live work)
+  and then ICEd at runtime: `imul by 1` → `c-1 = 0` → `trailing_zeros
+  = 64` → `1u64 << 64` debug-panic inside `imul_pow2p1_shamt`. Fixed by
+  hoisting `n < bits` before the shift (also reordered pow2m1 for
+  symmetry). Committed as its own commit with the rest of the WIP —
+  passes full test.sh — but I have not audited the fold rules beyond
+  that panic path; owner should sanity-check.
