@@ -9,6 +9,7 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
@@ -110,6 +111,11 @@ pub struct Stats {
     /// Wall time per step name, summed over functions; printed under
     /// `PLIRON_TIMING`.
     pub timing: FxHashMap<&'static str, std::time::Duration>,
+    /// How often the shared `Analysis` slot rebuilt each structural
+    /// analysis — the granularity-split scoreboard.
+    pub cfg_builds: usize,
+    pub dt_builds: usize,
+    pub la_builds: usize,
 }
 
 impl Stats {
@@ -123,6 +129,9 @@ impl Stats {
         self.dupd += o.dupd;
         self.forwarded += o.forwarded;
         self.slot_dse += o.slot_dse;
+        self.cfg_builds += o.cfg_builds;
+        self.dt_builds += o.dt_builds;
+        self.la_builds += o.la_builds;
         for (n, d) in &o.timing {
             *self.timing.entry(n).or_default() += *d;
         }
@@ -356,26 +365,57 @@ impl Gate {
     }
 }
 
+/// Hash of everything the structural analyses read: the layout block
+/// sequence, each block's terminator identity, and its successors in
+/// written order (jump-table and exception-table destinations
+/// included). `O(blocks + edges)` to compute — far cheaper than the
+/// bforest inserts `ControlFlowGraph::compute` pays per edge — so
+/// `bump`/`invalidate` use it to decide whether a mutation changed the
+/// CFG at all, keeping cfg/dt/la alive across value-only rewrites.
+fn edge_fp(func: &Function) -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write_usize(func.dfg.num_blocks());
+    for b in func.layout.blocks() {
+        h.write_usize(b.index());
+        if let Some(inst) = func.layout.last_inst(b) {
+            h.write_usize(inst.index());
+            for bc in func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                h.write_usize(bc.block(&func.dfg.value_lists).index());
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Version-keyed cache of the analyses passes share. Owned by
 /// `run_pipeline` (outside `Pipe`) so an `&Analysis` result and
 /// `&mut Function` can be borrowed at once.
 ///
 /// Entries are dropped when the pipeline bumps `ver` after a mutating
 /// step, and passes that mutate mid-step call `invalidate()` at the same
-/// places they previously recomputed. Accessors also check a cheap shape
-/// fingerprint — a read after an un-`invalidate`d structural mutation
-/// panics instead of silently serving stale data.
+/// places they previously recomputed. The drop is granular: cfg/dt/la
+/// survive a bump whose `edge_fp` is unchanged (the step rewrote only
+/// values/args), while the value-keyed caches always drop. Accessors
+/// also assert the fingerprint — a read after an un-`invalidate`d
+/// structural mutation panics instead of silently serving stale data.
 #[derive(Default)]
 pub struct Analysis {
     ver: u64,
-    /// `num_insts` at materialize time, for the stale-analysis debug
-    /// assert. `layout.blocks().count()` would be O(blocks) per query —
-    /// quadratic on giant functions — and inst count changes on nearly
-    /// every mutation anyway (block splits insert a branch).
-    shape: usize,
+    /// `edge_fp` of the function state `cfg` describes; `Some` iff
+    /// `cfg` is `Some`. Replaces the old `num_insts` fingerprint:
+    /// inst count changes on value-only rewrites that leave the CFG
+    /// intact, while this catches every edge/block/terminator change.
+    cfg_fp: Option<u64>,
     cfg: Option<ControlFlowGraph>,
     dt: Option<DominatorTree>,
     la: Option<LoopAnalysis>,
+    /// Materialization counts, merged into `Stats` at pipeline end.
+    pub(crate) cfg_builds: usize,
+    pub(crate) dt_builds: usize,
+    pub(crate) la_builds: usize,
     /// Step-cache hash chain: the previous step's output hash is this
     /// step's input hash, so cache hits never re-hash the function.
     /// `fnh` hashes the FnJob input maps once per function. `pk` is
@@ -421,42 +461,58 @@ pub struct CfgDtLa<'a> {
 
 impl Analysis {
     fn clear(&mut self) {
+        self.cfg_fp = None;
         self.cfg = None;
         self.dt = None;
         self.la = None;
+        self.clear_values();
+    }
+
+    /// Drop only the value-keyed caches — used when a mutation left the
+    /// CFG edge/block structure provably intact (`edge_fp` match).
+    fn clear_values(&mut self) {
         self.amap = None;
         self.iso = None;
         self.uses.get_mut().take();
     }
 
     /// The pipeline advanced the IR version (a step declared `mutates`).
-    pub fn bump(&mut self) {
+    /// When the cached CFG's edge fingerprint still matches — the step
+    /// rewrote only values/args — cfg/dt/la stay valid and only the
+    /// value-keyed caches drop.
+    pub fn bump(&mut self, func: &Function) {
         self.ver += 1;
-        self.clear();
+        if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
+            self.clear_values();
+        } else {
+            self.clear();
+        }
     }
 
     /// A pass mutated the function mid-step; drop everything computed
-    /// against the old shape.
-    pub fn invalidate(&mut self) {
-        self.clear();
-    }
-
-    fn shape(func: &Function) -> usize {
-        func.dfg.num_insts()
+    /// against the old state. Same granularity as `bump`: a value-only
+    /// rewrite keeps cfg/dt/la.
+    pub fn invalidate(&mut self, func: &Function) {
+        if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
+            self.clear_values();
+        } else {
+            self.clear();
+        }
     }
 
     /// Lazily fills the CFG only — `dt`/`la` build in their own
     /// accessors, so a cfg-only consumer doesn't pay for domtree+loops.
     fn materialize(&mut self, func: &Function) {
-        let shape = Self::shape(func);
         if self.cfg.is_some() {
             debug_assert_eq!(
-                self.shape, shape,
+                self.cfg_fp,
+                Some(edge_fp(func)),
                 "analysis read after IR mutation without Analysis::invalidate()"
             );
         } else {
-            self.shape = shape;
+            self.cfg_fp = Some(edge_fp(func));
             self.cfg = Some(ControlFlowGraph::with_function(func));
+            self.cfg_builds += 1;
         }
     }
 
@@ -468,11 +524,13 @@ impl Analysis {
                 func,
                 self.cfg.as_ref().unwrap(),
             ));
+            self.dt_builds += 1;
         }
         if self.la.is_none() {
             let mut la = LoopAnalysis::new();
             la.compute(func, self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap());
             self.la = Some(la);
+            self.la_builds += 1;
         }
         CfgDtLa {
             cfg: self.cfg.as_ref().unwrap(),
@@ -489,6 +547,7 @@ impl Analysis {
                 func,
                 self.cfg.as_ref().unwrap(),
             ));
+            self.dt_builds += 1;
         }
         (self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap())
     }
@@ -802,6 +861,9 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
         crate::stepcache::pipeline_store(&k, p, stats0.as_ref().unwrap(), reads, draws, ran);
     }
     crate::stepcache::flush(&mut an);
+    p.stats.cfg_builds += an.cfg_builds;
+    p.stats.dt_builds += an.dt_builds;
+    p.stats.la_builds += an.la_builds;
     found
 }
 
@@ -992,7 +1054,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
             }
             p.clctx.func = before;
             *p.derived = derived0;
-            an.invalidate();
+            an.invalidate(&p.clctx.func);
         }
         *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
         return;
@@ -1026,7 +1088,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.
-        an.bump();
+        // `bump` fingerprints the CFG: a value-only step keeps the
+        // cached cfg/dt/la and drops just the value-keyed caches.
+        an.bump(&p.clctx.func);
         if prof_chain {
             let (m, t) = chain_stats(&p.clctx.func);
             if m >= 8 {
@@ -1426,7 +1490,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
     // round can step the remaining address into a param and evict the
     // shared base from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
-        an.invalidate();
+        an.invalidate(&p.clctx.func);
         indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     k
@@ -1449,7 +1513,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
     // at indvars time; stepping them into params evicts the base's live
     // range from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
-        an.invalidate();
+        an.invalidate(&p.clctx.func);
         indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     if k > 0 && p.dump {
@@ -1585,7 +1649,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     // a second indvars round turns them into stepped pointers.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         // loopvec rewrote the loop the cache describes.
-        an.invalidate();
+        an.invalidate(&p.clctx.func);
         indvars::run(&mut p.clctx.func, an, p.amode_scale);
     }
     k
@@ -2080,7 +2144,7 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
     if k > 0 {
-        an.invalidate();
+        an.invalidate(&p.clctx.func);
     }
     k += indvars::postinc_ne(&mut p.clctx.func, an);
     if k > 0 && p.dump {

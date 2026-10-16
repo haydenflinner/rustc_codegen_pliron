@@ -425,7 +425,7 @@ pub fn run(
         if !hit {
             break;
         }
-        an.invalidate();
+        an.invalidate(func);
     }
     n
 }

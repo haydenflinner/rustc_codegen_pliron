@@ -149,7 +149,7 @@ pub fn run(
             }
             n += 1;
             // The preheader block + edge retargets rewired the CFG.
-            an.invalidate();
+            an.invalidate(func);
             continue 'outer;
         }
         break;

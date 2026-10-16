@@ -544,3 +544,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     casts (`fvpromote_f16`/`_lo`/`_hi` -> `fcvtl`/`fcvtl2`,
     `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
     lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.
+
+45. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
+    now also assigns each loop an Euler-tour interval `[tin, tout)` over
+    the loop forest (`assign_loop_intervals`); `is_in_loop` tests
+    `tin[lp] <= tin[innermost(block)] < tout[lp]` instead of finger-
+    walking the parent chain. The opt pipeline calls it per
+    (loop, block) pair inside `layout.blocks()` filters — O(loops ×
+    blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
+    profile.
