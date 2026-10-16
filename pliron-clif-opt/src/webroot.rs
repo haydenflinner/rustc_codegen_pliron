@@ -121,6 +121,10 @@ impl Web {
     }
     /// `+ k`/`− k` by a constant.
     fn shifted(&self, k: i64) -> Web {
+        // `x ± 0` is `x` — the `0 + k → bad` rule below asserts `k != 0`.
+        if k == 0 {
+            return self.clone();
+        }
         Web {
             slots: self
                 .slots
@@ -129,7 +133,9 @@ impl Web {
                 .collect(),
             // 0 + k is a nonzero garbage address — still
             // never-dereferenceable, but no longer provably `== 0`.
-            nul: false,
+            // A `bad` (0+j) member + k can land on 0 when j == -k, so
+            // null stays possible too.
+            nul: self.bad,
             bad: self.nul || self.bad,
             other: self.other,
         }
