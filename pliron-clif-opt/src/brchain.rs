@@ -29,6 +29,8 @@ use cranelift_codegen::ir::{
 };
 use rustc_hash::FxHashMap;
 
+use crate::jumpthread::pure_op;
+
 /// Maximum number of live (non-default-equivalent) table entries that
 /// get a compare chain. Above that the indirect branch wins on code
 /// size: the chain costs `icmp`+`brif` per entry vs ~8 instructions
@@ -91,8 +93,13 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
         let k = (k as u64) & m;
         if k < n { entries[k as usize] } else { dflt_bc }
     };
-    // Chase the dispatch value through conversions to its block param.
+    // Chase the dispatch value through conversions to its block param,
+    // recording each conversion's result-mask width so the index const
+    // can be normalized to what the table actually reads (a sign- or
+    // over-wide-spelled `iconst` imm on the param is not the dispatched
+    // index).
     let mut v = arg;
+    let mut conv_masks: Vec<u32> = Vec::new();
     let (blk, num) = loop {
         v = func.dfg.resolve_aliases(v);
         match func.dfg.value_def(v) {
@@ -109,11 +116,45 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
                 let InstructionData::Unary { arg, .. } = func.dfg.insts[d] else {
                     unreachable!()
                 };
+                // `uextend`: the index is the operand's value zero-extended,
+                // so normalize `k` to the operand width. `ireduce`: the
+                // index truncates to this inst's result width.
+                conv_masks.push(match func.dfg.insts[d].opcode() {
+                    cranelift_codegen::ir::Opcode::Uextend => func.dfg.value_type(arg).bits(),
+                    _ => func.dfg.value_type(v).bits(),
+                });
                 v = arg;
             }
             ValueDef::Param(b, num) => break (b, num),
             _ => return None,
         }
+    };
+    // `blk` dies once its edges are threaded: `term` must live in `blk`
+    // (a dominated block's code would be skipped too), every
+    // non-terminator inst must be pure, and no inst result it defines may
+    // be used outside — the rebound-param machinery only covers `blk`'s
+    // params.
+    if func.layout.inst_block(term) != Some(blk) {
+        return None;
+    }
+    for i in func.layout.block_insts(blk) {
+        if i == term {
+            continue;
+        }
+        if !pure_op(func, i) {
+            return None;
+        }
+    }
+    // A `k` edge arg is the param's constant — apply the conversion
+    // chain's narrowing masks (walked outermost-first) before indexing.
+    let norm = |k: i64| -> i64 {
+        conv_masks.iter().rev().fold(k, |k, &b| {
+            if b >= 64 {
+                k
+            } else {
+                k & ((1i64 << b) - 1)
+            }
+        })
     };
     // Classify every incoming edge's argument for `param[num]`; a
     // select arg is only expressible where the pred's terminator is a
@@ -133,8 +174,11 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
             }
             let src: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
             // Non-`Value` edge args (try_call payloads) can't be
-            // re-expressed on the resolved targets.
-            if !src.iter().all(|a| matches!(a, BlockArg::Value(_))) {
+            // re-expressed on the resolved targets, and the arg list must
+            // cover every `blk` param (`src[j]` substitutions index it).
+            if src.len() != func.dfg.block_params(blk).len()
+                || !src.iter().all(|a| matches!(a, BlockArg::Value(_)))
+            {
                 return None;
             }
             let ea = match src.get(num) {
@@ -148,7 +192,7 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
                 // Two-way arg on an edge we can't split: unless both
                 // arms resolve to the same call, threading is
                 // impossible.
-                EdgeArg::Sel(_, ka, kb) if same_target(func, entry(ka), entry(kb)) => {
+                EdgeArg::Sel(_, ka, kb) if same_target(func, entry(norm(ka)), entry(norm(kb))) => {
                     EdgeArg::K(ka)
                 }
                 _ => return None,
@@ -159,15 +203,57 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
     if work.is_empty() {
         return None;
     }
+    // An edge arg on a resolved target may name a `blk` param (bound per
+    // edge via `src`) or a value defined above this dispatch. Anything
+    // defined inside `blk` — or anywhere not dominating the edge's pred —
+    // would dangle on the new edge, so validate them all before
+    // rewriting: a non-`blk`-param arg must dominate its edge's block.
+    let dt_lazy = std::cell::RefCell::new(None::<DominatorTree>);
+    for (pinst, _, _, ea) in &work {
+        let Some(pblk) = func.layout.inst_block(*pinst) else {
+            return None;
+        };
+        let ks: &[i64] = match *ea {
+            EdgeArg::K(k) => &[k],
+            EdgeArg::Sel(_, ka, kb) => &[ka, kb],
+        };
+        for &k in ks {
+            let call = entry(norm(k));
+            for a in call.args(&func.dfg.value_lists) {
+                let BlockArg::Value(av) = a else {
+                    continue;
+                };
+                let r = func.dfg.resolve_aliases(av);
+                if let ValueDef::Param(b, _) = func.dfg.value_def(r)
+                    && b == blk
+                {
+                    continue;
+                }
+                let db = match func.dfg.value_def(r) {
+                    ValueDef::Param(pb, _) => pb,
+                    ValueDef::Result(i, _) => match func.layout.inst_block(i) {
+                        Some(db) => db,
+                        None => return None,
+                    },
+                    _ => return None,
+                };
+                let mut guard = dt_lazy.borrow_mut();
+                let dt = guard.get_or_insert_with(|| DominatorTree::with_function(func, cfg));
+                if !dt.block_dominates(db, pblk) {
+                    return None;
+                }
+            }
+        }
+    }
     // Resolved targets — threading removes `blk`, so a self-entry
     // (table target == `blk`) can't be expressed.
     let mut tblocks = Vec::new();
     for (_, _, _, ea) in &work {
         match *ea {
-            EdgeArg::K(k) => tblocks.push(entry(k).block(&func.dfg.value_lists)),
+            EdgeArg::K(k) => tblocks.push(entry(norm(k)).block(&func.dfg.value_lists)),
             EdgeArg::Sel(_, ka, kb) => {
-                tblocks.push(entry(ka).block(&func.dfg.value_lists));
-                tblocks.push(entry(kb).block(&func.dfg.value_lists));
+                tblocks.push(entry(norm(ka)).block(&func.dfg.value_lists));
+                tblocks.push(entry(norm(kb)).block(&func.dfg.value_lists));
             }
         }
     }
@@ -198,6 +284,13 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
             for i in func.layout.block_insts(x) {
                 for v in func.dfg.inst_values(i) {
                     let r = func.dfg.resolve_aliases(v);
+                    // A result defined inside `blk` can't be rebound —
+                    // its uses outside would dangle once `blk` dies.
+                    if let ValueDef::Result(d, _) = func.dfg.value_def(r)
+                        && func.layout.inst_block(d) == Some(blk)
+                    {
+                        return None;
+                    }
                     if params.contains(&r) && !used.contains(&r) {
                         used.push(r);
                     }
@@ -285,7 +378,7 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
         };
         match ea {
             EdgeArg::K(k) => {
-                let (tb, targs) = finish(func, entry(k));
+                let (tb, targs) = finish(func, entry(norm(k)));
                 let dfg = &mut func.dfg;
                 let bc = BlockCall::new(tb, targs, &mut dfg.value_lists);
                 dfg.insts[pinst]
@@ -294,8 +387,8 @@ fn param_dispatch(func: &mut Function, cfg: &ControlFlowGraph, term: Inst) -> Op
                 n += 1;
             }
             EdgeArg::Sel(c, ka, kb) => {
-                let (tb, targs) = finish(func, entry(ka));
-                let (fb, fargs) = finish(func, entry(kb));
+                let (tb, targs) = finish(func, entry(norm(ka)));
+                let (fb, fargs) = finish(func, entry(norm(kb)));
                 let pblk = func.layout.inst_block(pinst)?;
                 func.layout.remove_inst(pinst);
                 let mut pos = FuncCursor::new(func).at_bottom(pblk);
@@ -343,6 +436,7 @@ fn select_dispatch(
     // table arg is `dst`'s param (`split_whitespace` shapes the dispatch
     // exactly this way).
     let mut v = arg;
+    let mut conv_masks: Vec<u32> = Vec::new();
     for _ in 0..4 {
         v = func.dfg.resolve_aliases(v);
         match func.dfg.value_def(v) {
@@ -359,6 +453,12 @@ fn select_dispatch(
                 let InstructionData::Unary { arg, .. } = func.dfg.insts[d] else {
                     unreachable!()
                 };
+                // Same normalization as `param_dispatch`: `uextend`
+                // masks to the operand width, `ireduce` to the result.
+                conv_masks.push(match func.dfg.insts[d].opcode() {
+                    cranelift_codegen::ir::Opcode::Uextend => func.dfg.value_type(arg).bits(),
+                    _ => func.dfg.value_type(v).bits(),
+                });
                 v = arg;
             }
             ValueDef::Param(b, num) => {
@@ -397,8 +497,17 @@ fn select_dispatch(
     let dflt = jt.default_block();
     let w = func.dfg.value_type(arg).bits();
     let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let norm = |k: i64| -> i64 {
+        conv_masks.iter().rev().fold(k, |k, &b| {
+            if b >= 64 {
+                k
+            } else {
+                k & ((1i64 << b) - 1)
+            }
+        })
+    };
     let call = |k: i64| -> (Block, Vec<BlockArg>) {
-        let k = (k as u64) & m;
+        let k = (norm(k) as u64) & m;
         if k < n {
             dest(func, jt.as_slice()[k as usize])
         } else {
@@ -501,4 +610,104 @@ pub fn run(func: &mut Function) -> usize {
         cfg_lazy = None;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::Function;
+
+    fn parse(src: &str) -> Function {
+        cranelift_reader::parse_functions(src).unwrap().remove(0)
+    }
+
+    /// Run `param_dispatch` on the function's (single) `br_table`.
+    fn dispatch(f: &mut Function) -> Option<usize> {
+        let cfg = ControlFlowGraph::with_function(f);
+        let term = f
+            .layout
+            .blocks()
+            .flat_map(|b| f.layout.block_insts(b))
+            .find(|&i| matches!(f.dfg.insts[i], InstructionData::BranchTable { .. }))
+            .expect("no br_table");
+        param_dispatch(f, &cfg, term)
+    }
+
+    /// Two preds merge the dispatch value into `blk3(v3)`, which
+    /// `br_table`s on it; `extra` is arbitrary content inside `blk3`,
+    /// `tail` extra content inside `block4`.
+    fn shape(extra: &str, tail: &str) -> Function {
+        parse(&format!(
+            "function %f(i64) {{
+            block0(v0: i64):
+                v1 = iconst.i64 0
+                jump block3(v1)
+
+            block1(v8: i64):
+                v2 = iconst.i64 1
+                jump block3(v2)
+
+            block3(v3: i64):
+                {extra}
+                br_table v3, block4, [block5]
+
+            block4:
+                {tail}
+                return
+
+            block5:
+                return
+            }}"
+        ))
+    }
+
+    #[test]
+    fn refuses_side_effecting_dispatch_block() {
+        // The store runs on every path through `blk` — threading preds
+        // to the table targets would delete it.
+        let mut f = shape("store.i64 notrap v0, v3", "");
+        assert!(dispatch(&mut f).is_none(), "{}", f.display());
+    }
+
+    #[test]
+    fn pure_dispatch_block_still_threads() {
+        let mut f = shape("v9 = iadd.i64 v3, v3", "");
+        assert!(dispatch(&mut f).is_some(), "{}", f.display());
+    }
+
+    #[test]
+    fn refuses_blk_result_escape() {
+        // `v9` is defined in `blk` and read by a table target — after
+        // threading, `blk` dies and the use dangles.
+        let mut f = shape("v9 = iadd.i64 v3, v3", "v10 = iadd.i64 v9, v9");
+        assert!(dispatch(&mut f).is_none(), "{}", f.display());
+    }
+
+    #[test]
+    fn refuses_entry_arg_defined_in_blk() {
+        // A table entry passes `v9` (defined in `blk`) as a target arg —
+        // copied verbatim onto a pred edge it would dangle.
+        let mut f = parse(
+            "function %f(i64) {
+            block0(v0: i64):
+                v1 = iconst.i64 0
+                jump block3(v1)
+
+            block1(v8: i64):
+                v2 = iconst.i64 1
+                jump block3(v2)
+
+            block3(v3: i64):
+                v9 = iadd.i64 v3, v3
+                br_table v3, block4, [block5(v9)]
+
+            block4:
+                return
+
+            block5(v10: i64):
+                return
+            }",
+        );
+        assert!(dispatch(&mut f).is_none(), "{}", f.display());
+    }
 }
