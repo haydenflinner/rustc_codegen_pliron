@@ -141,38 +141,41 @@ pub fn run(ctx: &Context, st: &mut State) {
                     }
                     continue;
                 }
-                let Some(r) = d.results().next() else {
+                let mut rs = d.results().peekable();
+                if rs.peek().is_none() {
                     continue;
-                };
+                }
                 macro_rules! is {
                     ($t:ty) => {
                         Operation::is_op::<$t>(op, ctx)
                     };
                 }
-                if st.consts.contains_key(&r) {
-                    if !const_nonnull(ctx, st, r) {
+                for r in rs {
+                    if st.consts.contains_key(&r) {
+                        if !const_nonnull(ctx, st, r) {
+                            p.src.push((r,));
+                        }
+                    } else if st.nonnull.contains(&op) || is!(AllocaOp) {
+                    } else if is!(BitcastOp) || is!(FreezeOp) {
+                        p.copy.push((d.get_operand(0), r));
+                    } else if is!(GetElementPtrOp)
+                        && (st.inbounds.contains(&op)
+                            || Operation::get_op::<GetElementPtrOp>(op, ctx)
+                                .unwrap()
+                                .no_wrap_flags(ctx)
+                                .contains(GepNoWrapFlags::INBOUNDS))
+                    {
+                        p.copy.push((d.get_operand(0), r));
+                    } else if is!(SelectOp) {
+                        p.copy.push((d.get_operand(1), r));
+                        p.copy.push((d.get_operand(2), r));
+                    } else if is!(CallOp)
+                        && let Some(c) = direct_callee(ctx, st, op)
+                    {
+                        p.call.push((ids.id(c), r));
+                    } else {
                         p.src.push((r,));
                     }
-                } else if st.nonnull.contains(&op) || is!(AllocaOp) {
-                } else if is!(BitcastOp) || is!(FreezeOp) {
-                    p.copy.push((d.get_operand(0), r));
-                } else if is!(GetElementPtrOp)
-                    && (st.inbounds.contains(&op)
-                        || Operation::get_op::<GetElementPtrOp>(op, ctx)
-                            .unwrap()
-                            .no_wrap_flags(ctx)
-                            .contains(GepNoWrapFlags::INBOUNDS))
-                {
-                    p.copy.push((d.get_operand(0), r));
-                } else if is!(SelectOp) {
-                    p.copy.push((d.get_operand(1), r));
-                    p.copy.push((d.get_operand(2), r));
-                } else if is!(CallOp)
-                    && let Some(c) = direct_callee(ctx, st, op)
-                {
-                    p.call.push((ids.id(c), r));
-                } else {
-                    p.src.push((r,));
                 }
             }
         }
