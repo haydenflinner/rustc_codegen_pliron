@@ -26,9 +26,10 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
 
 fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
-    for op in b.deref(ctx).iter(ctx) {
-        v.extend(op.deref(ctx).successors());
-        v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+    // Only the terminator carries successor edges (invokes included).
+    if let Some(t) = b.deref(ctx).iter(ctx).last() {
+        v.extend(t.deref(ctx).successors());
+        v.extend(st.invokes.get(&t).map(|&(l, _)| l));
     }
     v
 }

@@ -19,7 +19,9 @@ use crate::inline::blocks;
 use crate::state::State;
 
 /// Operand `i` that terminator `t` forwards to successor `si`, if `t` is a
-/// branch forwarding exactly `na` operands there.
+/// branch forwarding exactly `na` operands there. NOT memoizable:
+/// `replace_all_uses_with` rewrites operand lists on edges belonging to
+/// other blocks' pred lists, so a cached Vec goes stale.
 fn succ_operand(ctx: &Context, t: Ptr<Operation>, si: usize, i: usize, na: usize) -> Option<Value> {
     let o = Operation::get_op_dyn(t, ctx);
     let v = op_cast::<dyn BranchOpInterface>(&*o)?.successor_operands(ctx, si);
@@ -41,9 +43,10 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
         if !seen.insert(b) {
             continue;
         }
-        for op in b.deref(ctx).iter(ctx) {
-            work.extend(op.deref(ctx).successors());
-            work.extend(st.invokes.get(&op).map(|&(l, _)| l));
+        // Only the terminator carries successor edges (invokes included).
+        if let Some(t) = b.deref(ctx).iter(ctx).last() {
+            work.extend(t.deref(ctx).successors());
+            work.extend(st.invokes.get(&t).map(|&(l, _)| l));
         }
     }
     seen
@@ -59,22 +62,23 @@ pub fn run(ctx: &mut Context, st: &State) {
         .collect();
     let mut n = 0;
     for f in fns {
-        loop {
-            let bs = blocks(ctx, f);
-            // Unreachable code has no dominance order, and lowering emits it in
-            // layout order, so only touch reachable blocks and values.
-            let reach = reachable(ctx, st, &bs);
-            let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> =
-                FxHashMap::default();
-            for &b in &bs {
-                let Some(t) = b.deref(ctx).iter(ctx).last() else {
-                    continue;
-                };
-                let succs: Vec<_> = t.deref(ctx).successors().collect();
-                for (si, s) in succs.into_iter().enumerate() {
-                    preds.entry(s).or_default().push((t, si));
-                }
+        // `reach`/`preds` are loop-invariant: `remove_successor_operand`
+        // only shrinks an edge's operand list, never retargets edges, so
+        // block adjacency can't change between fixpoint rounds.
+        let bs = blocks(ctx, f);
+        let reach = reachable(ctx, st, &bs);
+        let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> =
+            FxHashMap::default();
+        for &b in &bs {
+            let Some(t) = b.deref(ctx).iter(ctx).last() else {
+                continue;
+            };
+            let succs: Vec<_> = t.deref(ctx).successors().collect();
+            for (si, s) in succs.into_iter().enumerate() {
+                preds.entry(s).or_default().push((t, si));
             }
+        }
+        loop {
             let mut changed = false;
             for &b in &bs[1..] {
                 let Some(ps) = preds

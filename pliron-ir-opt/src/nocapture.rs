@@ -19,6 +19,7 @@
 
 use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::Context;
+use pliron::linked_list::ContainsLinkedList;
 use pliron::op::op_cast;
 use pliron::operation::{OpDbg, Operation};
 use pliron::r#type::Typed;
@@ -32,7 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::state::ConstVal;
 use crate::types::{TyK, classify};
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::nowrite::PURE;
 use crate::state::State;
 use crate::{Syms, bodied};
@@ -191,6 +192,9 @@ pub fn run(ctx: &Context, st: &mut State) {
     // pass: the analysis never mutates the function, and the same temp
     // slot is typically the destination of many stores.
     let mut accmemo = crate::sroa::AccMemo::default();
+    // `classify` on a value's type, memoized — the flow loop otherwise
+    // re-walks the type per (result × operand) pair.
+    let mut kinds: FxHashMap<Value, (bool, bool)> = FxHashMap::default();
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -205,7 +209,7 @@ pub fn run(ctx: &Context, st: &mut State) {
             p.param.push((a, i as u32));
         }
         for &b in &bs {
-            for op in ops(ctx, b) {
+            for op in b.deref(ctx).iter(ctx) {
                 macro_rules! is {
                     ($t:ty) => {
                         Operation::is_op::<$t>(op, ctx)
@@ -221,21 +225,21 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // a pointer derived from it: `ptrtoint`/`inttoptr` are
                     // the sole int<->ptr bridges, so e.g. an i64 call result
                     // can't be the ptr arg (no `store i8 (hash)` capture).
-                    let ptrish = |v: Value| {
-                        matches!(
-                            classify(ctx, v.get_type(ctx)),
-                            TyK::Ptr | TyK::Func(..)
-                        )
-                    };
-                    let intish = |v: Value| {
-                        matches!(classify(ctx, v.get_type(ctx)), TyK::Int(_))
+                    let mut pk = |v: Value| -> (bool, bool) {
+                        *kinds.entry(v).or_insert_with(|| {
+                            let k = classify(ctx, v.get_type(ctx));
+                            (
+                                matches!(k, TyK::Ptr | TyK::Func(..)),
+                                matches!(k, TyK::Int(_)),
+                            )
+                        })
                     };
                     let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
                     for r in d.results() {
-                        let rp = ptrish(r);
-                        let ri = intish(r);
+                        let (rp, ri) = pk(r);
                         for v in d.operands() {
-                            if bridge || !(ptrish(v) && ri) && !(intish(v) && rp) {
+                            let (vp, vi) = pk(v);
+                            if bridge || !(vp && ri) && !(vi && rp) {
                                 p.flow.push((v, r));
                             }
                         }
@@ -356,13 +360,11 @@ pub fn run(ctx: &Context, st: &mut State) {
     }
     let mut nc: FxHashMap<String, FxHashSet<u32>> = FxHashMap::default();
     let cap: FxHashSet<(u32, u32)> = p.captured.iter().copied().collect();
+    // `nparams` is a relation Vec — linear `find` per fn is O(fns²).
+    let nparams: FxHashMap<u32, u32> = p.nparams.iter().copied().collect();
     for s in &bodied {
         let f = ids.id(s);
-        let n = p
-            .nparams
-            .iter()
-            .find(|&&(g, _)| g == f)
-            .map_or(0, |&(_, n)| n);
+        let n = nparams.get(&f).copied().unwrap_or(0);
         nc.insert(
             s.clone(),
             (0..n).filter(|&i| !cap.contains(&(f, i))).collect(),

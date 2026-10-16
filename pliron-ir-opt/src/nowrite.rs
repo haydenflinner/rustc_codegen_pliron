@@ -5,6 +5,7 @@
 
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
 use pliron::value::Value;
 use pliron_llvm::ops::{
@@ -138,7 +139,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         let mut wl = Vec::new();
         let mut rp: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
         for &b in &bs {
-            for op in ops(ctx, b) {
+            for op in b.deref(ctx).iter(ctx) {
                 for s in op.deref(ctx).successors() {
                     rp.entry(s).or_default().push(b);
                 }
