@@ -1921,59 +1921,67 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // `jtround` fold a real null test (serde_derive `get_member`). Carry
     // only where `d`'s definition still covers `w`'s — same block, `d`
     // first (a param "def" is the block head).
-    let covered = {
-        use cranelift_codegen::ir::ProgramPoint;
-        let f = &p.clctx.func;
-        // `try_value_def` skips reserved/stale values and doesn't chase
-        // aliases (`value_def` resolves unchecked and panics on chains
-        // ending at a tombstone); an alias def just falls through to
-        // no-carry. Program points compare in O(1): a param's point is
-        // its block head, which orders before every inst in the block —
-        // the same ordering the old inst-index scan gave.
-        let pp = |v: Value| match f.dfg.try_value_def(v) {
-            // A def may be detached (removed from the layout) while its
-            // value still exists — `pp_block`/`pp_cmp` panic on those,
-            // where the old position scan returned `None`.
-            Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
-                Some(ProgramPoint::Inst(i))
+    // The coverage check below only matters when `d` carries a site
+    // fact (derived/nonnull); most carried pairs have neither, so gate
+    // the two `try_value_def` + `pp_block` lookups on the hash probes.
+    let dbase = p.derived.get(&d).copied();
+    let dnn = p.nonnull.contains(&d);
+    if dbase.is_some() || dnn {
+        let covered = {
+            use cranelift_codegen::ir::ProgramPoint;
+            let f = &p.clctx.func;
+            // `try_value_def` skips reserved/stale values and doesn't
+            // chase aliases (`value_def` resolves unchecked and panics
+            // on chains ending at a tombstone); an alias def just falls
+            // through to no-carry. Program points compare in O(1): a
+            // param's point is its block head, which orders before
+            // every inst in the block — the same ordering the old
+            // inst-index scan gave.
+            let pp = |v: Value| match f.dfg.try_value_def(v) {
+                // A def may be detached (removed from the layout) while
+                // its value still exists — `pp_block`/`pp_cmp` panic on
+                // those, where the old position scan returned `None`.
+                Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
+                    Some(ProgramPoint::Inst(i))
+                }
+                Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
+                    Some(ProgramPoint::Block(b))
+                }
+                _ => None,
+            };
+            match (pp(d), pp(w)) {
+                (Some(a), Some(b)) => {
+                    f.layout.pp_block(a) == f.layout.pp_block(b)
+                        && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+                }
+                _ => false,
             }
-            Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
-                Some(ProgramPoint::Block(b))
-            }
-            _ => None,
         };
-        match (pp(d), pp(w)) {
-            (Some(a), Some(b)) => {
-                f.layout.pp_block(a) == f.layout.pp_block(b)
-                    && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+        if covered {
+            if let Some(b) = dbase {
+                p.derived.insert(w, b);
             }
-            _ => false,
+            if dnn {
+                if std::env::var_os("PLIRON_NNDBG").is_some() {
+                    let dd = p
+                        .clctx
+                        .func
+                        .dfg
+                        .value_def(d)
+                        .inst()
+                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                    let wd = p
+                        .clctx
+                        .func
+                        .dfg
+                        .value_def(w)
+                        .inst()
+                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                    eprintln!("nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step);
+                }
+                p.nonnull.insert(w);
+            }
         }
-    };
-    if covered
-        && let Some(&b) = p.derived.get(&d)
-    {
-        p.derived.insert(w, b);
-    }
-    if covered && p.nonnull.contains(&d) {
-        if std::env::var_os("PLIRON_NNDBG").is_some() {
-            let dd = p
-                .clctx
-                .func
-                .dfg
-                .value_def(d)
-                .inst()
-                .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-            let wd = p
-                .clctx
-                .func
-                .dfg
-                .value_def(w)
-                .inst()
-                .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-            eprintln!("nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step);
-        }
-        p.nonnull.insert(w);
     }
     if p.noalias.contains(&d) {
         p.noalias.insert(w);
