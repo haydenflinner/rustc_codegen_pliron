@@ -165,6 +165,14 @@ fn root_min(
                     off.wrapping_add(i64::from(i32::from(offset))),
                 );
             }
+            // `black_box` hides the value, not the object: its result
+            // names the input's exact pointee. The op still clobbers
+            // memory where it sits (`can_store`), so no ordering is
+            // lost — the peel only sharpens identity.
+            InstructionData::Unary {
+                opcode: Opcode::BlackBox,
+                arg,
+            } => v = arg,
             InstructionData::Binary {
                 opcode: Opcode::Iadd,
                 args,
