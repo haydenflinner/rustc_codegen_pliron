@@ -71,6 +71,52 @@ impl X64ABIMachineSpec {
 
 impl IsaFlags for x64_settings::Flags {}
 
+// PLIRON: shared env picker for `get_machine_env{,_for}`; `hi_in` lets a
+// caller further narrow the allocatable set (see patch 49).
+fn machine_env_inner(flags: &settings::Flags, _call_conv: isa::CallConv, hi_in: bool) -> &MachineEnv {
+    // PLIRON: when frame pointers are omitted, RBP is unused by the frame
+    // and becomes a callee-saved allocatable register like any other.
+    let free_rbp = !flags.preserve_frame_pointers()
+        && std::env::var_os("PLIRON_NO_FREE_RBP").is_none();
+    // PLIRON_HI_ALWAYS diagnostic: force the hi env even for functions
+    // with no >256-bit values (A/B the patch-49 gate).
+    let hi = (hi_in || std::env::var_os("PLIRON_HI_ALWAYS").is_some())
+        && super::inst::high_xmm_regs();
+    match (flags.enable_pinned_reg(), free_rbp, hi) {
+        (true, false, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, false);
+            &MACHINE_ENV
+        }
+        (true, false, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, true);
+            &MACHINE_ENV
+        }
+        (true, true, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, false);
+            &MACHINE_ENV
+        }
+        (true, true, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, true);
+            &MACHINE_ENV
+        }
+        (false, false, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, false);
+            &MACHINE_ENV
+        }
+        (false, false, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, true);
+            &MACHINE_ENV
+        }
+        (false, true, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, false);
+            &MACHINE_ENV
+        }
+        (false, true, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, true);
+            &MACHINE_ENV
+        }
+    }
+}
 impl ABIMachineSpec for X64ABIMachineSpec {
     type I = Inst;
 
@@ -900,46 +946,21 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         }
     }
 
+    // PLIRON: only allow zmm16-31 in a function that actually has a
+    // >256-bit vector value. Parking a narrow (<=256-bit) vreg in the high
+    // registers miscompiles — lanes 12-15 of the last f32x4 chunk of each
+    // 64-byte region corrupt — so only functions with real 512-bit data
+    // keep the wide env and stay profitable (see PLIRON patch 49).
+    fn get_machine_env_for(
+        has_wide: bool,
+        flags: &settings::Flags,
+        call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        machine_env_inner(flags, call_conv, has_wide)
+    }
+
     fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
-        // PLIRON: when frame pointers are omitted, RBP is unused by the frame
-        // and becomes a callee-saved allocatable register like any other.
-        let free_rbp = !flags.preserve_frame_pointers()
-            && std::env::var_os("PLIRON_NO_FREE_RBP").is_none();
-        let hi = super::inst::high_xmm_regs();
-        match (flags.enable_pinned_reg(), free_rbp, hi) {
-            (true, false, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, false);
-                &MACHINE_ENV
-            }
-            (true, false, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, true);
-                &MACHINE_ENV
-            }
-            (true, true, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, false);
-                &MACHINE_ENV
-            }
-            (true, true, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, true);
-                &MACHINE_ENV
-            }
-            (false, false, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, false);
-                &MACHINE_ENV
-            }
-            (false, false, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, true);
-                &MACHINE_ENV
-            }
-            (false, true, false) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, false);
-                &MACHINE_ENV
-            }
-            (false, true, true) => {
-                static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, true);
-                &MACHINE_ENV
-            }
-        }
+        machine_env_inner(flags, _call_conv, true)
     }
 
     fn get_regs_clobbered_by_call(

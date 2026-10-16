@@ -584,3 +584,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     F16X4 vaddph-family arms for AVX512-FP16 hosts. Lets
     pliron-clif-lower's `simd_leaves` admit these 64-bit leaves; the
     fmin/fmax helpers copy the F32X4 NaN-safe sequences verbatim.
+
+49. Per-function wide-xmm gating (`src/machinst/abi.rs`,
+    `src/isa/x64/abi.rs`): `Callee` records `has_wide_vector` (any CLIF
+    value whose vector type is >256 bits) computed in `new` from
+    `f.dfg.values()`, and `machine_env()` calls a new defaulted
+    `ABIMachineSpec::get_machine_env_for(has_wide, flags, call_conv)`.
+    On x64 it forces the hi=false env for functions with no >256-bit
+    values: when `wide_vector_bits() >= 512` offered all 32 zmm regs to
+    every function, regalloc parked narrow (<=256-bit) vregs in
+    zmm16-31 under pressure — those functions never need the regs for
+    their own ops — and the parked values read back corrupted
+    (observed: lanes 12-15 of each 64-byte region returned the
+    slot's chunk-0 bytes). Functions that actually manipulate 512-bit
+    data keep the wide env, so zmm codegen stays profitable where it
+    is used. The `high_xmm_regs()`/`WIDE_VECTOR_BITS` knobs are
+    unchanged — they cap the maximum, this patch gates it per fn.
