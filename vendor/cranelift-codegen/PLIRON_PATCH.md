@@ -570,3 +570,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `compile`, so emit no longer rebuilds them per function. Paths
     that mutate the function after seeding (the narrow-vector
     `veclegalize` retry in pliron-clif-lower) must `clear()` both.
+
+48. Sub-128-bit vector ops in wide xmm regs (`src/isa/x64/lower.isle`):
+    an F32X2/F16X4 value lives in the low 64 bits of an xmm and only its
+    real lanes are observable, so the packed 128-bit op is used and the
+    high lanes carry unobservable garbage. Adds F32X2
+    fadd/fsub/fmul/fdiv/fsqrt/fneg/fabs/fmin/fmax rules, an `x64_round`
+    F32X2 arm (ceil/floor/nearest/trunc), F32X2 arms on all eight
+    vfmadd/vfnmadd/vfmsub/vfnmsub 213/132 decls (fma.f32x2 arrives via
+    the type-polymorphic fmadd rules), f32x2 pshufd extractlane +
+    f32x4_insertlane reuse, xmm `fvpromote_f16`/`fvdemote_f16` arms for
+    <4 x f16> <-> <4 x f32> (F16C), f16x4 pshuflw/pinsrw lane ops, and
+    F16X4 vaddph-family arms for AVX512-FP16 hosts. Lets
+    pliron-clif-lower's `simd_leaves` admit these 64-bit leaves; the
+    fmin/fmax helpers copy the F32X4 NaN-safe sequences verbatim.

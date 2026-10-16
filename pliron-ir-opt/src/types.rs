@@ -218,14 +218,21 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     {
         return Some(clt::I16X8);
     }
-    // Packed f16: only as a full 128-bit leaf, on hosts with native
-    // half-precision SIMD (aarch64 fp16, x64 AVX512-FP16). Lane access goes
-    // through extractlane/insertlane, which 64-bit f16x4 can't rely on.
-    if e.deref(ctx).is::<FP16Type>()
-        && n == 8
-        && NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Some(clt::F16X8);
+    // Packed f16: a full 128-bit leaf on hosts with native half-precision
+    // SIMD (aarch64 fp16, x64 AVX512-FP16); a 64-bit F16X4 leaf on any host
+    // with F16C, where it exists for the packed vcvtph2ps/vcvtps2ph
+    // f16x4<->f32x4 converts (lane ops also have real lowerings now — the
+    // vendored x64 pshuflw/pinsrw rules — and every other op splits).
+    if e.deref(ctx).is::<FP16Type>() {
+        if n == 8 && NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(clt::F16X8);
+        }
+        if n == 4
+            && (F16C.load(std::sync::atomic::Ordering::Relaxed)
+                || NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Some(clt::F16X4);
+        }
     }
     let lane = match classify(ctx, e) {
         TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,

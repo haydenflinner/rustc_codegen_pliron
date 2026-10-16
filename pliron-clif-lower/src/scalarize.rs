@@ -18,6 +18,7 @@ use pliron::utils::apint::APInt;
 use pliron_llvm::op_interfaces::CastOpInterface;
 use pliron_llvm::ops::*;
 use pliron_llvm::types::{VectorType, VectorTypeKind};
+use cranelift_codegen::ir::types as clt;
 
 fn vec_of(ctx: &Context, t: TypeHandle) -> Option<(TypeHandle, u32)> {
     t.deref(ctx)
@@ -92,7 +93,14 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
 fn simd_leaves(ctx: &Context, t: TypeHandle) -> bool {
     vec_of(ctx, t).is_none() || {
         let l = crate::types::leaves(ctx, t);
-        !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() >= 128)
+        // 64-bit leaves are admitted only where the vendored x64 lowering
+        // really covers them (PLIRON 48): F32X2 packed-float ops + the
+        // F16X4 packed-convert container (whose non-cast ops still split).
+        !l.is_empty()
+            && l.iter().all(|x| {
+                x.1.is_vector()
+                    && (x.1.bits() >= 128 || matches!(x.1, clt::F32X2 | clt::F16X4))
+            })
     }
 }
 
@@ -314,8 +322,13 @@ fn f16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
     let t = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
     match vec_of(ctx, t) {
         Some((e, n)) if e.deref(ctx).is::<FP16Type>() => {
+            // Promote when the <n x f32> twin is itself natively lowered —
+            // 256-bit-wide leaves for large n as before, and now F32X4/F32X2
+            // leaves for n == 4/2 (their casts are the packed F16C converts
+            // or per-lane converts into native f32x2 inserts).
             let f32t: TypeHandle = FP32Type::get(ctx).into();
-            crate::types::wide_f32_candidate(ctx, f32t, n as u64)
+            let vt: TypeHandle = VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into();
+            simd_leaves(ctx, vt)
         }
         _ => false,
     }
