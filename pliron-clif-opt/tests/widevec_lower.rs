@@ -748,6 +748,7 @@ fn loopvec_desc_emits_ymm_end_to_end() {
     assert!(has_swizzle, "descending stream did not emit vswizzle");
 
     let isa = isa();
+    let _g = COMPILE_LOCK.lock().unwrap();
     WIDE_VECTOR_BITS.store(256, Ordering::Relaxed);
     let mut ctx = Context::for_function(func);
     ctx.compile(&*isa, &mut ControlPlane::default())
