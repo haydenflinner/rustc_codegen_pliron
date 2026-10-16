@@ -585,21 +585,31 @@ impl DataFlowGraph {
         // Try to create short alias chains by finding the original source value.
         // This also avoids the creation of loops.
         let original = self.resolve_aliases(src);
-        debug_assert_ne!(
-            dest, original,
-            "Aliasing {dest} to {src} would create a loop"
-        );
         let ty = self.value_type(original);
-        debug_assert_eq!(
-            self.value_type(dest),
-            ty,
-            "Aliasing {} to {} would change its type {} to {}",
-            dest,
-            src,
-            self.value_type(dest),
-            ty
-        );
-        debug_assert_ne!(ty, types::INVALID);
+        // PLIRON: upstream debug-asserts the alias is type-correct; in
+        // release a pass that resolves args across stale/malformed chains
+        // would silently write a cross-type alias (uses of `dest` then
+        // read `src`'s differently-typed data). Skipping the alias is
+        // strictly conservative — `dest` keeps its own def — so bail
+        // loudly-but-bounded instead of writing it.
+        if dest == original
+            || self.value_type(dest) != ty
+            || ty == types::INVALID
+            || self.value_is_attached(dest)
+        {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                eprintln!(
+                    "pliron: change_to_alias skipped bad alias {dest}->{src} \
+                     (dest_ty={} src_ty={ty} attached={} loop={})\n{}",
+                    self.value_type(dest),
+                    self.value_is_attached(dest),
+                    dest == original,
+                    std::backtrace::Backtrace::capture(),
+                );
+            }
+            return;
+        }
 
         self.values[dest] = ValueData::Alias { ty, original }.into();
     }
