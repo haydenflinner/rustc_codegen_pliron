@@ -1093,6 +1093,11 @@ fn stub(
     let f = s.func;
     // Frame layout is the optimizer's to change (slot merging, SROA), so a
     // pointer into the frame is recorded and hashed without its offset.
+    // The stub still writes through the real pointer: a callee writing an
+    // out-param that aliases a merged slot must leave identical bytes
+    // behind whichever layout it lands in — a merge that lets a folded
+    // slot's stub fill clobber a live neighbor diverges and reports.
+    let orig_args = args.clone();
     let args: Vec<DataValue> = args
         .into_iter()
         .map(|a| match a {
@@ -1111,9 +1116,40 @@ fn stub(
         h = mix(h, u64::from_le_bytes(b[8..].try_into().unwrap()));
     }
     if !s.nowrite.contains(&name) {
-        for (k, a) in args.iter().enumerate() {
+        for (k, a) in orig_args.iter().enumerate() {
             if let DataValue::I64(p) = a {
                 let p = *p as u64;
+                if (STACK_BASE..STACK_BASE + 0x1000_0000).contains(&p) {
+                    // Frame pointer: bound the fill to the containing
+                    // slot's extent so it can't spill into a neighbor.
+                    // Slots sit one per 4KiB page inside each frame's
+                    // fixed-size page (outer frames count too — a callee
+                    // can out-param into a caller's slot).
+                    let d = p - STACK_BASE;
+                    let fidx = d / s.frame_size;
+                    if fidx as usize >= s.frames.len() {
+                        continue;
+                    }
+                    let rel = (d % s.frame_size) / 0x1000;
+                    let in_off = (d % s.frame_size) % 0x1000;
+                    let Some((slot, _)) =
+                        s.func.sized_stack_slots.iter().nth(rel as usize)
+                    else {
+                        continue;
+                    };
+                    let sz = s.func.sized_stack_slots[slot].size as u64;
+                    if in_off >= sz {
+                        continue;
+                    }
+                    let n = (sz - in_off).min(64) as usize;
+                    let v: Vec<u8> = (0..n)
+                        .map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8)
+                        .collect();
+                    if let Some(b) = s.bytes_mut(p, n as u64) {
+                        b.copy_from_slice(&v[..n]);
+                    }
+                    continue;
+                }
                 let writable = s
                     .find(p, 8)
                     .is_some_and(|(base, r)| r.stub_writable && base < STACK_BASE);
