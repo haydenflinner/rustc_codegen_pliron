@@ -379,6 +379,8 @@ pub struct Analysis {
     /// Alias pairs already carried onto their targets; facts are inputs
     /// and aliases are permanent, so a pair never needs carrying twice.
     carried: FxHashSet<(Value, Value)>,
+    /// `dfg.alias_epoch` at the last `carry_aliases` scan.
+    alias_epoch: u32,
     /// `proots::alias_map_cfg` for the current `ver` — the param-alias
     /// relation every memory pass needs (dse runs three times).
     amap: Option<FxHashMap<Value, Value>>,
@@ -2079,6 +2081,12 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
 /// mutating steps — re-carrying an already-carried pair is idempotent,
 /// and `an.carried` skips pairs already handled.
 fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
+    // Steps that wrote no aliases since the last scan can't have new
+    // (alias, root) pairs — most mutating steps don't alias anything, so
+    // the whole-`values()` walk is usually dead work.
+    if p.clctx.func.dfg.alias_epoch() == an.alias_epoch {
+        return;
+    }
     if p.derived.is_empty()
         && p.nonnull.is_empty()
         && p.noalias.is_empty()
@@ -2087,8 +2095,12 @@ fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
         && p.operand_frozen.is_empty()
         && p.lifetimes.is_empty()
     {
+        // Don't record the epoch here: a later step may add a fact map
+        // entry without touching aliases, and this epoch's pairs still
+        // need carrying then.
         return;
     }
+    an.alias_epoch = p.clctx.func.dfg.alias_epoch();
     let func = &p.clctx.func;
     let pairs: Vec<(Value, Value)> = func
         .dfg

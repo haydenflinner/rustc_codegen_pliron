@@ -405,3 +405,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     Regression test: `pliron-clif-opt/tests/widevec_gate.rs` asserts the
     loud error at ceiling 128 and (on non-x86 hosts, where no wide ISA
     exists) that wide `bnot`/`bitselect` never compile silently.
+
+33. aarch64 dead extension after `cset` (`src/isa/aarch64/lower.isle`):
+    `uextend`/`sextend` of an `icmp`/`fcmp` result is a no-op — the
+    `cset`/`fcset` materialization already writes a clean full-width 0/1.
+    New rules return `put_in_reg` of the compare instead of emitting
+    `MInst.Extend`. Visible as `cset; uxtb` pairs on every
+    bool-as-integer idiom (`(x == y) as i64`, `select c, 1, 0`).
+
+34. DFG alias epoch (`src/ir/dfg.rs`): `alias_epoch` counter bumped on
+    every alias write (`change_to_alias`, `replace_with_aliases`,
+    `make_value_alias_for_serialization`); tombstone writes and
+    same-root retargets (`compact_aliases`, `resolve_all_aliases`)
+    don't bump since they create no new resolvable pairs.
+    `carry_aliases` in the opt pipeline compares against its last-seen
+    epoch and skips the whole-`values()` scan on mutating steps that
+    created no aliases — ~1.5% of bench pipeline time.

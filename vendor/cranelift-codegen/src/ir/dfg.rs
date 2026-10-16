@@ -142,6 +142,11 @@ pub struct DataFlowGraph {
     /// Primary value table with entries for all values.
     values: PrimaryMap<Value, ValueDataPacked>,
 
+    /// PLIRON: bumped whenever a new value alias is written
+    /// (`change_to_alias`/`replace_with_aliases`), letting consumers skip
+    /// whole-table alias scans on mutations that created none.
+    alias_epoch: u32,
+
     /// Function signature table. These signatures are referenced by indirect call instructions as
     /// well as the external function references.
     pub signatures: PrimaryMap<SigRef, Signature>,
@@ -182,6 +187,7 @@ impl DataFlowGraph {
             dynamic_types: DynamicTypes::new(),
             value_lists: ValueListPool::new(),
             values: PrimaryMap::new(),
+            alias_epoch: 0,
             signatures: PrimaryMap::new(),
             ext_funcs: PrimaryMap::new(),
             values_labels: None,
@@ -251,6 +257,13 @@ impl DataFlowGraph {
     /// Get the total number of values.
     pub fn num_values(&self) -> usize {
         self.values.len()
+    }
+
+    /// PLIRON: epoch bumped by every `change_to_alias`/
+    /// `replace_with_aliases` call — see the field comment. Equal epochs
+    /// mean no new aliases exist since the caller last scanned.
+    pub fn alias_epoch(&self) -> u32 {
+        self.alias_epoch
     }
 
     /// Get an iterator over all values and their definitions.
@@ -612,6 +625,7 @@ impl DataFlowGraph {
         }
 
         self.values[dest] = ValueData::Alias { ty, original }.into();
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
     }
 
     /// PLIRON: flatten every alias so its `original` is the chain's final
@@ -716,6 +730,7 @@ impl DataFlowGraph {
             self.values[dest] = ValueData::Alias { ty, original }.into();
         }
 
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
         self.clear_results(dest_inst);
     }
 
@@ -1655,6 +1670,7 @@ impl DataFlowGraph {
         };
         let data = ValueData::Alias { ty, original: src };
         self.values[dest] = data.into();
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
     }
 
     /// If `v` is already defined as an alias, return its destination value.
