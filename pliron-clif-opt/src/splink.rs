@@ -61,6 +61,25 @@ fn scalar_const(func: &Function, i: Inst) -> bool {
     )
 }
 
+/// Is `i` a rematerializable address (`tls_value`/`symbol_value`/
+/// `func_addr`)? These lower to a `lea`/`movsym` (+ at most one fixed
+/// TLS-segment load on COFF/ELF-IE), never trap, and are loop-invariant —
+/// so a def outside a loop whose only uses sit inside it buys a
+/// callee-saved register for the whole loop plus regalloc2 boundary
+/// moves on every back edge (count_alpha's `mov %rbp,%rdx`/`mov %rdx,%rbp`
+/// shuffles), while a per-use clone is a few cheap insts in the use
+/// block. `addr_of_symbol` in jumpthread.rs already treats them as
+/// deterministic.
+fn remat_addr(func: &Function, i: Inst) -> bool {
+    matches!(
+        func.dfg.insts[i],
+        InstructionData::UnaryGlobalValue {
+            opcode: Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr,
+            ..
+        }
+    )
+}
+
 /// `k` masked to `bits` as a single cyclic run of 1s — the element shape
 /// aarch64's logical immediates encode.
 fn single_run(elem: u64, e: u32) -> bool {
@@ -163,12 +182,14 @@ pub fn run(func: &mut Function, la: &LoopAnalysis, x64: bool) -> usize {
                     uses.entry(d).or_default().insert(b);
                     continue;
                 }
-                // Scalar consts only move when the use's innermost loop
-                // excludes the def — that's the shape that costs a spill.
+                // Scalar consts and rematerializable addresses only move
+                // when the use's innermost loop excludes the def — that's
+                // the shape that costs a spill or a loop-spanning live
+                // range (and its boundary moves).
                 if let (Some(lp), Some(db)) = (lb, func.layout.inst_block(d))
                     && !la.is_in_loop(db, lp)
-                    && scalar_const(func, d)
-                    && cheap_scalar(func, d, x64)
+                    && ((scalar_const(func, d) && cheap_scalar(func, d, x64))
+                        || remat_addr(func, d))
                 {
                     uses.entry(d).or_default().insert(b);
                 }

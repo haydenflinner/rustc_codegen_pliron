@@ -579,6 +579,14 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let mut out_rets = vec![];
 
         let mut rets = rets.into_iter();
+        // PLIRON: the `return` inst's operands, paired with each non-sret
+        // signature return. Used to decide which return values get a
+        // detached copy (see `ret_detach`).
+        let ret_args: &[Value] = self
+            .cur_inst
+            .map(|i| self.f.dfg.inst_args(i))
+            .unwrap_or(&[]);
+        let mut arg_idx = 0usize;
         for (i, ret) in self
             .abi()
             .signature()
@@ -587,11 +595,20 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             .into_iter()
             .enumerate()
         {
-            let regs = if ret.purpose == ArgumentPurpose::StructReturn {
+            let val = (ret.purpose != ArgumentPurpose::StructReturn)
+                .then(|| ret_args.get(arg_idx).copied())
+                .flatten();
+            let mut regs = if ret.purpose == ArgumentPurpose::StructReturn {
                 self.sret_reg.unwrap()
             } else {
+                arg_idx += 1;
                 *rets.next().unwrap()
             };
+            // PLIRON: detach loop-carried/shared return values from the
+            // fixed-return-reg constraint (see `ret_detach`).
+            if self.ret_detach(val) {
+                regs = self.ret_copy_regs(regs, val.unwrap());
+            }
 
             let (regs, insns) = self.vcode.abi().gen_copy_regs_to_retval(
                 self.vcode.sigs(),
@@ -619,6 +636,64 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         let inst = self.abi().gen_rets(out_rets);
         self.emit(inst);
+    }
+
+    /// PLIRON: should `v` (a `return` operand) be copied through a fresh
+    /// vreg before the rets pseudo?
+    ///
+    /// The RetPair's `FixedReg` operand constraint lands directly on the
+    /// returned vreg. regalloc2 merges a `return` operand's bundle with
+    /// every blockparam in-edge and computes a *single* requirement for
+    /// the whole bundle, so one fixed-reg use pins every range of the
+    /// bundle to the return register — including ranges that must cross
+    /// calls (which then split out into callee-saved regs, paying edge
+    /// `mov`s at every region boundary; seen in count_alpha's inner
+    /// loop). Copying through a fresh minimal-range vreg confines the
+    /// constraint and costs exactly the one move the constraint would
+    /// have forced anyway.
+    ///
+    /// Applied only when the return value's bundle plausibly spans more
+    /// than the return itself — block params (merged with every in-edge)
+    /// and values with other uses — so single-use non-param values keep
+    /// the original (mov-free) path. `PLIRON_RETCOPY=0` disables.
+    fn ret_detach(&self, val: Option<Value>) -> bool {
+        static RETCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*RETCOPY
+            .get_or_init(|| std::env::var_os("PLIRON_RETCOPY").is_none_or(|v| v != "0"))
+        {
+            return false;
+        }
+        let Some(v) = val else { return false };
+        let v = self.f.dfg.resolve_aliases(v);
+        match self.f.dfg.value_def(v) {
+            ValueDef::Param(..) => true,
+            ValueDef::Result(..) => self.value_ir_uses[v] == ValueUseState::Multiple,
+            _ => false,
+        }
+    }
+
+    /// PLIRON: copy `regs` into fresh vregs, emitting the moves. Gives
+    /// `ret_detach`d return operands a minimal-range vreg so the
+    /// fixed-return-reg constraint stays local to the copy.
+    fn ret_copy_regs(&mut self, regs: ValueRegs<Reg>, val: Value) -> ValueRegs<Reg> {
+        let val = self.f.dfg.resolve_aliases(val);
+        let ty = self.f.dfg.value_type(val);
+        let (_, tys) = I::rc_for_type(ty).unwrap_or_default();
+        let mut out: SmallVec<[Reg; 2]> = smallvec![];
+        for (i, &r) in regs.regs().iter().enumerate() {
+            let reg_ty = tys.get(i).copied().unwrap_or(ty);
+            let dst =
+                writable_value_regs(self.vregs.alloc_with_deferred_error(reg_ty))
+                    .only_reg()
+                    .unwrap();
+            self.emit(I::gen_move(dst, r, reg_ty));
+            out.push(dst.to_reg());
+        }
+        match out.len() {
+            1 => ValueRegs::one(out[0]),
+            2 => ValueRegs::two(out[0], out[1]),
+            _ => panic!("Value must reside in 1 or 2 registers"),
+        }
     }
 
     /// Generate list of registers to hold the output of a call with
