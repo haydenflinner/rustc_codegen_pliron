@@ -402,7 +402,9 @@ fn emit_obj(
     // callers while `Call` targets still index `o.funcs`. Callees whose
     // last call edge disappears are dropped by wasm-ld's GC — this is
     // the main lever on the 4x function-count gap vs stock.
-    winline(&mut o.funcs, verbose, o.sp);
+    if crate::env_get("PLIRON_WASM_INLINE") != Some("0") {
+        winline(&mut o.funcs, verbose, o.sp);
+    }
 
     // Only import functions that are actually called; GOT.func globals
     // name their targets, so they don't need an import.
@@ -2654,6 +2656,17 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                     inloop.extend(s.iter().copied());
                 }
             }
+            // Cascade cap: each round's splices expose fresh callsites
+            // inside the copies, so small rules can replicate a big
+            // callee body tens of times (core's `quicksort` hit 344k
+            // wat-lines / ~0.6 MB of one function). Past this budget a
+            // caller stays a caller.
+            let caller_cap = crate::env_get("PLIRON_WASM_INLINE_CAP")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            if body_size(funcs[ci].body.as_ref().unwrap()) > caller_cap {
+                continue;
+            }
             // One scan per caller: collect all eligible call values.
             // Positions are resolved per-site at splice time (the tail
             // split keeps every other call's identity valid).
@@ -2719,6 +2732,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             if !sites.is_empty() {
                 did = true;
                 for &(iv, fi) in &sites {
+                    if body_size(funcs[ci].body.as_ref().unwrap()) > caller_cap {
+                        break;
+                    }
                     let callee = funcs[fi].body.clone().unwrap();
                     check_targets(&callee, &funcs[fi].name);
                     let b = funcs[ci].body.as_mut().unwrap();

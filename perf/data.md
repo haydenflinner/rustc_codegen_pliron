@@ -108,3 +108,20 @@ failures (`test_powi_constants` ×3) fail identically under
 LLVM LLJIT: **62 failures**, almost all bf16 (`identity`, `encode`,
 `binary::*`) — a pre-existing Windows LLVM-path correctness problem;
 bf16 tests all pass under Cranelift.
+
+## 6. Isolated rechecks (microbench, same std, same process conditions)
+
+criterion reported chars_alpha +28 % and strwork +42 % vs LLVM; isolated
+binaries (best-of-15 ×10-iter) tell a different story — the regression is
+partly harness/scheduler ordering on the hybrid part:
+
+| kernel | LLVM | pliron | isolated ratio | criterion ratio |
+|---|---|---|---|---|
+| chars_alpha (3 M chars) | 2.10 ms | 1.97 ms | 0.94 (pliron faster) | 1.284 |
+| strwork (4 k iters) | 1.07 ms | 1.15 ms | 1.07 | 1.416 |
+
+Codegen diff on `count_alpha`: near-identical inner loops (~14 insns/char);
+pliron emits 2 extra register-move edge copies per alpha char and keeps the
+emulated-EH flag pointer live across the loop. The remaining real delta is
+small; criterion's first-run-LLVM-then-pliron ordering on the hybrid
+scheduler accounts for the rest.
