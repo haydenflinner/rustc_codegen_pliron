@@ -883,6 +883,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             pt!(cx, "spec", spec::run(ctx, st));
             pt!(cx, "domcheck:spec", domcheck::run(ctx, st, "spec"));
         }
+        // `grew` tracks call-graph growth AFTER the round-1 fact analyses
+        // (inline rounds 1+2 already sit inside every round-1 window): only
+        // devirt's indirect->direct call rewrites and devirt-inline splices
+        // can change a monotone fact fixpoint's output; sroa escape copies
+        // are checked separately at the gates that stores/captures affect.
+        let mut grew = false;
         // Emulated EH (wasm, COFF) unwinds through ordinary calls the body
         // scan can't see -- `llvm.wasm.throw`-class entries are declared
         // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp —
@@ -938,11 +944,12 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             if pass_enabled("PLIRON_DEVIRT") {
                 let (sites, owners) = pt!(cx, "devirt", inline::devirt(ctx, st));
                 pt!(cx, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
+                grew |= !sites.is_empty();
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
                     // Passes since the inline rounds may have moved calls —
                     // rebuild the adjacency fresh.
                     adj = None;
-                    pt!(
+                    let d3 = pt!(
                         cx,
                         "devirt-inline",
                         inline::run(
@@ -956,6 +963,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                             &mut adj,
                         )
                     );
+                    grew |= !d3.callers.is_empty();
                     pt!(cx, "domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
                     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
                         pt!(cx, "sroa-fwd2", sroa::forward(ctx, st));
@@ -976,7 +984,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         // callee sets final: indirect calls through fn-ptr slots resolve to
         // `arg` edges, and params those callees don't keep go non-capturing.
         // The earlier run stays for sroa's `copyable_arg` check.
-        if pass_enabled("PLIRON_NOCAP") {
+        // Ascent rules are monotone: only added bodies (inline), rewritten
+        // call targets (devirt) or escaping copies can derive new captures;
+        // without them the recompute is byte-identical to nocap1's.
+        if pass_enabled("PLIRON_NOCAP") && (grew || !st.escape_copies.is_empty()) {
             pt!(cx, "nocap2", nocapture::run(ctx, st));
         }
         // IPO return-value attributes, after inlining/devirt so remaining
@@ -999,10 +1010,15 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         if pass_enabled("PLIRON_GUARDELIM") {
             pt!(cx, "guardelim", guardelim::run(ctx, st));
         }
-        if pass_enabled("PLIRON_NOUNWIND") || coff_eh {
+        // nounwind2/nowrite2 exist to re-derive the summaries after
+        // guardelim cleans panic CFGs and retarg rewrites calls; those are
+        // deletions only (monotone rules => stale facts stay conservative),
+        // so the only growth sources worth a re-run are the devirt window
+        // (`grew`) plus sroa's escape copies adding stores/captures.
+        if (pass_enabled("PLIRON_NOUNWIND") || coff_eh) && grew {
             pt!(cx, "nounwind2", nounwind::run(ctx, st));
         }
-        if pass_enabled("PLIRON_NOWRITE") {
+        if pass_enabled("PLIRON_NOWRITE") && (grew || !st.escape_copies.is_empty()) {
             pt!(cx, "nowrite2", nowrite::run(ctx, st));
         }
         // `willreturn` on the final post-inline/devirt call set: callgvn
