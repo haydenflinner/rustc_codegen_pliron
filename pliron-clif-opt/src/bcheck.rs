@@ -303,6 +303,166 @@ fn ubound_on() -> bool {
     *ON
 }
 
+/// `PLIRON_BCHECK_DIAMOND=0` disables non-panic (rejoining-bad-edge)
+/// checks — see the comment at the admission site.
+fn diamond_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_BCHECK_DIAMOND"));
+    *ON
+}
+
+/// `v` is loop-invariant *by value*: `invariant()` (defined outside the
+/// body / pass-through header param) plus in-body insts that are pure and
+/// speculatable with recursively invariant operands — an in-header `imul`
+/// of outer-loop values that licm declined to hoist (cubecl's
+/// memory_write `idx = step + tbase*steps`). The clone-side counterpart
+/// is `remat_guard`, which re-emits such a def tree at the guard block.
+/// `depth` bounds recursion; `seen` is per-query cycle protection.
+fn invariant_v(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    info: &LoopInfo,
+    body: &FxHashSet<Block>,
+    v: Value,
+    seen: &mut FxHashSet<Value>,
+    depth: usize,
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if invariant(func, cfg, info, body, v) {
+        return true;
+    }
+    if depth == 0 || !seen.insert(v) {
+        return false;
+    }
+    let Some(i) = func.dfg.resolved_value_def(v).inst() else {
+        return false;
+    };
+    // Only single-result speculatable insts are re-emittable; keep this in
+    // lockstep with `remat_guard`'s acceptance so a term admitted here is
+    // reproducible at the guard.
+    if func.dfg.inst_results(i).len() != 1 || !crate::licm::speculatable(func, i) {
+        return false;
+    }
+    func.dfg
+        .inst_args(i)
+        .iter()
+        .all(|&a| invariant_v(func, cfg, info, body, a, seen, depth - 1))
+}
+
+/// Emit `v`'s in-body-invariant def chain at `pos` (the guard block) and
+/// return the cloned root, so a guard term that `invariant_v` admitted
+/// has a dominating value. Leaves: constants (rematerialized), values
+/// defined outside `body` (already dominating), and pass-through header
+/// params (rewritten to their uniform entry arg or `gp[n]`, exactly like
+/// the `gval` param rule). Anything else fails `invariant_v` already, so
+/// reaching a `None` chain here is just belt-and-braces.
+#[allow(clippy::too_many_arguments)]
+fn remat_guard(
+    pos: &mut FuncCursor,
+    cfg: &ControlFlowGraph,
+    body: &FxHashSet<Block>,
+    info: &LoopInfo,
+    gp: &[Value],
+    g: Block,
+    v: Value,
+) -> Value {
+    fn rec(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        info: &LoopInfo,
+        body: &FxHashSet<Block>,
+        v: Value,
+        seen: &mut FxHashSet<Value>,
+        out: &mut Vec<Inst>,
+        depth: usize,
+    ) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if iconst(func, v).is_some() {
+            return true;
+        }
+        if !def_block(func, v).is_some_and(|b| body.contains(&b)) {
+            return true; // a real invariant leaf
+        }
+        if depth == 0 || !seen.insert(v) {
+            return false;
+        }
+        match func.dfg.value_def(v) {
+            // Header params are rewritten by the caller's `vmap` seed,
+            // not cloned — only a step-free (pass-through) param may be a
+            // leaf: `invariant()` gives exactly that answer for a param,
+            // and a stepped one must not reach the entry-value rewrite.
+            cranelift_codegen::ir::ValueDef::Param(b, _) => {
+                b == info.h && invariant(func, cfg, info, body, v)
+            }
+            cranelift_codegen::ir::ValueDef::Result(i, n) => {
+                if n != 0
+                    || func.dfg.inst_results(i).len() != 1
+                    || !crate::licm::speculatable(func, i)
+                {
+                    return false;
+                }
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .all(|&a| rec(func, cfg, info, body, a, seen, out, depth - 1))
+                    && {
+                        out.push(i);
+                        true
+                    }
+            }
+            _ => false,
+        }
+    }
+    let v = pos.func.dfg.resolve_aliases(v);
+    if let Some(k) = iconst(pos.func, v) {
+        let ty = pos.func.dfg.value_type(v);
+        return iconst_masked(pos, ty, k);
+    }
+    if !def_block(pos.func, v).is_some_and(|b| body.contains(&b)) {
+        return v;
+    }
+    let func = &mut *pos.func;
+    let mut chain = Vec::new();
+    if !rec(func, cfg, info, body, v, &mut FxHashSet::default(), &mut chain, 8) {
+        return v;
+    }
+    let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+    // Seed pass-through header params the same way `gval` does.
+    for &p in func.dfg.block_params(info.h) {
+        if let cranelift_codegen::ir::ValueDef::Param(_, n) = func.dfg.value_def(p) {
+            vmap.insert(
+                p,
+                info.eargs
+                    .get(n)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(gp[n]),
+            );
+        }
+    }
+    let empty: FxHashMap<Block, Block> = FxHashMap::default();
+    for i in chain {
+        let data = func.dfg.insts[i];
+        let nd = {
+            let mut cm = CloneMap {
+                func,
+                vmap: &vmap,
+                bmap: &empty,
+            };
+            data.map(&mut cm)
+        };
+        let ni = func.dfg.make_inst(nd);
+        let ctv = func.dfg.ctrl_typevar(i);
+        func.dfg.make_inst_results(ni, ctv);
+        func.layout.append_inst(ni, g);
+        vmap.insert(
+            func.dfg.first_result(i),
+            func.dfg.first_result(ni),
+        );
+    }
+    *vmap.get(&v).unwrap_or(&v)
+}
+
 /// Decompose `v` as `m*i + sum(b)` over the counting iv. Each `b` term is
 /// `(lin, factor)` so `imul` by a constant scales through.
 fn affine(
@@ -356,7 +516,7 @@ fn affine(
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             for (x, y) in [(a, b), (b, a)] {
                 if let Some(mut af) = affine(func, cfg, info, body, depth - 1, x)
-                    && invariant(func, cfg, info, body, y)
+                    && invariant_v(func, cfg, info, body, y, &mut FxHashSet::default(), 8)
                 {
                     // Constants sign-extend into the wide domain; a `V` term
                     // would zext `-k` into `2^64-k` and sink every guard.
@@ -377,7 +537,7 @@ fn affine(
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             // `affine - invariant`: subtract one b term.
             if let Some(mut af) = affine(func, cfg, info, body, depth - 1, a)
-                && invariant(func, cfg, info, body, b)
+                && invariant_v(func, cfg, info, body, b, &mut FxHashSet::default(), 8)
             {
                 let (v, k) = match iconst(func, b) {
                     Some(k) => (Lin::K(k), -1),
@@ -389,7 +549,7 @@ fn affine(
             // `invariant - affine` (e.g. `n - 1 - i`): negate m and every
             // b term, then add the invariant. The index sequence decreases,
             // so the guard bounds the entry value instead of the last one.
-            if invariant(func, cfg, info, body, a)
+            if invariant_v(func, cfg, info, body, a, &mut FxHashSet::default(), 8)
                 && let Some(mut af) = affine(func, cfg, info, body, depth - 1, b)
             {
                 af.m = match af.m {
@@ -418,7 +578,7 @@ fn affine(
             for (x, y) in [(a, b), (b, a)] {
                 // counter * invariant: idx = i*y + iv0*y; the iv0*y term is
                 // a V*V product we can only express when iv0 is a constant.
-                if x == info.iv && invariant(func, cfg, info, body, y) {
+                if x == info.iv && invariant_v(func, cfg, info, body, y, &mut FxHashSet::default(), 8) {
                     let k = info.iv0k?;
                     return Some(Aff {
                         m: Lin::V(y),
@@ -1103,8 +1263,8 @@ fn run_loop(
                 bargs: bargs.clone(),
                 eargs: eargs.clone(),
             };
-            if !invariant(func, cfg, &lo, &body, bound)
-                || matches!(istep, Step::V(sv) if !invariant(func, cfg, &lo, &body, sv))
+            if !invariant_v(func, cfg, &lo, &body, bound, &mut FxHashSet::default(), 8)
+                || matches!(istep, Step::V(sv) if !invariant_v(func, cfg, &lo, &body, sv, &mut FxHashSet::default(), 8))
             {
                 continue;
             }
@@ -1118,7 +1278,7 @@ fn run_loop(
                 };
                 let inv = match s {
                     Step::K(_) => true,
-                    Step::V(sv) => invariant(func, cfg, &lo, &body, sv),
+                    Step::V(sv) => invariant_v(func, cfg, &lo, &body, sv, &mut FxHashSet::default(), 8),
                 };
                 if inv {
                     lo.stepped.insert(q, (j, s));
@@ -1157,7 +1317,7 @@ fn run_loop(
                     bargs: bargs.clone(),
                     eargs: eargs.clone(),
                 };
-                if invariant(func, cfg, &lo, &body, bound) {
+                if invariant_v(func, cfg, &lo, &body, bound, &mut FxHashSet::default(), 8) {
                     found = Some(lo);
                     break;
                 }
@@ -1231,10 +1391,10 @@ fn run_loop(
                 IntCC::UnsignedGreaterThan => (false, true),
                 _ => continue,
             };
-            if !invariant(func, cfg, &info, &body, bb) {
+            if !invariant_v(func, cfg, &info, &body, bb, &mut FxHashSet::default(), 8) {
                 if debug {
                     if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len not invariant",
+                        tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len {bb:?} not invariant (icmp {x:?} {cc:?} {y:?})",
                             h.as_u32(),
                             b.as_u32()
                         )
@@ -1310,16 +1470,32 @@ fn run_loop(
             let safe_slot = if safe_true { 0 } else { 1 };
             let bad = dests[1 - safe_slot].block(&func.dfg.value_lists);
             if !dead_end(func, bad, throw_ret) {
-                if debug {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
-                            h.as_u32(),
-                            b.as_u32(),
-                            bsub
-                        )
-                    };
+                // PLIRON: "diamond" checks — the bad edge rejoins the loop
+                // body instead of reaching a cold panic dead-end (e.g.
+                // `if base < window { store }` in cubecl's memory_write:
+                // every element pays a predictable branch a versioned
+                // clone removes entirely). The `hi < len` proof makes the
+                // fold exact regardless of where `bad` goes; the guards
+                // are (a) `bad` is a body block — folding can't drop a
+                // non-loop exit — and (b) the loop has an identified
+                // counting exit (`trip_tests`), so the folded clone can't
+                // go infinite on the contains-scan shape that motivated
+                // `dead_end` for exits. `PLIRON_BCHECK_DIAMOND=0` off.
+                if !(diamond_on()
+                    && body.contains(&bad)
+                    && !trip_tests.is_empty())
+                {
+                    if debug {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} bad edge not dead (bsub={:?})",
+                                h.as_u32(),
+                                b.as_u32(),
+                                bsub
+                            )
+                        };
+                    }
+                    continue;
                 }
-                continue;
             }
             checks.push(Chk {
                 inst: t,
@@ -1491,8 +1667,14 @@ fn run_loop(
 
     // A loop-invariant value usable at g: constants are rematerialized, an
     // unchanged header param becomes its entry value (the uniform entry
-    // arg when known — it dominates g — else g's opaque param).
-    let gval = |info: &LoopInfo, gp: &[Value], pos: &mut FuncCursor, v: Value| -> Value {
+    // arg when known — it dominates g — else g's opaque param), and an
+    // in-body value `invariant_v` admitted is re-emitted by `remat_guard`.
+    let gval = |info: &LoopInfo,
+                gp: &[Value],
+                body: &FxHashSet<Block>,
+                pos: &mut FuncCursor,
+                v: Value|
+     -> Value {
         let v = pos.func.dfg.resolve_aliases(v);
         let v = if let Some(b) = def_block(pos.func, v)
             && b == info.h
@@ -1504,7 +1686,10 @@ fn run_loop(
         };
         match iconst(pos.func, v) {
             Some(k) => iconst_masked(pos, ity, k),
-            None => v,
+            None => {
+                let g = info.g.unwrap();
+                remat_guard(pos, cfg, body, info, gp, g, v)
+            }
         }
     };
     let mut pos = FuncCursor::new(func).at_bottom(g);
@@ -1517,7 +1702,7 @@ fn run_loop(
             pos.ins().uextend(wty, v)
         }
     };
-    let boundv = gval(&info, &gp, &mut pos, info.bound);
+    let boundv = gval(&info, &gp, &body, &mut pos, info.bound);
     // Trip-count terms are only needed by affine checks. `t` is the last
     // counter value, in the index type; the wide path zextends it. `t_k`
     // is `t` when `bound`/`iv0` are entry constants — an `m*t` extremal
@@ -1525,7 +1710,7 @@ fn run_loop(
     // overflow flag (`s + C < len` ⇔ `s < len.saturating_sub(C)`).
     let need_affine = checks.iter().any(|c| c.bsub.is_none());
     let (t, t_k) = if need_affine {
-        let iv0v = gval(&info, &gp, &mut pos, info.iv);
+        let iv0v = gval(&info, &gp, &body, &mut pos, info.iv);
         let d = pos.ins().isub(boundv, iv0v);
         let t = match info.adj.cmp(&0) {
             core::cmp::Ordering::Equal => d,
@@ -1602,7 +1787,7 @@ fn run_loop(
     let mut flags: Vec<Value> = Vec::new();
     let mut ok: Option<Value> = None;
     for c in &checks {
-        let lenv = gval(&info, &gp, &mut pos, c.len);
+        let lenv = gval(&info, &gp, &body, &mut pos, c.len);
         let cc = if c.le {
             IntCC::UnsignedLessThanOrEqual
         } else {
@@ -1671,7 +1856,7 @@ fn run_loop(
                     r
                 }
                 Lin::V(v) => {
-                    let v = gval(&info, &gp, &mut pos, v);
+                    let v = gval(&info, &gp, &body, &mut pos, v);
                     let (r, of) = pos.ins().umul_overflow(v, t);
                     flags.push(of);
                     r
@@ -1694,7 +1879,7 @@ fn run_loop(
                         iconst_masked(&mut pos, ity, p)
                     }
                     Lin::V(v) => {
-                        let v = gval(&info, &gp, &mut pos, v);
+                        let v = gval(&info, &gp, &body, &mut pos, v);
                         if tm.k == 0 {
                             continue;
                         }
@@ -1769,7 +1954,7 @@ fn run_loop(
         let m = match c.aff.m {
             Lin::K(k) => iconst_masked(&mut pos, wty, k),
             Lin::V(v) | Lin::N(v) => {
-                let v = gval(&info, &gp, &mut pos, v);
+                let v = gval(&info, &gp, &body, &mut pos, v);
                 let v = zext(&mut pos, v);
                 if let Lin::N(_) = c.aff.m {
                     pos.ins().ineg(v)
@@ -1785,7 +1970,7 @@ fn run_loop(
             let v = match tm.v {
                 Lin::K(k) => iconst_masked(&mut pos, wty, k),
                 Lin::V(v) | Lin::N(v) => {
-                    let v = gval(&info, &gp, &mut pos, v);
+                    let v = gval(&info, &gp, &body, &mut pos, v);
                     let v = zext(&mut pos, v);
                     if let Lin::N(_) = tm.v {
                         pos.ins().ineg(v)

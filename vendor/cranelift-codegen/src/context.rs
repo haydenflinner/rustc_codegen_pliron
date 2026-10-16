@@ -217,6 +217,13 @@ impl Context {
         // uses and would undo the placement.
         self.bump_hoist();
 
+        // PLIRON: rematerializable-address sinking (see below). Runs
+        // after the egraph for the same reason: elaboration hoists a
+        // `tls_value`/`symbol_value`/`func_addr` out of the loop its
+        // only uses sit in, buying it a loop-spanning live range (and
+        // regalloc2 boundary moves on every region crossing).
+        self.remat_sink();
+
         // PLIRON: reorder pure insts so a shared operand's last use lands
         // on a destructive two-address op; elaboration's DFS arg order can
         // strand a later use past a `rotl`-like op, forcing a live-range
@@ -727,6 +734,126 @@ impl Context {
                 "bumphoist {}: moved {} remat {}",
                 self.func.name, moved, remats
             );
+        }
+    }
+
+    /// PLIRON: sink rematerializable-address defs into loop use blocks.
+    ///
+    /// `tls_value`/`symbol_value`/`func_addr` lower to a `lea`/`movsym`
+    /// (plus at most one fixed TLS-segment load on COFF/ELF-IE): pure,
+    /// non-trapping, identical on every execution. When such a def sits
+    /// outside a loop while all of its uses sit inside, its live range
+    /// spans every back edge — holding a register hostage for the whole
+    /// loop and forcing regalloc2 boundary moves at each region crossing
+    /// (count_alpha's `mov %rbp,%rdx`/`mov %rdx,%rbp` pairs around the
+    /// `__pliron_eh` check path). The pliron-side `splink` pass does this
+    /// for the CLIF pipeline, but the egraph elaborator re-hoists these
+    /// ops as loop-invariant — so repeat the sinking here, post-egraph.
+    fn remat_sink(&mut self) {
+        use crate::ir::{Inst, InstructionData, Opcode, Value};
+        use crate::{FxHashMap, FxHashSet};
+
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("PLIRON_REMATSINK").is_none_or(|v| v != "0")
+        }) {
+            return;
+        }
+
+        // remat inst -> set of use blocks (other than its def block).
+        let mut uses: FxHashMap<Inst, FxHashSet<crate::ir::Block>> = FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    let v = self.func.dfg.resolve_aliases(v);
+                    let Some(d) = self.func.dfg.value_def(v).inst() else {
+                        continue;
+                    };
+                    if self.func.layout.inst_block(d) == Some(b) {
+                        continue;
+                    }
+                    if !matches!(
+                        self.func.dfg.insts[d],
+                        InstructionData::UnaryGlobalValue {
+                            opcode: Opcode::TlsValue
+                                | Opcode::SymbolValue
+                                | Opcode::FuncAddr,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
+                    uses.entry(d).or_default().insert(b);
+                }
+            }
+        }
+        // Skip the (re)compute unless a remat addr crosses a block.
+        if uses.is_empty() {
+            return;
+        }
+        self.compute_loop_analysis();
+        let mut n = 0;
+        for (d, bs) in uses {
+            let Some(db) = self.func.layout.inst_block(d) else {
+                continue;
+            };
+            let old = self.func.dfg.resolve_aliases(self.func.dfg.first_result(d));
+            for &b in &bs {
+                // Only sink across a loop boundary: the use's innermost
+                // loop must not contain the def.
+                let Some(lp) = self.loop_analysis.innermost_loop(b) else {
+                    continue;
+                };
+                if self.loop_analysis.is_in_loop(db, lp) {
+                    continue;
+                }
+                let data = self.func.dfg.insts[d];
+                let ni = self.func.dfg.make_inst(data);
+                let ctv = self.func.dfg.ctrl_typevar(d);
+                self.func.dfg.make_inst_results(ni, ctv);
+                match self.func.layout.first_inst(b) {
+                    Some(first) => self.func.layout.insert_inst(ni, first),
+                    None => self.func.layout.append_inst(ni, b),
+                }
+                let nv = self.func.dfg.first_result(ni);
+                let mut raw: FxHashSet<Value> = FxHashSet::default();
+                for i in self.func.layout.block_insts(b) {
+                    for v in self.func.dfg.inst_values(i) {
+                        if self.func.dfg.resolve_aliases(v) == old {
+                            raw.insert(v);
+                        }
+                    }
+                }
+                for i in self.func.layout.block_insts(b).collect::<Vec<_>>() {
+                    self.func
+                        .dfg
+                        .map_inst_values(i, |v| if raw.contains(&v) { nv } else { v });
+                }
+                n += 1;
+            }
+            // Uses left on `old` (def block, or non-qualifying use
+            // blocks) keep the original alive; otherwise drop it.
+            let mut still_used = false;
+            'outer: for b in self.func.layout.blocks() {
+                for i in self.func.layout.block_insts(b) {
+                    if self
+                        .func
+                        .dfg
+                        .inst_values(i)
+                        .any(|v| self.func.dfg.resolve_aliases(v) == old)
+                    {
+                        still_used = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if !still_used {
+                self.func.layout.remove_inst(d);
+                self.func.dfg.clear_results(d);
+            }
+        }
+        if n > 0 && std::env::var_os("PLIRON_REMATSINK_DEBUG").is_some() {
+            eprintln!("rematsink {}: sunk {}", self.func.name, n);
         }
     }
 

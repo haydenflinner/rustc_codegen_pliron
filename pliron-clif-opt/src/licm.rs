@@ -35,7 +35,7 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
 /// Speculatable: executing it unconditionally can't trap, touch memory, or
 /// branch. Constants and frame addresses are free everywhere, so hoisting
 /// them is pure churn — skipped.
-fn speculatable(func: &Function, i: Inst) -> bool {
+pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
     let op = func.dfg.insts[i].opcode();
     if func.dfg.inst_results(i).is_empty()
         || op.is_terminator()

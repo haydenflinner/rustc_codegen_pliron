@@ -204,7 +204,15 @@ impl Pipe<'_> {
                     self.fname,
                     self.clctx.func.display()
                 )
-            };
+            } else {
+                // Non-rustc embedders (cubecl's JIT) install no tracing
+                // subscriber — write the dump straight to stderr.
+                eprintln!(
+                    "==== clif {} after {tag} ====\n{}",
+                    self.fname,
+                    self.clctx.func.display()
+                );
+            }
         }
     }
     fn log(&self, label: &str, k: usize) {
@@ -2816,6 +2824,11 @@ pub static DEFAULT: &[Step] = &[
         s_punroll,
     )
     .needs(shape::LOOPS),
+    // punroll clones whole blocks, including in-header insts an earlier
+    // hoist could not move (e.g. bcheck's versioned loop header: the
+    // thread-base chain is cloned K times into the unrolled group and
+    // would recompute per iteration).
+    cstep("licm3", "", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
     // Merge identical constants across dominated blocks — unroll/clone
     // passes stamp fresh `iconst`s per copy, and each one is a `mov`
     // downstream instead of a shared register (or `wzr`).

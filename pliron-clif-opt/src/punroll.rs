@@ -1183,7 +1183,12 @@ fn run_loop(
         rotated,
         body,
     } = walk(func, cfg, dt, la, lp, h, name)?;
-    if loop_uses_vectors(func, &chain) {
+    // `PLIRON_PUNROLL_VEC=1`: allow unrolling loops that touch vector
+    // values. The `loop_uses_vectors` rationale assumes vector work is
+    // already vf-wide in the element domain — but a streaming-store loop
+    // (cubecl memory_write: 2x256b stores/iter) still amortizes its loop
+    // overhead exactly like LLVM's 4x unroll of the same loop.
+    if loop_uses_vectors(func, &chain) && !vec_on() {
         bail!("vector-typed loop");
     }
     let n_insts = body_insts(func, &chain);
@@ -1702,6 +1707,14 @@ fn run_loop(
 /// vf*UNROLL-wide in the element domain; cloning the body again pays a
 /// fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
 /// mizes addressing (post-index forms get cloned into reg+imm offsets).
+/// `PLIRON_PUNROLL_VEC=1` lifts the `loop_uses_vectors` bail — see the
+/// call site comment.
+fn vec_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PLIRON_PUNROLL_VEC").is_some_and(|v| v != "0"));
+    *ON
+}
+
 fn loop_uses_vectors(func: &Function, blocks: &[Block]) -> bool {
     blocks.iter().any(|&b| {
         func.dfg
