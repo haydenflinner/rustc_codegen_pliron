@@ -546,20 +546,8 @@ pub fn isolated_escapes(
                             _ => Some(k),
                         }
                         .is_some_and(|ai| nocap.contains(&(i, ai as u32)));
-                    // The scope name may peel to a stack slot (`v` is a
-                    // `stack_addr` marked noalias): memory locs key under
-                    // the *normalized* root, so the slot escaped whenever
-                    // its scope name did. Without this `store &ss3[k], s9`
-                    // only un-isolates `V(v)` and `S(ss3)` stays
-                    // "isolated" — a store through the stashed pointer
-                    // then can't kill the slot's locs.
-                    let nr = norm_root(func, ps, noalias, v).0;
-                    if nr != r && cand.contains(&nr) {
-                        escapes.entry(nr).or_default().push(b);
-                    }
                     if !bounded {
                         ncc_bad.insert(r);
-                        ncc_bad.insert(nr);
                     }
                 }
             }
