@@ -1609,3 +1609,22 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   clifpeep.rs is owned by another agent (dirty worktree) — webmerge_ctx
   /khash_m/subtree_hashes ~1.1k samples are theirs to profile;
   emit-side lower_to_object/FnLower::lower ~3s incl. Context::compile.
+- `b4a9cdb` jumpthread: reuse the final converged-iteration NonNull for
+  fold_null_tests (n==0 means round made no edits after nn was built) —
+  removes one whole-function fixpoint per converged function.
+- `1d018bc` edgespec: `resolve` took `env` by value then cloned it per
+  hop (`let mut env = env.clone()`) and cloned `skipped` into `through`
+  per recursion — now moves env and shares `skipped` via &mut
+  insert/remove discipline. Bigger win: `cone_ok`'s cone BFS + local
+  dominator bitset fixpoint + use decoding ran per landing attempt —
+  now memoized per destination in a per-run `cones` map (`Cone{order,
+  midx,cdom,uses}`), since plans run before any mutation. edgespec plans
+  ~311 -> ~278ms, edgespec step 324 -> ~261ms, mc-espec ~270 -> ~256ms.
+- `57d6c42` unroll: `candidate` scanned the whole function per loop
+  header to compute `used_out` (defs used outside body) — O(headers x
+  fn). Now queries a `Uses` index built once per outer iteration
+  (invalidated with cfg). unroll 337 -> ~241ms.
+- Latest bench snapshot (PLIRON_TIMING, PAR=0): pipeline 9.9s,
+  jumpthread 2.1s, slp 1.56s, ifconv2 479ms, loadfwd 391ms, mergechain
+  322ms, sameargs2 306ms, edgespec 261ms, unroll 241ms; bench build
+  ~20s wall under load.
