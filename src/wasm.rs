@@ -8064,6 +8064,7 @@ impl<'o, 'a> CX<'o, 'a> {
     fn norm(&mut self, v: WV, w: u32) -> WV {
         match w {
             32 | 64 => v,
+            _ if self.normed(v, w) => v,
             w if w > 32 => {
                 let m = self.i64c((1u64 << w) - 1);
                 self.op(O::I64And, &[v, m], WT::I64)
@@ -8072,6 +8073,45 @@ impl<'o, 'a> CX<'o, 'a> {
                 let m = self.i32c(((1u64 << w) - 1) as u32);
                 self.op(O::I32And, &[v, m], WT::I32)
             }
+        }
+    }
+
+    /// `v`'s i32 value provably fits `w` bits, so `norm` is a no-op.
+    /// Covers the shapes narrow CLIF arithmetic leaves behind: icmp
+    /// results (0/1), `and`s against masks or of 0/1 compares, selects
+    /// whose arms already fit, and narrow unsigned loads.
+    fn normed(&self, v: WV, w: u32) -> bool {
+        let mask = if w >= 32 { u32::MAX } else { (1u32 << w) - 1 };
+        let ValueDef::Operator(op, args, _) = &self.b.values[v] else {
+            return false;
+        };
+        let arg = |i: usize| self.b.arg_pool[*args][i];
+        match op {
+            // wasm compares produce i32 0/1.
+            O::I32Eq | O::I32Ne | O::I32LtS | O::I32LtU | O::I32GtS | O::I32GtU
+            | O::I32LeS | O::I32LeU | O::I32GeS | O::I32GeU | O::I32Eqz
+            | O::I64Eq | O::I64Ne | O::I64LtS | O::I64LtU | O::I64GtS | O::I64GtU
+            | O::I64LeS | O::I64LeU | O::I64GeS | O::I64GeU | O::I64Eqz
+            | O::F32Eq | O::F32Ne | O::F32Lt | O::F32Le | O::F32Gt | O::F32Ge
+            | O::F64Eq | O::F64Ne | O::F64Lt | O::F64Le | O::F64Gt | O::F64Ge => {
+                w >= 1
+            }
+            O::I32Const { value } => *value <= mask,
+            O::I64Const { value } => *value <= mask as u64,
+            // a & b <= min(a, b): one in-range operand is enough.
+            O::I32And => self.normed(arg(0), w) || self.normed(arg(1), w),
+            O::I32ShrU => match &self.b.values[arg(1)] {
+                ValueDef::Operator(O::I32Const { value: s }, ..) => {
+                    (u32::MAX >> s.min(&31)) <= mask
+                }
+                _ => false,
+            },
+            O::Select | O::TypedSelect { .. } => {
+                self.normed(arg(0), w) && self.normed(arg(1), w)
+            }
+            O::I32Load8U { .. } => w >= 8,
+            O::I32Load16U { .. } => w >= 16,
+            _ => false,
         }
     }
 
