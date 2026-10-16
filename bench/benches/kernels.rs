@@ -39,42 +39,116 @@ fn install_crash_probe() {
     unsafe extern "system" fn h(p: *mut ExnPtrs) -> i32 {
         unsafe {
             let rec = (*p).rec;
-            let rip = *((*p).ctx.add(0xF8) as *const usize);
+            let ctx = (*p).ctx;
+            let rip = *(ctx.add(0xF8) as *const usize);
+            // ExceptionInformation[] at ExceptionRecord+0x20: [0]=access kind,
+            // [1]=accessed address for AV.
+            let info = (rec as *const usize).add(0x20 / 8);
+            let (akind, aaddr) = (*info, *info.add(1));
             let base = {
-                extern "system" fn gm(n: *const u16) -> usize {
-                    unsafe { GetModuleHandleW(n) as usize }
-                }
                 unsafe extern "system" {
                     fn GetModuleHandleW(n: *const u16) -> *mut u8;
                 }
-                gm(std::ptr::null())
+                GetModuleHandleW(std::ptr::null()) as usize
             };
             std::eprintln!(
-                "CRASH code={:#x} addr={:#x} rip={:#x} exe+{:#x}",
+                "CRASH code={:#x} akind={} aaddr={:#x} rip={:#x} exe+{:#x}",
                 (*rec).code,
-                (*rec).addr,
+                akind,
+                aaddr,
                 rip,
                 rip.wrapping_sub(base)
             );
-            // CONTEXT: Rsp @ 0x98, Rbp @ 0xA0 (x64)
-            let rsp = *((*p).ctx.add(0x98) as *const usize);
-            let rbp = *((*p).ctx.add(0xA0) as *const usize);
-            std::eprintln!("  rsp={:#x} rbp={:#x}", rsp, rbp);
-            for i in 0..48usize {
+            // Symbolize rip + stack slots via dbghelp.
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> usize;
+                fn SymInitializeW(h: usize, p: *const u16, invade: i32) -> i32;
+                fn SymFromAddrW(h: usize, addr: usize, disp: *mut u64, sym: *mut u8) -> i32;
+            }
+            let proc = GetCurrentProcess();
+            SymInitializeW(proc, std::ptr::null(), 1);
+            let symname = |addr: usize| -> String {
+                // SYMBOL_INFOW: hdr 88 bytes then WCHAR name
+                let mut buf = [0u8; 512];
+                let mut disp = 0u64;
+                {
+                    *(buf.as_mut_ptr() as *mut u32) = 88; // SizeOfStruct
+                    *(buf.as_mut_ptr().add(80) as *mut u32) = 200; // MaxNameLen
+                    if SymFromAddrW(proc, addr, &mut disp, buf.as_mut_ptr()) != 0 {
+                        let nl = *(buf.as_ptr().add(76) as *const u32) as usize;
+                        let np = buf.as_ptr().add(84) as *const u16;
+                        let w = std::slice::from_raw_parts(np, nl);
+                        format!("{}+{:#x}", String::from_utf16_lossy(w), disp)
+                    } else {
+                        format!("?{:#x}", addr)
+                    }
+                }
+            };
+            std::eprintln!("  rip = {}", symname(rip));
+            // Virtual unwind via RtlLookupFunctionEntry + RtlVirtualUnwind —
+            // walks .pdata RUNTIME_FUNCTION entries (ours AND llvm's).
+            unsafe extern "system" {
+                fn RtlLookupFunctionEntry(pc: usize, base: *mut usize, hist: *mut usize) -> *const u8;
+                fn RtlVirtualUnwind(
+                    htype: u32,
+                    base: usize,
+                    pc: usize,
+                    fnentry: *const u8,
+                    ctx: *mut u8,
+                    handler: *mut usize,
+                    estframe: *mut usize,
+                    ctxptrs: usize,
+                ) -> usize;
+            }
+            let mut c2 = [0u8; 1600];
+            ctx.copy_to_nonoverlapping(c2.as_mut_ptr(), 1600);
+            for _ in 0..32 {
+                let pc = *(c2.as_ptr().add(0xF8) as *const usize);
+                if pc == 0 {
+                    break;
+                }
+                let mut ib = 0usize;
+                let fe = RtlLookupFunctionEntry(pc, &mut ib, std::ptr::null_mut());
+                if fe.is_null() {
+                    std::eprintln!("  leaf/no-entry pc={:#x} {}", pc, symname(pc));
+                    // leaf: return addr on stack
+                    let sp = *(c2.as_ptr().add(0x98) as *const usize);
+                    *(c2.as_mut_ptr().add(0xF8) as *mut usize) = *(sp as *const usize);
+                    *(c2.as_mut_ptr().add(0x98) as *mut usize) = sp + 8;
+                    continue;
+                }
+                let mut hd = 0usize;
+                let mut ef = 0usize;
+                RtlVirtualUnwind(0, ib, pc, fe, c2.as_mut_ptr(), &mut hd, &mut ef, 0);
+                let npc = *(c2.as_ptr().add(0xF8) as *const usize);
+                std::eprintln!("  frame pc={:#x} -> {}", pc, symname(pc));
+                if npc == pc {
+                    break;
+                }
+            }
+            // x64 CONTEXT GPRs: rax@0x78 .. r15@0xF0, rip@0xF8
+            let names = ["rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"];
+            for (i, n) in names.iter().enumerate() {
+                let v = *(ctx.add(0x78 + i * 8) as *const usize);
+                let tag = if v >= base && v < base + 0x360000 { " (in exe)" } else { "" };
+                std::eprintln!("  {n}={v:#x}{tag}");
+            }
+            let rsp = *(ctx.add(0x98) as *const usize);
+            for i in 0..160usize {
                 let q = *(rsp as *const usize).add(i);
-                // print slots that look like return addresses (in .text)
                 if q >= base && q < base + 0x2c6000 {
-                    std::eprintln!("  [rsp+{:#04x}] = exe+{:#x}", i * 8, q - base);
+                    std::eprintln!("  [rsp+{:#04x}] = {}", i * 8, symname(q));
                 }
             }
         }
         0
     }
+    type Veh = unsafe extern "system" fn(*mut ExnPtrs) -> i32;
     unsafe extern "system" {
-        fn AddVectoredExceptionHandler(first: u32, h: *const ()) -> usize;
+        fn AddVectoredExceptionHandler(first: u32, h: Option<Veh>) -> usize;
     }
     unsafe {
-        AddVectoredExceptionHandler(1, h as usize as *const ());
+        AddVectoredExceptionHandler(1, Some(h));
     }
 }
 #[cfg(not(windows))]

@@ -572,6 +572,7 @@ pub fn lower_module(
                 eh_tls_v: None,
                 eject: None,
             };
+            tracing::debug!(target: "pliron::lower", lowerfn = %n);
             fl.lower(f.op);
             fl.b.finalize(cfg);
             asm_stubs.extend(fl.stubs.iter().copied());
@@ -4561,6 +4562,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // called on a SysV host).
         let cc = info.cc.unwrap_or(cc);
         let mut sig = make_sig(ctx, fn_ty, &info.exts, cc);
+        tracing::debug!(
+            target: "pliron::lower",
+            callee = ?match call.callee(ctx) {
+                CallOpCallable::Direct(id) => self.st.ident_to_sym.get(&id.to_string()).cloned(),
+                CallOpCallable::Indirect(_) => None,
+            },
+            callsig = ?format!("{} params -> {} rets", sig.params.len(), sig.returns.len()),
+        );
         let args: Vec<Value> = call.args(ctx);
         let mut cargs = Vec::new();
         // Which pliron operand each CLIF arg expands from (for `nocap`
