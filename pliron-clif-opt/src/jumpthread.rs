@@ -2509,9 +2509,10 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         // s -> w -> insts inside s's cone that use w.
         let mut cone: FxHashMap<Block, FxHashMap<Value, Vec<Inst>>> = FxHashMap::default();
         for &w in &exports {
-            let Some(ss) = uses.sites.get(&w) else {
+            let ss = uses.sites(w);
+            if ss.is_empty() {
                 continue;
-            };
+            }
             for &(b, i) in ss {
                 if b == y {
                     continue;

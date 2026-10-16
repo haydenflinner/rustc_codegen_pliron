@@ -901,9 +901,10 @@ fn self_feeding(
     if !seen.insert(v) {
         return true;
     }
-    let Some(sites) = uses.sites.get(&v) else {
+    let sites = uses.sites(v);
+    if sites.is_empty() {
         return true;
-    };
+    }
     let mut last = None;
     for &(_, i) in sites {
         // An inst using `v` twice is listed twice.

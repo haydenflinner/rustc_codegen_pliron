@@ -172,7 +172,7 @@ fn rotate(
     let mut seen_user: FxHashSet<Inst> = FxHashSet::default();
     let mut side_cache: FxHashMap<Block, Option<usize>> = FxHashMap::default();
     for &d in &rdefs {
-        for &(b, i) in useidx.sites.get(&d).into_iter().flatten() {
+        for &(b, i) in useidx.sites(d) {
             if b == h || !domtree.is_reachable(b) {
                 continue;
             }

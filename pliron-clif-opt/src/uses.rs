@@ -7,6 +7,7 @@
 //! Snapshot semantics: mutating the function invalidates it — rebuild
 //! alongside cfg/domtree, at the same point in the pass.
 
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{Block, Function, Inst, Value, ValueDef};
 use rustc_hash::FxHashMap;
 
@@ -75,9 +76,12 @@ pub fn worklist_dce(func: &mut Function, killable: impl Fn(&Function, Inst) -> b
 }
 
 pub struct Uses {
-    /// Resolved value -> (block, inst) of each `inst_values` use
-    /// (args, branch-edge args, EH contexts — the same set).
-    pub sites: FxHashMap<Value, Vec<(Block, Inst)>>,
+    /// CSR over resolved values: uses of `v` are
+    /// `flat[off[v.index()]..off[v.index() + 1]]` in layout order —
+    /// a dense index beats hashing per lookup and per-use `Vec`
+    /// allocation during build.
+    off: Vec<u32>,
+    flat: Vec<(Block, Inst)>,
 }
 
 impl Uses {
@@ -87,33 +91,56 @@ impl Uses {
         Self::build(func, |_, _, _| {})
     }
 
+    /// `(block, inst)` sites using `v`, in layout order. `v` must be
+    /// resolved — an unresolved alias reads as unused, same as a hash
+    /// lookup miss did.
+    pub fn sites(&self, v: Value) -> &[(Block, Inst)] {
+        let i = v.index();
+        if i + 1 < self.off.len() {
+            &self.flat[self.off[i] as usize..self.off[i + 1] as usize]
+        } else {
+            &[]
+        }
+    }
+
     /// One `inst_values` walk producing the index plus caller-side
-    /// per-use work — splitting into two scans just to share the type
-    /// would double the walk.
+    /// per-use work — the histogram is folded into the walk over a
+    /// dense (idx, site) pairs vec, then a stable counting-sort
+    /// scatter fills `flat`.
     pub fn build(func: &Function, mut extra: impl FnMut(Value, Block, Inst)) -> Self {
-        let mut sites: FxHashMap<Value, Vec<(Block, Inst)>> = FxHashMap::default();
+        let n = func.dfg.num_values();
+        let mut off = vec![0u32; n + 1];
+        let mut pairs: Vec<(u32, Block, Inst)> = Vec::new();
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
                 for v in func.dfg.inst_values(i) {
                     let v = func.dfg.resolve_aliases(v);
-                    sites.entry(v).or_default().push((b, i));
+                    off[v.index() + 1] += 1;
+                    pairs.push((v.index() as u32, b, i));
                     extra(v, b, i);
                 }
             }
         }
-        Self { sites }
+        for i in 1..=n {
+            off[i] += off[i - 1];
+        }
+        let mut flat = vec![(Block::new(0), Inst::new(0)); off[n] as usize];
+        let mut cur = off.clone();
+        for (idx, b, i) in pairs {
+            flat[cur[idx as usize] as usize] = (b, i);
+            cur[idx as usize] += 1;
+        }
+        Self { off, flat }
     }
 
     /// `v` still referenced anywhere. Removals only delete uses, so a
     /// snapshot taken before a dead-code sweep stays conservative.
     pub fn is_used(&self, v: Value) -> bool {
-        self.sites.contains_key(&v)
+        !self.sites(v).is_empty()
     }
 
     /// Any use of `v` outside block `home`.
     pub fn escapes(&self, v: Value, home: Block) -> bool {
-        self.sites
-            .get(&v)
-            .is_some_and(|ss| ss.iter().any(|&(b, _)| b != home))
+        self.sites(v).iter().any(|&(b, _)| b != home)
     }
 }

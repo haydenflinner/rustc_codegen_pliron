@@ -2111,9 +2111,9 @@ fn unswitch_loop(
                                 .flat_map(|i| func.dfg.inst_results(i)),
                         )
                         .any(|&v| {
-                            uses.sites
-                                .get(&func.dfg.resolve_aliases(v))
-                                .is_some_and(|ss| ss.iter().any(|(b, _)| !dead.contains(b)))
+                            uses.sites(func.dfg.resolve_aliases(v))
+                                .iter()
+                                .any(|(b, _)| !dead.contains(b))
                         })
             })
             .collect();

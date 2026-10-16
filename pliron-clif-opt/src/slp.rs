@@ -491,10 +491,17 @@ struct StoreInfo {
 fn build_uses(func: &Function) -> Uses {
     let n = func.dfg.num_values();
     let mut off = vec![0u32; n + 1];
+    // One function walk collects (resolved value index, inst) pairs and
+    // histograms them; the counting-sort scatter then runs over this
+    // dense vec instead of re-walking layout + inst_values + aliases.
+    // Stable order == layout order, matching the old two-scan build.
+    let mut pairs: Vec<(u32, Inst)> = Vec::new();
     for b2 in func.layout.blocks() {
         for i in func.layout.block_insts(b2) {
             for v in func.dfg.inst_values(i) {
-                off[func.dfg.resolve_aliases(v).index() + 1] += 1;
+                let idx = func.dfg.resolve_aliases(v).index() as u32;
+                off[idx as usize + 1] += 1;
+                pairs.push((idx, i));
             }
         }
     }
@@ -503,14 +510,9 @@ fn build_uses(func: &Function) -> Uses {
     }
     let mut flat = vec![Inst::new(0); off[n] as usize];
     let mut cur = off.clone();
-    for b2 in func.layout.blocks() {
-        for i in func.layout.block_insts(b2) {
-            for v in func.dfg.inst_values(i) {
-                let slot = &mut cur[func.dfg.resolve_aliases(v).index()];
-                flat[*slot as usize] = i;
-                *slot += 1;
-            }
-        }
+    for (idx, i) in pairs {
+        flat[cur[idx as usize] as usize] = i;
+        cur[idx as usize] += 1;
     }
     Uses {
         off,

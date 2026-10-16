@@ -207,7 +207,7 @@ fn analyze(
     }
     // `p`'s uses must all live in `b` so `p_next` can reach them; the
     // iadd keeps `p`, everything else switches to `p_next`.
-    let sites = uses.sites.get(&p)?;
+    let sites = uses.sites(p);
     let mut subst = Vec::new();
     for &(ub, ui) in sites {
         if ub != b {
@@ -223,9 +223,8 @@ fn analyze(
     // `p_next`'s only use may be that backedge arg — after the shift it
     // carries the old `p` value, which is what `p`'s uses need but not
     // what a stray second consumer would expect.
-    match uses.sites.get(&p_next) {
-        Some(ss) if ss.len() == 1 && ss[0] == (b, term) => {}
-        _ => return None,
+    if uses.sites(p_next) != [(b, term)] {
+        return None;
     }
     // Every other entry edge must pass `iadd a_i, s` with the same `s`.
     let cfg = an.cfg(func);

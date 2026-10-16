@@ -225,9 +225,9 @@ fn candidate(
     let mut used_out = FxHashSet::default();
     for &v in &defs {
         if uses
-            .sites
-            .get(&v)
-            .is_some_and(|ss| ss.iter().any(|&(b, _)| !body.contains(&b)))
+            .sites(v)
+            .iter()
+            .any(|&(b, _)| !body.contains(&b))
         {
             used_out.insert(v);
         }

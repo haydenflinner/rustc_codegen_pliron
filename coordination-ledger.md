@@ -1815,3 +1815,25 @@ inline Vecs à la cranelift `ValueListPool`) remains unexplored — its
 payoff is cache capacity for scattered `op.deref` reads, harder to
 attribute than traversal; revisit if a quieter profile still shows
 pliron deref traffic high.
+
+### resolve+def fusion + CSR Uses — LANDED (597d2d3, uncommitted uses.rs)
+
+`ValueData::from`+`resolve_aliases` (~8-9% leaf in prof5) attacked at
+the call-site level, not the decoder: new DFG methods
+`resolved_value_def` / `try_resolved_value_def` / `resolve_and_def`
+walk the alias chain once and reuse the decoded data — the ubiquitous
+`value_def(resolve_aliases(v))` pattern drops from two `values[v]`
+hits + two decodes to one of each. ~95 sites converted mechanically
+(receiver-equality-verified regex; punroll.rs's 5 left with its
+foreign WIP). Same panic/Option semantics. Also `#[inline]` on the hot
+dfg/layout readers (d8e8372, patch 40) — dev profile has no LTO so
+every one of these was a real cross-crate call.
+
+`slp::build_uses` (~4.4% leaf) was two whole-function walks
+(layout iter + inst_values + resolve per use, twice). Now one walk
+collecting (idx, inst) pairs + histogram, then a counting-sort
+scatter — halves the per-use cost. Same treatment applied to the
+shared `uses::Uses`: `sites` is now CSR (`sites(v) -> &[(Block,Inst)]`)
+instead of `FxHashMap<Value, Vec>` — kills per-use hash+alloc at build
+and hashing per lookup at use. All ~10 consumers were pure point
+lookups; `None`/miss maps to `&[]` identically.
