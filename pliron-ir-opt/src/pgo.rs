@@ -41,6 +41,17 @@ use crate::state::{ConstVal, GlobalInfo, State};
 /// `.prof` magic: "PLPROF01" little-endian.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"PLPROF01");
 
+/// The object format a CGU is emitted as — pliron-ir-opt is rustc-free,
+/// so the caller maps `sess.target` onto this before section names or
+/// ctor asm are picked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjFmt {
+    Elf,
+    MachO,
+    Coff,
+    Wasm,
+}
+
 /// A function's counts from one profile record.
 #[derive(Clone, Debug, Default)]
 pub struct ProfFn {
@@ -227,16 +238,17 @@ fn declare_global(
 
 /// Instrument every body in the module. Emits the counters table, the
 /// per-function records + header globals, and the counter ops. Returns
-/// `(hdr_sym, ctor_sym)` — the caller emits the `.init_array` ctor asm
-/// (native) or leaves the profile region to the linker/host (wasm).
-/// `wasm` selects data-object sections (native `pliron_prof*`) vs. plain
-/// data objects the wasm linker resolves.
+/// `(hdr_sym, ctor_sym)` — the caller emits the ctor asm (native) or
+/// leaves the profile region to the linker/host (wasm). `fmt` selects
+/// data-object sections (native `pliron_prof*`) vs. plain data objects
+/// the wasm linker resolves.
 pub fn instrument(
     ctx: &mut Context,
     st: &mut State,
     cgu: &str,
-    wasm: bool,
+    fmt: ObjFmt,
 ) -> (String, String, String) {
+    let wasm = fmt == ObjFmt::Wasm;
     // CGU names carry '-' ('foo.abc-cgu.0') — illegal in asm operands,
     // and the hdr/ctor syms cross into rsasm text; sanitize the suffix.
     let cgu: String = cgu
@@ -331,7 +343,13 @@ pub fn instrument(
     }
 
     // ---- data objects ----
-    let sec = |s: &str| (!wasm).then(|| s.to_string());
+    // Mach-O wants `seg,sec` form with a 16-byte sectname cap (so
+    // `pliron_prof_names` doesn't fit); ELF/COFF names are free-form.
+    let sec = |elf: &str, macho: &str| match fmt {
+        ObjFmt::Wasm => None,
+        ObjFmt::MachO => Some(format!("__DATA,{macho}")),
+        _ => Some(elf.to_string()),
+    };
     let mk = |ctx: &mut Context, st: &mut State, ty: TypeHandle, cv: ConstVal| {
         crate::sroa::mk_const(ctx, st, ty, cv)
     };
@@ -352,7 +370,7 @@ pub fn instrument(
                 tls: false,
                 linkage: Linkage::Local,
                 used: true,
-                section: sec("pliron_prof_ctrs"),
+                section: sec("pliron_prof_ctrs", "pliron_prof_ctrs"),
             },
         );
     }
@@ -397,7 +415,7 @@ pub fn instrument(
             tls: false,
             linkage: Linkage::Local,
             used: true,
-            section: sec("pliron_prof"),
+            section: sec("pliron_prof", "pliron_prof"),
         },
     );
     // symbol names for `pliron-prof dump`
@@ -417,27 +435,55 @@ pub fn instrument(
             tls: false,
             linkage: Linkage::Local,
             used: false,
-            section: sec("pliron_prof_names"),
+            section: sec("pliron_prof_names", "pliron_pnames"),
         },
     );
 
     (hdr_sym, ctor_sym, ctrs_sym)
 }
 
-/// Registration ctor + `.init_array` slot, as rsasm text (x86-64 ELF;
-/// aarch64 uses adrp/add + .xword). Mach-O/COFF could emit
-/// `__mod_init_func`/`.CRT$XCU` the same way — `None` there for now.
-pub fn ctor_asm(hdr_sym: &str, ctor_sym: &str, aarch64: bool) -> Option<String> {
-    let (hdr, ctor) = (hdr_sym, ctor_sym);
-    let body = if aarch64 {
-        format!("adrp x0, {hdr}\n  add x0, x0, :lo12:{hdr}\n  b __pliron_prof_register")
-    } else {
-        format!("lea {hdr}(%rip), %rdi\n  jmp __pliron_prof_register")
+/// Registration ctor + init slot, as rsasm text: ELF gets a `.init_array`
+/// entry, Mach-O a `__DATA,__mod_init_func` pointer via rsasm's
+/// `.mod_init_func` shorthand. COFF would want `.CRT$XCU` and wasm has
+/// no ctors at all — `None` for both. `__pliron_prof_register` is
+/// declared as a normal import by the caller so the splice resolves it
+/// (Mach-O included, where it links as `___pliron_prof_register`).
+pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<String> {
+    let asm = match fmt {
+        ObjFmt::Elf => {
+            let body = if aarch64 {
+                format!("adrp x0, {hdr}\n  add x0, x0, :lo12:{hdr}\n  b __pliron_prof_register")
+            } else {
+                format!("lea {hdr}(%rip), %rdi\n  jmp __pliron_prof_register")
+            };
+            let slot = if aarch64 { ".xword" } else { ".quad" };
+            format!(
+                ".att_syntax\n.text\n.weak {ctor}\n.hidden {ctor}\n{ctor}:\n  {body}\n.section .init_array,\"aw\",@init_array\n.balign 8\n{slot} {ctor}\n.text\n"
+            )
+        }
+        ObjFmt::MachO => {
+            // `.weak_definition` + `.private_extern` mirrors the ELF
+            // `.weak`/`.hidden` pair under Mach-O's symbol model.
+            let (att, body) = if aarch64 {
+                (
+                    "",
+                    format!(
+                        "adrp x0, {hdr}@PAGE\n  add x0, x0, {hdr}@PAGEOFF\n  b __pliron_prof_register"
+                    ),
+                )
+            } else {
+                (
+                    ".att_syntax\n",
+                    format!("lea {hdr}(%rip), %rdi\n  jmp __pliron_prof_register"),
+                )
+            };
+            format!(
+                "{att}.section __TEXT,__text,regular,pure_instructions\n.globl {ctor}\n.weak_definition {ctor}\n.private_extern {ctor}\n{ctor}:\n  {body}\n.mod_init_func\n.balign 8\n.quad {ctor}\n.text\n"
+            )
+        }
+        _ => return None,
     };
-    let slot = if aarch64 { ".xword" } else { ".quad" };
-    Some(format!(
-        ".att_syntax\n.text\n.weak {ctor}\n.hidden {ctor}\n{ctor}:\n  {body}\n.section .init_array,\"aw\",@init_array\n.balign 8\n{slot} {ctor}\n.text\n"
-    ))
+    Some(asm)
 }
 
 // ---------------------------------------------------------------------------

@@ -67,10 +67,13 @@ Per CGU, three data objects plus one constructor stub:
 - `__pliron_prof_hdr.<cgu>` — `{magic, recs ptr, recs len, ctrs ptr,
   ctrs len, cgu hash}` with relocations to the other two, `pliron_prof`.
 - `__pliron_prof_ctor.<cgu>` — three lines of rsasm
-  (`lea hdr; jmp __pliron_prof_register`) plus an `.init_array` slot,
-  emitted through `st.asm`/objmerge so it gets a real `SHT_INIT_ARRAY`
-  section. Undefined `__pliron_prof_register` pulls the runtime out of
-  `libpliron_prof.a`; link without it and you get a clean
+  (`lea hdr; jmp __pliron_prof_register`) plus an init slot, emitted
+  through `st.asm`/objmerge: `.init_array` on ELF,
+  `__DATA,__mod_init_func` on Mach-O (weak + private_extern; sectnames
+  are capped at 16 bytes, so the names blob lands in `pliron_pnames`).
+  `__pliron_prof_register` is declared as a normal import so the splice
+  resolves it like any other callee — undefined, it pulls the runtime
+  out of `libpliron_prof.a`; link without it and you get a clean
   "undefined symbol" naming the missing runtime.
 
 Counter placement: one entry counter per block, plus an edge counter on

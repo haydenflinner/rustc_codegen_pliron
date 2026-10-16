@@ -65,7 +65,10 @@ where
         } else {
             s.kind()
         };
-        let keep = matches!(
+        // `object` calls Mach-O `__DATA,__mod_init_func` Unknown, but the
+        // ctor pointer it holds is the reason the asm exists — keep it by
+        // name. Its S_MOD_INIT_FUNC_POINTERS flags pass through below.
+        let keep = (matches!(
             kind,
             SectionKind::Text
                 | SectionKind::Data
@@ -76,7 +79,8 @@ where
                 | SectionKind::Tls
                 | SectionKind::UninitializedTls
                 | SectionKind::Elf(_)
-        ) && s.size() > 0;
+        ) || (out.format() == BinaryFormat::MachO && name == b"__mod_init_func"))
+            && s.size() > 0;
         if !keep {
             continue;
         }

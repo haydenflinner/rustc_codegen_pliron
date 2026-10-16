@@ -471,21 +471,42 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     // fingerprints are computed at the same CFG stage in gen and use
     // builds.
     if crate::env_set("PLIRON_PGO") || crate::env_set("PLIRON_PGO_USE") {
-        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
-        if crate::env_set("PLIRON_PGO") {
-            let (hdr, ctor, _) = pgo::instrument(ctx, st, name, wasm);
-            if !wasm
-                && let Some(a) = pgo::ctor_asm(&hdr, &ctor, matches!(
-                    cx.tcx.sess.target.arch,
-                    rustc_target::spec::Arch::AArch64
-                ))
-            {
-                st.asm.push_str(&a);
+        let fmt = match cx.tcx.sess.target.options.binary_format {
+            rustc_target::spec::BinaryFormat::MachO => pgo::ObjFmt::MachO,
+            rustc_target::spec::BinaryFormat::Coff => pgo::ObjFmt::Coff,
+            rustc_target::spec::BinaryFormat::Wasm => pgo::ObjFmt::Wasm,
+            _ => pgo::ObjFmt::Elf,
+        };
+        let asm = {
+            let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+            let mut asm = None;
+            if crate::env_set("PLIRON_PGO") {
+                let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt);
+                asm = pgo::ctor_asm(
+                    &hdr,
+                    &ctor,
+                    matches!(cx.tcx.sess.target.arch, rustc_target::spec::Arch::AArch64),
+                    fmt,
+                );
             }
-        }
-        if let Some(f) = crate::env_get("PLIRON_PGO_USE") {
-            pgo::load(ctx, st, f);
+            if let Some(f) = crate::env_get("PLIRON_PGO_USE") {
+                pgo::load(ctx, st, f);
+            }
+            asm
+        };
+        if let Some(a) = asm {
+            // The ctor's `jmp __pliron_prof_register` resolves through the
+            // splice's symbol map like any other callee — declare the
+            // import so Mach-O gets its `_` mangle (and every format a
+            // real undefined symbol rather than an asm-only name).
+            let fty = cx.type_func(&[cx.type_ptr()], cx.type_void());
+            cx.declare_fn_sym(
+                "__pliron_prof_register",
+                fty,
+                Linkage::Import,
+                Exts::default(),
+            );
+            cx.st.borrow_mut().asm.push_str(&a);
         }
     }
     let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
