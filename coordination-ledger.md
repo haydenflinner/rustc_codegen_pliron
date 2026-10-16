@@ -1645,3 +1645,20 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   replays cached stderr on fingerprint hits — `cargo clean -p
   pliron-bench` can leave a replay-only rerun; `touch` the bench
   source to force real codegen.
+- `4f657e3` jumpthread: after a quiet `round`, skip the next
+  iteration's rescan when the prefix phases changed nothing (ifconv
+  only touches `derived` inside real conversions, verified at
+  ifconv.rs:796). 189 skipped scans across 765 bench fns — each
+  converging fn saves its final would-be-quiet round. nn+round
+  ~1260 -> ~1230ms (loaded).
+  slp: `pos`/`taken` converted to `SecondaryMap` (dense inst-indexed);
+  `NO_POS` sentinel + `pos_at`/`pos_get` helpers preserve the old
+  Option/panic semantics since SecondaryMap can't distinguish unset
+  from set-to-default.
+- Note on the string-interning question: `Identifier` is
+  `Cow<'static,str>`, not interned, but the hot-path clones were
+  already removed (direct_callee attr borrow). Remaining string cost is
+  `pass_enabled`→`record()` `to_string()` under stepcache windows only.
+  The linked_list `Iter::next` leaf (~1.4k samples) is structural:
+  per-node `RefCell` in `Ptr::deref` (context.rs:207) — fixing it means
+  a vendor-level arena redesign, not a pass change.
