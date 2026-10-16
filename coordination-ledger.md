@@ -1628,3 +1628,20 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
   jumpthread 2.1s, slp 1.56s, ifconv2 479ms, loadfwd 391ms, mergechain
   322ms, sameargs2 306ms, edgespec 261ms, unroll 241ms; bench build
   ~20s wall under load.
+- `d3c5077` jumpthread: `round` now builds NonNull lazily on the first
+  real candidate edge (`Option<NonNull>` passed in; a round with no
+  candidates never pays the whole-fn fixpoint) and the `users` /
+  `edge_facts` / `body_vals` whole-function maps are lazy too. On
+  convergence `fold_null_tests` runs inside the loop on the built nn,
+  carrying the usize out (`fnn_cur`) — dodges the `derived` borrow
+  across ifconv and old-bootstrap NLL. Same lazy pattern wired into
+  `s_jtround` (nn dropped after productive rounds since threading
+  mutates the function). slp: PLIRON_XPACK_DEBUG env lookups hoisted
+  into an `X::dbg` field.
+  Bench (loaded machine, two real runs): nn+round 1285/1359ms,
+  jumpthread 3.26/3.64s, pipeline 12.0/12.7s — within noise of the
+  pre-change ~1.0-1.1s nn+round; the win is strictly-less-work on
+  quiet rounds, which are rare in the bench's hot functions. Cargo
+  replays cached stderr on fingerprint hits — `cargo clean -p
+  pliron-bench` can leave a replay-only rerun; `touch` the bench
+  source to force real codegen.
