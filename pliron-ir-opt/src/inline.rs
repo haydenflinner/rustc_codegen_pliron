@@ -82,6 +82,13 @@ pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
 }
 
 pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Option<&'a String> {
+    // `st.calls` memoizes the resolved callee at scan time — one hash
+    // probe instead of the attr-dict get + ident lookup every pass was
+    // repeating per call site. The callee attr is constructor-only, so
+    // the memo can't go stale; ops without an entry fall back below.
+    if let Some(sym) = st.calls.get(&op).and_then(|ci| ci.callee.as_ref()) {
+        return Some(sym);
+    }
     let c = Operation::get_op::<CallOp>(op, ctx)?;
     // Borrow the callee attr directly: `callee()` clones it into an owned
     // Identifier (one String alloc) and the obvious lookup then spends a

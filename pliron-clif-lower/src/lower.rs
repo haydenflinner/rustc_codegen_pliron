@@ -528,6 +528,7 @@ pub fn lower_module(
     // pliron `Context`, which is RefCell-interned and not shareable.
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let _pgfl = host.prof().activity("pliron_fnlower", None);
+    let tpa = std::time::Instant::now();
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -889,6 +890,8 @@ pub fn lower_module(
         clctx.clear();
     }
 
+    pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+    let tpb = std::time::Instant::now();
     let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
     let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
         1
@@ -926,6 +929,8 @@ pub fn lower_module(
         jobs.into_iter().map(|m| m.into_inner().unwrap()).collect()
     };
 
+    pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+    let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
     // compiling each function serially.
@@ -1104,6 +1109,7 @@ pub fn lower_module(
         m.define_data(id, &desc)
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
+    pliron_cfg::trace("*phaseC*", tpc.elapsed().as_secs_f64() * 1e3, name);
     Lowered {
         eh,
         ids,
