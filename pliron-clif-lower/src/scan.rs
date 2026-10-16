@@ -122,6 +122,9 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
                 .insert(op.deref(ctx).get_result(0), (sz * n, al.max(1)));
         } else if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
             let fn_ty = c.callee_type(ctx);
+            let callee = c
+                .get_attr_llvm_call_callee(ctx)
+                .and_then(|id| st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())).cloned());
             st.calls.insert(
                 op,
                 CallInfo {
@@ -134,6 +137,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
                     arg_extent: None,
                     arg_noalias: None,
                     bb: false,
+                    callee,
                 },
             );
         } else if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {
