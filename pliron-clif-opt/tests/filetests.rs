@@ -56,6 +56,10 @@ fn pass(name: &str) -> Pass {
         "selargs" => clifpeep::selargs,
         "selfarg" => clifpeep::selfarg,
         "sgntest" => clifpeep::sgntest,
+        "slp" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::slp::run(f, &mut an, &rustc_hash::FxHashSet::default(), true, false)
+        },
         "sublea" => clifpeep::sublea,
         "uloads32" => clifpeep::uloads32,
         "unswitch" => |f| {
