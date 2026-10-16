@@ -416,6 +416,80 @@ fn bin_k_data(func: &Function, args: [Value; 2]) -> Option<(Value, i64)> {
         .or_else(|| iconst(func, a[0]).map(|k| (a[1], k)))
 }
 
+/// `v` decomposed as `x + a`: an `iadd`/`isub` with a constant gives the
+/// base and signed addend; anything else is `x + 0`.
+fn addend(func: &Function, v: Value) -> Option<(Value, i64)> {
+    let v = func.dfg.resolve_aliases(v);
+    let i = func.dfg.value_def(v).inst()?;
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return Some((v, 0));
+    };
+    match opcode {
+        Opcode::Iadd => bin_k_data(func, args),
+        Opcode::Isub => {
+            iconst(func, args[1]).map(|k| (func.dfg.resolve_aliases(args[0]), k.wrapping_neg()))
+        }
+        _ => Some((v, 0)),
+    }
+}
+
+/// `icmp eq|ne` normalized to `(x + a) cc k`: `eq` is whether the
+/// equality holds when the compare is true (false for `ne`), `x`/`a`
+/// come from the add-chain operand — a bare operand is `x + 0` — and `k`
+/// is whatever the other operand is.
+fn icmp_chain(func: &Function, c: Value) -> Option<(bool, Value, i64, Value)> {
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst()?;
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let eq = match cond {
+        IntCC::Equal => true,
+        IntCC::NotEqual => false,
+        _ => return None,
+    };
+    // Prefer a side whose addend is non-zero so two compares share the
+    // `(x, k)` normal form; fall back to `args[0] + 0`.
+    let pick = |a: Value, b: Value| addend(func, a).filter(|&(_, a)| a != 0).map(|(x, a)| (x, a, b));
+    pick(args[0], args[1])
+        .or_else(|| pick(args[1], args[0]))
+        .or_else(|| addend(func, args[0]).map(|(x, a)| (x, a, args[1])))
+        .map(|(x, a, k)| (eq, x, a, k))
+}
+
+/// `v` as a constant: a plain `iconst`, or `x ± k` over a constant base
+/// — select arms arrive as `iadd 0, 1` before `lcse`/`sameargs` fold
+/// them to `iconst`.
+fn keval(func: &Function, v: Value) -> Option<i64> {
+    iconst(func, v).or_else(|| {
+        addend(func, v).and_then(|(x, a)| iconst(func, x).map(|k| k.wrapping_add(a)))
+    })
+}
+
+/// Given `x + a2 == k2` for certain, is `x + a1 == k1` decided?
+/// `⟺ a1 - a2 ≡ k1 - k2 (mod 2^bits)` — known when `k1`/`k2` are the
+/// same value or both constants.
+fn eq_decided(func: &Function, bits: u32, a1: i64, k1: Value, a2: i64, k2: Value) -> Option<bool> {
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    if func.dfg.resolve_aliases(k1) == func.dfg.resolve_aliases(k2) {
+        return Some(a1.wrapping_sub(a2) as u64 & mask == 0);
+    }
+    match (iconst(func, k1), iconst(func, k2)) {
+        (Some(k1), Some(k2)) => Some(
+            (k1 as u64).wrapping_sub(k2 as u64) & mask == (a1 as u64).wrapping_sub(a2 as u64) & mask,
+        ),
+        _ => None,
+    }
+}
+
 /// `v` as `uextend b` where `b` is an i8 provably in {0,1} — returns `b`,
 /// usable as a `select` condition.
 fn uext01(func: &Function, v: Value) -> Option<Value> {
@@ -4358,6 +4432,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     }
     let mut uses = None;
     let mut dead_sel: Vec<(Inst, Value, Value)> = Vec::new();
+    let mut adj_add: Vec<(Inst, Inst, i64)> = Vec::new();
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -4666,6 +4741,42 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                             continue;
                         }
                     }
+                    // `select c2, .., select(c1, t, e)`: the arm reached
+                    // under `c2`'s equality outcome carries the fact
+                    // `x + a2 == k`, which decides a nested compare
+                    // `x + a1 == k` on the same `x`/`k` — `x+3==k` and
+                    // `x-5==k` can't co-hold, so `if x+3==k {a+=1}
+                    // if x-5!=k {a+=2}` only ever applies `+2`. Rewrite
+                    // the outer arm to the nested select's dead arm.
+                    if let Some((eq2, x2, a2, k2)) = icmp_chain(pos.func, args[0]) {
+                        let arm_i = if eq2 { 1 } else { 2 };
+                        let inner = pos.func.dfg.resolve_aliases(args[arm_i]);
+                        if let Some(si) = pos.func.dfg.value_def(inner).inst()
+                            && let InstructionData::Ternary {
+                                opcode: Opcode::Select,
+                                args: sa,
+                            } = pos.func.dfg.insts[si]
+                            && let Some((eq1, x1, a1, k1)) = icmp_chain(pos.func, sa[0])
+                            && pos.func.dfg.resolve_aliases(x1) == x2
+                            && let Some(v) = eq_decided(
+                                pos.func,
+                                pos.func.dfg.value_type(k1).bits(),
+                                a1,
+                                k1,
+                                a2,
+                                k2,
+                            )
+                        {
+                            let arm = sa[if v == eq1 { 1 } else { 2 }];
+                            if let InstructionData::Ternary { args, .. } =
+                                &mut pos.func.dfg.insts[inst]
+                            {
+                                args[arm_i] = arm;
+                            }
+                            n += 1;
+                            continue;
+                        }
+                    }
                     // `select (x >= lo), (x < hi), 0` → `(x - lo) <u w` —
                     // `Range*::contains` as one sub+compare instead of a
                     // guard branch's worth of work; under loopvec a
@@ -4685,6 +4796,39 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     n += 1;
                 }
                 continue;
+            }
+            // `iadd (select c, k1, k2), K` with adjacent const arms →
+            // `select c, k1+K, k2+K`: the arms stay adjacent so aarch64
+            // emits a single `csinc` off one materialized register,
+            // absorbing the add (3 → 2 insts once the select is dead).
+            // Deferred — profitable only if the select's other uses die
+            // with the arm-fact rewrite above, which runs after this
+            // inst's position in the scan.
+            if !x64
+                && crate::pass_enabled("PLIRON_SELADD")
+                && let InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } = pos.func.dfg.insts[inst]
+            {
+                let sel_k = |i: usize| {
+                    iconst(pos.func, args[i ^ 1])?;
+                    let v = pos.func.dfg.resolve_aliases(args[i]);
+                    let si = pos.func.dfg.value_def(v).inst()?;
+                    let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: sa,
+                    } = pos.func.dfg.insts[si]
+                    else {
+                        return None;
+                    };
+                    let (k1, k2) = (keval(pos.func, sa[1])?, keval(pos.func, sa[2])?);
+                    (k1.wrapping_sub(k2).abs() == 1).then_some((si, iconst(pos.func, args[i ^ 1])?))
+                };
+                if let Some((si, k)) = sel_k(0).or_else(|| sel_k(1)) {
+                    adj_add.push((inst, si, k));
+                    continue;
+                }
             }
             let InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
@@ -4901,6 +5045,36 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
         pos.func.dfg.clear_results(inst);
         pos.func.layout.remove_inst(inst);
         pos.func.dfg.change_to_alias(res, arm);
+    }
+    // Apply the deferred adjacent-const `iadd+select` folds: the inner
+    // select must be down to the `iadd` as its only use (the arm-fact
+    // rewrite can kill a second use), otherwise the rewrite would add a
+    // select on top of a still-live one.
+    if !adj_add.is_empty() {
+        let uses = use_counts(func);
+        for (inst, si, k) in adj_add {
+            let res = func.dfg.first_result(si);
+            if uses.get(&func.dfg.resolve_aliases(res)).copied().unwrap_or(0) > 1 {
+                continue;
+            }
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: sa,
+            } = func.dfg.insts[si]
+            else {
+                continue;
+            };
+            let (Some(k1), Some(k2)) = (keval(func, sa[1]), keval(func, sa[2])) else {
+                continue;
+            };
+            let ty = func.dfg.value_type(func.dfg.first_result(inst));
+            let mut cur = FuncCursor::new(func).at_inst(inst);
+            let c = sa[0];
+            let t = cur.ins().iconst(ty, k1.wrapping_add(k));
+            let f = cur.ins().iconst(ty, k2.wrapping_add(k));
+            cur.func.replace(inst).select(c, t, f);
+            n += 1;
+        }
     }
     // Region collapse after `brif_not` has normalised `brif` args to the
     // underlying conditions.
@@ -7556,6 +7730,70 @@ mod tests {
                 "bool_add select produced invalid IR: {e}\n{}",
                 func.display()
             );
+        }
+    }
+
+    /// `select (x-5 != k), (select (x+3 == k), 1, 0) + 2, sel(..)` — the
+    /// `x-5 == k` fact on the false arm refutes `x+3 == k` there, so the
+    /// nested select collapses to 0; then the dead `select(p1,1,0)`
+    /// leaves `+2` merging into `select(p1,3,2)`.
+    #[test]
+    fn arm_fact_folds_correlated_selects() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I8));
+        sig.params.push(AbiParam::new(types::I8));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let x = func.dfg.append_block_param(entry, types::I8);
+        let k = func.dfg.append_block_param(entry, types::I8);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let three = cur.ins().iconst(types::I8, 3);
+        let x3 = cur.ins().iadd(x, three);
+        let p1 = cur.ins().icmp(IntCC::Equal, x3, k);
+        let one = cur.ins().iconst(types::I64, 1);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let a1 = cur.ins().select(p1, one, zero);
+        let five = cur.ins().iconst(types::I8, 5);
+        let xm5 = cur.ins().isub(x, five);
+        let p2 = cur.ins().icmp(IntCC::NotEqual, xm5, k);
+        let two = cur.ins().iconst(types::I64, 2);
+        let a12 = cur.ins().iadd(a1, two);
+        let r = cur.ins().select(p2, a12, a1);
+        cur.ins().return_(&[r]);
+
+        run(&mut func, false);
+        // The outer select's false arm must be the constant 0, and its
+        // true arm `select(p1, 3, 2)` — adjacent consts for `csinc`.
+        let ret = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Return)
+            .unwrap();
+        let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: ra,
+        } = func.dfg.insts[func.dfg.value_def(func.dfg.inst_args(ret)[0]).inst().unwrap()]
+        else {
+            panic!("outer select missing\n{}", func.display())
+        };
+        assert_eq!(iconst(&func, ra[2]), Some(0), "{}", func.display());
+        let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: ta,
+        } = func.dfg.insts[func.dfg.value_def(ra[1]).inst().unwrap()]
+        else {
+            panic!("true arm not a select\n{}", func.display())
+        };
+        assert_eq!(iconst(&func, ta[1]), Some(3));
+        assert_eq!(iconst(&func, ta[2]), Some(2));
+        assert_eq!(func.dfg.resolve_aliases(ta[0]), func.dfg.resolve_aliases(p1));
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("arm_fact fold produced invalid IR: {e}\n{}", func.display());
         }
     }
 

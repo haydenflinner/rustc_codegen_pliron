@@ -493,6 +493,12 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rn);
             collector.reg_use(rm);
         }
+        // PLIRON:
+        Inst::CSInc { rd, rn, rm, .. } => {
+            collector.reg_def(rd);
+            collector.reg_use(rn);
+            collector.reg_use(rm);
+        }
         Inst::CSet { rd, .. } | Inst::CSetm { rd, .. } => {
             collector.reg_def(rd);
         }
@@ -1622,6 +1628,14 @@ impl Inst {
                 let rm = pretty_print_ireg(rm, OperandSize::Size64);
                 let cond = cond.pretty_print(0);
                 format!("csneg {rd}, {rn}, {rm}, {cond}")
+            }
+            // PLIRON:
+            &Inst::CSInc { rd, rn, rm, cond } => {
+                let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size64);
+                let rn = pretty_print_ireg(rn, OperandSize::Size64);
+                let rm = pretty_print_ireg(rm, OperandSize::Size64);
+                let cond = cond.pretty_print(0);
+                format!("csinc {rd}, {rn}, {rm}, {cond}")
             }
             &Inst::CSet { rd, cond } => {
                 let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size64);

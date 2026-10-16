@@ -247,6 +247,14 @@
         (rn Reg)
         (rm Reg))
 
+       ;; PLIRON: a conditional-select increment operation
+       ;; (`cond ? rn : rm + 1`).
+       (CSInc
+        (rd WritableReg)
+        (cond Cond)
+        (rn Reg)
+        (rm Reg))
+
        ;; A conditional-set operation.
        (CSet
         (rd WritableReg)
@@ -3137,6 +3145,16 @@
          (MInst.CSNeg dst cond if_true if_false)
          dst)))
 
+;; PLIRON: helper for a `CSInc` — `cond ? if_true : if_false + 1` —
+;; one inst where `csel` needs a second materialized register.
+(attr csinc (veri chain))
+(decl csinc (Cond Reg Reg) ConsumesFlags)
+(rule (csinc cond if_true if_false)
+      (let ((dst WritableReg (temp_writable_reg $I64)))
+        (ConsumesFlags.ConsumesFlagsReturnsReg
+         (MInst.CSInc dst cond if_true if_false)
+         dst)))
+
 ;; Helper for generating `MInst.CCmp` instructions.
 ;; Creates a new `ProducesFlags` from the supplied `ProducesFlags` followed
 ;; immediately by the `MInst.CCmp` instruction.
@@ -5390,6 +5408,45 @@
          (MInst.CSel dst_lo cond rn_lo rm_lo)
          (MInst.CSel dst_hi cond rn_hi rm_hi)
          (value_regs dst_lo dst_hi)))))
+;; PLIRON: `select c, K+1, K` (or the mirrored `K, K+1`) on adjacent
+;; constants is a single `csinc` on the shared base register — LLVM's
+;; `cinc` idiom — instead of two materializations and a `csel`.
+(rule 5 (lower_select_cond ty flags cond
+        rn @ (u64_from_iconst a) rm @ (u64_from_iconst b))
+  (if (ty_int_ref_scalar_64 ty))
+  (if-let true (u64_eq a (u64_wrapping_add b 1)))
+  (if-let true (u64_gt b 0))
+  (let ((rb Reg (put_in_reg rm)))
+    (with_flags flags (csinc (invert_cond cond) rb rb))))
+(rule 6 (lower_select_cond ty flags cond
+        rn @ (u64_from_iconst a) rm @ (u64_from_iconst b))
+  (if (ty_int_ref_scalar_64 ty))
+  (if-let true (u64_eq b (u64_wrapping_add a 1)))
+  (if-let true (u64_gt a 0))
+  (let ((ra Reg (put_in_reg rn)))
+    (with_flags flags (csinc cond ra ra))))
+;; Zero bases ride `xzr` so `select c, 1, 0` / `select c, 0, 1` stay one
+;; inst like `cset` (same encoding anyway — this just avoids a `mov 0`).
+(rule 9 (lower_select_cond ty flags cond
+        (u64_from_iconst 1) (u64_from_iconst 0))
+  (if (ty_int_ref_scalar_64 ty))
+  (with_flags flags (csinc (invert_cond cond) (zero_reg) (zero_reg))))
+(rule 9 (lower_select_cond ty flags cond
+        (u64_from_iconst 0) (u64_from_iconst 1))
+  (if (ty_int_ref_scalar_64 ty))
+  (with_flags flags (csinc cond (zero_reg) (zero_reg))))
+;; An iconst-0 arm selects off `xzr` directly — saves a `mov w_, 0`
+;; materialization per select.
+(rule 7 (lower_select_cond ty flags cond
+        rn (u64_from_iconst 0))
+  (if (ty_int_ref_scalar_64 ty))
+  (let ((rt Reg (put_in_reg rn)))
+    (with_flags flags (csel cond rt (zero_reg)))))
+(rule 8 (lower_select_cond ty flags cond
+        (u64_from_iconst 0) rm)
+  (if (ty_int_ref_scalar_64 ty))
+  (let ((re Reg (put_in_reg rm)))
+    (with_flags flags (csel cond (zero_reg) re))))
 (rule 1 (lower_select_cond ty flags cond rn rm)
   (if (ty_int_ref_scalar_64 ty))
   (with_flags flags (csel cond rn rm)))

@@ -1499,6 +1499,10 @@ impl MachInstEmit for Inst {
             &Inst::CSNeg { rd, rn, rm, cond } => {
                 sink.put4(enc_csel(rd, rn, rm, cond, 1, 1));
             }
+            // PLIRON:
+            &Inst::CSInc { rd, rn, rm, cond } => {
+                sink.put4(enc_csel(rd, rn, rm, cond, 0, 1));
+            }
             &Inst::CSet { rd, cond } => {
                 sink.put4(enc_csel(rd, zero_reg(), zero_reg(), cond.invert(), 0, 1));
             }

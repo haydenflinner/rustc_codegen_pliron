@@ -458,3 +458,20 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     - `lower (black_box i8/i16)` emits `uxtb`/`uxth` when the operand's
       high bits are dirty (oracle says not clean); clean inputs still pass
       through with no inst.
+
+37. aarch64 `CSInc` MInst + adjacent/zero const select lowering
+    (`src/isa/aarch64/inst.isle`, `src/isa/aarch64/inst/emit.rs`,
+    `src/isa/aarch64/inst/mod.rs`):
+
+    - New `MInst.CSInc { rd, cond, rn, rm }` — the `(op,o2)=(0,1)` csel-family
+      encoding (`csinc rd, rn, rm, cc` = `rn` if cc else `rm + 1`), with emit,
+      reg-collect, and display arms, and a `csinc` ISLE helper.
+    - `lower_select_cond` rules: `select c, K+1, K` /
+      `select c, K, K+1` lower to one `csinc` off the shared materialized
+      base register (LLVM's `cinc` idiom) instead of two movs + `csel`;
+      `select c, 1, 0` / `select c, 0, 1` use `xzr` as the base so they
+      stay a single inst like `cset`; `select c, t, 0` / `select c, 0, e`
+      use `xzr` for the zero arm, dropping a `mov w_, 0` per select.
+      Priorities are staggered (adjacent 5/6 < zero-arm 7/8 < 0/1 9) so the
+      more-specific const pairs win; `u64_gt 0` keeps the adjacent rules off
+      the zero shapes.
