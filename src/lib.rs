@@ -995,7 +995,10 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir());
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = if crate::env_set("PLIRON_WASM_CLIF") {
+        // The CLIF-pipeline path is the default — it runs the full
+        // pliron-clif-opt suite (and loopvec under +simd128); the dialect
+        // path (`PLIRON_WASM_CLIF=0`) is the minimal fallback.
+        let obj = if crate::env_get("PLIRON_WASM_CLIF") != Some("0") {
             wasm::lower_to_wasm_clif(
                 &cx.pctx.borrow(),
                 &cx.st.borrow(),
