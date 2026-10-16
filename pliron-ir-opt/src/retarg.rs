@@ -19,7 +19,7 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
 use rustc_hash::FxHashMap;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied, has_body};
 
@@ -55,6 +55,7 @@ pub fn run(ctx: &Context, st: &State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();
     let mut p = Returned::default();
+    let mut scratch = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -63,7 +64,8 @@ pub fn run(ctx: &Context, st: &State) {
         }
         let mut n = 0;
         for b in bs {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 let d = op.deref(ctx);
                 if let Some(r) = Operation::get_op::<ReturnOp>(op, ctx) {
                     // A valueless `ret` breaks the chain.
@@ -106,7 +108,8 @@ pub fn run(ctx: &Context, st: &State) {
             continue;
         }
         for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 if !Operation::is_op::<CallOp>(op, ctx) || op.deref(ctx).get_num_results() == 0 {
                     continue;
                 }

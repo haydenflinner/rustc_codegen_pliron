@@ -39,7 +39,7 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -82,10 +82,11 @@ pub fn run(ctx: &Context, st: &mut State) {
     {
         p.known.push((ids.id(s),));
     }
+    let mut os = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
         for b in blocks(ctx, st.funcs[s].op) {
-            let os = ops(ctx, b);
+            crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
                     ($t:ty) => {

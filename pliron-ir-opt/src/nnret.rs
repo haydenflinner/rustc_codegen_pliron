@@ -26,7 +26,7 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 use crate::{Syms, bodied, has_body};
@@ -88,13 +88,15 @@ pub fn run(ctx: &Context, st: &mut State) {
     let mut p = MayNull::default();
     // Every value the bodies define.
     let mut local: FxHashSet<Value> = FxHashSet::default();
+    let mut scratch = Vec::new();
     for s in &cand {
         let f = ids.id(s);
         p.cand.push((f,));
         let bs = blocks(ctx, st.funcs[s].op);
         for &b in &bs {
             local.extend(b.deref(ctx).arguments());
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 local.extend(op.deref(ctx).results());
             }
         }
@@ -118,7 +120,8 @@ pub fn run(ctx: &Context, st: &mut State) {
             );
         }
         for &b in &bs {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 let d = op.deref(ctx);
                 if d.successors().next().is_some()
                     && let Some(br) =

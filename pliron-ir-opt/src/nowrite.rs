@@ -14,7 +14,7 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -162,9 +162,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                 }
             }
         }
+        let mut os = Vec::new();
         for b in bs {
             let cr = can_ret.contains(&b);
-            let os = ops(ctx, b);
+            crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
                     ($t:ty) => {

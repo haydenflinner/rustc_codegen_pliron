@@ -19,7 +19,7 @@ use pliron_llvm::ops::{CallOp, UndefOp};
 use rustc_hash::FxHashMap;
 
 use crate::has_body;
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 
 pub fn run(ctx: &mut Context, st: &mut State) {
@@ -27,12 +27,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         && tracing::enabled!(target: "pliron::spec", tracing::Level::DEBUG);
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
+    let mut scratch = Vec::new();
     for f in st.funcs.values() {
         if !has_body(ctx, f.op) {
             continue;
         }
         for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 if let Some(sym) = direct_callee(ctx, st, op) {
                     sites.entry(sym.clone()).or_default().push(op);
                 }

@@ -81,6 +81,12 @@ pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
+/// `ops` into a caller-owned buffer so per-block walks allocate once.
+pub fn ops_into(ctx: &Context, b: Ptr<BasicBlock>, out: &mut Vec<Ptr<Operation>>) {
+    out.clear();
+    out.extend(b.deref(ctx).iter(ctx));
+}
+
 pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Option<&'a String> {
     // `st.calls` memoizes the resolved callee at scan time — one hash
     // probe instead of the attr-dict get + ident lookup every pass was
