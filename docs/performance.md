@@ -327,18 +327,34 @@ crate size. Wall-clock `cargo rustc --release` on workspace-member crates
 |---|---|---|---|
 | regex-syntax 0.8.11 | 3.04 s | 16.1 s | ~5.3x |
 | serde_json 1.0.154 | 1.33 s | 9.5 s | ~7.1x |
-| syn 2.0.119 | 3.83 s | 152.9 s | ~40x |
+| syn 2.0.119 | 3.83 s | ~122 s | ~32x |
 
-`syn` is the pathological case: ~182s of summed pipeline-step time spread
-uniformly across passes (looprot 23.7s, indvars 18.9s, slp 15.1s,
-jumpthread 11.4s, emit 10.6s, then ivrefold/loadfwd/ifconv2/selfarg/licm/
-mergechain/edgespec ~6-7s each) — no single quadratic, just ~95 passes of
-per-function cost on syn's macro-generated functions. One CGU alone holds
-72s (slp 12.5s inside it is the largest single-step spend).
+`syn` is the pathological case. After the per-pass fixes below, summed
+pipeline-step time dropped from ~483s to ~220s and the heaviest CGU from
+100.9s to 43.2s — but wall barely moved because codegen is bound by the
+non-pipeline floor: with `PLIRON_OPT_BISECT=0` (all clif passes off) syn
+still takes ~87s vs LLVM's 3.8s total. A perf profile of that floor is
+diffuse: ~14% hash-map infra (IndexMap attribute lookups, `CallInfo`/`State`
+tables), ~6.5% `pliron_clif_lower::lower`, ~9.7% *ungated* ir-opt work
+(`inline` 4.4% — its first round runs with no `pass_enabled` gate —
+plus nocapture/nowrite/phisimp/domcheck), ~2.6% regalloc2, long tail in
+pliron op construction (`pliron_llvm::ops`, `value`/`operation` tables).
+So the remaining compile-time gap is mostly *our glue*: op construction +
+hash tables + lowering, not the clif passes and not vendored cranelift.
 
-The optimizer pipeline takes ~95% of backend time. Function-level worker
-threads run the pipeline in parallel across a crate's code-generation
-units.
+Per-pass fixes that took pipeline CPU ~483s → ~220s:
+
+- `indvars::elim_shadowed`: the fixpoint rebuilt the whole-function use
+  set every round (O(fn × rounds) per loop) — now a per-value operand
+  refcount decremented in place when a pure inst dies.
+- `Analysis::uses()`/`refresh_uses()`: a `(ver, num_insts)`-keyed shared
+  `Uses` index (Rc snapshot) so steps that each rebuilt `Uses::new` share
+  one build per IR version. Wired into ivalign, ivrefold::deadrecs,
+  looprot; ~7 more call sites remain (jumpthread ×2, unroll, memspec ×2,
+  bcheck, slp).
+
+Function-level worker threads run the pipeline in parallel across a
+crate's code-generation units.
 
 A content-addressed step cache (`PLIRON_STEPCACHE=1`) stores per-pass and
 per-function results. A warm rerun of the pipeline takes about 16 ms per
