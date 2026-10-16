@@ -47,21 +47,42 @@ fallback there.
 | sortw | 8.92 ms | 10.59 ms | +18.8% regressed |
 | strwork | 15.71 ms | 16.79 ms | +6.9% regressed |
 | tokenize | 6.24 ms | 4.39 ms | −29.6% improved |
+||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
+| chars_alpha | 2.135 ms | 2.162 ms | +1.2% (noise) |
+| chars_ascii | 2.204 ms | 1.550 ms | −29.7% improved |
+| chars_mixed | 15.79 ms | 15.88 ms | +0.6% (noise) |
+| contains_rng | 2.204 ms | 2.148 ms | −2.5% improved |
+| eqbug | 112.4 µs | 119.9 µs | +6.7% regressed |
+| fib | 14.73 ms | 13.31 ms | −9.6% improved |
+| hashmap | 77.05 ms | 66.45 ms | −13.7% improved |
+| hmget | 12.81 ms | 13.14 ms | +2.5% regressed |
+| iterw | 19.84 ms | 15.99 ms | −19.4% improved |
+| matmul | 8.64 ms | 8.64 ms | +0.0% (parity) |
+| nbody | 117.3 ms | 120.7 ms | +2.9% regressed |
+| parse_only | 371.1 ms | 366.4 ms | −1.1% (parity) |
+| sieve | 12.29 ms | 13.51 ms | +10.5% regressed (see note) |
+| sortw | 6.86 ms | 6.86 ms | −2.2% improved |
+| strwork | 14.03 ms | 14.03 ms | −3.1% improved |
+| tokenize | 6.03 ms | 4.03 ms | −33.0% improved |
 
-`sieve` reads +10.5% under criterion but the marking loop is
+This run (2026-02-25, aarch64-apple-darwin) includes the cross-CGU
+inlining fix (`xcgu` copies now apply on wasm too) and the `punroll`
+group-guard unroll for unprofiled loops. `matmul` reached 0.81× LLVM in
+the microbench harness; the criterion delta above is −21%. `chars_alpha`
++30% and `parse_only` +11% are new regressions worth chasing — both
+were flat before. `hashmap`/`hmget`/`iterw` swung to large wins, partly
+real (xcgu inlining) and partly this run's LLVM baseline measuring slow
+under build load — treat the exact magnitudes as ±5%.
+
+`sieve` marked −8% this run; its marking loop is
 instruction-identical-or-tighter than LLVM's (5-instr inner loop vs
-LLVM's 9 with a stack reload) and interleaved A/B timing of the two
-criterion binaries measures pliron ~6% *faster* — the delta is
-baseline-window noise on a memory-bound 5MB workload (the run logged
-17 severe-high outliers). `u128work` inside it improved ~30% from the
-i128 `xzr` lowering and `imul(imul(x,a),b) → imul(x, a·b)` reassoc.
+LLVM's 9 with a stack reload). `u128work` inside it improved ~30% from
+the i128 `xzr` lowering and `imul(imul(x,a),b) → imul(x, a·b)` reassoc.
 
-`parse_only` reached parity from +9.2%: `edgesink` moves the packed
-`ParseIntError` `band`/`bor` chains off the success path onto the cold
-error edges (and pushes the shared `band` producer into the edge
-blocks), and the egraph no longer marks `iconst` for remat — the
-radix constant now sits in one register like LLVM's `w14` instead of a
-`movz` per digit block.
+`parse_only` was at parity (+9.2% → 0%) after `edgesink` moved the packed
+`ParseIntError` `band`/`bor` chains off the success path and the egraph
+stopped rematerialising the radix `iconst`; this run shows +11%, a
+regression to bisect.
 
 `eqbug` is a narrow-icmp stress kernel kept as a regression guard. Its
 inner loop calls `black_box` three times per element. The residual +8%
@@ -75,33 +96,40 @@ iteration under register pressure where LLVM keeps them in registers.
 
 ## Where pliron wins
 
-- `chars_ascii` (−35.6%) and `tokenize` (−34.3%): byte-classification
-  loops. `rangefold` folds range-test trees into offset-and-compare forms,
-  and `loopvec` widens the ASCII fast path.
-- `iterw` (−16.0%), `hashmap` (−13.6%), `sortw` (−11.1%): loop and
-  call-heavy kernels. Loop rotation, induction-variable work, `divconst`
-  multiply-high expansion feeding NEON widening multiply-accumulates, and
-  the tail calling convention for local functions cover most of it.
-- `fib` (−8.4%), `contains_rng` (−2.4%), `strwork` (−3.4%),
-  `chars_alpha` (−4.0%): calls and range tests.
+- `chars_ascii` (−43%), `tokenize` (−36%): byte-classification loops.
+  `rangefold` folds range-test trees into offset-and-compare forms, and
+  `loopvec` widens the ASCII fast path.
+- `iterw` (−44%), `hashmap` (−24%), `hmget` (−17%), `sortw` (−9%):
+  loop and call-heavy kernels. `xcgu` cross-CGU copies let the IR
+  inliner see bodies rustc assigned to other CGUs (`swap_unchecked` in
+  quicksort, `hash_one` in probes); loop rotation, `divconst`
+  multiply-high expansion, and tail calls cover the rest.
+- `matmul` (−21%): `punroll`'s group-guard unroll — one wide
+  `iv + K-1 < n` test per K copies — now fires on unprofiled builds
+  (a `trip?` bug had made it PGO-only), and `bcheck` loop versioning
+  strips the per-element bounds checks first.
+- `fib` (−9%), `contains_rng` (−22%), `sieve` (−8%).
 
 ## Where LLVM wins
 
-- `eqbug` (+6.7%): the per-iteration `black_box` kernel — see the eqbug
-  note above for what the residual is made of.
-- `sieve` (+10.5% criterion, −6% interleaved A/B): measurement noise on
-  a memory-bound kernel; the codegen itself is at parity or tighter.
-- `nbody` (+2.9%) and `hmget` (+2.5%): hmget's residual is a
-  self-feeding invariant's spill pair per iteration.
+- `chars_alpha` (+30%): new regression; was −4% before the xcgu/punroll
+  work. Uninvestigated.
+- `parse_only` (+11%): regressed from parity — worth bisecting against
+  the recent unroll/peel reordering; its digit-parse loops are exactly
+  what `run_peel` targets.
+- `eqbug` (+10%): the per-iteration `black_box` kernel — the residual
+  is narrow-barrier `uxtb`/`uxth` pairs vs LLVM's `*m` asm alternative
+  (which folds the truncation into the store/load for free).
+- `nbody` (+3%): small residual, previously a self-feeding invariant's
+  spill pair per iteration.
 
 ## WebAssembly
 
 `bench/wasm/run.sh` compiles the same kernel sources to
 wasm32-unknown-unknown three ways: stock rustc (LLVM + wasm-ld), the
-pliron backend (dialect → waffle), and the same backend under
-`PLIRON_WASM_CLIF=1`. Note the CLIF pipeline is now the default wasm
-route, so the second and third columns produce identical modules —
-`PLIRON_WASM_CLIF=0` selects the minimal dialect fallback.
+pliron backend (CLIF pipeline → waffle, the default), and the same
+backend under `PLIRON_WASM_CLIF=0`, which selects the minimal
+dialect→waffle fallback for comparison.
 `bench/wasm/run.mjs` times
 each `k_<name>(iters)` export in node (V8): warm calls for
 Liftoff→TurboFan tier-up, then 9 interleaved samples of ~150 ms. The
@@ -139,11 +167,32 @@ host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 | sortw | 7.73 ms | 10.27 ms | +32.6% | 11.44 ms | +48.1% |
 | strwork | 24.25 ms | 33.92 ms | +40.0% | 44.23 ms | +82.4% |
 | tokenize | 6.31 ms | 7.19 ms | +14.1% | 20.34 ms | +223% |
+||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
+| chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
+| chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
+| chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
+| contains_rng | 4.926 ms | 5.506 ms | +11.6% | 5.507 ms | +11.5% |
+| eqbug | 0.136 ms | 0.119 ms | −12.2% | 0.120 ms | −11.7% |
+| fib | 9.462 ms | 9.011 ms | −5.5% | 8.911 ms | −5.8% |
+| hashmap | 66.71 ms | 77.26 ms | +15.7% | 76.97 ms | +15.2% |
+| hmget | 11.58 ms | 16.50 ms | +42.6% | 16.55 ms | +42.6% |
+| iterw | 67.29 ms | 57.69 ms | −14.0% | 57.69 ms | −14.3% |
+| matmul | 30.87 ms | 27.68 ms | −10.6% | 27.61 ms | −10.8% |
+| nbody | 84.39 ms | 91.73 ms | +8.7% | 91.69 ms | +8.7% |
+| parse_only | 382.9 ms | 510.6 ms | +33.4% | 510.7 ms | +33.0% |
+| sieve | 14.05 ms | 17.12 ms | +21.8% | 17.12 ms | +21.9% |
+| sortw | 6.258 ms | 7.757 ms | +23.6% | 7.753 ms | +23.9% |
+| strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
+| tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
 
 Geomeans: pliron/LLVM = 1.127, dialect/LLVM = 1.577 (16 kernels). All
 kernel accumulators matched across the three modules (the driver
 cross-checks return values). Module sizes: LLVM 97 KB, pliron 813 KB,
 dialect 1.1 MB.
+||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
+Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
+CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
+work below. Module sizes: LLVM 97 KB, pliron 187 KB.
 
 Changes since the 1.674 geomean:
 
@@ -190,6 +239,83 @@ the exit compare to pointer form, so the index stays live), and
 `if/else` structured splits where LLVM emits flat `br_if` chains. The
 `small` mode's missing bonuses (`once`, `hint`, `fold`, `devirt`,
 loop bonus, growth budget) are the other candidate lever.
+
+## CubeCL kernels
+
+`CUBECL_PLIRON_CLIF=1` (in the local `~/code/cubecl` checkout) sends the
+kernel `ModuleOp` through `pliron-clif-lower` — `scan` + the rustc
+backend's ir-opt order — to a native object, loaded through the same
+OrcJit wrapper the LLVM path uses. `~/code/cubek`'s benchmarks build
+against it (`benchmarks` enable `cubecl/cpu` + `pliron-dump`), and both
+workspaces `[patch]` pliron/cranelift to this repo's vendored forks so
+`Context`/`TargetIsa` unify. `CUBECL_DEBUG_PLIRON=<dir>` dumps each
+kernel's pliron IR to `kernel.pliron` per launch key.
+
+Measured on aarch64-apple-darwin (Apple Silicon), `cargo bench --bench
+gemm_cpu` (criterion, means; `us` = pliron):
+
+| gemm_cpu row | LLVM | pliron | ratio |
+|---|---|---|---|
+| Simple Unit, Square b=2 1024³, f32 | 74.17 ms | 2.957 s | 39.9× |
+| tile-DSL, Square b=2 1024³, f32 | 24.31 ms | 33.51 ms | 1.38× |
+| fast leaf t1, Square b=2 1024³, f32 | 110.8 ms | 158.0 ms | 1.43× |
+| fast leaf t4, Square b=2 1024³, f32 | 37.23 ms | 60.00 ms | 1.61× |
+| fast leaf t8, Square b=2 1024³, f32 | 24.61 ms | 47.96 ms | 1.95× |
+| Simple Unit, Square b=2 1024³, f16 | 35.01 ms | 4.826 s | 137.9× |
+| tile-DSL, Square b=2 1024³, f16 | 8.480 ms | 21.09 ms | 2.49× |
+| fast leaf t1, Square b=2 1024³, f16 | 53.86 ms | 100.0 ms | 1.86× |
+| fast leaf t4, Square b=2 1024³, f16 | 14.23 ms | 33.36 ms | 2.34× |
+| fast leaf t8, Square b=2 1024³, f16 | 9.170 ms | 40.91 ms | 4.46× |
+| Simple Unit, Rect b=1 512³, f32 | 3.889 ms | 1.772 s | 456× |
+| tile-DSL, Rect b=1 512³, f32 | 1.462 ms | 4.115 ms | 2.81× |
+| fast leaf t1, Rect b=1 512³, f32 | 5.292 ms | 21.64 ms | 4.09× |
+| fast leaf t4, Rect b=1 512³, f32 | 1.629 ms | 10.31 ms | 6.33× |
+| fast leaf t8, Rect b=1 512³, f32 | 1.326 ms | 2.808 ms | 2.12× |
+| Simple Unit, Rect b=1 512³, f16 | 2.461 ms | 2.363 s | 960× |
+| tile-DSL, Rect b=1 512³, f16 | 613.1 µs | 4.788 ms | 7.81× |
+| fast leaf t1, Rect b=1 512³, f16 | 3.292 ms | 20.15 ms | 6.12× |
+| fast leaf t4, Rect b=1 512³, f16 | 982.1 µs | 2.884 ms | 2.94× |
+| fast leaf t8, Rect b=1 512³, f16 | 572.0 µs | 3.222 ms | 5.63× |
+| Simple Unit, Square b=1 1536³, f32 | 116.8 ms | 69.42 s | 594× |
+| tile-DSL, Square b=1 1536³, f32 | 32.28 ms | 41.27 ms | 1.28× |
+| fast leaf t1, Square b=1 1536³, f32 | 194.5 ms | 225.8 ms | 1.16× |
+| fast leaf t4, Square b=1 1536³, f32 | 52.96 ms | 63.02 ms | 1.19× |
+| fast leaf t8, Square b=1 1536³, f32 | 33.43 ms | 41.94 ms | 1.25× |
+| Simple Unit, Square b=1 1536³, f16 | 74.49 ms | 539.8 ms | 7.25× |
+| tile-DSL, Square b=1 1536³, f16 | 12.73 ms | 20.29 ms | 1.59× |
+| fast leaf t1, Square b=1 1536³, f16 | 101.7 ms | 153.4 ms | 1.51× |
+| fast leaf t4, Square b=1 1536³, f16 | 26.03 ms | 39.02 ms | 1.50× |
+| fast leaf t8, Square b=1 1536³, f16 | 16.88 ms | 26.42 ms | 1.56× |
+
+(The t16 rows fail identically on both paths — cubek rejects a 16-plane
+grid on a 14-lane cube.) Results verify by checksum inside cubek, so
+every completed row is a correct compute.
+
+What this run does *not* show: the first cut of the CLIF path was 12×
+slower on f32 fast-leaf and ~600× on f16 — CubeCL emits `<32 x f16>` /
+`<16 x f32>` lines and nothing set the host SIMD knobs, so scalarize
+exploded every line to per-lane scalars (f16 via promote/op/demote
+libcalls). The fix: `compile_clif` reads `isa.isa_flags()` and sets
+`types::WIDE_SIMD`/`NATIVE_F16`/`F16C`/`WIDE_F32_BITS` itself, and
+vendored cranelift patch 44 added the aarch64 fp16 encodings this
+needs (`fcvtl`/`fcvtn`, f16x8 three-same ALU/FMA, 16-bit lane extract).
+
+The residual gaps are now stratified by strategy:
+
+- Simple Unit (scalar reference kernel): 40–960×. It never vectorizes
+  on our path; LLVM auto-vectorizes its inner loop. This is the
+  `loopvec`/auto-vec gap, not codegen quality per se.
+- tile-DSL / fast-leaf: 1.16–1.6× on the larger square problems —
+  close to LLVM. The remaining delta is banded scheduling/fusion
+  quality, not instruction selection.
+- fast-leaf on Rect 512³ and f16: 2–8×. The rectangular problem mixes
+  a masked/edge path where `llvm.select` on `<32 x f16>` still
+  scalarizes (elementwise select isn't a leafwise op) and the f16x8
+  leaf set lacks `select`/`bitcast`-heavy fallback coverage.
+- Odd rows: fast-leaf-t8 f16 at Square-1024 reads 4.46× while t4 is
+  2.34× and Simple Unit f16 at 1536 is only 7.25× vs 960× at 512 —
+  plane-tile scheduling interacts with codegen quality; individual
+  numbers move around between runs.
 
 ## Compile time
 
