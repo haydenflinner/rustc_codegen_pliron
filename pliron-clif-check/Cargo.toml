@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 pliron-clif-opt = { path = "../pliron-clif-opt" }
-cranelift-codegen = { version = "0.135.5", default-features = false, features = ["std", "host-arch"] }
-cranelift-module = "0.135.5"
-cranelift-reader = "0.135.5"
+cranelift-codegen = { version = "=0.135.5", default-features = false, features = ["std", "host-arch"] }
+cranelift-module = "=0.135.5"
+cranelift-reader = "=0.135.5"
 rustc-hash = "2"
 target-lexicon = "0.13"

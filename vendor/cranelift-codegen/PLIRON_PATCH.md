@@ -532,3 +532,15 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `arguments_mut`, `typevar_operand` — the generated code is all
     non-generic, so every `inst.opcode()`/arg read from the opt crates
     was an outlined call.
+
+44. aarch64 packed-f16 support (`src/isa/aarch64/lower.isle`,
+    `inst.isle`, `inst/emit.rs`, `inst/mod.rs`): NEON fp16 is universal
+    on Apple Silicon but upstream had no lowering for it. Adds scalar
+    `fpromote.f32`/`fdemote.f16` (`fcvt s,h`/`fcvt h,s` via new
+    `FPUOp1::Cvt16To32`/`Cvt32To16`), fp16 three-same encodings for
+    `VecALUOp` fadd/fsub/fmul/fdiv/fmax/fmin and `VecALUModOp`
+    fmla/fmls on `f16xN`, `FpuMoveFromVec` Size16 (`dup h, v.h[i]`),
+    an `fcvtn2` ISLE helper, and rules for the vendored packed-half
+    casts (`fvpromote_f16`/`_lo`/`_hi` -> `fcvtl`/`fcvtl2`,
+    `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
+    lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.

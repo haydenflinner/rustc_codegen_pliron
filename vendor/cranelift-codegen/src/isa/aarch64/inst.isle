@@ -1738,6 +1738,9 @@
     (Sqrt)
     (Cvt32To64)
     (Cvt64To32)
+    ;; PLIRON: half <-> single converts (fcvt s,h / fcvt h,s).
+    (Cvt16To32)
+    (Cvt32To16)
 ))
 
 ;; A floating-point unit (FPU) operation with two args.
@@ -3303,6 +3306,10 @@
 ;; Helper for generating `fcvtn` instructions.
 (decl fcvtn (Reg ScalarSize) Reg)
 (rule (fcvtn x size) (vec_rr_narrow_low (VecRRNarrowOp.Fcvtn) x size))
+
+;; PLIRON: helper for generating `fcvtn2` instructions.
+(decl fcvtn2 (Reg Reg ScalarSize) Reg)
+(rule (fcvtn2 x y size) (vec_rr_narrow_high (VecRRNarrowOp.Fcvtn) x y size))
 
 ;; Helper for generating `sqxtn` instructions.
 (decl sqxtn (Reg ScalarSize) Reg)

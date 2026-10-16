@@ -1855,6 +1855,8 @@ impl MachInstEmit for Inst {
             }
             &Inst::FpuMoveFromVec { rd, rn, idx, size } => {
                 let (imm5, shift, mask) = match size.lane_size() {
+                    // PLIRON: `dup h<d>, v<n>.h[i]` for packed-f16 lane reads.
+                    ScalarSize::Size16 => (0b00010, 2, 0b111),
                     ScalarSize::Size32 => (0b00100, 3, 0b011),
                     ScalarSize::Size64 => (0b01000, 4, 0b001),
                     _ => unimplemented!(),
@@ -1892,6 +1894,18 @@ impl MachInstEmit for Inst {
                     FPUOp1::Cvt64To32 => {
                         debug_assert_eq!(size, ScalarSize::Size64);
                         0b000_11110_01_1_000100_10000
+                    }
+                    // PLIRON: fcvt s<d>, h<n> / fcvt h<d>, s<n>. The ftype
+                    // field (bits 23:22) names the *source* precision and is
+                    // injected below from `size`; opc (bits 16:15) names the
+                    // destination (00 = s, 11 = h).
+                    FPUOp1::Cvt16To32 => {
+                        debug_assert_eq!(size, ScalarSize::Size16);
+                        0b000_11110_00_1_000000_10000
+                    }
+                    FPUOp1::Cvt32To16 => {
+                        debug_assert_eq!(size, ScalarSize::Size32);
+                        0b000_11110_00_1_000011_10000
                     }
                 };
                 let top22 = top22 | size.ftype() << 12;
@@ -2756,7 +2770,23 @@ impl MachInstEmit for Inst {
                     _ => false,
                 };
 
-                let (top11, bit15_10) = match alu_op {
+                // PLIRON: packed-f16 ops encode in the "three same (fp16)"
+                // space — different opcodes, no sz bit — so they bypass the
+                // `enc_float_size` injection below.
+                let (top11, bit15_10) = if is_float
+                    && size.lane_size() == ScalarSize::Size16
+                {
+                    match alu_op {
+                        VecALUOp::Fadd => (0b000_01110_010, 0b000101),
+                        VecALUOp::Fsub => (0b000_01110_110, 0b000101),
+                        VecALUOp::Fmul => (0b001_01110_010, 0b000111),
+                        VecALUOp::Fdiv => (0b001_01110_010, 0b001111),
+                        VecALUOp::Fmax => (0b000_01110_010, 0b001101),
+                        VecALUOp::Fmin => (0b000_01110_110, 0b001101),
+                        _ => unreachable!("no fp16 vector encoding for {alu_op:?}"),
+                    }
+                } else {
+                    match alu_op {
                     VecALUOp::Sqadd => (0b000_01110_00_1 | enc_size << 1, 0b000011),
                     VecALUOp::Sqsub => (0b000_01110_00_1 | enc_size << 1, 0b001011),
                     VecALUOp::Uqadd => (0b001_01110_00_1 | enc_size << 1, 0b000011),
@@ -2835,8 +2865,9 @@ impl MachInstEmit for Inst {
                     VecALUOp::Uzp2 => (0b01001110_00_0 | enc_size << 1, 0b010110),
                     VecALUOp::Trn1 => (0b01001110_00_0 | enc_size << 1, 0b001010),
                     VecALUOp::Trn2 => (0b01001110_00_0 | enc_size << 1, 0b011010),
+                    }
                 };
-                let top11 = if is_float {
+                let top11 = if is_float && size.lane_size() != ScalarSize::Size16 {
                     top11 | size.enc_float_size() << 1
                 } else {
                     top11
@@ -2856,8 +2887,15 @@ impl MachInstEmit for Inst {
 
                 let (top11, bit15_10) = match alu_op {
                     VecALUModOp::Bsl => (0b001_01110_01_1, 0b000111),
+                    // PLIRON: f16 lanes use the fp16 three-same space.
+                    VecALUModOp::Fmla if size.lane_size() == ScalarSize::Size16 => {
+                        (0b000_01110_010, 0b000011)
+                    }
                     VecALUModOp::Fmla => {
                         (0b000_01110_00_1 | (size.enc_float_size() << 1), 0b110011)
+                    }
+                    VecALUModOp::Fmls if size.lane_size() == ScalarSize::Size16 => {
+                        (0b000_01110_110, 0b000011)
                     }
                     VecALUModOp::Fmls => {
                         (0b000_01110_10_1 | (size.enc_float_size() << 1), 0b110011)

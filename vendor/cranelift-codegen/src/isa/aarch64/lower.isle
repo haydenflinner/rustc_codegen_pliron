@@ -874,10 +874,18 @@
 (rule (lower (fpromote $F64 x))
       (fpu_rr (FPUOp1.Cvt32To64) x (ScalarSize.Size32)))
 
+;; PLIRON: f16 -> f32 is `fcvt s, h`.
+(rule (lower (fpromote $F32 x))
+      (fpu_rr (FPUOp1.Cvt16To32) x (ScalarSize.Size16)))
+
 ;;;; Rules for `fdemote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (fdemote $F32 x))
       (fpu_rr (FPUOp1.Cvt64To32) x (ScalarSize.Size64)))
+
+;; PLIRON: f32 -> f16 is `fcvt h, s`.
+(rule (lower (fdemote $F16 x))
+      (fpu_rr (FPUOp1.Cvt32To16) x (ScalarSize.Size32)))
 
 ;;;; Rules for `ceil` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -3662,6 +3670,25 @@
 
 (rule (lower (fvpromote_low _ val))
       (vec_rr_long (VecRRLongOp.Fcvtl32) val false))
+
+;;; PLIRON: packed-f16 <-> f32 vector casts (fvpromote_f16*/fvdemote_f16*) ;;;;;;;
+;; `fvpromote_f16`/`fvpromote_f16_lo`/`_hi` convert the low/high half of an
+;; f16 vector to f32x4 (fcvtl/fcvtl2); `fvdemote_f16_pair` packs two f32x4
+;; into one f16x8 (fcvtn + fcvtn2).
+
+(rule (lower (fvpromote_f16 $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x false))
+
+(rule (lower (fvpromote_f16_lo $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x false))
+
+(rule (lower (fvpromote_f16_hi $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x true))
+
+(rule (lower (fvdemote_f16_pair $F16X8 x y))
+      (let ((low Reg (fcvtn x (ScalarSize.Size32)))
+            (result Reg (fcvtn2 low y (ScalarSize.Size32))))
+        result))
 
 ;;; Rules for `brif` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

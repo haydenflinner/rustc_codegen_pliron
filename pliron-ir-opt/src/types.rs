@@ -218,6 +218,15 @@ pub fn native_vec(ctx: &Context, e: TypeHandle, n: u64) -> Option<ClType> {
     {
         return Some(clt::I16X8);
     }
+    // Packed f16: only as a full 128-bit leaf, on hosts with native
+    // half-precision SIMD (aarch64 fp16, x64 AVX512-FP16). Lane access goes
+    // through extractlane/insertlane, which 64-bit f16x4 can't rely on.
+    if e.deref(ctx).is::<FP16Type>()
+        && n == 8
+        && NATIVE_F16.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Some(clt::F16X8);
+    }
     let lane = match classify(ctx, e) {
         TyK::Int(w @ (8 | 16 | 32 | 64)) => ClType::int(w as u16)?,
         TyK::F32 => clt::F32,
