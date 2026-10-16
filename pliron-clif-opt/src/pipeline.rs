@@ -402,6 +402,14 @@ pub struct Analysis {
     /// `carry_aliases` can grow `Pipe::noalias` inside a version, and the
     /// set never shrinks.
     iso: Option<(usize, FxHashSet<crate::loadfwd::Root>)>,
+    /// `Uses` index shared between passes within a version — ~10 steps
+    /// need one and each used to rebuild it per fn. `Rc` so callers get
+    /// the same owned-snapshot semantics as a local `Uses::new` (stale
+    /// after the caller's own mutations until refetched). Keyed on
+    /// `(ver, num_insts)` — inst count changes on nearly every
+    /// structural mutation — and dropped by `clear()` like the rest.
+    /// `RefCell` so the accessor can be `&self`.
+    uses: std::cell::RefCell<Option<(u64, usize, std::rc::Rc<crate::uses::Uses>)>>,
 }
 
 /// One borrow of the three structural analyses (`&self` tuple).
@@ -418,6 +426,7 @@ impl Analysis {
         self.la = None;
         self.amap = None;
         self.iso = None;
+        self.uses.get_mut().take();
     }
 
     /// The pipeline advanced the IR version (a step declared `mutates`).
@@ -487,6 +496,35 @@ impl Analysis {
     pub fn cfg<'a>(&'a mut self, func: &Function) -> &'a ControlFlowGraph {
         self.materialize(func);
         self.cfg.as_ref().unwrap()
+    }
+
+    /// The `Uses` index for the current `(ver, num_insts)` — shared so
+    /// the steps that want a use map build it once per IR version
+    /// instead of once each. The returned `Rc` is an owned snapshot
+    /// like a local `Uses::new`: it does not track later mutation —
+    /// refetch (or `refresh_uses`) at the points a local map would be
+    /// rebuilt.
+    pub fn uses(&self, func: &Function) -> std::rc::Rc<crate::uses::Uses> {
+        let mut slot = self.uses.borrow_mut();
+        let shape = func.dfg.num_insts();
+        if slot
+            .as_ref()
+            .is_none_or(|&(v, s, _)| v != self.ver || s != shape)
+        {
+            *slot = Some((
+                self.ver,
+                shape,
+                std::rc::Rc::new(crate::uses::Uses::new(func)),
+            ));
+        }
+        slot.as_ref().unwrap().2.clone()
+    }
+
+    /// Rebuild `uses` after in-step mutation (the keyed shape may not
+    /// have changed for pure value edits).
+    pub fn refresh_uses(&self, func: &Function) -> std::rc::Rc<crate::uses::Uses> {
+        self.uses.borrow_mut().take();
+        self.uses(func)
     }
 
     /// Everything `dse::run` reads before mutating — `(cfg, param-src

@@ -24,23 +24,24 @@ pub fn run(
     // bcheck clones appended at the end) of the rotation budget.
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
-    // Batch use index, built on the first rotatable candidate and dropped
-    // with the other analyses after each rotation — one O(fn) build per
-    // rotation instead of a whole-function scan per candidate.
-    let mut useidx: Option<crate::uses::Uses> = None;
     for h in blocks {
         if n >= MAX_ROTATIONS {
             break;
         }
-        let (cfg, domtree) = an.cfg_dt(func);
-        if rotatable(func, cfg, domtree, h) {
-            let u = useidx.get_or_insert_with(|| crate::uses::Uses::new(func));
-            if rotate(func, cfg, domtree, h, derived, u) {
+        // `rotatable` runs under the `cfg_dt` borrow; the shared use
+        // index is fetched in the gap before `rotate` re-borrows them.
+        let ok = {
+            let (cfg, domtree) = an.cfg_dt(func);
+            rotatable(func, cfg, domtree, h)
+        };
+        if ok {
+            let u = an.uses(func);
+            let (cfg, domtree) = an.cfg_dt(func);
+            if rotate(func, cfg, domtree, h, derived, &u) {
                 n += 1;
                 // Edge splits/clones rewired the CFG — the next candidate's
                 // reads must see the new shape.
                 an.invalidate();
-                useidx = None;
             }
         }
     }

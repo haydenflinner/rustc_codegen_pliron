@@ -791,14 +791,20 @@ fn elim_shadowed(
     }
     // Pure insts whose results are unreferenced — transitively — are
     // waste: they can't keep `iv` live, and they get removed along
-    // with the affine adds. `used` shrinks until stable.
-    let mut used: FxHashSet<Value> = func
+    // with the affine adds. `used` is a per-value operand count so a
+    // newly dead inst releases its operands in place — the fixpoint
+    // stays O(body × rounds) instead of rescanning the whole function
+    // (callers, exits, other loops) after every round.
+    let mut used: FxHashMap<Value, u32> = FxHashMap::default();
+    for i in func
         .layout
         .blocks()
         .flat_map(|b| func.layout.block_insts(b))
-        .flat_map(|i| func.dfg.inst_values(i))
-        .map(|v| func.dfg.resolve_aliases(v))
-        .collect();
+    {
+        for v in func.dfg.inst_values(i) {
+            *used.entry(func.dfg.resolve_aliases(v)).or_insert(0) += 1;
+        }
+    }
     let mut dead: FxHashSet<Inst> = FxHashSet::default();
     loop {
         let mut grew = false;
@@ -815,23 +821,26 @@ fn elim_shadowed(
                     || op.is_branch()
                     || op.is_terminator()
                     || op.other_side_effects());
-                if pure && func.dfg.inst_results(i).iter().all(|&r| !used.contains(&r)) {
+                if pure
+                    && func
+                        .dfg
+                        .inst_results(i)
+                        .iter()
+                        .all(|&r| used.get(&r).copied().unwrap_or(0) == 0)
+                {
                     dead.insert(i);
                     grew = true;
+                    for v in func.dfg.inst_values(i) {
+                        if let Some(c) = used.get_mut(&func.dfg.resolve_aliases(v)) {
+                            *c -= 1;
+                        }
+                    }
                 }
             }
         }
         if !grew {
             break;
         }
-        used = func
-            .layout
-            .blocks()
-            .flat_map(|b| func.layout.block_insts(b))
-            .filter(|&i| !dead.contains(&i))
-            .flat_map(|i| func.dfg.inst_values(i))
-            .map(|v| func.dfg.resolve_aliases(v))
-            .collect();
     }
     // Every use of an `iv`-affine value must be a bound icmp (both
     // sides affine is ambiguous), the lockstep adds themselves, the

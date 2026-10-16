@@ -963,6 +963,9 @@ fn self_feeding(
 /// when the body's addressing moved to another param). Uses outside
 /// that chain keep `p` live. Returns slots eliminated.
 pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+    // Fetched before `cfg_dt` — its `&mut` borrow would block the
+    // shared index call below.
+    let uses = an.uses(func);
     let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
     // Values that are alias targets: removing them would strand the
@@ -979,9 +982,9 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
         })
         .map(|v| func.dfg.resolve_aliases(v))
         .collect();
-    // One use index for the whole pass: removals below only delete uses,
-    // so stale sites are re-read from the IR and never hide a live use.
-    let uses = crate::uses::Uses::new(func);
+    // One use index for the whole pass (shared per version): removals
+    // below only delete uses, so stale sites are re-read from the IR
+    // and never hide a live use.
     let mut n = 0;
     for h in func.layout.blocks().collect::<Vec<_>>() {
         let params = func.dfg.block_params(h).to_vec();

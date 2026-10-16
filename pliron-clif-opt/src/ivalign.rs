@@ -43,7 +43,7 @@ struct Shift {
 }
 
 pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
-    let uses = Uses::new(func);
+    let uses = an.uses(func);
     let mut shifts = Vec::new();
     for b in func.layout.blocks().collect::<Vec<_>>() {
         let Some(term) = func.layout.last_inst(b) else {
