@@ -1705,6 +1705,11 @@ fn splices(func: &mut Function) -> usize {
         // Splice J's params onto each needed successor: append one param per
         // used J-param, remap the upward-exposed uses, grow J's calls to it.
         let mut mutated = false;
+        // Operand remaps applied to each spliced successor. A decided pred
+        // that is itself a spliced successor had its J-edge args rewritten by
+        // `map_inst_values`, so its captured `jargs` snapshot is stale — the
+        // redirect below must replay the same substitution.
+        let mut sremaps: FxHashMap<Block, FxHashMap<Value, Value>> = FxHashMap::default();
         for &s in &sset {
             // Raw operand values in s by the value they resolve to — one
             // scan serves every used-param remap below.
@@ -1739,6 +1744,7 @@ fn splices(func: &mut Function) -> usize {
                     func.dfg
                         .map_inst_values(i, |v| remap.get(&v).copied().unwrap_or(v));
                 }
+                sremaps.insert(s, remap);
                 mutated = true;
             }
             if !added.is_empty() {
@@ -1764,6 +1770,18 @@ fn splices(func: &mut Function) -> usize {
             // iconsts rematerialize; anything else must already dominate
             // the pred's tail.
             for (p, pt, di, jargs, _, sargs) in decided.iter().filter(|d| d.4 == s) {
+                // If p was spliced earlier in this walk its edge args were
+                // remapped onto fresh params — replay that substitution on
+                // the snapshot instead of emitting the dead raw value.
+                let jarg = |a: &BlockArg| -> BlockArg {
+                    let &BlockArg::Value(v) = a else { return *a };
+                    sremaps
+                        .get(p)
+                        .and_then(|m| m.get(&v))
+                        .copied()
+                        .map(BlockArg::Value)
+                        .unwrap_or(*a)
+                };
                 let mut new_args: Vec<BlockArg> = Vec::new();
                 let mut ok2 = true;
                 for a in sargs {
@@ -1773,7 +1791,7 @@ fn splices(func: &mut Function) -> usize {
                     };
                     let av = func.dfg.resolve_aliases(*av);
                     if let Some(k) = rpjs.iter().position(|&rpj| rpj == av) {
-                        new_args.push(jargs[k]);
+                        new_args.push(jarg(&jargs[k]));
                         continue;
                     }
                     match func.dfg.value_def(av) {
@@ -1806,7 +1824,7 @@ fn splices(func: &mut Function) -> usize {
                     continue;
                 }
                 for &k in &added {
-                    new_args.push(jargs[k]);
+                    new_args.push(jarg(&jargs[k]));
                 }
                 let dfg = &mut func.dfg;
                 let nbc = BlockCall::new(s, new_args, &mut dfg.value_lists);
