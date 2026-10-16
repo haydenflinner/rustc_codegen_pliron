@@ -1170,18 +1170,18 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
     // syncable slices' SSA values into `pin_a`; on its normal-return edge
     // (and, for an invoke, on a fresh unwind trampoline) reload them so
     // the callee's writes land back in SSA.
+    //
+    // Every syncable slice is synced for every call, not just the slices
+    // overlapping that call's pinned arg extents: `pin_a` is a single
+    // contiguous object, so a callee can legally roam all of it — a
+    // slice pinned only by a different call's arg would otherwise expose
+    // uninitialized mirror bytes to a roaming read and silently drop a
+    // roaming write.
     if let Some(pa) = pin_a {
-        for (cop, rngs) in &pin_rngs {
-            let ss: Vec<usize> = (0..sl.len())
-                .filter(|&i| {
-                    syncable[i]
-                        && rngs
-                            .iter()
-                            .any(|&(lo, hi)| lo < sl[i].off + sl[i].size && sl[i].off < hi)
-                })
-                .collect();
+        let ss: Vec<usize> = (0..sl.len()).filter(|&i| syncable[i]).collect();
+        for cop in pin_rngs.keys() {
             if ss.is_empty() {
-                continue;
+                break;
             }
             for &i in &ss {
                 let l = LoadOp::new(ctx, new[i], sl[i].ty).get_operation();
