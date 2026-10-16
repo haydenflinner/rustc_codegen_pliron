@@ -3969,13 +3969,23 @@ pub fn run(
     // function, so `fold_null_tests` runs on it inside the loop and the
     // usize result crosses the boundary while `nn`'s borrow may not.
     let mut fnn_cur: Option<usize> = None;
+    // Set after a round that changed nothing: if the next iteration's
+    // prefix phases (which are the only `func`/`derived` mutators —
+    // ifconv writes `derived` only inside real conversions) also change
+    // nothing, `round` would rescan an identical function and come back
+    // empty. Skip the rescan; `fold_null_tests` still gets a fresh nn.
+    let mut round_quiet = false;
+    let mut round_skips = 0usize;
     for _ in 0..8 {
         let mut tp = std::time::Instant::now();
+        let mut changed = false;
         if trivp {
-            {
+            let v = {
                 let (_, d) = cd.get_or_insert_with(|| cfg_dt(func));
-                pmap.extend(remove_trivial_params(func, d));
-            }
+                remove_trivial_params(func, d)
+            };
+            changed = !v.is_empty();
+            pmap.extend(v);
             check(func, "trivp");
         }
         if prof {
@@ -3987,6 +3997,7 @@ pub fn run(
             dead_params += removed;
             if removed != 0 {
                 remove_unused_notrap_loads(func);
+                changed = true;
             }
             check(func, "deadp");
         }
@@ -4000,6 +4011,7 @@ pub fn run(
         } else {
             0
         };
+        changed |= dc > 0;
         dominated_folds += dc;
         check(func, "domcond");
         if prof {
@@ -4017,6 +4029,7 @@ pub fn run(
         };
         check(func, "ifconv");
         if ic > 0 {
+            changed = true;
             cd = None;
             remove_unreachable_blocks(func);
         }
@@ -4024,6 +4037,7 @@ pub fn run(
         let bpn = bypass_forwarders(func);
         check(func, "bypass");
         if bpn > 0 {
+            changed = true;
             // Edge retargets invalidate the cached graph before `round`
             // reads it.
             cd = None;
@@ -4033,10 +4047,14 @@ pub fn run(
             tp = std::time::Instant::now();
         }
         let mut nn_opt = None;
-        let rn = {
+        let rn = if round_quiet && !changed {
+            round_skips += 1;
+            0
+        } else {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
             round(func, loads, derived, &mut nn_opt, domcond, c, d)
         };
+        round_quiet = rn == 0;
         check(func, "round");
         if prof {
             eprintln!("  nn+round {:?}", tp.elapsed());
@@ -4055,7 +4073,7 @@ pub fn run(
         }
     }
     if prof {
-        eprintln!("  loop-total {:?}", tp.elapsed());
+        eprintln!("  loop-total {:?} (skips {round_skips})", tp.elapsed());
         tp = std::time::Instant::now();
     }
     let fnn = match fnn_cur {

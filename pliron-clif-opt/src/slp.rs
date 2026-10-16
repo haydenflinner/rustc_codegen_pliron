@@ -25,7 +25,7 @@
 //! overwritten stores drop out). `PLIRON_XPACK=0` disables this half.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, Type, Value,
@@ -149,11 +149,40 @@ enum Pack {
     },
 }
 
+/// Sentinel for insts outside the scanned block: `SecondaryMap` can't
+/// distinguish an unset entry from one set to the default, and real
+/// positions are always < the block's inst count.
+const NO_POS: usize = usize::MAX;
+/// Dense inst → index-in-block map; queried inside `col`/`sinkable` hot
+/// loops where a hash map costs ~10x an array index.
+type PosMap = SecondaryMap<Inst, usize>;
+/// Dense inst membership set for the current block's consumed insts.
+type TakenMap = SecondaryMap<Inst, bool>;
+
+fn block_pos(insts: &[Inst]) -> PosMap {
+    let mut pos = PosMap::with_default(NO_POS);
+    for (k, &i) in insts.iter().enumerate() {
+        pos[i] = k;
+    }
+    pos
+}
+
+fn pos_get(pos: &PosMap, i: Inst) -> Option<usize> {
+    (pos[i] != NO_POS).then(|| pos[i])
+}
+
+#[track_caller]
+fn pos_at(pos: &PosMap, i: Inst) -> usize {
+    let p = pos[i];
+    assert_ne!(p, NO_POS, "inst {i:?} is not in the scanned block");
+    p
+}
+
 struct Ctx<'a> {
     func: &'a Function,
     domtree: &'a DominatorTree,
     /// Layout-order index of insts in the current block.
-    pos: &'a FxHashMap<Inst, usize>,
+    pos: &'a PosMap,
     /// Insts of the current block in layout order.
     insts: &'a [Inst],
     block: Block,
@@ -174,7 +203,7 @@ impl Ctx<'_> {
         else {
             return None;
         };
-        (self.pos.get(&inst).is_some_and(|&p| p < self.emit)).then_some(inst)
+        (pos_get(self.pos, inst).is_some_and(|p| p < self.emit)).then_some(inst)
     }
 
     /// `v` is available at the emit point.
@@ -183,7 +212,7 @@ impl Ctx<'_> {
             ValueDef::Param(b, _) => self.domtree.block_dominates(b, self.block),
             ValueDef::Result(inst, _) => {
                 if self.func.layout.inst_block(inst) == Some(self.block) {
-                    self.pos.get(&inst).is_some_and(|&p| p < self.emit)
+                    pos_get(self.pos, inst).is_some_and(|p| p < self.emit)
                 } else {
                     self.domtree
                         .dominates(inst, self.insts[self.emit], &self.func.layout)
@@ -250,7 +279,7 @@ impl Ctx<'_> {
                 Some((b0, o0)) if base == b0 && off == o0 + i as i64 * esz => {}
                 _ => return None,
             }
-            self.min_load = self.min_load.min(self.pos[&inst]);
+            self.min_load = self.min_load.min(pos_at(self.pos, inst));
         }
         // The merged vector access must be 8 or 16 bytes.
         if esz * n as i64 != 8 && esz * n as i64 != 16 {
@@ -535,9 +564,9 @@ fn try_block(
     if stores.len() < 2 {
         return 0;
     }
-    let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+    let pos = block_pos(&insts);
     for s in &mut stores {
-        s.pos = pos[&s.inst];
+        s.pos = pos_at(&pos, s.inst);
     }
     // Group by (base, elem type, flags); within each, find consecutive-offset
     // runs of exactly `16/esz` or `8/esz` lanes.
@@ -546,7 +575,7 @@ fn try_block(
         by_key.entry((s.base, s.ty, s.flags)).or_default().push(s);
     }
     let mut changed = 0;
-    let mut taken: FxHashSet<Inst> = FxHashSet::default();
+    let mut taken = TakenMap::new();
     for group in by_key.values() {
         let mut g: Vec<&StoreInfo> = group.clone();
         g.sort_by_key(|s| s.off);
@@ -562,7 +591,7 @@ fn try_block(
             }
             let mut run: Vec<&StoreInfo> = Vec::new();
             for &s in &g {
-                if taken.contains(&s.inst) {
+                if taken[s.inst] {
                     continue;
                 }
                 match run.last() {
@@ -608,7 +637,7 @@ fn try_block(
                         }
                         changed += run.len();
                         for s in &run {
-                            taken.insert(s.inst);
+                            taken[s.inst] = true;
                         }
                     }
                     run.clear();
@@ -776,7 +805,7 @@ struct X<'a> {
     ps: &'a FxHashMap<Value, Value>,
     na: &'a FxHashSet<Value>,
     domtree: &'a DominatorTree,
-    pos: &'a FxHashMap<Inst, usize>,
+    pos: &'a PosMap,
     insts: &'a [Inst],
     block: Block,
     /// Emit point: layout position of the lane-1 (later) root inst.
@@ -813,7 +842,7 @@ impl X<'_> {
     /// `v` is defined in this block strictly before the emit point.
     fn before_emit(&self, v: Value) -> Option<Inst> {
         let i = self.def(v)?;
-        (self.pos.get(&i).is_some_and(|&p| p < self.emit)).then_some(i)
+        (pos_get(self.pos, i).is_some_and(|p| p < self.emit)).then_some(i)
     }
 
     /// `a` and `b` are the same constant materialized twice (unroll copies
@@ -864,7 +893,7 @@ impl X<'_> {
             ValueDef::Param(b, _) => self.domtree.block_dominates(b, self.block),
             ValueDef::Result(inst, _) => {
                 if self.func.layout.inst_block(inst) == Some(self.block) {
-                    self.pos.get(&inst).is_some_and(|&p| p < self.emit)
+                    pos_get(self.pos, inst).is_some_and(|p| p < self.emit)
                 } else {
                     self.domtree
                         .dominates(inst, self.insts[self.emit], &self.func.layout)
@@ -971,7 +1000,7 @@ impl X<'_> {
                     return Some(Pack::Splat(a));
                 }
                 if rb.1 == ra.1 + i64::from(ra.2) && (ra.2 == 4 || ra.2 == 8) {
-                    self.min_load = self.min_load.min(self.pos[&ia]).min(self.pos[&ib]);
+                    self.min_load = self.min_load.min(pos_at(self.pos, ia)).min(pos_at(self.pos, ib));
                     self.loads.push(ra);
                     self.loads.push(rb);
                     let InstructionData::Load { arg, offset, .. } = self.func.dfg.insts[ia] else {
@@ -1003,8 +1032,8 @@ impl X<'_> {
         {
             eprintln!(
                 "    xpack col-enter d{depth}: {a:?}(def={da:?} pos={:?}) {b:?}(def={db:?} pos={:?}) emit={}",
-                da.and_then(|i| self.pos.get(&i)),
-                db.and_then(|i| self.pos.get(&i)),
+                da.and_then(|i| pos_get(self.pos, i)),
+                db.and_then(|i| pos_get(self.pos, i)),
                 self.emit
             );
         }
@@ -1168,7 +1197,7 @@ impl X<'_> {
 /// blocks `emit` dominates.
 fn ext_ok(x: &X<'_>, u: Inst) -> bool {
     if x.func.layout.inst_block(u) == Some(x.block) {
-        x.pos.get(&u).is_some_and(|&p| p > x.emit)
+        pos_get(x.pos, u).is_some_and(|p| p > x.emit)
     } else {
         x.domtree.dominates(x.insts[x.emit], u, &x.func.layout)
     }
@@ -1202,7 +1231,7 @@ fn sinkable(x: &X<'_>, u: Inst, dead: &FxHashSet<Inst>, sink: &FxHashSet<Inst>) 
     if x.loads.iter().any(|&lr| may_overlap(ur, lr)) {
         return None;
     }
-    let pu = x.pos[&u];
+    let pu = pos_at(x.pos, u);
     for p in pu + 1..=x.emit {
         let i2 = x.insts[p];
         if dead.contains(&i2) || sink.contains(&i2) {
@@ -1233,7 +1262,7 @@ fn store_dead(
     ur: (crate::loadfwd::Root, i64, u32),
     dead: &FxHashSet<Inst>,
 ) -> bool {
-    let mut p = x.pos[&u] + 1;
+    let mut p = pos_at(x.pos, u) + 1;
     while p < x.insts.len() {
         let i2 = x.insts[p];
         p += 1;
@@ -1267,9 +1296,9 @@ fn plan_pair(
     domtree: &DominatorTree,
     uses: &Uses,
     insts: &[Inst],
-    pos: &FxHashMap<Inst, usize>,
+    pos: &PosMap,
     block: Block,
-    taken: &FxHashSet<Inst>,
+    taken: &TakenMap,
     ia: Inst,
     ib: Inst,
     x64: bool,
@@ -1295,7 +1324,7 @@ fn plan_pair(
             return None;
         }};
     }
-    if taken.contains(&ia) || taken.contains(&ib) {
+    if taken[ia] || taken[ib] {
         return None;
     }
     let op = func.dfg.insts[ia].opcode();
@@ -1321,7 +1350,7 @@ fn plan_pair(
         pos,
         insts,
         block,
-        emit: pos[&ia].max(pos[&ib]),
+        emit: pos_at(pos, ia).max(pos_at(pos, ib)),
         rows: Vec::new(),
         members: FxHashSet::default(),
         loads: Vec::new(),
@@ -1472,7 +1501,7 @@ fn finish_plan(
             }
             if x.members.contains(&p) {
                 x.keep.insert(p);
-            } else if x.pos.contains_key(&p) {
+            } else if pos_get(x.pos, p).is_some() {
                 pin.insert(p);
             } else if p != seed {
                 // Other-block defs can't move; no need to chase their args.
@@ -1598,7 +1627,7 @@ fn finish_plan(
         let (la, lb) = x.rows[r];
         !x.keep.contains(if lane == 0 { &la } else { &lb })
     });
-    sink.sort_by_key(|&i| pos[&i]);
+    sink.sort_by_key(|&i| pos_at(pos, i));
     // Profitability: every kept row swaps two scalars for one vector op;
     // gathers/splats/extracts cost insts. High-port-pressure rows (sqrt/div)
     // count extra — halving a ~13–20-cycle op is worth many simple insts,
@@ -1648,9 +1677,9 @@ fn plan_store(
     domtree: &DominatorTree,
     uses: &Uses,
     insts: &[Inst],
-    pos: &FxHashMap<Inst, usize>,
+    pos: &PosMap,
     block: Block,
-    taken: &FxHashSet<Inst>,
+    taken: &TakenMap,
     i1: Inst,
     i2: Inst,
     x64: bool,
@@ -1663,7 +1692,7 @@ fn plan_store(
     Vec<(Value, usize, u8)>,
     FxHashSet<Inst>,
 )> {
-    if taken.contains(&i1) || taken.contains(&i2) {
+    if taken[i1] || taken[i2] {
         return None;
     }
     let (
@@ -1714,13 +1743,13 @@ fn plan_store(
     let vt = ty.by(2).filter(|v| !x64 || v.bits() == 128)?;
     // The store earlier in layout re-emits its write at the emit point, so
     // nothing in between may touch its bytes (or be an opaque side effect).
-    let (first, last) = if pos[&sa] < pos[&sb] {
+    let (first, last) = if pos_at(pos, sa) < pos_at(pos, sb) {
         (sa, sb)
     } else {
         (sb, sa)
     };
     let r_first = mem_range(func, ps, na, first)?;
-    for p in pos[&first] + 1..pos[&last] {
+    for p in pos_at(pos, first) + 1..pos_at(pos, last) {
         let i2 = insts[p];
         let o2 = func.dfg.insts[i2].opcode();
         if o2.is_call() || o2.is_terminator() || o2.is_branch() {
@@ -1741,7 +1770,7 @@ fn plan_store(
         pos,
         insts,
         block,
-        emit: pos[&last],
+        emit: pos_at(pos, last),
         rows: Vec::new(),
         members: FxHashSet::default(),
         loads: Vec::new(),
@@ -1846,7 +1875,7 @@ fn xpack_block(
 ) -> usize {
     let mut total = 0;
     let mut tried = 0usize;
-    let mut taken: FxHashSet<Inst> = FxHashSet::default();
+    let mut taken = TakenMap::new();
     // Pairs whose plan failed, → span at failure (current-frame
     // positions, refreshed each iteration so apply-time edits compare
     // in the same frame). A rescan after each apply only ever finds new
@@ -1867,7 +1896,7 @@ fn xpack_block(
         // blocks with few same-opcode insts.
         let mut byop: FxHashMap<Opcode, Vec<usize>> = FxHashMap::default();
         for (k, &i) in insts.iter().enumerate() {
-            if taken.contains(&i) {
+            if taken[i] {
                 continue;
             }
             let op = func.dfg.insts[i].opcode();
@@ -1880,14 +1909,14 @@ fn xpack_block(
         if nstores < 2 && !dup {
             return total;
         }
-        let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let pos = block_pos(&insts);
         // The map is function-wide and shared across blocks; an apply
         // mutates the IR, so it's rebuilt on the next loop iteration.
         let us = &*uses.get_or_insert_with(|| build_uses(func));
         if !failed.is_empty() {
             failed.retain(|&(x, y), span| {
-                match (pos.get(&x), pos.get(&y)) {
-                    (Some(&a), Some(&b)) => {
+                match (pos_get(&pos, x), pos_get(&pos, y)) {
+                    (Some(a), Some(b)) => {
                         *span = (a.min(b), a.max(b));
                         true
                     }
@@ -1920,7 +1949,7 @@ fn xpack_block(
         }
         let mut applied = None;
         'scan: for (p, &ia) in insts.iter().enumerate() {
-            if taken.contains(&ia) {
+            if taken[ia] {
                 continue;
             }
             let op = func.dfg.insts[ia].opcode();
@@ -1954,7 +1983,7 @@ fn xpack_block(
                         plan_pair(func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64)
                     };
                     if plan.is_none() && !is_store {
-                        if let (Some(&a1), Some(&b1)) = (pos.get(&a), pos.get(&b)) {
+                        if let (Some(a1), Some(b1)) = (pos_get(&pos, a), pos_get(&pos, b)) {
                             failed.insert((a, b), (a1.min(b1), a1.max(b1)));
                         }
                     }
@@ -1964,7 +1993,7 @@ fn xpack_block(
                 // which decides whether adjacent loads merge.
                 let plan = try_plan(ia, ib).or_else(|| try_plan(ib, ia));
                 if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
-                    let emit_at = pos[&ib].max(pos[&ia]);
+                    let emit_at = pos_at(&pos, ib).max(pos_at(&pos, ia));
                     applied = Some((emit_at, root, vt, kept, sink, dead, extracts, keep));
                     break 'scan;
                 }
@@ -1990,12 +2019,12 @@ fn xpack_block(
                     }
                 }
             }
-            taken.insert(la);
-            taken.insert(lb);
+            taken[la] = true;
+            taken[lb] = true;
         }
         for &u in sink.iter().chain(dead.iter()) {
             changed_insts.insert(u);
-            if let Some(&d) = pos.get(&u) {
+            if let Some(d) = pos_get(&pos, u) {
                 changed_pos.push(d);
             }
             for &v in func.dfg.inst_args(u) {
