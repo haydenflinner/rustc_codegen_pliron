@@ -521,16 +521,20 @@ pub fn isolated_escapes(
                 let ok = match data {
                     InstructionData::Load { .. } => k == 0,
                     InstructionData::Store { .. } => k == 1,
-                    // The result is tracked under the same root, or is
-                    // itself a distinct `noalias` scope (a param bound to
-                    // `base + k`, like `&v[1..]` next to `pivot`): either
-                    // way the address stays tracked.
+                    // The result must itself normalize to `r`: a `base + k`
+                    // cursor keys under `r` only when the peel reaches the
+                    // same object. A scoped (`noalias`) result that does NOT
+                    // normalize to `r` — e.g. `slot + i*16`, whose demand
+                    // keys under `V(res)` — is an untracked alias of the
+                    // slot's memory, not a benign use: keeping the slot
+                    // isolated would let stores die under demands rooted at
+                    // the scope name (trait-object-arrays-11205 SIGSEGV).
                     InstructionData::Binary {
                         opcode: Opcode::Iadd,
                         ..
                     } => {
                         let res = func.dfg.first_result(i);
-                        rt(func, res).0 == r || noalias.contains(&res)
+                        rt(func, res).0 == r
                     }
                     // A comparison can't carry the pointer anywhere.
                     _ if matches!(data.opcode(), Opcode::Icmp) => true,

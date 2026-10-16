@@ -682,4 +682,89 @@ mod tests {
         });
         assert_eq!(dse(&mut func), 0);
     }
+
+    /// `st ss; ld (ss + p*16); ret`: a slot read through a dynamic-offset
+    /// pointer must keep its stores — the load's demand keys under the
+    /// computed `V` root, not `S(ss)`, so the slot must not count as
+    /// isolated for that to be safe.
+    #[test]
+    fn dynamic_offset_load_keeps_slot_store() {
+        use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
+        let mut func = func_with(|cur, p| {
+            let ss = cur.func.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                32,
+                3,
+            ));
+            let base = cur.ins().stack_addr(types::I64, ss, 0);
+            let one = cur.ins().iconst(types::I64, 1);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, base, 0);
+            let off = cur.ins().imul_imm(p, 16);
+            let addr = cur.ins().iadd(base, off);
+            cur.ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), addr, 0);
+        });
+        assert_eq!(dse(&mut func), 0);
+    }
+
+    /// Store in one block, dynamic-offset load in a successor loop block:
+    /// the slot must escape (the demand keys under `V(addr)`), so neither
+    /// store may die.
+    #[test]
+    fn dynamic_offset_load_in_loop_keeps_slot_store() {
+        use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let ss = func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            32,
+            3,
+        ));
+        let entry = func.dfg.make_block();
+        let looop = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        func.layout.append_block(entry);
+        func.layout.append_block(looop);
+        func.layout.append_block(exit);
+        let i = func.dfg.append_block_param(looop, types::I64);
+        let p = func.dfg.append_block_param(entry, types::I64);
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+            let base = cur.ins().stack_addr(types::I64, ss, 0);
+            let one = cur.ins().iconst(types::I64, 1);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, base, 0);
+            let eight = cur.ins().iconst(types::I64, 8);
+            let hi = cur.ins().iadd(base, eight);
+            cur.ins()
+                .store(MemFlagsData::new().with_notrap(), one, hi, 0);
+            let zero = cur.ins().iconst(types::I64, 0);
+            cur.ins().jump(looop, &[zero.into()]);
+        }
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(looop);
+            let base = cur.ins().stack_addr(types::I64, ss, 0);
+            let off = cur.ins().imul_imm(i, 16);
+            let addr = cur.ins().iadd(base, off);
+            let x = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), addr, 0);
+            let addr8 = cur.ins().iadd_imm(addr, 8);
+            let y = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), addr8, 0);
+            let i2 = cur.ins().iadd_imm(i, 1);
+            let useit = cur.ins().iadd(x, y);
+            let done = cur.ins().icmp_imm_s(cranelift_codegen::ir::condcodes::IntCC::Equal, useit, 3);
+            cur.ins().brif(done, exit, &[], looop, &[i2.into()]);
+        }
+        FuncCursor::new(&mut func)
+            .at_bottom(exit)
+            .ins()
+            .return_(&[]);
+        let _ = p;
+        assert_eq!(dse(&mut func), 0);
+    }
 }
