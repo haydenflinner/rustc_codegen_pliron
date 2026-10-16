@@ -532,6 +532,18 @@ fn run_loop(
                         ok = false;
                         break;
                     }
+                    if op.is_terminator()
+                        && func.dfg.insts[i]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                            .is_empty()
+                        && !matches!(op, Opcode::Trap)
+                    {
+                        // A `return`/`resume` exits the function without
+                        // producing a branch exit edge — sinking would
+                        // drop the write on that path.
+                        ok = false;
+                        break;
+                    }
                     if let InstructionData::Load {
                         opcode,
                         arg,
