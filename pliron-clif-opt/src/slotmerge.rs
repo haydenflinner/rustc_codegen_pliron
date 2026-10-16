@@ -439,6 +439,35 @@ pub fn run(
                             escape!(s, i);
                         }
                     }
+                } else {
+                    // Pure ops on a slot-derived value observe the
+                    // address itself, not the slot's bytes — folding the
+                    // slot onto another would change the result
+                    // (`icmp`/`isub` ptrdiff/bit ops/truncation). Only
+                    // pointer-affine ops keep a faithful same-slot
+                    // address; everything else escapes the slot.
+                    let affine = match op {
+                        Opcode::Select
+                        | Opcode::Uextend
+                        | Opcode::Bitcast
+                        | Opcode::Splat
+                        | Opcode::Insertlane
+                        | Opcode::Extractlane => true,
+                        // ptr + scalar / ptr - scalar stays a pointer
+                        // into the same slot; ptr + ptr / ptr - ptr is
+                        // data — an identity observation.
+                        Opcode::Iadd => arg_slots(0).is_empty() || arg_slots(1).is_empty(),
+                        Opcode::Isub => arg_slots(1).is_empty(),
+                        _ => false,
+                    };
+                    if !affine {
+                        for k in 0..args.len() {
+                            for &s in arg_slots(k) {
+                                use_at(&mut iv, &mut uses, s, pos);
+                                escape!(s, i);
+                            }
+                        }
+                    }
                 }
             }
         }
