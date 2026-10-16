@@ -668,6 +668,41 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         if crate::env_set("PLIRON_XIDBG") {
             eprintln!("xoridem   fold h={h:?} n={n} accs={}", accs.len());
         }
+        // Even trips: an accumulator's final value is `s0` — each acc is
+        // either `clean` (every in-loop load of the slot is a recurrence
+        // input, so the stores can be erased outright) or restored from a
+        // preheader snapshot. The snapshot ops reuse the store pointer, so
+        // for a restore `p` must be an SSA-level loop invariant (defined
+        // outside `lset`) — `arg_inv` admits pure defs inside the loop and
+        // a preheader use of those would be a use-before-def.
+        let clean_of = |p: Value, ast: &[(Ptr<Operation>, Ptr<BasicBlock>, Value, Value)]| {
+            let a = slot_base(ctx, p).unwrap();
+            let roots: FxHashSet<Ptr<Operation>> = ast
+                .iter()
+                .filter_map(|&(_, _, w, _)| {
+                    let xo = w.defining_op()?;
+                    (0..xo.deref(ctx).get_num_operands()).find_map(|i| {
+                        let v = xo.deref(ctx).get_operand(i);
+                        is_load_of(ctx, st, v, p).then(|| v.defining_op().unwrap())
+                    })
+                })
+                .collect();
+            loads.iter().all(|&l| {
+                slot_base(ctx, l.deref(ctx).get_operand(0)) != Some(a) || roots.contains(&l)
+            })
+        };
+        let cleans: FxHashMap<Value, bool> = if odd {
+            FxHashMap::default()
+        } else {
+            accs.iter().map(|(&p, (ast, _))| (p, clean_of(p, ast))).collect()
+        };
+        if !odd
+            && accs
+                .iter()
+                .any(|(&p, _)| !cleans[&p] && !invariant(ctx, &lset, p))
+        {
+            continue;
+        }
         claimed.extend(lset.iter().copied());
         // Iteration 0 runs as written; the latch's back-edge is rewired
         // to the exit so it is also the last. On odd trips `s0 ^ D` is
@@ -680,22 +715,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
         let lt = *bops[&latch].last().unwrap();
         if !odd {
             for (&p, (ast, ty)) in &accs {
-                let a = slot_base(ctx, p).unwrap();
-                let roots: FxHashSet<Ptr<Operation>> = ast
-                    .iter()
-                    .filter_map(|&(_, _, w, _)| {
-                        let xo = w.defining_op()?;
-                        (0..xo.deref(ctx).get_num_operands()).find_map(|i| {
-                            let v = xo.deref(ctx).get_operand(i);
-                            is_load_of(ctx, st, v, p).then(|| v.defining_op().unwrap())
-                        })
-                    })
-                    .collect();
-                let clean = loads.iter().all(|&l| {
-                    slot_base(ctx, l.deref(ctx).get_operand(0)) != Some(a)
-                        || roots.contains(&l)
-                });
-                if clean {
+                if cleans[&p] {
                     for &(sop, _, w, _) in ast {
                         Operation::erase(sop, ctx);
                         peel_dead(ctx, st, w, MAX_ACC_WALK);
@@ -738,5 +758,91 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     }
     if crate::env_set("PLIRON_STATS") || crate::env_set("PLIRON_XIDBG") {
         eprintln!("xoridem   {n} folds");
+    }
+}
+
+#[cfg(test)]
+mod xtest {
+    use super::*;
+    use crate::state::State;
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::parsable::parse_from_str;
+    use pliron::printable::Printable;
+    use pliron_llvm::ops::{ConstantOp, FuncOp};
+
+    /// A `store (gep-in-loop) <- xor(load, inv)` accumulator on an even
+    /// trip whose slot is also read by a non-recurrence load needs the
+    /// preheader-snapshot restore — but `p` is defined inside the loop, so
+    /// the snapshot's `load p` would be a use-before-def. The fold must
+    /// bail rather than emit it.
+    #[test]
+    fn dirty_restore_needs_invariant_ptr() {
+        let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <builtin.integer i32(builtin.integer i32) variadic = false> [] {
+          ^ph(x: builtin.integer i32):
+            zero = llvm.constant <builtin.integer <0: i32>> : builtin.integer i32;
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            two = llvm.constant <builtin.integer <2: i32>> : builtin.integer i32;
+            four = llvm.constant <builtin.integer <4: i64>> : builtin.integer i64;
+            one32c = llvm.constant <builtin.integer <1: i32>> : builtin.integer i32;
+            a = llvm.alloca [builtin.integer i32 x one] : llvm.ptr (0);
+            c = llvm.alloca [builtin.integer i32 x one] : llvm.ptr (0);
+            llvm.store *a <- x;
+            llvm.store *c <- zero;
+            llvm.br ^h()
+          ^h():
+            cv = llvm.load c : builtin.integer i32;
+            t = llvm.icmp cv <ULT> two : builtin.integer i1;
+            llvm.cond_br if t ^b() else ^e()
+          ^b():
+            q = llvm.gep <builtin.integer i8> (a, four)[OperandIdx(1)] : llvm.ptr (0);
+            v = llvm.load q : builtin.integer i32;
+            xv = llvm.xor v, x : builtin.integer i32;
+            llvm.store *q <- xv;
+            w2 = llvm.load a : builtin.integer i32;
+            w3 = llvm.add w2, zero <{nsw=false,nuw=false}> : builtin.integer i32;
+            cv2 = llvm.load c : builtin.integer i32;
+            cn = llvm.add cv2, one32c <{nsw=false,nuw=false}> : builtin.integer i32;
+            llvm.store *c <- cn;
+            llvm.br ^h()
+          ^e():
+            r = llvm.load a : builtin.integer i32;
+            llvm.return r
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let st = &mut State::default();
+        // Seed st.consts: constants appear in order 0,1,2,4,1.
+        let mut cvals = [0u128, 1, 2, 4, 1].into_iter();
+        for fb in crate::inline::blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+            .filter(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .flat_map(|fop| crate::inline::blocks(ctx, fop))
+        {
+            for o in crate::inline::ops(ctx, fb) {
+                if Operation::is_op::<ConstantOp>(o, ctx) {
+                    st.consts.insert(
+                        o.deref(ctx).get_result(0),
+                        crate::state::ConstVal::Bits(cvals.next().unwrap()),
+                    );
+                }
+            }
+        }
+        let mut folds = 0;
+        for b in crate::inline::blocks(ctx, mop.get_operation()) {
+            for o in crate::inline::ops(ctx, b) {
+                if Operation::is_op::<FuncOp>(o, ctx) {
+                    folds += run_fn(ctx, st, o);
+                }
+            }
+        }
+        assert_eq!(folds, 0, "xoridem restored through a loop-defined ptr");
     }
 }
