@@ -2000,3 +2000,22 @@ mutations make the key lie, and escape queries can't undercount) and
 `bcheck::unswitch_loop`'s sweep (clone-added uses missing from a stale
 snapshot = dangling-block miscompile). Those need `refresh_uses`,
 which costs what `Uses::new` costs — no win, real risk.
+
+## slp FMA/RMW packs + plirun harness merged (9f3b4aa via devin/gpu-vec)
+
+Merged subagent B's `slp.rs` work: `Opcode::Fma` in `vecable`, pack
+formation accepts loads anywhere in the block (`tloads` —
+(inst,pos,Lin,esz) validated against member stores post-collection,
+`tree` for the dead-tree check, both snapshotted/rolled back on
+failed packs), and a `Lin` Σcoeff·x+k address decomposer for
+`(idx+lane)*4` addressing `base_off` can't see. Target: CubeCL
+simple_unit GEMM unrolled RMW tile (the 40–960× gap). `plirun`
+(pliron-clif-lower example) replays `CUBECL_DEBUG_PLIRON` dumps
+through scan→ir-opt→CLIF→obj without cubek/rustc — the iteration
+harness for kernel codegen quality.
+
+Merge note: three-way merge combined cleanly with the `Uses<'d>`
+shared-snapshot refactor (3e8331b) — wrapper API (`iter`/`remove`)
+was unchanged so B's code merged textually-correct. Verified: full
+`cargo test -p pliron-clif-opt` (27 binaries incl. new slp_fma),
+workspace check, plirun example builds.
