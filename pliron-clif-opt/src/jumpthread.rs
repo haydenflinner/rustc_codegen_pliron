@@ -3937,9 +3937,11 @@ pub fn run(
         (c, d)
     };
     // When the loop converges (`n == 0`), the `nn` built that iteration is
-    // still exact — nothing after it rewrote the function — so carry it out
-    // for `fold_null_tests` instead of rebuilding.
-    let mut nn_cur: Option<NonNull> = None;
+    // still exact — nothing after it rewrote the function — so run
+    // `fold_null_tests` on it inside the loop instead of rebuilding. The
+    // usize result crosses the loop boundary; `nn`'s borrow may not (older
+    // bootstrap rustc NLL rejects it).
+    let mut fnn_cur: Option<usize> = None;
     for _ in 0..8 {
         let mut tp = std::time::Instant::now();
         if trivp {
@@ -4019,7 +4021,7 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            nn_cur = Some(nn);
+            fnn_cur = Some(fold_null_tests(func, &nn));
             break;
         }
     }
@@ -4027,8 +4029,10 @@ pub fn run(
         eprintln!("  loop-total {:?}", tp.elapsed());
         tp = std::time::Instant::now();
     }
-    let nn = nn_cur.unwrap_or_else(|| NonNull::new(func, loads, derived));
-    let fnn = fold_null_tests(func, &nn);
+    let fnn = match fnn_cur {
+        Some(x) => x,
+        None => fold_null_tests(func, &NonNull::new(func, loads, derived)),
+    };
     if prof {
         eprintln!("  fold_null_tests {:?}", tp.elapsed());
     }
