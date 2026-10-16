@@ -135,6 +135,8 @@ Vector lowering on the wasm-CLIF path (all pushed):
 - `PLIRON_WASM_CLIF` is now default-on (`=0` falls back to the dialect
   path). simd.sh/fuzz.sh/real.sh/bench.sh all green on it; the dialect
   path stays as the minimal fallback and passes fuzz too.
+  (Later: the dialect path was deleted outright — CLIF won on speed,
+  size, and compile time, so the fallback only cost maintenance.)
 - `lower_clif_wasm` gets `simd` from `+simd128`; loopvec now emits v128
   on wasm. bench.sh --simd: k_count_eq 0.87x and k_dot_i32 0.85x stock
   (faster than LLVM), histogram 0.88x, utf8 0.85x; geomean 2.81x.

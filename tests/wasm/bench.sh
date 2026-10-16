@@ -22,10 +22,6 @@ ONLY=${2:-}
 cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml
 LD="$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe"
 BE="${BACKEND:-$ROOT/target/debug/$lib}"
-# The dialect->waffle path has no vector lowering; the CLIF path
-# (full clif-opt pipeline -> waffle) does. Default to it; override with
-# PLIRON_WASM_CLIF=0 to exercise the dialect path.
-export PLIRON_WASM_CLIF="${PLIRON_WASM_CLIF:-1}"
 tag=scalar; [ -n "$FEAT" ] && tag=simd
 P=$ROOT/target/wasm-bench/pliron-$tag
 S=$ROOT/target/wasm-bench/stock-$tag

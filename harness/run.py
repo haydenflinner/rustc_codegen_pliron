@@ -258,6 +258,8 @@ def ui_wasm_sysroot(args):
         print("ui-wasm: pliron-wasm-ld build failed"); return None
     be = f"-Zcodegen-backend={BACKEND}"
     ld = os.path.join(ROOT, "tools/pliron-wasm-ld/target/release/pliron-wasm-ld")
+    if sys.platform == "win32":
+        ld += ".exe"
     # wasi-libc (pure Rust, pliron-compiled)
     env = dict(os.environ, RUSTFLAGS=f"{be} -Clinker={ld}",
                CARGO_TARGET_DIR=os.path.join(build, "wasi-libc"))
@@ -270,7 +272,11 @@ def ui_wasm_sysroot(args):
     lnc = os.path.join(wasi_libc, "libc.a")
     if os.path.lexists(lnc):
         os.remove(lnc)
-    os.symlink("libpliron_wasi_libc.a", lnc)
+    try:
+        os.symlink("libpliron_wasi_libc.a", lnc)
+    except OSError:
+        # Windows without symlink privilege: a copy works the same for -lc.
+        shutil.copy2(os.path.join(wasi_libc, "libpliron_wasi_libc.a"), lnc)
     with open(os.path.join(wasi_libc, "libunwind.a"), "w") as f:
         f.write("!<arch>\n")
     # dummy crate → forces -Zbuild-std to emit std rlibs/rmeta we can harvest

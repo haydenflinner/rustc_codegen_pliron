@@ -32,25 +32,14 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WROOT=$(cygpath -m "$ROOT") ;; esac
 # pliron: std and the kernels all go through the backend — prebuilt std
 # rlibs hold wasm-ld objects pliron-wasm-ld cannot read, so -Zbuild-std
 # rebuilds them (same reason as tests/wasm/run.sh). Cargo does not track
-# the backend dylib, so the target dir starts fresh. Built twice: the
-# default CLIF pipeline path (MIR/dialect -> Cranelift IR -> waffle) and
-# the dialect fallback (PLIRON_WASM_CLIF=0, dialect -> waffle direct),
-# which skips the Cranelift opt suite in favour of waffle-level passes.
+# the backend dylib, so the target dir starts fresh.
 rm -rf "$ROOT/target/wasm-bench"
 (cd bench/wasm &&
   CARGO_TARGET_DIR=$ROOT/target/wasm-bench \
   RUSTFLAGS="-Zcodegen-backend=$WROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=std,panic_abort)
-rm -rf "$ROOT/target/wasm-bench-dialect"
-(cd bench/wasm &&
-  CARGO_TARGET_DIR=$ROOT/target/wasm-bench-dialect \
-  PLIRON_WASM_CLIF=0 \
-  RUSTFLAGS="-Zcodegen-backend=$WROOT/target/debug/$lib -Clinker=$WLD" \
-  cargo build -q --release --target wasm32-unknown-unknown \
-  -Zbuild-std=std,panic_abort)
 
 exec node "$ROOT/bench/wasm/run.mjs" \
   "$ROOT/target/wasm-bench-llvm/wasm32-unknown-unknown/release/wasmbench.wasm" \
-  "$ROOT/target/wasm-bench/wasm32-unknown-unknown/release/wasmbench.wasm" \
-  "$ROOT/target/wasm-bench-dialect/wasm32-unknown-unknown/release/wasmbench.wasm" "$@"
+  "$ROOT/target/wasm-bench/wasm32-unknown-unknown/release/wasmbench.wasm" "$@"

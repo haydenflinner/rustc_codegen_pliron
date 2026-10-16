@@ -21,7 +21,7 @@ skipped with a reason; edition defaults to 2015 like compiletest.
 
 Writes target/ui/results.json and prints a failure summary.
 """
-import collections, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, threading
+import collections, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, tempfile, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _sibling = os.path.join(ROOT, "..", "rust")
@@ -35,6 +35,8 @@ FILTER = sys.argv[2] if len(sys.argv) > 2 else ""
 TGT = os.environ.get("UI_TARGET")
 WSYS = os.environ.get("UI_WSYS")
 WLD = os.path.join(ROOT, "tools/pliron-wasm-ld/target/release/pliron-wasm-ld")
+if sys.platform == "win32":
+    WLD += ".exe"
 WSRUN = os.path.join(ROOT, "tests/wasm/run_wasi_cfg.mjs")
 OUT = os.path.join(ROOT, "target/ui" + (f"-{TGT}" if TGT else ""))
 # Directives that change what a test needs in ways we don't emulate.
@@ -43,8 +45,9 @@ SKIP = re.compile(r"^//@\s*(aux-|revisions|ignore-|only-|needs-|known-bug|proc-m
 os.environ["RUSTUP_TOOLCHAIN"] = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
 os.environ.setdefault("RUSTC_ICE", os.path.join(ROOT, "target/harness/ices"))
 os.makedirs(os.environ["RUSTC_ICE"], exist_ok=True)
-SO = "dylib" if sys.platform == "darwin" else "so"
-BE = f"-Zcodegen-backend={ROOT}/target/debug/librustc_codegen_pliron.{SO}"
+SO = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
+LIB = "" if sys.platform == "win32" else "lib"
+BE = f"-Zcodegen-backend={ROOT}/target/debug/{LIB}rustc_codegen_pliron.{SO}"
 EXTRA = os.environ.get("UI_FLAGS", "").split()  # e.g. UI_FLAGS=-O
 WILD = (["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options",
          f"-Clink-arg=-B{ROOT}/target/wild-ld"]
@@ -73,8 +76,15 @@ def _find_wasmtime():
     w = shutil.which("wasmtime")
     if w:
         return w
-    for c in glob.glob(os.path.expanduser("~/bin/wasmtime/*/wasmtime*")) \
-            + [os.path.expanduser("~/bin/wasmtime/wasmtime")]:
+    # Prefer the full `wasmtime` binary: `wasmtime-min` in the same install
+    # has no compiler ("support for compiling modules was disabled") and can
+    # only run precompiled .cwasm artifacts.
+    cands = []
+    for d in glob.glob(os.path.expanduser("~/bin/wasmtime/*")):
+        cands += [os.path.join(d, n) for n in ("wasmtime", "wasmtime.exe")]
+    cands += glob.glob(os.path.expanduser("~/bin/wasmtime/*/wasmtime*"))
+    cands.append(os.path.expanduser("~/bin/wasmtime/wasmtime"))
+    for c in cands:
         if os.path.isfile(c):
             return c
     return None
@@ -150,6 +160,7 @@ def tests():
 
 
 def classify_compile(err):
+    err = err or ""
     m = re.search(r"panicked at ([^\n]+)\n([^\n]*)", err)
     if m:
         return "ice", f"{m.group(1)} {m.group(2)}"[:300]
@@ -194,7 +205,7 @@ def build_and_run(path, sp, exe, backend):
     for k in sp["cunset"]:
         cenv.pop(k, None)
     try:
-        c = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+        c = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=180,
                            cwd=os.path.dirname(path), env=cenv)
     except subprocess.TimeoutExpired:
         return "compile-timeout", "", None
@@ -216,14 +227,16 @@ def exec_bin(path, sp, exe):
             # behave identically on both backends since the same runner is
             # used for both sides of the diff).
             wcmd = [WASMTIME, "run", f"--argv0={exe}"]
-            for k, v in sp["env"]:
+            for k, v in sp["env"].items():
                 wcmd += ["--env", f"{k}={v}"]
-            for guest, host in ((d, d),
-                                ("/tmp", os.environ.get("TMPDIR", "/tmp"))):
+            # The preopen host dir must exist: Windows has no TMPDIR and no
+            # /tmp, so fall back to the platform temp dir.
+            tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
+            for guest, host in ((d, d), ("/tmp", tmpdir)):
                 wcmd += ["--dir", f"{host}::{guest}"]
             wcmd += [exe] + sp["rflags"]
             try:
-                r = subprocess.run(wcmd, capture_output=True, text=True,
+                r = subprocess.run(wcmd, capture_output=True, text=True, errors="replace",
                                    timeout=60, env=dict(os.environ))
             except subprocess.TimeoutExpired:
                 return "run-timeout", "", None
@@ -234,11 +247,12 @@ def exec_bin(path, sp, exe):
             return "ran", "", (r.returncode, out, err)
         cfg = {"args": [exe] + sp["rflags"],
                "env": dict(sp["env"]),
-               "preopens": {d: d, ".": d, "/tmp": os.environ.get("TMPDIR", "/tmp")}}
+               "preopens": {d: d, ".": d,
+                            "/tmp": os.environ.get("TMPDIR") or tempfile.gettempdir()}}
         e = dict(os.environ, WASI_RUN_CFG=json.dumps(cfg))
         try:
             r = subprocess.run(["node", "--no-warnings", WSRUN, exe],
-                               capture_output=True, text=True, timeout=60, env=e)
+                               capture_output=True, text=True, errors="replace", timeout=60, env=e)
         except subprocess.TimeoutExpired:
             return "run-timeout", "", None
         except OSError as ex:
@@ -247,7 +261,7 @@ def exec_bin(path, sp, exe):
         err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
         return "ran", "", (r.returncode, out, err)
     try:
-        r = subprocess.run([exe] + sp["rflags"], capture_output=True, text=True,
+        r = subprocess.run([exe] + sp["rflags"], capture_output=True, text=True, errors="replace",
                            timeout=60, cwd=os.path.dirname(path), env=run_env(sp))
     except subprocess.TimeoutExpired:
         return "run-timeout", "", None
@@ -260,7 +274,7 @@ def exec_bin(path, sp, exe):
     return "ran", "", (r.returncode, out, err)
 
 
-STOCK_CACHE_VERSION = 5  # bump when normalization or comparison semantics change
+STOCK_CACHE_VERSION = 6  # bump when normalization or comparison semantics change
 _STOCK_LOCKS = collections.defaultdict(threading.Lock)
 
 
@@ -269,7 +283,7 @@ def stock_result(path, sp):
     key = hashlib.sha256(
         open(path, "rb").read()
         + json.dumps([STOCK_CACHE_VERSION, sp["kind"], sp["edition"], sp["cflags"], sp["rflags"],
-                      sp["env"], sp["unset"], EXTRA, TGT, 2 if TGT else None]
+                      sp["env"], sp["unset"], EXTRA, TGT, WASMTIME]
                      + ([sp["cenv"], sp["cunset"]] if sp["cenv"] or sp["cunset"] else []),
                      sort_keys=True).encode()
     ).hexdigest()[:32]
@@ -313,7 +327,7 @@ def run(path):
     if why:
         return rel, "skipped", why
     ref_st, ref_msg, want = stock_result(path, sp)
-    exe = os.path.join(OUT, "bin", rel.replace("/", "__")[:-3])
+    exe = os.path.join(OUT, "bin", rel.replace("/", "__").replace("\\", "__")[:-3])
     st, msg, got = build_and_run(path, sp, exe, True)
     if kind not in ("run-pass", "run-fail"):
         # Compile-only kinds: agreement on compile outcome is the whole
