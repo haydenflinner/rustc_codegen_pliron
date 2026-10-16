@@ -334,9 +334,13 @@ t_pgo() {
     PLIRON_PROFILE_FILE=$prof $out/pgo_i$exe > $out/pgo_i.out &&
     $cli dump $prof > $out/pgo.dump &&
     grep -q 'functions' $out/pgo.dump &&
-    PLIRON_PGO_USE=$prof rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
+    # pgo::load reads the merged PLPROF01 map, not the raw PLRAW01 dump —
+    # without this merge the use-side is rejected ("bad profile") and the
+    # '0 functions matched' check below passes vacuously.
+    $cli merge $prof -o $out/pgo.merged &&
+    PLIRON_PGO_USE=$out/pgo.merged rustc $BE --edition 2021 -O -C codegen-units=1 tests/pgo/main.rs \
       -o $out/pgo_u$exe 2> $out/pgo_use.txt &&
-    ! grep -q ': 0 functions matched' $out/pgo_use.txt &&
+    grep -Eq ': [1-9][0-9]* functions matched' $out/pgo_use.txt &&
     $out/pgo_u$exe | diff - $out/pgo_i.out
   # wasm leg: the instrumented module carries no runtime; the host pulls
   # the same .prof out of linear memory via __pliron_prof_hdrs.
