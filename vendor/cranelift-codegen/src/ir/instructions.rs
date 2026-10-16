@@ -84,6 +84,7 @@ impl BlockCall {
     }
 
     /// Return the block for this BlockCall.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn block(&self, pool: &ValueListPool) -> Block {
         let val = self.values.first(pool).unwrap();
         Self::value_to_block(val)
@@ -231,6 +232,7 @@ impl BlockArg {
     }
 
     /// Decode a raw `Value` encoding of this block argument.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn decode_from_value(v: Value) -> Self {
         let raw = v.as_u32();
         let tag = raw >> 30;
@@ -423,6 +425,7 @@ impl InstructionData {
     /// Get the destinations of this instruction, if it's a branch.
     ///
     /// `br_table` returns the empty slice.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn branch_destination<'a>(
         &'a self,
         jump_tables: &'a ir::JumpTables,
@@ -445,6 +448,7 @@ impl InstructionData {
     /// Get a mutable slice of the destinations of this instruction, if it's a branch.
     ///
     /// `br_table` returns the empty slice.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn branch_destination_mut<'a>(
         &'a mut self,
         jump_tables: &'a mut ir::JumpTables,

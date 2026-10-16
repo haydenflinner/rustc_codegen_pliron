@@ -44,11 +44,12 @@ pub(crate) mod private {
 /// compile time. The `container` link intentionally stays inside the
 /// node: `get_parent_*` accessors have no `Context` to reach this table.
 ///
-/// `tag` stores the node's full `ArenaIndex` so a stale entry left by a
-/// deallocated node (whose slot index was reused) reads as unlinked
-/// rather than handing out the old node's links.
+/// `tag` stores the node's raw `ArenaIndex` bits (`ffi()`) so a stale
+/// entry left by a deallocated node (whose slot index was reused) reads
+/// as unlinked rather than handing out the old node's links. 0 is
+/// vacant — a real key's version low bit is always set.
 pub struct NodeLinks<T: private::LinkedList> {
-    tag: Option<crate::context::ArenaIndex>,
+    tag: u64,
     next: Option<Ptr<T>>,
     prev: Option<Ptr<T>>,
 }
@@ -64,7 +65,7 @@ impl<T: private::LinkedList> Copy for NodeLinks<T> {}
 impl<T: private::LinkedList> Default for NodeLinks<T> {
     fn default() -> Self {
         Self {
-            tag: None,
+            tag: 0,
             next: None,
             prev: None,
         }
@@ -76,8 +77,7 @@ impl<T: private::LinkedList> Default for NodeLinks<T> {
 /// Shared by the links and op-dispatch tables.
 #[inline]
 pub(crate) fn links_index<T: crate::context::private::ArenaObj>(ptr: Ptr<T>) -> usize {
-    use slotmap::Key;
-    ptr.idx.data().as_ffi() as u32 as usize
+    ptr.idx.ffi() as u32 as usize
 }
 
 impl<T: private::LinkedList> NodeLinks<T> {
@@ -88,7 +88,7 @@ impl<T: private::LinkedList> NodeLinks<T> {
         T::links_store(ctx)
             .borrow()
             .get(links_index(ptr))
-            .filter(|links| links.tag == Some(ptr.idx))
+            .filter(|links| links.tag == ptr.idx.ffi())
             .copied()
             .unwrap_or_default()
     }
@@ -106,7 +106,7 @@ fn update_links<T: private::LinkedList>(
         links.resize(i + 1, NodeLinks::default());
     }
     let links = &mut links[i];
-    links.tag = Some(ptr.idx);
+    links.tag = ptr.idx.ffi();
     f(links);
 }
 

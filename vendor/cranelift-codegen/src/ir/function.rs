@@ -393,12 +393,14 @@ pub struct Function {
 impl core::ops::Deref for Function {
     type Target = FunctionStencil;
 
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn deref(&self) -> &Self::Target {
         &self.stencil
     }
 }
 
 impl core::ops::DerefMut for Function {
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.stencil
     }

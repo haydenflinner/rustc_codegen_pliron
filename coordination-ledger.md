@@ -1837,3 +1837,47 @@ shared `uses::Uses`: `sites` is now CSR (`sites(v) -> &[(Block,Inst)]`)
 instead of `FxHashMap<Value, Vec>` — kills per-use hash+alloc at build
 and hashing per lookup at use. All ~10 consumers were pure point
 lookups; `None`/miss maps to `&[]` identically.
+
+### op_kind dispatch table — LANDED (647e890)
+
+`is_op::<T>`/`get_op_dyn` dereferenced the whole ~250B Operation
+(RefCell borrow + slotmap hop) to compare a TypeId — several times
+per op in interface-scanning passes (nocapture does 4-6 is_op per op).
+`concrete_op` now mirrored into `ctx.op_kind: RefCell<Vec<(Option<
+ArenaIndex>, ConcreteOpInfo)>>` indexed by slot index — 32B contiguous
+entries. `alloc` writes, `dealloc` clears the tag; stale ptrs panic
+identically to a dangling deref. Only `Operation::dealloc` removes
+arena entries, so no stale-entry path.
+
+Note for other agents: `is_op` reads now go through the table —
+`is_op` on a ptr whose node was created any way other than
+`Operation::new`/`ArenaObj::alloc` will panic. All creation funnels
+through `Operation::new`.
+
+### cross-crate call elimination, round 2 — LANDED (pending push)
+
+Fresh samply profile: `cargo rustc -p pliron-clif-opt` through the
+backend, 233k dylib-attributed samples. Top leafs were all non-generic
+accessor call overhead: `Function::deref` (4.8k), `ArenaIndex::data`
+(2.7k — every `get_next`/`dispatch` hop paid a non-inlinable slotmap
+`Key::data` call), `Insts::index` (1.7k), `branch_destination`+args
+family (~6k), `maybe_resolve_aliases` (~4k).
+
+Fixes: (a) `#[inline]` on the generated `opcode`/`arguments`/
+`typevar_operand` (meta generator), `Insts`/`Blocks` index impls,
+branch_destination(_mut), BlockCall::block, BlockArg::decode_from_value,
+Type::index/from_repr, Function::deref(_mut). (b) pliron
+`ArenaIndex::ffi()` — one inlinable call returning raw key bits; the
+links/op_kind side-table tags are now bare `u64` (0 = vacant, version
+low bit is always set), so tag checks are a scalar compare instead of a
+derived `ArenaIndex::eq` call.
+
+Next-largest leafs now: `hashbrown::drop_inner_table`/
+`new_uninitialized` for `Ptr<Value>`/`Ptr<Block>`-keyed maps (~5.2k)
+— per-function entity-map alloc/teardown; a dense Vec-indexed-by-entity
+`SecondaryMap`-style table is the fix. `RawVec::finish_grow` (~4.8k)
+is Vec growth everywhere; `Vec<Ptr>::from_iter` on list collects
+(~3.5k) — `Iter` has no `size_hint`, so collects can't prealloc;
+could add `size_hint` if containers tracked length. `carry_one` 1.2k
+(post-epoch-gate residual), `indvars::edge_arg` ~1k, `sroa::gep_offset`
+0.5k, `trace::dyn_site` 0.6k (tracer overhead worth a look).

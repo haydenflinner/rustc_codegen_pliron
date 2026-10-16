@@ -114,6 +114,8 @@ fn gen_arguments_method(formats: &[Rc<InstructionFormat>], fmt: &mut Formatter, 
         ("arguments", "", "core::slice::from_ref", "as_slice")
     };
 
+    // PLIRON: cross-crate callers don't get dev-profile inlining without it.
+    fmt.line("#[inline]");
     fmt.add_block(&format!(
         "pub fn {method}<'a>(&'a {mut_}self, pool: &'a {mut_}ir::ValueListPool) -> &'a {mut_}[Value]"),
 
@@ -167,6 +169,8 @@ fn gen_arguments_method(formats: &[Rc<InstructionFormat>], fmt: &mut Formatter, 
 fn gen_instruction_data_impl(formats: &[Rc<InstructionFormat>], fmt: &mut Formatter) {
     fmt.add_block("impl InstructionData", |fmt| {
         fmt.doc_comment("Get the opcode of this instruction.");
+        // PLIRON: cross-crate callers don't get dev-profile inlining without it.
+        fmt.line("#[inline]");
         fmt.add_block("pub fn opcode(&self) -> Opcode",|fmt| {
             let mut m = Match::new("*self");
             for format in formats {
@@ -178,6 +182,8 @@ fn gen_instruction_data_impl(formats: &[Rc<InstructionFormat>], fmt: &mut Format
                 fmt.empty_line();
 
         fmt.doc_comment("Get the controlling type variable operand.");
+        // PLIRON: cross-crate callers don't get dev-profile inlining without it.
+        fmt.line("#[inline]");
         fmt.add_block("pub fn typevar_operand(&self, pool: &ir::ValueListPool) -> Option<Value>",|fmt| {
             let mut m = Match::new("*self");
             for format in formats {

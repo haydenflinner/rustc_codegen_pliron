@@ -32,6 +32,7 @@ pub struct Insts(PrimaryMap<Inst, InstructionData>);
 impl Index<Inst> for Insts {
     type Output = InstructionData;
 
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index(&self, inst: Inst) -> &InstructionData {
         self.0.index(inst)
     }
@@ -39,6 +40,7 @@ impl Index<Inst> for Insts {
 
 /// Allow mutable access to instructions via indexing.
 impl IndexMut<Inst> for Insts {
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index_mut(&mut self, inst: Inst) -> &mut InstructionData {
         self.0.index_mut(inst)
     }
@@ -86,12 +88,14 @@ impl Blocks {
 impl Index<Block> for Blocks {
     type Output = BlockData;
 
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index(&self, block: Block) -> &BlockData {
         &self.0[block]
     }
 }
 
 impl IndexMut<Block> for Blocks {
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index_mut(&mut self, block: Block) -> &mut BlockData {
         &mut self.0[block]
     }
@@ -293,6 +297,7 @@ impl DataFlowGraph {
 ///
 /// Find the original SSA value that `value` aliases, or None if an
 /// alias cycle is detected.
+#[inline] // PLIRON: hot cross-crate call in dev builds
 fn maybe_resolve_aliases(
     values: &PrimaryMap<Value, ValueDataPacked>,
     value: Value,
@@ -314,6 +319,7 @@ fn maybe_resolve_aliases(
 /// Resolve value aliases.
 ///
 /// Find the original SSA value that `value` aliases.
+#[inline] // PLIRON: hot cross-crate call in dev builds
 fn resolve_aliases(values: &PrimaryMap<Value, ValueDataPacked>, value: Value) -> Value {
     if let Some(v) = maybe_resolve_aliases(values, value) {
         v

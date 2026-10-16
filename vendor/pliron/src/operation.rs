@@ -463,7 +463,7 @@ impl Operation {
     fn dispatch(ptr: Ptr<Self>, ctx: &Context) -> ConcreteOpInfo {
         let kinds = ctx.op_kind.borrow();
         match kinds.get(crate::linked_list::links_index(ptr)) {
-            Some((Some(tag), kind)) if *tag == ptr.idx => *kind,
+            Some((tag, kind)) if *tag == ptr.idx.ffi() => *kind,
             _ => panic!("Dangling Ptr deref"),
         }
     }
@@ -619,9 +619,9 @@ impl ArenaObj for Operation {
         let mut kinds = ctx.op_kind.borrow_mut();
         let i = crate::linked_list::links_index(ptr);
         if kinds.len() <= i {
-            kinds.resize(i + 1, (None, kind));
+            kinds.resize(i + 1, (0, kind));
         }
-        kinds[i] = (Some(ptr.idx), kind);
+        kinds[i] = (ptr.idx.ffi(), kind);
         ptr
     }
     /// PLIRON: clears the `op_kind` entry on top of the default
@@ -634,7 +634,7 @@ impl ArenaObj for Operation {
             .borrow_mut()
             .get_mut(crate::linked_list::links_index(ptr))
         {
-            entry.0 = None;
+            entry.0 = 0;
         }
     }
     fn dealloc_sub_objects(ptr: Ptr<Self>, ctx: &mut Context) {

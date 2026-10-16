@@ -47,6 +47,19 @@ impl Display for ArenaIndex {
     }
 }
 
+impl ArenaIndex {
+    /// PLIRON: raw key bits (`Key::data().as_ffi()`) in one inlinable
+    /// hop — the `new_key_type!`-generated `data()` carries no
+    /// `#[inline]`, so `Ptr<T>` methods monomorphized into dependent
+    /// crates were paying a real call per decode. Version low bit is
+    /// always set (`slotmap` ORs 1 into it), so 0 works as a vacant
+    /// tag sentinel for the dense side tables.
+    #[inline]
+    pub(crate) fn ffi(self) -> u64 {
+        self.0.as_ffi()
+    }
+}
+
 /// An arena allocation pool for IR objects.
 pub type Arena<T> = SlotMap<ArenaIndex, RefCell<T>>;
 
@@ -74,10 +87,11 @@ pub struct Context {
     /// mirrored here indexed by the op's `ArenaIndex` index component,
     /// so `is_op`/`get_op_dyn` check a ~32-byte contiguous entry instead
     /// of a `RefCell` borrow + deref of the ~250-byte node. The tag is
-    /// the slot's `ArenaIndex`; a stale pointer reads a mismatched or
-    /// cleared tag and panics like a dangling `deref`.
+    /// the slot's `ArenaIndex::ffi()` bits (0 = vacant); a stale pointer
+    /// reads a mismatched or cleared tag and panics like a dangling
+    /// `deref`.
     pub(crate) op_kind:
-        RefCell<Vec<(Option<ArenaIndex>, crate::op::ConcreteOpInfo)>>,
+        RefCell<Vec<(u64, crate::op::ConcreteOpInfo)>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.

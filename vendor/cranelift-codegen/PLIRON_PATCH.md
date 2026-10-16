@@ -517,3 +517,18 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `value_def(resolve_aliases(v))` pattern costs one map hit + one
     decode instead of two. ~95 opt-crate call sites converted.
     Panic/Option semantics identical to the unfused pair.
+
+42. More `#[inline]` on hot cross-crate readers (`src/ir/dfg.rs`,
+    `src/ir/instructions.rs`, `src/ir/types.rs`, `src/ir/function.rs`):
+    `Insts`/`Blocks` `Index`/`IndexMut`, free `maybe_resolve_aliases`/
+    `resolve_aliases`, `BlockCall::block`, `BlockArg::decode_from_value`,
+    `branch_destination`/`_mut`, `Type::index`/`from_repr`,
+    `Function` `Deref`/`DerefMut`. A fresh profile of
+    `cargo rustc -p pliron-clif-opt` through the backend put these at
+    ~11k/233k leaf samples combined. Same no-LTO rationale as #40.
+
+43. `#[inline]` on generated `InstructionData` methods
+    (`cranelift-codegen-meta/src/gen_inst.rs`): `opcode`, `arguments`,
+    `arguments_mut`, `typevar_operand` — the generated code is all
+    non-generic, so every `inst.opcode()`/arg read from the opt crates
+    was an outlined call.

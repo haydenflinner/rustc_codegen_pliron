@@ -383,6 +383,7 @@ impl Type {
     }
 
     /// Index of this type, for use with hash tables etc.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn index(self) -> usize {
         usize::from(self.0)
     }
@@ -413,6 +414,7 @@ impl Type {
 
     /// Converts from a bit-level representation of the type back to a
     /// `Type`.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub(crate) fn from_repr(bits: u16) -> Type {
         Type(bits)
     }

@@ -27,3 +27,8 @@ opcodes can be declared. Changes, all in `src/shared/instructions.rs`:
    (memflags + 3 values + offset32) — see cranelift-reader patch 1 and
    cranelift-codegen patch 28 for the parser/verifier/display arms and
    the x64 rules.
+
+1. `#[inline]` on generated `InstructionData::opcode`, `arguments`,
+   `arguments_mut`, `typevar_operand` (`src/gen_inst.rs`). Non-generic
+   generated methods don't inline cross-crate in dev builds; these are
+   among the hottest calls in the opt pipeline.
