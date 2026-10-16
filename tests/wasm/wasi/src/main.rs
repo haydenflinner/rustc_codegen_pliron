@@ -63,6 +63,14 @@ fn main() {
         "variadic",
         unsafe { vsum(3, 10i32, 20i64, 30.5f64) == 60.5 },
     );
+    // Consecutive i32/u32 args: the wasm C ABI packs varargs in 4-byte
+    // slots at natural alignment, not SysV 8-byte slots — a stride-8 bug
+    // shows up as misaligned reads here. The i64 after three i32s
+    // exercises >4-alignment padding (offset 16, not 12/24).
+    check(
+        "variadic slots",
+        unsafe { vpack(6, 1i32, 2u32, 3i32, 4i64, 5i32, 6.5f64) == 21.5 },
+    );
     check(
         "libm",
         (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
@@ -77,6 +85,22 @@ unsafe extern "C" fn vsum(n: i32, mut ap: ...) -> f64 {
             match i {
                 0 => ap.next_arg::<i32>() as f64,
                 1 => ap.next_arg::<i64>() as f64,
+                _ => ap.next_arg::<f64>(),
+            }
+        };
+    }
+    s
+}
+
+unsafe extern "C" fn vpack(n: i32, mut ap: ...) -> f64 {
+    let mut s = 0.0;
+    for i in 0..n {
+        s += unsafe {
+            match i {
+                0 => ap.next_arg::<i32>() as f64,
+                1 => ap.next_arg::<u32>() as f64,
+                2 | 4 => ap.next_arg::<i32>() as f64,
+                3 => ap.next_arg::<i64>() as f64,
                 _ => ap.next_arg::<f64>(),
             }
         };

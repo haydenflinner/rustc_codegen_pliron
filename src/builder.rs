@@ -914,16 +914,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // Each argument sits in an 8-byte slot aligned to its alignment (capped
         // at 16), matching the packing in the call lowering and what a foreign
         // callee's va_arg decodes from a forwarded VaList.
-        let (size, align) = crate::types::size_align(&self.cx.pctx.borrow(), ty);
+        let wasm = self.tcx().sess.target.is_like_wasm;
+        let ctx = self.cx.pctx.borrow();
+        let (size, align) = crate::types::size_align(&ctx, ty);
+        // wasm C ABI: the slot holds a pointer to a caller-side copy for
+        // aggregates other than single-element structs (va_indirect).
+        let indirect = wasm && crate::types::va_indirect(&ctx, ty);
+        drop(ctx);
         let ptr = self.type_ptr();
         let isize = self.type_isize();
         let i8t = self.type_i8();
         // wasm's va_list is an opaque pointer: the place itself is the cursor.
-        let cur_off = if self.tcx().sess.target.is_like_wasm {
-            0
-        } else {
-            8
-        };
+        let cur_off = if wasm { 0 } else { 8 };
         let cur_slot = if cur_off == 0 {
             list
         } else {
@@ -931,14 +933,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let cur_p = self.load(ptr, cur_slot, Align::EIGHT);
         let cur = self.ptrtoint(cur_p, isize);
-        let a_eff = align.clamp(8, 16);
+        // SysV: 8-byte slots, align clamped to [8,16]. wasm (BasicCABI):
+        // 4-byte slots at the arg's natural alignment; the indirect case
+        // reads a wasm32 pointer from a 4-byte slot.
+        let (a_eff, sz) = if wasm {
+            (
+                if indirect { 4 } else { align.max(1) },
+                if indirect {
+                    4
+                } else {
+                    crate::types::align_to(size, 4)
+                },
+            )
+        } else {
+            (align.clamp(8, 16), size.max(8).next_multiple_of(8))
+        };
         let a1 = self.const_usize(a_eff - 1);
         let mask = self.const_usize(!(a_eff - 1));
         let cur_a1 = self.add(cur, a1);
         let aligned = self.and(cur_a1, mask);
         let p = self.inttoptr(aligned, ptr);
-        let v = self.load(ty, p, Align::from_bytes(align).unwrap());
-        let sz = self.const_usize(size.max(8).next_multiple_of(8));
+        let v = if indirect {
+            let rp = self.load(ptr, p, Align::from_bytes(4).unwrap());
+            self.load(ty, rp, Align::from_bytes(align.max(4)).unwrap())
+        } else {
+            self.load(ty, p, Align::from_bytes(align).unwrap())
+        };
+        let sz = self.const_usize(sz);
         let next = self.add(aligned, sz);
         let next = self.inttoptr(next, ptr);
         self.store(next, cur_slot, Align::EIGHT);

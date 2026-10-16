@@ -40,7 +40,9 @@ use waffle::{
 use crate::context::{ArgExt, ConstVal, State};
 use crate::has_body;
 use crate::lower::{rpo, write_const};
-use crate::types::{TyK, classify, leaves, members, size_align, struct_offsets};
+use crate::types::{
+    TyK, align_to, classify, leaves, members, size_align, struct_offsets, va_indirect,
+};
 
 type Vals = SmallVec<[WV; 2]>;
 
@@ -4658,22 +4660,35 @@ impl<'o, 'a> FL<'o, 'a> {
             }
         }
         if var_arg {
-            // SysV overflow-area layout, matching va_start/va_arg's tag walk:
-            // each vararg in an 8-byte slot aligned to its alignment (<=16).
+            // wasm C ABI (tool-conventions BasicCABI): each vararg sits at
+            // its natural alignment and occupies align_up(size, 4) bytes —
+            // clang's emitVoidPtrVAArg with a 4-byte slot. Aggregates other
+            // than single-element structs are indirect: the slot holds a
+            // pointer to a caller-side copy.
             let mut off = 0u64;
             let mut plan = Vec::new();
             for &a in &va_args {
                 let ty = a.get_type(ctx);
-                let (size, align) = size_align(ctx, ty);
-                off = off.next_multiple_of(align.clamp(8, 16));
+                let ind = va_indirect(ctx, ty);
+                let (size, align) = if ind { (4, 4) } else { size_align(ctx, ty) };
+                off = align_to(off, align);
                 let slot = off;
-                off += size.max(8).next_multiple_of(8);
-                plan.push((a, ty, slot));
+                off += align_to(size, 4);
+                plan.push((a, ty, ind, slot));
             }
             let buf = self.slot(off.max(1), 16);
-            for (a, ty, slot) in plan {
-                for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
-                    self.store(lt, v, buf, slot + lo);
+            for (a, ty, ind, slot) in plan {
+                if ind {
+                    let (sz, al) = size_align(ctx, ty);
+                    let dst = self.slot(sz.max(1), al.max(1));
+                    for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        self.store(lt, v, dst, lo);
+                    }
+                    self.store(clt::I32, dst, buf, slot);
+                } else {
+                    for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        self.store(lt, v, buf, slot + lo);
+                    }
                 }
             }
             wargs.push(buf);

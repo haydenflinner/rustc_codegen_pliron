@@ -123,6 +123,17 @@ pub fn size_align(ctx: &Context, ty: TypeHandle) -> (u64, u64) {
     }
 }
 
+/// Whether a C vararg is passed indirectly (slot holds a pointer to a
+/// caller-side copy) under the wasm C ABI. clang's rule:
+/// `isAggregateTypeForABI && !isEmptyRecord && !isSingleElementStruct`.
+pub fn va_indirect(ctx: &Context, ty: TypeHandle) -> bool {
+    match classify(ctx, ty) {
+        TyK::Array(_, n) => n > 0,
+        TyK::Struct(fs, _) => fs.len() > 1,
+        _ => false,
+    }
+}
+
 pub fn struct_offsets(ctx: &Context, fields: &[TypeHandle], packed: bool) -> (Vec<u64>, u64, u64) {
     let mut off = 0;
     let mut align = 1;

@@ -31,7 +31,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use crate::context::{ArgExt, ConstVal, Exts, State, mask};
-use crate::types::{TyK, classify, leaf_range, leaves, size_align, struct_offsets};
+use crate::types::{
+    TyK, align_to, classify, leaf_range, leaves, size_align, struct_offsets, va_indirect,
+};
 use crate::{address_taken, has_body};
 
 type Vals = SmallVec<[ir::Value; 2]>;
@@ -4724,7 +4726,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // aligned to its alignment (capped at 16), leaves at their
                 // struct offsets. A VaList forwarding this buffer to a foreign
                 // callee then decodes it identically to a real register-save
-                // area's overflow region.
+                // area's overflow region. On wasm the buffer IS the real ABI
+                // (BasicCABI): 4-byte slots at natural alignment, and
+                // aggregates other than single-element structs are indirect
+                // (the slot holds a pointer to a copy).
                 let fixed = sig.params.len() - 1;
                 let mut seen = 0usize;
                 let mut first = args.len();
@@ -4741,18 +4746,40 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let mut plan = Vec::new();
                 for &a in &args[first..] {
                     let ty = a.get_type(ctx);
-                    let (size, align) = size_align(ctx, ty);
-                    off = off.next_multiple_of(align.clamp(8, 16));
+                    let ind = self.wasm && va_indirect(ctx, ty);
+                    let (size, align) = if ind { (4, 4) } else { size_align(ctx, ty) };
+                    off = if self.wasm {
+                        align_to(off, align)
+                    } else {
+                        off.next_multiple_of(align.clamp(8, 16))
+                    };
                     let slot = off;
-                    off += size.max(8).next_multiple_of(8);
-                    plan.push((a, ty, slot));
+                    off += if self.wasm {
+                        align_to(size, 4)
+                    } else {
+                        size.max(8).next_multiple_of(8)
+                    };
+                    plan.push((a, ty, ind, slot));
                 }
                 let buf = self.slot(off.max(1), 16);
-                for (a, ty, slot) in plan {
-                    for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                for (a, ty, ind, slot) in plan {
+                    if ind {
+                        let (sz, al) = size_align(ctx, ty);
+                        let dst = self.slot(sz.max(1), al.max(1));
+                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                            self.b
+                                .ins()
+                                .store(MemFlagsData::new(), v, dst, lo as i32);
+                        }
                         self.b
                             .ins()
-                            .store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
+                            .store(MemFlagsData::new(), dst, buf, slot as i32);
+                    } else {
+                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                            self.b
+                                .ins()
+                                .store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
+                        }
                     }
                 }
                 cargs.push(buf);
