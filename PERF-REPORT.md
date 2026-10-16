@@ -9,8 +9,9 @@ cubecl `clif-cpu-jit` `2556b654f`. Raw data: [`perf/data.md`](perf/data.md).
 |---|---|---|---|
 | **native runtime** | 1.00× | **1.037×** slower | 7/16 kernels faster, geomean within noise of parity |
 | **native compile time** | 488 ms | 925 ms | 1.9× slower (release dylib) |
-| **wasm runtime** | 1.00× | **1.166×** slower | 4/16 faster; dialect fallback is worse still (1.55×) |
-| **wasm compile time** | 648 ms | 2.76 s | 4.3× slower — the CLIF→waffle pipeline cost |
+| **wasm runtime** | 1.00× | **1.157×** slower | 4/16 faster; dialect fallback is worse still (1.55×) |
+| **wasm compile time** | 648 ms | 824 ms | 1.27× slower (was 4.3× before the winline cap) |
+| **wasm module size** | 97 KiB | **203 KiB** | 2.1× LLVM (was 8.4× — winline cascade fixed) |
 | **cubecl JIT runtime** | 1.00× | **~1.00×** | parity on compute & read; LLVM +8–23 % on copy/write |
 | **cubecl JIT compile time** | 24.8 ms/kernel | 9.1 ms/kernel | **2.7× faster** |
 | **cubecl correctness** | 989/1071 | **1048/1071** | LLVM's bf16 codegen is broken on Windows |
@@ -94,14 +95,17 @@ Three things stand out:
 - **Wasm is farther from LLVM than native is** (1.166 vs 1.037) — mostly
   because wasm kernels like `fib` (+77 %) and `tokenize` (+23 %) exercise
   the wasm-specific translation layer rather than the native CLIF one.
-- **Module size is 8× LLVM's.** wasm-ld's `--gc-sections` strips dead
-  std aggressively; `pliron-wasm-ld` is much more conservative today.
-  If size matters this is the cheapest big win left.
+- **Module size was 8× LLVM's — now 2.1×.** The bulk was one pathological
+  case: `winline`'s 8-round rescanning cascaded splices inside its own
+  copies, exploding core's `quicksort` into a ~0.6 MB single function
+  (75 % of the code section). `b50185e` caps caller growth at 2048 insts:
+  pliron wasm 813→203 KiB, dialect 1.08 MiB→341 KiB, and wasm compile
+  time 2757→824 ms (the mega-bodies were dominating `optimize()` too).
+  Runtime geomean unchanged (1.166→1.157) — wasm calls are cheap, the
+  inlining never paid for itself anyway.
 
-Compile-time is the worst number in the report: 4.3× LLVM for CLIF→waffle,
-9.4× for the dialect path. Some of that is `build-std` noise (stock std
-rlibs are prebuilt; ours must lower them through the backend), but the
-per-object codegen delta is real.
+Compile time is now 1.27× LLVM for CLIF→waffle (the dialect path is still
+slower to compile than it is to run).
 
 ## 3. CubeCL: LLVM LLJIT vs Cranelift JIT
 

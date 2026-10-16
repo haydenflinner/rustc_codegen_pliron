@@ -74,6 +74,22 @@ the dialect fallback on 14/16 (dialect wins only matmul & chars_mixed).
 Module size: LLVM 97 KiB, pliron 813 KiB, dialect 1.08 MiB — wasm-ld
 strips dead std code far more aggressively than pliron-wasm-ld does today.
 
+### Post-fix (b50185e: winline caller-growth cap)
+
+| metric | before | after |
+|---|---|---|
+| wasmbench.wasm (CLIF) | 813 KiB | **203 KiB** |
+| wasmbench.wasm (dialect) | 1.08 MiB | **341 KiB** |
+| wasm compile time (lib) | 2757 ms | **824 ms** (1.27x LLVM) |
+| runtime geomean | 1.166 | **1.157** (unchanged) |
+
+Root cause: `winline` rescanned callers for 8 rounds and each splice
+exposed fresh callsites inside the copies — core's `quicksort` grew to
+~344k wat lines (0.6 MB, ~75 % of the code section). Capping caller
+growth at 2048 insts drops it to ~7.7k lines. No runtime cost: wasm
+calls are cheap and the post-splice optimizer wasn't exploiting the
+merges anyway.
+
 ## 5. CubeCL CPU JIT — `examples/throughput`, release build
 
 ### Runtime (best of 5 for compute, best of 3 for memory; µs for launch)
